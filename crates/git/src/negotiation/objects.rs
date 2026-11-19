@@ -6,7 +6,13 @@
 //!    and the common haves, peeled to commits (and the commits a cut made whole, and the wants a run answers, whose
 //!    histories the runs carry) as had. The commits to send are those wanted and not had.
 //! 2. **Left out.** The trees of the edge commits, each had parent of a commit sent, and the trees and blobs a have
-//!    names that is no commit, are what the client holds: nothing in them is sent.
+//!    names that is no commit: nothing in them is sent. For a thin pack in a shallow exchange (the client is shallow,
+//!    or the cut is new), git's server runs `pack-objects --objects-edge-aggressive`, which leaves out the tree of
+//!    every had commit on its command line (`mark_edges_uninteresting`): each have `do_got_oid` lists (`have_obj`: a
+//!    commit only when no have before it named it or named it as a parent) and each commit a cut made whole
+//!    (`send_unshallow`'s `extra_edge_obj`); so does this. Without a thin pack only the edges are left out. (A-640
+//!    part 3 found the aggressive rule missing: git's own `--deepen` fetch, served, sent the shallow tip's blobs again;
+//!    git's stateless `deepen 2` without `thin-pack` sent them, which held the rule to thin packs alone.)
 //! 3. **Trees and blobs.** Each sent commit's root tree is opened at depth 0, its entries at depth 1, and so on; a tree
 //!    or blob is sent when nothing left out holds it and the filter admits it at the least depth it is met at. A tree met
 //!    again shallower is opened again, as git's `tree:` filter reopens it; under any other filter each tree opens once.
@@ -22,7 +28,7 @@ use super::ready::peel;
 use super::shallow::Cut;
 use super::{Counters, Filter, Graph, Refusal, Request, Run, charge};
 use crate::Admission;
-use crate::object_name::Kind;
+use crate::object_name::{Kind, ObjectId};
 
 /// The sides of a pack: what the request wants and has, and the cut its shallow lines make.
 pub(super) struct Sides<'s, N> {
@@ -46,7 +52,7 @@ pub(super) fn select<S: Graph>(
   counters: &mut Counters,
 ) -> Result<Vec<S::Node>, Refusal> {
   let sent = commits(graph, sides, admission, counters)?;
-  let left_out = left_out(graph, sides, &sent, admission)?;
+  let left_out = left_out(graph, request, sides, &sent, admission)?;
   let mut chosen = Chosen {
     filter: request.filter,
     left_out: &left_out,
@@ -113,9 +119,10 @@ fn commit_of<S: Graph>(graph: &S, node: S::Node) -> Option<S::Node> {
 }
 
 /// What the client holds of trees and blobs: everything in the edge commits' trees and in the haves that are no
-/// commits.
+/// commits; and, for a thin pack in a shallow exchange, everything in each had commit's tree on git's command line.
 fn left_out<S: Graph>(
   graph: &S,
+  request: &Request<'_>,
   sides: &Sides<'_, S::Node>,
   sent: &BTreeSet<S::Node>,
   admission: &mut Admission,
@@ -134,12 +141,62 @@ fn left_out<S: Graph>(
       }
     }
   }
+  left_out_aggressively(graph, request, sides, &mut held, admission)?;
   for have in sides.common.iter().filter_map(|node| peel(graph, *node)) {
     if graph.commit(have).is_none() {
       mark(graph, have, &mut held, admission)?;
     }
   }
   Ok(held)
+}
+
+/// For a thin pack in a shallow exchange, adds to `held` everything in the tree of each had commit git's command line
+/// names: each have it lists, and each commit a cut made whole (`--objects-edge-aggressive`).
+fn left_out_aggressively<S: Graph>(
+  graph: &S,
+  request: &Request<'_>,
+  sides: &Sides<'_, S::Node>,
+  held: &mut BTreeSet<S::Node>,
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
+  if !request.thin || sides.cut.grafts.is_empty() {
+    return Ok(());
+  }
+  let listed = listed_haves(graph, request.haves, admission)?;
+  for had in listed.iter().chain(&sides.cut.haves) {
+    if let Some(row) = graph.commit(*had) {
+      mark(graph, row.tree, held, admission)?;
+    }
+  }
+  Ok(())
+}
+
+/// The haves git lists for `pack-objects` (`do_got_oid`'s `have_obj`), those the store holds: in the order sent, a
+/// commit only when no have before it named it or named it as a parent, any other object each time.
+fn listed_haves<S: Graph>(
+  graph: &S,
+  haves: &[ObjectId],
+  admission: &mut Admission,
+) -> Result<Vec<S::Node>, Refusal> {
+  let mut marked = BTreeSet::new();
+  let mut listed = Vec::new();
+  for node in haves.iter().filter_map(|id| graph.node(id)) {
+    let counts = if graph.commit(node).is_some() {
+      let new = marked.insert(node);
+      for parent in graph.parents(node) {
+        charge::<S::Node>(admission)?;
+        marked.insert(parent);
+      }
+      new
+    } else {
+      true
+    };
+    if counts {
+      charge::<(S::Node, S::Node)>(admission)?;
+      listed.push(node);
+    }
+  }
+  Ok(listed)
 }
 
 /// Adds `root` and everything below it to `held`, without recursion, a tree already held skipped whole.
