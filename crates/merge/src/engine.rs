@@ -5065,6 +5065,9 @@ mod copy_tests;
 mod reanchor;
 pub use reanchor::{ReanchorRefused, Reanchored};
 
+mod stack;
+pub use stack::{Landed, RestateRefused, Restated, TreeBase, TreeNode, Upper};
+
 #[cfg(test)]
 mod judge_tests;
 #[cfg(test)]

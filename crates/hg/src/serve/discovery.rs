@@ -184,7 +184,8 @@ fn first_parent_run(repo: &impl Repository, top: Node) -> Result<[Node; 4], Refu
 
 /// Appends `branchmap`'s answer (`wireprotov1server.branchmap`): a line for each named branch of the served view, by
 /// name, of its name quoted as `urlreq.quote` quotes it and its heads (closed ones too) oldest first, as hexadecimal
-/// nodes, the lines joined by newlines. A revision is its branch's head when no child of it is on its branch.
+/// nodes, the lines joined by newlines. A revision is its branch's head when no revision on its branch descends from it
+/// ([`branch_head_revs`]).
 pub fn branchmap(
   repo: &impl Repository,
   admission: &mut Admission,
@@ -215,21 +216,150 @@ pub fn branchmap(
   Ok(())
 }
 
-/// Every branch's heads, oldest first: the revisions no child on their own branch names as a parent.
+/// Every branch's heads, oldest first, by 7.2's rule (A-667; `branchmap.py`, `_BaseBranchCache._process_new`: "A
+/// branchhead is a revision such that no descendant is on the same branch"), closed heads kept, as the wire's
+/// `branchmap` and `check:updated-heads` read them (`branchheads(closed=True)`, `all_nodes_are_heads`).
+///
+/// A revision with a child on its branch is no head. One without is a head unless a revision on its branch descends
+/// from it through other branches: then it is an ancestor of a parent from another branch of a revision on its branch
+/// (7.2's `uncertain`), since the path leaves its branch and the last revision off it is such a parent. So only a
+/// branch whose candidates have children, all on other branches, is walked, and only from its highest such parent at or
+/// above its lowest such candidate down to that candidate, as 7.2 walks `cl.ancestors(uncertain, floorrev)`; a
+/// candidate with no child at all is a head, as 7.2 skips a branch whose heads are all topological ones.
+///
+/// Apart from 7.2 in one shape, on purpose: a merge whose parent on its branch is an ancestor of its other parent (as
+/// `hg debugsetparents` makes one). 7.2's shortcut for one known head and one parent on the branch (`branchmap.py`
+/// 478-483) never looks at the other parent, so it keeps a head the rule ends, and whether it does depends on how its
+/// cache was updated (A-667's measurements); the rule is the one answer a server can give.
 pub fn branch_head_revs(
   repo: &impl Repository,
   admission: &mut Admission,
 ) -> Result<Vec<Rev>, Refusal> {
   let count = repo.count();
-  let mut continued = RevSet::new(count, admission)?;
-  for rev in 0..count {
-    for parent in parents_of(repo, rev)?.into_iter().flatten() {
-      if repo.branch(parent) == repo.branch(rev) {
-        continued.insert(parent);
-      }
-    }
+  let edges = Edges::of(repo, admission)?;
+  let suspected = (0..count).filter(|rev| edges.suspect(*rev));
+  admission.charge_items::<Rev>(suspected.clone().count())?;
+  let mut suspects: Vec<Rev> = suspected.collect();
+  suspects.sort_unstable_by(|left, right| {
+    repo
+      .branch(*left)
+      .cmp(repo.branch(*right))
+      .then(left.cmp(right))
+  });
+  let mut reach = RevSet::new(count, admission)?;
+  let mut ended = RevSet::new(count, admission)?;
+  for group in suspects.chunk_by(|left, right| repo.branch(*left) == repo.branch(*right)) {
+    end_reached(repo, &edges, group, &mut reach, &mut ended)?;
   }
-  let heads = (0..count).filter(|rev| !continued.contains(*rev));
+  let heads = (0..count).filter(|rev| !edges.continued.contains(*rev) && !ended.contains(*rev));
   admission.charge_items::<Rev>(heads.clone().count())?;
   Ok(heads.collect())
 }
+
+/// A parent from another branch of a revision on a branch (7.2's `uncertain`): that branch, and the parent.
+type Reentry<'r> = (&'r [u8], Rev);
+
+/// What one walk of the served view's parents finds for its branch heads.
+struct Edges<'r> {
+  /// The revisions a child on their own branch names as a parent: no heads.
+  continued: RevSet,
+  /// The revisions any child names as a parent: no topological heads.
+  parented: RevSet,
+  /// Every branch's parents from other branches, by branch and then revision.
+  reentries: Vec<Reentry<'r>>,
+}
+
+impl<'r> Edges<'r> {
+  /// The edges of `repo`'s served view, each charged before it is kept.
+  fn of<R: Repository>(repo: &'r R, admission: &mut Admission) -> Result<Self, Refusal> {
+    let count = repo.count();
+    let mut edges = Edges {
+      continued: RevSet::new(count, admission)?,
+      parented: RevSet::new(count, admission)?,
+      reentries: Vec::new(),
+    };
+    for rev in 0..count {
+      let branch = repo.branch(rev);
+      for parent in parents_of(repo, rev)?.into_iter().flatten() {
+        edges.parented.insert(parent);
+        if repo.branch(parent) == branch {
+          edges.continued.insert(parent);
+        } else {
+          admission.charge_items::<Reentry<'r>>(1)?;
+          edges.reentries.push((branch, parent));
+        }
+      }
+    }
+    edges.reentries.sort_unstable();
+    Ok(edges)
+  }
+
+  /// Whether `rev` has no child on its branch but a child on another: a head unless a walk ends it.
+  fn suspect(&self, rev: Rev) -> bool {
+    !self.continued.contains(rev) && self.parented.contains(rev)
+  }
+
+  /// `branch`'s parents from other branches at or above `floor`, lowest first.
+  fn reentries_of(&self, branch: &[u8], floor: Rev) -> &[Reentry<'r>] {
+    let start = self
+      .reentries
+      .partition_point(|(of, parent)| (*of, *parent) < (branch, floor));
+    let end = self.reentries.partition_point(|(of, _)| *of <= branch);
+    self.reentries.get(start..end).unwrap_or_default()
+  }
+}
+
+/// Marks in `ended` each of `group`, one branch's suspects lowest first, that is an ancestor of a parent from another
+/// branch of a revision on that branch; `reach` is left empty, as it was found.
+fn end_reached(
+  repo: &impl Repository,
+  edges: &Edges<'_>,
+  group: &[Rev],
+  reach: &mut RevSet,
+  ended: &mut RevSet,
+) -> Result<(), Refusal> {
+  let Some(&floor) = group.first() else {
+    return Ok(());
+  };
+  let reentries = edges.reentries_of(repo.branch(floor), floor);
+  let Some(&(_, top)) = reentries.last() else {
+    return Ok(());
+  };
+  for (_, parent) in reentries {
+    reach.insert(*parent);
+  }
+  mark_ancestors(repo, reach, floor, top)?;
+  for suspect in group {
+    if reach.contains(*suspect) {
+      ended.insert(*suspect);
+    }
+  }
+  for rev in floor..=top {
+    reach.remove(rev);
+  }
+  Ok(())
+}
+
+/// Adds to `reach` every ancestor at or above `floor` of what it holds from `top` down, walking each revision's parents
+/// once, from the highest.
+fn mark_ancestors(
+  repo: &impl Repository,
+  reach: &mut RevSet,
+  floor: Rev,
+  top: Rev,
+) -> Result<(), Refusal> {
+  for rev in (floor..=top).rev() {
+    if reach.contains(rev) {
+      for parent in parents_of(repo, rev)?.into_iter().flatten() {
+        if parent >= floor {
+          reach.insert(parent);
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod tests;

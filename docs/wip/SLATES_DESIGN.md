@@ -11885,9 +11885,15 @@ decides the details.
 > in memory, secures retention, holds every work's verdict (`Green::judge`), judges the whole entry with its new greens
 > counted held (`Partition::check_creating`), and only then commits the verdicts (`Green::commit_judged`) and records
 > the new greens and the entry as one log record; a refusal names every change refused and why, or the entry's
-> refusal, and gives back what it held. Owed: the fleet half (A-636): each green's log and each state log replicated on
-> its own, holders applying atomic records at their joins, replicas refusing split cuts, takeovers adopting each log
-> and each record whole; and the repository policy's check before the verdict (A-622's next part).
+> refusal, and gives back what it held. The fleet half's protocol is built (A-636 part 1, `crates/db/src/ledger/logs.rs`,
+> the fenced ledger over a repository's logs): each log is a register of its own, placed by its own object id and
+> committing at `f + 1` of its own holders; a record is committed once every log it moves holds it on `f + 1` and every
+> record before it is committed, so the repository's committed state is the greatest cut at or below each log's
+> committed length that holds every record whole; holders apply that cut at their joins; a replica answers a read at a
+> vector of positions and refuses one past what it applied or one that splits a record; a takeover fences every log's
+> quorum or none, adopts each log, and keeps a record only where every log's read holds it whole, dropping it and what
+> follows it otherwise. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs' register
+> class, the server's takeover by this rule); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12037,8 +12043,10 @@ is one more version, and the chain itself is never rewritten.
 > operation made has its git objects derived from the history alone (`slates_git::derived`, §4.17.2's status): its
 > trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
 > and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
-> client pushed keeps the client's commit. Owed: item 4's identities in the principal's record and the refusals at
-> submit (A-664 part 1), the commit recorded with the version and admitted (part 3), Mercurial's and Subversion's.
+> client pushed keeps the client's commit. Item 4's identities are kept in each principal's record (A-664 part 1,
+> `slates-db`'s `IdentityRecord`). Owed: setting them on the control channel, a session carrying them from its first
+> submit, and the refusals at submit (part 1's server half), the commit recorded with the version and admitted (part
+> 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12137,6 +12145,26 @@ is one more version, and the chain itself is never rewritten.
 > verdict"): a work based before its file was replaced was spliced into the replacement, and a truncate based before an
 > append dropped the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
 > close), their wire refusals typed, and a comment's version held as a live reader of its green's fold floor.
+>
+> **Status (2026-11-19, A-659; shared piece 5).** Works over works and bases given as trees are built in the engine
+> (`crates/merge/src/engine/stack.rs` and its modules). An upper (`slates_merge::engine::Upper`) is a work whose ops
+> document was composed against another work's post-state. It is restated over the version its lower landed as
+> (`Green::restate`): the green's changes between the lower's base and its landing are read for the paths the upper
+> names, and moved over the lower's operations by the walk the verdict mapped the lower with, so the moved changes and
+> the lower's landed operations come from one decision (the landed operations are held to the delta the green recorded,
+> a guard). The upper is mapped through the moved changes and judged as the verdict judges a work against the changes
+> after its base, in every dimension; what landed after that version is the verdict's, as for any work. A change the
+> lower made too is in the upper's base already (a same-span overwrite, a metadata value); one the lower met in another
+> shape (an identical replacement the verdict accepted whole) makes the file a conflict for the upper, never a guess.
+> `Green::land_stack` lands a stack of any depth in order, each work all or none, in one call: a work that does not
+> land leaves the ones above it unjudged (`Landed::LowerRefused`), and a stack landed again is answered each work's
+> version. A work over a tree (item 6) is judged by whole-value differences between the tree and the head at the paths
+> it names (`Green::restate_over_tree`). The oracles hold a stack to a replica where its works landed first, at its base,
+> and the other works after them, which is the rule below made plain, and a work over a tree to a whole-file model.
+> Owed: the server's verbs (an upper held over its lower and restated as the lower lands; the lower's base held as a
+> live reader of the green's fold floor while an upper over it is unlanded); the whole-file identity check for an
+> upper's length-changing operation that meets a change (refused today, since the upper's base file is no version's);
+> a copy in a stack; a stack whose bottom is a tree.
 - A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
   unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
   approvals; and the evidence the policy requires (status checks, signatures).
@@ -12335,9 +12363,10 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
-   (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); owed: the
-   fleet half (A-636: each log replicated on its own, holders applying atomic records at their joins, replicas refusing
-   split cuts, takeovers adopting each log and each record whole).
+   (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); the fleet
+   half's protocol built as the fenced ledger over a repository's logs (A-636 part 1: each log replicated on its own,
+   holders applying records at their joins, replicas refusing split cuts, takeovers fencing every log or none and
+   keeping each record whole); owed: its live plane (A-636 part 2).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -12345,7 +12374,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    sliced, comes with each server's object pieces).
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
-5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
+5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree
+   (built in the engine, A-659: `Green::land_stack`, `Green::restate` and `Green::restate_over_tree`; the server's verbs
+   owed).
 6. Review records: comments anchored and moved by position mapping; approvals as evidence (built in the engine and the
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
@@ -13294,6 +13325,17 @@ signature verification).
 > string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
 > requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
 > HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
+>
+> **Status (2026-11-19, A-667: each branch's heads by 7.2's rule).** `serve::discovery::branch_head_revs` takes a
+> revision for its branch's head when no later revision on its branch descends from it, through any branches (7.2's
+> `branchmap.py`: "A branchhead is a revision such that no descendant is on the same branch"), closed heads kept, for
+> `branchmap` and `check:updated-heads`; before, a child on the branch was asked for, and A-619's oracle stated the
+> same, so `default` 0, `stable` 1, `default` 2 answered `default`'s heads 0 and 2 where 7.2 answers 2. A branch is
+> walked only where its candidates have children on other branches and a parent from another branch lies above them
+> (7.2's `uncertain`). Apart from 7.2 on purpose: a merge whose parent on its branch is an ancestor of its other
+> parent, where 7.2's shortcut keeps a head by its cache's history (measured both ways against stock 7.2;
+> `docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`). Owed: an obsolete changeset the
+> served view shows is never a head in 7.2; the view carries no obsolescence yet.
 >
 > **Status (2026-11-19, A-641 part 2: a push's changegroup verified, and a line's move a work).** `push::verify`
 > checks a push's changegroup against what the repository holds, through a `Held` trait (each log's texts by node),
@@ -46853,6 +46895,218 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/vcs/src/derived/ancestry.rs` and `derived/ancestry/tests.rs` (new),
   `crates/vcs/src/derived.rs` (the module and its docs); `docs/wip/research/ancestry-queries.md` (new); A-645's entry
   ("Queries by API"); §4.17.1 "Reads"' status; GAPS' A-645 line.
+
+### A-659 — Works over works: an upper restated over the version its lower landed as, a stack landed in order with each work all or none, and a base given as a tree judged by whole-value differences (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.17.1 "Works over works", "A push is a work" item 6 and shared piece 5; §4.16 "Position mapping" and "The verdict")
+
+- **What was there.** §4.16 based a work on a version of the green only. A request built on another request, a stack of
+  topics, or an agent's next work on its last before that one landed had nowhere to stand: its base is a work's
+  post-state, which no version holds until the lower lands, and when the lower lands mapped (other works landed first)
+  no version ever holds it.
+- **The decision.** An upper (`slates_merge::engine::Upper`) holds its ops document as the deriver composed it against
+  its lower's post-state, and names no version. `Green::land_stack(bottom, uppers)` lands a stack in order: the bottom as
+  any work; each upper, once the work below it landed, restated over that version (`Green::restate`) and judged as a
+  work based on it, all or none; a work that does not land leaves every work above it unjudged
+  (`Landed::LowerRefused`, naming the first that did not land). No client round trip, and the lower is never judged
+  again. An upper restated over a version is judged under an identity derived from its own and that version, so a stack
+  landed again is answered each work's version and commits nothing.
+- **Restating, by the walk the verdict used.** The version a lower landed as differs from its post-state by what the
+  green's other works changed between the lower's base and its landing, which the verdict mapped the lower through.
+  Those changes are read from the green for the paths the upper names: the deltas at the versions the path's content
+  history names in that span, and each dimension's history, at the cost of the path's own changes. They are moved over
+  the lower's operations by the walk `crate::map` maps a range with: an operation ending at or before another's start
+  shifts it, and the first starting at or after its end ends the walk. Delta and work are both sorted, so the delta
+  operations each work operation passes are a prefix that only grows, and one decision gives both sides: the lower's
+  operations as the verdict landed them, and the changes as they stand over the lower's post-state. The first are held
+  to the delta the green recorded when the lower landed (`RestateRefused::Diverged` otherwise, a guard that never fires
+  on a correct engine). The upper's ranges are then mapped through the moved changes as a work's are through the deltas
+  since its base. A stack of any depth repeats this a level at a time, following a path through each lower's renames
+  (a renamed file's bytes from its source, A-547; its mode and attributes with its path, A-618), and a path a lower
+  made holds only its own content.
+- **What a lower absorbed.** A change the lower made too, which the verdict accepted as identical, is in the upper's
+  base already, so the upper does not meet it: a same-span overwrite, and a mode, attribute, link or IPC node the lower
+  set. Any other meeting the verdict accepted (an identical replacement of another shape, which it accepts whole) moves
+  by no position mapping, so every operation of an upper on that file is a conflict, never a guess.
+- **The upper's verdict.** Restated over a version, the upper is judged by the verdict as a work based on it, which
+  checks the head's state and the changes after it. Every check the verdict makes of a work against the changes after
+  its base is made against the moved changes too, in the words of the `Green::merge_*` it mirrors: a rename's source
+  removed (`RenameRename`) or its destination changed; a removal of a node changed in any dimension (`DeleteModify`,
+  A-643); a mode or an attribute another work set otherwise (`MetaMeta`), a symbolic link, a hard link or an IPC node
+  (`CreateCreate`); a hard link's node removed; a node-exclusive operation's paths changed at all (A-542). A value the
+  new base holds as the upper sets it is the identical case and accepted. A content operation no change met lands at
+  its moved place, a truncate the green's appends outgrew as the delete of what it saw (A-612); one a change met is a
+  conflict unless it overwrites exactly the new base's bytes there. A length-changing one a change met is a conflict:
+  the verdict's whole-file check would rebuild the upper's base file, which is no version's (owed).
+- **A base given as a tree** (`Green::restate_over_tree`, `land_over_tree`; the `TreeBase` a tool's store implements,
+  answering what the tree holds at a path in the green's terms). What the green changed since the tree is read as
+  whole-value differences between the tree and the head at the paths the work names: a file the head holds as the tree
+  held it keeps the work's operations in the same coordinates; one the head holds otherwise is an overlap over the whole
+  file unless the work makes exactly the head's bytes; a removal, a mode, an attribute and a link are judged against the
+  difference of their whole values. One lookup in the tree and one in the head a path, never a walk of the tree.
+- **Typed refusals** (`RestateRefused`): a work below that has not landed (`NotLanded`, its place); history a lower was
+  mapped through folded below the checkpoint or fold floor (`Folded`); a copy in a stack (`Copy`, owed with the
+  deriver's copy, as a rebase); a lower's landing the green recorded otherwise (`Diverged`).
+- **Tests** (`crates/merge/src/engine/stack/`): 11 worked cases (a stack on the head as its works applied in order; an
+  upper mapped through what its lower was mapped through; an upper meeting a change its lower never saw, with the rest
+  unjudged; a refused bottom; a stack landed again; an upper landed after its lower; a lower's rename and make followed;
+  removals and metadata judged; a change the lower made too; one it met in another shape; a truncate keeping an append;
+  every refusal), 3 tree cases, and two oracles. The stack's oracle runs generated histories of works at and behind the
+  head and stacks of one to four works with works landing between a stack's base and its landing, and holds each work of
+  each stack to a replica in which the stack's works below it landed first at its base and the works between after
+  them: the verdict then judges each upper against exactly "the green's deltas except the lower work's own", and
+  disjoint changes commute, so the green must land each work where its replica does and hold the replica's files byte
+  for byte. Its census counts every depth, uppers moved and unmoved, and every refusal. Where a work in between does not
+  land in the replica, the replica is no reference and the stack goes unchecked from that level up, counted: the
+  verdict depends on order there (two works insert at two points, then a stack's work deletes the bytes between them;
+  in the replica the delete lands first, the two points become one, and the second insert meets the first). The tree's
+  oracle holds a work over a tree some versions back to a whole-file model.
+- **Evidence** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the Mac Studio was offline, so the macOS run is
+  owed). Red at 43317a523 (r1386, 03:03 PST): `cargo test -p slates-merge --lib stack`, 17 tests, 16 failing against the
+  stubs (every upper and tree case and both oracles) and 1 passing (a refused bottom, which needs no restatement); a
+  first attempt (r1351) ran out its timeout compiling and counts as neither. Green at 0ae0875d5, merged with main
+  (r1408, 04:04 PST): `cargo test -p slates-merge --lib -- --nocapture`, 158 of 158 (main's Windows baseline of 141 at
+  018d32ba2, and these 17) in 31.2 s; `cargo fmt -p slates-merge -- --check` clean. The stack oracle's census: stacks
+  landed through depths one to four 774, 479, 273 and 128 times; uppers restated with an operation moved 108, unmoved
+  772; uppers refused 129 and bottoms 188; works landed between a stack's base and its landing 1,335; replicas
+  collapsed 0. The tree oracle's: files applied 175, refused 150. An earlier green run at 695ec9789 (r1395) passed 157
+  of 158: its stack oracle met the order the verdict depends on, which the oracle now counts (c63e25c54).
+- **Finding** (registered as A-668, landing next): the verdict's walk stops at the first delta operation starting at or
+  after a range's end, so a work's insert at an offset where a delta overwrites or truncates and inserts too (canonical
+  order puts the overwrite or truncate first) never meets the delta's insert: it is accepted before both, while the
+  same two works in the other order conflict as two inserts at one point. D-27 decides it: they conflict in both
+  orders. Until A-668 lands the oracles generate no two operations at one offset.
+- **Owed.** The server's verbs: an upper held over its lower, restated as the lower lands or is rebased, and the lower's
+  base held as a live reader of the green's fold floor while an upper over it is unlanded. The whole-file identity check
+  for an upper's length-changing operation. A copy in a stack. A stack whose bottom is a tree.
+- **Applied in the same change to:** §4.17.1's "Works over works" status and shared piece 5's text; GAPS' §4.17 entry;
+  `crates/merge/src/engine/stack.rs` and `stack/{moved,levels,judge,tree}.rs` with `stack/{tests,oracle,tree_tests}.rs`
+  (new); `crates/merge/src/engine.rs` (the module's two lines).
+
+### A-664 part 1, the record — A principal's tool identities as one record a principal, set whole from the version its setter read (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.13 "a principal's record"; §4.17.1 "A push is a work" item 4; §4.17.3 decision 7; after A-664 part 2, A-622)
+
+- **The record** (`slates_db::catalog::IdentityRecord`): the principal, git's author and committer (`GitIdentity`: the
+  name and the email as git writes them, which the server holds to git's own rules, `slates_git::derived::Identity`,
+  before it records them), Mercurial's user (`Name <address>`), and a version. One a principal, kept by the principal's
+  key on the partition that holds the principal's record, never grown by a workload.
+- **Set whole from the version read** (`Op::IdentitiesSet`, appended, wire tag 98 published): the record's version must
+  be the one after the version held (the first setting's 1), as A-622's repository policy is set, else refused
+  `PolicyChanged` naming the version now, with nothing changed. The partition's snapshot carries the records
+  (`identities`, appended), so a recovery holds them as they were.
+- **Main's ruling for the server half** (2026-11-19): a session's identities are resolved once, at its first submit,
+  from the principal's partition, and kept with the session; the submit carries them and the merge record stores them;
+  the green's owner never reads them per merge (§2 banned item 10's spirit), and an identity changed mid-session applies
+  from the next session.
+- **Tests** (`crates/db/src/tests/identities.rs`; Windows x86_64, jupiter, 2026-11-19, a fresh clone of the pushed branch
+  at ecf4ecc34 with its own target directory, while the Mac Studio was offline; the macOS run is owed): `cargo test
+  --locked -p slates-db --lib` 144 of 144 (main's 142 at 018d32ba2 and the 2 new), and `--test wire_order` 2 passed,
+  its writer ignored. A setting kept and then replaced whole; a stale, a skipped and another principal's non-first
+  setting each refused `PolicyChanged` naming the version held, nothing changed; an agent's and a host account's records
+  carried through the partition's snapshot, versions included. Red once on jupiter: the version guard taking any
+  version failed the version test; green again after.
+- **Owed.** The server half above (after main's `slates-server` baseline on jupiter); the Mercurial user held to
+  Mercurial's rules when it is set; part 3.
+- **Applied in the same change to:** `crates/db/src/catalog.rs` (`GitIdentity`, `IdentityRecord`), `op.rs`
+  (`IdentitiesSet`), `partition.rs` (the map, its check, apply and snapshot), `error.rs` (`PolicyChanged`'s words),
+  `crates/db/src/tests/identities.rs` (new), `crates/db/tests/wire_order.txt`; §4.17.1 "A push is a work"'s status;
+  GAPS' §4.17 entry.
+
+### A-667 — Each branch's heads by 7.2's rule: no later revision on the branch descends from a head (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); found by g304 against stock 7.2; §4.17.3 "Pull and clone" item 1, "Push" step 4; A-619, A-641)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::discovery::branch_head_revs`,
+`serve::RevSet::remove`, `serve::tests`' and `push::tests`' oracles, `serve/discovery_tests.rs`), GAPS (a fixed entry),
+`docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`.
+- **What was wrong.** A revision was its branch's head when no child of it was on its branch. 7.2's rule
+  (`branchmap.py` lines 422-424) ends every revision a later revision on its branch descends from, through any
+  branches: for `default` 0, `stable` 1 on 0, `default` 2 on 1, `hg heads default` answers 2, and `branchmap` and
+  `check:updated-heads` here answered 0 and 2. A-619's oracle and A-641's push-check oracle stated the implementation's
+  rule, so both certified it.
+- **The decision.** The rule, computed as 7.2 computes it where 7.2 is exact: a revision continued on its branch is no
+  head, one with no child at all is a head, and a branch whose other candidates have children is walked from its
+  highest parent from another branch at or above its lowest such candidate down to that candidate (7.2's `uncertain`
+  and `cl.ancestors(uncertain, floorrev)`). Closed heads are kept (`branchheads(closed=True)`, which the wire's
+  `branchmap` and `all_nodes_are_heads` read).
+- **Apart from 7.2, on purpose.** 7.2's shortcut for one known head and one parent on the branch (lines 478-483) never
+  looks at the other parent, so a merge whose parent on its branch is an ancestor of its other parent can leave a head
+  the rule ends; whether it does depends on how 7.2's cache was updated. Measured with Homebrew's 7.2 (2026-11-19):
+  `default` 0, `default` 1, `other` 2 on 1, `default` 3 on 2 and 0 answers 3 and 1 either way; `default` 0, `other` 1,
+  `default` 2, `other` 3, `default` 4 on 3 and 0 answers 4 and 2 with the cache kept commit by commit and 4 alone with
+  it computed whole. The rule is the one answer a server can give.
+- **Siblings.** `check:updated-heads` read the same function and is fixed with it; `check:heads` reads topological
+  heads, as 7.2 does; `reject_new_heads` (open topological heads on the branch) and the push's head count (topological
+  heads added and removed) have no caller yet and are owed with the landing; the push classifier is not built.
+- **Tests (Windows x86_64, jupiter, 2026-11-19, kiln, debug, rustc 1.98.1; the Mac Studio was offline).** Red: branch
+  `agents/g300-a667-branch-heads-red` (5c88fd3e9, the tests alone, against the old rule), `cargo test --locked -p
+  slates-hg --lib` 276 passed and 6 failed, the five new tests and A-619's corrected oracle, each answering the old
+  rule's extra heads. First green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone, which stated the old
+  rule too and is corrected. Green: 284 of 284 at 87690ec64 (main's 278 and A-667's six), in a target directory of its
+  own; rustfmt's layout from those runs. Merged with main b79ece5d5, whose slates-merge builds as a dependency only with
+  its `test-model` gate on `history_touches` removed (c370dddbe; reported to main), removed in the clone alone: 284 of
+  284 at 7e4388e32. The tests: g304's history, the two measured histories, a closed head kept and
+  ending a head through it, a generated oracle over histories moving between two branches with merges of any earlier
+  revisions, and its non-vacuity from fixed seeds. Owed: the same run on macOS.
+- **Owed.** An obsolete changeset the served view shows is never a head in 7.2 (lines 351-358) and its ancestors are
+  ended through it (lines 469-476); the served view carries no obsolescence yet.
+
+### A-636 part 1 — A repository's logs over the fenced ledger: each log replicated on its own, every record committed whole and applied at the holders' joins, a takeover fencing every log or none and keeping each record whole or dropping it, replicas reading by a vector of positions (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half; §4.8 "Promotion and takeover"; with A-642 and A-635)
+
+- **What it is.** `crates/db/src/ledger/logs.rs`: the fenced ledger (`crates/db/src/ledger.rs`, §4.8) over a
+  repository's logs, a pure, deterministic simulation as the ledger itself is (R8: `f = 0` is the laptop). Each log, a
+  green's chain or one of the state logs, is a register of its own (a `Cohort`) placed by its own object id among the
+  owner's neighbourhood. So logs land on different copysets, and a push to one green waits on that green's holders
+  alone (A-642: only a green's own later pushes wait). One owner proposes to every log (`LogsOwner`).
+- **A record held whole.** A record (`LogRecord`: an identity and A-635's `LogSpan`s) is proposed at every position it
+  moves on every log it moves. It is committed once every one of those logs holds it on `f + 1` of its holders and every
+  record before it there is committed. The repository's committed state is the greatest cut at or below each log's
+  committed length that holds every record it touches whole (`LogsCohort::committed_cut`, the oracle;
+  `LogsOwner::committed_cut`, what the owner learned from its acknowledgements).
+  - A holder applies the owner's cut once it holds the owner's whole log (`LogsOwner::announce`). The cut holds every
+    record whole, so every log of a record the holder holds reaches the record in that one step: its join.
+  - A replica answers a read at a vector of positions (`LogsCohort::read`). It refuses one past what it applied
+    (`NotApplied`), one naming a log it holds no copy of (`NotHeld`), and one that holds part of a record and not the
+    rest (`Split`). The split rule is A-635's, now `catalog::spans_split_by`, the function the owner's
+    `AtomicRecord::split_by` uses.
+- **Takeover.** Every log's round is asked first (`Cohort::can_take_over`, the ledger's phase one without the fence), so
+  a takeover that cannot fence every log fences none. Then each log is fenced, read and adopted as `Owner::take_over`
+  adopts one register. A record the adopted logs do not hold at every position it moves is dropped, with what follows it
+  in each of its logs, until every record left is whole (`LogsOwner::take_over`).
+  - Why it is safe: a committed record's positions are in the committed prefix of each of its logs, which every later
+    read meets (the ledger's NoLoss, a log at a time). So it is adopted on every log and kept, and everything before it
+    is committed too, so no drop reaches it. A dropped record was never committed whole, so no holder applied it and no
+    replica answered with it. The superseded owner reaches at most `f` holders of any log the takeover fenced
+    (StaleNeverCommits).
+  - A tail a takeover dropped stays on the holders the new owner has not offered that log to. A later takeover judges
+    it again by the same rule, and a record committed at its positions since outranks it there by its epoch.
+- **The ledger's additions.** `Cohort::can_take_over` and `Cohort::held`; `Owner::log`, `Owner::truncate` (sound only
+  for a tail no quorum committed) and `Owner::offer_again` (the owner's whole log offered again, proposing nothing).
+  `Owner::take_over` makes the same checks as before, now in one place (`phase_one`).
+- **Tests** (`cargo test -p slates-db --lib ledger`, debug, Windows x86_64, jupiter, 2026-11-19; the Mac Studio was
+  offline, so the macOS run is owed and filed with the run requests).
+  - Red first, at 76af85355: the tests against the module with its behaviour stubbed (an append refused, nothing
+    announced, a takeover adopting and fencing nothing, every read refused). The nine new tests failed; the eight other
+    tests the filter takes passed.
+  - Green at 39dcef8e5 (merged with main b79ece5d5): 17 of 17, and the whole db lib 153 of 153. rustfmt's layout was
+    applied after it (b59f5e010, no change of behaviour).
+  - Eight scenarios, one a rule: each log commits on its own holders, a push waiting on no other log; an atomic record
+    applied at its join by every holder of both its logs; a replica's vector reads and its three refusals; a takeover
+    dropping a record no read holds whole, with what follows it; a takeover keeping and finishing a record every read
+    holds; a superseded owner committing nothing on any log; a takeover that cannot fence every log fencing none; an
+    append's refusals, nothing proposed.
+  - The model test: 128 generated histories of up to 64 steps at `f` from 0 to 2, over three greens and the four state
+    logs on the owner's two copysets, each history run twice alike (determinism). Agreement, NoLoss, StaleNeverCommits,
+    every holder's applied cut and every replica's answer held after every step. Its census: 465 records of several
+    logs committed whole and 429 of one; 310 records of several logs left waiting on an out-of-reach log's holders, and
+    5 pushes to one log committed at once while such a record waited; 149 appends refused `Moved`; 96 records of
+    superseded owners, none committed; 194 takeovers and 141 refused, with 12 records dropped whole and 25 kept and
+    finished; 1,583 records of several logs applied at a holder's join; 260 replica reads answered, 72 refused `Split`,
+    25 `NotApplied` and 530 `NotHeld`.
+  - Red eight ways by mutation (at 03a009510, slates-db rebuilt for each), each turning red the tests that name its rule
+    and the model test with them every time: a takeover keeping a record no read holds whole; a takeover's rounds not
+    asked first, so it fences logs before one refuses; a read answering a split cut; a read answering past what was
+    applied; an append not refused `Moved`; the owner never learning a log committed; the holders never applying; the
+    owner's cut not lowered to whole records.
+- **Owed (A-636 part 2).** The live plane: each log's register on the wire (the cluster plane's ledger promotion a log
+  at a time, `LedgerPromise`), the state logs' register class (whose object ids a caller names here), the partition's
+  records shipped a log at a time, and the server's takeover adopting a repository's logs by this rule.
+- **Applied in the same change to:** §4.17.1's status and shared piece 2; GAPS (A-642's headline and the §4.17 entry);
+  this entry.
 
 ### A-666 part 2 — Path history as derived data: `log <path>` and `--follow` answered from each version's value, git's default-mode history simplification exactly, renames and copies as the works recorded them, a question's reads its path's changes (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Queries by API", part 2; A-647; §4.17.1 "Reads")
 
