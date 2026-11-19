@@ -36527,3 +36527,23 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-552 — The daemon's own supervision waits follow the windows its shards are judged by, or wait while what they wait on goes on (2026-11-19, UI goal 86 via g076b: D-c; R3's class D; §4.14 `daemon.alive`; A-228, A-232, A-455, A-525)
+Applied in the same change to: GAPS (the failover delay's entry, its class D line), `crates/server/src/daemon.rs`
+(`starved_share_ns`, `starve_this_thread`, `Daemon::starve_control_shard`'s doc, the test) and
+`crates/server/src/watchdog.rs` (`shard_window_ns`, `own_window_ns`).
+- **What was there.** A-359's sweep left the daemon's own supervision waits on the liveness window `W` (class D, D-c),
+  each owed its own change: a starved hold's CPU (`starved_share_ns`), the log writer's drain wait at a stop
+  (`stop_parts`), the learning gate's crossing wait (`start_with_fleet`), the Windows hold channel's two bounds
+  (`anchor_hold_windows`) and a taken-back writable copy's claim (`held_copy`). Since A-455 the watchdog judges each
+  shard by its own window, the liveness window raised to the scheduler overrun the shard measured within the observation
+  budget, so a wait that judges a shard's liveness by the bare `W` judged it by a window the watchdog no longer used.
+- **A starved hold (`starved_share_ns`).** Test support (A-232): a hold spins a share of each beat and sleeps the rest,
+  so its shard steps nothing for the span while the watchdog sees it move at every look. Its whole CPU is now half the
+  window the watchdog judges its shard by (`watchdog::own_window_ns`, read as the hold begins: a shard folds its
+  overrun in only when it waits, and a hold inside one poll waits for nothing), where it was half of `W`. The spin
+  judgment is that window held to the build, never less than it, so the hold is never judged spinning, and each beat's
+  share still shows CPU progress, so it is never judged still.
+- **Tests.** `a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by` (`crates/server/src/daemon.rs`: a quiet
+  shard's hold half the liveness window, a shard held two and a half windows half of those, a span under a beat a beat
+  at most); red with today's rule (the held shard's hold half the liveness window) on the Mac Studio.

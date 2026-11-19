@@ -147,25 +147,31 @@ pub enum SegmentSource {
   },
 }
 
-/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns`: one beat times half a liveness
-/// window over the span, at most the whole beat, so the hold's whole CPU is at most half a window and the watchdog never
-/// finds it spinning, while each beat's share shows CPU progress, so it is never wedged either (A-228's rule).
-pub fn starved_share_ns(span_ns: u64, _window_ns: u64) -> u64 {
+/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns` on a shard the watchdog judges
+/// by `window_ns` (its own window, A-455: the liveness window raised to the scheduler overrun the shard measured,
+/// [`crate::watchdog::shard_window_ns`]): one beat times half that window over the span, at most the whole beat. So the
+/// hold's whole CPU is at most half the shard's window and the watchdog, judging the shard spinning only after a whole
+/// window of CPU held to the build (never less than the window), never finds it spinning, while each beat's share shows
+/// CPU progress at every look, so it is never judged still either (A-228's rule). Until A-552 the share was half the
+/// liveness window whatever window the watchdog judged the shard by.
+pub fn starved_share_ns(span_ns: u64, window_ns: u64) -> u64 {
   HEARTBEAT_NS
-    .saturating_mul(LIVENESS_BUDGET_NS / 2)
+    .saturating_mul(window_ns / 2)
     .checked_div(span_ns)
     .unwrap_or(HEARTBEAT_NS)
     .min(HEARTBEAT_NS)
 }
 
 /// Test support: runs the calling thread for `span_ns` as a starved thread runs, a little CPU at a time (A-232): each
-/// beat it spins for its share ([`starved_share_ns`]) and sleeps the rest, so the shard it runs on steps nothing else
+/// beat it spins for its share ([`starved_share_ns`]) of the window its shard is judged by, read as the hold begins
+/// ([`crate::watchdog::own_window_ns`]; a shard folds its overrun in only when it waits, and a hold inside one poll
+/// waits for nothing, so the window stands for the span), and sleeps the rest, so the shard it runs on steps nothing else
 /// for the span while the watchdog sees it move every look, alive and never stuck. Returns the span it measured,
 /// nanoseconds. [`Daemon::starve_control_shard`] runs it on the control shard; a test that keeps another shard silent
 /// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
 /// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
 pub fn starve_this_thread(span_ns: u64) -> u64 {
-  let share_ns = starved_share_ns(span_ns, LIVENESS_BUDGET_NS);
+  let share_ns = starved_share_ns(span_ns, crate::watchdog::own_window_ns());
   let begin = slates_rt::futures::now_ns();
   let end = begin.saturating_add(span_ns);
   let mut beat_began = begin;
@@ -2442,8 +2448,8 @@ impl Daemon {
   /// then resume), its own probes, its record plane and its consensus loops.
   ///
   /// It runs as a starved thread runs, a little CPU at a time (A-232): each beat it spins for its share and sleeps the
-  /// rest, its share being what keeps its whole CPU over the span to half a liveness window
-  /// ([`starved_share_ns`]). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
+  /// rest, its share being what keeps its whole CPU over the span to half the window the watchdog judges the control
+  /// shard by ([`starved_share_ns`], A-552). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
   /// CPU without a step a spinning, stuck shard, not a starved one: an anchor would kill that daemon, and since A-232 a
   /// lone one ends itself. So a span past a window was a stuck daemon, not the live, starved one this models. Admission is retried while the
   /// control channel is full ([`Self::observation`]); the typed refusal when there is no control shard or

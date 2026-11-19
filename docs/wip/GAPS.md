@@ -4035,8 +4035,11 @@
 > on, never spun on (job 3's red check found that spin). Still on the tick: grants, the owed audit (piece 4), departed
 > hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the
 > idle seal and the huge-page re-arm.
+> **Since A-552 (D-c, 2026-11-19, g076b) the daemon's own supervision waits follow the windows its shards are judged
+> by, or wait while what they wait on goes on:** a starved hold (test support, `starved_share_ns`) spins half the window
+> the watchdog judges its shard by, where it spun half of `W`.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
-> `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
+> `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
