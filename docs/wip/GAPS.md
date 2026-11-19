@@ -4120,7 +4120,15 @@
 >   `a_mount_the_kernel_lets_go_after_any_wait_still_ends_its_attachment`,
 >   `a_mount_that_left_before_its_watch_started_ends_at_the_watchs_first_read`); owed: the live CLI mount suite on macOS
 >   (the real event, `umount -f` too), and the Linux half of the seam (`/proc/self/mountinfo`'s `EPOLLPRI` through an
->   epoll instance) has no server user, since Linux host mounts are FUSE and end at their device. Class B (the
+>   epoll instance) has no server user, since Linux host mounts are FUSE and end at their device. A-511's owed restart
+>   closed by A-540 (2026-11-19, g232): the mount's id lives in its attachment's durable record once seen
+>   (`Op::AttachmentMountSeen`, appended), and a start reads the table once and ends every attachment whose recorded
+>   mount it no longer names (`a_restart_ends_an_attachment_whose_recorded_mount_the_table_no_longer_lists`,
+>   `a_restart_holds_an_attachment_whose_recorded_mount_the_table_still_lists`,
+>   `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`,
+>   `a_held_mount_keeps_its_id_in_its_attachments_record`, and in `slates-db`
+>   `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`); an attachment never seen mounted keeps the
+>   rule before, since the table's silence about its point proves nothing. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
