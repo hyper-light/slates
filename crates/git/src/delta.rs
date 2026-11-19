@@ -1,0 +1,481 @@
+//! git's delta (A-582 part 3; §4.17.2 "Pieces (git)", piece 2, "delta instructions with an applier"): the
+//! instructions that rebuild an object from a base, as a pack's OFS_DELTA and REF_DELTA entries carry them once
+//! inflated.
+//!
+//! **Sources** (read 2026-11-19, git v2.50.1). The document [B], `Documentation/gitformat-pack.adoc`:
+//! - "Deltified representation" (lines 95-126): the base's size and the target's in the size encoding (83-93), then
+//!   instructions, each appending to the target;
+//! - "Instruction to copy from base object" (128-156): a first byte with its top bit set, whose low seven bits say
+//!   which of four little-endian offset bytes and three size bytes follow; "size zero is automatically converted to
+//!   0x10000";
+//! - "Instruction to add new data" (158-167): a first byte of 1 to 127 and that many bytes, "The size must be
+//!   non-zero";
+//! - "Reserved instruction" (169-175): the byte zero.
+//!
+//! The code [C]: `patch-delta.c`'s `patch_delta` (15-94), which every client runs to apply a delta, with `delta.h`'s
+//! `DELTA_SIZE_MIN` (83) and `get_delta_hdr_size` (89-102), followed where the document leaves room; and
+//! `diff-delta.c`'s `create_delta` (320-510), whose bytes the writers here match.
+//!
+//! [`sizes`] reads the two sizes; [`Instructions`] walks what follows; [`apply`] rebuilds a target into memory charged
+//! to the caller's [`Admission`], and [`apply_to`] into any [`Out`]; [`write_sizes`], [`write_copy`] and
+//! [`write_insert`] encode, as a pack writer will.
+//!
+//! **Hostile input (§4.9).** Every refusal of git's is one here, by kind, naming where in the delta it stopped:
+//! - a delta shorter than git's four bytes (`TooShort`);
+//! - a size, or an instruction's operands or bytes, past the delta's end (`Truncated`). git's `get_delta_hdr_size`
+//!   stops a size at the delta's end even when its last byte says another follows; the document ends a size only at a
+//!   byte whose top bit is clear, so this reader refuses one cut short;
+//! - a size past 64 bits (`SizeTooLong`). git dies on a group that loses bits ("size_t overflow", `st_left_shift`) but
+//!   leaves a group at a shift of 64 or more undefined; here any group there is refused, zero or not;
+//! - the reserved byte zero (`Reserved`, git's "unexpected delta opcode 0");
+//! - a source of another length than the delta names (`SourceSize`);
+//! - a copy past the source's end (`CopyOutsideSource`);
+//! - an instruction making bytes past the target's size (`PastTarget`), or instructions ending short of it
+//!   (`ShortOfTarget`): both git's "delta replay has gone wild".
+//!
+//! The first rule broken in the delta's order is the refusal, and a copy past both the source's end and the target's is
+//! `CopyOutsideSource`.
+//!
+//! **Bounds, none of them a literal.** Applying walks the delta twice: once to check every instruction against the
+//! source and the target's declared size, making nothing, and once to make the target, after [`apply`] has charged all
+//! of its bytes to the admission. So a delta naming a target its instructions do not make, or one larger than its
+//! request was admitted, is refused before a byte of it is allocated; and an allocation the system refuses is refused by
+//! kind (`AllocationRefused`), never a panic. The format bounds each instruction: an insert's 127 bytes, a copy's
+//! 24-bit size within the source.
+
+use crate::out::Out;
+use crate::{Admission, PastAdmission, to_u64};
+
+/// Format: the shortest delta git applies, `DELTA_SIZE_MIN` (`delta.h` 83).
+pub const MIN_LEN: usize = 4;
+
+/// Format: the most one insert carries, its first byte's seven bits (`gitformat-pack.adoc` 158-167).
+pub const INSERT_MAX: usize = 0x7f;
+
+/// Format: the bit of a size's byte that says another follows, and of an instruction's first byte that makes it a copy
+/// (`gitformat-pack.adoc` 83-93 and 128-156).
+const HIGH: u8 = 0x80;
+
+/// Format: a size byte's seven bits.
+const LOW: u8 = 0x7f;
+
+/// Format: the bits one size byte carries.
+const GROUP_BITS: u32 = 7;
+
+/// Format: a copy's operands, in the order they follow its first byte: the bit that says each is there, which number it
+/// is part of, and the bits of that number it carries, little-endian (`gitformat-pack.adoc` 128-156; `patch-delta.c`
+/// 49-55).
+const COPY_OPERANDS: [(u8, Operand, u32); 7] = [
+  (0x01, Operand::Offset, 0),
+  (0x02, Operand::Offset, 8),
+  (0x04, Operand::Offset, 16),
+  (0x08, Operand::Offset, 24),
+  (0x10, Operand::Len, 0),
+  (0x20, Operand::Len, 8),
+  (0x40, Operand::Len, 16),
+];
+
+/// Format: what a copy whose size bytes are all absent copies: "size zero is automatically converted to 0x10000"
+/// (`gitformat-pack.adoc` 154-156).
+const ZERO_LEN_COPY: u64 = 0x1_0000;
+
+/// Format: the most a copy's three size bytes say.
+const COPY_LEN_MAX: u64 = 0xff_ffff;
+
+/// Format: the most a copy's four offset bytes say.
+const COPY_OFFSET_MAX: u64 = 0xffff_ffff;
+
+/// Format: one operand byte's bits.
+const BYTE: u64 = 0xff;
+
+/// Which number a copy's operand byte is part of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operand {
+  /// The offset in the source.
+  Offset,
+  /// The bytes to copy.
+  Len,
+}
+
+/// A delta's two sizes: the source it applies to and the target it makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+  /// The source's length.
+  pub source: u64,
+  /// The target's length.
+  pub target: u64,
+}
+
+/// One instruction of a delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instruction<'a> {
+  /// Append `len` bytes of the source from `offset`.
+  Copy {
+    /// Where in the source.
+    offset: u64,
+    /// How many bytes.
+    len: u64,
+  },
+  /// Append these bytes, carried in the delta itself.
+  Insert(&'a [u8]),
+}
+
+/// Why bytes are not a delta, or not one for this source. Each refusal of the delta's own bytes names where in the
+/// delta it stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+  /// Shorter than the four bytes git applies (`DELTA_SIZE_MIN`, `delta.h` 83).
+  TooShort {
+    /// The delta's length.
+    len: u64,
+  },
+  /// A size, or an instruction's operands or bytes, past the delta's end.
+  Truncated {
+    /// Where the size or the instruction begins.
+    at: u64,
+  },
+  /// A size past 64 bits.
+  SizeTooLong {
+    /// Where the size begins.
+    at: u64,
+  },
+  /// The reserved instruction, the byte zero: an insert of nothing (git's "unexpected delta opcode 0").
+  Reserved {
+    /// Where it is.
+    at: u64,
+  },
+  /// A source of another length than the delta was made for.
+  SourceSize {
+    /// The length the delta names.
+    declared: u64,
+    /// The source's length.
+    source: u64,
+  },
+  /// A copy reaching past the source's end.
+  CopyOutsideSource {
+    /// Where the copy begins.
+    at: u64,
+    /// Its offset in the source.
+    offset: u64,
+    /// Its length.
+    len: u64,
+    /// The source's length.
+    source: u64,
+  },
+  /// An instruction making bytes past the target's declared size.
+  PastTarget {
+    /// Where the instruction begins.
+    at: u64,
+    /// The target's declared size.
+    target: u64,
+  },
+  /// The instructions end before they have made the target's declared size.
+  ShortOfTarget {
+    /// The bytes they made.
+    made: u64,
+    /// The target's declared size.
+    target: u64,
+  },
+  /// The target would take more than the admission had left.
+  PastAdmission(PastAdmission),
+  /// The system refused the target's memory, though the admission held it.
+  AllocationRefused {
+    /// The target's declared size.
+    target: u64,
+  },
+}
+
+/// A copy that cannot be written: empty, longer than its three size bytes say, or from past what its four offset bytes
+/// say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyRefusal {
+  /// A copy of no bytes, which the format cannot say: a size whose bytes are all absent means 0x10000.
+  Empty,
+  /// A copy longer than 0xffffff bytes.
+  TooLong {
+    /// Its length.
+    len: u64,
+  },
+  /// A copy from past 0xffffffff.
+  OffsetTooFar {
+    /// Its offset.
+    offset: u64,
+  },
+}
+
+/// The delta's two sizes and where its instructions begin. Refused for a delta shorter than git applies, and for a size
+/// past the delta's end or past 64 bits.
+pub fn sizes(delta: &[u8]) -> Result<(Sizes, usize), Refusal> {
+  if delta.len() < MIN_LEN {
+    return Err(Refusal::TooShort {
+      len: to_u64(delta.len()),
+    });
+  }
+  let (source, at) = size(delta, 0)?;
+  let (target, at) = size(delta, at)?;
+  Ok((Sizes { source, target }, at))
+}
+
+/// The size encoded at `at` in `delta`, seven bits a byte with later bytes more significant: the number and where the
+/// next field begins.
+fn size(delta: &[u8], at: usize) -> Result<(u64, usize), Refusal> {
+  let mut value = 0u64;
+  let mut shift = 0u32;
+  let mut next = at;
+  loop {
+    let byte = *delta.get(next).ok_or(Refusal::Truncated { at: to_u64(at) })?;
+    next = next.saturating_add(1);
+    let group = u64::from(byte & LOW);
+    let placed = group
+      .checked_shl(shift)
+      .filter(|placed| placed.checked_shr(shift) == Some(group))
+      .ok_or(Refusal::SizeTooLong { at: to_u64(at) })?;
+    value |= placed;
+    if byte & HIGH == 0 {
+      return Ok((value, next));
+    }
+    shift = shift.saturating_add(GROUP_BITS);
+  }
+}
+
+/// The instructions of a delta, each with where it begins. A refused instruction ends the walk.
+#[derive(Clone, Debug)]
+pub struct Instructions<'a> {
+  delta: &'a [u8],
+  at: usize,
+}
+
+impl<'a> Instructions<'a> {
+  /// The instructions of `delta` from `at`, where [`sizes`] said they begin.
+  pub fn new(delta: &'a [u8], at: usize) -> Self {
+    Self { delta, at }
+  }
+
+  /// A copy whose first byte is `first`, at `at`; its operands follow.
+  fn copy(&mut self, first: u8, at: u64) -> Result<Instruction<'a>, Refusal> {
+    let (mut offset, mut len) = (0u64, 0u64);
+    for (bit, operand, shift) in COPY_OPERANDS {
+      if first & bit == 0 {
+        continue;
+      }
+      let byte = *self.delta.get(self.at).ok_or(Refusal::Truncated { at })?;
+      self.at = self.at.saturating_add(1);
+      let value = u64::from(byte).checked_shl(shift).unwrap_or(0);
+      match operand {
+        Operand::Offset => offset |= value,
+        Operand::Len => len |= value,
+      }
+    }
+    if len == 0 {
+      len = ZERO_LEN_COPY;
+    }
+    Ok(Instruction::Copy { offset, len })
+  }
+
+  /// An insert of `count` bytes, at `at`; they follow.
+  fn insert(&mut self, count: u8, at: u64) -> Result<Instruction<'a>, Refusal> {
+    let end = self
+      .at
+      .checked_add(usize::from(count))
+      .ok_or(Refusal::Truncated { at })?;
+    let bytes = self
+      .delta
+      .get(self.at..end)
+      .ok_or(Refusal::Truncated { at })?;
+    self.at = end;
+    Ok(Instruction::Insert(bytes))
+  }
+}
+
+impl<'a> Iterator for Instructions<'a> {
+  type Item = Result<(u64, Instruction<'a>), Refusal>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let first = *self.delta.get(self.at)?;
+    let at = to_u64(self.at);
+    self.at = self.at.saturating_add(1);
+    let instruction = match first {
+      0 => Err(Refusal::Reserved { at }),
+      copy if copy & HIGH != 0 => self.copy(copy, at),
+      count => self.insert(count, at),
+    };
+    if instruction.is_err() {
+      self.at = self.delta.len();
+    }
+    Some(instruction.map(|instruction| (at, instruction)))
+  }
+}
+
+/// Checks `delta` against `source`, making nothing: its sizes, the source's length, and that its instructions stay
+/// inside the source and make exactly the target's bytes. The sizes and where the instructions begin.
+fn check(source: &[u8], delta: &[u8]) -> Result<(Sizes, usize), Refusal> {
+  let (sizes, start) = sizes(delta)?;
+  let source_len = to_u64(source.len());
+  if sizes.source != source_len {
+    return Err(Refusal::SourceSize {
+      declared: sizes.source,
+      source: source_len,
+    });
+  }
+  let mut made = 0u64;
+  for item in Instructions::new(delta, start) {
+    let (at, instruction) = item?;
+    made = made
+      .checked_add(made_by(instruction, at, source_len)?)
+      .filter(|made| *made <= sizes.target)
+      .ok_or(Refusal::PastTarget {
+        at,
+        target: sizes.target,
+      })?;
+  }
+  if made != sizes.target {
+    return Err(Refusal::ShortOfTarget {
+      made,
+      target: sizes.target,
+    });
+  }
+  Ok((sizes, start))
+}
+
+/// The bytes `instruction`, at `at`, appends: refused for a copy reaching past a source of `source_len` bytes.
+fn made_by(instruction: Instruction<'_>, at: u64, source_len: u64) -> Result<u64, Refusal> {
+  match instruction {
+    Instruction::Copy { offset, len } => {
+      if offset.checked_add(len).is_none_or(|end| end > source_len) {
+        return Err(Refusal::CopyOutsideSource {
+          at,
+          offset,
+          len,
+          source: source_len,
+        });
+      }
+      Ok(len)
+    }
+    Instruction::Insert(bytes) => Ok(to_u64(bytes.len())),
+  }
+}
+
+/// The source's bytes a copy takes, which [`check`] has held inside it.
+fn copied(source: &[u8], offset: u64, len: u64, at: u64) -> Result<&[u8], Refusal> {
+  let outside = Refusal::CopyOutsideSource {
+    at,
+    offset,
+    len,
+    source: to_u64(source.len()),
+  };
+  let start = usize::try_from(offset).map_err(|_| outside)?;
+  let end = start
+    .checked_add(usize::try_from(len).map_err(|_| outside)?)
+    .ok_or(outside)?;
+  source.get(start..end).ok_or(outside)
+}
+
+/// Rebuilds the target `delta` makes from `source` into `out`, after checking all of it: nothing is written for a delta
+/// that is refused. The delta's sizes.
+pub fn apply_to(source: &[u8], delta: &[u8], out: &mut impl Out) -> Result<Sizes, Refusal> {
+  let (sizes, start) = check(source, delta)?;
+  make(source, delta, start, out)?;
+  Ok(sizes)
+}
+
+/// Rebuilds the target `delta` makes from `source`: checked whole first, then its declared size charged to `admission`,
+/// then made in memory reserved once. Refused, nothing charged or allocated, for a delta that is not one for this
+/// source or a target past the admission; refused by kind, the charge kept, if the system will not give the memory.
+pub fn apply(source: &[u8], delta: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
+  let (sizes, start) = check(source, delta)?;
+  let refused = Refusal::AllocationRefused {
+    target: sizes.target,
+  };
+  let len = usize::try_from(sizes.target).map_err(|_| refused)?;
+  admission
+    .charge(sizes.target)
+    .map_err(Refusal::PastAdmission)?;
+  let mut target = Vec::new();
+  target.try_reserve_exact(len).map_err(|_| refused)?;
+  make(source, delta, start, &mut target)?;
+  Ok(target)
+}
+
+/// Makes the target into `out` by the instructions from `start`, which [`check`] has passed whole.
+fn make(source: &[u8], delta: &[u8], start: usize, out: &mut impl Out) -> Result<(), Refusal> {
+  for item in Instructions::new(delta, start) {
+    match item? {
+      (at, Instruction::Copy { offset, len }) => out.put(copied(source, offset, len, at)?),
+      (_, Instruction::Insert(bytes)) => out.put(bytes),
+    }
+  }
+  Ok(())
+}
+
+/// Writes a delta's two sizes, its first bytes, each in the fewest bytes, as `create_delta` does (`diff-delta.c`
+/// 344-358).
+pub fn write_sizes(sizes: Sizes, out: &mut impl Out) {
+  write_size(sizes.source, out);
+  write_size(sizes.target, out);
+}
+
+/// Writes one size, seven bits a byte, lowest first.
+fn write_size(value: u64, out: &mut impl Out) {
+  let mut rest = value;
+  loop {
+    let group = u8::try_from(rest & u64::from(LOW)).unwrap_or(0);
+    rest = rest.checked_shr(GROUP_BITS).unwrap_or(0);
+    if rest == 0 {
+      out.put(&[group]);
+      return;
+    }
+    out.put(&[group | HIGH]);
+  }
+}
+
+/// Writes a copy of `len` bytes from `offset` in the source as git's `create_delta` writes one (`diff-delta.c`
+/// 434-466): only the operand bytes that are not zero, each named by its bit, so a copy of 0x10000 bytes has no size
+/// bytes at all. git writes no copy longer than that ("limited to 64KB (pack v2)", 434); the format's three size bytes
+/// say up to 0xffffff, which `patch-delta.c` reads (55), so this writes up to that. Refused, nothing written, for a
+/// copy the format cannot say.
+pub fn write_copy(offset: u64, len: u64, out: &mut impl Out) -> Result<(), CopyRefusal> {
+  if len == 0 {
+    return Err(CopyRefusal::Empty);
+  }
+  if len > COPY_LEN_MAX {
+    return Err(CopyRefusal::TooLong { len });
+  }
+  if offset > COPY_OFFSET_MAX {
+    return Err(CopyRefusal::OffsetTooFar { offset });
+  }
+  // A size whose bytes are all absent reads as 0x10000, so that size is written as none.
+  let len_written = if len == ZERO_LEN_COPY { 0 } else { len };
+  let mut first = HIGH;
+  let mut operands = [0u8; COPY_OPERANDS.len()];
+  let mut count = 0usize;
+  for (bit, operand, shift) in COPY_OPERANDS {
+    let number = match operand {
+      Operand::Offset => offset,
+      Operand::Len => len_written,
+    };
+    let byte = u8::try_from(number.checked_shr(shift).unwrap_or(0) & BYTE).unwrap_or(0);
+    if byte != 0 {
+      first |= bit;
+      if let Some(slot) = operands.get_mut(count) {
+        *slot = byte;
+      }
+      count = count.saturating_add(1);
+    }
+  }
+  out.put(&[first]);
+  out.put(operands.get(..count).unwrap_or_default());
+  Ok(())
+}
+
+/// Writes `bytes` as inserts, as many as their length needs at [`INSERT_MAX`] each, and nothing for no bytes, since an
+/// insert of nothing is the reserved instruction.
+pub fn write_insert(bytes: &[u8], out: &mut impl Out) {
+  for run in bytes.chunks(INSERT_MAX) {
+    out.put(&[u8::try_from(run.len()).unwrap_or(0)]);
+    out.put(run);
+  }
+}
+
+#[cfg(test)]
+#[path = "tests/delta.rs"]
+mod tests;
