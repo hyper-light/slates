@@ -721,7 +721,7 @@ impl HookRun {
       self.state = RunState::Draining(status);
       return self.wait();
     }
-    self.finish(Outcome::of_exit(status, std::mem::take(&mut self.words)), false)
+    self.finish_exit(status, false)
   }
 
   /// The timer fired at `now_ns`: at or past the deadline, the run is cut at its bound (no sample, the bound backed
@@ -751,10 +751,10 @@ impl HookRun {
       }
       Event::OutputEnded => {
         self.output_open = false;
-        self.finish(Outcome::of_exit(status, std::mem::take(&mut self.words)), false)
+        self.finish_exit(status, false)
       }
       Event::Timer { now_ns } if self.deadline_ns().is_some_and(|deadline| now_ns >= deadline) => {
-        self.finish(Outcome::of_exit(status, std::mem::take(&mut self.words)), true)
+        self.finish_exit(status, true)
       }
       Event::ClientLeft => self.finish(Outcome::Abandoned, true),
       Event::Exited { .. } | Event::Timer { .. } => self.wait(),
@@ -788,6 +788,12 @@ impl HookRun {
       }
       Event::Timer { .. } => Step::Wait { wake_at_ns: None },
     }
+  }
+
+  /// The run is over with the outcome of its hook's own exit, `status`, and the words it wrote.
+  fn finish_exit(&mut self, status: ExitStatus, end_leftovers: bool) -> Step {
+    let words = std::mem::take(&mut self.words);
+    self.finish(Outcome::of_exit(status, words), end_leftovers)
   }
 
   /// The run is over with `outcome`.
