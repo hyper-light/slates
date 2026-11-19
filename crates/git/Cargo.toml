@@ -9,13 +9,12 @@ readme.workspace = true
 description = "git's wire formats (§4.17.2, A-582): pkt-lines and side-band-64k, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission."
 
 [dependencies]
-# A gzip request body's inflate (A-595: git sends `Content-Encoding: gzip` for a long request); its backend is chosen by
-# measurement (§4.17.2 piece 3).
-flate2 = { workspace = true }
 # SHA-256 object names (§4.17.2, A-600), through the workspace's one cryptographic library.
 aws-lc-rs = { workspace = true }
 # SHA-1 object names with collision detection, as git's sha1dc (A-600; the workspace manifest says why this crate).
 sha1-checked = { workspace = true }
+# HTTP/1.1's request codec (A-595), which Mercurial's and Subversion's HTTP share: git's routes read its heads.
+slates-http = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }

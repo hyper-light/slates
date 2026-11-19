@@ -1,0 +1,21 @@
+[package]
+name = "slates-http"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "HTTP/1.1's request codec and reply framing for slates' version-control servers (§4.17.2, A-595): a request head, Content-Length and chunked bodies and gzip content coding read as pure state machines over bytes, every byte a request holds charged to its admission."
+
+[dependencies]
+# A gzip request body's inflate (A-595: git gzips a fetch request past a kilobyte); its backend is chosen by
+# measurement (§4.17.2 piece 3), and this crate codes against flate2's own API alone.
+flate2 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+
+[lints]
+workspace = true

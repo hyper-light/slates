@@ -1,478 +1,381 @@
-use std::io::Write as _;
+use slates_http::Admission;
+use slates_http::head::{Head, HeadReader, HeadRefused, Malformed, Progress, Version as HttpVersion};
 
-use super::*;
+use super::{
+  Allowed, Reply, Route, RouteRefused, Service, Version, advertisement_prelude, refusal_reply,
+  reply_head, route, version,
+};
+use crate::to_u64;
 
-/// A head's bytes from its lines, each ended by CRLF (the caller hands the head without its blank line).
-fn head(lines: &[&str]) -> Vec<u8> {
-  lines.join("\r\n").into_bytes()
-}
+/// Room enough for every head and path these tests route.
+const ROOM: u64 = 1 << 20;
 
-/// A gzip stream of `data`, as git's client compresses a long request.
-fn gzip(data: &[u8]) -> Vec<u8> {
-  let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-  encoder.write_all(data).unwrap();
-  encoder.finish().unwrap()
-}
-
-/// A-595. Do: parse an advertisement's GET with `Git-Protocol: version=2`, a POST framed by `Content-Length` and
-/// gzip-encoded, a chunked POST, and an HTTP/1.0 request and one asking to close. Expect each field git's routes read,
-/// each framing, and the connection's keep as HTTP/1.1, HTTP/1.0 and `Connection` say.
-#[test]
-fn a_request_head_is_parsed_with_gits_fields_and_its_framing() {
-  let get = parse_head(&head(&[
-    "GET /team/repo.git/info/refs?service=git-upload-pack HTTP/1.1",
-    "Host: localhost:8080",
-    "Git-Protocol: version=2",
-    "Accept: */*",
-  ]))
-  .unwrap();
-  assert_eq!(get.method, Method::Get);
-  assert_eq!(
-    (get.path.as_str(), get.query.as_str()),
-    ("/team/repo.git/info/refs", "service=git-upload-pack")
-  );
-  assert_eq!(get.git_protocol.as_deref(), Some("version=2"));
-  assert_eq!(
-    (get.framing, get.keep_alive, get.gzip),
-    (Framing::None, true, false)
-  );
-  let post = parse_head(&head(&[
-    "POST /repo.git/git-upload-pack HTTP/1.1",
-    "Host: localhost",
-    "Content-Type: application/x-git-upload-pack-request",
-    "Content-Encoding: gzip",
-    "Content-Length: 1234",
-    "Authorization: Basic dXNlcjpwYXNz",
-  ]))
-  .unwrap();
-  assert_eq!(
-    (post.method, post.framing, post.gzip),
-    (Method::Post, Framing::Length(1234), true)
-  );
-  assert_eq!(
-    post.content_type.as_deref(),
-    Some("application/x-git-upload-pack-request")
-  );
-  assert_eq!(post.authorization.as_deref(), Some("Basic dXNlcjpwYXNz"));
-  let chunked = parse_head(&head(&[
-    "POST /repo.git/git-receive-pack HTTP/1.1",
-    "Host: h",
-    "Transfer-Encoding: chunked",
-  ]))
-  .unwrap();
-  assert_eq!(chunked.framing, Framing::Chunked);
-  assert!(
-    !parse_head(&head(&["GET /r/info/refs HTTP/1.0"]))
-      .unwrap()
-      .keep_alive,
-    "HTTP/1.0 closes"
-  );
-  assert!(
-    !parse_head(&head(&[
-      "GET /r/info/refs HTTP/1.1",
-      "Host: h",
-      "Connection: close"
-    ]))
-    .unwrap()
-    .keep_alive
-  );
-}
-
-/// A-595 (hostile input, §4.9). Do: parse heads past their bounds and heads that contradict themselves. Expect each
-/// refused by its kind: a request line past [`MAX_LINE`] 414; a field line past it, or more than [`MAX_FIELDS`] fields,
-/// 431; both framings, two lengths that differ, an HTTP/1.1 request without a `Host`, two `Host`s, a space before a
-/// colon, a length that isn't a number, or another version 400; a transfer coding other than chunked 501; a content
-/// coding other than gzip 415.
-#[test]
-fn a_head_past_its_bounds_or_contradicting_itself_is_refused_by_kind() {
-  let long_target = format!("GET /{} HTTP/1.1", "a".repeat(MAX_LINE));
-  assert_eq!(parse_head(long_target.as_bytes()), Err(Refused::UriTooLong));
-  let long_field = format!("X-Long: {}", "b".repeat(MAX_LINE));
-  assert_eq!(
-    parse_head(&head(&[
-      "GET /r/info/refs HTTP/1.1",
-      "Host: h",
-      &long_field
-    ])),
-    Err(Refused::HeadersTooLarge)
-  );
-  let mut many = vec!["GET /r/info/refs HTTP/1.1".to_owned(), "Host: h".to_owned()];
-  many.extend((0..MAX_FIELDS).map(|n| format!("X-{n}: v")));
-  let many: Vec<&str> = many.iter().map(String::as_str).collect();
-  assert_eq!(parse_head(&head(&many)), Err(Refused::HeadersTooLarge));
-  for (lines, refused) in [
-    (
-      vec![
-        "POST /r/git-upload-pack HTTP/1.1",
-        "Host: h",
-        "Content-Length: 5",
-        "Transfer-Encoding: chunked",
-      ],
-      Refused::BadRequest,
-    ),
-    (
-      vec![
-        "POST /r/git-upload-pack HTTP/1.1",
-        "Host: h",
-        "Content-Length: 5",
-        "Content-Length: 6",
-      ],
-      Refused::BadRequest,
-    ),
-    (vec!["GET /r/info/refs HTTP/1.1"], Refused::BadRequest),
-    (
-      vec!["GET /r/info/refs HTTP/1.1", "Host: a", "Host: b"],
-      Refused::BadRequest,
-    ),
-    (
-      vec!["GET /r/info/refs HTTP/1.1", "Host : h"],
-      Refused::BadRequest,
-    ),
-    (
-      vec![
-        "POST /r/git-upload-pack HTTP/1.1",
-        "Host: h",
-        "Content-Length: five",
-      ],
-      Refused::BadRequest,
-    ),
-    (
-      vec!["GET /r/info/refs HTTP/2.0", "Host: h"],
-      Refused::BadRequest,
-    ),
-    (
-      vec!["GET r/info/refs HTTP/1.1", "Host: h"],
-      Refused::BadRequest,
-    ),
-    (
-      vec![
-        "POST /r/git-upload-pack HTTP/1.1",
-        "Host: h",
-        "Transfer-Encoding: gzip, chunked",
-      ],
-      Refused::NotImplemented,
-    ),
-    (
-      vec![
-        "POST /r/git-upload-pack HTTP/1.1",
-        "Host: h",
-        "Content-Length: 5",
-        "Content-Encoding: br",
-      ],
-      Refused::UnsupportedMediaType,
-    ),
-  ] {
-    assert_eq!(parse_head(&head(&lines)), Err(refused), "{lines:?}");
+/// The head `input` holds; it must be whole.
+fn head(input: &[u8]) -> Head<'_> {
+  match HeadReader::new().read(input, &mut Admission::new(ROOM)) {
+    Ok(Progress::Complete { value, .. }) => value,
+    other => panic!("{:?} read {other:?}", String::from_utf8_lossy(input)),
   }
-  assert_eq!(
-    parse_head(&[0xff, 0xfe]),
-    Err(Refused::BadRequest),
-    "a head that isn't text"
-  );
 }
 
-/// A chunked body with an extension and a trailer, then a byte of the next request: what every chunked test reads.
-const CHUNKED: &[u8] = b"5;name=value\r\nhello\r\n7\r\n, world\r\n0\r\nX-Trailer: t\r\n\r\nN";
+/// `method target` over HTTP/1.1 with `Host` and `fields`, routed.
+fn routed(method: &str, target: &str, fields: &[&str]) -> Result<Route, RouteRefused> {
+  routed_over("HTTP/1.1", method, target, fields)
+}
 
-/// A-595. Do: decode a chunked body with a chunk extension and a trailer, followed by a byte of the next request; then
-/// every cut of it short of its end. Expect the body's data joined, the bytes it took ending before the next request's,
-/// its exact size charged; and every cut [`Chunked::Partial`], charging nothing (a reader waits for more).
+/// `method target` over `http` with `Host` and `fields`, routed.
+fn routed_over(http: &str, method: &str, target: &str, fields: &[&str]) -> Result<Route, RouteRefused> {
+  let mut text = format!("{method} {target} {http}\r\nHost: git.example\r\n");
+  for field in fields {
+    text.push_str(field);
+    text.push_str("\r\n");
+  }
+  text.push_str("\r\n");
+  let bytes = text.into_bytes();
+  route(&head(&bytes), &mut Admission::new(ROOM))
+}
+
+/// The fields of a request to `service`: its content type and a body of ten bytes.
+fn service_fields(service: &str) -> [String; 2] {
+  [
+    format!("Content-Type: application/x-{service}-request"),
+    "Content-Length: 10".to_owned(),
+  ]
+}
+
+/// A-595: do ask for each service's advertisement by `GET` and `HEAD`, with and without `Git-Protocol`. Expect the
+/// advertisement of that service and repository at the version asked, the head alone for `HEAD`.
 #[test]
-fn a_chunked_body_decodes_whole_and_every_cut_of_it_is_partial() {
-  let mut admission = Admission::new(1000);
+fn info_refs_with_a_service_is_its_advertisement() {
   assert_eq!(
-    decode_chunked(CHUNKED, &mut admission),
-    Ok(Chunked::Whole {
-      body: b"hello, world".to_vec(),
-      consumed: CHUNKED.len() - 1,
+    routed("GET", "/team/repo.git/info/refs?service=git-upload-pack", &[]),
+    Ok(Route::Advertise {
+      repo: "team/repo.git".to_owned(),
+      service: Service::UploadPack,
+      version: Version::V0,
+      head_only: false,
     })
   );
-  assert_eq!(admission.left(), 1000 - 12, "the body's exact size charged");
-  for cut in 0..CHUNKED.len() - 1 {
-    let mut room = Admission::new(1000);
-    assert_eq!(
-      decode_chunked(&CHUNKED[..cut], &mut room),
-      Ok(Chunked::Partial),
-      "cut at {cut}"
-    );
-    assert_eq!(room.left(), 1000, "a cut charges nothing");
-  }
+  assert_eq!(
+    routed("HEAD", "/repo/info/refs?service=git-receive-pack", &["Git-Protocol: version=2"]),
+    Ok(Route::Advertise {
+      repo: "repo".to_owned(),
+      service: Service::ReceivePack,
+      version: Version::V2,
+      head_only: true,
+    })
+  );
+  assert_eq!(
+    routed("GET", "/r/info/refs?service=git-upload-pack", &["git-protocol: version=1"]),
+    Ok(Route::Advertise {
+      repo: "r".to_owned(),
+      service: Service::UploadPack,
+      version: Version::V1,
+      head_only: false,
+    })
+  );
 }
 
-/// A-595 (hostile input). Do: decode chunked bodies whose size lines aren't hexadecimal, are empty, overflow 64 bits or
-/// run past [`MAX_LINE`]; one whose chunk data isn't followed by its CRLF; and one with more trailer lines than
-/// [`MAX_FIELDS`]. Expect each refused [`BodyRefused::BadChunk`], never a panic or a partial wait.
+/// A-595: do read `Git-Protocol` values. Expect the greatest version git speaks among the `version=` keys, as
+/// `protocol.c` chooses it, v0 without one, an unknown version ignored.
 #[test]
-fn bad_chunk_sizes_and_framing_are_refused() {
-  let long_size = format!("{}\r\n", "1".repeat(MAX_LINE + 2));
-  let mut trailers = String::from("0\r\n");
-  trailers.push_str(&"X: y\r\n".repeat(MAX_FIELDS + 1));
-  trailers.push_str("\r\n");
-  for body in [
-    b"zz\r\nhello\r\n0\r\n\r\n".to_vec(),
-    b"\r\nhello\r\n0\r\n\r\n".to_vec(),
-    b"10000000000000000\r\n".to_vec(),
-    b"-5\r\nhello\r\n0\r\n\r\n".to_vec(),
-    b"+5\r\nhello\r\n0\r\n\r\n".to_vec(),
-    long_size.into_bytes(),
-    b"5\r\nhelloXX0\r\n\r\n".to_vec(),
-    trailers.into_bytes(),
-  ] {
-    assert_eq!(
-      decode_chunked(&body, &mut Admission::new(u64::MAX)),
-      Err(BodyRefused::BadChunk),
-      "{:?}",
-      String::from_utf8_lossy(&body)
-    );
-  }
-}
-
-/// A-595 (hostile input). Do: decode a chunked body whose first chunk declares four gigabytes, none of it sent, under an
-/// admission of a kilobyte. Expect it refused past the admission at once, not waited for, and nothing charged.
-#[test]
-fn a_chunked_body_declaring_past_its_admission_is_refused_before_its_data_arrives() {
-  let mut admission = Admission::new(1024);
-  assert_eq!(
-    decode_chunked(b"ffffffff\r\n", &mut admission),
-    Err(BodyRefused::TooLarge(PastAdmission {
-      asked: 0xffff_ffff,
-      left: 1024,
-    }))
-  );
-  assert_eq!(admission.left(), 1024);
-}
-
-/// A-595 (hostile input). Do: inflate a gzip body within its admission; a gzip bomb, a megabyte of zeros in about a
-/// kilobyte, under an admission of 64 KiB; bytes that aren't gzip; and every cut of the good body. Expect the first
-/// inflated whole and its size charged; the bomb refused past its admission having made no more than the room and one
-/// byte; the others refused [`BodyRefused::BadGzip`], never inflated in part.
-#[test]
-fn a_gzip_body_inflates_within_its_admission_and_a_bomb_stops_at_it() {
-  let text = b"0032want 0123456789012345678901234567890123456789\n0000".repeat(40);
-  let packed = gzip(&text);
-  let mut admission = Admission::new(1 << 20);
-  assert_eq!(
-    gunzip(&packed, &mut admission).as_deref(),
-    Ok(text.as_slice())
-  );
-  assert_eq!(
-    admission.left(),
-    (1 << 20) - u64::try_from(text.len()).unwrap()
-  );
-  let bomb = gzip(&vec![0u8; 1 << 20]);
-  assert!(bomb.len() < 4096, "a bomb: {} bytes", bomb.len());
-  let mut room = Admission::new(1 << 16);
-  assert_eq!(
-    gunzip(&bomb, &mut room),
-    Err(BodyRefused::TooLarge(PastAdmission {
-      asked: (1 << 16) + 1,
-      left: 1 << 16,
-    }))
-  );
-  assert_eq!(room.left(), 1 << 16, "a refused inflate charges nothing");
-  assert_eq!(
-    gunzip(b"not gzip at all", &mut Admission::new(1 << 20)),
-    Err(BodyRefused::BadGzip)
-  );
-  for cut in 0..packed.len() {
-    assert_eq!(
-      gunzip(&packed[..cut], &mut Admission::new(1 << 20)),
-      Err(BodyRefused::BadGzip),
-      "cut at {cut}"
-    );
-  }
-}
-
-/// The head a route test asks with: `method target`, `Host`, and `extra` fields.
-fn asked(method_and_target: &str, extra: &[&str]) -> RequestHead {
-  let mut lines = vec![
-    format!("{method_and_target} HTTP/1.1"),
-    "Host: h".to_owned(),
+fn git_protocol_asks_for_its_greatest_version() {
+  let cases: [(Option<&[u8]>, Version); 10] = [
+    (None, Version::V0),
+    (Some(b""), Version::V0),
+    (Some(b"version=2"), Version::V2),
+    (Some(b"version=1"), Version::V1),
+    (Some(b"version=0"), Version::V0),
+    (Some(b"version=3"), Version::V0),
+    (Some(b"version=22"), Version::V0),
+    (Some(b"version=2:version=1"), Version::V2),
+    (Some(b"version=1:version=2"), Version::V2),
+    (Some(b"object-format=sha256:version=1"), Version::V1),
   ];
-  lines.extend(extra.iter().map(|line| (*line).to_owned()));
-  let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-  parse_head(&head(&lines)).unwrap()
-}
-
-/// A-595. Do: route an advertisement's GET for each service with and without `Git-Protocol: version=2`, each service's
-/// POST of its content type with a body, and requests no route takes. Expect the advertisement and the service with the
-/// version asked; and each other refused by its kind: no service or an unknown one 403, another method 405, another
-/// content type 415, no body 411, a path leaving its repository 400, and a path no route names 404.
-#[test]
-fn routes_name_the_advertisement_and_the_services_and_refuse_the_rest_by_kind() {
-  let repo = || "/team/repo.git".to_owned();
-  assert_eq!(
-    route(&asked(
-      "GET /team/repo.git/info/refs?service=git-upload-pack",
-      &[]
-    )),
-    Ok(Route::Advertise {
-      repo: repo(),
-      service: Service::UploadPack,
-      version: Version::V0
-    })
-  );
-  assert_eq!(
-    route(&asked(
-      "GET /team/repo.git/info/refs?service=git-receive-pack",
-      &["Git-Protocol: version=2"]
-    )),
-    Ok(Route::Advertise {
-      repo: repo(),
-      service: Service::ReceivePack,
-      version: Version::V2
-    })
-  );
-  let request = |service: &str| format!("Content-Type: application/x-{service}-request");
-  assert_eq!(
-    route(&asked(
-      "POST /team/repo.git/git-upload-pack",
-      &[
-        &request("git-upload-pack"),
-        "Content-Length: 4",
-        "Git-Protocol: version=2"
-      ]
-    )),
-    Ok(Route::Serve {
-      repo: repo(),
-      service: Service::UploadPack,
-      version: Version::V2
-    })
-  );
-  assert_eq!(
-    route(&asked(
-      "POST /team/repo.git/git-receive-pack",
-      &[&request("git-receive-pack"), "Transfer-Encoding: chunked"]
-    )),
-    Ok(Route::Serve {
-      repo: repo(),
-      service: Service::ReceivePack,
-      version: Version::V0
-    })
-  );
-  for (head, refused) in [
-    (asked("GET /r.git/info/refs", &[]), Refused::Forbidden),
-    (
-      asked("GET /r.git/info/refs?service=git-annex", &[]),
-      Refused::Forbidden,
-    ),
-    (
-      asked(
-        "POST /r.git/info/refs?service=git-upload-pack",
-        &["Content-Length: 0"],
-      ),
-      Refused::MethodNotAllowed,
-    ),
-    (
-      asked("GET /r.git/git-upload-pack", &[]),
-      Refused::MethodNotAllowed,
-    ),
-    (
-      asked(
-        "POST /r.git/git-upload-pack",
-        &[&request("git-receive-pack"), "Content-Length: 4"],
-      ),
-      Refused::UnsupportedMediaType,
-    ),
-    (
-      asked(
-        "POST /r.git/git-upload-pack",
-        &[&request("git-upload-pack")],
-      ),
-      Refused::LengthRequired,
-    ),
-    (
-      asked(
-        "GET /r.git/../other.git/info/refs?service=git-upload-pack",
-        &[],
-      ),
-      Refused::BadRequest,
-    ),
-    (
-      asked("GET //info/refs?service=git-upload-pack", &[]),
-      Refused::BadRequest,
-    ),
-    (
-      asked("GET /info/refs?service=git-upload-pack", &[]),
-      Refused::NotFound,
-    ),
-    (asked("GET /r.git/HEAD", &[]), Refused::NotFound),
-  ] {
-    assert_eq!(
-      route(&head),
-      Err(refused),
-      "{} {}?{}",
-      match &head.method {
-        Method::Get => "GET",
-        Method::Post => "POST",
-        Method::Other(m) => m,
-      },
-      head.path,
-      head.query
-    );
+  for (value, expected) in cases {
+    assert_eq!(version(value), expected, "{value:?}");
   }
 }
 
-/// A-595. Do: read `Git-Protocol` values: none, `version=2`, `version=1`, keys around it, the last of two, and a version
-/// slates doesn't speak. Expect v0, v2, v1, v2, the last asked, and v0.
+/// A-595: do POST each service's request framed each way. Expect the service's route, at the version asked.
 #[test]
-fn the_version_is_the_last_version_key_git_protocol_names() {
-  assert_eq!(version(None), Version::V0);
-  assert_eq!(version(Some("version=2")), Version::V2);
-  assert_eq!(version(Some("version=1")), Version::V1);
+fn a_service_post_of_its_type_with_a_body_is_served() {
+  let [content_type, length] = service_fields("git-receive-pack");
   assert_eq!(
-    version(Some("object-format=sha1:version=2:agent=git")),
-    Version::V2
+    routed("POST", "/a/b.git/git-receive-pack", &[&content_type, &length]),
+    Ok(Route::Serve {
+      repo: "a/b.git".to_owned(),
+      service: Service::ReceivePack,
+      version: Version::V0,
+    })
   );
-  assert_eq!(version(Some("version=2:version=1")), Version::V1);
-  assert_eq!(version(Some("version=3")), Version::V0);
+  let [content_type, _] = service_fields("git-upload-pack");
+  assert_eq!(
+    routed(
+      "POST",
+      "/r.git/git-upload-pack",
+      &[&content_type, "Transfer-Encoding: chunked", "Git-Protocol: version=2"]
+    ),
+    Ok(Route::Serve {
+      repo: "r.git".to_owned(),
+      service: Service::UploadPack,
+      version: Version::V2,
+    })
+  );
+  assert_eq!(
+    routed(
+      "POST",
+      "/r.git/git-upload-pack",
+      &["Content-Type: Application/X-Git-Upload-Pack-Request; charset=x", "Content-Length: 4"]
+    ),
+    Ok(Route::Serve {
+      repo: "r.git".to_owned(),
+      service: Service::UploadPack,
+      version: Version::V0,
+    })
+  );
 }
 
-/// A-595. Do: write each service's advertisement prelude for v0, v1 and v2, a reply's head, chunks and refusals. Expect
-/// for v0 and v1 the pkt-line `# service=<service>` and a flush, byte for byte as gitprotocol-http writes them, and for v2
-/// nothing; a reply with its content type, `Cache-Control: no-cache` and chunked; a chunk as its size in hexadecimal and
-/// its data, none for no data; and a refusal's status, a `405` naming the methods the routes take.
+/// A-595: do send each request `http-backend` refuses. Expect each refused by its kind, with its status.
 #[test]
-fn the_advertisement_starts_with_its_service_line_and_a_flush_for_v0_and_v1_and_nothing_for_v2() {
-  assert_eq!(
-    advertisement_prelude(Service::UploadPack, Version::V0).unwrap(),
-    b"001e# service=git-upload-pack\n0000"
-  );
-  assert_eq!(
-    advertisement_prelude(Service::ReceivePack, Version::V1).unwrap(),
-    b"001f# service=git-receive-pack\n0000"
-  );
-  assert_eq!(
-    advertisement_prelude(Service::UploadPack, Version::V2).unwrap(),
-    b""
-  );
-  let reply =
-    String::from_utf8(reply_head(&advertisement_type(Service::UploadPack), true)).unwrap();
-  assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
-  for field in [
-    "Content-Type: application/x-git-upload-pack-advertisement\r\n",
-    "Cache-Control: no-cache\r\n",
-    "Transfer-Encoding: chunked\r\n",
-  ] {
-    assert!(reply.contains(field), "{field:?} in {reply}");
+fn every_refusal_is_typed_with_http_backends_status() {
+  let [upload_type, upload_length] = service_fields("git-upload-pack");
+  let cases: Vec<(&str, &str, Vec<&str>, RouteRefused, u16)> = vec![
+    ("GET", "/r/info/refs", vec![], RouteRefused::DumbProtocol, 403),
+    ("GET", "/r/info/refs?other=1", vec![], RouteRefused::DumbProtocol, 403),
+    ("GET", "/r/info/refs?service=git-frobnicate", vec![], RouteRefused::UnsupportedService, 403),
+    ("GET", "/r/info/refs?service=upload-pack", vec![], RouteRefused::UnsupportedService, 403),
+    ("GET", "/r/info/refs?service=git-upload-archive", vec![], RouteRefused::ServiceNotServed, 403),
+    ("POST", "/r/git-upload-archive", vec![], RouteRefused::ServiceNotServed, 403),
+    ("GET", "/r/HEAD", vec![], RouteRefused::DumbProtocol, 403),
+    ("GET", "/r/objects/info/packs", vec![], RouteRefused::DumbProtocol, 403),
+    ("GET", "/r/objects/info/alternates", vec![], RouteRefused::DumbProtocol, 403),
+    ("GET", "/r/objects/info/http-alternates", vec![], RouteRefused::DumbProtocol, 403),
+    ("GET", "/r/objects/ab/0123456789abcdef0123456789abcdef012345", vec![], RouteRefused::DumbProtocol, 403),
+    (
+      "GET",
+      "/r/objects/ab/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
+      vec![],
+      RouteRefused::DumbProtocol,
+      403,
+    ),
+    (
+      "GET",
+      "/r/objects/pack/pack-0123456789abcdef0123456789abcdef01234567.pack",
+      vec![],
+      RouteRefused::DumbProtocol,
+      403,
+    ),
+    (
+      "GET",
+      "/r/objects/pack/pack-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.idx",
+      vec![],
+      RouteRefused::DumbProtocol,
+      403,
+    ),
+    ("GET", "/r/objects/AB/0123456789abcdef0123456789abcdef012345", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/r/objects/ab/0123", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/r/something-else", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/info/refs?service=git-upload-pack", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/a/../b/info/refs?service=git-upload-pack", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/a/./b/info/refs?service=git-upload-pack", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/a//b/info/refs?service=git-upload-pack", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/a/%2e%2e/info/refs?service=git-upload-pack", vec![], RouteRefused::NotFound, 404),
+    ("GET", "/a%2Fb/info/refs?service=git-upload-pack", vec![], RouteRefused::BadPath, 400),
+    ("GET", "/a%00b/info/refs?service=git-upload-pack", vec![], RouteRefused::BadPath, 400),
+    ("GET", "/a%ff/info/refs?service=git-upload-pack", vec![], RouteRefused::BadPath, 400),
+    ("POST", "/r/info/refs?service=git-upload-pack", vec![], RouteRefused::MethodNotAllowed(Allowed::GetHead), 405),
+    ("PUT", "/r/HEAD", vec![], RouteRefused::MethodNotAllowed(Allowed::GetHead), 405),
+    ("GET", "/r/git-upload-pack", vec![], RouteRefused::MethodNotAllowed(Allowed::Post), 405),
+    ("HEAD", "/r/git-receive-pack", vec![], RouteRefused::MethodNotAllowed(Allowed::Post), 405),
+    ("POST", "/r/git-upload-pack", vec![upload_length.as_str()], RouteRefused::UnsupportedMediaType, 415),
+    (
+      "POST",
+      "/r/git-upload-pack",
+      vec!["Content-Type: application/x-git-receive-pack-request", upload_length.as_str()],
+      UnsupportedMediaType,
+      415,
+    ),
+    ("POST", "/r/git-upload-pack", vec![upload_type.as_str()], RouteRefused::LengthRequired, 411),
+    (
+      "GET",
+      "/r/info/refs?service=git-upload-pack",
+      vec!["Git-Protocol: version=2", "Git-Protocol: version=1"],
+      RouteRefused::Head(HeadRefused::BadRequest(Malformed::RepeatedField)),
+      400,
+    ),
+    (
+      "POST",
+      "/r/git-upload-pack",
+      vec![upload_type.as_str(), upload_type.as_str(), upload_length.as_str()],
+      RouteRefused::Head(HeadRefused::BadRequest(Malformed::RepeatedField)),
+      400,
+    ),
+  ];
+  for (method, target, fields, refusal, code) in cases {
+    assert_eq!(routed(method, target, &fields), Err(refusal), "{method} {target} {fields:?}");
+    assert_eq!(refusal.status(HttpVersion::Http11).code, code, "{refusal:?}");
   }
-  assert!(
-    String::from_utf8(reply_head(&result_type(Service::ReceivePack), false))
-      .unwrap()
-      .contains("Connection: close\r\n")
+  assert_eq!(
+    routed("OPTIONS", "*", &[]),
+    Err(RouteRefused::NotFound)
   );
-  assert_eq!(chunk(b"hello, world"), b"c\r\nhello, world\r\n");
-  assert_eq!(chunk(b""), b"");
-  assert_eq!(LAST_CHUNK, b"0\r\n\r\n");
-  let refused = String::from_utf8(refusal_reply(Refused::MethodNotAllowed)).unwrap();
-  assert!(
-    refused.starts_with("HTTP/1.1 405 Method Not Allowed\r\n")
-      && refused.contains("Allow: GET, POST\r\n"),
-    "{refused}"
+}
+
+/// A-595: do route requests in the order `http-backend` checks them: a wrong method on an alias path, an alias path for
+/// an unknown service, and an unknown service with a wrong content type. Expect the method first, then the path, then
+/// the service, then the content type.
+#[test]
+fn checks_run_in_http_backends_order() {
+  assert_eq!(
+    routed("GET", "/a/../b/git-upload-pack", &[]),
+    Err(RouteRefused::MethodNotAllowed(Allowed::Post))
   );
-  assert!(
-    String::from_utf8(refusal_reply(Refused::NotFound))
-      .unwrap()
-      .starts_with("HTTP/1.1 404 Not Found\r\n")
+  assert_eq!(
+    routed("GET", "/a/../b/info/refs?service=git-frobnicate", &[]),
+    Err(RouteRefused::NotFound)
   );
+  assert_eq!(
+    routed("POST", "/r/git-upload-archive", &["Content-Type: text/plain"]),
+    Err(RouteRefused::ServiceNotServed)
+  );
+}
+
+/// A-595: do send a `405` to HTTP/1.0 and HTTP/1.1. Expect `400` to HTTP/1.0, which has no `405`, as `bad_request`.
+#[test]
+fn a_wrong_method_is_400_to_http_1_0() {
+  let refused = routed_over("HTTP/1.0", "POST", "/r/info/refs?service=git-upload-pack", &[]);
+  assert_eq!(refused, Err(RouteRefused::MethodNotAllowed(Allowed::GetHead)));
+  let refusal = RouteRefused::MethodNotAllowed(Allowed::GetHead);
+  assert_eq!(refusal.status(HttpVersion::Http10).code, 400);
+  assert_eq!(refusal.status(HttpVersion::Http11).code, 405);
+}
+
+/// A-595: do route paths and queries with escapes, a `+` and repeated services. Expect the path decoded, the query read
+/// as a form, and the last `service` winning, as `http-backend`'s `get_parameter` reads it.
+#[test]
+fn paths_and_queries_are_read_decoded() {
+  assert_eq!(
+    routed("GET", "/my%20repo/sub%2Bdir/info/refs?service=git%2Dupload-pack", &[]),
+    Ok(Route::Advertise {
+      repo: "my repo/sub+dir".to_owned(),
+      service: Service::UploadPack,
+      version: Version::V0,
+      head_only: false,
+    })
+  );
+  assert_eq!(
+    routed("GET", "/r/info/ref%73?service=git-frobnicate&service=git-receive-pack", &[]),
+    Ok(Route::Advertise {
+      repo: "r".to_owned(),
+      service: Service::ReceivePack,
+      version: Version::V0,
+      head_only: false,
+    })
+  );
+  assert_eq!(
+    routed("GET", "/r/info/refs?service=git-upload-pack&service=git-frobnicate", &[]),
+    Err(RouteRefused::UnsupportedService)
+  );
+  assert_eq!(
+    routed("GET", "http://git.example/r/info/refs?service=git-upload-pack", &[]),
+    Ok(Route::Advertise {
+      repo: "r".to_owned(),
+      service: Service::UploadPack,
+      version: Version::V0,
+      head_only: false,
+    })
+  );
+}
+
+/// A-595: do route a path under an admission that holds it and under one a byte short. Expect the decoded path charged
+/// exactly, and the short one refused with nothing charged.
+#[test]
+fn a_route_charges_the_path_it_keeps() {
+  let bytes = b"GET /team/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: h\r\n\r\n";
+  let head = head(bytes);
+  let kept = to_u64("team/repo.git/info/refs".len());
+  let mut admission = Admission::new(kept + 3);
+  assert!(route(&head, &mut admission).is_ok());
+  assert_eq!(admission.left(), 3);
+  let mut admission = Admission::new(kept - 1);
+  assert_eq!(route(&head, &mut admission), Err(RouteRefused::PastRoom));
+  assert_eq!(admission.left(), kept - 1);
+}
+
+/// A-595: do write each service's prelude at each version. Expect gitprotocol-http's `# service=` pkt-line and a flush
+/// for v0 and v1, byte for byte, and nothing for v2.
+#[test]
+fn the_prelude_names_the_service_for_v0_and_v1_alone() {
+  let cases: [(Service, Version, &[u8]); 6] = [
+    (Service::UploadPack, Version::V0, b"001e# service=git-upload-pack\n0000"),
+    (Service::UploadPack, Version::V1, b"001e# service=git-upload-pack\n0000"),
+    (Service::UploadPack, Version::V2, b""),
+    (Service::ReceivePack, Version::V0, b"001f# service=git-receive-pack\n0000"),
+    (Service::ReceivePack, Version::V1, b"001f# service=git-receive-pack\n0000"),
+    (Service::ReceivePack, Version::V2, b""),
+  ];
+  for (service, version, expected) in cases {
+    let mut out = Vec::new();
+    advertisement_prelude(service, version, &mut out).unwrap();
+    assert_eq!(out, expected, "{service:?} {version:?}");
+  }
+}
+
+/// A-595: do write each smart reply's head over each version. Expect `200`, `http-backend`'s three cache fields and
+/// then the content type, in its order, chunked to HTTP/1.1 and framed by the close to HTTP/1.0, byte for byte.
+#[test]
+fn a_smart_reply_head_is_written_as_http_backend_answers() {
+  let mut out = Vec::new();
+  reply_head(Reply::Advertisement(Service::UploadPack), HttpVersion::Http11, true, &mut out).unwrap();
+  assert_eq!(
+    out,
+    b"HTTP/1.1 200 OK\r\nExpires: Fri, 01 Jan 1980 00:00:00 GMT\r\nPragma: no-cache\r\nCache-Control: no-cache, max-age=0, must-revalidate\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nTransfer-Encoding: chunked\r\n\r\n"
+  );
+  let mut out = Vec::new();
+  reply_head(Reply::Result(Service::ReceivePack), HttpVersion::Http11, false, &mut out).unwrap();
+  assert_eq!(
+    out,
+    b"HTTP/1.1 200 OK\r\nExpires: Fri, 01 Jan 1980 00:00:00 GMT\r\nPragma: no-cache\r\nCache-Control: no-cache, max-age=0, must-revalidate\r\nContent-Type: application/x-git-receive-pack-result\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+  );
+  let mut out = Vec::new();
+  reply_head(Reply::Result(Service::UploadPack), HttpVersion::Http10, true, &mut out).unwrap();
+  assert_eq!(
+    out,
+    b"HTTP/1.1 200 OK\r\nExpires: Fri, 01 Jan 1980 00:00:00 GMT\r\nPragma: no-cache\r\nCache-Control: no-cache, max-age=0, must-revalidate\r\nContent-Type: application/x-git-upload-pack-result\r\nConnection: close\r\n\r\n"
+  );
+}
+
+/// A-595: do write the replies to a `405` over each version and a `403`. Expect each status, `Allow` with the route's
+/// methods on a `405` alone and before the cache fields, as `bad_request` writes them, no body, the connection closed.
+#[test]
+fn a_refusal_reply_is_written_as_http_backend_answers() {
+  let cache = "Expires: Fri, 01 Jan 1980 00:00:00 GMT\r\nPragma: no-cache\r\nCache-Control: no-cache, max-age=0, must-revalidate\r\n";
+  let cases: [(RouteRefused, HttpVersion, String); 4] = [
+    (
+      RouteRefused::MethodNotAllowed(Allowed::GetHead),
+      HttpVersion::Http11,
+      format!("HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\n{cache}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+    ),
+    (
+      RouteRefused::MethodNotAllowed(Allowed::Post),
+      HttpVersion::Http11,
+      format!("HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\n{cache}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+    ),
+    (
+      RouteRefused::MethodNotAllowed(Allowed::Post),
+      HttpVersion::Http10,
+      format!("HTTP/1.1 400 Bad Request\r\n{cache}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+    ),
+    (
+      RouteRefused::DumbProtocol,
+      HttpVersion::Http11,
+      format!("HTTP/1.1 403 Forbidden\r\n{cache}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+    ),
+  ];
+  for (refusal, http, expected) in cases {
+    let mut out = Vec::new();
+    refusal_reply(refusal, http, &mut out).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), expected, "{refusal:?} {http:?}");
+  }
 }
