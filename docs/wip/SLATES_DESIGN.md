@@ -17817,7 +17817,8 @@ Status: designed 2026-10-06; built piece by piece, each with its own record.
 ### A-113 — An NFS loopback connection outlives its daemon (2026-10-06)
 Applied in the same change to: §4.6 (macOS fallback), GAPS, BENCHMARKS, docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md.
 
-Status: built on macOS 2026-10-06; Linux owed (below).
+Status: built on macOS 2026-10-06; Linux built 2026-11-19 by A-550 (its unit tests on Linux; the Linux kill run of
+`crates/cli/tests/nfs_held.rs` owed).
 - What it answers: the anchor held the NFS listener across a daemon restart, but not the connections. A daemon's death
   closed every kernel client's connection with requests in flight, and the client reconnected. On macOS that cost a
   1.0 s stall per kill, and under ten kills in 12 s with writes in flight, Apple's NFS client panicked the kernel twice
@@ -17845,11 +17846,12 @@ Status: built on macOS 2026-10-06; Linux owed (below).
 - A request applied and unanswered at a death is never applied again. An NFSv3 mutation's reply is held, keyed by the
   held connection and the xid, and published with its effect, so the successor answers the request it reads again
   from that reply (A-128). An NFSv4.1 request retried after a restart is answered from its call records (A-127).
-- Linux is owed. Linux keeps `SO_SNDLOWAT` fixed and copies what fits, so a send can end mid-record; a successor
+- Linux (A-550). Linux keeps `SO_SNDLOWAT` fixed and copies what fits, so a send can end mid-record; a successor
   resuming such a stream would hand the client the next reply's bytes as the rest of the torn one. The remedy is an
   exact check at adoption: the bytes the kernel says were written (`tcpi_bytes_acked` plus `SIOCOUTQ`) against the
-  bounds of the send in flight, recorded in a ledger the anchor holds. Until then Linux connections are not held and
-  behave as before.
+  bounds of the send in flight, recorded in a ledger the anchor holds. Built 2026-11-19 (A-550): a Linux connection is
+  held under that ledger, and a successor serves it on only on a record's boundary; until then Linux connections were
+  not held.
 - Scope: the loopback listener. The TLS network export keeps its TLS state in the daemon, so its connections are not
   held; a peer reconnects.
 - Rejected:
@@ -18423,7 +18425,7 @@ Status: built 2026-10-09.
     lives only until the daemon ends. A client reuses an xid on one connection only after 2³² requests (RFC 5531 §9).
 - Bounds: held replies on a shard are its held connections' turns in progress; recovered ones are at most the previous
   image's.
-- Proven (macOS; Linux holds no connection yet, A-113):
+- Proven (macOS; Linux holds its connections since A-550, 2026-11-19, its kill run of this flow owed):
   - `a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again` pipelines MKDIR bursts on one held
     connection and kills the daemon inside each. Every MKDIR's first reply must be `NFS3_OK` and every directory must
     exist after. A successor must have answered at least one request from a held reply, counted as
@@ -36994,10 +36996,18 @@ Applied in the same change to: §4.16 "Composition at seal", GAPS (the 2026-11-0
 `docs/bugs/2026-11-19-an-edit-after-a-rename-was-accepted-and-lost.md`, `crates/merge/src/{engine,chain_entry}.rs`,
 `crates/server/tests/green_post_state.rs`.
 
-### A-550 — A held NFS connection is served on after its daemon only on a record's boundary: the judgment, part 1 of A-113's Linux half (2026-11-18, goal 85, g079; §4.6 the loopback listener; A-113, A-128)
+### A-550 — A held NFS connection is served on after its daemon only on a record's boundary: A-113's Linux half, the judgment (part 1) and the ledger, the kernel's count and the hold (part 2) (2026-11-18/19, goal 85, g079; §4.6 the loopback listener; A-113, A-128)
 Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part 2 owed), `crates/server/src/held_send.rs`
 (new: `SendLedger`, `Resume`, `resume` and the unit test), `crates/server/src/lib.rs`, and the bug record
-`docs/bugs/2026-11-18-linux-nfs-loopback-connections-were-dropped-at-every-daemon-restart.md`.
+`docs/bugs/2026-11-18-linux-nfs-loopback-connections-were-dropped-at-every-daemon-restart.md`. Part 2 (2026-11-19):
+`crates/rt/src/netsys.rs` (`settle_handed`, `bytes_acked_in`, Linux `bytes_handed` over `TCP_INFO` and `SIOCOUTQ`,
+the other platforms' `bytes_handed` answering none), `crates/rt/src/tcp.rs` (`TcpStream::bytes_handed`),
+`unsafe-budget.toml` (slates-rt 106 → 107, the `SIOCOUTQ` ioctl), `crates/server/src/held_send.rs` (the ledger:
+`Geometry`, `LedgerView` and its store plans, `LedgerRecord`, `Handover`, `split_ledgers`, the Linux `Ledger` over a
+`SharedObject`), `crates/server/src/nfs.rs` (`holding`, `admit`, `adopt_held`, `send_ledgered`, the slot in `Connection`,
+`Ending` and `migrate`), `crates/server/src/daemon.rs` (the ledgers split from the handed copies, carried to the
+listener's start), `crates/server/src/config.rs` (`held_copy_bound` + `LEDGER_COPIES`), A-113's and A-128's status
+lines, GAPS, and the bug record's part 2.
 - **What was there.** A-113 holds each loopback NFS connection in the anchor across a restart, so a restart is a slow
   reply and never a dropped connection, on macOS only: its sends are all or nothing (`SO_SNDLOWAT`). Linux copies what
   fits, so a send can end mid-record, and a successor resuming such a stream would hand the client the next reply's
@@ -37009,13 +37019,59 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   it) leaves the stream on a record's boundary, and the connection is served on: a request still queued is answered
   afresh, a whole reply sent twice is dropped by its client (RFC 5531). Any other count, the sum's overflow included,
   is a torn stream: the connection ends and its client reconnects, as every one did before.
-- **Owed (part 2, Linux-only).** The ledger in anchor-owned RAM, written before each send and advanced after it, each
-  record checksummed; the kernel's count (`tcpi_bytes_acked` plus `SIOCOUTQ`); Linux connections held once both are
-  there; and the kill run.
+- **Built (part 2, 2026-11-19): the kernel's count.** `TcpStream::bytes_handed` reads Linux's `tcpi_bytes_acked`
+  (`TCP_INFO`, its bytes 120..128; `include/uapi/linux/tcp.h`, the same through `tcpi_bytes_received` in v6.12 and
+  mainline) plus `SIOCOUTQ` (`TIOCOUTQ`, include/uapi/linux/sockios.h:27). The first is `snd_una`'s progress
+  (`tcp_snd_una_update` adds `ack - snd_una` and nothing else does, net/ipv4/tcp_input.c:3941 mainline, :3652 v6.12;
+  `tcp_disconnect` zeroes it), the second `write_seq - snd_una` (`tcp_ioctl`), so their sum is `write_seq`'s progress:
+  every byte written, and one more once a FIN is queued (`tcp_send_fin`, net/ipv4/tcp_output.c:3882). **No SYN is
+  counted** on an accepted connection: its socket starts with `snd_una` and `write_seq` both at `snt_isn + 1`
+  (`tcp_create_openreq_child`, net/ipv4/tcp_minisocks.c:577 and :594 mainline, :540 and :557 v6.12); its count is its
+  listener's, copied (`sk_clone`, net/core/sock.c:2521) from a zeroed allocation (`sk_alloc` asks `__GFP_ZERO`, :2337)
+  that never sends; and the `TCP_SYN_RECV` step writes `snd_una` directly (tcp_input.c:7381 mainline, :6851 v6.12), the
+  handshake's last ACK moving it by nothing. Admission checks it besides: a connection is held under the ledger only
+  when its count reads zero as accepted (`nfs.held_send.count_refused` counts any other). The two counters are read
+  apart, so the acknowledged one is read on both sides of the queue and a round is kept only when the two agree; nothing
+  writes meanwhile, so each disagreeing round has seen at least one byte acknowledged that was outstanding at the first
+  reading, which bounds the rounds (`settle_handed`). A count that falls, more acknowledged than was outstanding, or a
+  sum past the counter is refused. Read 2026-11-19 at v6.12 and mainline (master, the 7.x line).
+- **Built (part 2): the ledger.** A `SharedObject` (a `memfd`) the anchor holds as a third kind of copy beside the DAX
+  objects and the writable maps' copies, so it outlives its writer. Its record is four little-endian words (the tag
+  `NFSLEDG\x01`, the generation, the slots, the stride: no other kind's record is that long), its copy id the top
+  sixteen bits all ones (every other copy's id is an encoded handle whose top bits are a partition below 65,535) over
+  the generation's low 48 bits. The header word counts the slots ever claimed (how far a successor reads, so it touches
+  only the pages used); each slot, on cache lines of its own (`Geometry::new`, from the profile's cache line), holds
+  the connection's id, a selector, and two records of `committed` and `in_flight`. An update writes the idle record and
+  then flips the selector, one store, so the record in force was always written whole: in place of the checksum this
+  bullet first named, which could only have turned a torn record into a needless reconnect. Claims take the lowest free
+  slot, on the listener's shard; a connection's sends record on whichever shard serves it, and its slot moves with it.
+- **Built (part 2): the hold.** `admit` holds a Linux connection when an anchor holds for the daemon, this daemon keeps
+  a ledger, and the count reads zero: its slot is claimed before the anchor holds it, so a held connection always has a
+  record. Every send goes through `send_ledgered` (replies and NFSv4.1 callbacks alike: the only writer of a
+  connection's stream), recording the run before it and committing it after. At a start, `Handover` lets go every
+  inherited ledger but the newest, judges each handed-back connection by its record there and the kernel's count
+  (`adoption`: unrecorded, uncounted or torn ends it, each counted; a boundary serves it on), fills a fresh ledger
+  (the next generation) with the connections served on at the bytes behind them, has the anchor hold it, lets the
+  inherited one go, and only then spawns them. A death anywhere in that leaves the inherited ledger (nothing sent since)
+  or a fresh one filled before it was held as the newest, so the judgment stays right. The anchor's copy bound gains
+  `LEDGER_COPIES` (2 on Linux: the one in force and a start's fresh one). A ledger the daemon cannot make or the anchor
+  will not hold leaves its Linux connections unheld, as before, counted (`nfs.held_send.ledger_refused`).
 - **Tests.** `a_held_connection_is_served_on_only_on_a_records_boundary` (`crates/server/src/held_send.rs`, every
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
-  judgment.
+  judgment. Part 2, every host: `a_successor_judges_a_writer_stopped_after_any_store_rightly` (the crash oracle: a claim
+  and four sends, each update's stores made one at a time and each kernel take between, the connection judged from a
+  copy of the words after every one: unrecorded until the claim's last store, served on at exactly the bytes handed on
+  a boundary, torn inside a send), `slots_are_claimed_lowest_first_and_found_only_by_their_connection`,
+  `a_ledger_record_reads_back_and_nothing_else_reads_as_one` (golden bytes), `ledger_copy_ids_are_their_own`,
+  `the_newest_ledger_judges_and_the_next_is_newer`, `a_handed_back_connection_is_served_on_or_ended_with_its_reason`;
+  in `slates-rt`, `the_bytes_handed_settle_however_acknowledgements_fall_between_the_readings` (every schedule of 0 to 4
+  outstanding bytes acknowledged before any of nine readings settles on the bytes handed),
+  `the_acknowledged_count_is_read_where_linux_keeps_it` (golden offset) and `a_count_that_cannot_settle_is_refused`.
+  Linux only: `an_accepted_connection_counts_every_byte_written_and_no_syn` (a real loopback connection reads 0, then
+  1,000 queued, then 1,000 read by its peer) and `a_ledger_object_outlives_its_writer` (a `memfd` ledger read back
+  through a duplicate after its writer is dropped; a record of another size refused). Owed, main's: the Linux kill
+  run of `crates/cli/tests/nfs_held.rs`, which holds Linux connections for the first time.
 
 ### A-556 — A carried takeover's cohort holds back only the objects its round ranked to the carrier (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; GAPS, live-durability 2026-11-09; A-272 (ii), A-309)
 Applied in the same change to: GAPS (the live-durability entry), `crates/db/src/register.rs`

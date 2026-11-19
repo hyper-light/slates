@@ -12044,19 +12044,30 @@ dead daemon left: 72 pipelined writes across six kills answered on one connectio
 (`crates/cli/tests/nfs_held.rs`; docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md).
 
 Open:
-- Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
-  against a ledger of the send in flight (A-113) before it may resume one.
+- ~~Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
+  against a ledger of the send in flight (A-113) before it may resume one.~~ **Built 2026-11-19 (A-550 parts 1 and 2,
+  goal 85 B12, g079); the Linux kill run is owed (below).**
   - **Built, part 1 (2026-11-18, A-550, goal 85, g079): the adoption's judgment.** `crate::held_send::resume` judges a
     held connection from the bytes the kernel says its writer handed it against the ledger of the send in flight:
     exactly the bytes before that send (`Untouched`) or those and the whole send (`Whole`) serve on, any other count is
     `Torn` and ends the connection. Held by `a_held_connection_is_served_on_only_on_a_records_boundary` (the server's
     unit tests, every host), red with today's rule on the Mac Studio.
-  - **Owed, part 2 (Linux-only, main's to write and compile; run-requests.md):** the ledger in anchor-owned RAM (per
-    held connection, `committed` and `in_flight` written before each send and `committed` advanced after it, each
-    record checksummed so a torn write reads as torn); the kernel's count at adoption (`TCP_INFO`'s
-    `tcpi_bytes_acked`, measured for whether it counts the SYN, plus `SIOCOUTQ`); `make_sends_whole` answering held on
-    Linux once both are there, and `nfs::adopt_held` ending a `Torn` connection before it reads; then the Linux kill
-    run of `crates/cli/tests/nfs_held.rs`.
+  - **Built, part 2 (2026-11-19, A-550, g079): the kernel's count, the ledger and the hold.**
+    `slates_rt::tcp::TcpStream::bytes_handed` is `tcpi_bytes_acked` plus `SIOCOUTQ`, read until the acknowledged count
+    agrees on both sides of the queue's reading. It counts no SYN on an accepted connection, by the kernel's source
+    (the child's `snd_una` and `write_seq` both start one past the SYN-ACK, its count is the zeroed listener's, and the
+    handshake's last ACK moves `snd_una` by nothing: v6.12 and mainline, lines in the design's A-550) and by a check at
+    every admission (the count must read zero). The ledger is a `memfd` the anchor holds as a copy (record tag
+    `NFSLEDG\x01`, copy ids with their top sixteen bits all ones): a slot per held connection, two records and a selector,
+    so the record in force was always written whole (no checksum needed). `admit` holds a Linux connection under it; every
+    send records before and commits after (`send_ledgered`); a start judges each handed-back connection by the newest
+    ledger and the kernel's count, fills a fresh ledger, has it held, lets the old go, then serves. Held by the crash
+    oracle `a_successor_judges_a_writer_stopped_after_any_store_rightly` and five more on every host, the count's
+    settling oracle in `slates-rt`, and on Linux `an_accepted_connection_counts_every_byte_written_and_no_syn` and
+    `a_ledger_object_outlives_its_writer`.
+  - **Owed (main's runs; run-requests.md):** the Linux kill run of `crates/cli/tests/nfs_held.rs` (x86_64 and arm64),
+    which now holds Linux connections for the first time; the gates (clippy on `slates-rt` and `slates-server`, `cargo
+    xtask check` with the unsafe budget's new site, the Windows compile of the `bytes_handed` arm).
 - The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
   so it waits for Ada.
   - **2026-11-18 (g079), Ada's go.** On Adas-Mac-Studio-2 (b24c5c95: M4 Max, macOS 26.2, no memory tagging),
