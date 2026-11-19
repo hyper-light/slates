@@ -233,3 +233,7 @@ pub fn branch_head_revs(
   admission.charge_items::<Rev>(heads.clone().count())?;
   Ok(heads.collect())
 }
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod tests;
