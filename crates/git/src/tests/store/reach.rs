@@ -11,11 +11,13 @@ use slates_vcs::{ContentId, ContentStore, Inserted};
 
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::objects::tree::Mode as FileMode;
+use crate::store::repository::reach::Shape;
 use crate::store::{ReachRefused, ReachSets, Repository, Sets};
 
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
-  Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store, tree, wide,
+  BUDGET, Made, Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store,
+  tree, wide,
 };
 
 /// A read's answer as the tests take it.
@@ -436,6 +438,80 @@ fn t_a647_p3_a_reached_set_past_one_window_is_kept_and_served() {
   assert!(
     newest.runs() * RUN_BYTES > WINDOW,
     "the runs alone pass one window"
+  );
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
+}
+
+/// Shape: a window as short as the server's store-level tests hold content in (A-662), so a ref's reached set passes
+/// many blocks and several levels of its tree within a few hundred pushes.
+const SHORT_WINDOW: usize = 1 << 8;
+
+/// Shape: the roots ref 1 merges in the storage test: enough that its reached set, kept as one sorted sequence, passes
+/// the bound a version's nodes are held to.
+const ROOTS: usize = 400;
+
+/// A root commit of its own, a blob and a tree beneath it: its objects, and its id.
+fn root_of(format: ObjectFormat, text: &str, seconds: u64) -> (Vec<Made>, ObjectId) {
+  let text = blob(format, text.as_bytes());
+  let root = tree(format, &[(FileMode::File, b"root", text.id)]);
+  let made = commit(format, root.id, &[], seconds);
+  let id = made.id;
+  (vec![made, root, text], id)
+}
+
+/// A-647 part 4. Do: in a store of a 256-byte window, make 400 root commits on ref 2 and as many on ref 3 by turns, so
+/// each of ref 2's roots is a run of its own; make ref 1 at a root of its own; then merge ref 2's roots into ref 1,
+/// newest first, each merge a commit, a tree and a blob of its own, so every version of ref 1 brings a run below every
+/// run it reached (the worst case for a set kept as one sorted sequence, which each such version writes again whole).
+/// Record what each version of ref 1 added to the store for its value. Expect: every version adds at most the nodes on
+/// the paths to the blocks its two sets change and its value's node, a bound set by the window and the depth of the
+/// ref's tree, never by what the ref reaches; and ref 1's newest reached set, kept whole, would pass that bound.
+#[test]
+fn t_a647_p4_a_version_stores_what_it_adds_not_what_it_reaches() {
+  let format = ObjectFormat::Sha1;
+  let mut store = ContentStore::new(BUDGET, SHORT_WINDOW).unwrap();
+  let mut repository = Repository::new(format);
+  let mut roots = Vec::with_capacity(ROOTS);
+  for at in 0..ROOTS {
+    for green in [2, 3] {
+      let (objects, id) = root_of(format, &format!("ref {green} root {at}\n"), at as u64);
+      push_and_move(&mut repository, &mut store, objects, &[(green, Some(id))]).unwrap();
+      if green == 2 {
+        roots.push(id);
+      }
+    }
+  }
+  let (objects, mut head) = root_of(format, "ref 1's own root\n", 0);
+  push_and_move(&mut repository, &mut store, objects, &[(1, Some(head))]).unwrap();
+  let mut added = Vec::with_capacity(ROOTS);
+  for (at, root) in roots.iter().enumerate().rev() {
+    let text = blob(format, format!("merge {at}\n").as_bytes());
+    let files = tree(format, &[(FileMode::File, b"merge", text.id)]);
+    let merge = commit(format, files.id, &[head, *root], at as u64);
+    head = merge.id;
+    let before = repository.counters().value_bytes;
+    let pushed = vec![merge, files, text];
+    push_and_move(&mut repository, &mut store, pushed, &[(1, Some(head))]).unwrap();
+    added.push(repository.counters().value_bytes - before);
+  }
+  let shape = Shape::of(SHORT_WINDOW).unwrap();
+  let newest = repository.reached(&store, 1, ROOTS).unwrap();
+  assert_eq!(
+    newest.runs(),
+    ROOTS + 1,
+    "each merged root a run, and ref 1's own one"
+  );
+  let last = newest.iter().last().unwrap();
+  let levels = u64::from(shape.level_of(last / shape.block));
+  let window = SHORT_WINDOW as u64;
+  let bound = (4 * (levels + 1) + 1) * window;
+  let past = added.iter().enumerate().find(|(_, bytes)| **bytes > bound);
+  assert_eq!(past, None, "a version past {bound} bytes ({levels} levels)");
+  let whole = newest.runs() as u64 * RUN_BYTES as u64;
+  assert!(
+    whole > bound,
+    "kept whole, {whole} bytes, the set would pass the bound"
   );
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
