@@ -44,6 +44,12 @@ HookPointName 4 HgChangegroup
 HookPointName 5 SvnPreCommit
 HookPointName 6 SvnPreRevpropChange
 HookPointName 7 SvnPostCommit
+HookPointName 8 SvnStartCommit
+HookPointName 9 SvnPostRevpropChange
+HookPointName 10 SvnPreLock
+HookPointName 11 SvnPostLock
+HookPointName 12 SvnPreUnlock
+HookPointName 13 SvnPostUnlock
 LandingState 0 Planning
 LandingState 1 AwaitingGrant
 LandingState 2 Validating

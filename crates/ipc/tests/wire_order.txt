@@ -62,6 +62,7 @@ DatabaseRefusal 6 CheckFailed
 DatabaseRefusal 7 StateChanged
 DatabaseRefusal 8 PolicyRuleMalformed
 DatabaseRefusal 9 PolicyHookMalformed
+DatabaseRefusal 10 PolicyHooksEnvMalformed
 DeleteWhileOpen 0 NoKernelClient
 DeleteWhileOpen 1 Unlinked
 DeleteWhileOpen 2 SillyRenamed
@@ -91,6 +92,12 @@ HookPointName 4 HgChangegroup
 HookPointName 5 SvnPreCommit
 HookPointName 6 SvnPreRevpropChange
 HookPointName 7 SvnPostCommit
+HookPointName 8 SvnStartCommit
+HookPointName 9 SvnPostRevpropChange
+HookPointName 10 SvnPreLock
+HookPointName 11 SvnPostLock
+HookPointName 12 SvnPreUnlock
+HookPointName 13 SvnPostUnlock
 HostAnswer 0 NotFound
 HostAnswer 1 NotDirectory
 HostAnswer 2 NotFile

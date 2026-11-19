@@ -1578,6 +1578,7 @@ mod tests {
         version: 1,
         rules,
         hooks: Vec::new(),
+        hooks_env: Vec::new(),
       },
     }
   }

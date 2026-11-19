@@ -7,14 +7,18 @@
 //! A-597), so a recorded policy always compiles. A hook is at one of its repository's tool's points, under a name the
 //! point allows (Mercurial's `pretxnchangegroup` or `pretxnchangegroup.suffix`, one hook a name; git's and Subversion's
 //! the point's own name, one hook a point, as each keeps one hook file a point), and runs a program by an absolute path
-//! holding no NUL. A policy is charged its rules' and hooks' encoded bytes, so an empty one costs nothing.
+//! holding no NUL. A Subversion repository's hooks-env (A-648) holds sections named by something, holding no NUL, whose
+//! variables are each one variable of a hook's environment: a name not empty, holding no `=` and no NUL, and a value
+//! holding no NUL; any other repository holds none, since git's and Mercurial's hooks inherit the server's environment.
+//! A policy is charged its rules', hooks' and hooks-env sections' encoded bytes, so an empty one costs nothing.
 
 use std::collections::BTreeSet;
 
 use slates_wire::Wire;
 
 use crate::catalog::{
-  HookConfig, HookPointName, PolicyNames, PolicyRule, RepositoryPolicy, VcsTool,
+  HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable, PolicyNames, PolicyRule,
+  RepositoryPolicy, VcsTool,
 };
 use crate::error::DbError;
 
@@ -22,7 +26,7 @@ use crate::error::DbError;
 const GLOB_FORM: &str = ":glob:";
 
 /// Refuses a policy for a repository serving `tool` that the log must never record: the first malformed rule, then the
-/// first malformed hook, by index.
+/// first malformed hook, then the first malformed hooks-env section, by index.
 pub(super) fn check(tool: VcsTool, policy: &RepositoryPolicy) -> Result<(), DbError> {
   if let Some(index) = policy.rules.iter().position(|rule| !rule_holds(tool, rule)) {
     return Err(DbError::PolicyRuleMalformed {
@@ -37,22 +41,36 @@ pub(super) fn check(tool: VcsTool, policy: &RepositoryPolicy) -> Result<(), DbEr
       });
     }
   }
+  if let Some(index) = policy
+    .hooks_env
+    .iter()
+    .position(|section| !section_holds(tool, section))
+  {
+    return Err(DbError::PolicyHooksEnvMalformed {
+      index: index_of(index),
+    });
+  }
   Ok(())
 }
 
-/// The bytes a policy is charged: its rules' and hooks' encoded bytes, what the partition holds of it beyond an empty
-/// one.
+/// The bytes a policy is charged: its rules', hooks' and hooks-env sections' encoded bytes, what the partition holds of
+/// it beyond an empty one.
 pub(super) fn bytes(policy: &RepositoryPolicy) -> usize {
   let rules = policy
     .rules
     .iter()
     .map(|rule| rule.to_bytes().len())
     .fold(0, usize::saturating_add);
-  policy
+  let hooks = policy
     .hooks
     .iter()
     .map(|hook| hook.to_bytes().len())
-    .fold(rules, usize::saturating_add)
+    .fold(rules, usize::saturating_add);
+  policy
+    .hooks_env
+    .iter()
+    .map(|section| section.to_bytes().len())
+    .fold(hooks, usize::saturating_add)
 }
 
 /// An item's index among its part of the policy, as a refusal names it.
@@ -81,6 +99,21 @@ fn hook_holds(tool: VcsTool, hook: &HookConfig) -> bool {
     && std::path::Path::new(&hook.program).is_absolute()
 }
 
+/// Whether `section` is one a repository serving `tool` may hold (the module doc): a Subversion repository's, named, and
+/// each variable one a hook's environment can carry.
+fn section_holds(tool: VcsTool, section: &HooksEnvSection) -> bool {
+  tool == VcsTool::Subversion
+    && !section.name.is_empty()
+    && !section.name.contains('\0')
+    && section.variables.iter().all(variable_holds)
+}
+
+/// Whether `variable` is one variable of a hook's environment: a name not empty, holding no `=` and no NUL, and a value
+/// holding no NUL.
+fn variable_holds(variable: &HooksEnvVariable) -> bool {
+  !variable.name.is_empty() && !variable.name.contains(['=', '\0']) && !variable.value.contains(&0)
+}
+
 /// Whether `name` names a hook at `point`: at a Mercurial point, the point's name alone or with a `.suffix`; at a git or
 /// Subversion point, the point's name alone.
 fn named_for(point: HookPointName, name: &str) -> bool {
@@ -99,8 +132,8 @@ fn named_for(point: HookPointName, name: &str) -> bool {
 mod tests {
   use super::{bytes, check};
   use crate::catalog::{
-    HookConfig, HookPointName, PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
-    RepositoryPolicy, VcsTool,
+    HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable, PolicyEffect, PolicyNames,
+    PolicyRight, PolicyRule, PolicyWho, RepositoryPolicy, VcsTool,
   };
   use crate::error::DbError;
 
@@ -138,7 +171,134 @@ mod tests {
       version: 1,
       rules,
       hooks,
+      hooks_env: Vec::new(),
     }
+  }
+
+  /// A Subversion policy of nothing but the hooks-env `sections`.
+  fn with_env(sections: Vec<HooksEnvSection>) -> RepositoryPolicy {
+    RepositoryPolicy {
+      hooks_env: sections,
+      ..policy(Vec::new(), Vec::new())
+    }
+  }
+
+  /// A hooks-env section `name` of `variables`, each a name and a value.
+  fn env_section(name: &str, variables: &[(&str, &[u8])]) -> HooksEnvSection {
+    HooksEnvSection {
+      name: name.to_owned(),
+      variables: variables
+        .iter()
+        .map(|(name, value)| HooksEnvVariable {
+          name: (*name).to_owned(),
+          value: value.to_vec(),
+        })
+        .collect(),
+    }
+  }
+
+  /// A-648 (Subversion's nine points, `hooks.c`). Do: hold a hook at each of Subversion's points under its own name in a
+  /// Subversion repository; hold each alone in a git repository; hold pre-lock named for post-lock. Expect: all nine
+  /// held, named as Subversion names them; each refused in the git repository and the misnamed one refused, by index.
+  #[test]
+  fn subversions_nine_points_are_held_by_a_subversion_repository_alone() {
+    let program = program();
+    let points = [
+      HookPointName::SvnStartCommit,
+      HookPointName::SvnPreCommit,
+      HookPointName::SvnPostCommit,
+      HookPointName::SvnPreRevpropChange,
+      HookPointName::SvnPostRevpropChange,
+      HookPointName::SvnPreLock,
+      HookPointName::SvnPostLock,
+      HookPointName::SvnPreUnlock,
+      HookPointName::SvnPostUnlock,
+    ];
+    let names: Vec<&str> = points.iter().map(|point| point.name()).collect();
+    let expected = [
+      "start-commit",
+      "pre-commit",
+      "post-commit",
+      "pre-revprop-change",
+      "post-revprop-change",
+      "pre-lock",
+      "post-lock",
+      "pre-unlock",
+      "post-unlock",
+    ];
+    assert_eq!(names, expected);
+    let hooks: Vec<HookConfig> = points
+      .iter()
+      .map(|point| hook(*point, point.name(), &program))
+      .collect();
+    assert_eq!(
+      check(VcsTool::Subversion, &policy(Vec::new(), hooks.clone())),
+      Ok(())
+    );
+    for one in hooks {
+      let name = one.name.clone();
+      let refused = Err(DbError::PolicyHookMalformed { index: 0 });
+      assert_eq!(
+        check(VcsTool::Git, &policy(Vec::new(), vec![one])),
+        refused,
+        "{name}"
+      );
+    }
+    let misnamed = hook(HookPointName::SvnPreLock, "post-lock", &program);
+    assert_eq!(
+      check(VcsTool::Subversion, &policy(Vec::new(), vec![misnamed])),
+      Err(DbError::PolicyHookMalformed { index: 0 })
+    );
+  }
+
+  /// A-648 (a hook's environment, `run_hook_cmd`). Do: hold a hooks-env of a default section, a pre-commit section and
+  /// an empty post-commit section in a Subversion repository; then, each after a good section, sections a hook's
+  /// environment cannot carry: named by nothing, a name holding a NUL, a variable named by nothing, one holding `=`,
+  /// one holding a NUL, a value holding a NUL; and a good section in a git repository and a Mercurial one. Expect: the
+  /// first held; each other refused naming its section's index.
+  #[test]
+  fn a_hooks_env_is_held_by_a_subversion_repository_alone_and_only_as_a_hook_can_take_it() {
+    let good = env_section("default", &[("LANG", b"en_US.UTF-8")]);
+    let svn = |sections: Vec<HooksEnvSection>| check(VcsTool::Subversion, &with_env(sections));
+    let held = vec![
+      good.clone(),
+      env_section("pre-commit", &[("ONLY", b"pre-commit")]),
+      env_section("post-commit", &[]),
+    ];
+    assert_eq!(svn(held), Ok(()));
+    let bad = [
+      env_section("", &[("A", b"1")]),
+      env_section("pre\0commit", &[("A", b"1")]),
+      env_section("default", &[("", b"1")]),
+      env_section("default", &[("A=B", b"1")]),
+      env_section("default", &[("A\0B", b"1")]),
+      env_section("default", &[("A", b"1\02")]),
+    ];
+    for section in bad {
+      let refused = Err(DbError::PolicyHooksEnvMalformed { index: 1 });
+      assert_eq!(
+        svn(vec![good.clone(), section.clone()]),
+        refused,
+        "{section:?}"
+      );
+    }
+    for tool in [VcsTool::Git, VcsTool::Mercurial] {
+      let refused = Err(DbError::PolicyHooksEnvMalformed { index: 0 });
+      assert_eq!(
+        check(tool, &with_env(vec![good.clone()])),
+        refused,
+        "{tool:?}"
+      );
+    }
+  }
+
+  /// A-648 (the merge budget). Do: charge a policy whose only item is one hooks-env section. Expect: that section's
+  /// encoded bytes, as a rule or a hook is charged its own.
+  #[test]
+  fn a_hooks_env_section_is_charged_its_encoded_bytes() {
+    let section = env_section("default", &[("LANG", b"en_US.UTF-8")]);
+    let encoded = slates_wire::Wire::to_bytes(&section).len();
+    assert_eq!(bytes(&with_env(vec![section])), encoded);
   }
 
   /// A-622 (the rules the log keeps). Do: check rules of every kind against each tool. Expect: git takes refs alone,

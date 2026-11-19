@@ -5078,7 +5078,13 @@ fn dispatch_inner(
       read,
       rules,
       hooks,
-    } => crate::repository::set_policy(state, principal, (&repository, read), (&rules, &hooks)),
+      hooks_env,
+    } => crate::repository::set_policy(
+      state,
+      principal,
+      (&repository, read),
+      (&rules, &hooks, &hooks_env),
+    ),
     RequestBody::Checkout {
       green,
       base,

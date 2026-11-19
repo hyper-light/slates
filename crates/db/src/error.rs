@@ -149,6 +149,13 @@ pub enum DbError {
     /// The hook's index among the policy's hooks.
     index: u32,
   },
+  /// A repository policy's hooks-env section the log must never record (A-648): in a repository that is not
+  /// Subversion's, named by nothing or holding a NUL, or with a variable that is not one variable of a hook's
+  /// environment (a name empty or holding `=` or a NUL, a value holding a NUL). Never entered in the log.
+  PolicyHooksEnvMalformed {
+    /// The section's index among the policy's hooks-env sections.
+    index: u32,
+  },
 }
 
 /// The rule a review record's change broke (§4.17.1 "Works over works", shared piece 6; A-596; `crate::review`).
@@ -252,6 +259,12 @@ impl fmt::Display for DbError {
       }
       Self::PolicyHookMalformed { index } => {
         write!(f, "a repository policy's hook {index} is malformed")
+      }
+      Self::PolicyHooksEnvMalformed { index } => {
+        write!(
+          f,
+          "a repository policy's hooks-env section {index} is malformed"
+        )
       }
     }
   }
