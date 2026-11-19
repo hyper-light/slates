@@ -38,8 +38,13 @@
 //! the import's task owns its host. A turn's lend opens again what the turn before it closed: the files of the revlog
 //! being read and the walk to their directory, counted ([`Opened`]).
 //!
-//! **Owed** (GAPS): the daemon's import of a repository's directory, which holds the host and lends this a turn at a
-//! time on the repository's owner shard, and the register's entry of what the import returns.
+//! **It keeps no index.** The import builds its own and hands it back to its caller (`Imported::index`); this is only
+//! the seam the import reads files through.
+//!
+//! **Owed** (GAPS): the daemon's import of a repository's directory on the repository's owner shard, which lends the
+//! host through this a turn at a time and the content store with it, and hands the imported index to the repository's
+//! one store, the Mercurial arm of A-662's per-repository map (`vcs_store`'s `HgStore`, in place of the empty index
+//! made with the repository's record), never a second holder; and the register's entry of what the import returns.
 
 use std::collections::VecDeque;
 

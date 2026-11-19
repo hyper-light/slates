@@ -13699,7 +13699,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
    never whole, and texts rebuilt from the one before. Built (A-649 part 3b): the import in slices under the owner's
    quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Owed: the
-   daemon's import of a repository's directory through it, a turn at a time on the repository's owner shard.
+   daemon's import of a repository's directory through it, a turn at a time on the repository's owner shard, the
+   imported index handed to the repository's Mercurial store in A-662's per-repository map (`vcs_store`'s `HgStore`).
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -46385,6 +46386,10 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
   `Import::advance` where the host is the shard's (lent afresh each turn, as a repository's store is lent for each step
   of an answer, A-640), or the whole import where the import's task owns its host. A turn's lend opens again what the
   turn before closed, counted (`Opened`: directories and files opened, answers given from a held file).
+- **Where the index goes.** The adapter keeps no index: the import builds its own and hands it to its caller. The
+  daemon's import (owed) hands it to the repository's one store, the Mercurial arm of A-662's per-repository map
+  (`vcs_store`'s `HgStore`, in place of the empty index made with the repository's record), lending the shard's content
+  store with the host each turn; nothing keeps a second index.
 - **Not taken (decided by the bounds, not measured).** Holding the last path's whole directory chain, which would save
   the walk between sibling directories, holds a descriptor per level of a path a hostile listing can nest thousands
   deep. Holding handles across turns without the host, which would save a turn's reopening, leaves them for the owner

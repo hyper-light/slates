@@ -607,7 +607,8 @@
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
 > `verify`); and the daemon's import of a repository's directory through the server's adapter (A-649 part 4), a turn at
-> a time on the repository's owner shard. **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH
+> a time on the repository's owner shard, its index handed to the repository's Mercurial store in A-662's
+> per-repository map (`vcs_store`'s `HgStore`), never a second holder. **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
 > stub), the three captured sessions served whole. **Built (A-649 part 1):** every key of the index tagged by its kind
