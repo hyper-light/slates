@@ -89,6 +89,12 @@ For the reporter (A-616, 2026-11-19), at `d434dc14`, tier C: `libsvn_repos/repor
 `fc69ad86f58de9b9`, `include/svn_repos.h` `8421f33e065fd927` and `include/svn_delta.h` `809dd92780dd3c1d`; at 1.15.0:
 `reporter.c` `5657b77e3ad25d3f` (two comments and a hash constructor apart), `editorp.c` and `delta.c` byte-identical,
 and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` and `types.c` `8c9fe593b18d24cf`.
+For the reporter's drive (A-616 part 2), at 1.15.0, tier C: `libsvn_repos/rev_hunt.c` `5acc827a362d11f4`
+(`svn_repos_deleted_rev`), `libsvn_fs_fs/tree.c` `f507210992ec9736` (`fs_closest_copy`, `find_youngest_copyroot`,
+`fs_dir_optimal_order`), `libsvn_fs_fs/pack.c` `fa5564fab4b997ce` (`svn_fs_fs__order_dir_entries`: entries by `strcmp`
+of their names from format 7 on), `svnserve/svnserve.c` `3de22e31a26902f9` (`zero_copy_limit` 0 and
+`error_check_interval` 4096 unless `--client-speed`), `libsvn_delta/xdelta.c` `2e7b6226acfa9078` (for the deltas of
+changed texts, owed), and `libsvn_ra_svn/marshal.c` at 1.15.0 for the editor commands' bytes.
 
 ## 2. The wire: ra_svn (`svn://`, and `svn+ssh://` through a tunnel)
 

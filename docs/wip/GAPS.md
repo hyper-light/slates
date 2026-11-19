@@ -709,10 +709,10 @@
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
 > Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
 > ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616
-> part 1, and its drive's calls with their ra_svn writer, A-616 part 2's first slice), with the lock verbs; hooks and
-> `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`,
-> the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed is claimed until
-> measured.
+> part 1, and its drive's calls, their ra_svn writer and the drive itself, A-616 part 2's first two slices), with the
+> lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over
+> `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed
+> is claimed until measured.
 > A-616 part 1 (2026-11-19, g234): the reporter's commands and its report (`report`): `update`, `switch`, `status`
 > and `diff` read through a port of `vparse_tuple`, the report kept and checked as `reporter.c` keeps and checks it,
 > every refusal in `svnserve`'s words, held to stock 1.15.0's sessions over one recorded history; `cargo test --locked
@@ -725,6 +725,12 @@
 > again, byte for byte but LZ4 blocks; 313 of 313 on the Mac Studio, red first. Owed of part 2 now: the drive over the
 > index and the green, with `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; the
 > handler that reads the client's early answer and its answers to `close-edit` and `abort-edit`.
+> A-616 part 2, its second slice (2026-11-19, g234): the drive (`report::drive::Drive`), `reporter.c` over the index,
+> the green and the session's guards, an explicit stack a step at a time, held to all 27 recorded `svnserve` drives
+> call for call (sets where `svnserve` is in hash order, texts by what they make), red six ways. Owed of part 2 now:
+> the deltas of changed texts (`xdelta.c`), sent as new data today; the handler that writes the drive and reads the
+> client's early answer and its answers to `close-edit` and `abort-edit`; one copy-root walk for `reads` and the
+> drive.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
