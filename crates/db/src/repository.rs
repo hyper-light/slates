@@ -33,7 +33,7 @@
 //! **The register (A-603).** A repository's greens share one register, and every change of the repository is an entry
 //! of it at the next position: an `Op::RepositoryAdvanced` entry commits several greens' versions, greens joining the
 //! lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence markers) as one
-//! step, its checks read at its position first ([`entry`]); every other operation that changes a repository is an entry
+//! step, its checks read at its position first (`entry`); every other operation that changes a repository is an entry
 //! of that one change (a namespace operation, a member's version recorded alone, a member's destroy), so the position
 //! counts every change and one position names one state of the repository. The register is created with its
 //! repository, carried whole by a partition snapshot, and goes with its repository.

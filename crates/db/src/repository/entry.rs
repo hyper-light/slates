@@ -14,9 +14,9 @@
 //! that does not hold refuses the whole entry, typed, before the log records any of it; the apply is then
 //! unconditional, so a replay of the log rebuilds the same register (guard then apply, `crate::partition`).
 //!
-//! **No copy of the tables.** The guard keeps what the entry's earlier items changed in an [`Overlay`] of small maps
+//! **No copy of the tables.** The guard keeps what the entry's earlier items changed in an `Overlay` of small maps
 //! over the register's state, so judging an entry costs its own items, each a lookup, never a copy of the namespace or
-//! the state. Tried first in thought and rejected: applying the entry to a clone of the repository's tables and
+//! the state. Rejected on its cost, not measured: applying the entry to a clone of the repository's tables and
 //! keeping the clone on success, which costs the repository's size for every entry.
 //!
 //! **What each change costs the budget.** A version's chain entry, a phase root's node and phase, and a marker's bytes
