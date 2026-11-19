@@ -341,6 +341,18 @@ impl Authz {
   }
 }
 
+/// Whether a session whose principal's compiled rules are `rules` may read `path` (`serve.c` `authz_check_access` for
+/// `svn_authz_read`): every path where the repository names no authorization file (`rules` none: "If authz cannot be
+/// performed, grant access"); with rules, a path they give read or write access. A path that is no repository path
+/// (one holding a NUL byte, which no C string does) is not readable, as `lookup_access` denies a lookup that fails.
+/// The one read rule of a session: its read commands, an update's target and the update's drive all ask it.
+pub fn may_read(rules: Option<&PrincipalRules>, path: &str) -> bool {
+  let Some(rules) = rules else {
+    return true;
+  };
+  RepositoryPath::new(path.as_bytes()).is_ok_and(|path| rules.access(path) >= Access::Read)
+}
+
 /// Refuses a file past the bound or holding a NUL byte, before anything is read from it; the model calls it for each
 /// file as it comes to read it, the groups file after the rules file.
 fn check_bytes(bytes: &[u8], file: AuthzFile, bounds: Bounds) -> Result<(), AuthzRefused> {

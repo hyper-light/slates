@@ -555,8 +555,12 @@
 > (`store::Encoding`: a pair of trees walked, a window's worth of rows read, or one object encoded, a unit), the same
 > bytes over any turns; closes A-639's "the fragments' encoding sliced". Owed: the live clone over the HTTP edge
 > (A-625 part 3's store per repository), and with it the owner driving encodings by turns; a delta search past a
-> window; within an encoding, one object, a pair of trees and a part's put each still a unit whole; the red-checks
-> and the other platforms' runs (main's).
+> window, of which part 1 is built (A-653 continued (3): `store::Search`, git's delta search a bounded amount a step,
+> byte for byte the one pass's, `delta_of` one search run to its end) and part 2 owed (the stream's objects past a
+> window searched through it, their buffers and index charged to the request's admission, sent whole only where it
+> cannot hold them, that case counted; git's rule read from `pack-objects.c` at v2.50.1 first); within an encoding,
+> one object (its delta trials until `Encoder::put` steps them through a `Search`), a pair of trees and a part's put
+> each still a unit whole; the red-checks and the other platforms' runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
@@ -579,10 +583,12 @@
 > filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
 > hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
 > certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
-> Subversion's environment is its hooks-env section alone (A-623). Owed, Mercurial 7.2's: `_exthook` always sets
-> `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`; empty when off) and `shellenviron` sets
-> `HG` to hg's executable, both unset under slates; and the transaction's `HG_TXNID` and `HG_TXNNAME`
-> (`research/mercurial-server.md` §6), which slates' changegroup hooks lack.
+> Subversion's environment is its hooks-env section alone (A-623). Mercurial 7.2's, closed by A-657 part 4 (g304,
+> 2026-11-19): `_exthook` always sets `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`)
+> and `shellenviron` sets `HG`, and the transaction adds `HG_BUNDLE2`, `HG_TXNID` and `HG_TXNNAME`
+> (`research/mercurial-server.md` §6); recorded from stock 7.2's own `pretxnchangegroup` and `changegroup`
+> (`crates/hg/fixtures/hooks`), slates' changegroup hooks now carry all five, held to the recording by `vcs_hooks`'
+> test (red without them in kiln r192, green on macOS arm64, Mac Studio, kiln r202).
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -873,26 +879,30 @@
 > its repository's shard, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the
 > shard lacks (until the site is handed A-662's stores, after which that path goes), the media type named as the reply
 > begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
-> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, each its own piece with its
-> failing test first (main's to start): the zlib bound an answer is charged before it is compressed is stock zlib's
-> `compressBound`, which the linked zlib-rs's level 1 outgrows on bytes that do not compress (65,536 of the bytes its
-> fixed codes write in nine bits came to 73,721 against 65,569; Windows x86_64, jupiter, kiln r92, 2026-11-19), so a
-> compressor choosing zlib above level 0 could hold an answer up to about an eighth of its stream past its charge (the
-> site's first value takes zlib at level 0, stored, within it); and a query's fields past the request's room are `400`
-> where a path past it is `414`.
+> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, its own piece with its failing
+> test first (main's to start): a query's fields past the request's room are `400` where a path past it is `414`.
 > **Built (A-675):** the daemon's import of a Mercurial repository's directory (`slates-server`'s
 > `vcs_store::hg_import`): started into a repository's empty store, advanced a turn at a time on its owner shard within
 > the shard's quantum, its index then in the empty index's place; at most one client region's bytes held, charged while
 > it runs; refused, abandoned or freed midway, everything given back; proven by the `states` repository imported a unit
 > a turn equal row for row to its import in one call (macOS arm64, Mac Studio: `vcs_store::` 18 of 18 with A-662's 13;
 > red first, the five new tests failing against stubs).
+> **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
+> charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
+> `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
+> outgrew their charge (65,536 that its fixed codes write in nine bits came to 73,721 against 65,569). zlib's arm is now
+> zlib-rs 0.6.8's `compress_bound`, n + ceil(n / 8) + 9, a byte more below 9 bytes and one more for none, which level 1
+> meets exactly at 4,095 and 4,096 bytes. Red first on main with the oracle alone
+> (`cargo test --locked -p slates-hg --lib compression`: 2 of 18 failed, both at zlib level 1, as jupiter's r92 found),
+> then `slates-hg --lib` 308 of 308 and fmt clean on macOS arm64 (Mac Studio, kiln r181); the other platforms owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
 > g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
-> step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes: the policy
-> (`vcs_policy::admit`) and the hooks at `pretxnchangegroup` and `changegroup` (A-657 part 4); the landing's seam
+> step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
+> built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
+> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
 > at recovery (A-662 refuses a Mercurial record `Owed` until then), and the served view over them (with A-650's site);
@@ -1203,6 +1213,10 @@
 > commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
 > authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
 > for anonymous): the read commands' authorization is owed (A-606).
+> Continued (2), 2026-11-19 (g297's step-6 finding): one read rule for a session, the rules `Policy::authz` gives the
+> principal, compiled once by the connection and asked through `authz::may_read` by the read commands, `update`'s
+> target and the report drive alike, where the update and its drive had asked the caller's guards; `Guards` keeps the
+> locks alone. Red then green (macOS arm64, Mac Studio, 158 of 158). Owed: the Windows run and red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
