@@ -949,7 +949,12 @@
 > built, version 4 (the copies' records, the copied trees' keys holding what their copy gave them, set by a restore with
 > no history, and the identity's running sum, which the restore takes), the anchor's layout 12 refusing every older
 > segment at adoption, so no version 3 checkpoint is ever read; the service's `merge.checkpoint.unavailable` now counts
-> only a floor folded past (see A-626 part 3). Owed from A-626: a rebase restating a copy (part 4); a restore that grafts
+> only a floor folded past (see A-626 part 3). Its oracle found a replica hashing otherwise than its owner: a copy made
+> after the replica's checkpoint from a version before it was read through the source's history there, which a
+> restored green does not hold. Fixed in the same part without a format change: what a copy brought is read from its
+> graft, the source at the version before the copy through the copy's fix, kept with its record until the fold floor
+> reaches it (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). Owed from
+> A-626: a rebase restating a copy (part 4); a restore that grafts
 > a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
 > if measured worth it; the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
@@ -2639,6 +2644,16 @@
 > refused at adoption. Owed: the guard, a structural test tying every format version the segment keeps (the ops
 > document, the chain entry, the checkpoint, the origin, the work log, every record a partition persists) to
 > `LAYOUT_VERSION`, so a format change without a bump fails the build.
+
+> **The identity's recount is no oracle on a green folded past a copy: found open (2026-11-19, A-626 part 3, g307, by
+> reading; `Green::head_identity_from_scratch`, `Green::copied_tree_entries`).** The recount takes out what each copy
+> made after the green's restore brought, reading the copy's source at the version before it (since part 3, through
+> the copy's fix). A green built from its origin counts every copy, so once its histories are folded past a copy
+> (`fold_history_before`, which also lets the copy's kept fix go), the recount reads below the floor for it. Only the
+> recount is affected: the running identity and every sum moved below the head read what a copy brought only for a copy
+> above the floor. No test folds a green holding a copy and then recounts it. Owed: a recount for such a green that
+> reads no history below the floor and costs no fold a walk of a copied tree (a restore's `copies_before` comes from the
+> checkpoint's sum; a fold has no independent sum to take), and a test that folds past a copy and recounts.
 
 > **A metadata change to a node replaced after a work's base, and a rename of a replaced symlink or hard link: fixed
 > (2026-11-19, A-631, g267; found by A-612's sweep; §4.16 "The verdict": "delete against modify in either direction",

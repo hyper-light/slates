@@ -1360,6 +1360,11 @@ impl Green {
   /// histories hold now, never a fixed allowance: the service adds it to `chain_entry::entry_bound` before the verdict.
   /// Nothing for an increment without such a copy.
   pub fn copy_entry_room(&self, inc: &Increment) -> usize {
+    // Most increments declare no copy: they are answered without resolving the document, which the admission and the
+    // change index's reservation would each do once more (A-626 part 3).
+    if !inc.doc.ops.iter().any(|op| op.kind == OpKind::Copy) {
+      return 0;
+    }
     let r = Green::resolve(inc);
     self
       .copy_fixes(&r)

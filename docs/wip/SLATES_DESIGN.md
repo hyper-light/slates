@@ -47342,7 +47342,9 @@ tests (`src/checkpoint/tests.rs`, new), `crates/merge/src/engine/copy_checkpoint
 `leave_out_copied`, `copy_records_at`, `sum_at`, `restore_copied`, `take_sum`, the `place_*` setters),
 `crates/merge/src/engine.rs` (`checkpoint` without `copied_by`, `with_checkpoint` restoring the copies and the sum, the
 `restore_*` setters over `place_*`, `copies_before` and the recount), `crates/merge/src/engine/branch.rs`
-(`identity_moved_to`), `crates/merge/src/engine/copy.rs` (`every_key` for the engine), `crates/merge/src/identity.rs`
+(`identity_moved_to`), `crates/merge/src/engine/copy.rs` (`every_key` for the engine; `brought_entry`, the record's
+kept fix, `record_bytes`, `release_kept_fixes`), the bug record
+`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`, `crates/merge/src/identity.rs`
 (`SUM_BYTES`, `add_sum`, `less`, `is_empty`, `to_bytes`, `from_bytes`), `crates/anchor/src/layout.rs`
 (`LAYOUT_VERSION` 12), and the tests (`engine/copy_tests.rs`: the checkpoint and restore test replacing the refusal's,
 the copy oracle restoring every history at every version; `tests/checkpoint.rs`, main's, updated by reading).
@@ -47391,4 +47393,34 @@ the copy oracle restoring every history at every version; `tests/checkpoint.rs`,
     restored and given every later chain entry, hashing as the replay at every version it reaches, reading as the model
     at every version from the checkpoint on, its identity its recount; a census of checkpoints carrying copies and of
     ones listing copied keys.
+- **Found by the oracle: what a copy brought is read from its graft, never below the floor.** The oracle's first run
+  restored greens at 2 and at 3 and replayed a copy made at 4 from version 1 (seed `cc ef9d3557…`, now a reviewed
+  seed). Their recounts read the source's history at 1, which a restored green does not hold. By reading, so did the
+  running identity for a key the copy brought that changes in its fold window or its own increment, and so did a sum
+  moved below the copy. A replica replaying such a copy hashed otherwise than its owner
+  (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). It is no artefact of
+  the oracle: the owner folds only as far as its retention budget needs, below the reachable floor it checkpoints at,
+  so a copy above its own fold floor may name a version below its last checkpoint, and recovery replays it.
+  - *Recording the entries a copy brought*: rejected. `svn copy ^/trunk ^/branches/x` is Subversion's most common
+    commit, and at A-645's scale it copies a 250 GB tree. A record holding every entry turns A-542's O(path length)
+    copy into O(the tree), in the format and in the checkpoint.
+  - *A floor rule* (a checkpoint waiting at the oldest source version a copy still needs): it does not meet the case.
+    The copies it fails on are made after the checkpoint, so no rule at the checkpoint holds them. And a copy at or
+    before the checkpoint needs nothing below it once restored: its keys read their current values from its record on,
+    the identity is past it, and the carried sum stands for what it brought.
+  - *No read below the floor* (taken). A copy grafts its source held at the version before it, with its fix (part 2).
+    Nothing reads what a copy brought unless the copy stands above the floor: the identity is brought past a copy before
+    the floor passes it, and a branch or a checkpoint is made at the floor or above. The version before such a copy
+    never lies below the floor or a restored green's checkpoint. The destination's own maps would answer a key the copy
+    gave and nothing changed since (its current value), and one changed later (its history at the copy's version). But
+    they cannot answer a key the copy's own version changed, or an inner copy of that version replaced, since that
+    value stood at no version: only the graft holds it. So every reader reads the graft (`Green::brought_entry`): the
+    source at the version before the copy, through the copy's fix. The fix, which the chain entry already carries whole,
+    is kept with the record while the copy stands above the fold floor and let go when the floor reaches it
+    (`Green::release_kept_fixes`). It is charged with the change index and secured before the verdict as the entry's
+    room is. A copy whose source was unchanged since its version keeps none: the common copy, from the head, stays
+    O(path length). The checkpoint's format is unchanged: a record carries no fix and no copied entry.
+  - Tests: a replica given a copy and then a change to a key it brought, its identity read once after both; one given
+    a copy whose own increment edits beneath it; each must hash as its owner and its identity equal its recount, and
+    the first replica's checkpoint below the copy must carry its owner's sum.
 - **Evidence.** Pending the Mac Studio, offline since about 09:20 UTC.
