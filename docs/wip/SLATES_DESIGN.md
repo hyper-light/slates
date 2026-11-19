@@ -44436,3 +44436,21 @@ Applied in the same change to:
   Red on r960, with the old rename rule and the old scans restored (the scans counting): 4 of the 7 tests the run
   selected failed, and the guards passed either way. The file over the symlink, and the file over its own link, were
   each `TypeChanged`; the oracle shrank to the hard link renamed over the symlink; the removal examined 2,000 entries.
+
+### A-649 part 1 — Every key of Mercurial's index tagged by its kind, so no log row can meet an object's id (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The repository's index"; A-588 part 2's sibling, found by A-630)
+Applied in the same change to: §4.17.3 (the index's as-built rule), `crates/hg` (`index`: the `O` tag,
+`HgIndex::commit_objects`, `HgIndex::object`, `Refused::NotANode`), GAPS (the §4.17.3 entry).
+- **The fault.** A-588 part 2 keyed a log row `L`, the log's key and the number, and left a push's object rows to the
+  shared quarantine, which keys each by its raw id. A file log row of a 13-byte path is twenty bytes long (`L`, `f`, the
+  13 bytes, a NUL and four bytes of number), a node's length, so a node chosen to spell one (about 2^48 SHA-1 tries for
+  a number a pusher can reach, by arithmetic, not measured) would make the two rows one key, and the second written
+  would be refused `RowDiffers`: a path's history blocked by a push. No code wrote such object rows yet.
+- **The rule.** Every key begins with its kind's tag: `L` a log row, `N` a node row, `O` an object row; a raw node is
+  never a key. `HgIndex::commit_objects` writes a quarantine's objects as `O` rows in one batch and gives back the
+  quarantine's holds (refused, nothing is written and the quarantine keeps them), and `HgIndex::object` reads one back:
+  its kind, length and root content. An id that is not a node's twenty bytes is refused (`NotANode`). git's rows keep
+  the same rule (`o`, `p`).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-tags-red` (d947583cc, not for main:
+  the two functions stubbed back to the quarantine's raw keys), `cargo test --locked -p slates-hg --lib` 249 passed and
+  2 failed, the object whose id is a 13-byte path's row refused `RowDiffers` and a five-byte id accepted. Green: 251 of
+  251 at ceb19f2bd, in a target directory of its own (its log compiled slates-hg); rustfmt's layout from that run.

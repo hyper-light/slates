@@ -382,7 +382,10 @@ fn a_log_row_never_meets_an_object_key_whatever_a_path_s_length() {
   let object = (kind, len, store.get(&root));
   assert_eq!(object, (FILE, 18, Some(&b"the object's bytes"[..])));
   let revision = index.revision(&store, log, 0).map(|row| row.node);
-  assert_eq!((revision, quarantine.is_empty()), (Some([1; NODE_LEN]), true));
+  assert_eq!(
+    (revision, quarantine.is_empty()),
+    (Some([1; NODE_LEN]), true)
+  );
 }
 
 /// AC-HG.9, A-649: do commit an object whose id is not a node's twenty bytes. Expect it refused by kind with nothing

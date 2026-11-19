@@ -517,7 +517,10 @@
 > rather than run again; revlogs read by ranges rather than whole; a text rebuilt from the one before it where its chain
 > passes through it (7.2's revision cache), rather than from its chain's base; a manifest's file nodes held to the file
 > logs (a whole `verify`); and the server's adapter from §4.15's host seam to `RepositoryFiles` (one name at a time; a
-> store name that is not UTF-8, which only the plain encoding leaves, refused by kind there). Owed, in order, after
+> store name that is not UTF-8, which only the plain encoding leaves, refused by kind there).
+> **Built (A-649 part 1):** every key of the index tagged by its kind (`L`, `N`, and `O` for a push's object rows,
+> `HgIndex::commit_objects`), so no log row can meet an object's id whatever a path's length; red first (2 failed), 251
+> of 251. Owed, in order, after
 > §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s `listkeys` dump, `slates hg serve --stdio`'s loop (a
 > bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas in place of full texts, the
 > `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of the walks
