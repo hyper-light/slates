@@ -10,7 +10,7 @@
 pub(crate) mod generated;
 
 use slates_merge::engine::Increment;
-use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
+use slates_merge::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 
 /// Builds an increment: an ops document with a consistent post-state (content and xattr bytes are
 /// appended to the post-state and named by their offset). Paths are interned in use order; the
@@ -27,7 +27,7 @@ impl Build {
     Build::default()
   }
 
-  fn idx(&mut self, path: &str) -> u16 {
+  fn idx(&mut self, path: &str) -> u64 {
     self.doc.paths.intern(path)
   }
 
@@ -81,7 +81,7 @@ impl Build {
       path: path_idx,
       at: 0,
       len: 0,
-      src: u64::from(target_idx),
+      src: target_idx,
     });
     self
   }
@@ -95,8 +95,24 @@ impl Build {
     self.edge(OpKind::Symlink, path, target)
   }
 
+  /// A hard link at `path` to the node at `target` at the work's base (A-646: a link names a node
+  /// of the node table).
   pub(crate) fn link(&mut self, path: &str, target: &str) -> &mut Build {
-    self.edge(OpKind::Link, path, target)
+    let path_idx = self.idx(path);
+    let target_idx = self.idx(target);
+    let node = self.doc.nodes.intern(NodeRef {
+      path: target_idx,
+      origin: NodeOrigin::Base,
+    });
+    self.doc.ops.push(Op {
+      kind: OpKind::Link,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: 0,
+      src: node,
+    });
+    self
   }
 
   fn name_op(&mut self, kind: OpKind, path: &str) -> &mut Build {
@@ -145,7 +161,7 @@ impl Build {
       kind: OpKind::SetXattr,
       flags: 0,
       path: path_idx,
-      at: u64::from(name_idx),
+      at: name_idx,
       len: value.len() as u64,
       src,
     });
@@ -178,7 +194,7 @@ impl Build {
       kind: OpKind::RemoveXattr,
       flags: 0,
       path: path_idx,
-      at: u64::from(name_idx),
+      at: name_idx,
       len: 0,
       src: u64::MAX,
     });
