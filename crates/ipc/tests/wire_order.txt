@@ -62,6 +62,7 @@ DatabaseRefusal 6 CheckFailed
 DatabaseRefusal 7 StateChanged
 DatabaseRefusal 8 PolicyRuleMalformed
 DatabaseRefusal 9 PolicyHookMalformed
+DatabaseRefusal 10 Moved
 DeleteWhileOpen 0 NoKernelClient
 DeleteWhileOpen 1 Unlinked
 DeleteWhileOpen 2 SillyRenamed

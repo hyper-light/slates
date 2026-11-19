@@ -1,9 +1,9 @@
-//! Algorithm negotiation (A-594; RFC 4253 §7, §7.1; the strict-kex draft §3.1; the AES-GCM draft §2).
+//! Algorithm negotiation (A-594, A-634; RFC 4253 §7, §7.1; the strict-kex draft §3.1; the AES-GCM draft §2).
 
 use proptest::prelude::*;
 
 use crate::client::put_string;
-use crate::kexinit::{KexInit, KexInitRefusal, List, negotiate, server_kexinit};
+use crate::kexinit::{KexInit, KexInitRefusal, KexMethod, List, negotiate, server_kexinit};
 use crate::packet::Cipher;
 use crate::wire::WireRefusal;
 
@@ -39,9 +39,9 @@ fn as_strs(lists: &[String; 10]) -> [&str; 10] {
   std::array::from_fn(|index| lists[index].as_str())
 }
 
-/// A-594: do write the server's first KEXINIT and a later one, and read them back. Expect `curve25519-sha256` with both
-/// strict markers in the first and none in the later one; `ssh-ed25519`; the two AEAD ciphers each way; `none` as the
-/// MAC and the compression; empty language lists; no guess.
+/// A-594, A-634: do write the server's first KEXINIT and a later one, and read them back. Expect `mlkem768x25519-sha256`
+/// then `curve25519-sha256`, with both strict markers in the first and none in the later one; `ssh-ed25519`; the two
+/// AEAD ciphers each way; `none` as the MAC and the compression; empty language lists; no guess.
 #[test]
 fn the_server_offers_its_methods_and_its_markers_first_only() {
   let first = server_kexinit(&[1; 16], true).unwrap();
@@ -56,6 +56,7 @@ fn the_server_offers_its_methods_and_its_markers_first_only() {
   assert_eq!(
     names(List::Kex),
     [
+      "mlkem768x25519-sha256",
       "curve25519-sha256",
       "kex-strict-s-v00@openssh.com",
       "kex-strict-s"
@@ -78,7 +79,10 @@ fn the_server_offers_its_methods_and_its_markers_first_only() {
   let later = server_kexinit(&[2; 16], false).unwrap();
   let read_later = KexInit::read(&later).unwrap();
   let kex: Vec<&[u8]> = read_later.list(List::Kex).names().collect();
-  assert_eq!(kex, [&b"curve25519-sha256"[..]]);
+  assert_eq!(
+    kex,
+    [&b"mlkem768x25519-sha256"[..], &b"curve25519-sha256"[..]]
+  );
 }
 
 /// A-594: do negotiate clients that prefer each cipher, and one that prefers different ciphers each way. Expect the
@@ -209,9 +213,10 @@ fn no_common_algorithm_is_refused_by_list() {
   );
 }
 
-/// A-594 (RFC 4253 §7): do negotiate a guessing client whose preferred key exchange and host key are the server's, one
-/// that prefers another key exchange, one that prefers another host key, and one that does not guess. Expect the guessed
-/// packet kept for the first, skipped for the next two, and nothing to skip for the last.
+/// A-594, A-634 (RFC 4253 §7): do negotiate a guessing client whose preferred key exchange and host key are the
+/// server's (the hybrid, as OpenSSH 10 lists it), one that prefers another key exchange the server also runs, one that
+/// prefers another host key, and one that does not guess. Expect the guessed packet kept for the first, skipped for the
+/// next two, and nothing to skip for the last.
 #[test]
 fn a_wrong_guess_is_skipped() {
   let skip = |kex: &str, host_keys: &str, guess: bool| {
@@ -224,18 +229,47 @@ fn a_wrong_guess_is_skipped() {
     .unwrap()
     .skip_guessed_packet
   };
-  assert!(!skip("curve25519-sha256,ext-info-c", "ssh-ed25519", true));
-  assert!(skip(
-    "mlkem768x25519-sha256,curve25519-sha256",
-    "ssh-ed25519",
-    true
-  ));
-  assert!(skip("curve25519-sha256", "rsa-sha2-512,ssh-ed25519", true));
-  assert!(!skip(
-    "mlkem768x25519-sha256,curve25519-sha256",
-    "ssh-ed25519",
-    false
-  ));
+  let hybrid_first = "mlkem768x25519-sha256,curve25519-sha256,ext-info-c";
+  let curve_first = "curve25519-sha256,mlkem768x25519-sha256";
+  let observed = [
+    skip(hybrid_first, "ssh-ed25519", true),
+    skip(curve_first, "ssh-ed25519", true),
+    skip(hybrid_first, "rsa-sha2-512,ssh-ed25519", true),
+    skip(curve_first, "ssh-ed25519", false),
+  ];
+  assert_eq!(observed, [false, true, true, false]);
+}
+
+/// A-634 (RFC 4253 §7.1: "the first algorithm on the client's name-list that is also on the server's name-list"): do
+/// negotiate clients listing the hybrid first, `curve25519-sha256` before the hybrid, a method the server does not run
+/// before the hybrid, and `curve25519-sha256` after a name the server does not run. Expect the hybrid,
+/// `curve25519-sha256`, the hybrid and `curve25519-sha256`: the client's choice, whatever the server prefers.
+#[test]
+fn the_clients_first_key_exchange_is_chosen() {
+  let chosen = |kex: &str| {
+    let lists = client(kex, "chacha20-poly1305@openssh.com");
+    negotiate(
+      &KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(),
+      true,
+    )
+    .unwrap()
+    .kex
+  };
+  let observed = [
+    chosen("mlkem768x25519-sha256,curve25519-sha256,ext-info-c"),
+    chosen("curve25519-sha256,mlkem768x25519-sha256"),
+    chosen("sntrup761x25519-sha512,mlkem768x25519-sha256,curve25519-sha256"),
+    chosen("curve25519-sha256@libssh.org,curve25519-sha256"),
+  ];
+  assert_eq!(
+    observed,
+    [
+      KexMethod::Mlkem768X25519Sha256,
+      KexMethod::Curve25519Sha256,
+      KexMethod::Mlkem768X25519Sha256,
+      KexMethod::Curve25519Sha256
+    ]
+  );
 }
 
 /// A-594 hostile: do read KEXINITs cut short, with a bad name-list, with a byte left over, and with another message's
@@ -282,7 +316,11 @@ proptest! {
     payload.extend_from_slice(&tail);
     if let Ok(read) = KexInit::read(&payload) {
       if let Ok(negotiated) = negotiate(&read, true) {
-        prop_assert!(read.list(List::Kex).contains("curve25519-sha256"));
+        let method = match negotiated.kex {
+          KexMethod::Mlkem768X25519Sha256 => "mlkem768x25519-sha256",
+          KexMethod::Curve25519Sha256 => "curve25519-sha256",
+        };
+        prop_assert!(read.list(List::Kex).contains(method));
         prop_assert!(Cipher::OFFERED.contains(&negotiated.client_to_server));
       }
     }

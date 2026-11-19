@@ -9319,10 +9319,21 @@ fn judge_submission(
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
   let increment_bytes = inc.encode();
-  let bound = slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc);
-  // Judged as the record will be: a member's version is an entry of its repository's register (A-603).
-  let next = state.db.partition().green_head(green_id).saturating_add(1);
-  let admission = crate::repository::version_record(state, green_id, next, vec![0; bound]);
+  // A copy from a version its source changed after records the source's values then in its entry (A-626 part 2): the
+  // green adds that room, derived from what its histories hold, never a fixed allowance.
+  let Some(room) = state
+    .greens
+    .get(&green_id)
+    .map(|engine| engine.copy_entry_room(&inc))
+  else {
+    return refused(Refusal::NotFound);
+  };
+  let bound =
+    slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc).saturating_add(room);
+  let admission = Op::GreenAdvanced {
+    green: green_id,
+    increment: vec![0; bound],
+  };
   let now = state.clock.monotonic_ns();
   if let Err(refusal) = chain_admits(state, green_id, &admission, now) {
     return refused(refusal);
@@ -9486,8 +9497,11 @@ fn record_accepted(
     identity,
     crate::signed_work::to_entry(verification),
   );
-  // A member's version is an entry of its repository's register (§4.17.1 shared piece 2, A-603).
-  let record = crate::repository::version_record(state, green, version, entry);
+  // A version alone is an append to its own green's log (A-642): no position of a whole repository moves.
+  let record = Op::GreenAdvanced {
+    green,
+    increment: entry,
+  };
   let now = state.clock.monotonic_ns();
   state
     .db

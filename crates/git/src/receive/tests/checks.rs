@@ -139,6 +139,7 @@ fn the_first_object_refused_in_pack_order_is_named() {
 fn refused_with(reason: &[u8]) -> Outcome {
   Outcome::Ng(Declined {
     reason: reason.to_vec(),
+    hook: Vec::new(),
     message: None,
   })
 }

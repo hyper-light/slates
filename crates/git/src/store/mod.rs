@@ -30,6 +30,12 @@
 //! resolved one tree a component down ([`Repository::entry`]): no walk of history and none of the tree. Making a
 //! green's maps (A-534) from a commit that is no version's head is receive-pack's create (piece 6).
 //!
+//! **A protected branch's questions** (A-644, `protect`): how a move changes its ref ([`Repository::change`]: a create,
+//! a fast-forward, a rewrite or a delete), judged against the ref's own head with no walk where generation numbers
+//! decide it; and which commits a move brings, D(k)'s, with the first merge commit among them
+//! ([`Repository::merge_commit`]) and the first no trusted key signed ([`Repository::unsigned_commit`], through a
+//! [`CommitSigners`]).
+//!
 //! **Bounds.** Every byte the store keeps is in the shared store's derived budget: the objects and the index as
 //! `slates-vcs` charges them, and the versions' sets and the head map as this store charges them ([`Repository`]); a
 //! commit past the budget is refused with nothing changed. Nothing here is a tuning constant: positions are counted,
@@ -56,6 +62,7 @@ pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
+pub use repository::protect::{Change, CommitSigners, Unsigned};
 pub use repository::{Found, Move, Repository, StoreCounters, StoreRefused};
 
 #[cfg(test)]

@@ -25,6 +25,11 @@ use super::rows::{self, CommitRow, ObjectRow};
 #[path = "graph.rs"]
 pub(super) mod graph;
 
+/// A protected branch's questions about a move (A-644): how it changes its ref and what it brings, a child of this
+/// module so it reads the walks and chains kept here.
+#[path = "protect.rs"]
+pub(super) mod protect;
+
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
 
@@ -121,6 +126,13 @@ pub struct StoreCounters {
   pub trees_skipped: u64,
   /// Moves found to be fast-forwards.
   pub fast_forwards: u64,
+  /// Fast-forward questions decided with no walk (A-644): the two heads one commit, or the new head's generation number
+  /// no greater than the old head's, which no descendant's is.
+  pub decided_without_walk: u64,
+  /// Fast-forward questions decided by a walk back from the new head (A-644).
+  pub descent_walks: u64,
+  /// Commits a protected branch's checks judged: each commit a move brings, once (A-644).
+  pub brought_judged: u64,
   /// Reached sets made again (a create, a rewrite).
   pub remade: u64,
   /// Of those, the ones that started from another green's set.
@@ -673,8 +685,11 @@ impl Repository {
     Ok(None)
   }
 
-  /// Whether the commit `ancestor` is `head` or one of its ancestors: a walk back by generation number from `head`, which
-  /// stops below the ancestor's generation, so it costs the commits between. Either not a commit: not a fast-forward.
+  /// Whether the commit `ancestor` is `head` or one of its ancestors. Decided with no walk where the ids or the
+  /// generation numbers decide it (A-644): `head` is `ancestor`; or `head`'s generation number is no greater than
+  /// `ancestor`'s, and since a commit's is one more than its parents' greatest, no descendant of `ancestor` has one
+  /// that small. Otherwise a walk back by generation number from `head`, which stops below the ancestor's generation,
+  /// so it costs the commits between. Either not a commit: not a fast-forward.
   fn fast_forward(
     &self,
     store: &ContentStore,
@@ -692,8 +707,16 @@ impl Repository {
       return Ok(false);
     }
     let floor = self.generation(store, push, &ancestor)?;
+    let top = self.generation(store, push, &head)?;
+    if head == ancestor || top <= floor {
+      self.count(|counters| {
+        counters.decided_without_walk = counters.decided_without_walk.saturating_add(1);
+      });
+      return Ok(head == ancestor);
+    }
+    self.count(|counters| counters.descent_walks = counters.descent_walks.saturating_add(1));
     let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
-    let mut heap = BinaryHeap::from([(self.generation(store, push, &head)?, head)]);
+    let mut heap = BinaryHeap::from([(top, head)]);
     while let Some((generation, id)) = heap.pop() {
       if id == ancestor {
         return Ok(true);

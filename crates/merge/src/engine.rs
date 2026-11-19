@@ -196,6 +196,83 @@ pub enum Outcome {
   },
 }
 
+/// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
+/// its effects kept until [`Green::commit_judged`] commits them as the version after the head it was judged at. A push
+/// judges each of its greens' works so, and commits them only once every one of them accepted: git's atomic push ("Either
+/// all refs are updated or none") and every Mercurial push, with nothing applied before. It commits into the green that
+/// judged it, which its caller names: the engine has no name of its own.
+pub struct Judged {
+  /// The increment it judged.
+  id: [u8; 32],
+  /// The head it was judged at.
+  at: u64,
+  /// The accepted effects, applied at the commit.
+  effects: Vec<Effect>,
+  /// What the verdict resolved the increment to (`crate::chain_entry`).
+  applied: Vec<crate::chain_entry::Applied>,
+}
+
+impl Judged {
+  /// The increment it judged.
+  pub fn id(&self) -> [u8; 32] {
+    self.id
+  }
+
+  /// The head it was judged at: it commits as the version after it.
+  pub fn at(&self) -> u64 {
+    self.at
+  }
+
+  /// What the verdict resolved the increment to: what the durable chain records of its version (`crate::chain_entry`).
+  pub fn applied(&self) -> &[crate::chain_entry::Applied] {
+    &self.applied
+  }
+}
+
+impl core::fmt::Debug for Judged {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Judged")
+      .field("id", &self.id)
+      .field("at", &self.at)
+      .field("effects", &self.effects.len())
+      .finish()
+  }
+}
+
+/// A verdict held (A-635): what [`Green::judge`] reached, nothing of it applied.
+#[derive(Debug)]
+pub enum Judgment {
+  /// Accepted, and held until [`Green::commit_judged`].
+  Accepted(Judged),
+  /// Accepted before, as `version`: the same increment again, after a lost answer; nothing to commit.
+  AcceptedBefore {
+    /// The version it was accepted as.
+    version: u64,
+  },
+  /// The conflict windows, kept in the rejected-result cache as a submit's are.
+  Conflict {
+    /// The conflicting windows.
+    windows: Vec<ConflictWindow>,
+  },
+  /// The increment's base is below the version the green's chain was checkpointed at (as [`Outcome::BaseUnavailable`]).
+  BaseUnavailable {
+    /// The increment's base.
+    base: u64,
+    /// The oldest base the green still judges.
+    floor: u64,
+  },
+}
+
+/// A held verdict whose green moved before it was committed (A-635): refused, nothing applied; judged again, it meets
+/// what moved the green.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadMoved {
+  /// The head it was judged at.
+  pub judged_at: u64,
+  /// The green's head now.
+  pub head: u64,
+}
+
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
 /// a rebase; only the work moves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1018,6 +1095,21 @@ impl Resolved {
     cleared
   }
 
+  /// The node a hard link to `target` names, through the links the increment makes (`a` to `b`,
+  /// `b` to `c`: `c`), at most one step a link it makes: the final target, and that path again
+  /// when the increment brings it into being itself (its own node, A-646), else none (the node at
+  /// the target at the work's base).
+  fn link_node<'a>(&'a self, target: &'a str) -> (&'a str, Option<&'a str>) {
+    let mut node = target;
+    for _ in 0..self.hardlinks.len() {
+      match self.hardlinks.get(node) {
+        Some(next) => node = next.as_str(),
+        None => break,
+      }
+    }
+    (node, self.establishes(node).then_some(node))
+  }
+
   /// Whether this increment itself brings `path` into being — a file it creates or renames into, or a
   /// directory it makes. The metadata dimensions (mode, xattr) consult this so a file created and
   /// chmod'd (or xattr'd) in one increment is not a delete/modify conflict against the not-yet-
@@ -1088,9 +1180,16 @@ enum Effect {
   SetXattr(String, String, Vec<u8>),
   /// Remove an xattr.
   RemoveXattr(String, String),
-  /// Copy a tree by reference (A-586): its destination, its source, the source's version, and whether it replaces what
-  /// the destination holds (A-626).
-  CopyTree(String, String, u64, bool),
+  /// Copy a tree by reference (A-586): its destination, its source, the source's version, whether it replaces what the
+  /// destination holds (A-626), and what it changes in the head's tree it grafts when the source changed after the
+  /// version (A-626 part 2).
+  CopyTree {
+    dst: String,
+    from: String,
+    version: u64,
+    replace: bool,
+    fix: Option<Box<crate::chain_entry::CopyFix>>,
+  },
 }
 
 /// How a [`Effect::SetContent`]'s bytes come from what a chain entry records (`crate::chain_entry`).
@@ -1136,11 +1235,18 @@ impl Effect {
         Applied::SetXattr(path.clone(), name.clone(), value.clone())
       }
       Effect::RemoveXattr(path, name) => Applied::RemoveXattr(path.clone(), name.clone()),
-      Effect::CopyTree(dst, from, version, replace) => Applied::CopyTree {
+      Effect::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+        fix,
+      } => Applied::CopyTree {
         dst: dst.clone(),
         from: from.clone(),
         version: *version,
         replace: *replace,
+        fix: fix.clone(),
       },
     }
   }
@@ -1162,7 +1268,7 @@ impl Effect {
       | Effect::RemoveHardlink(path)
       | Effect::SetXattr(path, ..)
       | Effect::RemoveXattr(path, _)
-      | Effect::CopyTree(path, ..) => path,
+      | Effect::CopyTree { dst: path, .. } => path,
     }
   }
 
@@ -1179,7 +1285,7 @@ impl Effect {
       Effect::SetXattr(path, name, _) | Effect::RemoveXattr(path, name) => {
         IdentityKey::Xattr(path.clone(), name.clone())
       }
-      Effect::CopyTree(dst, ..) => IdentityKey::Copy(dst.clone()),
+      Effect::CopyTree { dst, .. } => IdentityKey::Copy(dst.clone()),
     }
   }
 }
@@ -2582,23 +2688,13 @@ impl Green {
     self.file_named(a) == self.file_named(b)
   }
 
-  /// Whether a hard link names `path` (`links_to`): one lookup (A-646; it scanned every link).
-  fn named_by_links(&self, path: &str) -> bool {
-    #[cfg(test)]
-    scan_tests::count_examined();
-    self
-      .links_to
-      .get(path)
-      .is_some_and(|links| !links.is_empty())
-  }
-
   /// What a rename replaces at its destination `dst`, as POSIX `rename` replaces any destination
   /// but a directory: the effect removing the node standing there; none for a free destination, a
   /// file a file's set overwrites (A-612 records it), or a node the increment removes itself
   /// (`cleared`). Refused when the node is not the one the work's base held: a directory, or a
   /// symbolic link, hard link or IPC node changed after the base, is a type change, and a file
-  /// changed after it rename against rename; an IPC node a hard link names is delete against
-  /// modify, as its unlink is (A-643; A-646: an unchanged link or IPC node was refused too).
+  /// changed after it rename against rename (A-643; A-646: an unchanged link or IPC node was
+  /// refused too). A node hard links name survives the replacement at them (`Green::node_moves`).
   fn replaced_by_rename(
     &self,
     dst: &str,
@@ -2617,9 +2713,6 @@ impl Green {
     }
     if self.changed_last(self.last_changed.get(dst), dst) > base {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
-    }
-    if special && self.named_by_links(dst) {
-      return Err(Green::window(dst, MergeConflictClass::DeleteModify));
     }
     if cleared.contains(dst) {
       return Ok(None);
@@ -2771,10 +2864,11 @@ impl Green {
   /// removes directories); a path that is a directory falls through to the no-op.
   fn merge_unlink(&self, path: &str, base: u64) -> Result<Option<Effect>, ConflictWindow> {
     if self.specials.contains_key(path) {
-      // Two lookups, whatever the green holds: the node's last change in any dimension, its kind,
-      // mode or an attribute (`changed_after`), and the links naming it (`links_to`). Each had
-      // scanned every attribute change and every hard link of the green (A-646).
-      if self.changed_after(path, base) || self.named_by_links(path) {
+      // One lookup, whatever the green holds: the node's last change in any dimension, its kind,
+      // mode or an attribute (`changed_after`). It had scanned every attribute change and every
+      // hard link of the green; the links naming it no longer refuse its removal, since they keep
+      // the node (A-646).
+      if self.changed_after(path, base) {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
       }
       return Ok(Some(Effect::RemoveSpecial(path.to_owned())));
@@ -3052,13 +3146,15 @@ impl Green {
     Ok(Some(Effect::Symlink(path.to_owned(), target.to_owned())))
   }
 
-  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict, and so is a
-  /// target removed after the base, A-643).
+  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict). The link
+  /// names a node, never a path (A-646): its target is the home of the node the work named, the
+  /// one it makes (`made`), or the one at the target at the work's base, while that has not
+  /// changed since (`Green::node_home`; A-643 refused a target removed after the base).
   fn merge_hardlink(
     &self,
     path: &str,
     base: u64,
-    (target, target_established): (&str, bool),
+    (target, made): (&str, Option<&str>),
   ) -> Result<Option<Effect>, ConflictWindow> {
     // A file, directory or symlink already at this path is a different kind — a type conflict. An
     // existing hard link is not: that is the retarget case decided just below.
@@ -3069,19 +3165,42 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    // A target removed after the work's base is gone for the work, whatever stands at its path
-    // now: a link to it is delete against modify on the link, never a name for the file made in
-    // its place, unless the work makes the target itself (A-643).
-    if !target_established && self.file_removed_since(target, base) {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
-    }
+    let home = match made {
+      Some(home) => home.to_owned(),
+      None => self
+        .node_home(target, base)
+        .map_err(|class| Green::window(path, class))?,
+    };
     if self.changed_last(self.hardlink_changed.get(path), path) > base {
-      if self.hardlinks.get(path).map(String::as_str) == Some(target) {
+      if self.hardlinks.get(path) == Some(&home) {
         return Ok(None);
       }
       return Err(Green::window(path, MergeConflictClass::CreateCreate));
     }
-    Ok(Some(Effect::Hardlink(path.to_owned(), target.to_owned())))
+    Ok(Some(Effect::Hardlink(path.to_owned(), home)))
+  }
+
+  /// The home now of the node at `path` at version `base`: the file or IPC node a hard link there
+  /// names, or the one there, while it has not changed since the base (A-646). A node changed or
+  /// removed since, or moved away (its link changed, its file removed), is gone for a work based
+  /// before: delete against modify. A path holding no file or IPC node is a type change.
+  fn node_home(&self, path: &str, base: u64) -> Result<String, MergeConflictClass> {
+    if let Some(home) = self.hardlinks.get(path) {
+      if self.changed_after(path, base) {
+        return Err(MergeConflictClass::DeleteModify);
+      }
+      return Ok(home.clone());
+    }
+    if self.content.contains_key(path) || self.specials.contains_key(path) {
+      if self.file_removed_since(path, base) {
+        return Err(MergeConflictClass::DeleteModify);
+      }
+      return Ok(path.to_owned());
+    }
+    if self.dirs.contains_key(path) || self.symlinks.contains_key(path) {
+      return Err(MergeConflictClass::TypeChanged);
+    }
+    Err(MergeConflictClass::DeleteModify)
   }
 
   /// Merges an xattr set; a differing intervening value for the same `(path, name)` conflicts.
@@ -3205,16 +3324,18 @@ impl Green {
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&mut self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut effects = Vec::new();
+    // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
+    let fixes = self.copy_fixes(r);
     let mut windows: Vec<_> = r
       .invalid
       .iter()
       .chain(self.unfit_content(inc, r).iter())
-      .chain(self.unfit_copied(inc, r).iter())
+      .chain(self.unfit_copied(inc, (r, &fixes)).iter())
       .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
       .collect();
     // Copies first, and what lands on their trees after them (A-586): their effects lead, as commit applies them.
-    self.decide_copies(inc, r, &mut effects, &mut windows);
-    self.decide_copied(inc, r, &mut effects, &mut windows);
+    self.decide_copies(inc, (r, &fixes), &mut effects, &mut windows);
+    self.decide_copied(inc, (r, &fixes), &mut effects, &mut windows);
     for (path, node) in &r.specials {
       record(
         &mut effects,
@@ -3335,10 +3456,11 @@ impl Green {
       record(effects, windows, self.merge_symlink(path, inc.base, target));
     }
     for (path, target) in &r.hardlinks {
+      let (target, made) = r.link_node(target);
       record(
         effects,
         windows,
-        self.merge_hardlink(path, inc.base, (target, r.establishes(target))),
+        self.merge_hardlink(path, inc.base, (target, made)),
       );
     }
     for (path, name, value) in &r.xattr_sets {
@@ -3467,7 +3589,9 @@ impl Green {
   /// Applies the accepted effects, committing version `version`: the copies first (`commit_copies`, A-586 and A-626),
   /// so what the version does to a copied tree lands on what the copy brought, then every other effect, the content's
   /// removals and sets last.
-  fn commit(&mut self, effects: Vec<Effect>, version: u64) {
+  fn commit(&mut self, mut effects: Vec<Effect>, version: u64) {
+    let moves = self.node_moves(&effects);
+    effects.extend(moves);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
     let mut staged = Staged::default();
@@ -3492,6 +3616,111 @@ impl Green {
     }
     self.deltas.push(delta);
     self.record_changes(version, changed);
+  }
+
+  /// The effects a version's node moves add to it (A-646: a hard link names its node, never a
+  /// path). A node is its home, the one path holding its content or IPC node, and the hard links
+  /// naming it there. When the version removes or replaces a home while links still name its node,
+  /// the least surviving link becomes the home: it takes the node's content or IPC node, mode and
+  /// attributes, and every other surviving link names it there. When the version renames a home,
+  /// its links name the new home. Derived from the head and the version's own effects, so a replay
+  /// derives the same; never recorded, since they are the node model's consequence, not a work's
+  /// operation, and a rebase restates only the work's (`Green::rebased_from`).
+  fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
+    let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    let mut removed: BTreeSet<&str> = BTreeSet::new();
+    let mut copied: Vec<(&str, &str)> = Vec::new();
+    for effect in effects {
+      match effect {
+        Effect::Hardlink(path, target) => {
+          links.insert(path, Some(target.as_str()));
+        }
+        Effect::RemoveHardlink(path) => {
+          links.insert(path, None);
+        }
+        Effect::RemoveContent(path) | Effect::RemoveSpecial(path) => {
+          removed.insert(path);
+        }
+        Effect::SetContent(path, _, _, ContentSource::Copied(from, _)) if from != path => {
+          copied.push((from.as_str(), path.as_str()));
+        }
+        _ => {}
+      }
+    }
+    let mut moves = Vec::new();
+    let mut renamed: BTreeSet<&str> = BTreeSet::new();
+    for (from, to) in &copied {
+      if removed.contains(from) {
+        renamed.insert(*from);
+        for link in self.surviving_links(from, &links) {
+          moves.push(Effect::Hardlink(link.to_owned(), (*to).to_owned()));
+        }
+      }
+    }
+    let replaced = copied
+      .iter()
+      .map(|(_, to)| *to)
+      .filter(|to| self.content.contains_key(to));
+    let left: BTreeSet<&str> = removed.iter().copied().chain(replaced).collect();
+    for home in left.difference(&renamed) {
+      self.hand_over(home, self.surviving_links(home, &links), &mut moves);
+    }
+    moves
+  }
+
+  /// The links naming the node at `home` once the version's link effects (`links`: each link's last
+  /// target, `None` for a removal) apply: the head's links to it the version keeps, and the links
+  /// it makes to it.
+  fn surviving_links<'a>(
+    &'a self,
+    home: &str,
+    links: &BTreeMap<&'a str, Option<&'a str>>,
+  ) -> BTreeSet<&'a str> {
+    let kept = self
+      .links_to
+      .get(home)
+      .into_iter()
+      .flatten()
+      .map(String::as_str)
+      .filter(|link| !links.contains_key(link));
+    let made = links
+      .iter()
+      .filter(|(_, target)| **target == Some(home))
+      .map(|(link, _)| *link);
+    kept.chain(made).collect()
+  }
+
+  /// Hands the node at `home`, which the version removes or replaces, to the least of the links
+  /// that survive it: that link becomes the node's home, holding its content or IPC node, its mode
+  /// and its attributes, and the other links name it there (A-646). Nothing when no link survives:
+  /// the node goes with its home.
+  fn hand_over(&self, home: &str, survivors: BTreeSet<&str>, moves: &mut Vec<Effect>) {
+    let mut survivors = survivors.into_iter();
+    let Some(heir) = survivors.next() else {
+      return;
+    };
+    let heir_path = heir.to_owned();
+    if let Some(bytes) = self.content.get(home) {
+      let whole = insert_whole(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+      moves.push(Effect::SetContent(
+        heir_path.clone(),
+        bytes.to_vec(),
+        vec![whole],
+        ContentSource::Copied(home.to_owned(), Vec::new()),
+      ));
+    } else if let Some(node) = self.specials.get(home) {
+      moves.push(Effect::Special(heir_path.clone(), *node));
+    }
+    moves.push(Effect::RemoveHardlink(heir_path.clone()));
+    if let Some(mode) = self.modes.get(home) {
+      moves.push(Effect::Mode(heir_path.clone(), *mode));
+    }
+    for (name, value) in self.xattrs.of(home) {
+      moves.push(Effect::SetXattr(heir_path.clone(), name, value.clone()));
+    }
+    for link in survivors {
+      moves.push(Effect::Hardlink(link.to_owned(), heir_path.clone()));
+    }
   }
 
   /// Applies one accepted effect at `version`, but a file's removal or new bytes, which are staged for the end of the
@@ -3569,7 +3798,7 @@ impl Green {
       Effect::SetXattr(path, name, value) => self.set_xattr((path, name), Some(value), version),
       Effect::RemoveXattr(path, name) => self.set_xattr((path, name), None, version),
       // Applied before every other effect (`commit_copies`), so the effects on its tree land on what it brought.
-      Effect::CopyTree(..) => {}
+      Effect::CopyTree { .. } => {}
     }
   }
 
@@ -3859,41 +4088,78 @@ impl Green {
     &mut self,
     inc: &Increment,
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
+    match self.judge(inc) {
+      Judgment::Accepted(judged) => {
+        let (version, applied) = self.commit_held(judged);
+        (Outcome::Accepted { version }, Some(applied))
+      }
+      Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
+      Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
+      Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+    }
+  }
+
+  /// Judges an increment and holds the verdict (A-635): what a submit decides, nothing of it applied to the green but the
+  /// rejected-result cache's entry for a conflict, which a submit keeps too. An increment accepted before is answered
+  /// its version; a conflict the cache holds, its windows; a base below the checkpoint, unavailable; anything else is
+  /// decided against the head and held in a [`Judged`] for [`Green::commit_judged`].
+  pub fn judge(&mut self, inc: &Increment) -> Judgment {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return (Outcome::Accepted { version: *version }, None);
+      return Judgment::AcceptedBefore { version: *version };
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return (
-        Outcome::Conflict {
-          windows: windows.clone(),
-        },
-        None,
-      );
+      return Judgment::Conflict {
+        windows: windows.clone(),
+      };
     }
     if inc.base < self.deltas_from {
-      return (
-        Outcome::BaseUnavailable {
-          base: inc.base,
-          floor: self.deltas_from,
-        },
-        None,
-      );
+      return Judgment::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
     }
     let resolved = Green::resolve(inc);
     match self.decide(inc, &resolved) {
       Ok(effects) => {
         let applied = effects.iter().map(Effect::applied).collect();
-        // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
-        let version = self.head().saturating_add(1);
-        self.commit(effects, version);
-        self.accepted.insert(inc.id, version);
-        (Outcome::Accepted { version }, Some(applied))
+        Judgment::Accepted(Judged {
+          id: inc.id,
+          at: self.head(),
+          effects,
+          applied,
+        })
       }
       Err(windows) => {
         self.retain_rejected(inc.id, &windows);
-        (Outcome::Conflict { windows }, None)
+        Judgment::Conflict { windows }
       }
     }
+  }
+
+  /// Commits a held verdict as the version after the head it was judged at (A-635), with what the chain records of it:
+  /// refused [`HeadMoved`], nothing applied, once the green has moved since.
+  pub fn commit_judged(
+    &mut self,
+    judged: Judged,
+  ) -> Result<(u64, Vec<crate::chain_entry::Applied>), HeadMoved> {
+    let head = self.head();
+    if judged.at != head {
+      return Err(HeadMoved {
+        judged_at: judged.at,
+        head,
+      });
+    }
+    Ok(self.commit_held(judged))
+  }
+
+  /// Commits a verdict judged at the head: the version after it, and what the chain records of it.
+  fn commit_held(&mut self, judged: Judged) -> (u64, Vec<crate::chain_entry::Applied>) {
+    // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
+    let version = judged.at.saturating_add(1);
+    self.commit(judged.effects, version);
+    self.accepted.insert(judged.id, version);
+    (version, judged.applied)
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -3912,9 +4178,10 @@ impl Green {
     if let Some(version) = self.accepted.get(&inc.id) {
       return *version;
     }
+    let copies = copy::EntryCopies::of(applied);
     let effects = applied
       .iter()
-      .map(|effect| self.effect_of(effect, &inc.post_state))
+      .map(|effect| self.effect_of(effect, (&inc.post_state, &copies)))
       .collect();
     let version = self.head().saturating_add(1);
     self.commit(effects, version);
@@ -3943,7 +4210,11 @@ impl Green {
   }
 
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
-  fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
+  fn effect_of(
+    &self,
+    applied: &crate::chain_entry::Applied,
+    (post_state, copies): (&[u8], &copy::EntryCopies<'_>),
+  ) -> Effect {
     use crate::chain_entry::Applied;
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
@@ -3968,7 +4239,11 @@ impl Green {
         )
       }
       Applied::Copied { dst, from, ops } => {
-        let source = self.content.get(from).unwrap_or_default();
+        // A file a copy brings and the same version edits reads the bytes the copy brings (A-626 part 2).
+        let source = copies
+          .source_at(self, dst)
+          .content(from)
+          .unwrap_or_default();
         let bytes = apply(source, ops, post_state);
         let whole = vec![insert_whole(bytes.len() as u64)];
         Effect::SetContent(
@@ -3995,7 +4270,14 @@ impl Green {
         from,
         version,
         replace,
-      } => Effect::CopyTree(dst.clone(), from.clone(), *version, *replace),
+        fix,
+      } => Effect::CopyTree {
+        dst: dst.clone(),
+        from: from.clone(),
+        version: *version,
+        replace: *replace,
+        fix: fix.clone(),
+      },
     }
   }
 
@@ -4492,7 +4774,7 @@ impl Green {
         }
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
         // `Green::rebase` answers a work holding a copy before it restates anything (A-586).
-        Effect::CopyTree(..) => {}
+        Effect::CopyTree { .. } => {}
       }
     }
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
@@ -4644,6 +4926,8 @@ mod reanchor;
 pub use reanchor::{ReanchorRefused, Reanchored};
 
 #[cfg(test)]
+mod judge_tests;
+#[cfg(test)]
 mod node_exclusive_tests;
 
 #[cfg(test)]
@@ -4654,6 +4938,9 @@ mod replaced_node_tests;
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod node_tests;
 
 #[cfg(test)]
 mod tests {
