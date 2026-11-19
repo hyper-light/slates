@@ -51,10 +51,18 @@ mod tests {
   #[test]
   fn a_win32_code_is_never_read_as_the_errno_of_its_number() {
     for code in [FILE_EXISTS, ALREADY_EXISTS] {
-      assert_eq!(refusal_of(code), HostError::Unavailable(ERRNO_EXIST), "{code}");
+      assert_eq!(
+        refusal_of(code),
+        HostError::Unavailable(ERRNO_EXIST),
+        "{code}"
+      );
     }
     for code in [HANDLE_DISK_FULL, DISK_FULL] {
-      assert_eq!(refusal_of(code), HostError::Unavailable(ERRNO_NOSPC), "{code}");
+      assert_eq!(
+        refusal_of(code),
+        HostError::Unavailable(ERRNO_NOSPC),
+        "{code}"
+      );
     }
     for code in COLLIDING {
       assert_eq!(refusal_of(code), HostError::Win32(code), "{code}");
