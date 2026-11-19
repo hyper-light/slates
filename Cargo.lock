@@ -1690,6 +1690,7 @@ dependencies = [
  "sha1-checked",
  "slates-http",
  "slates-test-seeds",
+ "slates-vcs",
 ]
 
 [[package]]
