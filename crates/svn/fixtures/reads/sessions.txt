@@ -10,5 +10,8 @@ check-path: scripted, 8 commands
 stat: scripted, 7 commands
 get-mergeinfo: scripted, 9 commands
 get-iprops: scripted, 6 commands
+get-dir: scripted, 7 commands
+get-locations: scripted, 8 commands
+hostile-locations: scripted, 2 commands
 hostile-malformed: scripted, 2 commands
 unknown-command: scripted, 2 commands
