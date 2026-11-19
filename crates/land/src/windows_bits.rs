@@ -23,6 +23,25 @@ const NORMAL: u32 = 0x0000_0080;
 const SETTABLE: u32 = 0x0000_31A7;
 /// Format: a POSIX mode's write bits: a file with none of them is read-only (A-262).
 const WRITE_BITS: u32 = 0o222;
+/// Format: `FILE_WRITE_DATA` (winnt.h): the right that writes a file's data. `FlushFileBuffers` asks it of its handle
+/// ("The file handle must have the GENERIC_WRITE access right"), and NTFS refuses it to a read-only file (MS-FSA
+/// 2.1.5.1.2.1).
+const WRITE_DATA: u32 = 0x0000_0002;
+/// Format: `FILE_APPEND_DATA` (winnt.h): the other right MS-FSA 2.1.5.1.2.1 refuses a read-only file.
+const APPEND_DATA: u32 = 0x0000_0004;
+/// Format: `FILE_READ_ATTRIBUTES` (winnt.h): what a file's fingerprint and its attribute word are read with.
+const READ_ATTRIBUTES: u32 = 0x0000_0080;
+/// Format: `FILE_WRITE_ATTRIBUTES` (winnt.h): the right a set of `FILE_BASIC_INFO` asks (its attributes and times).
+const WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+/// Format: `SYNCHRONIZE` (winnt.h): a handle whose calls complete before they return.
+const SYNCHRONIZE: u32 = 0x0010_0000;
+/// Format: `FILE_WRITE_THROUGH` (ntioapi.h), `NtCreateFile`'s create option behind `CreateFile`'s
+/// `FILE_FLAG_WRITE_THROUGH`.
+const WRITE_THROUGH: u32 = 0x0000_0002;
+/// Format: `FILE_NON_DIRECTORY_FILE` (ntioapi.h): the open refuses a directory.
+const NON_DIRECTORY: u32 = 0x0000_0040;
+/// Format: `FILE_OPEN_REPARSE_POINT` (ntioapi.h): the object at the name itself, never one a link names.
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// What a landing made, as the volume's bits name it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +108,33 @@ pub(crate) fn held(read: u32, volume: u16, made: Made) -> bool {
   read & tracked(made) == decided(volume, made)
 }
 
+/// How a file's metadata entry holds its file on Windows (A-458, A-472, A-519): the access its open asks, the open's
+/// create options, and whether its batch's barrier flushes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MetaOpen {
+  /// The access asked (`NtCreateFile`'s `DesiredAccess`).
+  pub(crate) access: u32,
+  /// The create options (`NtCreateFile`'s `CreateOptions`).
+  pub(crate) options: u32,
+  /// Whether its batch's barrier flushes it (`FlushFileBuffers`).
+  pub(crate) flushed: bool,
+}
+
+/// The open a file's metadata entry takes: one that writes the file's attributes and may write its data, which its
+/// batch's barrier flushes (A-472).
+pub(crate) fn meta_open(_read_only: bool) -> MetaOpen {
+  MetaOpen {
+    access: READ_ATTRIBUTES | WRITE_ATTRIBUTES | WRITE_DATA | SYNCHRONIZE,
+    options: NON_DIRECTORY | OPEN_REPARSE_POINT,
+    flushed: true,
+  }
+}
+
+/// Whether a file's attribute word (`attributes`, read through a handle that writes none of its data) holds `READONLY`.
+pub(crate) fn read_only(attributes: u32) -> bool {
+  attributes & READONLY != 0
+}
+
 /// Whether the volume's bits make a link a directory link (A-275's `LINK_DIRECTORY`, `FILE_ATTRIBUTE_DIRECTORY` on a
 /// link): Windows makes one by creating the link's object as a directory, and removes it as a directory.
 pub(crate) fn directory_link(volume: u16) -> bool {
@@ -98,6 +144,56 @@ pub(crate) fn directory_link(volume: u16) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-519 (a read-only file's metadata entry). Do: take the open a file's metadata entry makes of a file that is not
+  /// read-only and of one that is, and judge two attribute words. Expect the first to ask the right `FlushFileBuffers`
+  /// needs (`FILE_WRITE_DATA`) and to be flushed by its batch's barrier; the second to ask neither right NTFS refuses a
+  /// read-only file (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`: MS-FSA 2.1.5.1.2.1), to ask the attributes' write and the
+  /// write-through its metadata is stored by (Microsoft's File Caching), and to be left out of its barrier; both opened
+  /// as files and never through a link; and a word read-only exactly where it holds `READONLY`. Before A-519 a read-only
+  /// file's entry asked the first open, which NTFS refused, and failed alone.
+  #[test]
+  fn a_read_only_files_metadata_is_opened_write_through_to_its_attributes_alone() {
+    let flushed = meta_open(false);
+    assert_eq!(flushed.access & WRITE_DATA, WRITE_DATA);
+    assert_eq!(flushed.options & WRITE_THROUGH, 0);
+    assert!(flushed.flushed);
+    let through = meta_open(true);
+    assert_eq!(
+      through.access & (WRITE_DATA | APPEND_DATA),
+      0,
+      "MS-FSA refuses either right to a read-only file"
+    );
+    assert_eq!(through.access & WRITE_ATTRIBUTES, WRITE_ATTRIBUTES);
+    assert_eq!(through.options & WRITE_THROUGH, WRITE_THROUGH);
+    assert!(!through.flushed, "a flush asks a right it does not hold");
+    for open in [flushed, through] {
+      assert_eq!(
+        open.options & (NON_DIRECTORY | OPEN_REPARSE_POINT),
+        NON_DIRECTORY | OPEN_REPARSE_POINT
+      );
+      assert_eq!(open.access & READ_ATTRIBUTES, READ_ATTRIBUTES);
+    }
+    assert!(read_only(READONLY | NORMAL));
+    assert!(!read_only(NORMAL));
+  }
+
+  /// A-519. The access rights and create options above are Windows' own, as windows-sys names them (on Windows).
+  #[cfg(windows)]
+  #[test]
+  fn the_metadata_opens_values_are_windows_own() {
+    use windows_sys::Wdk::Storage::FileSystem as nt;
+    use windows_sys::Win32::Storage::FileSystem as fs;
+    assert_eq!(WRITE_DATA, fs::FILE_WRITE_DATA);
+    assert_eq!(APPEND_DATA, fs::FILE_APPEND_DATA);
+    assert_eq!(READ_ATTRIBUTES, fs::FILE_READ_ATTRIBUTES);
+    assert_eq!(WRITE_ATTRIBUTES, fs::FILE_WRITE_ATTRIBUTES);
+    assert_eq!(SYNCHRONIZE, fs::SYNCHRONIZE);
+    assert_eq!(WRITE_THROUGH, nt::FILE_WRITE_THROUGH);
+    assert_eq!(NON_DIRECTORY, nt::FILE_NON_DIRECTORY_FILE);
+    assert_eq!(OPEN_REPARSE_POINT, nt::FILE_OPEN_REPARSE_POINT);
+    assert_eq!(READONLY, fs::FILE_ATTRIBUTE_READONLY);
+  }
 
   /// Format: winnt.h's values the tests name.
   const HIDDEN: u32 = 0x0002;
