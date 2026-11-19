@@ -13958,12 +13958,13 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 /// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
 /// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
 /// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
-/// pass: as of main 34d10acb5 no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag
-/// --vcs-ssh`, kiln r174), the CLI has no `repository create` (A-685, g305), and the edge's Mercurial command waits on
-/// a lender of its store (A-679, g304: `hg -R <repo> serve --stdio` through `serve::stdio`).
+/// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
+/// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
+/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
+/// HTTP site's pushes wait on A-680 part 2b.
 #[test]
-#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>), A-685 (g305: slates repository create <name> --tool hg) and \
-            A-679 (g304: hg serve --stdio on the SSH edge)"]
+#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (unbundle in the stdio \
+            session, through hg_push as A-680 part 2b lands the HTTP site's)"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let Some(hg) = stock_hg() else {
