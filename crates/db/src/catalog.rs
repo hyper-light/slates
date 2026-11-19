@@ -1889,26 +1889,33 @@ impl AtomicRecord {
   /// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of the
   /// record and not the rest: a log inside a span, or one log past its span beside another before its own.
   pub fn split_by(&self, at: impl Fn(&LogName) -> Option<u64>) -> bool {
-    let mut side = None;
-    for span in &self.spans {
-      let Some(position) = at(&span.log) else {
-        continue;
-      };
-      let held = if position >= span.to {
-        true
-      } else if position <= span.from {
-        false
-      } else {
-        return true;
-      };
-      match side {
-        None => side = Some(held),
-        Some(seen) if seen != held => return true,
-        Some(_) => {}
-      }
-    }
-    false
+    spans_split_by(&self.spans, at)
   }
+}
+
+/// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of a
+/// record's spans and not the rest (A-642): [`AtomicRecord::split_by`]'s rule, which the fleet's replicas judge every
+/// record's spans by (A-636), a record of one log's included.
+pub fn spans_split_by(spans: &[LogSpan], at: impl Fn(&LogName) -> Option<u64>) -> bool {
+  let mut side = None;
+  for span in spans {
+    let Some(position) = at(&span.log) else {
+      continue;
+    };
+    let held = if position >= span.to {
+      true
+    } else if position <= span.from {
+      false
+    } else {
+      return true;
+    };
+    match side {
+      None => side = Some(held),
+      Some(seen) if seen != held => return true,
+      Some(_) => {}
+    }
+  }
+  false
 }
 
 /// A Git LFS lock as a repository's lock log holds it (A-642): the locked path and the lock's record, its bytes the LFS
