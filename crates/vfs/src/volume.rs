@@ -8664,7 +8664,9 @@ mod upcase_name_tests {
     );
     for spelling in ["\u{3c2}.txt", "\u{3a3}.TXT", "\u{3c3}.Txt"] {
       assert_eq!(
-        upcase.lookup(&store, root, spelling).map(|found| found.inode),
+        upcase
+          .lookup(&store, root, spelling)
+          .map(|found| found.inode),
         Ok(sigma),
         "{spelling:?}"
       );

@@ -1493,8 +1493,19 @@
 >   (the DLL drops a longer normalized name), so a rename of a directory above it that the records spell otherwise
 >   leaves that record behind; and names the table folds alike and the volume keeps apart (final sigma `ς` against `σ`)
 >   are two files to the volume and one node to the driver, so the second's open while the first is open shares the
->   first's node and cache. The last would need the volume to refuse such a name beside its twin on a drive's volume,
->   or the drive to refuse the second open; neither is built.
+>   first's node and cache. Decided 2026-11-19 (the coordinator, from principle): the volume refuses the twin at create,
+>   so the state is never reachable; a refusal at the second open would leave it.
+> - **Built, A-576 part 1 (2026-11-19, goal 85, g258): a volume can fold by Windows' own upcase table.**
+>   `NameEquivalence::Upcase` folds each UTF-16 unit through Microsoft's recommended exFAT up-case table (specification
+>   Table 25, TableChecksum E619D30Dh, 874 units mapped; `crates/vfs/src/upcase.rs`), unit for unit with no
+>   normalization, as WinFsp's driver compares: `ς` beside `σ` is refused `EEXIST` at create and link, a rename onto it
+>   replaces the entry, and a decomposed and a precomposed `é` are two names. Such a volume and its drive take the same
+>   names for one, so neither residual above that comes from the two rules (the first and the last) can arise on it.
+>   Held by vfs's unit tests on every host (red 5 of 10 with the table removed, green 10 of 10, Mac Studio).
+> - **Owed, A-576 part 2:** the policy in the protocol and the catalog (`NamePolicy`, `DbNamePolicy`, appended and
+>   published), its choice in the CLI, the SDKs and MCP, an archive importing it (refused `Unsupported` until then), and
+>   what a WinFsp mount of a `Fold` volume does once a drive's volume can be made `Upcase`. Main's: the Windows check
+>   that the system's table is the volume core's at every unit (`the_volumes_upcase_table_is_the_systems`).
 
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.

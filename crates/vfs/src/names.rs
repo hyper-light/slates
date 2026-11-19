@@ -253,7 +253,11 @@ mod tests {
     ] {
       assert!(Upcase.same(a, b), "{a:?} {b:?}");
       assert_eq!(Upcase.hash(a), Upcase.hash(b), "{a:?} {b:?}");
-      assert_eq!(Upcase.compare(a, b), std::cmp::Ordering::Equal, "{a:?} {b:?}");
+      assert_eq!(
+        Upcase.compare(a, b),
+        std::cmp::Ordering::Equal,
+        "{a:?} {b:?}"
+      );
     }
     assert!(
       !Fold.same("\u{3c3}.txt", "\u{3c2}.txt"),

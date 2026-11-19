@@ -2090,7 +2090,8 @@ drift check `fstat`s.
 
 **Algorithms.**
 - Lookup: hash the name under the volume's equivalence policy (byte-exact: hash bytes; fold:
-  hash the folded, normalized form; compare folded forms on collision); `Small`: binary search
+  hash the folded, normalized form; upcase: hash each UTF-16 unit as Windows' upcase table maps
+  it, A-576; compare folded forms on collision); `Small`: binary search
   over `name_hash` then compare; `Indexed`: hash side index then ordered node for the entry. In
   a `Merged` directory the overlay is consulted first: an overlay entry wins, a `Whiteout` ends
   the lookup with `ENOENT`, otherwise the base listing is consulted (loaded on first use with the
@@ -2354,7 +2355,9 @@ names keep that name byte for byte, since the driver renames a node and the node
 must name it (`winfsp.h` 1285-1299). `GetFinalPathNameByHandleW` shows the made spelling. Three cases stay out of reach
 and are in GAPS: names the volume folds alike and Windows' table does not (normalization, the Kelvin sign) remain a node
 per spelling; a path past 1,024 units is upper-cased by the driver itself; and names the table folds alike and the
-volume keeps apart (`ς` and `σ`) share one node.
+volume keeps apart (`ς` and `σ`) share one node. A volume that folds by Windows' own table (`NameEquivalence::Upcase`,
+A-576) leaves neither name case: the drive and the volume take the same names for one, so a WinFsp drive's folding
+volume is to be one (A-576's part 2 lets a volume be made so).
 
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
@@ -37699,10 +37702,10 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
   sibling's open would name the new spelling while the driver joined the old node, and a rename would move the node and
   not the record.
 - **Rejected.** Recording each open as WinFsp upper-cases it, which keeps every record equal to the driver's by
-  construction: `GetFinalPathNameByHandleW` would then show upper case to Rust's `canonicalize`, Python's `realpath`
-  and git, which ask it for a file's path (A-369), and a notification of an entry under a held directory would carry
-  the upper-cased directory to watchers. Answering every open with its stored path, as A-543's record planned: refused by the driver
-  for any spelling that differs by more than case, and out of step with a node Windows already holds.
+  construction: `GetFinalPathNameByHandleW` would then show upper case to Rust's `canonicalize`, Python's `realpath` and
+  git, which ask it for a file's path (A-369), and a notification of an entry under a held directory would carry the
+  upper-cased directory to watchers. Answering every open with its stored path, as A-543's record planned: refused by
+  the driver for any spelling that differs by more than case, and out of step with a node Windows already holds.
 - **Also fixed.** WinFsp v2.1's DLL counts an open's normalized name twice when it places the open's security descriptor
   after it (`src/dll/fsop.c` 468, then 413), and leaves the alignment between them unwritten, so a Create's size reached
   bytes of the receive packet's earlier response. `finish_response` clears both spans, keeping A-215's rule that no
@@ -37710,9 +37713,9 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
 - **Cost.** On a folding drive, one look-up a component per open (the stored path), and one indexed look-up a component
   of the open names until Windows holds none (`OpenNames::spelled_at`), keyed by the upcased units; nothing on an exact
   drive.
-- **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are a
-  node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell otherwise
-  leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.
+- **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are
+  a node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell
+  otherwise leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.
 - **Tests.** Every host: `normalized::tests` (seven: each spelling names one node by its made spelling; a case-sensitive
   drive answers nothing; a stored spelling answered only where the driver takes it; the spelling Windows holds a path or
   a prefix by; past 1,024 units the driver's upper-cased name; a lost surrogate unanswered; final sigma takes the open
@@ -37726,3 +37729,48 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
   `host.rs` and the server's `winfsp.rs`, and the drive tests
   `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
   `an_exact_drive_keeps_two_spellings_two_files` (`crates/cli/tests/winfsp_semantics.rs`).
+
+### A-576 — A volume can fold names by Windows' own upcase table, so a name a WinFsp drive takes for another is that entry (2026-11-19, goal 85, g258; §4.4 name policy, §4.5 "Lookup", §4.6 "Windows", D-4; part 1 of 2; after A-551's third case)
+Applied in the same change to: §4.5 ("Lookup"), §4.6 (the folding-drive paragraph), GAPS (the folding-drive entry's
+third case), `crates/vfs/src/upcase.rs` (new: the table, its lookup, its tests), `crates/vfs/src/names.rs`
+(`NameEquivalence::Upcase`, `Folded::Upcase`), `crates/vfs/src/export.rs` (policy id 2), `crates/vfs/src/recover.rs`
+(`PolicyImage::Upcase`, appended), `crates/vfs/src/image.rs` (the folded index), `crates/vfs/src/volume.rs` (the
+volume's
+tests), `crates/vfs/src/lib.rs`, `crates/server/src/image.rs` (an archive naming the policy refused `Unsupported`),
+`crates/bridge-winfsp/src/host.rs` (the Windows check), `crates/bridge-winfsp/src/normalized.rs` (its tests on the real
+table).
+- **What was there.** A-551 serves a folding volume through a WinFsp drive that compares names without case, by the
+  system's upcase table, while the volume folds by NFC and Unicode lowercasing (`Fold`, APFS's rule). The two disagree:
+  over single BMP characters the table joins two characters lowercasing keeps apart only at final sigma (`Σ`, `ς`, `σ`),
+  so a `Fold` volume could hold `σ.txt` and `ς.txt` as two files that the driver opens as one file node, one cache and
+  one share-access record over two files; and lowercasing with NFC joins 838 pairs the table keeps apart, each one file
+  the driver sees as two nodes. (Python's Unicode 13 as the model of the lowercasing, 2026-11-19.)
+- **The rule (the coordinator's, from principle).** A volume served by a folding drive folds names exactly as the drive
+  does, so no two of its files are one name to Windows; a refusal at the second open would leave the state reachable.
+  `NameEquivalence::Upcase` folds each UTF-16 unit through Windows' upcase table, unit for unit with no normalization:
+  `ς` and `σ` are one name, refused `EEXIST` at create and link, and a rename onto the other spelling replaces that
+  entry; a decomposed and a precomposed `é` are two names, as on NTFS. The volume's lookups, its directory index and its
+  ordering are the table's, through the same hash and comparison paths the other policies take.
+- **The table.** Microsoft's recommended up-case table, Table 25 of the exFAT file system specification (§7.2.5.1,
+  learn.microsoft.com, read 2026-11-19): 2,918 compressed entries whose TableChecksum is E619D30Dh, as the specification
+  states; 874 of the 65,536 units map to another; no unit past ASCII maps into ASCII. The volume core holds the 874
+  mappings, and its tests hold them to the specification's table through that checksum and entry by entry. The driver
+  compares by the system's NLS table (`RtlCompareUnicodeString`), which ntdll's `RtlUpcaseUnicodeChar` reads; that the
+  two agree at every unit is a Windows test for main (`the_volumes_upcase_table_is_the_systems`), stated from memory
+  until it runs.
+- **Rejected.** Redefining `Fold` as the table: every image already made is hashed and ordered by `Fold`'s rule, and a
+  macOS mount of a folding volume wants APFS's normalization. A refusal at the drive's second open of a twin: the two
+  files would stay, and only Windows' view would be guarded.
+- **Part 2 (owed).** The protocol's and the catalog's name policies (`NamePolicy`, `DbNamePolicy`, appended and
+  published), the CLI's and the SDKs' and MCP's choice of it, an archive importing it, and what a WinFsp mount of a
+  `Fold` volume does (A-551's residuals) once a drive's volume can be made `Upcase`; and at mount, whether the system's
+  table is the volume's (the Windows check above, made where the drive is).
+- **Tests.** Every host: `upcase::tests` (the specification's table through its checksum and at every unit; the sigmas
+  and the letters the table leaves; sigma the one unit two others map to),
+  `names::tests::upcase_folds_names_as_windows_upcase_table_does` and the ordering oracle over all three policies with
+  equal hashes for equal names, the volume's `a_name_windows_folds_alike_to_an_entry_is_that_entry` and
+  `a_rebuilt_volume_folds_as_windows_upcase_table_does`, and export's policy round trip. On the Mac Studio (debug, load
+  average 26 to 39, 2026-11-19 02:36 UTC), `cargo test -p slates-vfs --lib -- upcase names:: an_archives_name_policy
+  upcase_name_tests`: red with the table removed in a copy (no unit past ASCII upcased), 5 of 10 failed; green 10 of 10;
+  the vfs lib 90 of 90 (one ignored); the bridge's `normalized::` 7 of 7 on the real table; the server's `image::` 2 of
+  2. Windows (main's): the table check.
