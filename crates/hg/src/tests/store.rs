@@ -38,7 +38,7 @@ fn data_files(repository: &str) -> BTreeSet<Vec<u8>> {
 #[test]
 fn every_fncache_entry_names_a_file_7_2_stored() {
   for (repository, dotencode) in [("dot", true), ("hybrid", false)] {
-    let layout = read_layout(file(&format!("{repository}-requires.txt")));
+    let layout = read_layout(file(&format!("{repository}-requires.txt"))).unwrap();
     assert_eq!(
       (layout.store, layout.fncache, layout.dotencode),
       (true, true, dotencode)

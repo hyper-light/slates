@@ -16,8 +16,17 @@
 //! **The fncache** lists every data revlog of an `fncache` store, one path a line after `decodedir`, the file ending in a
 //! newline and holding no empty line (7.2's `fncache._load` and `_checkentries` abort on either).
 //!
-//! **Requirements** (`.hg/store/requires`, or `.hg/requires` without `share-safe`): which of these a store uses.
-//! A store without `fncache`, and version 2's file index (`fileindex-v1`), are read by later parts.
+//! **The plain encoding** (`_plain_encode`, required as `exp-very-fragile-and-unsafe-plain-store-encoding`) only gives
+//! each directory under `data/` a trailing `_`; 7.2 names its own risk in the name, since a case-insensitive file system
+//! folds `FOO` and `foo` into one file.
+//!
+//! **Requirements** (`.hg/requires`, and under `share-safe` the store's own `store/requires`; A-630 part 2): every
+//! requirement 7.2 knows is either read here (which encoding, which listing), beside the point of the logs, or refused by
+//! kind, as are the ones 7.2 does not know and the pairs it refuses together. They choose the store's shape as 7.2's
+//! `localrepo.makestore` does: an fncache store named by dotencode's encoding, the plain one or the hybrid one; a file
+//! index store ([`crate::file_index`]) by dotencode's, though it never requires `dotencode`, or the plain one. A store
+//! that lists no file logs (no `store`, or neither `fncache` nor `fileindex-v1`) is refused: Mercurial wrote one last
+//! before 1.1.
 
 use crate::Admission;
 use crate::PastAdmission;
@@ -38,6 +47,12 @@ const PREFIX_LEN: usize = 5;
 
 /// Format: a hashed path's directory.
 const HASHED: &[u8] = b"dh/";
+
+/// Format: the directory of a file log's store path, which the plain encoding keeps as it is.
+const DATA_PREFIX: &[u8] = b"data/";
+
+/// Format: what the plain encoding puts in place of each `/` after `data/` (`_plain_encode`): `_`, then the `/`.
+const PLAIN_DIRECTORY: &[u8] = b"_/";
 
 /// Format: `encodedir`'s three renamings, in 7.2's order.
 const ENCODE_DIR: [(&[u8], &[u8]); 3] = [
@@ -313,6 +328,38 @@ pub fn encode_path(path: &[u8], dotencode: bool) -> Result<Vec<u8>, CollisionAtt
   Ok(encoded)
 }
 
+/// A store path as 7.2's plain encoding names it (`_plain_encode`, required as
+/// `exp-very-fragile-and-unsafe-plain-store-encoding`): under `data/`, every directory gains `_` after its name, so a
+/// directory cannot meet a revlog's name; nothing else changes, not a capital and not a reserved byte.
+pub fn plain_encode(path: &[u8]) -> Vec<u8> {
+  match path.strip_prefix(DATA_PREFIX) {
+    Some(rest) => [DATA_PREFIX, &replace_all(rest, &[SLASH], PLAIN_DIRECTORY)].concat(),
+    None => path.to_vec(),
+  }
+}
+
+/// How a store names its files (7.2's `store.Encoding`, which `localrepo.makestore` chooses from the requirements).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+  /// dotencode's (`_pathencode`): an fncache store with `dotencode`, and every file index store but a plain one.
+  Dot,
+  /// The hybrid one (`_hybridencode` without dotencode): an fncache store without `dotencode`.
+  Hybrid,
+  /// The plain one ([`plain_encode`]).
+  Plain,
+}
+
+impl Encoding {
+  /// The name the store path `path` has in a store of this encoding.
+  pub fn encode(self, path: &[u8]) -> Result<Vec<u8>, CollisionAttack> {
+    match self {
+      Self::Dot => encode_path(path, true),
+      Self::Hybrid => encode_path(path, false),
+      Self::Plain => Ok(plain_encode(path)),
+    }
+  }
+}
+
 /// Why an fncache was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FncacheRefused {
@@ -365,7 +412,74 @@ pub fn read_fncache(
   Ok(entries)
 }
 
-/// The store features a repository's requirements name, as far as reading its store needs them.
+/// What a requirement asks of a reader of the store's logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asks {
+  /// `store`: the revlogs under `.hg/store`, their names encoded.
+  Store,
+  /// `fncache`: the data revlogs listed in `fncache`.
+  Fncache,
+  /// `dotencode`: dotencode's encoding.
+  DotEncode,
+  /// The plain encoding.
+  Plain,
+  /// `fileindex-v1`: the data revlogs listed by the file index.
+  FileIndex,
+  /// `share-safe`: the store's own requirements in `store/requires`.
+  ShareSafe,
+  /// Nothing of the walk: what each revlog's own header says (the revlog versions, generaldelta, sparse-revlog, delta
+  /// information, the compression engines the reader inflates), a cache 7.2 rebuilds (the persistent nodemap), the
+  /// working directory's (dirstate-v2 and its tracked hint, sparse checkouts), or what the import does not take yet
+  /// (bookmarks kept in the store, the internal and archived phases: §4.17.3 pieces 5 and 7).
+  Neutral,
+  /// A store the import cannot take whole: a manifest log per directory (`treemanifest`), file logs missing outside a
+  /// narrow clone's patterns, file contents outside the store (`lfs`, `largefiles`), another repository's store
+  /// (`shared`, `relshared`), copies kept in sidedata the import does not read (`exp-copies-sidedata-changeset`).
+  Refused,
+}
+
+/// Format: every requirement Mercurial 7.2 knows: `requirements.py` and `repo/requirements.py`'s `BASE_SUPPORTED`,
+/// `exp-compression-` and each engine with a revlog header (`zlib`, `zstd`, `none`) and `revlog-compression-zstd`
+/// (`gather_supported_requirements`), and the shipped extensions' (`narrowhg-experimental`, `lfs`, `largefiles`); each
+/// with what it asks of the import.
+const KNOWN: [(&[u8], Asks); 30] = [
+  (b"store", Asks::Store),
+  (b"fncache", Asks::Fncache),
+  (b"dotencode", Asks::DotEncode),
+  (
+    b"exp-very-fragile-and-unsafe-plain-store-encoding",
+    Asks::Plain,
+  ),
+  (b"fileindex-v1", Asks::FileIndex),
+  (b"share-safe", Asks::ShareSafe),
+  (b"revlogv1", Asks::Neutral),
+  (b"exp-revlogv2.2", Asks::Neutral),
+  (b"exp-changelog-v2", Asks::Neutral),
+  (b"generaldelta", Asks::Neutral),
+  (b"sparserevlog", Asks::Neutral),
+  (b"delta-info-revlog", Asks::Neutral),
+  (b"revlog-compression-zstd", Asks::Neutral),
+  (b"exp-compression-zstd", Asks::Neutral),
+  (b"exp-compression-zlib", Asks::Neutral),
+  (b"exp-compression-none", Asks::Neutral),
+  (b"persistent-nodemap", Asks::Neutral),
+  (b"dirstate-v2", Asks::Neutral),
+  (b"dirstate-tracked-key-v1", Asks::Neutral),
+  (b"exp-sparse", Asks::Neutral),
+  (b"bookmarksinstore", Asks::Neutral),
+  (b"internal-phase-2", Asks::Neutral),
+  (b"exp-archived-phase", Asks::Neutral),
+  (b"treemanifest", Asks::Refused),
+  (b"narrowhg-experimental", Asks::Refused),
+  (b"lfs", Asks::Refused),
+  (b"largefiles", Asks::Refused),
+  (b"shared", Asks::Refused),
+  (b"relshared", Asks::Refused),
+  (b"exp-copies-sidedata-changeset", Asks::Refused),
+];
+
+/// What a repository's requirements say of its store, as far as reading its logs needs them (7.2's
+/// `localrepo.makestore`), each requirements file folded in by [`Layout::read`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
   /// `store`: the revlogs under `.hg/store`, their names encoded.
@@ -374,35 +488,297 @@ pub struct Layout {
   pub fncache: bool,
   /// `dotencode`: a first period or space escaped, a long raw path hashed.
   pub dotencode: bool,
-  /// `exp-revlogv2.2`: revlogs behind dockets.
-  pub revlog_v2: bool,
-  /// `fileindex-v1`: the data revlogs listed by version 2's file index.
+  /// `exp-very-fragile-and-unsafe-plain-store-encoding`: the plain encoding.
+  pub plain: bool,
+  /// `fileindex-v1`: the data revlogs listed by the file index.
   pub file_index: bool,
+  /// `share-safe`: the store's requirements are in its own `requires`, `store/requires`.
+  pub share_safe: bool,
 }
 
-/// The layout a `requires` file names, one requirement a line.
-pub fn read_layout(requires: &[u8]) -> Layout {
-  let mut layout = Layout::default();
-  for line in lines(requires) {
-    match line {
-      b"store" => layout.store = true,
-      b"fncache" => layout.fncache = true,
-      b"dotencode" => layout.dotencode = true,
-      b"exp-revlogv2.2" => layout.revlog_v2 = true,
-      b"fileindex-v1" => layout.file_index = true,
-      _ => {}
+/// How a store lists its file logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing {
+  /// The fncache: each file log's revlog files, unencoded.
+  Fncache,
+  /// The file index ([`crate::file_index`]): each tracked path.
+  FileIndex,
+}
+
+/// How a store lists its file logs and names its files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+  /// Where the file logs are listed.
+  pub listing: Listing,
+  /// How every store path is named.
+  pub encoding: Encoding,
+}
+
+/// Why a repository's requirements were refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequiresRefused {
+  /// A line 7.2 calls corrupt: empty, or not beginning with a letter or a digit (7.2: ".hg/requires file is
+  /// corrupt").
+  Corrupt {
+    /// The line's number in its file, from 1.
+    line: u64,
+  },
+  /// A requirement 7.2 does not know (7.2: "repository requires features unknown to this Mercurial").
+  Unknown {
+    /// The requirement.
+    requirement: Box<[u8]>,
+  },
+  /// A requirement whose store the import cannot take whole (what each is is said where they are listed).
+  Unsupported {
+    /// The requirement.
+    requirement: Box<[u8]>,
+  },
+  /// Two requirements 7.2 refuses together (`localrepo.ensurerequirementscompatible`): `dotencode` and the plain
+  /// encoding, or `fileindex-v1` with `fncache` or `dotencode`.
+  Incompatible {
+    /// One requirement.
+    first: &'static str,
+    /// The other.
+    second: &'static str,
+  },
+  /// A store that lists no file logs: no `store` (Mercurial before 0.9.2) or neither `fncache` nor `fileindex-v1`
+  /// (before 1.1). 7.2's `hg debugupgraderepo` gives either an fncache.
+  Unlisted,
+}
+
+impl Layout {
+  /// Folds one requirements file into the layout (`requires`, then `store/requires` under `share-safe`), each line a
+  /// requirement as 7.2's `scmutil.readrequires` cuts it.
+  pub fn read(&mut self, requires: &[u8]) -> Result<(), RequiresRefused> {
+    for (line, requirement) in (1_u64..).zip(lines(requires)) {
+      if !requirement.first().is_some_and(u8::is_ascii_alphanumeric) {
+        return Err(RequiresRefused::Corrupt { line });
+      }
+      let asks = KNOWN
+        .iter()
+        .find(|(name, _)| *name == requirement)
+        .map(|(_, asks)| *asks)
+        .ok_or_else(|| RequiresRefused::Unknown {
+          requirement: Box::from(requirement),
+        })?;
+      self.take(asks, requirement)?;
+    }
+    Ok(())
+  }
+
+  /// Records what one requirement asks.
+  fn take(&mut self, asks: Asks, requirement: &[u8]) -> Result<(), RequiresRefused> {
+    match asks {
+      Asks::Store => self.store = true,
+      Asks::Fncache => self.fncache = true,
+      Asks::DotEncode => self.dotencode = true,
+      Asks::Plain => self.plain = true,
+      Asks::FileIndex => self.file_index = true,
+      Asks::ShareSafe => self.share_safe = true,
+      Asks::Neutral => {}
+      Asks::Refused => {
+        return Err(RequiresRefused::Unsupported {
+          requirement: Box::from(requirement),
+        });
+      }
+    }
+    Ok(())
+  }
+
+  /// The store's shape, as 7.2's `localrepo.makestore` chooses it: an fncache store named by dotencode's encoding, the
+  /// plain one or the hybrid one; a file index store by dotencode's (with no `dotencode` requirement) or the plain one.
+  pub fn shape(&self) -> Result<Shape, RequiresRefused> {
+    self.compatible()?;
+    if !self.store {
+      return Err(RequiresRefused::Unlisted);
+    }
+    let encoding = |otherwise| {
+      if self.dotencode {
+        Encoding::Dot
+      } else if self.plain {
+        Encoding::Plain
+      } else {
+        otherwise
+      }
+    };
+    match (self.fncache, self.file_index) {
+      (true, _) => Ok(Shape {
+        listing: Listing::Fncache,
+        encoding: encoding(Encoding::Hybrid),
+      }),
+      (false, true) => Ok(Shape {
+        listing: Listing::FileIndex,
+        encoding: encoding(Encoding::Dot),
+      }),
+      (false, false) => Err(RequiresRefused::Unlisted),
     }
   }
-  layout
+
+  /// Refuses the pairs 7.2 refuses.
+  fn compatible(&self) -> Result<(), RequiresRefused> {
+    let pairs = [
+      (
+        self.dotencode && self.plain,
+        "dotencode",
+        "exp-very-fragile-and-unsafe-plain-store-encoding",
+      ),
+      (self.file_index && self.fncache, "fileindex-v1", "fncache"),
+      (
+        self.file_index && self.dotencode,
+        "fileindex-v1",
+        "dotencode",
+      ),
+    ];
+    match pairs.iter().find(|(both, _, _)| *both) {
+      Some(&(_, first, second)) => Err(RequiresRefused::Incompatible { first, second }),
+      None => Ok(()),
+    }
+  }
+}
+
+/// The layout one requirements file names.
+pub fn read_layout(requires: &[u8]) -> Result<Layout, RequiresRefused> {
+  let mut layout = Layout::default();
+  layout.read(requires)?;
+  Ok(layout)
 }
 
 #[cfg(test)]
 mod tests {
   use super::{
-    FncacheRefused, aux_encode, decode_dir, encode_dir, encode_filename, encode_path, read_fncache,
-    segments,
+    Encoding, FncacheRefused, Layout, Listing, RequiresRefused, Shape, aux_encode, decode_dir,
+    encode_dir, encode_filename, encode_path, plain_encode, read_fncache, read_layout, segments,
   };
   use crate::Admission;
+
+  /// A-630 part 2 (7.2's doctests of `_plain_encode`): do encode store paths outside and under `data/`, with spaces and
+  /// with directories named as revlogs are. Expect 7.2's names: a `_` after each directory under `data/`, nothing else.
+  #[test]
+  fn the_plain_encoding_names_as_7_2_names() {
+    for (path, encoded) in [
+      (&b"foo"[..], &b"foo"[..]),
+      (b"foo.txt", b"foo.txt"),
+      (b"bar/foo.txt", b"bar/foo.txt"),
+      (b"data/foo.txt", b"data/foo.txt"),
+      (b"data/bar/foo.txt", b"data/bar_/foo.txt"),
+      (
+        b"data/ b a r /fuz.d_/baz.i/foo.txt",
+        b"data/ b a r _/fuz.d__/baz.i_/foo.txt",
+      ),
+    ] {
+      assert_eq!(plain_encode(path), encoded);
+      assert_eq!(Encoding::Plain.encode(path).unwrap(), encoded);
+    }
+    assert_eq!(
+      Encoding::Hybrid.encode(b"data/.leading.i").unwrap(),
+      b"data/.leading.i"
+    );
+    assert_eq!(
+      Encoding::Dot.encode(b"data/.leading.i").unwrap(),
+      b"data/~2eleading.i"
+    );
+  }
+
+  /// The shape the requirements `lines` choose, one requirement a line.
+  fn shape(lines: &[&str]) -> Result<Shape, RequiresRefused> {
+    let mut layout = Layout::default();
+    layout.read(lines.join("\n").as_bytes())?;
+    layout.shape()
+  }
+
+  /// A-630 part 2 (7.2's `localrepo.makestore`): do read the requirements of an fncache store with dotencode, with the
+  /// plain encoding and with neither, and of a file index store with and without the plain encoding. Expect each
+  /// listing and encoding as 7.2 chooses them, a file index store named by dotencode's encoding though it never
+  /// requires `dotencode`.
+  #[test]
+  fn requirements_choose_the_store_s_shape_as_7_2_does() {
+    let fncache = |encoding| Shape {
+      listing: Listing::Fncache,
+      encoding,
+    };
+    let file_index = |encoding| Shape {
+      listing: Listing::FileIndex,
+      encoding,
+    };
+    let plain = "exp-very-fragile-and-unsafe-plain-store-encoding";
+    for (lines, expected) in [
+      (
+        &["store", "fncache", "dotencode"][..],
+        fncache(Encoding::Dot),
+      ),
+      (&["store", "fncache", plain], fncache(Encoding::Plain)),
+      (
+        &["store", "fncache", "generaldelta"],
+        fncache(Encoding::Hybrid),
+      ),
+      (
+        &["store", "fileindex-v1", "exp-revlogv2.2"],
+        file_index(Encoding::Dot),
+      ),
+      (
+        &["store", "fileindex-v1", plain],
+        file_index(Encoding::Plain),
+      ),
+    ] {
+      assert_eq!(shape(lines), Ok(expected), "{lines:?}");
+    }
+  }
+
+  /// AC-HG.9, A-630 part 2: do read requirements with an empty line, one beginning with a period, one 7.2 does not
+  /// know, the ones the import cannot take whole, the pairs 7.2 refuses, and stores that list no file log. Expect each
+  /// refused by its kind, naming the line or the requirement.
+  #[test]
+  fn requirements_the_import_cannot_take_are_refused_by_kind() {
+    let named = |requirement: &str| Box::from(requirement.as_bytes());
+    let plain = "exp-very-fragile-and-unsafe-plain-store-encoding";
+    let mut cases: Vec<(Vec<&str>, RequiresRefused)> = vec![
+      (
+        vec!["store", "", "fncache"],
+        RequiresRefused::Corrupt { line: 2 },
+      ),
+      (vec![".store"], RequiresRefused::Corrupt { line: 1 }),
+      (
+        vec!["store", "frobnicate"],
+        RequiresRefused::Unknown {
+          requirement: named("frobnicate"),
+        },
+      ),
+      (
+        vec!["store", "fncache", "dotencode", plain],
+        RequiresRefused::Incompatible {
+          first: "dotencode",
+          second: plain,
+        },
+      ),
+      (
+        vec!["store", "fncache", "fileindex-v1"],
+        RequiresRefused::Incompatible {
+          first: "fileindex-v1",
+          second: "fncache",
+        },
+      ),
+      (vec!["revlogv1"], RequiresRefused::Unlisted),
+      (vec!["store", "revlogv1"], RequiresRefused::Unlisted),
+      (vec!["store", "dotencode"], RequiresRefused::Unlisted),
+    ];
+    for refused in [
+      "treemanifest",
+      "narrowhg-experimental",
+      "lfs",
+      "largefiles",
+      "shared",
+    ] {
+      let requirement = named(refused);
+      cases.push((
+        vec!["store", refused],
+        RequiresRefused::Unsupported { requirement },
+      ));
+    }
+    for (lines, expected) in cases {
+      assert_eq!(shape(&lines), Err(expected), "{lines:?}");
+    }
+    assert!(read_layout(b"store\nfncache\n").is_ok_and(|layout| layout.fncache));
+  }
 
   /// A-630 (7.2's doctests of `_encodedir` and `decodedir`): do rename store paths with `.i`, `.d` and `.hg`
   /// directories, and back. Expect 7.2's renamings, and each read back.
