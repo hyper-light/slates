@@ -362,10 +362,6 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   /// Reads `bytes`, the next bytes of the pack, as far as they go, charging what it builds to `admission`: how many it
   /// took. It takes them all until the trailer ends, and none after.
   pub fn read(&mut self, bytes: &[u8], admission: &mut Admission) -> Result<usize, Refusal> {
-    // STUB for the failing-tests-first run (A-608): refuses everything.
-    if self.at == 0 {
-      return Err(Refusal::Truncated { at: 0 });
-    }
     let mut used = 0usize;
     loop {
       let rest = bytes.get(used..).unwrap_or_default();
@@ -382,10 +378,6 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   /// Ends the pack: refused unless its trailer has been read; then resolves the waiting deltas and answers every object
   /// in pack order.
   pub fn finish(mut self, admission: &mut Admission) -> Result<Unpacked, Refusal> {
-    // STUB for the failing-tests-first run (A-608): refuses everything.
-    if self.at == 0 {
-      return Err(Refusal::Truncated { at: 0 });
-    }
     let Stage::Done(checksum) = self.stage else {
       return Err(Refusal::Truncated { at: self.at });
     };
@@ -821,8 +813,8 @@ struct Inflated {
 }
 
 /// Inflates `rest` into the room left in `data`. When the room is full, one more byte of room tells a stream that ends
-/// there from one that would go on: any byte it takes is past the size. Refused for a stream the inflater refuses, one
-/// past the size, and one that ends short of it.
+/// there from one that would go on: any byte it takes is past the size. Refused for a stream past the size, one the
+/// inflater refuses, and one that ends short of it.
 fn inflate(inflater: &mut Decompress, data: &mut Data, rest: &[u8]) -> Result<Inflated, Refusal> {
   let at = data.began;
   let size = data.header.size;
@@ -835,13 +827,14 @@ fn inflate(inflater: &mut Decompress, data: &mut Data, rest: &[u8]) -> Result<In
   } else {
     data.content.get_mut(data.filled..).unwrap_or_default()
   };
-  let status = inflater
-    .decompress(rest, room, FlushDecompress::None)
-    .map_err(|_| Refusal::Inflate { at })?;
+  let result = inflater.decompress(rest, room, FlushDecompress::None);
+  // A byte past the size is judged before the stream's own error: one call can write it and then fail the Adler-32
+  // that follows, and the data running past its header is the refusal that names what is wrong.
   let wrote = inflater.total_out().saturating_sub(before_out);
   if full && wrote > 0 {
     return Err(Refusal::LongerThanSize { at, size });
   }
+  let status = result.map_err(|_| Refusal::Inflate { at })?;
   data.filled = data
     .filled
     .saturating_add(usize::try_from(wrote).unwrap_or(usize::MAX));
@@ -904,10 +897,6 @@ pub fn read_whole<L: Locate + ?Sized>(
 /// trailer, the same count, and every object's name at its own entry's offset. The index's names are distinct (A-591
 /// refuses a duplicate), so with the counts equal each object has exactly its own place.
 pub fn check_index(unpacked: &Unpacked, idx: &Idx<'_>) -> Result<(), IndexMismatch> {
-  // STUB for the failing-tests-first run (A-608): refuses everything.
-  if unpacked.objects.len() < usize::MAX {
-    return Err(IndexMismatch::Count { index: 0, pack: 0 });
-  }
   if idx.pack_checksum() != unpacked.checksum {
     return Err(IndexMismatch::Checksum {
       index: idx.pack_checksum(),
