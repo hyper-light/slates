@@ -35,13 +35,16 @@ const ARGUMENT_SEPARATOR: u8 = b',';
 /// Format: the byte between an argument's name and its value.
 const VALUE_SEPARATOR: u8 = b'=';
 
+/// One argument of a call: its name and its value.
+pub type Argument<'a> = (&'a [u8], &'a [u8]);
+
 /// One call of a batch: its command and its arguments, unescaped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call<'b> {
   /// The command.
   pub command: &'b [u8],
   /// The arguments, name and value, in order.
-  pub arguments: Vec<(&'b [u8], &'b [u8])>,
+  pub arguments: Vec<Argument<'b>>,
 }
 
 /// Why a batch was refused.
@@ -235,7 +238,7 @@ fn slice_calls<'b>(cmds: &[u8], filled: &'b [u8], count: usize) -> Result<Vec<Ca
 
 /// Appends a `cmds` argument as 7.2's client writes it (`encodebatchcmds`): each command, a space, its arguments as
 /// `name=value` escaped and joined by `,`; the calls joined by `;`.
-pub fn encode_calls(calls: &[(&[u8], &[(&[u8], &[u8])])], out: &mut Vec<u8>) {
+pub fn encode_calls(calls: &[(&[u8], &[Argument<'_>])], out: &mut Vec<u8>) {
   for (index, (command, arguments)) in calls.iter().enumerate() {
     if index > 0 {
       out.push(CALL_SEPARATOR);
@@ -300,7 +303,7 @@ pub fn results<'b>(
 
 #[cfg(test)]
 mod tests {
-  use super::{Call, Refusal, calls, encode_calls, encode_results, escape, results};
+  use super::{Argument, Call, Refusal, calls, encode_calls, encode_results, escape, results};
   use crate::Admission;
   use proptest::prelude::*;
 
@@ -396,8 +399,8 @@ mod tests {
         1..4,
       ),
     ) {
-      let arguments: Vec<Vec<(&[u8], &[u8])>> = generated.iter().map(|(_, pairs)| pairs.iter().map(|(name, value)| (name.as_slice(), value.as_slice())).collect()).collect();
-      let encoded_calls: Vec<(&[u8], &[(&[u8], &[u8])])> = generated.iter().zip(&arguments).map(|((command, _), pairs)| (command.as_bytes(), pairs.as_slice())).collect();
+      let arguments: Vec<Vec<Argument<'_>>> = generated.iter().map(|(_, pairs)| pairs.iter().map(|(name, value)| (name.as_slice(), value.as_slice())).collect()).collect();
+      let encoded_calls: Vec<(&[u8], &[Argument<'_>])> = generated.iter().zip(&arguments).map(|((command, _), pairs)| (command.as_bytes(), pairs.as_slice())).collect();
       let mut cmds = Vec::new();
       encode_calls(&encoded_calls, &mut cmds);
       let mut buffer = Vec::new();

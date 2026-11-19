@@ -244,8 +244,9 @@ fn an_ssh_pull_batches_discovery_then_takes_a_stream() {
   let cmds = sent[3].arguments.get(spec(b"batch"), b"cmds").unwrap();
   let mut buffer = Vec::new();
   let calls = batch::calls(cmds, &mut room(), &mut buffer).unwrap();
-  let pairs: Vec<Vec<(&[u8], &[u8])>> = calls.iter().map(|call| call.arguments.clone()).collect();
-  let encoded: Vec<(&[u8], &[(&[u8], &[u8])])> = calls
+  let pairs: Vec<Vec<batch::Argument<'_>>> =
+    calls.iter().map(|call| call.arguments.clone()).collect();
+  let encoded: Vec<(&[u8], &[batch::Argument<'_>])> = calls
     .iter()
     .zip(&pairs)
     .map(|(call, pairs)| (call.command, pairs.as_slice()))
@@ -366,8 +367,15 @@ fn exchange(name: &str, number: u32) -> (Vec<u8>, Vec<u8>, &'static [u8]) {
   )
 }
 
+/// What a captured HTTP request of `debugwireargs` carried, read for its spec.
+struct Wireargs {
+  command: Vec<u8>,
+  dictionary: Vec<(Vec<u8>, Vec<u8>)>,
+  named: Vec<Vec<u8>>,
+}
+
 /// The arguments of `debugwireargs` as a captured HTTP request carries them, read for its spec.
-fn wireargs(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+fn wireargs(name: &str) -> Wireargs {
   let (request, _, _) = exchange(name, 2);
   let parsed = raw(&request);
   let request = http::Request {
@@ -380,15 +388,15 @@ fn wireargs(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
   let arguments = fields
     .arguments(spec(b"debugwireargs"), &mut room())
     .unwrap();
-  (
-    fields.command().unwrap().to_vec(),
-    arguments
+  Wireargs {
+    command: fields.command().unwrap().to_vec(),
+    dictionary: arguments
       .dictionary
       .iter()
       .map(|(key, value)| (key.to_vec(), value.to_vec()))
       .collect(),
-    arguments.named.iter().map(|value| value.to_vec()).collect(),
-  )
+    named: arguments.named.iter().map(|value| value.to_vec()).collect(),
+  }
 }
 
 /// A-569 (golden): do read `debugwireargs` as 7.2's client sent it over HTTP three ways: in `X-HgArg` headers, at the
@@ -401,10 +409,10 @@ fn http_arguments_read_alike_in_headers_body_and_query() {
     (b"three".to_vec(), THREE.to_vec()),
   ];
   for name in ["http-wireargs", "http-postargs", "http-query"] {
-    let (command, read, named) = wireargs(name);
-    assert_eq!(command, b"debugwireargs", "{name}");
-    assert_eq!(named, [b"un".to_vec(), b"deux".to_vec()], "{name}");
-    assert_eq!(read, dictionary, "{name}");
+    let read = wireargs(name);
+    assert_eq!(read.command, b"debugwireargs", "{name}");
+    assert_eq!(read.named, [b"un".to_vec(), b"deux".to_vec()], "{name}");
+    assert_eq!(read.dictionary, dictionary, "{name}");
   }
 }
 
