@@ -1114,35 +1114,58 @@ mod tests {
     let mut map: Ptrie<u32> = Ptrie::new();
     for n in 0..500u32 {
       counted.put(n);
-      map.insert(&mut nodes, format!("d{}/f{n}", n % 7).as_bytes(), n, &mut counted);
+      map.insert(
+        &mut nodes,
+        format!("d{}/f{n}", n % 7).as_bytes(),
+        n,
+        &mut counted,
+      );
     }
     let alone = nodes.live();
     let mut fork = map.fork(&mut nodes);
     for n in (0..500u32).step_by(10) {
       let value = n + 1_000;
       counted.put(value);
-      if let Some(replaced) = fork.insert(&mut nodes, format!("d{}/f{n}", n % 7).as_bytes(), value, &mut counted) {
+      if let Some(replaced) = fork.insert(
+        &mut nodes,
+        format!("d{}/f{n}", n % 7).as_bytes(),
+        value,
+        &mut counted,
+      ) {
         counted.freed(replaced);
       }
     }
     let step = |nodes: &mut Nodes<u32>, releasing: &mut Releasing, counted: &mut Counted| {
       let before = nodes.live();
       let more = nodes.release_step(releasing, counted);
-      assert!(before - nodes.live() <= 1, "a step freed more than one node");
+      assert!(
+        before - nodes.live() <= 1,
+        "a step freed more than one node"
+      );
       more
     };
     let mut releasing = fork.releasing();
     while step(&mut nodes, &mut releasing, &mut counted) {}
-    assert_eq!(nodes.live(), alone, "the fork's release freed other than what it alone held");
+    assert_eq!(
+      nodes.live(),
+      alone,
+      "the fork's release freed other than what it alone held"
+    );
     for n in 0..500u32 {
-      assert_eq!(map.get(&nodes, format!("d{}/f{n}", n % 7).as_bytes()), Some(&n));
+      assert_eq!(
+        map.get(&nodes, format!("d{}/f{n}", n % 7).as_bytes()),
+        Some(&n)
+      );
     }
     let mut releasing = map.releasing();
     while step(&mut nodes, &mut releasing, &mut counted) {}
     assert_eq!(nodes.live(), 0);
     assert_eq!(nodes.missing(), 0);
     for (value, held) in &counted.holds {
-      assert_eq!(*held, 0, "value {value} was freed {held} times fewer than it was held");
+      assert_eq!(
+        *held, 0,
+        "value {value} was freed {held} times fewer than it was held"
+      );
     }
   }
 

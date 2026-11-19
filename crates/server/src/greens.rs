@@ -201,7 +201,12 @@ impl Greens {
 
   /// Starts `repository`'s lineage with `root` as its first member, `id`: `root`'s arenas become the lineage's, nothing
   /// copied. A lineage the repository already has is left as it is and the engine handed back.
-  pub fn found(&mut self, repository: RepositoryId, id: VolumeId, root: Green) -> Result<(), Green> {
+  pub fn found(
+    &mut self,
+    repository: RepositoryId,
+    id: VolumeId,
+    root: Green,
+  ) -> Result<(), Green> {
     if self.lineages.contains_key(&repository) || self.contains_key(&id) {
       return Err(root);
     }
@@ -212,7 +217,12 @@ impl Greens {
   }
 
   /// Makes `id` a member of `from`'s lineage at `from`'s `version`, without a walk (`Lineage::branch`).
-  pub fn branch(&mut self, from: &VolumeId, version: u64, id: VolumeId) -> Result<(), LineageRefused> {
+  pub fn branch(
+    &mut self,
+    from: &VolumeId,
+    version: u64,
+    id: VolumeId,
+  ) -> Result<(), LineageRefused> {
     let (repository, source) = *self.members.get(from).ok_or(LineageRefused::Stale)?;
     if self.contains_key(&id) {
       return Err(LineageRefused::Stale);
@@ -228,7 +238,10 @@ impl Greens {
 
   /// Retires member `id` from its lineage: its engine is gone at once, and what it held comes back as a [`Release`] to
   /// step under the shard's budget ([`Greens::release_step`]). `None` when `id` is no member.
-  pub fn retire(&mut self, id: &VolumeId) -> Option<(RepositoryId, Result<Release, LineageRefused>)> {
+  pub fn retire(
+    &mut self,
+    id: &VolumeId,
+  ) -> Option<(RepositoryId, Result<Release, LineageRefused>)> {
     let (repository, handle) = *self.members.get(id)?;
     let lineage = self.lineages.get_mut(&repository)?;
     let retired = lineage.get_mut().retire(handle);
@@ -283,7 +296,11 @@ impl Greens {
 
   /// One step of a retired member's release in `repository`'s lineage: false once it is done, when an emptied lineage
   /// goes too.
-  pub fn release_step(&mut self, repository: RepositoryId, release: &mut Release) -> Result<bool, LineageRefused> {
+  pub fn release_step(
+    &mut self,
+    repository: RepositoryId,
+    release: &mut Release,
+  ) -> Result<bool, LineageRefused> {
     let lineage = self
       .lineages
       .get_mut(&repository)

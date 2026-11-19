@@ -840,10 +840,7 @@ fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_it
   assert_eq!(lineage.reverted(), 1, "the file changed at version 3");
   retire_whole(&mut lineage, branch);
   assert_eq!(lineage.branch(branch, 0), Err(LineageRefused::Stale));
-  assert!(matches!(
-    lineage.retire(branch),
-    Err(LineageRefused::Stale)
-  ));
+  assert!(matches!(lineage.retire(branch), Err(LineageRefused::Stale)));
   let again = lineage.branch(root, 3).unwrap();
   assert_ne!(again, branch, "a reused seat is a new handle");
   assert_eq!(lineage.with(branch, |_| ()), Err(LineageRefused::Stale));

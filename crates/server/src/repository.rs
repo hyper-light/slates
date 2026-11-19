@@ -381,20 +381,22 @@ pub(crate) fn create_branch(
     Ok(version) => version,
     Err(refusal) => return refused(refusal),
   };
-  let require_evidence = state
-    .db
-    .partition()
-    .volume(source)
-    .is_some_and(|volume| {
-      matches!(
-        volume.policy.role,
-        Role::Green {
-          require_evidence: true,
-          ..
-        }
-      )
-    });
-  let made = record_branch(state, principal, (&record, name), (source, version), require_evidence);
+  let require_evidence = state.db.partition().volume(source).is_some_and(|volume| {
+    matches!(
+      volume.policy.role,
+      Role::Green {
+        require_evidence: true,
+        ..
+      }
+    )
+  });
+  let made = record_branch(
+    state,
+    principal,
+    (&record, name),
+    (source, version),
+    require_evidence,
+  );
   let id = match made {
     Ok(id) => id,
     Err(refusal) => return refused(refusal),
@@ -847,10 +849,7 @@ mod tests {
         }
       }
       assert_eq!(state.greens.lineage_nodes(repo), Some(alone));
-      assert_eq!(
-        file(state, root).as_deref(),
-        Some(b"root bytes".as_slice())
-      );
+      assert_eq!(file(state, root).as_deref(), Some(b"root bytes".as_slice()));
     });
   }
 
@@ -959,7 +958,10 @@ mod tests {
       for green in [root, topic, deep] {
         let id = to_db_volume(green);
         assert!(!state.greens.contains_key(&id), "{green:?} served");
-        assert!(state.fenced_greens.contains_key(&id), "{green:?} not fenced");
+        assert!(
+          state.fenced_greens.contains_key(&id),
+          "{green:?} not fenced"
+        );
       }
     });
   }

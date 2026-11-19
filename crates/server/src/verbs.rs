@@ -8343,9 +8343,8 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
   // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
-  let delta = crate::merge_service::with_work_base(state, w, |base| {
-    w.files.declare_delta(base, &volume_op)
-  });
+  let delta =
+    crate::merge_service::with_work_base(state, w, |base| w.files.declare_delta(base, &volume_op));
   let Ok((moved, removed)) = delta else {
     return refused(Refusal::UnknownBase {
       green: to_wire_volume(w.green),
@@ -16556,7 +16555,13 @@ impl GreenReplay {
     state: &ShardState,
     id: DbVolumeId,
     seeded: slates_merge::engine::Green,
-  ) -> Result<GreenReplay, (crate::merge_service::GreenFence, Box<slates_merge::engine::Green>)> {
+  ) -> Result<
+    GreenReplay,
+    (
+      crate::merge_service::GreenFence,
+      Box<slates_merge::engine::Green>,
+    ),
+  > {
     Ok(GreenReplay {
       id,
       phase: chain_phase_or_back(state, id, seeded)?,
@@ -16745,7 +16750,13 @@ fn chain_phase_or_back(
   state: &ShardState,
   id: DbVolumeId,
   seeded: slates_merge::engine::Green,
-) -> Result<GreenReplayPhase, (crate::merge_service::GreenFence, Box<slates_merge::engine::Green>)> {
+) -> Result<
+  GreenReplayPhase,
+  (
+    crate::merge_service::GreenFence,
+    Box<slates_merge::engine::Green>,
+  ),
+> {
   use crate::merge_service::GreenFence;
   // The engine seeded from the origin (the empty engine for a green with no origin, the branched one for a lineage's
   // branch), restored at its checkpoint if it has one, as `Green::restore` does in one call.

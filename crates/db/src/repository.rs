@@ -229,7 +229,11 @@ impl Repositories {
 
   /// A green joins the lineage of a repository that exists, on that repository's partition, once; the lineage's first
   /// member is its root and every other was made from a member of the same lineage (A-575).
-  fn check_joined(&self, record: &MemberRecord, held: impl Fn(VolumeId) -> Held) -> Result<(), DbError> {
+  fn check_joined(
+    &self,
+    record: &MemberRecord,
+    held: impl Fn(VolumeId) -> Held,
+  ) -> Result<(), DbError> {
     let repository = self
       .repository(record.repository)
       .ok_or(DbError::NotFound)?;
@@ -778,8 +782,21 @@ mod tests {
     let [root, first, second, deep] = [1, 2, 3, 4].map(|serial| volume_id(HOME, serial));
     let plain = volume_id(HOME, 5);
     let foreign = volume_id(ELSEWHERE, 6);
-    for (id, green) in [(root, true), (first, true), (second, true), (deep, true), (plain, false), (foreign, true)] {
-      run(&mut partition, &Op::VolumeCreated { record: volume(id, green) }).unwrap();
+    for (id, green) in [
+      (root, true),
+      (first, true),
+      (second, true),
+      (deep, true),
+      (plain, false),
+      (foreign, true),
+    ] {
+      run(
+        &mut partition,
+        &Op::VolumeCreated {
+          record: volume(id, green),
+        },
+      )
+      .unwrap();
     }
     let record = repository(9, "linux");
     let repo = record.id;
@@ -790,29 +807,79 @@ mod tests {
     run(&mut partition, &joined(repo, second, branch(root, 3))).unwrap();
     run(&mut partition, &joined(repo, deep, branch(first, 1))).unwrap();
     let refused = |partition: &mut Partition, op: &Op| run(partition, op).unwrap_err();
-    assert!(matches!(refused(&mut partition, &joined(repo, plain, MemberOrigin::Root)), DbError::NotGreen));
-    assert!(matches!(refused(&mut partition, &joined(repo, root, branch(first, 0))), DbError::AlreadyExists { .. }));
-    assert!(matches!(refused(&mut partition, &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)), DbError::NotFound));
-    assert!(matches!(refused(&mut partition, &joined(repo, foreign, MemberOrigin::Root)), DbError::NotFound));
+    assert!(matches!(
+      refused(&mut partition, &joined(repo, plain, MemberOrigin::Root)),
+      DbError::NotGreen
+    ));
+    assert!(matches!(
+      refused(&mut partition, &joined(repo, root, branch(first, 0))),
+      DbError::AlreadyExists { .. }
+    ));
+    assert!(matches!(
+      refused(
+        &mut partition,
+        &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)
+      ),
+      DbError::NotFound
+    ));
+    assert!(matches!(
+      refused(&mut partition, &joined(repo, foreign, MemberOrigin::Root)),
+      DbError::NotFound
+    ));
     let other = repository(10, "other");
     let other_repo = other.id;
     run(&mut partition, &Op::RepositoryCreated { record: other }).unwrap();
     let spare = volume_id(HOME, 7);
-    run(&mut partition, &Op::VolumeCreated { record: volume(spare, true) }).unwrap();
-    assert!(matches!(refused(&mut partition, &joined(other_repo, spare, branch(root, 0))), DbError::NotFound));
-    run(&mut partition, &joined(other_repo, spare, MemberOrigin::Root)).unwrap();
+    run(
+      &mut partition,
+      &Op::VolumeCreated {
+        record: volume(spare, true),
+      },
+    )
+    .unwrap();
+    assert!(matches!(
+      refused(&mut partition, &joined(other_repo, spare, branch(root, 0))),
+      DbError::NotFound
+    ));
+    run(
+      &mut partition,
+      &joined(other_repo, spare, MemberOrigin::Root),
+    )
+    .unwrap();
     let late = volume_id(HOME, 11);
-    run(&mut partition, &Op::VolumeCreated { record: volume(late, true) }).unwrap();
-    assert!(matches!(refused(&mut partition, &joined(other_repo, late, MemberOrigin::Root)), DbError::AlreadyExists { .. }));
+    run(
+      &mut partition,
+      &Op::VolumeCreated {
+        record: volume(late, true),
+      },
+    )
+    .unwrap();
+    assert!(matches!(
+      refused(
+        &mut partition,
+        &joined(other_repo, late, MemberOrigin::Root)
+      ),
+      DbError::AlreadyExists { .. }
+    ));
     assert_eq!(partition.repositories().branch_floor(root), Some(3));
     assert_eq!(partition.repositories().branch_floor(first), Some(1));
     assert_eq!(partition.repositories().branch_floor(second), None);
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(answers(&rebuilt), answers(&partition));
-    let order: Vec<VolumeId> = partition.repositories().members_of(repo).map(|member| member.green).collect();
+    let order: Vec<VolumeId> = partition
+      .repositories()
+      .members_of(repo)
+      .map(|member| member.green)
+      .collect();
     assert_eq!(order, vec![root, first, second, deep]);
-    assert_eq!(refused(&mut partition, &Op::VolumeDestroyed { id: root }), DbError::BranchedFrom { members: 2 });
-    assert_eq!(refused(&mut partition, &Op::VolumeDestroyed { id: first }), DbError::BranchedFrom { members: 1 });
+    assert_eq!(
+      refused(&mut partition, &Op::VolumeDestroyed { id: root }),
+      DbError::BranchedFrom { members: 2 }
+    );
+    assert_eq!(
+      refused(&mut partition, &Op::VolumeDestroyed { id: first }),
+      DbError::BranchedFrom { members: 1 }
+    );
     run(&mut partition, &Op::VolumeDestroyed { id: deep }).unwrap();
     run(&mut partition, &Op::VolumeDestroyed { id: first }).unwrap();
     assert_eq!(partition.repositories().branch_floor(root), Some(3));
@@ -822,8 +889,16 @@ mod tests {
     assert_eq!(partition.repositories().members_of(repo).count(), 0);
     let mut disordered = partition.to_snapshot(0);
     disordered.repository_members = vec![
-      MemberRecord { repository: repo, green: first, origin: branch(root, 1) },
-      MemberRecord { repository: repo, green: root, origin: MemberOrigin::Root },
+      MemberRecord {
+        repository: repo,
+        green: first,
+        origin: branch(root, 1),
+      },
+      MemberRecord {
+        repository: repo,
+        green: root,
+        origin: MemberOrigin::Root,
+      },
     ];
     assert!(matches!(
       Partition::from_snapshot(&disordered, caps(), 0),
@@ -1026,7 +1101,12 @@ mod tests {
       if !self.repositories.contains_key(&serial) || !self.greens.contains(&green) {
         return Answer::NotFound;
       }
-      if self.lineages.values().flatten().any(|(member, _)| *member == green) {
+      if self
+        .lineages
+        .values()
+        .flatten()
+        .any(|(member, _)| *member == green)
+      {
         return Answer::AlreadyExists;
       }
       let members = self.lineages.get(&serial);
@@ -1039,7 +1119,11 @@ mod tests {
         }
         _ => {}
       }
-      self.lineages.entry(serial).or_default().push((green, origin));
+      self
+        .lineages
+        .entry(serial)
+        .or_default()
+        .push((green, origin));
       Answer::Ok
     }
   }

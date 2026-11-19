@@ -25,6 +25,16 @@
 > piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (g292, A-542's second half) grafts
 > on these maps and needs a per-prefix appearance record under the one history rule. The integration suites, clippy
 > and `xtask` over the change are main's (run requests).
+> **A-575 (2026-11-19):** piece 1 is built: the repository verbs (`CreateRepository`, `CreateBranch`, `BindBranch`,
+> `RetireBranch`; `crates/server/src/repository.rs`) hold a repository's greens in one lineage on its partition
+> (`crates/server/src/greens.rs`, every verb's engine lent through one guard); a member's destroy retires it at once
+> and releases what only it held a node a unit under the shard's slice; memberships are partition records
+> (`MemberRecord`, `Op::RepositoryGreenJoined`) carried by its snapshot and held to the rules by A-515's model test,
+> extended; a recovery rebuilds members the way they joined. Tests on the Mac Studio: `slates-merge --lib`,
+> `slates-db --lib repository`, and `slates-server --lib` with three repository tests (see A-575). Owed: a branch's base
+> as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
+> holds its source's history from its version (today it does, within the source's retention budget); the record's
+> replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
 > (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks

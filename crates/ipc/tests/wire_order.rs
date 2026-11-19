@@ -30,9 +30,9 @@ use slates_ipc::protocol::{
   GrantScope, GrantState, HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache,
   LandingDegradation, LandingStage, MoveRefusal, NamePolicy, ObjectFormat, OwnMountUse,
   PlannedAction, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal,
-  ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass,
-  SnapshotBoundary, TargetPathConstraint, TargetRefusal, UnsupportedReason, VcsTool,
-  Verification, VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
+  ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass, SnapshotBoundary,
+  TargetPathConstraint, TargetRefusal, UnsupportedReason, VcsTool, Verification, VolumeRefusal,
+  WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 

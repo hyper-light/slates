@@ -11272,8 +11272,14 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 **The state's maps, and a green made at another green's version (A-534; §4.17.1 item 4).**
 
 > **Status (2026-11-19, A-534).** Built in the engine: `crates/merge/src/ptrie.rs` (the tree), `crates/merge/src/dims.rs`
-> (the eight maps), `crates/merge/src/engine/branch.rs` (`Lineage`). The server does not yet hold greens in lineages;
-> its repository verbs (§4.17.1 piece 1) are owed, so `CreateGreen { base }` still walks its base.
+> (the eight maps), `crates/merge/src/engine/branch.rs` (`Lineage`).
+>
+> **Status (2026-11-19, A-575).** The server holds a repository's greens in one lineage on the repository's partition
+> (`crates/server/src/greens.rs`): a verb lends a member's engine out of its lineage for one borrow (`Lent`) and every
+> other lend of that lineage meanwhile is refused and counted; a member's destroy retires it at once and gives what
+> only it held back a node a unit under the shard's slice (`Lineage::retire`, `Release`, `repository::run_releases`);
+> a recovery rebuilds members in the order they joined, a branch by branching its source again at its version. A green
+> standing alone is served as before, and `CreateGreen { base }` still walks its base.
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -11438,10 +11444,23 @@ decides the details.
 > **Status (2026-11-19, A-534).** Item 4's engine half is built (§4.16 "The state's maps, and a green made at another
 > green's version"): a green's current values are persistent radix trees, and `Lineage::branch` makes a green whose
 > version 0 is another green's version `v` by forking them and setting back what changed after `v`, O(the changed
-> paths), never a walk. Owed: a repository's greens held in one lineage on their owner shard, a branch made through the
-> register (shared piece 2) and recovered over its source at `v`; a green at a commit that is no version's head (that
-> commit's tree has no state to fork until the object store of piece 3 holds trees); and Subversion's `Copy` on the same
-> maps (§4.17.4, A-542).
+> paths), never a walk. Owed: a branch made through the register (shared piece 2); a green at a commit that is no
+> version's head (that commit's tree has no state to fork until the object store of piece 3 holds trees); and
+> Subversion's `Copy` on the same maps (§4.17.4, A-542).
+>
+> **Status (2026-11-19, A-575).** The repository verbs are built (`crates/server/src/repository.rs`; the wire's
+> `CreateRepository`, `CreateBranch`, `BindBranch`, `RetireBranch`): a repository and its root (a new empty green, or an
+> unbound green of the partition joining as it stands) bound to its default branch; a branch made at a version of
+> another through `Lineage::branch` and bound; a name bound again to a member, which restores a retired branch; a name
+> retired with its green kept (item 5). They route to the partition the repository's name hashes to; they are the
+> owner's until the policy of piece 7; every refusal is typed, and each verb judges what a later record could refuse
+> before its first, since a refused verb's records commit with it. Each member's membership is a record of the
+> partition (`MemberRecord`: its repository, and whether it is the lineage's root or made at which version of which
+> member), carried by the partition's snapshot, held to the rules by a model test, and a recovery rebuilds members the
+> way they joined. A branch can be made only at a version its source's durable checkpoint has not passed, and a live
+> branch keeps its source's checkpoint and history from passing that version (`merge_service::reachable_floor`): what a
+> long-lived branch costs its source is that history, bounded by the source's retention budget. Owed: a branch's base
+> recorded as a delta against its source's checkpoint, which ends both.
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -11692,8 +11711,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 **Pieces that follow (shared, in order).** Each is one piece with its own tests.
 1. The repository record and its namespace; green ids carrying the repository's partition (built, A-515: the
    record, the namespace and their rules in the metadata database); a green made at another green's version, or at one
-   commit's tree, without walking it (built in the engine at another green's version, A-534: persistent maps and
-   `Lineage::branch`, §4.16; at a commit that is no version's head, owed with piece 3's trees; the verbs, owed).
+   commit's tree, without walking it (built at another green's version: A-534's persistent maps and `Lineage::branch`
+   in the engine, §4.16, and A-575's verbs over one lineage a repository on its partition, recovered from the log and
+   the snapshot; at a commit that is no version's head, owed with piece 3's trees).
 2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
    recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
@@ -37655,3 +37675,60 @@ paths), `crates/merge/src/engine/branch.rs` and `branch/tests.rs` (new: `Lineage
   a green at a commit that is no version's head (piece 3's trees); and §4.17.4's `Copy` (g292, A-542's second half),
   which grafts with `subtree` and `graft` on these maps and needs a per-prefix appearance record under the one history
   rule (a grafted key has no history, and must not read as present before the copy).
+
+### A-575 — A repository's greens are one lineage on its partition: the repository verbs, a member lent for one borrow, a member's release sliced, and memberships recovered from the log and the snapshot (2026-11-19, g261 for UI goal 91; §4.17.1 items 1 to 5 and shared piece 1's last part; §4.16 "The state's maps"; D-28; A-515, A-534)
+Applied in the same change to: §4.16 (the subsection's status), §4.17.1 (a status block, the pieces list's item 1), GAPS
+(the §4.17 entry), `crates/merge/src/ptrie.rs` (`Releasing`, `Nodes::release_step`), `crates/merge/src/dims.rs`
+(`GreenRelease`, `Arenas::release_step`), `crates/merge/src/engine/branch.rs` (`Lineage::take`, `put_back`, `create`,
+`retire` returning a `Release`, `release_step`, `len`; `Lent`; `LineageRefused::Busy`) and its tests,
+`crates/db/src/{catalog,op,error,partition,repository}.rs` (`MemberOrigin`, `MemberRecord`, `Op::RepositoryGreenJoined`,
+`DbError::BranchedFrom`, the snapshot's `repository_members`), `crates/db/tests/wire_order.{rs,txt}`,
+`crates/ipc/src/protocol.rs` (`CreateRepository`, `CreateBranch`, `BindBranch`, `RetireBranch`, `VcsTool`, `ObjectFormat`),
+`crates/ipc/tests/wire_order.{rs,txt}`, `crates/server/src/{greens,repository}.rs` (new), and the server's readers of an
+engine (`state`, `daemon`, `verbs`, `merge_service`, `checkout`, `listing`, `error`).
+- **What was there.** A-534 built the engine's lineage and `Lineage::branch`; A-515 the repository record and its
+  namespace. Nothing created a repository or held its greens together: the server kept every engine alone
+  (`ShardState::greens`, an ordered map).
+- **The verbs.** `CreateRepository` records the repository and its lineage's root (a new empty green, or an unbound green
+  of the partition, which joins as it stands, O(1)) bound to its default branch; `CreateBranch` makes a member at a
+  version of a branch (its head when none) through `Lineage::branch` and binds its name; `BindBranch` binds a name to a
+  member no name binds (restoring a retired branch); `RetireBranch` lets a name go and keeps its green (§4.17.1 item 5).
+  They route to the partition the repository's name hashes to, as a create by name does; they are the owner's until
+  piece 7's policy. A refused verb's records commit with its refusal, so each verb judges, with the partition's own
+  guard, whatever a later record could refuse before its first.
+- **One way to reach an engine.** `ShardState::greens` is `crate::greens::Greens`: lone engines, and each repository's
+  lineage in a cell. Every reader and writer of an engine goes through `get` or `get_mut`, whose guards dereference to
+  the engine: a member is lent out of its lineage with the arenas in it (`Lent`) and goes back when the guard is
+  dropped; a second lend of the same lineage meanwhile is refused and counted (`Greens::busy_lends`), never undefined.
+  The guard lives to the end of its scope, so the verbs that read an engine and then write the shard's state read in a
+  block or through `merge_service::with_work_base`.
+- **The retire, sliced.** A member's destroy (the green's own destroy verb) retires it from its lineage at once, its
+  handle stale, and queues what only it held; one task the first queued release starts gives the holds back a node a
+  unit under the shard's slice (`image::sliced`), as `carry` slices its walk. A green other live members were made from
+  refuses its destroy, typed `Volume { Pinned }`, as a snapshot its clones pin.
+- **Recovery.** Each member's membership is a partition record (`MemberRecord`: root, or made at version `v` of member
+  `m`), applied by the guard's rules (one root a lineage; a branch made from a member of the same lineage that joined
+  before it), carried by the partition's snapshot in join order and refused `Corrupt` out of it. A recovery rebuilds
+  members in join order: the root from its own origin and chain into a new lineage, a branch by branching its source
+  again at `v` and replaying its own checkpoint and chain over that engine, which goes back to its lineage whatever the
+  replay finds. A branch whose source is not here at `v` is fenced `SourceUnavailable`, never served.
+- **The bound.** A branch can be made only at a version its source's durable checkpoint has not passed (`UnknownBase`
+  otherwise: a recovery could not branch there again), and a live branch keeps its source's checkpoint and in-memory
+  fold at or below the oldest version it was made at (`Repositories::branch_floor` in `merge_service::reachable_floor`).
+  So a long-lived branch holds its source's history from its version, within the source's retention budget, whose
+  typed refusal is the bound. Owed: a branch's base recorded as a delta against its source's checkpoint (the keys
+  changed between them and their values at `v`, which `Lineage::branch` computes anyway), which ends both limits.
+- **Tests and evidence** (the Mac Studio, 2026-11-19, debug, fresh clones of the branch). `cargo test -p slates-merge
+  --lib` 26 of 26 (four new: a release a node a step frees what its map alone held; a member taken out holds the arenas
+  and every other lend waits, `Busy`; a retired branch gives back a node a step and frees only what it alone held; an
+  empty member joins with nothing); `cargo test -p slates-db --lib repository` 4 of 4 (A-515's model test extended
+  with roots, branches at versions and the destroy guard, every lineage's members and every green's branch floor
+  compared whole, and rebuilt from the snapshot after every step; a deterministic test of every join refusal and a
+  disordered snapshot refused `Corrupt`); `cargo test -p slates-server --lib` 509 passed, 3 ignored, the three new
+  repository tests among them (the verbs and each wrong verb refused by its kind; a destroyed branch released a node a
+  unit with its source pinned until then; a recovery rebuilding every member the way it joined, the root's checkpoint
+  held at the branch's version, and a corrupt root fencing every member made from it); `cargo fmt --all` clean. Failing
+  first, on the clone with one rule taken out each time: the branch floor (the recovery test fails), the destroy guard
+  (the database's lineage and model tests and the server's destroy test fail), the release a node a unit (both stepped
+  release tests fail), and a member's lend (all three server tests fail). The integration suites, clippy, `xtask`, the
+  wire-order tests and the other targets are main's (run requests).
