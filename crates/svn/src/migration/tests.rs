@@ -9,9 +9,12 @@
 //!   keeping the revisions before it and nothing of the refused one.
 //! - `generated`: generated histories written as dumps, imported, held to the model tree they were made from in every
 //!   revision, then exported, imported again and exported again to the same history and bytes.
+//! - `step`: the commit step every revision takes (A-655): a revision checked then applied, all of it or none, each
+//!   refusal leaving the records as they were, and the same revisions committed again reaching the same records.
 
 mod generated;
 mod golden;
 mod refusals;
 mod rules;
+mod step;
 mod support;

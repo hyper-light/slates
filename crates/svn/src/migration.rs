@@ -7,15 +7,18 @@
 //! **The records** ([`Repository`]): what a Subversion repository slates serves is made of, as these verbs read and
 //! write it: the Subversion index (A-553), every node-revision computed from each revision's changed-path rows; each
 //! revision's properties; every text and property list held once by its content identity (BLAKE3, the identity the
-//! green and the shared object store name content by, §4.11, A-581); and the repository's UUID. A repository
+//! green and the shared object store name content by, §4.11, A-581); the lock table (A-602); and the repository's
+//! UUID. Every revision, an import's or a client's, is committed by one step ([`Repository::check`], then
+//! [`Repository::apply`]; A-655). A repository
 //! `CreateRepository` made (A-575) starts as [`Repository::new`] leaves one: revision 0, an empty root, `svn:date`.
 //!
 //! **Import** ([`Importer`]) reads a dump through A-593's reader as its bytes arrive and makes each revision as FSFS
 //! makes it through `load-fs-vtable.c`: a transaction on the youngest revision, each record's action applied to it
 //! (a copy from the revision the dump names, a replacement a deletion and an addition), the properties set whole or
 //! changed, the text set whole or a delta applied to its base, every checksum the stream carries checked (the text's,
-//! a delta's base's, a copy source's), then the transaction's changed paths appended to the index as one revision with
-//! the stream's revision properties. The history keeps its revision numbers: a stream continues the repository's
+//! a delta's base's, a copy source's), then the transaction's changed paths committed as one revision with the
+//! stream's revision properties, through the commit step a client's commit takes ([`Repository::commit`], A-655). The
+//! history keeps its revision numbers: a stream continues the repository's
 //! history (revision 0 into an empty repository, else the revision after the youngest), so a dump made in parts loads
 //! part after part; the UUID record names the repository, set into one that holds no revision and refused when it
 //! names another. Properties are kept byte for byte, as the repository held them.
@@ -40,7 +43,7 @@
 mod export;
 mod import;
 mod paths;
-mod properties;
+pub(crate) mod properties;
 mod records;
 
 #[cfg(test)]
@@ -48,8 +51,9 @@ mod tests;
 
 pub use export::{Exporter, Exporting};
 pub use import::{Importer, Importing};
-pub use records::{Properties, Repository, Room};
+pub use records::{Checked, Properties, Repository, Room};
 
+use crate::commit::revision::StepRefusal;
 use crate::dump::{Digest, DumpError, Uuid};
 use crate::index::{IndexRefusal, Revision};
 use crate::svndiff::SvndiffError;
@@ -198,6 +202,24 @@ const SVN_ERR_REPOS_BAD_ARGS: u32 = 165_004;
 /// `SVN_ERR_CHECKSUM_MISMATCH`.
 /// Format: the miscellaneous category's start, 200,000, plus 14 (`svn_error_codes.h`).
 const SVN_ERR_CHECKSUM_MISMATCH: u32 = 200_014;
+
+impl From<StepRefusal> for MigrationRefusal {
+  /// An import's revision refused by the commit step (A-655): the index's and the room's refusals as the import's
+  /// own; a repository that moved past the revision's head as a revision that no longer continues its history; and
+  /// what an import's revision cannot meet (a lock entry, a content it does not bring, a date it does not make) as
+  /// records that do not hold together.
+  fn from(refusal: StepRefusal) -> Self {
+    match refusal {
+      StepRefusal::Index(refusal) => Self::Index(refusal),
+      StepRefusal::Room { needed, room } => Self::Room { needed, room },
+      StepRefusal::OutOfDate { head, youngest } => Self::OutOfSequence {
+        expected: youngest.saturating_add(1),
+        found: head.saturating_add(1),
+      },
+      StepRefusal::Lock(_) | StepRefusal::Corrupt | StepRefusal::Date { .. } => Self::Corrupt,
+    }
+  }
+}
 
 impl MigrationRefusal {
   /// The number of the Subversion error the same refusal is in Subversion's own load or dump.
