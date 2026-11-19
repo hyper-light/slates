@@ -1598,12 +1598,8 @@ fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &st
     gid: 0,
     gids: Vec::new(),
   };
-  exchange(
-    port,
-    &umnt_call(1, &caller, &format!("/{name}")),
-    Duration::from_secs(5),
-  )
-  .expect("the daemon answers the forged UMNT");
+  exchange(port, &umnt_call(1, &caller, &format!("/{name}")))
+    .expect("the daemon answers the forged UMNT");
   // Watched past the daemon's confirmation deadline (one liveness budget), with room for a loaded box:
   // the attachment must hold the whole time.
   let watch_until = Instant::now() + FORGED_UNMOUNT_WATCH;

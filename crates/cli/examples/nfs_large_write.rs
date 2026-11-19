@@ -484,7 +484,7 @@ mod unix {
       gid: 0,
       gids: Vec::new(),
     };
-    let root = fetch_root_handle(port, &caller, &path, WAIT).unwrap().0;
+    let root = fetch_root_handle(port, &caller, &path).unwrap().0;
     let mut client = Rpc::connect(port);
     // One transfer of bytes that are not all alike, as a real file's are.
     let data: Vec<u8> = (0..TRANSFER)
