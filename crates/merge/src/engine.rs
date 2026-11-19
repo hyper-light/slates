@@ -2127,6 +2127,32 @@ impl Green {
     self.dirs.contains_key(path)
   }
 
+  /// The files and directories beneath `path` at the head, each with whether it is a directory, deepest first, `path`
+  /// itself not among them (A-655 part 2b): what a Subversion deletion names, since a node-exclusive removal of a
+  /// directory needs the same increment to empty it (`merge_rmdir`), and a tree a copy grafted is listed as the head
+  /// holds it. It walks the keys beneath `path` alone; the root's tree is every key.
+  pub fn beneath(&self, path: &str) -> Vec<(String, bool)> {
+    let prefix = if path.is_empty() {
+      String::new()
+    } else {
+      format!("{path}/")
+    };
+    let mut found: Vec<(String, bool)> = self
+      .content
+      .prefix(&prefix)
+      .map(|(file, _)| (file, false))
+      .chain(
+        self
+          .dirs
+          .prefix(&prefix)
+          .map(|(directory, _)| (directory, true)),
+      )
+      .filter(|(found, _)| !found.is_empty())
+      .collect();
+    found.sort_by(|left, right| right.0.cmp(&left.0));
+    found
+  }
+
   /// IPC aliases share the primary inode's metadata; no independent value is stored at an alias.
   fn metadata_path<'a>(&'a self, path: &'a str) -> &'a str {
     self
