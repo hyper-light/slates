@@ -1,5 +1,6 @@
 //! Tests of the daemon's HTTP edge (A-625 part 3): a daemon in-process starts it from its configuration, and a rustls
-//! client over loopback TLS asks for a repository another shard's partition holds, with each kind of credential.
+//! client over loopback TLS asks for a repository another shard's partition holds, with each kind of credential; and
+//! pushes to it the bytes stock git sent (A-654 part 3).
 
 use std::io::{Read, Write};
 use std::net::TcpStream as ClientStream;
@@ -10,7 +11,14 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use slates_db::HostId;
 use slates_db::catalog::Principal;
-use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, ReplyBody, RequestBody, VcsTool};
+use slates_git::http::{self, Service, Version};
+use slates_git::object_name::{ObjectFormat as GitFormat, ObjectId};
+use slates_git::pktline::{self, Packet};
+use slates_git::receive::{Advertised, write_advertisement};
+use slates_ipc::protocol::{
+  CredentialMaterial, ObjectFormat, PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+  ReplyBody, RequestBody, VcsTool,
+};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::config::{EdgeIdentity, VcsHttpConfig};
@@ -183,6 +191,11 @@ fn status_of(
   stream
     .write_all(request.as_bytes())
     .expect("the request is sent");
+  status_in(&head_of(&mut stream))
+}
+
+/// The head of the answer `stream` carries, read a byte at a time through its blank line.
+fn head_of(stream: &mut impl Read) -> String {
   let mut head = Vec::new();
   let mut byte = [0u8; 1];
   while !head.ends_with(b"\r\n\r\n") {
@@ -191,12 +204,82 @@ fn status_of(
       other => panic!("the answer's head ended early ({other:?}): {head:?}"),
     }
   }
-  let line = String::from_utf8_lossy(&head).into_owned();
-  line
+  String::from_utf8_lossy(&head).into_owned()
+}
+
+/// The status `head`'s status line names.
+fn status_in(head: &str) -> u16 {
+  head
     .split(' ')
     .nth(1)
     .and_then(|code| code.parse().ok())
-    .unwrap_or_else(|| panic!("no status line: {line:?}"))
+    .unwrap_or_else(|| panic!("no status line: {head:?}"))
+}
+
+/// One line of `stream`, its CRLF dropped.
+fn line_of(stream: &mut impl Read) -> String {
+  let mut line = Vec::new();
+  let mut byte = [0u8; 1];
+  while !line.ends_with(b"\r\n") {
+    match stream.read(&mut byte) {
+      Ok(1) => line.push(byte[0]),
+      other => panic!("a line ended early ({other:?}): {line:?}"),
+    }
+  }
+  line.truncate(line.len().saturating_sub(2));
+  String::from_utf8_lossy(&line).into_owned()
+}
+
+/// The data of a chunked body (RFC 9112 §7.1) read from `stream` through its last chunk and its trailer section.
+fn chunks_of(stream: &mut impl Read) -> Vec<u8> {
+  let mut body = Vec::new();
+  loop {
+    let line = line_of(stream);
+    let size = line.split(';').next().unwrap_or_default().trim();
+    let size =
+      usize::from_str_radix(size, 16).unwrap_or_else(|_| panic!("no chunk size: {line:?}"));
+    if size == 0 {
+      while !line_of(stream).is_empty() {}
+      return body;
+    }
+    let mut chunk = vec![0; size];
+    stream.read_exact(&mut chunk).expect("a chunk's data");
+    body.extend(chunk);
+    assert_eq!(line_of(stream), "", "a chunk's data ends its line");
+  }
+}
+
+/// The answer of the edge on `port`, trusting `certificate`, to `method target` with `fields` and `body` (sent with its
+/// length), on a new TLS connection: its status and its body, de-chunked (none for an answer that is not chunked).
+fn answer_of(
+  (port, certificate): (u16, &CertificateDer<'static>),
+  (method, target): (&str, &str),
+  fields: &[&str],
+  body: &[u8],
+) -> (u16, Vec<u8>) {
+  let mut stream = tls_client(port, certificate);
+  let mut request = format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\n");
+  for field in fields {
+    request.push_str(field);
+    request.push_str("\r\n");
+  }
+  if !body.is_empty() {
+    request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+  }
+  request.push_str("\r\n");
+  let mut sent = request.into_bytes();
+  sent.extend_from_slice(body);
+  stream.write_all(&sent).expect("the request is sent");
+  let head = head_of(&mut stream);
+  let chunked = head
+    .to_ascii_lowercase()
+    .contains("transfer-encoding: chunked");
+  let body = if chunked {
+    chunks_of(&mut stream)
+  } else {
+    Vec::new()
+  };
+  (status_in(&head), body)
 }
 
 /// The edge's counts on partition `partition`'s shard.
@@ -259,4 +342,168 @@ fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_th
   assert_eq!(answers, [503, 503, 401, 401, 403]);
   assert_eq!(listener, (3, 1, 1), "moves, no credentials, expired");
   assert_eq!(repository, (3, 1, 2), "arrivals, forbidden, unavailable");
+}
+
+/// Format: the content type of receive-pack's requests (gitprotocol-http), as stock git sends it.
+const RECEIVE_REQUEST: &str = "Content-Type: application/x-git-receive-pack-request";
+/// Format: stock git 2.50.1's push creating `main` in an empty repository, as `make-push-fixtures.sh` captured it
+/// (`crates/git/fixtures/push`): its commands, then its pack.
+const CREATE_REQUEST: &[u8] = include_bytes!("../../../../git/fixtures/push/create.request.bin");
+/// Format: what `git receive-pack` answered that push: its advertisement of no ref, then its report.
+const CREATE_RESPONSE: &[u8] = include_bytes!("../../../../git/fixtures/push/create.response.bin");
+/// Format: the agent the captured server advertised.
+const GITS_AGENT: &[u8] = b"git/2.50.1-Darwin";
+/// Format: the commit that push made `main`.
+const FIRST: &str = "b1fac94f2ed5e3cb5850e4b5f89d23fce635601e";
+/// Format: the zero id, a delete's new value.
+const ZERO: &str = "0000000000000000000000000000000000000000";
+/// Format: the capabilities stock git 2.50.1 sends on a push's first command (the fixtures' requests).
+const CAPABILITIES: &str =
+  " report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.50.1-Darwin";
+/// Format: the report line of a delete git refuses as `receive.denyDeletes` refuses one.
+const DELETION_PROHIBITED: &[u8] = b"ng refs/heads/main deletion prohibited";
+
+/// The object `hex` names, in SHA-1.
+fn named(hex: &str) -> ObjectId {
+  ObjectId::from_hex(GitFormat::Sha1, hex.as_bytes()).expect("an id")
+}
+
+/// receive-pack's advertisement of `refs` by a server advertising push options when `push_options`, under `agent`.
+fn receive_advertisement(refs: &[(ObjectId, &[u8])], push_options: bool, agent: &[u8]) -> Vec<u8> {
+  let advertised = Advertised {
+    format: GitFormat::Sha1,
+    atomic: true,
+    ofs_delta: true,
+    push_options,
+    session_id: None,
+    agent,
+  };
+  let mut out = Vec::new();
+  write_advertisement(refs, &advertised, &mut out).expect("an advertisement");
+  out
+}
+
+/// What the daemon's site answers receive-pack's advertisement with at protocol v0: the `# service=` prelude, then the
+/// push driver's advertisement of `refs` (this server's agent, no push options).
+fn served_advertisement(refs: &[(ObjectId, &[u8])]) -> Vec<u8> {
+  let mut out = Vec::new();
+  http::advertisement_prelude(Service::ReceivePack, Version::V0, &mut out).expect("a prelude");
+  out.extend(receive_advertisement(
+    refs,
+    false,
+    slates_git::upload::AGENT.as_bytes(),
+  ));
+  out
+}
+
+/// git's report to the `create` push: what `git receive-pack` wrote after its advertisement.
+fn gits_create_report() -> &'static [u8] {
+  let advertisement = receive_advertisement(&[], true, GITS_AGENT);
+  CREATE_RESPONSE
+    .strip_prefix(advertisement.as_slice())
+    .expect("git's advertisement first")
+}
+
+/// A push request deleting `main` at [`FIRST`], as stock git sends one: its command, then a flush and no pack.
+fn delete_of_main() -> Vec<u8> {
+  let line = format!("{FIRST} {ZERO} refs/heads/main\0{CAPABILITIES}");
+  let mut out = Vec::new();
+  pktline::write(Packet::Data(line.as_bytes()), &mut out).expect("a command");
+  pktline::write(Packet::Flush, &mut out).expect("a flush");
+  out
+}
+
+/// The owner's bearer credential.
+fn owner_bearer() -> String {
+  format!("Authorization: Bearer {OWNER_TOKEN}")
+}
+
+/// receive-pack's advertisement of repository `name` as the edge answers the owner: its status and body.
+fn advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16, Vec<u8>) {
+  let target = format!("/{name}/info/refs?service=git-receive-pack");
+  answer_of(edge, ("GET", &target), &[&owner_bearer()], &[])
+}
+
+/// `request` pushed to repository `name` by its owner as stock git posts it: the answer's status and body.
+fn pushed(edge: (u16, &CertificateDer<'static>), name: &str, request: &[u8]) -> (u16, Vec<u8>) {
+  let target = format!("/{name}/git-receive-pack");
+  answer_of(
+    edge,
+    ("POST", &target),
+    &[&owner_bearer(), RECEIVE_REQUEST],
+    request,
+  )
+}
+
+/// Sets repository `name`'s policy, from its first version, to a rule denying everyone the deletion of `main`.
+fn deny_deletion(daemon: &Daemon, name: &str) {
+  let name = name.to_owned();
+  let reply = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::SetRepositoryPolicy {
+        repository: name.clone(),
+        read: 0,
+        rules: vec![PolicyRule {
+          names: PolicyNames::Refs,
+          pattern: "refs/heads/main".to_owned(),
+          right: PolicyRight::Delete,
+          effect: PolicyEffect::Deny,
+          who: PolicyWho::Anyone,
+        }],
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+      },
+    )
+  });
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// Asserts that `answer` is `200` with a report refusing `main`'s deletion as git refuses it.
+fn assert_deletion_prohibited(answer: &(u16, Vec<u8>)) {
+  let (status, report) = answer;
+  assert_eq!(*status, 200, "{}", String::from_utf8_lossy(report));
+  assert!(
+    report
+      .windows(DELETION_PROHIBITED.len())
+      .any(|line| line == DELETION_PROHIBITED),
+    "{}",
+    String::from_utf8_lossy(report)
+  );
+}
+
+/// A-654 part 3 (§4.17.2 "A push" and "Transports" item 1; gitprotocol-http's smart service; golden vectors: stock git
+/// 2.50.1's `create` push, captured by `make-push-fixtures.sh`). Do: start a two-shard daemon whose edge serves loopback
+/// TLS; create a git repository on the second shard's partition and enroll its owner's token; then, each on a new
+/// connection with the owner's bearer token, ask for receive-pack's advertisement, POST the request stock git sent to
+/// create `main`, ask for the advertisement again, set a policy denying `main`'s deletion, POST a delete of `main`, and
+/// ask for the advertisement once more. Expect: the first advertisement `200`, the `# service=` prelude and then no ref
+/// under this server's capabilities; the push `200`, its body the very report `git receive-pack` wrote; the second
+/// advertisement `main` at the pushed commit; the delete `200`, refused `deletion prohibited` in git's words; `main`
+/// still advertised at the pushed commit.
+#[test]
+fn a_stock_git_push_over_the_daemons_edge_lands_through_the_push_driver() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let before = advertised(edge, &name);
+  let created = pushed(edge, &name, CREATE_REQUEST);
+  let after = advertised(edge, &name);
+  deny_deletion(&daemon, &name);
+  let deleted = pushed(edge, &name, &delete_of_main());
+  let last = advertised(edge, &name);
+  daemon.stop();
+  let main = [(named(FIRST), b"refs/heads/main".as_slice())];
+  assert_eq!(before, (200, served_advertisement(&[])));
+  assert_eq!(created, (200, gits_create_report().to_vec()));
+  assert_eq!(after, (200, served_advertisement(&main)));
+  assert_deletion_prohibited(&deleted);
+  assert_eq!(last, after);
 }
