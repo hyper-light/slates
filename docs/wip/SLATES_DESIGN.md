@@ -11368,7 +11368,8 @@ it). Fast path: if `last_changed[path] <= base` for every path in the increment,
 node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
 Subversion client's commit needs. A `Copy` (A-586) is always judged so, as an addition: its destination's tree must be
-absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies. One that
+absent at the head and unchanged after the base, and its source's tree must have held something at the version it
+copies, a source changed since being copied as it stood then (A-626 part 2). One that
 replaces (A-626, `REPLACE`) is judged as its destination tree's removal with that addition: the tree unchanged after the
 base and holding no hard link nor any link's target. A copy into another copy's tree in the same increment is judged
 against what that copy brings there.
@@ -11604,6 +11605,11 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > "Copies" bullet below); with them, three defects of A-586's branch made before a copy, which A-626's oracle found.
 > Owed (the A-626 entry): a copy from a version its source changed after, a checkpoint of a green holding a copy, and a
 > rebase that restates one.
+>
+> **Status (2026-11-19, A-626 part 2).** Built in the engine: a copy from a version its source changed after, brought as
+> the tree stood then (the head's graft fixed by what the change index names since, the fix recorded whole in the chain
+> entry, its room derived before the verdict and added to the entry's bound by the service). Owed: a checkpoint of a
+> green holding a copy, and a rebase that restates one (the A-626 part 2 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -11622,8 +11628,10 @@ which of its pending paths green has moved under (awareness, never load-bearing)
   origin therefore records no history for the origin's keys (until 2026-11-19 each had a version-0 entry, which held
   every origin file's bytes a second time), and a green made at another's version starts with none.
 - **Copies (A-586).** `Copy` copies a path's tree at a version (Subversion's copy-from revision) to an absent
-  destination, by reference in every map, when the source's tree did not change after that version, so the head's tree
-  is the version's. It is recorded once, never key by key: an appearance record at the destination (the version, the
+  destination, by reference in every map: the head's tree, which is the version's when the source did not change after
+  it, and otherwise is fixed to the version's (A-626 part 2: each key the change index names since set to its value
+  then, a copy made since inside the source cut, nothing grafted when one made since replaced it; the fix recorded whole
+  in the chain entry, its room derived before the verdict). It is recorded once, never key by key: an appearance record at the destination (the version, the
   source, the source's version), one entry of the change index and one `last_changed` entry for the destination, which
   stands for its tree. A key reads by the latest copy above it while it holds what that copy gave it (its own last
   change, if any, is older): its current value from the copy's version on, its own history before. Its first change
@@ -13661,6 +13669,10 @@ and export by landing).
 > a stock client's commit holding either is no longer refused. Owed (the A-626 entry): a copy from a version its source
 > changed after, a checkpoint of a green holding a copy, and a rebase restating one.
 >
+> **Status (2026-11-19, A-626 part 2).** Built: a copy from a version its source changed after (`svn cp ^/trunk@N` with
+> the trunk changed since, as FSFS takes it), brought as the tree stood then, recorded whole in its chain entry with the
+> room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
+>
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
 > writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
@@ -13798,6 +13810,17 @@ and export by landing).
 > asks for; the facts' revision as `dav_svn__get_safe_cr` gives it (A-616's facts carry `svn_fs_node_created_rev`'s,
 > which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
 > Apache with `mod_dav_svn`.
+>
+> **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
+> connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
+> `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
+> before every call (`abort-edit`, then 210004 "Successful edit status returned too soon" or the client's errors);
+> `close-edit`'s answer read (`( success ( ) )`, or `abort-edit` and the client's errors written back as
+> `svn_ra_svn__handle_failure_status` reads them); a drive's refusal answered with its error and the client's after
+> it. Held to every recorded report command replayed whole against `svnserve`'s bytes (34 sessions), an early answer
+> before each of a checkout's calls, fourteen answers to `close-edit`, any budget and any cut; red six ways. Owed: the
+> server's connection task that runs it (piece 7's), the deltas of changed texts (A-652's generator), and a recorded
+> session of copy sources.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -14288,8 +14311,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
    A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation built,
    A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; the replace with history
-   and copies nested in one increment built, A-626 part 1; owed: the checkpoint, the rebase, and a copy from a changed
-   source's older version).
+   and copies nested in one increment built, A-626 part 1; a copy from a changed source's older version built, A-626
+   part 2; owed: the checkpoint and the rebase).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -44439,9 +44462,7 @@ the readers' ties, the reservations), `crates/merge/src/engine/branch.rs` (the r
     source, 34 keys changed beneath a copy, 31 replaces, 34 nested pairs (4 with an inner replace), 29 moves.
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
 - **Owed** (A-626's later parts):
-  - a copy from a version its source changed after (part 2): the source's changes since set back at the destination,
-    recorded in the chain entry so replay reads no folded history, reserved before the verdict, with room in the
-    server's entry bound (`crates/server/src/verbs.rs`, computed from the increment alone);
+  - a copy from a version its source changed after (part 2): built as A-626 part 2 (its entry);
   - a checkpoint of a green holding a copy (part 3): its copies and the identity's sum carried;
   - a rebase restating a copy (part 4): the deriver's `VolumeOp::Copy`.
 
@@ -45196,6 +45217,123 @@ Applied in the same change to:
 
   Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
   removal of `TARGET`, which left `h` a link naming nothing.
+
+### A-616, continued (3) — One report command's exchange on an ra_svn connection (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/exchange.rs` and its
+tests, new; `report.rs`'s `Context` gains the caller's `most_open` and `Refused` an `Editor` refusal;
+`report/drive.rs`'s `Sources` public; the fixtures' green and the drives' shared form in `report/drive/green.rs`).
+
+- **The exchange** (`report::exchange`; `serve.c` `accept_report`, `editorp.c`, `marshal.c` at `d434dc14`, 1.15.0
+  alike): `Exchange::begin` answers the command (part 1's `Reporter`), `receive` reads the report, then writes the
+  drive's calls through the editor writer until the caller's room is used or the drive's steps are spent
+  (`Turn::Wrote`), at least one call a turn. Before every call but `close-edit` and `abort-edit` (and an absent entry
+  not sent) it looks for the client's answer, as `check_for_error` does: one there is answered `abort-edit`, read, and
+  the command fails with 210004 "Successful edit status returned too soon" after a success, else with the client's
+  errors. `close-edit`'s answer ends the command with `( success ( ) )`, or with `abort-edit` and the client's errors
+  written back; a drive's refusal is answered with its own error and the client's after it
+  (`svn_error_compose_create`).
+- **The client's errors** as `svn_ra_svn__read_cmd_response` and `svn_ra_svn__handle_failure_status` read them: read
+  from the last back, a command-error wrapper (210000) dropped, the number kept as an `apr_status_t` (its low 32 bits,
+  sign-extended when written back), message and file read as C strings; "Empty error list", "Malformed error list",
+  "Malformed network data" and "Unknown status '…' in command response" (210004 each) for the shapes it refuses.
+- **Where it differs from `svnserve`**, in when and what, never in what a stock client reads: it looks for an early
+  answer before every command, where `svnserve` looks after 4,096 bytes written or a flush (`error_check_interval`,
+  `svnserve.c` 801), so it notices one no later; an answer that is no item, or nested past three lists, ends the
+  connection, where `svnserve` reads 64 levels and refuses the command; an error the client sent without a message is
+  written back without one, where `svnserve` writes `svn_strerror`'s text.
+- **Tests.** Every recorded session with a report command (34; the malformed one's connection ends unflushed) replayed
+  from its command, the client's answer handed over only once asked, as a stock client sends it: `svnserve`'s items
+  before and after the drive byte for byte, its drive call for call in the shared form; an early success and an early
+  failure after each of a checkout's calls; fourteen answers to `close-edit`; a drive's refusal with and without the
+  client's errors; answers past the bounds; one byte and one step a turn, and the report cut at every byte, writing
+  alike. `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: red first (`receive` refusing at
+  once: 6 of 6 failed), then 371 of 371; red five more ways by mutation (the early check dropped, wrappers kept, the
+  client's errors dropped after a refusal, C strings uncut, the list read from the front), each caught; rustfmt's
+  layout from the Studio.
+- **Owed** (GAPS): the server's connection task that runs an exchange (piece 7's, with `get-latest-rev` and the other
+  reads); the deltas of changed texts through A-652's generator; a recorded session asking for copy sources.
+
+### A-626 part 2 — A copy from a version its source changed after brings the tree as it stood then: the head's graft fixed by what the change index names since, the fix recorded whole in the chain entry, its room derived before the verdict (2026-11-19, g295 for UI goal 93; §4.16 "The state's maps" and "The verdict", §4.17.4 item 3 and piece 3; A-586, A-626 part 1)
+Applied in the same change to: §4.16 (a status block, the verdict's sentence on `Copy`, the "Copies" bullet), §4.17.4
+(a status block, piece 3), the A-626 part 1 entry (its owed list), GAPS (the §4.17.4 entry),
+`crates/merge/src/chain_entry.rs` (`CopyFix`, `COPY_TREE_FIXED`, `fix_bytes`), `crates/merge/src/engine/copy.rs`
+(`copy_fix`, `SourceAt`, `copy_entry_room`, `EntryCopies`, the fix's commit), `crates/merge/src/engine.rs`
+(`Effect::CopyTree`'s fix, the verdict's fixes, replay), `crates/merge/src/dims/copy.rs` and `crates/merge/src/ptrie.rs`
+(`count_tree`, `Ptrie::prefix_len`), `crates/server/src/verbs.rs` (the entry's bound), and the tests
+(`engine/copy_tests.rs`, `chain_entry.rs`).
+- **What was there.** A copy whose source's tree changed after the version it names was refused (`RenameRename`). FSFS
+  takes it, since a node-revision is kept whole forever: `svn cp ^/trunk@100 ^/branches/old` with the head at 5,000, a
+  working copy's `svn cp -r 100`, a merge or a revert that restores an old tree.
+- **How the tree at the version is built.** The maps hold the head; the histories hold the rest; and the change index
+  names exactly the paths that changed since a version. So the copy grafts the head's tree and fixes it (`CopyFix`):
+  each key at a path the change index names in the source's tree since the version is set to its value then, where it
+  differs from what the graft brings; a copy made since inside the source is cut (its tree was absent or taken away at
+  its version, so every key it held at the version is named by its removal); a copy made since over the source replaced
+  the whole tree, so nothing of the head's is grafted (`start_empty`) and every key the tree held then is set. The cost
+  is the change since the version, O(the change index's entries since and the keys at the paths they name), never the
+  tree. A key the head holds but no path names is unchanged since the version, and an attribute name with no history of
+  its own reads alike at both ends, so the head's names are never listed: the copy still walks no map.
+- **The commit and the identity.** The fix is applied after the graft, its values set with nothing recorded key by
+  key: the copy's entry in the set hash already stands for the source's tree at the version it names (the recount
+  reads `copied_tree_entries` there), and a key's first change after the copy records the value the copy gave it, as
+  A-586 rules. The readers need nothing new.
+- **The verdict's view.** The copied tree's operations in the same increment (edits, creations, removals, directories,
+  metadata, a nested copy's place) are judged against the source as the copy brings it (`SourceAt`: the head's keys,
+  less the fix's cuts, with its values set), so an edit beneath a copy of an older version splices into that version's
+  bytes. Whether anything stood in a tree at the version, which a copy needs (FSFS refuses a missing source), is
+  counted, never walked: the radix trees keep each node's count (`Ptrie::prefix_len`, `count_tree`), so the head's keys
+  under the root, less the cut subtrees', plus each key the fix sets and less each it takes, is a number of descents.
+- **The chain entry.** A fixed copy is the record kind `COPY_TREE_FIXED` (19): `COPY_TREE`'s two paths, then the fix
+  (whether it starts empty, then its cuts, files, IPC nodes, directories, modes, symbolic links and attributes, each a
+  count and its records in key order, a value a presence byte and its bytes). Every count is checked against the bytes
+  left before anything is allocated, a key written twice is refused (`DuplicatePath`), a flag other than 0 or 1 is
+  refused (`BadKind`). A copy without a fix keeps tag 18's bytes, so every entry written before reads as it did. Replay
+  applies the recorded fix, and an edit beneath a fixed copy reads the bytes the copy brings from the entry
+  (`EntryCopies`): it reads no history, whatever its holder folded or restored.
+- **The room, derived.** `Green::copy_entry_room(inc)` is the sum of `chain_entry::fix_bytes` over the fixes the
+  increment's copies need, computed from the green's histories before the verdict; the service adds it to
+  `entry_bound`, which counts the increment alone (`crates/server/src/verbs.rs`), so the chain admits what the entry
+  will hold. `fix_bytes` equals the encoding's length (a test holds it), and a copy of an unchanged source needs none.
+- **Refusals.** A version whose values are folded away (below the fold floor, or the checkpoint the green was restored
+  at) is refused for a source changed since (`TypeChanged`: what it held is gone); a source unchanged since is copied
+  from any version, the head's tree being the version's. A hard link in the tree at the version is refused as one at
+  the head is.
+- **Tests** (`crates/merge/src/engine/copy_tests.rs`, `crates/merge/src/chain_entry.rs`).
+  - A copy of the trunk at version 1 after two versions changed it in every dimension holds the trunk's tree at 1;
+    the change index names its destination alone; the entry fits the room derived for it, and a copy of an unchanged
+    source needs none; it replays from its encoded entry.
+  - Copies from before a copy inside the source (cut) and from before one over it (start empty), replayed version by
+    version.
+  - An edit beneath a copy of an older version in the copy's own increment lands on that version's bytes, live and
+    replayed.
+  - A copy from a folded version of a changed source is refused typed; one of an unchanged source is accepted.
+  - The fix's codec: a round trip with `fix_bytes` its length, a golden vector, and hostile input (a count past the
+    bytes, a key twice, a bad flag) refused typed.
+  - The oracle's model now copies each source as its version held it; its census counts copies accepted from a
+    version their source changed after.
+- **Evidence** (the Mac Studio M3 Ultra, kiln, debug, fresh clones of `agents/g295-a626-part2`; 2026-11-19).
+  - The first run (`69936d04d`, 06:34 UTC, load 12.2): 117 of 118; the oracle found the copy walking a map, the head's
+    attribute names listed at each named path; read from the histories alone since (`4ff0b7131`).
+  - `cargo test --locked -p slates-merge --lib` at `4ff0b7131` (r1027, 06:38 UTC, load 9.4): 118 of 118, 24.40 s;
+    `cargo fmt --check` clean for slates-merge and slates-server. The census over 128 histories: 75 copies accepted,
+    354 refused, 9 from the root, 40 from an older version, 24 into their own source's tree, 14 from a version their
+    source changed after, 25 keys changed beneath a copy, 28 replaces, 31 nested pairs (2 with an inner replace), 19
+    moves.
+  - `cargo test --locked -p slates-server --lib` at `4ff0b7131`: 590 passed, 3 ignored, 1 failed:
+    `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`. It fails 5 of 5
+    alone and 3 of 3 with main's `verbs.rs` put back (main `d449a10c7`), so it is main's, not this change's (reported).
+  - Red seven ways (r1040, 06:42 to 06:48 UTC), each on a copy of the tree with one guard taken out, the whole `--lib`
+    suite run: copies of a changed source refused again, 4 failed; no cuts, 2; no empty start, 2; the fix left out of
+    the entry, 4; replay reading the head's bytes, 1; the verdict reading the head's bytes, 1; no room, 1.
+  - Merged with main (A-646's hard links naming their nodes, clean; `verbs.rs`'s admission now `Op::GreenAdvanced`,
+    the room joining its bound): at `e728908e6` (06:50 UTC, load 8.3) slates-merge's `--lib` 133 of 133, 25.95 s, fmt
+    clean, the census 106 accepted, 390 refused, 23 from the root, 60 from an older version, 40 into their own tree,
+    23 from a changed source, 37 keys changed beneath, 48 replaces, 46 nested pairs (2 inner replaces), 26 moves;
+    slates-server's `--lib` 614 passed, 3 ignored, and the same one of main's failed (3 of 3 with main `dc46c9f`'s
+    `verbs.rs`).
+  - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
+- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: its copies and the identity's sum
+  carried); a rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
 
 ### A-644 part 1 — A protected branch's answers from the store, in git's words: how a move changes its ref, decided by generation numbers with no walk where they decide it, and the first merge commit and the first unsigned commit a move brings (2026-11-19, g230, UI goal 93; §4.17.2 "Protected branches, in git's terms", "A push" step 6 and "Pieces (git)" piece 11; after A-590, A-614, A-620 and A-642)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `research/vcs-servers.md` §5.9; `crates/git`

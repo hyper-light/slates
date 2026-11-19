@@ -1180,9 +1180,16 @@ enum Effect {
   SetXattr(String, String, Vec<u8>),
   /// Remove an xattr.
   RemoveXattr(String, String),
-  /// Copy a tree by reference (A-586): its destination, its source, the source's version, and whether it replaces what
-  /// the destination holds (A-626).
-  CopyTree(String, String, u64, bool),
+  /// Copy a tree by reference (A-586): its destination, its source, the source's version, whether it replaces what the
+  /// destination holds (A-626), and what it changes in the head's tree it grafts when the source changed after the
+  /// version (A-626 part 2).
+  CopyTree {
+    dst: String,
+    from: String,
+    version: u64,
+    replace: bool,
+    fix: Option<Box<crate::chain_entry::CopyFix>>,
+  },
 }
 
 /// How a [`Effect::SetContent`]'s bytes come from what a chain entry records (`crate::chain_entry`).
@@ -1228,11 +1235,18 @@ impl Effect {
         Applied::SetXattr(path.clone(), name.clone(), value.clone())
       }
       Effect::RemoveXattr(path, name) => Applied::RemoveXattr(path.clone(), name.clone()),
-      Effect::CopyTree(dst, from, version, replace) => Applied::CopyTree {
+      Effect::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+        fix,
+      } => Applied::CopyTree {
         dst: dst.clone(),
         from: from.clone(),
         version: *version,
         replace: *replace,
+        fix: fix.clone(),
       },
     }
   }
@@ -1254,7 +1268,7 @@ impl Effect {
       | Effect::RemoveHardlink(path)
       | Effect::SetXattr(path, ..)
       | Effect::RemoveXattr(path, _)
-      | Effect::CopyTree(path, ..) => path,
+      | Effect::CopyTree { dst: path, .. } => path,
     }
   }
 
@@ -1271,7 +1285,7 @@ impl Effect {
       Effect::SetXattr(path, name, _) | Effect::RemoveXattr(path, name) => {
         IdentityKey::Xattr(path.clone(), name.clone())
       }
-      Effect::CopyTree(dst, ..) => IdentityKey::Copy(dst.clone()),
+      Effect::CopyTree { dst, .. } => IdentityKey::Copy(dst.clone()),
     }
   }
 }
@@ -3310,16 +3324,18 @@ impl Green {
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&mut self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut effects = Vec::new();
+    // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
+    let fixes = self.copy_fixes(r);
     let mut windows: Vec<_> = r
       .invalid
       .iter()
       .chain(self.unfit_content(inc, r).iter())
-      .chain(self.unfit_copied(inc, r).iter())
+      .chain(self.unfit_copied(inc, (r, &fixes)).iter())
       .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
       .collect();
     // Copies first, and what lands on their trees after them (A-586): their effects lead, as commit applies them.
-    self.decide_copies(inc, r, &mut effects, &mut windows);
-    self.decide_copied(inc, r, &mut effects, &mut windows);
+    self.decide_copies(inc, (r, &fixes), &mut effects, &mut windows);
+    self.decide_copied(inc, (r, &fixes), &mut effects, &mut windows);
     for (path, node) in &r.specials {
       record(
         &mut effects,
@@ -3782,7 +3798,7 @@ impl Green {
       Effect::SetXattr(path, name, value) => self.set_xattr((path, name), Some(value), version),
       Effect::RemoveXattr(path, name) => self.set_xattr((path, name), None, version),
       // Applied before every other effect (`commit_copies`), so the effects on its tree land on what it brought.
-      Effect::CopyTree(..) => {}
+      Effect::CopyTree { .. } => {}
     }
   }
 
@@ -4162,9 +4178,10 @@ impl Green {
     if let Some(version) = self.accepted.get(&inc.id) {
       return *version;
     }
+    let copies = copy::EntryCopies::of(applied);
     let effects = applied
       .iter()
-      .map(|effect| self.effect_of(effect, &inc.post_state))
+      .map(|effect| self.effect_of(effect, (&inc.post_state, &copies)))
       .collect();
     let version = self.head().saturating_add(1);
     self.commit(effects, version);
@@ -4193,7 +4210,11 @@ impl Green {
   }
 
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
-  fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
+  fn effect_of(
+    &self,
+    applied: &crate::chain_entry::Applied,
+    (post_state, copies): (&[u8], &copy::EntryCopies<'_>),
+  ) -> Effect {
     use crate::chain_entry::Applied;
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
@@ -4218,7 +4239,11 @@ impl Green {
         )
       }
       Applied::Copied { dst, from, ops } => {
-        let source = self.content.get(from).unwrap_or_default();
+        // A file a copy brings and the same version edits reads the bytes the copy brings (A-626 part 2).
+        let source = copies
+          .source_at(self, dst)
+          .content(from)
+          .unwrap_or_default();
         let bytes = apply(source, ops, post_state);
         let whole = vec![insert_whole(bytes.len() as u64)];
         Effect::SetContent(
@@ -4245,7 +4270,14 @@ impl Green {
         from,
         version,
         replace,
-      } => Effect::CopyTree(dst.clone(), from.clone(), *version, *replace),
+        fix,
+      } => Effect::CopyTree {
+        dst: dst.clone(),
+        from: from.clone(),
+        version: *version,
+        replace: *replace,
+        fix: fix.clone(),
+      },
     }
   }
 
@@ -4742,7 +4774,7 @@ impl Green {
         }
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
         // `Green::rebase` answers a work holding a copy before it restates anything (A-586).
-        Effect::CopyTree(..) => {}
+        Effect::CopyTree { .. } => {}
       }
     }
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
