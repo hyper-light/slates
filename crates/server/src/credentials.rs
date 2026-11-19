@@ -404,6 +404,10 @@ pub struct CramUser {
 /// a presented token (`vcs_http::daemon_edge`). The key is the record's contexts; the token is never held. The session's
 /// principal is the record's: the user name names the token and no one.
 pub async fn cram_md5_key(user: &[u8]) -> Result<CramUser, Unkeyed> {
+  // RED: no record keys a CRAM-MD5 user.
+  if !user.is_empty() {
+    return Err(Unkeyed::Unknown);
+  }
   let id = id_of_user(user).ok_or(Unkeyed::NotAnId)?;
   let record = find(id)
     .await

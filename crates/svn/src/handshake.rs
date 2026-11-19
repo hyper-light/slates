@@ -549,20 +549,11 @@ impl CramContexts {
   /// longer than MD5's block, as `cram.c` makes it, zero-filled to the block; each pad block is
   /// compressed once from MD5's initial state.
   pub fn of_secret(secret: &[u8]) -> CramContexts {
-    let hashed;
-    let shortened: &[u8] = if secret.len() > rfc1321::BLOCK_BYTES {
-      hashed = rfc1321::digest(secret);
-      &hashed
-    } else {
-      secret
-    };
-    let mut key = [0u8; rfc1321::BLOCK_BYTES];
-    for (slot, byte) in key.iter_mut().zip(shortened) {
-      *slot = *byte;
-    }
+    // RED: the contexts carry no key, as a record that kept none.
+    let _ = (secret, padded_state as fn(&[u8; rfc1321::BLOCK_BYTES], u8) -> rfc1321::State);
     CramContexts {
-      outer: padded_state(&key, OUTER_PAD),
-      inner: padded_state(&key, INNER_PAD),
+      outer: rfc1321::INITIAL,
+      inner: rfc1321::INITIAL,
     }
   }
 
