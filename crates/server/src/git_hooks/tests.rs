@@ -102,7 +102,8 @@ impl Drop for ScratchDir {
 }
 
 /// Writes `view` into `root` as a presentation serves it: each directory it lists made, each file
-/// it lists read from the store a window at a time.
+/// it lists read from the store a window at a time, and what each path names asked of the view
+/// as a presentation answers a lookup, which must be what its directory listed.
 #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
 fn present(state: &ShardState, view: &GitHookView, root: &Path) {
   let mut directories: Vec<Vec<u8>> = vec![Vec::new()];
@@ -119,6 +120,7 @@ fn present(state: &ShardState, view: &GitHookView, root: &Path) {
         .concat()
       };
       let at = root.join(std::ffi::OsStr::from_bytes(&path));
+      assert_eq!(view.node(&path), Some(listed.node), "{}", at.display());
       match listed.node {
         Node::Directory => {
           std::fs::create_dir_all(&at).expect("a directory written");
