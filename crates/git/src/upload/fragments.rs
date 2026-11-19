@@ -10,9 +10,9 @@
 //! does at most one turn of the stream's work, the packets are the same however the turns divide it, and the stream
 //! holds no borrow of the store between turns, as A-639 keeps it.
 //!
-//! **Owned.** The plan is copied when the pack begins (its runs, its objects, its filter), each charged to the request's
-//! admission first, since the stream outlives every lending of the store; what a turn wrote is kept until the answer
-//! has taken it, one turn's bytes at most.
+//! **Owned.** The plan is copied when the pack begins (its runs, its objects, its filter), each charged to the
+//! request's admission first, since the stream outlives every lending of the store; what a turn wrote is kept until the
+//! answer has taken it, one turn's bytes at most.
 
 use super::{PackPlan, PackRefused, PackSource, Served};
 use crate::Admission;

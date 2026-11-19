@@ -15,12 +15,12 @@
 //! `object-format` and `agent`. The two `allow-*-in-want` tell the client a want need not be a tip, which holds here:
 //! as under protocol v2, a want may be any object the repository holds.
 //!
-//! **A request** is read whole: the wants, the first carrying the client's capabilities (git reads them on any want, and
-//! so does this), then any `shallow`, `deepen`, `deepen-since`, `deepen-not` and `filter`, then a flush; then the haves,
-//! ended by `done` or a flush, the request's end read as a flush as git reads one. A capability the server did not
-//! advertise is refused, as the document asks ("Server MUST diagnose and abort if capabilities it does not understand
-//! were sent" [gitprotocol-capabilities]), where git 2.50.1 passes it; so is a line out of its place, or bytes after the
-//! request's end.
+//! **A request** is read whole: the wants, the first carrying the client's capabilities (git reads them on any want,
+//! and so does this), then any `shallow`, `deepen`, `deepen-since`, `deepen-not` and `filter`, then a flush; then the
+//! haves, ended by `done` or a flush, the request's end read as a flush as git reads one. A capability the server did
+//! not advertise is refused, as the document asks ("Server MUST diagnose and abort if capabilities it does not
+//! understand were sent" [gitprotocol-capabilities]), where git 2.50.1 passes it; so is a line out of its place, or
+//! bytes after the request's end.
 //!
 //! **The answer**, as `upload_pack` writes it statelessly. A request with no want is answered with nothing. A request
 //! that deepens is answered first with the shallow-update and its flush (`receive_needs`). Then the acknowledgments,
@@ -28,8 +28,8 @@
 //! - a have the repository lacks: once the server is ready, `ACK <it> continue` under `multi_ack`, `ACK <it> ready`
 //!   under `multi_ack_detailed`;
 //! - a held have: `ACK <id> common` under `multi_ack_detailed`, `ACK <id> continue` under `multi_ack`, and, with
-//!   neither, `ACK <id>` while git counts one have (`have_obj`: a commit counts unless an earlier held commit names it as
-//!   a parent or it was named already; any other object counts each time it is named).
+//!   neither, `ACK <id>` while git counts one have (`have_obj`: a commit counts unless an earlier held commit names it
+//!   as a parent or it was named already; any other object counts each time it is named).
 //!
 //! At `done`: `ACK <last held>` under either multi-ack when a have counts, `NAK` when none does, then the pack. At a
 //! flush: `ACK <last held> ready` under `multi_ack_detailed` when a have was held, none was lacked and the server is
@@ -39,8 +39,8 @@
 //! commit and its parents). It is asked again only when a held have was added since it was last asked, since lacked
 //! haves change nothing it reads, and each asking keeps what it builds within the request's room and then lets it go.
 //!
-//! **The pack** is A-615's choice for the wants and every have, since `create_pack_file` takes them all. It is framed on
-//! side-band-64k, on side-band (1000-byte packets, `DEFAULT_PACKET_MAX`) or on neither, as the client chose, with a
+//! **The pack** is A-615's choice for the wants and every have, since `create_pack_file` takes them all. It is framed
+//! on side-band-64k, on side-band (1000-byte packets, `DEFAULT_PACKET_MAX`) or on neither, as the client chose, with a
 //! flush after it on either band.
 //!
 //! **Stateless only.** Over SSH a v0 client speaks in rounds on one stream, and the server keeps what each round taught

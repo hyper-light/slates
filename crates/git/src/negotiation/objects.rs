@@ -5,14 +5,14 @@
 //! 1. **Commits.** The walk paints the wants answered by no run (and the parents of commits a cut made whole) as wanted,
 //!    and the common haves, peeled to commits (and the commits a cut made whole, and the wants a run answers, whose
 //!    histories the runs carry) as had. The commits to send are those wanted and not had.
-//! 2. **Left out.** The trees of the edge commits, each had parent of a commit sent, and the trees and blobs a have names
-//!    that is no commit: nothing in them is sent. For a thin pack in a shallow exchange (the client is shallow, or the
-//!    cut is new), git's server runs `pack-objects --objects-edge-aggressive`, which leaves out the tree of every had
-//!    commit on its command line (`mark_edges_uninteresting`): each have `do_got_oid` lists (`have_obj`: a commit only
-//!    when no have before it named it or named it as a parent) and each commit a cut made whole (`send_unshallow`'s
-//!    `extra_edge_obj`); so does this. Without a thin pack only the edges are left out. (A-640 part 3 found the
-//!    aggressive rule missing: git's own `--deepen` fetch, served, sent the shallow tip's blobs again; git's stateless
-//!    `deepen 2` without `thin-pack` sent them, which held the rule to thin packs alone.)
+//! 2. **Left out.** The trees of the edge commits, each had parent of a commit sent, and the trees and blobs a have
+//!    names that is no commit: nothing in them is sent. For a thin pack in a shallow exchange (the client is shallow,
+//!    or the cut is new), git's server runs `pack-objects --objects-edge-aggressive`, which leaves out the tree of
+//!    every had commit on its command line (`mark_edges_uninteresting`): each have `do_got_oid` lists (`have_obj`: a
+//!    commit only when no have before it named it or named it as a parent) and each commit a cut made whole
+//!    (`send_unshallow`'s `extra_edge_obj`); so does this. Without a thin pack only the edges are left out. (A-640
+//!    part 3 found the aggressive rule missing: git's own `--deepen` fetch, served, sent the shallow tip's blobs again;
+//!    git's stateless `deepen 2` without `thin-pack` sent them, which held the rule to thin packs alone.)
 //! 3. **Trees and blobs.** Each sent commit's root tree is opened at depth 0, its entries at depth 1, and so on; a tree
 //!    or blob is sent when nothing left out holds it and the filter admits it at the least depth it is met at. A tree met
 //!    again shallower is opened again, as git's `tree:` filter reopens it; under any other filter each tree opens once.

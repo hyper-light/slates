@@ -729,8 +729,8 @@ fn oracle_sent(
 }
 
 /// What the oracle leaves out: everything in the trees of the sent commits' unsent parents, and in the haves that are
-/// no commits; and, for a thin pack in a shallow exchange, everything in the tree of each have git lists and each commit
-/// a cut made whole (git's `--objects-edge-aggressive`).
+/// no commits; and, for a thin pack in a shallow exchange, everything in the tree of each have git lists and each
+/// commit a cut made whole (git's `--objects-edge-aggressive`).
 fn oracle_left_out(
   graph: &TestGraph,
   asks: &Asks,
@@ -771,8 +771,8 @@ fn oracle_aggressive(graph: &TestGraph, asks: &Asks, cut: &OracleCut) -> BTreeSe
     .collect()
 }
 
-/// The haves git lists for `pack-objects` (`have_obj`): in the order sent, a commit only when no have before it named it
-/// or named it as a parent, any other object each time.
+/// The haves git lists for `pack-objects` (`have_obj`): in the order sent, a commit only when no have before it named
+/// it or named it as a parent, any other object each time.
 fn oracle_listed_haves(graph: &TestGraph, haves: &[ObjectId]) -> Vec<u32> {
   let mut marked = BTreeSet::new();
   let mut listed = Vec::new();
