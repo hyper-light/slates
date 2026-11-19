@@ -2920,7 +2920,9 @@ fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'stati
   }
 }
 
-/// The volume's whole image as a record's wire bytes.
+/// The volume's whole image as a record's wire bytes, standing alone (A-577): a clone's holds what it shares with its
+/// origin too, since a successor rebuilds the volume from its log with no origin beside it (`Volume::to_standalone_image`;
+/// its recovery image names those inodes by number only, and a rebuild from it found no tree under its root).
 fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Option<Vec<u8>> {
   let handle = *state.by_id.get(&id)?;
   let ShardState { volumes, store, .. } = state;
@@ -2929,7 +2931,7 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
     .host
     .as_mut()
     .map(|host| host as &mut dyn slates_vfs::host::HostFs);
-  let image = slot.volume.to_image(store, host).ok()?;
+  let image = slot.volume.to_standalone_image(store, host).ok()?;
   Some(VolumeRecord::Full { image }.to_bytes())
 }
 
@@ -5742,6 +5744,9 @@ const REFUSED_RECORD: &str = "fleet.live.takeover_refused.record";
 const REFUSED_APPLY: &str = "fleet.live.takeover_refused.apply";
 /// Counter: a takeover refused because the log's first entry is not a whole record (or there is none).
 const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_first";
+/// Counter: a takeover refused because a clone's full record names an inode it shares with its origin that the image
+/// before it does not hold ([`keep_shared`], A-577): the log cannot lay out the tree, and is never served short of it.
+const REFUSED_SHARED: &str = "fleet.live.takeover_refused.shared";
 /// Counter: a takeover refused because the rebuilt image could not be laid out as an archive (no root, a cycle,
 /// content missing for an extent).
 const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
@@ -6474,7 +6479,9 @@ impl Rebuilding {
 }
 
 /// One payload of a live log opened under `keys`, decoded and applied to the rebuild's image, its runs kept: a whole
-/// record begins the image again, a delta applies to it, and a delta before any whole one is refused.
+/// record begins the image again, a delta applies to it, and a delta before any whole one is refused. A clone's full
+/// record, which names what the clone shares with its origin by number, keeps those inodes from the image before it
+/// ([`keep_shared`], A-577).
 fn apply_payload(
   keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
   (image, runs): RebuildState<'_>,
@@ -6483,19 +6490,56 @@ fn apply_payload(
   let publication = open_payload(keys, payload).ok_or(REFUSED_OPEN)?;
   let record =
     <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
-  match (record, image.as_mut()) {
-    (VolumeRecord::Full { image: whole }, _) => {
+  match record {
+    VolumeRecord::Full { image: mut whole } => {
+      if whole.origin_shared.is_empty() {
+        runs.clear();
+      } else {
+        let before = image.as_ref().ok_or(REFUSED_NOT_WHOLE_FIRST)?;
+        keep_shared(&mut whole, before, runs)?;
+      }
       *image = Some(whole);
-      runs.clear();
     }
-    (VolumeRecord::Delta { delta }, Some(image)) => {
+    VolumeRecord::Delta { delta } => {
+      let image = image.as_mut().ok_or(REFUSED_NOT_WHOLE_FIRST)?;
       slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
     }
-    (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
   }
   for run in publication.runs {
     runs.insert((run.inode, run.offset), run.bytes);
   }
+  Ok(())
+}
+
+/// A clone's full record `whole` laid over the image `before` it (A-577): `whole` carries the inodes the clone shares
+/// with its origin snapshot by number only (`VolumeImage::origin_shared`), as its recovery image does, so each is taken
+/// from `before` (the log's whole records stand alone, `Volume::to_standalone_image`, so the first holds every one) with
+/// its content runs; every other run goes, as a full record's do, since the record's own follow it. The image then
+/// stands alone. Refused [`REFUSED_SHARED`] when `before` lacks a shared inode, or `whole` carries one both whole and by
+/// number: the log could not lay out the tree, and is never served short of it.
+fn keep_shared(
+  whole: &mut slates_vfs::recover::VolumeImage,
+  before: &slates_vfs::recover::VolumeImage,
+  runs: &mut BTreeMap<(u64, u64), Vec<u8>>,
+) -> Result<(), &'static str> {
+  let shared: BTreeSet<u64> = whole.origin_shared.iter().copied().collect();
+  if whole.inodes.iter().any(|inode| shared.contains(&inode.no)) {
+    return Err(REFUSED_SHARED);
+  }
+  let kept: Vec<InodeImage> = before
+    .inodes
+    .iter()
+    .filter(|inode| shared.contains(&inode.no))
+    .cloned()
+    .collect();
+  if kept.len() != shared.len() {
+    return Err(REFUSED_SHARED);
+  }
+  runs.retain(|(inode, _), _| shared.contains(inode));
+  whole.inodes.extend(kept);
+  whole.inodes.sort_by_key(|inode| inode.no);
+  whole.origin_shared = Vec::new();
+  whole.origin_epoch = None;
   Ok(())
 }
 
@@ -7855,5 +7899,123 @@ mod tests {
       !at_risk_after,
       "and its log then holds it where a takeover finds it"
     );
+  }
+
+  /// The inode number of the root file `name` in the volume in slot `handle`.
+  fn file_no(
+    state: &ShardState,
+    handle: slates_mem::Handle<crate::state::VolumeSlot>,
+    name: &str,
+  ) -> Option<u64> {
+    let slot = state.volumes.get(handle).ok()?;
+    let root = slot.volume.root_inode(&state.store).ok()?;
+    let found = slot.volume.lookup_no(&state.store, root, name).ok()?;
+    Some(found.inode.0)
+  }
+
+  /// Writes `bytes` as the whole of the root file `name` in the volume in slot `handle`, made if absent.
+  fn write_file(
+    state: &mut ShardState,
+    handle: slates_mem::Handle<crate::state::VolumeSlot>,
+    name: &str,
+    bytes: &[u8],
+  ) -> Option<()> {
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).ok()?;
+    let root = slot.volume.root_inode(store).ok()?;
+    let file = match slot.volume.lookup_no(store, root, name) {
+      Ok(found) => found.inode,
+      Err(_) => slot.volume.create_file_no(store, root, name, 0o644).ok()?,
+    };
+    slot.volume.truncate(store, file, 0).ok()?;
+    slot.volume.write(store, file, 0, bytes).ok()?;
+    Some(())
+  }
+
+  /// A-577 (§4.10 live shipping, A-200). Do: on a shard, make a volume with root files `a` and `b`, snapshot and clone
+  /// it; take the clone's standalone image, its log's first whole record, with content runs for `a` and `b`; rewrite `b`
+  /// and make `c` in the clone; lay its recovery image, what its next full record carries, over the first by the
+  /// rebuild's rule ([`keep_shared`]). Expect the clone's standalone image now, inode for inode, standing alone, with
+  /// `a`'s run kept and `b`'s gone (the record's own follow it). Before A-577 a full record replaced the image whole,
+  /// and a clone's named what it shares with its origin by number only, so a successor's rebuild lost it.
+  #[test]
+  fn a_clones_full_record_keeps_what_it_shares_from_the_image_before_it() {
+    let checked = crate::daemon::audit_on_shard(|state| {
+      use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
+      let principal = slates_db::catalog::Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let ReplyBody::Created { id: origin } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        RequestBody::Create {
+          name: "shared-origin".to_owned(),
+          size: SizeClass::Dynamic { max: 1 << 20 },
+          names: NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        return None;
+      };
+      let origin_handle = *state
+        .by_id
+        .get(&slates_db::catalog::VolumeId { bytes: origin.bytes })?;
+      write_file(state, origin_handle, "a", b"inherited a")?;
+      write_file(state, origin_handle, "b", b"inherited b")?;
+      let ReplyBody::Snapshotted { id: snapshot, .. } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        RequestBody::Snapshot { volume: origin },
+      ) else {
+        return None;
+      };
+      let ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        RequestBody::Clone {
+          volume: origin,
+          snapshot,
+          name: "shared-clone".to_owned(),
+        },
+      ) else {
+        return None;
+      };
+      let handle = *state
+        .by_id
+        .get(&slates_db::catalog::VolumeId { bytes: clone.bytes })?;
+      let before = state
+        .volumes
+        .get(handle)
+        .ok()?
+        .volume
+        .to_standalone_image(&state.store, None)
+        .ok()?;
+      let (a, b) = (file_no(state, handle, "a")?, file_no(state, handle, "b")?);
+      let mut runs = BTreeMap::from([((a, 0), b"inherited a".to_vec()), ((b, 0), b"inherited b".to_vec())]);
+      write_file(state, handle, "b", b"rewritten b")?;
+      write_file(state, handle, "c", b"made c")?;
+      let slot = state.volumes.get(handle).ok()?;
+      let mut whole = slot.volume.to_image(&state.store, None).ok()?;
+      let now = slot.volume.to_standalone_image(&state.store, None).ok()?;
+      let shared_before = whole.origin_shared.clone();
+      keep_shared(&mut whole, &before, &mut runs).ok()?;
+      Some((
+        shared_before.contains(&a),
+        whole.inodes == now.inodes,
+        whole.origin_shared.is_empty() && whole.origin_epoch.is_none(),
+        runs.keys().copied().collect::<Vec<_>>(),
+        a,
+      ))
+    });
+    let (a_was_shared, same_tree, standing_alone, runs, a) = checked.expect("the scene was made");
+    assert!(a_was_shared, "the full record named the untouched `a` by number");
+    assert!(same_tree, "the rebuilt image is the clone's whole tree now");
+    assert!(standing_alone, "and stands alone");
+    assert_eq!(runs, vec![(a, 0)], "`a`'s content kept, `b`'s left to the record");
   }
 }
