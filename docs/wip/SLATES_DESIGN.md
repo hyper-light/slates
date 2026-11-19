@@ -33156,6 +33156,11 @@ location test's entry), `crates/server/src/{owner_location,fleet,verbs}.rs`, and
   `the_kernels_unmount_refusals_are_typed`, `an_unmount_is_believed_only_when_the_table_agrees`, and
   `an_unmount_of_a_path_where_nothing_is_mounted_is_refused_not_mounted` (the host's own table, no call made);
   `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, a kernel mount) takes `Busy` on macOS.
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug).** Red once, on a copy where `EBUSY` mapped to the untyped
+  `Unmount` and no request let go: `the_kernels_unmount_refusals_are_typed` and `an_unmount_is_asked_as_the_os_takes_it`
+  failed. Green at 43166ce14: `cargo test -p slates-api --lib -- mount:: contract_history`, 12 of 12, the host's own
+  table included. The Linux half (`ask_unmount` over `fusermount3`) compiles only on Linux: its build, clippy, `xtask`
+  and the macOS bare-metal run with a `PATH` lacking `/sbin` are main's (filed).
 - **Owed.** Naming the processes that hold a busy mount (libproc's `proc_listpidspath` on macOS, `/proc` on Linux);
   Linux's busy `fusermount3 -u` stays `Unmount` with its exit, since the helper reports no error number.
 

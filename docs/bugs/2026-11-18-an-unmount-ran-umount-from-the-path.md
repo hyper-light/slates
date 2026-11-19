@@ -44,8 +44,11 @@ On a host whose `PATH` lacked `/sbin`, no slates mount on macOS (or a BSD) could
   `an_unmount_is_believed_only_when_the_table_agrees` (pure, every Unix host) and
   `an_unmount_of_a_path_where_nothing_is_mounted_is_refused_not_mounted` (the host's own table, no call made), all in
   `crates/api/src/mount.rs`.
-- Red, once, on a copy where `EBUSY` maps to the old untyped `Unmount` and no request asks to let go: the mapping and
-  request tests fail.
+- Red, once (the Mac Studio, 2026-11-19, debug), on a copy where `EBUSY` maps to the old untyped `Unmount` and no
+  request asks to let go: `the_kernels_unmount_refusals_are_typed` and `an_unmount_is_asked_as_the_os_takes_it` failed.
+  Green at 43166ce14: `cargo test -p slates-api --lib -- mount:: contract_history`, 12 of 12.
+- Main's: the Linux build of `ask_unmount`'s `fusermount3` half, clippy, `xtask`, and the macOS bare-metal run with a
+  runner `PATH` lacking `/sbin` (filed).
 
 ## Siblings
 

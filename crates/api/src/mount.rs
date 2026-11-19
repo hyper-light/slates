@@ -1157,18 +1157,39 @@ mod tests {
     let path = "/Volumes/work";
     let before = [entry(1, "/"), entry(2, path), entry(3, path)];
     let taken = super::mount_at(&before, path).map(|mounted| mounted.identity);
-    assert_eq!(taken, Some(MountIdentity { mount: 3, device: 7 }), "the shadowing mount is taken");
+    assert_eq!(
+      taken,
+      Some(MountIdentity {
+        mount: 3,
+        device: 7
+      }),
+      "the shadowing mount is taken"
+    );
     assert_eq!(super::mount_at(&before, "/Volumes/other"), None);
-    let busy = || Err(MountFault::Busy { path: path.to_owned() });
+    let busy = || {
+      Err(MountFault::Busy {
+        path: path.to_owned(),
+      })
+    };
     let gone = [entry(1, "/"), entry(2, path)];
     assert_eq!(super::judged(path, taken, Some(&gone), Ok(())), Ok(()));
-    assert_eq!(super::judged(path, taken, Some(&gone), busy()), Ok(()), "the table, not the call");
+    assert_eq!(
+      super::judged(path, taken, Some(&gone), busy()),
+      Ok(()),
+      "the table, not the call"
+    );
     assert_eq!(
       super::judged(path, taken, Some(&before), Ok(())),
-      Err(MountFault::StillMounted { path: path.to_owned() })
+      Err(MountFault::StillMounted {
+        path: path.to_owned()
+      })
     );
     assert_eq!(super::judged(path, taken, Some(&before), busy()), busy());
-    assert_eq!(super::judged(path, None, None, busy()), busy(), "no table: the call's answer");
+    assert_eq!(
+      super::judged(path, None, None, busy()),
+      busy(),
+      "no table: the call's answer"
+    );
     assert_eq!(super::judged(path, None, None, Ok(())), Ok(()));
   }
 }
