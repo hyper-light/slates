@@ -1243,9 +1243,15 @@ fn a_merged_revision_is_sent_once() {
   let command = b"( log ( ( 7:tags/t1 5:trunk ) ( 0 ) ( 11 ) false false 0 true revprops ( ) ) ) ";
   let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
   let revisions = entry_revisions(&out);
-  let fours = revisions.iter().filter(|entry| **entry == (4, false)).count();
+  let fours = revisions
+    .iter()
+    .filter(|entry| **entry == (4, false))
+    .count();
   assert_eq!(fours, 1, "{revisions:?}");
-  let eleven = revisions.iter().position(|entry| *entry == (11, false)).unwrap();
+  let eleven = revisions
+    .iter()
+    .position(|entry| *entry == (11, false))
+    .unwrap();
   assert_eq!(revisions.get(eleven + 1), Some(&(0, true)), "{revisions:?}");
 }
 
@@ -1255,8 +1261,14 @@ fn a_merged_revision_is_sent_once() {
 #[test]
 fn a_merge_of_two_runs_walks_the_younger_run_first() {
   let mut fixture = Fixture::new();
-  let name = "svn:mergeinfo".bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
-  let value = "/branches/b1:3-4,9".bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+  let name = "svn:mergeinfo"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  let value = "/branches/b1:3-4,9"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
   fixture.commit(&[format!("row 12 /trunk dir change props {name}={value}").as_str()]);
   let command = b"( log ( ( 5:trunk ) ( 12 ) ( 12 ) false false 0 true revprops ( ) ) ) ";
   let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);

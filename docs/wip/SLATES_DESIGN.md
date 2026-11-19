@@ -13761,8 +13761,10 @@ and export by landing).
 > with the refusal a newer client reads as none. Its sixth slice, in part (2026-11-19, g297): `log` without merged
 > revisions, `svn_repos_get_logs5` and `do_logs` over FSFS's node history on the index, a stream a revision a step,
 > merged revisions refused until built; and the crate's one walk of copy roots (A-616's) asked by every read command.
-> Owed: `log`'s merged revisions, `get-file-revs`; the fold of a name beyond ASCII (utf8proc's case folding and mark
-> stripping); read access by the authorization rules (A-606).
+> The sixth slice whole (2026-11-19, g297): `log`'s merged revisions as `svn_repos_get_logs5` finds them, nested walks
+> of each merge's runs, the stock `svn log -g` and `svn mergeinfo --show-revs` replayed whole. Owed: `get-file-revs`;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
+> (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -42878,8 +42880,34 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   newest first, the names' shortcut dropped, a reopened history stepping once: each failed named tests; the standard
   trio's shortcut and the root's special case answer the same bytes without them, so the first was removed and the
   second kept for its cost.
-- **Owed** (the next slices): `log`'s merged revisions and `get-file-revs`, each replayed against the transcripts
-  already recorded; `list`'s fold of a name beyond ASCII
+- **Part 2, its sixth slice whole** (2026-11-19, g297): `log`'s merged revisions (`reads/log/merged.rs`, the
+  interim refusal gone). With them the log's own history is mergeinfo first (`get_paths_history_as_mergeinfo`: each
+  path's location segments over the range, a segment from S to E the source of the revisions after S - 1 through E);
+  at each revision sent, the mergeinfo it changed for the paths (`fs_mergeinfo_changed`: each changed path whose
+  `svn:mergeinfo` changed against its base, the revision before or the copy's source, a side without a value taking its
+  inherited one, a value that does not parse making the revision one without changes, issue #3896;
+  `get_combined_mergeinfo_changes`: each path's inherited mergeinfo against its previous location's unless a copy's
+  inherited part is the same, issue #4022, then every changed path at or beneath a path), the paths being each
+  history's next location as `do_logs` builds them, which the recording shows (`tags/t1`'s log has r7's merge of
+  `/branches/b1/dir` through `/trunk`). A revision that merged anything is sent with children: its runs of merged
+  revisions (`combine_mergeinfo_path_lists`, reverse merges marked) sorted and walked from the last, each by a nested
+  walk newest first with no limit, its histories opened leniently and its searches recorded so none repeats
+  (`reduce_search`, `store_search`); a merged revision sent only when a changed path lies outside the log's own history
+  (`interesting_merge`, the client's receiver called first so its changed paths are written either way) and only once
+  (`nested_merges`); then revision 0 marked `invalid-revnum` closes the children, as `revision_receiver`'s
+  `stack_depth` allows. The issue #4022 check needs the nearest ancestor's mergeinfo as it is held, so A-605's
+  `mergeinfo_at` and a new `mergeinfo_as_held` share one walk up the tree (`nearest_mergeinfo`). Where Subversion's
+  answer hangs on its seeded hash order it has none to match, and the C code's intent is taken, each a test:
+  `combine_mergeinfo_path_lists` removes the source it used up, where `array_pop_front` removes the first; runs with
+  one range keep their order. Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 414 of 414,
+  rustfmt clean; the `log-merged` session (7 commands: newest and oldest first, a tag's reverse merge, a file, the
+  root, a limit, two paths), `svn log -g` and both `svn mergeinfo --show-revs` sessions (five connections, `reparent`
+  followed) replayed whole; and four tests the recorded repository does not reach (a merged revision sent once oldest
+  first, two runs walked from the last, segments as mergeinfo, runs as `combine_mergeinfo_path_lists` means them).
+  Red-checked thirteen ways (no children, reverse merges unmarked, merged revisions sent again, no `interesting_merge`
+  test, the request's paths for the histories' next, no issue #4022 check, segments unshifted, runs walked from the
+  first, the first source removed): each failed named tests.
+- **Owed** (the next slices): `get-file-revs`, replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
   when the session could authenticate.
