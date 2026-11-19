@@ -2528,10 +2528,20 @@ impl Green {
     &self,
     (dst, ops): (&str, &[Op]),
     (base, post_state): (u64, &[u8]),
-    from: &str,
+    (from, cleared): (&str, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
   ) -> Result<(), ConflictWindow> {
     if from == dst {
+      return Ok(());
+    }
+    // A hard link renamed over the file it names is that file renamed onto itself: POSIX `rename`
+    // does nothing when both names are links to one file, and neither does the verdict, which
+    // would otherwise remove the file and leave the link naming itself (A-643).
+    if self
+      .hardlinks
+      .get(from)
+      .is_some_and(|target| target.as_str() == dst)
+    {
       return Ok(());
     }
     // The source must still name something — a file, a symlink or a hard link. A source an
@@ -2557,6 +2567,12 @@ impl Green {
     if self.changed_last(self.last_changed.get(dst), dst) > base {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
     }
+    // A link renamed over a file replaces the file, as a file renamed over one does and as POSIX
+    // `rename` replaces its destination: the file is removed and its removal recorded
+    // (`file_removed`), so no path holds a file and a link at once. A file the increment removes
+    // itself, by an unlink or a rename away, is removed by that, once (A-643).
+    let replaced = (!source_is_file && self.content.contains_key(dst) && !cleared.contains(dst))
+      .then(|| Effect::RemoveContent(dst.to_owned()));
     // Move whatever the source names, capturing its current value so an intervening change to the
     // source follows the move, and removing the source name.
     if let Some(source) = self.content.get(from) {
@@ -2571,9 +2587,11 @@ impl Green {
       ));
       effects.push(Effect::RemoveContent(from.to_owned()));
     } else if let Some(target) = self.symlinks.get(from) {
+      effects.extend(replaced);
       effects.push(Effect::Symlink(dst.to_owned(), target.clone()));
       effects.push(Effect::RemoveSymlink(from.to_owned()));
     } else if let Some(target) = self.hardlinks.get(from) {
+      effects.extend(replaced);
       effects.push(Effect::Hardlink(dst.to_owned(), target.clone()));
       effects.push(Effect::RemoveHardlink(from.to_owned()));
     }
@@ -2647,7 +2665,8 @@ impl Green {
   /// Merges an unlink at `path`.
   /// Merges an unlink of whatever the path names — a regular file, a symlink, or a hard link
   /// (§4.16). Each is a delete/modify conflict if that dimension changed since the increment's base;
-  /// a path that names nothing is a no-op (idempotent removal). A directory is not unlinked (rmdir
+  /// a regular file, if it changed in any dimension, its mode and attributes too (A-643); a path
+  /// that names nothing is a no-op (idempotent removal). A directory is not unlinked (rmdir
   /// removes directories); a path that is a directory falls through to the no-op.
   fn merge_unlink(&self, path: &str, base: u64) -> Result<Option<Effect>, ConflictWindow> {
     if self.specials.contains_key(path) {
@@ -2664,7 +2683,10 @@ impl Green {
       return Ok(Some(Effect::RemoveSpecial(path.to_owned())));
     }
     if self.content.contains_key(path) {
-      if self.changed_last(self.last_changed.get(path), path) > base {
+      // A file changed after the base in any dimension, its bytes, its mode or an attribute, is
+      // not the one the work removes: delete against modify in either direction (A-643; the
+      // bytes alone were judged before, and the head's mode or attribute went with the file).
+      if self.changed_after(path, base) {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
       }
       return Ok(Some(Effect::RemoveContent(path.to_owned())));
@@ -2826,10 +2848,12 @@ impl Green {
     Ok(Some(Effect::MakeDir(path.to_owned())))
   }
 
-  /// Merges a directory removal against the increment's own removals.
+  /// Merges a directory removal against the increment's own removals, and against its base: a
+  /// directory changed after the base in any dimension is delete against modify (A-643).
   fn merge_rmdir(
     &self,
     path: &str,
+    base: u64,
     cleared: &BTreeSet<String>,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if self.content.contains_key(path)
@@ -2841,6 +2865,12 @@ impl Green {
     }
     if !self.dirs.contains_key(path) {
       return Ok(None);
+    }
+    // A directory changed after the base in any dimension (removed and made again, its mode or an
+    // attribute changed) is not the one the work removes: delete against modify (A-643; the
+    // removal had no base, and removed a directory made again since).
+    if self.changed_after(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     let prefix = format!("{path}/");
     if self.has_live_child(&prefix, cleared) {
@@ -2925,12 +2955,13 @@ impl Green {
     Ok(Some(Effect::Symlink(path.to_owned(), target.to_owned())))
   }
 
-  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict).
+  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict, and so is a
+  /// target removed after the base, A-643).
   fn merge_hardlink(
     &self,
     path: &str,
     base: u64,
-    target: &str,
+    (target, target_established): (&str, bool),
   ) -> Result<Option<Effect>, ConflictWindow> {
     // A file, directory or symlink already at this path is a different kind — a type conflict. An
     // existing hard link is not: that is the retarget case decided just below.
@@ -2940,6 +2971,12 @@ impl Green {
       || self.specials.contains_key(path)
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
+    // A target removed after the work's base is gone for the work, whatever stands at its path
+    // now: a link to it is delete against modify on the link, never a name for the file made in
+    // its place, unless the work makes the target itself (A-643).
+    if !target_established && self.file_removed_since(target, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     if self.changed_last(self.hardlink_changed.get(path), path) > base {
       if self.hardlinks.get(path).map(String::as_str) == Some(target) {
@@ -3086,8 +3123,11 @@ impl Green {
         self.merge_special(path, inc.base, *node),
       );
     }
-    self.decide_content(inc, r, &mut effects, &mut windows);
-    self.decide_directories(r, &mut effects, &mut windows);
+    // The paths the increment removes itself: a rename over a file and a directory's removal read
+    // them.
+    let cleared = r.cleared();
+    self.decide_content(inc, (r, &cleared), &mut effects, &mut windows);
+    self.decide_directories((inc.base, r, &cleared), &mut effects, &mut windows);
     self.decide_metadata(inc, r, &mut effects, &mut windows);
     self.decide_node_exclusive(inc, &mut windows);
     if windows.is_empty() {
@@ -3127,13 +3167,15 @@ impl Green {
   fn decide_content(
     &mut self,
     inc: &Increment,
-    r: &Resolved,
+    (r, cleared): (&Resolved, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
     for (dst, from) in &r.renames {
       let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
-      if let Err(window) = self.merge_rename((dst, ops), (inc.base, &inc.post_state), from, effects)
+      let source = (from.as_str(), cleared);
+      if let Err(window) =
+        self.merge_rename((dst, ops), (inc.base, &inc.post_state), source, effects)
       {
         windows.push(window);
       }
@@ -3161,16 +3203,15 @@ impl Green {
   /// The directory dimension: creation and removal (removal against the increment's own removals).
   fn decide_directories(
     &self,
-    r: &Resolved,
+    (base, r, cleared): (u64, &Resolved, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
-    let cleared = r.cleared();
     for path in &r.mkdirs {
       record(effects, windows, self.merge_mkdir(path));
     }
     for path in &r.rmdirs {
-      record(effects, windows, self.merge_rmdir(path, &cleared));
+      record(effects, windows, self.merge_rmdir(path, base, cleared));
     }
   }
 
@@ -3196,7 +3237,7 @@ impl Green {
       record(
         effects,
         windows,
-        self.merge_hardlink(path, inc.base, target),
+        self.merge_hardlink(path, inc.base, (target, r.establishes(target))),
       );
     }
     for (path, name, value) in &r.xattr_sets {
