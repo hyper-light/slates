@@ -939,9 +939,15 @@ impl Daemon {
     #[cfg(windows)]
     configure_windows_hold_owner(windows_channel.is_some(), &shards)?;
     let handed_connections = handed.connections;
-    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone.
+    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone, while it
+    // goes on (A-552): a check gives the learning its own shard's window (the one its watchdog judges it by, A-455) to
+    // end one more shard's, and parks a beat between looks, so its watchdog sees it move at every look of its own.
     #[cfg(unix)]
-    let gate = slates_base::own_mounts::Gate::new(LIVENESS_BUDGET_NS);
+    let gate = slates_base::own_mounts::Gate::new(
+      shards.len(),
+      crate::watchdog::own_window_ns,
+      HEARTBEAT_NS,
+    );
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();

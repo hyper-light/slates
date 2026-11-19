@@ -4039,9 +4039,11 @@
 > by, or wait while what they wait on goes on:** a starved hold (test support, `starved_share_ns`) spins half the window
 > the watchdog judges its shard by, where it spun half of `W`; a stop waits for its log writer while it writes lines,
 > giving it up a window (the widest its shards are judged by) after its last, where it gave up a slow writer after one
-> `W` in all.
+> `W` in all; a crossing check waits while its daemon's shards go on ending their learning (`start_with_fleet`'s gate),
+> woken at each end and parked a beat between looks, giving up once its own shard's window passes with none ending,
+> where it spun one `W` in all.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
-> `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
+> the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for

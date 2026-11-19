@@ -20854,7 +20854,8 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
     mounts from its catalog (Linux FUSE by point and the `slates:` prefix, macOS NFS by point and source) before it
     reacquires any base or resumes any landing; a shard's base can lie under another shard's mount, so every crossing
     check of the daemon's waits until every one of its shards has learned (a ticket per shard, taken before it starts;
-    bounded by the liveness budget, refused `EAGAIN` past it). The gate is the daemon's: its shard threads enter it as
+    waited for while the learning goes on, refused `EAGAIN` once the waiting shard's own window passes with no shard
+    ending its learning, A-552). The gate is the daemon's: its shard threads enter it as
     they start, and a check waits on its own daemon's shards alone. A Linux shard the anchor handed no FUSE device keeps
     no mount that could wait on it (a kept mount with no device answers `ENOTCONN`), so it takes no ticket. (The first
     form counted every shard of the process: in a test binary that starts daemons side by side, a landing's target
@@ -36529,10 +36530,11 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   judgment.
 
 ### A-552 — The daemon's own supervision waits follow the windows its shards are judged by, or wait while what they wait on goes on (2026-11-19, UI goal 86 via g076b: D-c; R3's class D; §4.14 `daemon.alive`; A-228, A-232, A-455, A-525)
-Applied in the same change to: GAPS (the failover delay's entry, its class D line), `crates/server/src/daemon.rs`
-(`starved_share_ns`, `starve_this_thread`, `Daemon::starve_control_shard`'s doc, `stop_parts`, the test),
-`crates/server/src/watchdog.rs` (`shard_window_ns`, `own_window_ns`) and `crates/machine/src/log.rs` (`LogWriter::stop`,
-its progress count, the sink seam and the test).
+Applied in the same change to: §4.6 (A-227's kept mounts: the gate's wait), GAPS (the failover delay's entry, its class
+D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`, `Daemon::starve_control_shard`'s doc,
+`stop_parts`, `start_with_fleet`'s gate, the test), `crates/server/src/watchdog.rs` (`shard_window_ns`,
+`own_window_ns`), `crates/machine/src/log.rs` (`LogWriter::stop`, its progress count, the sink seam and the test) and
+`crates/base/src/own_mounts.rs` (`Gate`, `Learning`'s drop, `await_learned`, the test).
 - **What was there.** A-359's sweep left the daemon's own supervision waits on the liveness window `W` (class D, D-c),
   each owed its own change: a starved hold's CPU (`starved_share_ns`), the log writer's drain wait at a stop
   (`stop_parts`), the learning gate's crossing wait (`start_with_fleet`), the Windows hold channel's two bounds
@@ -36553,9 +36555,22 @@ its progress count, the sink seam and the test).
   holding its route with nothing to send) is left to the process's end, as before. The window is the widest this
   daemon's shards are judged by (A-455), read before the runtime stops: a host that keeps the shards off their CPUs that
   long keeps the writer's thread off its own as long.
+- **The learning gate's crossing wait (`start_with_fleet`, A-227).** A crossing check on a shard thread waited for its
+  daemon's shards to learn their kept mounts by spinning one window in all, so a daemon whose shards were still ending
+  their learning, each in its turn, had its crossings refused `EAGAIN` while every shard was alive and learning. Now
+  each learning that ends wakes every waiting check (the gate keeps each entered shard thread and unparks them), and a
+  check gives up only once the waiting shard's own window (A-455, `watchdog::own_window_ns`, read at each look) passes
+  with no shard ending its learning. Between looks it parks a beat apart (`HEARTBEAT_NS`, the watchdog's own cadence),
+  never spinning: a check that spun past a window of CPU would have its own shard judged spinning, and one parked past
+  a window would have it judged still, while a beat's wake shows its watchdog CPU progress at every look. The wait is
+  bounded by the daemon's shards: each ends its learning once.
 - **Tests.** `a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by` (`crates/server/src/daemon.rs`: a quiet
   shard's hold half the liveness window, a shard held two and a half windows half of those, a span under a beat a beat
   at most); red with today's rule (the held shard's hold half the liveness window) on the Mac Studio.
   `a_stop_waits_while_its_writer_takes_lines_and_gives_up_a_still_one` (`crates/machine/src/log.rs`: twelve lines to a
   standard error taking one every sixth of a window, all written and the writer ended; a writer a held route keeps, with
   nothing queued, given up after a window); red with today's rule (given up after one window with lines unwritten).
+  `a_crossing_waits_while_its_daemons_shards_go_on_learning_and_gives_up_on_a_still_window`
+  (`crates/base/src/own_mounts.rs`: six shards ending their learning a quarter window apart, the check answered once
+  the last has, a window and a half on; a shard that never ends, `EAGAIN` after a window); red with today's rule
+  (`EAGAIN` after one window while shards were still ending theirs).
