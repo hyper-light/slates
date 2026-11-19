@@ -42469,7 +42469,7 @@ Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`sto
   SHA-256 checked equal after the copy. The stores differ only where `dotencode` does (the leading period and space).
 - **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 195 of 195 at its second
   build (the first's one error a borrowed temporary, E0716), 6 of them this part's; rustfmt's layout taken from that
-  run. Golden: in each store every fncache entry encoded to exactly the data revlogs 7.2 stored (the sets equal, each a
+  run; 203 of 203 with rustfmt clean on the tree merged with main (A-619's read serving among them) at b412d90. Golden: in each store every fncache entry encoded to exactly the data revlogs 7.2 stored (the sets equal, each a
   fixture), every tracked path's revlog in the fncache, three hashed names and the case collision among them. Unit:
   7.2's doctests of `_encodedir`, `decodedir`, `_buildencodefun`, `encodefilename` and `_auxencode`; long paths hashed
   in both encodings. Hostile: an fncache without its newline, with an empty line, or past its admission.
