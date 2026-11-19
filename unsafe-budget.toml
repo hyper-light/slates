@@ -660,3 +660,6 @@ slates-image = 0
 # 2026-10-29, when `cargo xtask unsafe` found the crate unbudgeted since A-187 added it (CI runs the structural and
 # literal checks, not the budget).
 slates-seal = 0
+# slates-svn (0): the Subversion server's pure pieces (A-500, §4.17.4): svndiff's integers, windows and sections read
+# and written by checked offsets and `get`, LZ4 through lz4_flex's safe codec; no casts, no maps, no FFI.
+slates-svn = 0
