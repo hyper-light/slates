@@ -41216,8 +41216,8 @@ Applied in the same change to:
   reader and a writer that refused everything: `cargo test -p slates-svn --lib --locked dump` 0 of 25
   (`~/.cache/g264-logs/a593-red.txt` there). Green: `cargo test -p slates-svn --lib --locked` 78 of 78 in 9.02 s, the
   crate's 53 and the codec's 25 (`a593-green2.txt`); the one failure on the way was the oracle's own (it took revision
-  properties for a node's). `cargo fmt -p slates-svn` applied. The tree merged with main (3ddea7ef1, 04:48 UTC, load
-  10.78): 203 of 203 in 8.89 s, main's 178 and the codec's 25 (`a593-merged.txt`), `cargo fmt --check` clean. Clippy,
+  properties for a node's). `cargo fmt -p slates-svn` applied. The tree merged with main (475952115, 04:51 UTC, load
+  10.39): 260 of 260 in 8.83 s, main's 235 and the codec's 25 (`a593-merged2.txt`), `cargo fmt --check` clean. Clippy,
   `xtask check` and the cross-target lint are main's (the run-request queue).
 - **Rejected.** Reading records as written and carrying their blank lines to the writer, so that a deletion ended by
   its empty line alone could be written again: byte for byte too, but a replacement by a copy would reach `load` as two
