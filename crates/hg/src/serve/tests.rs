@@ -652,7 +652,7 @@ impl Partial<'_> {
     sample
   }
 
-  fn full_sample(&mut self, heads: &[Rev], size: usize) -> BTreeSet<Rev> {
+  fn full_sample(&mut self, size: usize) -> BTreeSet<Rev> {
     let revs = self.undecided().clone();
     if revs.len() <= size {
       return revs;
@@ -785,7 +785,7 @@ fn find_common_heads(local: &History, remote: &History, initial: usize, full: us
   let mut full_sample = false;
   while !partial.undecided().is_empty() {
     let sample: Vec<Rev> = if full_sample || !partial.bases.is_empty() {
-      partial.full_sample(&own_heads, full).into_iter().collect()
+      partial.full_sample(full).into_iter().collect()
     } else {
       partial
         .quick_sample(&own_heads, initial)

@@ -80,7 +80,7 @@ dump() {
 cd "$WORK"
 hg version -q
 hg init server
-printf '[phases]\npublish = False\n' >> server/.hg/hgrc
+printf '[phases]\npublish = False\n[experimental]\nevolution.createmarkers = true\nevolution.exchange = true\n' >> server/.hg/hgrc
 cd server
 printf 'a\n' > a; hg add -q a; hg commit -m 'add a'
 printf 'a\nb\n' > a; hg commit -m 'edit a'

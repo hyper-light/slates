@@ -158,11 +158,13 @@ pub fn bookmark_entries<'r>(
   repo: &'r impl Repository,
   admission: &mut Admission,
 ) -> Result<Vec<Bookmark<'r>>, Refusal> {
-  let held = repo
-    .bookmarks()
-    .filter(|(_, node)| repo.rev(node).is_some());
-  admission.charge_items::<Bookmark<'_>>(held.clone().count())?;
-  let mut marks: Vec<Bookmark<'r>> = held
+  let held = || {
+    repo
+      .bookmarks()
+      .filter(|(_, node)| repo.rev(node).is_some())
+  };
+  admission.charge_items::<Bookmark<'_>>(held().count())?;
+  let mut marks: Vec<Bookmark<'r>> = held()
     .map(|(name, node)| Bookmark {
       name,
       node: Some(node),
