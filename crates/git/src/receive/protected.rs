@@ -11,9 +11,9 @@
 //! hook, and git answers a hook's refusal with the hook's own words on band 2, read 128 bytes at a time, then its own
 //! line `error: hook declined to update <ref>`, and reports `hook declined`. slates' checks answer as that hook would
 //! ([`hook_declined`]), in words of its own that name the commit and the rule: [`merge_commit`] and
-//! [`unsigned_commit`]. Every hosted git server answers its own protections through this report (GitLab and Gitea say
-//! `pre-receive hook declined`, GitHub `protected branch hook declined`), and the stock client shows the words whatever
-//! the reason says.
+//! [`unsigned_commit`]. A hosted server answers its own protections through a hook's report too (Gitea v1.24.0's
+//! pre-receive hook, which git reports `pre-receive hook declined`), and the stock client shows the words whatever the
+//! reason says.
 //!
 //! **Golden vectors.** `fixtures/protected/make-protected-fixtures.sh` captured ten pushes stock git 2.50.1 made to a
 //! stock server protecting `main` this way (and two to a SHA-256 one), its update hook speaking these words; the tests

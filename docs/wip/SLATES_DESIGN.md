@@ -12438,20 +12438,20 @@ engine: the verdict, rebase, position mapping, the register).
 > is A-640's next part.
 >
 > **Status (2026-11-19, A-644 part 1: a protected branch's answers from the store, in git's words).** `crates/git`
-> (`store::protect`) answers what a protected branch asks of a move, judged against the ref's own green and nothing
-> else (A-642). How the move changes the ref (`Repository::change`: create, fast-forward, rewrite, delete): the
-> fast-forward is the store's own question, decided with no walk where generation numbers decide it (a new head of no
-> greater generation than the current one descends from it only by being it), and otherwise by the walk back that stops
-> below the current head's generation; the store counts both. Which commits the move brings: D(k)'s, a create's whole
-> history, walked newest generation first, each once. The first merge commit among them (`merge_commit`), and the
-> first no trusted key signed (`unsigned_commit`): its signature split from what it covers as git's verifier splits
-> them (commit.c's `parse_buffer_signed_by_header`, now A-590's parser's rule), its format told by the armour's first
-> line, an SSH signature handed to the caller's verifier (`CommitSigners`), OpenPGP and X.509 refused, typed, until a
-> later piece verifies them. `receive::protected` answers in git's words: `non-fast-forward` and `deletion prohibited`
-> with git's own band-2 lines, and `hook declined` after the words a hook would write, relayed as git relays a hook's
-> (in 128-byte pieces), then git's `hook declined to update`. Proven against twelve pushes stock git 2.50.1 made to a
-> stock server protecting `main`, byte for byte; an oracle over generated histories; and the signatures and payloads
-> git's verifier read, which `ssh-keygen -Y verify` checked. Owed (part 2): the policy that asks these questions (A-622's
+> (`store::protect`) answers what a protected branch asks of a move, judged against the ref's own green and nothing else
+> (A-642). How the move changes the ref (`Repository::change`: create, fast-forward, rewrite, delete): the fast-forward
+> is the store's own question, decided with no walk where generation numbers decide it (a new head of no greater
+> generation than the current one descends from it only by being it), and otherwise by the walk back that stops below
+> the current head's generation; the store counts both. Which commits the move brings: D(k)'s, a create's whole history,
+> walked newest generation first, each once. The first merge commit among them (`merge_commit`), and the first no
+> trusted key signed (`unsigned_commit`): its signature split from what it covers as git's verifier splits them
+> (commit.c's `parse_buffer_signed_by_header`, now A-590's parser's rule), its format told by the armour's first line,
+> an SSH signature handed to the caller's verifier (`CommitSigners`), OpenPGP and X.509 refused, typed, until a later
+> piece verifies them. `receive::protected` answers in git's words: `non-fast-forward` and `deletion prohibited` with
+> git's own band-2 lines, and `hook declined` after the words a hook would write, relayed as git relays a hook's (in
+> 128-byte pieces), then git's `hook declined to update`. Proven against twelve pushes stock git 2.50.1 made to a stock
+> server protecting `main`, byte for byte; an oracle over generated histories; and the signatures and payloads git's
+> verifier read, which `ssh-keygen -Y verify` checked. Owed (part 2): the policy that asks these questions (A-622's
 > rules and a trust list of commit signers), `admit`'s typed refusals, and A-321's verifier under git's namespace.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
@@ -43418,31 +43418,32 @@ with `make-protected-fixtures.sh`; `.gitattributes`.
   repository". Each reads every other ref's position (a global reference, A-642), and each lets a protected name be made
   at a commit pushed first to a branch nothing protects, never judged.
 - **Signatures, as git's verifier reads them.** commit.c's `parse_buffer_signed_by_header` [C: v2.50.1] makes the
-  signature every header of the repository's own name, in order, and the payload the commit without any line that
-  begins `gpgsig`, with its continuation lines. A-590's payload left out only `gpgsig` and `gpgsig-sha256`, so a header
-  named, say, `gpgsigx` stayed in it: a signature git verifies would not verify here, and one made over the longer payload
-  would verify here where git refuses it. Both rules are now git's (`Commit::write_signature`,
-  `write_signed_payload`), red first. The format is the armour's first line, as `get_format_by_sig` tells it. An SSH
-  signature and its payload go to the caller's verifier (`CommitSigners`; A-321's under git's namespace on the server,
-  part 2); OpenPGP and X.509 are refused, typed (`Unsigned::OpenPgp`, `X509`), since verifying them is a later piece;
-  none, or an armour in no format git signs with, is refused (`Missing`, `Unknown`).
-- **git's words** (`receive::protected`). git refuses a non-fast-forward and a delete itself (`receive.denyNonFastForwards`,
-  `receive.denyDeletes`): `non-fast-forward` after `error: denying non-fast-forward <ref> (you should pull first)`, and
-  `deletion prohibited` after `error: denying ref deletion for <ref>`. A linear history and signed commits are what git
-  leaves to an update hook, and git answers a refusing hook with the hook's own words on band 2, read 128 bytes at a
-  time (`copy_to_sideband`'s buffer), then `error: hook declined to update <ref>`, and reports `hook declined`. slates'
-  checks answer as that hook would, in words that name the commit and the rule (`denying merge commit <id> on <ref>
-  (linear history required)`; `denying unsigned commit <id> on <ref> (signed commits required)`; `denying commit <id>
-  on <ref>: <why> (signed commits required)`). `Declined::hook` carries a hook's words, and the report relays them in
-  git's pieces. Every hosted server answers its protections through this report (Gitea: `pre-receive hook declined`).
+  signature every header of the repository's own name, in order, and the payload the commit without any line that begins
+  `gpgsig`, with its continuation lines. A-590's payload left out only `gpgsig` and `gpgsig-sha256`, so a header named,
+  say, `gpgsigx` stayed in it: a signature git verifies would not verify here, and one made over the longer payload
+  would verify here where git refuses it. Both rules are now git's (`Commit::write_signature`, `write_signed_payload`),
+  red first. The format is the armour's first line, as `get_format_by_sig` tells it. An SSH signature and its payload go
+  to the caller's verifier (`CommitSigners`; A-321's under git's namespace on the server, part 2); OpenPGP and X.509 are
+  refused, typed (`Unsigned::OpenPgp`, `X509`), since verifying them is a later piece; none, or an armour in no format
+  git signs with, is refused (`Missing`, `Unknown`).
+- **git's words** (`receive::protected`). git refuses a non-fast-forward and a delete itself
+  (`receive.denyNonFastForwards`, `receive.denyDeletes`): `non-fast-forward` after `error: denying non-fast-forward
+  <ref> (you should pull first)`, and `deletion prohibited` after `error: denying ref deletion for <ref>`. A linear
+  history and signed commits are what git leaves to an update hook, and git answers a refusing hook with the hook's own
+  words on band 2, read 128 bytes at a time (`copy_to_sideband`'s buffer), then `error: hook declined to update <ref>`,
+  and reports `hook declined`. slates' checks answer as that hook would, in words that name the commit and the rule
+  (`denying merge commit <id> on <ref> (linear history required)`; `denying unsigned commit <id> on <ref> (signed
+  commits required)`; `denying commit <id> on <ref>: <why> (signed commits required)`). `Declined::hook` carries a
+  hook's words, and the report relays them in git's pieces. A hosted server answers its own protections through a
+  hook's report too (Gitea v1.24.0's pre-receive hook, which git reports `pre-receive hook declined`).
 - **Golden vectors.** `make-protected-fixtures.sh` (git 2.50.1, Apple Git-155, and OpenSSH 10.2p1 on the MacBook,
   2026-11-19; no local path in any byte, checked): a stock bare server with both `deny` settings and an update hook
   keeping a linear history of commits a trusted key signed (`git verify-commit` against `gpg.ssh.allowedSignersFile`),
   twelve pushes through a tee: a signed create, a signed fast-forward, an unsigned commit, another key's, OpenPGP's and
   X.509's armours, a signed merge, the merge pushed to an unprotected branch, a forced rewrite, a delete, and a SHA-256
-  server's signed create and unsigned commit. Its keys are made fresh each run and only the public halves kept (as A-321's
-  golden signatures were made), so a re-run writes new signed commits. The script also splits two signed commits (one
-  `gpgsig`, one `gpgsig-sha256`) into signature and payload as commit.c splits them, and keeps each pair only once
+  server's signed create and unsigned commit. Its keys are made fresh each run and only the public halves kept (as
+  A-321's golden signatures were made), so a re-run writes new signed commits. The script also splits two signed commits
+  (one `gpgsig`, one `gpgsig-sha256`) into signature and payload as commit.c splits them, and keeps each pair only once
   `ssh-keygen -Y verify` accepts it.
 - **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln r975 and r984, 2026-11-19: 353
   passed, 2 of main's ignored; `cargo fmt -p slates-git -- --check` clean). Every push is answered from A-614's store

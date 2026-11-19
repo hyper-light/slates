@@ -314,11 +314,12 @@ pack is indexed before any URI pack can supply a base.
 | `routers/private/hook_pre_receive.go`, `routers/private/hook_verification.go` | Gitea `v1.24.0` | cb0325ee50ed2074, 48dcea533dea9fec |
 
 What a protected branch rests on (quoted):
-- **git refuses two things itself** [B: `config/receive.adoc`]: `receive.denyNonFastForwards` "will deny a ref update which
-  is not a fast-forward ... even if that push is forced", and `receive.denyDeletes` "will deny a ref update that deletes
-  the ref". [C: `receive-pack.c` `update()`, lines 1519-1580] a delete of a branch: `rp_error("denying ref deletion for
-  %s", name)` and the reason `deletion prohibited`; a non-fast-forward of a branch: `rp_error("denying non-fast-forward
-  %s" " (you should pull first)", name)` and `non-fast-forward`, both judged before the update hook runs.
+- **git refuses two things itself** [B: `config/receive.adoc`]: `receive.denyNonFastForwards` "will deny a ref update
+  which is not a fast-forward ... even if that push is forced", and `receive.denyDeletes` "will deny a ref update that
+  deletes the ref". [C: `receive-pack.c` `update()`, lines 1519-1580] a delete of a branch: `rp_error("denying ref
+  deletion for %s", name)` and the reason `deletion prohibited`; a non-fast-forward of a branch: `rp_error("denying
+  non-fast-forward %s" " (you should pull first)", name)` and `non-fast-forward`, both judged before the update hook
+  runs.
 - **The rest is a hook's** [B: `githooks.adoc` "update"]: "The hook executes once for each ref to be updated"; "Exiting
   with a non-zero status prevents `git receive-pack` from updating that ref". [C: `update()`] after a refusing hook,
   `rp_error("hook declined to update %s", name)` and the reason `hook declined`. [C: `run_update_hook`,
