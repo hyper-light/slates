@@ -1,8 +1,10 @@
 //! A-614's D(k) and reached sets as a type of derived data (A-647 part 2): every version's value derived through
 //! `slates-vcs`'s mechanism from its parents' values is the store's own D(k) and reached set, and is, identity for
-//! identity, the value the store kept from its admission as it committed; and (A-647 part 3) the store serves every
-//! version's two sets from that value alone.
+//! identity, the value the store kept from its admission as it committed; (A-647 part 3) the store serves every
+//! version's two sets from that value alone; and (A-647 part 4) a version's value adds to the store only the nodes no
+//! earlier set had, so what it stores is bound by what it brought, never by what it reaches.
 
+use std::collections::BTreeSet;
 use std::mem::size_of;
 
 use proptest::prelude::*;
@@ -11,11 +13,13 @@ use slates_vcs::{ContentId, ContentStore, Inserted};
 
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::objects::tree::Mode as FileMode;
-use crate::store::{ReachRefused, ReachSets, Repository, Sets};
+use crate::store::repository::reach::Shape;
+use crate::store::{Positions, ReachRefused, ReachSets, Repository, Sets};
 
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
-  Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store, tree, wide,
+  BUDGET, Made, Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store,
+  tree, wide,
 };
 
 /// A read's answer as the tests take it.
@@ -153,7 +157,7 @@ proptest! {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
     let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
     let mut model = Model::new(format);
-    let mut ty = ReachSets::declare(Mode::Eager);
+    let mut ty = ReachSets::declare(WINDOW, Mode::Eager);
     let (mut kept, mut derived) = (Derivations::new(), Derivations::new());
     for op in &ops {
       let before = versions(&real.repository);
@@ -215,7 +219,7 @@ fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
   assert_eq!(parents((2, 0)), Some(Vec::new()));
   assert_eq!(parents((1, 3)), Some(vec![(1, 2), (2, 0)]));
   assert_eq!(parents((1, 4)), None);
-  let mut ty = ReachSets::declare(Mode::Lazy);
+  let mut ty = ReachSets::declare(WINDOW, Mode::Lazy);
   let mut values = Derivations::new();
   let root = read_to_end(&mut values, &mut ty, &repository, &mut store, (1, 3)).unwrap();
   assert_eq!(values.counters().derived, 5);
@@ -236,7 +240,7 @@ fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
 #[test]
 fn t_a647_the_reach_type_refuses_by_kind() {
   let (mut store, repository) = rewritten();
-  let mut ty = ReachSets::declare(Mode::Lazy);
+  let mut ty = ReachSets::declare(WINDOW, Mode::Lazy);
   let foreign = store.put_derived(&[], b"not two sets").unwrap().identity;
   let mut values = Derivations::new();
   let first = read_to_end(&mut values, &mut ty, &repository, &mut store, (1, 0)).unwrap();
@@ -269,72 +273,96 @@ fn t_a647_the_reach_type_refuses_by_kind() {
   );
 }
 
-/// The little-endian bytes of `value`.
-fn word(value: u64) -> Vec<u8> {
-  value.to_le_bytes().to_vec()
-}
-
-/// A set's bytes: its count of runs, then each run's start and end.
-fn set_bytes(runs: &[(u64, u64)]) -> Vec<u8> {
-  let mut bytes = word(runs.len() as u64);
+/// A leaf of `runs`, each relative to its block, naming `names`, held once by the caller.
+fn leaf(store: &mut ContentStore, runs: &[(u64, u64)], names: &[ContentId]) -> ContentId {
+  let mut payload = b"L".to_vec();
   for (start, end) in runs {
-    bytes.extend(word(*start));
-    bytes.extend(word(*end));
+    payload.extend(start.to_le_bytes());
+    payload.extend(end.to_le_bytes());
   }
-  bytes
+  store.put_derived(names, &payload).unwrap().identity
 }
 
-/// A value of the type's form holding `bytes` as its sets' object and saying its length is `len`, held once by the
-/// caller.
-fn value_of(store: &mut ContentStore, bytes: &[u8], len: u64) -> ContentId {
-  let object = store.put_object(bytes).unwrap();
-  let node = store.put_derived(&[object], &word(len)).unwrap().identity;
-  store.release(&object).unwrap();
-  node
+/// An inner node of `level` and `bitmap` naming `names`, held once by the caller.
+fn inner(store: &mut ContentStore, level: u8, bitmap: &[u8], names: &[ContentId]) -> ContentId {
+  let payload = [b"I".as_slice(), &[level], bitmap].concat();
+  store.put_derived(names, &payload).unwrap().identity
 }
 
-/// A-647 parts 2 and 3, hostile values. Do: read values whose sets' object is not two sets kept one way (a count past
-/// the bytes, runs out of order, touching or empty, a byte left over, a byte short), and nodes not of the value's form
-/// (the sets' bytes in the node itself, as part 2 kept them; two objects named; a length past the object's; a length
-/// cut short). Expect: each refused, never read past its end, and the sound value read back.
+/// A value naming `names`, its payload `present`, then a shape of `block` and `fanout`, held once by the caller.
+fn value(
+  store: &mut ContentStore,
+  names: &[ContentId],
+  present: u8,
+  shape: (u64, u64),
+) -> ContentId {
+  let mut payload = vec![b'V', present];
+  payload.extend(shape.0.to_le_bytes());
+  payload.extend(shape.1.to_le_bytes());
+  store.put_derived(names, &payload).unwrap().identity
+}
+
+/// A-647 parts 2 to 4, hostile values. Do: read, in a store of nodes made by hand with a shape of blocks of four
+/// positions and two children a node, a sound value (a reached set of two leaves under a node of level 1, D(k) a leaf),
+/// then values broken one way each: the value's own node (another tag, a bit past the two sets, a set its bits name
+/// missing or one more named, a block odd, a single child a node, a payload cut short), a leaf (runs out of order,
+/// touching, empty, past its block, a byte left over, a name), and an inner node (of level 0, a bitmap of another
+/// length, a bit past the children, a bit with no child, a child of another level, no child at all). Expect: the
+/// sound value reads back as its sets; every broken one is refused, never read past its end.
 #[test]
 fn t_a647_a_hostile_reach_value_is_refused() {
   let mut store = store();
-  let good = [set_bytes(&[(0, 2), (4, 5)]), set_bytes(&[(4, 5)])].concat();
-  let hostile = [
-    [set_bytes(&[(0, 2)]), word(u64::MAX)].concat(),
-    [set_bytes(&[(4, 5), (0, 2)]), set_bytes(&[])].concat(),
-    [set_bytes(&[(0, 2), (2, 3)]), set_bytes(&[])].concat(),
-    [set_bytes(&[(3, 3)]), set_bytes(&[])].concat(),
-    [good.clone(), vec![0]].concat(),
-    good[..good.len() - 1].to_vec(),
+  let shape = (4, 2);
+  let (low, high) = (
+    leaf(&mut store, &[(0, 2)], &[]),
+    leaf(&mut store, &[(1, 3)], &[]),
+  );
+  let tree = inner(&mut store, 1, &[0b11], &[low, high]);
+  let one = leaf(&mut store, &[(1, 2)], &[]);
+  let sound = value(&mut store, &[tree, one], 3, shape);
+  let sets = Sets::read(&store, &sound).unwrap();
+  assert_eq!(sets.reached.iter().collect::<Vec<_>>(), [0, 1, 5, 6]);
+  assert_eq!(sets.brought.iter().collect::<Vec<_>>(), [1]);
+  let mut tagged = value(&mut store, &[tree, one], 3, shape);
+  let payload = store.derived(&tagged).unwrap().payload().to_vec();
+  tagged = store
+    .put_derived(&[tree, one], &[b"X".as_slice(), &payload[1..]].concat())
+    .unwrap()
+    .identity;
+  let short = store
+    .put_derived(&[tree, one], &[b'V', 3, 4, 0, 0, 0, 0, 0, 0, 0])
+    .unwrap()
+    .identity;
+  let leaves = [
+    leaf(&mut store, &[(2, 3), (0, 1)], &[]),
+    leaf(&mut store, &[(0, 1), (1, 2)], &[]),
+    leaf(&mut store, &[(1, 1)], &[]),
+    leaf(&mut store, &[(0, 5)], &[]),
+    store.put_derived(&[], b"L\x01").unwrap().identity,
+    leaf(&mut store, &[(0, 1)], &[one]),
   ];
-  for bytes in &hostile {
-    let root = value_of(&mut store, bytes, bytes.len() as u64);
-    assert_eq!(Sets::read(&store, &root), None, "{bytes:?}");
+  let inners = [
+    inner(&mut store, 0, &[0b1], &[low]),
+    inner(&mut store, 1, &[0b1, 0], &[low]),
+    inner(&mut store, 1, &[0b101], &[low, high]),
+    inner(&mut store, 1, &[0b11], &[low]),
+    inner(&mut store, 2, &[0b1], &[low]),
+    inner(&mut store, 1, &[0], &[]),
+  ];
+  let mut broken = vec![
+    tagged,
+    value(&mut store, &[tree, one], 7, shape),
+    value(&mut store, &[tree], 3, shape),
+    value(&mut store, &[tree, one], 1, shape),
+    value(&mut store, &[tree, one], 3, (3, 2)),
+    value(&mut store, &[tree, one], 3, (4, 1)),
+    short,
+  ];
+  for node in leaves.into_iter().chain(inners) {
+    broken.push(value(&mut store, &[node], 1, shape));
   }
-  let len = good.len() as u64;
-  let root = value_of(&mut store, &good, len);
-  let sets = Sets::read(&store, &root).unwrap();
-  assert_eq!((sets.reached.len(), sets.brought.len()), (3, 1));
-  let object = store.put_object(&good).unwrap();
-  let forms = [
-    store.put_derived(&[], &good).unwrap().identity,
-    store
-      .put_derived(&[object, object], &word(len))
-      .unwrap()
-      .identity,
-    store
-      .put_derived(&[object], &word(len + 1))
-      .unwrap()
-      .identity,
-    store
-      .put_derived(&[object], &word(len)[..7])
-      .unwrap()
-      .identity,
-  ];
-  for (way, node) in forms.iter().enumerate() {
-    assert_eq!(Sets::read(&store, node), None, "form {way}");
+  for (way, root) in broken.iter().enumerate() {
+    assert_eq!(Sets::read(&store, root), None, "broken way {way}");
   }
 }
 
@@ -436,6 +464,196 @@ fn t_a647_p3_a_reached_set_past_one_window_is_kept_and_served() {
   assert!(
     newest.runs() * RUN_BYTES > WINDOW,
     "the runs alone pass one window"
+  );
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
+}
+
+/// Shape: a window as short as the server's store-level tests hold content in (A-662), so a ref's reached set passes
+/// many blocks and several levels of its tree within a few hundred pushes.
+const SHORT_WINDOW: usize = 1 << 8;
+
+/// Shape: the turns of each of the storage test's phases: enough that ref 1's newest reached set, kept as one sorted
+/// sequence of runs, passes the bound every one of its versions is held to.
+const TURNS: usize = 400;
+
+/// A commit of its own over `parents`, a blob of `text` and a tree naming it beneath it: its objects, and its id.
+fn commit_of(
+  format: ObjectFormat,
+  text: &str,
+  parents: &[ObjectId],
+  seconds: u64,
+) -> (Vec<Made>, ObjectId) {
+  let text = blob(format, text.as_bytes());
+  let files = tree(format, &[(FileMode::File, b"file", text.id)]);
+  let made = commit(format, files.id, parents, seconds);
+  let id = made.id;
+  (vec![made, files, text], id)
+}
+
+/// Pushes `objects` and moves `green` to `head`: what the commit's values added to the store.
+fn push_counted(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  objects: Vec<Made>,
+  (green, head): (u64, ObjectId),
+) -> u64 {
+  let before = repository.counters().value_bytes;
+  push_and_move(repository, store, objects, &[(green, Some(head))]).unwrap();
+  repository.counters().value_bytes - before
+}
+
+/// Root commits made on refs 2 and 3 by turns, so each of ref 2's is a run of its own: ref 2's, oldest first.
+fn roots_by_turns(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  format: ObjectFormat,
+) -> Vec<ObjectId> {
+  let mut roots = Vec::with_capacity(TURNS);
+  for at in 0..TURNS {
+    for green in [2, 3] {
+      let (objects, id) = commit_of(format, &format!("ref {green} root {at}\n"), &[], at as u64);
+      push_and_move(repository, store, objects, &[(green, Some(id))]).unwrap();
+      if green == 2 {
+        roots.push(id);
+      }
+    }
+  }
+  roots
+}
+
+/// Ref 1 made at a root of its own, pushed by turns with ref 3 (a commit over its head; a root of ref 3's), then merged
+/// with each of `roots`, newest first: what each of its versions added to the store for its value, in order.
+fn ref_one_by_turns_then_merges(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  format: ObjectFormat,
+  roots: &[ObjectId],
+) -> Vec<u64> {
+  let (objects, mut head) = commit_of(format, "ref 1's own root\n", &[], 0);
+  let mut added = vec![push_counted(repository, store, objects, (1, head))];
+  for at in 0..TURNS {
+    let (objects, made) = commit_of(format, &format!("ref 1 turn {at}\n"), &[head], at as u64);
+    head = made;
+    added.push(push_counted(repository, store, objects, (1, head)));
+    let (objects, root) = commit_of(format, &format!("ref 3 turn {at}\n"), &[], at as u64);
+    push_and_move(repository, store, objects, &[(3, Some(root))]).unwrap();
+  }
+  for (at, root) in roots.iter().enumerate().rev() {
+    let text = format!("merge {at}\n");
+    let (objects, made) = commit_of(format, &text, &[head, *root], at as u64);
+    head = made;
+    added.push(push_counted(repository, store, objects, (1, head)));
+  }
+  added
+}
+
+/// The blocks of `shape` the positions of `set` touch.
+fn blocks_touched(shape: Shape, set: &Positions) -> u64 {
+  let blocks: BTreeSet<u64> = set.iter().map(|position| position / shape.block).collect();
+  blocks.len() as u64
+}
+
+/// The nodes on a path from a set's tree's root down to a leaf: the root's level, the least whose range covers the
+/// set's last block, and one for the leaf; none for the empty set.
+fn path_nodes(shape: Shape, set: &Positions) -> u64 {
+  set.run_pairs().last().map_or(0, |&(_, end)| {
+    u64::from(shape.level_of((end - 1) / shape.block)) + 1
+  })
+}
+
+/// What a version may add for its value: a window for each node on the paths from its two trees' roots down to the
+/// blocks its D(k) touches, and one for its value's own node. Its reached set is the one before it grown by D(k), so
+/// that set's tree differs from the one before only on those paths; D(k)'s tree is those paths.
+fn bound(shape: Shape, sets: &Sets) -> u64 {
+  let paths = blocks_touched(shape, &sets.brought);
+  let nodes = paths * (path_nodes(shape, &sets.reached) + path_nodes(shape, &sets.brought));
+  (nodes + 1) * SHORT_WINDOW as u64
+}
+
+/// Ref 1's `versions` read back from their values, each held to what its push brought: D(k) new to the version
+/// before's reached set, a commit's three objects (a merge's six: the merged root's too), and its reached set the one
+/// before grown by D(k). Each version's bound, in order.
+fn bounds_of(
+  repository: &Repository,
+  store: &ContentStore,
+  shape: Shape,
+  versions: usize,
+) -> Vec<u64> {
+  let mut before = Positions::new();
+  let mut bounds = Vec::with_capacity(versions);
+  for version in 0..versions {
+    let sets = Sets {
+      reached: repository.reached(store, 1, version).unwrap(),
+      brought: repository.brought(store, 1, version).unwrap(),
+    };
+    let objects = if version > TURNS { 6 } else { 3 };
+    assert_eq!(sets.brought.len(), objects, "version {version}'s D(k)");
+    assert!(
+      sets.brought.intersection(&before).is_empty(),
+      "version {version} brought no object anew"
+    );
+    assert_eq!(
+      sets.reached,
+      before.union(&sets.brought),
+      "version {version}'s reached set"
+    );
+    bounds.push(bound(shape, &sets));
+    before = sets.reached;
+  }
+  bounds
+}
+
+/// A-647 part 4. Do: in a store of a 256-byte window, make 400 root commits on ref 2 and as many on ref 3 by turns, so
+/// each of ref 2's roots is a run of its own; make ref 1 at a root of its own and push it by turns with ref 3, a commit
+/// over its head each turn, so each of those versions brings a run past every run it reached; then merge ref 2's roots
+/// into ref 1, newest first, each merge a commit, a tree and a blob of its own, so each of those versions brings a run
+/// below every run ref 1 reached (the worst case for a set kept as one sorted sequence, which such a version writes
+/// again from that run on). Record what each of ref 1's versions added to the store for its value. Expect: every
+/// version adds at most a window for each node on the paths from its two trees' roots down to the blocks its D(k)
+/// touches and one for its value's node, a bound set by what it brought and its trees' depth, never by what the ref
+/// reaches; every version, not only the newest, still answers its D(k) (its push's objects) and its reached set (the
+/// one before grown by them); and ref 1's newest reached set, kept as one sorted sequence, passes every version's bound.
+#[test]
+#[allow(
+  clippy::print_stderr,
+  reason = "the census is the test's evidence, printed with every run"
+)]
+fn t_a647_p4_a_version_stores_what_it_adds_not_what_it_reaches() {
+  let format = ObjectFormat::Sha1;
+  let mut store = ContentStore::new(BUDGET, SHORT_WINDOW).unwrap();
+  let mut repository = Repository::new(format);
+  let roots = roots_by_turns(&mut repository, &mut store, format);
+  let added = ref_one_by_turns_then_merges(&mut repository, &mut store, format, &roots);
+  let shape = Shape::of(SHORT_WINDOW).unwrap();
+  let bounds = bounds_of(&repository, &store, shape, added.len());
+  let newest = repository.reached(&store, 1, added.len() - 1).unwrap();
+  let whole = (newest.runs() * RUN_BYTES) as u64;
+  let past: Vec<(usize, u64, u64)> = (0..added.len())
+    .filter(|&version| added[version] > bounds[version])
+    .map(|version| (version, added[version], bounds[version]))
+    .collect();
+  let (turns, merges) = added.split_at(TURNS + 1);
+  eprintln!(
+    "reach sets census: shape {shape:?}, versions {}, most added by a turn {} and by a merge {} bytes, most bound {}, \
+     added in all {}, newest set {} runs ({whole} bytes whole), versions past their bound {}",
+    added.len(),
+    turns.iter().max().unwrap(),
+    merges.iter().max().unwrap(),
+    bounds.iter().max().unwrap(),
+    added.iter().sum::<u64>(),
+    newest.runs(),
+    past.len()
+  );
+  assert_eq!(past.first(), None, "(version, added, bound)");
+  assert_eq!(
+    newest.runs(),
+    2 * TURNS + 1,
+    "each root a run, each turn's commit one, and the merges one"
+  );
+  assert!(
+    whole > *bounds.iter().max().unwrap(),
+    "kept whole, the newest set passes every version's bound"
   );
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());

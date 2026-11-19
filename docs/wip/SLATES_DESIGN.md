@@ -12884,7 +12884,10 @@ engine: the verdict, rebase, position mapping, the register).
 > the store keeps the sets as the values alone: its commit puts each version's sets, as its admission walked them, as
 > the version's value, held by the version's record, and it serves every version's D(k) and reached set from it
 > (`Repository::brought`, `Repository::reached`), an older version's reached set as well as the newest's; the chains'
-> copies are gone. A value names its sets' bytes as an object of any length (format 2), so no set is too large to keep.
+> copies are gone. Since A-647 part 4 each set is a tree of derived nodes over fixed blocks of positions, shaped by the
+> store's window (format 3): a block's runs kept relative to it and a range the set holds whole one node a level, so
+> the same set is the same root on every tier, no set is too large to keep, and a version's value adds to the store
+> only the nodes on the paths to the blocks its D(k) touches, never its reached set again.
 >
 > **Status (2026-11-19, A-664 part 2: a version's trees and commit as derived data, piece 13's first part).**
 > `crates/git` (`derived`) makes the git objects of a version the server turns into git's (§4.17.1 "A push is a work"
@@ -45120,8 +45123,9 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
     step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
     the store's outputs unchanged (part 2), then served from the values alone, the chains' copies dropped, every
-    version's sets answerable (part 3). A version's git trees and commit as types, the commit the server makes (A-664
-    part 2). Owed: A-553's and A-588's stores as types.)
+    version's sets answerable (part 3), each set kept as a tree of nodes over fixed blocks of positions, so a version's
+    value stores what it brought, never its reached set again (part 4). A version's git trees and commit as types, the
+    commit the server makes (A-664 part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -52010,3 +52014,75 @@ Applied in the same change to:
 - **Owed.** The objects a hidden ref alone reaches hidden by slates-git; the daemon starting the SSH edge (A-684); the
   live stock `git clone` and fetch over the daemon's edge (the next piece, g309's); the exchange moved by the live
   signals; Linux and Windows runs, clippy, the doc and lint gates (main's).
+
+### A-647 part 4 — A version's reach sets kept as trees of nodes over fixed blocks of positions, so its value adds what it brought, never its reached set again (format 3) (2026-11-19, g294 from g302's draft, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 3)
+
+- **Why.** Part 3's owed line: "A value's reached set sharing its parent's runs by identity (a set kept as a tree of
+  nodes a version extends, so a fast-forward's value costs its D(k))". Format 2 kept each version's sets as one sorted
+  sequence of runs, which the content store cuts into windows at fixed offsets and keeps once each
+  (`ContentStore::put_object`). So a version that appends a run past every run it reached (a branch pushed by turns)
+  adds only the first window, the last and the lists above them, but a version whose D(k) falls below its newest run (a
+  merge of an older root) moves every window after it and stores its reached set again from there (g302's finding, by
+  reading `crates/vcs/src/content.rs`; measured in the red below).
+- **Format 3** (`slates-git reach sets 3 ` and the window, eight bytes, big-endian: the trees' shape is the window's, so
+  the window is part of the type's name). Each set is a tree of derived nodes over fixed blocks of positions
+  (`Shape`, derived from the store's window through the store's own encoding of a derived node, `encode_derived`): a
+  block is two positions for each run a leaf of one window holds, so a block whose positions are each a run of their
+  own fits one leaf, and an inner node names as many children as one window holds. A leaf holds its block's runs, each
+  relative to the block, so two blocks of the same runs are one node by identity; an inner node of level `l` names the
+  children of its range that hold any of the set, its payload a tag, its level and a bit for each child slot; a range
+  the set holds whole is one node a level, whatever its place, so a run over many blocks costs a node a level. The
+  root's level is the least whose range covers the set's last block, so a set has one tree. A value is a derived node
+  naming the reached set's root and then D(k)'s, each left out when empty, its payload a tag, a byte saying which it
+  names, and the shape (a block's positions and an inner node's children, eight bytes each, little-endian), so a value
+  reads alone whatever window made it. Every other form is refused by kind, a child of another level than the one below
+  its parent too.
+- **What a version stores.** The tree is a function of the set and the window alone, never of the history that made
+  it, so the same set is the same root on every tier. It is built whole from the set's runs at each commit, hashing as
+  much as format 2 did, and the store keeps a node once whoever puts it, so a version's value adds only the nodes no
+  earlier set had: the leaves of the blocks its D(k) touches and the inner nodes above them, in both trees, and its own
+  node. `StoreCounters::value_bytes` counts what the commits' values added to the content store.
+- **Rejected.** A-647 part 1's path map (a 16-way hash trie) as the sets' tree: its least branch, sixteen names, passes
+  the 256-byte window the server's store-level tests keep content in (chosen there so blobs span windows); the radix
+  tree's fanout is the most one window holds, at least two.
+- **Tests** (`crates/git/src/tests/store/reach.rs`; macOS arm64, Mac Studio d1323898, debug, 2026-11-19; Linux and
+  Windows owed to main).
+  - New: `t_a647_p4_a_version_stores_what_it_adds_not_what_it_reaches`. In a store of a 256-byte window (blocks of 30
+    positions, 7 children a node), 400 roots on refs 2 and 3 by turns; ref 1 made at a root of its own, pushed 400
+    times by turns with ref 3 (each version a run past every run it reached), then merged with ref 2's 400 roots, newest
+    first (each version a run below every run it reached). Each of ref 1's 801 versions is held to a window for each
+    node on the paths from its two trees' roots down to the blocks its D(k) touches, and one for its value's node; each
+    still answers its D(k) (its push's three objects, a merge's six) and its reached set (the one before grown by D(k));
+    and the newest reached set, 801 runs, kept as one sorted sequence (12,816 bytes) passes every version's bound.
+    Format 3's hostile values: a sound value of two leaves under a node of level 1 read back, then the value's node
+    broken seven ways, a leaf six ways and an inner node six ways, each refused.
+  - Red first (c44d98d8, branch `agents/g294-a647p4-red`, not for main: g302's red bbd4bad12 with its final storage
+    test, never run before; over main 0462bd92): format 2 under the new test, `cargo test --locked -p slates-git --lib
+    -- t_a647` (kiln r383): 6 passed and the new test failed, 15 versions past their bound, the most a merge added
+    7,740 bytes against a bound of 4,352 (a turn 1,260), 1,077,340 bytes in all.
+  - Green (64494654: g302's green 1067842cb, written whole and never compiled, brought onto main 0462bd92 with main's
+    path-map fields of `GitStore` kept; it built at once): `cargo test --locked -p slates-git --lib -- store served
+    protected receive object_info upload`, every module that builds a store, 208 passed, 4 ignored (main's), in 2.98 s
+    (kiln r402); the census with `--nocapture` (r404): no version past its bound, the most a turn added 466 bytes and a
+    merge 938, 378,007 bytes in all; `cargo test --locked -p slates-server --lib -- vcs_store vcs_http::git
+    vcs_ssh::git repository::push --test-threads=4` 46 passed (r404: the store 24, git's HTTP service 12, its SSH
+    service 6, the pushes 4); `cargo fmt -p slates-git -p slates-server -- --check` clean, no warning; the integration
+    test of a daemon making a git repository's store with its window, `cargo test --locked -p slates-cli --test cli --
+    a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge` (r413): 1 passed, in 4.68 s.
+  - As it lands, over main 5206419b (gate copy 906d0197, kiln r428; main's A-682 serving upload-pack from each
+    repository's store, A-680 part 2a, A-689 and A-690 in): slates-git's filters 208 passed, 4 ignored (main's);
+    slates-server's 52 passed (main's new tests of the store's upload among them), no warning; the CLI test 1 passed;
+    fmt clean.
+- **Owed.** A node's size against what a version adds: a leaf of one window holds about a sixteenth of the window in
+  runs and an inner node names about a thirty-second of it in children, so with a large window (macOS's 256 KiB) a
+  version on a large repository may add up to a window a node on its paths; a derived node smaller than the window
+  (fewer bytes a version, more nodes a read) is a measurement owed, not a guess. `Sets::read` expands what the nodes
+  name with no cap past the set itself, trusting server-made nodes (a client cannot forge one, identities being
+  keyed); a cap is owed if values ever cross a trust boundary. Dropping values no version needs (A-647); A-553's and
+  A-588's stores as types.
+- **Applied in the same change to:** `crates/git/src/store/reach.rs` (format 3: `Shape`, the trees' `Builder`,
+  `Sets::read`, `Sets::put`, `shape_of`, `ReachSets::declare` with the window), `store/repository.rs`
+  (`StoreCounters::value_bytes`, `put_values` by the store's shape), `store/mod.rs` (the module's docs); the tests in
+  `crates/git/src/tests/store/reach.rs` (the storage test, format 3's hostile values, the type declared with the
+  window); `crates/server/src/vcs_store.rs` (`GitStore::new` takes the content store's window) and its tests;
+  §4.17.2's status; A-645's entry; GAPS' A-645 line.
