@@ -35,6 +35,16 @@
 > packfile-uris, packfile); a pack entry's header with `OBJ_OFS_DELTA` and `OBJ_REF_DELTA` and the delta instructions
 > with an applier; idx v2; and the pack stream, which needs a deflate engine chosen by measurement (§4.17.2 piece 3).
 > The captured packs and indexes for those parts are in the fixtures already.
+> **A-575 (2026-11-19):** piece 1 is built: the repository verbs (`CreateRepository`, `CreateBranch`, `BindBranch`,
+> `RetireBranch`; `crates/server/src/repository.rs`) hold a repository's greens in one lineage on its partition
+> (`crates/server/src/greens.rs`, every verb's engine lent through one guard); a member's destroy retires it at once
+> and releases what only it held a node a unit under the shard's slice; memberships are partition records
+> (`MemberRecord`, `Op::RepositoryGreenJoined`) carried by its snapshot and held to the rules by A-515's model test,
+> extended; a recovery rebuilds members the way they joined. Tests on the Mac Studio: `slates-merge --lib`,
+> `slates-db --lib repository`, and `slates-server --lib` with three repository tests (see A-575). Owed: a branch's base
+> as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
+> holds its source's history from its version (today it does, within the source's retention budget); the record's
+> replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
 > **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
 > header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
 > `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
@@ -81,18 +91,22 @@
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
 
-> **Open (g267, 2026-11-19, found settling A-565): a live clone is answered before any of it is durable.** A clone of a
-> live-shipped volume is live-shipped too, but the `Clone` verb's reply waits on its origin's log
-> (`verbs::replicated_waits` takes the verb's own volume), which the clone did not change, so the clone is answered while
-> nothing of it is held anywhere else, and its status reports a zero loss window. At `f = 1` an owner lost before the
-> clone's first write is durable leaves a successor with no log of it (`live_ship::fetch`: `Ok(None)`) and no seal (a
-> fresh clone's head is its origin's), serving it empty: an acknowledged clone lost, against A-200's promise. Writes are
-> not lost (a live clone's first write ships its whole image, inherited tree included, and waits for it). Not affected:
-> kiln's fleet workspaces (never live-shipped; their status reports their whole age at risk until a seal is placed).
-> **Owed:** the clone's reply held for its first whole entry, `durable_target` naming it from the clone's making, and the
-> loss report zero only once the log holds a durable whole entry; the failing test is written and parked
-> (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `crates/server/src/verbs.rs`). Record:
-> `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`.
+> **Fixed (g267, 2026-11-19, A-577; found settling A-565): a live clone was answered before any of it was durable.** A
+> clone of a live-shipped volume is live-shipped too, but its `Clone` reply waited on its origin's log, and its record,
+> a copy of its origin's, named the origin's head, so nothing of it shipped until its own first seal: at `f = 1` an owner
+> lost before the clone's first write was durable left a successor with no log and no seal of it, an acknowledged clone
+> lost, its status reading a zero window; at `f > 0` its writes waited until the held-reply bound refused them; and
+> its log's whole records were its recovery image, which names its inherited tree by number, so a rebuild from the log
+> found no root to lay out. Now a clone's registers start at the creation head (the fleet knows it at once), a live
+> log's whole records stand alone (`Volume::to_standalone_image`; a later full record's shared inodes kept from the
+> image before it, `live_ship::keep_shared`), its reply waits for its own first whole entry durable on `f` holders
+> (after its alias on the cross-partition path), and its status reports the window its seals leave until its new log has
+> answered at a whole entry. The reply's cost: one entry, the clone's whole image,
+> answered at one round trip to `f` holders, behind the record plane's placement of its catalog and creation head (up to
+> two record periods for a clone the fleet does not know yet). **Owed:** an image merged as a clone
+> (`image::run_merge`) still answers before its live clone's log holds it; the record plane shipping a new live volume's
+> catalog and creation head on demand rather than at its period; the fleet's own test of the window (filed for main).
+> Record: `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
@@ -988,6 +1002,14 @@
 > INIT; a stream reads the form after a restore and after its daemon's death; each of fourteen guards removed alone
 > fails its test. Owed: a real guest's run (a non-member's `setfacl` on a set-group-ID file, over a Shards stream and
 > over slates' own virtio-fs device).
+> **Fixed since (A-587, 2026-11-19):** A-378 left the owner word behind. A Shards stream takes the word before its
+> bridge sees the request, and read it in the short form, so after a guest's INIT kept the extended one the word's
+> name was read from the setter's flags and the pad, never matched, and the run was shown its share as the host's:
+> kiln's macOS microVM drive (r134, kiln 815a790c, slates' A-378 vendored since kiln 688cb98ce) had its stand-in's
+> create in its served project refused `EACCES`. The word is read in the form the stream's INIT kept. Tests: the word
+> in each form (`crates/bridge-fuse/src/shards_fs.rs`), and a daemon's stream taking it after an INIT that kept the
+> extended form, its root then shown as the run's (`crates/server/src/shards.rs`). Swept: no other intercept of the
+> stream reads a negotiated form. Owed: kiln's re-vendor and its macOS microVM drive (main's run).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
@@ -1227,7 +1249,8 @@
 >   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
 >   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
->   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
+>   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is answered only once its log
+>   holds it since A-577);
 >   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
@@ -5424,7 +5447,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > under a replica: the holder answers no read and accepts no record under its old id, as a fresh-id restart does), with
 > `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: a store-lost holder answering with nothing
 > completed a quorum that missed a committed record at `f = 2`) and `a_write_its_client_left_is_kept_or_dropped_whole`;
-> the real-process runs of both faults are main's (run-requests.md). The owner's `put_wal` is its `Local` records,
+> the real-process runs of both faults are main's (run-requests.md): the store-destroyed flows exist, and the client
+> killed mid-write is `a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover` (`live_chaos.rs`,
+> 2026-11-19: its write killed between sent and answered by the owner's `fleet.live.awaited`, the owner then lost, the
+> next owner judged by every invariant). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.

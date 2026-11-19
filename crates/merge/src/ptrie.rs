@@ -165,22 +165,49 @@ impl<V> Nodes<V> {
 
   /// Gives one hold on the subtree at `slot` back: each node no holder names any more is freed, its value told.
   fn release(&mut self, slot: Slot, holders: &mut impl Holders<V>) {
-    let mut pending = vec![slot];
-    while let Some(slot) = pending.pop() {
-      let Some(node) = self.node_mut(slot) else {
-        continue;
-      };
-      node.holders = node.holders.saturating_sub(1);
-      if node.holders > 0 {
-        continue;
-      }
-      if let Some(node) = self.take(slot) {
-        pending.extend(node.children.iter().map(|(_, child)| *child));
-        if let Some(value) = node.value {
-          holders.freed(value);
-        }
+    let mut releasing = Releasing {
+      pending: vec![slot],
+    };
+    while self.release_step(&mut releasing, holders) {}
+  }
+
+  /// One step of a release ([`Releasing`]): one hold given back on the next node, which is freed, its value told and
+  /// its children queued, when no other holder names it. False once nothing is left to give back.
+  pub fn release_step(&mut self, releasing: &mut Releasing, holders: &mut impl Holders<V>) -> bool {
+    let Some(slot) = releasing.pending.pop() else {
+      return false;
+    };
+    let Some(node) = self.node_mut(slot) else {
+      return true;
+    };
+    node.holders = node.holders.saturating_sub(1);
+    if node.holders > 0 {
+      return true;
+    }
+    if let Some(node) = self.take(slot) {
+      releasing
+        .pending
+        .extend(node.children.iter().map(|(_, child)| *child));
+      if let Some(value) = node.value {
+        holders.freed(value);
       }
     }
+    true
+  }
+}
+
+/// A map's hold on its nodes being given back a node a step ([`Ptrie::releasing`], [`Nodes::release_step`]), so a
+/// release as large as the map runs in a shard's slices (A-575: a green's retire from its lineage). The nodes still to
+/// visit: each a node whose hold is still to give back; bounded by the nodes of the map.
+#[derive(Debug, Default)]
+pub struct Releasing {
+  pending: Vec<Slot>,
+}
+
+impl Releasing {
+  /// Whether every hold has been given back.
+  pub fn is_done(&self) -> bool {
+    self.pending.is_empty()
   }
 }
 
@@ -363,6 +390,14 @@ impl<V: Clone> Ptrie<V> {
   pub fn release(&mut self, nodes: &mut Nodes<V>, holders: &mut impl Holders<V>) {
     if let Some(root) = self.root.take() {
       nodes.release(root, holders);
+    }
+  }
+
+  /// This map's hold on its nodes, to give back a node a step ([`Nodes::release_step`]): the map is empty after, and
+  /// no node is touched until the steps run.
+  pub fn releasing(&mut self) -> Releasing {
+    Releasing {
+      pending: self.root.take().into_iter().collect(),
     }
   }
 
@@ -1065,6 +1100,72 @@ mod tests {
       for (value, held) in &counted.holds {
         prop_assert_eq!(*held, 0, "value {} was freed {} times fewer than it was held", value, held);
       }
+    }
+  }
+
+  /// A-575. Do: fill a map, fork it, change a tenth of the fork's keys, then give the fork's hold back a step at a time
+  /// and the original's after it. Expect: no step frees more than one node; the original reads the same after the
+  /// fork's release; and once both are released the arena holds no node and every value was freed as often as it was
+  /// held.
+  #[test]
+  fn a_release_a_node_a_step_frees_what_its_map_alone_held() {
+    let mut nodes: Nodes<u32> = Nodes::default();
+    let mut counted = Counted::default();
+    let mut map: Ptrie<u32> = Ptrie::new();
+    for n in 0..500u32 {
+      counted.put(n);
+      map.insert(
+        &mut nodes,
+        format!("d{}/f{n}", n % 7).as_bytes(),
+        n,
+        &mut counted,
+      );
+    }
+    let alone = nodes.live();
+    let mut fork = map.fork(&mut nodes);
+    for n in (0..500u32).step_by(10) {
+      let value = n + 1_000;
+      counted.put(value);
+      if let Some(replaced) = fork.insert(
+        &mut nodes,
+        format!("d{}/f{n}", n % 7).as_bytes(),
+        value,
+        &mut counted,
+      ) {
+        counted.freed(replaced);
+      }
+    }
+    let step = |nodes: &mut Nodes<u32>, releasing: &mut Releasing, counted: &mut Counted| {
+      let before = nodes.live();
+      let more = nodes.release_step(releasing, counted);
+      assert!(
+        before - nodes.live() <= 1,
+        "a step freed more than one node"
+      );
+      more
+    };
+    let mut releasing = fork.releasing();
+    while step(&mut nodes, &mut releasing, &mut counted) {}
+    assert_eq!(
+      nodes.live(),
+      alone,
+      "the fork's release freed other than what it alone held"
+    );
+    for n in 0..500u32 {
+      assert_eq!(
+        map.get(&nodes, format!("d{}/f{n}", n % 7).as_bytes()),
+        Some(&n)
+      );
+    }
+    let mut releasing = map.releasing();
+    while step(&mut nodes, &mut releasing, &mut counted) {}
+    assert_eq!(nodes.live(), 0);
+    assert_eq!(nodes.missing(), 0);
+    for (value, held) in &counted.holds {
+      assert_eq!(
+        *held, 0,
+        "value {value} was freed {held} times fewer than it was held"
+      );
     }
   }
 
