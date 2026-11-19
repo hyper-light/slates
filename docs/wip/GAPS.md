@@ -354,7 +354,8 @@
 > holds the commit's id, encoded beside A-294's device kinds. A-618's push makes, moves and removes a link, and lays
 > each node's encoding where the deriver placed it (it had laid only file and attribute bytes). The engine takes a link
 > moved to another commit as the same kind (`SpecialKind::same_type`); before, every move was `TypeChanged`. Tests:
-> `slates-merge --lib` 97 of 97 on the Mac Studio, red first and red four ways by mutation. Owed: a link's form in a
+> `slates-merge --lib` 97 of 97 on the Mac Studio (104 of 104 merged with main and A-643), red first and red four ways
+> by mutation. Owed: a link's form in a
 > volume and in a checkout (git's: an empty directory).
 > **A-624 part 2 (2026-11-19, g230; piece 14's rest):** `slates-git` (`v2`) reads `object-info` and `bundle-uri`
 > requests and answers them over traits: `object-info` as git 2.50.1 answers (`size` only when asked, an unknown

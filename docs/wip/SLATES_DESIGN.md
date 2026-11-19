@@ -43526,7 +43526,8 @@ Applied in the same change to:
   - the generated histories with links to two commits, the census requiring links made.
 
   On the Mac Studio, 2026-11-19, the tests were red first: 5 of 96 failed against stubs. Next, 2 failed on the
-  engine's rule (`TypeChanged`). Then `cargo test -p slates-merge --lib` passed 97 of 97, and fmt was clean. Red four
+  engine's rule (`TypeChanged`). Then `cargo test -p slates-merge --lib` passed 97 of 97, and 104 of 104 merged with
+  main (A-643), with `slates-git --lib` 338 of 338 (2 ignored, main's); fmt was clean. Red four
   ways by mutation: the whole-kind comparison (3 failed), no node bytes (4), an empty id taken (1), and a move without
   its `Unlink` (3).
 - **Applied in the same change to:** `crates/merge/src/special.rs` (and `special/tests.rs`, new), `push.rs`,
