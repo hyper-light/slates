@@ -43,16 +43,18 @@
 //! `400`, `414`, `415`, `406`), a request without a `Host` `400`; its credentials, a `401` naming each challenge in
 //! `LFS-Authenticate` too, as `slates_git::lfs::serve` answers one (A-629 part 1); its repository, moved to its shard or
 //! `404`; the policy's gate for LFS's rights (a download or a listing reads, an upload or a lock submits, another's
-//! lock rewrites; [`LFS_RIGHTS`]), else `403`; and its service ([`LfsService`]), `503` on a site without one. Each
-//! endpoint's own right on the ref it names is the answer's (`crate::lfs::LfsAccess`). A served LFS request decides its
-//! status after its body (`StatusMode::AfterBody`, main's ruling, 2026-11-19): its body is kept whole within the
-//! request's room, which the engine's admission already bounds, and answered once it ends, with the status, fields and
-//! body the service decided, and with its actions expiring with the bearer token that asked ([`Proven`]).
+//! lock rewrites; [`LFS_RIGHTS`]), else `403`; and its service ([`LfsService`]), `503` for an endpoint the site's
+//! service does not serve (every one, on a site without a service). Each endpoint's own right on the ref it names is the
+//! answer's (`crate::lfs::LfsAccess`). A served LFS request decides its status after its body
+//! (`StatusMode::AfterBody`, main's ruling, 2026-11-19): its body is kept whole within the request's room, which the
+//! engine's admission already bounds, and answered once it ends, with the status, fields and body the service decided,
+//! its hrefs under the authority the request named, and its actions expiring with the bearer token that asked
+//! ([`Proven`]).
 
 use slates_db::catalog::{Principal, RepositoryRecord, VcsTool};
 use slates_git::http::{self, Field, Reply, Route, Service, Version};
 use slates_git::lfs::Timestamp;
-use slates_git::lfs::serve::{self as lfs_serve, RouteRefused, Routed};
+use slates_git::lfs::serve::{self as lfs_serve, Endpoint, RouteRefused, Routed};
 use slates_http::Admission;
 use slates_http::head::{Head, Target, Version as HttpVersion};
 use slates_http::reply::Status;
@@ -278,15 +280,21 @@ impl<E: Exchange> Exchange for GitExchange<E> {
 /// repository of here, once its body is read whole. The daemon's answers on the repository's owner shard
 /// (`crate::lfs::answer`, A-629 part 2b-ii).
 pub(crate) trait LfsService {
+  /// Whether it serves `endpoint`: the site answers one it does not `503` at its head, its body never read.
+  fn serves(&self, endpoint: &Endpoint) -> bool;
   /// The answer to `call`.
   fn answer(&mut self, call: &LfsCall<'_>) -> lfs_serve::Answer;
 }
 
-/// A site's LFS service where it has none: never asked, since such a site answers every LFS request `503` at its head.
+/// A site's LFS service where it has none: it serves no endpoint, so it is never asked for an answer.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NoLfs;
 
 impl LfsService for NoLfs {
+  fn serves(&self, _endpoint: &Endpoint) -> bool {
+    false
+  }
+
   fn answer(&mut self, _call: &LfsCall<'_>) -> lfs_serve::Answer {
     lfs_serve::Answer {
       status: Status::SERVICE_UNAVAILABLE,
@@ -486,13 +494,13 @@ pub(crate) struct GitSite<A, R, S, L = NoLfs> {
   repositories: R,
   /// The services.
   services: S,
-  /// Git LFS's service, when the site serves Git LFS.
-  lfs: Option<L>,
+  /// Git LFS's service.
+  lfs: L,
 }
 
 impl<A, R, S> GitSite<A, R, S, NoLfs> {
-  /// A site naming `realm` in its challenges, charging each route's path to `room`; it serves no Git LFS until it is
-  /// given a service ([`GitSite::with_lfs`]).
+  /// A site naming `realm` in its challenges, charging each route's path to `room`; it serves no Git LFS endpoint until
+  /// it is given a service ([`GitSite::with_lfs`]).
   pub(crate) fn new(
     realm: String,
     room: u64,
@@ -506,7 +514,7 @@ impl<A, R, S> GitSite<A, R, S, NoLfs> {
       authenticator,
       repositories,
       services,
-      lfs: None,
+      lfs: NoLfs,
     }
   }
 }
@@ -520,7 +528,7 @@ impl<A, R, S, L> GitSite<A, R, S, L> {
       authenticator: self.authenticator,
       repositories: self.repositories,
       services: self.services,
-      lfs: Some(lfs),
+      lfs,
     }
   }
 }
@@ -572,9 +580,10 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     }
   }
 
-  /// The answer to an LFS request routed to `routed` (the module doc): a request without a `Host` `400`; its credentials,
-  /// a `401` naming its challenges for git-lfs too; its repository and the policy's gate; then served, its status, fields
-  /// and body its service's, decided once its body has ended.
+  /// The answer to an LFS request routed to `routed` (the module doc): a request naming no authority `400`; its
+  /// credentials, a `401` naming its challenges for git-lfs too; its repository and the policy's gate; an endpoint the
+  /// service does not serve `503`; then served, its status, fields and body its service's, decided once its body has
+  /// ended.
   async fn answer_lfs(
     &mut self,
     head: &Head<'_>,
@@ -582,7 +591,7 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     routed: Routed,
   ) -> Decided<SiteExchange<S::Exchange, L>> {
     let Some(authority) = authority(head) else {
-      return refused_with(Status::BAD_REQUEST, Fields::new(), false);
+      return refused_with(Status::BAD_REQUEST, cache_fields(), false);
     };
     let proven = match self.proof(head, secure).await {
       Ok(proven) => proven,
@@ -598,11 +607,11 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
       }
       Gate::Refused(refused) => return self.refuse(refused, secure, true),
     }
-    let Some(service) = self.lfs.clone() else {
+    if !self.lfs.serves(&routed.endpoint) {
       return self.refuse(Refused::Unavailable, secure, true);
-    };
+    }
     let exchange = LfsExchange {
-      service,
+      service: self.lfs.clone(),
       routed,
       query: query_of(head),
       principal: proven.principal,
@@ -770,16 +779,17 @@ fn owned(fields: &[Field]) -> Fields {
     .collect()
 }
 
-/// An LFS route's refusal, whoever asks (the module doc): its status, and `Allow` naming the endpoint's methods on a
-/// `405`.
+/// An LFS route's refusal, whoever asks (the module doc): its status, `Allow` naming the endpoint's methods on a `405`,
+/// then the cache fields every refusal of the site carries, as git's own routes' do.
 fn lfs_route_refused<E>(refused: RouteRefused, version: HttpVersion) -> Decided<E> {
   let status = refused.status(version);
-  let fields = match refused {
+  let mut fields = match refused {
     RouteRefused::MethodNotAllowed(allow) if status == Status::METHOD_NOT_ALLOWED => {
       vec![(ALLOW.to_vec(), allow.methods().to_vec())]
     }
     _ => Fields::new(),
   };
+  fields.extend(cache_fields());
   refused_with(status, fields, false)
 }
 
@@ -798,12 +808,12 @@ fn lfs_challenged<E>(mut decided: Decided<E>) -> Decided<E> {
   decided
 }
 
-/// The authority `head` names (`Host`), which an LFS answer's hrefs are made under; none when it names none, names it
-/// twice, or names it in other than UTF-8.
+/// The authority `head` names, which an LFS answer's hrefs are made under: an absolute-form target's, else `Host`'s, as
+/// slates-http read and checked it (RFC 9112 §3.2, RFC 3986 §3.2); none for an HTTP/1.0 request that named none, or an
+/// empty one.
 fn authority(head: &Head<'_>) -> Option<String> {
-  let host = head.field(b"host").ok().flatten()?;
-  let host = std::str::from_utf8(host).ok()?;
-  (!host.is_empty()).then(|| host.to_owned())
+  let authority = std::str::from_utf8(head.authority?).ok()?;
+  (!authority.is_empty()).then(|| authority.to_owned())
 }
 
 /// `head`'s query, without its `?`.

@@ -706,6 +706,12 @@ const NO_CONTENT: Status = Status {
   reason: "No Content",
 };
 
+/// Shape: another status no reply's content may follow (RFC 9110 §15.3.6).
+const RESET_CONTENT: Status = Status {
+  code: 205,
+  reason: "Reset Content",
+};
+
 /// What a driver of [`served_after_body`] names: the route's status mode, the status its service names (none when it
 /// names none), and whether it names it after the reply's first run rather than as the reply begins.
 type Naming = (StatusMode, Option<Status>, bool);
@@ -759,11 +765,11 @@ fn after_body_reply(status: &str) -> String {
   )
 }
 
-/// A-629 (main's ruling, 2026-11-19: a route's status is decided at its head or after its body). Do: serve a POST with a
-/// body on a route that decides its status after the body, its service naming `201` as its reply begins; naming none;
-/// naming `204`; then on a streamed route naming `201`; then on the first route naming `201` after its first run. Expect
-/// the first reply's head to carry `201`; the second `200`; the third and the fourth refused `500` in stages, nothing
-/// of a reply written; and the fifth's head `200`, the late status never written.
+/// A-629 part 2c (main's ruling, 2026-11-19: a route's status is decided at its head or after its body). Do: serve a
+/// POST with a body on a route that decides its status after the body, its service naming `201` as its reply begins;
+/// naming none; naming `204`; naming `205`; then on a streamed route naming `201`; then on the first route naming `201`
+/// after its first run. Expect the first reply's head to carry `201`; the second `200`; the third, the fourth and the
+/// fifth refused `500` in stages, nothing of a reply written; and the sixth's head `200`, the late status never written.
 #[test]
 fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names() {
   let refused =
@@ -773,12 +779,14 @@ fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_nam
       served_after_body((StatusMode::AfterBody, Some(CREATED), false)),
       served_after_body((StatusMode::AfterBody, None, false)),
       served_after_body((StatusMode::AfterBody, Some(NO_CONTENT), false)),
+      served_after_body((StatusMode::AfterBody, Some(RESET_CONTENT), false)),
       served_after_body((StatusMode::Streamed, Some(CREATED), false)),
       served_after_body((StatusMode::AfterBody, Some(CREATED), true)),
     ],
     [
       after_body_reply("201 Created"),
       after_body_reply("200 OK"),
+      refused.to_owned(),
       refused.to_owned(),
       refused.to_owned(),
       after_body_reply("200 OK"),

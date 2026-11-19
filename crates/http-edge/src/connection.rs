@@ -742,7 +742,7 @@ impl Connection {
 
   /// The status the service names for its reply as its reply begins, on a route that decides it after the body
   /// ([`StatusMode::AfterBody`], the module doc). Taken only before any of the reply is sent, and only while a reply is
-  /// under way; one no reply's content may follow (`1xx`, `204`, `304`, or no status at all) or one named for a
+  /// under way; one no reply's content may follow (`1xx`, `204`, `205`, `304`, or no status at all) or one named for a
   /// streamed route fails the request `500`, in stages.
   pub fn reply_status(&mut self, status: Status) {
     let State::Reply { reply, .. } = &mut self.state else {
@@ -876,6 +876,9 @@ fn rendered(
 /// Format: `204 No Content` (RFC 9110 §15.3.5), a reply without content.
 const NO_CONTENT: u16 = 204;
 
+/// Format: `205 Reset Content` (RFC 9110 §15.3.6), a reply without content.
+const RESET_CONTENT: u16 = 205;
+
 /// Format: `304 Not Modified` (RFC 9110 §15.4.5), a reply without content.
 const NOT_MODIFIED: u16 = 304;
 
@@ -883,12 +886,11 @@ const NOT_MODIFIED: u16 = 304;
 const LAST_CODE: u16 = 599;
 
 /// Whether a reply of `status` may carry content, as every served reply's framing does: RFC 9110 §6.4.1, "All 1xx
-/// (Informational), 204 (No Content), and 304 (Not Modified) responses do not include content", and a code outside
-/// §15's classes is no status.
+/// (Informational), 204 (No Content), and 304 (Not Modified) responses do not include content"; §15.3.6, "a server
+/// MUST NOT generate content in a 205 response"; and a code outside §15's classes is no status.
 fn carries_content(status: Status) -> bool {
   (Status::OK.code..=LAST_CODE).contains(&status.code)
-    && status.code != NO_CONTENT
-    && status.code != NOT_MODIFIED
+    && ![NO_CONTENT, RESET_CONTENT, NOT_MODIFIED].contains(&status.code)
 }
 
 /// `fields` as `slates-http`'s reply writer takes them.
