@@ -13,6 +13,8 @@ description = "git's wire formats (§4.17.2, A-582): pkt-lines and side-band-64k
 aws-lc-rs = { workspace = true }
 # SHA-1 object names with collision detection, as git's sha1dc (A-600; the workspace manifest says why this crate).
 sha1-checked = { workspace = true }
+# The pack reader's inflation (A-608), through the workspace's one deflate engine, zlib-rs (A-607), no backend picked.
+flate2 = { workspace = true }
 # zlib's CRC32, which a pack index keeps of each object (A-591; the workspace manifest says why this crate).
 crc32fast = { workspace = true }
 

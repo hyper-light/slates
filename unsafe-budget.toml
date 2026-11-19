@@ -706,3 +706,6 @@ slates-svn = 0
 # slates-vcs (0): the version-control servers' object store (A-581, §4.17.1 shared piece 3): content by BLAKE3 identity in
 # an ordered map, tables read by checked offsets and `get`; no casts, no maps, no FFI.
 slates-vcs = 0
+# slates-ssh (0): SSH's transport (A-594, §4.17.2): the wire types read by checked offsets and `get`, the cryptography
+#   through aws-lc-rs's safe API (X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305); no FFI of its own.
+slates-ssh = 0

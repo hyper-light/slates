@@ -1,0 +1,31 @@
+anonymous: svn:// via relay; repository anon; lists ANONYMOUS; client svn info svn://127.0.0.1/anon
+  exit 0
+cram-md5: svn:// via relay; repository cram; lists CRAM-MD5; client svn info svn://127.0.0.1/cram
+  exit 0
+cram-md5-secret-64: svn:// via relay; repository cram; lists CRAM-MD5; client svn info svn://127.0.0.1/cram
+  exit 0
+cram-md5-secret-70: svn:// via relay; repository cram; lists CRAM-MD5; client svn info svn://127.0.0.1/cram
+  exit 0
+cram-md5-wrong-password: svn:// via relay; repository cram; lists CRAM-MD5; client svn info svn://127.0.0.1/cram
+  exit 1
+  stderr: svn: E170013: Unable to connect to a repository at URL 'svn://127.0.0.1/cram'
+  stderr: svn: E170001: Authentication error from server: Password incorrect
+anonymous-or-cram-md5: svn:// via relay; repository both; lists ANONYMOUS CRAM-MD5; client svn info svn://127.0.0.1/both
+  exit 0
+no-repository: svn:// via relay; repository missing; lists none: no repository; client svn info svn://127.0.0.1/missing
+  exit 1
+  stderr: svn: E170013: Unable to connect to a repository at URL 'svn://127.0.0.1/missing'
+  stderr: svn: E210005: No repository found in 'svn://127.0.0.1/missing'
+no-access: svn:// via relay; repository none; lists none: no mechanism; client svn info svn://127.0.0.1/none
+  exit 1
+  stderr: svn: E170013: Unable to connect to a repository at URL 'svn://127.0.0.1/none'
+  stderr: svn: E170001: No access allowed to this repository
+external: tunnel, svnserve -t; repository both; lists ANONYMOUS EXTERNAL CRAM-MD5; client svn info svn+fixture://127.0.0.1/both
+  exit 0
+hostile-version-3: svn://, hand-made client; repository anon; lists ANONYMOUS; client (written by this script)
+hostile-no-edit-pipeline: svn://, hand-made client; repository anon; lists ANONYMOUS; client (written by this script)
+hostile-capability-not-a-word: svn://, hand-made client; repository anon; lists ANONYMOUS; client (written by this script)
+hostile-ra-client-without-client-list: svn://, hand-made client; repository anon; lists ANONYMOUS; client (written by this script)
+hostile-unlisted-mechanism-then-anonymous: svn://, hand-made client; repository anon; lists ANONYMOUS; client (written by this script)
+hostile-answer-only-version: svn://, hand-made client; repository anon; lists ANONYMOUS; client (written by this script)
+hostile-external-other-user-then-own: svnserve -t, hand-made client; repository both; lists ANONYMOUS EXTERNAL CRAM-MD5; client (written)

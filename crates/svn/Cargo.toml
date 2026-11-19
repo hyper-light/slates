@@ -12,6 +12,9 @@ description = "The Subversion server's pure pieces (§4.17.4, A-500): svndiff ve
 # svndiff version 2 stores each window section as an LZ4 block (`libsvn_subr/compress_lz4.c`); the workspace's LZ4
 # codec, built with its safe encoder and decoder only.
 lz4_flex = { workspace = true }
+# CRAM-MD5's HMAC-MD5 for the ra_svn handshake (`handshake`, A-599; the workspace manifest says why these crates).
+hmac = { workspace = true }
+md-5 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
