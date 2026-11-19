@@ -403,15 +403,15 @@ fn adopt_inherited(
 }
 
 /// Takes ownership of a descriptor the supervisor handed over at `raw`: a fleet serve socket
-/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::held::ENV_DEVICES`,
-/// `crate::fuse_hold`).
+/// (`ENV_FLEET_SERVE`), or the handoff table's object and the descriptors it names, the device channel, the held
+/// devices, connections and copies (`slates_anchor::held::ENV_HELD`, A-462; `crate::fuse_hold`).
 #[cfg(unix)]
 pub(crate) fn inherited_descriptor(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {
   use std::os::fd::FromRawFd;
   // SAFETY: the supervisor made this descriptor inheritable and handed it across the spawn at this number
-  // (`ENV_FLEET_SERVE` or `ENV_DEVICES`; every number non-negative and distinct from the others in its
-  // variable, checked by the parser); this process adopts each once, at start, before anything else could claim
-  // the number, so the `OwnedFd` is its single owner and closes it on drop. The supervisor keeps its own copy.
+  // (`ENV_FLEET_SERVE`, or `ENV_HELD` and the table it names; every number non-negative and distinct from the others,
+  // checked by the parsers); this process adopts each once, at start, before anything else could claim the number, so
+  // the `OwnedFd` is its single owner and closes it on drop. The supervisor keeps its own copy.
   unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
 }
 
@@ -1920,18 +1920,7 @@ async fn serve_peer_records(
                 .learned_members
                 .get(&peer_anchor)
                 .map_or(seed, |member| member.host);
-              match crate::owner_location::serve(state, peer_host, &request) {
-                Ok((reply, declined)) => {
-                  if let Some(declined) = declined {
-                    state.count(declined, 1);
-                  }
-                  reply
-                }
-                Err(error) => {
-                  state.count(error.counter(), 1);
-                  Vec::new()
-                }
-              }
+              crate::owner_location::answer(state, peer_host, &request)
             })
             .unwrap_or_default()
           }

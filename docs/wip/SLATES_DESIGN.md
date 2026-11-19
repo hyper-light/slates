@@ -2859,7 +2859,9 @@ before the report is published, so a tool never reads attributes newer than the 
 > header; and the session a restarted daemon needs travels as two checked bytes, with golden and hostile-input
 > tests (`crates/bridge-fuse/src/session.rs`). The anchor's channel is built too (`crates/anchor/src/devices.rs`).
 > The anchor opens it at start, bounded at `shards × MAX_ATTACHMENTS` devices, drains it every supervision step
-> and before every spawn, and hands the channel and every held device to each daemon in `SLATES_ANCHOR_DEVICES`.
+> and before every spawn, and hands the channel and every held device to each daemon in `SLATES_ANCHOR_DEVICES`
+> (since A-462 in one table of devices, connections and copies, written into a sealed object whose descriptor and
+> length `SLATES_ANCHOR_HELD` names, since a variable past `MAX_ARG_STRLEN` fails the exec).
 > Every message is checked by kind, length and descriptor count. Proven across real processes: a daemon sends a
 > device and its session, then exits; the restarted daemon inherits that same device and reads what the first
 > one left in it (`crates/anchor/tests/anchor.rs`). The daemon's half, holding and taking over, and the exact
@@ -2994,7 +2996,9 @@ Apple's XDR arguments (`NFS_MATTR_FH`). The mount's source is `slates:/<name>`. 
 therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every local user can read.
 - **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself. The daemon ends
   the attachment of a host mount of that volume only once the kernel's mount table
-  (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point.
+  (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point. Since A-493 it watches the table
+  for as long as this shard has learned its kernel's unmounts take after their `UMNT` (`nfs::unmount_bound_ns`), not
+  a fixed second.
 - **OCI binds.** The source mount's attachment is found by that same bound mount point in the
   daemon's records.
 - **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
@@ -5189,7 +5193,9 @@ drops.
 > learns. While a Linux completion bridge runs (Node's adopted descriptor), the park waits on the bridge's pipe, the
 > eventfd's only reader then, and gives the pipe's level back as it ends. The synchronous round trip waits so; the
 > reply deadline still paces the waits that cannot see the departure yet (the async driver's tick, the wait for a slot
-> on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS.
+> on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS. A park a look ends (its
+> timeout the look's, the daemon then found alive) is counted as its own kind, `ClientEnd::parks_ended_by_looks`, beside
+> the replies and the unanswered wakes, and teaches the wake estimate nothing (A-506).
 
 > **Status (2026-11-18, A-468): a client whose daemon is gone reconnects while its instance's rendezvous has a holder,
 > and fails `DaemonGone` at once when it has none.** Until A-468 a reconnect was tried for the reconnect budget (`T + W`,
@@ -5744,9 +5750,10 @@ The root configuration records the root group's voters the same way (A-406: `Roo
 contact with the root voters its configuration names, not its join's. A root learner fetches when its alive view of the
 regions differs from the configuration's, and also when a root voter it knows is no longer alive: a region whose
 representative died stays a region, so only the voters show it. It fetches as well when a peer's location query is bound
-to a newer root version than the one it holds (A-489), and asks that peer beside the voters it knows
-(`fleet::root_learner_fetch`). A seat change moves the root's version and neither of the other two signals, so a learner
-that missed it at formation kept its older root and refused every location round a peer on the newer root asked.
+to a newer root version than the one it holds (A-489), or a peer's refusal of its own location query names one (A-504),
+and asks that peer beside the voters it knows (`fleet::root_learner_fetch`). A seat change moves the root's version and
+neither of the other two signals, so a learner that missed it at formation kept its older root: as a peer it refused
+every location round asked under the newer root, and as an asker every round it asked was refused.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -6716,9 +6723,10 @@ version.
 > bound to a newer view than the peer holds now also tells the peer that it is behind and that the asker holds the newer
 > root, so the peer's root learner fetches from the asker at its next period. The asker looks again every poll interval,
 > and that look is answered. Counted `fleet.owner_location.root_behind`. Regression:
-> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. Owed: the converse. An asker
-> behind its peers' root learns nothing from their refusal, which is an empty reply, so its rounds are refused until its
-> own learner fetches for another reason (A-489's owed item).
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. The converse is done too (A-504): a
+> refusal names the root its peer holds, where it was an empty reply, so an asker behind it counts itself behind
+> (`fleet.owner_location.asker_behind`), its root learner fetches from that peer at its next period, and each look of a
+> lookup asks under the root the asker holds at that look. Regression: `a_behind_askers_round_is_answered_after_one_fetch`.
 
 > **A forward waits for the owner's session (2026-09-25).** A forward took the owner's record session once
 > and, when a coordinator dispatch or a discovery page had it out, refused the client `HomedElsewhere` at
@@ -6762,7 +6770,11 @@ ports, and the mapping between them is the operator's. It announces the advertis
 plane's too (A-330), since a peer prefers the announcement to the manifest at every later dial: announced at
 its bound port, every redial of a record link went around the mapping. A manifest with fewer than `f + 1` nodes, a
 repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
-the TLS stack cannot use, is refused by name at boot. The two serve
+the TLS stack cannot use, is refused by name at boot. A node addressed by name, and any peer enrolled under a trusted
+root (it announces its address, which may be a name), is resolved at every dial through the host's nameservers, read
+once at boot: `/etc/resolv.conf` on Unix; on Windows, which has no such file, the DNS servers of the network adapters
+that are up and have a gateway, with `resolv.conf(5)`'s default timeout and attempts (A-490); a manifest that may dial
+a name on a host with no IPv4 nameserver is refused at boot by name. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -26946,7 +26958,10 @@ model below; each red before its fix):
   report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
   its holder still keeps is kept whole since A-335.) Since A-341 the kept retirement does tell, at a successor's
   confirmation: an unasked copy goes as a stale one where the object's settled cohorts are within tolerance
-  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance or when judged on a completion record.
+  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance. Since A-484 the takeover judged is the first
+  since the copy was written, its writer's (`Acceptor::written_by`, `RegionalConfiguration::copy_stale`), never the
+  last in the line, and it is judged on its completion record too, which keeps the neighbourhoods it recovered through
+  and the hosts that stayed members through it; a settled line's unasked copy is judged the same way.
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -32382,7 +32397,7 @@ handoff's length built, the Unix sibling found); and:
 - **Found beside it** (GAPS): the Unix handoff rides environment variables too (`SLATES_ANCHOR_DEVICES`, about 109
   characters a device with a resync session; `SLATES_ANCHOR_COPIES`, about 77 a DAX object), and Linux refuses an
   `execve` with a single string past `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` (`include/uapi/linux/binfmts.h`: 131,072 bytes
-  on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Open; not this change's.
+  on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Not this change's: built by A-462.
 
 ### A-450 — A consumer moves an agent with its volume through the library alone (2026-11-18, g267, kiln goal 95101ef3 K4; §4.10 "Ownership follows the writer", A-291)
 
@@ -33186,9 +33201,8 @@ owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-a
   A-406 declined. Binding the reply to a homes-only version would leave the learner on a stale root for everything else
   the root records. The query already carries the version, so it is the signal `root_diverges` called owed ("a
   version-carrying signal").
-- **Owed.** The converse direction. An asker that is a root learner behind its peers is refused by them with an empty
-  reply, which tells it nothing, so its rounds fail until its own learner fetches for another reason. A refusal that
-  names the peer's root version, or a reply under the peer's own view, would let it fetch: a reply format change.
+- **Owed, then done by A-504.** The converse direction: an asker that is a root learner behind its peers was refused by
+  them with an empty reply, which told it nothing, so its rounds failed until its own learner fetched for another reason.
 - **Tests.** `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`
   (`crates/server/src/owner_location.rs`, on a shard: the older and the newer views refused and its own served, three
   newer views counted; no fetch from a shown peer before the queries, a fetch from the one that showed the newest after
@@ -33316,3 +33330,243 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
 Applied in the same change to: Part 0 (§0.1's reading order), Part 3 (D-28), §4.17 (new), GAPS (a §4.17 entry at the
 top), `research/vcs-servers.md` (new). The second part: §4.17's status, §4.17.1's method (the `log` and `blame`
 correction), §4.17.2 (new), GAPS (the §4.17 entry), `research/vcs-servers.md` §5.
+
+### A-490 — A Windows fleet node reads its nameservers from its network adapters, since Windows has no `/etc/resolv.conf`: a kiln runner on Windows can join a fleet that trusts kiln's CA (2026-11-18, UI goal 85 bug 5 via g071, found by g267 in kiln K3; §4.8 "Deployment"; contract 39)
+- **The bug.** A fleet node reads the host's nameservers at boot when a node is named or an enrollment root is trusted
+  (a peer enrolled under a root announces its addresses, which may be names). The one reader read `/etc/resolv.conf`,
+  so a Windows node whose manifest trusted a root was refused at its start and at kiln's `check_fleet`, every address a
+  literal or not; every kiln runner's manifest names kiln's CA as its root.
+- **The rule.** `read_resolver` is a seam with two halves of one signature. Unix reads `/etc/resolv.conf` as before.
+  Windows reads the DNS servers its network adapters list (`GetAdaptersAddresses`) and keeps, by Go's rule there
+  (`net/dnsconfig_windows.go`), those of the adapters that are up and have a gateway, in order, each once. Windows states
+  no timeout or attempt count an application can read, so `resolv.conf(5)`'s defaults (5 s, 2 attempts) stand, as Go
+  takes them; with one nameserver they give up 10 s after the first query, as the Windows DNS client does (Microsoft's
+  KB 2834226). No count caps the servers: the Windows client asks every server it holds (KB 2834226).
+- **Bounded and checked.** The call is asked for its size, then into a buffer of that size; an adapter added between the
+  two refuses the start by name rather than retrying. The walk reads a link or an address only once it lies wholly
+  inside the buffer, aligned, and walks no more steps than entries fit in the buffer.
+- **Test.** `a_windows_hosts_adapters_give_its_resolver` (`crates/api/src/role/fleet.rs`, on every host).
+- **Evidence (the Mac Studio, kiln, 2026-11-18, debug).** Red once, on a copy where no adapter counts (Windows with no
+  source, as before): the test failed at its first assertion. Green: `cargo test --locked -p slates-api --lib
+  role::fleet` 11 of 11. `cargo xwin check -p slates-api` (lib and all targets) and `cargo xwin clippy -p slates-api --lib
+  --no-deps -- -D warnings` for `x86_64-pc-windows-msvc`: clean, so the Windows half compiles and lints. Clippy found
+  nothing in A-490's lines on macOS (slates-server clean; slates-api's two findings are `crates/api/tests/api.rs` 1324
+  and 1630, another change's), and Windows clippy with dependencies stops first on `crates/server/src/shards.rs:1371`,
+  also another change's. `cargo xtask unsafe`: slates-api 9 of 9; structural ok; the literal check's 45 findings are
+  none of A-490's files. The live start on Windows and the Linux check are filed for main.
+
+Applied in the same change to: §4.8 "Deployment", GAPS (the kiln runners' entry), `docs/bugs/` (a record), `docs/cli.md`,
+`docs/deploy.md`, `crates/api/src/role/fleet.rs`, `crates/api/src/role/fleet/windows_dns.rs` (new),
+`crates/api/Cargo.toml`, `unsafe-budget.toml`, and the doc comments of `crates/server/src/dns.rs` and
+`crates/server/src/deploy.rs`.
+
+### A-484 — A copy no takeover asked for is judged by its writer's takeover, on its retirement or its completion record (2026-11-18, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; A-341's owed piece and a hole in its rule; A-309, A-335)
+Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), the bug record of
+2026-11-18 on an unasked copy judged by the last takeover in its line, `crates/db/src/register.rs`
+(`CompletedTakeover::recovery`, `held` and `recovery_cohorts`; `RegionalConfiguration::within_tolerance`,
+`confirmed_for` and `copy_stale`; `Acceptor::written_by`), `crates/cluster/src/raft_wire.rs` (regional layout 5),
+`crates/server/src/takeover.rs` (`unasked_copy_stale`, used at a successor's confirmation and on a settled line) and
+`crates/db/tests/lineage_model.rs` (the holder rule, `reclaimed_unasked_record`).
+- **What was there.** A-341 let a holder the takeover never asked let its copy go where the kept retirement showed the
+  object recovered within tolerance, judged by the retired host the copy's routing last moved from. Two gaps. A
+  completion record kept no neighbourhood, so a copy first judged once the takeover completed (every object of the
+  last successor to confirm, and any lagging holder's) was kept for good (`fleet.takeover.kept_unasked`). And the
+  takeover judged was the last in the copy's line, not the first since the copy was written: where the writer's
+  takeover was past tolerance, its successor confirmed without ever learning the object (nobody its round asked held
+  it), and when that successor retired in turn its own takeover was within tolerance for an object it never held, so
+  the copy, possibly the object's last, went. Counting every member of a cohort also let a cohort host that retired
+  before the departed and was admitted again under its id make a cohort look within tolerance that was past it when
+  the round ran.
+- **The rule.** A copy no round asked for is stale only where the first takeover since it was written, its writer's,
+  recovered the object within tolerance and its share of the object is done (`copy_stale`: `confirmed_for` and
+  `within_tolerance` of the writer's takeover): within tolerance every committed record is on a recovery quorum's worth
+  of each settled cohort, so the round that took the object over heard one at least as new as the copy and adopted it
+  before its successor confirmed. The holder knows the writer from its acceptor (`written_by`: the owner of the last
+  record it accepted, kept while an install moves the authority to a successor); not persisted, so an acceptor rebuilt
+  from an image after an install moved its authority knows none, and its copy is kept. The judgment counts only the
+  retirement's survivors that are still members (none is admitted again while it is kept), or, once it completed, the
+  record's held hosts: the survivors still members at completion, members through every round. The record keeps the
+  settled neighbourhood of each recovery owner (`recovery`), so its cohorts are drawn as the retirement's were. An
+  object an explicit move took off its creator's line is not judged so (a restored holder cannot tell the move's owner
+  from the writer): its unasked copies are kept.
+- **The encoding.** Regional layout 5: each completion record carries, after its version and before its confirmed
+  hosts, its recovery neighbourhoods (a count, then each owner and its settled form) and its held hosts. A layout-4
+  configuration is refused by name (`LayoutVersion`).
+- **Tests.** `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover`
+  (`crates/server/src/daemon.rs`, red before: the second install let the copy go);
+  `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (its record phase now lets the second
+  register and a lagging holder's fourth copy go, the head kept for its content); in `crates/db/src/register.rs`
+  `a_completion_record_judges_an_object_as_its_kept_retirement_did`,
+  `a_cohort_host_admitted_again_counts_for_no_takeover_it_was_not_a_survivor_of` (red before),
+  `a_copy_is_judged_by_its_writers_takeover_never_a_later_one` and `an_acceptor_knows_its_copys_writer_while_it_can`;
+  `a_lying_completion_record_recovery_count_is_refused` and the layout golden (`crates/cluster/src/raft_wire.rs`); the
+  lineage model's oracle unchanged, its unasked releases judged by the writer's takeover, and
+  `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record` (the generated histories at the
+  default 400 seeds judge no copy on a record: `reclaimed_unasked` 10 and `kept_unasked` 214, as under A-341). Kiln on
+  the Mac Studio, 2026-11-18, debug: `slates-db` `register::` 84 of 84, `slates-cluster` `raft_wire::` 21 of 21,
+  `slates-server` `takeover::` and the holder tests 23 of 23. Red once each on a mutated copy: with A-341's rule (the
+  last takeover in the line) the server test's copy went at the second install (kept `(true, false)`); with every
+  member counted the returning host made the cohort read within tolerance (`(false, true)`).
+- **Still owed (GAPS).** The settle rule for a live owner (a holder an owner's neighbourhood settled away from), the
+  content release signal, and the Lineage.tla text for A-341 and this change.
+
+### A-504 — A location refusal names the root its peer holds, so an asker behind it fetches from that peer and asks again under the root it then holds (2026-11-18, g229, UI goal 85, bug 4's converse; §4.8 "Lookup" and learners, D-14; A-406, A-489)
+- **What was there.** A peer refused a location query with an empty reply, which named nothing, and every look of a
+  lookup asked under the root the lookup began with (`verbs::locate_within_horizon`). So an asker that was a root
+  learner behind its peers (A-489's case, the other way round) was refused by every peer on the newer root. Its own
+  learner fetched only when its regions or the voters it knew looked wrong (`fleet::root_diverges`). Even once it caught
+  up, its looks still asked under the old root and were refused again, for the lookup's whole budget.
+- **The rule.** A refusal names the root version its peer holds (`owner_location::Refused`, sent by
+  `owner_location::answer` for every refusal). An asker that reads one naming a newer root than it holds is behind:
+  counted `fleet.owner_location.asker_behind`, it records that version and that peer as A-489's peer side does
+  (`learn_from_refusal`, `ShardState::root_newer_seen`), and its root learner's next period fetches from that peer
+  (`fleet::root_learner_fetch`). Each look asks under the root the asker holds at that look (`Query::under_held_root`), so
+  the look after the fetch is answered.
+- **The encoding.** `Refused` is a new message of the location stream, a fixed 8 bytes (the version). It is never read
+  as a reply nor a reply as it: a reply is 42 bytes or more, and each decodes exactly. The located reply's bytes are
+  unchanged. An asker of an earlier build reads a refusal as malformed and folds it as no claim, as it folded the empty
+  reply. A peer of an earlier build still refuses with an empty reply, which is read as a refusal naming nothing. No
+  enum the `wire_order` guards cover changed (they cover `slates-ipc`'s protocol and `slates-db`'s records), so nothing
+  is published.
+- **Tests.** `a_behind_askers_round_is_answered_after_one_fetch` (`crates/server/src/owner_location.rs`, two daemons). The
+  peer's root is a version past the asker's. Its refusal names that root. The asker counts itself behind and its
+  learner fetches from the peer. After reaching the peer's root, the asker's next look under it is answered with the
+  peer's claim. Red with the refusal sent empty as before: the asker learned nothing. Also
+  `a_refusal_names_the_peers_root_and_no_reply_reads_as_one` (hostile input: every cut, a byte more, and each read as
+  the other).
+
+Applied in the same change to: §4.8 "Lookup" (the owner location status) and learners, A-489's owed item, GAPS (the
+location test's entry), `crates/server/src/{owner_location,fleet,verbs}.rs`, and the bug record
+`docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+
+### A-493 — A `UMNT` is confirmed at the pace this shard learned of its kernel's unmounts (2026-11-19, g232; UI goal 86, R3's class C, C-c part 2; §4.6 A-34, RFC 1813 §5.2.2, §5.2.3)
+
+Applied in the same change to: §4.6's unmount paragraph, GAPS (the R3 debt's class C), `crates/server/src/nfs.rs`
+(`unmount_bound_ns`, `wait_for_unmount`, `Unmounted`, `confirm_unmount`; `UNMOUNT_CONFIRM_NS` removed),
+`crates/server/src/state.rs` (`ShardState::unmount_times`), `crates/server/src/daemon.rs` (its start),
+`crates/cli/tests/cli.rs` (the forged-`UMNT` watch's comment).
+- **What was there.** A `UMNT` started a watch of the kernel's mount table that gave up after one liveness budget,
+  fixed (`UNMOUNT_CONFIRM_NS`): a genuine unmount slower than that on a loaded host left its attachment kept as a mount
+  nobody unmounted.
+- **What the wait waits for.** A `UMNT` is a hint: it removes an entry from a server's mount list, and the list goes
+  stale whenever a client never sends one (RFC 1813 §5.2.2, §5.2.3); nfs(5) has the client reach the server's mountd
+  again only as it unmounts. The kernel sends it while it unmounts, so a genuine one's mount leaves the table within the
+  kernel's own remaining steps, as long as this host's kernel takes under its load; a forged one's never leaves. Neither
+  the client's connection (a `UMNT` reaches the MOUNT program on a call of its own, not on the mount's NFS connection:
+  XNU's `nfs3_umount_rpc`, from memory, not verified here) nor the owner shard's time (the shard is not what is waited
+  on) measures that. The name's routing to its owner shard (`nfs::routed`) is already
+  waited in that shard's own time (A-408).
+- **The rule.** Each shard learns its kernel's unmounts as the told waits learn their mounts (`LearnedWait`, A-431,
+  A-442): a confirmation that found the mount gone is a sample, the bound the samples' tail plus the liveness window a
+  live party may be late by, and one that ran out (a forged `UMNT`, or an unmount slower than the bound) is no sample but
+  doubles the next bound, never past the node's failover delay. A shard that measured nothing waits the liveness window
+  first, as before.
+- **Tests** (`nfs.rs`): `a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace` (a shard that
+  measured a window-and-a-half unmount confirms one that leaves the table a window and a fifth after its `UMNT`);
+  `a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off` (unconfirmed at the first bound, the
+  next bound backed off).
+- **Owed.** A confirmation that ran out leaves its attachment kept even if the mount leaves later; a watch of the
+  kernel's unmount events (`EVFILT_FS`, `VQ_UNMOUNT`) would end it whenever the mount goes, with one watch a mount
+  bounding them.
+
+### A-462 — The Unix anchor hands its held entries on in a sealed object, never in environment variables, whose exec limits a table at the bounds passes (2026-11-18, goal 90; A-460's Unix half; A-61's, A-113's and A-197's handoff)
+Applied in the same change to: §4.6's A-61 status (the table); A-460's entry (its found line); GAPS, A-281's entry (the
+Unix sibling built); and:
+- `crates/anchor`: `held.rs` (`ENV_HELD` replaces `ENV_DEVICES`, `ENV_CONNECTIONS` and `ENV_COPIES`; the parts'
+  encoders and parsers named for what they are, `Held::devices_part`, `connections_part`, `copies_part`,
+  `parse_devices`, `parse_connections`, `parse_copies`; `Table`, `TableBounds`, `table_cap`, `encode_table`,
+  `decode_table`, `encode_pointer`, `parse_pointer`, `check_table_owner`; `TableObject`, `hand_in_process`,
+  `read_table`; the module's notes); `supervise.rs` (`device_env` writes the table into its object, kept until the spawn
+  holds its copy; a table that cannot be made refuses the spawn); `error.rs` (`AnchorError::Handoff`);
+  `tests/anchor.rs` (the children read their table; `a_table_past_the_old_exec_limit_reaches_the_successor_whole`).
+- `crates/server`: `anchor_hold.rs` (`adopt` reads the table the pointer names, `handed_table`, against the daemon's
+  own bounds); `anchor_hold_windows.rs` and `daemon.rs` (`adopt` takes the configuration on both platforms);
+  `fleet.rs` (the adoption's notes); the tests that play the anchor in-process (`shards_resync.rs`,
+  `shards_resync_restart.rs`, `shards_resync_dax.rs`, `held_copy_replay.rs`) hand their daemon a table.
+- `crates/cli`: `tests/cli.rs` (the garbling daemon reads a copy of its table and leaves the object for the daemon it
+  becomes).
+
+- **What was there.** The anchor handed a spawned daemon its channel and every held device, connection and copy in three
+  environment variables (`SLATES_ANCHOR_DEVICES`, `SLATES_ANCHOR_CONNECTIONS`, `SLATES_ANCHOR_COPIES`; A-61, A-113,
+  A-197). Linux refuses an `execve` whose single argument or environment string passes `MAX_ARG_STRLEN`, `PAGE_SIZE *
+  32` ("the limit per string is 32 pages", failing `E2BIG`: `execve(2)`; `include/uapi/linux/binfmts.h`), 131,072
+  bytes on 4 KiB pages; macOS bounds an exec's arguments and environment together at `ARG_MAX`, 1,048,576 bytes
+  (`getconf ARG_MAX` and `sysctl kern.argmax` on the Mac Studio, macOS 26.4, measured 2026-11-18). A held device takes
+  up to 157 characters with a session at its 64-byte cap, so the devices' variable passed Linux's limit at about 800
+  devices, while the bounds admit `shards × 4096`: past it the anchor could not start its next daemon at all.
+- **The rule.** The three parts, unchanged, become one table, a line each and a CRC32C after them, written into an
+  object of its own length sealed and read-only as a DAX peer's copy is (`slates_mem::PeerObject`, `PeerAccess::Read`:
+  on Linux a memfd sealed `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, the anchor's own view,
+  made before the seals, its only writer; on macOS an unlinked shared-memory object whose handed descriptor was opened
+  read alone). The spawn inherits that descriptor beside the ones the table names, and `SLATES_ANCHOR_HELD` carries only
+  its number and the table's length, `FD:LEN_HEX`, at most 27 characters. The daemon checks both against the most a
+  table of its own bounds takes (`table_cap`: each device and copy at 157 characters, each connection at 28, and the
+  frame) before it maps a byte, reads the object read alone and closes it, checks the checksum and the three lines, and
+  refuses whole a table that names its own descriptor again; then adopts each part as before. A table the anchor cannot
+  make refuses the spawn, typed (`AnchorError::Handoff`), rather than start a daemon that would take every held entry
+  for none. The write seal is the "future" one, the DAX peer objects': `F_SEAL_WRITE` refuses while any writable map
+  exists, and the anchor's view writes the table; the daemon's descriptor can neither write nor resize the object.
+- **Why one object, not the hold channel.** The channel is a datagram socketpair the daemon writes and the anchor
+  drains; a table of thousands of entries would cross it a datagram at a time while the daemon starts, and the
+  descriptors would ride beside them in `SCM_RIGHTS` batches of their own. The object costs the table's own length, only
+  at a spawn, and its descriptor is inherited as every held one already is.
+- **Tests.** On every Unix host (`held.rs`): `a_table_past_execs_string_limit_round_trips_through_the_codec_and_the_handoff`
+  (1,000 devices with sessions at the cap and 256 connections and copies, a table past 131,072 bytes, its pointer
+  within 27 characters, every part back whole, the table's object holding its bytes and refusing a write and a resize
+  through the descriptor a daemon is handed; the cap's own length taken and one more byte refused before a read),
+  `hostile_handoff_pointers_and_tables_are_refused`, `a_tables_own_descriptor_is_never_named_again`. Real processes
+  (`tests/anchor.rs`, Linux and macOS): `a_table_past_the_old_exec_limit_reaches_the_successor_whole`, a real supervisor
+  whose first daemon holds enough devices with full sessions to pass the platform's old limit by a tenth (about 975 on
+  Linux, 7,800 on macOS) and whose successor reads every one live from the table; the limit is read from the machine
+  the test runs on (its page size times 32 on Linux, `getconf ARG_MAX` on macOS), never frozen from one machine.
+- **Evidence.** Red first, on main at `b2909fc` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s lib
+  tests did not build (49 errors: no `Table`, `TableBounds`, `TableObject`, `encode_table`, `decode_table`,
+  `encode_pointer`, `parse_pointer`, `table_cap`, `read_table`, `check_table_owner`, `POINTER_TEXT_CAP`, nor the parts
+  named for what they are). Green on the tree as merged with main at `5fef5b1` (`383b0f8`), the same day and machine:
+  `cargo test --locked -p slates-anchor --lib -- handles:: held::` 34 of 34, the three above among them, the sealed
+  object made and read on macOS; `cargo fmt --check` clean for the four crates; `cargo clippy --locked --all-targets
+  -- -D warnings` clean for `slates-anchor`, `slates-server` and `slates-cli` on macOS and, through `cargo xwin`, for
+  `slates-anchor` and `slates-server` on Windows; `cargo xwin check` of `slates-cli`'s tests clean; `cargo xtask`'s
+  structural, unsafe, version, toolchain and capabilities checks pass, and its literal check finds nothing in this
+  change's files (its five findings are in `crates/base/src/s3/list.rs`, main's `125d07953`, filed for main). For
+  Linux, from the Mac: `cargo clippy` of `slates-anchor`'s lib for x86_64 and aarch64 Linux clean (its tests and
+  `slates-server` need a Linux C toolchain), and the Linux-only `held_copy_replay.rs` type-checks with its gate widened
+  in a scratch copy. The x86_64 Linux `cargo check` of both crates waited behind the one Linux runner's load and is filed
+  for main, with the real-process restarts.
+- **Found beside it, and fixed in the same landing** (main's workspace clippy and `xtask check`, r343): four findings in
+  `handles.rs` (a test past the complexity bound, a constant assertion, a string sliced by index, and
+  `WHAT_SHARDS_DAX`'s `Format:` line out of the literal check's four-line reach); the same kinds in this change's
+  siblings (`held.rs`'s and `held_windows.rs`'s tests, `tests/handles_windows.rs`'s `full_role`, the server's stand-in
+  anchor script and the Windows serve loop, whose anchor waits now share one call). In that loop a wake for a session
+  changed outside the stream's task no longer tells the anchor on its own: it takes a turn, and the turn tells it
+  (`Turned::Session`, as a turn owing a session already did), after any durability or change notice owed and
+  before any reply goes out, so the rule that the anchor learns a session before a reply depends on it holds unchanged;
+  a turn that owes a refill sends nothing, and a later turn tells it. `held_turn.rs`'s `1_u64`,
+  which the literal check reads as `1_`, main fixed meanwhile with its `Derived:` line (`cf61d54e4`), so this landing
+  leaves it.
+
+### A-506 — A park a liveness look ends is counted as its own kind, and teaches the wake estimate nothing (2026-11-18, UI goal 86 via g251b; A-456's accounting; §4.7 "Failure matrix", "Wake strategy"; A-223, A-456)
+
+- **What was there.** Since A-456 a departure wait on macOS, and on Windows since its fix the same day, parks until the
+  next look at the daemon's life, and a park whose timeout comes first ends neither by a reply's wake nor by an
+  unanswered one: the look finds the daemon alive and the client parks again. `ClientEnd` counted every park
+  (`park_ratio`) but such an end as no kind, so the client suite's accounting, every park ended by a reply or an
+  unanswered wake, failed on macOS: `the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed`, 32 parks, 17 replies,
+  0 unanswered (main's run r432 at 7113415eb). The bug record:
+  `docs/bugs/2026-11-18-a-park-a-liveness-look-ended-was-counted-as-no-kind.md`.
+- **The rule.** A departure park that waited until its next look and timed out is counted as ended by that look
+  (`ClientEnd::parks_ended_by_looks`, `Client::parks_ended_by_looks`), decided in `after_park` from the park's own
+  timeout, so a Linux park, which has none, is never counted so. Every park a wait makes is then a reply's, an
+  unanswered wake's, a look's, a deadline's or the departure's. Such a park teaches the wake estimate nothing: its wait
+  is kept for the estimate only when a wake ended it (`after_wake`), as before, and the test now holds that.
+- **Tests.** `endpoint::departure::a_park_a_liveness_look_ends_is_counted_as_its_own_kind_and_teaches_the_estimate_nothing`
+  (a reply held 1.5 s: every park counted; on macOS and Windows at least one park a look ended, as many as the looks
+  made or one more, on Linux none; the estimate gains at most one sample for each park a look did not end), with the
+  late-reply test's replier shared (`reply_late`). The client suite's accounting names the new kind.
+- **Checks.** On the Mac Studio (debug, r68, 2026-11-18, load 11 to 14): the unit test, a reply held 1.5 s, made 12
+  parks, 1 reply, 0 unanswered wakes and 11 parks ended by looks (11 looks), and taught the estimate 1 sample; red with
+  the count removed (0 ended by looks). `the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed` red on main
+  `3d174a1` (63 parks, 17 replies, 0 unanswered) and green with the fix. `slates-ipc --lib` 61 of 61 (1 ignored),
+  `slates-client --lib` 5 of 5; clippy clean on macOS (ipc and client, all targets), Linux x86_64 and aarch64 and Windows
+  x86_64 and arm64 (ipc, all targets), `cargo xwin check` of the client clean; `cargo xtask check` structural ok and no
+  literal of this change's; rustfmt clean.

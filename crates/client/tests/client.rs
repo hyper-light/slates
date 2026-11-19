@@ -2291,12 +2291,15 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
   assert_eq!(client.reconnects(), 0, "nothing made the client reconnect");
   let (parks, replies) = client.park_ratio();
   let unanswered = client.unanswered_wakes();
+  let at_looks = client.parks_ended_by_looks();
   assert!(replies >= 10, "every call was a reply: {replies}");
   // Every park ends in a reply, in a wake that brought none (a spurious return from the OS wait, or a
-  // previous reply's late wake landing on this park), or at the deadline (none here: nothing stalled).
+  // previous reply's late wake landing on this park), at a look at the daemon's life that found it alive (macOS,
+  // Windows: the park's timeout was the look's; A-506), or at the deadline (none here: nothing stalled).
   assert!(
-    parks <= replies + unanswered,
-    "every park is ended by a reply or counted as an unanswered wake: {parks} parks, {replies} replies, {unanswered} unanswered"
+    parks <= replies + unanswered + at_looks,
+    "every park is ended by a reply or counted as an unanswered wake or a look's: {parks} parks, {replies} replies, \
+     {unanswered} unanswered, {at_looks} ended by looks"
   );
   daemon.stop();
 }
