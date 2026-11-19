@@ -50,6 +50,10 @@ const OBJECT: ObjectId = ObjectId([0x51; 16]);
 const STEPS: usize = 1_500;
 /// Shape: the seeds each `f` is run over.
 const SEEDS: u64 = 48;
+/// Shape: the seeds the forgotten-fence restart is run over: four times the others'. At `f = 2` it needs a holder among
+/// those that promised an owner's new incarnation to restart before the next takeover, while the old one still runs,
+/// and 48 seeds drew none (the Mac Studio, 2026-11-18).
+const RESTART_SEEDS: u64 = 4 * SEEDS;
 /// Shape: the owner hosts the master hands epochs to, apart from the holders (the models' `Hosts`).
 const OWNERS: [HostId; 3] = [HostId(101), HostId(102), HostId(103)];
 /// Shape: the epochs one run hands out at most, so each epoch has steps to act in.
@@ -897,7 +901,7 @@ fn a_promise_that_raises_no_fence_breaks_the_register_under_the_nemesis() {
 #[test]
 fn a_restart_that_forgets_the_fence_breaks_the_register_under_the_nemesis() {
   for f in [1, 2] {
-    let (broken, _) = run(f, SEEDS, Mutation::RestartWithoutFence);
+    let (broken, _) = run(f, RESTART_SEEDS, Mutation::RestartWithoutFence);
     assert!(
       !broken.is_empty(),
       "f = {f}: no seed broke a check with restarts that forget the fence"
