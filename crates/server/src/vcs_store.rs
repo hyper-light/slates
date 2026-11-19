@@ -62,6 +62,7 @@ use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
 
+pub(crate) mod paths;
 pub(crate) mod record;
 #[cfg(test)]
 mod tests;
@@ -124,6 +125,10 @@ pub(crate) struct GitStore {
   pub(crate) derivations: Derivations,
   /// The reach sets' type, eager: each version's value kept as it commits, from the admission's own walks.
   pub(crate) reach: ReachSets,
+  /// The path map's type over the repository's greens (A-664 part 3, [`paths`]): each green's versions' maps of paths
+  /// to git's files, kept in `derivations` as each version commits. Declared with the content store's window when the
+  /// store is made ([`made`]); `None` for a store made without one.
+  pub(crate) paths: Option<paths::GreenPaths>,
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
   versions: BTreeMap<u64, Vec<u64>>,
@@ -139,6 +144,7 @@ impl GitStore {
       repository: Repository::new(format),
       derivations: Derivations::new(),
       reach: ReachSets::declare(Mode::Eager),
+      paths: None,
       versions: BTreeMap::new(),
       charged: 0,
     }
@@ -343,7 +349,15 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     stores.content = Some(content);
   }
   let store = match record.tool {
-    VcsTool::Git => RepositoryStore::Git(GitStore::new(git_format(record.format).ok_or(Unmade)?)),
+    VcsTool::Git => {
+      let mut git = GitStore::new(git_format(record.format).ok_or(Unmade)?);
+      // The map splits by the content store's own window, which its type's name carries (A-647).
+      git.paths = stores
+        .content
+        .as_ref()
+        .and_then(|content| paths::declare(content.window()));
+      RepositoryStore::Git(git)
+    }
     VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore::default()),
     VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
   };

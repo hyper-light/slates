@@ -2071,6 +2071,29 @@ impl Green {
     self.content.iter()
   }
 
+  /// Every symbolic link the green currently holds, with its target. With [`Green::files`], [`Green::hardlinks`] and
+  /// [`Green::specials`] it is every name the green holds that is not a directory: what a whole reading of the head
+  /// takes (A-664 part 3: a git repository's green read as git's files where no earlier map is kept).
+  pub fn symlinks(&self) -> impl Iterator<Item = (String, &str)> {
+    self
+      .symlinks
+      .iter()
+      .map(|(path, target)| (path, target.as_str()))
+  }
+
+  /// Every hard link the green currently holds, with the path of the name it aliases ([`Green::symlinks`]).
+  pub fn hardlinks(&self) -> impl Iterator<Item = (String, &str)> {
+    self
+      .hardlinks
+      .iter()
+      .map(|(path, target)| (path, target.as_str()))
+  }
+
+  /// Every special node the green currently holds under its primary name, with its metadata ([`Green::symlinks`]).
+  pub fn specials(&self) -> impl Iterator<Item = (String, SpecialNode)> {
+    self.specials.iter().map(|(path, node)| (path, *node))
+  }
+
   /// Whether a directory exists at the path.
   pub fn is_dir(&self, path: &str) -> bool {
     self.dirs.contains_key(path)
