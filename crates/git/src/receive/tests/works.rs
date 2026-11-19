@@ -11,7 +11,7 @@ use slates_vcs::ContentStore;
 use super::{ADVERTISED, commit_text, pack_of, request, unbounded, zero};
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::receive::works::{
-  Appends, Entry, GreenRead, Greens, SUBMODULE, Unappended, Version, Works,
+  Appends, Entry, GreenRead, Greens, KIND_CHANGED, Unappended, Version, Works,
 };
 use crate::receive::{
   ATOMIC_TRANSACTION_FAILED, Declined, FAILED_TO_UPDATE, NoneHidden, Outcome, Received, Session,
@@ -31,7 +31,7 @@ const GREEN: u64 = 1;
 /// The served branch.
 const MAIN: &[u8] = b"refs/heads/main";
 /// The push's name, which every work's identity begins with.
-const NAME: [u8; 32] = *b"A-620 part 2, a push to the store";
+const NAME: [u8; 32] = *b"A-620 part 2, a push to a store.";
 
 /// `id` as A-618 keys objects.
 fn key(id: ObjectId) -> ObjectKey {
@@ -439,19 +439,25 @@ fn a_branch_moved_before_its_append_is_refused_and_nothing_is_appended() {
 }
 
 /// A-620 part 2 (A-618's typed refusals, in slates' words where git has none). Do: push a commit
-/// whose tree holds a submodule link. Expect: `submodule links not served`, its band-2 line naming
-/// the link's path; nothing appended.
+/// whose tree makes the file `file` a directory. Expect: `path changes kind`, its band-2 line naming
+/// the path; nothing appended.
 #[test]
 fn a_work_a_store_cannot_build_is_refused_in_slates_words_naming_its_path() {
   let mut served = Served::new();
-  let linked = id_of(Kind::Commit, b"another repository's commit");
-  let tree = tree_bytes(&[(b"160000", b"sub", linked)]);
+  let inner = id_of(Kind::Blob, b"inner\n");
+  let directory = tree_bytes(&[(b"100644", b"inner", inner)]);
+  let tree = tree_bytes(&[(b"40000", b"file", id_of(Kind::Tree, &directory))]);
   let commit = commit_text(id_of(Kind::Tree, &tree), &[served.head]);
   let next = id_of(Kind::Commit, &commit);
-  let objects = vec![(Kind::Tree, tree), (Kind::Commit, commit)];
+  let objects = vec![
+    (Kind::Blob, b"inner\n".to_vec()),
+    (Kind::Tree, directory),
+    (Kind::Tree, tree),
+    (Kind::Commit, commit),
+  ];
   let bytes = push_of(&[(served.head, next, MAIN)], &objects, b" report-status");
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
-  assert_eq!(received.outcomes, [refused(SUBMODULE, MAIN, b"sub")]);
+  assert_eq!(received.outcomes, [refused(KIND_CHANGED, MAIN, b"file")]);
   assert!(logs.appended.is_empty());
 }

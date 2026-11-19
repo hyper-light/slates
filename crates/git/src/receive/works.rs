@@ -54,12 +54,8 @@ pub const DUPLICATE_NAME: &[u8] = b"duplicate entries";
 /// `TargetNotHeld`).
 pub const TARGET_NOT_HELD: &[u8] = b"link target not held";
 
-/// Slates' words: the reason a link to another repository's commit is given while its node kind is
-/// owed (A-618's `Submodule`; §4.17.2 item 5).
-pub const SUBMODULE: &[u8] = b"submodule links not served";
-
-/// Slates' words: the reason a path that changes between a file, a directory and a link is given
-/// while its composition is owed (A-618's `KindChanged`; GAPS §8f).
+/// Slates' words: the reason a path that changes between a file, a directory, a symbolic link and
+/// a submodule's link is given while its composition is owed (A-618's `KindChanged`; GAPS §8f).
 pub const KIND_CHANGED: &[u8] = b"path changes kind";
 
 /// Slates' words: the reason a work past the push's room is given (A-618's `PastRoom`).
@@ -159,7 +155,7 @@ pub trait Appends {
 }
 
 /// receive-pack's part 2 judge (module docs).
-pub struct Works<'w, G: ?Sized, R: ?Sized, O: ?Sized, A: ?Sized> {
+pub struct Works<'w, G: ?Sized, R: ?Sized, O, A: ?Sized> {
   /// The greens as the push reads them.
   greens: &'w G,
   /// The repository's indexed objects, for a commit or tag the push did not bring.
@@ -178,7 +174,7 @@ impl<'w, G, R, O, A> Works<'w, G, R, O, A>
 where
   G: Greens + ?Sized,
   R: Repository + ?Sized,
-  O: PushObjects + ?Sized,
+  O: PushObjects,
   A: Appends + ?Sized,
 {
   /// A judge of the push named `name` (two submits of one push carry one name): its greens read
@@ -310,7 +306,7 @@ impl<G, R, O, A> Judge for Works<'_, G, R, O, A>
 where
   G: Greens + ?Sized,
   R: Repository + ?Sized,
-  O: PushObjects + ?Sized,
+  O: PushObjects,
   A: Appends + ?Sized,
 {
   type Accepted = Entry;
@@ -398,7 +394,6 @@ fn work_refused(name: &[u8], refused: &PushRefused) -> Declined {
     PushRefused::NameNotHeld { path } => (NAME_NOT_HELD, path.as_slice()),
     PushRefused::DuplicateName { path } => (DUPLICATE_NAME, path.as_bytes()),
     PushRefused::TargetNotHeld { path } => (TARGET_NOT_HELD, path.as_bytes()),
-    PushRefused::Submodule { path } => (SUBMODULE, path.as_bytes()),
     PushRefused::KindChanged { path } => (KIND_CHANGED, path.as_bytes()),
     PushRefused::PastRoom { .. } => (PAST_ROOM, b"".as_slice()),
     PushRefused::Unplaced { path } => (UNPLACED, path.as_bytes()),
