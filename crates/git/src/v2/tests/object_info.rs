@@ -167,7 +167,8 @@ fn each_answer_is_the_one_stock_git_wrote_from_the_same_objects() {
   );
 }
 
-/// The loose objects `objects.bin` holds, handed to the store one after another as an import hands them.
+/// The loose objects `objects.bin` holds, handed to the store one after another as an import hands them, each whole
+/// (a delta chain's depth of zero).
 struct Loose<'a> {
   bytes: &'a [u8],
   at: usize,
@@ -185,6 +186,7 @@ impl Entries for Loose<'_> {
       kind: header.kind,
       claimed: None,
       content: &rest[took..end],
+      depth: 0,
     }))
   }
 }
