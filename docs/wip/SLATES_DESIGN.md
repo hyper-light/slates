@@ -14290,9 +14290,11 @@ and export by landing).
 > histories and file revisions ended, 220001 where a command needs a hidden path whole), and the connection judging
 > each read by its principal's rules; held to a second repository served under an authorization file, its four scripted
 > and seven stock sessions replayed whole (macOS arm64, Mac Studio, 54 of 54); svndiff 0 held to `svnserve`'s own writes
-> since A-616 continued (7) recorded its session. Owed: the fold of a name beyond ASCII (utf8proc's case folding and
-> mark stripping); a denied read in a session that could authenticate, which `svnserve` asks to, mid-command, before it
-> refuses.
+> since A-616 continued (7) recorded its session. Its step 7 (2026-11-19, g297): a read the anonymous session may not
+> make, where the client could authenticate, asks it to mid-command as `must_have_access` does and runs again under the
+> principal it proves, judged by that principal's rules (stock `svn cat` and `svn ls` replayed whole through the
+> connection); `list`'s fold beyond ASCII as utf8proc folds (every scalar value Unicode 17 assigns held to utf8proc
+> 2.12.0). Owed: the 58 code points Unicode 18 assigned, until the fold's tables are Unicode 18's.
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -14445,7 +14447,8 @@ and export by landing).
 > other command of `svnserve`'s set refused as one it does not know (210001, `Turn::Unserved`) until its piece lands
 > (commit, A-655; the lock verbs; `replay`, `change-rev-prop`; `get-file-revs` since A-613's seventh slice, which
 > answers it among the reads); `update`'s target checked for read
-> access on the session's path. One connection serves `svn://` and `svnserve -t`: a tunnel's user comes in through the
+> access on the session's path, and the reads that check their path first asking an anonymous client that could
+> authenticate to, mid-command, as `update` does (A-613 part 2, step 7). One connection serves `svn://` and `svnserve -t`: a tunnel's user comes in through the
 > repository its caller names (`EXTERNAL`). Held to every recorded report session replayed from its first byte against
 > stock `svnserve` 1.15.0's (40 sessions; property lists and listings as sets; every item equal since A-613's eighth
 > slice judges the reads by the session's rules); red five ways. A-616's
@@ -43617,10 +43620,44 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   the connection, each principal's own rules (anonymous refused and censored, a log a byte of room a call; alice
   reading `secret`); A-656's 40 recorded sessions, every item equal. The first build (r97) failed the abort's replay,
   the request written that `svnserve` never flushed. Owed: red-checks.
-- **Owed** (the next slices): `list`'s fold of a name beyond ASCII (utf8proc's NFD with case folding and marks stripped,
-  composed again, which needs Unicode's case-folding and general-category tables); the authentication request a denied
-  read makes mid-command when the session is anonymous and could authenticate (a password database, SASL or a tunnel's
-  user), with the connection that runs the exchange.
+- **Part 2, step 7** (2026-11-19, g297): a denied read's authentication request mid-command, and `list`'s fold beyond
+  ASCII.
+  - **The request** (`serve.c` `must_have_access` 809-850, `internal_auth_request` 696-727, `send_mechs` 582-592):
+    `get-file`, `get-dir`, `check-path`, `stat`, `get-iprops` and `list` check their path first. Where the session may
+    not read it, has no user, authenticated users may read, and a way in is kept (a tunnel's user, or a password
+    database; `send_mechs` with a username needed lists `EXTERNAL` and `CRAM-MD5`, never `ANONYMOUS`), the read writes
+    nothing (`Outcome::Authenticate`), the connection asks (`Interrupted::Read`), and once the client is established
+    runs it again with `Authentication::Done`: its answer with no trivial request before it, or "Authorization failed"
+    (170001) where the new principal may not read the path either. The read is judged by the new principal's rules:
+    `Established::reads_session` compiles them again once the principal changes (the eighth slice's finding (a),
+    now tested). One rule says whether a client could authenticate for a command (`Established::mechanisms_for`), for
+    `commit`, `update` and the reads alike.
+  - **The fold** (`reads/fold.rs`; `libsvn_subr/utf8proc.c` `normalize_cstring` through `svn_utf__xfrm`, `list.c`
+    `matches_any`): utf8proc's decomposition with case folding and marks stripped, composed again, in
+    `utf8proc_decompose_char`'s order (a Hangul syllable decomposed; a mark dropped before it could fold; a C or F case
+    folding, then a canonical decomposition, each piece folded again), then canonical order, then composition as
+    `utf8proc_normalize_utf32` composes; the pattern matched as the client sent it. Tables: Unicode 17.0.0, the
+    `unicode-normalization` 0.1.25 crate's (already the workspace's, through slates-vfs) and Unicode's CaseFolding.txt
+    17.0.0 (`crates/svn/data/unicode`, sha256 `ff8d8fef…`, its 1,585 C and F lines read once).
+  - **Recording** (Mac Studio, stock Subversion 1.15.0, kiln r149): the report recorder's `read-auth-cat` and
+    `read-auth-ls` (alice) and `read-auth-cat-bob` (bob, given a key in the recorder's password file), each anonymous
+    after the handshake and asked mid-command; the recorder now records a named stock session that needs no working
+    copy, and stopped its `svnserve` (none left). The fold's oracle, `crates/svn/fixtures/fold/make-fold.py`: the
+    utf8proc `svnserve` links (Homebrew's 2.12.0, Unicode 18.0.0), called through ctypes as Subversion calls it, over
+    every scalar value (5,760 fold to another) and 28 names of several code points.
+  - **Tests** (macOS arm64, Mac Studio, kiln r179: `cargo test --locked -p slates-svn --lib -- reads:: serve::` 64 of
+    64; the crate has no integration target): the three recordings replayed whole through the connection, the
+    challenge `svnserve` sent fed back; a denied read answered after alice's CRAM-MD5 by alice's rules (the anonymous
+    principal's compiled for an earlier read), bob refused after his, a tunnel's anonymous read through `EXTERNAL`;
+    each of the six reads asking with nothing written; a read run again with no trivial request; the fold of every
+    scalar value Unicode 17 assigns (1,112,006) and the 28 names as utf8proc's; `Ärger.txt` and `Straße` listed by
+    `arger*` and `strasse`, and by no unfolded `Ärger*`; CaseFolding.txt's C and F lines read whole, its version the
+    crate's. Red first (kiln r149): the three serve tests failed, answered "Authorization failed" where `svnserve`
+    asks. The fold's tests were written beside it and not run red: the ASCII fold they replace leaves `Ärger.txt` as it
+    is, which the oracle's first name refuses.
+- **Owed**: the 58 code points Unicode 18 assigned that utf8proc 2.12.0 folds and the fold here keeps, until
+  `unicode-normalization`'s tables are Unicode 18's (the oracle test prints them); red-checks of the seventh slice, the
+  eighth and step 7 (the `get-file-revs-svndiff0` recording landed with A-616 continued (7)).
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:

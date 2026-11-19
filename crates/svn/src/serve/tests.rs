@@ -26,6 +26,7 @@ use crate::report::recorded::{
   value_of,
 };
 use std::collections::BTreeMap;
+use std::ffi::CString;
 
 mod commit;
 
@@ -138,6 +139,7 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
   let mut next = client.iter();
   let mut held: Vec<u8> = Vec::new();
   let mut established = false;
+  let mut challenges = 0;
   loop {
     let given = established.then_some(&sources);
     let before = items(&out).len();
@@ -161,10 +163,60 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
         held.drain(..consumed);
         established = true;
       }
+      Ok(Turn::ChallengeNeeded { consumed }) => {
+        held.drain(..consumed);
+        let (nonce, time_micros, host) = recorded_challenge(recorded, challenges);
+        challenges += 1;
+        connection
+          .challenge(nonce, time_micros, &host, &mut out)
+          .unwrap();
+      }
+      Ok(Turn::KeyNeeded { user, consumed }) => {
+        let key = CramKey::from_secret(recorded_secret(user)).unwrap();
+        held.drain(..consumed);
+        connection.key(Some(&key), &mut out).unwrap();
+      }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),
       Ok(other) => panic!("{}: {other:?}", recorded.name),
       Err(refused) => return (out, Ending::Refused(refused)),
     }
+  }
+}
+
+/// The parts of the `n`-th CRAM-MD5 challenge `svnserve` sent in `recorded`, `<nonce.time@host>`
+/// (`cram.c` `make_nonce`), so the connection sends the very challenge its client answered.
+fn recorded_challenge(recorded: Recorded, n: usize) -> (u64, i64, CString) {
+  let challenge = items(recorded.server)
+    .iter()
+    .filter_map(|item| match value_of(item) {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::Word("step"), Value::List(challenge)] => match challenge.as_slice() {
+          [Value::String(text)] => Some(text.to_vec()),
+          _ => None,
+        },
+        _ => None,
+      },
+      _ => None,
+    })
+    .nth(n)
+    .unwrap();
+  let text = std::str::from_utf8(&challenge).unwrap();
+  let inner = text.strip_prefix('<').unwrap().strip_suffix('>').unwrap();
+  let (nonce, rest) = inner.split_once('.').unwrap();
+  let (time_micros, host) = rest.split_once('@').unwrap();
+  (
+    nonce.parse().unwrap(),
+    time_micros.parse().unwrap(),
+    CString::new(host).unwrap(),
+  )
+}
+
+/// The secret the recorder's password file gives `user` (`make-fixtures.py` `PASSWD`).
+fn recorded_secret(user: &[u8]) -> &'static [u8] {
+  match user {
+    b"alice" => ALICE_SECRET,
+    b"bob" => b"bob's secret",
+    other => panic!("no key for {}", String::from_utf8_lossy(other)),
   }
 }
 
@@ -859,6 +911,156 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   assert_eq!(out, a_directory);
   let log = send_in_slices(&fixture, &alices, &mut connection, log_r1);
   assert!(log.contains("13:/trunk/secret A"), "{log}");
+}
+
+/// `check-path` of `secret` beneath the session's `/trunk`, which the fixtures' rules keep from all
+/// but alice.
+const CHECK_SECRET: &[u8] = b"( check-path ( 6:secret ( ) ) ) ";
+
+/// A directory's kind answered after the trivial auth request.
+const A_DIRECTORY: &str = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
+
+/// The request for an authentication for one command through a tunnel: `EXTERNAL` alone, in the
+/// repository's realm, its UUID.
+fn external_request() -> String {
+  let realm = std::str::from_utf8(UUID).unwrap();
+  format!("( success ( ( EXTERNAL ) {}:{realm} ) ) ", realm.len())
+}
+
+/// A-613 part 2, step 7 (`serve.c` `must_have_access` 809-850 for a read: the request made with a
+/// username needed, then the lookup made again): anonymously, where users hold keys, check `dir`,
+/// then `secret`; authenticate as alice by CRAM-MD5; call again; check `secret` once more; expect
+/// `dir` a directory after the trivial auth request, then the request listing `CRAM-MD5` alone with
+/// nothing before it, the challenge and `( success ( )` alone, then `secret` a directory with no
+/// trivial auth request before it (alice's rules compiled once the principal changed, the
+/// anonymous principal's having been compiled for `dir`), then, alice's still, a directory after
+/// the trivial request.
+#[test]
+fn a_denied_read_authenticates_first_and_is_judged_by_the_new_principals_rules() {
+  let fixture = fixture();
+  let anonymous = FixtureGuards::anonymous();
+  let mut connection = established();
+  let (out, _) = send(
+    &fixture,
+    &anonymous,
+    &mut connection,
+    b"( check-path ( 3:dir ( ) ) ) ",
+  );
+  assert_eq!(out, A_DIRECTORY);
+  let (out, turn) = send(&fixture, &anonymous, &mut connection, CHECK_SECRET);
+  assert_eq!(
+    (out, turn.map(|turn| turn.starts_with("Took"))),
+    (cram_md5_request(), Ok(true))
+  );
+  let (out, verdict) = cram_md5(&mut connection, b"alice", ALICE_SECRET);
+  assert_eq!(
+    verdict,
+    Verdict::Established(Principal::User(b"alice".to_vec()))
+  );
+  assert!(out.ends_with("> ) ) ( success ( ) ) "), "{out}");
+  let alice = FixtureGuards::default();
+  let (out, turn) = send(&fixture, &alice, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+  assert_eq!(connection.waiting(), Waiting::Command);
+  let (out, _) = send(&fixture, &alice, &mut connection, CHECK_SECRET);
+  assert_eq!(out, A_DIRECTORY);
+}
+
+/// A-613 part 2, step 7 (`must_have_access`' second lookup, 841-846): anonymously, where users hold
+/// keys, stat `secret`; authenticate as bob, whom the rules keep out of it too; call again; expect
+/// the request listing `CRAM-MD5` alone, bob's success, then "Authorization failed" (170001) with
+/// no trivial auth request before it, and the next command awaited.
+#[test]
+fn a_read_still_refused_after_the_authentication_is_refused_with_no_trivial_request() {
+  let fixture = fixture();
+  let anonymous = FixtureGuards::anonymous();
+  let mut connection = established();
+  let (out, _) = send(
+    &fixture,
+    &anonymous,
+    &mut connection,
+    b"( stat ( 6:secret ( ) ) ) ",
+  );
+  assert_eq!(out, cram_md5_request());
+  let (_, verdict) = cram_md5(&mut connection, b"bob", b"bob's secret");
+  assert_eq!(
+    verdict,
+    Verdict::Established(Principal::User(b"bob".to_vec()))
+  );
+  let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out, turn), (not_authorized(), wrote));
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// A-613 part 2, step 7 (`must_have_access` through a tunnel: `send_mechs` lists `EXTERNAL` for the
+/// tunnel's user, never `ANONYMOUS` where a username is needed): through alice's tunnel, where
+/// anonymous users read too, established anonymously, check `secret`; answer `EXTERNAL`; call
+/// again; expect the request listing `EXTERNAL` alone, the session alice's with `( success ( ) )`
+/// alone, then `secret` a directory with no trivial auth request before it.
+#[test]
+fn a_tunnels_anonymous_read_authenticates_as_the_tunnels_user() {
+  let fixture = fixture();
+  let tunnel = Repository {
+    anonymous: true,
+    ..alices_tunnel()
+  };
+  let mut connection = established_on(&tunnel, ANONYMOUSLY);
+  let (out, _) = send(
+    &fixture,
+    &FixtureGuards::anonymous(),
+    &mut connection,
+    CHECK_SECRET,
+  );
+  assert_eq!(out, external_request());
+  let none = None::<&Sources<'_, Green, FixtureGuards>>;
+  let mut out = Vec::new();
+  let external = connection.receive(none, EXTERNALLY.as_bytes(), &mut out, PLENTY);
+  let alice = Principal::User(b"alice".to_vec());
+  assert!(matches!(external, Ok(Turn::Established { principal, .. }) if principal == alice));
+  assert_eq!(String::from_utf8_lossy(&out), "( success ( ) ) ");
+  let (out, turn) = send(&fixture, &FixtureGuards::default(), &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+}
+
+/// The recorded reads that authenticate in the middle of their command (`make-fixtures.py`
+/// `read-auth-*`): stock `svn cat` and `svn ls` of `/trunk/secret` as alice, and `svn cat` as bob.
+const READ_AUTH: [Recorded; 3] = [
+  Recorded {
+    name: "read-auth-cat.1",
+    client: include_bytes!("../../fixtures/report/read-auth-cat.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-cat.1.server.bin"),
+  },
+  Recorded {
+    name: "read-auth-ls.1",
+    client: include_bytes!("../../fixtures/report/read-auth-ls.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-ls.1.server.bin"),
+  },
+  Recorded {
+    name: "read-auth-cat-bob.1",
+    client: include_bytes!("../../fixtures/report/read-auth-cat-bob.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-cat-bob.1.server.bin"),
+  },
+];
+
+/// A-613 part 2, step 7, against stock `svnserve` 1.15.0 (`make-fixtures.py` `read-auth-*`): replay
+/// stock `svn cat` and `svn ls` of `/trunk/secret` as alice and `svn cat` of it as bob, each
+/// anonymous after the handshake and asked to authenticate in the middle of its read, through a
+/// connection over the fixtures' repository, with the challenge `svnserve` sent and each user's key
+/// from the recorder's password file; expect every item as `svnserve` wrote it: the request
+/// listing `CRAM-MD5` alone, the challenge and `( success ( ) )`, then alice's answer with no
+/// trivial auth request before it, and bob refused "Authorization failed" (170001).
+#[test]
+fn reads_that_authenticate_in_the_middle_of_their_command_are_answered_as_svnserve_answered_them() {
+  let fixture = fixture();
+  let texts = texts_by_md5(&fixture.green);
+  for recorded in READ_AUTH {
+    let (out, ending) = replay(&fixture, recorded, PLENTY);
+    assert_eq!(ending, Ending::Waiting, "{}", recorded.name);
+    assert_as_svnserve(recorded.name, &items(&out), recorded.server, &texts);
+  }
 }
 
 /// A-656 with A-655 (`serve.c` `commit` 1471-1580): commit, through a tunnel as alice, a drive
