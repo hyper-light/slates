@@ -59,6 +59,9 @@ struct Pair {
   client: Client,
   events: Vec<SessionEvent<u32>>,
   now: u64,
+  /// The client's bytes the server has not taken: kept until it reads again, as the SSH edge keeps them, since `receive`
+  /// takes fewer than all while an event or a key lookup waits on its caller.
+  unread: Vec<u8>,
 }
 
 impl Pair {
@@ -74,6 +77,7 @@ impl Pair {
       client: Client::new(options),
       events: Vec::new(),
       now: 0,
+      unread: Vec::new(),
     }
   }
 
@@ -108,19 +112,28 @@ impl Pair {
       }
       stalls += u32::from(!moved);
     }
+    self.unread = rest.to_vec();
     Ok(())
   }
 
-  /// Moves bytes both ways until neither side sends anything.
+  /// Moves bytes both ways until neither side sends anything, or the server takes none of the client's held bytes and
+  /// so waits on its caller (a key lookup).
   fn pump(&mut self) -> Result<(), SessionRefusal> {
     for _ in 0..1_000 {
       let sent = self.to_client();
-      let input = self.client.take_output();
-      if !sent && input.is_empty() {
+      let fresh = self.client.take_output();
+      let held = self.unread.len();
+      if !sent && fresh.is_empty() && held == 0 {
         self.take_events();
         return Ok(());
       }
+      let mut input = std::mem::take(&mut self.unread);
+      input.extend_from_slice(&fresh);
       self.to_server(&input)?;
+      if !sent && fresh.is_empty() && self.unread.len() == held {
+        self.take_events();
+        return Ok(());
+      }
     }
     Ok(())
   }
