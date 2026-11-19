@@ -516,26 +516,28 @@
 > or behind a docket), appended in 7.2's order, each log whole or refused, each text held to its node; 7.2's cheap
 > `verify` checks across the logs; censored, ellipsis, externally stored and unknown flags refused by kind; a refused
 > import releasing its index and every hold. Proven by `cargo test --locked -p slates-hg --lib`, 224 of 224 on the Mac
-> Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against
-> one history stock 7.2 stored five
-> ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's `debugdata`, every node 7.2's, five
-> indexes equal row for row, nothing read but the files each holds. Owed of the import, with later pieces: the phase
-> roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an import holds every changeset, secret ones
-> too, and must not be served); the import sliced under the shard's step budget and resumed after a host's pending read,
-> rather than run again; revlogs read by ranges rather than whole; a text rebuilt from the one before it where its chain
-> passes through it (7.2's revision cache), rather than from its chain's base; a manifest's file nodes held to the file
-> logs (a whole `verify`); and the server's adapter from §4.15's host seam to `RepositoryFiles` (one name at a time; a
-> store name that is not UTF-8, which only the plain encoding leaves, refused by kind there). Owed, in order, after
-> §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s `listkeys` dump, `slates hg serve --stdio`'s loop (a
-> bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas in place of full texts, the
-> `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of the walks
-> over the whole view; (5, rest) pushes: the changegroup verified and its changesets classified into works (lines,
-> bookmarks), each through A-618's builder over the flat manifests' paths; the landing, each moved green appended at the
-> position the push read and the greens the checks read compared there (A-642), phases and bookmarks in the same
-> landing, through a trait until g261's rebuilt entry and A-635's verdict over several works land; the policy
-> (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare and swap; a compressed bundle
-> inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the
-> admission), and the bundle read in slices too (part 1 holds it whole);
+> Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
+> history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
+> `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
+> import, with later pieces: the phase roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an
+> import holds every changeset, secret ones too, and must not be served); the import sliced under the shard's step
+> budget and resumed after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a
+> text rebuilt from the one before it where its chain passes through it (7.2's revision cache), rather than from its
+> chain's base; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's
+> host seam to `RepositoryFiles` (one name at a time; a store name that is not UTF-8, which only the plain encoding
+> leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1
+> request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
+> `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
+> stub), the three captured sessions served whole. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving:
+> `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in
+> place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads
+> in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its changesets classified
+> into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the landing, each moved
+> green appended at the position the push read and the greens the checks read compared there (A-642), phases and
+> bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over several works land;
+> the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare and swap; a compressed
+> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
+> the admission), and the bundle read in slices too (part 1 holds it whole);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -631,8 +633,8 @@
 > sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
 > the caller's room, red-checked six ways, the fixtures recorded again for every command still owed; its third slice
 > (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways; its fourth slice (g297),
-> `get-location-segments`, red-checked five ways. Owed from it: `log` with merged revisions, `get-file-revs`,
-> `get-deleted-rev`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> `get-location-segments`, red-checked five ways; its fifth slice (g297), `get-deleted-rev`, red-checked five ways.
+> Owed from it: `log` with merged revisions, `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
@@ -2385,22 +2387,21 @@
 > merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
-> **Three siblings of A-643's verdicts, open (2026-11-19, A-643's sweep, g267; §4.16 "The verdict"; POSIX
-> `rename`).**
-> 1. A rename over a symbolic link, a hard link or an IPC node is refused `TypeChanged` even with no concurrent change:
->    `merge_rename` reads `occupied_by_nonfile` before any base. POSIX `rename` replaces any non-directory destination,
->    and does nothing for two links to one file, so `mv file link`, `mv link link`, and a hard link renamed over
->    another link to its own file can never land. These are false conflicts, not broken states. Found by reading.
-> 2. A hard link names its target by path. The head's removal of a file that hard links name is accepted (only an IPC
->    node's removal reads the links naming it), and the links then name a path with nothing, or the file made there
->    next. POSIX keeps a removed file's bytes under its remaining names. A-643's oracle generates this and follows the
->    engine: its remake of `TARGET` is accepted while `HARDLINK` names it. A question of the model, for its owner.
-> 3. `merge_unlink`'s IPC-node branch scans every attribute change and every hard link for each unlink
->    (`xattr_changed.iter().any`, `hardlinks.values().any`): O(changes) per op on the verdict's path. `changed_after`
->    and `links_to` answer both by lookup. Found by reading.
->
-> Owed: a failing test of each, then the rule: for 1, the destination replaced as A-643 replaces a file, and two links
-> to one file a no-op; for 2, the model's decision; for 3, the lookups, with a counter test.
+> **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
+> sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
+> 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
+>    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
+>    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
+>    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
+> 2. Owed, A-646 part 2: a hard link names its target by path, so the head's removal of a file that hard links name is
+>    accepted and the links then name a path with nothing, or the file made there next. A-646 decides it from
+>    principle: a hard link names its target's node, as a POSIX inode does, never a path. A removed name leaves the node
+>    to its other names, its content kept while any name holds it, and a later file at the path is a different node.
+>    The engine and the ops document will say so, the document's version changed as A-621 changed it.
+> 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
+>    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
+>    entries examined where the scan examined 2,000 (r960).
+> Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a
