@@ -367,6 +367,10 @@ fn git_part(store: &mut ContentStore, pack: &[u8], idx: &[u8], format: ObjectFor
     })
     .collect();
   placed.sort_by_key(|entry| entry.offset);
+  // Every entry's position is 0, so the entries in their own order are in position order (A-653).
+  let order = (0..placed.len())
+    .map(|index| u32::try_from(index).unwrap())
+    .collect();
   Kept {
     content: store.put_object(body).unwrap(),
     len: to_u64(body.len()),
@@ -374,6 +378,7 @@ fn git_part(store: &mut ContentStore, pack: &[u8], idx: &[u8], format: ObjectFor
     positions: Positions::new(),
     references: Positions::new(),
     offsets: 0,
+    order,
   }
 }
 
