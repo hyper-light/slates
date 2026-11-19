@@ -18928,9 +18928,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows` and
   `a_part_way_fill_stays_counted_until_its_range_is_filled_again`; red without the fix 3 of 3 (the first slice still
   read `A` after the file was zeroed; one range counted where two held bytes), green with it, on the Mac Studio.
-  - **Open, the siblings it found (each from reading, each owed a failing test):** a successor's adopted DAX object
-    (A-365) may hold a fill's bytes in a range its range table does not name (a range the dead daemon was filling, or
-    one that failed there), which the successor's next fill skips as before A-419; and on Windows a range is committed
+  - **Fixed 2026-11-18 (A-526, goal 85, g079): a successor's adopted DAX object (A-365) could hold a fill's bytes in a
+    range its range table does not name** (a range the dead daemon was filling, or one that failed there), which the
+    successor's next fill skipped as before A-419. A backing taken back from a dead daemon now clears each range not
+    filled before its first fill (`ShardsBacking::owes_clear`); held by
+    `a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again` (bridge-core's unit tests), red
+    without the fix on the Mac Studio. Record:
+    `docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
+    **Left:** those bytes are counted by nothing until the range is filled or the backing goes (at most the ranges the
+    dead daemon's fills had begun and not finished).
+  - **Open, the other sibling (from reading, owed a failing test, a Windows one):** on Windows a range is committed
     before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
