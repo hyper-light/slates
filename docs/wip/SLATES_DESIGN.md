@@ -36530,8 +36530,9 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
 
 ### A-552 — The daemon's own supervision waits follow the windows its shards are judged by, or wait while what they wait on goes on (2026-11-19, UI goal 86 via g076b: D-c; R3's class D; §4.14 `daemon.alive`; A-228, A-232, A-455, A-525)
 Applied in the same change to: GAPS (the failover delay's entry, its class D line), `crates/server/src/daemon.rs`
-(`starved_share_ns`, `starve_this_thread`, `Daemon::starve_control_shard`'s doc, the test) and
-`crates/server/src/watchdog.rs` (`shard_window_ns`, `own_window_ns`).
+(`starved_share_ns`, `starve_this_thread`, `Daemon::starve_control_shard`'s doc, `stop_parts`, the test),
+`crates/server/src/watchdog.rs` (`shard_window_ns`, `own_window_ns`) and `crates/machine/src/log.rs` (`LogWriter::stop`,
+its progress count, the sink seam and the test).
 - **What was there.** A-359's sweep left the daemon's own supervision waits on the liveness window `W` (class D, D-c),
   each owed its own change: a starved hold's CPU (`starved_share_ns`), the log writer's drain wait at a stop
   (`stop_parts`), the learning gate's crossing wait (`start_with_fleet`), the Windows hold channel's two bounds
@@ -36544,6 +36545,17 @@ Applied in the same change to: GAPS (the failover delay's entry, its class D lin
   overrun in only when it waits, and a hold inside one poll waits for nothing), where it was half of `W`. The spin
   judgment is that window held to the build, never less than it, so the hold is never judged spinning, and each beat's
   share still shows CPU progress, so it is never judged still.
+- **The log writer's drain at a stop (`stop_parts`, A-305's writer).** The stop waited one window in all for the writer
+  to write what its shards queued and end, so a standard error that took lines slowly lost the rest of them. The writer
+  now counts the lines it has written, and the stop waits while that count moves, a window at a time, giving the
+  writer up at the first look a window after the last that finds no line written since. So a slow standard error is
+  waited for until it has every line, and a still one (a reader that takes nothing, or a stuck shard's thread still
+  holding its route with nothing to send) is left to the process's end, as before. The window is the widest this
+  daemon's shards are judged by (A-455), read before the runtime stops: a host that keeps the shards off their CPUs that
+  long keeps the writer's thread off its own as long.
 - **Tests.** `a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by` (`crates/server/src/daemon.rs`: a quiet
   shard's hold half the liveness window, a shard held two and a half windows half of those, a span under a beat a beat
   at most); red with today's rule (the held shard's hold half the liveness window) on the Mac Studio.
+  `a_stop_waits_while_its_writer_takes_lines_and_gives_up_a_still_one` (`crates/machine/src/log.rs`: twelve lines to a
+  standard error taking one every sixth of a window, all written and the writer ended; a writer a held route keeps, with
+  nothing queued, given up after a window); red with today's rule (given up after one window with lines unwritten).

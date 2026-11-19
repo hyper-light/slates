@@ -4037,9 +4037,11 @@
 > idle seal and the huge-page re-arm.
 > **Since A-552 (D-c, 2026-11-19, g076b) the daemon's own supervision waits follow the windows its shards are judged
 > by, or wait while what they wait on goes on:** a starved hold (test support, `starved_share_ns`) spins half the window
-> the watchdog judges its shard by, where it spun half of `W`.
+> the watchdog judges its shard by, where it spun half of `W`; a stop waits for its log writer while it writes lines,
+> giving it up a window (the widest its shards are judged by) after its last, where it gave up a slow writer after one
+> `W` in all.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
-> `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
+> `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for

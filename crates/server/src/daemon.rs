@@ -3823,6 +3823,15 @@ impl Daemon {
   /// daemon's error stream, which its anchor keeps (every worker is still joined and every slot given back,
   /// AUD-29-12); with `panic = "abort"` a release build never reaches here after a worker's panic.
   fn stop_parts(&mut self) {
+    // The window the log writer's drain is judged by (A-552): the widest this daemon's shards are judged by now (A-455),
+    // read while they still run. A host that keeps the shards off their CPUs that long keeps the writer's thread off its
+    // own as long, so a narrower window would give up a writer that is only starved.
+    let log_window_ns = self
+      .shards
+      .iter()
+      .map(|shard| crate::watchdog::shard_window_ns(shard.0))
+      .max()
+      .unwrap_or_else(|| crate::watchdog::watch_window_ns(0));
     // The FUSE mounts end with each shard's serve loop (`EndMounts`), on the shard's own thread as the
     // shutdown cancels it — never as a question queued behind the shard's work, which would answer every
     // question already waiting there instead of terminating it (§4.6; AUD-29-64).
@@ -3843,11 +3852,12 @@ impl Daemon {
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
     }
-    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. A shard that
-    // never ended still holds its route, and a standard error that takes nothing holds the writer: it is waited for a
-    // window, then left to the process's end, never waited for without end.
+    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. It is waited
+    // for while it writes lines (A-552). A shard that never ended still holds its route, and a standard error that takes
+    // nothing holds the writer still: it is given up a window after its last line, then left to the process's end,
+    // never waited for without end.
     if let Some(mut log_writer) = self.log_writer.take() {
-      log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+      log_writer.stop(std::time::Duration::from_nanos(log_window_ns));
     }
   }
 }

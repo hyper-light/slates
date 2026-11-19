@@ -88,13 +88,14 @@ std::thread_local! {
   static ROUTE: RefCell<Option<LogRoute>> = const { RefCell::new(None) };
 }
 
-/// The queue's bytes in flight and its bound, shared by a writer and the threads routed to it. One per writer, leaked for
-/// the process's life: two words.
+/// The queue's bytes in flight and its bound, shared by a writer and the threads routed to it, and the lines the writer
+/// has written, which its stop reads as its progress (A-552). One per writer, leaked for the process's life: three words.
 #[derive(Debug)]
 #[repr(align(128))]
 struct Queued {
   bytes: AtomicUsize,
   capacity: usize,
+  written: AtomicU64,
 }
 
 /// A thread's way to a [`LogWriter`]: the sending side of its queue. Made by [`LogWriter::route`] and installed on the
@@ -146,6 +147,8 @@ impl LogRoute {
 pub struct LogWriter {
   /// The route its owner clones for each thread; dropped at the stop, so the thread ends when the routed threads have.
   route: Option<LogRoute>,
+  /// The queue the route sends into, kept past the route's drop for the stop to read the writer's progress.
+  queued: &'static Queued,
   handle: Option<std::thread::JoinHandle<()>>,
   /// Told when the thread has written its last line.
   ended: Receiver<()>,
@@ -170,6 +173,7 @@ impl LogWriter {
     let queued: &'static Queued = Box::leak(Box::new(Queued {
       bytes: AtomicUsize::new(0),
       capacity,
+      written: AtomicU64::new(0),
     }));
     let handle = std::thread::Builder::new()
       .name("slates-log".to_owned())
@@ -177,12 +181,15 @@ impl LogWriter {
         for line in queue {
           queued.bytes.fetch_sub(line.len(), Ordering::AcqRel);
           sink(line);
+          // After the write: a writer held inside one shows no progress.
+          queued.written.fetch_add(1, Ordering::Release);
         }
         // An owner that stopped waiting (a stop past its wait) is told nothing more.
         let _told = ended_sender.send(());
       })?;
     Ok(LogWriter {
       route: Some(LogRoute { lines, queued }),
+      queued,
       handle: Some(handle),
       ended,
     })
@@ -196,17 +203,30 @@ impl LogWriter {
     })
   }
 
-  /// Stops the writer: lets its route go and waits `within` for the thread to write what is queued and end, then joins
-  /// it. Whether it ended: a thread still holding a route (a stuck shard's, which nothing joins), or a standard error
-  /// that takes nothing, keeps it past the wait, and it is left to the process's end rather than waited for without end.
-  pub fn stop(&mut self, within: std::time::Duration) -> bool {
+  /// Stops the writer: lets its route go, waits for the thread to write what is queued and end, and joins it. It waits
+  /// while the writer goes on writing lines, its owner's liveness window `window` at a time, and gives it up at the first
+  /// look a window after the last that finds no line written since (A-552): a standard error that takes lines slowly is
+  /// waited for until it has them all, while one that takes nothing, or a thread still holding a route (a stuck
+  /// shard's, which nothing joins) with nothing left to send, keeps the writer still, and it is left to the process's end
+  /// rather than waited for without end. Whether it ended. Until A-552 the stop waited one window in all, so it gave up a
+  /// slow, live writer with lines unwritten.
+  pub fn stop(&mut self, window: std::time::Duration) -> bool {
     drop(self.route.take());
     let Some(handle) = self.handle.take() else {
       return true;
     };
-    match self.ended.recv_timeout(within) {
-      Ok(()) | Err(RecvTimeoutError::Disconnected) => handle.join().is_ok(),
-      Err(RecvTimeoutError::Timeout) => false,
+    let mut written = self.queued.written.load(Ordering::Acquire);
+    loop {
+      match self.ended.recv_timeout(window) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return handle.join().is_ok(),
+        Err(RecvTimeoutError::Timeout) => {
+          let now = self.queued.written.load(Ordering::Acquire);
+          if now == written {
+            return false;
+          }
+          written = now;
+        }
+      }
     }
   }
 }
