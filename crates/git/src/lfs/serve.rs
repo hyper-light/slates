@@ -698,9 +698,9 @@ pub struct Answer {
 }
 
 impl Answer {
-  /// Writes the answer: its head (its media type, `LFS-Authenticate` for a `401`, its length) and
-  /// its body; the connection closed after it when `close`.
-  pub fn reply(&self, close: bool, out: &mut Vec<u8>) -> Result<(), BadField> {
+  /// The fields its head carries before its framing: its media type, and `LFS-Authenticate` for a
+  /// `401`. An edge that frames the reply itself (A-625's) writes these (A-629).
+  pub fn fields(&self) -> Vec<(&[u8], &[u8])> {
     let mut fields: Vec<(&[u8], &[u8])> = Vec::new();
     match self.kind {
       Kind::Json => fields.push((CONTENT_TYPE, MEDIA_TYPE.as_bytes())),
@@ -710,6 +710,13 @@ impl Answer {
     if let Some(challenge) = &self.challenge {
       fields.push((LFS_AUTHENTICATE, challenge.as_bytes()));
     }
+    fields
+  }
+
+  /// Writes the answer: its head (its [`Answer::fields`], its length) and its body; the
+  /// connection closed after it when `close`.
+  pub fn reply(&self, close: bool, out: &mut Vec<u8>) -> Result<(), BadField> {
+    let fields = self.fields();
     reply::head(
       self.status,
       &fields,
