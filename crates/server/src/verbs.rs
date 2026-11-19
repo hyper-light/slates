@@ -3426,7 +3426,8 @@ pub fn ask_room_for_kept_forwards(state: &mut ShardState) -> bool {
 }
 
 /// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
-/// merges when the last part arrives.
+/// merges when the last part arrives. A part whose shard's state refused it comes home unserved and makes the listing
+/// refused ([`settle_unserved`], A-557).
 fn scatter_list(
   state: &mut ShardState,
   client_index: u32,
@@ -3452,10 +3453,9 @@ fn scatter_list(
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part =
-          crate::state::with_state(|s| list_part(s, &principal, after)).unwrap_or_default();
+        let part = crate::state::with_state(|s| list_part(s, &principal, after));
         crate::xshard::send_reply_home(origin, move || {
-          gather(request, part);
+          gather(request, shard, part);
         });
       }),
       None,
@@ -3469,7 +3469,7 @@ fn scatter_list(
 
 /// The caller's grants are a scatter-gather like a listing: a grant record is written on the shard that
 /// presented its landing (the volume's owner), so every shard answers with the grants it holds for the
-/// principal and the origin merges when the last part arrives.
+/// principal and the origin merges when the last part arrives. An unserved part refuses them, as a listing's does.
 fn scatter_grants(
   state: &mut ShardState,
   client_index: u32,
@@ -3495,10 +3495,9 @@ fn scatter_grants(
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after))
-          .unwrap_or_default();
+        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after));
         crate::xshard::send_reply_home(origin, move || {
-          gather_grants(request, part);
+          gather_grants(request, shard, part);
         });
       }),
       None,
@@ -3510,8 +3509,17 @@ fn scatter_grants(
   Served::Forwarded
 }
 
-/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page.
-fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary>) {
+/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page; a part
+/// `shard` did not serve is settled refused ([`settle_unserved`]).
+fn gather_grants(
+  request: u64,
+  shard: u16,
+  part: Option<PagePart<slates_ipc::protocol::GrantSummary>>,
+) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::Grants, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.grant_scatters.get_mut(&request)?;
     entry.2.push(part);
@@ -3533,7 +3541,8 @@ fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary
 }
 
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
-/// the origin assembles the daemon's view (§4.14 `slates.status`).
+/// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
+/// listing's part does.
 fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3554,7 +3563,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
       Box::pin(async move {
         let part = crate::state::with_state(shard_report);
         crate::xshard::send_reply_home(origin, move || {
-          gather_status(request, part);
+          gather_status(request, shard, part);
         });
       }),
       None,
@@ -3641,10 +3650,10 @@ fn send_part(
   }
 }
 
-/// Settles a part that could not be sent to `shard`: an acknowledgement's release is counted ([`release_part_back`]);
-/// a listing's, grants' or status' part marks its scatter refused and counts down. When that was the scatter's last
-/// part, the entry goes and the scatter's answer is returned, `Overloaded` for the first refused shard, counted, with
-/// its client slot and whether it is paged.
+/// Settles a part that could not be sent to `shard`, or that `shard` did not serve ([`settle_unserved`]): an
+/// acknowledgement's release is counted ([`release_part_back`]); a listing's, grants' or status' part marks its scatter
+/// refused and counts down. When that was the scatter's last part, the entry goes and the scatter's answer is returned,
+/// `Overloaded` for the first refused shard, counted, with its client slot and whether it is paged.
 fn settle_refused(
   state: &mut ShardState,
   kind: ScatterKind,
@@ -3664,6 +3673,28 @@ fn settle_refused(
   let client_index = done?;
   state.scatter_refusals.remove(&request);
   Some((client_index, part_unsent(state, first), paged))
+}
+
+/// Format: the count of read scatters' parts that came home unserved (A-557): their shard's state refused the borrow
+/// (fenced by a failed consensus publication, a retention refusal, no state installed, a nested borrow), so the
+/// scatter was answered `Overloaded` for that shard ([`settle_unserved`]). It tells such an answer from one whose part
+/// met a full control channel, which answers the same.
+const SCATTER_PART_UNSERVED: &str = "scatter.part_unserved";
+
+/// Settles a listing's, grants' or status' part that `shard` did not serve, its state refusing the borrow, as a part
+/// that could not be sent ([`settle_refused`]), counted ([`SCATTER_PART_UNSERVED`]); delivers the scatter's refusal when
+/// that was its last part. Settled in its own borrow, and delivered after it: `deliver` borrows the state itself. A
+/// scatter is answered whole or refused naming a shard whose part it lacks, never as if whole without that part
+/// (§4.8 "Lookup": an enumeration is a scatter-gather over owners). Before A-557 the part tasks sent a refused borrow
+/// home as an empty part, so a listing, the grants or a status was answered without that shard's volumes, grants or
+/// report (`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`).
+fn settle_unserved(kind: ScatterKind, request: u64, shard: u16) {
+  if let Some(Some((client_index, reply, paged))) = crate::state::with_state_counted(|s| {
+    s.count(SCATTER_PART_UNSERVED, 1);
+    settle_refused(s, kind, request, shard)
+  }) {
+    crate::state::deliver(client_index, request, reply, paged);
+  }
 }
 
 /// Format: the count of scatters left unanswered because a shard they needed was gone, its daemon stopping
@@ -3708,7 +3739,7 @@ fn count_down<T>(
 }
 
 /// The answer a scatter gives when its part for `shard` could not be sent, the shard's control channel full past a
-/// wait for room: the typed `Overloaded`, counted by its name.
+/// wait for room, or came home unserved ([`settle_unserved`]): the typed `Overloaded`, counted by its name.
 fn part_unsent(state: &mut ShardState, shard: u16) -> ReplyBody {
   let refusal = Refusal::Overloaded { shard };
   state.count(refusal_name(&refusal), 1);
@@ -3802,11 +3833,16 @@ fn release_part_back(state: &mut ShardState, request: u64, part: &ReplyBody) {
   }
 }
 
-/// Gathers one shard's part of a status; the last part delivers the whole.
-fn gather_status(request: u64, part: Option<ShardReport>) {
+/// Gathers one shard's part of a status; the last part delivers the whole. A report `shard` did not serve is settled
+/// refused ([`settle_unserved`]): before A-557 it was skipped, and the status answered without that shard.
+fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::Status, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.status_scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -4374,8 +4410,13 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
   }
 }
 
-/// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: ListPart) {
+/// One shard's part of a listing arrives at the origin; the last part completes the reply. A part `shard` did not serve
+/// is settled refused ([`settle_unserved`]).
+fn gather(request: u64, shard: u16, part: Option<ListPart>) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::List, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.scatters.get_mut(&request)?;
     entry.2.push(part);
@@ -22086,6 +22127,149 @@ mod tests {
     assert_eq!(
       unrecorded, 1,
       "the Overloaded answer was left unrecorded once"
+    );
+  }
+
+  /// Shape: the id of the client the read-scatter test seats on the shard it asks from, beside the audit daemon's own,
+  /// which seat none.
+  const ASKING: u32 = 31;
+
+  /// The principal the read-scatter test asks as.
+  fn scatter_asker() -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid: 0,
+    }
+  }
+
+  /// Seats client [`ASKING`] on `state`'s shard as an admission does, over a region made here in the shard's geometry:
+  /// its seat's index, and the client's own mapping of the region, which the test reads its replies from.
+  fn seat_asking(state: &mut crate::state::ShardState) -> (u32, slates_ipc::ClientRegion) {
+    static REGIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+      "slates-cr-scatter-{}-{}",
+      std::process::id(),
+      REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut region =
+      slates_ipc::ClientRegion::create(&name, ASKING, state.shard, state.config.region).unwrap();
+    #[cfg(target_os = "macos")]
+    region.unlink_name().unwrap();
+    #[cfg(unix)]
+    let client = region.open_again().unwrap();
+    #[cfg(windows)]
+    let client = {
+      let (handoff, len) = region.handoff().unwrap();
+      slates_ipc::ClientRegion::open(&handoff, len).unwrap()
+    };
+    let seat = state
+      .clients
+      .insert(crate::state::ClientSlot {
+        status_pages: crate::status_pages::StatusPages::default(),
+        end: slates_ipc::DaemonEnd::new(region),
+        principal: scatter_asker(),
+        client_id: ASKING,
+        pid: 0,
+        retiring: false,
+        watch: None,
+        proven: true,
+        control: None,
+        revoked: false,
+        consumer_policy: None,
+        owner_route: None,
+        read_ahead: None,
+        read_ahead_pending: 0,
+        remote_volumes: Vec::new(),
+        maps_sent: std::collections::BTreeSet::new(),
+      })
+      .unwrap();
+    (seat.index(), client)
+  }
+
+  /// What a client seated on the second shard of a two-shard daemon whose control shard is fenced is answered, by
+  /// request sequence, for a listing (1), its grants (2) and the daemon's status (3), each waited for within the
+  /// observation budget; the fenced shard; and the asking shard's count of parts that came home unserved.
+  fn asked_past_a_fenced_shard() -> (
+    Option<u16>,
+    std::collections::BTreeMap<u32, ReplyBody>,
+    Option<u64>,
+  ) {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, region, all_sent) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let asked = |sequence| {
+        slates_wire::request::RequestId {
+          client: ASKING,
+          sequence,
+        }
+        .word()
+      };
+      // Each is answered later, through `deliver`, once its last part is home.
+      let sent = [
+        super::scatter_list(state, seat, asked(1), scatter_asker(), None),
+        super::scatter_grants(state, seat, asked(2), scatter_asker(), None),
+        super::scatter_status(state, seat, asked(3)),
+      ];
+      let all_sent = sent
+        .iter()
+        .all(|served| matches!(served, super::Served::Forwarded));
+      (state.shards.first().copied(), region, all_sent)
+    });
+    assert!(all_sent, "each scatter sent its part to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let mut answers = std::collections::BTreeMap::new();
+    while answers.len() < 3 {
+      match end.wait(Some(crate::daemon::OBSERVE_BUDGET_NS)) {
+        Ok(reply) => {
+          let body: ReplyBody =
+            slates_ipc::protocol::unpack(end.region(), reply.kind, &reply.payload).unwrap();
+          answers.insert(
+            slates_wire::request::RequestId::from_word(reply.request).sequence,
+            body,
+          );
+        }
+        Err(error) => {
+          eprintln!("no further answer: {error}");
+          break;
+        }
+      }
+    }
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    (fenced, answers, unserved)
+  }
+
+  /// A-557 (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`'s sibling; §4.8 "Lookup": an
+  /// enumeration is a scatter-gather over owners; §4.14 `slates.status`). Do: on a two-shard daemon, fence the control
+  /// shard as a failed consensus publication does, so every borrow of its state is refused; from a client seated on the
+  /// other shard, list the volumes, ask for the grants and ask for the daemon's status. Expect: each answered
+  /// `Overloaded { shard }` naming the fenced shard, and each part counted unserved where it was asked. Before, the
+  /// fenced shard's part came home as an empty one and each was answered as if whole: a listing without that shard's
+  /// volumes, grants without its grants, a status without its report.
+  #[test]
+  fn a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard() {
+    let (fenced, answers, unserved) = asked_past_a_fenced_shard();
+    let fenced = fenced.expect("the daemon has a control shard");
+    for (verb, sequence) in [("list", 1u32), ("grants", 2), ("status", 3)] {
+      let answer = answers.get(&sequence);
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::Overloaded { shard }
+          }) if *shard == fenced
+        ),
+        "{verb} with the control shard {fenced} fenced: {answer:?}"
+      );
+    }
+    assert_eq!(
+      unserved,
+      Some(3),
+      "each scatter's part came home unserved, counted where it was asked"
     );
   }
 
