@@ -300,7 +300,7 @@ impl Resolved {
       }
     }
     for (path, target) in std::mem::take(&mut self.hardlinks) {
-      if inside(path.as_str()) || inside(target.as_str()) {
+      if inside(path.as_str()) || inside(target.path.as_str()) {
         self.invalid.insert(path);
       } else {
         self.hardlinks.insert(path, target);

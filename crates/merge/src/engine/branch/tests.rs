@@ -12,7 +12,7 @@ use super::super::{Green, Increment, Outcome};
 use super::{Lent, Lineage, LineageGreen, LineageRefused};
 use crate::checkpoint::Checkpoint;
 use crate::increment::Base;
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 use crate::origin::Origin;
 use crate::special::{SpecialKind, SpecialNode};
 
@@ -118,6 +118,15 @@ impl Work {
   fn name(&mut self, name: &str) -> u64 {
     self.doc.paths.intern(name)
   }
+
+  /// The node record of the node at `name` at the work's base (A-646).
+  fn node(&mut self, name: &str) -> u64 {
+    let path = self.name(name);
+    self.doc.nodes.intern(NodeRef {
+      path,
+      origin: NodeOrigin::Base,
+    })
+  }
 }
 
 impl Edit {
@@ -185,13 +194,13 @@ impl Edit {
       Edit::Mkdir(_) => work.op(OpKind::Mkdir, path, 0, 0, u64::MAX),
       Edit::Rmdir(_) => work.op(OpKind::Rmdir, path, 0, 0, u64::MAX),
       Edit::Mode(_, mode) => work.op(OpKind::SetMode, path, 0, u64::from(*mode), 0),
-      Edit::Symlink(_, target) | Edit::Link(_, target) => {
-        let kind = match self {
-          Edit::Symlink(..) => OpKind::Symlink,
-          _ => OpKind::Link,
-        };
+      Edit::Symlink(_, target) => {
         let src = work.name(PATHS[*target]);
-        work.op(kind, path, 0, 0, src);
+        work.op(OpKind::Symlink, path, 0, 0, src);
+      }
+      Edit::Link(_, target) => {
+        let src = work.node(PATHS[*target]);
+        work.op(OpKind::Link, path, 0, 0, src);
       }
       Edit::SetXattr(_, name, value) => {
         let name = work.name(NAMES[*name]);
@@ -857,8 +866,12 @@ fn version_of(green: &Green, id: u8, ops: &[(OpKind, &str, &str)]) -> Increment 
         work.op(*kind, path, 0, 3, src);
       }
       OpKind::SetMode => work.op(*kind, path, 0, 0o755, 0),
-      OpKind::Symlink | OpKind::Link => {
+      OpKind::Symlink => {
         let src = work.name(argument);
+        work.op(*kind, path, 0, 0, src);
+      }
+      OpKind::Link => {
+        let src = work.node(argument);
         work.op(*kind, path, 0, 0, src);
       }
       OpKind::SetXattr => {

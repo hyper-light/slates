@@ -249,3 +249,78 @@ fn a_replay_derives_the_same_node_moves() -> Result<(), String> {
   }
   Ok(())
 }
+
+/// A-646 part 2b (the ops document names a node). Do: create `new` and link `linked` to the node
+/// the work makes there, in one work based at the head. Expect it accepted and `linked` naming
+/// `new`: a node the work makes is its own, never looked for at the base, where nothing stood.
+#[test]
+fn a_link_to_a_node_the_work_makes_names_it() -> Result<(), String> {
+  let mut green = green();
+  accept(
+    &mut green,
+    Work::default()
+      .create("new", b"<new>\n")
+      .link_made("linked", "new"),
+    1,
+  )?;
+  match green.hardlink("linked") {
+    Some("new") => Ok(()),
+    other => Err(format!("{other:?}")),
+  }
+}
+
+/// A-646 part 2b. Do: link `linked` to a node the work says it makes at `nothing`, which it does
+/// not make. Expect `TypeChanged` on `linked` and no link: the document names a node that does not
+/// exist.
+#[test]
+fn a_link_to_a_node_the_work_does_not_make_is_refused() -> Result<(), String> {
+  let mut green = green();
+  let answer = green.submit(&Work::default().link_made("linked", "nothing").at(0, 1));
+  let refused = classes_on(&answer, "linked") == Some(vec![MergeConflictClass::TypeChanged]);
+  if !refused || green.hardlink("linked").is_some() {
+    return Err(format!("{answer:?}"));
+  }
+  Ok(())
+}
+
+/// What a green answers of `linked`, `HARDLINK` and `TARGET` after `FILE` was renamed over
+/// `TARGET`.
+fn after_the_rename(green: &Green) -> (Option<&str>, Option<&[u8]>, Option<&[u8]>) {
+  (
+    green.hardlink("linked"),
+    green.content(HARDLINK),
+    green.content(TARGET),
+  )
+}
+
+/// A-646 part 2b (POSIX: `ln g linked; mv f g` keeps `linked` on `g`'s old file, `mv f g; ln g
+/// linked` puts it on `f`'s). Do: in one work, link `linked` to the node at `TARGET` at the base
+/// and rename `FILE` over `TARGET`; and on another green, rename `FILE` over `TARGET` and link
+/// `linked` to the node the work makes there. Expect the first `linked` to name the old node,
+/// handed to its least link `HARDLINK` with `TARGET`'s bytes, and the second to name the node
+/// renamed there, while `HARDLINK` keeps `TARGET`'s old bytes. The document's origin tells the two
+/// works apart.
+#[test]
+fn a_link_names_the_node_its_work_named_before_or_after_a_rename_onto_its_target()
+-> Result<(), String> {
+  let renamed = |work: Work| work.naming(OpKind::Rename, TARGET, FILE);
+  let mut before = green();
+  accept(
+    &mut before,
+    renamed(Work::default().naming(OpKind::Link, "linked", TARGET)),
+    1,
+  )?;
+  let mut after = green();
+  accept(
+    &mut after,
+    renamed(Work::default()).link_made("linked", TARGET),
+    1,
+  )?;
+  let (old, new) = (Some(&b"<g>\n"[..]), Some(&b"<f>\n"[..]));
+  let found = (after_the_rename(&before), after_the_rename(&after));
+  let expected = ((Some(HARDLINK), old, new), (Some(TARGET), old, new));
+  if found != expected {
+    return Err(format!("{found:?}"));
+  }
+  Ok(())
+}
