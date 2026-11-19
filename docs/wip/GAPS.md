@@ -622,9 +622,17 @@
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
 > kept whole), a rebase restating a copy (the deriver's `VolumeOp::Copy`), a copy from a version its source changed
-> after (refused today), Subversion's replace with history, moves and second copies into a copied tree in one increment,
-> the server's change-index consumers treating a copy's destination as its tree (a Merkle identity over the radix trees
-> was weighed and declined, A-586). Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
+> after (refused today), the server's change-index consumers treating a copy's destination as its tree (a Merkle
+> identity over the radix trees was weighed and declined, A-586). A-626 part 1 (2026-11-19, g295): Subversion's replace
+> with history (`REPLACE`, the destination's tree taken away key by key at the copy's version) and copies nested in one
+> increment (a second copy into a copied tree, a move inside one as a copy and a removal) built, with three defects of
+> A-586's branch made before a copy fixed; held to a per-version model with a replay and a branch at every version
+> (`cargo test -p slates-merge --lib` 99 of 99 on the Mac Studio, red seven ways, see A-626). Owed from A-626: a copy
+> from a version its source changed after (part 2: the changes since set back at the destination, recorded in the
+> chain entry and reserved before the verdict, with room in the server's entry bound), a checkpoint of a green holding
+> a copy (part 3), a rebase restating a copy (part 4); the replaced tree held by reference rather than removed key by
+> key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
+> Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
 > ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616
 > part 1, and its drive's calls with their ra_svn writer, A-616 part 2's first slice), with the lock verbs; hooks and
 > `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`,
