@@ -10861,6 +10861,16 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
 > partition. Across nodes (a work on the creating client's node) is not built.
 
+> **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
+> recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
+> target's own time. Every ask may lose its answer after it ran, and the pass took the work's shard's list of such
+> works, so one lost answer left all of them unbuilt for the daemon's life: unserved, every change they acknowledged out
+> of reach (against A-207 and the recovery rule above, "unserved until it has"), and each floor holding its green's
+> checkpoint at its base. The list is now read, never taken (`verbs::unbuilt_works`), each ask is made once more after
+> a lost answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
+> nothing (`verbs::install_replayed_work`). Owed: a work whose asks go unanswered twice stays unbuilt until the next
+> start; its verbs then answer `NotFound` rather than `Unpublished`.
+
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
 f+1 acknowledgements, if the auto-seal has not), build the increment, send it to green's owner: the same shard is a call, another
@@ -34109,3 +34119,30 @@ unsynced until a barrier; `tests/base.rs`, the directory witness's test) and `cr
   directory has no home for `path_of_inode` to read; fixed (`witnessed_path`), and that integration test's rerun is
   filed for main with the other checks main runs (clippy, `cargo xtask check`, the cross-target checks, the oracle and
   crash oracle, the Windows `--test os` suite).
+
+### A-513 — A work replayed through its green's owner at recovery is found again after a lost answer, and installed once (2026-11-18, g230, goal 85; A-488's and A-505's sibling; §4.16 "Recovery", A-207, A-247)
+Applied in the same change to: §4.16 (a status after A-247's), GAPS (class A's lost-answer siblings),
+`docs/bugs/2026-11-18-a-remote-works-rebuild-lost-every-work-of-a-shard-to-one-lost-answer.md` (new), and
+`crates/server/src/daemon.rs` (`rebuild_remote_works`, `rebuild_remote_work`, `ask_once_more`),
+`crates/server/src/verbs.rs` (`unbuilt_works`, `install_replayed_work`) and `crates/server/src/work_home.rs`
+(`Unbuilt`).
+- **The question first: may such a work stay unbuilt?** The pass's docs accepted that a shard that does not answer
+  leaves its works unbuilt, their verbs answering `NotFound` as a work whose log would not replay. Under §4.16 that
+  does not hold. A work's log is kept, so nothing is lost from storage, but the work is unserved for the daemon's life:
+  every change it acknowledged before the restart is out of the client's reach, which A-207 exists to prevent ("every
+  change it acknowledged before the restart is there after it"), and A-247's recovery rule makes the work unserved only
+  "until it has" been replayed. Its floor stays too (`reconcile_work_floors` keeps a floor whose work could not be
+  rebuilt), so its green's checkpoint never folds past its base. A log that does not replay is a different case: that
+  is the work's own state, refused and counted (`merge.work_rebuild_refused`). A lost answer is not.
+- **What was there.** `rebuild_remote_works` took each shard's list (`std::mem::take` of `work_home.unbuilt`), so a
+  listing whose answer was lost after it ran left every such work of that shard unbuilt; a lost answer to the log read
+  or the owner's replay skipped the work; and an install asked again made the work afresh and charged its budget twice.
+- **The rule.** The list is read and never taken; each ask is made once more when its answer was lost, behind the
+  first on the target's channel, as A-505 asks a map's send; the install ends the work's record on its shard, so a
+  second install changes nothing. The log read and the owner's replay are reads, so asking again is safe. A work whose
+  asks go unanswered twice keeps its record, counted in the recovery's log line, and is replayed at the next start.
+- **Test.** `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`
+  (`verbs`' unit tests: a recorded work listed twice, the first answer lost; its outcome installed twice, the first
+  answer lost, the work marked between). Expect the second listing to name the work, the first install to make and
+  charge it, the second to charge nothing and keep the marked work, and nothing owed after.
+

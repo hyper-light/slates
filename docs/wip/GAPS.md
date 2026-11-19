@@ -3898,8 +3898,18 @@
 >   runs on the target and whose answer a stopped shard loses after it: a direct map's send to its client, closed by
 >   A-505 (2026-11-19, g225: the client's shard records each map it sent until its reply arrives, a second ask is
 >   answered from the record, and a hand-off whose answers were all lost keeps its copy as handed;
->   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); open: the Shards route's take
->   of an offer, and recovery's `rebuild_remote_works` (its docs accept a non-answering shard's works left unbuilt).
+>   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); recovery's
+>   `rebuild_remote_works`, closed by A-513 (2026-11-18, g230: judged under §4.16 first, the acceptance did not hold. A
+>   work left unbuilt by a lost answer, not by a log that would not replay, is unserved for the daemon's life, every
+>   change it acknowledged out of reach against A-207 and A-247's "unserved until it has", and its floor holds its
+>   green's checkpoint at its base; and the pass took the shard's whole list, so one lost answer cost every such work
+>   of the shard. Now the list is read, never taken (`verbs::unbuilt_works`), each ask is made once more after a lost
+>   answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
+>   nothing (`verbs::install_replayed_work`), where it once made the work afresh and charged it twice;
+>   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
+>   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
+>   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
+>   not built. Open: the Shards route's take of an offer.
 >   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and

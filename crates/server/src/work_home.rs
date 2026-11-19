@@ -160,7 +160,10 @@ struct Queue {
 }
 
 /// One work whose log could not be replayed at its shard's start because its green lives on another shard (A-247):
-/// replayed through the green's owner once every partition has recovered (`rebuild_remote_works`).
+/// replayed through the green's owner once every partition has recovered (`rebuild_remote_works`). The record stays on
+/// the work's shard until the replay's outcome is installed there (`verbs::install_replayed_work`), so an ask whose
+/// answer was lost finds it again (A-513).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Unbuilt {
   /// The work.
   pub(crate) work: DbVolumeId,
@@ -191,7 +194,8 @@ pub(crate) struct WorkHome {
   pub(crate) admitted: Option<Result<Admitted, Refusal>>,
   /// … the reservation of a new work's name at the partition it hashes to, when the work is made on another (A-400).
   pub(crate) named: Option<Result<(), Refusal>>,
-  /// The works whose log waits for their green's owner (A-247).
+  /// The works whose log waits for their green's owner (A-247), each until its replay's outcome is installed here
+  /// (A-513). Bounded by the shard's recovered works.
   pub(crate) unbuilt: Vec<Unbuilt>,
   /// Whether this shard's deadline timer for deferred verdicts is running.
   timer_armed: bool,
