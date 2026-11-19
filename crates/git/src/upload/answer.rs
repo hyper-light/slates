@@ -20,8 +20,9 @@
 //! A pack git's `pack-objects` would die of as it begins (A-640 part 4: a `sparse:oid` filter's blob not resolved or
 //! not read) is answered as git's server answers it: what came before the pack, then the dying process's lines as git
 //! formats them (`vfreportf`: cut to 4096 bytes, a control byte but a tab and a newline shown as `?`) and relays them
-//! (a band-2 packet each read of at most 128 bytes, a line read alone), then git's band-3 words, and no flush; with no
-//! band, what came before the pack alone.
+//! (a band-2 packet each read of at most 128 bytes, writes made one after another read together, [`Said`]), then git's
+//! band-3 words, and no flush; with no band, what came before the pack alone. What `pack-objects` writes as it reads
+//! the filter's name and lives on (a warning) is relayed the same way before the pack.
 
 use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;

@@ -272,6 +272,18 @@
 > b94ae6e90); failing first, 16 of 105 with the resolution, the tree walk and the death's answer stubbed. Owed:
 > `sparse:oid` within `combine:` (refused: git's answer turns on its order of walk); the revision forms refused by
 > kind; git's band-2 warning of an ambiguous ref name; main's Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, fourth slice (2026-11-19, g296; names read with what git writes):** `upload::revision` reads a
+> `sparse:oid` filter's revision as git does but for its suffixes (an object's full name, a ref, `git describe`'s
+> name, and an abbreviated name of 4 to 64 digits by the store's search by prefix, `Repository::abbreviated` over
+> `slates-vcs`'s `Index::iter_from`), and relays what git's `pack-objects` writes meanwhile on band 2, before the pack
+> or the lines it dies with: the warning of a name that names a ref and something else, with git's advice for a ref
+> named like an object; an ambiguous abbreviation's error and its candidates (`Repository::unique_digits`, git's
+> descriptions). git's writes made one after another are relayed together in 128-byte reads, writes with an object
+> read between them apart (`answer::Said`). Held byte for byte to stock git 2.50.1's 14 new v2 recordings and one v0.
+> RUNS-PENDING. Owed: the suffixes `~`, `^`, `^{...}`, `@{...}` and `:/<text>` (still refused by kind; the next
+> slice), `sparse:oid` within `combine:`; main's Linux and Windows runs, clippy, xtask, docs. Not git's: a commit's
+> subject is taken from its bytes as stored (git re-encodes by its `encoding` header); a date before 1970 in its zone
+> (git dies of it) or past 9999 (git writes more digits).
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation

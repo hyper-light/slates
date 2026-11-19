@@ -13184,6 +13184,19 @@ engine: the verdict, rebase, position mapping, the register).
 > `fatal:` line on band 2 in packets of at most 128 bytes, its band-3 words and no flush; under v0 with no band, the
 > acknowledgments alone. Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid` exchanges. Still refused:
 > `sparse:oid` within `combine:`.
+>
+> **Status (2026-11-19, A-640 part 4, fourth slice: names read with what git writes).** `crates/git`
+> (`upload::revision`) reads a `sparse:oid` filter's revision as git's `get_oid_1` reads it, but for its suffixes: an
+> object's full name or a ref, `git describe`'s name, or an abbreviated name of 4 digits to 64, found by the store's
+> search by prefix (`Repository::abbreviated`, over `slates-vcs`'s `Index::iter_from`) and chosen among as git's hint
+> chooses (a SHA-1 name's digits past 40 compared with zeros, as git keeps a name). What git's `pack-objects` writes to
+> its error stream meanwhile is relayed on band 2 before the pack, or before the lines it dies with: the warning of a
+> name that names a ref and something else (two of git's patterns, or a ref and one object's abbreviation), with
+> git's advice after it for a ref named like an object's full name; and an ambiguous abbreviation's error and advice,
+> its candidates each by its unique abbreviation (`Repository::unique_digits`) and what git says of it. Writes git
+> makes one after another go out together in 128-byte reads, and writes with an object read between them apart
+> (`answer::Said`), as git's recordings show. Held byte for byte to stock git 2.50.1's fourteen new v2 recordings and
+> one v0. Still refused by kind: `~`, `^`, `^{...}`, `@{...}` and `:/<text>`; and `sparse:oid` within `combine:`.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -51539,3 +51552,70 @@ Applied in the same change to:
   `EdgeState::new` on the listener's shard and `EdgeState::arrivals` on the others); Subversion's tunnel moved to the
   shard of the repository its greeting names (A-688); a test of an arrival that waits for a full shard's seat and of
   one refused past the bound; main's live OpenSSH `git clone` over SSH and the other platforms' runs.
+
+### A-640 part 4, fourth slice — Names read with what git writes: abbreviated and `git describe` names by the store's search by prefix, and git's warnings, errors and advice relayed as its server relays them (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-640 part 4 third slice, A-614)
+Applied in the same change to:
+- §4.17.2's statuses (a status after the third slice's);
+- GAPS (the A-640 entries);
+- `crates/vcs/src/index.rs` (`Index::iter_from`, a run's `rows_from`) and `table.rs` (`TableView::iter_from`);
+- `crates/git/src/store/abbrev.rs` (new, a child of `repository.rs`: `Abbrev`, `Repository::abbreviated`,
+  `default_digits` and `unique_digits`), `store/graph.rs` (`StoreGraph::abbreviated`, `unique_digits`, and
+  `object_bytes` in place of `blob_bytes`), `store/mod.rs`;
+- `crates/git/src/upload/revision.rs` (new: the name's resolution, moved from `sparse.rs` and grown), `upload/sparse.rs`
+  (the read alone; `Read::said`), `upload/answer.rs` (`Said`, `relay`; `Answer::died` takes what was said),
+  `upload/fetch.rs` and `upload/v0.rs` (what was said relayed before the pack), `upload/refs.rs` (`dwim` counts the
+  patterns that find a ref), `upload/mod.rs` (`SparseForm`'s doc and words), `lfs.rs` (`Timestamp::put_date`);
+- the fixtures: the recorders `fixtures/make-fixtures.sh` and `fixtures/v0/make-v0-fixtures.sh`, and the fifteen
+  exchanges they recorded (`fixtures/fetch-sparse-{abbrev,describe,warn,ambiguous}-*`, `fixtures/v0/sparse-warn-v0.*`,
+  `fixtures/v0/SHA256SUMS`);
+- the tests: `upload/tests/names.rs` (new), `upload/tests/sparse.rs`, `upload/tests/v0.rs`, `tests/v0.rs`,
+  `crates/vcs/src/tests.rs`.
+
+- **What git does** [C: git v2.50.1, `object-name.c` `get_oid_with_context_1`, `get_oid_1`, `get_oid_basic`,
+  `get_describe_name`, `ref_and_count_parts_valid`, `get_short_oid`, `init_object_disambiguation`, `match_hash`,
+  `update_candidates`, `finish_object_disambiguation`, the `disambiguate_*_only` hints, `show_ambiguous_object`,
+  `sort_ambiguous` and `repo_find_unique_abbrev_r`; `refs.c` `expand_ref`; `advice.c` `vadvise`; `pretty.c`
+  `format_subject`; `date.c` `show_date`; `dir.c` `add_patterns_from_blob_to_list`; `upload-pack.c`
+  `create_pack_file`]. A revision is a full name (a ref of that name too draws "warning: refname '%s' is ambiguous."
+  and the advice of refs named like an object), else a ref by git's patterns (the first, warned of when another
+  pattern finds one or the name abbreviates exactly one object's name), else `git describe`'s name (the last `-g`
+  after a ref name and a count of hexadecimal digits, its digits looked up quietly for a commit), else an abbreviated
+  name: 4 to 64 digits, compared with a name kept in 32 bytes, zeros past its hash; one object is that object, several
+  the one the hint takes (a blob for the filter's name, a tree or what peels to one before a path, a commit for
+  `git describe`'s) when exactly one does, and otherwise ambiguous: "error: short object ID %s is ambiguous", then
+  "hint: The candidates are:" and a line for each candidate the hint takes, when two or more do, or for every one;
+  tags, commits, trees, blobs, each in name order; each by its unique abbreviation (git's default, 7 digits up to
+  16,383 objects and half the bits of the count above, extended past the most any other name shares) and what it is:
+  a commit's author date in the author's zone (`YYYY-MM-DD`) and subject, a tag's tagger date in UTC and name.
+- **The search by prefix** (`Repository::abbreviated`). An object row's key is its name after a byte, so the objects
+  an abbreviation names are the index's rows from the least key such a name can have, while each name begins with its
+  digits: `Index::iter_from` reads the tail from that key and each run from the table its fences say may hold it, a
+  binary search of that table's rows, then a row a step, merged in key order. The unique abbreviation asks, from git's
+  default up, whether another name begins with one more digit, two rows a step at most; the store counts every
+  object it holds, as a repository whose objects are all packed (git counts packed objects alone).
+- **The relay** (`answer::Said`). git's server reads `pack-objects`' error stream a read of at most 128 bytes, and
+  its recordings show writes made one after another read together (a warning and its advice in one read; an
+  abbreviation's advice and the `fatal:` line after it), while a write followed by an object read is read alone (the
+  `error:` line before git reads the candidates it lists; a warning before git reads the object the name names). This
+  server keeps the writes as runs broken where git reads (or frees) an object, and relays each run in reads of 128
+  bytes: under v2 after the packfile section's header (before it under `sideband-all` with `packfile-uris`, where git
+  writes the header when its pack begins), under v0 after the acknowledgments on its band, and with no band not at all.
+- **Tests.** Stock git's recordings (the two recorders on the Mac Studio, git 2.50.1, Apple Git-155; every older file
+  reproduced byte for byte but `fetch-progress`'s timed text; the new files rebuilt here from their parts and checked
+  against the Studio's SHA-256 sums, 31 of 31): the blob by 4 digits, by 8 upper case, padded past its 40 with a `0`
+  (served) and a `1` (nothing), main's head abbreviated before a path, the root tree abbreviated (no blob), `git
+  describe`'s name; the warning for a tag `main` beside the branch (v2 and v0), for a branch `4cdb` that also
+  abbreviates the blob (its commit then no blob, its `fatal:` line read apart), for a branch named by main's head's
+  name (with the advice); an abbreviation ambiguous between two blobs sharing 8 digits (listed by 9), two commits
+  (alone and before a path), two tags. The eight objects whose names begin alike are made in the test from the
+  recorder's bytes, their names checked as the recorder checks them. The search by prefix against a filter of every
+  name, for every prefix of every name from 4 digits to 64 in both cases; the unique abbreviation against a count by
+  hand; `Index::iter_from` against the model map in the store's generated histories, and from inside a run of seven
+  tables.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). RUNS-PENDING
+- **Not git's.** git takes a commit's subject from its message re-encoded to UTF-8 by its `encoding` header; this
+  server takes the bytes as stored. git dies of a date before 1970 in its own zone and writes a year past 9999 in more
+  digits; this server writes the first in the proleptic calendar and the second as the epoch's date.
+- **Owed.** The suffixes `~`, `^`, `^{...}`, `@{...}` and `:/<text>` (still refused by kind; the next slice: in a
+  served repository a reflog form names nothing, `@{0}` alone names `HEAD`'s commit, `@{1}` dies of an empty log,
+  `@{upstream}` and `@{push}` die in git's words); `sparse:oid` within `combine:`.
