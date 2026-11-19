@@ -15862,6 +15862,9 @@ pub(crate) async fn rebuild_recovered(
   state.next_prefix = max_prefix;
   rebuilt.destroys_completed = complete_recovered_destroys(state);
   slices.unit_done().await;
+  // Each repository's tool store made again, every entry's objects replayed through its admission and commit in log
+  // order, a record a unit (A-662).
+  crate::vcs_store::recover(state, slices).await;
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
   slices.unit_done().await;
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).

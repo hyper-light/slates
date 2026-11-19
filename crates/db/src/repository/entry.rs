@@ -21,8 +21,9 @@
 //! the state. Rejected on its cost, not measured: applying the entry to a clone of the repository's tables and
 //! keeping the clone on success, which costs the repository's size for every entry.
 //!
-//! **What each change costs the budget.** A version's chain entry, a phase root's node and phase, and a marker's bytes
-//! are held in the partition's RAM for as long as the record lives, so each is charged to the partition's merge budget
+//! **What each change costs the budget.** A version's chain entry, a phase root's node and phase, a marker's bytes and a
+//! push's objects (A-662) are held in the partition's RAM for as long as the record lives, so each is charged to the
+//! partition's merge budget
 //! (`PartitionCaps::green_chain_bytes`) with the chains, origins, checkpoints and work logs: an entry past it is refused
 //! `Capacity`, typed, and a removed root or a destroyed repository gives its bytes back.
 
@@ -195,6 +196,8 @@ pub(super) fn bytes(entry: &RepositoryEntry) -> StateBytes {
   for change in &entry.state {
     bytes.add(change_bytes(change));
   }
+  // The push's objects are held by the register for as long as the repository lives (A-662).
+  bytes.added = bytes.added.saturating_add(entry.objects.len());
   bytes
 }
 

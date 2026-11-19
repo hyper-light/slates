@@ -34,6 +34,8 @@
 >
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts, takeovers fencing every log or none. OWED: its live plane (A-636 part 2, g261).
 >
+> **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304) and Subversion's (g268), refused `Owed` until then; the Subversion index charged by its bytes once slates-svn measures them; a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the `StoreLender` for upload-pack over this map (A-625 part 3); the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
+>
 > §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
@@ -361,6 +363,16 @@
 > ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
 > nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
 > run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
+> **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
+> whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
+> slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
+> transcribed, is a file of its own that slates-vcs's tests and slates-server's policy tests both compile, under
+> `#[cfg(test)]` in each, so no product build links it. A cargo feature was rejected: its code builds as product code,
+> where the lint wall refuses the transcription's indexing.
+> Runs (macOS arm64, Mac Studio, kiln r61 over main a6306963e with the change): slates-server's `vcs_policy` 15 of 15
+> and its two callers' tests (the HTTP edge's git site 10, LFS 4); the module's tests in slates-vcs 3 of 3; fmt clean.
+> No integration target reaches either: neither has a caller outside tests yet. Owed (main): the Linux and Windows
+> runs, clippy, `cargo xtask check` (the `#[path]` include), and the doc links to `slates_vcs::wildmatch`.
 > **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
 > (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
 > hooks-env in its policy (refused by section, `DatabaseRefusal` 11, when no hook's environment can carry it or the
@@ -784,8 +796,10 @@
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
-> `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
-> content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
+> `pretxnchangegroup` and `changegroup` (A-657 part 4); the landing's seam (`hg_push::Objects`) handed each
+> repository's index and content store from their home on its owner shard (A-662 built it: `vcs_store`'s Mercurial
+> arm, made with the record, charged and freed with it), each push's record and its replay at recovery (A-662 refuses
+> a Mercurial record `Owed` until then), and the served view over them (with A-650's site); part
 > 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
 > bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
 > the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one

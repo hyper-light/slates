@@ -18,8 +18,11 @@
 //! 3. each work's verdict, held (`Green::judge`);
 //! 4. the whole entry, by the register's guard, the new greens counted held (`Partition::check_creating`).
 //!
-//! Only then are the verdicts committed (`Green::commit_judged`), and the new greens' records and the entry recorded as
-//! one log record. A refusal names every change refused and why ([`ChangeRefused`]), or the entry's refusal, and leaves
+//! Only then does a git push's store commit its objects (`crate::vcs_store::commit` through [`push_sealed`], A-662: the
+//! entry holds their record, which the guard charged), then the verdicts are committed (`Green::commit_judged`), and the
+//! new greens' records and the entry recorded as one log record. A store that committed for an entry then not recorded
+//! is made again from the log (`crate::vcs_store::rebuild`); a push not committed is left whole with its caller, for its
+//! next ref or to give back. A refusal names every change refused and why ([`ChangeRefused`]), or the entry's refusal, and leaves
 //! the greens, the namespace and the register as they were: a branch made in memory is retired, and every retention
 //! secured is given back.
 //!
@@ -281,6 +284,51 @@ pub(crate) fn push(
   changes: Vec<BranchChange>,
   parts: EntryParts,
 ) -> Result<Appended, AppendRefused> {
+  push_holding(state, (principal, repository), changes, parts, None)
+}
+
+/// One move of a git push's store (A-662): the green it names, a new branch's by its name, and its new head, none to
+/// delete it.
+pub(crate) type StoreMove = (
+  crate::vcs_store::Target,
+  Option<slates_git::object_name::ObjectId>,
+);
+
+/// [`push`] of a git push whose objects `sealed` holds (A-662): the entry holds their record, and the repository's store
+/// commits them with `moves` between the register's guard and the entry's apply, each move resolved once the new
+/// branches are made: its green's key, and the version the entry leaves the green at. Appended, the store holds the
+/// objects; refused, `sealed` is as it was, for the push's next ref or to be given back.
+#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's push path (A-654).
+pub(crate) fn push_sealed(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  changes: Vec<BranchChange>,
+  parts: EntryParts,
+  (sealed, moves): (&mut crate::vcs_store::SealedPush, &[StoreMove]),
+) -> Result<Appended, AppendRefused> {
+  if sealed.repository() != repository {
+    return Err(AppendRefused::Repository(Refusal::NotFound));
+  }
+  push_holding(
+    state,
+    (principal, repository),
+    changes,
+    parts,
+    Some((sealed, moves)),
+  )
+}
+
+/// A sealed push and the moves its append commits.
+type Sealed<'p> = (&'p mut crate::vcs_store::SealedPush, &'p [StoreMove]);
+
+/// [`push`] and [`push_sealed`]'s one path, with the sealed push if any.
+fn push_holding(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  changes: Vec<BranchChange>,
+  parts: EntryParts,
+  sealed: Option<Sealed<'_>>,
+) -> Result<Appended, AppendRefused> {
   let record = state
     .db
     .partition()
@@ -295,7 +343,7 @@ pub(crate) fn push(
   }
   let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
-  let pushed = push_planned(state, &record, steps, parts, &mut held);
+  let pushed = push_planned(state, &record, (steps, parts), &mut held, sealed);
   if pushed.is_err() {
     held.give_back(state);
   }
@@ -490,9 +538,9 @@ fn plan_delete(
 fn push_planned(
   state: &mut ShardState,
   record: &RepositoryRecord,
-  steps: Vec<Step>,
-  parts: EntryParts,
+  (steps, parts): (Vec<Step>, EntryParts),
   held: &mut Held,
+  mut sealed: Option<Sealed<'_>>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
   secure(state, &steps, held).map_err(AppendRefused::Changes)?;
@@ -504,7 +552,23 @@ fn push_planned(
       _ => None,
     })
     .collect();
-  let entry = entry(record.id, (&steps, &verdicts), parts);
+  let mut entry = entry(record.id, (&steps, &verdicts), parts);
+  if let Some((sealed, moves)) = sealed.as_mut() {
+    let resolved = resolve(state, (&steps, &entry), moves)?;
+    if let Err(refused) = sealed.admit((&mut state.store, &mut state.vcs_stores), resolved) {
+      return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+        state, &refused,
+      )));
+    }
+    match sealed.record(&state.vcs_stores) {
+      Ok(objects) => entry.objects = objects,
+      Err(refused) => {
+        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+          state, &refused,
+        )));
+      }
+    }
+  }
   let changes_anything = !(entry.joined.is_empty()
     && entry.versions.is_empty()
     && entry.names.is_empty()
@@ -515,8 +579,76 @@ fn push_planned(
     settle_secured(state, held);
     return Ok(answer(&steps, &verdicts));
   }
-  let committed = commit(state, &steps, verdicts)?;
-  let entry = recorded_entry(state, entry, &steps, &committed);
+  // The store commits the push's objects between the guard and the apply (A-662), so a refusal here applies nothing.
+  let store_committed = match sealed {
+    Some((sealed, _)) => {
+      if let Err(refused) = crate::vcs_store::commit(state, sealed) {
+        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+          state, &refused,
+        )));
+      }
+      true
+    }
+    None => false,
+  };
+  let applied = apply_planned(state, (&steps, verdicts), (entry, made), held);
+  if applied.is_err() && store_committed {
+    // The store is ahead of a log that refused the entry: made again from the log (A-662).
+    crate::vcs_store::rebuild(state, record.id);
+  }
+  applied
+}
+
+/// Each of a git push's store moves resolved (A-662): a green of the repository keyed by its id, a new branch's by the
+/// green its step made, each with the version the entry leaves its green at (its entry's version, a new green's 0
+/// when no work moves it, a deleted branch's head). A move naming no green of the push is refused `NotFound`.
+fn resolve(
+  state: &ShardState,
+  (steps, entry): (&[Step], &RepositoryEntry),
+  moves: &[StoreMove],
+) -> Result<Vec<crate::vcs_store::record::RecordedMove>, AppendRefused> {
+  let version_of = |green: DbVolumeId, otherwise: u64| {
+    entry
+      .versions
+      .iter()
+      .rev()
+      .find(|version| version.green == green)
+      .map_or(otherwise, |version| version.version)
+  };
+  moves
+    .iter()
+    .map(|(target, head)| {
+      let (green, otherwise) = match target {
+        crate::vcs_store::Target::Green(green) => (*green, state.db.partition().green_head(*green)),
+        crate::vcs_store::Target::Created(name) => steps
+          .iter()
+          .find_map(|step| match step {
+            Step::Create {
+              name: made, record, ..
+            } if made == name => Some((record.id, 0)),
+            _ => None,
+          })
+          .ok_or(AppendRefused::Entry(Refusal::NotFound))?,
+      };
+      Ok((
+        crate::vcs_store::green_key(green),
+        version_of(green, otherwise),
+        *head,
+      ))
+    })
+    .collect()
+}
+
+/// The push once judged and its store committed: the verdicts committed, then the new greens' records and the entry
+/// recorded as one log record, and each version's merge record enqueued.
+fn apply_planned(
+  state: &mut ShardState,
+  (steps, verdicts): (&[Step], Vec<Option<Verdict>>),
+  (entry, made): (RepositoryEntry, Vec<VolumeRecord>),
+  held: &mut Held,
+) -> Result<Appended, AppendRefused> {
+  let committed = commit(state, steps, verdicts)?;
+  let entry = recorded_entry(state, entry, steps, &committed);
   let mut ops: Vec<Op> = made
     .into_iter()
     .map(|record| Op::VolumeCreated { record })
@@ -525,8 +657,8 @@ fn push_planned(
   record_all(state, &ops)?;
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
-  after(state, &steps, &committed, held);
-  Ok(answer_committed(&steps, &committed, true))
+  after(state, steps, &committed, held);
+  Ok(answer_committed(steps, &committed, true))
 }
 
 /// Makes each new branch's member in memory (`Lineage::branch`), nothing recorded.
