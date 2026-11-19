@@ -429,8 +429,9 @@
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
 > objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
 > 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619); piece 5's first part, a push's bundle read, its race checks and its reply (A-641 part 1) (2026-11-19; UI
-> goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079 for A-598 and A-619, g301 for A-641).**
+> (A-619), and the session over a byte channel (A-650 part 2); piece 5's first part, a push's bundle read, its race
+> checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
+> for A-598 and A-619, g301 for A-641, g303 for A-650).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -528,8 +529,13 @@
 > leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1
 > request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
-> stub), the three captured sessions served whole. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving:
-> `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in
+> stub), the three captured sessions served whole. **Built (A-650 part 2):** the session over a byte channel
+> (`serve::stdio`), the entry point the daemon's SSH edge (A-651) calls with the session channel's bytes: one answer
+> held at a time, standard error before standard output, the consumed bytes given back to the window, a request needing
+> more than the window refused out of band; proven by 259 of 259 on the Mac Studio (red 5 of 5 with the step held
+> waiting), the three captured sessions handed in at every cut down to a byte. Owed, in order, after §4.17.1's seven
+> pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
+> the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in
 > place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads
 > in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its changesets classified
 > into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the landing, each moved

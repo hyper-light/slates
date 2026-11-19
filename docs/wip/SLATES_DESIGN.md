@@ -13059,6 +13059,19 @@ signature verification).
 > string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
 > requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
 > HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
+>
+> **Status (2026-11-19, A-650 part 2: the session over a byte channel).** `serve::stdio` runs the session over the
+> bytes of `hg serve --stdio`'s standard streams, as the SSH server's session channel carries them (A-633; the daemon's
+> SSH edge that calls it is A-651's): the channel's bytes go in as they arrive, a step serves the request at the front
+> once it is whole and the last answer has been taken (so one answer is held at most, as a process writing to a full
+> pipe stops reading), standard error goes out before standard output (7.2's order for an error), and the bytes each
+> step consumed go back to the channel's window. The input held is at most the window; a request that needs more than
+> the window could never be whole, so it is answered out of band and ends the session. The session ends at an empty
+> line, an unreadable request or the end of input, and the channel then closes with exit status 0, as `hg serve
+> --stdio` exits. Proven by `cargo test --locked -p slates-hg --lib` on the Mac Studio, 259 of 259, red first (5 of 5
+> failed with the step held waiting): the three captured sessions handed in a byte, seven bytes, a kilobyte and the
+> whole at a time, each answering as the session answers the same bytes whole; one answer held until taken; the
+> window's refusals; the end of input; arbitrary bytes at arbitrary cuts.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13459,7 +13472,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
-   3); owed: the process around it, HTTP.
+   3), and the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`); owed: the process
+   around it, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
@@ -44656,3 +44670,34 @@ Applied in the same change to:
   `part2.dump` are written again byte for byte); the wiring: a repository `CreateRepository` made holding these records
   on its shard, its texts in the shared object store, the import and export on the control channel, a revision a
   version of the repository's green, and an import or export sliced under the shard's budget.
+
+### A-650 (part 2) — Mercurial over SSH: one entry point that runs the session over the channel's bytes, one answer held at a time within the channel's window (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface" and piece 4; §4.17.2 "Transports" item 2; A-619 part 3, A-633; the daemon's SSH edge that calls it is A-651)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (new: `serve::stdio` with
+`Stdio`, `Progress`, `PastWindow`, `EXIT_STATUS`; `serve::session::Refused::PastWindow`; the session's `message`
+shared with it; `getbundle`'s test store, sessions and whole-session replay opened to the sibling tests), GAPS (the
+§4.17.3 entry).
+- **What it does.** `Stdio::new(capacity)` is one `hg -R <repo> serve --stdio` session over a byte channel whose window
+  is `capacity` bytes. `receive(data)` takes the client's bytes as the channel delivers them (refused, taking nothing,
+  past the window; dropped once the session has ended); `eof()` marks the end of the client's input; `step(store, room)`
+  serves the request at the front through `session::serve`, each request admitted `room` bytes, once it is whole and
+  nothing of the last answer waits, and says how many input bytes it consumed; `stderr()` and `stdout()` hold what is to
+  be sent, stderr first, and `sent_stderr(n)`, `sent_stdout(n)` drop what the channel took; `finished()` says the
+  session ended with every answer sent, and the channel then ends with `EXIT_STATUS`, 0.
+- **The SSH edge's loop (A-651).** On `SessionEvent::Data`, `receive` the bytes; send what `stderr()` then `stdout()`
+  hold with `Session::send_stderr` and `send_data`, telling the session what each took; once both are empty, `step`,
+  and give the window back the consumed bytes with `Session::consumed`; on `Writable`, send again; on `Eof`, `eof`; once
+  `finished`, `Session::finish(EXIT_STATUS)`.
+- **Decided.** One answer held at a time, as 7.2's process writing to a full pipe stops reading; the window is the
+  input's bound, so a request that needs more than the window could never be whole and is answered out of band with the
+  session ended (`Refused::PastWindow`), where waiting would hold the channel; a request cut short by the end of input
+  is dropped, where 7.2 serves a last line without its newline less its last byte.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 18.4 to 12.0): `cargo test --locked -p slates-hg --lib`, 259 of 259;
+  `cargo fmt -p slates-hg -- --check`, clean. Red first: the same tests with the step held waiting, 5 of 5 failed. The
+  three captured sessions of stock `hg serve --stdio` 7.2 (`fixtures/serve`) handed in a byte, seven bytes, a kilobyte
+  and the whole at a time, each answering byte for byte as the session answers the same bytes whole, every request
+  answered, all input consumed, the session finished; two requests sent at once, the second waiting while the first
+  answer waits; a piece past a 24-byte window refused, and a request needing 98 bytes answered out of band and the
+  session ended; the end of input after a whole request and a part; arbitrary bytes at arbitrary cuts over generated
+  windows, the input held never past the window and every session finished.
+- **Owed.** The SSH edge's loop above (A-651); the session's answers sliced within the shard's step budget (a
+  `getbundle` is made whole in one step, bounded by the request's room).
