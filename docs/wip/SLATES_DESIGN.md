@@ -11663,7 +11663,8 @@ decides the details.
 > version 0 is another green's version `v` by forking them and setting back what changed after `v`, O(the changed
 > paths), never a walk. Owed: a branch made through the register (shared piece 2); a green at a commit that is no
 > version's head (that commit's tree has no state to fork until the object store of piece 3 holds trees); and
-> Subversion's `Copy` on the same maps (§4.17.4, A-542).
+> Subversion's `Copy` on the same maps (§4.17.4, A-542). Since A-614 the object store holds trees,
+> and a green made from a commit that is no version's head is git's receive-pack create (§4.17.2 piece 6).
 >
 > **Status (2026-11-19, A-575).** The repository verbs are built (`crates/server/src/repository.rs`; the wire's
 > `CreateRepository`, `CreateBranch`, `BindBranch`, `RetireBranch`): a repository and its root (a new empty green, or an
@@ -12192,6 +12193,28 @@ engine: the verdict, rebase, position mapping, the register).
 > its LF as git writes that line, and read either way, as git's readers read it. A capability git does not define is
 > kept by name; a malformed object name or line is refused by kind and place. Proven against fifteen exchanges and six
 > advertisements stock git wrote under protocol.version 0 and 1. Serving a v0 or v1 fetch is piece 14's next part.
+>
+> **Status (2026-11-19, A-614: piece 5's part 1, the object store's index, versions and reads).** `crates/git`
+> (`store`) keeps a repository's objects on §4.17.1's store (`slates-vcs`, A-581). Objects come in through one trait,
+> `Entries` (a pack reader's resolved objects, A-608, or an import's), each named once by git's rule, the store's
+> parameter (`GitNaming` over `object_name`), and an id its source claims is checked against that name; an input
+> SHA-1's detection finds to be part of a collision attack is refused with git's own words ("SHA-1 appears to be part
+> of a collision attack: <sha1>"). A push's objects are held by the push alone until its verdict. Committed, each
+> object new to the repository gets a position in arrival order and two rows in the repository's one index: its row
+> (type, length, position, and the green and version that brought it; a commit's adds its root tree and parents by
+> position, its committer's date and its generation number, topological levels), and a position row naming the id
+> back. Each version of a ref keeps D(k) and the green its reached set, as runs of positions (a push's new objects are
+> one run), both computed at admission by walks over the push and the index that stop at what the green reached, a
+> reached tree skipped whole. A fast-forward, found by a walk back that stops at the old head's generation, grows the
+> set by D(k); a create, a rewrite and a ref made at another ref's commit make the set again from the newest commit that
+> is some green's current head, found back through generation numbers, walking only beyond it, so a ref made at
+> another's head walks nothing. A version's head and root tree are read from its rows, and a path resolves one tree a
+> component down: no walk of history or of the tree. Every refusal is typed and changes nothing; the versions' records
+> and the head map are charged to the store's budget. Owed: part 2, each version's D(k) kept as a pack fragment and
+> the base pack, with the learned delta window and depth, zlib level and rebuild point (A-607's flate2 over zlib-rs);
+> part 3, the commit rows' changed-path Bloom filters; the walks and a commit sliced under the shard's budget, and
+> their transient sets charged; the versions' records kept as content. A green's maps made from a commit that is no
+> version's head (A-534's owed item) is receive-pack's create, piece 6.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12393,7 +12416,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
 | Reaping a stalled client | silence past the tail of the gaps seen for that phase of the exchange, with the estimate's own error added (A-363's form) | the shard's connection budget | the round trip measured at connect |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
-| Index table merges | merge two immutable tables when the measured cost of probing one more table, times the measured lookup rate, exceeds the measured merge cost spread over the tables' expected life | one merge in flight per repository | merge when the first lookup's measured probe cost exceeds its measured share of a merge |
+| Index table merges (§4.17.1's rule, A-581: the git store's index is `slates-vcs`'s, A-614) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, the largest due `j`); a table is one window of the content plane and the tail seals once its rows no longer fit one | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
 | SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
 
 git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
@@ -12461,9 +12484,12 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 3. The pack reader: streaming, bounded, inflating, resolving deltas against the pack and the index, checking the
    trailer; hostile input. (The deflate implementation, chosen by measurement: zlib-rs through flate2's API, A-607.)
 4. The tree, commit and tag parsers with the fsck checks.
-5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack.
+5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack
+   (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 the
+   fragments and the base pack; part 3 the commit rows' changed-path Bloom filters).
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
-   report-status-v2, atomic.
+   report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
+   version's head.
 7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise; packs from
    fragments; shallow; filters; `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
@@ -41379,7 +41405,10 @@ unknown).
   A hash relative to the copy's own frame was weighed and set aside. It moves a subtree's sum in one step only when the
   source's own relative sum is kept. That holds for a source that is itself a copy, not for a trunk built commit by
   commit, which would need a sum per directory, a Merkle tree of the radix tree. A Merkle tree would make the
-  identity a function of the state alone and a copy O(its path); it is a change of A-202's format, recorded as owed.
+  identity a function of the state alone and a copy O(its path), at the cost of a change of A-202's format.
+  Decided (main, 2026-11-19): one entry a copy stays. In Subversion a copy's history is part of the repository (`svn
+  log` and `svn blame` follow it), so an identity of the state and its copies is the faithful one, and it costs O(1)
+  a copy; a Merkle identity would change A-202's format for no gain Subversion can see.
   A green made at another's version inherits its source's sum, which holds the entries of copies made at or before the
   version, and not their records. So its own recount differs from its identity, and a holder replaying the branch from
   the same record computes the same identity.
@@ -41624,6 +41653,82 @@ Applied in the same change to:
   property section), as `svnadmin` learns a delta's by writing it to a temporary file first.
 - **Owed of piece 6:** the verbs over the codec (`svnadmin create`, `load`, `dump`, `setrevprop`, `setlog`, `info`,
   `uuid`, `youngest`) and the dump round trip, their gate.
+
+### A-614 — The git object store on §4.17.1's, part 1: git's naming as the store's parameter, objects in through one trait, positions and rows with commit rows, D(k) and reached sets computed at admission, and a version read as a tree with no walk (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" items 1 to 3 and 6, "Pieces (git)" piece 5; §4.17.1 "Objects"; A-534, A-581, A-590, A-600, A-608)
+
+Applied in the same change to: §4.17.2 (a status block; pieces 5 and 6; the tunables table's index-merge row, which now
+reads §4.17.1's shared rule), §4.17.1 (A-534's owed green at any commit, now piece 6's), GAPS (the §4.17 entry),
+`crates/git` (`store`, `ObjectId: AsRef<[u8]>`, the dependency on `slates-vcs`), `crates/vcs` (`Quarantine::hold_named`,
+`Quarantine::objects`), the workspace manifest and `Cargo.lock`.
+
+- **The store's parameter and its door.** Objects come in through `Entries`, a trait any source implements: A-608's
+  pack reader (its resolved objects carry a kind, an id and content), an import's loose objects (piece 15). The store
+  depends on no reader's module. Each object is named once by git's rule (`GitNaming`: `object_name::name_of`, SHA-1
+  with collision detection or SHA-256), an id its source claims is checked against that one name (`IdMismatch`), and
+  an input SHA-1's detection finds to be part of a known collision attack is refused `NotNamed` with git's own words
+  (`sha1dc_git.c`: "SHA-1 appears to be part of a collision attack: %s"). The bytes are held by the push alone
+  (`slates_vcs::Quarantine::hold_named`, which stages bytes its caller already named, so each object is hashed once in
+  the store), and a refused or abandoned push leaves nothing. A reader that names its objects itself (A-608's does) and
+  this store's check hash each object twice; trusting an in-process reader's names is a measured decision left for
+  later, and the store does not trust its source until then.
+- **Rows.** When the verdict commits, each object new to the repository gets the next position in arrival order and two
+  rows in the repository's one `slates-vcs` index (`store::rows`): under `o` and its id, its type, length, position,
+  and the green and version that brought it, a commit's adding its root tree and parents by position, its committer's
+  date and its generation number (one more than its parents' greatest: commit-graph's topological levels); under `p`
+  and its position, big-endian, the id. One `insert_all` writes them, its order, rows and room checked first; nothing
+  rewrites them. A push holding a commit whose parent or tree neither it nor the repository holds is refused
+  (`Missing`), stricter than git, which leaves unreachable objects unchecked, because a row needs every position it
+  names.
+- **D(k) and reached sets.** Each version of a ref keeps D(k) and the green its reached set as runs of positions
+  (`Positions`: Roaring's run containers alone, since a push's new objects are one run). Both are computed at admission,
+  before the verdict (`Repository::admit`), by walks over the push and the index that stop at what the green reached,
+  a reached tree skipped whole. A fast-forward, found by a walk back from the new head that stops at the old head's
+  generation number, grows the set by D(k). A create, a rewrite, a ref made again and a ref moved to another ref's commit
+  make the set again: from the newest commit some green's current head names, found back from the new head by
+  generation number, walking only beyond it; a ref made at another's head walks nothing. A commit checks that every
+  moved green is still where its move was admitted (`Moved`), charges the versions' records and the head map to the
+  store's budget, then writes the rows; a refusal at either changes nothing.
+- **A version read as a tree.** A version's head is its record's position, its root tree its commit row's, and a path
+  resolves one tree a component down: no walk of history and none of the tree. A green's maps made from a commit that is
+  no version's head (A-534's owed item) is receive-pack's create, piece 6.
+- **Tunables.** None in this part: positions are counted, generation numbers computed, and the walks bounded by what
+  they read. The index's table size, tail and merge point are `slates-vcs`'s, derived and learned (A-581), and git's
+  index-merge row now reads that rule. Part 2's delta window and depth, zlib level and base-pack rebuild point are
+  learned there, on A-607's engine.
+- **Mantle.** Main passed on Ada's two notes: first that Mantle's code could be pulled in, then that it must not be
+  ("do not use mantle it is slow"). Mantle's engine (its RocksDB conversion) was read and nothing was taken; no
+  dependency on it exists.
+- **Tests** (`cargo test --locked -p slates-git --lib store::`, 14 of 14, and `-p slates-vcs --lib`, 30 of 30, the Mac
+  Studio, 2026-11-19, at 6b66211e9): the oracle `the_git_store_reads_as_its_map_model_over_every_history` (64 generated
+  histories in either format over three refs: commits on a head, on any earlier commit and as roots, refs moved to
+  others' heads, deletes, pushes admitted then abandoned; after every step every version's head and D(k), every
+  reached set, every commit row and every path at every head as the model computes them, no row for an object never
+  committed, an abandoned push changing no byte, an empty store at the end), and
+  `git_names_each_object_and_a_collision_attack_is_refused_in_gits_words` (git's t0013 SHAttered vector through a
+  raw-hashing naming, since no published collision survives git's header), `positions_are_kept_as_runs`,
+  `an_object_row_reads_back_and_a_hostile_one_is_refused`,
+  `a_pushs_commits_get_rows_with_their_tree_parents_date_and_generation`,
+  `a_fast_forward_brings_only_what_its_green_had_not_reached` (a reached directory skipped whole, counted),
+  `a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk` (the walk counter unmoved),
+  `a_rewrite_brings_what_its_old_head_did_not_reach_and_makes_its_set_again`,
+  `a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches`,
+  `a_versions_tree_is_read_from_its_rows_and_a_path_resolves_one_tree_a_component`,
+  `an_abandoned_push_leaves_nothing_and_a_false_claim_is_refused`,
+  `a_missing_parent_an_unsealed_push_and_a_foreign_push_are_refused`,
+  `a_stale_move_and_a_commit_past_the_budget_change_nothing`, and `slates-vcs`'s
+  `bytes_named_by_their_caller_are_held_under_that_name`.
+- **Red-checks** (the Studio, at 6b66211e9, each mutation applied once to a copy, the store's tests run, the tree clean
+  after and green again): a walk walking nothing (5 red), a reached tree walked again (2), a generation one short (3), no
+  move a fast-forward (1: the counter, since a set made again is still right), no base ever found (2), a claimed id
+  never checked (1), a commit's tree its own position (5), a rewrite's set only grown (2), a deleted ref keeping its set
+  (2), the versions charged nothing (8), no position rows (7).
+- **Owed.** Part 2: each version's D(k) kept encoded once as a pack fragment (zlib, each entry's CRC32, offset deltas
+  within a fragment and id deltas to earlier ones, commits and trees apart from blobs) and the base pack, with the
+  learned delta window and depth, zlib level and rebuild point. Part 3: the commit rows' changed-path Bloom filters.
+  Then the walks and a commit sliced under the shard's budget with their transient sets charged, and the versions'
+  records kept as content. Main's heavier checks are filed in the run-request queue: clippy, the lint matrix, `xtask`,
+  and the doc build.
+
 ### A-613 — The ra_svn read commands, a sans-io handler over the index and mergeinfo, held to stock svnserve's transcripts; its first part (2026-11-19, g262, UI goal 93; §4.17.4 "4. Reads", "5. The wire" and piece 7's second part; A-531, A-553, A-599, A-605)
 Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 entry),
 `docs/wip/research/vcs-servers-subversion.md` (§13, new), `crates/svn/src/reads.rs` and `crates/svn/src/reads/tests.rs`

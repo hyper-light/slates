@@ -53,6 +53,7 @@ pub mod pack;
 pub mod pktline;
 pub mod refname;
 pub mod sideband;
+pub mod store;
 pub mod unpack;
 pub mod v0;
 pub mod v2;
