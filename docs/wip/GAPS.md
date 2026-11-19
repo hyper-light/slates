@@ -1171,9 +1171,8 @@
 >   take no mount down. macOS and the BSDs now call `unmount(2)` (`MNT_FORCE` for the busy one), and every Unix host
 >   judges an unmount by the kernel's mount table: nothing mounted at the path is `NotMounted` before any call,
 >   `EBUSY` is `MountFault::Busy`, and the table still listing the mount after a call that said done is
->   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
->   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
->   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
+>   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`).
+>   Owed: the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
 > - **a host mount bound into a container, built 2026-11-18 (A-520, `CONTRACT` = 44; kiln's container engine, kiln goal
 >   01a1f124):** the OCI form (§4.6 A-9) was the wire's and the command line's alone (`slates attach --oci-source`), so
 >   a host that drives slates through the library alone (kiln) could not bind a volume into a container.
@@ -1188,6 +1187,20 @@
 >   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
 >   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
 >   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
+>   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
+>   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
+>   `EBUSY` is on macOS. Every `Busy` carries `MountHolders`, read on that refusal alone from the kernel's own tables
+>   without touching the mount (`slates_bridge_oci::mount_holders`): on Linux each process's descriptors, working and
+>   root directories, `statx`ed through `/proc` with `AT_STATX_DONT_SYNC` and compared by device, bounded by
+>   `pid_max` and `nr_open` and refused `PastBound` past them; another user's process counted unreadable. Tests:
+>   `a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy`,
+>   `a_busy_mounts_holders_are_named_as_the_kernel_listed_them` (every host), the reader's tally and bound tests, and
+>   `the_caller_is_named_holding_the_mount_its_root_is_on` (Linux, by use). **Not read on macOS (A-537's judgment):**
+>   every libproc answer that reports a file is filled by xnu's `fill_vnodeinfo`, which runs `vn_stat` on the vnode,
+>   and `proc_listpidspath` starts with `stat(2)` of the path; on the `hard` loopback NFS mount either waits without bound
+>   once the daemon has gone, the case a busy unmount meets, so macOS answers `HoldersUnread::NoReader`. Owed: a macOS
+>   reader that does not ask the filesystem (libproc offers none); the Linux reader's run on Linux (filed for main);
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
