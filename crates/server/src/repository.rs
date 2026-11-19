@@ -34,6 +34,9 @@
 //!
 //! **Names.** A member's volume name is `<repository>:<branch>:<id>`: readable in a listing, unique on its partition by
 //! its id.
+//!
+//! **The store.** `CreateRepository` makes the repository's tool store beside its record, on this owner shard
+//! (`crate::vcs_store`, A-662).
 
 use slates_db::catalog::{
   BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
@@ -343,6 +346,10 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
   }
   if !adopted {
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
+  }
+  // The repository's tool store, beside its record, on its owner shard (A-662).
+  if let Some(record) = state.db.partition().repositories().repository(repository).cloned() {
+    crate::vcs_store::make(state, &record);
   }
 }
 

@@ -2002,6 +2002,13 @@ pub struct RepositoryEntry {
   pub names: Vec<NameChange>,
   /// The repository's own state's changes, in order.
   pub state: Vec<StateChange>,
+  /// The objects the push brought to the repository's tool store (§4.17.1 "Durability and residency"; A-662): the
+  /// content identities of the objects its quarantine sealed and the repository did not hold, in the order they were
+  /// admitted, with their bytes and the moves the store committed them with, encoded by the repository's tool and
+  /// opaque here. The register holds them as a version's chain entry holds its work's post-state, for as long as the
+  /// repository lives, so a recovery replays them through the store's own admission and commit. Empty when the entry
+  /// brought none.
+  pub objects: Vec<u8>,
 }
 
 /// A phase root of a repository (§4.17.3 decision 3, A-603): `node` is a root of phase `phase`.
@@ -2031,4 +2038,6 @@ pub struct RegisterRecord {
   pub markers: Vec<Vec<u8>>,
   /// The locks, in path order.
   pub locks: Vec<LockRecord>,
+  /// Each entry's objects (`RepositoryEntry::objects`, A-662), in the order the register received them.
+  pub objects: Vec<Vec<u8>>,
 }

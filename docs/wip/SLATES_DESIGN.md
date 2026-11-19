@@ -12221,6 +12221,22 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
+> content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
+> (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each version
+> commits), Mercurial's A-588 index with its derived values, Subversion's A-553 index. `CreateRepository` makes the
+> entry beside the record on the owner shard; its bytes are charged to the shard's budget as retention, lent the room the
+> shard can admit for a step and trued up to what the store holds after it. A push's objects are its changeset and
+> everything the store computes from them is derived: a git push's one entry (A-635's append) holds its record, the
+> content identities of the objects its quarantine sealed that the repository lacked, in admission order, with their
+> bytes and the moves the store committed them with; the partition's register keeps each entry's objects for the
+> repository's life and a snapshot carries them, charged to the merge budget. The store commits between the register's
+> guard and the entry's apply, so a refused push never reaches it; a recovery makes each store again and replays every
+> record, in log order, through the live path's own steps, refusing a record whose bytes are not the contents it names
+> or whose admission makes another record (guard then apply). Owed: the snapshot carrying each store's sealed tables by
+> identity, so a recovery replays only the log's suffix; Mercurial's and Subversion's records and replay (their push
+> pieces); a recovered version's pack fragments encoded again off the answer's path (A-654); the fleet half (A-636).
+
 **Every tunable is learned online.** The rule for every server in this section (Ada, 2026-11-18): a tunable is an
 estimate the server keeps learning from the deployment's own traffic. It is never a constant, and never a value measured
 once on one machine and frozen, at build or at boot. Each server's table names, for every tunable:
@@ -12313,8 +12329,10 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
-   whose merge point is learned, and the quarantine with the tool's naming as a parameter; its use on the owner shard,
-   sliced, comes with each server's object pieces).
+   whose merge point is learned, and the quarantine with the tool's naming as a parameter; its home on the owner shard
+   built, A-662: one content store a shard and each repository's tool store with its derived values, charged to the
+   shard's budget, a push's objects held by its entry and replayed by a recovery; the work sliced comes with each
+   server's object pieces).
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
 5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
@@ -46321,3 +46339,84 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   check` and the doc gate are main's (the run-request queue).
 - **Owed.** Part 2: the owner's commit step through A-635's `RepositoryLogs::append`, at the position the commit read
   (`Moved` answered as `svnserve`'s out-of-date), which a dump's import drives too (A-652 part 3).
+
+### A-662 — Each repository's store on its owner shard: one content store a shard and each repository's tool store with its derived values, made with its record, charged to the shard's budget, a push's objects held by its one entry and replayed by a recovery (2026-11-19, g258, UI goal 93 (kiln 51cef9f7); §4.17.1 "Durability and residency" and shared pieces 2, 3 and 7; §4.17.2 "The repository in git's terms"; A-581, A-588, A-553, A-614, A-635, A-642, A-645, A-647)
+
+- **What was there.** The tool stores were pure crates: A-614's git store over A-581's content store, A-588's Mercurial
+  index, A-553's Subversion index, A-647's derived values. The server held none of them (A-625 part 3's upload-pack
+  answered `503` for want of one), and nothing made a push's objects durable: a daemon restart would have kept every
+  green and lost every object its pushes brought.
+- **The decision (main's, 2026-11-19, building on A-645's "a push's objects are its changeset; everything computed from
+  them is derived").**
+  - **One map.** `ShardState::vcs_stores` (`crates/server/src/vcs_store.rs`) holds one content store a shard, made at
+    its first repository with the content plane's chunk as its window (D-6), so content is held once across
+    repositories and tools (A-581), and one entry a repository: git's store with its `Derivations` (A-647 part 2's
+    `ReachSets`, declared eager and kept from the admission's own sets as each version commits); Mercurial's `HgIndex`
+    with its `Derivations`; Subversion's index beside its one green. The derived values live with their store, made,
+    charged, freed and recovered with it; no second home.
+  - **Lifecycle.** `CreateRepository` makes the entry beside the record on the owner shard (`repository::install_root`);
+    `vcs_store::free` gives every hold back with the repository (no repository destroy verb exists yet; GAPS).
+  - **Budget (§4.2).** Every byte the content store counts is charged to the shard's memory budget as retention, as a
+    green's history is: a step is lent the room the shard's budget could admit now, the arena first grown from its pool
+    by what the step brings (`Store::make_room`, as `secure_green_retention` grows it), and after the step the charge
+    is trued up to what the store holds and the store's own budget set back to it. A step past the room is refused by
+    the store (`OverBudget`), typed, with nothing changed, and answered `BudgetExceeded` with the room the budget had.
+    No figure is a constant (R3).
+  - **Durability.** A git push's one entry (A-635's append) holds its record (`vcs_store::record`): the deepest delta
+    chain its pack carried (the store's learned depth reads it), its moves by each green's key in the store and the
+    commit its new head names, and every object its quarantine sealed that the repository lacked, in admission order,
+    by content identity (`ContentStore::object_id`) with its bytes. Objects the repository holds already are passed over
+    at admission, since the store reads an indexed object from its index before any push, so the record holds each
+    object's bytes once. `RepositoryEntry::objects` carries it opaquely; the partition's register keeps each entry's
+    objects in the order it received them for the repository's life, charged to the merge budget and carried by its
+    snapshot (`Repositories::objects`, `object_record`). They take no position, so an entry with objects and one green
+    stays a single-green append and joins nothing (A-642).
+  - **Guard then apply.** The store commits between the register's guard (`Partition::check_creating`, which charged
+    the record) and the entry's apply, inside the append, so a push a rule, a verdict or the guard refuses never reaches
+    the store; a store that refuses (its budget) refuses the entry with nothing applied. After the store committed, a
+    verdict's commit or the record not made durable leaves the store ahead of the log, so the store is made again from
+    the log (`vcs_store::rebuild`), the recovery's own replay. A recovery (`verbs::rebuild_recovered`, after the
+    members) makes every store again and replays each record, in log order, a record a unit of the recovery's slices,
+    through the live path's own steps: each object checked against the identity its record names before it is admitted,
+    the record the admission makes compared with the one the log holds (a recomputation that differs is refused, as
+    §4.16 refuses one), the seal, the moves, the commit and the derived values kept. A store not made again is given
+    back and named unrecovered with why.
+  - **Keys.** A-614's store names a green by a `u64`: the half of its volume id holding its partition and counter, which
+    `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green as before.
+  - **Not recorded, derived.** Positions, rows, D(k), reached sets, derived values and pack fragments. A fragment's
+    encoding follows measured times (A-614 part 2's learned window and level), so a recovery leaves fragments to the
+    same off-path step that encodes a live version's (A-654), and the oracle compares everything else.
+- **Mercurial and Subversion.** Their arms are placed, made, charged (the Mercurial index through the content store),
+  freed and recovered here; their records and replay are their push pieces' (g304's unbundle, g268's commit step), and a
+  recovery refuses a record of either typed (`Owed`) until then.
+- **Tests** (`crates/server/src/vcs_store/tests.rs`; `crates/db/src/repository/entry/tests.rs`):
+  - the record's bytes pinned by hand and read back; every truncation, `u64::MAX` counts, another magic or version, a
+    bad marker, another format, a delta's type number and a trailing byte each refused by kind;
+  - the oracle `t_a662_the_store_after_a_recovery_equals_the_store_before`: generated histories over three refs (commits
+    on a head, roots, commits on another ref's head, a ref moved to another's head, deletes, one commit moving two refs,
+    held blobs sent again, objects in pack order and reversed, several pack depths) against a store never recovered and
+    one made again from its records at generated points; after each recovery and at the end both equal whole (every
+    position's id and row, each ref's D(k), heads, trees, derived values and reached set, every content with its
+    holders) and both make the same records; a fixed history counts every kind of push and three recoveries;
+  - a record whose bytes are not its identity's (`Identity`), one the admission would not make (`Diverged`) and one
+    naming a commit nobody sent each refused, leaving the store as it was;
+  - each tool's arm made with its record, Mercurial's and Subversion's records refused `Owed`, a refused store named
+    unrecovered, every store freed with nothing charged;
+  - a push through A-635's append on the owner shard: an abandoned push leaves nothing; two pushes recorded one record
+    each, the second without the blob the first brought; the charge equal to what the store holds; the store made again
+    from the partition's log equal whole and replaying both records; freeing gives every byte back;
+  - the db: an entry's objects kept in order, charged, carried by a snapshot, refused `Capacity` past the merge budget
+    with nothing kept, given back with the repository.
+- **Evidence.** PENDING the Studio's run (filled before landing).
+- **Owed.** The snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix;
+  the replay sliced within a record and the owner's seal and compaction of each store's index; a recovered version's
+  fragments encoded again off the answer's path (A-654); Mercurial's and Subversion's records and replay; the
+  Subversion index charged by its bytes; a record naming a blob a work's post-state holds by reference; a repository
+  destroy verb calling `free`; the `StoreLender` over this map (A-625 part 3); the fleet half (A-636).
+- **Applied in the same change to:** §4.17.1 (a status block; shared piece 3's line); GAPS (the §4.17 entry);
+  `crates/server/src/vcs_store.rs`, `vcs_store/record.rs` and `vcs_store/tests.rs` (new); `crates/server/src/lib.rs`,
+  `state.rs`, `daemon.rs` (the field), `repository.rs` (`install_root` makes the store), `repository/push.rs`
+  (`EntryParts::sealed`, the store's commit between the guard and the apply, the rebuild), `lfs.rs` (the new field),
+  `verbs.rs` (the recovery's call); `crates/db/src/catalog.rs` (`RepositoryEntry::objects`, `RegisterRecord::objects`),
+  `repository.rs` (the register's objects, `objects`, `object_record`), `repository/entry.rs` (their charge) and its
+  tests; `Cargo.toml` (slates-hg, slates-svn), `crates/server/Cargo.toml`, `Cargo.lock`.

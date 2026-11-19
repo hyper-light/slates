@@ -38,6 +38,11 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+# The repositories' stores on their owner shard (A-662, `crate::vcs_store`): the content store every tool's store holds
+# its objects in, and Mercurial's and Subversion's indexes beside git's.
+slates-vcs = { workspace = true }
+slates-hg = { workspace = true }
+slates-svn = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }
 
@@ -72,8 +77,6 @@ slates-bridge-winfsp = { workspace = true }
 [dev-dependencies]
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
 rcgen = { workspace = true }
-# The content store an upload-pack test's empty repository is kept in (A-625 part 3; `crate::vcs_http::git::upload`).
-slates-vcs = { workspace = true }
 # The guest-device test builds the FUSE requests a guest kernel would (the codec's ABI constants).
 slates-bridge-fuse = { workspace = true }
 # The typed client, for the recovery oracle (§4.8 A-9, AC-2.12): it drives the same verbs a session
