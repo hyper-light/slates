@@ -978,10 +978,14 @@ mod tests {
           }
           Step::Fork { map } => {
             let forked = maps[map].as_ref().map(|(trie, model)| (trie.fork(&mut nodes), model.clone()));
-            if let (Some(forked), Some(slot)) = (forked, maps.iter().position(Option::is_none)) {
-              maps[slot] = Some(forked);
-            } else if let Some((mut forked, _)) = forked {
-              forked.release(&mut nodes, &mut counted);
+            if let Some(forked) = forked {
+              match maps.iter().position(Option::is_none) {
+                Some(slot) => maps[slot] = Some(forked),
+                None => {
+                  let (mut forked, _) = forked;
+                  forked.release(&mut nodes, &mut counted);
+                }
+              }
             }
           }
           Step::Release { map } => {
@@ -995,17 +999,20 @@ mod tests {
               model.iter().filter(|(key, _)| key.starts_with(&src))
                 .map(|(key, value)| ([dst.as_slice(), &key[src.len()..]].concat(), *value)).collect()
             }).unwrap_or_default();
-            if let (Some(shared), Some((trie, model))) = (shared, maps[to].as_mut()) {
-              let occupied = model.keys().any(|key| key.starts_with(&dst));
-              let result = trie.graft(&mut nodes, &dst, shared, &mut counted);
-              prop_assert_eq!(result.is_err(), occupied);
-              if !occupied {
-                for (key, value) in moved {
-                  model.insert(key, value);
+            if let Some(shared) = shared {
+              match maps[to].as_mut() {
+                Some((trie, model)) => {
+                  let occupied = model.keys().any(|key| key.starts_with(&dst));
+                  let result = trie.graft(&mut nodes, &dst, shared, &mut counted);
+                  prop_assert_eq!(result.is_err(), occupied);
+                  if !occupied {
+                    for (key, value) in moved {
+                      model.insert(key, value);
+                    }
+                  }
                 }
+                None => Ptrie::drop_subtree(&mut nodes, shared, &mut counted),
               }
-            } else if let Some(shared) = shared {
-              Ptrie::drop_subtree(&mut nodes, shared, &mut counted);
             }
           }
         }
