@@ -298,7 +298,11 @@ impl DriveReader {
 
   /// Checks that a command names the innermost open node.
   fn expect_innermost(&self, token: &Value<'_>) {
-    assert_eq!(self.open.last(), Some(&text(token)), "not the innermost node");
+    assert_eq!(
+      self.open.last(),
+      Some(&text(token)),
+      "not the innermost node"
+    );
   }
 }
 
@@ -318,7 +322,10 @@ fn holds_lz4_block(stream: &[u8]) -> bool {
       rest = &rest[used..];
     }
     let [_, _, _, instructions, new_data] = lengths.map(|length| usize::try_from(length).unwrap());
-    for section in [&rest[..instructions], &rest[instructions..instructions + new_data]] {
+    for section in [
+      &rest[..instructions],
+      &rest[instructions..instructions + new_data],
+    ] {
       let (original, used) = read_integer(section).unwrap();
       compressed |= u64::try_from(section.len() - used).unwrap() < original;
     }
@@ -417,7 +424,12 @@ fn every_recorded_drive_is_written_again_as_svnserve_wrote_it() {
     let read = read_drive(&theirs);
     let written = write_all(&calls(&read.calls), &stock_capabilities());
     let ours = items(&written);
-    assert_eq!(read_drive(&ours).calls, read.calls, "{}: the calls", session.name);
+    assert_eq!(
+      read_drive(&ours).calls,
+      read.calls,
+      "{}: the calls",
+      session.name
+    );
     assert_eq!(ours.len(), theirs.len(), "{}: the items", session.name);
     for ((ours, theirs), compressed) in ours.iter().zip(&theirs).zip(&read.compressed) {
       if !compressed {
@@ -480,7 +492,9 @@ fn absent_entries_go_only_to_a_client_that_announced_them() {
 /// `accepts-svndiff2`; expect every delta's stream in version 0 and its windows alike.
 #[test]
 fn a_client_that_does_not_accept_svndiff2_is_sent_version_0() {
-  let checkout = SESSIONS.iter().find(|session| session.name == "checkout-head.1");
+  let checkout = SESSIONS
+    .iter()
+    .find(|session| session.name == "checkout-head.1");
   let read = read_drive(&drive_items(checkout.unwrap().server));
   let mut older = stock_capabilities();
   older.accepts_svndiff2 = false;
@@ -534,7 +548,11 @@ fn expect_steps(name: &str, steps: &[Step<'_>]) {
       assert_eq!(result, Ok(()), "{name}: step {index}");
       clean.write(call, &mut clean_out).unwrap();
     } else {
-      assert_eq!(result, Err(EditorRefused::OutOfOrder), "{name}: step {index}");
+      assert_eq!(
+        result,
+        Err(EditorRefused::OutOfOrder),
+        "{name}: step {index}"
+      );
       assert_eq!(out.len(), before, "{name}: step {index} appended");
     }
   }
@@ -657,11 +675,18 @@ fn a_node_past_the_bound_on_nodes_open_is_refused() {
   writer.write(&root, &mut out).unwrap();
   writer.write(&open("a"), &mut out).unwrap();
   let before = out.len();
-  assert_eq!(writer.write(&open("a/b"), &mut out), Err(EditorRefused::TooDeep));
+  assert_eq!(
+    writer.write(&open("a/b"), &mut out),
+    Err(EditorRefused::TooDeep)
+  );
   assert_eq!(out.len(), before);
   writer.write(&Call::CloseDirectory, &mut out).unwrap();
   writer.write(&open("c"), &mut out).unwrap();
-  assert!(String::from_utf8(out).unwrap().ends_with("( add-dir ( 1:c 2:d0 2:d2 ( ) ) ) "));
+  assert!(
+    String::from_utf8(out)
+      .unwrap()
+      .ends_with("( add-dir ( 1:c 2:d0 2:d2 ( ) ) ) ")
+  );
 }
 
 /// A-616 part 2 (`notes/svndiff`'s integers, read back from the writer's own encoding): read
@@ -673,7 +698,10 @@ fn svndiff_integers_are_read_within_the_format() {
     (b"\x00", Some((0, 1))),
     (b"\x7f", Some((127, 1))),
     (b"\x81\x00", Some((128, 2))),
-    (b"\x81\xff\xff\xff\xff\xff\xff\xff\xff\x7f", Some((u64::MAX, 10))),
+    (
+      b"\x81\xff\xff\xff\xff\xff\xff\xff\xff\x7f",
+      Some((u64::MAX, 10)),
+    ),
     (b"\x82\xff\xff\xff\xff\xff\xff\xff\xff\x7f", None),
     (b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x00", None),
     (b"\x80", None),

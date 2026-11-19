@@ -13318,6 +13318,18 @@ and export by landing).
 > of mixed revisions, holding a lock, over a switched and a not-present path, switches, `status -u`, a diff, and
 > thirteen hand-made reports. Owed, part 2: the editor drive that answers a finished report over the index (A-553),
 > its texts as svndiff, its entry properties, absent entries, copy sources and its early-error abort.
+>
+> **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
+> (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
+> makes, in `reporter.c`'s order, each with the editor's own arguments and the raw facts of the node it names; A-627's
+> `dav::Drive` consumes the same calls. `EditorWriter` writes each as `editorp.c` and `marshal.c` do: tokens `d` and
+> `c` from one counter, absent entries only to a client that announced `absent-entries`, svndiff 2 to a client that
+> accepts it and 0 to any other, each window as `svndiff.c`'s three chunks, and a call out of the editor's order
+> refused with nothing written. Held to every drive in the recordings (28: 22 stock, six hand-made), each read back
+> and written again: the same calls and windows, and every item byte for byte but a chunk `svnserve` stored
+> LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
+> `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
+> answers to `close-edit` and `abort-edit`.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -42829,3 +42841,35 @@ Applied in the same change to:
   `unwrap`, `assert` or `panic` in a function returning `Option` or `Result`.
 - **Owed** (GAPS): part 2, the editor drive answering a finished report; URLs read as `svn_uri_canonicalize` reads
   them; and the authentication `svnserve` asks for mid-session when an anonymous `update` may not read.
+
+### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
+`report/editor.rs` with its tests, new; `report/recorded.rs`, the recorded sessions in one table both test modules
+read, taken out of `report/tests.rs`).
+
+- **The calls** (`report::drive::Call`): `svn_delta_editor_t`'s, with the editor's own arguments, in `reporter.c`'s
+  order (`drive`, `delta_dirs`, `update_entry`, `delta_proplists`, `delta_files`), so the nodes open are a stack and a
+  property change applies to the innermost. An open or an add carries `Facts` (the node's repository path, its created
+  revision, a file's SHA-1), from which `update.c` derives its hrefs; a delta is `ApplyTextDelta`, each `Window`,
+  `TextDeltaEnd`, so no file's delta is held whole, and its svndiff version is the consumer's. Agreed with g298
+  (A-627) through main as the calls `dav::Drive` takes.
+- **The writer** (`report::editor::EditorWriter`; `editorp.c` and `marshal.c`'s `svn_ra_svn__write_cmd_*` at
+  `d434dc14`, 1.15.0 alike): tokens `d` and `c` and one counter from 0 (`make_token`); `absent-dir` and `absent-file`
+  only to a client that announced `absent-entries`; svndiff 2, each section LZ4 when shorter, to a client that accepts
+  it, 0 to any other, never 1 (`svn_ra_svn__svndiff_version`, A-500); the stream's header as one chunk at its first
+  window or its end, and each window as `svndiff.c`'s `window_handler` writes it, its integers, its instructions and
+  its new data, each a chunk when not empty. A call out of the editor's order is refused, typed, with nothing written
+  and the writer as it was; `abort-edit` may follow a written `close-edit`, as `ra_svn_close_edit` writes one when the
+  client refuses the edit.
+- **One difference, in bytes alone:** a compressed section is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it
+  may differ while it decodes to the same window; every section stored uncompressed is `svnserve`'s byte for byte.
+- **Tests.** Every drive of the 38 recorded sessions (28 hold one) read back into calls, its deltas decoded, and
+  written again: the same calls and windows, and every item byte for byte but the chunks of a delta `svnserve`
+  compressed; svndiff 0 to a client without `accepts-svndiff2`; absent entries to one without `absent-entries` left
+  out; eighteen calls out of the editor's order refused with nothing written; the bound on nodes open; svndiff
+  integers and window encodings at and past their limits. `cargo test --locked -p slates-svn --lib` on the Mac Studio,
+  2026-11-19: red first with the writer writing nothing (5 of the 7 failed, the two helper tests passed), then 313 of
+  313; `cargo fmt -p slates-svn -- --check` clean after rustfmt's layout.
+- **Owed** (GAPS): the drive over the index (A-553) and the green, with `svn_repos_deleted_rev` and
+  `svn_fs_closest_copy`; the deltas of changed texts; the handler that answers the client's early answer and its
+  answers to `close-edit` and `abort-edit`.

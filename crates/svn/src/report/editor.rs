@@ -628,7 +628,10 @@ fn chunk(token: &str, bytes: &[u8], out: &mut Vec<u8>) -> Result<(), EditorRefus
 fn hex(digest: &[u8; 16]) -> [u8; 32] {
   let mut text = [0u8; 32];
   for (pair, &byte) in text.as_chunks_mut::<2>().0.iter_mut().zip(digest) {
-    *pair = [hex_digit(byte >> NIBBLE_BITS), hex_digit(byte & NIBBLE_MASK)];
+    *pair = [
+      hex_digit(byte >> NIBBLE_BITS),
+      hex_digit(byte & NIBBLE_MASK),
+    ];
   }
   text
 }
