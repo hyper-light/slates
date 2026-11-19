@@ -285,7 +285,8 @@ fn every_request_git_sent_reads_and_routes_as_git_meant_it() {
 
 /// A-595: do remove the framing of every request body held, whole and in cuts; gzip the inflated fetch again and inflate
 /// it. Expect each body's data as sent (the chunked ones' SHA-256 equal to the one the recording host computed), the
-/// gzip fetch's bytes back, and every body whole pkt-lines: the probes a flush alone, the large fetch 1400 wants.
+/// gzip fetch's bytes back, and every body whole pkt-lines: the probes a flush alone, the large fetch 1401 wants of
+/// 1400 commits (HEAD's wanted twice, as git asks for it).
 #[test]
 fn every_body_git_sent_reads_back_as_git_wrote_it() {
   for (number, length) in [(4, 182), (9, 4), (11, 4)] {
@@ -317,11 +318,16 @@ fn every_body_git_sent_reads_back_as_git_wrote_it() {
     let lines = packets(&data);
     assert_eq!(lines.last(), Some(&Packet::Flush), "exchange {number}");
     if number == 12 {
-      let wants = lines
+      // git wants each ref's tip, HEAD's among them, so the commit HEAD names is wanted twice.
+      let wants: Vec<&[u8]> = lines
         .iter()
-        .filter(|packet| matches!(packet, Packet::Data(line) if line.starts_with(b"want ")))
-        .count();
-      assert_eq!(wants, 1400);
+        .filter_map(|packet| match packet {
+          Packet::Data(line) => line.strip_prefix(b"want "),
+          _ => None,
+        })
+        .collect();
+      let distinct: std::collections::BTreeSet<&[u8]> = wants.iter().copied().collect();
+      assert_eq!((wants.len(), distinct.len()), (1401, 1400));
     }
   }
   let inflated = part(5, "request-inflated.bin");
