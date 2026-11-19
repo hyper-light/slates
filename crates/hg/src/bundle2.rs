@@ -289,13 +289,14 @@ impl<'a> Header<'a> {
   fn params(&self) -> impl Iterator<Item = Param<'a>> + use<'a> {
     let mut values = Cursor::new(self.values);
     let sizes: &'a [u8] = self.sizes;
-    sizes.chunks_exact(2).map_while(move |pair| {
-      let (key_len, value_len) = match *pair {
-        [key_len, value_len] => (usize::from(key_len), usize::from(value_len)),
-        _ => return None,
-      };
-      let key = values.take(key_len, "part parameter key").ok()?;
-      let value = values.take(value_len, "part parameter value").ok()?;
+    let (pairs, _) = sizes.as_chunks::<2>();
+    pairs.iter().map_while(move |&[key_len, value_len]| {
+      let key = values
+        .take(usize::from(key_len), "part parameter key")
+        .ok()?;
+      let value = values
+        .take(usize::from(value_len), "part parameter value")
+        .ok()?;
       Some(Param { key, value })
     })
   }

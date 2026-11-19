@@ -433,71 +433,22 @@ mod tests {
   #[test]
   fn a_repository_binds_only_unbound_greens_of_its_own_partition() {
     let mut partition = Partition::new(caps(), 0);
-    let main_green = volume_id(HOME, 1);
-    let topic_green = volume_id(HOME, 2);
-    let plain = volume_id(HOME, 3);
-    let foreign = volume_id(ELSEWHERE, 4);
-    for (id, green) in [
-      (main_green, true),
-      (topic_green, true),
-      (plain, false),
-      (foreign, true),
-    ] {
-      run(
-        &mut partition,
-        &Op::VolumeCreated {
-          record: volume(id, green),
-        },
-      )
-      .unwrap();
-    }
+    let volumes = greens_a_plain_volume_and_a_foreign_green(&mut partition);
+    let [main_green, topic_green, ..] = volumes;
     let record = repository(9, "linux");
     let repo = record.id;
     run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
-    let bind = |name: &str, green: VolumeId| Op::RepositoryBranchAdded {
-      record: BranchRecord {
-        repository: repo,
-        name: name.to_owned(),
-        green,
-      },
-    };
-    run(&mut partition, &bind("refs/heads/main", main_green)).unwrap();
-    run(&mut partition, &bind("refs/heads/topic", topic_green)).unwrap();
-    assert_eq!(
-      run(&mut partition, &bind("refs/heads/plain", plain)),
-      Err(DbError::NotGreen)
-    );
-    assert_eq!(
-      run(&mut partition, &bind("refs/heads/foreign", foreign)),
-      Err(DbError::NotFound)
-    );
-    assert_eq!(
-      run(
-        &mut partition,
-        &bind("refs/heads/ghost", volume_id(HOME, 99))
-      ),
-      Err(DbError::NotFound)
-    );
-    assert_eq!(
-      run(&mut partition, &bind("refs/heads/main", topic_green)),
-      Err(DbError::AlreadyExists {
-        existing: main_green.bytes
-      })
-    );
-    assert_eq!(
-      run(&mut partition, &bind("refs/heads/again", main_green)),
-      Err(DbError::AlreadyExists {
-        existing: main_green.bytes
-      })
-    );
-    assert_eq!(
-      run(&mut partition, &bind("", plain)),
-      Err(DbError::InvalidName)
-    );
-    assert_eq!(
-      run(&mut partition, &bind("refs/heads/a\0b", plain)),
-      Err(DbError::InvalidName)
-    );
+    run(
+      &mut partition,
+      &branch_added(repo, "refs/heads/main", main_green),
+    )
+    .unwrap();
+    run(
+      &mut partition,
+      &branch_added(repo, "refs/heads/topic", topic_green),
+    )
+    .unwrap();
+    assert_each_wrong_binding_refused_by_kind(&mut partition, repo, volumes);
     let names: Vec<(&str, VolumeId)> = partition.repositories().branches(repo, "").collect();
     assert_eq!(
       names,
@@ -513,6 +464,65 @@ mod tests {
     assert_eq!(prefixed, vec![("refs/heads/topic", topic_green)]);
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(answers(&rebuilt), answers(&partition));
+  }
+
+  /// A-515's volumes, in order: two greens and a plain volume on the repository's partition (`HOME`), and a green on
+  /// another.
+  fn greens_a_plain_volume_and_a_foreign_green(partition: &mut Partition) -> [VolumeId; 4] {
+    let ids = [
+      volume_id(HOME, 1),
+      volume_id(HOME, 2),
+      volume_id(HOME, 3),
+      volume_id(ELSEWHERE, 4),
+    ];
+    for (id, green) in ids.into_iter().zip([true, true, false, true]) {
+      run(
+        partition,
+        &Op::VolumeCreated {
+          record: volume(id, green),
+        },
+      )
+      .unwrap();
+    }
+    ids
+  }
+
+  /// A-515's binding of `name` in `repo` to `green`.
+  fn branch_added(repo: RepositoryId, name: &str, green: VolumeId) -> Op {
+    Op::RepositoryBranchAdded {
+      record: BranchRecord {
+        repository: repo,
+        name: name.to_owned(),
+        green,
+      },
+    }
+  }
+
+  /// A-515's refusals: the plain volume `NotGreen`; the other partition's green and an unknown id `NotFound`; a taken
+  /// name and a bound green `AlreadyExists`; an empty name and one with a NUL `InvalidName`.
+  fn assert_each_wrong_binding_refused_by_kind(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    [main_green, topic_green, plain, foreign]: [VolumeId; 4],
+  ) {
+    let taken = DbError::AlreadyExists {
+      existing: main_green.bytes,
+    };
+    for (name, green, refusal) in [
+      ("refs/heads/plain", plain, DbError::NotGreen),
+      ("refs/heads/foreign", foreign, DbError::NotFound),
+      ("refs/heads/ghost", volume_id(HOME, 99), DbError::NotFound),
+      ("refs/heads/main", topic_green, taken.clone()),
+      ("refs/heads/again", main_green, taken),
+      ("", plain, DbError::InvalidName),
+      ("refs/heads/a\0b", plain, DbError::InvalidName),
+    ] {
+      assert_eq!(
+        run(partition, &branch_added(repo, name, green)),
+        Err(refusal),
+        "binding {name:?}"
+      );
+    }
   }
 
   /// A-515 (§4.17.1 "Deleting a branch"). Do: bind a branch, destroy its green, and separately retire a branch and

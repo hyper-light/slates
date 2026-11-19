@@ -10,10 +10,12 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// and merge records carry the submit's completion key (A-255), 8 the submitting work beside it, and a completion record
 /// a green's successor adopted carries that work too (A-288), 9 the audit ring removed, whose records the op log and the
 /// snapshots held (A-265), 10 the audit's crossing durable: a partition's snapshot carries the records it owes the
-/// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18). An older segment is
-/// refused, never misread.
+/// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18), 11 a recorded reply's
+/// host code typed by its numbering: a completion record keeps its reply's bytes, whose errno fields a Windows daemon of
+/// layout 10 filled with Win32 error codes, now an errno alone beside an appended Win32 variant (A-539, 2026-11-19). An
+/// older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 10;
+pub const LAYOUT_VERSION: u32 = 11;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus

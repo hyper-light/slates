@@ -2668,7 +2668,7 @@ impl Volume {
     self.epoch = saved.0;
     self.root = saved.1;
     self.inode_root = saved.2;
-    outcome?;
+    let live_entries = outcome?;
     let orphans = snapshot_orphans(store, inode_root, &snap.orphans)?;
 
     // Place the snapshot at the exact slot and generation it had before the crash: a `SnapshotId`
@@ -2693,6 +2693,9 @@ impl Volume {
         // (A-541): what a clone of it made after the restart starts counting from.
         live_inodes: u64::try_from(snap.inodes.len().saturating_add(snap.shared.len()))
           .unwrap_or(u64::MAX),
+        // And its tree's live entries, from its own directories' images and the head's directories it shares
+        // (`rebuild_snapshot_tree`, A-549), so the image's layout does not change either.
+        live_entries,
         seq: snap.seq,
         identity: None,
         orphans,
@@ -2769,12 +2772,17 @@ impl Volume {
           .ok_or(VfsError::RecoveryIncomplete)?;
         Ok((source_root, kind_image(store.inodes.get(handle)?.kind)))
       }
+      // The head's table, rebuilt first, holds every number the head holds. For a clone that includes the records it
+      // still shares with its origin, which its image carries by number alone (`origin_shared`, A-64), so they have no
+      // image among the head's own; a snapshot of the clone that holds one shares it with the head all the same. So the
+      // entry resolves through the table, as an origin's does, and its kind is the inode's (A-561).
       SharedSource::Head => {
-        let image = refs
-          .head_images
-          .get(&entry.number)
+        let handle = trie::get(&store.tries, refs.head_inode_root, InodeNo(entry.number))
           .ok_or(VfsError::RecoveryIncomplete)?;
-        Ok((refs.head_inode_root, image.kind))
+        Ok((
+          refs.head_inode_root,
+          kind_image(store.inodes.get(handle)?.kind),
+        ))
       }
       SharedSource::Snapshot { at } => {
         let image = refs
@@ -2789,8 +2797,8 @@ impl Volume {
 
   /// Rebuilds a snapshot's tree into the volume's current (snapshot) roots, sharing with the head
   /// every file or symlink the snapshot holds unchanged (an identical image) instead of rebuilding a
-  /// private copy — the §4.2 CoW-sharing efficiency. Returns the inode numbers shared with the head,
-  /// which the caller excludes from the snapshot's deadlist so a drop never frees the head's copy.
+  /// private copy — the §4.2 CoW-sharing efficiency. Returns the live entries the tree holds (A-549), which its record
+  /// keeps for a clone made of it after the restart.
   fn rebuild_snapshot_tree(
     &mut self,
     store: &mut Store,
@@ -2799,7 +2807,7 @@ impl Volume {
     root_no: InodeNo,
     epoch: Epoch,
     refs: &SharingRefs,
-  ) -> Result<(), VfsError> {
+  ) -> Result<u64, VfsError> {
     // `snap.shared` names the files and symlinks the snapshot does not carry itself because an
     // identical version is already in the rebuilt store: the head still holds it (share the head's
     // inode) or an earlier snapshot captured it (share that snapshot's inode — the earlier snapshot
@@ -2851,7 +2859,21 @@ impl Volume {
         store.inodes.get_mut(handle)?.born = epoch;
       }
     }
-    Ok(())
+    // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
+    // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
+    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which takes a whiteout as an entry and
+    // which the caller sets the head's count back over.
+    let mut entries = snap
+      .inodes
+      .iter()
+      .map(named_entries)
+      .fold(0, u64::saturating_add);
+    for number in &held {
+      let node = *dirs.get(number).ok_or(VfsError::RecoveryIncomplete)?;
+      let live = store.dirs.get(node)?.live_len(&store.blocks);
+      entries = entries.saturating_add(u64::try_from(live).unwrap_or(u64::MAX));
+    }
+    Ok(entries)
   }
 
   /// The head's node of a directory a snapshot shares with the head (A-395), stamped with every block of its entries at
@@ -3605,6 +3627,16 @@ fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
   inode.attrs = attrs_from_image(&image_inode.attrs);
   inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
   inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows, inode.kind);
+}
+
+/// The live entries a directory's image carries (§4.2's namespace dimension, A-549): its names that name a child, since
+/// one that names none is a whiteout, which the live count never holds ([`child_for`]). None for any other inode.
+fn named_entries(image_inode: &InodeImage) -> u64 {
+  let BodyImage::Directory { entries, .. } = &image_inode.body else {
+    return 0;
+  };
+  let named = entries.iter().filter(|entry| entry.child.is_some()).count();
+  u64::try_from(named).unwrap_or(u64::MAX)
 }
 
 fn child_for(

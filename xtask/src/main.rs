@@ -259,7 +259,74 @@ fn is_test_tree(path: &Path) -> bool {
   path.components().any(|c| {
     let s = c.as_os_str();
     s == "tests" || s == "benches" || s == "examples"
-  })
+  }) || is_out_of_line_test_module(path)
+}
+
+/// Whether `path` is a module file its parent declares under `#[cfg(test)]` (`#[cfg(test)] mod tests;` in
+/// `svndiff.rs`, its body in `svndiff/tests.rs`): a test module kept in a file of its own, which is test code as an
+/// inline `#[cfg(test)] mod tests { ... }` is. Until 2026-11-19 only the inline form was seen, and A-500's golden
+/// vectors in `crates/svn/src/svndiff/tests.rs` read as 124 tuning literals. The declaring file is the parent module's:
+/// `mod.rs`, `lib.rs` or `main.rs` in the module's directory, or the `<dir>.rs` beside it.
+fn is_out_of_line_test_module(path: &Path) -> bool {
+  let (Some(file_name), Some(parent)) = (path.file_name(), path.parent()) else {
+    return false;
+  };
+  let (name, module_dir) = if file_name == "mod.rs" {
+    match (parent.file_name(), parent.parent()) {
+      (Some(dir_name), Some(grandparent)) => (dir_name.to_string_lossy().into_owned(), grandparent),
+      _ => return false,
+    }
+  } else {
+    match path.file_stem() {
+      Some(stem) => (stem.to_string_lossy().into_owned(), parent),
+      None => return false,
+    }
+  };
+  let declaring = [
+    module_dir.join("mod.rs"),
+    module_dir.join("lib.rs"),
+    module_dir.join("main.rs"),
+    module_dir.with_extension("rs"),
+  ];
+  declaring
+    .iter()
+    .filter(|candidate| candidate.as_path() != path)
+    .any(|candidate| {
+      std::fs::read_to_string(candidate).is_ok_and(|source| declared_under_cfg_test(&source, &name))
+    })
+}
+
+/// Whether `source` declares the module `name` out of line (`mod name;`, any visibility) under a `#[cfg(...)]` that
+/// names `test` and not `not(test)`, with only attributes, comments and blank lines between: the same lexical reading
+/// [`lines_with_test_flag`] gives an inline test module.
+fn declared_under_cfg_test(source: &str, name: &str) -> bool {
+  let mut armed = false;
+  for line in source.lines() {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("#[cfg(") {
+      armed = trimmed.contains("test") && !trimmed.contains("not(test");
+      continue;
+    }
+    if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
+      continue;
+    }
+    if armed {
+      let declared = trimmed
+        .trim_start_matches("pub(crate) ")
+        .trim_start_matches("pub(super) ")
+        .trim_start_matches("pub ");
+      if declared
+        .strip_prefix("mod ")
+        .and_then(|rest| rest.strip_suffix(';'))
+        .map(str::trim)
+        == Some(name)
+      {
+        return true;
+      }
+    }
+    armed = false;
+  }
+  false
 }
 
 /// Splits a source file into lines, marking the ones inside a `#[cfg(test)]` module.
@@ -958,6 +1025,47 @@ mod structural {
       if code.contains(pattern) {
         violations.push(format!("{}:{line_no}: {what}: `{pattern}`", file.display()));
       }
+    }
+  }
+
+  #[cfg(test)]
+  mod out_of_line_test_modules {
+    use crate::declared_under_cfg_test;
+
+    /// 2026-11-19 (R3, A-500). Do: read declaring files that put `tests` under `#[cfg(test)]` out of line, with an
+    /// attribute between and with a visibility, and files that declare it plainly, under `cfg(not(test))`, after a
+    /// test-only function, or declare another module. Expect: only the first three are test modules.
+    #[test]
+    fn a_module_declared_under_cfg_test_in_its_parent_is_test_code() {
+      assert!(declared_under_cfg_test(
+        "#[cfg(test)]\nmod tests;\n",
+        "tests"
+      ));
+      assert!(declared_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"t.rs\"]\n// golden vectors\nmod tests;\n",
+        "tests"
+      ));
+      assert!(declared_under_cfg_test(
+        "#[cfg(all(test, unix))]\npub(crate) mod tests;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test("mod tests;\n", "tests"));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(not(test))]\nmod tests;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(test)]\nfn helper() {}\nmod tests;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(test)]\nmod other;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(test)]\nmod tests {\n}\n",
+        "tests"
+      ));
     }
   }
 

@@ -1845,6 +1845,40 @@ impl Partition {
 
   // ------------------------------------------------------------------ the transition
 
+  /// [`Op::VolumeDestroyed`]'s effect: the tombstone takes the volume's slot, its sequence read before the record goes;
+  /// and the volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its one
+  /// wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
+  fn destroy_volume(&mut self, id: VolumeId) -> Result<(), DbError> {
+    let sequence = self.tombstone_sequence(id);
+    let tenant = self.volume(id).map(|volume| volume.owner.tenant());
+    self.remove_volume(id)?;
+    if let Some(sequence) = sequence {
+      self.tombstones.insert(id, sequence);
+    }
+    self.erase_volume_keys(id, tenant);
+    Ok(())
+  }
+
+  /// [`Op::SnapshotDestroyed`]'s effect: the record and its index entry go, with any capture base it was; and a carried
+  /// capture's mark goes with its snapshot (A-503), so its landings are refused from then on.
+  fn destroy_snapshot(&mut self, volume: VolumeId, id: SnapshotId) -> Result<(), DbError> {
+    let h = self
+      .snapshot_index
+      .remove(&snapshot_key(volume, id))
+      .ok_or(DbError::NotFound)?;
+    self.snapshots.remove(h)?;
+    self.captured_bases.remove(&CapturedBase {
+      volume,
+      snapshot: id,
+    });
+    if let Some((_, mark)) = self.carried.get_mut(&volume)
+      && *mark == Some(id)
+    {
+      *mark = None;
+    }
+    Ok(())
+  }
+
   /// Applies a recorded operation; unconditional, so replay is deterministic. A record the
   /// operation names that does not exist (a corrupted history) is a typed refusal.
   pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
@@ -1898,19 +1932,7 @@ impl Partition {
         v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
-      Op::VolumeDestroyed { id } => {
-        // The tombstone takes the volume's slot: its sequence is read before the record goes.
-        let sequence = self.tombstone_sequence(*id);
-        let tenant = self.volume(*id).map(|volume| volume.owner.tenant());
-        self.remove_volume(*id)?;
-        if let Some(sequence) = sequence {
-          self.tombstones.insert(*id, sequence);
-        }
-        // The volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its
-        // one wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
-        self.erase_volume_keys(*id, tenant);
-        Ok(())
-      }
+      Op::VolumeDestroyed { id } => self.destroy_volume(*id),
       Op::VolumeReleased { id } => self.release_volume(*id),
       Op::BaseCaptured { volume, snapshot } => {
         self.captured_bases.insert(CapturedBase {
@@ -1977,24 +1999,7 @@ impl Partition {
         self.snapshots.get_mut(h)?.identity = Some(*identity);
         Ok(())
       }
-      Op::SnapshotDestroyed { volume, id } => {
-        let h = self
-          .snapshot_index
-          .remove(&snapshot_key(*volume, *id))
-          .ok_or(DbError::NotFound)?;
-        self.snapshots.remove(h)?;
-        self.captured_bases.remove(&CapturedBase {
-          volume: *volume,
-          snapshot: *id,
-        });
-        // A carried capture's mark goes with its snapshot (A-503): its landings are refused from then on.
-        if let Some((_, mark)) = self.carried.get_mut(volume)
-          && *mark == Some(*id)
-        {
-          *mark = None;
-        }
-        Ok(())
-      }
+      Op::SnapshotDestroyed { volume, id } => self.destroy_snapshot(*volume, *id),
       Op::LineageAdded { edge } => {
         self.lineage.insert(&edge.child.bytes, edge.clone());
         Ok(())

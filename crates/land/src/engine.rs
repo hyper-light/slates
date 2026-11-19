@@ -44,7 +44,9 @@ use std::time::Instant;
 
 use slates_vfs::base::{BaseConfig, Landed};
 use slates_vfs::error::VfsError;
-use slates_vfs::host::{Barrier, HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs};
+use slates_vfs::host::{
+  Barrier, HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs, OsCode,
+};
 use slates_vfs::inode::{Fingerprint, WindowsAttributes, Witness};
 use slates_vfs::volume::{Store, Volume};
 
@@ -74,20 +76,6 @@ const KEPT_PREFIX: &str = ".slates-kept-";
 const HIDDEN_NAME_RADIX: u32 = 16;
 /// Format: the leading bytes of a manifest path's BLAKE3 that an aside name carries: one `u64`.
 const PATH_HASH_BYTES: usize = size_of::<u64>();
-/// Format: `EEXIST` on Linux and macOS (the seam reports it as `Unavailable(17)`).
-const ERRNO_EXIST: i32 = 17;
-/// Format: `EINVAL` on Linux and macOS: a filesystem without `RENAME_EXCHANGE` reports it.
-const ERRNO_INVAL: i32 = 22;
-/// Format: `ENOTSUP` on macOS: a filesystem without `RENAME_SWAP` reports it.
-const ERRNO_NOTSUP_MACOS: i32 = 45;
-/// Format: `EOPNOTSUPP` on Linux (`ENOTSUP` is the same number there).
-const ERRNO_NOTSUP_LINUX: i32 = 95;
-/// Format: `ENOSPC` on Linux and macOS: the entry fails and the landing continues.
-const ERRNO_NOSPC: i32 = 28;
-/// Format: `EDQUOT` on Linux.
-const ERRNO_DQUOT_LINUX: i32 = 122;
-/// Format: `EDQUOT` on macOS.
-const ERRNO_DQUOT_MACOS: i32 = 69;
 /// Format: the mode of a temporary directory before the entry's own mode is applied: owner
 /// only, so a half-built replacement is never readable by others.
 const STAGE_MODE: u32 = 0o700;
@@ -146,10 +134,10 @@ pub enum Outcome {
   Skipped(SkipReason),
   /// The disk changed to the overlay's bytes on its own; accepted without a write.
   AcceptedIdentical,
-  /// The host refused the write with this errno; the temporary was removed.
+  /// The host refused the write with this code, typed by its numbering (A-539); the temporary was removed.
   Failed {
-    /// The errno.
-    errno: i32,
+    /// The code the host named; none where it named none (a fetch under way, A-524).
+    code: Option<OsCode>,
   },
   /// A compare-and-swap lost before any write reached the name.
   Conflict(ConflictClass),
@@ -188,8 +176,8 @@ pub enum Degradation {
   BarriersOnly,
   /// A crash interrupted the landing; the report lists what finished.
   Crashed {
-    /// The errno.
-    errno: i32,
+    /// The code the host named, typed by its numbering (A-539).
+    code: OsCode,
   },
   /// A directory the landing touched could not be opened or synced: the entries named in it are on the
   /// disk but not known durable, so they stay in the volume's overlay, and a resume syncs the directory
@@ -565,8 +553,8 @@ struct Landing<'a, H: LandFs> {
   costs: CostSamples,
   /// The batch barriers taken (A-130).
   barriers: usize,
-  /// The host errno that ended the landing, when one did.
-  crashed: Option<i32>,
+  /// The host's code that ended the landing, when one did (A-539: typed by its numbering).
+  crashed: Option<OsCode>,
   /// Touched directories that could not be opened or synced: entries in them are not advanced.
   unsynced: BTreeSet<Box<str>>,
   /// Whether the media barrier the grant asked for failed: then no entry is advanced.
@@ -825,7 +813,7 @@ impl<H: LandFs> Landing<'_, H> {
   ) -> Result<(), HostError> {
     match self.host.rename_noreplace(aside_dir, aside, dir, name) {
       Ok(()) => Ok(()),
-      Err(HostError::Unavailable(ERRNO_EXIST)) => self.keep(aside_dir, aside_dir_path, aside, path),
+      Err(HostError::Exists(_)) => self.keep(aside_dir, aside_dir_path, aside, path),
       Err(e) => Err(e),
     }
   }
@@ -1687,30 +1675,25 @@ impl<H: LandFs> Landing<'_, H> {
   fn written_of(&mut self, attempted: Result<Written, WriteFailure>) -> Written {
     match attempted {
       Ok(w) => w,
-      Err(WriteFailure::Host(HostError::Unavailable(errno))) if disk_full(errno) => Written {
-        outcome: Outcome::Failed { errno },
+      // No room fails its entry alone, and the landing goes on (A-539: the seam names it, whatever the platform numbers).
+      Err(WriteFailure::Host(HostError::NoSpace(code))) => Written {
+        outcome: Outcome::Failed { code: Some(code) },
         window_ns: None,
       },
-      Err(WriteFailure::Host(HostError::Unavailable(errno))) => {
-        self.crashed = Some(errno);
+      // Any other refusal the host names a code for — a name in use or a verb missing where the landing expected
+      // neither, or anything it could not serve — ends the landing, whatever the code's number.
+      Err(WriteFailure::Host(
+        HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code),
+      )) => {
+        self.crashed = Some(code);
         Written {
-          outcome: Outcome::Failed { errno },
-          window_ns: None,
-        }
-      }
-      // A refusal in Win32's numbering is no kind the landing tells apart, whatever its number (A-527): it ends the
-      // landing, as an errno other than a full disk does, reported by its own number.
-      Err(WriteFailure::Host(HostError::Win32(code))) => {
-        let errno = win32_number(code);
-        self.crashed = Some(errno);
-        Written {
-          outcome: Outcome::Failed { errno },
+          outcome: Outcome::Failed { code: Some(code) },
           window_ns: None,
         }
       }
       // An entry below the target on a mount this daemon serves (A-227): refused before any open, that entry alone.
-      Err(WriteFailure::Host(HostError::OwnMount(errno))) => Written {
-        outcome: Outcome::Failed { errno },
+      Err(WriteFailure::Host(HostError::OwnMount(code))) => Written {
+        outcome: Outcome::Failed { code: Some(code) },
         window_ns: None,
       },
       Err(WriteFailure::Host(HostError::NotFound | HostError::NotDirectory)) => Written {
@@ -1722,9 +1705,9 @@ impl<H: LandFs> Landing<'_, H> {
         window_ns: None,
       },
       // A landing's target is a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to,
-      // that entry fails alone, with no errno to name.
+      // that entry fails alone, with no code to name.
       Err(WriteFailure::Host(HostError::Pending(_))) => Written {
-        outcome: Outcome::Failed { errno: 0 },
+        outcome: Outcome::Failed { code: None },
         window_ns: None,
       },
       Err(WriteFailure::Volume(e)) => Written {
@@ -1743,7 +1726,7 @@ impl<H: LandFs> Landing<'_, H> {
         self.touched.insert(dir_path.into());
         match self.host.mkdir(dir, name, mode, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
-          Err(HostError::Unavailable(ERRNO_EXIST)) => self.existing_directory(dir, name)?,
+          Err(HostError::Exists(_)) => self.existing_directory(dir, name)?,
           Err(e) => return Err(e.into()),
         }
       }
@@ -1758,7 +1741,7 @@ impl<H: LandFs> Landing<'_, H> {
           .symlink(dir, name, target, &staged, entry.windows.bits())
         {
           Ok(()) => Outcome::Written,
-          Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
+          Err(HostError::Exists(_)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
         }
       }
@@ -1852,7 +1835,8 @@ impl<H: LandFs> Landing<'_, H> {
     let started = Instant::now();
     let temp = match self.host.clone_temp(dir, &created, from, overlay.size) {
       Ok(temp) => temp,
-      Err(HostError::Unavailable(errno)) if no_clone(errno) => return Ok(None),
+      // The filesystem shares no extents (A-445): the bytes are written instead.
+      Err(HostError::Unsupported(_)) => return Ok(None),
       Err(e) => return Err(e.into()),
     };
     self.cloned = self.cloned.saturating_add(1);
@@ -2062,7 +2046,7 @@ impl<H: LandFs> Landing<'_, H> {
     // appeared meanwhile refused it, and it stays at its hidden name for the give-up below.
     let outcome = match placed {
       Ok(()) => Outcome::Written,
-      Err(HostError::Unavailable(ERRNO_EXIST)) => {
+      Err(HostError::Exists(_)) => {
         match self.host.unlink(dir, hidden) {
           Ok(()) | Err(HostError::NotFound) => {}
           Err(e) => return Err(e.into()),
@@ -2121,7 +2105,7 @@ impl<H: LandFs> Landing<'_, H> {
     let started = Instant::now();
     match self.host.exchange(dir, hidden, name) {
       Ok(()) => {}
-      Err(HostError::Unavailable(errno)) if no_exchange(errno) => {
+      Err(HostError::Unsupported(_)) => {
         self.exchange = false;
         return self.replace_by_renames(old, swap);
       }
@@ -2264,7 +2248,7 @@ impl<H: LandFs> Landing<'_, H> {
       self.put_back(dir, split(path).0, &aside, dir, name, path)?;
       self.host.unlink(dir, &staged)?;
       return match e {
-        HostError::Unavailable(ERRNO_EXIST) => Ok(Written {
+        HostError::Exists(_) => Ok(Written {
           outcome: Outcome::Undone(ConflictClass::TargetInUse),
           window_ns: None,
         }),
@@ -2407,13 +2391,14 @@ impl<H: LandFs> Landing<'_, H> {
       Err(HostError::NotDirectory | HostError::NotFile) if change.directory => {
         return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TypeChanged)));
       }
-      Err(HostError::Unavailable(errno)) => return Ok(MetaSet::Done(Outcome::Failed { errno })),
-      Err(HostError::Win32(code)) => {
-        return Ok(MetaSet::Done(Outcome::Failed {
-          errno: win32_number(code),
-        }));
+      // Refused by any kind the host names a code for, this entry fails alone (A-519, A-527): the landing tells none of
+      // them apart here (A-539).
+      Err(e) => {
+        return match named_code(e) {
+          Some(code) => Ok(MetaSet::Done(Outcome::Failed { code: Some(code) })),
+          None => Err(e.into()),
+        };
       }
-      Err(e) => return Err(e.into()),
     };
     let set = self.set_meta_through(file, change);
     if !matches!(set, Ok(MetaSet::Staged(_))) {
@@ -2546,9 +2531,9 @@ impl<H: LandFs> Landing<'_, H> {
     match self.host.rmdir(dir, name) {
       Ok(()) => Ok(Outcome::Written),
       Err(HostError::NotFound) => Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
-      Err(HostError::Unavailable(_) | HostError::Win32(_)) => {
-        Ok(Outcome::Conflict(ConflictClass::TargetInUse))
-      }
+      // Not empty (`ENOTEMPTY`, or POSIX's other answer `EEXIST`), in use, or refused by any other kind the host names
+      // a code for (A-539): the outsider's, kept.
+      Err(e) if named_code(e).is_some() => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
       Err(e) => Err(e.into()),
     }
   }
@@ -2570,7 +2555,7 @@ impl<H: LandFs> Landing<'_, H> {
       None => {
         let outcome = match self.host.mkdir(dir, name, mode, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
-          Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
+          Err(HostError::Exists(_)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
         };
         return Ok(Written {
@@ -2627,9 +2612,7 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(there) if there.dev == made.dev && there.ino == made.ino => {
         match self.host.rmdir(dir, fresh) {
           Ok(()) => {}
-          Err(HostError::Unavailable(_) | HostError::Win32(_)) => {
-            self.keep(dir, split(path).0, fresh, path)?;
-          }
+          Err(e) if named_code(e).is_some() => self.keep(dir, split(path).0, fresh, path)?,
           Err(e) => return Err(e.into()),
         }
       }
@@ -2671,7 +2654,7 @@ impl<H: LandFs> Landing<'_, H> {
       self.put_back(dir, split(path).0, &aside, dir, name, path)?;
       self.host.rmdir(dir, &plain)?;
       return match e {
-        HostError::Unavailable(ERRNO_EXIST) => Ok(Written {
+        HostError::Exists(_) => Ok(Written {
           outcome: Outcome::Undone(ConflictClass::TargetInUse),
           window_ns: None,
         }),
@@ -2719,7 +2702,7 @@ impl<H: LandFs> Landing<'_, H> {
     }
     match self.host.exchange(dir, a, b) {
       Ok(()) => Ok(true),
-      Err(HostError::Unavailable(errno)) if no_exchange(errno) => {
+      Err(HostError::Unsupported(_)) => {
         self.exchange = false;
         Ok(false)
       }
@@ -2841,7 +2824,7 @@ impl<H: LandFs> Landing<'_, H> {
       // The new name was taken meanwhile (`EEXIST`), or the host refused: the directory goes back.
       self.put_back(from_dir, from_dir_path, &aside, from_dir, from_name, from)?;
       return match e {
-        HostError::Unavailable(ERRNO_EXIST) => Ok(Outcome::Undone(ConflictClass::TargetInUse)),
+        HostError::Exists(_) => Ok(Outcome::Undone(ConflictClass::TargetInUse)),
         e => Err(e.into()),
       };
     }
@@ -2932,15 +2915,14 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
-  /// A host refusal that ends the landing: an errno other than a full disk (a host that stopped answering
-  /// — the simulated crash, an `EIO`) aborts the landing so nothing is advanced; a full disk and the typed
-  /// refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
+  /// A host refusal that ends the landing: one the host names a code for other than no room (a host that stopped
+  /// answering — the simulated crash, an `EIO`, a Win32 code) aborts the landing so nothing is advanced; no room and the
+  /// typed refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
   fn note_crash(&mut self, error: HostError) {
-    match error {
-      HostError::Unavailable(errno) if !disk_full(errno) => self.crashed = Some(errno),
-      // A Win32 code is no errno's full disk, whatever its number (A-527).
-      HostError::Win32(code) => self.crashed = Some(win32_number(code)),
-      _ => {}
+    if let HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code) =
+      error
+    {
+      self.crashed = Some(code);
     }
   }
 
@@ -3046,7 +3028,7 @@ impl<H: LandFs> Landing<'_, H> {
             }
             return Ok(false);
           }
-          Err(HostError::Unavailable(ERRNO_EXIST)) => {}
+          Err(HostError::Exists(_)) => {}
           Err(e) => return Err(e),
         }
       }
@@ -3110,8 +3092,8 @@ impl<H: LandFs> Landing<'_, H> {
       }
       HostKind::Dir => match self.host.rmdir(dir, aside) {
         Ok(()) => Ok(true),
-        // Not empty: never this landing's.
-        Err(HostError::Unavailable(_) | HostError::Win32(_)) => Ok(false),
+        // Not empty, or refused by any kind the host names a code for (A-539): never this landing's.
+        Err(e) if named_code(e).is_some() => Ok(false),
         Err(e) => Err(e),
       },
       _ => Ok(false),
@@ -3341,6 +3323,25 @@ fn batch_pages(store: &Store) -> u64 {
   u64::try_from(pages).unwrap_or(u64::MAX).max(1)
 }
 
+/// The code of a refusal the host named a code for, of any kind (A-539): a name that exists, no room, a verb the
+/// filesystem lacks, or anything else it could not serve. A metadata entry's open and a refused `rmdir` read these alike,
+/// as they read every errno before the seam named the kinds; a path on this daemon's own mount (A-227), a fetch under
+/// way (A-524) and the typed refusals are read on their own.
+fn named_code(error: HostError) -> Option<OsCode> {
+  match error {
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code) => Some(code),
+    HostError::NotFound
+    | HostError::NotDirectory
+    | HostError::NotFile
+    | HostError::StaleHandle
+    | HostError::OwnMount(_)
+    | HostError::Pending(_) => None,
+  }
+}
+
 /// The staged temporary a file with `overlay`'s bytes may be cloned from (A-445): the first of the batch's staged files
 /// with the same BLAKE3 and length, each complete and written out. The batch is the index: bounded by its pages
 /// ([`batch_pages`]), and its temporaries are held open until it is placed, so the one found is still this landing's.
@@ -3351,26 +3352,6 @@ fn clone_source(staged: &VecDeque<Staged>, overlay: &OverlayIdentity) -> Option<
       staged.copy.overlay.hash == overlay.hash && staged.copy.overlay.size == overlay.size
     })
     .map(|staged| staged.copy.temp)
-}
-
-/// Whether a clone was refused for want of sharing (`ENOTSUP` on macOS, `EOPNOTSUPP` on Linux and from the Windows
-/// writer): the bytes are then written instead.
-fn no_clone(errno: i32) -> bool {
-  errno == ERRNO_NOTSUP_MACOS || errno == ERRNO_NOTSUP_LINUX
-}
-
-fn no_exchange(errno: i32) -> bool {
-  errno == ERRNO_INVAL || errno == ERRNO_NOTSUP_MACOS || errno == ERRNO_NOTSUP_LINUX
-}
-
-fn disk_full(errno: i32) -> bool {
-  errno == ERRNO_NOSPC || errno == ERRNO_DQUOT_LINUX || errno == ERRNO_DQUOT_MACOS
-}
-
-/// The number an entry's failure reports for a refusal in Win32's numbering (A-527): the code as its own number, which
-/// the report's one number field holds beside errnos (GAPS); never compared with an errno's.
-fn win32_number(code: u32) -> i32 {
-  i32::try_from(code).unwrap_or(i32::MAX)
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -3820,7 +3801,7 @@ struct Saved {
   degraded: Vec<Degradation>,
   costs: CostSamples,
   barriers: usize,
-  crashed: Option<i32>,
+  crashed: Option<OsCode>,
   unsynced: BTreeSet<Box<str>>,
   media_failed: bool,
   placed: BTreeMap<Box<str>, Fingerprint>,
@@ -4464,8 +4445,8 @@ fn begin_advance<H: LandFs>(
   request: &LandingRequest,
   durability: Durability,
 ) -> Result<AdvanceState, LandingRefusal> {
-  if let Some(errno) = landing.crashed {
-    landing.degraded.push(Degradation::Crashed { errno });
+  if let Some(code) = landing.crashed {
+    landing.degraded.push(Degradation::Crashed { code });
   }
   if !landing.exchange {
     landing.degraded.push(Degradation::NoExchange {
@@ -4773,15 +4754,5 @@ mod tests {
       "a hash the batch does not hold"
     );
     assert_eq!(clone_source(&VecDeque::new(), &wanted(0xAA, 10)), None);
-  }
-
-  /// A-445. Do: ask whether each refusal means "this pair cannot share" (the bytes are then written) or a failure.
-  /// Expect `ENOTSUP` (macOS 45) and `EOPNOTSUPP` (Linux's and the Windows writer's 95) to fall back, and no other.
-  #[test]
-  fn only_a_refusal_to_share_falls_back_to_writing_the_bytes() {
-    assert!(no_clone(ERRNO_NOTSUP_MACOS) && no_clone(ERRNO_NOTSUP_LINUX));
-    for errno in [ERRNO_EXIST, ERRNO_INVAL, ERRNO_NOSPC, 1, 5] {
-      assert!(!no_clone(errno), "{errno}");
-    }
   }
 }

@@ -38,7 +38,8 @@ use aws_lc_rs::digest;
 use slates_transport::pacer::NANOS_PER_SECOND;
 use slates_transport::rtt::RttEstimator;
 use slates_vfs::host::{
-  BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
+  BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, OsCode,
+  WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -54,15 +55,18 @@ use super::time::ns_of_iso8601;
 const DIR_MODE: u32 = 0o040_755;
 /// Format: the `st_mode` of a base file: `S_IFREG` over `rw-r--r--`, as a file made under the conventional umask is.
 const FILE_MODE: u32 = 0o100_644;
-/// Format: POSIX's `EIO`, 5 on Linux and macOS: the store did not answer, or answered what was not asked.
-const EIO: i32 = 5;
-/// Format: POSIX's `ENOMEM`, 12 on Linux and macOS: a directory's listing is larger than the base's whole cache.
-const ENOMEM: i32 = 12;
-/// Format: POSIX's `EACCES`, 13 on Linux and macOS: the store refused the credential, or it expired.
-const EACCES: i32 = 13;
+/// Format: POSIX's `EIO`, 5 on Linux and macOS: the store did not answer, or answered what was not asked. An errno on
+/// every platform, typed so (A-539): the S3 base names a store's refusal in POSIX's words.
+const EIO: OsCode = OsCode::Errno(5);
+/// Format: POSIX's `ENOMEM`, 12 on Linux and macOS: a directory's listing is larger than the base's whole cache. An
+/// errno on every platform, typed so (A-539).
+const ENOMEM: OsCode = OsCode::Errno(12);
+/// Format: POSIX's `EACCES`, 13 on Linux and macOS: the store refused the credential, or it expired. An errno on every
+/// platform, typed so (A-539).
+const EACCES: OsCode = OsCode::Errno(13);
 /// Format: POSIX's `EINVAL`, 22 on Linux and macOS: a name asked for its link target that is no link, as `readlinkat`
-/// answers. S3 has no links, so a base lists none.
-const EINVAL: i32 = 22;
+/// answers. S3 has no links, so a base lists none. An errno on every platform, typed so (A-539).
+const EINVAL: OsCode = OsCode::Errno(22);
 /// Format: the domains a digest of a path and of an ETag are taken in, so neither collides with the other or with a
 /// base's identity.
 const INODE_DOMAIN: &[u8] = b"slates s3 inode\0";
