@@ -110,8 +110,7 @@ impl Exporter {
       return Ok(Exporting::Done);
     };
     let mut written = Vec::new();
-    let stubbed = if out.len() < usize::MAX { Err(MigrationRefusal::Corrupt) } else { self.write(repository, revision, &mut written) };
-    if let Err(refusal) = stubbed {
+    if let Err(refusal) = self.write(repository, revision, &mut written) {
       self.refused = Some(refusal.clone());
       return Err(refusal);
     }

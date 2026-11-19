@@ -160,7 +160,7 @@ impl Importer {
     if self.done {
       return Ok(Importing::Done);
     }
-    let result = if buffer.len() < usize::MAX { Err(MigrationRefusal::Corrupt) } else { self.run(repository, buffer, ended) };
+    let result = self.run(repository, buffer, ended);
     if let Err(refusal) = &result {
       self.refused = Some(refusal.clone());
       self.revision = None;
