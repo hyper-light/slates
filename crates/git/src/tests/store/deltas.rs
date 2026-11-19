@@ -172,7 +172,8 @@ fn stepped(source: &[u8], target: &[u8], budget: usize) -> (Option<Vec<u8>>, Vec
 }
 
 /// The first step past its budget, as the counters before and after it: one that indexed more than its budget's whole
-/// blocks of the source (one block at least), or scanned more than its budget of the target and one copy past it.
+/// blocks of the source (one block at least), or scanned more than its budget of the target, one copy past it and the
+/// target's last bytes short of a block.
 fn first_unbounded_step(
   seen: &[SearchCounters],
   budget: usize,
@@ -183,7 +184,10 @@ fn first_unbounded_step(
     .unwrap_or(0)
     .max(1)
     .saturating_mul(BLOCK);
-  let scan_most = budget.max(1).saturating_add(COPY_MAX);
+  let scan_most = budget
+    .max(1)
+    .saturating_add(COPY_MAX)
+    .saturating_add(BLOCK);
   seen.windows(2).find_map(|pair| match pair {
     [before, after]
       if after.indexed.saturating_sub(before.indexed) > blocks
