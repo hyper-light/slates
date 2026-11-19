@@ -1,5 +1,5 @@
-//! The `phase-heads` and `check:phases` payloads (A-545; `internals.bundle2` [B]; `phases.py` `binaryencode` and
-//! `binarydecode` [C]): entries of 24 bytes, a big-endian signed 32-bit phase then a node. `phase-heads` gives the heads
+//! The `phase-heads` and `check:phases` payloads (A-545; `internals.bundle2` \[B\]; `phases.py` `binaryencode` and
+//! `binarydecode` \[C\]): entries of 24 bytes, a big-endian signed 32-bit phase then a node. `phase-heads` gives the heads
 //! of each phase (a getbundle's part, and a push's toward a server with `phases=heads` when the push publishes
 //! changesets); `check:phases` gives the public heads and draft roots the pushing client saw. 7.2 reads 24 bytes at a
 //! time and refuses a short last entry ("bad phase-heads stream"); a phase it does not define fails it with a

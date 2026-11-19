@@ -121,6 +121,7 @@ fn repository(serial: u8, name: &str) -> RepositoryRecord {
     format: ObjectFormat::Sha1,
     default_branch: None,
     owner: owner(),
+    policy: crate::catalog::RepositoryPolicy::default(),
   }
 }
 

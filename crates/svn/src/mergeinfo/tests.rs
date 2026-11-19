@@ -51,12 +51,15 @@ fn ranges_of(mergeinfo: &Mergeinfo, source: &str) -> Vec<MergeRange> {
 // ---------------------------------------------------------------------------------------------------------------------
 // Subversion's vectors: parsing and writing.
 
+/// One of Subversion's valid values: the value, its one source and its ranges.
+type ValidCase<'a> = (&'a str, &'a str, &'a [(Revision, Revision, bool)]);
+
 /// A-605: `test_parse_single_line_mergeinfo` (`mergeinfo_vals`, `mergeinfo_paths`, `mergeinfo_ranges`): Subversion's 25
 /// valid values each read to its one path and its ranges: unordered and overlapping ranges sorted and combined, colons
 /// in paths, relative and non-canonical paths made canonical.
 #[test]
 fn subversions_valid_values_read_to_its_paths_and_ranges() {
-  let cases: [(&str, &str, &[(Revision, Revision, bool)]); 25] = [
+  let cases: [ValidCase<'_>; 25] = [
     ("/trunk:1", "/trunk", &[(0, 1, true)]),
     ("/trunk/foo:1-6", "/trunk/foo", &[(0, 6, true)]),
     (
@@ -1045,6 +1048,9 @@ fn a_byte_where_a_range_must_end_is_refused_by_where_it_stands() {
   }
 }
 
+/// A value and what reading it gives: the value written back, or the refusal.
+type Edge<'a> = (&'a [u8], Result<&'a [u8], MergeinfoRefusal>);
+
 /// A-605: The grammar's edges as `parse_rangelist` and `parse_top` draw them: a comma before a newline is accepted, at
 /// the value's end refused; one trailing newline is accepted, an empty line refused; the C locale's spaces after a
 /// colon skipped; the empty value is empty mergeinfo; a path named twice has its ranges merged, inheritable winning
@@ -1052,28 +1058,27 @@ fn a_byte_where_a_range_must_end_is_refused_by_where_it_stands() {
 #[test]
 fn the_grammar_edges_fall_where_subversions_parser_draws_them() {
   use MergeinfoRefusal as R;
-  assert_eq!(parsed("/a:1,\n/b:2").to_bytes(), b"/a:1\n/b:2");
-  assert_eq!(
-    Mergeinfo::parse(b"/a:1,"),
-    Err(R::RangeListUnterminated { at: 5 })
-  );
-  assert_eq!(parsed("/a:1\n").to_bytes(), b"/a:1");
-  assert_eq!(
-    Mergeinfo::parse(b"/a:1\n\n"),
-    Err(R::PathNotTerminated { at: 5 })
-  );
-  assert_eq!(Mergeinfo::parse(b"\n"), Err(R::PathNotTerminated { at: 0 }));
-  assert_eq!(Mergeinfo::parse(b"/a: \n/b:1"), Err(R::NoRanges { at: 0 }));
-  assert_eq!(parsed("/a:\t\x0b\x0c\r 5").to_bytes(), b"/a:5");
-  assert_eq!(parsed(""), Mergeinfo::default());
-  assert!(parsed("").is_empty());
-  assert_eq!(
-    parsed("trunk:4033\n/trunk:4039-4995").to_bytes(),
-    b"/trunk:4033,4039-4995"
-  );
-  assert_eq!(parsed("/a:1-5\n/a:3*").to_bytes(), b"/a:1-5");
-  assert_eq!(parsed("/a:3*\n/a:1-5*").to_bytes(), b"/a:1-5*");
-  assert_eq!(parsed("/a/../b/./:1").to_bytes(), b"/a/../b:1");
+  let edges: [Edge<'_>; 12] = [
+    (b"/a:1,\n/b:2", Ok(b"/a:1\n/b:2")),
+    (b"/a:1,", Err(R::RangeListUnterminated { at: 5 })),
+    (b"/a:1\n", Ok(b"/a:1")),
+    (b"/a:1\n\n", Err(R::PathNotTerminated { at: 5 })),
+    (b"\n", Err(R::PathNotTerminated { at: 0 })),
+    (b"/a: \n/b:1", Err(R::NoRanges { at: 0 })),
+    (b"/a:\t\x0b\x0c\r 5", Ok(b"/a:5")),
+    (b"", Ok(b"")),
+    (
+      b"trunk:4033\n/trunk:4039-4995",
+      Ok(b"/trunk:4033,4039-4995"),
+    ),
+    (b"/a:1-5\n/a:3*", Ok(b"/a:1-5")),
+    (b"/a:3*\n/a:1-5*", Ok(b"/a:1-5*")),
+    (b"/a/../b/./:1", Ok(b"/a/../b:1")),
+  ];
+  for (value, expected) in edges {
+    let read = Mergeinfo::parse(value).map(|mergeinfo| mergeinfo.to_bytes());
+    assert_eq!(read, expected.map(<[u8]>::to_vec), "{value:?}");
+  }
 }
 
 /// A-605: The value is a C string: a parse reads to its first NUL, as `svn_mergeinfo_parse` reads a `const char *`; a
@@ -1151,7 +1156,8 @@ fn cover_strategy() -> impl Strategy<Value = Vec<u8>> {
 
 /// Covers of `MODEL_REVISIONS` revisions, none of them non-inheritable.
 fn whole_strategy() -> impl Strategy<Value = Vec<u8>> {
-  prop::collection::vec(prop_oneof![Just(NONE), Just(WHOLE)], MODEL_REVISIONS)
+  let cover = any::<bool>().prop_map(|whole| if whole { WHOLE } else { NONE });
+  prop::collection::vec(cover, MODEL_REVISIONS)
 }
 
 /// Which revisions a list holds, whatever their kind.
@@ -1183,19 +1189,20 @@ fn pointwise(first: &[u8], second: &[u8], keep: impl Fn(u8, u8) -> bool) -> Vec<
 /// Up to three sources, among them a root, a colon and two paths ordered differently by bytes and by path, each with
 /// covers.
 fn sources_strategy() -> impl Strategy<Value = BTreeMap<&'static str, Vec<u8>>> {
-  let source = prop_oneof![
-    Just("/trunk"),
-    Just("/a-b"),
-    Just("/a/b"),
-    Just("/"),
-    Just("/x:y")
-  ];
+  let source = prop::sample::select(vec!["/trunk", "/a-b", "/a/b", "/", "/x:y"]);
   prop::collection::btree_map(source, cover_strategy(), 0..4)
 }
 
 /// The span of every model list.
 fn span() -> u64 {
   u64::try_from(MODEL_REVISIONS).unwrap()
+}
+
+/// A byte of a hostile value: four times in five from the grammar's alphabet, else any byte.
+fn hostile_byte() -> impl Strategy<Value = u8> {
+  let alphabet = prop::sample::select(b"0123456789-,*:/\n .a".to_vec());
+  (0_u8..5, alphabet, any::<u8>())
+    .prop_map(|(pick, from_alphabet, byte)| if pick < 4 { from_alphabet } else { byte })
 }
 
 proptest! {
@@ -1286,7 +1293,7 @@ proptest! {
       mergeinfo.insert(path(source), from_covers(cover));
     }
     let written = mergeinfo.to_bytes();
-    let read = Mergeinfo::parse(&written).unwrap();
+    let read = Mergeinfo::parse(&written).map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
     prop_assert_eq!(read.to_bytes(), written);
     prop_assert_eq!(read, mergeinfo);
   }
@@ -1295,10 +1302,7 @@ proptest! {
   /// back to a value that reads as itself; a commit's check accepts exactly what a read accepts of a value with no NUL.
   #[test]
   fn hostile_values_are_refused_or_read_canonically(
-    value in prop::collection::vec(prop_oneof![
-      4 => prop::sample::select(b"0123456789-,*:/\n .a".to_vec()),
-      1 => any::<u8>(),
-    ], 0..48)
+    value in prop::collection::vec(hostile_byte(), 0..48)
   ) {
     match Mergeinfo::parse(&value) {
       Ok(mergeinfo) => {
@@ -1319,10 +1323,12 @@ proptest! {
   #[test]
   fn cut_and_flipped_values_never_panic(cut in 0_usize..64, flip in 0_usize..512) {
     let value = b"/trunk:1-5,7*,9-12\n/branches/b:3,100-2147483647*".to_vec();
-    let cut_value = value.get(..cut.min(value.len())).unwrap().to_vec();
+    let cut_value = value.get(..cut.min(value.len())).unwrap_or_default().to_vec();
     let mut flipped = value.clone();
     let position = flip / 8 % flipped.len();
-    flipped[position] ^= 1 << (flip % 8);
+    if let Some(byte) = flipped.get_mut(position) {
+      *byte ^= 1 << (flip % 8);
+    }
     for candidate in [cut_value, flipped] {
       if let Ok(mergeinfo) = Mergeinfo::parse(&candidate) {
         prop_assert_eq!(Mergeinfo::parse(&mergeinfo.to_bytes()), Ok(mergeinfo));
@@ -1371,23 +1377,38 @@ fn a_range_is_forward_and_holds_the_revisions_after_its_start() {
   );
 }
 
+/// A node's own mergeinfo, what it would inherit, and whether the first elides to the second.
+type Elision<'a> = (Option<&'a Mergeinfo>, Option<&'a Mergeinfo>, bool);
+
 /// A-605: `should_elide_mergeinfo`: no mergeinfo never elides; empty mergeinfo elides to none or empty; any other never
 /// to none or empty, and otherwise when equal with inheritance compared.
 #[test]
 fn mergeinfo_elides_by_subversions_rules() {
-  let empty = Mergeinfo::default();
-  let some = parsed("/trunk:1-5");
-  let partial = parsed("/trunk:1-5*");
-  assert!(!elides(None, None));
-  assert!(!elides(None, Some(&some)));
-  assert!(elides(Some(&empty), None));
-  assert!(elides(Some(&empty), Some(&empty)));
-  assert!(!elides(Some(&empty), Some(&some)));
-  assert!(!elides(Some(&some), None));
-  assert!(!elides(Some(&some), Some(&empty)));
-  assert!(elides(Some(&some), Some(&parsed("/trunk:1-3,4-5"))));
-  assert!(!elides(Some(&partial), Some(&some)));
-  assert!(!elides(Some(&some), Some(&parsed("/trunk:1-6"))));
+  let (empty, some, partial) = (
+    Mergeinfo::default(),
+    parsed("/trunk:1-5"),
+    parsed("/trunk:1-5*"),
+  );
+  let (split, more) = (parsed("/trunk:1-3,4-5"), parsed("/trunk:1-6"));
+  let cases: [Elision<'_>; 10] = [
+    (None, None, false),
+    (None, Some(&some), false),
+    (Some(&empty), None, true),
+    (Some(&empty), Some(&empty), true),
+    (Some(&empty), Some(&some), false),
+    (Some(&some), None, false),
+    (Some(&some), Some(&empty), false),
+    (Some(&some), Some(&split), true),
+    (Some(&partial), Some(&some), false),
+    (Some(&some), Some(&more), false),
+  ];
+  for (explicit, inherited, expected) in cases {
+    assert_eq!(
+      elides(explicit, inherited),
+      expected,
+      "{explicit:?} to {inherited:?}"
+    );
+  }
 }
 
 /// A-605: The protocol's words: each mode's own, and any other word explicit (`svn_inheritance_from_word`).
@@ -1479,7 +1500,7 @@ fn at_or_beneath(place: &str, path: &str) -> bool {
 
 /// `place` moved from beneath `from` to beneath `to`.
 fn moved(place: &str, from: &str, to: &str) -> String {
-  let rest = &place[from.len()..];
+  let rest = place.get(from.len()..).unwrap_or_default();
   if from == "/" {
     format!("{to}/{rest}")
   } else {
@@ -1491,7 +1512,7 @@ fn moved(place: &str, from: &str, to: &str) -> String {
 fn parent_of(path: &str) -> &str {
   match path.rfind('/') {
     Some(0) | None => "/",
-    Some(cut) => &path[..cut],
+    Some(cut) => path.get(..cut).unwrap_or("/"),
   }
 }
 
@@ -1651,9 +1672,9 @@ impl Naive {
     while place != "/" {
       let parent = parent_of(&place).to_owned();
       let relative = if parent == "/" {
-        path[1..].to_owned()
+        path.get(1..)?.to_owned()
       } else {
-        path[parent.len() + 1..].to_owned()
+        path.get(parent.len() + 1..)?.to_owned()
       };
       chain.push((parent.clone(), relative));
       place = parent;
@@ -1668,9 +1689,9 @@ impl Naive {
       if let PropertyList::Held {
         identity,
         has_mergeinfo: true,
-      } = tree[&place].properties
+      } = tree.get(&place)?.properties
       {
-        let value = self.values[&identity].as_ref().unwrap();
+        let value = self.values.get(&identity)?.as_ref()?;
         let read = Mergeinfo::parse(value).ok();
         return Some(read.map(|mergeinfo| {
           if relative.is_empty() {
@@ -1695,7 +1716,7 @@ impl Naive {
         PropertyList::Held {
           identity,
           has_mergeinfo: true,
-        } => Mergeinfo::parse(self.values[&identity].as_ref().unwrap())
+        } => Mergeinfo::parse(self.values.get(&identity)?.as_ref()?)
           .ok()
           .map(|mergeinfo| (place.clone(), mergeinfo)),
         _ => None,
@@ -1732,7 +1753,7 @@ impl Contents for Naive {
       tree
         .keys()
         .filter(|place| *place != directory && parent_of(place) == directory)
-        .map(|place| place.rsplit('/').next().unwrap().to_owned())
+        .filter_map(|place| Some(place.rsplit('/').next()?.to_owned()))
         .collect(),
     )
   }
@@ -2041,7 +2062,7 @@ fn op_for(naive: &Naive, wish: &Wish, taken: &[String]) -> Option<Op> {
     .filter(|path| *path != "/" && !overlaps(path, taken))
     .collect();
   match wish.op % 6 {
-    0 | 1 | 2 => {
+    0..=2 => {
       let directories: Vec<&String> = head
         .iter()
         .filter(|(path, node)| {
@@ -2065,7 +2086,7 @@ fn op_for(naive: &Naive, wish: &Wish, taken: &[String]) -> Option<Op> {
         0 => Some(Op::AddDir(path, wished_props(wish))),
         1 => Some(Op::AddFile(path, wished_props(wish))),
         _ => {
-          let revision = u64::from(wish.from) % u64::try_from(naive.trees.len()).unwrap();
+          let revision = u64::from(wish.from) % u64::try_from(naive.trees.len()).ok()?;
           let tree = naive.tree(revision);
           let sources: Vec<String> = tree
             .keys()
@@ -2127,7 +2148,9 @@ fn same_queries(
   use MergeinfoInheritance as I;
   for path in naive.tree(revision).keys() {
     for inheritance in [I::Explicit, I::Inherited, I::NearestAncestor] {
-      let expected = naive.mergeinfo(path, revision, inheritance).unwrap();
+      let expected = naive
+        .mergeinfo(path, revision, inheritance)
+        .ok_or_else(|| TestCaseError::fail(format!("{path}@{revision} absent")))?;
       let actual = mergeinfo_at(&naive.index, naive, path, revision, inheritance)
         .map_err(|refusal| TestCaseError::fail(format!("{path}@{revision}: {refusal:?}")))?;
       prop_assert_eq!(
@@ -2139,7 +2162,10 @@ fn same_queries(
         inheritance
       );
       let holder_unparsed = naive.mergeinfo(path, revision, I::Inherited) == Some(None)
-        && naive.tree(revision)[path].properties.has_mergeinfo();
+        && naive
+          .tree(revision)
+          .get(path)
+          .is_some_and(|node| node.properties.has_mergeinfo());
       census.unparsed += usize::from(holder_unparsed && inheritance == I::Inherited);
       census.inherited += usize::from(inheritance == I::NearestAncestor && actual.is_some());
     }
@@ -2159,7 +2185,10 @@ fn same_queries(
       );
       census.listings += 1;
     }
-    let directory = naive.tree(revision)[path].kind == NodeKind::Directory;
+    let directory = naive
+      .tree(revision)
+      .get(path)
+      .is_some_and(|node| node.kind == NodeKind::Directory);
     census.pruned += usize::from(directory && naive.listed.borrow().is_empty());
   }
   let absent = mergeinfo_at(&naive.index, naive, "/absent", revision, I::Inherited);

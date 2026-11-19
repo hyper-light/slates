@@ -182,15 +182,7 @@ fn revision_zero_is_an_empty_root_that_is_its_own_copy_root() {
   let index = Index::new();
   assert_eq!(index.youngest(), 0);
   let root = at(&index, "/", 0);
-  assert_eq!(root.kind(), NodeKind::Directory);
-  assert_eq!((root.created_path(), root.created_revision()), ("/", 0));
-  assert_eq!(root.copy_root(), root.id());
-  assert_eq!((root.predecessor(), root.predecessor_count()), (None, 0));
-  assert_eq!((root.node_id(), root.copy_id()), (ROOT_NODE, ROOT_COPY));
-  assert_eq!(
-    (root.text(), root.properties(), root.mergeinfo_count()),
-    (None, PropertyList::Empty, 0)
-  );
+  assert_an_empty_root_that_is_its_own_copy_root(&root);
   assert_eq!(
     index.history("/").unwrap(),
     &[HistoryEntry {
@@ -239,12 +231,13 @@ fn a_change_makes_a_new_node_revision_of_every_directory_above_it_and_none_besid
   let mut index = trunk();
   let before = at(&index, "/trunk/lib", 1).id();
   commit(&mut index, vec![edit("/trunk/lib/a.c", 3)]);
-  for path in ["/", "/trunk", "/trunk/lib", "/trunk/lib/a.c"] {
-    assert_eq!(index.created_revision(path, 2).unwrap(), Some(2), "{path}");
-  }
-  for path in ["/branches", "/trunk/README"] {
-    assert_eq!(index.created_revision(path, 2).unwrap(), Some(1), "{path}");
-  }
+  assert_created_in(
+    &index,
+    &["/", "/trunk", "/trunk/lib", "/trunk/lib/a.c"],
+    2,
+    2,
+  );
+  assert_created_in(&index, &["/branches", "/trunk/README"], 2, 1);
   let lib = at(&index, "/trunk/lib", 2);
   assert_eq!(
     (lib.predecessor(), lib.predecessor_count()),
@@ -283,21 +276,10 @@ fn a_path_beneath_a_copy_is_its_sources_node_revision_until_it_changes_there() {
   );
   let (branch_id, _, branch_copy) = identities(&index, "/branches/b1", 2);
   commit(&mut index, vec![edit("/branches/b1/lib/a.c", 4)]);
-  let changed = at(&index, "/branches/b1/lib/a.c", 3);
-  assert_eq!(
-    (changed.created_path(), changed.created_revision()),
-    ("/branches/b1/lib/a.c", 3)
-  );
-  assert_eq!(
-    (changed.node_id(), changed.predecessor()),
-    (source_line, Some(source_id))
-  );
-  assert_eq!(changed.copy_id(), branch_copy);
-  assert_eq!(changed.copy_root(), branch_id);
-  let lib = at(&index, "/branches/b1/lib", 3);
-  assert_eq!(
-    (lib.created_path(), lib.copy_id(), lib.copy_root()),
-    ("/branches/b1/lib", branch_copy, branch_id)
+  assert_a_new_node_revision_on_the_branch(
+    &index,
+    (source_id, source_line),
+    (branch_id, branch_copy),
   );
   assert_eq!(
     index
@@ -563,6 +545,71 @@ fn mergeinfo_counts_every_node_holding_it_at_and_beneath_a_directory() {
   assert_eq!(counts(&index, 7, &["/trunk", "/"]), [0, 0]);
 }
 
+/// After an edit on branch b1 in revision 3: its `lib/a.c` is a new node-revision of the source's line (`source`: the
+/// source's node-revision and node identities), with b1's copy identity and b1 as its copy root (`branch`: b1's
+/// node-revision and copy identities), and so is its `lib` directory.
+fn assert_a_new_node_revision_on_the_branch(
+  index: &Index,
+  (source_id, source_line): (NodeRevisionId, NodeId),
+  (branch_id, branch_copy): (NodeRevisionId, CopyId),
+) {
+  let changed = at(index, "/branches/b1/lib/a.c", 3);
+  assert_eq!(
+    (changed.created_path(), changed.created_revision()),
+    ("/branches/b1/lib/a.c", 3)
+  );
+  assert_eq!(
+    (changed.node_id(), changed.predecessor()),
+    (source_line, Some(source_id))
+  );
+  assert_eq!(changed.copy_id(), branch_copy);
+  assert_eq!(changed.copy_root(), branch_id);
+  let lib = at(index, "/branches/b1/lib", 3);
+  assert_eq!(
+    (lib.created_path(), lib.copy_id(), lib.copy_root()),
+    ("/branches/b1/lib", branch_copy, branch_id)
+  );
+}
+
+/// `/d/f` replaced in revision 5 by a copy of its revision 2 shares an ancestor with revision 2, while the plain re-add
+/// of revision 4 is unrelated to it.
+fn assert_the_replacement_by_copy_relates_and_the_re_add_does_not(index: &Index) {
+  assert_eq!(at(index, "/d/f", 5).copy_from(), Some(("/d/f", 2)));
+  assert_eq!(
+    index.relation(("/d/f", 5), ("/d/f", 2)).unwrap(),
+    NodeRelation::CommonAncestor
+  );
+  assert_eq!(
+    index.relation(("/d/f", 4), ("/d/f", 2)).unwrap(),
+    NodeRelation::Unrelated
+  );
+}
+
+/// Revision zero's root as FSFS makes it: a directory created at `/` in revision 0, its own copy root, with no
+/// predecessor, the root's node and copy identities, and no text, properties or mergeinfo.
+fn assert_an_empty_root_that_is_its_own_copy_root(root: &Node<'_>) {
+  assert_eq!(root.kind(), NodeKind::Directory);
+  assert_eq!((root.created_path(), root.created_revision()), ("/", 0));
+  assert_eq!(root.copy_root(), root.id());
+  assert_eq!((root.predecessor(), root.predecessor_count()), (None, 0));
+  assert_eq!((root.node_id(), root.copy_id()), (ROOT_NODE, ROOT_COPY));
+  assert_eq!(
+    (root.text(), root.properties(), root.mergeinfo_count()),
+    (None, PropertyList::Empty, 0)
+  );
+}
+
+/// The revision each of `paths` was last created in, as of `revision`, is `created`.
+fn assert_created_in(index: &Index, paths: &[&str], revision: Revision, created: Revision) {
+  for path in paths {
+    assert_eq!(
+      index.created_revision(path, revision).unwrap(),
+      Some(created),
+      "{path}"
+    );
+  }
+}
+
 /// A-553 (§4.17.4 item 2, "History"): a path's history lists every node-revision created at it and every deletion of
 /// it, a replacement once; a directory's lists every revision that changed anything beneath it.
 #[test]
@@ -589,15 +636,7 @@ fn a_history_list_holds_every_creation_and_deletion_at_its_path() {
   assert_eq!(revisions(index.history("/").unwrap()), [0, 1, 2, 3, 4, 5]);
   assert_eq!(index.created_revision("/d/f", 3).unwrap(), None);
   assert_eq!(index.created_revision("/d/f", 4).unwrap(), Some(4));
-  assert_eq!(at(&index, "/d/f", 5).copy_from(), Some(("/d/f", 2)));
-  assert_eq!(
-    index.relation(("/d/f", 5), ("/d/f", 2)).unwrap(),
-    NodeRelation::CommonAncestor
-  );
-  assert_eq!(
-    index.relation(("/d/f", 4), ("/d/f", 2)).unwrap(),
-    NodeRelation::Unrelated
-  );
+  assert_the_replacement_by_copy_relates_and_the_re_add_does_not(&index);
   assert!(index.history("/never").unwrap().is_empty());
 }
 
@@ -1597,7 +1636,7 @@ impl Txn<'_> {
   /// A copy of a path of an earlier revision, of at most `COPY_CAP` paths, at a free place or over `replacing`.
   fn copy_of(&self, wish: &Wish, path: String, action: Action) -> Option<ChangedPath> {
     let revision = u64::from(wish.from) % self.revision;
-    let tree = &self.fs.trees[usize::try_from(revision).unwrap()];
+    let tree = self.fs.trees.get(usize::try_from(revision).ok()?)?;
     let sources: Vec<&String> = tree.keys().collect();
     let source = pick(&sources, wish.source)?.clone();
     if tree
@@ -1831,7 +1870,7 @@ impl Pairings {
 
 /// The naive answer at `path` in `revision`, if present.
 fn naive_answer(fs: &NaiveFs, path: &str, revision: Revision) -> Option<Answer> {
-  let label = *fs.trees[usize::try_from(revision).unwrap()].get(path)?;
+  let label = *fs.trees.get(usize::try_from(revision).ok()?)?.get(path)?;
   let node = &fs.nodes[label];
   Some(Answer {
     label,
@@ -1852,11 +1891,14 @@ fn naive_answer(fs: &NaiveFs, path: &str, revision: Revision) -> Option<Answer> 
   })
 }
 
-/// The index's answer at `path` in `revision`, if present.
-fn index_answer(index: &Index, path: &str, revision: Revision) -> Option<Answer> {
-  let node = index.node(path, revision).unwrap()?;
+/// The index's answer at `path` in `revision`, if present; a refusal of the question is the oracle's failure.
+fn index_answer(index: &Index, path: &str, revision: Revision) -> Result<Option<Answer>, String> {
+  let asked = index.node(path, revision);
+  let Some(node) = asked.map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))? else {
+    return Ok(None);
+  };
   let id = |id: NodeRevisionId| id.0;
-  Some(Answer {
+  Ok(Some(Answer {
     label: id(node.id()),
     node_id: (node.node_id().revision, node.node_id().number),
     copy_id: (node.copy_id().revision, node.copy_id().number),
@@ -1874,7 +1916,7 @@ fn index_answer(index: &Index, path: &str, revision: Revision) -> Option<Answer>
       properties: node.properties(),
       mergeinfo: node.mergeinfo_count(),
     },
-  })
+  }))
 }
 
 /// Every path any revision of `fs` held.
@@ -1888,10 +1930,13 @@ fn every_path(fs: &NaiveFs) -> BTreeSet<String> {
 /// Holds two naive replays of one history equal at every path of every revision.
 fn same_naive(left: &NaiveFs, right: &NaiveFs) -> Result<(), String> {
   let mut pairings = Pairings::new();
-  for (revision, tree) in left.trees.iter().enumerate() {
-    let revision = u64::try_from(revision).unwrap();
+  for (position, tree) in left.trees.iter().enumerate() {
+    let revision = u64::try_from(position).map_err(|error| error.to_string())?;
     let paths: Vec<&String> = tree.keys().collect();
-    let other: Vec<&String> = right.trees[usize::try_from(revision).unwrap()]
+    let other: Vec<&String> = right
+      .trees
+      .get(position)
+      .ok_or_else(|| format!("revision {revision}: absent from the other replay"))?
       .keys()
       .collect();
     if paths != other {
@@ -1900,8 +1945,9 @@ fn same_naive(left: &NaiveFs, right: &NaiveFs) -> Result<(), String> {
       ));
     }
     for path in paths {
-      let first = naive_answer(left, path, revision).unwrap();
-      let second = naive_answer(right, path, revision).unwrap();
+      let absent = || format!("{path}@{revision}: listed and absent");
+      let first = naive_answer(left, path, revision).ok_or_else(absent)?;
+      let second = naive_answer(right, path, revision).ok_or_else(absent)?;
       pairings.same(&first, &second, &format!("{path}@{revision}"))?;
     }
   }
@@ -1935,7 +1981,7 @@ fn same_as_index(index: &Index, fs: &NaiveFs, census: &mut Census) -> Result<(),
     for path in &paths {
       let place = format!("{path}@{revision}");
       match (
-        index_answer(index, path, revision),
+        index_answer(index, path, revision)?,
         naive_answer(fs, path, revision),
       ) {
         (None, None) => {}
@@ -1966,7 +2012,7 @@ fn same_history(
 ) -> Result<(), String> {
   let ours: Vec<(Revision, bool, usize)> = index
     .history(path)
-    .unwrap()
+    .map_err(|refusal| format!("{path}: {refusal:?}"))?
     .iter()
     .map(|entry| match entry.event {
       HistoryEvent::Created(node) => (entry.revision, true, node.0),

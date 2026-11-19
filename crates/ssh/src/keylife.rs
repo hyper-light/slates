@@ -11,7 +11,7 @@
 //!   bound of that kind; its own limit, 2^70 bytes under one nonce (the chacha draft §8), cannot be reached by one packet.
 //! - When to rekey: before the limit, at its half, the point RFC 4344 §3.1 itself prefers for packets ("rekey after
 //!   receiving more than 2**31 packets"), applied the same way to blocks and to both directions, as OpenSSH applies its
-//!   own (`MAX_PACKETS (1U<<31)` in `packet.c` at `fa4b2a82`) [C]. The other half covers what is in flight while the new
+//!   own (`MAX_PACKETS (1U<<31)` in `packet.c` at `fa4b2a82`) \[C\]. The other half covers what is in flight while the new
 //!   exchange runs; a key that reaches its whole limit anyway ends the connection.
 //! - An operator may cap a key's use lower ([`UsageCap`], as the session plane's `cap_key_usage` does), never higher.
 //!

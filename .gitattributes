@@ -44,9 +44,13 @@ crates/hg/fixtures/**/*.hg -text
 crates/hg/fixtures/wire/** -text
 # Revisions stock `hg` 7.2 stored (A-588): NUL-separated extras and manifests, metadata blocks, kept as stored.
 crates/hg/fixtures/objects/** -text
+# Revlogs stock `hg` 7.2 stored (A-611): index, data and docket files, and every revision's text, kept as stored.
+crates/hg/fixtures/revlogs/** -text
 # git's own wire and packs, captured from stock git 2.50.1: slates-git's golden vectors (A-582).
 crates/git/fixtures/*.bin -text
 crates/git/fixtures/*.pack -text
 crates/git/fixtures/*.idx -text
 # The deltas those packs carry, inflated once by make-delta-fixtures.sh (A-582 part 3).
 crates/git/fixtures/deltas/*.delta -text
+# Subversion dumps stock `svnadmin` 1.15.0 wrote (A-593): carriage returns and NULs inside their texts, kept as written.
+crates/svn/fixtures/dump/*.dump -text

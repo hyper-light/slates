@@ -321,6 +321,40 @@ fn an_object_its_tool_will_not_name_is_refused_with_the_tools_own_reason() {
   assert_empty(&store);
 }
 
+/// A-614 (§4.17.2 "A push", item 3: a store that names each object itself holds it under that name). Do: hold bytes
+/// under the name their tool gives them, then the same bytes again, then other bytes under that name; list what the
+/// push holds. Expect: `New`, then `Again` with one hold, then `Collision` with nothing stored; the push listing its one
+/// object with its kind, root and length.
+#[test]
+fn bytes_named_by_their_caller_are_held_under_that_name() {
+  let mut store = store();
+  let mut push = Quarantine::new();
+  let bytes: &[u8] = b"a blob its store named";
+  let id = named(&GitShaped, 3, b"", bytes);
+  assert_eq!(
+    push.hold_named(&mut store, &id, 3, bytes),
+    Ok(Admitted::New)
+  );
+  assert_eq!(
+    push.hold_named(&mut store, &id, 3, bytes),
+    Ok(Admitted::Again)
+  );
+  assert_eq!(store.holders(&ContentId::of(bytes)), 1);
+  assert!(matches!(
+    push.hold_named(&mut store, &id, 3, b"other bytes"),
+    Err(AdmitRefused::Collision { .. })
+  ));
+  assert!(!store.contains(&ContentId::of(b"other bytes")));
+  let held: Vec<(Vec<u8>, u8, ContentId, u64)> = push
+    .objects()
+    .map(|(id, kind, content, len)| (id.to_vec(), kind, content, len))
+    .collect();
+  let len = u64::try_from(bytes.len()).unwrap();
+  assert_eq!(held, vec![(id, 3, ContentId::of(bytes), len)]);
+  push.abandon(&mut store).unwrap();
+  assert_empty(&store);
+}
+
 /// A-581, §4.17.1 "Objects" item 1, D-6. Do: push a git-shaped object of ten windows (a full `a` window three times)
 /// and an object equal to that window, commit both, and read the long one back through its row. Expect: the long
 /// object's row names its root, a list; its bytes read back whole by its row's length; the short object is the long
@@ -817,36 +851,79 @@ fn blobs() -> Vec<Vec<u8>> {
   ]
 }
 
+/// A step, generated as plain tuples and a weighted selector, so the strategy needs no `Arc`-backed `prop_oneof!`
+/// (R2; `crates/base/src/s3/host.rs` is the pattern). The selector's ranges keep the weights the steps had: admit 4,
+/// commit 2, abandon 1, insert 3, get 2, seal 2, compact 2, due 1, fork 1, release 1, recreate 1.
 fn step() -> impl Strategy<Value = Step> {
-  let index = 0..INDEXES;
-  let push = 0..PUSHES;
-  let blob = 0..blobs().len();
-  let tool = prop_oneof![Just(Tool::Git), Just(Tool::Hg)];
-  prop_oneof![
-    4 => (push.clone(), tool, blob.clone(), 1u8..3, proptest::bool::weighted(0.1))
-      .prop_map(|(push, tool, blob, kind, lie)| Step::Admit(Arrival { push, tool, blob, kind, lie })),
-    2 => (push.clone(), index.clone()).prop_map(|(push, index)| Step::Commit { push, index }),
-    1 => push.prop_map(|push| Step::Abandon { push }),
-    3 => (index.clone(), 0u8..12, blob, 0u8..2)
-      .prop_map(|(index, key, blob, payload)| Step::Insert { index, key, blob, payload }),
-    2 => (index.clone(), 0u8..12).prop_map(|(index, key)| Step::Get { index, key }),
-    2 => (index.clone(), any::<bool>()).prop_map(|(index, all)| Step::Seal { index, all }),
-    2 => (index.clone(), 0usize..5).prop_map(|(index, runs)| Step::Compact { index, runs }),
-    1 => (index.clone(), 0u64..10_000, 0u64..10_000)
-      .prop_map(|(index, lookups_ns, inserts_ns)| Step::Due { index, lookups_ns, inserts_ns }),
-    1 => index.clone().prop_map(|index| Step::Fork { index }),
-    1 => index.clone().prop_map(|index| Step::Release { index }),
-    1 => index.prop_map(|index| Step::Recreate { index }),
-  ]
+  (
+    (
+      0u8..20,
+      0..PUSHES,
+      0..INDEXES,
+      any::<bool>(),
+      0..blobs().len(),
+      1u8..3,
+    ),
+    (
+      proptest::bool::weighted(0.1),
+      0u8..12,
+      0u8..2,
+      any::<bool>(),
+      0usize..5,
+      (0u64..10_000, 0u64..10_000),
+    ),
+  )
+    .prop_map(
+      |(
+        (selector, push, index, git, blob, kind),
+        (lie, key, payload, all, runs, (lookups_ns, inserts_ns)),
+      )| {
+        let tool = if git { Tool::Git } else { Tool::Hg };
+        match selector {
+          0..4 => Step::Admit(Arrival {
+            push,
+            tool,
+            blob,
+            kind,
+            lie,
+          }),
+          4..6 => Step::Commit { push, index },
+          6 => Step::Abandon { push },
+          7..10 => Step::Insert {
+            index,
+            key,
+            blob,
+            payload,
+          },
+          10..12 => Step::Get { index, key },
+          12..14 => Step::Seal { index, all },
+          14..16 => Step::Compact { index, runs },
+          16 => Step::Due {
+            index,
+            lookups_ns,
+            inserts_ns,
+          },
+          17 => Step::Fork { index },
+          18 => Step::Release { index },
+          _ => Step::Recreate { index },
+        }
+      },
+    )
 }
+
+/// One push's objects: each id with its kind and bytes.
+type Pushed = BTreeMap<Vec<u8>, (u8, Vec<u8>)>;
+
+/// One stored object's layout: each window's identity and its bytes.
+type Layout = BTreeMap<ContentId, Vec<u8>>;
 
 /// The oracle's model: each index a map of key to body, each push a map of id to kind and bytes, and every blob's
 /// layout.
 struct Model {
   indexes: Vec<Option<BTreeMap<Vec<u8>, Vec<u8>>>>,
-  pushes: Vec<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>,
+  pushes: Vec<Pushed>,
   blobs: Vec<Vec<u8>>,
-  layouts: BTreeMap<ContentId, BTreeMap<ContentId, Vec<u8>>>,
+  layouts: BTreeMap<ContentId, Layout>,
 }
 
 impl Model {

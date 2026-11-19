@@ -35,8 +35,12 @@
 //! ([`crate::ptrie::Nodes::visited`] does not move). A file's copy is one more holder of its block, never its bytes.
 //! An attribute's tree is two prefixes, the path's own attributes and its descendants' ([`Xattrs::copy_tree`]). The
 //! destination must be absent with nothing beneath it, as Subversion's copy needs (§4.17.4 item 3.2), and the subtree
-//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root is
-//! refused here: its tree is every key, which no one prefix names apart from its own; the engine decides its copy.
+//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root's
+//! tree is every key (A-586: a stock client copies `^/` into a child of itself): the whole map is held and grafted
+//! beneath the destination, and the root's own key, which came with it, is moved to the destination's own key (for
+//! attributes, its own prefix is cut away from beneath the destination, [`crate::ptrie::Ptrie::cut`]). The root is never
+//! a destination: it is always present. A tree is taken away again by [`Dim::cut_tree`], a copy's inverse, which a green
+//! made at a version before a copy runs.
 
 use std::collections::BTreeSet;
 
@@ -146,6 +150,11 @@ impl<V: Clone> Dim<V> {
   /// empty after, and no node is freed until the steps run.
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.root.releasing()
+  }
+
+  /// The nodes walks of this map's arena visited, while it holds its arena ([`Nodes::visited`]).
+  pub(crate) fn visited(&self) -> u64 {
+    self.nodes.visited()
   }
 }
 
@@ -336,6 +345,11 @@ impl Files {
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.map.releasing()
   }
+
+  /// [`Dim::visited`].
+  pub(crate) fn visited(&self) -> u64 {
+    self.map.visited()
+  }
 }
 
 /// Format: the bytes that end a path in an attribute's key (module docs, "Attributes keep their order"): two NULs,
@@ -460,6 +474,11 @@ impl Xattrs {
   /// [`Dim::releasing`].
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.map.releasing()
+  }
+
+  /// [`Dim::visited`].
+  pub(crate) fn visited(&self) -> u64 {
+    self.map.visited()
   }
 }
 

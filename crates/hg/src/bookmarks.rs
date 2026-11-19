@@ -1,5 +1,5 @@
-//! The `bookmarks` and `check:bookmarks` payloads (A-545; `internals.bundle2` [B]; `bookmarks.py` `binaryencode` and
-//! `binarydecode` [C]): entries of a 20-byte node, the name's length as a big-endian unsigned 16-bit integer, and the
+//! The `bookmarks` and `check:bookmarks` payloads (A-545; `internals.bundle2` \[B\]; `bookmarks.py` `binaryencode` and
+//! `binarydecode` \[C\]): entries of a 20-byte node, the name's length as a big-endian unsigned 16-bit integer, and the
 //! name. A node with every bit set (`wdirid`) stands for "no bookmark": in `bookmarks`, a deletion; in
 //! `check:bookmarks`, a bookmark the pushing client saw absent. 7.2 refuses an entry cut short ("bad bookmark
 //! stream"), as this module does.

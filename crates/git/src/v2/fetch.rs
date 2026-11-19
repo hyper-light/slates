@@ -1,6 +1,6 @@
-//! `fetch` (A-582, part 2; gitprotocol-v2 "fetch" [B]; `upload-pack.c` `process_args`, `send_acks`,
+//! `fetch` (A-582, part 2; gitprotocol-v2 "fetch" \[B\]; `upload-pack.c` `process_args`, `send_acks`,
 //! `send_shallow_info`, `send_wanted_ref_info`, `create_pack_file`, and `fetch-pack.c` `send_fetch_request`,
-//! `do_fetch_pack_v2`, `process_ack` [C]): its arguments, and its response's sections.
+//! `do_fetch_pack_v2`, `process_ack` \[C\]): its arguments, and its response's sections.
 //!
 //! **Arguments.** `want <id>`, `want-ref <ref>`, `have <id>`, `done`, `thin-pack`, `no-progress`, `include-tag`,
 //! `ofs-delta`, `shallow <id>`, `deepen <depth>`, `deepen-since <time>`, `deepen-not <rev>`, `deepen-relative`, `filter
@@ -39,12 +39,13 @@
 //! 2.50.1's `upload_pack_v2` wrote `wanted-refs` before `shallow-info`, which its own client refused, until
 //! `191740edaa4a` swapped them.
 
+use super::Refusal;
 use super::line::{self, Ending, Line, Packets, Part, SP};
-use super::{Refusal, refname};
 use crate::Admission;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::out::{Measure, Out};
 use crate::pktline::Packet;
+use crate::refname;
 use crate::sideband::{self, Band};
 
 /// Format: the argument naming an object the client wants [gitprotocol-v2 "fetch"].

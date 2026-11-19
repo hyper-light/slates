@@ -163,6 +163,37 @@ impl Quarantine {
         id: Box::from(arriving.id),
       });
     }
+    self.stage(store, arriving)
+  }
+
+  /// Holds bytes its caller has already named by its tool's rule, under that name: a tool's store that names each object
+  /// itself as it arrives (git's, A-614, which hashes each of a pack's objects once and checks a claimed id against
+  /// that one name). It is [`Quarantine::admit`] after its check: an id the push brought before is `Again` for the same
+  /// bytes and a `Collision` for others, and the budget refuses by kind.
+  pub fn hold_named(
+    &mut self,
+    store: &mut ContentStore,
+    id: &[u8],
+    kind: u8,
+    bytes: &[u8],
+  ) -> Result<Admitted, AdmitRefused<core::convert::Infallible>> {
+    self.stage(
+      store,
+      Arriving {
+        id,
+        kind,
+        context: &[],
+        bytes,
+      },
+    )
+  }
+
+  /// Holds a named object's bytes, or answers an id the push brought before.
+  fn stage<R>(
+    &mut self,
+    store: &mut ContentStore,
+    arriving: Arriving<'_>,
+  ) -> Result<Admitted, AdmitRefused<R>> {
     if let Some(staged) = self.staged.get(arriving.id) {
       return Quarantine::again(store, staged, arriving);
     }
@@ -212,6 +243,15 @@ impl Quarantine {
       .staged
       .get(id)
       .map(|staged| (staged.kind, staged.content, staged.len))
+  }
+
+  /// Every object held, in its ids' order: its id, kind, root content and length. A tool's own index writes its rows
+  /// from these (git's object and commit rows, A-614), then abandons the quarantine to give its holds back.
+  pub fn objects(&self) -> impl Iterator<Item = (&[u8], u8, ContentId, u64)> + '_ {
+    self
+      .staged
+      .iter()
+      .map(|(id, staged)| (&**id, staged.kind, staged.content, staged.len))
   }
 
   /// Commits every object into `index` as one step, then gives back the quarantine's holds, leaving it empty. Refused

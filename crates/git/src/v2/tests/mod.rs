@@ -168,6 +168,14 @@ pub(crate) fn canonical(bytes: &[u8]) -> Vec<u8> {
   out
 }
 
+/// Whether the flip at `index` made an upper-case hexadecimal digit of a lower-case one, which an id reads the same.
+fn upper_case_flip(original: &[u8], flipped: &[u8], index: usize) -> bool {
+  let byte = flipped[index];
+  byte.is_ascii_hexdigit()
+    && byte.is_ascii_uppercase()
+    && original[index] == byte.to_ascii_lowercase()
+}
+
 /// Where `refusal` stopped, for those that name a place.
 pub(crate) fn place(refusal: &Refusal) -> Option<u64> {
   match *refusal {
@@ -237,10 +245,11 @@ fn every_cut_of_every_stream_is_truncated_or_unfinished() {
   }
 }
 
-/// A-582 part 2, hostile input: do flip every bit of every byte of every golden stream and decode each. Expect: no
-/// panic; a refusal names a place inside the stream; and a stream still accepted encodes back to exactly its bytes,
-/// its length digits in lower case, so a decode never loses or invents a byte. The flips reach the refusals of every
-/// layer, which the tallies show.
+/// A-582 part 2, A-624, hostile input: do flip every bit of every byte of every golden stream and decode each. Expect:
+/// no panic; a refusal names a place inside the stream; and a stream still accepted encodes back to exactly its bytes,
+/// its length digits in lower case, so a decode never loses or invents a byte, except where the flip made an id's
+/// digit upper case, which is read as the same id and written back as the original byte. The flips reach the
+/// refusals of every layer, which the tallies show.
 #[test]
 fn every_bit_flip_of_every_stream_is_refused_by_kind_or_read_back_exactly() {
   let mut accepted = 0u32;
@@ -252,7 +261,9 @@ fn every_bit_flip_of_every_stream_is_refused_by_kind_or_read_back_exactly() {
         flipped[index] ^= 1 << bit;
         match decode_then_encode(message, &flipped) {
           Ok(written) => {
-            assert_eq!(written, canonical(&flipped), "{name} {index}.{bit}");
+            let as_read = written == canonical(&flipped)
+              || (upper_case_flip(stream, &flipped, index) && written == canonical(stream));
+            assert!(as_read, "{name} {index}.{bit}");
             accepted += 1;
           }
           Err(refusal) => {

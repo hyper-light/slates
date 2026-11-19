@@ -723,6 +723,15 @@ pub enum Op {
     /// The entry.
     entry: crate::catalog::RepositoryEntry,
   },
+  /// A repository's policy was set whole by its owner (§4.17.1 "Policy", A-622): its rules and hooks replaced, its
+  /// version the one after the version its setter read. An entry of the repository's register of this one change, so
+  /// it takes the register's next position (A-603). Appended.
+  RepositoryPolicySet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The policy, its version the next.
+    policy: crate::catalog::RepositoryPolicy,
+  },
 }
 
 impl Op {
@@ -763,6 +772,7 @@ impl Op {
       Op::ReviewApprovalStaled { .. } => "review_approval_staled",
       Op::ReviewClosed { .. } => "review_closed",
       Op::RepositoryAdvanced { .. } => "repository_advanced",
+      Op::RepositoryPolicySet { .. } => "repository_policy_set",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
