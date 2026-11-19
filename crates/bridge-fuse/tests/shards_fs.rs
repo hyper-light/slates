@@ -284,6 +284,12 @@ fn setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
   body
 }
 
+/// [`owner_word`] as a stream whose guest's `INIT` kept no `FUSE_SETXATTR_EXT` reads it: the tests below send the short
+/// `fuse_setxattr_in` (the extended form's own tests are the crate's, A-587).
+fn owner_word_short(request: &[u8]) -> Option<OwnerWord> {
+  owner_word(request, false)
+}
+
 /// A-281 (Shards' owner word, as Shards' server takes it). Do: read the word as a stream does, from the guest's root on
 /// the share's root, with and without trailing NULs and either flag; from another caller; on another node; with values
 /// that are no `UID:GID`; with a value cut short of its size; and read requests that are not the word. Expect the run's
@@ -293,7 +299,7 @@ fn setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
 fn shards_owner_word_is_taken_from_the_guests_root_on_the_shares_root_alone() {
   let set = Opcode::SetXattr as u32;
   let word = |nodeid: u64, caller: (u32, u32), value: &[u8]| {
-    owner_word(&message_as(
+    owner_word_short(&message_as(
       set,
       7,
       nodeid,
@@ -343,7 +349,7 @@ fn shards_owner_word_is_taken_from_the_guests_root_on_the_shares_root_alone() {
   let mut short = setxattr_body(OWNER_WORD, b"1000:1001");
   short[0..4].copy_from_slice(&64u32.to_le_bytes());
   assert_eq!(
-    owner_word(&message_as(set, 7, 1, (0, 0), &short)),
+    owner_word_short(&message_as(set, 7, 1, (0, 0), &short)),
     refused(5),
     "a value cut short of its size: EIO"
   );
@@ -355,7 +361,7 @@ fn shards_owner_word_is_taken_from_the_guests_root_on_the_shares_root_alone() {
 /// answers each.
 fn expect_every_other_request_left_to_the_dispatch() {
   assert_eq!(
-    owner_word(&message_as(
+    owner_word_short(&message_as(
       Opcode::SetXattr as u32,
       7,
       1,
@@ -366,7 +372,7 @@ fn expect_every_other_request_left_to_the_dispatch() {
     "another name is the dispatch's"
   );
   assert_eq!(
-    owner_word(&message_as(
+    owner_word_short(&message_as(
       Opcode::GetXattr as u32,
       7,
       1,
@@ -376,7 +382,11 @@ fn expect_every_other_request_left_to_the_dispatch() {
     None,
     "another opcode is the dispatch's"
   );
-  assert_eq!(owner_word(&[0u8; 8]), None, "no header: the dispatch's");
+  assert_eq!(
+    owner_word_short(&[0u8; 8]),
+    None,
+    "no header: the dispatch's"
+  );
 }
 
 /// A volume whose root and three files are kept as the host's, the run's and neither's, behind no bridge yet.

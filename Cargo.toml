@@ -115,6 +115,12 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 # gzip and deflate (A-595: a smart HTTP request body git gzips; §4.17.2 piece 3, a pack's objects): its backend is
 # chosen by measurement, the crate's default (miniz_oxide, pure Rust) until then.
 flate2 = "1"
+# SHA-1 with collision detection for git's object names (§4.17.2, A-600), as git's own sha1dc detects the SHAttered and
+# later attacks: RustCrypto's pure-Rust port of Stevens and Shumow's sha1collisiondetection (repository
+# RustCrypto/hashes), over RustCrypto's `sha1` and `digest`. Approved by main (2026-11-19) as RustCrypto's, pure Rust,
+# and refusing git's own t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`). No default features: neither
+# `std` nor the OID tables are used.
+sha1-checked = { version = "0.10.0", default-features = false }
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }

@@ -260,6 +260,8 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     // A repository's namespace binds greens only, under non-empty names without NUL bytes (§4.17.1, A-515).
     DbError::NotGreen => Refusal::NotGreen,
     DbError::InvalidName => Refusal::InvalidName,
+    // A green live members of its lineage were made from is pinned by them, as a snapshot by its clones (A-575).
+    DbError::BranchedFrom { .. } => volume(VolumeRefusal::Pinned),
   }
 }
 

@@ -2793,7 +2793,7 @@ impl Daemon {
       (engine.folded_below(), engine.retained_bytes().history)
     };
     let served = self.observe(self.shard_of_object(object), move |s| {
-      s.greens.get(&volume).map(history)
+      s.greens.get(&volume).map(|engine| history(&engine))
     })?;
     if served.is_some() {
       return Ok(served);
@@ -4615,7 +4615,7 @@ async fn init_shard(
     status_scatters: std::collections::BTreeMap::new(),
     last_work_ns: now,
     pending_forwards: std::collections::VecDeque::new(),
-    greens: std::collections::BTreeMap::new(),
+    greens: crate::greens::Greens::default(),
     works: std::collections::BTreeMap::new(),
     merge: crate::merge_service::MergeShardState::default(),
     ack_scatters: std::collections::BTreeMap::new(),

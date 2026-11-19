@@ -356,11 +356,16 @@ pub(crate) fn checkout_verb(
   if !unchanged_origin {
     return refused(Refusal::ConsistentBaseUnavailable);
   }
-  let Some(engine) = state.greens.get(&record.id) else {
+  // The green is lent for its head and the plan, then given back before the checkout's steps change anything.
+  let Some((version, planned)) = state.greens.get(&record.id).map(|engine| {
+    (
+      engine.head(),
+      plan(&Head::of_origin(&origin), &Head::of_green(&engine)),
+    )
+  }) else {
     return refused(Refusal::NotFound);
   };
-  let version = engine.head();
-  let (steps, report) = match plan(&Head::of_origin(&origin), &Head::of_green(engine)) {
+  let (steps, report) = match planned {
     Ok(planned) => planned,
     Err(path) => {
       return refused(Refusal::Unsupported {
