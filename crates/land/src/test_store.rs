@@ -1,10 +1,11 @@
 //! The store and the volume configuration this crate's unit tests land over (`captured_tests`, `chmod_tests`): one place
 //! for the fixture's sizes, each a shape of the tests rather than a tuning (R3), so the suites build the same fixture and
-//! a size is reviewed once.
+//! a size is reviewed once; and the host refusals of every kind the seam names, which those suites arm.
 
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::StepClock;
+use slates_vfs::host::{HostError, OsCode};
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, VolumeConfig};
@@ -27,6 +28,18 @@ const JOURNAL_BYTES: usize = 1 << 16;
 const CLOCK_START_NS: u64 = 1_000;
 /// Shape: the volume clock's step a read, in nanoseconds.
 const CLOCK_STEP_NS: u64 = 1;
+
+/// Shape: a host refusal of each kind the seam names (A-539), by the number its platform gives it: a name that exists
+/// (`EEXIST`, 17), no room (`ENOSPC`, 28), a verb the filesystem lacks (macOS's `EOPNOTSUPP`, 102, which its `open`
+/// answers for a socket), anything else (`EIO`, 5), and a Win32 code (`ERROR_ALREADY_EXISTS`, 183) beside them. Where the
+/// landing tells none of these apart, it must read each alike; it never compares the number.
+pub(crate) const REFUSALS_OF_EVERY_KIND: [HostError; 5] = [
+  HostError::Exists(OsCode::Errno(17)),
+  HostError::NoSpace(OsCode::Errno(28)),
+  HostError::Unsupported(OsCode::Errno(102)),
+  HostError::Unavailable(OsCode::Errno(5)),
+  HostError::Exists(OsCode::Win32(183)),
+];
 
 /// A store over one mapped region of `REGION_PAGES` pages.
 pub(crate) fn store() -> Store {

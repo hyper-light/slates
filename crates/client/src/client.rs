@@ -438,8 +438,9 @@ pub struct Client {
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
   /// deferred verb) do not block another request's. Only replies to `awaited` operations are kept, so
-  /// it never holds more than `awaited` does and nothing is ever evicted (AUD-29-22).
-  pending: Vec<(u64, ReplyBody)>,
+  /// it never holds more than `awaited` does and nothing is ever evicted (AUD-29-22). Each is kept with the stamp the
+  /// daemon wrote with it into the ring (`slates_ipc::slot`, "The stamp"; A-559), for [`Client::poll_reply_stamped`].
+  pending: Vec<(u64, ReplyBody, u32)>,
   /// The caller-owned operations outstanding: begun with [`Client::begin`], their replies not yet taken
   /// ([`Client::poll_reply`]) or abandoned ([`Client::abandon`]). Admission refuses a new one at
   /// `awaited_cap` (AUD-29-22): until 2026-10-01 the reply buffer instead evicted its oldest entry past twice
@@ -2279,7 +2280,7 @@ impl Client {
     let awaited = self
       .awaited
       .keys()
-      .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
+      .filter(|word| !self.pending.iter().any(|(held, _, _)| held == *word))
       .map(|word| RequestId::from_word(*word).sequence);
     let held = self
       .retry_held
@@ -2465,7 +2466,7 @@ impl Client {
             // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
             // goes on. Bounded: no more replies are in flight than the ring has slots.
             let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
-            self.buffer(reply.request, body);
+            self.buffer(reply.request, body, reply.stamp);
             continue;
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
@@ -2680,7 +2681,7 @@ impl Client {
   /// terminal channel failure): its buffered reply, if any, is dropped, and a reply that arrives later is
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
-    self.pending.retain(|(held, _)| *held != word);
+    self.pending.retain(|(held, _, _)| *held != word);
     if self.edit_chains.remove(&word).is_some()
       || self.list_chains.remove(&word).is_some()
       || self.changed_chains.remove(&word).is_some()
@@ -2750,15 +2751,26 @@ impl Client {
   /// [`Self::poll_reply`] by the request id's word — the form an async pump uses, which holds a
   /// request's id as its `u64` word across the yield to its event loop.
   pub fn poll_reply_word(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
-    if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
-      let (_, body) = self.pending.remove(pos);
+    self
+      .poll_reply_stamped(word)?
+      .map(|(body, _)| resolved(body))
+      .transpose()
+  }
+
+  /// [`Self::poll_reply_word`] with when the reply landed (A-559): the reply as the daemon wrote it, a refusal as
+  /// `ReplyBody::Refused` rather than an error, and the stamp the daemon wrote with it into the ring
+  /// (`slates_ipc::slot`, "The stamp"), zero where none did. A caller that splits its latency between the daemon and
+  /// itself widens the stamp with `slates_ipc::slot::landed_ns`.
+  pub fn poll_reply_stamped(&mut self, word: u64) -> Result<Option<(ReplyBody, u32)>, ClientError> {
+    if let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) {
+      let (_, body, stamp) = self.pending.remove(pos);
       self.awaited.remove(&word);
       // A page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
       self.list_chains.remove(&word);
       self.changed_chains.remove(&word);
       self.verdict_chains.remove(&word);
       self.note_reply(word, &body, true);
-      return resolved(body).map(Some);
+      return Ok(Some((body, stamp)));
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
@@ -2768,11 +2780,17 @@ impl Client {
         self.changed_chains.remove(&word);
         self.verdict_chains.remove(&word);
         self.note_reply(word, &body, true);
-        return resolved(body).map(Some);
+        return Ok(Some((body, reply.stamp)));
       }
-      self.buffer(reply.request, body);
+      self.buffer(reply.request, body, reply.stamp);
     }
     Ok(None)
+  }
+
+  /// The stamp the last request this client sent was written with as it landed in the command ring (A-559;
+  /// `slates_ipc::slot`, "The stamp"): zero before any. Read right after a send, it is that send's.
+  pub fn request_stamp(&self) -> u32 {
+    self.end.request_stamp()
   }
 
   /// Spins for `spin_ns` taking `id`'s reply if it lands — the async fast path: most replies arrive
@@ -2801,21 +2819,21 @@ impl Client {
   pub fn take_ready(&mut self) -> Result<Vec<u64>, ClientError> {
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
-      self.buffer(reply.request, body);
+      self.buffer(reply.request, body, reply.stamp);
     }
-    Ok(self.pending.iter().map(|(word, _)| *word).collect())
+    Ok(self.pending.iter().map(|(word, _, _)| *word).collect())
   }
 
   /// Buffers a reply drained for another request: kept when an outstanding operation awaits it (bounded by
   /// the admitted outstanding set, so nothing is evicted, item 8), dropped and counted when nothing does —
   /// a protocol-only acknowledgement's reply, or an abandoned operation's (AUD-29-22).
-  fn buffer(&mut self, id_word: u64, body: ReplyBody) {
+  fn buffer(&mut self, id_word: u64, body: ReplyBody, stamp: u32) {
     // A chain step's reply is its chain's: filed under the public word the caller awaits.
     if let Some(public) = self.chain_steps.remove(&id_word) {
       self.awaited.remove(&id_word);
       self.note_reply(id_word, &body, false);
-      if !self.pending.iter().any(|(held, _)| *held == public) {
-        self.pending.push((public, body));
+      if !self.pending.iter().any(|(held, _, _)| *held == public) {
+        self.pending.push((public, body, stamp));
       }
       return;
     }
@@ -2832,12 +2850,13 @@ impl Client {
       }
       return;
     }
-    if self.awaited.contains_key(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word)
+    if self.awaited.contains_key(&id_word)
+      && !self.pending.iter().any(|(held, _, _)| *held == id_word)
     {
       // Held as soon as it is drained: a reply in `pending` counts as received, so an acknowledgement sent before
       // its caller takes it must already stop below a refusal it will resend.
       self.note_reply(id_word, &body, true);
-      self.pending.push((id_word, body));
+      self.pending.push((id_word, body, stamp));
     } else {
       self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);
     }
@@ -3061,10 +3080,10 @@ impl Client {
   /// still typed: a chain advances on a refusal by ending.
   fn take_held(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
     self.take_ready()?;
-    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+    let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) else {
       return Ok(None);
     };
-    let (_, body) = self.pending.remove(pos);
+    let (_, body, _) = self.pending.remove(pos);
     self.awaited.remove(&word);
     Ok(Some(body))
   }
@@ -3257,10 +3276,10 @@ impl Client {
       return self.poll_as(word, extract_edited);
     }
     self.take_ready()?;
-    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+    let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) else {
       return Ok(None);
     };
-    let (_, body) = self.pending.remove(pos);
+    let (_, body, _) = self.pending.remove(pos);
     self.awaited.remove(&word);
     match resolved(body) {
       Ok(body) => self.advance_chain(word, body),

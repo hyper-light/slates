@@ -850,30 +850,7 @@ fn encode_regional_at(config: &RegionalConfiguration, layout: u32) -> Vec<u8> {
         .collect::<Vec<HostId>>(),
     );
   }
-  put_u32(
-    &mut out,
-    u32::try_from(config.retired.len()).unwrap_or(u32::MAX),
-  );
-  for (host, retirement) in &config.retired {
-    put_u64(&mut out, host.0);
-    put_u64(&mut out, retirement.version);
-    // Whether its confirmations certify their content (A-538): a byte, in the current layout only.
-    if certifies {
-      out.push(u8::from(retirement.certified));
-    }
-    encode_settled(&mut out, &retirement.settled);
-    encode_hosts(&mut out, &retirement.survivors);
-    encode_hosts(&mut out, &retirement.confirmed);
-    encode_hosts(&mut out, &retirement.unconfirmed);
-    // The current neighbourhood a change in flight reached (A-309): a presence byte, then its settled form.
-    match &retirement.current {
-      Some(current) => {
-        out.push(u8::from(true));
-        encode_settled(&mut out, current);
-      }
-      None => out.push(u8::from(false)),
-    }
-  }
+  encode_retired(&mut out, &config.retired, certifies);
   put_u32(
     &mut out,
     u32::try_from(config.adoptions.len()).unwrap_or(u32::MAX),
@@ -903,6 +880,38 @@ fn encode_regional_at(config: &RegionalConfiguration, layout: u32) -> Vec<u8> {
   }
   encode_hosts(&mut out, &config.voters);
   out
+}
+
+/// Encodes the kept retirements: their count, then each host, its version, its certification byte where `certifies` (the
+/// current layout and layout 6, A-538), its settled neighbourhood, its survivors, confirmed and unconfirmed hosts, and
+/// its current neighbourhood (a presence byte, then its settled form, A-309). Split from [`encode_regional_at`] so each
+/// step reads alone.
+fn encode_retired(
+  out: &mut Vec<u8>,
+  retired: &std::collections::BTreeMap<HostId, Retirement>,
+  certifies: bool,
+) {
+  put_u32(out, u32::try_from(retired.len()).unwrap_or(u32::MAX));
+  for (host, retirement) in retired {
+    put_u64(out, host.0);
+    put_u64(out, retirement.version);
+    // Whether its confirmations certify their content (A-538): a byte, in the layouts that carry it.
+    if certifies {
+      out.push(u8::from(retirement.certified));
+    }
+    encode_settled(out, &retirement.settled);
+    encode_hosts(out, &retirement.survivors);
+    encode_hosts(out, &retirement.confirmed);
+    encode_hosts(out, &retirement.unconfirmed);
+    // The current neighbourhood a change in flight reached (A-309): a presence byte, then its settled form.
+    match &retirement.current {
+      Some(current) => {
+        out.push(u8::from(true));
+        encode_settled(out, current);
+      }
+      None => out.push(u8::from(false)),
+    }
+  }
 }
 
 /// Encodes the completion records: their count, then each host, its version, its certification byte where `certifies`

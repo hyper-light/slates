@@ -114,7 +114,7 @@ impl Drop for Signalled<'_> {
     if unregistered == 0 {
       // Refused, so a callback may still read the post: it is kept for the process's life rather than freed under the
       // callback. Only a wait object this future did not make is refused, which no path here passes.
-      std::mem::forget(registered.post);
+      let _kept_for_the_process: &'static mut Post = Box::leak(registered.post);
     }
   }
 }
