@@ -617,8 +617,9 @@
 > §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
 > `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`, `Prepared::asks`) and the hooks at
-> `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
+> the walks over the whole view; (5, rest) pushes (A-657 part 4 built the policy before the verdict in `acl`'s words and
+> the `pretxnchangegroup` and `changegroup` hooks through the driver): the principal's Mercurial identity in `acl`'s
+> words (§4.13); the server's home for each Mercurial repository's index and
 > content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
 > 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
 > bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by

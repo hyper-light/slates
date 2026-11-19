@@ -13229,8 +13229,22 @@ signature verification).
 > 7.2's, then `push-plain`, `push-phase` and `push-bookmark` landed and answered byte for byte as 7.2 answered them,
 > `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
 > branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
-> histories. Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index
-> and the served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+> histories. Owed: the server's home for each repository's index and the served view over it (with A-650), the bundle
+> read in slices, the pushkey and part hooks, markers (piece 7).
+>
+> **Status (2026-11-19, A-657 part 4: a push's admission).** Before its verdict a prepared push asks the repository's
+> policy about every name it changes (`hg_push::admitted` over A-622 part 2's `vcs_policy::admit`: a line moved,
+> merged away or made on a new branch submits to its branch, a line made beside another head rewrites it, a bookmark
+> moved forward or made submits, moved elsewhere rewrites, deleted deletes), refused in `acl`'s words naming the
+> principal, the name and the first changeset the push brings on it (a bookmark's node), or in hgweb's for a principal
+> no rule lets push. Then the repository's `pretxnchangegroup` hooks run in their order through A-622's hook driver over
+> the push's pending view, `HG_NODE` and `HG_NODE_LAST` its first and last new changesets and none when it adds none,
+> the first that does not accept stopping the rest and answering `<name> hook exited with status <n>` (or `killed by
+> signal <n>`) with every hook's words salvaged as `output` parts after the changegroup's reply; the `changegroup`
+> hooks run after the commit and change no answer. Proven on the fixtures' repository (a rule denying `default`, a list
+> leaving the owner out on bookmarks) and through the driver with the test binary playing each hook. Owed: the
+> principal's Mercurial identity in `acl`'s words (§4.13), the pending view itself (piece 9's revlog view), the hooks'
+> learned times kept per hook on the shard.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13646,7 +13660,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    through A-618's builder over laid-out flat manifests. Built (A-657, part 3; `push::classify`, `push::held`,
    `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
    (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
-   each green's log with the phase roots in the same entry, the index kept; owed: the policy and the hooks (part 4).
+   each green's log with the phase roots in the same entry, the index kept. Built (A-657 part 4): the policy before the
+   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -45983,3 +45998,23 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   crate-visible); `crates/hg/src/push/{classify,classify_tests,held,commit,commit_tests}.rs` (new);
   `crates/server/src/repository.rs`, `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs` (new);
   `crates/server/Cargo.toml`, `Cargo.toml` and `Cargo.lock` (slates-server on slates-hg and slates-vcs).
+
+### A-657 part 4 (A-641 part 4) — a Mercurial push's admission: the repository's policy asked before the verdict in acl's words, and the hooks at pretxnchangegroup and changegroup through the hook driver (2026-11-19, g304, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" step 5, "Hooks", piece 5; A-622 parts 2 and 3, A-597; after A-657 part 3)
+
+- **What.** `hg_push::admitted(state, (principal, repository), &prepared)`: `vcs_policy::admit` over `Prepared::asks`, each
+  `Ask` a namespace, a label, a right and the changeset `acl` names; `admission_hooks` and `observing_hooks` (the
+  policy's hooks at `pretxnchangegroup` and `changegroup`, in its order, through A-597's `hg_pretxnchangegroup` and
+  `hg_changegroup`), `run_hooks` (A-622 part 3's driver, the first refusal answering in 7.2's words, each run's lesson
+  handed back), `Prepared::with_output` (the hooks' `output` parts after the changegroup's reply);
+  `classify::Plan::firsts`.
+- **Read from 7.2's code** (research §24): `hook.py` `_exthook` and `procutil.explainexit` (`%s hook %s`, `exited with
+  status %d`, `killed by signal %d`; a non-throwing point only warns), `changegroup.apply` (`pretxnchangegroup` runs
+  only when changesets were added, `node` and `node_last` the first and last); `acl`'s words written from its source
+  as recalled, to be checked against 7.2's `hgext/acl.py` on the Mac Studio.
+- **Decided.** The rights a Mercurial push asks (a forced push's new head is a rewrite of its branch; a merge that
+  retires a line submits); `acl`'s user the principal's record until §4.13 names its Mercurial identity; a hook past its
+  learned bound, unstartable, or ended by its client leaving refuses in slates' words, as a throwing hook would.
+- **Evidence.** Pending the Mac Studio's runs.
+- **Applied in the same change to:** §4.17.3's status (part 4) and piece 5's line; GAPS' §4.17.3 entry;
+  `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`; `crates/hg/src/push/classify.rs` and
+  `classify_tests.rs`.
