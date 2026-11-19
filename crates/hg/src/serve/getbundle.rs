@@ -769,8 +769,9 @@ impl<'m> MarkerIndex<'m> {
     index
   }
 
-  /// The markers `node` makes directly relevant.
-  fn direct(&self, node: &[u8]) -> impl Iterator<Item = usize> + '_ {
+  /// The markers `node` makes directly relevant (the iterator holds both the index and `node`, as edition 2024's
+  /// return-position `impl Trait` captures every lifetime in scope).
+  fn direct(&self, node: &[u8]) -> impl Iterator<Item = usize> {
     [&self.by_successor, &self.prunes_of, &self.prunes_under]
       .into_iter()
       .flat_map(move |map| map.get(node).into_iter().flatten().copied())
