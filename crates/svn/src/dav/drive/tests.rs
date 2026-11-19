@@ -52,7 +52,7 @@ fn filled(byte: u8, count: u64) -> Window {
 }
 
 /// A node's facts.
-fn facts(repository_path: &str, created_revision: Revision, sha1: Option<&str>) -> Facts<'_> {
+fn facts<'a>(repository_path: &'a str, created_revision: Revision, sha1: Option<&str>) -> Facts<'a> {
   Facts {
     repository_path,
     created_revision,

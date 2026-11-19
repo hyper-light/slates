@@ -98,7 +98,7 @@ fn recorded_lock<'a>(head: &'a str, body: &'a [u8], user: Option<&'a str>) -> Lo
 }
 
 /// The UNLOCK a recorded head makes for `user`.
-fn recorded_unlock(head: &str, user: Option<&'static str>) -> UnlockHttp<'_> {
+fn recorded_unlock<'a>(head: &'a str, user: Option<&'a str>) -> UnlockHttp<'a> {
   UnlockHttp {
     path: request_path(head).strip_prefix("/repo").unwrap(),
     user,
