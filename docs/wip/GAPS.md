@@ -202,6 +202,17 @@
 > (piece 8's next part: listeners on a shard, TLS, authentication, `100 Continue`, the services' bodies streamed
 > through, the staged close); the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's DAV through it.
 > Clippy, `xtask` and the lint matrix over the change are main's (run requests).
+> **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
+> writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
+> repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
+> client's `want` (the first with its capabilities), `have`, `done`, `shallow`, `deepen`, `deepen-since`,
+> `deepen-not` and `filter`, the server's `NAK` and `ACK` plain, `continue`, `common` and `ready`, the shallow-update,
+> and `ERR` from either side. A capability git does not define is kept by name; a malformed id or line is refused by
+> kind and place. Golden vectors are fifteen exchanges and six advertisements stock git wrote under protocol.version 0
+> and 1 (`fixtures/v0`, `make-v0-fixtures.sh`, SHA-256 checked). `cargo test -p slates-git --lib` over main with it:
+> 203 of 203 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
+> Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
+> the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
