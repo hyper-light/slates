@@ -43,8 +43,9 @@ mod tests {
 
   /// Shape: a `fusermount3` run on a quiet machine, 20 ms: one exec of a small setuid program and one system call.
   const QUICK_RUN_NS: u64 = 20_000_000;
-  /// Shape: the failover delay the cases run under: two liveness windows, a quiet fleet's order.
-  const DELAY_NS: u64 = 2 * LIVENESS_BUDGET_NS;
+  /// Shape: the failover delay the cases run under: three liveness windows, a quiet fleet's order, past one doubling of
+  /// the bound quick runs leave (a little over a window) and short of two.
+  const DELAY_NS: u64 = 3 * LIVENESS_BUDGET_NS;
 
   /// A-525 (R3, A-414's owed list: the failover placeholder's readers). Do: ask a shard's helper bound with no run
   /// measured, then after quick runs; then give two runs up; then let one finish. Expect: a liveness window at first; a
