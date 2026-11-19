@@ -4190,6 +4190,13 @@
 > the term its holder's write lease runs for (A-414), and A-554's keeper sleeps to the earliest taken back plus the
 > delay held at each pass, where it mirrored the client's old two-second reconnect budget (the wiring is Linux-only,
 > built by main). D-c is closed by these.
+> **Since A-570 (piece 5)** the pressure hold is sampled at its start and at the kernel's own memory-pressure reports
+> (macOS's dispatch source, Linux's pressure-stall trigger with its silence past a window as the stall's end, Windows'
+> memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
+> polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. NFSv4
+> purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
+> leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
+> re-arm.
 > Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
 > series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
 > the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.

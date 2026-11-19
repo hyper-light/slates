@@ -3050,21 +3050,33 @@ impl Daemon {
 
   /// Test support: the host memory available that this daemon's pressure sampler reads from now on, in
   /// place of the platform's reading (§4.2; admission.md §5.5) — so a test drives the sampler's
-  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard, since the
-  /// sampling shard is the reaper's.
+  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard; each reading is a report to
+  /// the sampler, as the kernel's would be (A-570), and the first replaces the source the baseline was taken from, so
+  /// the baseline is taken again from it.
   pub fn inject_available_memory(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.injected_available = Some(bytes))?;
+      self.observe(Some(shard), move |s| {
+        if s.injected_available.replace(bytes).is_none() {
+          s.pressure_baseline = None;
+        }
+        crate::pressure::ask(s);
+      })?;
     }
     Ok(())
   }
 
   /// Test support: this process's own resident memory as the pressure sampler reads it from now on, in place of the
   /// platform's reading (§4.2): with [`Daemon::inject_available_memory`], a test drives the sampler's split between
-  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is.
+  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is, a
+  /// report to the sampler as that is, and the first replaces the resident baseline's source as that does.
   pub fn inject_resident_memory(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.injected_resident = Some(bytes))?;
+      self.observe(Some(shard), move |s| {
+        if s.injected_resident.replace(bytes).is_none() {
+          s.pressure_resident_baseline = None;
+        }
+        crate::pressure::ask(s);
+      })?;
     }
     Ok(())
   }
@@ -3255,7 +3267,8 @@ impl Daemon {
 
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
-  /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
+  /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at each report of the host's
+  /// memory pressure (A-570, `crate::pressure`); this
   /// drives it directly so a test proves the mechanism without a real low-memory host: a raised hold
   /// refuses a new reservation while an admitted volume's within-entitlement writes still land. The
   /// injected hold is pinned: the sampler leaves those shards' holds alone from then on, so the test is
@@ -4688,8 +4701,12 @@ async fn init_shard(
     injected_resident: None,
     pressure_resident_baseline: None,
     pressure_sent: vec![(0, 0); config_shards.len()],
+    pressure_task: None,
+    pressure_asked: false,
     stop_watch: None,
     nfs_purges_refused: false,
+    nfs_purge_at: None,
+    nfs_purge_owed: false,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -4754,6 +4771,8 @@ async fn init_shard(
   // window into the start, by the deadline keeper (A-265, A-554).
   let started_ns = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   crate::landing::arm_owed_audit_look(&mut state, started_ns);
+  // The NFSv4 purges a predecessor journaled and its owners never took go out at once (A-570).
+  crate::nfs::arm_purges_at_start(&mut state, started_ns);
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
@@ -4811,6 +4830,10 @@ async fn init_shard(
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The pressure hold's sampler (A-570): on the control shard it samples at its start and at each report of the host's
+  // memory pressure; elsewhere it ends at once.
+  let sampler = futures::spawn(crate::pressure::sampler()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(sampler);
   // The NFS mounts this shard learned from its predecessor end their attachments when the kernel lets them go, as a
   // mount bound later does (A-511): the shard's watch of the kernel's unmounts starts once it holds an own mount.
   #[cfg(target_os = "macos")]
@@ -4862,16 +4885,18 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: the pressure hold, NFS purges, base hints
-/// and the idle seal; since A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
+/// The shard's tick for the cold work it still owns, at the liveness cadence: base hints and the idle seal. Since
+/// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
 /// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
-/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`). Dead clients are no longer its: since A-475
-/// each client's watch reports its hang-up and the shard's reaper retires it then (`crate::reap`); nor, since A-522,
-/// A-536 and A-554, are abandoned staging buffers, status captures, lapsed write leases, lapsed CLI attachments, grants
-/// past their term and the owed audit's resend, which the shard's keeper takes at their own deadlines
-/// (`crate::deadlines`), nor destroys, which the serve loop steps once woken and the keeper retries at a refused
-/// record's deadline. The jobs left here leave a piece at a time for the events or deadlines that own them, and then
-/// the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
+/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
+/// own reports (`crate::pressure`), and the NFSv4 purges owed are sent by the reaper at their own deadline
+/// (`crate::nfs::note_purges`). Dead clients are no longer its: since A-475 each client's watch reports its hang-up and
+/// the shard's reaper retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging
+/// buffers, status captures, lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's
+/// resend, which the shard's keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve
+/// loop steps once woken and the keeper retries at a refused record's deadline. The jobs left here leave a piece at a
+/// time for the events or deadlines that own them, and then the loop and its tick go (the reaper series, GAPS).
+/// Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4881,9 +4906,6 @@ async fn reap_loop() {
   .get();
   loop {
     pace(cadence).await;
-    refresh_pressure_hold().await;
-
-    crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
@@ -5435,9 +5457,10 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 }
 
 /// Samples the host's available memory and withholds the daemon's pressure hold from admission (§4.2; admission.md
-/// §5.5), run by the control shard's reap loop at the liveness cadence — the design's "cheap-refresh", one sampler a
-/// daemon (every shard runs a reap loop; before 2026-10-09 each sampled and sent its own reading to every shard, N²
-/// cross-shard messages a second on a daemon at rest, each waking a parked shard).
+/// §5.5), run by the control shard's sampler at its start and at each report of the host's memory pressure
+/// (`crate::pressure`, A-570; the reap loop's tick ran it once a liveness window until then) — the design's
+/// "cheap-refresh", one sampler a daemon (before 2026-10-09 every shard sampled and sent its own reading to every
+/// shard, N² cross-shard messages a second on a daemon at rest, each waking a parked shard).
 ///
 /// The hold is the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that
 /// is committed content, charged already), and never more than the daemon's unfilled room exceeds the host's free
@@ -5456,7 +5479,7 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 /// (`memory_available_now` is `None` on an unsupported platform) leaves the hold at zero — the budget then admits
 /// exactly as before, no worse than not sampling. The read is one cheap syscall or `/proc` line per cadence, not per
 /// request; the shards are asked for their free room only while the pool cannot cover the hold.
-async fn refresh_pressure_hold() {
+pub(crate) async fn refresh_pressure_hold() {
   let Some((origin, shards, hold)) = sample_pressure_hold() else {
     return;
   };
@@ -5531,10 +5554,10 @@ fn sample_pressure_hold() -> Option<(u16, Vec<u16>, u64)> {
 async fn free_room_of(origin: u16, shards: &[u16]) -> Vec<u64> {
   let mut free = Vec::with_capacity(shards.len());
   for &shard in shards {
-    // A wall bound, by its reason (A-435): the reap cadence's sample, taken on the control shard's reaper task beside
-    // its lease expiries and reaps; a shard that does not answer within a heartbeat reads as no room (counted), and
-    // the hold it would have taken goes to the others or to the debt the next growth takes on, so nothing is lost,
-    // while a wait in the shard's own time would hold the cadence's other work behind one busy shard.
+    // A wall bound, by its reason (A-435): the sampler's question (`crate::pressure`, A-570); a shard that does not
+    // answer within a heartbeat reads as no room (counted), and the hold it would have taken goes to the others or to
+    // the debt the next growth takes on, so nothing is lost, while a wait in the shard's own time would hold the
+    // sample behind one busy shard, past the report that asked for it.
     let room = crate::xshard::call_within(
       origin,
       shard,

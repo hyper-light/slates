@@ -92,6 +92,11 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   // A taken-back map no holder claimed by its claim's deadline is reclaimed by the reaper (A-197, A-554; Linux).
   #[cfg(target_os = "linux")]
   crate::held_copy::owe_reclaim_if_due(state, now);
+  // A purge round the NFSv4 table owes (at a start that owes purges, or a retry window after a round left any owed) is
+  // handed to the reaper, which awaits its owners (A-570).
+  if state.nfs_purge_at.is_some_and(|at| at <= now) {
+    crate::nfs::owe_purge_round(state);
+  }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -119,6 +124,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.landing.audit_look_at,
     state.departures_retry_at,
     claim_due(state),
+    state.nfs_purge_at,
   ]
   .into_iter()
   .flatten()

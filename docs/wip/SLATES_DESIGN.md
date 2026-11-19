@@ -1053,6 +1053,18 @@ Same code, zero modes.
 
 ### 4.2 Memory: arenas, slabs, handles, pages, RAM-only guarantees (D-8, D-12, D-13)
 
+> **Status (2026-11-19, A-570: the pressure hold is sampled at the host's own reports).** The control shard's sampler
+> (`crate::pressure`) samples the host's available memory and the daemon's resident memory at its start, which fixes
+> the baseline, and again at each report the kernel makes of a change in its memory pressure, never at a tick
+> (`slates_machine::memory_pressure`): macOS's dispatch memory-pressure source at every level, Linux's pressure-stall
+> trigger for any stall in the shortest window an unprivileged process may ask for (two seconds, psi.rst), and Windows'
+> low- and high-memory resource notifications. A stall's end is a report too: macOS reports a return to normal,
+> Windows its high-memory notification, and Linux's trigger, which reports stalls alone, by its silence past its own
+> window and one update interval (the kernel reports once a window while stalls go on). Between reports the hold stands
+> as last sampled. A kernel that offers no report (no PSI, or before unprivileged triggers) has the watch refused by
+> kind at the start, logged and counted (`pressure.watch_refused`, `pressure.watch_unsupported`), and nothing polls in
+> its place. Until A-570 the reap loop's tick sampled once a liveness window on every daemon.
+
 > **Correction (2026-09-20).** An explicit shard count is applied before deriving any
 > per-shard capacity or anchor geometry. The previous post-derivation override stranded
 > capacity when reducing the count and promised more than the host limit when increasing it.
@@ -3142,8 +3154,9 @@ therefore one implementation shared by both versions.
     the next drop.
     - **Amended 2026-10-10: a purge is owed durably.** The obligation is journaled in the same transaction as the drop
       that makes it (`ClientChange::PurgeOwed`, `Op::NfsPurgeOwed`). It is settled only once every owner acknowledged
-      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and each shard's reap loop sends a
-      round (`nfs::purge_owed_here`) besides a compound's own.
+      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and the shard's reaper sends a round
+      (`nfs::purge_owed_here`) besides a compound's own: at once at a start that owes purges, and a retry window after
+      any access that leaves the table owing (A-570; until then the reap loop's tick sent one once a window).
     - Before, the obligation lived only in memory. A daemon death between a client's durable clear and every owner's
       acknowledgement left its opens, locks and delegations at the owners, with no shard left knowing the client and so
       no lease to expire them (`a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it`;
@@ -4966,6 +4979,14 @@ root-relative path as an explicit alternative; it does not report that the reque
 > instrumented CI case first fails at 5.01 s; 100 corrected native Linux runs and all nine ring cases pass, as do
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
+> **Status (2026-11-19, A-570: the pressure hold leaves the tick).** The pressure hold's sampler (`crate::pressure`, a
+> task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
+> them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
+> dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536),
+> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold and NFS purges (A-570): the NFSv4
+> table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands the reaper a round at once
+> at a start that owes purges and a retry window after any access that leaves it owing. Base hints are next.
 
 > **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
 > named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
@@ -37999,6 +38020,82 @@ entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `cr
   (piece 7); the commit rule over these rows is piece 5. Opening a row's path looks each of its directories up beneath
   the ones above it, so a row costs lookups in the square of its depth; a large import may want the revision's opened
   directories kept between its rows. Nothing here is measured yet (main's, with the server's load).
+
+### A-570 — The pressure hold is sampled at the host's own memory-pressure reports, off the reap loop's tick (2026-11-19, goal 86, g255; the event-driven reaper's piece 5, job 1; §4.2, §4.7; A-336, A-554)
+
+- **What was there.** The reap loop's tick sampled the host's available memory and the daemon's resident memory on the
+  control shard once a liveness window (`daemon::refresh_pressure_hold`), whatever the host did, and every daemon woke
+  for it.
+- **The signal, chosen from principle.** The kernel's own classification of its memory pressure, delivered when it
+  changes, is the signal: the kernel knows its reclaim state, and a polled threshold on available bytes would be a guess
+  of ours (R3). So the sampler samples at the host's report (`slates_machine::memory_pressure::Events`):
+  - macOS: libdispatch's `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` at every level (normal, warning, critical), the
+    documented source "that monitors the system for changes in the memory pressure condition" [B: Apple Developer
+    Documentation, dispatch/source.h]. XNU tells its listeners one process a pass until none is left
+    (`memorystatus_update_vm_pressure`, `vm_pressure_select_optimal_candidate_to_notify` [C: XNU xnu-11215.1.10,
+    `bsd/kern/kern_memorystatus_notify.c`]), so each listener hears each change. kqueue's `EVFILT_VM`
+    (`NOTE_VM_PRESSURE`) was the other candidate; XNU's pressure notifier in that file names only the dispatch
+    listeners, so it was not taken. The handler runs on a dispatch thread and writes a byte to a pipe; the sampler
+    awaits the pipe readable through its shard.
+  - Linux: a pressure-stall trigger on `/proc/pressure/memory` for any stall (a microsecond, the kernel's unit) in the
+    shortest window an unprivileged process may ask for, two seconds, signalled by `POLLPRI` and "rate-limited to one
+    per tracking window" [B: kernel `Documentation/accounting/psi.rst`]. The runtime awaits readability alone, so the
+    trigger sits in an epoll set of its own, readable while the trigger has fired (epoll(7)): no runtime change. The
+    trigger is written to the kernel's interface file, not a host path, so its open carries a reasoned
+    `structural: allow`, and xtask's table of host-path sites says slates-machine writes that one file.
+  - Windows: the low- and high-memory resource notifications (`CreateMemoryResourceNotification`), each signalled
+    while its condition holds [B: Microsoft Learn]: the sampler awaits the one that names the next change through
+    `slates_rt::handle_wait`, so neither is awaited while signalled and nothing spins.
+- **A stall's end is a report.** macOS's source reports a return to normal and Windows' high-memory notification the
+  recovery. Linux's trigger reports stalls alone, "rate-limited to one per tracking window", its update interval a
+  tenth of the window (`UPDATES_PER_WINDOW` in `kernel/sched/psi.c`): so after a report, a window and an update interval
+  with no report is the stall's end in the kernel's own terms, and the sampler samples then
+  (`Events::stall_ended_after_ns`). The hold is let go by that sample as memory comes back. Between reports the hold
+  stands as last sampled, so it follows the kernel's account of its pressure, not our reading of the bytes between.
+- **A kernel that offers no report** (a Linux without PSI, or one before unprivileged triggers in 6.5; another
+  platform) has its watch refused by kind at the start: logged, and counted in the shard's status
+  (`pressure.watch_refused`, `pressure.watch_unsupported`); nothing polls in its place, and the hold stands as the
+  start's sample left it. A first draft of this piece took the host's measured stall (A-336's reading) at the control
+  shard's heartbeat on such a host, and sampled again a retry window on while a hold was held: both were a second path
+  (§2, item 7), a poll in the event's place, and were withdrawn before landing at main's review.
+- **When it samples.** At its start, which fixes the baseline; at each report, a stall's end included. With no report it
+  never wakes.
+- **A test's reading is a report.** `Daemon::inject_available_memory` and `inject_resident_memory` ask the sampler, as a
+  kernel report would; the first such reading replaces the source the baseline was taken from, so the baseline is
+  taken again from it (the recovery suite's two pressure tests inject after the start and wait for that baseline).
+- **Cost.** One task a shard (`LOOP_TASKS_PER_SHARD` 7 → 8; it ends at once off the control shard), and slates-machine's
+  unsafe budget 86 → 97 (libdispatch's source on macOS, the notifications on Windows; the file names each site).
+- **Tests.** `crates/server/src/pressure.rs`: `a_reported_fall_in_available_memory_is_held_back_without_a_tick` (a
+  one-shard daemon's readings pinned, the baseline fixed, then available falls by an eighth of the capacity: held back
+  within half a window); `crates/machine/src/memory_pressure.rs`:
+  `the_hosts_memory_pressure_reports_open_where_the_platform_offers_them`.
+- **Filed for main's build.** The Linux and Windows arms (`memory_pressure.rs`'s two platform modules and
+  `pressure::report_or_asked`'s Windows arm) were written on macOS and never compiled by g255.
+
+- **The NFS purge (job 2).** What a shard's NFSv4 table owes its owners (a dropped client's state, a destroyed
+  session's records, journaled since 2026-10-10) goes out at its own deadline, no longer at the tick: each access to
+  the table closes by noting whether it owes anything (`nfs::note_purges`, in `nfs_state::record_clients`), which arms
+  a round a retry window on while it does and clears the deadline once it does not; a start whose partition owes purges
+  arms one at once (`nfs::arm_purges_at_start`). The keeper hands the round to the reaper (`nfs::owe_purge_round`),
+  which awaits the owners. A client's own compound still sends its purges inline. The tick sent what was owed at its
+  looks, whatever the phase: a purge refused just before a look went again at once, one refused just after a look
+  waited a whole window, and every shard woke for it. Test: `crates/server/src/nfs.rs`
+  `a_refused_purge_goes_again_a_window_after_its_round` (a one-shard daemon past the tick's first look, its owners
+  refusing purges: a dropped client's purge refused, then sent again no sooner than a window after that round and
+  within half a window more).
+
+- **Evidence.** The Mac Studio (kiln d1323898, 2026-11-19 18:29 local, load 8.9, debug). Red first on main 8cb6bef with
+  the two server tests alone: the 4 GiB fall was not held back within half a window (`Ok(Ok(0))`, the tick's sample
+  not yet taken), and the refused purge went again 517 ms after its round, at the tick's next look. Green on 878895a:
+  `cargo fmt --check` clean; `slates-machine --lib memory_pressure` 1 of 1 (the dispatch source opens and drops on
+  macOS); `slates-server --lib -- pressure:: purge_round_tests nfs_state:: deadlines:: reap:: remote_attach:: landing::
+  config::` 39 of 39, the fall held back 1.9 ms after it and the refused purge sent again 1.0013 s after its round.
+- **Left for the next piece, in order.** Base hints with their delegation drain, the idle seal, the huge-page re-arm;
+  then the reap loop and its tick are deleted, and §4.7's status says so.
+
+Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper series' line), `unsafe-budget.toml`,
+`xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
+`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.
 
 ### A-574 — A laptop's failover detection is what its watchdog and its anchor measure: the widest shard window, then the anchor's lapse bound, read at every beat on every node (2026-11-19, UI goal 86 via g076b; R3's class D, its last fixed-window term; R8; §4.4 "Derived constants", §4.14 `daemon.alive`; A-363, A-405, A-455, A-467)
 Applied in the same change to: §4.4's status (the failover delay's paragraph), GAPS (the failover delay's entry: A-405's
