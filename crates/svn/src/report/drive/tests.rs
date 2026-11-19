@@ -10,7 +10,9 @@
 //! revision a path was deleted in, copy sources, pausing at any step, and generated hostile
 //! reports, whose drives must end and stay in the editor's order.
 
-use super::green::{CHANGED, FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5};
+use super::green::{
+  CHANGED, FixtureGuards, Green, guards_of, md5, normalize, repository, texts_by_md5,
+};
 use super::*;
 use crate::handshake::ClientCapabilities;
 use crate::ra_svn::Value;
@@ -466,5 +468,9 @@ fn a_changed_text_is_sent_as_a_delta_against_its_base() {
   let new_data: usize = windows.iter().map(|window| window.new_data.len()).sum();
   assert!(copies > 0, "no window copied from the base");
   assert!(new_data * 100 < target.len(), "{new_data} new bytes of {}", target.len());
-  assert_eq!(target.len(), source.len() + "edited on the branch of history".len() - "of a text long enough to need several windows".len());
+  let closed = calls[at..].iter().find_map(|call| match call {
+    Written::CloseFile(md5) => Some(*md5),
+    _ => None,
+  });
+  assert_eq!(Some(md5(&target)), closed, "the text made is not the one closed");
 }
