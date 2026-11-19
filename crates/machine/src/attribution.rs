@@ -38,8 +38,14 @@ pub struct Exchange {
 /// landing to its taking. `None` when a stamp is missing or the instants are not in the order the exchange makes them
 /// (sent, request landed, reply landed, taken), so nothing is taken from the server's part.
 pub fn harness_part(exchange: &Exchange) -> Option<u64> {
-  let _ = exchange;
-  None
+  let request = exchange.request_landed_ns?;
+  let reply = exchange.reply_landed_ns?;
+  if reply < request {
+    return None;
+  }
+  let before = request.checked_sub(exchange.sent_ns)?;
+  let after = exchange.taken_ns.checked_sub(reply)?;
+  before.checked_add(after)
 }
 
 /// What a quantile judged against a bound came to (module docs, "The verdict").
@@ -57,8 +63,13 @@ pub enum Verdict {
 /// Judges one quantile against `bound_ns` (module docs, "The verdict"): `latency_ns`, the quantile of the latencies,
 /// and `server_ns`, the same quantile of their server parts.
 pub fn judge(latency_ns: u64, server_ns: u64, bound_ns: u64) -> Verdict {
-  let _ = (latency_ns, server_ns, bound_ns);
-  Verdict::Met
+  if server_ns >= bound_ns {
+    Verdict::Missed
+  } else if latency_ns >= bound_ns {
+    Verdict::HarnessBound
+  } else {
+    Verdict::Met
+  }
 }
 
 #[cfg(test)]

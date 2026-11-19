@@ -4979,6 +4979,7 @@ pub fn pack<M: Wire>(
     kind: SlotKind::Bulk,
     request,
     payload: payload.to_vec(),
+    stamp: 0,
   })
 }
 
@@ -5023,6 +5024,7 @@ pub fn owned(region: &ClientRegion, slot: Slot) -> Result<Slot, IpcError> {
     kind: SlotKind::Inline,
     request: slot.request,
     payload: bulk_body(region, &slot.payload)?,
+    stamp: slot.stamp,
   })
 }
 

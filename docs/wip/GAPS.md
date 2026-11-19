@@ -3423,6 +3423,28 @@
 >     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
 >     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
 >
+>     **The harness splits each latency by the producers' stamps, measures its own noise, and charges the server only
+>     for its own part (2026-11-19, g083, A-559).** Main's reading of r100: the rounds with a bad p99 were the rounds
+>     where `load_bench` itself stalled (accepted submits' p99 29.2 and 22.9 ms beside sweeps of 33.8 and 37.5 ms and
+>     unseen windows of 44.0 and 37.6 ms; 2.7 and 0.42 ms beside 11.0 and 5.1 ms). Every slot now carries its
+>     producer's stamp in the four bytes that were padding (`slates_ipc::slot`, "The stamp": the low 32 bits of the
+>     host's monotonic clock as the slot was written, the lowest bit set so zero is unstamped), so the client knows when
+>     its request landed and the daemon's reply landed, not only when the sweep took it. An attempt's harness part is
+>     the time before its request landed and after its reply did (`slates_machine::attribution::harness_part`); a
+>     latency's sums its attempts' and its client's held sends; the server part is the rest. The `floor` rows are
+>     replaced by `latency_server`, `latency_harness`, `operation_server` and `operation_harness`; an attempt with a stamp
+>     missing or out of order is the server's whole (`unsplit`). Before each level, as many threads as it has workers
+>     watch the clock for 100 ms (`slates_machine::bench::longest_gap_ns`, `destroy_rows`' probe), and the longest gap
+>     is the level's noise floor (the `noise` row). The `bound` row judges each kind by its server part
+>     (`slates_machine::attribution::judge`): `met\tharness` when every server part is under the bound and some latency
+>     is not, never charged to the server, `met\tno` when a server part is at or over it. Tests, failing first:
+>     `slates-machine`'s attribution rule (a reply a stalled sweep left in the ring is the harness's time; an unstamped
+>     or disordered exchange keeps its whole latency the server's; a quantile charged only for its server part), the
+>     slot's stamp (widened back to its landing within a wrap; zero and a pre-clock landing are none; carried through a
+>     write and a read), and the bench's own (`a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`).
+>     **Owed (main's):** the bench and the suites compiled and run (the example is no `--lib` target), and the A/B again
+>     on a quiet machine with the split rows.
+>
 >     **Where a slow request's time goes (2026-11-18, g083's trace diagnostic, never on main).** Each attempt the
 >     harness timed was joined with every span the daemon's shards held for its request (each shard's sink sized to
 >     hold the run; the owner's answer to each ask and each resumed verb spanned too), on the Mac Studio at 1,000

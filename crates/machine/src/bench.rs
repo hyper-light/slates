@@ -185,6 +185,22 @@ pub fn bytes_per_second(bytes: u64, elapsed_ns: u64) -> u64 {
   u64::try_from(bps).unwrap_or(u64::MAX)
 }
 
+/// The longest gap between two consecutive clock reads on the calling thread over `window`, with nothing done between
+/// them (A-559): a harness's own noise floor, measured in place before it judges anything, as `vfs_bench`'s
+/// `destroy_rows` measures its scheduling jitter. Anything that long can happen to any step of the thread, and is the
+/// machine's doing, not the step's.
+pub fn longest_gap_ns(window: Duration) -> u64 {
+  let started = Instant::now();
+  let mut last = started;
+  let mut longest = 0u64;
+  while started.elapsed() < window {
+    let now = Instant::now();
+    longest = longest.max(nanos(now.saturating_duration_since(last)));
+    last = now;
+  }
+  longest
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -212,6 +228,18 @@ mod tests {
     );
     assert!(m.quick, "{m:?}");
     assert!(m.median_ns() >= 30_000_000, "{m:?}");
+  }
+
+  /// A-559. Do: probe this thread's longest clock gap over 20 ms. Expect: the probe watches its whole window and no
+  /// longer than it plus one gap, and the gap it reports is within what it watched.
+  #[test]
+  fn the_noise_probe_watches_its_window_and_reports_a_gap_within_it() {
+    let window = Duration::from_millis(20);
+    let started = Instant::now();
+    let longest = longest_gap_ns(window);
+    let watched = nanos(started.elapsed());
+    assert!(watched >= nanos(window), "watched {watched} ns of a {window:?} window");
+    assert!(longest <= watched, "a gap of {longest} ns in {watched} ns watched");
   }
 
   #[test]
