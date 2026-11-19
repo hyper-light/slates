@@ -13484,9 +13484,10 @@ signature verification).
 > 7.2 itself (`crates/hg/fixtures/hooks`): beside A-597's, `HG`, `HGPLAIN` 1, `HG_BUNDLE2` 1, `HG_TXNNAME` `serve`, and
 > one `HG_TXNID` for both hooks of a push. Proven on the fixtures' repository (a rule denying `default`, a list leaving
 > the owner out on bookmarks, a bookmark deleted, a push opening `stable` before moving `default`), against the
-> recorded environments, and through the driver with the test binary playing each hook. Owed: the
-> principal's Mercurial identity in `acl`'s words (§4.13), the pending view itself (piece 9's revlog view), the hooks'
-> learned times kept per hook on the shard.
+> recorded environments, and through the driver with the test binary playing each hook (macOS arm64, Mac Studio:
+> red with the five variables removed, then the server's 47 of 47 and slates-hg's 36 of 36). Owed: the principal's
+> Mercurial identity in `acl`'s words (§4.13), the pending view itself (piece 9's revlog view), the hooks' learned
+> times kept per hook on the shard.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -48203,7 +48204,17 @@ the copy oracle restoring every history at every version; `tests/checkpoint.rs`,
   is `hg` (slates runs no hg of its own, so a hook's `$HG` is the first on its search path); `HG_TXNID` is `TXN:` and
   forty digits of a BLAKE3 key derived from the push's name (7.2's hashes its transaction's start: one value a push,
   which no hook can predict).
-- **Evidence.** Pending the Mac Studio's runs.
+- **Evidence** (macOS arm64, Mac Studio, kiln r175, 2026-11-19, debug, on 97cc365b3). Red first: `changegroup_env`
+  without the five variables, `cargo test --locked -p slates-server --lib
+  vcs_hooks::tests::mercurials_hooks_get_the_environment_stock_7_2_hands_them` failed, 7 names against 7.2's recorded
+  12. Green: `cargo test --locked -p slates-server --lib -- hg_push vcs_hooks --test-threads=4` 47 of 47, its build
+  warning-free; `cargo test --locked -p slates-hg --lib -- push::` 36 of 36; `cargo fmt -p slates-hg -p slates-server
+  -- --check` clean. The first builds found three faults, each fixed: `hg_push` called slates-hg's crate-private
+  `node::write_hex` (now the server's `hex_of`); the hooks test's runtime returned at its first idle poll, no timer
+  being armed, and the test hung (its run now goes under `futures::within`, as `hook_driver`'s and `svn_hooks`' tests
+  do); and `Prepared`'s hook inputs were never read (a test now lands a push with a hook's words and reads its reply
+  as a client does). No integration target reaches the hook driver's Mercurial path. Further reds, clippy and the
+  other platforms are main's; `run_hooks` and the hook builders it uses are Unix's.
 - **Applied in the same change to:** §4.17.3's status (part 4) and piece 5's line; GAPS' §4.17.3 entry and its
   Mercurial hook variables (owed, now closed); `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`;
   `crates/server/src/vcs_hooks.rs`; `crates/hg/src/push/classify.rs` and `classify_tests.rs`;
