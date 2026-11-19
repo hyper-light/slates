@@ -249,9 +249,9 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       .publish_launcher_secret(secret.bytes())
       .map_err(|e| failed("launcher secret", e))?;
   }
-  // A crash loop's backoff doubles to the operator's failover SLO (A-311), logged with its derivation as the daemon's
+  // A crash loop's backoff doubles to its cap (A-311, [`restart_policy`]), logged with its derivation as the daemon's
   // derived constants are.
-  let policy = RestartPolicy::derive(config.failover_slo_ns);
+  let policy = restart_policy(&config);
   slates_machine::log_line!(
     "slates anchor: a crash loop backs off from its failed start's own life, doubling to {} ms: {} (anchors {:?})",
     policy.get().backoff_cap_ns / NS_PER_MS,
@@ -975,9 +975,40 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, (budget_ns, gap_ns): (u64
   lapses_at.saturating_sub(now_ns).min(gap_ns)
 }
 
+/// The policy this anchor restarts its daemon by (A-311): a crash loop's backoff doubles from the failed start's own life
+/// to the NFSv4 lease the daemon `config` derives grants its clients (A-525, `RestartPolicy::derive`).
+fn restart_policy(config: &DaemonConfig) -> slates_machine::Derived<RestartPolicy> {
+  RestartPolicy::derive(config.nfs_v4.lease_ns)
+}
+
 #[cfg(test)]
 mod lapse_tests {
   use super::*;
+
+  /// A-525 (A-311's cap; R3, A-414's owed list: the failover placeholder's readers). Do: derive a daemon configuration
+  /// as the anchor does, from this machine's profile, and take the anchor's restart policy for it. Expect the crash
+  /// loop's cap to be the NFSv4 lease that daemon grants its clients (A-425: an idle Linux client's renewal floor and a
+  /// liveness window): restarted at least once a lease, a crash-looping daemon is back before a client renewing at its
+  /// floor finds its lease run out once the cause clears. Before, the cap was the operator's ten-second placeholder,
+  /// past the six-second lease, so a client's state could lapse between two starts.
+  #[test]
+  fn a_crash_loops_backoff_is_capped_at_the_nfs_v4_lease_its_daemon_grants() {
+    let profile = MachineProfile::measure_patiently(&slates_machine::ProfileOptions {
+      budget_per_probe: Duration::from_nanos(HEARTBEAT_NS),
+      codecs: false,
+      core_matrix: false,
+    })
+    .unwrap();
+    let config = DaemonConfig::derive(&profile, "restart-policy", Some(1));
+    let policy = restart_policy(&config);
+    assert_eq!(
+      policy.get().backoff_cap_ns,
+      config.nfs_v4.lease_ns,
+      "a crash loop's doubling stops at the NFSv4 lease: {} ({:?})",
+      policy.formula,
+      policy.anchors
+    );
+  }
 
   /// g243's sibling (`docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`), A-228's start rule.
   /// Do: judge a start blocked in a call, its clock still and never runnable, look by look for most of a window; at the

@@ -52,12 +52,8 @@
 #   with it, since a mapping is its bytes whoever made it (`region.rs` `lock_bytes_whole`/`lock_bytes_range`):
 #   the whole-map lock on fault and its macOS arm (2) and the range lock with `MADV_DONTDUMP` (2), less the two
 #   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
-#   Sealed blocks (`sealed.rs`, 2026-11-18, A-273 step 3, D-7 "immutable chunk reads from any core"): a green's
-#   content read in place by its replicas on other shards instead of copied (A-64: content once). The reading helper
-#   (`read_in_place`, an unsafe fn by its contract: 1) and its one `slice::from_raw_parts` over a block's exposed
-#   address (1), its two callers, the writer's own read and a reader's read of a block in its live table (2), and the
-#   free of a block's boxed slice once every reader passed its release (`free_in_place`, `Box::from_raw`: 1): +5.
-#   63 → 68.
+#   Sealed blocks (`sealed.rs`, A-273 step 3, +5 on 2026-11-18: 63 → 68) went with the A-273 replicas, measured and
+#   rejected (2026-11-19, A-528): 68 → 63.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -196,6 +192,8 @@
 #   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
+# slates-hg (0): Mercurial's bundle2, bundle1, changegroup and delta codecs (A-514) are bounds-checked byte slices
+#   read through a cursor and written into vectors; safe Rust throughout.
 # slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
 #   same-kernel zero-copy read (§4.6, A-135): `MappedRead` mapped the daemon's arena block into this process
 #   (rustix `mmap`, `munmap`, and `slice::from_raw_parts` over the mapped bytes). Lowered 3 → 0 on 2026-10-25
@@ -309,7 +307,7 @@ slates-machine = 86
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 68
+slates-mem = 63
 # 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
 #   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
 #   `Inner::discard`). The call has no safe wrapper.
@@ -531,6 +529,7 @@ slates-bridge-fuse = 0
 # `TcpStream` (the socket unsafe lives in slates-rt) — no unsafe in this crate.
 slates-bridge-nfs = 0
 slates-merge = 0
+slates-hg = 0
 # slates-transport (0): the control-datagram codec is byte slices read and written in field order
 # through a bounded reader, never a cast; the owned QUIC dialect and the AEAD seal (later slices, §4.10a)
 # will carry their own budgeted sites (the rt UDP driver's unsafe lives in slates-rt).
@@ -655,7 +654,11 @@ slates-bridge-virtiofs = 3
 # (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
 # `statfs` of the path would touch the very mount the daemon serves. The Linux read of
 # `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
-slates-bridge-oci = 1
+# Raised to 2 on 2026-11-18 (A-511, g232): the macOS unmount watch's one `kevent` call (`kevent_now` in
+# `mount_table.rs`), which registers the `EVFILT_FS` filter on `VQ_UNMOUNT` and reads its event. rustix's
+# `kevent` cannot name `EVFILT_FS` (its `EventFilter` has no such variant), so the call is libc's; the queue
+# itself is made through rustix, and the Linux watch (an epoll instance over `/proc/self/mountinfo`) is safe rustix.
+slates-bridge-oci = 2
 # slates-conformance (0): pure parsers and records; no FFI, no I/O.
 slates-conformance = 0
 # slates-test-seeds (0): a proptest persistence over compiled seed text; no FFI, no I/O.

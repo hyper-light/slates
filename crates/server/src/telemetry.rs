@@ -44,7 +44,10 @@ pub(crate) fn emit(state: &mut ShardState, span: Span) {
 /// The `Telemetry` verb on the shard it names (§4.14): drains up to the reply quota of the ring, marks
 /// the batch with the loss before it, and judges every chokepoint's freshness against the horizon. The
 /// window a batch covers is the time since the previous drain (since boot for the first), so a reader
-/// draining on a cadence sees exactly the spans of each interval, each once.
+/// draining on a cadence sees exactly the spans of each interval, each once. The horizon is the failover delay the
+/// fleet measures (A-525; `F = D + E + R`, A-363, fanned to every shard as `ShardState::failover_ns`): a producer silent
+/// longer than the fleet takes to replace a dead owner is reported absent. Until A-525 it was the operator's ten-second
+/// placeholder.
 pub fn drain_verb(state: &mut ShardState, partition: u16) -> ReplyBody {
   if partition != state.partition {
     // `serve` routes a drain to the shard it names; reaching another shard is a routing bug, refused
@@ -55,7 +58,7 @@ pub fn drain_verb(state: &mut ShardState, partition: u16) -> ReplyBody {
   let drained = state.telemetry.drain_up_to(state.telemetry_quota);
   let window_ns = now_ns.saturating_sub(state.last_drain_ns);
   state.last_drain_ns = now_ns;
-  let horizon_ns = state.config.failover_slo_ns;
+  let horizon_ns = state.failover_ns;
   let dropped_total = state.telemetry.dropped();
   let report = summarize(
     partition,
@@ -453,6 +456,50 @@ mod tests {
       spans_per_reply(fixed - 1).get(),
       0,
       "too small a chunk: no spans, honestly"
+    );
+  }
+
+  /// A-525 (§4.14 freshness; R3, A-414's owed list: the failover placeholder's readers). Do: on an audit shard whose
+  /// live failover delay is two liveness windows, emit a `merge.verdict` span that ended three windows ago (no audit
+  /// shard makes one of its own) and drain the shard's telemetry. Expect the chokepoint not fresh, its age still stated,
+  /// and the batch's horizon the live delay: a producer silent past the failover delay the fleet measures (A-363) is
+  /// reported absent. Before, the horizon was the operator's ten-second placeholder, and a producer silent for five
+  /// times the delay was still fresh.
+  #[test]
+  fn a_chokepoint_silent_past_the_live_failover_delay_is_reported_absent() {
+    use slates_vfs::clock::Clock;
+    let window = crate::daemon::LIVENESS_BUDGET_NS;
+    let reply = crate::daemon::audit_on_shard(move |s| {
+      s.failover_ns = 2 * window;
+      let now = s.clock.monotonic_ns();
+      let mut tracer = Tracer::new(1, 0);
+      let span = tracer
+        .open_unlinked(
+          REQUEST,
+          Chokepoint::MergeVerdict,
+          now.checked_sub(4 * window).unwrap(),
+        )
+        .end(1, now.checked_sub(3 * window).unwrap());
+      super::emit(s, span);
+      let partition = s.partition;
+      super::drain_verb(s, partition)
+    });
+    let ReplyBody::Telemetry { report } = reply else {
+      panic!("the drain answers a report: {reply:?}");
+    };
+    let verdict = entry_of(&report, "merge.verdict");
+    assert!(
+      !verdict.fresh,
+      "silent past the live failover delay: absent, not fresh ({verdict:?})"
+    );
+    assert!(
+      verdict.latest_age_ns.is_some_and(|age| age >= 3 * window),
+      "its last sighting is still stated, as an age ({verdict:?})"
+    );
+    assert_eq!(
+      report.horizon_ns,
+      2 * window,
+      "the batch is judged against the live failover delay"
     );
   }
 }

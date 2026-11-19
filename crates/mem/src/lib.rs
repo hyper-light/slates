@@ -20,8 +20,7 @@
 //! formulas live next to their values as `Derived` (§4.2, "Derived constants").
 //!
 //! Modules: [`handle`], [`segmented`], [`slab`], [`buddy`], [`region`], [`lock`], [`prefault`],
-//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`], [`shared`], [`sealed`] (runs of bytes one shard writes once
-//! and any shard reads in place, A-273), and [`dax_object`] (the memory a VMM
+//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`], [`shared`], and [`dax_object`] (the memory a VMM
 //! maps one file's DAX ranges from, §4.6); under `--cfg loom`, `loom_bounds` holds the exploration bounds
 //! every loom model in the workspace checks through (AC-0.7).
 
@@ -46,7 +45,6 @@ pub mod prefault;
 mod ranges;
 pub mod region;
 pub mod ring;
-pub mod sealed;
 pub mod segmented;
 pub mod shared;
 pub mod slab;

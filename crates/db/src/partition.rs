@@ -1555,6 +1555,9 @@ impl Partition {
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
+      Op::AttachmentMountSeen { id, .. } => {
+        self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound)
+      }
       // Only an attachment presenting a snapshot is re-pinned; the head is not a version to move from.
       Op::AttachmentRepinned { id, .. } => self
         .attachment(*id)
@@ -2110,6 +2113,15 @@ impl Partition {
             (None, None) => crate::catalog::AttachForm::ChosenPath { path: path.clone() },
           };
         }
+        Ok(())
+      }
+      Op::AttachmentMountSeen { id, mount } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.mount = Some(*mount);
         Ok(())
       }
       Op::AttachmentRepinned { id, snapshot } => {

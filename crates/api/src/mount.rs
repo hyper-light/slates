@@ -382,15 +382,73 @@ const FUSE_DEVICE: &str = "/dev/fuse";
 /// machine's state — this process's `PATH`, `/dev/fuse`, WinFsp's library — and mounts nothing, so it needs no daemon;
 /// a daemon started from this process finds the same `PATH`. macOS always offers its loopback mount, `mount(2)` being
 /// built in.
+///
+/// On macOS and the BSDs the loopback mount is offered only where no one but root can capture loopback traffic (A-535):
+/// its capability rides every file handle in the clear, since the kernel's NFS client speaks neither RPC-with-TLS nor
+/// RPCSEC_GSS ([`MountMissing::PrivateLoopback`] otherwise).
 #[cfg(target_os = "macos")]
 pub fn available() -> Result<MountKind, MountFault> {
-  Ok(MountKind::NfsLoopback)
+  loopback_available(capture_open(bpf_devices()))
 }
 
-/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`.
+/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`, and a loopback no one but root can capture.
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 pub fn available() -> Result<MountKind, MountFault> {
-  nfs_available(backend())
+  nfs_available(backend()).and_then(|_| loopback_available(capture_open(bpf_devices())))
+}
+
+/// Format: the BPF capture devices of macOS and the BSDs: `/dev/bpf` (FreeBSD's cloning device) and `/dev/bpf<n>`,
+/// which xnu makes in order from 0 (`bsd/net/bpf.c`).
+#[cfg(all(unix, not(target_os = "linux")))]
+const BPF_DEVICE: &str = "/dev/bpf";
+
+/// Format: the owner-read permission bit (`S_IRUSR`, `<sys/stat.h>`).
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const READ_BY_OWNER: u32 = 0o400;
+/// Format: the group-read and other-read permission bits (`S_IRGRP | S_IROTH`, `<sys/stat.h>`).
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const READ_BY_OTHERS: u32 = 0o044;
+/// Format: root's user id.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const ROOT_UID: u32 = 0;
+
+/// The BPF capture devices this host has, as `(st_mode, st_uid)`: `/dev/bpf` if it exists, then `/dev/bpf0`,
+/// `/dev/bpf1` and on until one is missing or cannot be read, so the count is the system's own (a read of the device
+/// nodes' metadata, never an open).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bpf_devices() -> Vec<(u32, u32)> {
+  let of = |stat: rustix::fs::Stat| (u32::from(stat.st_mode), stat.st_uid);
+  let mut devices: Vec<(u32, u32)> = rustix::fs::stat(BPF_DEVICE).map(of).into_iter().collect();
+  for index in 0u32.. {
+    match rustix::fs::stat(format!("{BPF_DEVICE}{index}")) {
+      Ok(stat) => devices.push(of(stat)),
+      Err(_) => break,
+    }
+  }
+  devices
+}
+
+/// Whether anyone but root can capture this host's loopback traffic (A-535), judged from its BPF devices' modes and
+/// owners (`devices`, as `(st_mode, st_uid)`): one a group or anyone may read, or one owned by a user other than root
+/// who may read it. macOS leaves each `crw-------` root's alone; Wireshark's ChmodBPF gives every one to its
+/// `access_bpf` group to read. Pure, so every case is tested on any host.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+pub(crate) fn capture_open(devices: impl IntoIterator<Item = (u32, u32)>) -> bool {
+  devices
+    .into_iter()
+    .any(|(mode, uid)| mode & READ_BY_OTHERS != 0 || (uid != ROOT_UID && mode & READ_BY_OWNER != 0))
+}
+
+/// Whether the loopback mount may be offered on a host where loopback capture is `open` or not (A-535): refused
+/// [`MountMissing::PrivateLoopback`] where it is open. Pure, so every case is tested on any host.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+pub(crate) fn loopback_available(open: bool) -> Result<MountKind, MountFault> {
+  if open {
+    return Err(MountFault::Unsupported {
+      missing: MountMissing::PrivateLoopback,
+    });
+  }
+  Ok(MountKind::NfsLoopback)
 }
 
 /// See the macOS arm: Linux needs `fusermount3` on the `PATH` and `/dev/fuse` this user may read and write.
@@ -861,8 +919,8 @@ const BUSY_UNMOUNT: LetGo = LetGo::Forced;
 #[cfg(test)]
 mod tests {
   use super::{
-    MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
-    winfsp_available,
+    MountBackend, MountKind, ROOT_UID, capture_open, classify, export_path, fuse_available,
+    loopback_available, mount_args, nfs_available, winfsp_available,
   };
   use crate::error::{MountFault, MountMissing};
 
@@ -1036,8 +1094,54 @@ mod tests {
     );
   }
 
-  /// §4.6 A-34, A-278 — on macOS the loopback mount is always available: `mount(2)` is built in, so a host's fact is
-  /// `NfsLoopback` with nothing to install.
+  /// §4.13, A-535 — a macOS or BSD host is told it can mount only where no one but root can capture its loopback: a
+  /// mount's capability rides every file handle in the clear, which the kernel's NFS client cannot encrypt. Do: judge BPF
+  /// devices as macOS leaves them (root's, read by root alone), as Wireshark's ChmodBPF leaves one (read by its group),
+  /// read by anyone, owned and read by a user, and none at all; then ask the loopback's availability under each answer.
+  /// Expect capture open exactly where a group, anyone or a user other than root may read a device; the mount offered
+  /// where capture is closed and refused `PrivateLoopback` where it is open, its words naming the devices and the fix.
+  /// Before A-535 every macOS host was told it could mount, and a group granted capture read each mount's capability
+  /// off loopback. Pure, so every case runs on any host.
+  #[test]
+  fn a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback() {
+    /// Format: a character device's file-type bits (`S_IFCHR`, `<sys/stat.h>`).
+    const CHAR_DEVICE: u32 = 0o020_000;
+    /// Shape: a user other than root (macOS's first account's id).
+    const USER: u32 = 501;
+    let root_only = (CHAR_DEVICE | 0o600, ROOT_UID);
+    assert!(
+      !capture_open([root_only, root_only]),
+      "macOS's default: each device root's alone"
+    );
+    assert!(
+      capture_open([root_only, (CHAR_DEVICE | 0o660, ROOT_UID)]),
+      "one device its group may read, as ChmodBPF leaves them"
+    );
+    assert!(
+      capture_open([(CHAR_DEVICE | 0o604, ROOT_UID)]),
+      "a device anyone may read"
+    );
+    assert!(
+      capture_open([(CHAR_DEVICE | 0o600, USER)]),
+      "a device a user owns and may read"
+    );
+    assert!(!capture_open([]), "no device: nothing captures");
+    assert_eq!(loopback_available(false), Ok(MountKind::NfsLoopback));
+    assert_eq!(
+      loopback_available(true),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::PrivateLoopback
+      })
+    );
+    let words = MountMissing::PrivateLoopback.to_string();
+    assert!(
+      words.contains("/dev/bpf") && words.contains("chmod 600"),
+      "the refusal names the devices and the fix: {words}"
+    );
+  }
+
+  /// §4.6 A-34, A-278, A-535 — on a Mac whose loopback no one but root can capture (macOS's default) the loopback mount
+  /// is available: `mount(2)` is built in, so a host's fact is `NfsLoopback` with nothing to install.
   #[cfg(target_os = "macos")]
   #[test]
   fn macos_always_offers_its_loopback_mount() {
