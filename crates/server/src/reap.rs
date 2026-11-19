@@ -92,7 +92,10 @@ fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u3
 /// running later; only frozen attachment ids cross the mutating boundary, never a live client query.
 /// On each shard the client's direct maps held there (§4.6, A-188) bracket the removal: a writable map's stores reach
 /// its file only through the attachment it was made under, so they are written back first (A-186), a store to a shared
-/// map outliving its process; and the copies are let go once the attachments are gone.
+/// map outliving its process; and the copies are let go once the attachments are gone. On macOS the offers the client
+/// never claimed on the socket route go last (A-492, `crate::shards_route::let_go_of_client`): an offer waits for its
+/// claim while its client lives, and a stream's offer holds the end its stream waits on, so letting it go ends the stream
+/// and its attachment, which no removal of the client's own attachments reaches (a guest's).
 ///
 /// Each call waits in its shard's own time (A-432; R3's class A, A-65): a window of `budget_ns`, then on while the
 /// shard works or waits for a CPU, until it has run `budget_ns` of CPU (held to this build), so a shard alive and busy
@@ -100,7 +103,7 @@ fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u3
 /// defers the reap `Overloaded`, which the next sweep retries rather than removing an attachment its stores still need.
 /// Each waited one window on the wall, so a busy owner deferred every reap that met it and the next sweep sent the same
 /// write-back again beside the first.
-async fn remove_on_owners(
+pub(crate) async fn remove_on_owners(
   origin: u16,
   shards: &[u16],
   batch: usize,
@@ -149,6 +152,15 @@ async fn remove_on_owners(
       origin,
       shard,
       move |state| crate::direct_map::let_go_held(state, client),
+      budget_ns,
+    )
+    .await
+    .ok_or(Refusal::Overloaded { shard })?;
+    #[cfg(target_os = "macos")]
+    crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| crate::shards_route::let_go_of_client(state, client),
       budget_ns,
     )
     .await

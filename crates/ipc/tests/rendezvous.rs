@@ -80,7 +80,7 @@ fn rendezvous_client_unsealed() {
   let Ok(instance) = std::env::var(CHILD_UNSEALED_ROLE) else {
     return;
   };
-  let outcome = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).map(|_| ());
+  let outcome = begin_connect_as(&instance, 0).map(|_| ());
   assert!(
     matches!(outcome, Err(IpcError::Unsupported { .. })),
     "a process with no seal installed claims nothing: {outcome:?}"
@@ -293,7 +293,7 @@ fn a_claim_is_polled_without_waiting_and_refused_once_its_daemon_is_gone() {
   toy_seal::install();
   let instance = format!("test-claim-{}", std::process::id());
   let listener = Listener::open(&instance, None).unwrap();
-  let mut claim = begin_connect_as(&instance, 0, 0).unwrap();
+  let mut claim = begin_connect_as(&instance, 0).unwrap();
   let (mut polls, longest) = poll_through_a_claim_wait(&mut claim);
   drop(listener);
   let (refusal, more, gone_longest) = poll_until_refused(claim);
@@ -387,7 +387,7 @@ fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) 
 /// Begins a claim and polls it while the daemon end serves, until it connects within the claim wait: the
 /// connection and the longest poll.
 fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::Connected, Longest) {
-  let claim = begin_connect_as(instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(instance, 0).unwrap();
   let (connected, longest, accepted) = serve_until_connected(listener, claim);
   // The daemon's ends go with the test; the client's mapping keeps the region it opened.
   drop(accepted);
@@ -455,7 +455,7 @@ fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
   toy_seal::install();
   let instance = format!("test-claim-reset-{}", std::process::id());
   let listener = Listener::open(&instance, None).unwrap();
-  let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   drop(listener);
   let (refusal, _, _) = poll_until_refused(claim);
   assert!(
@@ -479,7 +479,7 @@ fn rendezvous_restart_child() {
   assert!(adoption.is_some(), "the parent hands its held rendezvous");
   let first = Listener::open(&instance, adoption.as_ref()).unwrap();
   let first_opened = SystemTime::now();
-  let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   // A daemon killed with the claim unanswered: nothing it published is taken back, its start stamp included.
   drop(first);
   // A daemon's start stamp is the wall clock when it opens. Wait until the clock has passed the first daemon's
@@ -533,8 +533,8 @@ fn a_refused_claim_does_not_cost_its_round_the_client_it_accepted() {
   toy_seal::install();
   let instance = format!("test-round-{}", std::process::id());
   let mut listener = Listener::open(&instance, None).unwrap();
-  let mut first = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
-  let mut second = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let mut first = begin_connect_as(&instance, 0).unwrap();
+  let mut second = begin_connect_as(&instance, 0).unwrap();
   exchange_keys(&mut listener, [&mut first, &mut second]);
   let pid = std::process::id();
   let mut regions_asked = 0;
@@ -665,13 +665,13 @@ fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
   toy_seal::install();
   let instance = format!("test-fresh-{}", std::process::id());
   let mut dead = Listener::open(&instance, None).unwrap();
-  let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   let (old_client, _, old_accepted) = serve_until_connected(&mut dead, claim);
   drop(old_accepted);
   drop(dead);
   let mut fresh = once_released(|| Listener::open(&instance, None))
     .expect("a fresh rendezvous opens while a client of the dead daemon still maps the old one");
-  let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   let (new_client, _, accepted) = serve_until_connected(&mut fresh, claim);
   assert!(
     old_client.liveness.daemon_gone(),
@@ -1062,7 +1062,7 @@ fn a_listener_of_another_user_is_refused_by_the_client() {
     .lines()
     .map_while(Result::ok)
     .find(|line| line.contains(IMPOSTOR_TAG));
-  let claimed = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).map(|_| ());
+  let claimed = begin_connect_as(&instance, 0).map(|_| ());
   impostor.kill().unwrap();
   impostor.wait().unwrap();
   assert!(
@@ -1183,10 +1183,8 @@ fn a_socket_file_a_dead_owner_left_is_replaced_and_a_live_ones_is_not() {
   rustix::net::bind(&dead, &SocketAddrUnix::new(node.as_str()).unwrap()).unwrap();
   drop(dead);
   let mut listener = Listener::open(&instance, None).unwrap();
-  let (connected, _, _accepted) = serve_until_connected(
-    &mut listener,
-    begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap(),
-  );
+  let (connected, _, _accepted) =
+    serve_until_connected(&mut listener, begin_connect_as(&instance, 0).unwrap());
   assert!(
     connected.region.client_id() > 0,
     "a claim connects through the replaced node"

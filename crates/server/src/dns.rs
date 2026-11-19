@@ -6,9 +6,10 @@
 //!
 //! This is a minimal, asynchronous A-record client (RFC 1035 §4) over the runtime's own UDP socket, and
 //! nothing more: one question, the first `A`/`IN` answer, the nameservers and the timeout from the operating
-//! system's resolver configuration (the command reads `/etc/resolv.conf`, R1 allows it to read host paths;
-//! this crate takes the values). It exists because the lint wall reserves `std::net` (so `getaddrinfo`
-//! through the standard library is not available here), and because a blocking resolver call on the control
+//! system's resolver configuration (the command reads it: `/etc/resolv.conf` on Unix, the DNS servers of the
+//! network adapters on Windows, A-490; R1 allows it to read host state; this crate takes the values). It exists
+//! because the lint wall reserves `std::net` (so `getaddrinfo` through the standard library is not available here),
+//! and because a blocking resolver call on the control
 //! shard would stall every SWIM probe and acknowledgement that shard serves for the length of a DNS outage —
 //! a false death by name resolution. Here the wait is a future on the shard's driver like any other exchange
 //! (R6), bounded by the resolver's timeout and attempt count, and it delays only the one dial that asked.
@@ -27,8 +28,10 @@ use slates_rt::RtError;
 use slates_rt::futures::now_ns;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
-/// The resolver configuration the command read from the operating system (`/etc/resolv.conf`): where to
-/// ask, how long to wait for each answer, and how many rounds over the nameservers to make.
+/// The resolver configuration the command read from the operating system (`/etc/resolv.conf` on Unix; on Windows the
+/// DNS servers of its network adapters that are up with a gateway, with `resolv.conf(5)`'s defaults for the timeout and
+/// the attempts, A-490): where to ask, how long to wait for each answer, and how many rounds over the nameservers to
+/// make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolver {
   /// The nameservers to ask, in the operating system's order; each is tried in turn within one attempt.
