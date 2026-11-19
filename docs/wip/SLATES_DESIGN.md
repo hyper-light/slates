@@ -13107,6 +13107,19 @@ and export by landing).
 > dumps stock `svnadmin` 1.15.0 wrote (golden, SHA-256 checked), to `svnlook changed`, to format 3 rebuilding format
 > 2's trees, to every cut and bit flip. Owed of piece 6: the verbs over it (`svnadmin create`, `load`, `dump`,
 > `setrevprop`, `setlog`, `info`, `uuid`, `youngest`) and the dump round trip.
+>
+> **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
+> piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
+> as a value (its base path); `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s search over dates read as
+> `svn_time_from_cstring` and APR read them), `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` (A-605's
+> catalog) and `get-iprops`, each writing what `svnserve` writes: the trivial authentication request first, refusals
+> with Subversion's numbers and messages, an unknown command refused, malformed parameters ending the connection.
+> Held to transcripts of stock `svnserve` 1.15.0 answering stock `svn` 1.15.0 and scripted clients
+> (`crates/svn/fixtures/reads`, recorded by its `make-fixtures.py` through a relay, each file's SHA-256 in
+> `SHA256SUMS`), property lists compared as sets: `svnserve` writes them in APR's per-table seeded hash order, three
+> recordings gave three orders, and slates writes them in name order. Owed: `get-file`, `get-dir`, `list`, `log` with
+> merged revisions, `get-locations`, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then
+> `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -41826,3 +41839,39 @@ Applied in the same change to:
   - Each action's expiry learned from the deployment's own token lifetimes (§4.17.1's rule).
   - The stock client driven end to end against slates' own server, main's run once the routes exist.
   - Mercurial's `lfs` (§4.17.3).
+
+### A-613 — The ra_svn read commands, a sans-io handler over the index and mergeinfo, held to stock svnserve's transcripts; its first part (2026-11-19, g262, UI goal 93; §4.17.4 "4. Reads", "5. The wire" and piece 7's second part; A-531, A-553, A-599, A-605)
+Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 entry),
+`docs/wip/research/vcs-servers-subversion.md` (§13, new), `crates/svn/src/reads.rs` and `crates/svn/src/reads/tests.rs`
+(new), `crates/svn/fixtures/reads/` (new: the recorder, 28 transcripts, the repository's record, `sessions.txt`,
+`subversion-version.txt`, `SHA256SUMS`), `crates/svn/src/lib.rs` (its `mod` line).
+- **What was there.** Item 4 named the reads and item 5 the wire; the item codec (A-531), the index (A-553), the
+  handshake (A-599) and mergeinfo (A-605) were built; nothing answered a command after the handshake.
+- **The decision.** One function answers one parsed command against the index, the green (a `Repository` seam: revision
+  properties and property lists, beside A-605's `Contents`) and the session's value (its base path; A-599 hands it
+  over), appending what `svnserve` writes and saying whether it answered, whether the connection ends (malformed
+  parameters, which `svnserve` ends without a word) or whether another piece answers. Each command is `serve.c`'s at
+  `1.14.x` `d434dc14` (notes §13), its bytes held to stock `svnserve` 1.15.0's own: the trivial authentication request
+  before a command's work, so a revision past the youngest is refused after it; parameters as `svn_ra_svn__parse_tuple`
+  reads them (extra ones ignored, C strings to their NUL, a number past 2^63 - 1 a negative revision); paths joined to
+  the base and made canonical; refusals as `( failure ( ( code message 0: 0 ) ) )`; `get-iprops` without a revision
+  refused as `svnserve` refuses it ("Invalid revision number '-1'"); dates read by `svn__strtoul` fields and APR's day
+  count, written by `gmtime`'s. Property lists are written in name order: `svnserve`'s order is APR's per-table seeded
+  hash order, which three recordings showed changing, and a client reads the list into a hash.
+- **The fixtures.** `make-fixtures.py` builds a repository from a dump it writes (fixed UUID, authors, dates and logs,
+  revision 0's date set after the load), serves it with `svnserve -i` behind a relay on a fixed port that logs each
+  connection both ways, and records stock `svn` sessions and scripted ones that send exact commands, refusals among
+  them. It ran on the Mac Studio (stock 1.15.0 from Homebrew), and its output reached the tree through kiln, bytes
+  never retyped: one program ran the recorder there and wrote its archive here.
+- **Tests** (the Mac Studio, `cargo test -p slates-svn --lib reads`, 2026-11-19): 7 of 7; the fixtures' sums checked
+  with `shasum -a 256 -c` first. Eight scripted sessions (49 commands) and four stock sessions (`svn info` of the root
+  and at a date, `svn propget --revprop`, `svn proplist --revprop`) replayed command by command, every answer item
+  `svnserve`'s; the parameters' edges; commands handed back and unknown ones; dates and the dated search's edges; and
+  hostile commands, never a panic. Red-checked six ways (a directory's size 0, `get-iprops` taking the youngest, an
+  authentication request before an unknown command's refusal, a huge revision read as malformed, mergeinfo keys left
+  absolute, dates before 1970 accepted): each failed its tests.
+- **Owed** (the next parts): `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`,
+  `get-location-segments`, `get-file-revs`, `get-deleted-rev`, each with its transcripts (two stock sessions recorded
+  here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
+  revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
+  anonymous read makes when the session could authenticate.
