@@ -37796,11 +37796,19 @@ entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `cr
   random drive orders, and in its generation order, must equal its own replay in path order. A census, printed every
   run, must show each rule met, the drive orders that differ from path order and the decisions where order could
   matter (a child compared against a parent the same transaction already cloned with another copy identity) among them.
-- **Evidence** (the Mac Studio, kiln, 2026-11-19 02:03 UTC, load 29, debug build of a fresh clone of the branch).
-  Failing first: with `append` refusing every record, `cargo test --locked -p slates-svn --lib index::` failed 19 of 20,
-  the one pass revision 0's, which needs no record. With the index, the crate's whole `--lib` suite 53 of 53 (20 of
-  them the index's) in 0.25 s, and `cargo test --locked -p slates-merge --lib node_exclusive` 8 of 8 with
-  `is_multiple_of`. Clippy, `xtask check` and the cross-target lint are main's (the run-request queue).
+- **Evidence** (the Mac Studio, kiln, 2026-11-19, debug builds of fresh clones of the branch). Failing first (02:03
+  UTC, load 29): with `append` refusing every record, `cargo test --locked -p slates-svn --lib index::` failed 19 of 20,
+  the one pass revision 0's, which needs no record. Green (02:31 UTC, load 23, the branch merged with main): the
+  crate's whole `--lib` suite 53 of 53 in 0.24 s, 20 of them the index's, and `cargo test --locked -p slates-merge --lib
+  node_exclusive` 8 of 8 with `is_multiple_of`. The oracle's census over its generated histories (proptest's default
+  count): 1,223 clones that kept their copy identity, 48 lazy copies and 70 soft copies; 786 copies, 607 of them into
+  their source's own subtree; 514 deletions and 259 replacements; 221 empty revisions; 422 answers reached beneath a
+  copy; 1,882 directories counting mergeinfo beneath them; 32,362 unrelated, 5,242 unchanged and 21,620
+  common-ancestor relations; 495 revisions replayed in a drive order other than path order, and 12 inheritance
+  decisions where that order could have mattered, every identity equal. Each of three rules broken in a copy of the
+  index failed its own case and the oracle, 18 of 20 passing: a soft copy keeping its copy identity, a copy adding no
+  mergeinfo to the directories above it, a copy not counting its source as a predecessor. Clippy, `xtask check` and
+  the cross-target lint are main's (the run-request queue).
 - **Rejected.** Keeping each revision's whole tree, as the naive filesystem does: a revision would cost the tree's size;
   it is the oracle only. Applying a revision against its transaction's own base: the record would have to carry it,
   and for every commit FSFS accepts it gives the identities N - 1 gives. Giving each path beneath a copy its own rows:
