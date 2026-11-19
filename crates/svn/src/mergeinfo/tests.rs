@@ -1342,6 +1342,7 @@ fn the_queries_refuse_by_kind() {
   assert!(descendants(&naive.index, &naive, "/nothing", 3).is_err());
 
   /// A green that lost every list and every directory.
+  #[derive(Debug)]
   struct Lost;
   impl Contents for Lost {
     fn entries(&self, _: &str, _: Revision) -> Option<Vec<String>> {
