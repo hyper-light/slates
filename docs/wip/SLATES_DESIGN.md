@@ -47845,6 +47845,30 @@ Applied in the same change to: §4.17.4's status (part 2's first slice); GAPS (t
   migration's svndiff writers write one continuous stream, where write boundaries never show; the commit's drive
   reads a client's chunks whatever their boundaries.
 
+### A-672 — The copy oracle's census is met by a fixed history whatever the seed (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); A-626's copy oracle; found by g306 in A-668's merged-tree run; A-670's rule)
+Applied in the same change to: `crates/merge/src/engine/copy_tests.rs` (`fixed_history`, `Census::met`, the oracle run
+with the fixed history first), GAPS (A-668's entry, where the census's failure was filed for its owner).
+- **What was there.** `every_copy_reads_as_its_model_over_every_history` required every count of its census past zero
+  over 128 histories generated from a new seed each run, and an increment of two nested copies whose inner copy replaces
+  what the outer one brought there is rare: in about one nested pair in thirty (2 of 31 and 2 of 46 in A-626 part 2's
+  runs, none of 30 in A-668's merged-tree run r81, 3 of 37 in r131; none in A-626 part 3's green run r84, 3 in the run
+  after it). A run met none of them about one time in three to five and failed by the seed's luck, though every history
+  agreed with its model, and passed by luck as often.
+- **The fix** (A-670's rule for the restatement oracle's census). One fixed history, run first through the whole oracle,
+  meets every case the census counts on every run, and the test fails at once, naming the counts, if it ever stops
+  meeting one; the generated histories add to the counts. Its nine steps: a file put twice; its directory copied as the
+  version before the head held it, its tree changed since; a put beneath that copy; the root copied into its own tree;
+  a copy replacing its destination, then the same copy without replacing, refused; a copy with a file moved inside it
+  as a stock client moves one; and two copies nested in one increment, the inner replacing the file the outer brought.
+- **Evidence** (macOS arm64, Mac Studio, kiln r4, 2026-11-19, debug; the Windows x86_64 and Linux runs owed). Over main
+  at cd84e3811 (c2e1cc8d2): `cargo test --locked -p slates-merge --lib copy -- --nocapture` 34 passed, none failed,
+  146 filtered out; the fixed history met all eleven cases (3 accepted, each other case once), and with the generated
+  histories the census came to 89 accepted, 438 refused, 16 from the root, 53 from before, 27 into themselves, 25 from
+  a changed source, 18 changed beneath, 37 replaced, 35 nested, 4 nested replacing and 21 moved, the generated
+  histories meeting the rare case in 3 of 34 nested pairs; `cargo fmt -p slates-merge -- --check` clean. The change is
+  in the lib's test module alone, which no integration target compiles; its red is the luck recorded above (r81, r84),
+  and a red of the new guard (a fixed history that stops meeting a case) is a mutation run, main's.
+
 ### A-649 part 4 — The server's adapter from the base plane's host seam to the import's `RepositoryFiles` (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.5's host seam; A-555)
 Applied in the same change to: §4.17.3 (its status, piece 3), `crates/server` (`hg_base`; `slates-hg` a dependency),
 the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the seam's server side built), GAPS (the
