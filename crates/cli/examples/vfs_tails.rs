@@ -416,7 +416,7 @@ mod unix {
         gid: rustix::process::getgid().as_raw(),
         gids: Vec::new(),
       };
-      let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export, CONNECT_WAIT)
+      let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export)
         .unwrap()
         .0;
       let mut credential = slates_bridge_nfs::xdr::XdrWriter::new();
