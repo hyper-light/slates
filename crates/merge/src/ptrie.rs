@@ -851,7 +851,11 @@ fn remove_at<V: Clone>(
 
 /// The node at `slot`, below a map's root, after a change beneath it: freed when it is left with no value and no child,
 /// replaced by its only child when it is left a bare edge (the child takes the edge's bytes before its own), else itself.
-fn tidied<V: Clone>(nodes: &mut Nodes<V>, slot: Slot, holders: &mut impl Holders<V>) -> Option<Slot> {
+fn tidied<V: Clone>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  holders: &mut impl Holders<V>,
+) -> Option<Slot> {
   let (bare, children) = match nodes.node(slot) {
     Some(node) => (node.value.is_none(), node.children.clone()),
     None => return None,
@@ -905,9 +909,21 @@ fn cut_at<V: Clone>(
   let (replacement, cut) = if common == rest.len() {
     // The prefix ends inside the child's label or at its end: every key below the child starts with it, and the link
     // to the child is the subtree's hold.
-    (None, Some(Shared { slot: child, skip: common }))
+    (
+      None,
+      Some(Shared {
+        slot: child,
+        skip: common,
+      }),
+    )
   } else if common == label {
-    cut_at(nodes, child, rest.get(label..).unwrap_or_default(), false, holders)
+    cut_at(
+      nodes,
+      child,
+      rest.get(label..).unwrap_or_default(),
+      false,
+      holders,
+    )
   } else {
     return (Some(slot), None);
   };
@@ -921,7 +937,13 @@ fn cut_at<V: Clone>(
 
 /// Points the child at `index` of the node at `slot` to `replacement`, or drops it when there is none, and takes the
 /// `taken` values that left with it off the node's count ([`cut_at`]).
-fn relink_child<V>(nodes: &mut Nodes<V>, slot: Slot, index: usize, replacement: Option<Slot>, taken: usize) {
+fn relink_child<V>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  index: usize,
+  replacement: Option<Slot>,
+  taken: usize,
+) {
   let Some(node) = nodes.node_mut(slot) else {
     return;
   };

@@ -743,7 +743,12 @@ struct Seed {
 /// keeps it reconstructible at every version before the change, and a key that appears records only its appearance. At
 /// the version of the copy that gave it the value, for a key in a copied tree (A-586). Nothing when its history holds
 /// the value already, or when the copy is the change's own version, since the copy's value then never stood at one.
-fn seed<K: Ord + Clone, T>(history: &mut BTreeMap<K, Vec<(u64, T)>>, key: &K, held: Option<T>, at: Seed) {
+fn seed<K: Ord + Clone, T>(
+  history: &mut BTreeMap<K, Vec<(u64, T)>>,
+  key: &K,
+  held: Option<T>,
+  at: Seed,
+) {
   if let Some(held) = held
     && let Some(since) = at.since.filter(|since| *since != at.version)
   {
@@ -2288,7 +2293,8 @@ impl Green {
   /// head's.
   fn lands_on_head(&self, path: &str, base: u64, ops_and_post: (&[Op], &[u8])) -> bool {
     let history = self.content_history.get(path);
-    let Some(history) = history.filter(|_| self.covered_since(path, last_version(history)).is_none())
+    let Some(history) =
+      history.filter(|_| self.covered_since(path, last_version(history)).is_none())
     else {
       // No history, or a copy's value (A-586), whose history's last value is no head's: the bytes at the base against
       // the head's (at the base they are the head's, unless a copy since replaced them).
@@ -3204,7 +3210,12 @@ impl Green {
     }
     self.special_changed.insert(path.clone(), version);
     let at = self.seed_of(&self.mode_history, &path, &path, version);
-    seed(&mut self.mode_history, &path, held(self.modes.get(&path)), at);
+    seed(
+      &mut self.mode_history,
+      &path,
+      held(self.modes.get(&path)),
+      at,
+    );
     if self.modes.remove(&path).is_some() {
       self.identity_dirty.insert(IdentityKey::Mode(path.clone()));
       self.mode_changed.insert(path.clone(), version);
@@ -3309,7 +3320,12 @@ impl Green {
         }
         Effect::Mode(path, mode) => {
           let at = self.seed_of(&self.mode_history, &path, &path, version);
-          seed(&mut self.mode_history, &path, held(self.modes.get(&path)), at);
+          seed(
+            &mut self.mode_history,
+            &path,
+            held(self.modes.get(&path)),
+            at,
+          );
           self.modes.insert(&path, mode);
           self.mode_changed.insert(path.clone(), version);
           self

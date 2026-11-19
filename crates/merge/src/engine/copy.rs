@@ -138,7 +138,10 @@ fn source_of(copies: &BTreeMap<String, (String, u64)>, path: &str) -> String {
 }
 
 /// Takes out of `map` the entries whose path `inside` holds.
-fn split_map<V>(map: &mut BTreeMap<String, V>, inside: &impl Fn(&str) -> bool) -> BTreeMap<String, V> {
+fn split_map<V>(
+  map: &mut BTreeMap<String, V>,
+  inside: &impl Fn(&str) -> bool,
+) -> BTreeMap<String, V> {
   let (taken, kept) = std::mem::take(map)
     .into_iter()
     .partition(|(path, _)| inside(path.as_str()));
@@ -417,14 +420,30 @@ impl Green {
     windows: &mut Vec<ConflictWindow>,
   ) {
     for path in &copied.unlinks {
-      record(effects, windows, Ok(self.copied_unlink(path, &from(path.as_str()))));
+      record(
+        effects,
+        windows,
+        Ok(self.copied_unlink(path, &from(path.as_str()))),
+      );
     }
     for path in &copied.mkdirs {
-      record(effects, windows, self.copied_mkdir(path, &from(path.as_str())));
+      record(
+        effects,
+        windows,
+        self.copied_mkdir(path, &from(path.as_str())),
+      );
     }
-    let cleared: BTreeSet<String> = copied.cleared().iter().map(|path| from(path.as_str())).collect();
+    let cleared: BTreeSet<String> = copied
+      .cleared()
+      .iter()
+      .map(|path| from(path.as_str()))
+      .collect();
     for path in &copied.rmdirs {
-      record(effects, windows, self.copied_rmdir(path, &from(path.as_str()), &cleared));
+      record(
+        effects,
+        windows,
+        self.copied_rmdir(path, &from(path.as_str()), &cleared),
+      );
     }
   }
 
@@ -436,19 +455,29 @@ impl Green {
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
-    let absent = |path: &String| !self.node_stands(&from(path.as_str())) && !copied.establishes(path);
+    let absent =
+      |path: &String| !self.node_stands(&from(path.as_str())) && !copied.establishes(path);
     for (path, mode) in &copied.modes {
       let effect = Effect::Mode(path.clone(), *mode);
-      record(effects, windows, Green::unless_absent(absent(path), path, effect));
+      record(
+        effects,
+        windows,
+        Green::unless_absent(absent(path), path, effect),
+      );
     }
     for (path, target) in &copied.symlinks {
-      let refused = self.holds_node(&from(path.as_str())) && !self.symlinks.contains_key(from(path.as_str()));
+      let refused =
+        self.holds_node(&from(path.as_str())) && !self.symlinks.contains_key(from(path.as_str()));
       let effect = Effect::Symlink(path.clone(), target.clone());
       record(effects, windows, Green::unless(refused, path, effect));
     }
     for (path, name, value) in &copied.xattr_sets {
       let effect = Effect::SetXattr(path.clone(), name.clone(), value.clone());
-      record(effects, windows, Green::unless_absent(absent(path), path, effect));
+      record(
+        effects,
+        windows,
+        Green::unless_absent(absent(path), path, effect),
+      );
     }
     for (path, name) in &copied.xattr_removes {
       let held = self.xattrs.contains_key(&from(path.as_str()), name);
@@ -486,7 +515,9 @@ impl Green {
 
   /// Whether a file, directory or IPC node stands at `path`: what a mode or an attribute can be set on.
   fn node_stands(&self, path: &str) -> bool {
-    self.content.contains_key(path) || self.dirs.contains_key(path) || self.specials.contains_key(path)
+    self.content.contains_key(path)
+      || self.dirs.contains_key(path)
+      || self.specials.contains_key(path)
   }
 
   /// A file created at `path` in a copied tree, where the copy brings nothing (`from`, its place in the source).
@@ -630,11 +661,15 @@ impl Green {
     self.changes_bytes = self
       .changes_bytes
       .saturating_add(appearance_bytes(dst, src));
-    self.copies.entry(dst.to_owned()).or_default().push(Appearance {
-      version,
-      source: src.to_owned(),
-      source_version,
-    });
+    self
+      .copies
+      .entry(dst.to_owned())
+      .or_default()
+      .push(Appearance {
+        version,
+        source: src.to_owned(),
+        source_version,
+      });
   }
 
   /// The entries of the copies made at `dst` after `since`: what a copy puts into the set hash (module docs).

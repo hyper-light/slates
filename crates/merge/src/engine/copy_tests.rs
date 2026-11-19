@@ -183,7 +183,11 @@ fn trunk() -> Green {
 fn a_copy_shares_its_source_and_reads_as_its_copy() {
   let mut green = trunk();
   let (walked, grafted) = (green.walked(), green.copies_grafted());
-  let version = accept(&mut green, Work::exclusive().copy("trunk", "branches/x", 1), 2);
+  let version = accept(
+    &mut green,
+    Work::exclusive().copy("trunk", "branches/x", 1),
+    2,
+  );
   assert_eq!(version, 2);
   assert_eq!(green.walked(), walked, "the copy walked a map");
   assert_eq!(green.copies_grafted(), grafted + 1);
@@ -200,7 +204,11 @@ fn a_copy_shares_its_source_and_reads_as_its_copy() {
   assert_eq!(green.content_at("branches/x/a", 2), Some(b"alpha".to_vec()));
   assert_eq!(green.content_len_at("branches/x/d/b", 2), Some(4));
   let before = green.base_at(1);
-  assert!(base_paths(&before).iter().all(|path| !path.starts_with("branches")));
+  assert!(
+    base_paths(&before)
+      .iter()
+      .all(|path| !path.starts_with("branches"))
+  );
   let after = green.base_at(2);
   assert!(after.dirs.contains(&"branches/x/d".to_owned()));
   assert!(after.modes.contains(&("branches/x".to_owned(), 0o755)));
@@ -228,11 +236,18 @@ fn a_copy_costs_its_paths_whatever_its_tree_holds() {
   );
   accept(&mut green, Work::exclusive().copy("src", "dst", 1), 2);
   assert_eq!(green.walked(), walked, "the copy walked a map");
-  assert_eq!(green.retained_bytes().history, history, "the copy recorded values");
+  assert_eq!(
+    green.retained_bytes().history,
+    history,
+    "the copy recorded values"
+  );
   let grown = 2 * change_bytes("dst") + appearance_bytes("dst", "src");
   assert_eq!(green.changes_bytes() - changes, grown);
   assert_eq!(green.changes_bytes(), green.changes_recounted());
-  assert_eq!(green.content("dst/7/4039"), Some(&4039u32.to_le_bytes()[..]));
+  assert_eq!(
+    green.content("dst/7/4039"),
+    Some(&4039u32.to_le_bytes()[..])
+  );
   assert_eq!(green.files().count(), 8192);
 }
 
@@ -247,13 +262,18 @@ fn a_keys_first_change_after_a_copy_records_the_value_the_copy_gave_it() {
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
   accept(
     &mut green,
-    Work::exclusive().overwrite("b/a", 0, b"AL").mode("b/a", 0o700),
+    Work::exclusive()
+      .overwrite("b/a", 0, b"AL")
+      .mode("b/a", 0o700),
     3,
   );
   assert_eq!(green.content_at("b/a", 1), None);
   assert_eq!(green.content_at("b/a", 2), Some(b"alpha".to_vec()));
   assert_eq!(green.content_at("b/a", 3), Some(b"ALpha".to_vec()));
-  assert_eq!(green.content_page_at("b/a", 2, (1, 2)), Some((b"lp".to_vec(), 5)));
+  assert_eq!(
+    green.content_page_at("b/a", 2, (1, 2)),
+    Some((b"lp".to_vec(), 5))
+  );
   assert_eq!(green.content_len_at("b/a", 2), Some(5));
   assert!(green.base_at(2).modes.contains(&("b/a".to_owned(), 0o644)));
   assert!(green.base_at(3).modes.contains(&("b/a".to_owned(), 0o700)));
@@ -297,7 +317,10 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   let entry = chain_entry::encode(&increment.encode(), &increment, &applied, None, None, None);
   let decoded = chain_entry::decode(&entry).expect("the entry decodes");
   assert_eq!(decoded.applied, applied);
-  assert_eq!(replica.apply_recorded(&decoded.increment, &decoded.applied), 2);
+  assert_eq!(
+    replica.apply_recorded(&decoded.increment, &decoded.applied),
+    2
+  );
   assert_eq!(replica.head_identity(), green.head_identity());
   assert_eq!(replica.base_at(2), green.base_at(2));
   assert_eq!(replica.content("b/a"), Some(&b"ALpha"[..]));
@@ -325,7 +348,11 @@ fn a_copy_of_the_root_brings_every_path_beneath_its_destination() {
   assert!(green.is_dir("snap") && green.is_dir("snap/d"));
   assert_eq!(green.xattr("snap", PROPS), Some(&b"root"[..]));
   assert_eq!(green.xattr("", PROPS), Some(&b"root"[..]));
-  assert!(base_paths(&green.base_at(2)).iter().all(|path| !path.ends_with('/')));
+  assert!(
+    base_paths(&green.base_at(2))
+      .iter()
+      .all(|path| !path.ends_with('/'))
+  );
   assert_eq!(green.changed_between(1, 2), ["snap"]);
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
 }
@@ -338,7 +365,10 @@ fn a_copy_of_the_root_brings_every_path_beneath_its_destination() {
 fn a_copy_is_refused_typed_and_changes_nothing() {
   let mut green = trunk();
   let mut work = Work::default();
-  work.create("t2/a", b"t2").link("h/l", "trunk/a").create("taken/x", b"x");
+  work
+    .create("t2/a", b"t2")
+    .link("h/l", "trunk/a")
+    .create("taken/x", b"x");
   accept(&mut green, &work, 2);
   accept(&mut green, Work::default().create("gone/x", b"g"), 3);
   accept(&mut green, Work::default().unlink("gone/x"), 4);
@@ -353,7 +383,11 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
   use MergeConflictClass::{CreateCreate, RenameRename, TypeChanged};
   let cases: Vec<(Work, u64, Vec<(&str, MergeConflictClass)>)> = vec![
     (one_copy("t2", "taken", 5), 5, vec![("taken", CreateCreate)]),
-    (one_copy("t2", "trunk/a", 5), 5, vec![("trunk/a", CreateCreate)]),
+    (
+      one_copy("t2", "trunk/a", 5),
+      5,
+      vec![("trunk/a", CreateCreate)],
+    ),
     (one_copy("t2", "", 5), 5, vec![("", TypeChanged)]),
     (one_copy("nothing", "y", 5), 5, vec![("y", TypeChanged)]),
     (one_copy("t2", "y", 6), 5, vec![("y", TypeChanged)]),
@@ -370,10 +404,12 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
       .into_iter()
       .map(|(path, class)| (path.to_owned(), class))
       .collect();
-    let found: BTreeSet<(String, MergeConflictClass)> =
-      windows(&outcome).expect("a conflict").into_iter().collect();
+    let found: Vec<(String, MergeConflictClass)> = windows(&outcome).expect("a conflict");
     for window in &expected {
-      assert!(found.contains(window), "case {index}: {window:?} not in {found:?}");
+      assert!(
+        found.contains(window),
+        "case {index}: {window:?} not in {found:?}"
+      );
     }
     assert_eq!(green.head(), head, "case {index} committed");
   }
@@ -395,7 +431,13 @@ fn one_copy(from: &str, to: &str, version: u64) -> Work {
 #[test]
 fn an_edit_declared_before_a_copy_replaced_its_file_conflicts() {
   let mut green = Green::new();
-  accept(&mut green, Work::default().create("d/x", b"old!").create("t/x", b"new!"), 1);
+  accept(
+    &mut green,
+    Work::default()
+      .create("d/x", b"old!")
+      .create("t/x", b"new!"),
+    1,
+  );
   accept(&mut green, Work::default().unlink("d/x"), 2);
   accept(&mut green, Work::exclusive().copy("t", "d", 2), 3);
   let stale = green.submit(&Work::default().overwrite("d/x", 0, b"E").at(10, 1));
@@ -584,7 +626,12 @@ impl Pair {
         Some(work)
       }
       Step::Copy { from, to, back } => {
-        return self.copy(PATHS[from % PATHS.len()], PATHS[to % PATHS.len()], back, census);
+        return self.copy(
+          PATHS[from % PATHS.len()],
+          PATHS[to % PATHS.len()],
+          back,
+          census,
+        );
       }
     };
     if let Some(work) = work {
@@ -617,16 +664,35 @@ impl Pair {
   /// A copy of `from` at the head less `back % 3` to `to`: by reference in the green, key by key in the reference when
   /// the reference's own state says the copy stands (module docs of `copy`); both must decide alike, and the copy must
   /// walk no map.
-  fn copy(&mut self, from: &str, to: &str, back: u8, census: &mut Census) -> Result<(), TestCaseError> {
+  fn copy(
+    &mut self,
+    from: &str,
+    to: &str,
+    back: u8,
+    census: &mut Census,
+  ) -> Result<(), TestCaseError> {
     let head = self.reference.head();
     let version = head.saturating_sub(u64::from(back % 3));
     let stands = self.copy_stands(from, to, version);
     let walked = self.green.walked();
     let accepted = self.submit(&one_copy(from, to, version));
-    prop_assert_eq!(accepted, stands, "copy {:?} at {} to {:?}", from, version, to);
+    prop_assert_eq!(
+      accepted,
+      stands,
+      "copy {:?} at {} to {:?}",
+      from,
+      version,
+      to
+    );
     if !accepted {
       census.refused += 1;
-      census.changed_after += usize::from(self.reference.changed_between(version, head).iter().any(|path| in_tree(path, from)));
+      census.changed_after += usize::from(
+        self
+          .reference
+          .changed_between(version, head)
+          .iter()
+          .any(|path| in_tree(path, from)),
+      );
       return Ok(());
     }
     prop_assert_eq!(self.green.walked(), walked, "the copy walked a map");
@@ -635,7 +701,10 @@ impl Pair {
     census.from_before += usize::from(version < head);
     census.into_themselves += usize::from(in_tree(to, from));
     let work = copied_key_by_key(&self.reference, from, to, version);
-    prop_assert!(self.submit_reference(&work), "the reference refused its copy");
+    prop_assert!(
+      self.submit_reference(&work),
+      "the reference refused its copy"
+    );
     Ok(())
   }
 
@@ -644,9 +713,17 @@ impl Pair {
   /// then.
   fn copy_stands(&self, from: &str, to: &str, version: u64) -> bool {
     let head = self.reference.head();
-    let occupied = base_paths(&self.reference.base_at(head)).iter().any(|path| in_tree(path, to));
-    let changed = self.reference.changed_between(version, head).iter().any(|path| in_tree(path, from));
-    let held = base_paths(&self.reference.base_at(version)).iter().any(|path| in_tree(path, from));
+    let occupied = base_paths(&self.reference.base_at(head))
+      .iter()
+      .any(|path| in_tree(path, to));
+    let changed = self
+      .reference
+      .changed_between(version, head)
+      .iter()
+      .any(|path| in_tree(path, from));
+    let held = base_paths(&self.reference.base_at(version))
+      .iter()
+      .any(|path| in_tree(path, from));
     !to.is_empty() && !occupied && !changed && held
   }
 
@@ -657,13 +734,24 @@ impl Pair {
     prop_assert_eq!(head, self.reference.head());
     for version in 0..=head {
       let base = self.green.base_at(version);
-      prop_assert_eq!(&base, &self.reference.base_at(version), "the base at {}", version);
+      prop_assert_eq!(
+        &base,
+        &self.reference.base_at(version),
+        "the base at {}",
+        version
+      );
       for (path, _) in &base.files {
-        prop_assert_eq!(self.green.content_at(path, version), self.reference.content_at(path, version));
+        prop_assert_eq!(
+          self.green.content_at(path, version),
+          self.reference.content_at(path, version)
+        );
       }
       self.check_changes(version, head)?;
     }
-    prop_assert_eq!(self.green.head_identity(), self.green.head_identity_from_scratch());
+    prop_assert_eq!(
+      self.green.head_identity(),
+      self.green.head_identity_from_scratch()
+    );
     prop_assert_eq!(self.green.changes_bytes(), self.green.changes_recounted());
     prop_assert_eq!(self.green.copies_refused(), 0);
     Ok(())
@@ -692,7 +780,11 @@ impl Pair {
       }
       opened.insert(path);
     }
-    let mut expected: BTreeSet<String> = self.reference.changed_between(version, head).into_iter().collect();
+    let mut expected: BTreeSet<String> = self
+      .reference
+      .changed_between(version, head)
+      .into_iter()
+      .collect();
     expected.extend(destinations);
     prop_assert_eq!(opened, expected, "the changes since {}", version);
     Ok(())
@@ -724,7 +816,9 @@ fn copied_key_by_key(reference: &Green, from: &str, to: &str, version: u64) -> W
   let mut work = Work::default();
   for (path, _) in &base.files {
     if let Some(at) = place(path) {
-      let bytes = reference.content_at(path, version).expect("a file of the base");
+      let bytes = reference
+        .content_at(path, version)
+        .expect("a file of the base");
       work.create(&at, &bytes);
     }
   }
@@ -793,5 +887,8 @@ fn every_copy_reads_as_its_key_by_key_reference_over_every_history() {
     census.into_themselves,
     census.changed_after,
   ];
-  assert!(met.iter().all(|&count| count > 0), "a case never met: {census:?}");
+  assert!(
+    met.iter().all(|&count| count > 0),
+    "a case never met: {census:?}"
+  );
 }

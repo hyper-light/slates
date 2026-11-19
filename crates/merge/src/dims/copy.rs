@@ -88,9 +88,7 @@ impl<V: Clone> Dim<V> {
         .root
         .graft(&mut self.nodes, &into, shared, holders)
         .map_err(|_: GraftRefused| CopyRefused::Occupied)?;
-      if own_in_held
-        && let Some(misplaced) = self.root.remove(&mut self.nodes, &into, holders)
-      {
+      if own_in_held && let Some(misplaced) = self.root.remove(&mut self.nodes, &into, holders) {
         // The root's own key came with every key and stands at the destination's separator: it goes from there, and
         // is set at the destination's own key below.
         holders.freed(misplaced);
@@ -149,9 +147,7 @@ impl Files {
 
   /// [`Dim::cut_tree`]: a block is let go with its last holder.
   pub(crate) fn cut_tree(&mut self, path: &str) {
-    self
-      .map
-      .cut_tree_held(path.as_bytes(), &mut self.blocks);
+    self.map.cut_tree_held(path.as_bytes(), &mut self.blocks);
   }
 }
 
@@ -190,7 +186,11 @@ impl Xattrs {
     if root_own > 0 {
       let mut misplaced = beneath_to;
       misplaced.extend_from_slice(&PATH_END);
-      if let Some(cut) = self.map.root.cut(&mut self.map.nodes, &misplaced, &mut Plain) {
+      if let Some(cut) = self
+        .map
+        .root
+        .cut(&mut self.map.nodes, &misplaced, &mut Plain)
+      {
         Ptrie::drop_subtree(&mut self.map.nodes, cut, &mut Plain);
       }
     }

@@ -42,8 +42,7 @@ use std::ops::{Deref, DerefMut};
 
 use super::{
   Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry,
-  history_at, last_version, link_entry, mode_entry, present_at, relink, special_entry,
-  xattr_entry,
+  history_at, last_version, link_entry, mode_entry, present_at, relink, special_entry, xattr_entry,
 };
 use crate::dims::{Arenas, GreenRelease};
 use crate::identity::{Entry, SetHash};
@@ -241,12 +240,24 @@ impl Green {
   fn keys_changed_after(&self, path: &str, version: u64) -> Vec<IdentityKey> {
     let after = |last: Option<u64>| last.is_some_and(|last| last > version);
     let lasts: [(Option<u64>, fn(String) -> IdentityKey); 6] = [
-      (last_version(self.content_history.get(path)), IdentityKey::File),
-      (last_version(self.special_history.get(path)), IdentityKey::Special),
+      (
+        last_version(self.content_history.get(path)),
+        IdentityKey::File,
+      ),
+      (
+        last_version(self.special_history.get(path)),
+        IdentityKey::Special,
+      ),
       (last_version(self.dir_history.get(path)), IdentityKey::Dir),
       (last_version(self.mode_history.get(path)), IdentityKey::Mode),
-      (last_version(self.symlink_history.get(path)), IdentityKey::Symlink),
-      (last_version(self.hardlink_history.get(path)), IdentityKey::Hardlink),
+      (
+        last_version(self.symlink_history.get(path)),
+        IdentityKey::Symlink,
+      ),
+      (
+        last_version(self.hardlink_history.get(path)),
+        IdentityKey::Hardlink,
+      ),
     ];
     let mut keys: Vec<IdentityKey> = lasts
       .into_iter()

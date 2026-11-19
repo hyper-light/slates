@@ -306,7 +306,10 @@ fn a_cut_takes_a_paths_tree_away_and_leaves_its_neighbours() {
   modes.cut_tree("");
   files.cut_tree("");
   attributes.cut_tree("");
-  assert_eq!((modes.len(), files.map.len(), attributes.map.len()), (0, 0, 0));
+  assert_eq!(
+    (modes.len(), files.map.len(), attributes.map.len()),
+    (0, 0, 0)
+  );
   assert_eq!(files.blocks.live(), 0);
 }
 
