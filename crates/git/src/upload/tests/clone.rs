@@ -53,11 +53,16 @@ fn small() -> (served::Served, Vec<ObjectId>) {
   let commits: Vec<Vec<u8>> = branches()
     .iter()
     .map(|(_, message)| {
-      format!("tree {EMPTY_TREE}\nauthor {SIGNATURE}\ncommitter {SIGNATURE}\n\n{message}").into_bytes()
+      format!("tree {EMPTY_TREE}\nauthor {SIGNATURE}\ncommitter {SIGNATURE}\n\n{message}")
+        .into_bytes()
     })
     .collect();
   let mut entries: Vec<(Kind, &[u8])> = vec![(Kind::Tree, b"")];
-  entries.extend(commits.iter().map(|commit| (Kind::Commit, commit.as_slice())));
+  entries.extend(
+    commits
+      .iter()
+      .map(|commit| (Kind::Commit, commit.as_slice())),
+  );
   let pack = pack_of(&entries);
   let objects = unpack::read_whole(
     &pack,
@@ -69,7 +74,13 @@ fn small() -> (served::Served, Vec<ObjectId>) {
   .objects;
   let tips: Vec<ObjectId> = commits
     .iter()
-    .map(|commit| objects.iter().find(|object| object.content == *commit).unwrap().id)
+    .map(|commit| {
+      objects
+        .iter()
+        .find(|object| object.content == *commit)
+        .unwrap()
+        .id
+    })
     .collect();
   let hexes: Vec<String> = tips.iter().map(ToString::to_string).collect();
   let moves: Vec<(u64, &str)> = hexes

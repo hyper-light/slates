@@ -162,8 +162,19 @@
 > the caller names the refs' greens, and a read the store cannot make is kept as a fault the service refuses on. Over
 > the repository stock git 2.50.1 served from, loaded into a real store, the negotiation sends exactly git's objects
 > for a clone and for a fetch with a have (338 of 338 on the Mac Studio merged with main, red four ways). This closes
-> A-615's "A-614's store implementing `Graph`". Owed in A-640: the v2 service with one entry point; `ls-refs`; the v0 and v1 service, with v0's ref names
-> held to A-615's rule; the pack from A-639's fragments; `sparse:oid`.
+> A-615's "A-614's store implementing `Graph`".
+> **A-640 part 2 (2026-11-19, g296; the v2 service, one entry point):** `slates-git` (`upload`) serves protocol v2
+> through `upload::serve`: the advertisement §4.17.2 names, each request held to it as `serve.c` holds one, `ls-refs`
+> from the served refs (each prefix a run of the sorted refs, held to an oracle over 256 generated repositories),
+> `fetch` mapped onto A-615's negotiation over part 1's graph (`want-ref`, and `deepen-not` by git's patterns; a
+> `want-ref` sent twice refused, by the document's words), its sections in the document's order and its pack framed
+> on band 1 from a `PackSource` a slice at a time, each step within the caller's room; `object-info` over A-624's
+> answer; refusals in git's words, plain or on band 3. Proven against stock git 2.50.1: its `ls-refs` byte for byte,
+> its five fetch exchanges section for section with the same objects, and a stock clone's own requests served from
+> small.git rebuilt in the store (368 of 368 on the Mac Studio, red eight ways). Owed in A-640: v0 and v1 (part 3,
+> refused with `ERR` until then, v0's ref names held to A-615's rule); `sparse:oid` (part 4); the pack from A-639's
+> fragments behind `PackSource`; `packfile-uris` and `bundle-uri` from the store's URI packs and bundle list;
+> progress on band 2; the walk in cooperative slices; hidden refs, which are policy.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation

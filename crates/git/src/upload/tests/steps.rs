@@ -4,7 +4,9 @@ use proptest::prelude::*;
 
 use super::{MAIN_REF, WholeObjects, answer_v2, read_fetch, serving};
 use crate::Admission;
-use crate::fixtures::{FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE, LS_REFS_REQUEST, LS_REFS_RESPONSE};
+use crate::fixtures::{
+  FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE, LS_REFS_REQUEST, LS_REFS_RESPONSE,
+};
 use crate::http::Version;
 use crate::object_name::ObjectFormat;
 use crate::served::{self, REFS};
