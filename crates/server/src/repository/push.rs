@@ -94,7 +94,7 @@ pub(crate) struct EntryParts {
 
 /// What a push did to one branch, in the order of its changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum BranchPushed {
+pub(crate) enum BranchAppended {
   /// `green` moved to `version`; `before` when an earlier send of the same work made that version.
   Moved {
     /// The branch's green.
@@ -120,9 +120,9 @@ pub(crate) enum BranchPushed {
 
 /// What a push did.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Pushed {
+pub(crate) struct Appended {
   /// Each change's result, in the order given.
-  pub(crate) changes: Vec<BranchPushed>,
+  pub(crate) changes: Vec<BranchAppended>,
   /// Whether it recorded anything: false when every work was sent before and nothing else changed.
   pub(crate) recorded: bool,
 }
@@ -138,7 +138,7 @@ pub(crate) trait RepositoryLogs {
     repository: RepositoryId,
     changes: Vec<BranchChange>,
     parts: EntryParts,
-  ) -> Result<Pushed, PushRefused>;
+  ) -> Result<Appended, AppendRefused>;
 }
 
 impl RepositoryLogs for ShardState {
@@ -148,7 +148,7 @@ impl RepositoryLogs for ShardState {
     repository: RepositoryId,
     changes: Vec<BranchChange>,
     parts: EntryParts,
-  ) -> Result<Pushed, PushRefused> {
+  ) -> Result<Appended, AppendRefused> {
     push(self, principal, repository, changes, parts)
   }
 }
@@ -191,7 +191,7 @@ pub(crate) struct ChangeRefused {
 
 /// A push refused, typed; nothing of it applied.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PushRefused {
+pub(crate) enum AppendRefused {
   /// The repository: none here (`NotFound`), or another principal's (`Forbidden`, until the policy of piece 7).
   Repository(Refusal),
   /// The changes refused, each named by its index.
@@ -280,20 +280,20 @@ pub(crate) fn push(
   repository: RepositoryId,
   changes: Vec<BranchChange>,
   parts: EntryParts,
-) -> Result<Pushed, PushRefused> {
+) -> Result<Appended, AppendRefused> {
   let record = state
     .db
     .partition()
     .repositories()
     .repository(repository)
     .cloned()
-    .ok_or(PushRefused::Repository(Refusal::NotFound))?;
+    .ok_or(AppendRefused::Repository(Refusal::NotFound))?;
   if &record.owner != principal {
-    return Err(PushRefused::Repository(Refusal::Forbidden {
+    return Err(AppendRefused::Repository(Refusal::Forbidden {
       verb: "push".to_owned(),
     }));
   }
-  let steps = plan(state, &record, principal, changes).map_err(PushRefused::Changes)?;
+  let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
   let pushed = push_planned(state, &record, steps, parts, &mut held);
   if pushed.is_err() {
@@ -493,10 +493,10 @@ fn push_planned(
   steps: Vec<Step>,
   parts: EntryParts,
   held: &mut Held,
-) -> Result<Pushed, PushRefused> {
-  make(state, &steps, held).map_err(PushRefused::Changes)?;
-  secure(state, &steps, held).map_err(PushRefused::Changes)?;
-  let verdicts = judge(state, &steps, held).map_err(PushRefused::Changes)?;
+) -> Result<Appended, AppendRefused> {
+  make(state, &steps, held).map_err(AppendRefused::Changes)?;
+  secure(state, &steps, held).map_err(AppendRefused::Changes)?;
+  let verdicts = judge(state, &steps, held).map_err(AppendRefused::Changes)?;
   let made: Vec<VolumeRecord> = steps
     .iter()
     .filter_map(|step| match step {
@@ -730,7 +730,7 @@ fn admit(
   made: &[VolumeRecord],
   entry: &RepositoryEntry,
   steps: &[Step],
-) -> Result<(), PushRefused> {
+) -> Result<(), AppendRefused> {
   let first = state.db.partition().check_creating(made, entry);
   if let Err(slates_db::DbError::Capacity {
     table: "green_chains",
@@ -746,13 +746,13 @@ fn admit(
       }
     }
   } else {
-    return first.map_err(|error| PushRefused::Entry(refusal_of_db(&error)));
+    return first.map_err(|error| AppendRefused::Entry(refusal_of_db(&error)));
   }
   state
     .db
     .partition()
     .check_creating(made, entry)
-    .map_err(|error| PushRefused::Entry(refusal_of_db(&error)))
+    .map_err(|error| AppendRefused::Entry(refusal_of_db(&error)))
 }
 
 /// What a step's commit made: the version, and what its chain entry records of it.
@@ -764,13 +764,13 @@ fn commit(
   state: &mut ShardState,
   steps: &[Step],
   verdicts: Vec<Option<Verdict>>,
-) -> Result<Committed, PushRefused> {
+) -> Result<Committed, AppendRefused> {
   for (step, verdict) in steps.iter().zip(&verdicts) {
     if let (Some((green, _)), Some(Verdict::Held(judged))) = (step.work(), verdict) {
       let head = state.greens.get(&green).map(|engine| engine.head());
       if head != Some(judged.at()) {
         state.count(PUSH_COMMIT_REFUSED, 1);
-        return Err(PushRefused::Entry(Refusal::ContentUnavailable));
+        return Err(AppendRefused::Entry(Refusal::ContentUnavailable));
       }
     }
   }
@@ -837,7 +837,7 @@ fn recorded_entry(
 /// whatever it met, as a verb's is (`verbs::run_recorded`), and a refused publication's in-memory effects reconciled
 /// with what the log holds (`verbs::reconcile_unpublished_effects`). Each op was judged whole beforehand
 /// (`Partition::check_creating`), so none is refused here; one that is, is counted.
-fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), PushRefused> {
+fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), AppendRefused> {
   let now = state.clock.monotonic_ns();
   let own = !state.db.in_transaction();
   if own {
@@ -847,13 +847,13 @@ fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), PushRefused> {
   for op in ops {
     if let Err(error) = state.db.mutate(&mut state.segment, op, now) {
       state.count(PUSH_COMMIT_REFUSED, 1);
-      recorded = Err(PushRefused::Entry(refusal_of_db(&error)));
+      recorded = Err(AppendRefused::Entry(refusal_of_db(&error)));
       break;
     }
   }
   if own && let Err(error) = state.db.commit(&mut state.segment) {
     crate::verbs::reconcile_unpublished_effects(state);
-    return Err(PushRefused::Entry(refusal_of_db(&error)));
+    return Err(AppendRefused::Entry(refusal_of_db(&error)));
   }
   recorded
 }
@@ -896,7 +896,7 @@ fn settle_secured(state: &mut ShardState, held: &mut Held) {
 }
 
 /// The answer of a push that recorded nothing: every work's version from before.
-fn answer(steps: &[Step], verdicts: &[Option<Verdict>]) -> Pushed {
+fn answer(steps: &[Step], verdicts: &[Option<Verdict>]) -> Appended {
   let committed: Committed = verdicts
     .iter()
     .map(|verdict| match verdict {
@@ -908,7 +908,7 @@ fn answer(steps: &[Step], verdicts: &[Option<Verdict>]) -> Pushed {
 }
 
 /// The answer, change by change.
-fn answer_committed(steps: &[Step], committed: &Committed, recorded: bool) -> Pushed {
+fn answer_committed(steps: &[Step], committed: &Committed, recorded: bool) -> Appended {
   let changes = steps
     .iter()
     .zip(committed)
@@ -917,18 +917,18 @@ fn answer_committed(steps: &[Step], committed: &Committed, recorded: bool) -> Pu
         let (version, before) = made
           .as_ref()
           .map_or((0, false), |(version, _, before)| (*version, *before));
-        BranchPushed::Moved {
+        BranchAppended::Moved {
           green: *green,
           version,
           before,
         }
       }
-      Step::Create { record, .. } => BranchPushed::Created {
+      Step::Create { record, .. } => BranchAppended::Created {
         green: record.id,
         version: made.as_ref().map_or(0, |(version, ..)| *version),
       },
-      Step::Delete { green, .. } => BranchPushed::Deleted { green: *green },
+      Step::Delete { green, .. } => BranchAppended::Deleted { green: *green },
     })
     .collect();
-  Pushed { changes, recorded }
+  Appended { changes, recorded }
 }

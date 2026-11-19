@@ -44204,8 +44204,8 @@ superseded, kept on the wire), `crates/ipc/tests/wire_order.txt`, `crates/server
   refuses `HeadMoved` with nothing applied once the green moved. `submit_resolved` is a judgment committed at once, so a
   submit and a push run one verdict.
 - **The push.** `crates/server/src/repository/push.rs`, one interface: `RepositoryLogs::append(principal, repository,
-  changes, parts) -> Result<Pushed, PushRefused>`, implemented by the shard's state (`push`), and fakeable by a tool's
-  tests. Each change is `BranchChange::Update { green, work }` (A-618's work against the branch's green),
+  changes, parts) -> Result<Appended, AppendRefused>`, implemented by the shard's state (`push`), and fakeable by a
+  tool's tests. Each change is `BranchChange::Update { green, work }` (A-618's work against the branch's green),
   `Create { name, from, version, work }` (a new branch made at `version` of member `from`, moved by a work made against
   `from` at `version`, which applies to the new green at its version 0) or `Delete { name, version }` (retired, its green
   kept, unless it moved past the version the client saw); `EntryParts` carries checks, names and state changes. Nothing
@@ -44216,7 +44216,7 @@ superseded, kept on the wire), `crates/ipc/tests/wire_order.txt`, `crates/server
   their records and then the entry before either is recorded). Then the verdicts commit, at the heads they were judged
   at, and the new greens' records and the entry are one log record. A refusal names every change refused and why
   (`ChangeRefused { index, why }`: the verdict's windows, `Moved`, `Twice`, `ApprovalRequired` naming the work an
-  approver would approve, or the wire's typed refusal) or the entry's (`PushRefused::Entry`), and gives back what it
+  approver would approve, or the wire's typed refusal) or the entry's (`AppendRefused::Entry`), and gives back what it
   held: a branch made in memory is retired, every retention trued up. A work sent again is answered its version and
   records nothing.
 - **A-642's logs.** No position of a whole repository: each green keeps its own log (its chain), and the repository's

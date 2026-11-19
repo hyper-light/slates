@@ -17,7 +17,8 @@ use slates_merge::push::{
 };
 
 use super::{
-  BranchChange, BranchPushed, ChangeRefusal, ChangeRefused, EntryParts, PushRefused, Pushed, push,
+  AppendRefused, Appended, BranchAppended, BranchChange, ChangeRefusal, ChangeRefused, EntryParts,
+  push,
 };
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
@@ -279,7 +280,7 @@ fn two_branches(state: &mut ShardState) -> (RepositoryId, [DbVolumeId; 2], Store
   );
   assert_eq!(
     pushed.map(|pushed| pushed.changes),
-    Ok(vec![BranchPushed::Moved {
+    Ok(vec![BranchAppended::Moved {
       green: main,
       version: 1,
       before: false
@@ -343,14 +344,14 @@ fn assert_both_moved_in_one_record(
   let pushed = push(state, &owner(), repo, together, EntryParts::default());
   assert_eq!(
     pushed,
-    Ok(Pushed {
+    Ok(Appended {
       changes: vec![
-        BranchPushed::Moved {
+        BranchAppended::Moved {
           green: main,
           version: 2,
           before: false
         },
-        BranchPushed::Moved {
+        BranchAppended::Moved {
           green: topic,
           version: 1,
           before: false
@@ -381,14 +382,14 @@ fn assert_sent_again_records_nothing(
 ) {
   let before = kept(state, repo, &[main, topic]);
   let again = push(state, &owner(), repo, together, EntryParts::default());
-  let moved = |green, version| BranchPushed::Moved {
+  let moved = |green, version| BranchAppended::Moved {
     green,
     version,
     before: true,
   };
   assert_eq!(
     again,
-    Ok(Pushed {
+    Ok(Appended {
       changes: vec![moved(main, 2), moved(topic, 1)],
       recorded: false,
     })
@@ -405,7 +406,7 @@ fn assert_refused_whole(
 ) -> Vec<ChangeRefused> {
   let before = kept(state, repo, &greens);
   let refused = match push(state, &owner(), repo, changes, EntryParts::default()) {
-    Err(PushRefused::Changes(refused)) => refused,
+    Err(AppendRefused::Changes(refused)) => refused,
     other => panic!("not refused by change: {other:?}"),
   };
   let named: Vec<usize> = refused.iter().map(|refused| refused.index).collect();
@@ -460,10 +461,10 @@ fn a_push_creates_and_deletes_branches_in_the_same_step() {
 fn assert_created_deleted_and_moved(
   state: &mut ShardState,
   repo: RepositoryId,
-  pushed: &Pushed,
+  pushed: &Appended,
   [main, topic]: [DbVolumeId; 2],
 ) {
-  let Some(BranchPushed::Created {
+  let Some(BranchAppended::Created {
     green: feature,
     version: 1,
   }) = pushed.changes.first().cloned()
@@ -491,8 +492,8 @@ fn assert_created_deleted_and_moved(
     pushed.changes.get(1..),
     Some(
       &[
-        BranchPushed::Deleted { green: topic },
-        BranchPushed::Moved {
+        BranchAppended::Deleted { green: topic },
+        BranchAppended::Moved {
           green: main,
           version: 2,
           before: false
@@ -654,7 +655,7 @@ fn the_gates_and_the_entry_refuse_the_whole_push() {
     let elsewhere = RepositoryId { bytes: [0xee; 16] };
     assert_eq!(
       push(state, &stranger(), repo, Vec::new(), EntryParts::default()),
-      Err(PushRefused::Repository(Refusal::Forbidden {
+      Err(AppendRefused::Repository(Refusal::Forbidden {
         verb: "push".to_owned()
       }))
     );
@@ -666,7 +667,7 @@ fn the_gates_and_the_entry_refuse_the_whole_push() {
         Vec::new(),
         EntryParts::default()
       ),
-      Err(PushRefused::Repository(Refusal::NotFound))
+      Err(AppendRefused::Repository(Refusal::NotFound))
     );
   });
 }
@@ -691,7 +692,7 @@ fn assert_a_failed_check_refuses_the_entry(
   }];
   assert_eq!(
     push(state, &owner(), repo, changes, parts),
-    Err(PushRefused::Entry(Refusal::Database {
+    Err(AppendRefused::Entry(Refusal::Database {
       refusal: slates_ipc::protocol::DatabaseRefusal::Moved {
         green: crate::verbs::to_wire_volume(topic),
         read: 5,
@@ -788,7 +789,7 @@ fn assert_the_write_policy_gates_the_push(
     }];
     assert_eq!(
       push(state, &owner(), repo, changes, EntryParts::default()),
-      Err(PushRefused::Changes(vec![ChangeRefused {
+      Err(AppendRefused::Changes(vec![ChangeRefused {
         index: 0,
         why: refusal
       }]))
