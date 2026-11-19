@@ -4979,6 +4979,9 @@ mod scan_tests;
 mod node_tests;
 
 #[cfg(test)]
+mod restate_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
