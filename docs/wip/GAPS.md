@@ -3254,6 +3254,10 @@
 >     - A deferred verb's task records its final reply, and some tasks end on `Overloaded`: a granted landing whose
 >       target lease went unanswered (`landing::acquire_target_lease`, answered through `finish_unrun`), so its
 >       resend meets it for good.
+>     - A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
+>       and `retry_deferred` records it, so its resend meets it for good (found by A-557, 2026-11-19, g225;
+>       `settle_refused`'s `paged` and the refusal branch of `gather` and `gather_grants`; the status scatter and
+>       `xshard::AnswerUnstarted` deliver theirs unrecorded).
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
@@ -4802,8 +4806,12 @@
 > - `a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
 > - `a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded`.
 >
-> Reported, not changed: the three read scatters still settle a part whose *remote* state borrow is refused as empty,
-> so an answer can omit a shard's part as if complete. Record:
+> ~~Reported, not changed: the three read scatters still settle a part whose *remote* state borrow is refused as empty,
+> so an answer can omit a shard's part as if complete.~~ Fixed 2026-11-19 by A-557 (g225, goal 85): such a part comes
+> home unserved and the listing, grants or status answers `Overloaded { shard }` for it, counted
+> `scatter.part_unserved`. Its control shard fenced, a two-shard daemon answered all three as if whole before
+> (`a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard`, `crates/server/src/verbs.rs`;
+> `docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`). Record:
 > `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in

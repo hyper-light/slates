@@ -7204,6 +7204,15 @@ failure.
 > of message as the release, sent by the client's own shard after it, so it queues behind the release. A request can
 > only find a release refused, which is counted.
 
+> **Status (2026-11-19, A-557: a read scatter is answered whole, or refused naming a shard whose part it lacks).** A
+> listing, the grants and `DaemonStatus` gather a part from every shard. A part whose shard's state refused the borrow
+> (the control shard fenced by a failed consensus publication, a retention refusal, a shard whose start failed) came
+> home as an empty part, so the answer left out that shard's volumes, grants or report and read as whole. A part now
+> comes home as what its shard served or as nothing, and nothing is settled as a part that could not be sent: the
+> answer is `Overloaded { shard }` for the first such shard, and `scatter.part_unserved` counts it apart from a full
+> control channel's refusal (`settle_unserved`; `a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard`,
+> red before; `docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`).
+
 **Flow control.** Credit-based, absolute offsets per stream; windows derived from the measured
 bandwidth-delay product and the class's latency budget; the sender never exceeds credit; a
 stalled receiver stalls only its own class.
@@ -36527,3 +36536,34 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-557 — A read scatter is answered whole, or refused naming a shard whose part it lacks (2026-11-19, goal 85 via g225; §4.8 "Lookup", §4.9, §4.14 `slates.status`; the 2026-11-05 scatter record's sibling, A-216, A-426)
+
+- **What was there.** A listing, the grants and `DaemonStatus` gather a part from every shard. A part whose shard's
+  state refused the borrow came home as an empty part (`unwrap_or_default`, or a status' `None` skipped by `extend`), so
+  the answer left out that shard's volumes, grants or report and read as whole. A shard refuses when it is fenced (a
+  failed consensus publication fences the control shard), when its retention check refuses, when its start failed and
+  installed no state (the daemon serves the rest), or when a borrow is nested.
+- **The rule.** A part comes home as what its shard served, or as nothing. Nothing is settled as a part that could not
+  be sent (`settle_unserved` over `settle_refused`), so the scatter answers `Overloaded { shard }` for the first such
+  shard once its last part is in: never a page or a report without that shard's part (§4.8 "Lookup": an enumeration is
+  a scatter-gather over owners). `scatter.part_unserved` counts it apart from a full control channel's refusal, which
+  answers the same. It is refused rather than marked partial, since the wire has no partial page or report to mark.
+- **Test.** `a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard` (`crates/server/src/verbs.rs`): a
+  two-shard daemon with its control shard fenced; a client seated on the other shard lists, asks for its grants and
+  asks for the status, and reads each answer from its own ring. Red with the old part tasks (the listing answered
+  `Listed { volumes: [], next: None }`, 0.75 s, Mac Studio); green with the fix, all three `Overloaded { shard: 0 }` and
+  three parts counted unserved.
+- **Reported, not changed.**
+  - A listing's or the grants' `Overloaded` is recorded as the request's completion. It is delivered as not yet
+    recorded, and `retry_deferred` records it, so a resend under its id meets the refusal and never runs the scatter
+    again. The protocol calls `Overloaded` not started, and `AnswerUnstarted` delivers its own unrecorded. This holds
+    for a part that could not be sent since 2026-11-05 as well, and A-557's unserved part takes the same path.
+  - A forwarded verb whose owner shard refuses the borrow is answered `NotFound`: `call_in_shard_time` returns the
+    refused borrow as `None`, and `named_if_unshared` turns that into `NotFound`.
+  - `settle_refused` can leave an orphaned refusal mark for a scatter already settled gone at a stop.
+
+Applied in the same change to: §4.9 (its status), GAPS (the 2026-11-05 entry's reported sibling, closed),
+`crates/server/src/{verbs,state}.rs`, `crates/ipc/src/protocol.rs` (the doc of `Refusal::Overloaded`; the wire is
+unchanged), the bug records `docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md` and
+`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
