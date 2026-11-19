@@ -249,11 +249,12 @@
 > oracle FSFS's `merge()` and `verify_locks` transcribed over the index tests' naive filesystem, equal to the verdict
 > with the lock table's real check on 4,096 generated histories a run; `cargo test -p slates-svn --lib` on the Mac
 > Studio (see A-592). Owed from it: the drive asking the out-of-date test, and the lock check FSFS also makes at each
-> editor call, as each command arrives, over a transaction built a command at a time (piece 7). Found by it, owed to
-> A-602's lock check: `LockTable::verdict` verifies the locks a commit meets in the byte order of their paths, where
-> FSFS checks the changed paths in `svn_path_compare_paths` order (a path's children before its later siblings,
-> `transaction.c` 3537-3539), so a commit refused by locks at both `/t/a/b` and `/t/a-b` is answered at `/t/a-b` where
-> `svnserve` answers `/t/a/b`; the verdict's refusal is the lock check's, so it follows when that order does. A-602
+> editor call, as each command arrives, over a transaction built a command at a time (piece 7). Found by it and fixed
+> by A-617 (2026-11-19, g268): `LockTable::verdict` verified the locks a commit meets in the byte order of their paths,
+> where FSFS checks the changed paths in `svn_path_compare_paths` order and returns at the first that fails
+> (`transaction.c` 3537-3539, 3578), so a commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at
+> `/t/a-b` where `svnserve` answers `/t/a/b`; it now meets them in FSFS's order, and A-602's oracle accepts only the
+> first failing path's locks (it had accepted any lock in the commit). A-602
 > (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock` (with breaking), and the
 > verdict's lock check (with release or keep), each returning the register entries it decided, applied unconditionally;
 > its oracle FSFS's lock rules transcribed, equal on generated histories; `cargo test -p slates-svn --lib` 74 of 74 on

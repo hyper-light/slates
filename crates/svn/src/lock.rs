@@ -749,7 +749,11 @@ impl LockTable {
         }
       };
       reached.sort_by(|first, second| path_order(&first.path, &second.path));
-      met.extend(reached.into_iter().filter(|lock| seen.insert(lock.path.as_str())));
+      met.extend(
+        reached
+          .into_iter()
+          .filter(|lock| seen.insert(lock.path.as_str())),
+      );
     }
     Ok(met)
   }

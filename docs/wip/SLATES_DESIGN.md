@@ -13051,7 +13051,8 @@ for Subversion.)
    lock at or beneath it, as FSFS's `verify_locks` checks: a lock kept through its file's deletion can stand beneath a
    path added later. A lock held by another principal is `E160039`, checked first. A lock whose token the commit did
    not present is `E160037`, wherever in the commit the token was presented. A commit with no principal that meets a
-   lock is `E160034`. An accept releases every presented lock whose token and owner match, paths it did not change
+   lock is `E160034`. The first lock that fails answers, in the order FSFS's `verify_locks` meets them: the changed
+   paths in Subversion's path order, a path's children right after it, so `/t/a/b` before `/t/a-b` (A-617). An accept releases every presented lock whose token and owner match, paths it did not change
    among them, unless the client asked to keep them. The check and the release are in the verdict's one step on the
    owner, so no lock changes between them (A-602).
 5. **What the version records.** The revision's changed-path rows as the drive declared them (add; delete; replace, a
@@ -40532,3 +40533,29 @@ and its tests (new), `crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/prot
   all or none, a mismatch refusing the repository on that holder; a takeover adopts whole entries; and the repository
   record replicated with it (A-515's owed half). Until then each member's version ships on its green's own register, so
   in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
+
+### A-617 part 1 — A-602's lock check answers the first failing lock in Subversion's path order, as FSFS's `verify_locks` does (2026-11-19, g268 for UI goal 93; §4.17.4 item 3.4; A-592's finding, A-602)
+Applied in the same change to: §4.17.4 item 3.4 (the order the first failing lock answers in), GAPS (the §4.17.4
+entry: A-592's finding fixed), `crates/svn/src/lock.rs` (`LockTable::verdict` through `met`, `in_path_order` and
+`path_order`), `crates/svn/src/lock/tests.rs` (the model returns at the first failing check; the census counts the
+commits the order decided), `crates/svn/src/commit/tests.rs` (A-592's scratch case, committed; the transcription's
+order beneath a path read whole).
+- **What was there.** `LockTable::verdict` gathered the locks a commit's changes meet into a map by the locks' paths and
+  verified them in its byte order. FSFS's `verify_locks` sorts the changed paths with `svn_sort_compare_items_as_paths`
+  (`path.c` `svn_path_compare_paths`: a path's children right after it, before its later siblings) and returns at the
+  first path whose check fails (`transaction.c` 3537-3539, 3578). So a commit refused by locks at both `/t/a/b` and
+  `/t/a-b` was answered at `/t/a-b`, where `svnserve` answers `/t/a/b` (A-592's finding). A-602's oracle let it pass:
+  it accepted any lock that could refuse the commit anywhere, though only the order beneath one path read whole, a
+  hash table's in FSFS, is free.
+- **The decision.** `met` gives the locks in `verify_locks`' order: the changed paths in that path order, a modified
+  path's own lock and every lock at or beneath a path added, deleted or replaced, a path beneath one so read skipped,
+  each lock once; beneath a path read whole the same path order, the path's own lock first, as FSFS's walk sends it.
+  `path_order` compares names one by one, which equals `svn_path_compare_paths` on canonical paths (A-592's oracle held
+  the two equal over prefixes and bytes either side of `/`). The model of A-602's oracle returns at the first failing
+  path, so the table must answer one of that path's locks.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the branch). Failing first (04:39
+  UTC, load 8.7): with the tests and lock.rs before the fix, `cargo test --locked -p slates-svn --lib` failed 2 of 155:
+  A-592's case answered `/t/a-b`, and A-602's oracle met a commit modifying `/a-b` and `/a/f` refused at `/a-b`, none
+  of the first failing path's `{/a/f}`. Green (04:39 UTC): 155 of 155 in 1.14 s; A-602's census: 408 refused commits,
+  38 of them decided by the order; A-592's census unchanged in kind. `cargo fmt` clean. Clippy, `xtask check` and the
+  doc gate are main's (the run-request queue).
