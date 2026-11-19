@@ -863,6 +863,12 @@ impl KernelHolds {
   }
 }
 
+/// Format: the journal point a mount taken over from a daemon that died (A-61) judges the files its kernel held open
+/// before the takeover from: before the successor's first journal record (A-567). The successor's journal began again at
+/// its start, so every write it replayed from the dead daemon's log (A-63), and every other change made before the
+/// mount's first turn, is a record after it; A-231 places a held NFS connection's carried states at the same point.
+pub const TAKEN_OVER_FROM: u64 = 0;
+
 /// How a mount taken over from a daemon that died (A-61) adopts a file its kernel held open before the takeover (A-147,
 /// A-152): the journal point every byte of it is fresh as of, and the journal's changes to it since, each with whether
 /// it is one of this mount's own ([`PageStates::adopted`]; none when the journal no longer reaches back, which loses
@@ -887,18 +893,26 @@ impl TakenOver {
   }
 }
 
-/// How a mount taken over from a daemon that died adopts file `ino` ([`TakenOver`]): fresh as of `started_at`, the point
-/// the mount began serving, with the journal's changes to it since.
+/// How a mount taken over from a daemon that died adopts file `ino` ([`TakenOver`]; A-567): fresh as of
+/// [`TAKEN_OVER_FROM`], before the successor's first journal record, with every change the journal holds since applied,
+/// each this mount's own where `own` took it. So the writes the successor replayed from the dead daemon's log, and any
+/// change before the mount served or since, leave the bytes they touched stale: a cache write-back over them is judged
+/// by the volume's bytes ([`judge_writeback`]: applied only where those bytes equal it, refused `EIO` where one differs),
+/// never applied whole as fresh. A journal that no longer reaches back to the successor's first record loses the file,
+/// and its write-backs are refused.
+///
+/// Until A-567 the file was fresh as of the mount's start, the head at its first turn, after the replay: a dirty
+/// shared-map page the kernel held across the takeover was applied whole when written back, the replayed write's bytes
+/// with it.
 pub fn taken_over(
   own: &OwnRecords,
   ino: u64,
-  started_at: u64,
   bridge: &mut dyn slates_bridge_core::Bridge,
   cx: &slates_bridge_core::OpContext,
 ) -> TakenOver {
   TakenOver {
-    from: started_at,
-    changes: changes_since(own, ino, started_at, bridge, cx),
+    from: TAKEN_OVER_FROM,
+    changes: changes_since(own, ino, TAKEN_OVER_FROM, bridge, cx),
   }
 }
 
@@ -1680,7 +1694,7 @@ mod tests {
     let cx = attachments.context(attachment).unwrap();
     let mut bridge = slates_bridge_core::VolumeBridge::new(volume_id, &mut volume, &mut store);
     let started_at = bridge.seen(&cx).journal_seq;
-    let adoption = super::taken_over(&OwnRecords::default(), file.0, started_at, &mut bridge, &cx);
+    let adoption = super::taken_over(&OwnRecords::default(), file.0, &mut bridge, &cx);
     let mut states = PageStates::default();
     states.grow_room(adoption.most_ranges());
     states.adopted(file.0, adoption.from, adoption.changes.as_deref());

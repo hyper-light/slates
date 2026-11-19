@@ -1541,7 +1541,7 @@ fn dispatch_request(
   if state.adopts_unseen_handles
     && let Some((fh, ino)) = written_handle(request)
   {
-    adopt_unseen_handle(fh, ino, started_at, bridge, cx, state);
+    adopt_unseen_handle(fh, ino, bridge, cx, state);
   }
   let served = match crate::bridge::cache_writeback(request) {
     Some(nodeid) => serve_writeback(request, nodeid, started_at, bridge, cx, state),
@@ -1639,7 +1639,7 @@ fn note_read(
   state: &mut ServeState,
 ) {
   let started_at = state.started_at.unwrap_or(before);
-  adopt_unseen_handle(read.fh, ino, started_at, bridge, cx, state);
+  adopt_unseen_handle(read.fh, ino, bridge, cx, state);
   if !state.writable.holds(ino) {
     return;
   }
@@ -1675,11 +1675,13 @@ fn written_handle(request: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// On a mount taken over from a daemon that died (A-61), at its first turn: tracks every file the volume restored opens
-/// of for this mount's owner (A-152) as fresh as of the mount's start, and starts the rounds there, so they feed each
-/// file every change after it and no write-back of it reads the journal back to the start. A request naming one of its
-/// handles then finds it tracked ([`adopt_unseen_handle`]). Until 2026-10-23 every such file was adopted only when a
-/// request named it, from the journal's records since the start, and lost once the journal no longer reached back. A
-/// handle opened after the last publication is in no count, so its file is still adopted when a request names it.
+/// of for this mount's owner (A-152) as the takeover rule adopts it ([`crate::coherence::taken_over`], A-567): fresh as
+/// of before the successor's first journal record, with every change since, the writes it replayed among them, so a
+/// write-back over a byte one changed is judged by the volume's bytes. The rounds start at the head, so they feed each
+/// file every change after it. A request naming one of its handles then finds it tracked ([`adopt_unseen_handle`]).
+/// Until 2026-10-23 every such file was adopted only when a request named it, and until A-567 each was fresh as of the
+/// mount's start, after the replay. A handle opened after the last publication is in no count, so its file is still
+/// adopted when a request names it.
 fn adopt_restored(
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
@@ -1691,9 +1693,11 @@ fn adopt_restored(
   state.adopt_restored = false;
   let seen = bridge.seen(cx);
   state.coherence.begin_at(seen);
-  let start = *state.started_at.get_or_insert(seen.journal_seq);
+  if state.started_at.is_none() {
+    state.started_at = Some(seen.journal_seq);
+  }
   for ino in bridge.restored_open_files(cx) {
-    let adoption = crate::coherence::taken_over(&state.own, ino, start, bridge, cx);
+    let adoption = crate::coherence::taken_over(&state.own, ino, bridge, cx);
     make_room(bridge, cx, state, adoption.most_ranges());
     state
       .states
@@ -1713,9 +1717,10 @@ fn drop_released_restored(state: &mut ServeState, ino: u64, restored: &[u64]) {
 
 /// On a mount taken over from a daemon that died (A-61), a request naming handle `fh` of `ino` that this mount never saw
 /// opened adopts it (A-147). The kernel opened the handle before this daemon served it, maybe for writing, and a store
-/// through a map of it reaches this mount as a cache write-back. Its file is tracked from here on
-/// ([`PageStates::adopted`]): fresh as of the mount's start `started_at`, with the journal's changes to it since then.
-/// So a re-fetch is recorded, and a write-back is judged as on a mount that saw the open.
+/// through a map of it reaches this mount as a cache write-back. Its file is tracked from here on as the takeover rule
+/// adopts it ([`crate::coherence::taken_over`], A-567): fresh as of before the successor's first journal record, with
+/// every change since. So a re-fetch is recorded, and a write-back is judged as on a mount that saw the open, a replayed
+/// write's bytes stale until re-fetched.
 ///
 /// Before A-147 such a file stayed untracked, and each write-back of it was judged against every change since the
 /// mount's start. A store made after a re-fetch of bytes another path had changed was kept back, and lost
@@ -1725,7 +1730,6 @@ fn drop_released_restored(state: &mut ServeState, ino: u64, restored: &[u64]) {
 fn adopt_unseen_handle(
   fh: u64,
   ino: u64,
-  started_at: u64,
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
@@ -1737,7 +1741,7 @@ fn adopt_unseen_handle(
   if state.states.tracks(ino) {
     return;
   }
-  let adoption = crate::coherence::taken_over(&state.own, ino, started_at, bridge, cx);
+  let adoption = crate::coherence::taken_over(&state.own, ino, bridge, cx);
   make_room(bridge, cx, state, adoption.most_ranges());
   state
     .states
