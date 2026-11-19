@@ -613,7 +613,7 @@ mod tests {
   fn table_checksum(entries: &[u16]) -> u32 {
     let mut checksum = 0u32;
     for byte in entries.iter().flat_map(|entry| entry.to_le_bytes()) {
-      let carried = if checksum & 1 == 1 { 0x8000_0000 } else { 0 };
+      let carried: u32 = if checksum & 1 == 1 { 0x8000_0000 } else { 0 };
       checksum = carried
         .wrapping_add(checksum >> 1)
         .wrapping_add(u32::from(byte));
