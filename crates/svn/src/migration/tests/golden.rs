@@ -7,8 +7,10 @@
 use std::fmt::Write as _;
 
 use super::support::{
-  History, VECTOR_UUID, created, export, export_all, history, import, import_whole,
+  History, VECTOR_UUID, created, export, export_all, export_deltas, export_in, history, import,
+  import_whole,
 };
+use crate::dump::Format;
 use crate::index::{Action, ChangedPath, NodeKind};
 use crate::migration::Repository;
 use crate::migration::paths::{compare_paths, relative};
@@ -222,6 +224,42 @@ fn a_history_exported_in_parts_imports_to_the_history_exported_whole() {
   let mut joined = created();
   import_whole(&mut joined, &[first, second].concat()).unwrap();
   assert!(history(&joined) == history(&source));
+}
+
+/// A-652 (golden): do import the history stock `svnadmin` dumped, from format 2, from format 3, and in two parts, and
+/// export each repository in format 3, whole and from revision 4. Expect `svnadmin dump --deltas`'s bytes byte for byte
+/// (`deltas.dump`), and `svnadmin dump --deltas --incremental -r 4:13`'s (`part2.dump`): every text the deltifier's
+/// windows against its comparison, every property section of a change or a copy a change to its comparison's list.
+#[test]
+fn every_history_exports_in_format_three_as_svnadmin_dump_deltas_wrote_it() {
+  let sources: [&[&str]; 3] = [
+    &["full.dump"],
+    &["deltas.dump"],
+    &["part1.dump", "part2.dump"],
+  ];
+  for names in sources {
+    let repository = imported(names);
+    let whole = export_deltas(&repository).unwrap();
+    assert!(whole == vector("deltas.dump"), "{names:?}: deltas.dump");
+    let tail = export_in(
+      &repository,
+      PART1_LAST + 1,
+      repository.youngest(),
+      Format::Three,
+    )
+    .unwrap();
+    assert!(tail == vector("part2.dump"), "{names:?}: part2.dump");
+  }
+}
+
+/// A-652 (golden): do import `full.dump`, export it in format 3, and import that into a new repository. Expect the
+/// history exported: import(export(R)) is R through deltas too.
+#[test]
+fn a_repository_imported_from_its_format_three_export_is_the_repository_exported() {
+  let source = imported(&["full.dump"]);
+  let mut again = created();
+  import_whole(&mut again, &export_deltas(&source).unwrap()).unwrap();
+  assert!(history(&again) == history(&source));
 }
 
 /// A-628 (golden): do import `full.dump` and `deltas.dump`, export each repository and import the export into a new

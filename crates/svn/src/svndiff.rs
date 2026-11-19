@@ -24,6 +24,8 @@
 //!   caller's buffer is bounded by the format, never by the peer.
 //! - [`apply`] is the reference: it makes the target byte by byte, a target copy that runs past the position repeating
 //!   what it copied, as `notes/svndiff` defines.
+//! - [`deltas`] is Subversion's deltifier, the crate's one delta generator: the windows a stock server makes of a text
+//!   against its base, `text_delta.c`'s windowing and `xdelta.c`'s choice of instructions ported (A-652).
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -990,6 +992,9 @@ pub fn apply_all(source: &[u8], windows: &[Window]) -> Result<Vec<u8>, SvndiffEr
   }
   Ok(target)
 }
+
+mod deltify;
+pub use deltify::{Deltas, deltas};
 
 #[cfg(test)]
 mod tests;

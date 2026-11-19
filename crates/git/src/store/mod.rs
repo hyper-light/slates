@@ -26,6 +26,12 @@
 //! current head, found back through the commit rows by generation, walking only what lies beyond it: a branch made at
 //! another's head costs no walk.
 //!
+//! **D(k) as derived data** (A-647 part 2, [`ReachSets`]). A version's two sets are a type of `slates-vcs`'s derived
+//! data: a pure function of the version's record and its parents' values (version `k - 1`'s, and that of the version a
+//! remade set came from, which each version records), so any tier derives them with the admission's own walks over the
+//! committed index, and the owner keeps the admission's sets under (type, version) with no second walk
+//! ([`Repository::reach_value`]). The sets above are unchanged; the type reads them back, identity for identity.
+//!
 //! **A version read as a tree.** A version's head and its root tree are read from its commit row, and a path is
 //! resolved one tree a component down ([`Repository::entry`]): no walk of history and none of the tree. Making a
 //! green's maps (A-534) from a commit that is no version's head is receive-pack's create (piece 6).
@@ -72,6 +78,7 @@ pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned};
+pub use repository::reach::{ReachRefused, ReachSets, Sets};
 pub use repository::{Found, Move, Repository, StoreCounters, StoreRefused};
 pub use upload::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 

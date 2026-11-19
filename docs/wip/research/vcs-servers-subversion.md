@@ -707,6 +707,18 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   revision is judged by are each history's next location, not the revision's own (`do_logs` builds `cur_paths` after
   `check_history` has advanced), which the recording shows: `tags/t1`'s log has r7's merge of `/branches/b1/dir`,
   seen through `/trunk`.
+- **`log`'s merged revisions** [C: `log.c` `get_paths_history_as_mergeinfo`, `fs_mergeinfo_changed`,
+  `get_combined_mergeinfo_changes`, `handle_merged_revisions`, `combine_mergeinfo_path_lists`, `reduce_search`,
+  `store_search`, `interesting_merge`, `send_log`; `mergeinfo.c` `svn_mergeinfo__mergeinfo_from_segments`; `tree.c`
+  `get_mergeinfo_for_path`; recorded]: a revision with children is followed by its merged revisions and an entry of
+  revision 0 with `invalid-revnum` true; a reverse merge's are `subtractive-merge` true; a revision whose merged
+  revisions were all sent before has its closing entry alone (recorded: `tags/t1`'s r5 after r11 sent r4). Two places
+  depend on the seeded hash order and so have no stable answer to match: `combine_mergeinfo_path_lists`' removal
+  (`array_pop_front` takes the array's first source where it means the one used up, wrong when two sources share a
+  first range and the first sorted has more), and `qsort`'s order of runs with equal ranges; slates takes the intent.
+  `interesting_merge` calls the client's changed-path receiver before it judges, and `send_log` checks
+  `nested_merges` after `fill_log_entry`, so a merged revision passed over has had its changed paths written, which
+  join the next entry's (not recorded: the recorded `-g -v` logs pass none over with changed paths).
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
@@ -863,3 +875,13 @@ the first 16 hex digits of each file's sha256:
   written with its code's own (`svn_err_best_message`): `svn_checksum_parse_hex`'s refusal is "Invalid character in hex
   checksum" and an undecodable LZ4 block "LZ4 decompression failed" (`svn_error_codes.h` 221, 1498). A checksum is read
   as its first 32 hexadecimal digits, the rest ignored, and the all-zero digest is no checksum at all.
+- **The deltifier** (A-652) [C: `libsvn_delta/text_delta.c` `fc69ad86f58de9b9` (`compute_window` 146-170,
+  `svn_txdelta__insert_op` 209-278, `svn_txdelta__remove_copy` 280-323, `txdelta_next_window` 356-397,
+  `tpush_write_handler` 508-556); `libsvn_delta/xdelta.c` `54b4ca6d79472013` (`init_adler32`, `adler32_replace`,
+  `init_blocks_table`, `find_match`, `store_delta_trailer`, `compute_delta` 371-480); `libsvn_subr/string.c`
+  `62b5ad96280ba127` (`svn_cstring__match_length`, `svn_cstring__reverse_match_length`, plain byte loops at this
+  revision); `libsvn_fs_fs/cached_data.c` `24e324dfec74f1a5` (`svn_fs_fs__get_file_delta_stream` 2476: a stored delta
+  sent as it is only when it was stored against the very base asked for)]: the pull and push forms cut the same windows
+  (a source piece read when a target piece begins, a short piece ending the source's views), so every delta a stock
+  server sends or dumps is a function of its two texts; `svnadmin dump --deltas` writes it in svndiff version 0
+  (`store_delta`). Every recorded delta of the golden dumps is remade by the port window for window.

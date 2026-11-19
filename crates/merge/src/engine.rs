@@ -65,7 +65,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dims::{Dim, Files, Xattrs};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
@@ -1189,6 +1189,24 @@ fn span_bytes(from: &[u8], src: u64, len: u64) -> &[u8] {
   from.get(start..end).unwrap_or_default()
 }
 
+/// The node a hard link names (A-646): the path of its node record, and whether the work makes
+/// the node there (else it is the node at that path at the work's base).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkTarget {
+  path: String,
+  made: bool,
+}
+
+/// The node a `Link` op names (A-646): its node record in `doc`'s node table, with that record's
+/// path; `None` when the record or its path is missing, an invalid document.
+fn link_target(doc: &OpsDoc, node: u64) -> Option<LinkTarget> {
+  let node = doc.nodes.node(node)?;
+  Some(LinkTarget {
+    path: doc.paths.path(node.path)?.to_owned(),
+    made: node.origin == NodeOrigin::Made,
+  })
+}
+
 /// The changes an increment declares, resolved from the ops document into per-dimension groups by
 /// path (xattrs by path and name). The deriver has already composed each path's operations.
 #[derive(Default)]
@@ -1202,7 +1220,7 @@ struct Resolved {
   rmdirs: BTreeSet<String>,
   modes: BTreeMap<String, u32>,
   symlinks: BTreeMap<String, String>,
-  hardlinks: BTreeMap<String, String>,
+  hardlinks: BTreeMap<String, LinkTarget>,
   renames: BTreeMap<String, String>,
   xattr_sets: Vec<(String, String, Vec<u8>)>,
   xattr_removes: Vec<(String, String)>,
@@ -1222,19 +1240,32 @@ impl Resolved {
     cleared
   }
 
-  /// The node a hard link to `target` names, through the links the increment makes (`a` to `b`,
-  /// `b` to `c`: `c`), at most one step a link it makes: the final target, and that path again
-  /// when the increment brings it into being itself (its own node, A-646), else none (the node at
-  /// the target at the work's base).
-  fn link_node<'a>(&'a self, target: &'a str) -> (&'a str, Option<&'a str>) {
+  /// The node a hard link to `target` names (A-646): the node at a path at the work's base,
+  /// `(path, None)`, or a node the work makes, `(path, Some(path))`. A node the work makes is one
+  /// it creates or makes as an IPC node; one it renames there is the source's node, at the base;
+  /// one a link it makes names is that link's node, at most one step a link it makes. `None` when
+  /// the document names a node the work does not make, or links that never reach one: an invalid
+  /// work. A rename resolved to its source keeps the link on the moved node, which the commit's
+  /// node moves carry to the rename's destination (`Green::node_moves`).
+  fn link_node<'a>(&'a self, target: &'a LinkTarget) -> Option<(&'a str, Option<&'a str>)> {
     let mut node = target;
-    for _ in 0..self.hardlinks.len() {
-      match self.hardlinks.get(node) {
-        Some(next) => node = next.as_str(),
-        None => break,
+    for _ in 0..=self.hardlinks.len() {
+      let path = node.path.as_str();
+      if !node.made {
+        return Some((path, None));
+      }
+      if let Some(source) = self.renames.get(path) {
+        return Some((source.as_str(), None));
+      }
+      match self.hardlinks.get(path) {
+        Some(next) => node = next,
+        None => {
+          let made = self.creates.contains(path) || self.specials.contains_key(path);
+          return made.then_some((path, Some(path)));
+        }
       }
     }
-    (node, self.establishes(node).then_some(node))
+    None
   }
 
   /// Whether this increment itself brings `path` into being — a file it creates or renames into, or a
@@ -2745,9 +2776,14 @@ impl Green {
         OpKind::Symlink => {
           r.symlinks.insert(path, name(op.src));
         }
-        OpKind::Link => {
-          r.hardlinks.insert(path, name(op.src));
-        }
+        OpKind::Link => match link_target(&inc.doc, op.src) {
+          Some(target) => {
+            r.hardlinks.insert(path, target);
+          }
+          None => {
+            r.invalid.insert(path);
+          }
+        },
         OpKind::Rename => {
           r.renames.insert(path, name(op.src));
         }
@@ -3585,12 +3621,12 @@ impl Green {
       record(effects, windows, self.merge_symlink(path, inc.base, target));
     }
     for (path, target) in &r.hardlinks {
-      let (target, made) = r.link_node(target);
-      record(
-        effects,
-        windows,
-        self.merge_hardlink(path, inc.base, (target, made)),
-      );
+      let answer = match r.link_node(target) {
+        Some(node) => self.merge_hardlink(path, inc.base, node),
+        // The document names a node the work does not make, or links that never reach one.
+        None => Err(Green::window(path, MergeConflictClass::TypeChanged)),
+      };
+      record(effects, windows, answer);
     }
     for (path, name, value) in &r.xattr_sets {
       record(
