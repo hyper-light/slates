@@ -1058,14 +1058,14 @@ fn probe_answers(mut server: &[u8]) -> Vec<Vec<u8>> {
 /// named branches, a closed head on a branch whose name needs quoting, a merge, drafts, an amended draft whose
 /// predecessor is hidden, two bookmarks), each request its probe sent: `heads`; `known` of held, unknown and null
 /// nodes; `between` from the tip to the null node, to an ancestor, and the null pair; `branches`; `branchmap`; and
-/// `listkeys` of `namespaces`, `bookmarks` and `phases`. Expect nine answers, each byte for byte as 7.2's (its branch
+/// `listkeys` of `namespaces`, `bookmarks` and `phases`. Expect eight answers, each byte for byte as 7.2's (its branch
 /// cache's order here the names' order, which this answer keeps).
 #[test]
 fn every_probe_request_is_answered_as_mercurial_answered_it() {
   let history = probed();
   let requests = probe_requests(PROBE_CLIENT);
   let answers = probe_answers(PROBE_SERVER);
-  assert_eq!(requests.len(), 9);
+  assert_eq!(requests.len(), 8);
   assert_eq!(answers.len(), requests.len());
   for ((command, argument), expected) in requests.iter().zip(&answers) {
     let got = answer(|room, out| match command.as_str() {
