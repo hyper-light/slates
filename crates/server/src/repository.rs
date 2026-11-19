@@ -529,18 +529,20 @@ pub(crate) fn retire_branch(
 }
 
 /// Sets repository `repository`'s policy whole (§4.17.1 "Policy", A-622): its owner's verb, made from policy version
-/// `read`, the version its owner read. One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
-/// position. The database's guard refuses a version the policy has moved past (`PolicyChanged`, naming the version
-/// now) and a rule or hook the repository cannot hold (`Database`, naming the first by index), before anything is
-/// recorded; this verb refuses a trusted signer A-321's verifier cannot read, or signers for a repository that is not
-/// git's (`BadRequest`, A-644), and keeps each key once, in the order given.
+/// `read`, the version its owner read: its rules, its hooks, for Subversion its hooks-env (A-648), and for git the keys
+/// trusted to sign its commits (A-644). One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
+/// position. The database's guard refuses a version the policy has moved past (`PolicyChanged`, naming the version now)
+/// and a rule, hook or hooks-env section the repository cannot hold (`Database`, naming the first by index), before
+/// anything is recorded; this verb refuses a trusted signer A-321's verifier cannot read, or signers for a repository
+/// that is not git's (`BadRequest`), and keeps each key once, in the order given.
 pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks, signers): (
+  (rules, hooks, hooks_env, signers): (
     &[slates_ipc::protocol::PolicyRule],
     &[slates_ipc::protocol::HookConfig],
+    &[slates_ipc::protocol::HooksEnvSection],
     &[Vec<u8>],
   ),
 ) -> ReplyBody {
@@ -561,6 +563,7 @@ pub(crate) fn set_policy(
     version,
     rules: rules.iter().map(db_rule).collect(),
     hooks: hooks.iter().map(db_hook).collect(),
+    hooks_env: hooks_env.iter().map(db_hooks_env_section).collect(),
     signers,
   };
   let op = Op::RepositoryPolicySet {
@@ -667,9 +670,32 @@ fn db_hook(hook: &slates_ipc::protocol::HookConfig) -> slates_db::catalog::HookC
       Given::SvnPreCommit => Point::SvnPreCommit,
       Given::SvnPreRevpropChange => Point::SvnPreRevpropChange,
       Given::SvnPostCommit => Point::SvnPostCommit,
+      Given::SvnStartCommit => Point::SvnStartCommit,
+      Given::SvnPostRevpropChange => Point::SvnPostRevpropChange,
+      Given::SvnPreLock => Point::SvnPreLock,
+      Given::SvnPostLock => Point::SvnPostLock,
+      Given::SvnPreUnlock => Point::SvnPreUnlock,
+      Given::SvnPostUnlock => Point::SvnPostUnlock,
     },
     name: hook.name.clone(),
     program: hook.program.clone(),
+  }
+}
+
+/// The database's form of a hooks-env section (A-648).
+fn db_hooks_env_section(
+  section: &slates_ipc::protocol::HooksEnvSection,
+) -> slates_db::catalog::HooksEnvSection {
+  slates_db::catalog::HooksEnvSection {
+    name: section.name.clone(),
+    variables: section
+      .variables
+      .iter()
+      .map(|variable| slates_db::catalog::HooksEnvVariable {
+        name: variable.name.clone(),
+        value: variable.value.clone(),
+      })
+      .collect(),
   }
 }
 
@@ -1264,6 +1290,7 @@ mod tests {
             read,
             rules,
             hooks,
+            hooks_env: Vec::new(),
             signers: Vec::new(),
           },
         )
@@ -1335,6 +1362,140 @@ mod tests {
     });
   }
 
+  /// A-648 (§4.17.4 item 9). Do: create a Subversion repository; set its policy with a hook at each of the six points
+  /// the record gained and a hooks-env of a default section and a pre-lock one; then set one whose second section names
+  /// a variable holding `=`; and, in a git repository, one holding a hooks-env at all. Expect: the first acknowledged and
+  /// held whole, each point and section as given; the second refused naming section 1 and the git one section 0, with
+  /// nothing changed.
+  #[test]
+  fn a_subversion_repositorys_policy_holds_its_six_new_points_and_its_hooks_env() {
+    use slates_db::catalog::HookPointName as Held;
+    use slates_ipc::protocol::{
+      DatabaseRefusal, HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable,
+    };
+    crate::daemon::audit_on_shard(|state| {
+      let svn = RequestBody::CreateRepository {
+        name: "svn".to_owned(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Sha1,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      };
+      green_of(ask(state, &owner(), svn));
+      let program = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      let points = [
+        (
+          HookPointName::SvnStartCommit,
+          "start-commit",
+          Held::SvnStartCommit,
+        ),
+        (
+          HookPointName::SvnPostRevpropChange,
+          "post-revprop-change",
+          Held::SvnPostRevpropChange,
+        ),
+        (HookPointName::SvnPreLock, "pre-lock", Held::SvnPreLock),
+        (HookPointName::SvnPostLock, "post-lock", Held::SvnPostLock),
+        (
+          HookPointName::SvnPreUnlock,
+          "pre-unlock",
+          Held::SvnPreUnlock,
+        ),
+        (
+          HookPointName::SvnPostUnlock,
+          "post-unlock",
+          Held::SvnPostUnlock,
+        ),
+      ];
+      let hooks: Vec<HookConfig> = points
+        .iter()
+        .map(|(point, name, _)| HookConfig {
+          point: *point,
+          name: (*name).to_owned(),
+          program: program.clone(),
+        })
+        .collect();
+      let section = |name: &str, variable: &str, value: &[u8]| HooksEnvSection {
+        name: name.to_owned(),
+        variables: vec![HooksEnvVariable {
+          name: variable.to_owned(),
+          value: value.to_vec(),
+        }],
+      };
+      let env = vec![
+        section("default", "LANG", b"en_US.UTF-8"),
+        section("pre-lock", "ONLY", b"pre-lock"),
+      ];
+      let set = |state: &mut ShardState, repository: &str, read: u64, hooks, hooks_env| {
+        ask(
+          state,
+          &owner(),
+          RequestBody::SetRepositoryPolicy {
+            repository: repository.to_owned(),
+            read,
+            rules: Vec::new(),
+            hooks,
+            hooks_env,
+            signers: Vec::new(),
+          },
+        )
+      };
+      let held = |state: &ShardState, name: &str| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named(name)
+          .map(|record| record.policy.clone())
+          .unwrap()
+      };
+      assert_eq!(set(state, "svn", 0, hooks, env), ReplyBody::Acknowledged);
+      let first = held(state, "svn");
+      let points_held: Vec<Held> = first.hooks.iter().map(|hook| hook.point).collect();
+      let expected: Vec<Held> = points.iter().map(|(_, _, held)| *held).collect();
+      assert_eq!(points_held, expected);
+      let held_section =
+        |name: &str, variable: &str, value: &[u8]| slates_db::catalog::HooksEnvSection {
+          name: name.to_owned(),
+          variables: vec![slates_db::catalog::HooksEnvVariable {
+            name: variable.to_owned(),
+            value: value.to_vec(),
+          }],
+        };
+      let given = vec![
+        held_section("default", "LANG", b"en_US.UTF-8"),
+        held_section("pre-lock", "ONLY", b"pre-lock"),
+      ];
+      assert_eq!(first.hooks_env, given);
+      let bad = vec![
+        section("default", "LANG", b"C"),
+        section("pre-lock", "A=B", b"1"),
+      ];
+      assert_eq!(
+        refusal(set(state, "svn", 1, Vec::new(), bad)),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 1 }
+        }
+      );
+      green_of(create(state, "linux", "main"));
+      let git_env = vec![section("default", "LANG", b"C")];
+      assert_eq!(
+        refusal(set(state, "linux", 0, Vec::new(), git_env)),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 0 }
+        }
+      );
+      assert_eq!(
+        held(state, "svn"),
+        first,
+        "a refused setting changes nothing"
+      );
+    });
+  }
+
   /// An `ssh-ed25519` public key in SSH wire form, `fill` in every byte of its key.
   fn signer_key(fill: u8) -> Vec<u8> {
     let mut blob = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
@@ -1354,6 +1515,7 @@ mod tests {
       read,
       rules,
       hooks: Vec::new(),
+      hooks_env: Vec::new(),
       signers,
     };
     ask(state, &owner(), body)

@@ -15,6 +15,11 @@
 //! for every name past the 65,535th, so the 65,536th and every later name aliased one path: a correctness bug, not a
 //! limit. Interning looks a name up in an ordered map, so a table of n names costs O(n log n) comparisons where the
 //! scan it replaced cost O(n²); its tests count them.
+//!
+//! **A hard link names a node, never a path (A-646).** Since version 3 the document holds a node table after its paths:
+//! each record a path of the table and an origin, the node at that path at the work's base or the node the work makes
+//! there, and a `Link` names a record. Until version 3 a link named a path, which the engine read at the head, so a
+//! link followed whatever stood at its target's path; the node a work saw is the one it linked to.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -44,7 +49,8 @@ pub enum OpKind {
   Rmdir = 8,
   /// Format: a name renamed (the source path is `src` into the path table).
   Rename = 9,
-  /// Format: a hard link created.
+  /// Format: a hard link created: `path` is the link, `src` the index in the node table of the node it names (A-646; a
+  /// path index until version 3).
   Link = 10,
   /// Format: a symlink created.
   Symlink = 11,
@@ -232,19 +238,131 @@ impl PathTable {
   }
 }
 
+/// Format: where the node a hard link names is (A-646, §4.16 "Data model"), a node record's origin byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum NodeOrigin {
+  /// Format: the node at the path at the work's base: a link's node while that link stood unchanged since, a file or
+  /// an IPC node while it was not removed since.
+  Base = 0,
+  /// Format: the node the work makes at the path: a file it creates or renames there, an IPC node it makes, or the
+  /// node a link it makes there names.
+  Made = 1,
+}
+
+impl NodeOrigin {
+  /// The wire value.
+  pub fn to_wire(self) -> u8 {
+    self as u8
+  }
+
+  /// The origin for a wire value, or `None` for an unknown one.
+  pub fn from_wire(value: u8) -> Option<NodeOrigin> {
+    [NodeOrigin::Base, NodeOrigin::Made]
+      .into_iter()
+      .find(|origin| origin.to_wire() == value)
+  }
+}
+
+/// A node a hard link names (A-646): a path of the document's table, and where the node is. Ordered by path, then
+/// origin: the node table's canonical order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NodeRef {
+  /// The path, as an index into the path table.
+  pub path: u64,
+  /// Where the node is: at the path at the work's base, or made there by the work.
+  pub origin: NodeOrigin,
+}
+
+/// The node table (A-646): the distinct nodes the document's hard links name, each once, so a link names a node and
+/// links naming one node name one record. Sorted by path, then origin, by [`OpsDoc::canonicalize`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeTable {
+  /// The nodes, by index.
+  nodes: Vec<NodeRef>,
+  /// Each node's index, by node: what interning looks a node up in, O(log n).
+  index: BTreeMap<NodeRef, u64>,
+}
+
+impl NodeTable {
+  /// An empty table.
+  pub fn new() -> NodeTable {
+    NodeTable::default()
+  }
+
+  /// Interns `node`, returning its index (deduplicated, insertion order; the canonical order is imposed by
+  /// [`OpsDoc::canonicalize`]). The conversion's unreachable refusal answers `u64::MAX`, which names no node.
+  pub fn intern(&mut self, node: NodeRef) -> u64 {
+    let next = u64::try_from(self.nodes.len()).unwrap_or(u64::MAX);
+    match self.index.entry(node) {
+      Entry::Occupied(found) => *found.get(),
+      Entry::Vacant(slot) => {
+        slot.insert(next);
+        self.nodes.push(node);
+        next
+      }
+    }
+  }
+
+  /// The node at `index`.
+  pub fn node(&self, index: u64) -> Option<NodeRef> {
+    self.nodes.get(usize::try_from(index).ok()?).copied()
+  }
+
+  /// The nodes, by index.
+  pub fn nodes(&self) -> &[NodeRef] {
+    &self.nodes
+  }
+
+  /// Moves each node's path through `paths` (the path table's remap), puts the table in canonical order, and returns,
+  /// for each old index, its new index (so the links can be remapped). A path the remap does not know becomes
+  /// `u64::MAX`, which names none.
+  fn sort_and_remap(&mut self, paths: &[u64]) -> Vec<u64> {
+    let old = std::mem::take(&mut self.nodes);
+    self.index.clear();
+    let mut remap = vec![u64::MAX; old.len()];
+    let mut by_node: BTreeMap<NodeRef, Vec<usize>> = BTreeMap::new();
+    for (position, node) in old.iter().enumerate() {
+      let path = usize::try_from(node.path)
+        .ok()
+        .and_then(|index| paths.get(index))
+        .copied()
+        .unwrap_or(u64::MAX);
+      by_node
+        .entry(NodeRef {
+          path,
+          origin: node.origin,
+        })
+        .or_default()
+        .push(position);
+    }
+    for (node, positions) in by_node {
+      let rank = self.intern(node);
+      for position in positions {
+        if let Some(slot) = remap.get_mut(position) {
+          *slot = rank;
+        }
+      }
+    }
+    remap
+  }
+}
+
 /// Format: the ops document magic, `SLOD` in little-endian ASCII.
 const MAGIC: u32 = 0x444f_4c53;
-/// Format: the document version. 2 since A-621: a path index and the header's path and operation counts are 64 bits
-/// (they were 16 and 32), so a work names as many paths as its admission allows; a version 1 document is refused
-/// (`BadVersion`), never read under the other layout.
-const VERSION: u32 = 2;
+/// Format: the document version. 3 since A-646: the header counts a node table's records too, and a `Link` names one of
+/// them, a node, where it named a path; a version 2 document, whose links named paths, is refused (`BadVersion`), never
+/// read under the other meaning. 2 since A-621: a path index and the header's counts are 64 bits.
+const VERSION: u32 = 3;
 
-/// An ops document: the sorted path table and the operations, in a canonical order (by path
-/// index, then by offset), so the same declared work always serializes to the same bytes.
+/// An ops document: the sorted path table, the node table its hard links name, and the operations, in a canonical
+/// order (by path index, then by offset), so the same declared work always serializes to the same bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpsDoc {
   /// The path table.
   pub paths: PathTable,
+  /// The node table (A-646): the nodes the document's hard links name.
+  pub nodes: NodeTable,
   /// The operations, canonically ordered.
   pub ops: Vec<Op>,
 }
@@ -254,6 +372,7 @@ impl OpsDoc {
   pub fn new() -> OpsDoc {
     OpsDoc {
       paths: PathTable::new(),
+      nodes: NodeTable::new(),
       ops: Vec::new(),
     }
   }
@@ -262,14 +381,18 @@ impl OpsDoc {
   /// before encoding so the identity is independent of the order operations were added.
   pub fn canonicalize(&mut self) {
     let remap = self.paths.sort_and_remap();
+    let nodes = self.nodes.sort_and_remap(&remap);
     for op in &mut self.ops {
-      if matches!(
-        op.kind,
-        OpKind::Rename | OpKind::Link | OpKind::Symlink | OpKind::Copy
-      ) {
+      if matches!(op.kind, OpKind::Rename | OpKind::Symlink | OpKind::Copy) {
         op.src = usize::try_from(op.src)
           .ok()
           .and_then(|index| remap.get(index))
+          .map_or(u64::MAX, |index| *index);
+      }
+      if op.kind == OpKind::Link {
+        op.src = usize::try_from(op.src)
+          .ok()
+          .and_then(|index| nodes.get(index))
           .map_or(u64::MAX, |index| *index);
       }
       if matches!(op.kind, OpKind::SetXattr | OpKind::RemoveXattr) {
@@ -293,27 +416,29 @@ impl OpsDoc {
     });
   }
 
-  /// The canonical byte encoding: the header (magic and version, `u32` each; path count and op count, `u64` each), then
-  /// each path as a `u32` length-prefixed byte string, then each operation as a fixed record of [`OP_BYTES`] (kind and
-  /// flags, a byte each; path, offset, length and source, `u64` each). Little-endian throughout; no host-dependent
-  /// padding. A count's conversion to 64 bits cannot fail on the targets slates builds for.
+  /// The canonical byte encoding: the header (magic and version, `u32` each; path, node and op counts, `u64` each), then
+  /// each path as a `u32` length-prefixed byte string, then each node as a fixed record of [`NODE_BYTES`] (its origin, a
+  /// byte, and its path, a `u64`; A-646), then each operation as a fixed record of [`OP_BYTES`] (kind and flags, a byte
+  /// each; path, offset, length and source, `u64` each). Little-endian throughout; no host-dependent padding. A count's
+  /// conversion to 64 bits cannot fail on the targets slates builds for.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(
-      &u64::try_from(self.paths.paths().len())
-        .unwrap_or(u64::MAX)
-        .to_le_bytes(),
-    );
-    out.extend_from_slice(
-      &u64::try_from(self.ops.len())
-        .unwrap_or(u64::MAX)
-        .to_le_bytes(),
-    );
+    for count in [
+      self.paths.paths().len(),
+      self.nodes.nodes().len(),
+      self.ops.len(),
+    ] {
+      out.extend_from_slice(&u64::try_from(count).unwrap_or(u64::MAX).to_le_bytes());
+    }
     for path in self.paths.paths() {
       out.extend_from_slice(&u32::try_from(path.len()).unwrap_or(u32::MAX).to_le_bytes());
       out.extend_from_slice(path.as_bytes());
+    }
+    for node in self.nodes.nodes() {
+      out.push(node.origin.to_wire());
+      out.extend_from_slice(&node.path.to_le_bytes());
     }
     for op in &self.ops {
       out.push(op.kind.to_wire());
@@ -347,6 +472,7 @@ impl OpsDoc {
       return Err(DocDecodeError::BadVersion);
     }
     let path_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    let node_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let op_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     // A path is at least its 4-byte length prefix and an op is a fixed record of `OP_BYTES`; if the header's
     // counts cannot fit in the bytes that remain, the entry is corrupt — checked before any allocation
@@ -365,6 +491,7 @@ impl OpsDoc {
         return Err(DocDecodeError::DuplicatePath);
       }
     }
+    let nodes = take_nodes(&mut reader, node_count, paths.paths().len())?;
     if op_count > reader.remaining() / OP_BYTES {
       return Err(DocDecodeError::Truncated);
     }
@@ -388,12 +515,40 @@ impl OpsDoc {
     if !reader.is_empty() {
       return Err(DocDecodeError::TrailingBytes);
     }
-    Ok(OpsDoc { paths, ops })
+    Ok(OpsDoc { paths, nodes, ops })
   }
+}
+
+/// Reads `count` node records (A-646), checked against the bytes that remain before anything is reserved: each origin
+/// one this build knows and each path one of the `paths` the table holds (`BadNode`), and no node twice
+/// (`DuplicateNode`, as a path twice is refused).
+fn take_nodes(
+  reader: &mut Reader<'_>,
+  count: usize,
+  paths: usize,
+) -> Result<NodeTable, DocDecodeError> {
+  if count > reader.remaining() / NODE_BYTES {
+    return Err(DocDecodeError::Truncated);
+  }
+  let paths = u64::try_from(paths).unwrap_or(u64::MAX);
+  let mut nodes = NodeTable::new();
+  for expected in (0u64..).take(count) {
+    let origin = NodeOrigin::from_wire(reader.u8()?).ok_or(DocDecodeError::BadNode)?;
+    let path = reader.u64()?;
+    if path >= paths {
+      return Err(DocDecodeError::BadNode);
+    }
+    if nodes.intern(NodeRef { path, origin }) != expected {
+      return Err(DocDecodeError::DuplicateNode);
+    }
+  }
+  Ok(nodes)
 }
 
 /// The smallest a path entry can be in the encoding: its length prefix (a `u32`), for an empty path.
 const PATH_MIN_BYTES: usize = size_of::<u32>();
+/// Format: a node record's size (A-646, version 3): its origin, a byte, and its path's index, a `u64`.
+pub(crate) const NODE_BYTES: usize = size_of::<u8>() + size_of::<u64>();
 /// Format: a fixed operation record's size: kind + flags (`u8` each), and path, `at`, `len`, `src` (`u64` each), the
 /// fields of [`Op`] as [`OpsDoc::encode`] writes them, 34 bytes since version 2 (A-621). The chain entry writes an op's
 /// record the same way (`crate::chain_entry`).
@@ -422,6 +577,10 @@ pub enum DocDecodeError {
   TrailingBytes,
   /// A path table named one path twice (A-621): read as the first, every later index would name the path after its own.
   DuplicatePath,
+  /// A node record named an origin this build does not know, or a path the table does not hold (A-646).
+  BadNode,
+  /// A node table named one node twice (A-646), as a path table naming one path twice is refused.
+  DuplicateNode,
 }
 
 impl std::fmt::Display for DocDecodeError {
@@ -434,6 +593,8 @@ impl std::fmt::Display for DocDecodeError {
       DocDecodeError::BadPath => "a path is not valid UTF-8",
       DocDecodeError::TrailingBytes => "the ops document has trailing bytes",
       DocDecodeError::DuplicatePath => "the ops document names a path twice",
+      DocDecodeError::BadNode => "a node record names no known origin or no path of the table",
+      DocDecodeError::DuplicateNode => "the ops document names a node twice",
     };
     f.write_str(reason)
   }

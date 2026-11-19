@@ -6,7 +6,10 @@ revision's svn:date set with svnadmin setrevprop; then stock `svn` checkouts, up
 against stock `svnserve -d`, every byte of every connection each way logged by a relay on 127.0.0.1:3690 before it is
 forwarded; and hand-made clients for the refusals of a report.
 
-Usage: python3 -I make-fixtures.py OUTDIR
+Usage: python3 -I make-fixtures.py OUTDIR [NAME,...]
+With NAME,..., only those hand-made sessions are recorded into OUTDIR beside the fixtures already there, after the
+repository built again is checked against changed.txt and tree.txt (its offsets aside) and the tools against
+subversion-version.txt; sessions.txt gains their lines and SHA256SUMS is made again over every file.
 Writes, per stock session, NAME.K.client.bin and NAME.K.server.bin for the K-th connection its command opened; per
 hand-made session NAME.1.client.bin and NAME.1.server.bin; changed.txt (`svnlook changed --copy-info` of every
 revision) and tree.txt (`svnlook tree --full-paths --show-ids` of every revision), which hold the repository the tests
@@ -21,6 +24,7 @@ Sources: Subversion's `subversion/libsvn_ra_svn/protocol` §3.1.1 and §3.1.3, `
 
 import hashlib
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -249,6 +253,9 @@ EDIT_DONE = b"( success ( ) ) "
 
 def main():
     out = os.path.abspath(sys.argv[1])
+    # With a second argument, a comma-separated list of hand-made sessions, only those are recorded, beside the
+    # fixtures already in OUT: the repository is built again and must be the one changed.txt and tree.txt record.
+    only = set(sys.argv[2].split(",")) if len(sys.argv) > 2 else None
     os.makedirs(out, exist_ok=True)
     here = os.path.dirname(os.path.abspath(__file__))
     work = tempfile.mkdtemp(prefix="g234-a616-svnfix.", dir=os.path.expanduser("~/.cache"))
@@ -273,19 +280,32 @@ def main():
                 conf.write(text)
         revisions = history(os.path.join(here, "history.txt"))
         build(repository, revisions, work, env)
-        with open(os.path.join(out, "changed.txt"), "w") as changed, open(os.path.join(out, "tree.txt"), "w") as tree:
-            for number in range(1, len(revisions) + 1):
-                listing = run(["svnlook", "changed", "--copy-info", "-r", str(number), repository], env=env,
-                              capture_output=True, text=True).stdout
-                changed.write("r%d\n%s" % (number, listing))
-                listing = run(["svnlook", "tree", "--full-paths", "--show-ids", "-r", str(number), repository],
-                              env=env, capture_output=True, text=True).stdout
-                tree.write("r%d\n%s" % (number, listing))
+        changed, tree = "", ""
+        for number in range(1, len(revisions) + 1):
+            listing = run(["svnlook", "changed", "--copy-info", "-r", str(number), repository], env=env,
+                          capture_output=True, text=True).stdout
+            changed += "r%d\n%s" % (number, listing)
+            listing = run(["svnlook", "tree", "--full-paths", "--show-ids", "-r", str(number), repository],
+                          env=env, capture_output=True, text=True).stdout
+            tree += "r%d\n%s" % (number, listing)
+        if only is None:
+            for name, record in (("changed.txt", changed), ("tree.txt", tree)):
+                with open(os.path.join(out, name), "w") as written:
+                    written.write(record)
+        else:
+            without_offsets = lambda listing: re.sub(r"/\d+>", ">", re.sub(r"/\d+\)", ")", listing))
+            for name, record in (("changed.txt", changed), ("tree.txt", tree)):
+                held = open(os.path.join(out, name)).read()
+                if without_offsets(held) != without_offsets(record):
+                    raise RuntimeError("the repository built is not the one %s records" % name)
         versions = [subprocess.run([tool, "--version"], capture_output=True, text=True, env=env).stdout.splitlines()[:2]
                     for tool in ("svn", "svnserve")]
-        with open(os.path.join(out, "subversion-version.txt"), "w") as version_file:
-            for lines in versions:
-                version_file.write("\n".join(line.rstrip() for line in lines) + "\n")
+        version_text = "".join("\n".join(line.rstrip() for line in lines) + "\n" for lines in versions)
+        if only is None:
+            with open(os.path.join(out, "subversion-version.txt"), "w") as version_file:
+                version_file.write(version_text)
+        elif open(os.path.join(out, "subversion-version.txt")).read() != version_text:
+            raise RuntimeError("this Subversion is not the one subversion-version.txt records")
         log_file = os.path.join(work, "svnserve.log")
         daemon, port = start_daemon(root, log_file, env)
         relay = Relay(port, out)
@@ -296,6 +316,8 @@ def main():
         sessions = []
 
         def stock(name, argv):
+            if only is not None:
+                return None
             result = relay.session(name, lambda: subprocess.run(
                 svn + argv, capture_output=True, text=True, timeout=STEP_SECONDS, env=env, cwd=work))
             sessions.append((name, " ".join(argv).replace(work + "/", ""), result))
@@ -317,8 +339,9 @@ def main():
         stock("update-mixed-revisions", ["update", wc("wc-c")])
         # status -u: a working copy at r2 with a local edit; no text deltas.
         stock("checkout-r2", ["checkout", "-r2", trunk, wc("wc-d")])
-        with open(wc("wc-d/a.txt"), "ab") as edited:
-            edited.write(b"a local edit\n")
+        if only is None:
+            with open(wc("wc-d/a.txt"), "ab") as edited:
+                edited.write(b"a local edit\n")
         stock("status-u", ["status", "-u", wc("wc-d")])
         # A diff of two revisions of one URL.
         stock("diff-r1-r6", ["diff", "-r", "1:6", trunk])
@@ -334,7 +357,8 @@ def main():
         stock("checkout-for-lock", ["checkout", trunk, wc("wc-g")])
         stock("lock-a", ["lock", "--username", "alice", "--password", "secret", "-m", "held", wc("wc-g/a.txt")])
         stock("update-with-lock", ["update", wc("wc-g")])
-        run(["svnadmin", "rmlocks", repository, "/trunk/a.txt"], env=env, capture_output=True)
+        if only is None:
+            run(["svnadmin", "rmlocks", repository, "/trunk/a.txt"], env=env, capture_output=True)
         stock("update-with-broken-lock", ["update", wc("wc-g")])
         # Hand-made reports. Each is a list of steps: bytes to send, or bytes to wait for in what svnserve wrote, so a
         # client answers the drive only once the drive has ended (svnserve looks for input before every editor command
@@ -365,8 +389,18 @@ def main():
             ("hostile-report-malformed-set-path", [UPDATE_HEAD + b"( set-path ( 0: six false ) ) " + FINISH]),
             ("hostile-report-early-edit-response", [UPDATE_HEAD + SET_ROOT + FINISH + EDIT_DONE]),
             ("hostile-report-client-refuses-the-edit", [UPDATE_HEAD + SET_ROOT + FINISH, close_edit, wc_failure]),
+            # Copy sources, which no stock client asks for: /trunk from r3 to r4, where new.txt moved to renamed.txt,
+            # and /trunk at r4 from nothing (A-616 part 2, `add_file_smartly`).
+            ("hostile-update-copy-sources",
+             [b"( update ( ( 4 ) 0: true infinity true false ) ) " + b"( set-path ( 0: 3 false ( ) infinity ) ) "
+              + FINISH, close_edit, EDIT_DONE]),
+            ("hostile-checkout-copy-sources",
+             [b"( update ( ( 4 ) 0: true infinity true false ) ) " + b"( set-path ( 0: 4 true ( ) infinity ) ) "
+              + FINISH, close_edit, EDIT_DONE]),
         ]
         for name, steps in hostile:
+            if only is not None and name not in only:
+                continue
             prefix = os.path.join(out, name + ".1")
             sent = bytearray(opening(b"svn://127.0.0.1/repo/trunk"))
             received = bytearray()
@@ -393,14 +427,18 @@ def main():
             with open(prefix + ".server.bin", "wb") as server_record:
                 server_record.write(received)
             sessions.append((name, "(written by this script)", None))
-        with open(os.path.join(out, "sessions.txt"), "w") as summary:
+        if only is not None:
+            listed = open(os.path.join(out, "sessions.txt")).read()
+            sessions = [session for session in sessions if session[0] + ":" not in listed]
+        with open(os.path.join(out, "sessions.txt"), "w" if only is None else "a") as summary:
             for name, command, result in sessions:
                 summary.write("%s: %s\n" % (name, command))
                 if result is not None:
                     summary.write("  exit %d\n" % result.returncode)
                     for line in result.stderr.splitlines():
                         summary.write("  stderr: %s\n" % line.replace(work + "/", ""))
-        names = sorted(f for f in os.listdir(out) if f != "SHA256SUMS")
+        inputs = ("SHA256SUMS", "make-fixtures.py", "history.txt")
+        names = sorted(f for f in os.listdir(out) if f not in inputs)
         with open(os.path.join(out, "SHA256SUMS"), "w") as sums:
             for file_name in names:
                 with open(os.path.join(out, file_name), "rb") as fixture:

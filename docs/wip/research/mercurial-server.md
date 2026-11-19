@@ -670,6 +670,16 @@ server's directory are the ones its reviewed expected-failure list starts from.
   stand-in without naming a capture, the stand-in failed on the missing name, and the script took their exit status
   255 for a refused push, so each replay found the server unmoved and was accepted (`reply:changegroup` 1). The
   stand-in now records only a named capture, and only a recorded push may be refused.
+- **Part 2's verification** (A-641 part 2): `revlog.py` 3831-3848 (`addgroup` passes over a node its log holds,
+  "this can happen if two branches make the same change", and raises "unknown parent" and "unknown delta base");
+  `changegroup.py` 2896 ("missing file data for %s:%s - run hg verify", under `server.validate`).
+- **The path audit** (`pathutil.py` 87-118, SHA-256 `57d845838cc47f2f…`; `encoding.py` 56-76, `47900298a9ce5928…`):
+  "path ends in directory separator" for a trailing separator; "path contains illegal component" for
+  `os.path.splitdrive(path)[0]`, a first component `.hg`, `.hg.` or empty, any `..`, or a Windows short name of `.hg`
+  (`first.upper() in [b"HG", b"HG8B6C"]` before `~` and digits); "path '%s' is inside nested repo %r" for `.hg` or
+  `.hg.` as any later component, the components before it joined. Each comparison is `_lowerclean`'s: Python's
+  ASCII-only `lower()`, then `hfsignoreclean`, which removes the UTF-8 of U+200C to U+200F, U+202A to U+202E, U+206A
+  to U+206F and U+FEFF. 7.2 applies it to a working copy's writes, not to a push.
 
 ## 21. Found while building piece 3's import of an existing store and its file index (A-630 parts 2 and 3, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/import`)
 
@@ -738,3 +748,23 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **`batch`** splits `cmds` at `;`, each call at its first space, its arguments at `,` and `=`, unescapes them, runs the
   command (any in the table, its permission checked; a stream answer asserts) and joins the escaped answers with `;`.
   Measured: `heads ;known nodes=` answered `124` bytes, the three heads, `;`, and an empty `known`.
+
+## 23. Found while importing a repository's state with its history (A-649 part 2, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/state`)
+
+- **`phaseroots` is read strictly** (`phases._readroots`): each line is `line.split()` into exactly a phase and a node,
+  `int` and `bin` of each, and `roots[phase]` over `allphases`, so a line of another shape, a phase 7.2 does not define
+  or a node that is not hexadecimal aborts the command; a root whose node the changelog lacks is dropped with a debug
+  message ("removing unknown node … from … boundary"). An absent file means every changeset is public. Measured: the
+  history's file holds two roots, `1` for the first draft and `2` for the secret changeset, and the amended draft's
+  hidden predecessor is draft by descent, not by a root of its own.
+- **The bookmarks are read leniently** (`bookmarks.bmstore`): each line `strip`ped, an empty one passed over, `split(b'
+  ', 1)` into a node and a name, `bin` of the node; a line without the space, or digits `bin` refuses (odd, not
+  hexadecimal), is passed over with "malformed line in .hg/bookmarks", and a node the changelog lacks (a short one
+  among them) silently; a name given twice keeps its later node. The file is `.hg/bookmarks`, or the store's own under
+  `bookmarksinstore` (`format.bookmarks-in-store`), and a bookmark may name a secret changeset (measured: `secret-one`).
+- **The obsstore** (`obsolete.obsstore`) is read only when it holds bytes, so an empty file is no marker; it is in the
+  store's own format (here format 1, 7.2's default), markers in the order they were added. Measured: an amend's marker
+  (predecessor, successor, `ef1`, `operation` and `user` metadata) and a prune of a node never held (no successor).
+- **Mutable state and immutable rows.** The shared index never rewrites a row, while the phase roots and bookmarks move
+  with every push, so they are the register's (A-642), and the import hands them back typed; markers, never changed once
+  made, are the index's rows.

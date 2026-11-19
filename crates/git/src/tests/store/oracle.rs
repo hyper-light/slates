@@ -16,7 +16,9 @@ use crate::objects::tree::Mode;
 use crate::store::{Found, Repository};
 use crate::unpack::{NoIndex, read_whole};
 
-use super::{EXCHANGE, Made, Ticks, blob, commit, ids, push_and_move, sealed, store, tree};
+use super::{
+  EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, pack_of, push_and_move, sealed, store, tree,
+};
 
 /// Shape: the paths the generated histories edit: two at the top, two in `d`, one in `d/e`, one in `f`.
 const PATHS: [&[u8]; 6] = [b"a", b"b", b"d/x", b"d/y", b"d/e/z", b"f/w"];
@@ -25,11 +27,11 @@ const PATHS: [&[u8]; 6] = [b"a", b"b", b"d/x", b"d/y", b"d/e/z", b"f/w"];
 const CONTENTS: [&[u8]; 3] = [b"one\n", b"two\n", b"three\n"];
 
 /// Shape: the refs the histories move.
-const GREENS: u64 = 3;
+pub(super) const GREENS: u64 = 3;
 
 /// What a new commit is made on.
 #[derive(Clone, Copy, Debug)]
-enum Base {
+pub(super) enum Base {
   /// The ref's head: a fast-forward.
   Head,
   /// Any commit made so far: a rewrite, or a fast-forward when it is the head.
@@ -39,7 +41,7 @@ enum Base {
 }
 
 #[derive(Clone, Debug)]
-enum Op {
+pub(super) enum Op {
   /// A new commit on `base`, each edit setting a path to a content or removing it, pushed and the ref moved to it;
   /// `refuse` admits the push and abandons it instead.
   Commit {
@@ -54,7 +56,7 @@ enum Op {
   Delete { green: u64 },
 }
 
-fn op() -> impl Strategy<Value = Op> {
+pub(super) fn op() -> impl Strategy<Value = Op> {
   let edit = (0..PATHS.len(), proptest::option::of(0..CONTENTS.len()));
   (
     (0u8..9, 0..GREENS, 0..GREENS, 0u8..5, any::<usize>()),
@@ -83,9 +85,9 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 /// The model (module docs).
-struct Model {
-  format: ObjectFormat,
-  objects: BTreeMap<ObjectId, Made>,
+pub(super) struct Model {
+  pub(super) format: ObjectFormat,
+  pub(super) objects: BTreeMap<ObjectId, Made>,
   /// What each object names: a tree's entries, a commit's tree and then its parents.
   names: BTreeMap<ObjectId, Vec<ObjectId>>,
   generation: BTreeMap<ObjectId, u64>,
@@ -95,12 +97,12 @@ struct Model {
   commits: Vec<ObjectId>,
   indexed: BTreeSet<ObjectId>,
   /// Each ref's versions' heads.
-  heads: BTreeMap<u64, Vec<Option<ObjectId>>>,
+  pub(super) heads: BTreeMap<u64, Vec<Option<ObjectId>>>,
   seconds: u64,
 }
 
 impl Model {
-  fn new(format: ObjectFormat) -> Model {
+  pub(super) fn new(format: ObjectFormat) -> Model {
     Model {
       format,
       objects: BTreeMap::new(),
@@ -196,7 +198,7 @@ impl Model {
   }
 
   /// Everything `head` reaches: the closure of what objects name.
-  fn reach(&self, head: Option<ObjectId>) -> BTreeSet<ObjectId> {
+  pub(super) fn reach(&self, head: Option<ObjectId>) -> BTreeSet<ObjectId> {
     let mut reached = BTreeSet::new();
     let mut pending: Vec<ObjectId> = head.into_iter().collect();
     while let Some(id) = pending.pop() {
@@ -231,10 +233,10 @@ impl Model {
 }
 
 /// The real side.
-struct Real {
-  store: ContentStore,
-  repository: Repository,
-  clock: Ticks,
+pub(super) struct Real {
+  pub(super) store: ContentStore,
+  pub(super) repository: Repository,
+  pub(super) clock: Ticks,
 }
 
 fn commit_op(
@@ -302,7 +304,7 @@ fn delete_op(real: &mut Real, model: &mut Model, green: u64) {
   model.heads.entry(green).or_default().push(None);
 }
 
-fn apply(real: &mut Real, model: &mut Model, op: &Op) {
+pub(super) fn apply(real: &mut Real, model: &mut Model, op: &Op) {
   match op {
     Op::Commit {
       green,
@@ -327,25 +329,23 @@ fn apply(real: &mut Real, model: &mut Model, op: &Op) {
   }
 }
 
-/// Every green's versions read back through A-608's reader from one pack of all their fragments:
-/// the objects of their D(k)s, each with the bytes the model made. A pack that spans a rewrite may
-/// hold an object twice (a version brought it again); the reader takes both.
+/// Every green's versions read back through A-608's reader from the pack of all their D(k)s, which
+/// A-639's stream answers: each object of their union once, a rewrite's repeat sent once, with the
+/// bytes the model made.
 fn check_packs(real: &Real, model: &Model) {
   for (green, heads) in &model.heads {
-    let last = heads.len() - 1;
-    let pack = real
-      .repository
-      .pack(&real.store, *green, (0, last))
-      .unwrap();
+    let all = brought_by(&real.repository, *green, 0..heads.len());
+    let pack = pack_of(&real.repository, &real.store, &all);
     let unpacked =
       read_whole(&pack, model.format, &NoIndex, &mut Admission::new(u64::MAX)).unwrap();
+    let expected: BTreeSet<ObjectId> = (0..heads.len())
+      .flat_map(|version| model.brought(*green, version))
+      .collect();
+    assert_eq!(unpacked.objects.len(), expected.len());
     let read: BTreeMap<ObjectId, Vec<u8>> = unpacked
       .objects
       .into_iter()
       .map(|object| (object.id, object.content))
-      .collect();
-    let expected: BTreeSet<ObjectId> = (0..heads.len())
-      .flat_map(|version| model.brought(*green, version))
       .collect();
     assert_eq!(read.keys().copied().collect::<BTreeSet<_>>(), expected);
     assert!(

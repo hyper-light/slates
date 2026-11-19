@@ -119,6 +119,14 @@ pub enum Refused {
   },
   /// The command's own refusal.
   Serve(Refusal),
+  /// A request that needs more input than its channel lets the client send unconsumed, so it can never be whole
+  /// (A-650 part 2, [`super::stdio`]).
+  PastWindow {
+    /// The input bytes the request needs.
+    needed: u64,
+    /// The channel's window.
+    capacity: u64,
+  },
 }
 
 impl From<Refusal> for Refused {
@@ -390,7 +398,7 @@ fn abort_stream(words: &[u8], out: &mut Vec<u8>) -> Result<(), crate::bundle2::E
 }
 
 /// The words an error answer carries for a refusal: 7.2's own where it aborts alike.
-fn message(refused: &Refused) -> Vec<u8> {
+pub(super) fn message(refused: &Refused) -> Vec<u8> {
   let words = match refused {
     Refused::Request(refusal) => format!("unreadable request: {refusal:?}"),
     Refused::Batch(refusal) => format!("unreadable batch: {refusal:?}"),
@@ -399,6 +407,9 @@ fn message(refused: &Refused) -> Vec<u8> {
       format!("missing argument {}", String::from_utf8_lossy(name))
     }
     Refused::Serve(refusal) => serve_message(refusal),
+    Refused::PastWindow { needed, capacity } => {
+      format!("a request of {needed} bytes is past the channel's window of {capacity}")
+    }
   };
   words.into_bytes()
 }

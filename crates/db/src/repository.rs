@@ -475,6 +475,28 @@ impl Repositories {
       .map(|(path, lock)| (path.as_str(), lock.as_slice()))
   }
 
+  /// The lock on `path` of `repository`, when one stands (A-629 part 2b-ii: an unlock finds its
+  /// lock by the path its id names).
+  pub fn lock_on(&self, repository: RepositoryId, path: &str) -> Option<&[u8]> {
+    self.registers.get(&repository)?.lock(path)
+  }
+
+  /// `repository`'s locks from `from` on, each `(path, lock)`, in path order (A-629 part 2b-ii: a
+  /// page of locks goes on at its cursor's path, whether or not a lock still stands there).
+  pub fn locks_from(
+    &self,
+    repository: RepositoryId,
+    from: String,
+  ) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+    let bounds = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
+    self
+      .registers
+      .get(&repository)
+      .into_iter()
+      .flat_map(move |register| register.locks.range::<String, _>(bounds.clone()))
+      .map(|(path, lock)| (path.as_str(), lock.as_slice()))
+  }
+
   /// The atomic record version `version` of `green` belongs to, if one does (A-642: each green's log points to it).
   pub fn atomic_at(&self, green: VolumeId, version: u64) -> Option<&AtomicRecord> {
     let key = self.atomic_at.get(&(green, version))?;
@@ -1937,8 +1959,72 @@ mod tests {
       version,
       rules,
       hooks: Vec::new(),
+      hooks_env: Vec::new(),
       signers: Vec::new(),
     }
+  }
+
+  /// A-648 (§4.17.4 item 9). Do: create a Subversion repository; set its policy with a hook at start-commit, pre-lock
+  /// and post-unlock and a hooks-env of a default section and a pre-lock one; rebuild the partition from its snapshot
+  /// and, apart from it, replay its operations. Expect: the record holds the policy whole, and the rebuilt and the
+  /// replayed partitions hold it alike.
+  #[test]
+  fn a_subversion_repositorys_hooks_and_hooks_env_are_kept_by_a_snapshot_and_a_replay() {
+    use crate::catalog::{HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable};
+    let mut partition = Partition::new(caps(), 0);
+    let mut record = repository(11, "svn");
+    record.tool = VcsTool::Subversion;
+    let repo = record.id;
+    let created = Op::RepositoryCreated { record };
+    run(&mut partition, &created).unwrap();
+    let program = std::env::current_exe()
+      .unwrap()
+      .to_string_lossy()
+      .into_owned();
+    let hook = |point: HookPointName| HookConfig {
+      point,
+      name: point.name().to_owned(),
+      program: program.clone(),
+    };
+    let section = |name: &str, variable: &str, value: &[u8]| HooksEnvSection {
+      name: name.to_owned(),
+      variables: vec![HooksEnvVariable {
+        name: variable.to_owned(),
+        value: value.to_vec(),
+      }],
+    };
+    let policy = RepositoryPolicy {
+      version: 1,
+      rules: Vec::new(),
+      hooks: vec![
+        hook(HookPointName::SvnStartCommit),
+        hook(HookPointName::SvnPreLock),
+        hook(HookPointName::SvnPostUnlock),
+      ],
+      hooks_env: vec![
+        section("default", "LANG", b"en_US.UTF-8"),
+        section("pre-lock", "TOKENS", b"made by the hook"),
+      ],
+      signers: Vec::new(),
+    };
+    let set = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: policy.clone(),
+    };
+    run(&mut partition, &set).unwrap();
+    let held = |partition: &Partition| {
+      partition
+        .repositories()
+        .repository(repo)
+        .map(|record| record.policy.clone())
+    };
+    assert_eq!(held(&partition), Some(policy.clone()));
+    let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    assert_eq!(held(&rebuilt), Some(policy.clone()));
+    let mut replayed = Partition::new(caps(), 0);
+    replayed.apply(&created).unwrap();
+    replayed.apply(&set).unwrap();
+    assert_eq!(held(&replayed), Some(policy));
   }
 
   /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule and a hook; set

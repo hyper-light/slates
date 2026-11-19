@@ -1191,12 +1191,13 @@ pub enum RequestBody {
     /// The branch's name.
     name: String,
   },
-  /// Set repository `repository`'s policy whole (§4.17.1 "Policy"; A-622): its rules by name pattern, its hooks and the
-  /// keys trusted to sign its commits, replacing what it held, made from `read`, the policy version its setter read (0
-  /// for a repository never given one). Its owner's verb. Answered `Acknowledged`, the policy then at version `read +
-  /// 1`; refused `PolicyChanged` with the version now when the policy has moved since `read`, `Database` naming the
-  /// first rule or hook its repository cannot hold, and `BadRequest` for a signer that is no key slates verifies with
-  /// or signers for a repository that is not git's (A-644). Appended.
+  /// Set repository `repository`'s policy whole (§4.17.1 "Policy"; A-622): its rules by name pattern, its hooks, a
+  /// Subversion repository's hooks-env (A-648) and a git repository's keys trusted to sign its commits (A-644),
+  /// replacing what it held, made from `read`, the policy version its setter read (0 for a repository never given one).
+  /// Its owner's verb. Answered `Acknowledged`, the policy then at version `read + 1`; refused `PolicyChanged` with the
+  /// version now when the policy has moved since `read`, `Database` naming the first rule, hook or hooks-env section its
+  /// repository cannot hold, and `BadRequest` for a signer that is no key slates verifies with or signers for a
+  /// repository that is not git's. Appended.
   SetRepositoryPolicy {
     /// The repository.
     repository: String,
@@ -1206,6 +1207,9 @@ pub enum RequestBody {
     rules: Vec<PolicyRule>,
     /// The hooks, in order: one point's hooks run in that order.
     hooks: Vec<HookConfig>,
+    /// A Subversion repository's hooks-env, its sections in order (A-648): each hook's environment is its own section,
+    /// else the `default` one, else nothing. Empty for git and Mercurial. Appended.
+    hooks_env: Vec<HooksEnvSection>,
     /// The keys trusted to sign the repository's commits (A-644), each an SSH public key in wire form
     /// (`ssh-ed25519` or `sk-ssh-ed25519@openssh.com`, A-321): a commit a rule requires signed verifies under one of
     /// them. A git repository's alone. Appended.
@@ -1319,6 +1323,18 @@ pub enum HookPointName {
   SvnPreRevpropChange,
   /// Subversion's `post-commit`.
   SvnPostCommit,
+  /// Subversion's `start-commit` (A-648). Appended.
+  SvnStartCommit,
+  /// Subversion's `post-revprop-change` (A-648). Appended.
+  SvnPostRevpropChange,
+  /// Subversion's `pre-lock` (A-648). Appended.
+  SvnPreLock,
+  /// Subversion's `post-lock` (A-648). Appended.
+  SvnPostLock,
+  /// Subversion's `pre-unlock` (A-648). Appended.
+  SvnPreUnlock,
+  /// Subversion's `post-unlock` (A-648). Appended.
+  SvnPostUnlock,
 }
 
 /// One configured hook (§4.17.1: "a program the repository's owner configured"; A-622).
@@ -1331,6 +1347,26 @@ pub struct HookConfig {
   pub name: String,
   /// The program it runs: an absolute path on the host that runs the repository's hooks.
   pub program: String,
+}
+
+/// A variable of a Subversion repository's hooks-env (A-648), as `SetRepositoryPolicy` gives it: one `NAME = value`
+/// line of a section of the file `svnserve.conf`'s `hooks-env` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvVariable {
+  /// Its name: not empty, holding no `=` and no NUL.
+  pub name: String,
+  /// Its value, holding no NUL.
+  pub value: Vec<u8>,
+}
+
+/// A section of a Subversion repository's hooks-env (A-648), as `SetRepositoryPolicy` gives it: the variables the hook
+/// named as the section runs with, or, in the section named `default`, those of every hook with no section of its own.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvSection {
+  /// Its name, a hook's or `default`.
+  pub name: String,
+  /// Its variables, in order.
+  pub variables: Vec<HooksEnvVariable>,
 }
 
 /// The tool a repository serves (§4.17; A-575), as `CreateRepository` names it.
@@ -4369,6 +4405,13 @@ pub enum DatabaseRefusal {
     read: u64,
     /// The position the green is at.
     at: u64,
+  },
+  /// A repository policy's hooks-env section its repository cannot hold (A-648): in a repository that is not
+  /// Subversion's, named by nothing or holding a NUL, or with a variable no hook's environment can carry (a name empty
+  /// or holding `=` or a NUL, a value holding a NUL). Appended.
+  PolicyHooksEnvMalformed {
+    /// The section's index among the policy's hooks-env sections.
+    index: u32,
   },
 }
 

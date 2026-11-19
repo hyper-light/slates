@@ -31,7 +31,10 @@
 //!   bubble-up: a directory's created revision is the last revision that changed anything beneath it. An addition is a
 //!   new node with its parent's copy identity and copy root (`make_entry`); a copy keeps its source's node identity,
 //!   takes a fresh copy identity and is its own copy root (`svn_fs_fs__dag_copy`); a deletion removes the path and
-//!   everything beneath it; a modification sets the text or the property list of the node made mutable.
+//!   everything beneath it; a modification sets the text or the property list of the node made mutable. A replacement
+//!   is the deletion and then the addition, so a replacement by a copy of the very node-revision it replaces is a copy
+//!   like any other: `copy_helper` (`tree.c`) records nothing only for a copy onto a node still standing at its
+//!   destination, which no record holds (A-652).
 //! - A revision's rows are applied in path order, parents first, against revision N - 1. That is the state FSFS's
 //!   commit leaves (`tree.c` `merge()`): a directory changed both by the transaction and by the revisions since its base
 //!   must keep its node and copy identity on both sides, or the commit is a conflict ("not a direct modification of
@@ -56,9 +59,8 @@
 //! Every record is checked whole before anything changes, and a refused record leaves the index as it was: a path out
 //! of Subversion's canonical form; two rows for one path; a row naming a path its own revision leaves absent or present
 //! against its action; a directory of a row's path that is a file; the root added, deleted or replaced; a kind that
-//! differs from the node or copy source a row names; a copy whose source is past the previous revision or absent there,
-//! or which lands on the very node-revision already at its destination (FSFS records nothing for it); a text on a
-//! directory; a row whose fields contradict each other, `svn:mergeinfo` gained or lost without the mergeinfo flag among
+//! differs from the node or copy source a row names; a copy whose source is past the previous revision or absent
+//! there; a text on a directory; a row whose fields contradict each other, `svn:mergeinfo` gained or lost without the mergeinfo flag among
 //! them; and an index that would outgrow the room its caller gives. Each refusal is typed and names the Subversion error
 //! it is answered with ([`IndexRefusal::subversion_code`]).
 //!
@@ -394,12 +396,6 @@ pub enum IndexRefusal {
     /// The row's path.
     path: String,
   },
-  /// A copy onto the very node-revision already at its destination, which FSFS records as nothing (`tree.c`
-  /// `copy_helper`; `SVN_ERR_FS_CORRUPT`).
-  CopyOntoItself {
-    /// The destination.
-    path: String,
-  },
   /// Two rows for one path (`SVN_ERR_FS_CORRUPT`).
   Duplicate {
     /// The path.
@@ -442,7 +438,6 @@ impl IndexRefusal {
       Self::RootChange => SVN_ERR_FS_ROOT_DIR,
       Self::Room { .. } => SVN_ERR_FS_GENERAL,
       Self::KindMismatch { .. }
-      | Self::CopyOntoItself { .. }
       | Self::Duplicate { .. }
       | Self::Malformed { .. }
       | Self::TransactionName { .. }
@@ -1425,7 +1420,7 @@ impl<'index> Builder<'index> {
     let id = self.next_id()?;
     let (row, shape) = match &change.copy_from {
       None => (self.fresh_row(change, &parent)?, Shape::Fresh),
-      Some(source) => self.copied_row(change, source, replaced, id)?,
+      Some(source) => self.copied_row(change, source, id)?,
     };
     self.raise(ancestors, row.mergeinfo_count)?;
     // The row takes `id`: nothing was pushed since it was read.
@@ -1463,10 +1458,9 @@ impl<'index> Builder<'index> {
     &mut self,
     change: &ChangedPath,
     source: &CopySource,
-    replaced: Option<NodeRevisionId>,
     id: NodeRevisionId,
   ) -> Result<(Row, Shape), IndexRefusal> {
-    let (source_id, source_row) = self.copy_source(change, source, replaced)?;
+    let (source_id, source_row) = self.copy_source(change, source)?;
     let properties = change.properties.unwrap_or(source_row.properties);
     let had = source_row.properties.has_mergeinfo();
     check_mergeinfo_flag(change, had, properties.has_mergeinfo())?;
@@ -1494,13 +1488,12 @@ impl<'index> Builder<'index> {
     ))
   }
 
-  /// A copy's source: in a revision before this one, present there, of the row's kind, and not the node-revision the
-  /// copy would replace.
+  /// A copy's source: in a revision before this one, present there, and of the row's kind; the very node-revision the
+  /// copy replaces among them, since the replacement's deletion comes first (A-652).
   fn copy_source(
     &self,
     change: &ChangedPath,
     source: &CopySource,
-    replaced: Option<NodeRevisionId>,
   ) -> Result<(NodeRevisionId, Row), IndexRefusal> {
     // A copy reads any committed revision (`svn_fs_copy` takes any revision root): past the youngest is none. A record's
     // base is the youngest, so a record's source is at most the previous revision; a work's on an older base may be
@@ -1517,11 +1510,6 @@ impl<'index> Builder<'index> {
         path: source.path.clone(),
         revision: source.revision,
       })?;
-    if replaced == Some(source_id) {
-      return Err(IndexRefusal::CopyOntoItself {
-        path: change.path.clone(),
-      });
-    }
     let source_row = *self.row(source_id)?;
     if source_row.kind != change.kind {
       return Err(IndexRefusal::KindMismatch {
