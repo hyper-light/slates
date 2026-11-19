@@ -12723,8 +12723,11 @@ engine: the verdict, rebase, position mapping, the register).
 > `slates-vcs`'s derived data (`store::ReachSets`, `crates/git/src/store/reach.rs`): a pure function of the version's
 > record and its parents' values, version `k - 1`'s and that of the version a remade set was taken from, which each
 > version now records (`Followed`). Its derivation is the admission's own walks over the committed index, and the owner
-> keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). The store's outputs
-> are unchanged.
+> keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). Since A-647 part 3
+> the store keeps the sets as the values alone: its commit puts each version's sets, as its admission walked them, as
+> the version's value, held by the version's record, and it serves every version's D(k) and reached set from it
+> (`Repository::brought`, `Repository::reached`), an older version's reached set as well as the newest's; the chains'
+> copies are gone. A value names its sets' bytes as an object of any length (format 2), so no set is too large to keep.
 >
 > **Status (2026-11-19, A-664 part 2: a version's trees and commit as derived data, piece 13's first part).**
 > `crates/git` (`derived`) makes the git objects of a version the server turns into git's (§4.17.1 "A push is a work"
@@ -44606,8 +44609,9 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     (Built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type, version) in
     an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
     step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
-    the store's outputs unchanged (part 2). A version's git trees and commit as types, the commit the server makes
-    (A-664 part 2). Owed: A-553's and A-588's stores as types.)
+    the store's outputs unchanged (part 2), then served from the values alone, the chains' copies dropped, every
+    version's sets answerable (part 3). A version's git trees and commit as types, the commit the server makes (A-664
+    part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -49208,3 +49212,64 @@ the bundle capabilities first; `fixtures/serve-http` and its script, kept as cap
   `hg clone` and `hg pull` over HTTPS against the daemon (main's run); and two pieces of their own, each with its
   failing test first: zlib's bound as the linked zlib-rs states it (`compress_bound`), and a query's fields past the
   request's room `414`, as a path's are.
+
+### A-647 part 3 — git's store serves every version's D(k) and reached set from its value of the reach sets, the chains' copies dropped; a value names its sets' bytes as an object of any length (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 2, A-614)
+
+- **Why.** A-645: "The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth."
+  Part 2 made A-614's D(k) and reached sets a type and kept the admission's sets as its values, beside the chains' own
+  copies, which the store went on serving: one set kept twice, and the chains its source of truth. Part 2's owed line:
+  "The store serving `brought` and `reached` from its values, its chains' sets dropped".
+- **What the store keeps.** A version's record holds its value of the reach sets, held once, in place of its D(k), and
+  a chain no longer keeps its current head's reached set. The commit plans each move's sets as its admission walked
+  them (D(k) from the walk's members; the reached set grown from the newest value's, made again from a base value's set
+  and the walk beyond it, or emptied), puts each as its version's value, then charges the records and inserts the
+  rows; a refusal at any of these gives every value back, nothing changed. The chains charge their records and kept
+  parts alone; the values are content the store charges as it keeps them.
+- **What it serves.** `Repository::brought(store, green, version)` and `Repository::reached(store, green, version)` read
+  the version's value, so any version's reached set is answerable, not only the newest's, which was all the chains
+  kept. The admission's stop set, a remade set's base, a protected branch's walk (A-644), a version's fragments and a
+  green's base pack read the value they need once. upload-pack's gather reads a version's D(k) once and keeps it while
+  it gathers that version's objects one at a time (`Upload::reading`), not once an object. The negotiation's graph
+  takes a value that does not read as a fault (`GraphFault::Store`), and a version that does not exist reads as
+  nothing, as before. A value that does not read is refused typed (`StoreRefused::SetsUnreadable`).
+- **The value's format 2** (`slates-git reach sets 2`). Part 2's value kept the sets' bytes in the derived node itself,
+  and a node is at most one window of the store (`ContentStore::put_derived`), so a set of more runs than a window holds
+  was no value: the owner's keep counted it unkept, and a store serving from values would have refused the commit. A
+  value now names one object, the sets' bytes as before (each set a count and its runs), with the object's length as
+  its payload (eight bytes, little-endian), as blame keeps its spans (A-666 part 3); `put_object` keeps an object of any
+  length as windows and lists. `Repository::reach_value` hands the owner the version's own value, held once more, so
+  the owner's row and the record name one node, and a fill derives that node again, byte for byte.
+- **Tests** (`crates/git/src/tests/store/reach.rs` and `oracle.rs`; macOS arm64, Mac Studio, 2026-11-19; Linux and
+  Windows owed to main).
+  - Red first (a9c2adfa2, branch `agents/g302-a647p3-red`, not for main): the new calls over the chains, which keep the
+    newest reached set alone, so an older version's is refused `NoVersion` (`cargo test --locked -p slates-git --lib
+    store`, kiln r138): 81 passed, 5 failed, 4 ignored (main's). The five: A-614's oracle
+    (`the_git_store_reads_as_its_map_model_over_every_history`, whose `check_green` now holds every version's reached
+    set to its head's closure), the reach oracle (every version's two sets the derived value's), the two new tests, and
+    the hostile values in format 2, whose sound value format 1 cannot read. Built in 58.98 s; the tests 1.76 s.
+  - Green (32bfcf364 on the red; one commit for main): `cargo fmt -p slates-git -- --check` and `-p slates-server`
+    clean; `cargo test --locked -p slates-git --lib -- store served protected receive object_info upload`, every module
+    that builds a store, 185 passed, 4 ignored (main's), in 2.19 s (kiln r155); `cargo test --locked -p slates-server
+    --lib vcs_store -- --test-threads=4` 13 passed, its recovery facts reading both sets of every version through the
+    new calls; `cargo test --locked -p slates-server --lib -- vcs_http::git repository::push --test-threads=4`, the
+    server's git service and its pushes over the store, 14 passed (kiln r167).
+  - New: a ref fast-forwarded, rewritten to a root of its own, deleted and made again serves every version's D(k) and
+    reached set (`t_a647_p3_every_version_serves_its_own_sets`); two refs pushed by turns, 65 commits each, so each of
+    a ref's commits is a run of its own and its reached set passes the tests' 1 KiB window, commit every push and serve
+    every version's sets: three objects in one run brought, a run a commit reached
+    (`t_a647_p3_a_reached_set_past_one_window_is_kept_and_served`); A-614's oracle and the reach oracle at every
+    version; hostile values in format 2 (six malformed sets' objects, and four nodes not of the form: the bytes in the
+    node as format 1 kept them, two objects named, a length past the object's, a length cut short).
+- **What a value costs.** Each version's value holds its whole reached set, as part 2's values did in the owner's
+  index already: in the window test, ref 1's 65 values hold 1 + 2 + ... + 65 = 2,145 runs between them, where the
+  chains held 130 (65 one-run D(k) and the newest set's 65 runs). This part removes the chains' copy, not that.
+- **Owed.** A value's reached set sharing its parent's runs by identity (a set kept as a tree of nodes a version
+  extends, so a fast-forward's value costs its D(k)); dropping values no version needs (A-647); the kept parts'
+  positions (A-639, A-653), the store's other record of what versions reached, read from the values if A-639 finds it
+  worth one copy.
+- **Applied in the same change to:** `crates/git/src/store/repository.rs` (`Version::value`, `Chain` without its set,
+  the commit's plan and values, `brought`, `reached`, `sets`, `current_reached`, `StoreRefused::SetsUnreadable`, the
+  release), `store/reach.rs` (format 2, `Sets::put`, `reach_value`), `store/protect.rs`, `store/graph.rs`,
+  `store/upload.rs` (`Upload::reading`), `store/mod.rs` (the module's docs); the tests in `crates/git/src/tests/store/`
+  (`mod.rs`, `oracle.rs`, `reach.rs`, `upload.rs`, `fragments.rs`) and `crates/server/src/vcs_store/tests.rs`;
+  §4.17.2's status; A-645's entry ("Derived data, one mechanism"); GAPS' A-645 line.

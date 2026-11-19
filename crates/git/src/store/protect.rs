@@ -180,11 +180,11 @@ impl Repository {
     let Some(start) = self.peel(store, push, to)? else {
       return Ok(None);
     };
-    let reached = self.chains.get(&green).map(|chain| &chain.reached);
+    let reached = self.current_reached(store, green)?;
     let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
     let mut heap = BinaryHeap::from([(self.generation(store, push, &start)?, start)]);
     while let Some((_, id)) = heap.pop() {
-      if !seen.insert(id) || self.reached_by(store, reached, &id) {
+      if !seen.insert(id) || self.reached_by(store, reached.as_ref(), &id) {
         continue;
       }
       let parents = self.parents(store, push, &id)?;

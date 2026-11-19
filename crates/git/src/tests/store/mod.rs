@@ -239,12 +239,19 @@ fn pack_of(repository: &Repository, store: &ContentStore, objects: &Positions) -
 /// D(k) of `green`'s `versions`, joined.
 fn brought_by(
   repository: &Repository,
+  store: &ContentStore,
   green: u64,
   versions: impl IntoIterator<Item = usize>,
 ) -> Positions {
   versions.into_iter().fold(Positions::new(), |all, version| {
-    all.union(repository.brought(green, version).unwrap())
+    all.union(&repository.brought(store, green, version).unwrap())
   })
+}
+
+/// The set `green`'s newest version's head reaches, as the store serves it.
+fn reached_now(repository: &Repository, store: &ContentStore, green: u64) -> Positions {
+  let newest = repository.versions(green).checked_sub(1).unwrap();
+  repository.reached(store, green, newest).unwrap()
 }
 
 /// The ids of a set of positions.
@@ -526,22 +533,30 @@ fn a_fast_forward_brings_only_what_its_green_had_not_reached() {
   let second_ids = sorted(second.iter().map(|object| object.id).collect());
   push_and_move(&mut repository, &mut store, first, &[(1, Some(c1.id))]).unwrap();
   assert_eq!(
-    ids(&repository, &store, repository.brought(1, 0).unwrap()),
+    ids(
+      &repository,
+      &store,
+      &repository.brought(&store, 1, 0).unwrap()
+    ),
     first_ids
   );
   let skipped = repository.counters().trees_skipped;
   push_and_move(&mut repository, &mut store, second, &[(1, Some(c2.id))]).unwrap();
   assert_eq!(
-    ids(&repository, &store, repository.brought(1, 1).unwrap()),
+    ids(
+      &repository,
+      &store,
+      &repository.brought(&store, 1, 1).unwrap()
+    ),
     second_ids
   );
   assert!(repository.counters().trees_skipped > skipped);
   assert_eq!(repository.counters().fast_forwards, 1);
   let reached = repository
-    .brought(1, 0)
+    .brought(&store, 1, 0)
     .unwrap()
-    .union(repository.brought(1, 1).unwrap());
-  assert_eq!(repository.reached(1), Some(&reached));
+    .union(&repository.brought(&store, 1, 1).unwrap());
+  assert_eq!(repository.reached(&store, 1, 1), Ok(reached));
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
 }
@@ -572,8 +587,14 @@ fn a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk() {
   push_and_move(&mut repository, &mut store, Vec::new(), &[(2, Some(c2.id))]).unwrap();
   assert_eq!(repository.counters().walked, walked);
   assert_eq!(
-    (repository.reached(2), repository.brought(2, 0)),
-    (repository.reached(1), repository.reached(1))
+    (
+      repository.reached(&store, 2, 0),
+      repository.brought(&store, 2, 0)
+    ),
+    (
+      repository.reached(&store, 1, 0),
+      repository.reached(&store, 1, 0)
+    )
   );
   let top3 = blob(format, b"three\n");
   let root4 = tree(format, &[(Mode::File, b"top", top3.id)]);
@@ -583,10 +604,13 @@ fn a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk() {
   assert_eq!(repository.counters().walked, walked + 3);
   assert_eq!(repository.counters().bases_found, 2);
   let own = positions_of(&repository, &store, &[&c4, &root4, &top3]);
-  let expected = repository.reached(1).unwrap().union(&own);
+  let expected = repository.reached(&store, 1, 0).unwrap().union(&own);
   assert_eq!(
-    (repository.brought(3, 0), repository.reached(3)),
-    (Some(&expected), Some(&expected))
+    (
+      repository.brought(&store, 3, 0),
+      repository.reached(&store, 3, 0)
+    ),
+    (Ok(expected.clone()), Ok(expected))
   );
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
@@ -671,7 +695,11 @@ fn a_rewrite_brings_what_its_old_head_did_not_reach_and_makes_its_set_again() {
     )
   );
   assert_eq!(
-    ids(&repository, &store, repository.brought(1, 3).unwrap()),
+    ids(
+      &repository,
+      &store,
+      &repository.brought(&store, 1, 3).unwrap()
+    ),
     rewritten_ids
   );
   let reaches = sorted(
@@ -682,7 +710,7 @@ fn a_rewrite_brings_what_its_old_head_did_not_reach_and_makes_its_set_again() {
       .collect(),
   );
   assert_eq!(
-    ids(&repository, &store, repository.reached(1).unwrap()),
+    ids(&repository, &store, &reached_now(&repository, &store, 1)),
     reaches
   );
   repository.release(&mut store).unwrap();
@@ -713,15 +741,19 @@ fn a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches() {
   assert_eq!(
     (
       repository.head(&store, 1, 1),
-      repository.brought(1, 1).map(Positions::len)
+      repository.brought(&store, 1, 1).map(|set| set.len())
     ),
-    (None, Some(0))
+    (None, Ok(0))
   );
-  assert!(repository.reached(1).unwrap().is_empty());
+  assert!(repository.reached(&store, 1, 1).unwrap().is_empty());
   push_and_move(&mut repository, &mut store, Vec::new(), &[(1, Some(head))]).unwrap();
   let all = sorted(first.iter().map(|object| object.id).collect());
   assert_eq!(
-    ids(&repository, &store, repository.brought(1, 2).unwrap()),
+    ids(
+      &repository,
+      &store,
+      &repository.brought(&store, 1, 2).unwrap()
+    ),
     all
   );
   assert_eq!(
