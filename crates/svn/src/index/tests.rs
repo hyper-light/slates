@@ -141,6 +141,13 @@ fn at<'index>(index: &'index Index, path: &str, revision: Revision) -> Node<'ind
   index.node(path, revision).unwrap().unwrap()
 }
 
+/// The node-revision, node identity and copy identity at a place that holds a node, owned, to compare with what later
+/// revisions hold.
+fn identities(index: &Index, path: &str, revision: Revision) -> (NodeRevisionId, NodeId, CopyId) {
+  let node = at(index, path, revision);
+  (node.id(), node.node_id(), node.copy_id())
+}
+
 /// The created path and revision of a node-revision: FSFS's way of naming a copy root.
 fn named(index: &Index, id: NodeRevisionId) -> (String, Revision) {
   let node = index.node_revision(id).unwrap();
@@ -261,9 +268,9 @@ fn a_path_beneath_a_copy_is_its_sources_node_revision_until_it_changes_there() {
     &mut index,
     vec![copied("/branches/b1", NodeKind::Directory, "/trunk", 1)],
   );
-  let source = at(&index, "/trunk/lib/a.c", 1);
+  let (source_id, source_line, _) = identities(&index, "/trunk/lib/a.c", 1);
   let shared = at(&index, "/branches/b1/lib/a.c", 2);
-  assert_eq!(shared.id(), source.id());
+  assert_eq!(shared.id(), source_id);
   assert_eq!(
     (shared.created_path(), shared.created_revision()),
     ("/trunk/lib/a.c", 1)
@@ -274,7 +281,7 @@ fn a_path_beneath_a_copy_is_its_sources_node_revision_until_it_changes_there() {
       .unwrap(),
     NodeRelation::Unchanged
   );
-  let branch = at(&index, "/branches/b1", 2);
+  let (branch_id, _, branch_copy) = identities(&index, "/branches/b1", 2);
   commit(&mut index, vec![edit("/branches/b1/lib/a.c", 4)]);
   let changed = at(&index, "/branches/b1/lib/a.c", 3);
   assert_eq!(
@@ -283,14 +290,14 @@ fn a_path_beneath_a_copy_is_its_sources_node_revision_until_it_changes_there() {
   );
   assert_eq!(
     (changed.node_id(), changed.predecessor()),
-    (source.node_id(), Some(source.id()))
+    (source_line, Some(source_id))
   );
-  assert_eq!(changed.copy_id(), branch.copy_id());
-  assert_eq!(changed.copy_root(), branch.id());
+  assert_eq!(changed.copy_id(), branch_copy);
+  assert_eq!(changed.copy_root(), branch_id);
   let lib = at(&index, "/branches/b1/lib", 3);
   assert_eq!(
     (lib.created_path(), lib.copy_id(), lib.copy_root()),
-    ("/branches/b1/lib", branch.copy_id(), branch.id())
+    ("/branches/b1/lib", branch_copy, branch_id)
   );
   assert_eq!(
     index
@@ -443,14 +450,13 @@ fn a_node_never_copied_keeps_its_copy_identity_on_its_own_path_and_takes_the_cop
 /// its copy identity; reached through a copy of its parent it takes a fresh one, keeps its copy root, and what changes
 /// beneath it takes the fresh one too.
 #[test]
-fn a_copy_keeps_its_copy_identity_on_its_own_path_and_takes_a_fresh_one_reached_through_another_copy()
- {
+fn a_copy_keeps_its_copy_identity_on_its_path_and_takes_a_fresh_one_through_another_copy() {
   let mut index = trunk();
   commit(
     &mut index,
     vec![copied("/branches/b1", NodeKind::Directory, "/trunk", 1)],
   );
-  let branch = at(&index, "/branches/b1", 2);
+  let (branch_id, _, branch_copy) = identities(&index, "/branches/b1", 2);
   commit(
     &mut index,
     vec![set_properties(
@@ -463,20 +469,21 @@ fn a_copy_keeps_its_copy_identity_on_its_own_path_and_takes_a_fresh_one_reached_
   let kept = at(&index, "/branches/b1", 3);
   assert_eq!(
     (kept.copy_id(), kept.copy_root(), kept.created_revision()),
-    (branch.copy_id(), branch.id(), 3)
+    (branch_copy, branch_id, 3)
   );
+  let kept = kept.id();
   commit(
     &mut index,
     vec![copied("/old", NodeKind::Directory, "/branches", 3)],
   );
-  let outer = at(&index, "/old", 4);
-  assert_eq!(at(&index, "/old/b1", 4).id(), kept.id());
+  let (_, _, outer_copy) = identities(&index, "/old", 4);
+  assert_eq!(at(&index, "/old/b1", 4).id(), kept);
   commit(&mut index, vec![edit("/old/b1/lib/a.c", 8)]);
   let soft = at(&index, "/old/b1", 5);
-  assert!(![branch.copy_id(), outer.copy_id(), ROOT_COPY].contains(&soft.copy_id()));
+  assert!(![branch_copy, outer_copy, ROOT_COPY].contains(&soft.copy_id()));
   assert_eq!(
     (soft.copy_root(), soft.predecessor()),
-    (branch.id(), Some(kept.id()))
+    (branch_id, Some(kept))
   );
   assert_eq!(soft.copy_from(), None);
   assert_eq!(at(&index, "/old/b1/lib/a.c", 5).copy_id(), soft.copy_id());
