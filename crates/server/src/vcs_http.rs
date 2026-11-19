@@ -60,7 +60,7 @@ pub(crate) mod git;
 mod hg;
 pub(crate) mod waits;
 
-pub(crate) use daemon_edge::start;
+pub(crate) use daemon_edge::{bind, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;

@@ -499,8 +499,14 @@
 > certificate and key, handed over by its deployment plan (`FleetPlan::edge_identity`); a daemon that is no fleet node
 > serves cleartext, on loopback alone, any other address refused as usage before anything starts. macOS arm64 (Mac
 > Studio, red first, then green over main 1ef718820): the roles' and the command's grammar, the plan's identity shown
-> in a TLS handshake, and an anchor started with `--vcs-http 127.0.0.1:0` whose daemon's edge answers `401`. Owed:
-> the anchor holding the edge's listener across a daemon's restart; the option on a library starter's anchor.
+> in a TLS handshake, and an anchor started with `--vcs-http 127.0.0.1:0` whose daemon's edge answers `401`.
+> **A-625 part 3, continued (2): the anchor holds the edge's port (2026-11-19, g299):** on Unix the anchor binds the
+> edge's listener once and hands it to every daemon (`slates_anchor::ENV_VCS_HTTP`), which adopts it only where its
+> configuration would have bound; a restart never drops the port, a client connecting meanwhile answered by the next
+> daemon; `StartSpec::vcs_http` gives a library starter's anchor the same. macOS arm64 (Mac Studio, red first: the
+> port refused while the daemon restarted; green over main 4dca63df7): the anchor's handover, the adoption check, the
+> starter's option, and a killed daemon's successor answering a request made meanwhile at the same port. Owed:
+> Windows holds no listener across a restart (`docs/wip/platforms.md`, gap 2).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

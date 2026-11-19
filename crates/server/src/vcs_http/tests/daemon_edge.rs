@@ -260,3 +260,29 @@ fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_th
   assert_eq!(listener, (3, 1, 1), "moves, no credentials, expired");
   assert_eq!(repository, (3, 1, 2), "arrivals, forbidden, unavailable");
 }
+
+/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: ask whether listeners an anchor might hand over listen where a
+/// daemon's configuration says: at the same address and port; at the same address where the configuration asks for port
+/// 0 (the system's pick, which the anchor made once for every daemon); at another port; at another address. Expect: the
+/// first two taken and the last two refused, so a daemon adopts the anchor's listener only where it would have bound its
+/// own, and never serves the edge somewhere the operator did not ask.
+#[test]
+fn a_held_listener_is_adopted_only_where_the_configuration_says() {
+  let at = |octets: [u8; 4], port: u16| SocketAddrV4::new(Ipv4Addr::from(octets), port);
+  assert!(super::listens_at(
+    at([127, 0, 0, 1], 8080),
+    at([127, 0, 0, 1], 8080)
+  ));
+  assert!(super::listens_at(
+    at([127, 0, 0, 1], 51234),
+    at([127, 0, 0, 1], 0)
+  ));
+  assert!(!super::listens_at(
+    at([127, 0, 0, 1], 8081),
+    at([127, 0, 0, 1], 8080)
+  ));
+  assert!(!super::listens_at(
+    at([0, 0, 0, 0], 8080),
+    at([127, 0, 0, 1], 8080)
+  ));
+}
