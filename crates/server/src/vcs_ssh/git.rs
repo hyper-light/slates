@@ -188,10 +188,19 @@ impl<L: StoreLender> Command for UploadCommand<L> {
   }
 
   async fn step(&mut self) -> Result<Stepped, Refused> {
-    Ok(Stepped {
-      consumed: 0,
-      next: Next::Exited(0),
-    })
+    if self.answer.is_some() {
+      let next = self.write_answer()?;
+      return Ok(Stepped { consumed: 0, next });
+    }
+    if !self.advertised {
+      self.advertised = true;
+      self.serve(Asked::Advertise)?;
+      return Ok(Stepped {
+        consumed: 0,
+        next: Next::More,
+      });
+    }
+    self.next_request()
   }
 
   fn output(&self) -> (&[u8], &[u8]) {

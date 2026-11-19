@@ -212,8 +212,17 @@ impl<L: StoreLender + Clone> Services for ToolServices<L> {
   type Command = UploadCommand<L>;
 
   fn start(&mut self, start: &Start<'_>) -> Result<UploadCommand<L>, Unserved> {
-    let _ = start;
-    Err(Unserved)
+    match (start.service, start.repository) {
+      (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
+        Ok(UploadCommand::new(
+          self.lender.clone(),
+          repository.id,
+          slates_git::http::version(start.git_protocol),
+          self.room,
+        ))
+      }
+      _ => Err(Unserved),
+    }
   }
 }
 
