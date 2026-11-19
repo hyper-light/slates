@@ -45644,6 +45644,11 @@ Applied in the same change to (its second part, the deltifier and format 3):
   only past four bytes, a moved stretch copied from its place. Generated: deltas of edited and unrelated texts in rooms
   from one byte remake their targets, keep to their room and survive version 0's encoding; the migration's generated
   histories round-trip through format 3 to the same history and bytes.
+- **Owed of A-652: the import and export as repository verbs.** An imported revision is a commit: its green version
+  and its Subversion record are one durable step (item 3.5), so the import must commit through the owner's commit step a
+  client's commit takes, A-655's (through A-635's append), not a second path; and the export reads the shard's
+  Subversion index and records that step keeps (A-655, A-656). Neither is on main yet (A-655's branch is at the commit's
+  checks), so this part follows A-655's commit step.
 
 ### A-641 part 2 — a push's changegroup verified against what the repository holds, and a line's move made A-618's work over its flat manifests laid out as directories (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 2 and 3, decision 6 and piece 5; §4.17.1 "A push is a work" items 2 to 4; A-588, A-618, A-641 part 1)
 

@@ -782,7 +782,8 @@
 > alone on main from its seed (see A-628). The export in format 3 built by A-652 (2026-11-19, g264): Subversion's
 > deltifier ported as `svndiff::deltas(source, target, window room)`, the crate's one delta generator, remaking every
 > window `svnadmin dump --deltas` wrote, `deltas.dump` and `part2.dump` written again byte for byte (413 of 413 on the
-> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. Owed from it: the wiring (a
+> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. Owed from it: the wiring, after
+> A-655's owner commit step, since an imported revision commits through it (A-652's third part; a
 > `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
 > shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
