@@ -292,14 +292,20 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// PersistentVolume's `nfs.path`), its `Debug` showing the path without its token; [`ExportOptions`] asks for it
 /// read-only or beneath a directory; the simulator answers it with a path of its own per export (kiln's Kubernetes
 /// engine, its W10; 2026-11-19).
-/// 51: a role starts the version-control servers' shared HTTP edge (A-625 part 3; §4.17.2 "Transports" item 1):
+/// 51: a submit to a repository's green carries the message of the commit the server makes of its work, and its
+/// session's identities (A-664; §4.17.1 "A push is a work" item 4): one refused without a message is
+/// [`Invalid::MessageRequired`], and one by a principal with no identity in the repository's tool
+/// [`Invalid::IdentityRequired`], naming the tool, a [`VcsTool`] (re-exported); the wire's `Refusal::MessageRequired`
+/// and `IdentityRequired`, `RequestBody::SetIdentities` and `ReplyBody::IdentitiesSet` are appended, and each submit
+/// request carries an `Authorship` (2026-11-19).
+/// 52: a role starts the version-control servers' shared HTTP edge (A-625 part 3; §4.17.2 "Transports" item 1):
 /// [`role::ProcessOptions`] gains `vcs_http`, the address `--vcs-http ADDRESS` names, which [`role::Role::parse`] reads
 /// with [`role::vcs_http_address`] (an address off loopback refused for a daemon that is no fleet node, whose edge
 /// would serve cleartext) and [`role::Role::args`] gives back to the daemon an anchor starts; a fleet node's edge
 /// presents the node's own identity; a starter's anchor asks for none (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 51;
+pub const CONTRACT: u32 = 52;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;
@@ -326,8 +332,8 @@ pub use slates_ipc::protocol::{
   HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
   MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
   PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
-  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
-  VolumeSummary, VolumeTakeover,
+  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VcsTool, VolumeId,
+  VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

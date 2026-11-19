@@ -9,8 +9,11 @@
 //! that leaves bytes unread ends in [`Next::CloseWrite`] and [`Next::Drain`]; every other end is [`Next::Close`].
 //!
 //! **The reply's head** is written when the service's first bytes are passed in, or at its end, from the decision's
-//! fields: `200`, those fields, chunked to HTTP/1.1 and framed by the close to HTTP/1.0, `Connection: close` when the
-//! connection ends after it. `100 Continue` is sent when a decision admits a request whose client waits for it: it sent
+//! fields and then any the service names as its reply begins ([`Connection::reply_fields`]: a reply whose fields follow
+//! from its outcome, as Mercurial's media type follows from its command's): `200`, those fields, chunked to HTTP/1.1
+//! and framed by the close to HTTP/1.0, `Connection: close` when the connection ends after it. A field a reply cannot
+//! carry fails the request `500` before any of it is sent: the decision's at the decision, the service's as it names
+//! them. `100 Continue` is sent when a decision admits a request whose client waits for it: it sent
 //! `Expect: 100-continue` and none of its body has come (RFC 9110 §10.1.1: "A server MAY omit sending a 100 (Continue)
 //! response if it has already received some or all of the content").
 //!
@@ -29,7 +32,7 @@ use slates_http::Admission;
 use slates_http::body::{BodyReader, Step};
 use slates_http::gzip::{Gunzip, GzipRefused};
 use slates_http::head::{Coding, Framing, Head, HeadReader, HeadRefused, Progress, Version};
-use slates_http::reply::{self, Body, Status};
+use slates_http::reply::{self, BadField, Body, Status};
 
 use crate::tls::HttpsSession;
 
@@ -158,11 +161,12 @@ impl Request {
 /// A served request's reply.
 #[derive(Debug)]
 struct Reply {
-  /// The head, rendered at the decision and sent with the reply's first bytes; empty once sent.
-  head: Vec<u8>,
+  /// The head's fields: the decision's, then any the service names as its reply begins; the head is rendered from them
+  /// with the reply's first bytes, and they are dropped once it is sent.
+  fields: Fields,
   /// Whether the reply is the head alone (`HEAD`).
   head_only: bool,
-  /// Whether any of the reply has been sent: a failure after this aborts.
+  /// Whether any of the reply has been sent: the head goes with its first bytes, and a failure after this aborts.
   started: bool,
 }
 
@@ -548,33 +552,20 @@ impl Connection {
     };
     self.consume(head_len);
     match decision {
-      Decision::Serve { fields, head_only } => self.serve(request, &fields, head_only),
+      Decision::Serve { fields, head_only } => self.serve(request, fields, head_only),
       Decision::Refuse { status, fields } => self.refuse(request, status, &fields),
     }
   }
 
-  /// Serves a request: its reply's head rendered now (a decision whose fields a reply cannot carry is refused 500),
+  /// Serves a request: its reply's fields judged now (a decision whose fields a reply cannot carry is refused 500),
   /// `100 Continue` sent to a client waiting for it, and its body read, if it has one.
-  fn serve(&mut self, request: Request, fields: &Fields, head_only: bool) {
-    let body = match request.version {
-      Version::Http11 => Body::Chunked,
-      Version::Http10 => Body::UntilClose,
-    };
-    let mut head = Vec::new();
-    if reply::head(
-      Status::OK,
-      &borrowed(fields),
-      body,
-      !request.kept(),
-      &mut head,
-    )
-    .is_err()
-    {
+  fn serve(&mut self, request: Request, fields: Fields, head_only: bool) {
+    if rendered(request, &fields, &mut Vec::new()).is_err() {
       self.refuse_staged(Status::INTERNAL_SERVER_ERROR);
       return;
     }
     let reply = Reply {
-      head,
+      fields,
       head_only,
       started: false,
     };
@@ -704,15 +695,52 @@ impl Connection {
     }
   }
 
-  /// The service's next bytes of its reply: the head before the first, each run chunked (HTTP/1.1) or as it is
-  /// (HTTP/1.0); nothing past the head of a `HEAD`'s reply.
-  pub fn reply(&mut self, data: &[u8]) {
+  /// Fields the service names for its reply's head as its reply begins, written after the decision's (the module doc).
+  /// Taken only before any of the reply is sent, and only while a reply is under way; a field a reply cannot carry
+  /// fails the request `500`, in stages.
+  pub fn reply_fields(&mut self, fields: Fields) {
     let State::Reply { request, reply } = &mut self.state else {
       return;
     };
-    let mut bytes = std::mem::take(&mut reply.head);
-    reply.started = true;
-    if !reply.head_only {
+    if reply.started {
+      return;
+    }
+    reply.fields.extend(fields);
+    let carried = rendered(*request, &reply.fields, &mut Vec::new()).is_ok();
+    if !carried {
+      self.fail(Status::INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  /// A reply under way: its request, whether it is the head alone, and its head's bytes when they are still to be sent
+  /// (rendered now, the reply then started). `None` off a reply; `Some(Err(_))` where a field cannot be carried.
+  fn begin_reply(&mut self) -> Option<Result<(Request, bool, Vec<u8>), BadField>> {
+    let State::Reply { request, reply } = &mut self.state else {
+      return None;
+    };
+    let mut head = Vec::new();
+    if !reply.started {
+      if let Err(bad) = rendered(*request, &reply.fields, &mut head) {
+        return Some(Err(bad));
+      }
+      reply.started = true;
+      reply.fields = Fields::new();
+    }
+    Some(Ok((*request, reply.head_only, head)))
+  }
+
+  /// The service's next bytes of its reply: the head before the first, each run chunked (HTTP/1.1) or as it is
+  /// (HTTP/1.0); nothing past the head of a `HEAD`'s reply.
+  pub fn reply(&mut self, data: &[u8]) {
+    let (request, head_only, mut bytes) = match self.begin_reply() {
+      None => return,
+      Some(Ok(begun)) => begun,
+      Some(Err(_)) => {
+        self.fail(Status::INTERNAL_SERVER_ERROR);
+        return;
+      }
+    };
+    if !head_only {
       match request.version {
         Version::Http11 => reply::chunk(data, &mut bytes),
         Version::Http10 => bytes.extend_from_slice(data),
@@ -721,14 +749,18 @@ impl Connection {
     self.send(&bytes);
   }
 
-  /// The service's reply has ended: the last chunk (HTTP/1.1), then the next request or the connection's end.
+  /// The service's reply has ended: the head if none of the reply was sent, the last chunk (HTTP/1.1), then the next
+  /// request or the connection's end.
   pub fn reply_end(&mut self) {
-    let State::Reply { request, reply } = &mut self.state else {
-      return;
+    let (request, head_only, mut bytes) = match self.begin_reply() {
+      None => return,
+      Some(Ok(begun)) => begun,
+      Some(Err(_)) => {
+        self.fail(Status::INTERNAL_SERVER_ERROR);
+        return;
+      }
     };
-    let request = *request;
-    let mut bytes = std::mem::take(&mut reply.head);
-    if !reply.head_only && request.version == Version::Http11 {
+    if !head_only && request.version == Version::Http11 {
       bytes.extend_from_slice(reply::LAST_CHUNK);
     }
     self.send(&bytes);
@@ -777,6 +809,17 @@ impl Connection {
   pub fn ended(&self) -> Option<Ended> {
     self.ended
   }
+}
+
+/// Renders a served reply's head for `request` into `out`: `200`, `fields`, chunked to HTTP/1.1 and framed by the
+/// close to HTTP/1.0, `Connection: close` when the connection ends after it. Refused, writing nothing, where a field
+/// cannot be carried.
+fn rendered(request: Request, fields: &Fields, out: &mut Vec<u8>) -> Result<(), BadField> {
+  let body = match request.version {
+    Version::Http11 => Body::Chunked,
+    Version::Http10 => Body::UntilClose,
+  };
+  reply::head(Status::OK, &borrowed(fields), body, !request.kept(), out)
 }
 
 /// `fields` as `slates-http`'s reply writer takes them.

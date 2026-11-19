@@ -11,6 +11,8 @@ use crate::authz::{Authz, Principal};
 use crate::handshake::ClientCapabilities;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
 use crate::ra_svn::{Bounds, Parsed, Parser};
+use crate::report::drive::{Call, Facts};
+use crate::report::editor::EditorWriter;
 use crate::svndiff::decode_all;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -755,6 +757,7 @@ fn every_fixture_has_its_recorded_sum() {
     "locked-svn-cat-denied",
     "locked-svn-proplist",
     "get-file-revs",
+    "get-file-revs-svndiff0",
     "svn-blame",
     "svn-blame-g",
     "svn-mergeinfo-eligible",
@@ -1548,6 +1551,119 @@ fn svndiff_0_strings_are_the_writes_svndiff_c_makes() {
       ),
     ]
   );
+}
+
+/// The nodes the report editor holds open while it writes one added file's delta.
+/// Shape: the root directory and the file.
+const DELTA_NODES_OPEN: usize = 2;
+
+/// A-616 continued (7) (one writer of an svndiff stream's writes, `svndiff.c`, which `svnserve` sends a string each, a
+/// delta string of `get-file-revs` and a `textdelta-chunk` of an edit alike): replay `svnserve`'s
+/// `get-file-revs-svndiff0` session, whose client takes svndiff 0 alone, through `get-file-revs`; then write each delta
+/// `svnserve` sent there, its windows decoded from its strings, through the report editor for the same client. Expect
+/// both callers of the one writer to send `svnserve`'s strings byte for byte, the editor's as its `textdelta-chunk`s,
+/// over the session's 14 deltas: 4 that open with a window of new data alone (the header, its integers and its
+/// instruction one string), 9 that open with the header alone, and an empty text's header with nothing after it.
+#[test]
+fn both_callers_of_the_one_delta_writer_send_svnserves_svndiff_0_writes() {
+  let (name, client, server) = transcript!("get-file-revs-svndiff0");
+  assert_eq!(replay(name, client, server, &[]), 5, "{name}");
+  let deltas = recorded_deltas(server);
+  assert_eq!(delta_shapes(&deltas), (14, 4, 9, 1), "{name}");
+  for strings in &deltas {
+    assert_eq!(&editor_chunks(strings), strings, "{name}");
+  }
+}
+
+/// Each delta a `get-file-revs` answer sends, its strings before the closing empty one; a revision that sends none is
+/// left out.
+fn recorded_deltas(server: &[u8]) -> Vec<Vec<Vec<u8>>> {
+  file_revisions_sent(server)
+    .into_iter()
+    .filter_map(|(_, mut strings)| {
+      strings.pop();
+      (!strings.is_empty()).then_some(strings)
+    })
+    .collect()
+}
+
+/// How many deltas there are, and how many open with the header joined to a window of new data alone, with the header
+/// alone and more after it, and with the header alone and nothing else.
+fn delta_shapes(deltas: &[Vec<Vec<u8>>]) -> (usize, usize, usize, usize) {
+  let header = b"SVN\0".as_slice();
+  let joined = deltas
+    .iter()
+    .filter(|strings| {
+      first_string(strings)
+        .is_some_and(|bytes| bytes.len() > header.len() && bytes.starts_with(header))
+    })
+    .count();
+  let alone_then_more = deltas
+    .iter()
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() > 1)
+    .count();
+  let alone = deltas
+    .iter()
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() == 1)
+    .count();
+  (deltas.len(), joined, alone_then_more, alone)
+}
+
+/// A delta's first string, if it has one.
+fn first_string(strings: &[Vec<u8>]) -> Option<&[u8]> {
+  strings.first().map(Vec::as_slice)
+}
+
+/// The `textdelta-chunk`s the report editor writes, to a client that takes svndiff 0 alone, for an added file whose
+/// delta is the windows `strings` hold.
+fn editor_chunks(strings: &[Vec<u8>]) -> Vec<Vec<u8>> {
+  let (_, windows) = decode_all(&strings.concat()).unwrap();
+  let node = Facts {
+    repository_path: "/trunk/a.txt",
+    created_revision: 1,
+    sha1: None,
+  };
+  let mut drive = vec![
+    Call::TargetRevision(1),
+    Call::OpenRoot {
+      base: Some(1),
+      node,
+    },
+    Call::Add {
+      kind: NodeKind::File,
+      path: "a.txt",
+      copy_from: None,
+      node,
+    },
+    Call::ApplyTextDelta { base_md5: None },
+  ];
+  drive.extend(windows.iter().map(Call::Window));
+  drive.extend([
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5: [0; 16] },
+    Call::CloseDirectory,
+    Call::CloseEdit,
+  ]);
+  let mut writer = EditorWriter::new(&SVNDIFF0_SESSION.capabilities, DELTA_NODES_OPEN);
+  let mut out = Vec::new();
+  for call in &drive {
+    writer.write(call, &mut out).unwrap();
+  }
+  items(&out).iter().filter_map(textdelta_chunk).collect()
+}
+
+/// A `textdelta-chunk` command's chunk.
+fn textdelta_chunk(item: &Value<'_>) -> Option<Vec<u8>> {
+  let Value::List(parts) = item else {
+    return None;
+  };
+  let [Value::Word("textdelta-chunk"), Value::List(params)] = parts.as_slice() else {
+    return None;
+  };
+  let [_, Value::String(chunk)] = params.as_slice() else {
+    return None;
+  };
+  Some(chunk.to_vec())
 }
 
 /// A `get-file-revs` answer's revisions in order, each its path, its number and whether it came in by a merge.

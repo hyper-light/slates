@@ -540,7 +540,7 @@ fn svndiff_integers_are_read_within_the_format() {
 /// refused as a corrupt window, and a whole one split into its three sections.
 #[test]
 fn a_window_encoding_whose_lengths_do_not_hold_is_refused() {
-  let corrupt = Err(EditorRefused::Window(SvndiffError::CorruptWindowHeader));
+  let corrupt = Err(SvndiffError::CorruptWindowHeader);
   let encodings: [&[u8]; 4] = [
     b"",
     b"\x00\x00\x03\x01",

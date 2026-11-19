@@ -88,6 +88,14 @@ impl Work {
     self.op(OpKind::RemoveXattr, path, (name, 0, u64::MAX))
   }
 
+  /// Adds `path` made a FIFO, the node `SPECIAL` is ([`fifo_node`]).
+  pub(super) fn fifo(mut self, path: &str) -> Work {
+    let node = fifo_node().encode();
+    let src = self.post.len() as u64;
+    self.post.extend_from_slice(&node);
+    self.op(OpKind::Mknod, path, (0, node.len() as u64, src))
+  }
+
   /// Adds `path` made a file holding `bytes`.
   pub(super) fn create(mut self, path: &str, bytes: &[u8]) -> Work {
     let src = self.post.len() as u64;
@@ -146,19 +154,21 @@ pub(super) fn green() -> Green {
     .hardlinks
     .push((HARDLINK.to_owned(), TARGET.to_owned()));
   origin.dirs.push(DIR.to_owned());
-  origin.specials.push((
-    SPECIAL.to_owned(),
-    SpecialNode {
-      kind: SpecialKind::Fifo,
-      uid: 1,
-      gid: 1,
-      atime: 1,
-      mtime: 1,
-      ctime: 1,
-      btime: 1,
-    },
-  ));
+  origin.specials.push((SPECIAL.to_owned(), fifo_node()));
   Green::with_origin(origin)
+}
+
+/// The FIFO `green` holds at `SPECIAL`, and the one [`Work::fifo`] makes.
+fn fifo_node() -> SpecialNode {
+  SpecialNode {
+    kind: SpecialKind::Fifo,
+    uid: 1,
+    gid: 1,
+    atime: 1,
+    mtime: 1,
+    ctime: 1,
+    btime: 1,
+  }
 }
 
 /// Submits `work` at the head of `green` as increment `id`, expecting it accepted.
