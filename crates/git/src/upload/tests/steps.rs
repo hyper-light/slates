@@ -43,9 +43,9 @@ fn stepped<P: PackSource>(
 }
 
 /// A source of `len` bytes counting up: no pack, since the framing never reads what it frames, but longer than a packet.
-struct Counting {
+pub(super) struct Counting {
   /// How many bytes it writes.
-  len: usize,
+  pub(super) len: usize,
 }
 
 impl PackSource for Counting {

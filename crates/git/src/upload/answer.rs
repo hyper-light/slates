@@ -1,13 +1,16 @@
-//! An answer, written out a slice at a time (A-640 part 2): the bytes [`super::serve`] encoded, then, for a fetch that
-//! carries a pack, the pack its source writes, framed on band 1 a packet at a time, then the flush that ends the
-//! response (gitprotocol-v2 "packfile section": "The packfile section ... is multiplexed using side-band-64k").
+//! An answer, written out a slice at a time (A-640 parts 2 and 3): the bytes [`super::serve`] encoded, then, for a
+//! fetch that carries a pack, the pack its source writes, framed a packet at a time as the protocol frames it
+//! (`Framing`): protocol v2's packfile section on band 1, then its flush ("The packfile section ... is multiplexed
+//! using side-band-64k" [gitprotocol-v2]); protocol v0's side-band-64k or side-band on band 1, then a flush
+//! (`create_pack_file`); or, under v0 without side-band, the pack's bytes as they are.
 //!
 //! A step writes at most the room its caller gives it, and any bytes past that wait for the next step, so the caller's
 //! room bounds what a step writes and one packet bounds what it asks of the pack's source. A packet is filled to the
-//! most data a band-1 packet carries (`sideband::MAX_BAND_DATA`), the format's own limit, so a pack goes out in the
-//! fewest packets whatever room the caller gives. A source that refuses mid-pack, or writes nothing while saying more is
-//! coming, ends the response with git's band-3 words for a pack that could not be finished: nothing follows a band-3
-//! packet (gitprotocol-v2), and the client stops with them.
+//! most data its band carries, the format's own limit (`sideband::MAX_BAND_DATA` for side-band-64k, 995 bytes for
+//! side-band's 1000-byte packets), so a pack goes out in the fewest packets whatever room the caller gives. A source
+//! that refuses mid-pack, or writes nothing while saying more is coming, ends the response with git's band-3 words for
+//! a pack that could not be finished: nothing follows a band-3 packet, and the client stops with them. Without
+//! side-band there is no band to say it on, so the pack stops short, as git's does, and the client finds it cut.
 
 use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
@@ -19,6 +22,33 @@ use crate::{Admission, to_u64};
 
 /// Format: what an error line begins with outside a multiplexed response (`packet_writer_error`).
 const ERR: &[u8] = b"ERR ";
+
+/// Format: the flush packet, four zero digits [gitprotocol-common: "0000 (flush-pkt)"].
+const FLUSH: &[u8] = b"0000";
+
+/// How an answer frames its pack's data.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Framing {
+  /// Protocol v2's packfile section, through its grammar: band 1, then the flush.
+  V2(Response),
+  /// Protocol v0's side-band-64k or side-band: band 1 in packets of at most `data` bytes of the pack, then a flush.
+  Band {
+    /// The most bytes of the pack one packet carries.
+    data: usize,
+  },
+  /// Protocol v0 without side-band: the pack's bytes as they are, and nothing after them.
+  Raw,
+}
+
+impl Framing {
+  /// The most bytes of the pack one packet carries.
+  fn data(self) -> usize {
+    match self {
+      Framing::V2(_) | Framing::Raw => MAX_BAND_DATA,
+      Framing::Band { data } => data,
+    }
+  }
+}
 
 /// What a step left to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,8 +80,8 @@ pub struct Answer<K> {
 struct Streaming<K> {
   /// What its source keeps.
   source: K,
-  /// The response's grammar, inside the packfile section.
-  response: Response,
+  /// How the pack's data is framed.
+  framing: Framing,
   /// How many bytes of the response come before what is framed next.
   at: u64,
   /// The pack's next data, as its source wrote it.
@@ -94,12 +124,12 @@ impl<K> Answer<K> {
     }
   }
 
-  /// An answer of `head`, the packfile section's header last, then the pack `source` writes, framed by `response`,
-  /// which `head`'s `at` bytes have brought to the packfile section. The two packet buffers are charged to `admission`
-  /// first.
+  /// An answer of `head`, then the pack `source` writes, framed as `framing` frames it; under v2 its grammar is where
+  /// `head`'s `at` bytes brought it, the packfile section's header last. The two packet buffers are charged to
+  /// `admission` first.
   pub(super) fn streaming(
     head: Vec<u8>,
-    response: Response,
+    framing: Framing,
     at: u64,
     source: K,
     admission: &mut Admission,
@@ -110,7 +140,7 @@ impl<K> Answer<K> {
     Ok(Answer {
       pack: Some(Streaming {
         source,
-        response,
+        framing,
         at,
         data: Vec::with_capacity(MAX_BAND_DATA),
         framed: Vec::with_capacity(pktline::MAX_LEN),
@@ -192,7 +222,8 @@ impl<K> Streaming<K> {
     self.framed.clear();
     self.framed_written = 0;
     self.data.clear();
-    match packs.write(served, &mut self.source, &mut self.data, MAX_BAND_DATA) {
+    let room = self.framing.data();
+    match packs.write(served, &mut self.source, &mut self.data, room) {
       Ok(true) if self.data.is_empty() => self.end_early(Refusal::Pack(PackRefused::Stalled)),
       Ok(more) => match self.frame_data(more) {
         Ok(()) => Ok(()),
@@ -202,32 +233,44 @@ impl<K> Streaming<K> {
     }
   }
 
-  /// Frames the data the source wrote, on band 1, and the flush when it was the pack's last.
+  /// Frames the data the source wrote, and what ends the pack when it was the last.
   fn frame_data(&mut self, more: bool) -> Result<(), Refusal> {
-    if !self.data.is_empty() {
-      let wrote = self
-        .response
-        .write(&Event::Pack(&self.data), self.at, &mut self.framed)
-        .map_err(Refusal::Wire)?;
-      self.at = self.at.saturating_add(wrote);
+    match self.framing {
+      Framing::V2(mut response) => {
+        if !self.data.is_empty() {
+          let wrote = response
+            .write(&Event::Pack(&self.data), self.at, &mut self.framed)
+            .map_err(Refusal::Wire)?;
+          self.at = self.at.saturating_add(wrote);
+        }
+        if !more {
+          let wrote = response
+            .write(&Event::Flush, self.at, &mut self.framed)
+            .map_err(Refusal::Wire)?;
+          self.at = self.at.saturating_add(wrote);
+        }
+        self.framing = Framing::V2(response);
+      }
+      Framing::Band { .. } => {
+        sideband::write(Band::Data, &self.data, &mut self.framed);
+        if !more {
+          self.framed.extend_from_slice(FLUSH);
+        }
+      }
+      Framing::Raw => self.framed.extend_from_slice(&self.data),
     }
-    if !more {
-      let wrote = self
-        .response
-        .write(&Event::Flush, self.at, &mut self.framed)
-        .map_err(Refusal::Wire)?;
-      self.at = self.at.saturating_add(wrote);
-      self.closed = true;
-    }
+    self.closed = !more;
     Ok(())
   }
 
   /// Ends the response with git's band-3 words for a pack that could not be finished, in place of anything framed and
-  /// not written: refused with `refusal`.
+  /// not written, or, with no band to say it on, ends it there: refused with `refusal`.
   fn end_early(&mut self, refusal: Refusal) -> Result<(), Refusal> {
     self.framed.clear();
     self.framed_written = 0;
-    sideband::write(Band::Error, ABORT, &mut self.framed);
+    if !matches!(self.framing, Framing::Raw) {
+      sideband::write(Band::Error, ABORT, &mut self.framed);
+    }
     self.closed = true;
     Err(refusal)
   }
