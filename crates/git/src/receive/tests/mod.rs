@@ -1,3 +1,12 @@
+//! receive-pack's tests (A-620): eleven pushes stock git made as golden vectors, the request
+//! reader, each command's checks, the report and the admission. `append` holds the tests of the
+//! appends that move refs (A-642), `checks` those of the pushed objects' fsck and of hidden refs,
+//! `session` those of one push over one connection.
+
+mod append;
+mod checks;
+mod session;
+
 use std::collections::BTreeSet;
 use std::io::Write as _;
 
@@ -5,18 +14,21 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
 use super::{
-  Advertised, Command, Connected, Declined, Judge, Outcome, Pushed, Received, Refusal, Reported,
-  Repository, RequestReader, connectivity, message, receive, write_advertisement, write_report,
+  Advertised, Command, Connected, Declined, HiddenRefs, Judge, NoneHidden, Outcome, Pushed,
+  Received, Refusal, Reported, Repository, RequestReader, UNPACK_LIMIT, connectivity, message,
+  receive, visible, write_advertisement, write_report,
 };
 use crate::entry::{self, Header, Representation};
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::objects::commit::Commit;
 use crate::pack;
 use crate::pktline::{self, Packet};
+use crate::sideband::{self, Band};
 use crate::unpack::{self, NoIndex};
 use crate::{Admission, PastAdmission};
 
-/// One push stock git 2.50.1 made to stock `git receive-pack`, captured by `fixtures/push/make-push-fixtures.sh`.
+/// One push stock git 2.50.1 made to stock `git receive-pack`, captured by
+/// `fixtures/push/make-push-fixtures.sh`.
 struct Scenario {
   /// Its name in the script.
   name: &'static str,
@@ -44,7 +56,7 @@ macro_rules! scenario {
 }
 
 /// Every scenario, in the order the script pushed them.
-fn scenarios() -> [Scenario; 9] {
+fn scenarios() -> [Scenario; 11] {
   [
     scenario!("create"),
     scenario!("update"),
@@ -55,11 +67,21 @@ fn scenarios() -> [Scenario; 9] {
     scenario!("options"),
     scenario!("non-ff"),
     scenario!("atomic"),
+    scenario!("hidden"),
+    scenario!("fsck"),
   ]
 }
 
-/// What the captured server advertised: every capability git's defaults and the script's `receive.advertisePushOptions`
-/// give, and stock git's agent.
+/// The scenario the script named `name`.
+fn scenario(name: &str) -> Scenario {
+  scenarios()
+    .into_iter()
+    .find(|scenario| scenario.name == name)
+    .unwrap()
+}
+
+/// What the captured server advertised: every capability git's defaults and the script's
+/// `receive.advertisePushOptions` give, and stock git's agent.
 const ADVERTISED: Advertised<'static> = Advertised {
   format: ObjectFormat::Sha1,
   atomic: true,
@@ -68,6 +90,24 @@ const ADVERTISED: Advertised<'static> = Advertised {
   session_id: None,
   agent: b"git/2.50.1-Darwin",
 };
+
+/// The refs git's `receive.hideRefs` hides, read as git's `ref_is_hidden` (refs.c) reads a plain
+/// pattern: the ref of its name and every ref beneath it.
+struct HideRefs(&'static [&'static [u8]]);
+
+impl HiddenRefs for HideRefs {
+  fn is_hidden(&self, name: &[u8]) -> bool {
+    self.0.iter().any(|pattern| {
+      name
+        .strip_prefix(*pattern)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+    })
+  }
+}
+
+/// What the captured server hid from its hidden push on (the script's `receive.hideRefs`): no
+/// earlier server holds a ref beneath it, so it is every scenario's.
+const HIDDEN: HideRefs = HideRefs(&[b"refs/hidden"]);
 
 /// `n` as a `u64`.
 fn wide(n: usize) -> u64 {
@@ -114,7 +154,7 @@ impl Repository for Repo {
       .objects
       .binary_search_by(|(known, _, _)| known.cmp(id))
       .ok()?;
-    let (_, kind, content) = &self.objects[at];
+    let (_, kind, content) = self.objects.get(at)?;
     Some((*kind, content.as_slice()))
   }
 }
@@ -133,8 +173,17 @@ fn refs(lines: &str) -> Vec<(ObjectId, Vec<u8>)> {
     .collect()
 }
 
-/// git's own verdicts on the captured server, which refused non-fast-forwards (`receive.denyNonFastForwards`): an
-/// update of a branch whose old commit is not an ancestor of the new is declined in git's words, with git's band-2 line.
+/// `refs` as the advertisement takes them.
+fn named(refs: &[(ObjectId, Vec<u8>)]) -> Vec<(ObjectId, &[u8])> {
+  refs
+    .iter()
+    .map(|(id, name)| (*id, name.as_slice()))
+    .collect()
+}
+
+/// git's own verdicts on the captured server, which refused non-fast-forwards
+/// (`receive.denyNonFastForwards`): an update of a branch whose old commit is not an ancestor of
+/// the new is declined in git's words, with git's band-2 line.
 struct GitPolicy<'r> {
   repository: &'r Repo,
   judged: Vec<Vec<u8>>,
@@ -167,7 +216,9 @@ impl GitPolicy<'_> {
 }
 
 impl Judge for GitPolicy<'_> {
-  fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Vec<Reported>, Declined> {
+  type Accepted = ();
+
+  fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<(), Declined> {
     self.judged.push(command.name.clone());
     let update = !command.is_create() && !command.is_delete();
     if update
@@ -185,6 +236,17 @@ impl Judge for GitPolicy<'_> {
         message: Some(message(&line)),
       });
     }
+    Ok(())
+  }
+
+  fn append(&mut self, _command: &Command, (): ()) -> Result<Vec<Reported>, Declined> {
+    Ok(Vec::new())
+  }
+
+  fn append_atomic(
+    &mut self,
+    _accepted: Vec<(&Command, ())>,
+  ) -> Result<Vec<Vec<Reported>>, Declined> {
     Ok(Vec::new())
   }
 }
@@ -197,97 +259,152 @@ fn git_policy(repository: &Repo) -> GitPolicy<'_> {
   }
 }
 
-/// `scenario`'s push received against its server, judged by git's policy.
+/// `scenario`'s push received against its server, judged by git's policy, its hidden refs hidden.
 fn received(scenario: &Scenario, repository: &Repo) -> Received {
-  let mut policy = GitPolicy {
-    repository,
-    judged: Vec::new(),
-  };
   receive(
     scenario.request,
     &ADVERTISED,
     repository,
-    &mut policy,
+    &HIDDEN,
+    &mut git_policy(repository),
     &mut unbounded(),
   )
   .unwrap()
 }
 
-/// The advertisement written for `scenario`'s server.
+/// The advertisement written for `scenario`'s server, its hidden refs left out.
 fn advertisement(scenario: &Scenario) -> Vec<u8> {
   let refs = refs(scenario.before_refs);
-  let named: Vec<(ObjectId, &[u8])> = refs
-    .iter()
-    .map(|(id, name)| (*id, name.as_slice()))
-    .collect();
   let mut out = Vec::new();
-  write_advertisement(&named, &ADVERTISED, &mut out).unwrap();
+  write_advertisement(&visible(&named(&refs), &HIDDEN), &ADVERTISED, &mut out).unwrap();
   out
 }
 
-/// A-620 (§4.17.2 piece 6; golden vectors: nine pushes stock git 2.50.1 made to stock `git receive-pack`, captured by
-/// `fixtures/push/make-push-fixtures.sh`). Do: write the advertisement of each scenario's server from its refs; then
-/// receive its request against a repository holding the server's objects, judged by the server's own policy (it refused
-/// non-fast-forwards), and write the answer. Expect: the advertisement and the answer, together, the very bytes
-/// `git receive-pack` wrote: the capabilities in git's order (`capabilities^{}` for the empty repository), and the
-/// report on band 1 after any band-2 line, `unpack ok`, then `ok` or git's `ng` reasons (non-fast-forward, atomic push
-/// failure), then the flushes.
+/// The answer written to `received`.
+fn answer_to(received: &Received) -> Vec<u8> {
+  let mut answer = Vec::new();
+  write_report(received, &mut answer).unwrap();
+  answer
+}
+
+/// A multiplexed answer's band 1 and band 2, each its packets' bytes joined, once the answer is
+/// seen to end with its own flush and to hold nothing else.
+fn bands(answer: &[u8]) -> (Vec<u8>, Vec<u8>) {
+  let packets = pktline::decode(answer, &mut unbounded()).unwrap();
+  let (last, multiplexed) = packets.split_last().unwrap();
+  assert_eq!(*last, Packet::Flush);
+  let mut report = Vec::new();
+  let mut text = Vec::new();
+  for packet in multiplexed {
+    let Packet::Data(data) = packet else {
+      panic!("{packet:?} inside an answer");
+    };
+    match sideband::demux(data).unwrap() {
+      (Band::Data, bytes) => report.extend_from_slice(bytes),
+      (Band::Progress, bytes) => text.extend_from_slice(bytes),
+      (Band::Error, bytes) => panic!("band 3: {}", String::from_utf8_lossy(bytes)),
+    }
+  }
+  (report, text)
+}
+
+/// Asserts that `ours` answers as `gits` does but for the prose git writes after an fsck finding's
+/// id: band 1 byte for byte; band 2 line for line, each of git's lines ours, or ours, `: ` and
+/// git's prose.
+fn assert_agrees_but_for_prose(ours: &[u8], gits: &[u8], name: &str) {
+  let (our_report, our_text) = bands(ours);
+  let (git_report, git_text) = bands(gits);
+  assert_eq!(our_report, git_report, "{name}: band 1");
+  let our_lines: Vec<&[u8]> = our_text.split(|byte| *byte == b'\n').collect();
+  let git_lines: Vec<&[u8]> = git_text.split(|byte| *byte == b'\n').collect();
+  assert_eq!(our_lines.len(), git_lines.len(), "{name}: band 2's lines");
+  let agree = our_lines.iter().zip(&git_lines).all(|(ours, gits)| {
+    gits
+      .strip_prefix(*ours)
+      .is_some_and(|prose| prose.is_empty() || prose.starts_with(b": "))
+  });
+  let shown = |text: &[u8]| String::from_utf8_lossy(text).into_owned();
+  assert!(
+    agree,
+    "{name}: {} against {}",
+    shown(&our_text),
+    shown(&git_text)
+  );
+}
+
+/// A-620 (§4.17.2 piece 6; golden vectors: eleven pushes stock git 2.50.1 made to stock `git
+/// receive-pack`, captured by `fixtures/push/make-push-fixtures.sh`). Do: write the advertisement
+/// of each scenario's server from its refs, `refs/hidden` hidden as the script hid it; then
+/// receive its request against a repository holding the server's objects, judged by the server's
+/// own policy (it refused non-fast-forwards), and write the answer. Expect: the advertisement and
+/// the answer, together, the very bytes `git receive-pack` wrote: the capabilities in git's order
+/// (`capabilities^{}` for the empty repository), no hidden ref, band 2 before band 1, `unpack ok`
+/// or git's words, `ok` or git's `ng` reasons (non-fast-forward, atomic push failure, deny updating
+/// a hidden ref, unpacker error), the flushes. One answer differs, the fsck push's, and only in the
+/// prose git writes on band 2 after its finding's id.
 #[test]
 fn every_push_stock_git_made_is_answered_with_the_bytes_git_answered() {
+  let mut inexact = Vec::new();
   for scenario in scenarios() {
     let repository = Repo::from_pack(scenario.before_pack);
     let advertised = advertisement(&scenario);
     let (head, tail) = scenario.response.split_at(advertised.len());
     assert_eq!(advertised, head, "{}: the advertisement", scenario.name);
-    let mut answer = Vec::new();
-    write_report(&received(&scenario, &repository), &mut answer).unwrap();
-    assert_eq!(answer, tail, "{}: the answer", scenario.name);
+    let answer = answer_to(&received(&scenario, &repository));
+    if answer != tail {
+      assert_agrees_but_for_prose(&answer, tail, scenario.name);
+      inexact.push(scenario.name);
+    }
   }
+  assert_eq!(inexact, ["fsck"]);
 }
 
-/// A-620 (golden vectors, read). Do: read each captured request. Expect: the commands, capabilities and options stock
-/// git sent: report-status-v2, side-band-64k and quiet asked every time, its agent, `atomic` in the atomic push alone,
-/// and the push options `ci.skip` and `note=two words` in the options push alone; a pack after every request but the
-/// delete's.
+/// Asserts that `scenario`'s request asked what stock git asks: report-status-v2, side-band-64k
+/// and quiet, its agent, `atomic` in the atomic push alone, and the push options `ci.skip` and
+/// `note=two words` in the options push alone.
+fn assert_asked_as_git_asks(scenario: &Scenario, received: &Received) {
+  let request = &received.request;
+  let requested = &request.requested;
+  let name = scenario.name;
+  assert!(
+    requested.report_status_v2 && requested.side_band_64k && requested.quiet,
+    "{name}"
+  );
+  assert_eq!(requested.agent.as_deref(), Some(&b"git/2.50.1-Darwin"[..]));
+  assert_eq!(requested.atomic, name == "atomic", "{name}");
+  let options: Vec<&[u8]> = request.options.iter().map(Vec::as_slice).collect();
+  let expected: &[&[u8]] = if name == "options" {
+    &[b"ci.skip", b"note=two words"]
+  } else {
+    &[]
+  };
+  assert_eq!(options, expected, "{name}");
+}
+
+/// A-620 (golden vectors, read). Do: read each captured request. Expect: the commands,
+/// capabilities and options stock git sent (report-status-v2, side-band-64k and quiet asked every
+/// time, its agent, `atomic` in the atomic push alone, the push options in the options push alone);
+/// a pack after every request but the delete's; one outcome a command.
 #[test]
 fn every_request_stock_git_sent_reads_as_git_wrote_it() {
   for scenario in scenarios() {
     let repository = Repo::from_pack(scenario.before_pack);
     let received = received(&scenario, &repository);
-    let request = &received.request;
-    let requested = &request.requested;
-    assert!(
-      requested.report_status_v2 && requested.side_band_64k && requested.quiet,
-      "{}",
-      scenario.name
-    );
-    assert_eq!(requested.agent.as_deref(), Some(&b"git/2.50.1-Darwin"[..]));
-    assert_eq!(
-      requested.atomic,
-      scenario.name == "atomic",
-      "{}",
-      scenario.name
-    );
-    let options: Vec<&[u8]> = request.options.iter().map(Vec::as_slice).collect();
-    let expected: &[&[u8]] = if scenario.name == "options" {
-      &[b"ci.skip", b"note=two words"]
-    } else {
-      &[]
-    };
-    assert_eq!(options, expected, "{}", scenario.name);
+    assert_asked_as_git_asks(&scenario, &received);
     assert_eq!(
       received.unpacked.is_some(),
       scenario.name != "delete",
       "{}",
       scenario.name
     );
-    assert_eq!(received.outcomes.len(), request.commands.len());
+    assert_eq!(received.outcomes.len(), received.request.commands.len());
   }
 }
 
-/// A-620 (thin packs: a base the server holds). Do: receive the pushes whose packs stock git made thin (update,
-/// options, the non-fast-forward and the atomic push), against the server's objects. Expect: each pack read, its delta
-/// on the text blob resolved one deep against the server's own copy, a base the pack does not hold.
+/// A-620 (thin packs: a base the server holds). Do: receive the pushes whose packs stock git made
+/// thin (update, options, the non-fast-forward and the atomic push), against the server's objects.
+/// Expect: each pack read, its delta on the text blob resolved one deep against the server's own
+/// copy, a base the pack does not hold.
 #[test]
 fn a_thin_pack_resolves_its_deltas_against_the_repository() {
   let thin = ["update", "options", "non-ff", "atomic"];
@@ -309,14 +426,19 @@ fn a_thin_pack_resolves_its_deltas_against_the_repository() {
   }
 }
 
-/// A-620 (streaming). Do: feed each captured request to a reader a byte at a time. Expect: the same request as read
-/// whole, the reader taking exactly the request's bytes and none of the pack's.
+/// The bytes of `request` its request takes, before its pack.
+fn request_len(request: &[u8]) -> usize {
+  let mut reader = RequestReader::new(&ADVERTISED);
+  reader.read(request, &mut unbounded()).unwrap()
+}
+
+/// A-620 (streaming). Do: feed each captured request to a reader a byte at a time. Expect: the
+/// same request as read whole, the reader taking exactly the request's bytes and none of the
+/// pack's.
 #[test]
 fn a_request_read_a_byte_at_a_time_is_the_same_and_stops_where_the_pack_begins() {
   for scenario in scenarios() {
-    let mut whole = RequestReader::new(&ADVERTISED);
-    let took = whole.read(scenario.request, &mut unbounded()).unwrap();
-    let whole = whole.request().unwrap();
+    let took = request_len(scenario.request);
     let mut reader = RequestReader::new(&ADVERTISED);
     let mut fed = 0;
     for byte in scenario.request {
@@ -328,6 +450,7 @@ fn a_request_read_a_byte_at_a_time_is_the_same_and_stops_where_the_pack_begins()
       }
     }
     assert_eq!(fed, took, "{}", scenario.name);
+    let whole = received(&scenario, &Repo::from_pack(scenario.before_pack)).request;
     assert_eq!(reader.request().unwrap(), whole, "{}", scenario.name);
     let pack = &scenario.request[took..];
     assert!(
@@ -338,59 +461,57 @@ fn a_request_read_a_byte_at_a_time_is_the_same_and_stops_where_the_pack_begins()
   }
 }
 
-/// A-620 (hostile input: every cut). Do: receive every cut of each captured request. Expect: a cut inside the request
-/// refused as `Truncated` at the cut; a cut inside the pack answered as git answers a short pack, every command
-/// `unpacker error`, the unpack status git's words (`eof before pack header was fully read` within the pack's header,
-/// `index-pack abnormal exit` after it).
+/// git's words for a short pack cut `into` bytes in: `eof before pack header was fully read`
+/// within its header; after it, the program git runs for the objects its header counts
+/// (`unpack-objects` below its `unpack_limit`, `index-pack` at or above it) and its abnormal exit.
+fn short_pack_words(pack: &[u8], into: usize) -> &'static [u8] {
+  if wide(into) < entry::PACK_HEADER_LEN {
+    return b"eof before pack header was fully read";
+  }
+  let objects = u32::from_be_bytes(pack[8..12].try_into().unwrap());
+  if objects < UNPACK_LIMIT {
+    b"unpack-objects abnormal exit"
+  } else {
+    b"index-pack abnormal exit"
+  }
+}
+
+/// Asserts that `received` answers a push whose pack (`pack`, whole) was cut `into` bytes in as git
+/// answers a short pack: every command `unpacker error`, the unpack status git's words.
+fn assert_short_pack(received: &Received, pack: &[u8], into: usize, label: &str) {
+  let refusal = received.unpacked.as_ref().unwrap().as_ref().unwrap_err();
+  let words = super::unpack_words(refusal);
+  assert_eq!(words, short_pack_words(pack, into), "{label}");
+  let all_unpacker = received
+    .outcomes
+    .iter()
+    .all(|outcome| refused_for(outcome, b"unpacker error"));
+  assert!(all_unpacker, "{label}");
+}
+
+/// A-620 (hostile input: every cut). Do: receive every cut of each captured push. Expect: a cut
+/// inside the request refused as `Truncated` at the cut; a cut inside the pack answered as git
+/// answers a short pack, every command `unpacker error`, the unpack status git's words (`eof before
+/// pack header was fully read` within the pack's header, `unpack-objects abnormal exit` after it,
+/// every captured pack counting fewer objects than git's `unpack_limit`); nothing judged.
 #[test]
 fn every_cut_of_a_push_is_refused_or_answered_as_a_short_pack() {
   for scenario in scenarios() {
     let repository = Repo::from_pack(scenario.before_pack);
-    let mut reader = RequestReader::new(&ADVERTISED);
-    let request_len = reader.read(scenario.request, &mut unbounded()).unwrap();
+    let request_len = request_len(scenario.request);
     for cut in 0..scenario.request.len() {
-      let mut policy = GitPolicy {
-        repository: &repository,
-        judged: Vec::new(),
-      };
-      let result = receive(
-        &scenario.request[..cut],
-        &ADVERTISED,
-        &repository,
-        &mut policy,
-        &mut unbounded(),
-      );
-      if cut < request_len {
-        assert_eq!(
-          result,
-          Err(Refusal::Truncated { at: wide(cut) }),
-          "{} cut at {cut}",
-          scenario.name
-        );
-        continue;
+      let label = format!("{} cut at {cut}", scenario.name);
+      let mut policy = git_policy(&repository);
+      let bytes = &scenario.request[..cut];
+      let result = receive(bytes, &ADVERTISED, &repository, &HIDDEN, &mut policy, &mut unbounded());
+      match cut.checked_sub(request_len) {
+        None => assert_eq!(result, Err(Refusal::Truncated { at: wide(cut) }), "{label}"),
+        Some(into) => {
+          let pack = &scenario.request[request_len..];
+          assert_short_pack(&result.unwrap(), pack, into, &label);
+        }
       }
-      let received = result.unwrap();
-      let within_header = wide(cut - request_len) < crate::entry::PACK_HEADER_LEN;
-      let words: &[u8] = if within_header {
-        b"eof before pack header was fully read"
-      } else {
-        b"index-pack abnormal exit"
-      };
-      let refusal = received.unpacked.as_ref().unwrap().as_ref().unwrap_err();
-      assert_eq!(
-        super::unpack_words(refusal),
-        words,
-        "{} cut at {cut}",
-        scenario.name
-      );
-      let all_unpacker = received.outcomes.iter().all(
-        |outcome| matches!(outcome, Outcome::Ng(declined) if declined.reason == b"unpacker error"),
-      );
-      assert!(all_unpacker, "{} cut at {cut}", scenario.name);
-      assert!(
-        policy.judged.is_empty(),
-        "nothing judged after a refused pack"
-      );
+      assert!(policy.judged.is_empty(), "{label}: nothing judged");
     }
   }
 }
@@ -413,32 +534,22 @@ fn kind_of(refusal: &Refusal) -> &'static str {
   }
 }
 
-/// A-620 (hostile input: bit flips). Do: flip each bit of the atomic push's command list, one at a time, receive it and
-/// write the answer. Expect: each refused by kind, or received and answered; among the refusals a packet's length, a
-/// command, and the truncated request a lengthened packet leaves.
+/// A-620 (hostile input: bit flips). Do: flip each bit of the atomic push's command list, one at a
+/// time, receive it and write the answer. Expect: each refused by kind, or received and answered;
+/// among the refusals a packet's length, a command, and the truncated request a lengthened packet
+/// leaves.
 #[test]
 fn every_bit_flip_of_a_command_list_is_refused_by_kind_or_answered() {
-  let [.., atomic] = scenarios();
+  let atomic = scenario("atomic");
   let repository = Repo::from_pack(atomic.before_pack);
-  let mut reader = RequestReader::new(&ADVERTISED);
-  let request_len = reader.read(atomic.request, &mut unbounded()).unwrap();
   let mut seen = Vec::new();
-  for bit in 0..request_len * 8 {
+  for bit in 0..request_len(atomic.request) * 8 {
     let mut flipped = atomic.request.to_vec();
     flipped[bit / 8] ^= 1 << (bit % 8);
-    let mut policy = GitPolicy {
-      repository: &repository,
-      judged: Vec::new(),
-    };
-    match receive(
-      &flipped,
-      &ADVERTISED,
-      &repository,
-      &mut policy,
-      &mut unbounded(),
-    ) {
+    let mut policy = git_policy(&repository);
+    match receive(&flipped, &ADVERTISED, &repository, &HIDDEN, &mut policy, &mut unbounded()) {
       Ok(received) => {
-        write_report(&received, &mut Vec::new()).unwrap();
+        answer_to(&received);
         seen.push("answered");
       }
       Err(refusal) => seen.push(kind_of(&refusal)),
@@ -449,18 +560,25 @@ fn every_bit_flip_of_a_command_list_is_refused_by_kind_or_answered() {
   }
 }
 
-/// `data` as one zlib stream, deflated by this crate's engine: tests hold what streams mean, never their bytes.
+/// `data` as one zlib stream, deflated by this crate's engine: tests hold what streams mean, never
+/// their bytes.
 fn zlib(data: &[u8]) -> Vec<u8> {
   let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
   encoder.write_all(data).unwrap();
   encoder.finish().unwrap()
 }
 
-/// A pack of `objects`, each stored whole.
-fn pack_of(objects: &[(Kind, &[u8])]) -> Vec<u8> {
+/// A pack's header: its signature, version 2, and `objects`.
+fn pack_header(objects: u32) -> Vec<u8> {
   let mut bytes = pack::SIGNATURE.to_vec();
   bytes.extend_from_slice(&2u32.to_be_bytes());
-  bytes.extend_from_slice(&u32::try_from(objects.len()).unwrap().to_be_bytes());
+  bytes.extend_from_slice(&objects.to_be_bytes());
+  bytes
+}
+
+/// A pack of `objects`, each stored whole.
+fn pack_of(objects: &[(Kind, &[u8])]) -> Vec<u8> {
+  let mut bytes = pack_header(u32::try_from(objects.len()).unwrap());
   for (kind, content) in objects {
     let at = wide(bytes.len());
     let header = Header {
@@ -475,8 +593,8 @@ fn pack_of(objects: &[(Kind, &[u8])]) -> Vec<u8> {
   bytes
 }
 
-/// A request as a client writes one: `shallow` lines, the commands (the first with `capabilities`), a flush, the
-/// options and their flush when given, then `pack`.
+/// A request as a client writes one: `shallow` lines, the commands (the first with
+/// `capabilities`), a flush, the options and their flush when given, then `pack`.
 fn request(
   shallow: &[ObjectId],
   commands: &[(ObjectId, ObjectId, &[u8])],
@@ -514,13 +632,26 @@ fn zero() -> ObjectId {
   ObjectId::from_bytes(ObjectFormat::Sha1, &[0; 20]).unwrap()
 }
 
-/// A judge that applies every command it is asked about, and keeps their names.
+/// A judge that accepts every command it is asked about, keeps their names, and appends each.
 #[derive(Default)]
 struct Applies(Vec<Vec<u8>>);
 
 impl Judge for Applies {
-  fn judge(&mut self, command: &Command, _pushed: &Pushed<'_>) -> Result<Vec<Reported>, Declined> {
+  type Accepted = ();
+
+  fn judge(&mut self, command: &Command, _pushed: &Pushed<'_>) -> Result<(), Declined> {
     self.0.push(command.name.clone());
+    Ok(())
+  }
+
+  fn append(&mut self, _command: &Command, (): ()) -> Result<Vec<Reported>, Declined> {
+    Ok(Vec::new())
+  }
+
+  fn append_atomic(
+    &mut self,
+    _accepted: Vec<(&Command, ())>,
+  ) -> Result<Vec<Vec<Reported>>, Declined> {
     Ok(Vec::new())
   }
 }
@@ -535,11 +666,21 @@ fn commit_text(tree: ObjectId, parents: &[ObjectId]) -> Vec<u8> {
   text.into_bytes()
 }
 
-/// The outcomes of `bytes` received against `repository`, every command applied that the protocol's checks pass.
-fn outcomes_of(bytes: &[u8], repository: &Repo) -> (Vec<Outcome>, Vec<Vec<u8>>) {
+/// The outcomes of `bytes` received against `repository` with `hidden` hidden, every command
+/// applied that the protocol's checks pass, and the names of those the judge was asked about.
+fn outcomes_hiding(
+  bytes: &[u8],
+  repository: &Repo,
+  hidden: &dyn HiddenRefs,
+) -> (Vec<Outcome>, Vec<Vec<u8>>) {
   let mut judge = Applies::default();
-  let received = receive(bytes, &ADVERTISED, repository, &mut judge, &mut unbounded()).unwrap();
-  (received.outcomes, judge.0)
+  let received = receive(bytes, &ADVERTISED, repository, hidden, &mut judge, &mut unbounded());
+  (received.unwrap().outcomes, judge.0)
+}
+
+/// The same, nothing hidden.
+fn outcomes_of(bytes: &[u8], repository: &Repo) -> (Vec<Outcome>, Vec<Vec<u8>>) {
+  outcomes_hiding(bytes, repository, &NoneHidden)
 }
 
 /// Whether `outcome` is a refusal for `reason`.
@@ -547,9 +688,10 @@ fn refused_for(outcome: &Outcome, reason: &[u8]) -> bool {
   matches!(outcome, Outcome::Ng(declined) if declined.reason == reason)
 }
 
-/// A-620 (connectivity: `set_connectivity_errors`). Do: push a commit whose tree is in neither the pack nor the
-/// repository; one whose tree the repository holds; and a tag naming a commit nothing holds. Expect: the first and the
-/// third refused `missing necessary objects` without being judged; the second judged and applied.
+/// A-620 (connectivity: `set_connectivity_errors`). Do: push a commit whose tree is in neither the
+/// pack nor the repository; one whose tree the repository holds; and a tag naming a commit nothing
+/// holds. Expect: the first and the third refused `missing necessary objects` without being judged;
+/// the second judged and applied.
 #[test]
 fn a_tip_that_reaches_an_object_nothing_holds_is_missing_necessary_objects() {
   let mut repository = Repo::default();
@@ -579,21 +721,16 @@ fn a_tip_that_reaches_an_object_nothing_holds_is_missing_necessary_objects() {
   ];
   let bytes = request(&[], &commands, b" report-status", &[], &pack);
   let (outcomes, judged) = outcomes_of(&bytes, &repository);
-  assert!(
-    refused_for(&outcomes[0], b"missing necessary objects"),
-    "{outcomes:?}"
-  );
+  let missing = b"missing necessary objects";
+  assert!(refused_for(&outcomes[0], missing), "{outcomes:?}");
   assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
-  assert!(
-    refused_for(&outcomes[2], b"missing necessary objects"),
-    "{outcomes:?}"
-  );
+  assert!(refused_for(&outcomes[2], missing), "{outcomes:?}");
   assert_eq!(judged, [b"refs/heads/complete".to_vec()]);
 }
 
-/// A-620 (shallow lines: `update_shallow_info`). Do: push a commit whose parent nothing holds, once with the client
-/// calling it shallow and once without. Expect: `shallow update not allowed` with the shallow line, `missing necessary
-/// objects` without it.
+/// A-620 (shallow lines: `update_shallow_info`). Do: push a commit whose parent nothing holds, once
+/// with the client calling it shallow and once without. Expect: `shallow update not allowed` with
+/// the shallow line, `missing necessary objects` without it.
 #[test]
 fn a_shallow_commits_missing_parent_is_a_shallow_update_not_allowed() {
   let mut repository = Repo::default();
@@ -615,10 +752,10 @@ fn a_shallow_commits_missing_parent_is_a_shallow_update_not_allowed() {
   ));
 }
 
-/// A-620 (`atomic`: "Either all refs are updated or none", gitprotocol-capabilities). Do: push two commands, one whose
-/// tip is missing objects, with `atomic` and without. Expect: with `atomic`, the other refused `atomic push failure`
-/// and nothing judged (git 2.50.1 would still update it, the check failing before its transaction); without, the
-/// other judged and applied.
+/// A-620 (`atomic`: "Either all refs are updated or none", gitprotocol-capabilities). Do: push two
+/// commands, one whose tip is missing objects, with `atomic` and without. Expect: with `atomic`,
+/// the other refused `atomic push failure` and nothing judged (git 2.50.1 would still update it,
+/// the check failing before its transaction); without, the other judged and applied.
 #[test]
 fn an_atomic_push_with_one_refusal_applies_no_ref() {
   let mut repository = Repo::default();
@@ -634,14 +771,8 @@ fn an_atomic_push_with_one_refusal_applies_no_ref() {
   ];
   let atomic = request(&[], &commands, b" report-status atomic", &[], &pack);
   let (outcomes, judged) = outcomes_of(&atomic, &repository);
-  assert!(
-    refused_for(&outcomes[0], b"atomic push failure"),
-    "{outcomes:?}"
-  );
-  assert!(
-    refused_for(&outcomes[1], b"missing necessary objects"),
-    "{outcomes:?}"
-  );
+  assert!(refused_for(&outcomes[0], b"atomic push failure"), "{outcomes:?}");
+  assert!(refused_for(&outcomes[1], b"missing necessary objects"), "{outcomes:?}");
   assert!(judged.is_empty());
   let plain = request(&[], &commands, b" report-status", &[], &pack);
   let (outcomes, judged) = outcomes_of(&plain, &repository);
@@ -649,13 +780,27 @@ fn an_atomic_push_with_one_refusal_applies_no_ref() {
   assert_eq!(judged, [b"refs/heads/good".to_vec()]);
 }
 
-/// A-620 (`update`: "funny refname"). Do: delete refs of names git refuses (`HEAD`, outside `refs/`, `..`, a `.lock`
-/// component, a control byte) and of one level under `refs/`, and create one of one level. Expect: each refused name
-/// `funny refname` with git's band-2 line, unjudged; the one-level delete judged and applied, as git allows it.
+/// The outcome of a push of one command on `name`, a delete of it or a create at a pushed blob,
+/// and whether the judge was asked about it.
+fn one_command_outcome(name: &[u8], delete: bool) -> (Outcome, bool) {
+  let some = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
+  let (old, new, pack) = if delete {
+    (some, zero(), Vec::new())
+  } else {
+    (zero(), some, pack_of(&[(Kind::Blob, b"x")]))
+  };
+  let capabilities = b" report-status side-band-64k";
+  let bytes = request(&[], &[(old, new, name)], capabilities, &[], &pack);
+  let (mut outcomes, judged) = outcomes_of(&bytes, &Repo::default());
+  (outcomes.remove(0), !judged.is_empty())
+}
+
+/// A-620 (`update`: "funny refname"). Do: delete refs of names git refuses (`HEAD`, outside
+/// `refs/`, `..`, a `.lock` component, a control byte) and of one level under `refs/`, and create
+/// one of one level. Expect: each refused name `funny refname` with git's band-2 line, unjudged;
+/// the one-level delete judged and applied, as git allows it.
 #[test]
 fn a_ref_name_git_refuses_is_a_funny_refname() {
-  let repository = Repo::default();
-  let some = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
   let cases: [(&[u8], bool, bool); 7] = [
     (b"HEAD", true, true),
     (b"heads/main", true, true),
@@ -666,32 +811,6 @@ fn a_ref_name_git_refuses_is_a_funny_refname() {
     (b"refs/one", false, true),
   ];
   for (name, delete, funny) in cases {
-    let (old, new) = if delete {
-      (some, zero())
-    } else {
-      (zero(), some)
-    };
-    let pack = if delete {
-      Vec::new()
-    } else {
-      pack_of(&[(Kind::Blob, b"x")])
-    };
-    let bytes = request(
-      &[],
-      &[(old, new, name)],
-      b" report-status side-band-64k",
-      &[],
-      &pack,
-    );
-    let mut judge = Applies::default();
-    let received = receive(
-      &bytes,
-      &ADVERTISED,
-      &repository,
-      &mut judge,
-      &mut unbounded(),
-    )
-    .unwrap();
     let line = [b"refusing to update funny ref '", name, b"' remotely"].concat();
     let expected = if funny {
       Outcome::Ng(Declined {
@@ -701,20 +820,16 @@ fn a_ref_name_git_refuses_is_a_funny_refname() {
     } else {
       Outcome::Ok(Vec::new())
     };
-    assert_eq!(
-      received.outcomes,
-      [expected],
-      "{}",
-      String::from_utf8_lossy(name)
-    );
-    assert_eq!(judge.0.is_empty(), funny);
+    let label = String::from_utf8_lossy(name);
+    assert_eq!(one_command_outcome(name, delete), (expected, !funny), "{label}");
   }
 }
 
-/// A-620 (the protocol's refusals, as git's `read_head_info` dies on them). Do: read requests with another
-/// `object-format`, none named to a SHA-256 repository, a push certificate, capabilities on a second command, a shallow
-/// line after a command, a command short of its name's space, an id that is not hex, a delimiter packet, and a length
-/// that is not hex. Expect: each refused by its own kind, at its packet.
+/// A-620 (the protocol's refusals, as git's `read_head_info` dies on them). Do: read requests with
+/// another `object-format`, none named to a SHA-256 repository, a push certificate, capabilities
+/// on a second command, a shallow line after a command, a command short of its name's space, an id
+/// that is not hex, a delimiter packet, and a length that is not hex. Expect: each refused by its
+/// own kind, at its packet.
 #[test]
 fn each_request_the_protocol_does_not_allow_is_refused_by_kind() {
   let id = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
@@ -726,6 +841,7 @@ fn each_request_the_protocol_does_not_allow_is_refused_by_kind() {
   let command = format!("{} {id} refs/heads/x", zero());
   let first = line(&format!("{command}\0 report-status"));
   let second_at = wide(first.len());
+  let not_hex = format!("{} {}x refs/heads/x", zero(), id.to_string().get(1..).unwrap());
   let cases: Vec<(Vec<u8>, Refusal)> = vec![
     (
       line(&format!("{command}\0 object-format=sha256")),
@@ -747,14 +863,7 @@ fn each_request_the_protocol_does_not_allow_is_refused_by_kind() {
       line(&format!("{} {id}", zero())),
       Refusal::Command { at: 0 },
     ),
-    (
-      line(&format!(
-        "{} {}x refs/heads/x",
-        zero(),
-        &id.to_string()[1..]
-      )),
-      Refusal::Command { at: 0 },
-    ),
+    (line(&not_hex), Refusal::Command { at: 0 }),
     (b"0001".to_vec(), Refusal::UnexpectedPacket { at: 0 }),
     (
       b"00g0".to_vec(),
@@ -786,29 +895,29 @@ fn each_request_the_protocol_does_not_allow_is_refused_by_kind() {
   );
 }
 
-/// A-620 (report-status and report-status-v2 as `report` and `report_v2` write them). Do: answer a received push of
-/// three commands, one applied with two reports a hook made of it, one applied plainly, one refused, as report-status,
-/// as report-status-v2, multiplexed and not, and with neither asked for. Expect: v1 with no option lines; v2 with the
-/// first report's four option lines, `ok` again, the second's refname line; band 1 and a last flush only when
-/// multiplexed; nothing but the band-2 line and the flush when no report was asked for.
-#[test]
-fn reports_are_written_as_git_writes_them() {
-  let repository = Repo::default();
-  let id = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
+/// `texts` as report lines, each its own packet ending with LF, then a flush.
+fn report_lines(texts: &[String]) -> Vec<u8> {
+  let mut out = Vec::new();
+  for text in texts {
+    pktline::write(Packet::Data(format!("{text}\n").as_bytes()), &mut out).unwrap();
+  }
+  pktline::write(Packet::Flush, &mut out).unwrap();
+  out
+}
+
+/// A received push of three deletes: the first applied with two reports a hook made of it, the
+/// second applied plainly, the third refused with a band-2 line; asked as report-status.
+fn three_reported(id: ObjectId) -> Received {
   let commands: [(ObjectId, ObjectId, &[u8]); 3] = [
     (id, zero(), b"refs/for/main"),
     (id, zero(), b"refs/heads/b"),
     (id, zero(), b"refs/heads/c"),
   ];
   let bytes = request(&[], &commands, b" report-status", &[], &[]);
-  let mut received = receive(
-    &bytes,
-    &ADVERTISED,
-    &repository,
-    &mut Applies::default(),
-    &mut unbounded(),
-  )
-  .unwrap();
+  let repository = Repo::default();
+  let mut judge = Applies::default();
+  let mut received = receive(&bytes, &ADVERTISED, &repository, &NoneHidden, &mut judge, &mut unbounded())
+    .unwrap();
   let first = Reported {
     refname: Some(b"refs/pull/1/head".to_vec()),
     old: Some(zero()),
@@ -824,21 +933,26 @@ fn reports_are_written_as_git_writes_them() {
     reason: b"hook declined".to_vec(),
     message: Some(message(b"hook declined to update refs/heads/c")),
   });
-  let lines = |texts: &[String]| {
-    let mut out = Vec::new();
-    for text in texts {
-      pktline::write(Packet::Data(format!("{text}\n").as_bytes()), &mut out).unwrap();
-    }
-    pktline::write(Packet::Flush, &mut out).unwrap();
-    out
-  };
-  let v1 = lines(&[
+  received
+}
+
+/// A-620 (report-status and report-status-v2 as `report` and `report_v2` write them). Do: answer a
+/// received push of three commands, one applied with two reports a hook made of it, one applied
+/// plainly, one refused, as report-status, as report-status-v2, multiplexed and not, and with
+/// neither asked for. Expect: v1 with no option lines; v2 with the first report's four option
+/// lines, `ok` again, the second's refname line; band 1 and a last flush only when multiplexed;
+/// nothing but the band-2 line and the flush when no report was asked for.
+#[test]
+fn reports_are_written_as_git_writes_them() {
+  let id = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
+  let mut received = three_reported(id);
+  let v1 = report_lines(&[
     "unpack ok".into(),
     "ok refs/for/main".into(),
     "ok refs/heads/b".into(),
     "ng refs/heads/c hook declined".into(),
   ]);
-  let v2 = lines(&[
+  let v2 = report_lines(&[
     "unpack ok".into(),
     "ok refs/for/main".into(),
     "option refname refs/pull/1/head".into(),
@@ -851,143 +965,119 @@ fn reports_are_written_as_git_writes_them() {
     "ng refs/heads/c hook declined".into(),
   ]);
   let mut band_two = Vec::new();
-  crate::sideband::write(
-    crate::sideband::Band::Progress,
-    b"error: hook declined to update refs/heads/c\n",
-    &mut band_two,
-  );
+  let declined = b"error: hook declined to update refs/heads/c\n";
+  sideband::write(Band::Progress, declined, &mut band_two);
   for (v2_asked, multiplexed, expected) in
     [(false, false, &v1), (true, false, &v2), (true, true, &v2)]
   {
     received.request.requested.report_status_v2 = v2_asked;
     received.request.requested.side_band_64k = multiplexed;
-    let mut answer = Vec::new();
-    write_report(&received, &mut answer).unwrap();
     let wanted = if multiplexed {
       let mut wanted = band_two.clone();
-      crate::sideband::write(crate::sideband::Band::Data, expected, &mut wanted);
+      sideband::write(Band::Data, expected, &mut wanted);
       wanted.extend_from_slice(b"0000");
       wanted
     } else {
       expected.clone()
     };
+    let answer = answer_to(&received);
     assert_eq!(answer, wanted, "v2 {v2_asked}, multiplexed {multiplexed}");
   }
   received.request.requested.report_status = false;
   received.request.requested.report_status_v2 = false;
-  let mut answer = Vec::new();
-  write_report(&received, &mut answer).unwrap();
-  assert_eq!(answer, [band_two, b"0000".to_vec()].concat());
+  assert_eq!(answer_to(&received), [band_two, b"0000".to_vec()].concat());
 }
 
-/// A-620 (the pack's status in git's words: `parse_pack_header`, index-pack). Do: push a pack of a wrong signature, of
-/// version 4, cut inside its header, and one naming a base nothing holds. Expect: `unpack protocol error (pack
-/// signature mismatch detected)`, `unpack protocol error (pack version unsupported)`, `unpack eof before pack header was
-/// fully read` and `unpack index-pack abnormal exit`, every command `unpacker error`.
+/// A pack of one reference delta whose base nothing holds.
+fn thin_pack() -> Vec<u8> {
+  let absent = name_of(ObjectFormat::Sha1, Kind::Blob, b"absent").unwrap();
+  let mut thin = pack_header(1);
+  let header = Header {
+    representation: Representation::RefDelta { base: absent },
+    size: 5,
+  };
+  entry::write(header, entry::PACK_HEADER_LEN, &mut thin).unwrap();
+  thin.extend_from_slice(&zlib(&[6, 1, 0x91, 0, 1]));
+  let checksum = pack::checksum_of(ObjectFormat::Sha1, &thin).unwrap();
+  thin.extend_from_slice(checksum.as_bytes());
+  thin
+}
+
+/// Asserts that a push of a create of `refs/heads/x` with `pack` is answered `words`, its command
+/// `unpacker error`, under report-status.
+fn assert_pack_answered(pack: &[u8], words: &[u8]) {
+  let id = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
+  let command: [(ObjectId, ObjectId, &[u8]); 1] = [(zero(), id, b"refs/heads/x")];
+  let bytes = request(&[], &command, b" report-status", &[], pack);
+  let repository = Repo::default();
+  let mut judge = Applies::default();
+  let received =
+    receive(&bytes, &ADVERTISED, &repository, &NoneHidden, &mut judge, &mut unbounded()).unwrap();
+  let mut expected = Vec::new();
+  pktline::write(Packet::Data(&[words, b"\n"].concat()), &mut expected).unwrap();
+  pktline::write(Packet::Data(b"ng refs/heads/x unpacker error\n"), &mut expected).unwrap();
+  pktline::write(Packet::Flush, &mut expected).unwrap();
+  assert_eq!(answer_to(&received), expected, "{}", String::from_utf8_lossy(words));
+  assert!(judge.0.is_empty());
+}
+
+/// A-620 (the pack's status in git's words: `parse_pack_header`, `unpack`'s `unpack_limit`). Do:
+/// push a pack of a wrong signature, of version 4, cut inside its header, one naming a base nothing
+/// holds, and headers counting 99 and 100 objects with nothing after them. Expect: `unpack protocol
+/// error (pack signature mismatch detected)`, `unpack protocol error (pack version unsupported)`,
+/// `unpack eof before pack header was fully read`, `unpack unpack-objects abnormal exit` for the
+/// one-object pack and the 99, `unpack index-pack abnormal exit` for the 100; every command
+/// `unpacker error`, nothing judged.
 #[test]
 fn a_refused_pack_is_answered_in_gits_words() {
-  let repository = Repo::default();
-  let id = name_of(ObjectFormat::Sha1, Kind::Blob, b"x").unwrap();
   let good = pack_of(&[(Kind::Blob, b"x")]);
   let mut signature = good.clone();
   signature[3] = b'X';
   let mut version = good.clone();
   version[7] = 4;
-  let absent = name_of(ObjectFormat::Sha1, Kind::Blob, b"absent").unwrap();
-  let mut thin = pack::SIGNATURE.to_vec();
-  thin.extend_from_slice(&2u32.to_be_bytes());
-  thin.extend_from_slice(&1u32.to_be_bytes());
-  entry::write(
-    Header {
-      representation: Representation::RefDelta { base: absent },
-      size: 5,
-    },
-    12,
-    &mut thin,
-  )
-  .unwrap();
-  thin.extend_from_slice(&zlib(&[6, 1, 0x91, 0, 1]));
-  let checksum = pack::checksum_of(ObjectFormat::Sha1, &thin).unwrap();
-  thin.extend_from_slice(checksum.as_bytes());
-  let cases: [(Vec<u8>, &[u8]); 4] = [
+  let below = UNPACK_LIMIT - 1;
+  let cases: [(Vec<u8>, &[u8]); 6] = [
     (
       signature,
-      &b"unpack protocol error (pack signature mismatch detected)"[..],
+      b"unpack protocol error (pack signature mismatch detected)",
     ),
     (version, b"unpack protocol error (pack version unsupported)"),
     (
       good[..7].to_vec(),
       b"unpack eof before pack header was fully read",
     ),
-    (thin, b"unpack index-pack abnormal exit"),
+    (thin_pack(), b"unpack unpack-objects abnormal exit"),
+    (pack_header(below), b"unpack unpack-objects abnormal exit"),
+    (pack_header(UNPACK_LIMIT), b"unpack index-pack abnormal exit"),
   ];
   for (pack, words) in cases {
-    let bytes = request(
-      &[],
-      &[(zero(), id, b"refs/heads/x")],
-      b" report-status",
-      &[],
-      &pack,
-    );
-    let received = receive(
-      &bytes,
-      &ADVERTISED,
-      &repository,
-      &mut Applies::default(),
-      &mut unbounded(),
-    )
-    .unwrap();
-    let mut answer = Vec::new();
-    write_report(&received, &mut answer).unwrap();
-    let mut expected = Vec::new();
-    pktline::write(Packet::Data(&[words, b"\n"].concat()), &mut expected).unwrap();
-    pktline::write(
-      Packet::Data(b"ng refs/heads/x unpacker error\n"),
-      &mut expected,
-    )
-    .unwrap();
-    pktline::write(Packet::Flush, &mut expected).unwrap();
-    assert_eq!(answer, expected, "{}", String::from_utf8_lossy(words));
+    assert_pack_answered(&pack, words);
   }
 }
 
-/// A-620 (every size charged to the admission before it is built). Do: receive the options push under exactly what
-/// receiving it charges, one byte less, and a request of a thousand commands under a hundred kibibytes. Expect: the
-/// first received with the admission spent; the second refused by an admission, the protocol's or the pack's; the
-/// third refused by the protocol's admission while its commands are read.
+/// `options`'s push received under `admission`.
+fn options_received(options: &Scenario, admission: &mut Admission) -> Result<Received, Refusal> {
+  let repository = Repo::from_pack(options.before_pack);
+  let mut policy = git_policy(&repository);
+  receive(options.request, &ADVERTISED, &repository, &HIDDEN, &mut policy, admission)
+}
+
+/// A-620 (every size charged to the admission before it is built). Do: receive the options push
+/// under exactly what receiving it charges, one byte less, and a request of a thousand commands
+/// under a hundred kibibytes. Expect: the first received with the admission spent; the second
+/// refused by an admission, the protocol's or the pack's; the third refused by the protocol's
+/// admission while its commands are read.
 #[test]
 fn every_size_is_charged_to_the_admission_before_it_is_built() {
-  let [.., options, _, _] = scenarios();
-  let repository = Repo::from_pack(options.before_pack);
+  let options = scenario("options");
   let mut measure = unbounded();
-  receive(
-    options.request,
-    &ADVERTISED,
-    &repository,
-    &mut git_policy(&repository),
-    &mut measure,
-  )
-  .unwrap();
+  options_received(&options, &mut measure).unwrap();
   let charged = u64::MAX - measure.left();
   let mut exact = Admission::new(charged);
-  let received = receive(
-    options.request,
-    &ADVERTISED,
-    &repository,
-    &mut git_policy(&repository),
-    &mut exact,
-  )
-  .unwrap();
+  let received = options_received(&options, &mut exact).unwrap();
   assert_eq!(exact.left(), 0);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
-  let short = receive(
-    options.request,
-    &ADVERTISED,
-    &repository,
-    &mut git_policy(&repository),
-    &mut Admission::new(charged - 1),
-  );
-  let past = match short {
+  let past = match options_received(&options, &mut Admission::new(charged - 1)) {
     Err(Refusal::PastAdmission(_)) => true,
     Ok(received) => matches!(received.unpacked, Some(Err(_))),
     Err(_) => false,
@@ -1010,22 +1100,16 @@ fn every_size_is_charged_to_the_admission_before_it_is_built() {
   );
 }
 
-/// A-620 (connectivity alone). Do: check the connectivity of the update push's commands against its server, and
-/// against an empty repository. Expect: complete against its server; missing against nothing, the thin pack's base
-/// and the old history being nowhere.
+/// A-620 (connectivity alone). Do: check the connectivity of the update push's commands against
+/// its server, and against an empty repository. Expect: complete against its server; missing
+/// against nothing, the thin pack's base and the old history being nowhere.
 #[test]
 fn connectivity_is_complete_against_the_server_and_missing_against_nothing() {
-  let [_, update, ..] = scenarios();
+  let update = scenario("update");
   let repository = Repo::from_pack(update.before_pack);
   let received = received(&update, &repository);
-  let objects = &received
-    .unpacked
-    .as_ref()
-    .unwrap()
-    .as_ref()
-    .unwrap()
-    .objects;
-  let pushed = Pushed::new(objects, &mut unbounded()).unwrap();
+  let unpacked = received.unpacked.as_ref().unwrap().as_ref().unwrap();
+  let pushed = Pushed::new(&unpacked.objects, &mut unbounded()).unwrap();
   let against_server =
     connectivity(&received.request, &pushed, &repository, &mut unbounded()).unwrap();
   assert_eq!(against_server, [Connected::Complete]);

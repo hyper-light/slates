@@ -1,19 +1,22 @@
-//! The connectivity check (A-620 part 1; §4.17.2 "A push", item 5: "every object a new commit, tree or tag names is
-//! either in the push or in the repository's index", in time "proportional to the new objects", walking no history;
-//! git's `check_connected` and `set_connectivity_errors`, v2.50.1, which ask `rev-list --objects` for the new tips not
-//! reachable from any ref).
+//! The connectivity check (A-620 part 1; §4.17.2 "A push", item 5: "every object a new commit, tree
+//! or tag names is either in the push or in the repository's index", in time "proportional to the
+//! new objects", walking no history; git's `check_connected` and `set_connectivity_errors`,
+//! v2.50.1, which ask `rev-list --objects` for the new tips not reachable from any ref).
 //!
-//! The walk is of the pushed objects alone. An object the repository holds ends it, since nothing enters the repository
-//! before its push has passed this check. Each pushed object names others: a commit its tree and parents, a tree its
-//! entries (a submodule's commit excepted, as git's walk excepts it: it lies in another repository), a tag its object.
-//! A name that is neither pushed nor held makes the object, and every pushed object that reaches it, incomplete:
-//! `Shallow` when it is a parent of a commit the client called shallow (the push would make the repository shallow),
-//! `Missing` otherwise. An object that cannot be read is `Missing`, since what it names cannot be known.
+//! The walk is of the pushed objects alone. An object the repository holds ends it, since nothing
+//! enters the repository before its push has passed this check. Each pushed object names others: a
+//! commit its tree and parents, a tree its entries (a submodule's commit excepted, as git's walk
+//! excepts it: it lies in another repository), a tag its object. A name that is neither pushed nor
+//! held makes the object, and every pushed object that reaches it, incomplete: `Shallow` when it is
+//! a parent of a commit the client called shallow (the push would make the repository shallow),
+//! `Missing` otherwise. An object that cannot be read is `Missing`, since what it names cannot be
+//! known.
 //!
-//! **Bounds.** Every object is read twice, once to count the edges among the pushed objects and once to keep them, so
-//! the tables are charged exactly before they are made. A read's own transient structures (A-590's header and entry
-//! lists) are a small multiple of the object's bytes, which the pack's admission already charged, and are freed before
-//! the next read, so they are not charged again. The worst state is carried back over the edges with an explicit stack,
+//! **Bounds.** Every object is read twice, once to count the edges among the pushed objects and
+//! once to keep them, so the tables are charged exactly before they are made. A read's own
+//! transient structures (A-590's header and entry lists) are a small multiple of the object's
+//! bytes, which the pack's admission already charged, and are freed before the next read, so they
+//! are not charged again. The worst state is carried back over the edges with an explicit stack,
 //! each object finished once.
 
 use super::{Pushed, Refusal, Repository, Request, reserve};
@@ -28,9 +31,11 @@ pub enum Connected {
   /// Everything it reaches is pushed or held.
   #[default]
   Complete,
-  /// It reaches a commit the client called shallow whose parent nothing holds (git's "shallow update not allowed").
+  /// It reaches a commit the client called shallow whose parent nothing holds (git's "shallow
+  /// update not allowed").
   Shallow,
-  /// It reaches an object nothing holds, or one that cannot be read (git's "missing necessary objects").
+  /// It reaches an object nothing holds, or one that cannot be read (git's "missing necessary
+  /// objects").
   Missing,
 }
 
@@ -45,8 +50,8 @@ enum Mark {
   Done,
 }
 
-/// Each command's connectivity, in order: a delete is `Complete`; a new tip pushed has its walk's state; a new tip not
-/// pushed is `Complete` when the repository holds it and `Missing` otherwise.
+/// Each command's connectivity, in order: a delete is `Complete`; a new tip pushed has its walk's
+/// state; a new tip not pushed is `Complete` when the repository holds it and `Missing` otherwise.
 pub fn connectivity<R: Repository + ?Sized>(
   request: &Request,
   pushed: &Pushed<'_>,
@@ -68,7 +73,8 @@ pub fn connectivity<R: Repository + ?Sized>(
   Ok(connected)
 }
 
-/// Each pushed object's state: its own edges out of the pack judged, then the worst of everything it reaches.
+/// Each pushed object's state: its own edges out of the pack judged, then the worst of everything
+/// it reaches.
 fn states<R: Repository + ?Sized>(
   request: &Request,
   pushed: &Pushed<'_>,
@@ -120,8 +126,8 @@ fn sorted(ids: &[ObjectId], admission: &mut Admission) -> Result<Vec<ObjectId>, 
   Ok(sorted)
 }
 
-/// The edges among the pushed objects, `inside` of them, as each object's run of targets: the runs' bounds (one more
-/// than the objects) and the targets, by position, charged before they are made.
+/// The edges among the pushed objects, `inside` of them, as each object's run of targets: the runs'
+/// bounds (one more than the objects) and the targets, by position, charged before they are made.
 fn edges(
   pushed: &Pushed<'_>,
   format: ObjectFormat,
@@ -151,9 +157,9 @@ fn edges(
   Ok((offsets, targets))
 }
 
-/// Hands each object `object` names to `each`, with whether it is a commit's parent: whether the object could be read.
-/// The read's transient structures, bounded by the object's own bytes, take a scratch admission of their own (this
-/// module's **Bounds**).
+/// Hands each object `object` names to `each`, with whether it is a commit's parent: whether the
+/// object could be read. The read's transient structures, bounded by the object's own bytes, take a
+/// scratch admission of their own (this module's **Bounds**).
 fn for_each_edge(
   object: &Object,
   format: ObjectFormat,
@@ -191,8 +197,8 @@ fn for_each_edge(
   }
 }
 
-/// Hands each object `tree`'s entries name to `each`, but a submodule's commit, which lies in another repository:
-/// whether every name could be read.
+/// Hands each object `tree`'s entries name to `each`, but a submodule's commit, which lies in
+/// another repository: whether every name could be read.
 fn tree_edges(
   tree: &Tree<'_>,
   format: ObjectFormat,
@@ -212,9 +218,9 @@ fn tree_edges(
   whole
 }
 
-/// Makes each object's state the worst of its own and of every object it reaches, by an explicit stack of objects and
-/// the next edge of each, every object finished once. An edge back to an object on the stack, which object names
-/// cannot make, is passed over.
+/// Makes each object's state the worst of its own and of every object it reaches, by an explicit
+/// stack of objects and the next edge of each, every object finished once. An edge back to an
+/// object on the stack, which object names cannot make, is passed over.
 fn propagate(
   states: &mut [Connected],
   offsets: &[usize],
