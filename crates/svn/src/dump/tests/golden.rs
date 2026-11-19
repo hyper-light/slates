@@ -9,7 +9,8 @@ use crate::dump::{
   Admission, Digests, DumpError, Format, NodeAction, NodeHeader, RevisionHeader, check_text,
 };
 use crate::index::NodeKind;
-use crate::svndiff::{Window, apply_all};
+use crate::svndiff::{WINDOW_LIMIT, Window, apply_all, deltas};
+use std::num::NonZeroUsize;
 
 /// Format 2, every revision whole (`svnadmin dump`).
 const FULL: &[u8] = include_bytes!("../../../fixtures/dump/full.dump");
@@ -150,6 +151,10 @@ struct Counts {
   copies: usize,
   replacements_by_copy: usize,
   root_records: usize,
+  /// Text deltas whose windows the deltifier made again from their base and their text (A-652), and the first that it
+  /// did not.
+  remade_deltas: usize,
+  first_unremade: Option<String>,
 }
 
 /// A naive filesystem that applies one dump's events revision by revision, the oracle's other leg: format 2's whole
@@ -335,10 +340,27 @@ impl Replay {
       self.counts.most_windows = self.counts.most_windows.max(self.windows.len());
       check_text(base.md5, base.sha1, digests(&self.delta_base)).expect("the base the delta names");
       let made = apply_all(&self.delta_base, &self.windows).expect("the delta applies to its base");
+      self.remake(&node.path, &made);
       self.current().text = made;
     }
     let made = self.current().text.clone();
     check_text(text.md5, text.sha1, digests(&made)).expect("the text its header names");
+  }
+
+  /// Gives the deltifier the delta's base and the text it made, and counts whether its windows are the recorded ones.
+  fn remake(&mut self, path: &[u8], made: &[u8]) {
+    let room = NonZeroUsize::new(usize::try_from(WINDOW_LIMIT).unwrap()).unwrap();
+    let remade: Vec<Window> = deltas(&self.delta_base, made, room).unwrap().collect();
+    if remade == self.windows {
+      self.counts.remade_deltas += 1;
+    } else if self.counts.first_unremade.is_none() {
+      self.counts.first_unremade = Some(format!(
+        "{} in revision {}: remade {remade:?}, recorded {:?}",
+        String::from_utf8_lossy(path),
+        self.building(),
+        self.windows
+      ));
+    }
   }
 
   /// Ends the stream: the last revision's tree kept.
@@ -389,6 +411,27 @@ fn format_three_s_deltas_rebuild_format_two_s_trees_revision_by_revision() {
     "{counts:?}"
   );
   assert!(counts.root_records >= 2, "{counts:?}");
+}
+
+/// A-652 (golden): do replay `deltas.dump`, and `part1.dump` then `part2.dump`, and give Subversion's deltifier, as
+/// ported, each text delta's base and the text it makes. Expect the windows stock `svnadmin` 1.15.0 wrote, every one:
+/// its source and target views, its instructions and its new data (two-window deltas, copies changed, texts added
+/// against the empty text among them).
+#[test]
+fn the_deltifier_makes_every_window_svnadmin_dump_deltas_wrote() {
+  let parts = [vector("part1.dump"), vector("part2.dump")].concat();
+  for (name, dump) in [
+    ("deltas.dump", vector("deltas.dump")),
+    ("part1.dump, part2.dump", &parts[..]),
+  ] {
+    let (_, counts) = replay(&read_whole(dump).unwrap());
+    assert_eq!(counts.first_unremade, None, "{name}");
+    assert_eq!(counts.remade_deltas, counts.text_deltas, "{name}");
+    assert!(
+      counts.remade_deltas > 0 && counts.most_windows >= 2,
+      "{name}: {counts:?}"
+    );
+  }
 }
 
 /// One changed path as `svnlook changed --copy-info` lists it: its path without a directory's `/`, its action (a

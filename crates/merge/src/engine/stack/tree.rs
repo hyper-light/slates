@@ -254,7 +254,10 @@ impl Green {
       }
     }
     for (path, target) in &resolved.hardlinks {
-      let (node, made) = resolved.link_node(target);
+      // A link naming a node the work does not make is refused by the verdict that judges the restated work.
+      let Some((node, made)) = resolved.link_node(target) else {
+        continue;
+      };
       if made.is_none() && differs(node) {
         windows.whole(path, MergeConflictClass::DeleteModify);
       } else if differs(path.as_str()) && self.hardlink(path) != Some(made.unwrap_or(node)) {

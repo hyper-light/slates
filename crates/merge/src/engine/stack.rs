@@ -343,7 +343,7 @@ fn named(resolved: &Resolved, doc: &OpsDoc) -> BTreeSet<String> {
   }
   for (path, target) in &resolved.hardlinks {
     paths.insert(path.clone());
-    paths.insert(resolved.link_node(target).0.to_owned());
+    paths.extend(resolved.link_node(target).map(|(node, _)| node.to_owned()));
   }
   paths.extend(resolved.unlinks.iter().cloned());
   paths.extend(resolved.rmdirs.iter().cloned());

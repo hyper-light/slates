@@ -17,7 +17,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::{Green, Increment, Outcome};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 use crate::origin::Origin;
 use crate::special::{SpecialKind, SpecialNode};
 use crate::verdict::MergeConflictClass;
@@ -44,10 +44,29 @@ impl Work {
     self
   }
 
-  /// Adds a namespace op on `path` naming `other` (a rename's source, a link's target).
-  pub(super) fn naming(mut self, kind: OpKind, path: &str, other: &str) -> Work {
+  /// Adds a namespace op on `path` naming `other` (a rename's source; a link's target, the node at
+  /// it at the work's base, A-646).
+  pub(super) fn naming(self, kind: OpKind, path: &str, other: &str) -> Work {
+    self.named(kind, path, (other, NodeOrigin::Base))
+  }
+
+  /// Adds a hard link at `path` to the node the work makes at `target` (A-646).
+  pub(super) fn link_made(self, path: &str, target: &str) -> Work {
+    self.named(OpKind::Link, path, (target, NodeOrigin::Made))
+  }
+
+  /// Adds a namespace op on `path` naming `other`; a link names the node at it, from `origin`.
+  fn named(mut self, kind: OpKind, path: &str, (other, origin): (&str, NodeOrigin)) -> Work {
     let other = self.doc.paths.intern(other);
-    self.op(kind, path, (0, 0, other))
+    let src = if kind == OpKind::Link {
+      self.doc.nodes.intern(NodeRef {
+        path: other,
+        origin,
+      })
+    } else {
+      other
+    };
+    self.op(kind, path, (0, 0, src))
   }
 
   /// Adds a mode change of `path`.
@@ -719,7 +738,7 @@ fn a_hard_link_to_a_target_removed_after_its_base_conflicts() -> Result<(), Stri
   let own = Work::default()
     .op(OpKind::Unlink, TARGET, (0, 0, u64::MAX))
     .create(TARGET, b"<its own>\n")
-    .naming(OpKind::Link, "linked", TARGET);
+    .link_made("linked", TARGET);
   let answer = green.submit(&own.at(0, 9));
   let linked = green.hardlink("linked");
   if !matches!(answer, Outcome::Accepted { .. }) || linked != Some(TARGET) {

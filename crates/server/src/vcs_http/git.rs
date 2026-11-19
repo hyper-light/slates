@@ -18,9 +18,10 @@
 //!    asks to submit, rewrite or delete, any of which a push may do. The gate admits a principal some rule lets reach the
 //!    repository; which refs it then sees or changes is each ref's verdict, the service's (`vcs_policy::admit` for a
 //!    push).
-//! 5. The service. One whose server half has not landed is `503` (RFC 9110 §15.6.4: "the server is currently unable to
-//!    handle the request"): today both (`Unserved`), until upload-pack (A-615) and receive-pack's commit (A-620 part 2)
-//!    land behind this seam.
+//! 5. The service. One whose server half has not landed, or whose repository's store is not held here, is `503` (RFC
+//!    9110 §15.6.4: "the server is currently unable to handle the request"). upload-pack is served from a repository's
+//!    store by [`upload`] (A-640 part 2, A-625 part 3), once the server lends stores (owed); receive-pack answers `503`
+//!    until its session's entry point lands (A-654). `Unserved` answers `503` to both.
 //!
 //! A served request is `200` with the service's content type and the cache fields, in `http-backend`'s order
 //! (`slates_git::http::reply_fields`), its body the advertisement's `# service=` prelude for protocols v0 and v1
@@ -40,6 +41,10 @@ use slates_http_edge::credential::{self, Credential};
 
 use super::{Answer, Decided, Exchange, Failed, Site};
 use crate::vcs_policy::{self, Right};
+
+mod upload;
+
+pub(crate) use upload::{StoreLender, UploadServices};
 
 /// What proves a request's credentials to a principal (§4.13): the token a Basic credential carries as its password, or a
 /// bearer token, looked up among the principals' keys. A credential that proves no one is `401`.

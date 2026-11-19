@@ -199,7 +199,10 @@ impl Green {
   /// create (`Green::merge_hardlink`, `node_home`).
   fn upper_links(&self, r: &Resolved, against: &Against<'_>, windows: &mut Windows) {
     for (path, target) in &r.hardlinks {
-      let (node, made) = r.link_node(target);
+      // A link naming a node the work does not make is refused by the verdict that judges the restated work.
+      let Some((node, made)) = r.link_node(target) else {
+        continue;
+      };
       if made.is_none() && self.link_node_meets(node, against) {
         windows.whole(path, MergeConflictClass::DeleteModify);
         continue;

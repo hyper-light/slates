@@ -367,8 +367,8 @@ fn a_refused_import_keeps_the_revisions_before_it_and_answers_again_the_same() {
   assert_eq!(fresh.youngest(), 2);
 }
 
-/// A-628 (refusals): do export a range whose first revision is past its last, one past the youngest revision, and
-/// one in format 3. Expect `BadRange` (`E165004`) twice and `DeltasOwed` (`E200007`).
+/// A-628 (refusals): do export a range whose first revision is past its last, and one past the youngest revision in
+/// each format. Expect `BadRange` (`E165004`) each time.
 #[test]
 fn an_export_of_a_range_the_repository_cannot_give_is_refused() {
   let mut repository = created();
@@ -392,7 +392,6 @@ fn an_export_of_a_range_the_repository_cannot_give_is_refused() {
       youngest: 1
     }
   );
-  let deltas = Exporter::new(&repository, 0, 1, Format::Three).unwrap_err();
-  assert_eq!(deltas, MigrationRefusal::DeltasOwed);
-  assert_eq!(deltas.subversion_code(), 200_007);
+  let deltas = Exporter::new(&repository, 0, 2, Format::Three).unwrap_err();
+  assert_eq!(deltas, past);
 }

@@ -99,7 +99,17 @@ pub(super) fn export(
   first: u64,
   last: u64,
 ) -> Result<Vec<u8>, MigrationRefusal> {
-  let mut exporter = Exporter::new(repository, first, last, Format::Two)?;
+  export_in(repository, first, last, Format::Two)
+}
+
+/// Exports revisions `first` to `last` of `repository` in `format`.
+pub(super) fn export_in(
+  repository: &Repository,
+  first: u64,
+  last: u64,
+  format: Format,
+) -> Result<Vec<u8>, MigrationRefusal> {
+  let mut exporter = Exporter::new(repository, first, last, format)?;
   let mut out = Vec::new();
   while exporter.export(repository, &mut out)? != Exporting::Done {}
   Ok(out)
@@ -108,6 +118,11 @@ pub(super) fn export(
 /// Exports every revision of `repository` in format 2.
 pub(super) fn export_all(repository: &Repository) -> Result<Vec<u8>, MigrationRefusal> {
   export(repository, 0, repository.youngest())
+}
+
+/// Exports every revision of `repository` in format 3, every text a delta.
+pub(super) fn export_deltas(repository: &Repository) -> Result<Vec<u8>, MigrationRefusal> {
+  export_in(repository, 0, repository.youngest(), Format::Three)
 }
 
 /// One revision as a value: its properties, its transaction's name and its changed paths.
