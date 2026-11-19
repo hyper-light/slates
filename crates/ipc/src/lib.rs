@@ -64,6 +64,7 @@ pub mod protocol;
 mod os_code_vectors;
 pub mod region;
 pub mod rendezvous;
+pub mod room;
 pub mod seal;
 // The stand-in seal this crate's own tests rendezvous under (A-187), one file shared with the integration tests, which
 // name this crate as `slates_ipc`; so do the module tests, through the alias.
