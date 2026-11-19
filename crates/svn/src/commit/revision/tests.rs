@@ -12,10 +12,12 @@ use crate::migration::properties::decode;
 /// Shape: 1,795,073,195 seconds and 123,456 microseconds, computed from the calendar date.
 const NOW: AprTime = AprTime(1_795_073_195_123_456);
 
-/// A text's identity in the work.
+/// A text's identity in the work: any the green could name, distinct from the list's.
+/// Shape: a content identity's 32 bytes, each 7.
 const TEXT_IDENTITY: ContentIdentity = [7; 32];
 
 /// A property list's identity in the work.
+/// Shape: a content identity's 32 bytes, each 9.
 const LIST_IDENTITY: ContentIdentity = [9; 32];
 
 /// A work changing `/trunk/a.txt`'s text and properties, its client having sent its own `svn:date`, releasing one lock.
@@ -81,7 +83,11 @@ fn a_works_contents_and_entries_are_the_revisions() {
   let revision = Revision::of_work(made.clone(), NOW).unwrap();
   let text = revision.contents.get(&TEXT_IDENTITY).cloned();
   assert_eq!(text, Some(b"alpha\n".to_vec()));
-  let list = revision.contents.get(&LIST_IDENTITY).and_then(|bytes| decode(bytes));
+  let list = revision
+    .contents
+    .get(&LIST_IDENTITY)
+    .map(Vec::as_slice)
+    .and_then(decode);
   let expected = Properties::from([(b"svn:eol-style".to_vec(), b"native".to_vec())]);
   assert_eq!(list, Some(expected));
   let kept = (revision.head, revision.record, revision.lock_entries);
