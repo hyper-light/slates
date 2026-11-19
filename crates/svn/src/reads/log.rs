@@ -2,30 +2,40 @@
 //! `strict-node` is set, the revision rows the changed paths, the revision-property table the properties; A-613 part
 //! 2): the log entries of paths over a range of revisions, as `svnserve`'s `log_cmd` and `svn_repos_get_logs5` write
 //! them (`serve.c`, `libsvn_repos/log.c`, Subversion 1.15.0), held to stock `svnserve`'s transcripts
-//! (`crates/svn/fixtures/reads`, sessions `log`, the three `hostile-log-*` and `svn-log`):
-//! - The parameters are `l(?r)(?r)bb?n?Bwl`, read as `vparse_tuple` reads them: the paths (each a string), the start and
-//!   end revisions, whether changed paths are sent, `strict-node`, then optionally the limit, then optionally whether
-//!   merged revisions are included, the word `all-revprops` or `revprops` and a list of names (each a string). Five
-//!   items are a client before 1.5's (the author, date and log asked for), six add the limit, nine or more are whole;
-//!   seven or eight, another word, or an item of another kind end the connection. A limit past `INT_MAX` is none.
+//! (`crates/svn/fixtures/reads`, sessions `log`, `log-merged`, the three `hostile-log-*`, `svn-log`, `svn-log-g` and
+//! the two `svn-mergeinfo-*`):
+//! - The parameters are `l(?r)(?r)bb?n?Bwl`, read as `vparse_tuple` reads them: the paths (each a string), the start
+//!   and end revisions, whether changed paths are sent, `strict-node`, then optionally the limit, then optionally
+//!   whether merged revisions are included, the word `all-revprops` or `revprops` and a list of names (each a string).
+//!   Five items are a client before 1.5's (the author, date and log asked for), six add the limit, nine or more are
+//!   whole; seven or eight, another word, or an item of another kind end the connection. A limit past `INT_MAX` is
+//!   none.
 //! - After the authentication request: a missing or negative start or end is the youngest, either past it refused after
 //!   `done` ("No such revision N"); the range walked newest first when the start is not older than the end, else
 //!   oldest first (each revision found first, then sent in reverse).
 //! - No paths, or the root alone, without merged revisions: every revision of the range (`svn_repos_get_logs5`'s
-//!   shortcut). Otherwise `do_logs`: each path's node history ([`super::history`]) from the range's youngest revision,
+//!   shortcut). Otherwise `do_logs`: each path's node history (module `history`) from the range's youngest revision,
 //!   the absent path refused ("File not found"), every path's history checked at each revision in turn, a revision
 //!   sent when any path's history holds it, until every history is done or the limit is reached.
-//! - An entry is `( ( changed-path ... ) rev ( author ) ( date ) ( message ) has-children invalid-revnum count ( props )
-//!   subtractive-merge )`: the changed paths only when asked and never for revision 0, in the revision's stored order
-//!   (byte order of the paths), each `( path action ( copy-path copy-rev ) ( kind text-mod prop-mod ) )`; the revision
-//!   properties as `fill_log_entry` gathers them (every one, or those named; when the names match the revision's own
-//!   one for one, all of them) and `revision_receiver` splits them: `svn:author`, `svn:date` and `svn:log` in their own
-//!   places, the rest counted and listed, unless the three are all there are.
+//! - An entry is `( ( changed-path ... ) rev ( author ) ( date ) ( message ) has-children invalid-revnum count
+//!   ( props ) subtractive-merge )`: the changed paths only when asked and never for revision 0, in the revision's
+//!   stored order (byte order of the paths), each `( path action ( copy-path copy-rev ) ( kind text-mod prop-mod ) )`;
+//!   the revision properties as `fill_log_entry` gathers them (every one, or those named; when the names match the
+//!   revision's own one for one, all of them) and `revision_receiver` splits them: `svn:author`, `svn:date` and
+//!   `svn:log` in their own places, the rest counted and listed, unless the three are all there are.
+//! - With `include-merged-revisions` (module `merged`): the log's own history as mergeinfo first; then at each revision
+//!   sent, the mergeinfo it changed for the paths, and when it merged or reverse merged anything, the entry marked as
+//!   having children, which follow it: each run of merged revisions walked by a nested `do_logs` (newest first, no
+//!   limit, its histories opened leniently, its searches recorded so none is repeated), a merged revision sent only
+//!   when one of its changed paths lies outside the log's own history and only once, reverse merges marked
+//!   subtractive; then an entry of revision 0 marked `invalid-revnum` closing the children (`handle_merged_revisions`).
+//!   A merged revision passed over has its changed paths written all the same, which the next entry carries, as
+//!   `svnserve` writes them (`interesting_merge` calls the client's receiver first).
 //! - Then `done`, then `( success ( ) )` or the refusal.
 //!
-//! The walk is a [`super::Stream`] whose state is a stack of frames, one revision a step. `include-merged-revisions` is
-//! owed (A-613 part 2, the next slice): until it is built, a log asking for merged revisions is refused after `done`
-//! with `SVN_ERR_UNSUPPORTED_FEATURE`, Subversion's own refusal of a feature not offered, never answered without them.
+//! The walk is a [`super::Stream`] whose state is a stack of frames, one revision a step.
+
+mod merged;
 
 use super::history::History;
 use super::stream::{Progress, Stream};
@@ -34,7 +44,12 @@ use super::{
   c_string_of, full_path, kind_word, optional_revnum,
 };
 use crate::index::{Action, ChangedPath, Revision};
+use crate::mergeinfo::Mergeinfo;
 use crate::ra_svn::{ItemError, Value, write};
+use merged::{
+  MergeinfoChanges, PathListRange, combine, outside_history, reduce_search, store_search,
+};
+use std::collections::BTreeSet;
 
 /// The revision property holding a revision's log message.
 /// Format: `SVN_PROP_REVISION_LOG` (`svn_props.h`).
@@ -45,10 +60,6 @@ const LOG_PROPERTY: &[u8] = b"svn:log";
 /// `revision_receiver` (`serve.c`), whose shortcut for an entry with these three alone (`apr_hash_count(...) == 3`)
 /// gives the same answer as removing them: nothing left.
 const STANDARD_REVPROPS: [&[u8]; 3] = [AUTHOR_PROPERTY, DATE_PROPERTY, LOG_PROPERTY];
-
-/// `SVN_ERR_UNSUPPORTED_FEATURE`, answered for a log of merged revisions until they are built (module documentation).
-/// Format: the miscellaneous category's start, 120,000 + 16 × 5,000 = 200,000, plus 7 (`svn_error_codes.h`).
-const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
 
 /// The word asking for every revision property.
 /// Format: `log_cmd` (`serve.c`).
@@ -236,10 +247,34 @@ struct Walk {
   start: Revision,
   /// Whether revisions are sent as found (newest first) rather than gathered and sent oldest first.
   descending: bool,
-  /// The revisions found, to send oldest first.
-  found: Vec<Revision>,
+  /// The revisions found, to send oldest first, each with the mergeinfo changes it made.
+  found: Vec<Found>,
   /// The revisions sent so far.
   sent: u64,
+  /// The most revisions sent; 0 for no limit.
+  limit: u64,
+  /// Whether merged revisions are included.
+  merged: bool,
+  /// Whether this walk is of merged revisions (`handling_merged_revisions`).
+  handling: bool,
+  /// Whether its revisions were reverse merged (`subtractive_merge`).
+  subtractive: bool,
+  /// Whether this walk made the shared record of merged revisions sent, which goes when it ends.
+  owns: bool,
+}
+
+/// A revision found, with the mergeinfo changes it made.
+type Found = (Revision, MergeinfoChanges);
+
+/// What `send_log` is told of an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sending {
+  /// Whether merged revisions follow it.
+  has_children: bool,
+  /// Whether it is reverse merged.
+  subtractive: bool,
+  /// Whether it is a merged revision.
+  handling: bool,
 }
 
 /// A frame of the log's walk.
@@ -259,10 +294,20 @@ enum Frame {
   /// The revisions a walk found, sent oldest first: those not yet sent, the last first.
   Ascending {
     /// The revisions still to send, the next last.
-    revisions: Vec<Revision>,
+    revisions: Vec<Found>,
     /// The revisions sent so far.
     sent: u64,
+    /// The most revisions sent; 0 for no limit.
+    limit: u64,
   },
+  /// A revision's merged revisions (`handle_merged_revisions`): its runs, each walked in turn from the last, then the
+  /// entry closing them.
+  Children {
+    /// The runs still to walk, the next last.
+    runs: Vec<PathListRange>,
+  },
+  /// The end of the walk that made the shared record of merged revisions sent, after its last children.
+  Release,
 }
 
 /// What `revision_receiver` keeps between entries (`log_baton_t`).
@@ -287,6 +332,12 @@ pub(super) struct LogStream {
   ended: bool,
   /// What the receiver keeps between entries.
   receiver: Receiver,
+  /// The log's own history as mergeinfo (`log_target_history_as_mergeinfo`); empty without merged revisions.
+  history: Mergeinfo,
+  /// The merged revisions sent (`nested_merges`), while a walk of merged revisions keeps it.
+  nested: Option<BTreeSet<Revision>>,
+  /// The sources and ranges nested walks have searched (`processed`), while the newest-first walk keeps it.
+  processed: Option<Mergeinfo>,
 }
 
 impl LogStream {
@@ -298,6 +349,9 @@ impl LogStream {
       begun: false,
       ended: false,
       receiver: Receiver::default(),
+      history: Mergeinfo::default(),
+      nested: None,
+      processed: None,
     }
   }
 
@@ -338,7 +392,17 @@ impl LogStream {
         descending,
       }) => self.every(reads, next, remaining, descending),
       Some(Frame::Walk(walk)) => self.walk(reads, walk),
-      Some(Frame::Ascending { revisions, sent }) => self.ascending(reads, revisions, sent),
+      Some(Frame::Ascending {
+        revisions,
+        sent,
+        limit,
+      }) => self.ascending(reads, revisions, sent, limit),
+      Some(Frame::Children { runs }) => self.children(reads, runs),
+      Some(Frame::Release) => {
+        self.nested = None;
+        self.processed = None;
+        Ok(())
+      }
     }
   }
 
@@ -354,12 +418,6 @@ impl LogStream {
     };
     let start = settle(self.request.start)?;
     let end = settle(self.request.end)?;
-    if self.request.merged {
-      return Err(Stop::Refused(Failure::new(
-        SVN_ERR_UNSUPPORTED_FEATURE,
-        String::from("Trying to use an unsupported feature"),
-      )));
-    }
     let descending = start >= end;
     let (oldest, youngest) = (start.min(end), start.max(end));
     let paths = &self.request.paths;
@@ -379,7 +437,10 @@ impl LogStream {
       });
       return Ok(());
     }
-    let histories = reads.path_histories(paths, oldest, youngest, self.request.strict)?;
+    if self.request.merged {
+      self.history = reads.history_as_mergeinfo(paths, oldest, youngest)?;
+    }
+    let histories = reads.path_histories(paths, oldest, youngest, self.request.strict, false)?;
     self.frames.push(Frame::Walk(Walk {
       histories,
       current: youngest,
@@ -387,6 +448,11 @@ impl LogStream {
       descending,
       found: Vec::new(),
       sent: 0,
+      limit: self.request.limit,
+      merged: self.request.merged,
+      handling: false,
+      subtractive: false,
+      owns: false,
     }));
     Ok(())
   }
@@ -402,7 +468,7 @@ impl LogStream {
     if remaining == 0 {
       return Ok(());
     }
-    self.send(reads, next, false)?;
+    self.send(reads, next, Sending::top(false))?;
     let following = if descending {
       next.checked_sub(1)
     } else {
@@ -418,8 +484,9 @@ impl LogStream {
     Ok(())
   }
 
-  /// One revision of `do_logs`' loop: every history checked at the current revision, the revision sent (newest first)
-  /// or gathered (oldest first) when one holds it, then the next revision any history holds.
+  /// One revision of `do_logs`' loop: every history checked at the current revision; when one holds it, its mergeinfo
+  /// changes for the histories' next locations (with merged revisions), then the revision sent with its children
+  /// (newest first) or gathered (oldest first); then the next revision any history holds.
   fn walk<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
@@ -432,71 +499,188 @@ impl LogStream {
       any_left |= !info.done;
     }
     let mut finished = false;
+    let mut children = None;
     if changed {
-      if walk.descending {
-        self.send(reads, walk.current, false)?;
-        walk.sent = walk.sent.saturating_add(1);
-        finished = self.request.limit != 0 && walk.sent >= self.request.limit;
+      let changes = if walk.merged {
+        let paths: Vec<String> = walk
+          .histories
+          .iter()
+          .map(|info| info.path.clone())
+          .collect();
+        reads.mergeinfo_changes(&paths, walk.current)?
       } else {
-        walk.found.push(walk.current);
+        MergeinfoChanges::default()
+      };
+      if walk.descending {
+        let has_children = changes.any();
+        self.send(reads, walk.current, walk.sending(has_children))?;
+        if has_children {
+          if self.nested.is_none() {
+            self.nested = Some(BTreeSet::new());
+            self.processed = Some(Mergeinfo::default());
+            walk.owns = true;
+          }
+          children = Some(children_of(&changes));
+        }
+        walk.sent = walk.sent.saturating_add(1);
+        finished = walk.limit != 0 && walk.sent >= walk.limit;
+      } else {
+        walk.found.push((walk.current, changes));
       }
     }
-    let next = next_history_rev(&walk.histories);
-    if finished || !any_left || next.is_none_or(|next| next >= walk.current) {
-      if !walk.found.is_empty() {
-        self.frames.push(Frame::Ascending {
-          revisions: walk.found,
-          sent: 0,
-        });
-      }
-      return Ok(());
-    }
-    if let Some(next) = next {
-      walk.current = next;
-    }
-    self.frames.push(Frame::Walk(walk));
+    self.walk_on(walk, finished || !any_left);
+    self.frames.extend(children);
     Ok(())
   }
 
-  /// The gathered revisions' next, oldest first, until the limit.
+  /// The walk's frame after a revision: the walk again at the next revision a history holds, or, when it has ended,
+  /// what follows it: the revisions it gathered, sent oldest first, and the end of the record it made.
+  fn walk_on(&mut self, mut walk: Walk, ended: bool) {
+    let next = next_history_rev(&walk.histories);
+    let ended = ended || next.is_none_or(|next| next >= walk.current);
+    if !ended && let Some(next) = next {
+      walk.current = next;
+      self.frames.push(Frame::Walk(walk));
+      return;
+    }
+    if walk.owns {
+      self.frames.push(Frame::Release);
+    }
+    if !walk.found.is_empty() {
+      self.frames.push(Frame::Ascending {
+        revisions: walk.found,
+        sent: 0,
+        limit: walk.limit,
+      });
+    }
+  }
+
+  /// The gathered revisions' next, oldest first, with its children, until the limit.
   fn ascending<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
-    mut revisions: Vec<Revision>,
+    mut revisions: Vec<Found>,
     sent: u64,
+    limit: u64,
   ) -> Result<(), Stop> {
-    let Some(revision) = revisions.pop() else {
+    let Some((revision, changes)) = revisions.pop() else {
       return Ok(());
     };
-    self.send(reads, revision, false)?;
+    let has_children = changes.any();
+    self.send(reads, revision, Sending::top(has_children))?;
     let sent = sent.saturating_add(1);
-    let limited = self.request.limit != 0 && sent >= self.request.limit;
+    let limited = limit != 0 && sent >= limit;
     if !limited && !revisions.is_empty() {
-      self.frames.push(Frame::Ascending { revisions, sent });
+      self.frames.push(Frame::Ascending {
+        revisions,
+        sent,
+        limit,
+      });
     }
+    if has_children {
+      self.nested.get_or_insert_with(BTreeSet::new);
+      self.frames.push(children_of(&changes));
+    }
+    Ok(())
+  }
+
+  /// `handle_merged_revisions`' next run: a nested `do_logs` over its sources and revisions, what earlier walks
+  /// searched taken off and this search recorded (`reduce_search`, `store_search`); when no run is left, the entry
+  /// closing the children.
+  fn children<R: Repository + ?Sized>(
+    &mut self,
+    reads: &mut Reads<'_, R>,
+    mut runs: Vec<PathListRange>,
+  ) -> Result<(), Stop> {
+    let Some(run) = runs.pop() else {
+      return Ok(self.end_marker(reads)?);
+    };
+    self.frames.push(Frame::Children { runs });
+    let (mut paths, mut start, mut end) = (run.paths, run.start, run.end);
+    if let Some(processed) = &self.processed {
+      reduce_search(&mut paths, &mut start, &mut end, processed);
+    }
+    if paths.is_empty() {
+      return Ok(());
+    }
+    if let Some(processed) = &mut self.processed {
+      store_search(processed, &paths, start, end);
+    }
+    let histories = reads.path_histories(&paths, start, end, self.request.strict, true)?;
+    self.frames.push(Frame::Walk(Walk {
+      histories,
+      current: end,
+      start,
+      descending: true,
+      found: Vec::new(),
+      sent: 0,
+      limit: 0,
+      merged: true,
+      handling: true,
+      subtractive: run.reverse,
+      owns: false,
+    }));
     Ok(())
   }
 
   /// `send_log` and `fill_log_entry`: the revision's changed paths when asked (never revision 0's), its revision
-  /// properties as asked, then its entry.
+  /// properties as asked, then its entry; a merged revision only when a changed path lies outside the log's own history
+  /// (`interesting_merge`) and it was not sent before (`nested_merges`), its changed paths written either way.
   fn send<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
     revision: Revision,
-    has_children: bool,
+    sending: Sending,
   ) -> Result<(), Stop> {
-    if revision > 0 && self.request.changed_paths {
+    let judged = sending.handling && !self.history.is_empty();
+    let mut wanted = !judged;
+    if revision > 0 && (self.request.changed_paths || judged) {
       let changes = reads
         .index
         .changes(revision)
         .map_err(|refusal| Failure::of_index(&refusal))?;
       for change in changes {
-        self.changed_path(reads, change)?;
+        if self.request.changed_paths {
+          self.changed_path(reads, change)?;
+        }
+        wanted = wanted || outside_history(&self.history, revision, &change.path);
       }
     }
     let properties = self.entry_properties(reads, revision);
-    self.entry(reads, revision, has_children, properties)?;
+    if !wanted {
+      return Ok(());
+    }
+    if sending.handling
+      && let Some(nested) = &mut self.nested
+      && !nested.insert(revision)
+    {
+      return Ok(());
+    }
+    let flags = EntryFlags {
+      has_children: sending.has_children,
+      invalid: false,
+      subtractive: sending.subtractive,
+    };
+    self.entry(reads, revision, flags, properties)?;
     Ok(())
+  }
+
+  /// `handle_merged_revisions`' last entry, revision 0 marked `invalid-revnum`, closing an entry's children; nothing
+  /// when no entry with children is open (`revision_receiver`'s `stack_depth`).
+  fn end_marker<R: Repository + ?Sized>(
+    &mut self,
+    reads: &mut Reads<'_, R>,
+  ) -> Result<(), ItemError> {
+    let Some(depth) = self.receiver.stack_depth.checked_sub(1) else {
+      return Ok(());
+    };
+    self.receiver.stack_depth = depth;
+    let flags = EntryFlags {
+      has_children: false,
+      invalid: true,
+      subtractive: false,
+    };
+    self.entry(reads, 0, flags, None)
   }
 
   /// `path_change_receiver`: one changed path, the entry's two lists opened first.
@@ -586,7 +770,7 @@ impl LogStream {
     &mut self,
     reads: &mut Reads<'_, R>,
     revision: Revision,
-    has_children: bool,
+    flags: EntryFlags,
     properties: Option<Vec<(&[u8], &[u8])>>,
   ) -> Result<(), ItemError> {
     let properties = properties.unwrap_or_default();
@@ -617,16 +801,16 @@ impl LogStream {
       optional_string(author),
       optional_string(date),
       optional_string(message),
-      Value::Word(super::bool_word(has_children)),
-      Value::Word(super::bool_word(false)),
+      Value::Word(super::bool_word(flags.has_children)),
+      Value::Word(super::bool_word(flags.invalid)),
       Value::Number(u64::try_from(rest.len()).unwrap_or(u64::MAX)),
       super::proplist(rest),
-      Value::Word(super::bool_word(false)),
+      Value::Word(super::bool_word(flags.subtractive)),
     ] {
       write(&item, reads.out)?;
     }
     reads.out.extend_from_slice(LIST_CLOSE);
-    if has_children {
+    if flags.has_children {
       self.receiver.stack_depth = self.receiver.stack_depth.saturating_add(1);
     }
     Ok(())
@@ -651,32 +835,51 @@ impl LogStream {
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `get_path_histories`: each path's history opened at the range's youngest revision and taken to its first location,
-  /// the path refused when absent there.
+  /// the path refused when absent there, or with `lenient` (`ignore_missing_locations`, a nested walk's) passed over
+  /// when it is absent, below a file or past the youngest; the youngest revision itself must be one.
   fn path_histories(
     &self,
     paths: &[String],
     start: Revision,
     end: Revision,
     strict: bool,
+    lenient: bool,
   ) -> Result<Vec<PathInfo>, Failure> {
+    self.existing(i64::try_from(end).map_err(|_| Failure::corrupt())?)?;
     let mut histories = Vec::with_capacity(paths.len());
     for (position, path) in paths.iter().enumerate() {
-      let kept = position < OPEN_HISTORIES;
-      let mut info = PathInfo {
-        path: path.clone(),
-        history_rev: end,
-        done: false,
-        first_time: true,
-        history: None,
-        kept,
-      };
-      if kept {
-        info.history = Some(self.node_history(path, end)?);
+      match self.path_history(path, position, start, end, strict) {
+        Ok(info) => histories.push(info),
+        Err(failure) if lenient && missing(&failure) => {}
+        Err(failure) => return Err(failure),
       }
-      self.next_history(&mut info, strict, start)?;
-      histories.push(info);
     }
     Ok(histories)
+  }
+
+  /// One path's history for `get_path_histories`: opened and taken to its first location.
+  fn path_history(
+    &self,
+    path: &str,
+    position: usize,
+    start: Revision,
+    end: Revision,
+    strict: bool,
+  ) -> Result<PathInfo, Failure> {
+    let kept = position < OPEN_HISTORIES;
+    let mut info = PathInfo {
+      path: path.to_owned(),
+      history_rev: end,
+      done: false,
+      first_time: true,
+      history: None,
+      kept,
+    };
+    if kept {
+      info.history = Some(self.node_history(path, end)?);
+    }
+    self.next_history(&mut info, strict, start)?;
+    Ok(info)
   }
 
   /// `check_history`: whether the path's history holds `current`, and if so its next location taken.
@@ -733,6 +936,63 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     }
     Ok(())
   }
+}
+
+/// The flags an entry carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntryFlags {
+  /// `has-children`.
+  has_children: bool,
+  /// `invalid-revnum`: the entry closing a revision's children.
+  invalid: bool,
+  /// `subtractive-merge`.
+  subtractive: bool,
+}
+
+impl Sending {
+  /// A top-level revision's entry.
+  fn top(has_children: bool) -> Self {
+    Self {
+      has_children,
+      subtractive: false,
+      handling: false,
+    }
+  }
+}
+
+impl Walk {
+  /// What its revisions' entries are told.
+  fn sending(&self, has_children: bool) -> Sending {
+    Sending {
+      has_children,
+      subtractive: self.subtractive,
+      handling: self.handling,
+    }
+  }
+}
+
+/// `handle_merged_revisions`' runs of a revision's merged revisions: the added mergeinfo's, then the deleted's (reverse
+/// merges), sorted by their first and last revisions, walked from the last.
+fn children_of(changes: &MergeinfoChanges) -> Frame {
+  let mut runs = Vec::new();
+  if !changes.added.is_empty() {
+    combine(&changes.added, false, &mut runs);
+  }
+  if !changes.deleted.is_empty() {
+    combine(&changes.deleted, true, &mut runs);
+  }
+  runs.sort_by_key(|run| (run.start, run.end));
+  Frame::Children { runs }
+}
+
+/// Whether a lenient walk passes over a refusal opening a path's history (`ignore_missing_locations`).
+fn missing(failure: &Failure) -> bool {
+  matches!(
+    failure.code,
+    super::SVN_ERR_FS_NOT_FOUND
+      | super::SVN_ERR_FS_NOT_DIRECTORY
+      | super::SVN_ERR_FS_NO_SUCH_REVISION
+  )
 }
 
 /// A string in a list of its own, or an empty list (`write_tuple_string_opt_list`).
