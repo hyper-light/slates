@@ -3,10 +3,13 @@
 //!
 //! **What it is.** A repository keeps a log for each green, its chain of versions, and one for each part of its own
 //! state: the names, Mercurial's phase roots and markers, Git LFS's locks (A-642). Each log is a register of its own,
-//! a [`Cohort`] placed by the log's own object id, whose records commit at `f + 1` of its own `2f + 1` candidates. So a
-//! push to one green waits on that green's holders alone, never on another log's (A-642: with a log per green only that
-//! green's later pushes wait). One owner, the repository's partition's, proposes to every log, and a takeover moves
-//! them together.
+//! a [`Cohort`] placed by its register's id ([`LogName::register`]), whose records commit at `f + 1` of its own `2f + 1`
+//! candidates. A green's log is the green's own register, so greens' logs land on different copysets and a push to one
+//! green waits on that green's holders alone, never on another log's (A-642: with a log per green only that green's
+//! later pushes wait). The state logs are registers of their repository's class (`crate::register::RegisterClass`):
+//! they share the repository's holders and successor, so the repository's state moves as one, as a volume's catalog
+//! moves with its volume (A-636 part 2a). One owner, the repository's partition's, proposes to every log, and a
+//! takeover moves them together.
 //!
 //! **A record held whole.** A record moves one log or several by spans of positions ([`LogSpan`], A-635), and every
 //! position it takes carries its identity; its body is content, kept beside the logs. A record is committed once every
@@ -19,27 +22,32 @@
 //! one a log ([`LogsCohort::read`]); it refuses a vector past what it applied, and one that holds part of a record and
 //! not the rest (A-642: a replica's read refuses a cut an atomic record would split).
 //!
-//! **Takeover.** The successor fences and reads `f + 1` holders of every log, each as [`Owner::take_over`] reads one
-//! register, or of none: every log's round is asked first ([`Cohort::can_take_over`]), so a takeover that cannot fence
-//! every log fences nothing. It then keeps a record only where the logs it adopted hold it at every position the record
-//! moved, and otherwise drops it, with what follows it in each of its logs, until every record left is whole
-//! ([`LogsOwner::take_over`]). A committed record is never dropped: each log's read meets that log's commit quorum, so
-//! every log the record moves adopts it at its positions (the ledger's NoLoss, a log at a time), and every record before
-//! it is committed too, so no drop reaches it. A record dropped was never committed whole, so no holder applied any
-//! part of it and no replica answered with one. The superseded owner reaches at most `f` holders of any log the
-//! takeover fenced, so it commits nothing more on any log (StaleNeverCommits).
+//! **Takeover.** The successor takes the logs over a log at a time, as the live plane's rounds run (A-636 part 2a):
+//! each log's round fences and reads `f + 1` of that log's holders as [`Owner::take_over`] reads one register, each
+//! holder answering on the wire with that log's promise alone ([`Cohort::promise`], counted by [`super::PhaseOne`]).
+//! The repository is adopted only once every log's round has read its quorum; a log whose round cannot run refuses the
+//! takeover with nothing adopted, and the logs fenced before it stay fenced, as a live holder's fence stays raised once
+//! it has promised. Fencing is safe without adopting: it only stops the superseded owner on those logs, and a later
+//! takeover's epochs are above it. Once every log is read, it keeps a record only where the logs it adopted hold it at
+//! every position the record moved, and otherwise drops it, with what follows it in each of its logs, until every
+//! record left is whole ([`LogsOwner::take_over`]). A committed record is never dropped: each log's read meets that
+//! log's commit quorum, so every log the record moves adopts it at its positions (the ledger's NoLoss, a log at a
+//! time), and every record before it is committed too, so no drop reaches it. A record dropped was never committed
+//! whole, so no holder applied any part of it and no replica answered with one. The superseded owner reaches at most
+//! `f` holders of any log the takeover fenced, so it commits nothing more on any log (StaleNeverCommits).
 //!
 //! **What is simulated.** As [`super`] is, this is a pure, deterministic simulation (R8): holders are in-memory state
 //! and a message is a direct call, so `f = 0` is the laptop and `f > 0` the fleet, with no mode switch. Its model test
 //! drives appends, partitions, takeovers, superseded owners and replica reads, holds Agreement, NoLoss and
-//! StaleNeverCommits after every step, and counts what it met. The live plane's half is owed (A-636 part 2): each log's
-//! register on the wire, and the state logs' register class, whose object ids a caller names here.
+//! StaleNeverCommits after every step, and counts what it met, takeovers refused after fencing some logs among it. The
+//! live plane's rest is owed (A-636 part 2b and 2c): the partition's records shipped a log at a time to each log's
+//! holders, and the server's takeover adopting a repository's logs by this rule.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Cohort, Owner, Reach, TakeoverError};
 use crate::catalog::{LogName, LogSpan, spans_split_by};
-use crate::register::{DomainId, HostId, ObjectId, Quorum};
+use crate::register::{DomainId, HostId, Quorum};
 
 #[cfg(test)]
 mod tests;
@@ -120,13 +128,17 @@ pub enum ReadRefused {
   },
 }
 
-/// Why a takeover of a repository's logs was refused, nothing fenced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why a takeover of a repository's logs was refused, nothing adopted (A-636 part 2a): the first log whose round could not
+/// read `f + 1` of its holders, and the logs whose rounds ran before it, which stay fenced at the takeover's epochs as
+/// a live round's holders do once they promised. A later takeover's epochs are above them.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogsTakeoverRefused {
   /// The log whose round could not run.
   pub log: LogName,
   /// Why.
   pub error: TakeoverError,
+  /// The logs fenced before it, in log order.
+  pub fenced: Vec<LogName>,
 }
 
 /// A takeover's outcome: the new owner, and the records it dropped because no read held them whole.
@@ -153,19 +165,20 @@ pub struct LogsCohort {
 }
 
 impl LogsCohort {
-  /// The holders of `logs`, each log placed by its own object id among the owner's neighbourhood as [`Cohort::new`]
-  /// places one register, every holder empty.
+  /// The holders of `logs`, each log placed by its register ([`LogName::register`]) among the owner's neighbourhood as
+  /// [`Cohort::new`] places one register, every holder empty: a green's log by the green's id, the state logs by their
+  /// repository's, so they share its holders.
   pub fn new(
     owner: HostId,
     neighbourhood: &[HostId],
     domains: &BTreeMap<HostId, DomainId>,
-    logs: &[(LogName, ObjectId)],
+    logs: &[LogName],
     quorum: Quorum,
   ) -> LogsCohort {
     let logs = logs
       .iter()
-      .map(|(name, object)| {
-        let cohort = Cohort::new(owner, neighbourhood, domains, *object, quorum);
+      .map(|name| {
+        let cohort = Cohort::new(owner, neighbourhood, domains, name.register(), quorum);
         (*name, cohort)
       })
       .collect();
@@ -285,13 +298,24 @@ impl LogsCohort {
   }
 
   /// `host`, which acknowledged the owner's whole log of every log in `held`, applies the owner's committed `cut` over
-  /// them. The cut holds every record whole, so every log of a record the host holds reaches the record in this one
-  /// step: its join. What it applied before stays applied, since committed positions never change.
+  /// them: its join. The cut holds every record whole, so every log of a record the host acknowledged reaches the
+  /// record in this one step. A log the host holds and did not acknowledge this time (a takeover refused part way
+  /// fenced it there, A-636 part 2a) stays where the host left it, so the cut is first lowered to what that leaves
+  /// whole: a record that also moves such a log waits for it, and the host never applies part of a record. What it
+  /// applied before stays applied, since committed positions never change.
   fn apply(&mut self, host: HostId, held: &BTreeSet<LogName>, cut: &Cut) {
+    let mut limits = cut.clone();
+    for (name, log) in &self.logs {
+      if log.candidates().contains(&host) && !held.contains(name) {
+        limits.insert(*name, self.applied_at(host, name));
+      }
+    }
+    let identity_at = |name: &LogName, position: usize| self.logs.get(name)?.committed_at(position);
+    let joined = whole_cut(limits, &identity_at, &self.records);
     let applied = self.applied.entry(host).or_default();
     for name in held {
       let at = applied.entry(*name).or_insert(0);
-      *at = (*at).max(cut.get(name).copied().unwrap_or(0));
+      *at = (*at).max(joined.get(name).copied().unwrap_or(0));
     }
   }
 }
@@ -401,23 +425,25 @@ impl LogsOwner {
     cut
   }
 
-  /// Takes every log of the repository over as `new_id` (A-636): refused, nothing fenced, unless every log's round can
-  /// run; then each log fenced, read and adopted as [`Owner::take_over`] does, and every record the adopted logs do not
-  /// hold whole dropped with what follows it in each of its logs.
+  /// Takes every log of the repository over as `new_id`, a log at a time (A-636 part 2a): each log's round fences, reads
+  /// and adopts it as [`Owner::take_over`] does, its holders answering on the wire with that log's promise alone; the
+  /// repository is adopted only once every log's round has read `f + 1` of its holders, and then every record the
+  /// adopted logs do not hold whole is dropped with what follows it in each of its logs. A log whose round cannot run
+  /// refuses the takeover with nothing adopted, naming the logs fenced before it, which stay fenced as a live round's
+  /// holders do once they have promised (a live round cannot unfence them, so the simulation does not either).
   pub fn take_over(
     cohort: &mut LogsCohort,
     new_id: HostId,
     reachable: &Reach,
   ) -> Result<TakenOver, LogsTakeoverRefused> {
-    for (name, log) in &cohort.logs {
-      log
-        .can_take_over(reachable)
-        .map_err(|error| LogsTakeoverRefused { log: *name, error })?;
-    }
     let mut owners = BTreeMap::new();
     for (name, log) in &mut cohort.logs {
-      let owner = Owner::take_over(log, new_id, reachable)
-        .map_err(|error| LogsTakeoverRefused { log: *name, error })?;
+      let owner =
+        Owner::take_over(log, new_id, reachable).map_err(|error| LogsTakeoverRefused {
+          log: *name,
+          error,
+          fenced: owners.keys().copied().collect(),
+        })?;
       owners.insert(*name, owner);
     }
     let dropped = keep_whole(&mut owners, &cohort.records);

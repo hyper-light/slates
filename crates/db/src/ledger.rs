@@ -106,6 +106,8 @@ impl Holder {
 /// position has committed to; it never proposes.
 #[derive(Clone, Debug)]
 pub struct Cohort {
+  /// The register the cohort holds: what a holder's promise names (A-636 part 2a).
+  object: ObjectId,
   quorum: Quorum,
   candidates: Vec<HostId>,
   holders: BTreeMap<HostId, Holder>,
@@ -128,6 +130,7 @@ impl Cohort {
       holders.insert(*candidate, Holder::default());
     }
     Cohort {
+      object,
       quorum,
       candidates,
       holders,
@@ -137,6 +140,46 @@ impl Cohort {
   /// The quorum this cohort commits under.
   pub fn quorum(&self) -> Quorum {
     self.quorum
+  }
+
+  /// The register this cohort holds.
+  pub fn object(&self) -> ObjectId {
+    self.object
+  }
+
+  /// `holder`'s answer to a takeover's phase one as it puts it on the wire (A-636 part 2a; §4.8 "Promotion and
+  /// takeover"): its fence raised to the prepare's epoch, then its whole log in a [`LedgerPromise`] naming this
+  /// register, so a holder of several registers (a repository's state logs share their holders) never has one
+  /// register's promise counted for another's round ([`PhaseOne`]). A holder fenced above the epoch refuses with the
+  /// empty reply a live holder gives (`slates_cluster::serve_ledger_promotion`). No reply at all from a holder out of
+  /// reach, from one whose store was lost (A-585: it answers no read), or from a host that is no candidate. The
+  /// simulation has no configuration, so the promise echoes the prepare's generation; a live holder refuses a round
+  /// under another (`LedgerAcceptor::prepare`).
+  pub fn promise(
+    &mut self,
+    holder: HostId,
+    prepare: &Prepare,
+    reachable: &Reach,
+  ) -> Option<Vec<u8>> {
+    if !reachable.can_reach(holder) {
+      return None;
+    }
+    let object = self.object;
+    let stored = self.holders.get_mut(&holder)?;
+    if stored.lost {
+      return None;
+    }
+    if stored.fence.accept(prepare.epoch).is_err() {
+      return Some(Vec::new());
+    }
+    let promise = LedgerPromise {
+      holder,
+      object,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      log: stored.log.clone(),
+    };
+    Some(promise.encode())
   }
 
   /// The fault of a volume's store failing suddenly under a replica (A-585): `host`'s log and fence are gone, and it
@@ -157,13 +200,6 @@ impl Cohort {
   /// The candidate host ids, owner first.
   pub fn candidates(&self) -> &[HostId] {
     &self.candidates
-  }
-
-  /// Whether a takeover could run now (A-636): `f + 1` reachable candidates that still hold what they acknowledged, and
-  /// an epoch above every one a holder has seen. A takeover of several registers at once (a repository's logs,
-  /// [`logs`]) asks each register first, so it fences none of them unless it can fence all.
-  pub fn can_take_over(&self, reachable: &Reach) -> Result<(), TakeoverError> {
-    self.phase_one(reachable).map(|_| ())
   }
 
   /// What `host` holds of the register, by position (A-636): its log, or `None` for a host that is no candidate. A
@@ -433,25 +469,127 @@ impl Owner {
   /// it read. Refused if fewer than `f + 1` candidates are reachable. The returned owner's log
   /// begins with every record that had committed (Continuity), because the read quorum intersects
   /// every commit quorum.
+  ///
+  /// The read runs on the wire (A-636 part 2a): each reachable candidate answers the round's [`Prepare`] for this
+  /// register with its promise's bytes ([`Cohort::promise`]), and the round counts and adopts them as a successor
+  /// counts what reaches it ([`PhaseOne`]), so the simulation is the oracle of the live round's counting.
   pub fn take_over(
     cohort: &mut Cohort,
     new_id: HostId,
     reachable: &Reach,
   ) -> Result<Owner, TakeoverError> {
     let (reachable_candidates, new_epoch) = cohort.phase_one(reachable)?;
-    let mut logs: Vec<Vec<Record>> = Vec::new();
+    let prepare = Prepare {
+      owner: new_id,
+      object: cohort.object,
+      epoch: new_epoch,
+      generation: SIMULATED_GENERATION,
+    };
+    let mut round = PhaseOne::new(prepare, &cohort.candidates, cohort.quorum);
     for candidate in &reachable_candidates {
-      if let Some(holder) = cohort.holders.get_mut(candidate) {
-        // Raising the fence to a strictly higher epoch always succeeds; it fences the old owner.
-        let _ = holder.fence.accept(new_epoch);
-        logs.push(holder.log.clone());
+      // A reply the round does not count adds nothing to its quorum, which decides below.
+      if let Some(reply) = cohort.promise(*candidate, &prepare, reachable) {
+        round.hear(*candidate, &reply);
       }
     }
+    let log = round.adopted().ok_or(TakeoverError::NoQuorum {
+      reachable: round.promised(),
+      needed: cohort.quorum.commit(),
+    })?;
     Ok(Owner {
       id: new_id,
       epoch: new_epoch,
-      log: adopt(&logs),
+      log,
     })
+  }
+}
+
+/// Shape: the configuration generation the simulation's takeovers run under. The simulation has no configuration
+/// group, so every round runs under this one; a live holder refuses a round under a generation it has not installed
+/// (`LedgerAcceptor::prepare`).
+const SIMULATED_GENERATION: u64 = 0;
+
+/// One register's phase one as its successor counts it from the wire (A-636 part 2a; §4.8 "Promotion and takeover"):
+/// the prepare it asked, the register's candidates and quorum, and the whole log of each distinct candidate whose
+/// promise binds the prepare, in the order heard. Once `f + 1` have promised, it adopts per position the identity under
+/// the highest epoch ([`adopt`], the cluster plane's rule too). A takeover of several registers (a repository's logs,
+/// [`logs`]) runs one round a register, a log at a time; a holder of several answers each round with that register's
+/// log, and a promise naming another register is never counted ([`Heard::Unbound`]).
+#[derive(Clone, Debug)]
+pub struct PhaseOne {
+  /// The question asked.
+  prepare: Prepare,
+  /// The register's candidates.
+  candidates: Vec<HostId>,
+  /// The quorum the register commits under.
+  quorum: Quorum,
+  /// Each counted candidate's whole log, in the order heard.
+  promised: Vec<(HostId, Vec<Record>)>,
+}
+
+/// What a round made of one reply ([`PhaseOne::hear`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Heard {
+  /// A promise from a candidate not counted before: counted toward the quorum.
+  Counted,
+  /// No promise: a refusal's empty reply, or bytes cut short or padded.
+  Malformed,
+  /// A promise naming another holder than the one it came from.
+  Forged,
+  /// A promise for another round: another register (another log the holder keeps), epoch or generation.
+  Unbound,
+  /// A promise from a host that is none of the register's candidates.
+  NotCandidate,
+  /// A second promise from a candidate counted already.
+  Twice,
+}
+
+impl PhaseOne {
+  /// The round of `prepare` over a register's `candidates` at `quorum`, nothing heard yet.
+  pub fn new(prepare: Prepare, candidates: &[HostId], quorum: Quorum) -> PhaseOne {
+    PhaseOne {
+      prepare,
+      candidates: candidates.to_vec(),
+      quorum,
+      promised: Vec::new(),
+    }
+  }
+
+  /// Hears `from`'s reply `bytes`: counts it when it decodes to a promise naming `from` that binds the prepare and
+  /// comes from a candidate not counted before; otherwise says why not and counts nothing.
+  pub fn hear(&mut self, from: HostId, bytes: &[u8]) -> Heard {
+    let Ok(promise) = LedgerPromise::decode(bytes) else {
+      return Heard::Malformed;
+    };
+    if promise.holder != from {
+      return Heard::Forged;
+    }
+    if !promise.binds(&self.prepare) {
+      return Heard::Unbound;
+    }
+    if !self.candidates.contains(&from) {
+      return Heard::NotCandidate;
+    }
+    if self.promised.iter().any(|(holder, _)| *holder == from) {
+      return Heard::Twice;
+    }
+    self.promised.push((from, promise.log));
+    Heard::Counted
+  }
+
+  /// How many distinct candidates promised.
+  pub fn promised(&self) -> usize {
+    self.promised.len()
+  }
+
+  /// The log the round adopts once `f + 1` distinct candidates promised, per position the identity under the highest
+  /// epoch they hold ([`adopt`]); `None` before.
+  pub fn adopted(&self) -> Option<Vec<[u8; 32]>> {
+    if !self.quorum.committed(self.promised.len()) {
+      return None;
+    }
+    let logs: Vec<Vec<Record>> = self.promised.iter().map(|(_, log)| log.clone()).collect();
+    Some(adopt(&logs))
   }
 }
 

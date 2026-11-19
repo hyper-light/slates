@@ -88,6 +88,7 @@ impl PackSource for WholeObjects<'_> {
     &mut self,
     _: &Served<'_>,
     pack: &mut WholePack,
+    _: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
@@ -167,16 +168,11 @@ pub(super) fn answer_of(
 ) -> (Vec<u8>, Answer<WholePack>) {
   let served = serving(fixture, refs, head);
   let mut source = WholeObjects::new(&fixture.objects);
-  let mut answer = serve(
-    &served,
-    version,
-    asked,
-    &mut source,
-    &mut Admission::new(u64::MAX),
-  );
+  let mut admission = Admission::new(u64::MAX);
+  let mut answer = serve(&served, version, asked, &mut source, &mut admission);
   let mut bytes = Vec::new();
   assert_eq!(
-    answer.write(&served, &mut source, &mut bytes, usize::MAX),
+    answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),
     Written::End
   );
   (bytes, answer)

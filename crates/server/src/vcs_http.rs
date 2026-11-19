@@ -51,14 +51,17 @@
 //! drains for a staged close. One body run or one reply run a turn (§4.3): the task yields after each, so a large push or
 //! clone never holds its shard, and a drain yields after each read it drops.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the operator's identity, an
-//! authenticator over §4.13's principals and keys, the repositories' lookup on their partitions); the services' server
-//! halves (git's upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land;
+//! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
+//! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
+//! receive-pack through the push driver on the repository's owner shard (A-654 part 3).
+//!
+//! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
+//! handed the stores (A-615, A-662), which answers `503` until then;
 //! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
 //! `501` until then; the sites composed into one the daemon starts (git's alone today); the MCP edge onto this engine;
-//! the live `git clone` and `hg clone` over HTTPS (main's runs).
+//! the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;
@@ -66,7 +69,7 @@ mod hg;
 mod svn;
 pub(crate) mod waits;
 
-pub(crate) use daemon_edge::start;
+pub(crate) use daemon_edge::{bind, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;

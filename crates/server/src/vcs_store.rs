@@ -108,6 +108,9 @@ pub(crate) struct VcsStores {
   /// Each Mercurial repository's import under way, between its turns ([`hg_import`]): one a repository, so bounded by
   /// the partition's repositories.
   imports: BTreeMap<RepositoryId, hg_import::Importing>,
+  /// The request each import's end answers, by repository (A-678; `crate::repository::import`): one an import, so
+  /// bounded as the imports are.
+  answers: BTreeMap<RepositoryId, crate::repository::import::Answer>,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -254,6 +257,28 @@ impl VcsStores {
   /// Whether an import of repository `id` is under way ([`hg_import`]).
   pub(crate) fn importing(&self, id: RepositoryId) -> bool {
     self.imports.contains_key(&id)
+  }
+
+  /// Holds `answer` as the request repository `id`'s import's end answers (A-678): the answer it replaces.
+  pub(crate) fn hold_answer(
+    &mut self,
+    id: RepositoryId,
+    answer: crate::repository::import::Answer,
+  ) -> Option<crate::repository::import::Answer> {
+    self.answers.insert(id, answer)
+  }
+
+  /// The request repository `id`'s import's end answers, if one is held.
+  pub(crate) fn answer(&self, id: RepositoryId) -> Option<&crate::repository::import::Answer> {
+    self.answers.get(&id)
+  }
+
+  /// Takes the request repository `id`'s import's end answers, if one is held.
+  pub(crate) fn take_answer(
+    &mut self,
+    id: RepositoryId,
+  ) -> Option<crate::repository::import::Answer> {
+    self.answers.remove(&id)
   }
 
   /// Why repository `id`'s store was not made again by the recovery, if it was not.
@@ -462,11 +487,26 @@ fn lent_to_read<T>(
 ) -> T {
   lend(store, stores, 0);
   let answer = read(stores);
+  set_back(stores);
+  answer
+}
+
+/// [`lent_to_read`] over the whole shard's state: what a step needs that reads the stores beside the shard's greens and
+/// records, as git's push judges each command over the greens, its repository's store and its quarantine at once
+/// (A-654). Read only, so the room lent is given back and nothing is charged.
+pub(crate) fn with_room<T>(state: &mut ShardState, read: impl FnOnce(&ShardState) -> T) -> T {
+  lend(&mut state.store, &mut state.vcs_stores, 0);
+  let answer = read(state);
+  set_back(&mut state.vcs_stores);
+  answer
+}
+
+/// Sets the content store's budget back to what is charged after a read lent room ([`lent_to_read`], [`with_room`]).
+fn set_back(stores: &mut VcsStores) {
   let charged = stores.charged;
   if let Some(content) = stores.content.as_mut() {
     content.set_budget(charged);
   }
-  answer
 }
 
 /// A git push in its quarantine (§4.17.2 "A push" item 3): each object admitted to the repository's store as it comes
@@ -503,6 +543,13 @@ impl SealedPush {
   /// The repository it is a push to.
   pub(crate) fn repository(&self) -> RepositoryId {
     self.repository
+  }
+
+  /// The objects it holds in quarantine, read only: what a ref's work is read from beside the repository's index
+  /// (A-638's `PushedObjects`), and how a move changes its ref (A-644's `Repository::change`), as git's push judges
+  /// each command (A-654).
+  pub(crate) fn quarantine(&self) -> &Push {
+    &self.push
   }
 
   /// The record the entry holds (`RepositoryEntry::objects`): the moves now admitted and the objects not yet committed,

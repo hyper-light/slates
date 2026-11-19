@@ -12,7 +12,8 @@
 //!
 //! **Owned.** The plan is copied when the pack begins (its runs, its objects, its filter), each charged to the
 //! request's admission first, since the stream outlives every lending of the store; what a turn wrote is kept until the
-//! answer has taken it, one turn's bytes at most.
+//! answer has taken it, one turn's bytes at most. Each call lends the stream the request's admission for its turn, so
+//! a delta search over an object past a window holds its bytes on it while the search lasts (A-653 continued (4)).
 
 use super::{PackPlan, PackRefused, PackSource, Served};
 use crate::Admission;
@@ -139,6 +140,7 @@ impl PackSource for Fragments<'_> {
     &mut self,
     served: &Served<'_>,
     pack: &mut Streamed,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
@@ -152,7 +154,13 @@ impl PackSource for Fragments<'_> {
       };
       let progress = pack
         .upload
-        .advance(served.repository, served.store, turn, &mut pack.written)
+        .advance(
+          served.repository,
+          served.store,
+          turn,
+          admission,
+          &mut pack.written,
+        )
         .map_err(PackRefused::Store)?;
       pack.done = progress == Progress::Done;
     }
