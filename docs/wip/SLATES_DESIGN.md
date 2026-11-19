@@ -36663,5 +36663,7 @@ the ceiling), and `lib.rs`.
   ceiling, is zero while the wakes disagree, and settles within the settled wakes (4 to 11 µs); agreeing wakes are spun
   for once a second confirms the first; agreeing wakes slower than the ceiling spin the ceiling, and a zero ceiling
   never spins; one 10 ms delay moves the window by at most half a deviation. `reply`'s, on Windows (main's run): only a
-  reply the thread parked for teaches it, and a thread that started nothing never spins.
+  reply the thread parked for teaches it, and a thread that started nothing never spins. Green on the Mac Studio (kiln
+  r51, 4 of 4); red once with the window unbounded and unchecked again (the old rule's essence): after the first wake a
+  window of 144,000 ns past the 50,000 ns ceiling, and the agreement and ceiling tests failing with it.
 
