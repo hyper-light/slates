@@ -1752,8 +1752,8 @@ mod tests {
   /// A-597 (git's inputs, `githooks.adoc` and `run_receive_hook`). Do: build pre-receive for a push creating one ref and
   /// moving another with two push options, the same without push options, update for one command, and post-receive
   /// for the one command that applied. Expect: one `old new ref` line a command (the created ref's old value all
-  /// zeroes), the options numbered from 0 with their count, the count unset without them, update's three arguments,
-  /// and post-receive's line for the applied command alone.
+  /// zeroes), the options numbered from 0 with their count, the count 0 without them (as stock receive-pack 2.50.1 sets
+  /// it, A-665's fixtures), update's three arguments, and post-receive's line for the applied command alone.
   #[test]
   fn gits_hooks_get_what_receive_pack_gives_them() {
     let create = RefUpdate {
@@ -1803,7 +1803,10 @@ mod tests {
     let bare = git_pre_receive(PendingView(7), &[moved.clone()], None);
     assert_eq!(
       bare.env,
-      vec![("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Unset)]
+      vec![(
+        "GIT_PUSH_OPTION_COUNT".to_owned(),
+        EnvValue::Bytes(b"0".to_vec())
+      )]
     );
     let update = git_update(PendingView(7), &moved);
     assert_eq!(
@@ -1822,6 +1825,62 @@ mod tests {
       post.stdin,
       b"2222222222222222222222222222222222222222 3333333333333333333333333333333333333333 refs/heads/main\n".to_vec()
     );
+  }
+
+  /// What stock receive-pack 2.50.1 handed its hooks in the three pushes A-665's `make-view-fixtures.sh` recorded
+  /// (`crates/git/fixtures/view`): for each push, pre-receive's, update's and post-receive's listings.
+  const RECORDED_HOOKS: [[&str; 3]; 3] = [
+    [
+      include_str!("../../git/fixtures/view/hook.loose.pre-receive.txt"),
+      include_str!("../../git/fixtures/view/hook.loose.update.txt"),
+      include_str!("../../git/fixtures/view/hook.loose.post-receive.txt"),
+    ],
+    [
+      include_str!("../../git/fixtures/view/hook.pack.pre-receive.txt"),
+      include_str!("../../git/fixtures/view/hook.pack.update.txt"),
+      include_str!("../../git/fixtures/view/hook.pack.post-receive.txt"),
+    ],
+    [
+      include_str!("../../git/fixtures/view/hook.options.pre-receive.txt"),
+      include_str!("../../git/fixtures/view/hook.options.update.txt"),
+      include_str!("../../git/fixtures/view/hook.options.post-receive.txt"),
+    ],
+  ];
+
+  /// The `GIT_PUSH_OPTION_*` variables a recorded hook's listing holds, in its order (the listing is sorted, so the
+  /// options by number, then the count).
+  fn recorded_push_options(listing: &str) -> Vec<(String, EnvValue)> {
+    listing
+      .lines()
+      .filter_map(|line| line.strip_prefix("env "))
+      .filter(|variable| variable.starts_with("GIT_PUSH_OPTION_"))
+      .filter_map(|variable| variable.split_once('='))
+      .map(|(name, value)| (name.to_owned(), EnvValue::Bytes(value.as_bytes().to_vec())))
+      .collect()
+  }
+
+  /// A-665's finding (stock receive-pack hands every hook its list of push options, `cmd_receive_pack`, so
+  /// `run_and_feed_hook` sets the count even when none were negotiated; `githooks.adoc` says unset). Do: build
+  /// pre-receive, update and post-receive for the three pushes stock git 2.50.1 recorded: two to a server that
+  /// advertised no push options, one with `-o first -o 'second option'`. Expect: each hook's `GIT_PUSH_OPTION_*`
+  /// exactly as the recorded hook saw them: the count 0 where none were negotiated, the options and their count, and
+  /// none at all for update.
+  #[test]
+  fn gits_push_options_are_what_stock_receive_pack_hands_each_hook() {
+    let moved = RefUpdate {
+      old: "2222222222222222222222222222222222222222".to_owned(),
+      new: "3333333333333333333333333333333333333333".to_owned(),
+      name: "refs/heads/main".to_owned(),
+    };
+    let options = [b"first".to_vec(), b"second option".to_vec()];
+    let negotiated: [Option<&[Vec<u8>]>; 3] = [None, None, Some(&options)];
+    for (options, [pre, update, post]) in negotiated.into_iter().zip(RECORDED_HOOKS) {
+      let pre_receive = git_pre_receive(PendingView(1), std::slice::from_ref(&moved), options);
+      assert_eq!(pre_receive.env, recorded_push_options(pre));
+      assert_eq!(git_update(PendingView(1), &moved).env, recorded_push_options(update));
+      let post_receive = git_post_receive(CommittedView(1), std::slice::from_ref(&moved), options);
+      assert_eq!(post_receive.env, recorded_push_options(post));
+    }
   }
 
   /// A-597 (Mercurial's inputs, `config.txt` "hooks" and `hook.py`'s `HG_PENDING`). Do: build pretxnchangegroup and
