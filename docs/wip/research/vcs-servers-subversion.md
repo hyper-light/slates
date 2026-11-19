@@ -906,3 +906,29 @@ the first 16 hex digits of each file's sha256:
   (a source piece read when a target piece begins, a short piece ending the source's views), so every delta a stock
   server sends or dumps is a function of its two texts; `svnadmin dump --deltas` writes it in svndiff version 0
   (`store_delta`). Every recorded delta of the golden dumps is remade by the port window for window.
+
+## 16. The commit step and the hooks' places (A-655 part 2a; §4.17.4 items 3.1, 3.3, 3.5 and 9)
+
+Read 2026-11-19 by g268 at §1's revision, each file fetched from
+`raw.githubusercontent.com/apache/subversion/d434dc14866e0c48602dba59a15443255d0b8c1e/<path>`, its hash §1's row's
+(`svn_props.h`, not in §1's table: `c0a7446d92934323`).
+
+- **Begin** [C: `fs-wrap.c` `svn_repos_fs_begin_txn_for_commit2` 132-184]: the transaction begun on the revision
+  `open_root` read, with `SVN_FS_TXN_CHECK_LOCKS` alone (151-152), its name fetched for the hook; the revision
+  properties set through `svn_repos_fs_change_txn_props` (160-164), which runs `svn_repos__validate_prop` on each
+  (344-357) in the order `svn_prop_hash_to_array` lists APR's hash; then start-commit (166-172), whose refusal aborts
+  the transaction. `commit.c` `open_root` (414-466) checks the revision first (428-431).
+- **Commit** [C: `fs-wrap.c` `svn_repos_fs_commit_txn` 48-121]: pre-commit (69-71); every property named
+  `SVN_PROP_TXN_PREFIX`, `svn:txn-` (`svn_props.h` 706), removed (72-89); `svn_fs_commit_txn`; post-commit, whose
+  failure leaves the commit made and is reported. `commit.c` `close_edit` (799-882) refuses no transaction first
+  (811-813).
+- **The date** [C: `transaction.c` `write_final_revprop` 3598-3630]: `svn:date` set to
+  `svn_time_to_cstring(apr_time_now())` unless the transaction was begun with `SVN_FS_TXN_CLIENT_DATE` and the client
+  set one; `svn_fs_fs__begin_txn` (4195-4235) stamps a transaction with the time it began, which the commit overwrites.
+- **Out of date** [C: `transaction.c` `commit_body` 3741-3786; `tree.c` `svn_fs_fs__commit_txn` 2194-2330]: the commit
+  refuses a transaction whose base is not the youngest, "Transaction out of date" (`SVN_ERR_FS_TXN_OUT_OF_DATE`,
+  3784-3786), then verifies every lock again (`verify_locks`); `svn_fs_fs__commit_txn` merges against the youngest,
+  makes it the transaction's base (2291) and, on that refusal, merges again if the youngest moved (2295-2310), returning
+  the refusal only when it did not.
+- **Recorded** (§14's commits): stock `svn` 1.15.0 sends `svn:txn-user-agent` and `svn:txn-client-compat-version` with
+  every commit; no revision `svnserve` made keeps either.

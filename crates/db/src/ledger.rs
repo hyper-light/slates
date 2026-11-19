@@ -44,6 +44,8 @@ use crate::register::{
   RegisterError, candidates_for,
 };
 
+pub mod logs;
+
 /// One entry in a holder's log. Its position is its index in the log (dense, `0`-based); it carries
 /// the payload's identity (the `blake3` of a merge record's declared work, a head, a lease — the
 /// register class does not change the protocol) and the host epoch it was last accepted under, so a
@@ -155,6 +157,53 @@ impl Cohort {
   /// The candidate host ids, owner first.
   pub fn candidates(&self) -> &[HostId] {
     &self.candidates
+  }
+
+  /// Whether a takeover could run now (A-636): `f + 1` reachable candidates that still hold what they acknowledged, and
+  /// an epoch above every one a holder has seen. A takeover of several registers at once (a repository's logs,
+  /// [`logs`]) asks each register first, so it fences none of them unless it can fence all.
+  pub fn can_take_over(&self, reachable: &Reach) -> Result<(), TakeoverError> {
+    self.phase_one(reachable).map(|_| ())
+  }
+
+  /// What `host` holds of the register, by position (A-636): its log, or `None` for a host that is no candidate. A
+  /// replica answers a read from it.
+  pub fn held(&self, host: HostId) -> Option<&[Record]> {
+    self.holders.get(&host).map(|holder| holder.log.as_slice())
+  }
+
+  /// A takeover's phase one before it fences anything: the reachable candidates that still hold what they
+  /// acknowledged, refused below `f + 1`, and the epoch that fences the superseded owner.
+  fn phase_one(&self, reachable: &Reach) -> Result<(Vec<HostId>, HostEpoch), TakeoverError> {
+    // A holder whose store was lost answers no read (A-585): its nothing would count towards the quorum as a promise.
+    let reachable_candidates: Vec<HostId> = self
+      .candidates
+      .iter()
+      .copied()
+      .filter(|candidate| {
+        reachable.can_reach(*candidate)
+          && self
+            .holders
+            .get(candidate)
+            .is_some_and(|holder| !holder.lost)
+      })
+      .collect();
+    let needed = self.quorum().commit();
+    if reachable_candidates.len() < needed {
+      return Err(TakeoverError::NoQuorum {
+        reachable: reachable_candidates.len(),
+        needed,
+      });
+    }
+    // The next epoch fences every holder the round reaches; it is the successor of the highest
+    // epoch seen, not a tuning constant (structural increment, as `2f+1` and `f+1` are).
+    let new_epoch = HostEpoch(
+      self
+        .highest_epoch()
+        .checked_add(1)
+        .ok_or(TakeoverError::EpochExhausted)?,
+    );
+    Ok((reachable_candidates, new_epoch))
   }
 
   /// The highest epoch any holder has accepted under; a takeover's new epoch is its successor.
@@ -323,6 +372,32 @@ impl Owner {
     self.log.is_empty()
   }
 
+  /// The records the owner holds, by position: what it proposed and what it adopted (A-636).
+  pub fn log(&self) -> &[[u8; 32]] {
+    &self.log
+  }
+
+  /// Drops the owner's positions from `len` on (A-636). Sound only for a tail no quorum committed: a takeover over a
+  /// repository's logs ([`logs`]) drops a record not held whole by every log it moves, and what follows it. The holders
+  /// drop the tail when this owner next offers its log ([`Owner::offer_again`]).
+  pub fn truncate(&mut self, len: usize) {
+    self.log.truncate(len);
+  }
+
+  /// Offers the owner's whole log again to the reachable holders under its epoch, proposing nothing (A-636): a lagging
+  /// holder catches up, a tail beyond the log is dropped, and every position takes this owner's epoch (BUG-12). The
+  /// acknowledging holders hold the whole log; it commits at `f + 1` of them.
+  pub fn offer_again(&mut self, cohort: &mut Cohort, reachable: &Reach) -> Commit {
+    let position = u64::try_from(self.log.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    let acked = cohort.offer(self.epoch, &self.log, reachable);
+    let committed = cohort.quorum().committed(acked.len());
+    Commit {
+      position,
+      acked,
+      committed,
+    }
+  }
+
   /// Proposes a record carrying `identity` at the next position, offering the whole log to the
   /// reachable holders under this owner's epoch. Commits when `f + 1` acknowledge. A superseded
   /// owner (its epoch below the holders' fences) reaches at most `f` holders and does not commit;
@@ -363,34 +438,7 @@ impl Owner {
     new_id: HostId,
     reachable: &Reach,
   ) -> Result<Owner, TakeoverError> {
-    // A holder whose store was lost answers no read (A-585): its nothing would count towards the quorum as a promise.
-    let reachable_candidates: Vec<HostId> = cohort
-      .candidates
-      .iter()
-      .copied()
-      .filter(|candidate| {
-        reachable.can_reach(*candidate)
-          && cohort
-            .holders
-            .get(candidate)
-            .is_some_and(|holder| !holder.lost)
-      })
-      .collect();
-    let needed = cohort.quorum().commit();
-    if reachable_candidates.len() < needed {
-      return Err(TakeoverError::NoQuorum {
-        reachable: reachable_candidates.len(),
-        needed,
-      });
-    }
-    // The next epoch fences every holder the round reaches; it is the successor of the highest
-    // epoch seen, not a tuning constant (structural increment, as `2f+1` and `f+1` are).
-    let new_epoch = HostEpoch(
-      cohort
-        .highest_epoch()
-        .checked_add(1)
-        .ok_or(TakeoverError::EpochExhausted)?,
-    );
+    let (reachable_candidates, new_epoch) = cohort.phase_one(reachable)?;
     let mut logs: Vec<Vec<Record>> = Vec::new();
     for candidate in &reachable_candidates {
       if let Some(holder) = cohort.holders.get_mut(candidate) {
