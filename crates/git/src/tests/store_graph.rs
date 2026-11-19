@@ -6,7 +6,7 @@ use crate::fixtures::{FETCH_CLONE_RESPONSE, FETCH_HAVES_RESPONSE};
 use crate::negotiation::{Acknowledgments, Answer, Graph, Request, Run, negotiate};
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tree::Tree;
-use crate::served::{self, FIRST, MAIN, REFS, SECOND, SIDE, TAG, THIRD, id};
+use crate::served::{self, FIRST, MAIN, REFS, SECOND, SIDE, TAG, THIRD, V1, id};
 use crate::v2::fetch::{Event, decode_response};
 
 /// Everything `start` reaches through the graph.
@@ -102,10 +102,10 @@ fn the_store_reads_back_as_the_negotiations_graph() {
   assert_eq!(graph.fault(), None);
 }
 
-/// A-640 part 1: do ask the graph of the refs and versions. Expect: every ref's head a tip and the annotated tag the one
-/// tag; the greens each commit heads now, with their current versions (`first` heads `side`, and no longer `main`); the
-/// versions each commit headed; each of `main`'s versions a fast-forward, a rewound one not; and D(k) what the version's
-/// head reaches and the head before did not.
+/// A-640 part 1: do ask the graph of the refs and versions. Expect: every ref's head a tip and the annotated tag the
+/// one tag; the greens each commit heads now, with their current versions (`first` heads `side`, and no longer
+/// `main`); the versions each commit headed; each of `main`'s versions a fast-forward, a rewound one not; and D(k)
+/// what the version's head reaches and the head before did not.
 #[test]
 fn refs_versions_and_fast_forwards_read_as_the_store_kept_them() {
   let mut served = served::served();
@@ -146,6 +146,44 @@ fn refs_versions_and_fast_forwards_read_as_the_store_kept_them() {
   assert_eq!(graph.fault(), None);
 }
 
+/// A-640 part 1 (the one-round path's guard): do move greens every way a version can follow the one before: onward,
+/// onto the same commit, a tag onto itself, back, from a tag to a commit, and on from there, one move a version.
+/// Expect: the graph's fast-forward for each version made is the verdict the store gave the move when it admitted it,
+/// the tag moved onto itself among the moves it judged no fast-forward.
+#[test]
+fn the_graphs_fast_forward_is_the_stores_own_verdict_at_admission() {
+  let mut served = served::served();
+  let moves = [
+    (SIDE, THIRD),
+    (SIDE, THIRD),
+    (V1, TAG),
+    (SIDE, FIRST),
+    (V1, SECOND),
+    (V1, THIRD),
+  ];
+  let mut judged = Vec::new();
+  for (green, head) in moves {
+    let made = served::commit(
+      &mut served.repository,
+      &mut served.store,
+      &[],
+      &[(green, head)],
+    );
+    judged.extend(made.into_iter().map(|(version, verdict)| (green, version, verdict)));
+  }
+  let verdicts: Vec<bool> = judged.iter().map(|(_, _, verdict)| *verdict).collect();
+  assert_eq!(verdicts, [true, true, false, false, false, true]);
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS).unwrap();
+  for (green, version, verdict) in judged {
+    assert_eq!(
+      graph.fast_forward(green, version),
+      verdict,
+      "green {green}, version {version}"
+    );
+  }
+  assert_eq!(graph.fault(), None);
+}
+
 /// A-640 part 1 (the graph's faults): do read a position the store never gave, twice, then another. Expect: the null
 /// name read, and the first fault alone kept.
 #[test]
@@ -161,9 +199,9 @@ fn a_read_the_store_cannot_make_is_kept_as_the_first_fault() {
 }
 
 /// A-640 part 1 (§4.17.2 "A fetch"; git's `fetch-haves` and `fetch-clone` exchanges): do negotiate over the real store
-/// the request git's client sent with `first` as its have, then the clone with no have. Expect: `first` acknowledged and
-/// ready in one round, the run of `main`'s versions 1 and 2, nothing walked, the run carrying exactly the objects in the
-/// pack stock git sent; and the clone walked, sending exactly the objects stock git's clone pack holds.
+/// the request git's client sent with `first` as its have, then the clone with no have. Expect: `first` acknowledged
+/// and ready in one round, the run of `main`'s versions 1 and 2, nothing walked, the run carrying exactly the objects
+/// in the pack stock git sent; and the clone walked, sending exactly the objects stock git's clone pack holds.
 #[test]
 fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
   let served = served::served();

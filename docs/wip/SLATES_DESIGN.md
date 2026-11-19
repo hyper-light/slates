@@ -12360,6 +12360,16 @@ engine: the verdict, rebase, position mapping, the register).
 > `tree:<depth>`, `object:type` and `combine:` (`sparse:oid` read and refused, owed); and `include-tag`. Proven against
 > an oracle computing each answer from full reachability over generated histories. Building the pack from the runs and
 > the objects is piece 7's next part.
+>
+> **Status (2026-11-19, A-640 part 1: the store read as the negotiation's graph).** `crates/git` (`store::graph`) reads
+> A-614's store as A-615's `Graph`. A node is an object's position. Its name, kind, size and commit row come from its
+> rows, a tree's entries and a tag's object from its bytes, and a green's versions from its chain (numbered from 0, D(k)
+> the positions version k brought). A version's fast-forward is the store's own verdict at admission, found again by the
+> store's rule. The store keeps no ref names, so the caller names each ref's green. A read the store cannot make is kept
+> as the graph's first fault, and an answer made while one was kept is refused. Proven on the repository stock git
+> 2.50.1 answered the golden vectors from, loaded into a real store from its own pack: the negotiation over the store
+> sends exactly the objects git sent for a clone and for a fetch with a have. The service over v2, and over v0 and v1,
+> is A-640's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -42773,3 +42783,53 @@ Applied in the same change to:
 - **Owed:** the Windows driver (a job object for the hook's descendants and `slates_ipc::win_spawn`'s handle-list
   spawn); the launcher's namespace for a hook on Linux (§4.6); the push pieces' calls, each with its view and its tool's
   words for the outcomes; the hook times' table on the owner shard, one a configured hook.
+
+### A-640 — The upload-pack service end to end, part 1: A-614's store read as A-615's commit graph (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Pieces (git)" piece 7; after A-614 and A-615)
+
+**Part 1: the store as the negotiation's graph** (`crates/git/src/store/graph.rs`, `StoreGraph`). A-615's negotiation
+reads a repository through a trait (`Graph`); A-614's store now answers it, so a fetch is negotiated over the objects,
+versions and D(k) the store keeps, and neither module names the other's internals.
+
+- **Nodes.** A node is an object's position, the store's own handle, and a green is the store's green. An object's name
+  is its position's row; its kind, size and commit row (generation number, committer date, root tree, parents by
+  position) are its object row. A tree's entries and a tag's object are read from the object's bytes by A-590's parsers
+  through the store's own reads, a submodule's commit left out as the store's walks leave it out.
+- **Versions.** A green's versions are the store's chain: version `v` is the chain's `v`-th, numbered from 0, and D(v)
+  is the positions it brought. The greens a commit heads, each at its current version, come from the store's head map.
+  A version fast-forwarded the one before when the store judged its move so at admission (`Move::is_fast_forward`).
+  Versions keep no verdict, so the graph finds it again by the store's rule: both heads are commits, and the later is
+  the earlier or reaches it, searched back through parents no lower than the earlier head's generation number. A tag
+  moved onto itself is no fast-forward, as the store judged it, though its D(k) is empty; the first draft called it
+  one, which the test against the store's verdicts caught.
+- **Refs.** The store holds greens, not names, so the caller (the server, which keeps the repository's record) names
+  each ref's green (`NamedRef`). Every ref's head is a tip, and the refs under `refs/tags/` whose head is an annotated
+  tag are the tags `include-tag` reads.
+- **Faults.** The trait's reads cannot fail, and a store whose index and content agree never fails them. Where one does
+  (a position with no row, an object whose bytes git's parser refuses, a name the store does not hold), the read
+  answers nothing and the graph keeps the first fault (`StoreGraph::fault`, `GraphFault`). The service refuses an
+  answer made while one was kept, so a broken store never yields a wrong pack.
+- **Where.** The file is a child module of the store's `repository.rs` (`#[path = "graph.rs"]`), so it reads the
+  chains, the head map and the object reads that module keeps private. The store's other files (g083's) gain one line
+  each: the module's in `repository.rs` and its re-export in `mod.rs`.
+- **Tests** (`src/tests/store_graph.rs`; the fixture repository in `src/tests/served.rs`). The repository stock git
+  2.50.1 answered A-582's golden vectors from (`fixtures/make-fixtures.sh`) is loaded into a real store from its own
+  pack (`fixtures/ofs.pack`, all twelve objects), `main`'s history committed as three versions. Every node reads back
+  to its name, kind and size; each tree's entries are what git's tree parser reads; the tag names `second`; the
+  commits' generations are 1, 2 and 3 with their parents. Refs, versions and D(k) read as the store kept them, a rewind
+  of `side` included. The graph's fast-forward for each version is the store's verdict at admission, over six moves:
+  onward, onto the same commit, a tag onto itself, back, a tag to a commit, and onward again. A position the store
+  never gave reads as the null name and is kept as the first fault. And the negotiation over the store answers git's
+  own fetches with git's own objects. For `fetch-haves` (want `third`, have `first`) it answers an `ACK` for `first`,
+  `ready`, and one round over `main`'s versions 1 and 2 with nothing walked, carrying exactly the objects of git's thin
+  pack (read with its bases from the repository, as `index-pack --fix-thin` reads one). For `fetch-clone` the walk
+  sends exactly the objects of git's clone pack.
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): CHECKS-PENDING
+- **Next** (A-640's parts): the service over v2, with one entry point: `fetch`'s arguments mapped onto the negotiation
+  (`want-ref` and `deepen-not` through the refs), the answer's sections in order over side-band, and the pack from
+  A-639's fragments through a trait until it lands; `ls-refs` from the refs; the same service over v0 and v1
+  (`multi_ack_detailed`, `side-band-64k`) on A-604's codecs, with v0's ref names held to A-615's rule; then
+  `sparse:oid`.
+
+Part 1 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`store/graph.rs`,
+new; `store/repository.rs`, the child module's line; `store/mod.rs`, its re-export; `tests/store_graph.rs` and
+`tests/served.rs`, new; `lib.rs`, the test module's line).

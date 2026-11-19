@@ -7,8 +7,10 @@
 //! entries and a tag's object are read from the object's bytes by A-590's parsers, as the store's own walks read them,
 //! a submodule's commit left out (no object of this repository). A green's versions are the store's chain: version `v`
 //! is the chain's `v`-th, numbered from 0, D(v) the positions it brought, and the greens a commit heads the store's own
-//! head map. Whether a version fast-forwarded the one before is found as the store found it when it was admitted: its
-//! head reaches the earlier head, searched back through the commit rows no lower than the earlier head's generation.
+//! head map. Whether a version fast-forwarded the one before is the verdict the store gave its move at admission
+//! (`Move::is_fast_forward`), found again by the store's rule: both heads are commits, and the later is the earlier or
+//! reaches it, searched back through the commit rows no lower than the earlier head's generation. A tag moved onto
+//! itself is no fast-forward, as the store judged it.
 //!
 //! **Refs.** The store holds greens, not names: the caller (the server, which keeps the repository's record) names each
 //! ref's green. Every ref's head is a tip; the refs under `refs/tags/` whose head is an annotated tag are the tags
@@ -71,8 +73,8 @@ pub struct StoreGraph<'r> {
 }
 
 impl<'r> StoreGraph<'r> {
-  /// `repository`'s objects in `store`, with `refs` naming its greens; `None` only where the format's null name could not
-  /// be made, which no format allows.
+  /// `repository`'s objects in `store`, with `refs` naming its greens; `None` only where the format's null name could
+  /// not be made, which no format allows.
   pub fn new(
     repository: &'r Repository,
     store: &'r ContentStore,
@@ -164,8 +166,8 @@ impl<'r> StoreGraph<'r> {
     self.chain(green)?.versions.get(index)?.head
   }
 
-  /// Whether the commit at `later` reaches the commit at `earlier`, searched back through parents no lower than
-  /// `earlier`'s generation.
+  /// Whether the commit at `later` is the commit at `earlier` or reaches it, searched back through parents no lower
+  /// than `earlier`'s generation; never when either is no commit.
   fn reaches(&self, later: u64, earlier: u64) -> bool {
     let Some(floor) = self.commit(earlier).map(|row| row.generation) else {
       return false;
@@ -282,7 +284,7 @@ impl Graph for StoreGraph<'_> {
       return false;
     };
     match (self.head_of(green, before), self.head_of(green, version)) {
-      (Some(earlier), Some(later)) => earlier == later || self.reaches(later, earlier),
+      (Some(earlier), Some(later)) => self.reaches(later, earlier),
       _ => false,
     }
   }

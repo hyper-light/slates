@@ -152,6 +152,14 @@
 > through the refs); the pack from the runs' fragments and the chosen objects (piece 7's next part); `object-info`; the
 > walks in cooperative slices under the shard's budget, and the collections' own overhead charged (entries are charged
 > at their size); exact object sets from reached-set bitmaps; A-614's store implementing `Graph`.
+> **A-640 part 1 (2026-11-19, g296; the store as the negotiation's graph):** A-614's store answers A-615's `Graph`
+> (`store::graph`, `StoreGraph`). Nodes are positions, versions are the store's chains with D(k), each version's
+> fast-forward is the store's own verdict at admission (held to it over six moves, a tag moved onto itself among them),
+> the caller names the refs' greens, and a read the store cannot make is kept as a fault the service refuses on. Over
+> the repository stock git 2.50.1 served from, loaded into a real store, the negotiation sends exactly git's objects
+> for a clone and for a fetch with a have (GAPS-CHECKS-PENDING). This closes A-615's "A-614's store implementing
+> `Graph`". Owed in A-640: the v2 service with one entry point; `ls-refs`; the v0 and v1 service, with v0's ref names
+> held to A-615's rule; the pack from A-639's fragments; `sparse:oid`.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation

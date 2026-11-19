@@ -1,6 +1,6 @@
 //! A-640: the repository stock git 2.50.1 answered the golden vectors from (`fixtures/make-fixtures.sh`), loaded into
-//! A-614's store from its own pack (`fixtures/ofs.pack`, all twelve objects), its refs as greens and `main`'s history as
-//! three fast-forward versions, one a commit, so the service answers from the repository git answered from.
+//! A-614's store from its own pack (`fixtures/ofs.pack`, all twelve objects), its refs as greens and `main`'s history
+//! as three fast-forward versions, one a commit, so the service answers from the repository git answered from.
 //!
 //! `main` is `first`, `second`, `third` (`d0f175d3`); `side` is `first` (`de204ecf`); the annotated tag `v1`
 //! (`01b733a3`) names `second` (`46959f8a`); `HEAD` names `main`.
@@ -12,7 +12,7 @@ use slates_vcs::ContentStore;
 use crate::Admission;
 use crate::object_name::Kind;
 use crate::object_name::{ObjectFormat, ObjectId};
-use crate::store::{Entries, Incoming, NamedRef, Push, Repository};
+use crate::store::{Entries, Incoming, Move, NamedRef, Push, Repository};
 use crate::unpack::{self, NoIndex, Object, Outside, Reader};
 
 /// The pack of all twelve objects, as `git pack-objects --delta-base-offset` wrote it.
@@ -83,19 +83,20 @@ impl Entries for Source<'_> {
   }
 }
 
-/// Commits `objects` and moves each green in `moves` to its head, as one version each.
+/// Commits `objects` and moves each green in `moves` to its head, as one version each. Answers each move's version and
+/// whether the store judged the move a fast-forward when it admitted it.
 pub(crate) fn commit(
   repository: &mut Repository,
   store: &mut ContentStore,
   objects: &[Object],
   moves: &[(u64, &str)],
-) {
+) -> Vec<(u64, bool)> {
   let mut push = Push::new(ObjectFormat::Sha1);
   push
     .admit_all(store, &repository.naming(), &mut Source { objects, at: 0 })
     .unwrap();
   repository.seal(store, &mut push).unwrap();
-  let admitted: Vec<_> = moves
+  let admitted: Vec<Move> = moves
     .iter()
     .map(|(green, head)| {
       repository
@@ -103,7 +104,11 @@ pub(crate) fn commit(
         .unwrap()
     })
     .collect();
-  repository.commit(store, &mut push, &admitted).unwrap();
+  let versions = repository.commit(store, &mut push, &admitted).unwrap();
+  versions
+    .into_iter()
+    .zip(admitted.iter().map(Move::is_fast_forward))
+    .collect()
 }
 
 /// The repository stock git served the golden vectors from.
