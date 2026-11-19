@@ -14,6 +14,9 @@
 //! Where the platforms differ, each answers for itself rather than pretending:
 //! - **Whole sends** ([`TcpStream::make_sends_whole`]): macOS and the BSDs make a send of up to the record bound
 //!   all or none (`SO_SNDLOWAT`); Linux and Windows do not, and say so ([`WholeSends::NotOffered`]).
+//! - **The bytes handed** ([`TcpStream::bytes_handed`]): Linux counts every byte a stream's writers handed it
+//!   (`tcpi_bytes_acked` plus `SIOCOUTQ`), so where a send may stop mid-record a successor can still tell where its
+//!   stream stands (A-550); the others keep no such count.
 //! - **A receive low-water mark** ([`TcpStream::want_bytes`]): Unix keeps one; Windows' TCP provider refuses
 //!   `SO_RCVLOWAT` (Microsoft Learn, SOL_SOCKET options), and its refusal reaches the caller typed.
 //! - **Handing a stream to another process** (`SCM_RIGHTS` of the borrowed descriptor) is Unix's; Windows
@@ -319,6 +322,15 @@ impl TcpStream {
     } else {
       WholeSends::NotOffered
     })
+  }
+
+  /// How many bytes this stream's writers have handed the kernel since the connection was made, where the kernel keeps
+  /// that count (Linux, A-550): every byte written, acknowledged or still queued, and one more once a FIN is queued. An
+  /// accepted connection reads zero before anything is written to it. `None` elsewhere: macOS and the BSDs make a send
+  /// whole instead ([`TcpStream::make_sends_whole`]), and no anchor holds a Windows connection. Read it only of a stream
+  /// no task writes to (a connection just accepted, or one a dead daemon left): a write between its readings is refused.
+  pub fn bytes_handed(&self) -> Result<Option<u64>, RtError> {
+    netsys::bytes_handed(&self.socket)
   }
 
   /// Sets the receive low-water mark (`SO_RCVLOWAT`): readability is reported once `bytes` are queued (or at end of

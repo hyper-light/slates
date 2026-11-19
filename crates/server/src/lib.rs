@@ -78,8 +78,9 @@ mod green_adopt;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
-// The judgment a held NFS connection's adoption takes on Linux (A-550): pure, so every host's tests hold it.
-#[cfg_attr(not(test), allow(dead_code))]
+// A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
+// pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
 mod image;

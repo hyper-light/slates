@@ -127,6 +127,21 @@
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
 
+> **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
+> part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
+> were never checked over the implementation as history checks. `crates/db/src/register_nemesis.rs` (lib tests) runs the
+> real `Acceptor` and the owner's rules over a simulated network, under latency and reordering, loss, duplication,
+> one-way and two-way cuts, holders knocked offline and back from their persisted state, owners paused and resumed,
+> takeovers, and owner restarts under one generation. It checks Agreement (TotalOrder), Continuity (NoLoss for a
+> register), StaleNeverCommits and ReadSafety after every accept, commit and adoption. 48 seeds each at `f = 1` and
+> `f = 2` (1,500 steps a seed) break none, with every fault and the stale and late cases counted (the Mac Studio, 9 s
+> for all four tests). Three mutations kept as tests each break histories (a promise without its fence 39/48 and 44/48;
+> a restart that forgets the fence 16/192 and 9/192; promotion on a minority 23/48 and 7/48), and ReadSafety has a
+> direct red check. Found: the fence carries the load only across an owner's restart under one generation; a takeover's
+> generation refuses the stale owner first. **Owed:** the same nemesis over the live log (`slates_db::live`, whose
+> `crates/db/tests/live.rs` nemesis checks Agreement, NoLoss, StaleNeverCommits and Convergence but not ReadSafety), and
+> the real-process runs of `crates/cli/tests/live_chaos.rs` (main's).
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
@@ -426,7 +441,9 @@
 >   `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`) and
 >   `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key` (`crates/db/tests/model.rs`, with the step in
 >   the db model's histories). Still owed: a guest device or Shards stream serving the stale copy is ended, not waited
->   for, since the adopted state takes the id at once.
+>   for, since the adopted state takes the id at once. Since A-584 (2026-11-19) a Shards stream is ended when the loss
+>   is learned or yielded, and its next turn ends it without writing its guest's maps anywhere; a relinquish that runs
+>   before that turn still does not wait for it, with the guest device's.
 > - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
 >   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
 >   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
@@ -452,9 +469,19 @@
 >   learned fence makes). Held by `an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale`
 >   (`crates/server/tests/fleet.rs`). The FUSE half has no Linux test of its own: the yield calls what
 >   `a_held_descriptor_on_a_superseded_volume_reads_nothing_more` drives.
-> - **Owed (siblings):** the guest device (`crate::virtiofs`), the Shards stream (`crate::shards`) and the WinFsp mount
->   (`crate::winfsp`) still apply only the lease gate (`verbs::live_tree_fenced`) to such a volume, so each holds its
->   requests or, its lease confirmed, serves the copy; each needs its own form of this answer.
+> - **Fixed (A-584, 2026-11-19, goal 91): the Shards stream.** It ends as a revoked stream does, the device reading its
+>   end and its resync channel's, at the moment the owner learns its fence or yields the volume (`shards::superseded`,
+>   beside `fuse::superseded`) and at its next turn over a fence kept across a restart, before any write-back of its
+>   guest's maps, counted `shards.superseded_ended`. Held by
+>   `a_stream_whose_volume_this_node_lost_to_a_successor_ends_unanswered` (`crates/server/src/shards.rs`, the loss
+>   told and kept). Red before on the Mac Studio: the lease gate held the told stream's SAVE unanswered past the test's
+>   60 s wait (`docs/bugs/2026-11-19-a-shards-stream-on-a-volume-lost-to-a-successor-held-its-guest.md`). **What
+>   Shards must do and test:** nothing new to build, since its device already takes a stream's end as its share's end
+>   (no resync follows: the channel is given up with it); owed with its fleet runs, a guest over a stream whose owner
+>   loses the volume sees its share end, and its orchestrator attaches anew on the successor.
+> - **Owed (siblings):** the guest device (`crate::virtiofs`) and the WinFsp mount (`crate::winfsp`) still apply only
+>   the lease gate (`verbs::live_tree_fenced`) to such a volume, so each holds its requests or, its lease confirmed,
+>   serves the copy; each needs its own form of this answer.
 
 > **A live log forked at its owner's warm restart: kept and resumed past every position it may have shipped (2026-11-18,
 > A-344, §4.10, §4.8 "Recovery"; g230; found by A-343's probes).** The shipper lived in the owner shard's memory alone.
@@ -970,6 +997,12 @@
 > nothing holds it, and a clone made after a restart carries them again. Proven by the vfs lib tests (the let-go, and a
 > restart rebuilt beside the origin); the server's restore over a clone and a real daemon's restart of one are filed
 > for main. A clone made for a restore not yet come keeps its carried files only until a restart.
+> **Candidate (A-584's triage, 2026-11-19; recorded, not built, by main's decision):** a RESTORE onto a volume changed
+> since the cut, or of a guest that held a file with no name, needs a clone of the cut's snapshot, and nothing outside
+> the tables, which are opaque to Shards, tells the caller which snapshot that is: the refusal (`RESTORE_ELSEWHERE`)
+> names neither the volume nor the snapshot. A save and then a restore onto the volume unchanged since the cut needs
+> nothing more, so Shards' `shards restore` taking a served share and its real-VM test of one need nothing new of
+> slates.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
@@ -1182,8 +1215,9 @@
 >   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
 >   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
 >   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
->   their first compile and run owed to main; owed of it, A-503's own move test (a clone moved b to c after a to b),
->   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
+>   their first compile and run owed to main, as is A-503's own move test (A-589:
+>   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
+>   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
 >   (3) a kind
@@ -12003,19 +12037,30 @@ dead daemon left: 72 pipelined writes across six kills answered on one connectio
 (`crates/cli/tests/nfs_held.rs`; docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md).
 
 Open:
-- Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
-  against a ledger of the send in flight (A-113) before it may resume one.
+- ~~Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
+  against a ledger of the send in flight (A-113) before it may resume one.~~ **Built 2026-11-19 (A-550 parts 1 and 2,
+  goal 85 B12, g079); the Linux kill run is owed (below).**
   - **Built, part 1 (2026-11-18, A-550, goal 85, g079): the adoption's judgment.** `crate::held_send::resume` judges a
     held connection from the bytes the kernel says its writer handed it against the ledger of the send in flight:
     exactly the bytes before that send (`Untouched`) or those and the whole send (`Whole`) serve on, any other count is
     `Torn` and ends the connection. Held by `a_held_connection_is_served_on_only_on_a_records_boundary` (the server's
     unit tests, every host), red with today's rule on the Mac Studio.
-  - **Owed, part 2 (Linux-only, main's to write and compile; run-requests.md):** the ledger in anchor-owned RAM (per
-    held connection, `committed` and `in_flight` written before each send and `committed` advanced after it, each
-    record checksummed so a torn write reads as torn); the kernel's count at adoption (`TCP_INFO`'s
-    `tcpi_bytes_acked`, measured for whether it counts the SYN, plus `SIOCOUTQ`); `make_sends_whole` answering held on
-    Linux once both are there, and `nfs::adopt_held` ending a `Torn` connection before it reads; then the Linux kill
-    run of `crates/cli/tests/nfs_held.rs`.
+  - **Built, part 2 (2026-11-19, A-550, g079): the kernel's count, the ledger and the hold.**
+    `slates_rt::tcp::TcpStream::bytes_handed` is `tcpi_bytes_acked` plus `SIOCOUTQ`, read until the acknowledged count
+    agrees on both sides of the queue's reading. It counts no SYN on an accepted connection, by the kernel's source
+    (the child's `snd_una` and `write_seq` both start one past the SYN-ACK, its count is the zeroed listener's, and the
+    handshake's last ACK moves `snd_una` by nothing: v6.12 and mainline, lines in the design's A-550) and by a check at
+    every admission (the count must read zero). The ledger is a `memfd` the anchor holds as a copy (record tag
+    `NFSLEDG\x01`, copy ids with their top sixteen bits all ones): a slot per held connection, two records and a selector,
+    so the record in force was always written whole (no checksum needed). `admit` holds a Linux connection under it; every
+    send records before and commits after (`send_ledgered`); a start judges each handed-back connection by the newest
+    ledger and the kernel's count, fills a fresh ledger, has it held, lets the old go, then serves. Held by the crash
+    oracle `a_successor_judges_a_writer_stopped_after_any_store_rightly` and five more on every host, the count's
+    settling oracle in `slates-rt`, and on Linux `an_accepted_connection_counts_every_byte_written_and_no_syn` and
+    `a_ledger_object_outlives_its_writer`.
+  - **Owed (main's runs; run-requests.md):** the Linux kill run of `crates/cli/tests/nfs_held.rs` (x86_64 and arm64),
+    which now holds Linux connections for the first time; the gates (clippy on `slates-rt` and `slates-server`, `cargo
+    xtask check` with the unsafe budget's new site, the Windows compile of the `bytes_handed` arm).
 - The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
   so it waits for Ada.
   - **2026-11-18 (g079), Ada's go.** On Adas-Mac-Studio-2 (b24c5c95: M4 Max, macOS 26.2, no memory tagging),
@@ -12200,8 +12245,10 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
 >     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
 >     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
->   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
->     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
+>   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
+>     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
+>     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
+>   - A-555's remainder: WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
 >     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
 >     a volume over an S3 base through a daemon, its fetch answered by `SimS3`, once a volume over an S3 base can be
 >     made. A volume destroyed (or its host replaced) while requests wait on its fetches leaves them to their deadline,

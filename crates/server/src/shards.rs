@@ -54,7 +54,8 @@
 //!   VMM the whole content object (A-135). A refusal is an errno its guest's mapping returns.
 //!
 //! **Teardown.** The peer closing its end, a frame refused as hostile, an error on the stream, a `detach`, a
-//! revocation, the volume's destroy and the daemon's stop all end the attachment the same way ([`ended`]): its
+//! revocation, the volume's destroy, its loss to a successor ([`superseded`], A-584) and the daemon's stop all end the
+//! attachment the same way ([`ended`]): its
 //! references are swept through the bridge (a guest sends no forget per reference at its end), its registry entry
 //! revoked and drained, its descriptor closed, and its record removed as a recorded operation. Anything but the stream
 //! itself ends the stream first ([`end_stream`]), so the task wakes on its own readiness and ends the rest; the stream
@@ -265,6 +266,9 @@ const SAVE_REFUSED: &str = "shards.save_refused";
 const RESTORED: &str = "shards.restored";
 /// Format: the refusal-ledger name of a RESTORE refused (A-303), which changed nothing.
 const RESTORE_REFUSED: &str = "shards.restore_refused";
+/// Counter: streams ended because this node lost their volume to a successor (A-584, A-346's form for this route): each
+/// ended as a revoked one is, its guest answered nothing more from the copy the successor's writes passed.
+const SUPERSEDED_ENDED: &str = "shards.superseded_ended";
 /// Format: the reason a SAVE carries when it brings anything: Shards' device sends none.
 const SAVE_MALFORMED: &str = "a SAVE brings nothing after its ask";
 /// Format: the reason a SAVE carries when the guest's stores through its maps could not reach the volume first.
@@ -1497,6 +1501,17 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
 /// One turn of `stream`: the owed reply out first; then, while the owner may serve the volume, one frame taken and
 /// answered, its reply out as far as the stream takes it.
 fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
+  // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced at a later epoch, A-338, or
+  // yielded at this host's re-admission, A-334) ends its stream as a revoked one ends (A-584, A-346's form for this
+  // route): nothing more answered from the copy the successor's writes passed, and nothing of its guest's maps written
+  // into it, so this comes before an ending's write-back. Found here for a stream the loss was learned before it was
+  // made, and for one over a fence kept across a restart (A-344); [`superseded`] ends the rest at the loss.
+  if crate::verbs::lost_to_a_successor(s, stream.volume) {
+    if !stream.ending {
+      s.count(SUPERSEDED_ENDED, 1);
+    }
+    return Turned::Ended;
+  }
   // An ending stream first writes back its guest's stores through its maps (step 3), once, then ends.
   if stream.ending && !stream.dax.ingesting() && !begin_end_ingest(s, stream) {
     return Turned::Ended;
@@ -2623,6 +2638,25 @@ pub(crate) fn end_stream(s: &mut ShardState, attachment: u64) {
   }
 }
 
+/// Ends every stream this shard serves of `volume`, which this node has just lost to a successor (A-584; its log fenced
+/// at a later epoch, A-338, or yielded at this host's re-admission, A-334), as a revocation ends one ([`end_stream`]):
+/// its device reads the end, and its task, woken by it, ends the rest without writing its guest's maps into the copy the
+/// successor's writes passed ([`turn_with`]). The stream's form of the `NFS3ERR_STALE` an NFS mount of the volume
+/// answers and of the end a FUSE mount meets (A-346). Before, such a stream went on answering its guest from this
+/// node's copy, or, behind the lease gate, held its requests for good.
+pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
+  let streams: Vec<u64> = s
+    .shards_streams
+    .iter()
+    .filter(|(_, stream)| stream.volume == volume && !stream.ending)
+    .map(|(attachment, _)| *attachment)
+    .collect();
+  for attachment in streams {
+    end_stream(s, attachment);
+    s.count(SUPERSEDED_ENDED, 1);
+  }
+}
+
 /// Ends every stream the shard serves (the daemon's stop): each attachment's references swept, its registry entry
 /// released and its record removed. Run by the end of the shard's serve loop (`daemon::EndStreams`): on a stop
 /// nothing else runs on the shard.
@@ -3017,12 +3051,20 @@ mod tests {
     })
   }
 
-  /// Sends a SAVE as Shards' device sends one, on a stream attached to `volume` for [`owner`], and reads its answer: the
-  /// answer's first byte (granted or refused) and what follows it.
-  fn saved(
+  /// A stream attached to a volume for [`owner`], as Shards' device holds it: its attachment, its end (blocking, each read
+  /// bounded by [`ANSWER_WAIT`]) and the end of its resync channel where one was made, kept while the stream serves, since
+  /// dropping it would end the resync.
+  struct Device {
+    attachment: u64,
+    end: std::os::unix::net::UnixStream,
+    _resync: Option<HandedEnd>,
+  }
+
+  /// Attaches a Shards stream to `volume` for [`owner`], with the intent to write.
+  fn attached_device(
     daemon: &Daemon,
     volume: slates_ipc::protocol::VolumeId,
-  ) -> Result<(u8, Vec<u8>), String> {
+  ) -> Result<Device, String> {
     let (sent, received) = std::sync::mpsc::sync_channel(1);
     daemon
       .attach_shards_stream(
@@ -3041,25 +3083,55 @@ mod tests {
       .recv_timeout(ANSWER_WAIT)
       .map_err(|error| format!("the attach did not answer: {error:?}"))?
       .map_err(|refusal| format!("the attach was refused: {refusal:?}"))?;
-    // The resync channel's end, where one was made, is kept while the stream serves: dropped, it would end the resync.
-    let _resync = attached.resync;
-    let mut device = std::os::unix::net::UnixStream::from(attached.stream);
-    device
+    let end = std::os::unix::net::UnixStream::from(attached.stream);
+    end
       .set_nonblocking(false)
-      .and_then(|()| device.set_read_timeout(Some(ANSWER_WAIT)))
+      .and_then(|()| end.set_read_timeout(Some(ANSWER_WAIT)))
       .map_err(|error| format!("the device's end was not set up: {error}"))?;
+    Ok(Device {
+      attachment: attached.attachment,
+      end,
+      _resync: attached.resync,
+    })
+  }
+
+  /// What met a frame the device sent: a control answer (its first byte, granted or refused, and what follows it), or
+  /// the stream's end with no answer.
+  #[derive(Debug, PartialEq, Eq)]
+  enum Met {
+    Answered(u8, Vec<u8>),
+    Ended,
+  }
+
+  /// Whether `error`, met writing to or reading the device's end, is the stream's end: its peer gone.
+  fn is_end(error: &std::io::Error) -> bool {
+    matches!(
+      error.kind(),
+      std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionReset
+    )
+  }
+
+  /// Sends a SAVE on `device` as Shards' device sends one, and reads what meets it. An error that is neither an answer
+  /// nor the stream's end (no answer within [`ANSWER_WAIT`], a frame that is not a control answer) is the test's failure.
+  fn save_met(device: &mut Device) -> Result<Met, String> {
     let ask = [ASK_SAVE];
     let length = CONTROL_FRAME
       | u32::try_from(ask.len()).map_err(|_| "an ask's length fits its word".to_owned())?;
     let mut frame = length.to_le_bytes().to_vec();
     frame.extend_from_slice(&ask);
-    device
-      .write_all(&frame)
-      .map_err(|error| format!("the SAVE was not sent: {error}"))?;
+    match device.end.write_all(&frame) {
+      Ok(()) => {}
+      Err(error) if is_end(&error) => return Ok(Met::Ended),
+      Err(error) => return Err(format!("the SAVE was not sent: {error}")),
+    }
     let mut word = [0; LENGTH_BYTES];
-    device
-      .read_exact(&mut word)
-      .map_err(|error| format!("the SAVE was not answered: {error}"))?;
+    match device.end.read_exact(&mut word) {
+      Ok(()) => {}
+      Err(error) if is_end(&error) => return Ok(Met::Ended),
+      Err(error) => return Err(format!("the SAVE was neither answered nor ended: {error}")),
+    }
     let word = u32::from_le_bytes(word);
     if word & CONTROL_FRAME == 0 {
       return Err(format!("the answer is not a control frame: {word:#x}"));
@@ -3068,12 +3140,26 @@ mod tests {
       .map_err(|_| "an answer's length fits the address space".to_owned())?;
     let mut answer = vec![0; length];
     device
+      .end
       .read_exact(&mut answer)
       .map_err(|error| format!("the answer was cut short: {error}"))?;
     let (&first, rest) = answer
       .split_first()
       .ok_or_else(|| "the answer has no first byte".to_owned())?;
-    Ok((first, rest.to_vec()))
+    Ok(Met::Answered(first, rest.to_vec()))
+  }
+
+  /// Sends a SAVE as Shards' device sends one, on a stream attached to `volume` for [`owner`], and reads its answer: the
+  /// answer's first byte (granted or refused) and what follows it.
+  fn saved(
+    daemon: &Daemon,
+    volume: slates_ipc::protocol::VolumeId,
+  ) -> Result<(u8, Vec<u8>), String> {
+    let mut device = attached_device(daemon, volume)?;
+    match save_met(&mut device)? {
+      Met::Answered(first, rest) => Ok((first, rest)),
+      Met::Ended => Err("the stream ended with no answer to the SAVE".to_owned()),
+    }
   }
 
   /// A-516 (A-303's "Not here"; Shards' D176 part 5; §4.10, A-200). Do: on an audit daemon, make a volume shipped nowhere
@@ -3129,6 +3215,79 @@ mod tests {
         refused: 1
       },
       "the live volume's SAVE was held for its durability, then refused"
+    );
+  }
+
+  /// Format: the epoch the test's successor fenced each volume's log at: past the audit daemon's own, as a successor's
+  /// takeover is.
+  const SUCCESSOR_EPOCH: u64 = 2;
+
+  /// A-584 (A-346's sibling on the Shards route; §4.8 "Leases and reads", AUD-29-84). Do: on an audit daemon, attach a
+  /// Shards stream to each of two volumes; have this node learn it lost the first to a successor (its log fenced at a
+  /// later epoch, told at once, as a holder's answer finds it), and find the second's fence kept and untold (as a restart
+  /// over a kept fence finds it, A-344); then send each stream a SAVE as Shards' device does. Expect neither answered:
+  /// each stream ends as a revoked one does, its device reading the end, its attachment's record gone, two ends counted.
+  /// Before A-584 a stream applied only the lease gate to such a volume, so it went on answering its guest from this
+  /// node's copy, which the successor's writes had passed, or held its requests for good.
+  #[test]
+  fn a_stream_whose_volume_this_node_lost_to_a_successor_ends_unanswered() {
+    let daemon = crate::daemon::audit_daemon();
+    let volumes = crate::daemon::observe_first(&daemon, |state| {
+      (
+        volume_here(state, "lost-told", false),
+        volume_here(state, "lost-kept", false),
+      )
+    });
+    let (Some(told), Some(kept)) = volumes else {
+      daemon.stop();
+      panic!("the volumes were not made: {volumes:?}");
+    };
+    let devices = (
+      attached_device(&daemon, told),
+      attached_device(&daemon, kept),
+    );
+    let (Ok(mut told_device), Ok(mut kept_device)) = devices else {
+      daemon.stop();
+      panic!(
+        "the streams were not attached: {:?}, {:?}",
+        devices.0.err(),
+        devices.1.err()
+      );
+    };
+    let injected = (
+      daemon.inject_superseded(told, SUCCESSOR_EPOCH, true),
+      daemon.inject_superseded(kept, SUCCESSOR_EPOCH, false),
+    );
+    let told_met = save_met(&mut told_device);
+    let kept_met = save_met(&mut kept_device);
+    let attachments = (told_device.attachment, kept_device.attachment);
+    let after = crate::daemon::observe_first(&daemon, move |state| {
+      let partition = state.db.partition();
+      (
+        partition.attachment(attachments.0).is_some(),
+        partition.attachment(attachments.1).is_some(),
+        state.refusals.get(SUPERSEDED_ENDED).copied().unwrap_or(0),
+      )
+    });
+    daemon.stop();
+    assert!(
+      injected.0.is_ok() && injected.1.is_ok(),
+      "each loss was injected: {injected:?}"
+    );
+    assert_eq!(
+      told_met,
+      Ok(Met::Ended),
+      "a stream whose volume the node learns it lost ends, its guest answered nothing more"
+    );
+    assert_eq!(
+      kept_met,
+      Ok(Met::Ended),
+      "a stream over a fence kept untold ends at its next request"
+    );
+    assert_eq!(
+      after,
+      (false, false, 2),
+      "both attachments' records are gone and both ends are counted"
     );
   }
 }
