@@ -11,9 +11,10 @@
 //! `Missing` otherwise. An object that cannot be read is `Missing`, since what it names cannot be known.
 //!
 //! **Bounds.** Every object is read twice, once to count the edges among the pushed objects and once to keep them, so
-//! the tables are charged exactly before they are made; each read's own transient structures are held to what the
-//! admission has left, and never charged. The worst state is carried back over the edges with an explicit stack, each
-//! object finished once.
+//! the tables are charged exactly before they are made. A read's own transient structures (A-590's header and entry
+//! lists) are a small multiple of the object's bytes, which the pack's admission already charged, and are freed before
+//! the next read, so they are not charged again. The worst state is carried back over the edges with an explicit stack,
+//! each object finished once.
 
 use super::{Pushed, Refusal, Repository, Request, reserve};
 use crate::Admission;
@@ -87,7 +88,7 @@ fn states<R: Repository + ?Sized>(
   for (at, object) in objects.iter().enumerate() {
     let shallow_commit = shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
-    let read = for_each_edge(object, request.format, admission, &mut |target, parent| {
+    let read = for_each_edge(object, request.format, &mut |target, parent| {
       if pushed.position(&target).is_some() {
         inside = inside.saturating_add(1);
       } else if !repository.holds(&target) {
@@ -138,7 +139,7 @@ fn edges(
   reserve(&mut targets, inside)?;
   offsets.push(0);
   for object in objects {
-    for_each_edge(object, format, admission, &mut |target, _| {
+    for_each_edge(object, format, &mut |target, _| {
       if let Some(at) = pushed.position(&target)
         && targets.len() < targets.capacity()
       {
@@ -151,15 +152,14 @@ fn edges(
 }
 
 /// Hands each object `object` names to `each`, with whether it is a commit's parent: whether the object could be read.
-/// Each read holds its transient structures to what `admission` has left, without charging them; a read past that is
-/// refused as the admission's.
+/// The read's transient structures, bounded by the object's own bytes, take a scratch admission of their own (this
+/// module's **Bounds**).
 fn for_each_edge(
   object: &Object,
   format: ObjectFormat,
-  admission: &Admission,
   each: &mut impl FnMut(ObjectId, bool),
 ) -> Result<bool, Refusal> {
-  let mut scratch = Admission::new(admission.left());
+  let mut scratch = Admission::new(u64::MAX);
   let read = match object.kind {
     Kind::Commit => Commit::parse(&object.content, &mut scratch).map(|commit| {
       let tree = commit.tree(format);
