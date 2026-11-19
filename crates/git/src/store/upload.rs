@@ -1061,7 +1061,9 @@ impl<A: Answered> Upload<A> {
       from: position.saturating_add(1),
     };
     if row.len > to_u64(cx.store.window()) {
-      self.pending = Some(self.loose_large(cx, (id, row, content), out)?);
+      // Red (A-653 continued (4)): today's decision, an object past a window sent whole with no trial.
+      self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
+      self.pending = Some(self.send_whole(cx, (id, row, content), out)?);
       return Ok(next);
     }
     let bytes = cx

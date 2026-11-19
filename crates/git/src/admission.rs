@@ -87,9 +87,8 @@ impl Admission {
 
   /// Gives `hold`'s bytes back, at most what this admission's holds still keep (module docs).
   pub fn release(&mut self, hold: Hold) {
-    let back = hold.bytes.min(self.held);
-    self.held = self.held.saturating_sub(back);
-    self.left = self.left.saturating_add(back);
+    // Red (A-653 continued (4)): before the release, a charge was never given back.
+    drop(hold);
   }
 }
 
