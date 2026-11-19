@@ -31,15 +31,15 @@
 //! versions from the work's base to the head: the values there at the head, their last changes, the copies above them,
 //! the deltas on them, and what stood there at the base. Every commit records each path its effects change, its node
 //! moves included (`Green::record_changes`), so a footprint that meets no path changed since read the same at both
-//! heads, and its effects (a file's bytes, a link's home) are the same too. A copy made since changes the last change of
-//! every path in its tree without naming each, so a footprint in the tree of a copy made since is met as well. What only
-//! the copies' verdict reads (the reverse map of hard links, the head's version, the fold floor) is covered by judging
-//! the copies again. A hard link's change (made, removed, or turned to another file, a node move's included) is recorded
-//! at the link's own name and never at the file it names, so what changed since also names, for each link changed, the
-//! file it named at the earlier head and the one it names at the later ([`Since`]): the links naming a file read the same
-//! at both heads unless one of them changed. No copy changes them: a copy never brings a hard link, and never lands
-//! over one or over a file one names (its verdict refuses each, `copy`'s module docs), so no link has a copy made since
-//! above it.
+//! heads, and its effects (a file's ops and the head's file the commit makes it over, a link's home) are the same too.
+//! A copy made since changes the last change of every path in its tree without naming each, so a footprint in the tree
+//! of a copy made since is met as well. What only the copies' verdict reads (the reverse map of hard links, the head's
+//! version, the fold floor) is covered by judging the copies again. A hard link's change (made, removed, or turned to
+//! another file, a node move's included) is recorded at the link's own name and never at the file it names, so what
+//! changed since also names, for each link changed, the file it named at the earlier head and the one it names at the
+//! later ([`Since`]): the links naming a file read the same at both heads unless one of them changed. No copy changes
+//! them: a copy never brings a hard link, and never lands over one or over a file one names (its verdict refuses each,
+//! `copy`'s module docs), so no link has a copy made since above it.
 //!
 //! **The oracle** (`compute_tests.rs`): generated concurrent histories on a green that judges every work serially at its
 //! head and a green that commits by position the verdicts a lagging copy computed, both held equal at every step.

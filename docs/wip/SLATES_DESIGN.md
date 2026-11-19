@@ -47417,15 +47417,15 @@ Applied in the same change to:
     base, at the cost of the changes since.
   - **Copies** read the head's version and the green's fold floor (A-626 part 2's fix), so a work's copies are judged
     again whenever the green moved or the owner's floor is not the computing copy's.
-  - **Why it is exact.** Every commit records each path its effects change in the change index, node moves included,
-    so a footprint none of those paths meets read the same at both heads, and its effects (a file's bytes, a link's
-    home) are the same too. A copy made since changes the last change of every path in its tree without naming each,
-    so a footprint in its tree is met too. A hard link's change (made, removed, or turned to another file, a node
-    move's included) is recorded at the link's own name, never at the file it names, so what changed since also names,
-    for each link changed, the file it named at the earlier head and the one it names at the later (`Since`): a unit
-    reading the links naming a file is judged again when either is its file. A copy never brings a hard link and never
-    lands over one or over a file one names (A-626), so no copy changes which links name a file; the copies' verdicts,
-    which read the reverse map of links too, are judged again whenever the green moved.
+  - **Why it is exact.** Every commit records each path its effects change in the change index, node moves included, so
+    a footprint none of those paths meets read the same at both heads, and its effects (a file's ops and the head's file
+    the commit makes it over, a link's home) are the same too. A copy made since changes the last change of every path
+    in its tree without naming each, so a footprint in its tree is met too. A hard link's change (made, removed, or
+    turned to another file, a node move's included) is recorded at the link's own name, never at the file it names, so
+    what changed since also names, for each link changed, the file it named at the earlier head and the one it names at
+    the later (`Since`): a unit reading the links naming a file is judged again when either is its file. A copy never
+    brings a hard link and never lands over one or over a file one names (A-626), so no copy changes which links name a
+    file; the copies' verdicts, which read the reverse map of links too, are judged again whenever the green moved.
   - **Merged with A-669 and A-670** (main 4644dcec3). A-669 hands a node on to a link with the work's writes, and
     A-670 refuses a removal or a replacement of a file that a link made after the work's base names. Both read which
     links name a file, which a footprint of paths misses: a link made or removed since the position records only the
@@ -47436,6 +47436,12 @@ Applied in the same change to:
     replacement's footprint names the links naming its file; the first unit's names the links naming the files the work
     removes or replaces; and `Green::since` gathers, for each link changed since, its file then and now, O(the changes
     since).
+  - **Merged with "a verdict makes no file until it accepts"** (main 71f05f93d). A computed verdict holds a mapped file
+    as its ops at the computing head, never its bytes; the owner's hold pairs it with the increment's post-state
+    (`Judged`), and the commit makes the file over the head the hold was judged at (`Green::make_mapped`). A content
+    unit standing as computed names a file no version since changed, so the file made over the owner's head is the one
+    the computing copy would have made; one judged again places its ops at the owner's head first. The deferral needs no
+    rule of its own here.
   - **Typed refusals** (`PositionRefused`), nothing judged or applied: `OtherWork` (computed for another increment or
     base); `Ahead { at, head }` (computed at a head past the owner's: no copy is ahead of its owner); `NotRecorded {
     version }` (the computing copy had accepted the increment at a version this green's record does not hold, so it was
