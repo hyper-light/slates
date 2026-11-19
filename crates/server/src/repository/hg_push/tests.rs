@@ -12,7 +12,7 @@ use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::{HgIndex, Log};
 use slates_hg::phases::{Phase, PhaseHead};
 use slates_hg::push::held::IndexHeld;
-use slates_hg::push::reply::{Refused, Reply};
+use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Taken, Unbundle, read};
 use slates_hg::serve::{Repository, Rev};
 use slates_hg::{Admission, NULL_NODE, Node, delta, node};
@@ -22,7 +22,7 @@ use slates_vcs::ContentStore;
 
 use super::{
   BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, branch_prefix, land, line_name, line_of,
-  prepare,
+  prepare, transaction_id,
 };
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
@@ -578,6 +578,93 @@ fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert!(hg.holds(&made[3].node));
 }
 
+/// A-657 part 4 (`HG_TXNID`; 7.2's `localrepo.transaction`). Do: prepare stock `push-plain` on the rebuilt repository,
+/// and take the transaction ids of the push's name and of another. Expect: the prepared push's id is its name's, `TXN:`
+/// and forty lower-case hexadecimal digits; the same name gives the same id, another name another.
+#[test]
+fn a_push_names_its_transaction_as_7_2_does() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "transaction");
+    rebuild(state, &mut hg, (&[1], 1));
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let prepared = hg
+      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
+      .unwrap();
+    assert_eq!(prepared.transaction, transaction_id(&NAME));
+    let digits = prepared.transaction.strip_prefix("TXN:").unwrap();
+    assert_eq!(digits.len(), 40);
+    assert!(
+      digits
+        .bytes()
+        .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    assert_eq!(transaction_id(&NAME), transaction_id(&[7; 32]));
+    assert_ne!(transaction_id(&NAME), transaction_id(&[8; 32]));
+  });
+}
+
+/// A reply part as a client reads it: its type, the part it answers (`in-reply-to`) and its payload.
+type ReplyPart = (Vec<u8>, Option<Vec<u8>>, Vec<u8>);
+
+/// A reply's parts as a client reads them.
+fn reply_parts(bytes: &[u8]) -> Vec<ReplyPart> {
+  let bundle = Bundle2::decode(bytes, &mut room()).unwrap();
+  bundle
+    .top_level()
+    .map(|(index, part)| {
+      let payload = bundle
+        .payload(index)
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+      let answers = part.param(b"in-reply-to").map(<[u8]>::to_vec);
+      (part.kind.to_vec(), answers, payload)
+    })
+    .collect()
+}
+
+/// A-657 part 4 (§4.17.3 "Hooks"; 7.2's `bundle2._processpart` writes what a part's handler printed, a
+/// `pretxnchangegroup` hook's words among it, as an `output` part right after that handler's reply, naming the part).
+/// Do: prepare stock `push-plain` on the rebuilt repository, hand it the words an admission hook printed as `run_hooks`
+/// hands them back (naming the push's changegroup part), and land it. Expect: its hooks are handed the push's one
+/// changeset as first and last; the reply is 7.2's `push-plain` reply with the hook's words as an `output` part in
+/// reply to the changegroup part, right after `reply:changegroup`.
+#[test]
+fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "words");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let unbundle = stock(fixture!("push-plain.hg"));
+    let (changegroup, _) = unbundle.changegroup().unwrap();
+    let mut prepared = hg.prepare(state, &unbundle, &view).unwrap();
+    assert_eq!(prepared.added, Some((made[3].node, made[3].node)));
+    let words = b"pretxnchangegroup.words: checked\n".to_vec();
+    let in_reply_to = prepared.changegroup;
+    prepared.with_output(vec![Replied::Output {
+      in_reply_to,
+      words: words.clone(),
+    }]);
+    let reply = hg.land(state, prepared).answer.unwrap();
+    let mut expected = reply_parts(fixture!("push-plain-reply.hg"));
+    let after = expected
+      .iter()
+      .position(|(kind, ..)| kind.as_slice() == b"reply:changegroup")
+      .unwrap();
+    let named = changegroup.to_string().into_bytes();
+    expected.insert(
+      after.saturating_add(1),
+      (b"output".to_vec(), Some(named), words),
+    );
+    assert_eq!(reply_parts(&encoded(&reply)), expected);
+  });
+}
+
 /// A-657, A-642 (a race found where the entry appends). Do: on the rebuilt repository, prepare stock `push-plain`
 /// (its check that `second` is a head holds), then land another client's push moving `default` (`other`), then land
 /// the prepared push. Expect: the other push lands; the prepared one is refused as 7.2's race, byte for byte its
@@ -760,5 +847,439 @@ proptest! {
     prop_assert!(!mark.contains('\0') && mark.starts_with(BOOKMARK_TAG) && !mark.starts_with(LINE_TAG));
     prop_assert_eq!(bookmark_name(&second).starts_with(&mark), first == second);
     prop_assert!(line_of(&mark).is_none());
+  }
+}
+
+/// The stranger, another principal.
+fn stranger() -> slates_ipc::protocol::Principal {
+  slates_ipc::protocol::Principal::Uid { host: 0, uid: 4321 }
+}
+
+/// Sets repository `name`'s policy to `rules`, from version `read`.
+fn set_policy(
+  state: &mut ShardState,
+  (name, read): (&str, u64),
+  rules: Vec<slates_ipc::protocol::PolicyRule>,
+) {
+  let reply = dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::SetRepositoryPolicy {
+      repository: name.to_owned(),
+      read,
+      rules,
+      hooks: Vec::new(),
+      hooks_env: Vec::new(),
+    },
+  );
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.
+fn rule(
+  names: slates_ipc::protocol::PolicyNames,
+  pattern: &str,
+  (effect, who): (
+    slates_ipc::protocol::PolicyEffect,
+    slates_ipc::protocol::PolicyWho,
+  ),
+) -> slates_ipc::protocol::PolicyRule {
+  slates_ipc::protocol::PolicyRule {
+    names,
+    pattern: pattern.to_owned(),
+    right: slates_ipc::protocol::PolicyRight::Submit,
+    effect,
+    who,
+  }
+}
+
+/// A-657 part 4 (A-622 part 2's `admit`, §4.17.3 "Push" step 5; `acl`'s words). Do: with a rule denying every
+/// principal a submit to branch `default`, prepare stock `push-plain` and ask the policy; with the rule gone, ask again;
+/// on another repository whose one rule lets only a stranger submit to bookmarks, prepare stock `push-bookmark`'s move
+/// of `main` and ask. Expect: the first refused in `acl`'s words naming the principal, `default` and the first changeset
+/// the push brings on it in `short`'s twelve digits; the second admitted (no rule speaks, and the owner holds what none
+/// speaks to); the third refused as not allowed on bookmark `main`, naming every digit of the bookmark's new node, the
+/// `new` 7.2 hands `prepushkey` for a bookmark (`bundle2_part_handlers.handlebookmark`) and `acl` names.
+#[test]
+fn the_policy_refuses_before_the_verdict_in_acls_words() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyNames, PolicyWho};
+  crate::daemon::audit_on_shard(|state| {
+    let mut plain = Hg::new(state, "acl-plain");
+    rebuild(state, &mut plain, (&[1], 1));
+    set_policy(
+      state,
+      ("acl-plain", 0),
+      vec![rule(
+        PolicyNames::Branches,
+        "default",
+        (PolicyEffect::Deny, PolicyWho::Anyone),
+      )],
+    );
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let prepared = plain
+      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
+      .unwrap();
+    let denied = format!(
+      "acl: user \"{:?}\" denied on branch \"default\" (changeset \"048741fabe42\")",
+      owner()
+    );
+    assert_eq!(
+      super::admitted(state, (&owner(), plain.repository), &prepared),
+      Err(Refused::Abort {
+        message: denied.into_bytes(),
+        hint: None
+      })
+    );
+    set_policy(state, ("acl-plain", 1), Vec::new());
+    assert_eq!(
+      super::admitted(state, (&owner(), plain.repository), &prepared),
+      Ok(())
+    );
+    let mut marks = Hg::new(state, "acl-mark");
+    rebuild(state, &mut marks, (&[0], 0));
+    let only = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: stranger(),
+      }],
+    };
+    set_policy(
+      state,
+      ("acl-mark", 0),
+      vec![rule(
+        PolicyNames::Bookmarks,
+        "*",
+        (PolicyEffect::Allow, only),
+      )],
+    );
+    let view = View::of(
+      listing!("push-bookmark-server.txt"),
+      listing!("push-bookmark-bookmarks.txt"),
+    );
+    let prepared = marks
+      .prepare(state, &stock(fixture!("push-bookmark.hg")), &view)
+      .unwrap();
+    let second = "59d5dc23f8786c06d0fae53e625be1cdd640a783";
+    let listed = format!(
+      "acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"{second}\")",
+      owner()
+    );
+    assert_eq!(
+      super::admitted(state, (&owner(), marks.repository), &prepared),
+      Err(Refused::Abort {
+        message: listed.into_bytes(),
+        hint: None
+      })
+    );
+  });
+}
+
+/// A-657 part 4 (`acl`'s words for a bookmark deleted: 7.2's `bundle2_part_handlers.handlebookmark` hands `prepushkey`
+/// the pushkey's `new`, empty for a deletion, and `acl`'s `_pkhook` names it as the changeset). Do: with a rule denying
+/// every principal the deletion of any bookmark, prepare a push deleting `main` and ask the policy. Expect: refused in
+/// `acl`'s words naming bookmark `main` and an empty changeset, never the node `main` leaves.
+#[test]
+fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
+  crate::daemon::audit_on_shard(|state| {
+    let mut marks = Hg::new(state, "acl-delete");
+    rebuild(state, &mut marks, (&[1], 1));
+    set_policy(
+      state,
+      ("acl-delete", 0),
+      vec![PolicyRule {
+        names: PolicyNames::Bookmarks,
+        pattern: "*".to_owned(),
+        right: PolicyRight::Delete,
+        effect: PolicyEffect::Deny,
+        who: PolicyWho::Anyone,
+      }],
+    );
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let deleting = Unbundle {
+      parts: vec![taken(
+        0,
+        Asks::Bookmarks(vec![BookmarkAt {
+          name: b"main".to_vec(),
+          node: None,
+        }]),
+      )],
+    };
+    let prepared = marks.prepare(state, &deleting, &view).unwrap();
+    let denied = format!(
+      "acl: user \"{:?}\" denied on bookmark \"main\" (changeset \"\")",
+      owner()
+    );
+    assert_eq!(
+      super::admitted(state, (&owner(), marks.repository), &prepared),
+      Err(Refused::Abort {
+        message: denied.into_bytes(),
+        hint: None
+      })
+    );
+  });
+}
+
+/// A-657 part 4 (`acl`'s order: 7.2's `_txnhook` walks the pushed changesets in revision order and names the first it
+/// refuses). Do: with a rule denying every principal a submit to any branch, prepare a push whose first changeset opens
+/// branch `stable` and whose second moves `default`'s line, and ask the policy. Expect: refused naming `stable` and its
+/// changeset, the branch `acl` meets first, though the line the push moves is `default`'s.
+#[test]
+fn the_policy_names_the_branch_acl_meets_first() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyWho};
+  crate::daemon::audit_on_shard(|state| {
+    let mut two = Hg::new(state, "acl-order");
+    let made = rebuild(state, &mut two, (&[1], 1));
+    set_policy(
+      state,
+      ("acl-order", 0),
+      vec![rule(
+        PolicyNames::Branches,
+        "*",
+        (PolicyEffect::Deny, PolicyWho::Anyone),
+      )],
+    );
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let pushed = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[4, 3])))],
+    };
+    let prepared = two.prepare(state, &pushed, &view).unwrap();
+    let stable = hex(&made[4].node);
+    let denied = format!(
+      "acl: user \"{:?}\" denied on branch \"stable\" (changeset \"{}\")",
+      owner(),
+      stable.get(..12).unwrap()
+    );
+    assert_eq!(
+      super::admitted(state, (&owner(), two.repository), &prepared),
+      Err(Refused::Abort {
+        message: denied.into_bytes(),
+        hint: None
+      })
+    );
+  });
+}
+
+/// A-657 part 4's hooks (§4.17.3 "Hooks"; 7.2's `hook.py`), run through the hook driver with this test binary playing
+/// each hook (`hook_driver::tests::a_hook_role`).
+#[cfg(unix)]
+mod hooks {
+  use std::sync::mpsc::channel;
+
+  use slates_db::catalog::{HookConfig, HookPointName, RepositoryPolicy};
+  use slates_hg::push::reply::{Refused, Replied};
+  use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
+
+  use super::super::{Hook, HooksRan, admission_hooks, observing_hooks, run_hooks, transaction_id};
+  use super::NAME;
+  use crate::vcs_hooks::{CommittedView, EnvValue, PendingView};
+
+  /// Format: the variable that makes the test binary, re-invoked, a hook of the role it names (hook_driver's tests').
+  const ROLE: &str = "SLATES_HOOK_ROLE";
+  /// Format: the libtest name of the role test the binary is re-invoked with.
+  const ROLE_TEST: &str = "hook_driver::tests::a_hook_role";
+  /// Shape: how many bytes of a hook's words the test keeps.
+  const CAP: usize = 1 << 16;
+  /// Shape: how long a test lets a push's hooks take before giving up on them: ten liveness windows (`hook_driver`'s
+  /// and `svn_hooks`' tests), so a hook that never ends fails its test rather than hanging the suite.
+  const TEST_BOUND_NS: u64 = 10 * crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: the changegroup part's id the hooks' output names.
+  const PART: u32 = 4;
+
+  /// A one-shard runtime for a driven run, as hook_driver's tests make one.
+  fn runtime() -> LocalRuntime {
+    LocalRuntime::new(&RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 8,
+      timers_per_shard: 8,
+      ring_entries: 8,
+      step_budget_ns: 1_000_000,
+      timer_tick_ns: 100_000,
+      batch: 8,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+      wake_tracking: None,
+    })
+    .expect("a local runtime")
+  }
+
+  /// A policy configuring `hooks`, each a point and a name.
+  fn policy(hooks: &[(HookPointName, &str)]) -> RepositoryPolicy {
+    RepositoryPolicy {
+      version: 1,
+      signers: Vec::new(),
+      rules: Vec::new(),
+      hooks: hooks
+        .iter()
+        .map(|(point, name)| HookConfig {
+          point: *point,
+          name: (*name).to_owned(),
+          program: "/usr/local/bin/hook".to_owned(),
+        })
+        .collect(),
+      hooks_env: Vec::new(),
+    }
+  }
+
+  /// `hook` played by this test binary in `role`.
+  fn playing(mut hook: Hook, role: &str) -> Hook {
+    hook.program = std::env::current_exe().unwrap();
+    hook.input.args = [ROLE_TEST, "--exact", "--nocapture", "--"]
+      .iter()
+      .map(|arg| arg.as_bytes().to_vec())
+      .collect();
+    hook
+      .input
+      .env
+      .push((ROLE.to_owned(), EnvValue::Bytes(role.as_bytes().to_vec())));
+    hook
+  }
+
+  /// Runs `hooks` to their answer, the test binary's directory standing for the pending view; the test gives up past
+  /// [`TEST_BOUND_NS`]. The bound's timer is also what keeps the runtime parked for the hooks' events: with no timer
+  /// armed, `run_until_idle` returns at its first poll that finds nothing ready, and the run was left unanswered.
+  fn drive(hooks: Vec<Hook>) -> HooksRan {
+    let runtime = runtime();
+    let (sent, got) = channel();
+    let view = std::env::current_exe()
+      .unwrap()
+      .parent()
+      .unwrap()
+      .to_path_buf();
+    runtime
+      .spawn(async move {
+        let mut gone = core::future::pending::<()>();
+        let running = run_hooks((&hooks, &[]), (&view, CAP, Some(PART)), &mut gone);
+        let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
+        let _ = sent.send(answered.ok().flatten());
+      })
+      .expect("the run's task");
+    runtime.run_until_idle();
+    got
+      .recv()
+      .ok()
+      .flatten()
+      .expect("the hooks answered within the test's bound")
+  }
+
+  /// The value a hook's environment gives `name`.
+  fn env(hook: &Hook, name: &str) -> Option<EnvValue> {
+    hook
+      .input
+      .env
+      .iter()
+      .find(|(held, _)| held == name)
+      .map(|(_, value)| value.clone())
+  }
+
+  /// A-657 part 4 (§4.17.3 "Hooks": admission; 7.2's `apply` and `_exthook`). Do: configure three
+  /// `pretxnchangegroup` hooks around a `changegroup` one, take the admission hooks of a push adding changesets
+  /// 0101… to 0202… and of one adding none, then run them, the first accepting, the second refusing with status 3, the
+  /// third accepting. Expect: the three admission hooks in their order with `HG_NODE` and `HG_NODE_LAST` the first and
+  /// last changesets, `HG_PENDING` the view and `HG_URL` the transport's; none for a push adding nothing; the one
+  /// observing hook; every hook of the push in its one transaction (`HG_TXNID`); the run stops at the second,
+  /// answering `pretxnchangegroup.second hook exited with status 3`, both hooks' words salvaged as `output` parts
+  /// naming the changegroup part, two lessons learned, the third never run.
+  #[test]
+  fn admission_hooks_run_in_order_and_the_first_refusal_answers_in_7_2s_words() {
+    let policy = policy(&[
+      (
+        HookPointName::HgPretxnchangegroup,
+        "pretxnchangegroup.first",
+      ),
+      (HookPointName::HgChangegroup, "changegroup.after"),
+      (
+        HookPointName::HgPretxnchangegroup,
+        "pretxnchangegroup.second",
+      ),
+      (
+        HookPointName::HgPretxnchangegroup,
+        "pretxnchangegroup.third",
+      ),
+    ]);
+    let added = Some(([1; 20], [2; 20]));
+    let transaction = transaction_id(&NAME);
+    let url = "remote:ssh:127.0.0.1";
+    let hooks = admission_hooks(&policy, (added, &transaction), (PendingView(7), url));
+    assert_inputs(&hooks, url);
+    assert!(admission_hooks(&policy, (None, &transaction), (PendingView(7), url)).is_empty());
+    let observing = observing_hooks(&policy, (added, &transaction), (CommittedView(7), url));
+    assert_eq!(observing.len(), 1);
+    let in_transaction = Some(EnvValue::Bytes(transaction.as_bytes().to_vec()));
+    assert!(
+      hooks
+        .iter()
+        .chain(&observing)
+        .all(|hook| env(hook, "HG_TXNID") == in_transaction)
+    );
+    let roles = ["accept", "refuse", "accept"];
+    let ran = drive(
+      hooks
+        .into_iter()
+        .zip(roles)
+        .map(|(hook, role)| playing(hook, role))
+        .collect(),
+    );
+    assert_ran(&ran);
+  }
+
+  /// The three admission hooks in order, the first's changesets, view and url as 7.2 names them.
+  fn assert_inputs(hooks: &[Hook], url: &str) {
+    let names: Vec<&str> = hooks.iter().map(|hook| hook.name.as_str()).collect();
+    assert_eq!(
+      names,
+      [
+        "pretxnchangegroup.first",
+        "pretxnchangegroup.second",
+        "pretxnchangegroup.third"
+      ]
+    );
+    let first = hooks.first().unwrap();
+    assert_eq!(
+      env(first, "HG_NODE"),
+      Some(EnvValue::Bytes(b"01".repeat(20)))
+    );
+    assert_eq!(
+      env(first, "HG_NODE_LAST"),
+      Some(EnvValue::Bytes(b"02".repeat(20)))
+    );
+    assert_eq!(env(first, "HG_PENDING"), Some(EnvValue::ViewRoot));
+    assert_eq!(
+      env(first, "HG_URL"),
+      Some(EnvValue::Bytes(url.as_bytes().to_vec()))
+    );
+  }
+
+  /// The run stopped at the second hook, in 7.2's words, both hooks' words salvaged naming the changegroup part.
+  fn assert_ran(ran: &HooksRan) {
+    let message = b"pretxnchangegroup.second hook exited with status 3".to_vec();
+    assert_eq!(
+      ran.refused,
+      Some(Refused::Abort {
+        message,
+        hint: None
+      })
+    );
+    assert_eq!(ran.lessons.len(), 2);
+    let named: Vec<Option<u32>> = ran
+      .output
+      .iter()
+      .map(|part| match part {
+        Replied::Output { in_reply_to, words } if !words.is_empty() => *in_reply_to,
+        _ => None,
+      })
+      .collect();
+    assert_eq!(named, [Some(PART), Some(PART)]);
   }
 }
