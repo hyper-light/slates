@@ -51872,7 +51872,18 @@ A-686), GAPS (the §4.17.3 entry).
   Subversion site deciding without the connection's kind too): `slates-http-edge --lib credential` 10 of 10,
   `slates-server --lib vcs_http::` 51 of 51 (Subversion's site's five among them, its stock svn read over HTTPS; stock
   hg ran again and reached the site), `slates-cli --test cli vcs_http` 2 of 2, `--test svn_interop -- --list` compiled
-  (5 tests), fmt clean.
+  (5 tests), fmt clean. Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a), red first again
+  over main's own code (this piece's test files alone, kiln r392 and r429): `-p slates-server --lib --
+  vcs_http::daemon_edge::` 4 passed and 3 failed (the two daemon tests above, and stock hg against the daemon in its
+  crash report, `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, as `hg
+  identify` and as `hg debugcapabilities`); `-p slates-cli --test cli -- vcs_http stock_hg_without_credentials` 2
+  passed, 2 failed (the anchor's edge test on Bearer alone; g083's clone with no credentials, un-ignored, `stock hg
+  crashed on the edge's refusal`), the round trip ignored. Then on this tree (kiln r415 at 1435ec4bb, r429 at
+  209a11479): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 52 of 52 (stock hg 7.2's
+  `hg debugcapabilities` by Basic exits 0 listing `getbundle`, no skip), `slates-cli --test cli -- vcs_http
+  stock_hg_without_credentials` 4 of 4 with the round trip ignored (stock hg's clone with no credentials refused against
+  a real anchor in its own words, exit 255; A-685's `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`
+  among them), `--test svn_interop -- --list` compiled (5 tests), fmt clean.
 - **Not changed, on purpose.** g083's stock-hg HTTP round trip stays ignored on the hg site's pushes (A-680 part 2b),
   and the stock-svn interop tests' two HTTP legs on A-681's later parts and A-685, A-686 dropped from their reasons.
 - **Owed.** Stock hg's round trip over a running anchor, once the hg site takes pushes (A-680 part 2b); stock svn over

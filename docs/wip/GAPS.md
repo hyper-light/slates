@@ -595,7 +595,8 @@
 > vcs_http` 2 of 2, fmt clean; over main 693bc8feb (kiln r361, Subversion's site deciding alike) 10, 51 and 2 of each.
 > Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a): stock hg 7.2's `hg
 > debugcapabilities` by Basic on a daemon's loopback cleartext edge answered from the repository's store, and g083's
-> clone with no credentials against a real anchor un-ignored, refused in hg's own words. RUNS_PENDING
+> clone with no credentials against a real anchor un-ignored, refused in hg's own words: red first over main's code
+> (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean.
 > Owed: g083's stock-hg round trip over the anchor's edge, once the hg site takes pushes (A-680 part 2b); stock `hg
 > identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
 > found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
