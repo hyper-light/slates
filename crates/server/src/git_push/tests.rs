@@ -95,9 +95,21 @@ macro_rules! scenario {
   ($name:literal) => {
     Scenario {
       name: $name,
-      request: include_bytes!(concat!("../../../git/fixtures/push/", $name, ".request.bin")),
-      response: include_bytes!(concat!("../../../git/fixtures/push/", $name, ".response.bin")),
-      before: include_str!(concat!("../../../git/fixtures/push/", $name, ".before.refs")),
+      request: include_bytes!(concat!(
+        "../../../git/fixtures/push/",
+        $name,
+        ".request.bin"
+      )),
+      response: include_bytes!(concat!(
+        "../../../git/fixtures/push/",
+        $name,
+        ".response.bin"
+      )),
+      before: include_str!(concat!(
+        "../../../git/fixtures/push/",
+        $name,
+        ".before.refs"
+      )),
     }
   };
 }
@@ -325,7 +337,12 @@ fn reasons(received: &Received) -> Vec<Vec<u8>> {
 
 /// The records `repository`'s register holds, one a push appended (A-662).
 fn records(state: &ShardState, repository: RepositoryId) -> usize {
-  state.db.partition().repositories().objects(repository).count()
+  state
+    .db
+    .partition()
+    .repositories()
+    .objects(repository)
+    .count()
 }
 
 /// Whether `repository`'s namespace binds `name`.
@@ -408,7 +425,12 @@ fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_
       let expected = advertisement(scenario.before, &OURS);
       assert_eq!(advertised, expected, "{}: the advertisement", scenario.name);
       let (answer, _) = answered(state, &mut push, scenario.request);
-      assert_eq!(answer, gits_report(&scenario), "{}: the answer", scenario.name);
+      assert_eq!(
+        answer,
+        gits_report(&scenario),
+        "{}: the answer",
+        scenario.name
+      );
       if scenario.name == "create" {
         let first = vec![("text".to_owned(), text(false))];
         assert_eq!(files(state, repository, "main"), first);
@@ -423,7 +445,10 @@ fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_
       .partition()
       .repositories()
       .branch(repository, "main");
-    assert_eq!(main.map(|green| state.db.partition().green_head(green)), Some(2));
+    assert_eq!(
+      main.map(|green| state.db.partition().green_head(green)),
+      Some(2)
+    );
     assert_eq!(records(state, repository), chain().len());
   });
 }
@@ -444,19 +469,40 @@ fn t_a654_the_policy_hides_and_refuses_in_gits_words_and_a_configured_hook_refus
     let held = records(state, repository);
     let copy: &[u8] = b"refs/heads/copy";
     let delete = request(&[(SECOND, "", copy)], CAPABILITIES, &[]);
-    set_policy(state, "policy", 0, (vec![deny(PolicyRight::Read, "refs/heads/copy")], Vec::new()));
+    set_policy(
+      state,
+      "policy",
+      0,
+      (vec![deny(PolicyRight::Read, "refs/heads/copy")], Vec::new()),
+    );
     let (advertised, mut push) = started(state, repository);
     let main_alone = format!("{SECOND} refs/heads/main\n");
     assert_eq!(advertised, advertisement(&main_alone, &OURS));
     let (_, received) = answered(state, &mut push, &delete);
     assert_eq!(reasons(&received), [HIDDEN_DELETE]);
-    set_policy(state, "policy", 1, (vec![deny(PolicyRight::Delete, "refs/heads/copy")], Vec::new()));
+    set_policy(
+      state,
+      "policy",
+      1,
+      (
+        vec![deny(PolicyRight::Delete, "refs/heads/copy")],
+        Vec::new(),
+      ),
+    );
     let received = pushed(state, repository, &delete);
     let prohibited = Outcome::Ng(protected::deletion_prohibited(copy));
     assert_eq!(received.outcomes, [prohibited]);
     let other: &[u8] = b"refs/heads/other";
     let create = request(&[("", SECOND, other)], CAPABILITIES, empty_pack());
-    set_policy(state, "policy", 2, (vec![deny(PolicyRight::Submit, "refs/heads/other")], Vec::new()));
+    set_policy(
+      state,
+      "policy",
+      2,
+      (
+        vec![deny(PolicyRight::Submit, "refs/heads/other")],
+        Vec::new(),
+      ),
+    );
     assert_declined_as_a_hook(&pushed(state, repository, &create), other, b"rule 0");
     set_policy(state, "policy", 3, (Vec::new(), vec![pre_receive()]));
     let received = pushed(state, repository, &delete);
@@ -478,7 +524,10 @@ fn assert_declined_as_a_hook(received: &Received, name: &[u8], why: &[u8]) {
     panic!("not one refusal: {:?}", received.outcomes);
   };
   let gits = protected::hook_declined(name, Vec::new());
-  assert_eq!((&declined.reason, &declined.message), (&gits.reason, &gits.message));
+  assert_eq!(
+    (&declined.reason, &declined.message),
+    (&gits.reason, &gits.message)
+  );
   assert!(
     declined.hook.windows(why.len()).any(|words| words == why),
     "{}",
@@ -536,7 +585,10 @@ fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
     assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
     let cli = [(TAG, "", tag), ("", SECOND, b"refs/heads/cli".as_slice())];
     let received = pushed(state, repository, &request(&cli, ATOMIC, empty_pack()));
-    assert_eq!(reasons(&received), [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]);
+    assert_eq!(
+      reasons(&received),
+      [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
+    );
     assert_first_line_names(&received, b"refs/heads/cli");
     assert_eq!(records(state, repository), held);
     assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
