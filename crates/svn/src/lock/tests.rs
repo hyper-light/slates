@@ -782,8 +782,18 @@ struct Making<'r> {
   now: AprTime,
 }
 
-/// What `verify_locks` found: the locks that could refuse the commit, each its path and code, and the expired locks it
-/// met.
+/// What `verify_locks` found: the locks of the first changed path whose check fails, each its path and code (any of them
+/// could be the one FSFS answers, its walk beneath a path in a hash table's order), and the expired locks it met.
+/// Whether the model's `verify_locks` returns at the first failing check, as FSFS does, or goes on to find every lock that
+/// could refuse the commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+  /// As FSFS: at the first changed path whose check fails.
+  AtTheFirstFailure,
+  /// Every changed path checked, for the census.
+  Never,
+}
+
 #[derive(Default)]
 struct Verified {
   failures: BTreeSet<(String, u32)>,
@@ -1007,8 +1017,10 @@ impl Fsfs {
   }
 
   /// A commit's locks: `transaction.c` `verify_locks` under the write lock, then, accepted, `serve.c`'s `unlock_paths`
-  /// unless the client keeps its locks. Refused: every lock that could have refused it (`walk_locks` meets a
-  /// directory's locks in a hash table's order, so FSFS reports whichever it meets first), with nothing changed.
+  /// unless the client keeps its locks. Refused: the locks of the first changed path, in Subversion's path order, whose
+  /// check fails, since `verify_locks` returns there (any of them could be the one FSFS answers: `walk_locks` meets a
+  /// directory's locks in a hash table's order), with nothing changed (A-617: before, every lock that could refuse
+  /// the commit anywhere, which let a lock table answering in byte order pass).
   fn commit(
     &mut self,
     changes: &[(String, Action)],
@@ -1023,7 +1035,7 @@ impl Fsfs {
     if !not_canonical.is_empty() {
       return Err(not_canonical);
     }
-    let verified = self.verify_locks(changes, commit, now);
+    let verified = self.verify_locks(changes, commit, now, Stop::AtTheFirstFailure);
     if !verified.failures.is_empty() {
       return Err(verified.failures);
     }
@@ -1036,13 +1048,28 @@ impl Fsfs {
     Ok(())
   }
 
+  /// The locks that could refuse the commit at any of its changed paths, where FSFS stops at the first: what the census
+  /// compares with the first's to count the commits whose answer the order decided.
+  fn every_failure(
+    &self,
+    changes: &[(String, Action)],
+    commit: &CommitLocks,
+    now: AprTime,
+  ) -> BTreeSet<(String, u32)> {
+    self
+      .verify_locks(changes, commit, now, Stop::Never)
+      .failures
+  }
+
   /// `transaction.c` `verify_locks`: the changed paths "sorted depth-first-ily", each verified, recursively unless it
-  /// was only modified, skipping a path a recursive check of one of its parents covered.
+  /// was only modified, skipping a path a recursive check of one of its parents covered; `SVN_ERR` returns at the first
+  /// check that fails (3578), unless `stop` asks to go on.
   fn verify_locks(
     &self,
     changes: &[(String, Action)],
     commit: &CommitLocks,
     now: AprTime,
+    stop: Stop,
   ) -> Verified {
     let mut sorted = changes.to_vec();
     sorted.sort_by(|(one, _), (two, _)| compare_paths(one, two));
@@ -1057,6 +1084,9 @@ impl Fsfs {
       }
       let recurse = *action != Action::Modify;
       self.allow_locked_operation(path, recurse, commit, now, &mut verified);
+      if stop == Stop::AtTheFirstFailure && !verified.failures.is_empty() {
+        break;
+      }
       if recurse {
         last_recursed = Some(path.clone());
       }
@@ -1530,6 +1560,8 @@ struct Census {
   expired_met: usize,
   let_go: usize,
   refused_commits: usize,
+  /// Refused commits that more than one changed path could have refused, where FSFS's order chose the answer (A-617).
+  ordered_commits: usize,
 }
 
 /// The name of a refusal's kind, for the census.
@@ -1846,6 +1878,9 @@ impl World {
         }
         census.refused(&[&refusal]);
         census.refused_commits += 1;
+        if self.model.every_failure(changes, commit, self.now).len() > failures.len() {
+          census.ordered_commits += 1;
+        }
       }
       (guarded, modelled) => {
         return Err(format!(
@@ -2043,6 +2078,7 @@ impl Census {
       self.expired_met,
       self.let_go,
       self.refused_commits,
+      self.ordered_commits,
     ];
     counts.iter().all(|&count| count > 0)
       && EVERY_REFUSAL
