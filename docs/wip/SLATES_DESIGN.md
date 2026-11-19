@@ -4452,8 +4452,13 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > binds a volume's mount into a container with `Instance::bind_into_container` and the seam's verb of that name, which
 > ask this form and answer the binding's attachment and the runtime's entry (`ContainerBind`, `CONTRACT` = 44); the
 > simulator judges the mounts it recorded as this form judges the kernel's table. kiln's container engine binds each
-> agent's workspace mount so (kiln's `docs/agentic.md` W9). Still the command line's alone, owed to the library next:
-> the engine's profile (`slates oci-runtime`) and the check just before the runtime binds (`slates oci-check`).
+> agent's workspace mount so (kiln's `docs/agentic.md` W9). Since A-520's second piece (2026-11-19, `CONTRACT` = 47)
+> the rest of the handoff is the library's too, and the command line calls it: the engine's profile, judged before a
+> host mounts for it (`container_engine::engine_profile`, under `slates oci-runtime`), and the check just before the
+> runtime binds that the source is still the mount verified (`container::check_source`, under `slates oci-check`).
+> Since its third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host too, the profile
+> `a_rootless_container_reads_and_writes_the_volume_through_its_mount` ran through (2026-10-19): the container's root
+> is the user who mounted the volume, so a host runs its container as the container's root over an unshared mount.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -9158,6 +9163,24 @@ it builds against the contract and adds to it rather than around it.
 > `AT_STATX_DONT_SYNC` and compared by device), with `HoldersUnread` saying why none were read (macOS: every libproc
 > answer stats the file). On Linux a plain `fusermount3 -u` refused while the table still lists the mount is
 > `MountFault::Busy`, where it was `MountFault::Unmount` with the helper's exit.
+> **`CONTRACT` = 46 (A-524):** an S3 base is named by the library: `S3Base`, the endpoint (`https`, or plain `http`
+> to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys' rules, and the addressing,
+> each refused by its kind (§4.15's S3 base). A base whose fetch is outstanding answers `Pending` through the host
+> seam, and the wire's `Unpublished` until the server parks it (A-555).
+> **`CONTRACT` = 47 (A-520, second piece):** the container handoff's other two steps are library calls, which the
+> command line now makes: `container_engine::engine_profile(runtime)` asks the runtime's engine for its profile,
+> bounded as the command line asked it, and judges it, answering an `EngineProfile` or an `EngineFault` (the judge's
+> refusal before any profile, `Untested` with the profile it refused, an engine unreachable, an answer too large or
+> not in its shape, or a host that asks no engine); `container::check_source` and `ContainerBind::check_source`
+> judge whether a bind's source is still the mount verified, the table first and then the identity the kernel never
+> reuses, refusing `SourceFault`. `slates-bridge-oci` is linked on every platform, its judge's types the contract's.
+> **`CONTRACT` = 48 (A-520, third piece):** rootless podman holds its tested profile on its own Linux host. The
+> handshake speaks podman's own interface beside the Docker CLI's (`podman info`, one template: its operating system,
+> version, rootless and SELinux flags, and whether its service is remote), and the judge holds a local rootless podman
+> on Linux to T-4.13's rootless run (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`), its rules
+> `IdentityRule::ContainerRootAsMountingUser` (appended) and every hard link's name served at once; `Engine::Podman`
+> and `Endpoint::Local` are appended. A remote podman is refused `RemoteEngine`, one run as root `ProfileUntested`, a
+> labelling one `SelinuxLabelsUntested`, and every other rootless profile still `UserNamespaceUntested`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -10105,7 +10128,7 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > - `sim`: `SimS3`, the oracle: versioned and unversioned buckets, an outsider's puts and deletes, delimited listings
 >   paged with opaque tokens (a forged one refused `400`), reads bound by `If-Match` or a version answering `412`,
 >   `404 NoSuchKey` or `NoSuchVersion`, `416`, and a refused or expired credential, each as S3's reference states it.
-> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 43): the endpoint
+> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 46): the endpoint
 >   (`https`, or plain `http` to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys'
 >   rules, and the addressing (a dotted bucket refused virtual-hosted over HTTPS), each refused by its kind; its
 >   identity, a digest of the endpoint's host and port, the bucket and the prefix, is the device of every fingerprint.
@@ -36536,6 +36559,182 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-556 — A carried takeover's cohort holds back only the objects its round ranked to the carrier (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; GAPS, live-durability 2026-11-09; A-272 (ii), A-309)
+Applied in the same change to: GAPS (the live-durability entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::readiness_cohorts`, `readiness_current_cohorts`, `falls_through`; `within_tolerance` judges
+the same cohorts) and `crates/server/src/takeover.rs` (the round's readiness waits on them). Also
+`crates/cluster/src/raft_wire.rs`, where the regional encoder's retirements are split into their own step
+(`encode_retired`) for main's clippy gate.
+- **What was there.** A host that retires owing its share of an earlier takeover carries it
+  (`Retirement::unconfirmed`). The round of its own takeover then joined the carried retirement's cohort to every one
+  of its objects. In the store-destroyed flow the owner died before confirming the destroyed node's takeover, and its
+  own volume was joined with the destroyed node's cohort, which had lost two of its three hosts. Before A-309 the
+  volume read lost. Since A-309 it read past tolerance: the round waited for every survivor, gave the volume up if one
+  never answered within the promise wait (A-304), reported it recovered past tolerance (A-332), and an unasked holder
+  kept its copy (`within_tolerance` false).
+- **The rule.** A round waits on a carried retirement's cohort only for an object that retirement's round ranked
+  along a line into the departed host: each kept retirement, from the carried one, ranks the object to the next until
+  it reaches the departed host (`falls_through`). The rankings are fixed at each retirement, so every node reads the
+  same.
+- **Why it is safe.** A carried cohort holds the only copy of a record only of an object the carried host owned and
+  the departed host was taking over from it, and that is an object its round ranked to the departed host. An object
+  it ranked elsewhere is that successor's to recover: its holders route it there, and the departed host's round never
+  learns it. An object the carried host never owned, such as the departed host's own, its cohort never held. The
+  successors are still ranked over every recovery cohort, so a fleet of mixed builds names the same successor for each
+  object; only the wait narrows. The record's judgment keeps every recovery cohort, since a completion record keeps no
+  ranking.
+- **Tests.** `a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_the_carrier`
+  (`crates/db/src/register.rs`, red before): the carrier's own object is waited on through its own cohort alone and
+  reads within tolerance, while an object the first takeover ranked to the carrier is waited on through both cohorts.
+  Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `register::` 88 of 88, `slates-cluster` `raft_wire::` 22 of
+  22, `slates-server` takeover and holder tests 28 of 28. Red once on a mutated copy that joined every carried cohort,
+  as before: the carrier's own object waited on two cohorts (`(2, 2, 2)`).
+
+### A-520, second piece — The container engine's profile and the check just before a runtime binds are library calls, which the command line makes (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9, §4.12; AUD-29-66, AUD-29-67; `CONTRACT` = 47)
+Applied in the same change to: §4.6 (A-9's OCI record: the form through the library), §4.12's contract log
+(`CONTRACT` = 47), GAPS (the library's entry), `docs/library.md` (the serving list, what is owed),
+`docs/wip/oci-handoff.md` (a note that the handshake and the check moved), `crates/api/src/container_engine.rs` (new:
+the handshake moved from the command line over an injected query, `EngineProfile`, `EngineFault`, the judge's types
+re-exported, and the tests), `crates/api/src/container.rs` (`check_source`, `ContainerBind::check_source`, `SourceFault`,
+the judgment over an injected table and identity, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 47),
+`crates/api/Cargo.toml` (`slates-bridge-oci` on every platform), `crates/cli/src/oci_runtime.rs` (it prints the
+library's answer), `crates/cli/src/verbs.rs` (`oci_check` calls the library), `crates/cli/src/main.rs` (two comments),
+and `crates/cli/Cargo.toml` with `Cargo.lock` (the command line no longer links `slates-bridge-oci` itself).
+- **Why.** kiln's container engine reaches slates through this library alone (A-278), and §4.6 A-9's handoff asks two
+  things of a harness besides the bind (A-520's first piece): its runtime's profile, judged before it mounts for a
+  container (AUD-29-67), and the check that a bind's source is still the mount verified, made just before its runtime
+  binds it (AUD-29-66). Both were the command line's alone (`slates oci-runtime`, `slates oci-check`).
+- **The profile.** `container_engine::engine_profile(runtime)` asks in the order that consults least, as the command
+  line did: the runtime admitted by name before anything runs; the endpoint (`DOCKER_HOST`, else the context's),
+  refused unless local before the engine is asked; then the engine's statement; each query bounded by the daemon's
+  observe budget and one page. Its answer is an `EngineProfile` (the endpoint, the profile, the `TestedProfile` it holds)
+  or an `EngineFault`: `Refused` (the judge's refusal before any profile), `Untested` (a profile established and refused,
+  carried with its endpoint and profile, so the command line prints it before the refusal as it did, and a host can say
+  which engine it refused), `Unreachable`, `TooLarge`, `Unreadable`, or `Unsupported` where no Unix pipes are polled
+  (Windows, where no host mount is bound into a container either). The order is a pure function of an injected query
+  (`profile_of`), tested on every host.
+- **The check.** `container::check_source(source, identity)` and `ContainerBind::check_source()` read the kernel's table
+  first (no mount at the source is `Missing`, no identity read), then the identity of the mount there, which the kernel
+  never reuses (a kernel without one is `Uncheckable`; another refused read `Identity`), and compare (`Replaced`, naming
+  both mounts). The judgment is pure over the table and the identity it is given (`judged`); a host with no table to read
+  is told so by the table itself (`MountTable(Unsupported)`), never judged unchanged.
+- **Every platform links `slates-bridge-oci`,** whose macOS and Linux code sits in `cfg` arms beside fallbacks that answer
+  `Unsupported`, so its judge's types are the contract's everywhere and the check runs one code path on every host. No
+  crate had built it on Windows before; that build is main's (filed).
+- **Tests.** `crates/api/src/container_engine.rs`: `docker_desktop_on_macos_holds_its_tested_profile_and_the_context_is_asked_only_unnamed`,
+  `each_engine_on_each_host_holds_its_tested_profile_or_is_refused_typed`, `nothing_is_asked_past_a_refusal`, and the two
+  hostile-answer parser tests moved from the command line; `crates/api/src/container.rs`:
+  `a_source_is_judged_by_the_table_first_then_by_the_identity_the_kernel_never_reuses` and
+  `a_source_is_checked_against_the_hosts_own_table` (the root, read and nothing touched). Filed for main: the command
+  line's own tests and its Windows build, and the container tests that run `slates oci-runtime` and `slates oci-check`
+  by use (`crates/cli/tests/cli.rs`, T-4.13 and the replaced-source tests).
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug, load 4).** Red first, on a copy of this change made on the
+  Studio, never committed, whose engine judgment answered before asking anything (`Unsupported`) and whose check
+  judged every source unchanged: `cargo test --locked -p slates-api --lib -- container_engine:: container::tests
+  contract_history` failed the five new tests and passed the two moved parser tests, the bind's two and the
+  contract's history (run r15). Green with the change, the same copy restored from its commit: 10 of 10, and the
+  crate's whole `cargo test --locked -p slates-api --lib` 87 passed, 4 ignored. Main's A-524 took contract 46
+  meanwhile, so this change is 47; `cargo fmt -p slates-api -p slates-cli` laid the code out.
+- **Owed.** The judge's profiles for the engines slates has run since it was written (rootless podman, G-mount step 3,
+  and podman's command line, both refused today), and Windows, which binds nothing (G-mount step 4) until a route into
+  Docker Desktop's VM is measured (kiln's W9).
+
+### A-558 — A digest that finds another file at a clean entry's name leaves the inode on its file, as A-151 has it (2026-11-18, g230, UI goal 85, from g225's inventory; §4.15 "verified current", §4.5, A-151)
+Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-a-digest-pointed-an-open-base-inode-at-the-file-an-outsider-put-at-its-name.md`
+(new), and `crates/vfs/src/base.rs` (`verify_current`, `leave_name`, `Current`, `digest_begin`/`digest_begin_at`,
+`reopen_verified`, `DigestStats::replaced`, and its first unit test module).
+- **What was there.** `verify_current` opens a clean file's path afresh and compares its identity with the descriptor
+  the inode holds, the one check that sees a replacement racing the directory listing's validation. On a mismatch it
+  pointed the inode at the new file in place: it swapped in the new descriptor and adopted the new fingerprint. A handle
+  opened on the old file then read the outsider's bytes, and the name kept the old number. A-151 had made every relist
+  detach such an inode instead; this path was left as it was, with no test reaching it.
+- **The rule.** The inode leaves its name as a relist has it (`leave_name`): its descriptor is kept while a handle holds
+  it open (the opener reads the file it opened, POSIX), its directory's listing is reread, and the name leaves the node,
+  so the next lookup serves the disk's file as a new inode. `verify_current` answers `Current::Replaced`, counted
+  `DigestStats::replaced`, and so does an inode the validated listing itself took from its name, which was `NotFound`.
+  A digest by path looks the name up once more and digests the new entry; a second replacement is the disk changing it
+  now, refused `DigestUnverified`, as is a replacement between a digest's slices.
+- **Test.** `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one` (`base.rs`' unit tests):
+  a base file opened as a mount's `OPEN` does, then its path digested with an outsider's replacement landing at each
+  seam call of the digest in turn, a scene each, until one lands after the digest. Each landing must leave the handle
+  reading the file it opened, the digest naming the outsider's file (or the opened one where the replacement landed
+  after the digest's last check) or refused `DigestUnverified`, never torn bytes, the name a new inode, and at least one
+  landing must reach `verify_current`'s identity check (`replaced` moved). Green on the Mac Studio (kiln r33, debug);
+  red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
+  file and the name kept its number (`replaced` 1, so the path was reached).
+
+
+### A-520, third piece — Rootless podman holds its tested profile on its own Linux host, so a host runs containers under it (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9; AUD-29-67; `CONTRACT` = 48)
+Applied in the same change to: §4.6 (A-9's OCI record: the profiles held), §4.12's contract log (`CONTRACT` = 48), GAPS
+(the library's entry), `docs/library.md` (the profiles that hold evidence; what is owed), `docs/wip/oci-handoff.md`
+(§6's single profile superseded), `crates/bridge-oci/src/runtime.rs` (podman's interface and statement,
+`Interface`, `PodmanFacts`, `runtime_interface`, `podman_profile`; `Engine::Podman`, `Endpoint::Local` and
+`IdentityRule::ContainerRootAsMountingUser` appended; the judge's rootless-podman arm; the module's list of the profiles
+that hold evidence; and the tests), `crates/api/src/container_engine.rs` (podman's query and parser, the handshake
+routed by interface, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 48), and `crates/cli/src/oci_runtime.rs`
+(the new rule's words).
+- **Why.** kiln's container engine runs agents under the runtime a machine has, and on a Linux machine without
+  privilege that is rootless podman: R10's case. Slates had run a container workload through it by use
+  (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`, 2026-10-19; and G-mount step 3's map,
+  2026-10-25), yet its judge refused every rootless engine (`UserNamespaceUntested`) and podman's command line
+  (`RuntimeUnsupported`), so the library answered no profile for it.
+- **What podman is asked.** Podman's command line answers Docker's templates with its own fields and has no engine at
+  an endpoint, so the handshake speaks its own interface: one `podman info` template naming five fields of its
+  `libpod/define/info.go` (`Host.OS`, `Version.Version`, `Host.Security.Rootless`, `Host.Security.SELinuxEnabled`,
+  `Host.ServiceIsRemote`), small enough for the one page an answer may hold (its whole `info` is not), parsed as
+  hostile input. A podman whose service is remote (a `CONTAINER_HOST`, a podman machine's VM) is refused `RemoteEngine`,
+  as a Docker endpoint reached over a network is: a bind's source would resolve on the service's host. The Docker
+  endpoint's own admission still admits the Docker CLI's alone.
+- **The verdict.** A local rootless podman on Linux holds T-4.13's rootless leg: `IdentityRule::ContainerRootAsMountingUser`
+  (the container's root read, wrote, and was refused `EROFS` through a read-only bind as the user who mounted the volume,
+  over an unshared FUSE mount, which admits that user alone; so a host runs the container as its root) and
+  `HardLinkRule::EveryNameServedAtOnce` (the bind is the host's own FUSE mount with nothing shared between, as the Docker
+  Engine's measured). Podman run as root is `ProfileUntested` (no workload ran so); a labelling podman
+  `SelinuxLabelsUntested`; rootless podman on any other host, and every other rootless engine, `UserNamespaceUntested`.
+- **Tests.** `crates/bridge-oci/src/runtime.rs`: `podman_is_spoken_in_its_own_interface_and_never_at_a_docker_endpoint`,
+  `rootless_podman_on_its_own_linux_host_holds_its_tested_profile`,
+  `every_other_podman_and_every_other_rootless_profile_is_refused_typed`; `crates/api/src/container_engine.rs`:
+  `rootless_podman_on_linux_holds_its_tested_profile_asking_podman_alone` (podman asked its own statement alone) and
+  `every_other_podman_is_refused_typed` (with podman's hostile answers). `nothing_is_asked_past_a_refusal` names
+  nerdctl now, which the handshake still does not speak.
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug, load 15 to 22).** Red first, on a copy of this change made on
+  the Studio, never committed, whose interface left podman unspoken and whose judge refused every rootless profile,
+  as both were: `cargo test --locked -p slates-bridge-oci --lib runtime::` failed the three new tests, and `cargo
+  test --locked -p slates-api --lib -- container_engine:: contract_history` failed the two new podman tests and
+  passed the other six (run r47). Green with the change, the same copy restored from its commit: slates-bridge-oci's
+  whole `--lib` 8 passed; the same slates-api command 8 of 8, and its whole `--lib` 90 passed, 4 ignored. `cargo fmt
+  -p slates-api -p slates-cli -p slates-bridge-oci` laid the code out.
+- **Owed.** The profile's live check by use, filed for main: `slates oci-runtime podman` on a rootless Linux host
+  answering this evidence, the container's other ids refused through an unshared mount (the rule's second half, which
+  rests on FUSE's own rule today), and the hard-link probe through podman (the rule rests on the bind's mechanism, not
+  yet a podman run); podman's command line on macOS and Windows (a machine's VM), refused `RemoteEngine` until a run.
+
+### A-560 — A WinFsp receive worker learns its reply spin window from its own wakes, agreed before trusted and bounded by the shard's step quantum (2026-11-18, g230, UI goal 85's B4; §4.6 Windows, §4.3's 2-competitive rule; amends A-212's spin)
+Applied in the same change to: GAPS (the spin window's entry closed), `crates/bridge-winfsp/src/spin_window.rs` (new,
+pure), `reply.rs` (`Stamped`, `start`, `await_reply`; the start-up probe and its `SAMPLES` gone), `host.rs` (replies
+stamped at `Served::send`; `MountThread::start` reads the shard's step quantum), `dispatcher.rs` (`Worker::start` takes
+the ceiling), and `lib.rs`.
+- **What was there.** Each receive worker timed fifteen one-way channel wakes as it started and spun for their median for
+  its whole life, unbounded and unchecked: CI's arm64 runner, quiet, measured 143.9 and 108.1 µs on one daemon's two
+  workers where the other runs' measured 4.1 to 11.5 µs (diagnostics run 42178889880, run 3), and such a worker spun up
+  to 144 µs on every slow reply, a core taken from the shards of a 4-vCPU machine.
+- **The rule.** Every reply carries the instant the shard sent it (`reply::Stamped`), so each reply the worker parked
+  for, and that was sent after it parked, is one of its own wakes, and the window keeps learning from them for the
+  worker's life. The estimate is TCP's round-trip estimator as RFC 6298 §2 states it: a smoothed wake `S` and its
+  smoothed mean deviation `V`, gains `α = 1/8` and `β = 1/4`, seeded `S = R`, `V = R/2`, in Jacobson's fixed point. A
+  scheduling delay only lengthens a wake, so a sample past the RFC's band `S + 4V` is folded as the band's edge. The
+  wakes agree once `V < S/2`, below the RFC's seed; until then the window is zero and the worker parks. The window never
+  exceeds the step quantum of the shard that started the mount (`slates_rt::futures::step_budget_ns`, derived by the
+  daemon from the machine's measured wake): a longer spin takes more than a step of CPU from the shards. A worker
+  started off any shard has no quantum and never spins. No sample count is fixed; the constants are the RFC's.
+- **Tests.** `spin_window`'s, on every host: a start of delayed wakes (five of nine past 100 µs) never spins past the
+  ceiling, is zero while the wakes disagree, and settles within the settled wakes (4 to 11 µs); agreeing wakes are spun
+  for once a second confirms the first; agreeing wakes slower than the ceiling spin the ceiling, and a zero ceiling
+  never spins; one 10 ms delay moves the window by at most half a deviation. `reply`'s, on Windows (main's run): only a
+  reply the thread parked for teaches it, and a thread that started nothing never spins. Green on the Mac Studio (kiln
+  r51, 4 of 4); red once with the window unbounded and unchecked again (the old rule's essence): after the first wake a
+  window of 144,000 ns past the 50,000 ns ceiling, and the agreement and ceiling tests failing with it.
 
 ### A-557 — A read scatter is answered whole, or refused naming a shard whose part it lacks (2026-11-19, goal 85 via g225; §4.8 "Lookup", §4.9, §4.14 `slates.status`; the 2026-11-05 scatter record's sibling, A-216, A-426)
 

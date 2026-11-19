@@ -1058,22 +1058,40 @@ mod stored_path_tests {
     attachments.context(attachment).unwrap()
   }
 
-  /// The volume `names` makes with `\Src\Main.RS` in it, and `path` named as it stores each component.
-  fn stored_in(names: slates_vfs::names::NameEquivalence, path: &str) -> Result<String, VfsError> {
+  /// The volume `names` makes, with `\Src\Main.RS` made in it through a bridge. A step that fails stops the test here,
+  /// so a refused setup can never pass for the `NotFound` a test expects from the path it names.
+  fn with_main_rs(
+    names: slates_vfs::names::NameEquivalence,
+  ) -> (slates_vfs::volume::Store, slates_vfs::volume::Volume) {
     let (mut store, mut volume) = store_and_volume(names);
+    {
+      let cx = context();
+      let mut bridge = VolumeBridge::new(
+        slates_db::catalog::VolumeId { bytes: [0; 16] },
+        &mut volume,
+        &mut store,
+      );
+      let root = bridge.root(&cx).unwrap();
+      let dir = bridge
+        .mkdir(ObjectId::new(root, 0), &cx, "Src", 0o755)
+        .unwrap();
+      bridge
+        .create(ObjectId::new(dir.ino, 0), &cx, "Main.RS", 0o644, 0)
+        .unwrap();
+    }
+    (store, volume)
+  }
+
+  /// `path` named as the volume `names` makes, with `\Src\Main.RS` in it, stores each component: the answer under test
+  /// alone, through a bridge made afresh as the daemon's serve paths make one per request.
+  fn stored_in(names: slates_vfs::names::NameEquivalence, path: &str) -> Result<String, VfsError> {
+    let (mut store, mut volume) = with_main_rs(names);
     let cx = context();
     let mut bridge = VolumeBridge::new(
       slates_db::catalog::VolumeId { bytes: [0; 16] },
       &mut volume,
       &mut store,
     );
-    let root = bridge.root(&cx).unwrap();
-    let dir = bridge
-      .mkdir(ObjectId::new(root, 0), &cx, "Src", 0o755)
-      .unwrap();
-    bridge
-      .create(ObjectId::new(dir.ino, 0), &cx, "Main.RS", 0o644, 0)
-      .unwrap();
     stored_path(&mut bridge, &cx, path)
   }
 

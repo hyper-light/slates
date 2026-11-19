@@ -1,5 +1,15 @@
 # The OCI namespace handoff and the attachment capability report (§4.6 A-9, RQ-20, AC-4.11 / T-4.13): design and measurement record
 
+> **Moved into the library (2026-11-19, A-520).** The form is a verb of `slates-api` (`Instance::bind_into_container`,
+> `CONTRACT` = 44), and the harness's two checks are library calls (`CONTRACT` = 47):
+> `container_engine::engine_profile`, the handshake's queries and its hostile-answer parser, moved from
+> `crates/cli/src/oci_runtime.rs`, and `container::check_source`, moved from the CLI's `oci-check`. The command line's
+> `slates oci-runtime` and `slates oci-check` call them and print what they did before. Where this record names
+> the CLI's files for those, read the library's.
+> Since A-520's third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host as well
+> (`IdentityRule::ContainerRootAsMountingUser`): §6's "only Docker Desktop on macOS" and its rootless refusal
+> are superseded by `crates/bridge-oci/src/runtime.rs`'s list of the profiles that hold evidence.
+
 > **Lifetime correction (2026-09-20, A-28).** A binding belongs to its verified source
 > mount, not the short-lived command that returns the recipe. The source token, live bridge
 > record, volume, principal and rights are checked before admission. The record survives

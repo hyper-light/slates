@@ -1184,10 +1184,18 @@
 >   (a binding taken only from an answer that established one; the source's spelling) and `sim::tests` (the entry and
 >   its lifetime, every refusal with none holding room; Windows' refusal, on Windows' own build). By use, with a kernel
 >   mount: `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`,
->   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. Owed (A-520's next pieces): the
->   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
->   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
->   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. **Built 2026-11-19 (A-520's
+>   second piece, `CONTRACT` = 47):** the engine's profile and the pre-bind check are library calls the command line
+>   makes (`container_engine::engine_profile` under `slates oci-runtime`, `container::check_source` under
+>   `slates oci-check`), each held by unit tests on every host (the questions' order over an injected query; the check's
+>   judgment over an injected table and identity, and the host's own table). **Built 2026-11-19 (A-520's third
+>   piece, `CONTRACT` = 48):** rootless podman's profile on its own Linux host, the one rootless run slates has by use
+>   (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`): the handshake asks podman its own
+>   statement (`podman info`), and the judge holds it with `IdentityRule::ContainerRootAsMountingUser`; podman run as
+>   root, remote or labelling stays refused typed. Owed: that profile's live check by use (filed 2026-11-19: `slates
+>   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
+>   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
+>   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
@@ -2485,8 +2493,15 @@
 >   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
 >   `NotRecovered` by name.
 
-> **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
-> predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
+> **Fixed (A-556, g250, 2026-11-19; was open since live-durability, 2026-11-09; A-272 ii adjacent): an object whose line
+> never passed through an unconfirmed predecessor read lost, then past tolerance, on a second failure inside that
+> predecessor's takeover window.** A round now waits on a carried retirement's cohort only for the objects that
+> retirement's round ranked along a line into the departed host (`RegionalConfiguration::readiness_cohorts`,
+> `falls_through`; `within_tolerance` judges the same): a carried cohort holds the only copy of a record only of an
+> object it owned and ranked to the departed host. The successors are still ranked over every recovery cohort, so a
+> fleet of mixed builds names the same ones. Test: `a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_
+> the_carrier` (`crates/db/src/register.rs`, red before: the carrier's own object read past tolerance). The text below
+> is the record of the finding. A host that retires before
 > confirming its share of an earlier retirement records it as `unconfirmed`, and `RegionalConfiguration::recovery_cohorts`
 > then recovers **every** object of the host jointly with the predecessor's cohort, not only the objects it was taking
 > over from it. In the store-destroyed flow (diag-live-durability-77, x86 run 1): old b destroyed, the owner killed
@@ -5696,9 +5711,9 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >   answers. Raising shard threads above normal priority removed it (run 42059294312), on arms sharing a machine, so the gain is
 >   not yet measured, and it is a whole-daemon change. Also: under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both
 >   daemons for a late heartbeat in run 3 of all three jobs that reached it.
-> - **The reply spin window can be set by a noisy start (A-212's spin; OPEN, a measurement defect, owner winfsp-overlap,
->   2026-11-06).** Each receive worker times 15 one-way wakes through a bounded channel once as it starts and spins for
->   their median before it parks for a reply (`crates/bridge-winfsp/src/reply.rs`, `SAMPLES`). The median was meant to keep
+> - **The reply spin window can be set by a noisy start (A-212's spin; a measurement defect, 2026-11-06; FIXED
+>   2026-11-18, A-560, below).** Each receive worker timed 15 one-way wakes through a bounded channel once as it started
+>   and spun for their median before it parked for a reply (`crates/bridge-winfsp/src/reply.rs`, `SAMPLES`). The median was meant to keep
 >   one scheduling delay from setting the window, but a start where most samples are delayed sets it too. On CI's arm64
 >   runner, quiet, one daemon's two workers measured 143.9 µs and 108.1 µs (diagnostics run 42178889880, run 3), where the
 >   other runs' workers measured 4.1–11.5 µs. Such a worker spins up to 144 µs on each slow reply, taking a core from the
@@ -5706,7 +5721,14 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >   the receiver's gap against the DLL, but the window has no bound and no check that its samples agree. Owed: a window the
 >   measurement cannot set beyond what a wake on the machine costs (a bound derived from the profile's wake, or samples
 >   retaken until their spread is within the probe's own precision, as `wake.mean_ns` is), with a test that a delayed start
->   cannot set it.
+>   cannot set it. **Fixed by A-560:** the window is learned from the worker's own wakes for its whole life (each reply
+>   is stamped at its send, so a reply the worker parked for times its wake), by RFC 6298's estimator (its gains, its
+>   seed, and its `S + 4V` band past which a sample is a delay and is folded as the band's edge); it is zero until the
+>   wakes agree (the deviation below the RFC's seed, half the wake) and never longer than the step quantum of the shard
+>   that started the mount (`crates/bridge-winfsp/src/spin_window.rs`, pure; the start-up probe of 15 is gone). Test:
+>   `a_start_of_delayed_wakes_never_spins_past_the_ceiling_and_settles_on_the_wakes` (every host; the old rule's window
+>   on its start was 120 µs). **Owed (main's):** the Windows build and the bridge's Windows unit tests
+>   (`a_thread_learns_its_window_only_from_the_replies_it_parked_for`), and the WinFsp hops' A/B against A-212's figures.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >
@@ -18210,9 +18232,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - Sent to the owner for review and merge.
   - **Owed:** the owner's review of the five-patch series; Shards' Linux CI legs on it.
 - **Open, found by step 4 (2026-10-24), reported:**
-  - `verify_current` (§4.15's digest) re-points an untouched inode to another file found at its name, where A-151
-    detaches the inode and gives the name a new one; no test reaches this path (`digest_begin` has none). Its backings
-    are marked stale there, in case it runs.
+  - **Fixed 2026-11-18 (A-558):** `verify_current` (§4.15's digest) re-pointed an untouched inode to another file found
+    at its name, where A-151 detaches the inode and gives the name a new one. It now leaves the name as a relist does
+    (the descriptor kept while a handle holds the inode open, the listing reread, the name a new entry), counted
+    `DigestStats::replaced`; a digest by path looks once more and digests the new entry, and one between its slices is
+    refused `DigestUnverified`. An inode the validated listing already took from its name answers the same, where it
+    was `NotFound`. Test: `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one`
+    (`crates/vfs/src/base.rs`: the outsider's replacement landed at each seam call of a digest in turn).
   - `rewitness` recorded every witness `racy: false`, so a same-tick edit after it was caught only by a later
     fingerprint change (correctness on a coarse-granularity filesystem). **Fixed 2026-10-24**, failing test first: a
     re-witness asks the host's clock as a copy-up does (A-162).

@@ -66,12 +66,16 @@ mod purge_intents;
 pub mod purge_slot;
 #[cfg(windows)]
 mod purge_token;
-// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212).
+// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212), the window learned
+// from the thread's own wakes (A-560).
 #[cfg(windows)]
 mod reply;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;
+// The receive thread's spin window, learned from its own wakes, agreed before it is trusted and bounded by the shard's
+// step quantum (A-560). Pure, so it is tested on every host.
+pub mod spin_window;
 // Windows symbolic links: the map between the volume's link target and the reparse buffer Windows reads and sets
 // (A-275). Pure, so it is tested on every host.
 pub mod symlink;
