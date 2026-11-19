@@ -705,9 +705,10 @@ mod tests {
       .expect("the repository")
   }
 
-  /// A-575 (§4.17.1 items 1 to 5). Do: create a repository, write two versions of its root, branch it at version 1 and
-  /// at its head, retire a branch and bind it again, and try every wrong verb: a taken repository name, an unknown
-  /// branch, a version past the head, another principal, a name with a NUL, a bind of a green outside the lineage.
+  /// A-575 (§4.17.1 items 1 to 5). Do: create a repository, write two versions of its root while a work holds version
+  /// 1, branch it at version 1 and at its head, retire a branch and bind it again, and try every wrong verb: a taken
+  /// repository name, an unknown branch, a version past the head, another principal, a name with a NUL, a bind of a
+  /// green outside the lineage.
   /// Expect: each branch reads its version's bytes and the root its head's; no branch walked the lineage's maps; a
   /// retired name leaves its green, and binding it again restores it; each wrong verb refused by its kind.
   #[test]
@@ -715,6 +716,17 @@ mod tests {
     crate::daemon::audit_on_shard(|state| {
       let root = green_of(create(state, "linux", "main"));
       assert_eq!(write(state, root, b"one", 1), 1);
+      // A work based at version 1 holds it, as any reader does, so the root's checkpoint stays at or below it and a
+      // branch can be made there; with no reader the checkpoint follows the head and an older version is refused.
+      let held = ask(
+        state,
+        &owner(),
+        RequestBody::CreateWork {
+          green: root,
+          name: "holder".to_owned(),
+        },
+      );
+      assert!(matches!(held, ReplyBody::WorkCreated { .. }), "{held:?}");
       assert_eq!(write(state, root, b"two", 2), 2);
       let repo = repository(state, "linux");
       let walked = state.greens.lineage_walked(repo);
