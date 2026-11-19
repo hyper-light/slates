@@ -350,6 +350,58 @@ impl<S: PathChanges> DerivedType for PathMap<S> {
   }
 }
 
+/// What stands at a path of a map: a file, or a directory by the root of its trie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+  /// A file.
+  File(Entry),
+  /// A directory, by the root of its trie: a function of the files beneath it alone (module docs), so two directories
+  /// of the same files have one root on every tier.
+  Directory(ContentId),
+}
+
+/// What stands at `path` in the map `root`, and the trie nodes read to find it. The empty path is the root directory,
+/// which stands while the map holds a file; any other directory stands while a file is beneath it, as the map keeps no
+/// empty one.
+pub fn at(
+  store: &ContentStore,
+  root: ContentId,
+  path: &[u8],
+) -> Result<(Option<At>, u64), PathsRefused> {
+  let mut reads = 0_u64;
+  let found = at_counted(store, root, path, &mut reads)?;
+  Ok((found, reads))
+}
+
+/// [`at`], each node read counted in `reads`.
+fn at_counted(
+  store: &ContentStore,
+  root: ContentId,
+  path: &[u8],
+  reads: &mut u64,
+) -> Result<Option<At>, PathsRefused> {
+  let mut read = |node: ContentId| {
+    *reads = reads.saturating_add(1);
+    read_node(store, node)
+  };
+  if path.is_empty() {
+    let empty = matches!(read(root)?, Node::Leaf(entries) if entries.is_empty());
+    return Ok((!empty).then_some(At::Directory(root)));
+  }
+  let names = split_path(path)?;
+  let last = names.len().saturating_sub(1);
+  let mut directory = root;
+  for (index, name) in names.into_iter().enumerate() {
+    match lookup(&mut read, directory, name)? {
+      Some(Slot::Directory(below)) if index < last => directory = below,
+      Some(Slot::Directory(below)) => return Ok(Some(At::Directory(below))),
+      Some(Slot::File(entry)) if index == last => return Ok(Some(At::File(entry))),
+      _ => return Ok(None),
+    }
+  }
+  Ok(None)
+}
+
 /// What a name in a directory holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {

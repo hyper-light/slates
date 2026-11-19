@@ -624,6 +624,48 @@ impl LockTable {
     Ok(removed.into_values().map(removal).collect())
   }
 
+  /// Whether [`LockTable::apply`] takes every one of `entries`, in their order, changing nothing: the commit step's
+  /// guard over the entries its verdict decided, made before its log records them (A-655). Refused at the first entry
+  /// removing a lock the table, as the entries before it leave it, does not hold with that token.
+  pub fn check_entries(&self, entries: &[LockEntry]) -> Result<(), LockRefusal> {
+    let mut changed: BTreeMap<&str, Option<&LockToken>> = BTreeMap::new();
+    for entry in entries {
+      match entry {
+        LockEntry::Set(lock) => {
+          changed.insert(lock.path.as_str(), Some(&lock.token));
+        }
+        LockEntry::Removed { path, token } => {
+          let held = match changed.get(path.as_str()) {
+            Some(after) => *after,
+            None => self.locks.get(path).map(|lock| &lock.token),
+          };
+          if held != Some(token) {
+            return Err(LockRefusal::Unrecorded { path: path.clone() });
+          }
+          changed.insert(path.as_str(), None);
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Applies `entries` in their order, all of them or none: refused as [`LockTable::check_entries`] refuses them, with
+  /// the table unchanged.
+  pub fn apply_all(&mut self, entries: &[LockEntry]) -> Result<(), LockRefusal> {
+    self.check_entries(entries)?;
+    for entry in entries {
+      match entry {
+        LockEntry::Set(lock) => {
+          self.locks.insert(lock.path.clone(), lock.clone());
+        }
+        LockEntry::Removed { path, .. } => {
+          self.locks.remove(path);
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// Applies an entry the owner's guard wrote, unconditionally, so a replay reaches the owner's table. An entry
   /// removing a lock the table does not hold is a history no guard wrote, refused typed with the table unchanged.
   pub fn apply(&mut self, entry: &LockEntry) -> Result<(), LockRefusal> {
