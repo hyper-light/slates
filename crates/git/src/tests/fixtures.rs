@@ -76,3 +76,21 @@ pub(crate) const PACKFILE_RESPONSES: [(&str, &[u8]); 5] = [
   ("fetch-ref-in-want", FETCH_REF_IN_WANT_RESPONSE),
   ("fetch-progress", FETCH_PROGRESS_RESPONSE),
 ];
+/// A clone under `sparse:oid=main:dir/file` (A-640 part 4): a blob whose one pattern, `deep`, matches no path.
+pub(crate) const FETCH_SPARSE_REQUEST: &[u8] =
+  include_bytes!("../../fixtures/fetch-sparse-main-dir-file.request.bin");
+/// Its answer: every commit and tree, no blob.
+pub(crate) const FETCH_SPARSE_RESPONSE: &[u8] =
+  include_bytes!("../../fixtures/fetch-sparse-main-dir-file.response.bin");
+/// A clone under `sparse:oid=main:missing`, a path that is not there.
+pub(crate) const FETCH_SPARSE_MISSING_REQUEST: &[u8] =
+  include_bytes!("../../fixtures/fetch-sparse-main-missing.request.bin");
+/// Its answer: `packfile`, git's words on band 2, its band-3 words, and no flush.
+pub(crate) const FETCH_SPARSE_MISSING_RESPONSE: &[u8] =
+  include_bytes!("../../fixtures/fetch-sparse-main-missing.response.bin");
+/// A clone under `sparse:oid=main:dir`, a path that names a tree.
+pub(crate) const FETCH_SPARSE_TREE_REQUEST: &[u8] =
+  include_bytes!("../../fixtures/fetch-sparse-main-dir.request.bin");
+/// Its answer: `packfile`, git's words on band 2, its band-3 words, and no flush.
+pub(crate) const FETCH_SPARSE_TREE_RESPONSE: &[u8] =
+  include_bytes!("../../fixtures/fetch-sparse-main-dir.response.bin");

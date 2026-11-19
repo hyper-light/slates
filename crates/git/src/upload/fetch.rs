@@ -18,9 +18,12 @@
 //! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped.
 
 use super::answer::{Answer, Framing};
+use super::sparse::{self, Sparse};
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
-use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, Pack, ShallowInfo};
+use crate::negotiation::{
+  self, Acknowledgments, Deepen, Filter, Outcome, Pack, Patterns, ShallowInfo,
+};
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::store::StoreGraph;
 use crate::v2::fetch::{Argument, Event, Response, Section, WantedRef};
@@ -134,6 +137,15 @@ pub(super) fn answer<P: PackSource>(
     multiplexed,
   };
   let asked = read(graph, served, arguments, admission).map_err(refused)?;
+  let (patterns, dies) =
+    match sparse::read(graph, served, asked.filter.as_ref(), admission).map_err(refused)? {
+      Some(Sparse::Patterns(patterns)) => (Some(patterns), None),
+      Some(Sparse::Dies(refusal)) => (
+        Patterns::read(&[], &mut Admission::new(0)).ok(),
+        Some(refusal),
+      ),
+      None => (None, None),
+    };
   let request = negotiation::Request {
     wants: &asked.wants,
     haves: &asked.haves,
@@ -142,13 +154,13 @@ pub(super) fn answer<P: PackSource>(
     shallow: &asked.shallow,
     deepen: asked.deepen(),
     filter: asked.filter.as_ref(),
-    sparse: None,
+    sparse: patterns.as_ref(),
     include_tag: asked.flags.include_tag,
     thin: asked.flags.thin,
   };
   let outcome = negotiation::negotiate(graph, &request, admission)
     .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
-  let answer = written(served, &asked, outcome, packs, admission).map_err(refused)?;
+  let answer = written(served, &asked, outcome, packs, dies, admission).map_err(refused)?;
   match graph.fault() {
     Some(fault) => Err(refused(Refusal::Store(fault))),
     None => Ok(answer),
@@ -245,12 +257,14 @@ fn once_each(wanted: &[WantedRef<'_>], admission: &mut Admission) -> Result<(), 
   }
 }
 
-/// The answer to `outcome`: its sections encoded, and its pack begun from `packs`.
+/// The answer to `outcome`: its sections encoded, and its pack begun from `packs`; or, when its `sparse:oid` filter's
+/// blob `dies` unread, the pack answered as git answers it (A-640 part 4).
 fn written<P: PackSource>(
   served: &Served<'_>,
   asked: &Asked<'_>,
   outcome: Outcome<u64, u64>,
   packs: &mut P,
+  dies: Option<Refusal>,
   admission: &mut Admission,
 ) -> Result<Answer<P::Pack>, Refusal> {
   let format = served.repository.format();
@@ -267,6 +281,13 @@ fn written<P: PackSource>(
       Ok(Answer::whole(bytes).counted(outcome.counters))
     }
     negotiation::Answer::Pack(pack) => {
+      if let Some(refusal) = dies {
+        let (bytes, _) = charged(admission, |out| {
+          before_pack(&pack, &asked.wanted, format, multiplexed, out)
+        })?;
+        return Answer::died(bytes, refusal, admission)
+          .map(|answer| answer.counted(outcome.counters));
+      }
       let plan = PackPlan {
         runs: &pack.runs,
         objects: &pack.objects,

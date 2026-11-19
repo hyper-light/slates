@@ -91,6 +91,19 @@ pub(super) fn deepen_not(
   }
 }
 
+/// The object a revision names, by position (A-640 part 4, a `sparse:oid` filter's `<rev>`): a full object name of the
+/// repository's format, or the ref the first of git's patterns finds (`repo_dwim_ref`, which takes the first and only
+/// warns of the rest), `HEAD` read through to the default branch. `None` for any other form git reads, which this
+/// server does not.
+pub(super) fn revision(graph: &StoreGraph<'_>, served: &Served<'_>, rev: &[u8]) -> Option<u64> {
+  if let Ok(id) = ObjectId::from_hex(served.repository.format(), rev) {
+    return graph.node(&id);
+  }
+  REV_PARSE_RULES
+    .iter()
+    .find_map(|&(before, after)| resolved(graph, served, [before, rev, after]))
+}
+
 /// What the ref whose name `parts` make up, in order, names: `HEAD` read through to the default branch.
 fn resolved(graph: &StoreGraph<'_>, served: &Served<'_>, parts: [&[u8]; 3]) -> Option<u64> {
   if compare(HEAD, parts) == Ordering::Equal {

@@ -30,6 +30,7 @@ use super::{Chain, Place, Repository, StoreRefused};
 use crate::negotiation::{CommitRow, Graph};
 use crate::object_name::{Kind, ObjectId};
 use crate::store::rows::ObjectRow;
+use crate::{Admission, PastAdmission};
 
 /// Format: what every tag ref's name begins with.
 const TAGS: &[u8] = b"refs/tags/";
@@ -169,6 +170,24 @@ impl<'r> StoreGraph<'r> {
         Vec::new()
       }
     }
+  }
+
+  /// The bytes of the blob `id` names, its length charged to `admission` before they are read (A-640 part 4: the blob a
+  /// `sparse:oid` filter reads its patterns from): `None` when the store holds no blob of that name or cannot read it.
+  pub(crate) fn blob_bytes(
+    &self,
+    id: &ObjectId,
+    admission: &mut Admission,
+  ) -> Result<Option<Vec<u8>>, PastAdmission> {
+    let Some((row, content)) = self.repository.indexed(self.store, id) else {
+      return Ok(None);
+    };
+    if row.kind != Kind::Blob {
+      return Ok(None);
+    }
+    admission.charge(row.len)?;
+    let place = Place::Indexed { row, content };
+    Ok(Repository::bytes_of(self.store, id, &place).ok())
   }
 
   /// The position of `id`, a fault when the store does not hold it.

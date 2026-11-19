@@ -7,10 +7,13 @@ use crate::Admission;
 use crate::fixtures::{
   FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE, FETCH_HAVES_REQUEST, FETCH_HAVES_RESPONSE,
   FETCH_PROGRESS_REQUEST, FETCH_PROGRESS_RESPONSE, FETCH_REF_IN_WANT_REQUEST,
-  FETCH_REF_IN_WANT_RESPONSE, FETCH_SHALLOW_REQUEST, FETCH_SHALLOW_RESPONSE, FETCH_URIS_REQUEST,
+  FETCH_REF_IN_WANT_RESPONSE, FETCH_SHALLOW_REQUEST, FETCH_SHALLOW_RESPONSE,
+  FETCH_SPARSE_MISSING_REQUEST, FETCH_SPARSE_MISSING_RESPONSE, FETCH_SPARSE_REQUEST,
+  FETCH_SPARSE_RESPONSE, FETCH_SPARSE_TREE_REQUEST, FETCH_SPARSE_TREE_RESPONSE, FETCH_URIS_REQUEST,
 };
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::served::{self, FIRST, SECOND, TAG, THIRD, id};
+use crate::upload::Refusal;
 use crate::v2::fetch::{Event, Section, WantedRef};
 use crate::v2::object_info::{self, ObjectSizes};
 use crate::v2::request::{self, Arguments};
@@ -18,7 +21,7 @@ use crate::v2::{Ending, Line};
 
 /// Format: stock git's exchanges a fetch is held to, each named, its request and its answer
 /// (`fixtures/make-fixtures.sh`).
-const EXCHANGES: [(&str, &[u8], &[u8]); 5] = [
+const EXCHANGES: [(&str, &[u8], &[u8]); 6] = [
   ("fetch-clone", FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE),
   ("fetch-haves", FETCH_HAVES_REQUEST, FETCH_HAVES_RESPONSE),
   (
@@ -36,6 +39,7 @@ const EXCHANGES: [(&str, &[u8], &[u8]); 5] = [
     FETCH_PROGRESS_REQUEST,
     FETCH_PROGRESS_RESPONSE,
   ),
+  ("fetch-sparse", FETCH_SPARSE_REQUEST, FETCH_SPARSE_RESPONSE),
 ];
 
 /// A-640 part 2 (§4.17.2 "A fetch"; git's `fetch-clone`, `fetch-haves`, `fetch-shallow`, `fetch-ref-in-want` and
@@ -267,4 +271,51 @@ fn object_info_answers_the_sizes_stock_git_printed() {
   let mut expected = Vec::new();
   object_info::answer(&lines, ObjectFormat::Sha1, &printed, &mut expected).unwrap();
   assert_eq!(bytes, expected);
+}
+
+/// A-640 part 4 (git's `filter_sparse_oid__init` dies as `pack-objects` begins; stock git's `fetch-sparse-main-missing`
+/// and `fetch-sparse-main-dir` exchanges): do send git's clone under `sparse:oid=main:missing`, a path that is not
+/// there, and under `sparse:oid=main:dir`, one that names a tree. Expect: each answer byte for byte the one stock git
+/// 2.50.1 sent (the packfile section's header, git's `fatal:` words on band 2, its band-3 words, no flush), and refused
+/// with why.
+#[test]
+fn a_sparse_blob_that_is_not_there_or_no_blob_is_refused_as_git_refuses_it() {
+  let fixture = served::served();
+  let (bytes, answer) = answer_v2(&fixture, FETCH_SPARSE_MISSING_REQUEST);
+  assert_eq!(
+    bytes,
+    FETCH_SPARSE_MISSING_RESPONSE,
+    "{}",
+    String::from_utf8_lossy(&bytes)
+  );
+  assert_eq!(
+    answer.refusal(),
+    Some(&Refusal::SparseBlob {
+      name: b"main:missing".to_vec()
+    })
+  );
+  let (bytes, answer) = answer_v2(&fixture, FETCH_SPARSE_TREE_REQUEST);
+  assert_eq!(
+    bytes,
+    FETCH_SPARSE_TREE_RESPONSE,
+    "{}",
+    String::from_utf8_lossy(&bytes)
+  );
+  assert!(matches!(answer.refusal(), Some(Refusal::SparseData { .. })));
+}
+
+/// A-640 part 4 (git reads a sparse filter's blob only as `pack-objects` begins): do send a round no `done` closes,
+/// wanting `third` with a have the store does not hold, once with no filter and once under `sparse:oid=main:missing`.
+/// Expect: the same answer, its acknowledgments (`NAK`), though the filter's blob names nothing.
+#[test]
+fn a_round_without_a_pack_never_reads_its_sparse_blob() {
+  let fixture = served::served();
+  let want = naming("want", THIRD);
+  let have = naming("have", "3333333333333333333333333333333333333333");
+  let (plain, _) = answer_v2(&fixture, &command("fetch", &[&want, &have]));
+  let filtered = command("fetch", &[&want, &have, b"filter sparse:oid=main:missing"]);
+  let (bytes, answer) = answer_v2(&fixture, &filtered);
+  assert_eq!(bytes, plain);
+  assert_eq!(answer.refusal(), None);
+  assert!(bytes.windows(3).any(|window| window == b"NAK"));
 }

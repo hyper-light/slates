@@ -28,6 +28,10 @@ use crate::{Admission, to_u64};
 /// Format: what an error line begins with outside a multiplexed response (`packet_writer_error`).
 const ERR: &[u8] = b"ERR ";
 
+/// Format: what git's `die` writes before a dying process's words (`usage.c` `die_builtin`), which git's server relays
+/// on band 2 when `pack-objects` dies (A-640 part 4).
+const FATAL: &[u8] = b"fatal: ";
+
 /// Format: the flush packet, four zero digits [gitprotocol-common: "0000 (flush-pkt)"].
 const FLUSH: &[u8] = b"0000";
 
@@ -142,6 +146,29 @@ impl<K> Answer<K> {
       refusal: Some(refused.refusal),
       ..Answer::whole(head)
     }
+  }
+
+  /// The answer git's server gives when `pack-objects` dies as it begins (A-640 part 4: a sparse filter's blob that is
+  /// not resolved or not read): `head`, the sections before the pack and the packfile section's header; then `refusal`'s
+  /// words as the dying process's `fatal:` line, on band 2, where git relays its error; then git's band-3 words; and no
+  /// flush, as none follows git's. The band packets are charged to `admission` first.
+  pub(super) fn died(
+    mut head: Vec<u8>,
+    refusal: Refusal,
+    admission: &mut Admission,
+  ) -> Result<Answer<K>, Refusal> {
+    let mut fatal = FATAL.to_vec();
+    fatal.extend(refusal.words());
+    fatal.push(b'\n');
+    let bands = sideband::written_len(to_u64(fatal.len()))
+      .saturating_add(sideband::written_len(to_u64(ABORT.len())));
+    admission.charge(bands).map_err(Refusal::PastAdmission)?;
+    sideband::write(Band::Progress, &fatal, &mut head);
+    sideband::write(Band::Error, ABORT, &mut head);
+    Ok(Answer {
+      refusal: Some(refusal),
+      ..Answer::whole(head)
+    })
   }
 
   /// An answer of `head`, then the pack `source` writes, framed as `framing` frames it; under v2 its grammar is where
