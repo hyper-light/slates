@@ -44368,7 +44368,8 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
   `ACK`s. The pack is A-615's for the wants and every have. It is framed on side-band-64k, on side-band (1000-byte
   packets, so 995 bytes of the pack each) or bare, with a flush after it on either band, through the answer's framing
   shared with v2.
-- **A-615's object rule, corrected** (`negotiation/objects.rs`, its oracle with it). Serving git's own `--deepen` fetch
+- **A-615's object rule, corrected** (`negotiation/objects.rs`, its oracle with it; the bug note
+  `docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`). Serving git's own `--deepen` fetch
   (a thin pack; the client shallow at the tip, which it sent as a have) sent that tip's blobs again; git had left them
   out. git's stateless `deepen 2` without `thin-pack` had sent them. The rule that holds both is `pack-objects`':
   under `--thin` with `--shallow` it walks with `--objects-edge-aggressive`, and `mark_edges_uninteresting` leaves out
@@ -44422,7 +44423,8 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
 - **Next** (A-640's parts): `sparse:oid` (part 4); a stateful v0 session over SSH; `packfile-uris` and `bundle-uri`
   from the store's URI packs and bundle list; progress on band 2; the walk in cooperative slices.
 
-Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload/v0.rs`,
+Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), the bug note
+`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`, `crates/git` (`upload/v0.rs`,
 new, with `upload/tests/v0.rs`; `upload/mod.rs`, v0 and v1 dispatched and their refusals; `upload/answer.rs`, the
 pack's framing; `upload/advertise.rs`, `upload/refs.rs` and `upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`,
 `ready`, `shallow_update` and `Request::thin`; `negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`,
