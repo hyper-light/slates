@@ -76,6 +76,21 @@ impl Positions {
     self.runs.len()
   }
 
+  /// The runs `[start, end)`, ascending, as the set keeps them: what a derived value encodes (A-647 part 2).
+  pub(crate) fn run_pairs(&self) -> &[(u64, u64)] {
+    &self.runs
+  }
+
+  /// The set kept as `runs`, or `None` unless each is non-empty and they ascend with a gap between each two: the one
+  /// way a set is kept, so a decoded set is equal to the set encoded and to no other.
+  pub(crate) fn from_runs(runs: Vec<(u64, u64)>) -> Option<Positions> {
+    let each = runs.iter().all(|run| run.0 < run.1);
+    let apart = runs
+      .windows(2)
+      .all(|pair| matches!(pair, [left, right] if left.1 < right.0));
+    (each && apart).then_some(Positions { runs })
+  }
+
   /// Every position, ascending.
   pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
     self.runs.iter().flat_map(|&(start, end)| start..end)
