@@ -152,3 +152,55 @@ impl Scan<'_> {
     Some(())
   }
 }
+
+/// What a step of a search left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchStep {
+  /// More of the search to do.
+  More,
+  /// The search is done: the delta, or `None` where [`delta_of`] answers `None`.
+  Done(Option<Vec<u8>>),
+}
+
+/// What a search did, for a test to see each step bounded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchCounters {
+  /// Steps taken.
+  pub steps: u64,
+  /// The source's bytes indexed.
+  pub indexed: u64,
+  /// The target's bytes scanned.
+  pub scanned: u64,
+}
+
+/// git's delta of a source and a target searched a step at a time (A-653 continued (3)). This first state is the
+/// failing test's: the whole search in one step.
+#[derive(Default)]
+pub struct Search {
+  done: bool,
+  counters: SearchCounters,
+}
+
+impl Search {
+  /// A search with nothing done.
+  pub fn new() -> Search {
+    Search::default()
+  }
+
+  /// What the search did.
+  pub fn counters(&self) -> SearchCounters {
+    self.counters
+  }
+
+  /// One step: today's whole search.
+  pub fn step(&mut self, source: &[u8], target: &[u8], _budget: usize) -> SearchStep {
+    self.counters.steps = self.counters.steps.saturating_add(1);
+    if self.done {
+      return SearchStep::Done(None);
+    }
+    self.done = true;
+    self.counters.indexed = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    self.counters.scanned = u64::try_from(target.len()).unwrap_or(u64::MAX);
+    SearchStep::Done(delta_of(source, target))
+  }
+}
