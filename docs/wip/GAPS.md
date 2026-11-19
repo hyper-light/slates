@@ -1226,6 +1226,10 @@
 > principal, compiled once by the connection and asked through `authz::may_read` by the read commands, `update`'s
 > target and the report drive alike, where the update and its drive had asked the caller's guards; `Guards` keeps the
 > locks alone. Red then green (macOS arm64, Mac Studio, 158 of 158). Owed: the Windows run and red-checks (main's).
+> Continued (3), 2026-11-19: one record of locks; an update's drive reads A-602's lock table at the call's instant
+> (`Sources::now`), where it had asked the caller's `Guards::lock_token`; `Guards` removed. Red then green (macOS
+> arm64, Mac Studio, 130 of 130). Owed: the commit drive's second compile of `Policy::authz`; the Windows run and
+> red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
