@@ -234,7 +234,7 @@
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
 > encodes back byte for byte. This is main's answer to A-604's question: v0 and v2 read alike. Red first (2 of 39 v2
-> tests), then `cargo test -p slates-git --lib` 205 of 205. Owed of A-624: `object-info` and `bundle-uri` read and
+> tests), then `cargo test -p slates-git --lib` 221 of 221 over main with it. Owed of A-624: `object-info` and `bundle-uri` read and
 > answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads

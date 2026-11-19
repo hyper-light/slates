@@ -41733,7 +41733,7 @@ Applied in the same change to:
   refused, since no git writes them.
 - **Tests** (Mac Studio M3 Ultra, kiln, 2026-11-19). Failing first: an upper-case `want` in a `fetch` request and an
   upper-case id in an `ls-refs` answer, both refused `NotHex` before (2 of 39 v2 tests red). Then `cargo test --locked
-  -p slates-git --lib` 205 of 205, fmt clean. The cases that pinned the refusal (one in `tests/request.rs`, one in
+  -p slates-git --lib` 221 of 221 over main with this change, fmt clean. The cases that pinned the refusal (one in `tests/request.rs`, one in
   `tests/ls_refs.rs`, the unit test in `line.rs`) now pin the reading, and the bit-flip test takes a flip that
   upper-cases an id's digit as the same id, written back as the original byte.
 - **Owed of A-624:** `object-info` and `bundle-uri`, read and answered over a store trait (A-614 builds the store), and
