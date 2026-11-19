@@ -5,10 +5,11 @@
 //! for the next (RFC 6298 §5.5's back-off), never past the ceiling its caller names once backed off, and the next wait
 //! that completes ends the back-off. The learned pace itself is never cut by the ceiling: the ceiling caps a back-off.
 //!
-//! Four waits learn this way: AC-3.3's told wait, per shard (`crate::told`, A-431); every callback on an NFSv4.1 back
+//! Five waits learn this way: AC-3.3's told wait, per shard (`crate::told`, A-431); every callback on an NFSv4.1 back
 //! channel, per carrying connection (`crate::callback`, A-442); the FUSE helpers' runs, per shard
-//! (`crate::helper_runs`, A-525); and a FUSE or WinFsp mount's journal reader's patience, per mount, from its own
-//! rounds (`crate::reader_patience`, A-548). One rule, so they never drift apart.
+//! (`crate::helper_runs`, A-525); a FUSE or WinFsp mount's journal reader's patience, per mount, from its own rounds
+//! (`crate::reader_patience`, A-548); and a Windows daemon's exchanges with its anchor on the hold channel, per daemon
+//! (`crate::anchor_answers`, A-552). One rule, so they never drift apart.
 
 /// One kind of wait's measured lengths and its back-off.
 #[derive(Debug, Default)]
