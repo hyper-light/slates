@@ -880,7 +880,7 @@ fn a_capability_git_does_not_know_is_kept_by_name_and_written_back() {
   };
   assert_eq!(
     (&remade, written(|out| remade.write(out))),
-    (&advertisement, bytes)
+    (&advertisement, bytes.clone())
   );
   let want = format!("want {tip} multi_ack_detailed teleport=yes side-band-64k\n");
   let line = ClientLine::read(want.as_bytes(), ObjectFormat::Sha1).unwrap();
