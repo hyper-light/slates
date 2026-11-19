@@ -120,13 +120,29 @@ pub(crate) struct MetaOpen {
   pub(crate) flushed: bool,
 }
 
-/// The open a file's metadata entry takes: one that writes the file's attributes and may write its data, which its
-/// batch's barrier flushes (A-472).
-pub(crate) fn meta_open(_read_only: bool) -> MetaOpen {
-  MetaOpen {
-    access: READ_ATTRIBUTES | WRITE_ATTRIBUTES | WRITE_DATA | SYNCHRONIZE,
-    options: NON_DIRECTORY | OPEN_REPARSE_POINT,
-    flushed: true,
+/// The open a file's metadata entry takes (A-519). A file that is not read-only is opened to write its attributes and
+/// its data, which its batch's barrier needs to flush it (A-472): `FlushFileBuffers`' handle "must have the GENERIC_WRITE
+/// access right". NTFS opens a read-only file to no handle that writes its data: "If Open.File.FileType is DataFile and
+/// (File.FileAttributes.FILE_ATTRIBUTE_READONLY && (DesiredAccess.FILE_WRITE_DATA || DesiredAccess.FILE_APPEND_DATA)),
+/// then return STATUS_ACCESS_DENIED" (MS-FSA 2.1.5.1.2.1), the attributes' write not among them. So a read-only file is
+/// opened to write its attributes alone, write-through: "File system metadata is always cached. Therefore, to store any
+/// metadata changes to disk, the file must either be flushed or be opened with FILE_FLAG_WRITE_THROUGH" (Microsoft's
+/// File Caching). Each set through it is stored as it returns, and its barrier leaves it out. Both are opened as files,
+/// never through a link.
+pub(crate) fn meta_open(read_only: bool) -> MetaOpen {
+  let file = NON_DIRECTORY | OPEN_REPARSE_POINT;
+  if read_only {
+    MetaOpen {
+      access: READ_ATTRIBUTES | WRITE_ATTRIBUTES | SYNCHRONIZE,
+      options: file | WRITE_THROUGH,
+      flushed: false,
+    }
+  } else {
+    MetaOpen {
+      access: READ_ATTRIBUTES | WRITE_ATTRIBUTES | WRITE_DATA | SYNCHRONIZE,
+      options: file,
+      flushed: true,
+    }
   }
 }
 

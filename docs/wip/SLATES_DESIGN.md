@@ -10130,7 +10130,13 @@ entry either old or new, never torn).
    buffered information for a specified file" through a handle that may write (its documentation). No source says a
    directory's sync covers another inode's mode: fsync(2) names the file it flushes; ext4's documentation says a
    power loss loses "as much as the latest 5 seconds of metadata changes" (`commit=`); XFS's says its transactions
-   are asynchronous until a log force (A-472).
+   are asynchronous until a log force (A-472). NTFS opens a read-only file to no handle that may write: "If
+   Open.File.FileType is DataFile and (File.FileAttributes.FILE_ATTRIBUTE_READONLY && (DesiredAccess.FILE_WRITE_DATA ||
+   DesiredAccess.FILE_APPEND_DATA)), then return STATUS_ACCESS_DENIED" (MS-FSA 2.1.5.1.2.1). So a read-only file's
+   metadata entry opens it to write its attributes alone, write-through, by the rule Microsoft's File Caching states:
+   "File system metadata is always cached. Therefore, to store any metadata changes to disk, the file must either be
+   flushed or be opened with FILE_FLAG_WRITE_THROUGH". Each set through it is stored as it returns, and the batch's
+   barrier leaves the file out (A-519); those sets wait on the device on the shard, beside the directory syncs (GAPS).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
