@@ -119,6 +119,16 @@ struct TreeKeys {
 }
 
 impl TreeKeys {
+  /// Every path a mode or an attribute of the tree is at, once each.
+  fn metadata_paths(&self) -> BTreeSet<String> {
+    self
+      .modes
+      .iter()
+      .chain(self.xattrs.iter().map(|(path, _)| path))
+      .cloned()
+      .collect()
+  }
+
   /// Every path a key of the tree is at, once each.
   fn paths(&self) -> Vec<String> {
     let paths: BTreeSet<&String> = self
@@ -900,18 +910,13 @@ impl Green {
           .iter()
           .map(|path| Effect::RemoveSymlink(path.clone())),
       )
-      .chain(
-        tree
-          .xattrs
-          .iter()
-          .map(|(path, name)| Effect::RemoveXattr(path.clone(), name.clone())),
-      )
       .collect();
     for effect in removals {
       self.apply_effect(effect, version, &mut staged);
     }
-    for path in &tree.modes {
-      self.remove_mode(path, version);
+    // Every mode and attribute left in the tree goes with it, whatever stands at its path (A-618's `drop_metadata`).
+    for path in tree.metadata_paths() {
+      self.drop_metadata(&path, version);
     }
     tree.paths()
   }
@@ -964,24 +969,21 @@ impl Green {
   /// first (that copy's source at the destination's place in its tree): a replace takes away the head's tree at its
   /// destination and whatever those copies bring there.
   fn replaces_declared(inc: &Increment) -> Vec<(&str, Vec<String>)> {
-    let name = |index: u64| {
-      u16::try_from(index)
-        .ok()
-        .and_then(|index| inc.doc.paths.path(index))
-    };
+    // Each index is 64 bits (A-621); one the table does not hold names nothing.
+    let name = |index: u64| inc.doc.paths.path(index);
     let copies: Vec<(&str, &str)> = inc
       .doc
       .ops
       .iter()
       .filter(|op| op.kind == OpKind::Copy)
-      .filter_map(|op| Some((name(u64::from(op.path))?, name(op.src)?)))
+      .filter_map(|op| Some((name(op.path)?, name(op.src)?)))
       .collect();
     inc
       .doc
       .ops
       .iter()
       .filter(|op| op.replaces())
-      .filter_map(|op| name(u64::from(op.path)))
+      .filter_map(|op| name(op.path))
       .map(|dst| {
         let brought = copies
           .iter()

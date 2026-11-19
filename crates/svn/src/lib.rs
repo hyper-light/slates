@@ -32,4 +32,5 @@ pub mod lock;
 pub mod mergeinfo;
 pub mod ra_svn;
 pub mod reads;
+pub mod report;
 pub mod svndiff;

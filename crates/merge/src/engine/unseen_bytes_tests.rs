@@ -47,7 +47,7 @@ impl Work {
 
   /// Adds a rename of `from` onto `to`.
   fn rename(mut self, from: &str, to: &str) -> Work {
-    let src = u64::from(self.doc.paths.intern(from));
+    let src = self.doc.paths.intern(from);
     let path = self.doc.paths.intern(to);
     self.doc.ops.push(Op {
       kind: OpKind::Rename,

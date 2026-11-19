@@ -54,7 +54,7 @@ impl Work {
   }
 
   fn name(&mut self, text: &str) -> u64 {
-    u64::from(self.doc.paths.intern(text))
+    self.doc.paths.intern(text)
   }
 
   fn stash(&mut self, bytes: &[u8]) -> u64 {
@@ -867,7 +867,11 @@ fn a_replaces_reservations_cover_what_its_commit_adds() {
 /// [`trunk_and_branch`] with the versions of [`a_branch_before_a_replace_holds_the_tree_it_took_away`] up to `head`:
 /// the branch replaced with the trunk at 3, and at 4 the trunk copied to `e` with `b/d` copied into it.
 fn replaced_up_to(head: u64) -> Green {
-  let mut green = trunk_and_branch();
+  let mut green = if head >= 2 {
+    trunk_and_branch()
+  } else {
+    trunk()
+  };
   if head >= 3 {
     accept(&mut green, &replace_copy("trunk", "b", 1), 3);
   }
@@ -1136,6 +1140,15 @@ impl State {
     taken
   }
 
+  /// Takes the file at `path` away, with its mode and attributes once nothing stands there (A-618).
+  fn unlink(&mut self, path: &str) {
+    self.files.remove(path);
+    if !self.dirs.contains(path) {
+      self.modes.remove(path);
+      self.xattrs.retain(|(at, _), _| at != path);
+    }
+  }
+
   /// Adds `tree`'s keys.
   fn graft(&mut self, tree: State) {
     self.files.extend(tree.files);
@@ -1305,8 +1318,7 @@ impl Model {
       next.graft(source);
     }
     for path in unlinked {
-      next.files.remove(path);
-      next.xattrs.remove(&(path.clone(), NAME.to_owned()));
+      next.unlink(path);
       named.insert(path.clone());
     }
     (next, named, copied)
@@ -1393,7 +1405,7 @@ impl Oracle {
   /// The file at `path` and its attribute taken away, where a file stands.
   fn take(&mut self, path: &str, census: &mut Census) -> Result<(), TestCaseError> {
     let mut next = self.model.current();
-    if next.files.remove(path).is_none() {
+    if !next.files.contains_key(path) {
       return Ok(());
     }
     census.changed_beneath += usize::from(self.green.copy_above(path).is_some());
@@ -1401,11 +1413,11 @@ impl Oracle {
     work.unlink(path);
     if next
       .xattrs
-      .remove(&(path.to_owned(), NAME.to_owned()))
-      .is_some()
+      .contains_key(&(path.to_owned(), NAME.to_owned()))
     {
       work.remove_xattr(path, NAME);
     }
+    next.unlink(path);
     let named = BTreeSet::from([path.to_owned()]);
     self
       .submit(&work, Some((next, named, BTreeSet::new())))
@@ -1607,7 +1619,7 @@ impl Oracle {
   }
 
   /// The replay must read as the green at every version and hash as it; then a branch of the green at every version
-  /// must read as the model's tree there and hash as the replay did, and no branch may walk a map.
+  /// must read as the model's tree there and hash as the replay did, and making it may walk no map.
   fn replay_and_branch(mut self) -> Result<(), TestCaseError> {
     let (replica, identities) = self.replay()?;
     let head = self.green.head();
@@ -1622,10 +1634,17 @@ impl Oracle {
     prop_assert_eq!(identities.last().copied(), Some(self.green.head_identity()));
     let Oracle { green, model, .. } = self;
     let (mut lineage, source) = Lineage::new(green);
-    let walked = lineage.walked();
     let refused = |refused: super::LineageRefused| TestCaseError::fail(format!("{refused:?}"));
     for (version, identity) in (0..=head).zip(identities) {
+      // The branch alone walks nothing; reading its base after is a walk by design.
+      let walked = lineage.walked();
       let branch = lineage.branch(source, version).map_err(refused)?;
+      prop_assert_eq!(
+        lineage.walked(),
+        walked,
+        "the branch at {} walked a map",
+        version
+      );
       let (base, hashed) = lineage
         .with(branch, |green| (green.base_at(0), green.head_identity()))
         .map_err(refused)?;
@@ -1635,7 +1654,6 @@ impl Oracle {
       prop_assert_eq!(sorted(base), state.base(), "the branch at {}", version);
       prop_assert_eq!(hashed, identity, "the branch's identity at {}", version);
     }
-    prop_assert_eq!(lineage.walked(), walked, "a branch walked a map");
     Ok(())
   }
 }

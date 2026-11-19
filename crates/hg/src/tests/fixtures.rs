@@ -578,3 +578,127 @@ pub(crate) mod revlogs {
     find(name).unwrap_or_else(|| panic!("no revlog fixture {name}"))
   }
 }
+
+/// The store golden vectors (A-630): one history stock 7.2 stored twice, in a dotencode store and a hybrid one, each
+/// store's files whole, its file list, requirements and paths, and every revision's `debugdata` once, as
+/// `fixtures/store/make-store-fixtures.sh` wrote them (its header names the exact command and the run), compiled in
+/// by name.
+pub(crate) mod store {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/store/", $name)))),*];
+    };
+  }
+
+  stored![
+    "00changelog-0.txt",
+    "00changelog-1.txt",
+    "00changelog-2.txt",
+    "00changelog-3.txt",
+    "00changelog-4.txt",
+    "00manifest-0.txt",
+    "00manifest-1.txt",
+    "00manifest-2.txt",
+    "00manifest-3.txt",
+    "00manifest-4.txt",
+    "dot-files.txt",
+    "dot-paths.txt",
+    "dot-requires.txt",
+    "dot/00changelog.d",
+    "dot/00changelog.i",
+    "dot/00manifest.i",
+    "dot/data/_capital___under.txt.i",
+    "dot/data/_f_o_o.i",
+    "dot/data/au~78.txt.i",
+    "dot/data/colon~3aquest~3fstar~2a.txt.i",
+    "dot/data/co~6d1.i",
+    "dot/data/co~6e.i",
+    "dot/data/foo.i",
+    "dot/data/lp~749.x.i",
+    "dot/data/plain.txt.i",
+    "dot/data/pr~6e.d.i",
+    "dot/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+    "dot/data/tilde~7e~c3~a9.txt.i",
+    "dot/data/trailing .i",
+    "dot/data/trailing..i",
+    "dot/data/x.i.hg/inside.txt.i",
+    "dot/data/y.d.hg/inside.txt.i",
+    "dot/data/z.hg.hg/inside.txt.i",
+    "dot/data/~20space.i",
+    "dot/data/~2eleading.i",
+    "dot/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+    "dot/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+    "dot/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+    "dot/fncache",
+    "dot/requires",
+    "f0-0.txt",
+    "f1-0.txt",
+    "f10-0.txt",
+    "f11-0.txt",
+    "f12-0.txt",
+    "f13-0.txt",
+    "f13-1.txt",
+    "f14-0.txt",
+    "f15-0.txt",
+    "f16-0.txt",
+    "f17-0.txt",
+    "f18-0.txt",
+    "f19-0.txt",
+    "f2-0.txt",
+    "f20-0.txt",
+    "f21-0.txt",
+    "f3-0.txt",
+    "f4-0.txt",
+    "f5-0.txt",
+    "f5-1.txt",
+    "f6-0.txt",
+    "f7-0.txt",
+    "f8-0.txt",
+    "f9-0.txt",
+    "hybrid-files.txt",
+    "hybrid-paths.txt",
+    "hybrid-requires.txt",
+    "hybrid/00changelog.d",
+    "hybrid/00changelog.i",
+    "hybrid/00manifest.i",
+    "hybrid/data/ space.i",
+    "hybrid/data/.leading.i",
+    "hybrid/data/_capital___under.txt.i",
+    "hybrid/data/_f_o_o.i",
+    "hybrid/data/au~78.txt.i",
+    "hybrid/data/colon~3aquest~3fstar~2a.txt.i",
+    "hybrid/data/co~6d1.i",
+    "hybrid/data/co~6e.i",
+    "hybrid/data/foo.i",
+    "hybrid/data/lp~749.x.i",
+    "hybrid/data/plain.txt.i",
+    "hybrid/data/pr~6e.d.i",
+    "hybrid/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+    "hybrid/data/tilde~7e~c3~a9.txt.i",
+    "hybrid/data/trailing .i",
+    "hybrid/data/trailing..i",
+    "hybrid/data/x.i.hg/inside.txt.i",
+    "hybrid/data/y.d.hg/inside.txt.i",
+    "hybrid/data/z.hg.hg/inside.txt.i",
+    "hybrid/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+    "hybrid/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+    "hybrid/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+    "hybrid/fncache",
+    "hybrid/requires",
+  ];
+
+  /// The file named `name`, if there is one.
+  pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+  }
+
+  /// The file named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    find(name).unwrap_or_else(|| panic!("no store fixture {name}"))
+  }
+}

@@ -47,11 +47,13 @@ pub mod delta;
 pub mod entry;
 pub mod http;
 pub mod lfs;
+pub mod negotiation;
 pub mod object_name;
 pub mod objects;
 pub mod out;
 pub mod pack;
 pub mod pktline;
+pub mod receive;
 pub mod refname;
 pub mod sideband;
 pub mod store;
@@ -74,3 +76,7 @@ mod fixtures;
 #[cfg(test)]
 #[path = "tests/pack_fixtures.rs"]
 mod pack_fixtures;
+
+#[cfg(test)]
+#[path = "tests/v2_rest_fixtures.rs"]
+mod v2_rest_fixtures;

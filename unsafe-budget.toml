@@ -713,3 +713,6 @@ slates-git = 0
 # slates-http (0): the shared HTTP/1.1 request codec (A-595, §4.17.2 piece 8): heads and bodies read by checked offsets
 #   and `get`, gzip through flate2's safe API; no casts, no maps, no FFI.
 slates-http = 0
+# slates-http-edge (0): the HTTP edge's engine (A-625, §4.17.2): a state machine over bytes through slates-http's safe
+#   codec and rustls's safe API over aws-lc-rs; no FFI, no casts, no maps of its own.
+slates-http-edge = 0
