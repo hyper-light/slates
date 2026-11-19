@@ -2867,7 +2867,7 @@ fn run_forwarded(
 }
 
 /// Applies the channel-local status cursor discipline before dispatching ordinary verbs.
-fn status_on_channel(
+pub(crate) fn status_on_channel(
   state: &mut ShardState,
   client: Handle<ClientSlot>,
   request: u64,
@@ -15422,7 +15422,7 @@ fn remember_forwarded_ring(
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
 /// is kept and retried; never dropped).
-fn send_reply(
+pub(crate) fn send_reply(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
