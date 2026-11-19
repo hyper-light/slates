@@ -114,6 +114,15 @@ fn lengths_past_the_input_and_trailing_bytes_are_refused() {
   assert_eq!(reader.byte(), Err(WireRefusal::Truncated { at: 1 }));
 }
 
+/// `bytes` as a string, then `names` as a name-list.
+fn encoded(bytes: &[u8], names: &[String]) -> Vec<u8> {
+  let mut payload = Vec::new();
+  put_string(&mut payload, bytes).unwrap();
+  let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+  put_name_list(&mut payload, &refs).unwrap();
+  payload
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
@@ -124,15 +133,12 @@ proptest! {
     bytes in proptest::collection::vec(any::<u8>(), 0..300),
     names in proptest::collection::vec("[!-+\\--~]{1,64}", 0..8),
   ) {
-    let mut payload = Vec::new();
-    put_string(&mut payload, &bytes).unwrap();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    put_name_list(&mut payload, &refs).unwrap();
+    let payload = encoded(&bytes, &names);
     let mut reader = Reader::new(&payload);
-    prop_assert_eq!(reader.string().unwrap(), &bytes[..]);
-    let read: Vec<&[u8]> = reader.name_list().unwrap().names().collect();
+    prop_assert_eq!(reader.string(), Ok(&bytes[..]));
+    let read: Option<Vec<&[u8]>> = reader.name_list().ok().map(|list| list.names().collect());
     let expected: Vec<&[u8]> = names.iter().map(|name| name.as_bytes()).collect();
-    prop_assert_eq!(read, expected);
+    prop_assert_eq!(read, Some(expected));
     prop_assert_eq!(reader.finish(), Ok(()));
   }
 

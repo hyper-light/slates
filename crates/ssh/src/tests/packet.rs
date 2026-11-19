@@ -30,11 +30,52 @@ fn draft_payload() -> Vec<u8> {
 
 /// Opens `wire` as one whole packet with `opener`, framing it from its first four bytes first.
 fn open_wire(opener: &mut Opener, wire: &[u8], cap: usize) -> Result<Vec<u8>, PacketRefusal> {
-  let size = opener.frame(wire[..LENGTH_LEN].try_into().unwrap(), cap)?;
-  assert_eq!(size, wire.len(), "the frame names the whole packet");
+  let have = wire.len() as u64;
+  let incomplete = PacketRefusal::Incomplete {
+    have,
+    need: LENGTH_LEN as u64,
+  };
+  let head: [u8; LENGTH_LEN] = wire
+    .get(..LENGTH_LEN)
+    .and_then(|head| head.try_into().ok())
+    .ok_or(incomplete)?;
+  let size = opener.frame(head, cap)?;
+  if size != wire.len() {
+    return Err(PacketRefusal::Incomplete {
+      have,
+      need: size as u64,
+    });
+  }
   let mut packet = wire.to_vec();
   let opened = opener.open(&mut packet)?;
-  Ok(packet[opened.payload].to_vec())
+  packet
+    .get(opened.payload)
+    .map(<[u8]>::to_vec)
+    .ok_or(incomplete)
+}
+
+/// A sealer and an opener under `cipher` (none in the clear) with fixed key material, and the cipher's alignment and
+/// tag length.
+fn pair(cipher: Option<Cipher>) -> (Sealer, Opener, usize, usize) {
+  match cipher {
+    None => (Sealer::clear(), Opener::clear(), CLEAR_ALIGNMENT, 0),
+    Some(cipher) => {
+      let key = vec![0x42; cipher.key_len()];
+      let iv = vec![0x24; cipher.iv_len()];
+      let alignment = if cipher == Cipher::Aes256Gcm {
+        AES_BLOCK_LEN
+      } else {
+        CLEAR_ALIGNMENT
+      };
+      let sealer = Sealer::new(cipher, &key, &iv).unwrap();
+      (
+        sealer,
+        Opener::new(cipher, &key, &iv).unwrap(),
+        alignment,
+        TAG_LEN,
+      )
+    }
+  }
 }
 
 /// A-594 golden (`draft-ietf-sshm-chacha20-poly1305-04` Appendix A): do seal the draft's packet under its key at its
@@ -295,18 +336,11 @@ proptest! {
   fn any_payload_seals_aligned_and_opens_back(
     payload_len in 1usize..34_900,
     seed in any::<u64>(),
-    cipher in prop_oneof![Just(None), Just(Some(Cipher::ChaCha20Poly1305)), Just(Some(Cipher::Aes256Gcm))],
+    selector in 0usize..3,
   ) {
+    let cipher = [None, Some(Cipher::ChaCha20Poly1305), Some(Cipher::Aes256Gcm)][selector];
     let payload: Vec<u8> = (0..payload_len).map(|index| index as u8).collect();
-    let (mut sealer, mut opener, alignment, tag) = match cipher {
-      None => (Sealer::clear(), Opener::clear(), CLEAR_ALIGNMENT, 0),
-      Some(cipher) => {
-        let key = vec![0x42; cipher.key_len()];
-        let iv = vec![0x24; cipher.iv_len()];
-        let alignment = if cipher == Cipher::Aes256Gcm { AES_BLOCK_LEN } else { CLEAR_ALIGNMENT };
-        (Sealer::new(cipher, &key, &iv).unwrap(), Opener::new(cipher, &key, &iv).unwrap(), alignment, TAG_LEN)
-      }
-    };
+    let (mut sealer, mut opener, alignment, tag) = pair(cipher);
     let mut out = Vec::new();
     prop_assert_eq!(sealer.seal(&payload, &mut Seeded::new(seed), &mut out), Ok(()));
     prop_assert!(out.len() <= MAX_PACKET_EVERY_PEER_ACCEPTS);
