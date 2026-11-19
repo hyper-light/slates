@@ -75,6 +75,7 @@ mod own_nfs;
 mod checkout;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
+pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
@@ -148,6 +149,7 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+mod repository;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

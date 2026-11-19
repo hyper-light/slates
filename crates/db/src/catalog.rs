@@ -1404,6 +1404,36 @@ pub struct RepositoryRecord {
   pub owner: Principal,
 }
 
+/// How a green joined its repository's lineage (§4.17.1 item 4, A-575): a repository's greens share the nodes of their
+/// maps in one lineage on the repository's partition, and a recovery rebuilds each the way it joined, in the order they
+/// joined.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberOrigin {
+  /// The lineage's first green, rebuilt from its own origin and chain.
+  Root,
+  /// A green made at version `version` of member `from` without a walk (`slates_merge::engine::Lineage::branch`):
+  /// rebuilt by branching `from` at `version` again, then from its own checkpoint and chain.
+  Branch {
+    /// The member it was made from.
+    from: VolumeId,
+    /// The version of `from` it was made at, its own version 0.
+    version: u64,
+  },
+}
+
+/// A green of a repository's lineage (§4.17.1 item 4, A-575): its repository, and how it joined. A member stays one
+/// while its green lives, the repository destroyed or not (A-515 leaves a destroyed repository's greens), since its
+/// rebuild needs the member it was made from.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct MemberRecord {
+  /// The repository whose lineage it joined.
+  pub repository: RepositoryId,
+  /// The green.
+  pub green: VolumeId,
+  /// How it joined.
+  pub origin: MemberOrigin,
+}
+
 /// One name of a repository's namespace (§4.17.1; A-515): a branch, bound to the green whose versions are its values.
 /// A green is bound to at most one name, and lives on its repository's partition.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]

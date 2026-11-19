@@ -99,6 +99,12 @@ pub enum DbError {
   NotGreen,
   /// A repository's or a branch's name is empty or holds a NUL byte (§4.17.1, A-515).
   InvalidName,
+  /// A green that live members of its lineage were made from cannot be destroyed while they live: each would lose the
+  /// version it was made at, which its rebuild branches from again (§4.17.1 item 4, A-575). Never entered in the log.
+  BranchedFrom {
+    /// The live members made from it.
+    members: u64,
+  },
   /// A review record's change out of its order (§4.17.1 shared piece 6, A-596): an outdated comment moved or outdated
   /// again, a comment or approval changed at a version not after the one it stands on, an approval bound back to an
   /// earlier version, or a new record that is already outdated or stale. Never entered in the log.
@@ -147,6 +153,10 @@ impl fmt::Display for DbError {
       Self::Memory(e) => write!(f, "memory: {e}"),
       Self::NotGreen => f.write_str("not a green volume"),
       Self::InvalidName => f.write_str("an empty name, or one holding a NUL byte"),
+      Self::BranchedFrom { members } => write!(
+        f,
+        "{members} live members of its lineage were made from this green"
+      ),
       Self::ReviewOutOfOrder => f.write_str("a review record changed out of its order"),
     }
   }

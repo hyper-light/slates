@@ -649,6 +649,12 @@ pub enum Op {
     /// The kernel's id of its mount, as its mount table names it.
     mount: u64,
   },
+  /// A green joined its repository's lineage (§4.17.1 item 4, A-575): the repository's first green as its root, or a
+  /// green made at a version of another member. Appended.
+  RepositoryGreenJoined {
+    /// The membership.
+    record: crate::catalog::MemberRecord,
+  },
   /// A review comment was written on a request (§4.17.1 shared piece 6, A-596): anchored to a path, the whole lines a
   /// byte range covers, and the version of the request's work it stands on. Appended.
   ReviewCommented {
@@ -740,6 +746,7 @@ impl Op {
       Op::AttachmentRemoved { .. } => "attachment_removed",
       Op::AttachmentBound { .. } => "attachment_bound",
       Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
+      Op::RepositoryGreenJoined { .. } => "repository_green_joined",
       Op::ReviewCommented { .. } => "review_commented",
       Op::ReviewCommentMoved { .. } => "review_comment_moved",
       Op::ReviewCommentOutdated { .. } => "review_comment_outdated",
