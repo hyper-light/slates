@@ -3179,6 +3179,9 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::Win32(code) => HostAnswer::Errno {
       errno: i32::try_from(code).unwrap_or(i32::MAX),
     },
+    // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
+    // a refusal no errno names.
+    HostError::Pending => HostAnswer::Errno { errno: 0 },
   }
 }
 

@@ -170,10 +170,9 @@ fn a_rename_over_a_different_file_rebased_then_submitted_replaces_it() {
 
 /// §4.16 "Composition at seal" ("a base file renamed ... is one `Rename` plus its content"). Do: on a one-shard daemon,
 /// a green whose `a` reads `0123456789` and `b` sixteen other bytes; in a work, rename `a` over `b`, then write `XY` at
-/// the end of `b`; submit; read the head. Expect: `b` reads `0123456789XY`. Today the verdict skips the content of a
-/// renamed-into path and copies the source's head bytes, so the submit is accepted and the edit is lost.
+/// the end of `b`; submit; read the head. Expect: `b` reads `0123456789XY`. Until A-547 the verdict skipped the content
+/// of a renamed-into path and copied the source's head bytes, so the submit was accepted and the edit lost.
 #[test]
-#[ignore = "GAPS: an edit after a rename is accepted and lost (2026-11-09); the merge's rename takes the source's head bytes and skips the destination's content ops, and the chain entry's Copied form has no ops to replay"]
 fn an_edit_after_a_rename_over_a_file_is_merged_with_it() {
   let after = rename_over("rename-edit", b"bbbbbbbbbbbbbbbb", false, b"XY");
   assert!(
