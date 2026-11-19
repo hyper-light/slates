@@ -1129,6 +1129,10 @@
 > commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
 > authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
 > for anonymous): the read commands' authorization is owed (A-606).
+> Continued (2), 2026-11-19 (g297's step-6 finding): one read rule for a session, the rules `Policy::authz` gives the
+> principal, compiled once by the connection and asked through `authz::may_read` by the read commands, `update`'s
+> target and the report drive alike, where the update and its drive had asked the caller's guards; `Guards` keeps the
+> locks alone. Red then green (macOS arm64, Mac Studio, 158 of 158). Owed: the Windows run and red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
