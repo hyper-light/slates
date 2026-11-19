@@ -163,9 +163,10 @@ fn misnamed(object: ObjectId, registers: &[(RegisterClass, ObjectId)]) -> Vec<Ob
 
 /// A-636 part 2a (AUD-29-17; A-642): every register of an object names its class and leads back to its object. Do: for
 /// objects minted at four counters, the largest an id may carry among them, each register: its own, its catalog and
-/// its four state logs'; then an id minted one past the largest counter. Expect: six distinct registers an object, each
-/// naming the class it was made in, leading back to its object and made again from any other; and the id past the
-/// largest counter no object's own register, which is why a minter refuses past it.
+/// its four state logs'; then the same for an id minted one past the largest counter. Expect: six distinct registers an
+/// object, each naming the class it was made in, leading back to its object and made again from any other; and some
+/// register of the id past the largest counter naming another class or leading elsewhere, which is why a minter
+/// refuses past it.
 #[test]
 fn every_register_of_an_object_names_its_class_and_leads_back_to_it() {
   for object in COUNTERS.map(minted) {
@@ -178,10 +179,11 @@ fn every_register_of_an_object_names_its_class_and_leads_back_to_it() {
     );
     assert_eq!(misnamed(object, &registers), Vec::new(), "{object:?}");
   }
+  let past = minted(MAX_OBJECT_COUNTER.saturating_add(1));
   assert_ne!(
-    minted(MAX_OBJECT_COUNTER.saturating_add(1)).class(),
-    RegisterClass::Own,
-    "an id past the largest counter reads as another register"
+    misnamed(past, &registers_of(past)),
+    Vec::new(),
+    "an id past the largest counter has registers that do not lead back to it"
   );
 }
 
