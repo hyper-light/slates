@@ -305,6 +305,18 @@
 > with each object's SHA-256 an index row and uploads checked against it, lock records per repository); expiries
 > learned from the deployment's token lifetimes; the stock client end to end against slates' own server (main's run);
 > Mercurial's `lfs` (§4.17.3), which moves the module to a crate both servers use.
+> **A-629 part 1 (2026-11-19, g293; serving Git LFS, slates-git's half):** `slates-git` (`lfs::serve`, `lfs::objects`)
+> routes and answers the batch API, the basic transfers and the locks API over three seams: `Access` (vcs_policy's
+> check, A-597), the objects in `slates-vcs` (named by SHA-256, checked on arrival, nothing of a mismatch kept) and
+> `Locks` (the repository's lock log, A-642). An action's `expires_at` is the asking credential's expiry, none for one
+> that never expires (main's ruling; it replaces A-610's owed "expiries learned"). `Accept` by RFC 9110's precedence and
+> zero weights; `401` with `LFS-Authenticate` without credentials; every answer charged before it is made; a page cut
+> with the cursor that ends it reserved, and `413` for a page that cannot hold one lock. Proven by the stock git-lfs
+> 3.8.1 client's 24 recorded exchanges replayed through the server and a property test of the paging rule; `cargo test
+> -p slates-git --lib` on the Mac Studio: 293 of 293, the 22 new failing first against stubs.
+> Owed (part 2): the lock log in slates-db, guarded then applied (A-642); `Access` over vcs_policy and the lock owner
+> rule in slates-server; each repository's LFS index; the call A-625's edge makes. Then a streaming put in
+> `slates-vcs`, so an upload is not held whole; the stock client end to end against slates (main's run).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
@@ -341,7 +353,7 @@
 > record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
 > --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
 > mutation. Owed: receive-pack submitting the work (piece 6; git's store implementing
-> `PushObjects` is A-638's, below); submodule links (§4.17.2 item 5's special node kind, A-637); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> `PushObjects` is A-638's, below; submodule links are A-637's, below); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
 > post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
 > 64-bit path indices ended the 65,535-name cap this piece first refused past).
 >
@@ -354,6 +366,14 @@
 > store, and two pushes made works through it, are among the tests. Owed: receive-pack's part 2 submitting each ref's
 > work through these views. A `Cow` return on `unpack::Outside` and `receive::Repository` would let a view lend an
 > assembled base without keeping it (those traits are A-608's and A-620's).
+>
+> **A-637 (2026-11-19, g225; §4.17.2 item 5, a submodule's link):** built in `slates-merge`. `SpecialKind::Gitlink`
+> holds the commit's id, encoded beside A-294's device kinds. A-618's push makes, moves and removes a link, and lays
+> each node's encoding where the deriver placed it (it had laid only file and attribute bytes). The engine takes a link
+> moved to another commit as the same kind (`SpecialKind::same_type`); before, every move was `TypeChanged`. Tests:
+> `slates-merge --lib` 97 of 97 on the Mac Studio (104 of 104 merged with main and A-643), red first and red four ways
+> by mutation. Owed: a link's form in a
+> volume and in a checkout (git's: an empty directory).
 > **A-624 part 2 (2026-11-19, g230; piece 14's rest):** `slates-git` (`v2`) reads `object-info` and `bundle-uri`
 > requests and answers them over traits: `object-info` as git 2.50.1 answers (`size` only when asked, an unknown
 > object's space alone, ids alone without `size`, no LF) from `ObjectSizes`, which A-614's store answers by its rows
