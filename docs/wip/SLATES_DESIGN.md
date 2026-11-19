@@ -36886,8 +36886,57 @@ and:
   - Each arm of the recovered count, removed on a copy, failed the restart test at the later clone: without the shared
     directories it counted 7 of 9; recording zero, 0 of 9.
 - **Found by the sweep, left open** (GAPS, with the bug record):
-  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, the next piece).
+  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, fixed since).
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance.
   - A resize leaves the entry allowance at the size the volume was made with.
   - Recovery counts a whiteout as a live entry (found by reading).
+
+### A-561 — A restart rebuilds a clone holding its own snapshot, whatever it still shares with its origin (2026-11-19, goal 85, g234; found by A-549; §4.8 recovery, A-64's clone image, A-395)
+Applied in the same change to: A-549's entry and its bug record (the sibling marked fixed); GAPS, §8c (the fix and what
+main owes); the bug record `docs/bugs/2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`; and:
+- `crates/vfs`: `recover.rs` (`shared_source`'s head arm); `volume.rs` (the lib test
+  `a_clone_holding_its_own_snapshot_is_rebuilt_at_a_restart_whatever_it_shares_with_its_origin` in `clone_count_tests`,
+  and the module's notes).
+
+- **What was there.** A restart refused, `RecoveryIncomplete`, every clone that had taken a snapshot while it still
+  shared a file with its origin, which is any file it had not rewritten. The daemon listed the clone as not recovered
+  (`ImageRefused`) and every clone of its snapshot with it (`OriginNotRecovered`). The capture marks such a file
+  `SharedSource::Head`, since the head's table holds its very handle. A clone's image carries the record by number
+  (`origin_shared`, A-64), and recovery rebuilds the clone's head table over its origin snapshot's, so the table holds
+  it. But recovery looked a head-shared entry up only among the images of the head's own inodes, a strict subset of
+  what a clone's head holds. No test had restarted a clone with a snapshot of its own.
+- **The rule.** A snapshot's head-shared entry resolves through the head's rebuilt table, which holds every number the
+  head holds (its own and, for a clone, the records it shares with its origin), as an origin-shared entry resolves
+  through the origin snapshot's table; its kind is the inode's.
+- **Why recovery, not capture.** The other repair was to have a clone's capture check the origin rule first. It is
+  rejected for three reasons:
+  - The capture is right by the image's own definitions: `SharedSource::Head` is "the version the head still holds,
+    shared by CoW handle identity", and these records are exactly that. Only recovery's lookup was narrower than the
+    set the rules name.
+  - Images already published still name these entries `Head`. The anchor keeps the last publication across a restart,
+    an upgrade's included, and a capture-side change keeps the layout and `IMAGE_VERSION`, so those images would
+    still be refused. The recovery-side rule rebuilds them as well as new ones.
+  - A capture change would touch both of a publication's encoders (the struct builder and the streamed one, held equal
+    by `check_publication`), where this touches neither.
+
+  The deadlist pass already treats head-shared and origin-shared entries alike ("not this snapshot's to free"), so the
+  rebuilt deadlists are those the live volume kept. `held_directory` keeps its lookup among the head's own images,
+  which is complete there: a clone's snapshot never shares a directory with the head (A-395, A-64), and any other
+  volume's image holds its whole head.
+- **Tests.** A 6-bit matrix with 48 distinct cases:
+  - The origin changes a directory after its snapshot, or not.
+  - The clone removes an inherited file, makes a directory, takes a snapshot of its own and makes a file after it, has
+    that snapshot cloned, and rewrites an inherited file (after its snapshot, so the snapshot keeps the origin's record
+    through `SharedSource::Origin`). Each of these happens or not.
+
+  Each case restarts the origin, the clone and the clone of the clone. The clone and the clone of the clone must read
+  as before (every path's kind, number, size and bytes) and keep their counts, and a clone of the clone's snapshot
+  made after the restart must read and count as one made before it. The images are not compared whole, because
+  recovery re-stamps the birth of a directory record a clone's snapshot keeps from its origin, on purpose (A-64).
+- **Evidence.** On the Mac Studio, 2026-11-19:
+  - Red with main's `recover.rs`: 32 of 48 cases refused at "rebuild the clone", exactly those whose clone held a
+    snapshot of its own.
+  - Green with the rule: 48 of 48 cases, and `cargo test --locked -p slates-vfs --lib` passed 83 with 1 ignored.
+  - Before the fix, a log line in the refusing arm named the origin's `d/inner-0`, which the clone never touched.
+- **Owed (main's):** the recovery oracle and the server's recovery suite over a clone with a snapshot of its own.

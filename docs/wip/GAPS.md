@@ -8040,19 +8040,29 @@ clone by its snapshot's inodes (`Volume::snapshot_inodes`): a bounded clone's re
 dynamic clone's version hold. Measured before: a bounded clone of an origin floored 8 past its share of 28 ran with no
 inode cap (its allowance of 28 refused below its 36), a dynamic clone held 2 slots for 13 inodes, and a clone counted 13
 entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`).
-**Open, found by the sweep:**
-- A restart refused any clone holding a snapshot while it still shared a file with its origin, `RecoveryIncomplete`
-  from `Volume::clone_from_image` (A-561, the next piece): the clone's snapshot marks such a file shared with the head,
-  and recovery looks a head-shared entry up only among the images of the head's own inodes, which a clone's
-  origin-shared files are not. No test recovered a clone with a snapshot of its own; A-549's restart test recovers one
-  without.
-- A clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
+**Found by the sweep:**
+- Fixed since by A-561 (below): a restart refused any clone holding a snapshot while it still shared a file with its
+  origin, `RecoveryIncomplete` from `Volume::clone_from_image`: the clone's snapshot marks such a file shared with the
+  head, and recovery looked a head-shared entry up only among the images of the head's own inodes, which a clone's
+  origin-shared files are not. No test had recovered a clone with a snapshot of its own; A-549's restart test recovers
+  one without.
+- Open: a clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
   restart set both), so its namespace dimension is unbounded until a restart.
-- A resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume was made
-  with (`verbs::resize`).
-- Recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts it;
-  the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor at
-  the restart are raised by its whiteouts. Found by reading, not tested.
+- Open: a resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume
+  was made with (`verbs::resize`).
+- Open: recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts
+  it; the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor
+  at the restart are raised by its whiteouts. Found by reading, not tested.
+
+**Fixed 2026-11-19 (A-561, goal 85, g234): a restart refused a clone holding its own snapshot.** Every clone that had
+taken a snapshot while it still shared a file with its origin was left unrecovered at a restart (`ImageRefused`), and
+every clone of its snapshot with it (`OriginNotRecovered`): the snapshot marks such a file shared with the head, as the
+image's rules have it, and recovery looked a head-shared entry up only among the head's own inode images, which a clone's
+origin-shared records are not (A-64 carries them by number). Recovery now resolves a head-shared entry through the
+head's rebuilt table, as an origin-shared one through the origin's; the image is unchanged, so images published before
+the fix rebuild too. Measured before, on the Mac Studio: 32 of a matrix's 48 cases refused, every one whose clone held a
+snapshot of its own (`docs/bugs/2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`). **Owed (main's):**
+the recovery oracle and the server's recovery suite over a clone with a snapshot of its own, which no suite restarted.
 
 ## 8d. Phase 2 record (2026-09-05)
 

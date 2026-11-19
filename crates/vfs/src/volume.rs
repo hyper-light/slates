@@ -7878,7 +7878,9 @@ mod clone_orphan_tests {
 
 /// A-541: a clone's live-inode count (§4.2's inode dimension) is its snapshot's tree's, whatever its origin did since.
 /// After every step each volume's count is compared with the recount a restart makes of its tree (`rebuild`: the
-/// image's own inodes and the numbers it shares with its origin), as the oracle tests compare both counters.
+/// image's own inodes and the numbers it shares with its origin), as the oracle tests compare both counters. A-549 does
+/// the same for its live-entry count (the namespace dimension) against a walk of its namespace, and A-561 restarts a
+/// clone holding a snapshot of its own across a matrix of what it and its origin did, comparing what each reads.
 #[cfg(test)]
 mod clone_count_tests {
   use slates_mem::region::Region;
@@ -8219,7 +8221,7 @@ mod clone_count_tests {
   /// node; the test first checks the image shares it, or the count's shared arm would go untested. Expect the rebuilt
   /// clone's entry count and the later clone's to equal the entries a walk of each namespace reaches. Before A-549 the
   /// later clone started from the recovered origin's head count. The clone takes no snapshot of its own here: a restart
-  /// refused a clone holding one while it shared a file with its origin, a bug of its own (A-561).
+  /// refused a clone holding one while it shared a file with its origin until A-561, whose matrix test restarts those.
   #[test]
   fn a_clone_of_a_recovered_snapshot_counts_its_snapshots_entries() {
     let mut store = store();
@@ -8337,26 +8339,47 @@ mod clone_count_tests {
   /// first difference.
   fn rebuilt_as_it_was(case: u32) -> Result<(), String> {
     let mut store = store();
-    let mut origin = step("make the origin", Volume::create(&mut store, config(ORIGIN_PREFIX)))?;
+    let mut origin = step(
+      "make the origin",
+      Volume::create(&mut store, config(ORIGIN_PREFIX)),
+    )?;
     let root = step("the origin's root", origin.root_inode(&store))?;
     let inner = step("make d", origin.mkdir_no(&mut store, root, "d", DIR_MODE))?;
     for n in 0..INNER {
       let name = format!("inner-{n}");
-      step("make d's files", origin.create_file_no(&mut store, inner, &name, FILE_MODE))?;
+      step(
+        "make d's files",
+        origin.create_file_no(&mut store, inner, &name, FILE_MODE),
+      )?;
     }
     for n in 0..BEFORE {
       let name = format!("before-{n}");
-      step("make the root's files", origin.create_file_no(&mut store, root, &name, FILE_MODE))?;
+      step(
+        "make the root's files",
+        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+      )?;
     }
     let cut = step("snapshot the origin", origin.snapshot(&mut store))?;
     for n in 0..AFTER {
       let name = format!("after-{n}");
-      step("make files after the snapshot", origin.create_file_no(&mut store, root, &name, FILE_MODE))?;
+      step(
+        "make files after the snapshot",
+        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+      )?;
     }
-    step("remove before-0", origin.unlink_no(&mut store, root, "before-0"))?;
+    step(
+      "remove before-0",
+      origin.unlink_no(&mut store, root, "before-0"),
+    )?;
     if case & ORIGIN_CHANGES_D != 0 {
-      step("make inner-after", origin.create_file_no(&mut store, inner, "inner-after", FILE_MODE))?;
-      step("remove inner-0", origin.unlink_no(&mut store, inner, "inner-0"))?;
+      step(
+        "make inner-after",
+        origin.create_file_no(&mut store, inner, "inner-after", FILE_MODE),
+      )?;
+      step(
+        "remove inner-0",
+        origin.unlink_no(&mut store, inner, "inner-0"),
+      )?;
     }
     let mut clone = step(
       "clone the origin's snapshot",
@@ -8364,24 +8387,43 @@ mod clone_count_tests {
     )?;
     let clone_root = step("the clone's root", clone.root_inode(&store))?;
     let clone_inner = step("the clone's d", clone.lookup_no(&store, clone_root, "d"))?.inode;
-    let inherited = step("the clone's before-1", clone.lookup_no(&store, clone_root, "before-1"))?.inode;
-    step("make clone-made", clone.create_file_no(&mut store, clone_root, "clone-made", FILE_MODE))?;
+    let inherited = step(
+      "the clone's before-1",
+      clone.lookup_no(&store, clone_root, "before-1"),
+    )?
+    .inode;
+    step(
+      "make clone-made",
+      clone.create_file_no(&mut store, clone_root, "clone-made", FILE_MODE),
+    )?;
     if case & CLONE_REMOVES_INHERITED != 0 {
-      step("remove inner-1 in the clone", clone.unlink_no(&mut store, clone_inner, "inner-1"))?;
+      step(
+        "remove inner-1 in the clone",
+        clone.unlink_no(&mut store, clone_inner, "inner-1"),
+      )?;
     }
     if case & CLONE_MAKES_DIRECTORY != 0 {
-      step("make e in the clone", clone.mkdir_no(&mut store, clone_root, "e", DIR_MODE))?;
+      step(
+        "make e in the clone",
+        clone.mkdir_no(&mut store, clone_root, "e", DIR_MODE),
+      )?;
     }
     let clone_cut = if case & CLONE_SNAPSHOT != 0 {
       let clone_cut = step("snapshot the clone", clone.snapshot(&mut store))?;
       let after = "after-the-clones-snapshot";
-      step("make a file after the clone's snapshot", clone.create_file_no(&mut store, clone_root, after, FILE_MODE))?;
+      step(
+        "make a file after the clone's snapshot",
+        clone.create_file_no(&mut store, clone_root, after, FILE_MODE),
+      )?;
       Some(clone_cut)
     } else {
       None
     };
     if case & CLONE_REWRITES_INHERITED != 0 {
-      step("rewrite before-1 in the clone", clone.write(&mut store, inherited, 0, REWRITTEN))?;
+      step(
+        "rewrite before-1 in the clone",
+        clone.write(&mut store, inherited, 0, REWRITTEN),
+      )?;
     }
     let clone_of_clone = match clone_cut {
       Some(clone_cut) if case & CLONE_OF_CLONE != 0 => Some(step(
@@ -8409,19 +8451,36 @@ mod clone_count_tests {
     let origin_image = step("image the origin", origin.to_image(&store, None))?;
     let clone_image = step("image the clone", clone.to_image(&store, None))?;
     let clone_of_clone_image = match &clone_of_clone {
-      Some(volume) => Some(step("image the clone of the clone", volume.to_image(&store, None))?),
+      Some(volume) => Some(step(
+        "image the clone of the clone",
+        volume.to_image(&store, None),
+      )?),
       None => None,
     };
     // The restart: each volume rebuilt from its image into a store over the same RAM.
     let mut fresh = surviving(&store);
-    let images: Vec<_> = [Some(&origin_image), Some(&clone_image), clone_of_clone_image.as_ref()]
-      .into_iter()
-      .flatten()
-      .collect();
-    let claims = step("claim the images' blocks", Claims::prepare(&mut fresh, images))?;
+    let images: Vec<_> = [
+      Some(&origin_image),
+      Some(&clone_image),
+      clone_of_clone_image.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let claims = step(
+      "claim the images' blocks",
+      Claims::prepare(&mut fresh, images),
+    )?;
     let recovered_origin = step(
       "rebuild the origin",
-      Volume::from_image(&mut fresh, &origin_image, &claims, Box::new(StepClock::new(0, 1)), JOURNAL, None),
+      Volume::from_image(
+        &mut fresh,
+        &origin_image,
+        &claims,
+        Box::new(StepClock::new(0, 1)),
+        JOURNAL,
+        None,
+      ),
     )?;
     let mut recovered = step(
       "rebuild the clone",
@@ -8436,13 +8495,21 @@ mod clone_count_tests {
         None,
       ),
     )?;
-    same("the clone", &clone_shown, &(tree(&recovered, &fresh)?, counts(&recovered)))?;
+    same(
+      "the clone",
+      &clone_shown,
+      &(tree(&recovered, &fresh)?, counts(&recovered)),
+    )?;
     if let (Some(clone_cut), Some(shown)) = (clone_cut, &snapshot_shown) {
       let view = step(
         "clone the rebuilt clone's snapshot",
         Volume::clone_of(&fresh, &mut recovered, clone_cut, config(LATER_PREFIX)),
       )?;
-      same("a clone of the clone's snapshot", shown, &(tree(&view, &fresh)?, counts(&view)))?;
+      same(
+        "a clone of the clone's snapshot",
+        shown,
+        &(tree(&view, &fresh)?, counts(&view)),
+      )?;
     }
     if let (Some(clone_cut), Some(image), Some(shown)) =
       (clone_cut, &clone_of_clone_image, &clone_of_clone_shown)
@@ -8460,7 +8527,11 @@ mod clone_count_tests {
           None,
         ),
       )?;
-      same("the clone of the clone", shown, &(tree(&rebuilt, &fresh)?, counts(&rebuilt)))?;
+      same(
+        "the clone of the clone",
+        shown,
+        &(tree(&rebuilt, &fresh)?, counts(&rebuilt)),
+      )?;
     }
     Ok(())
   }

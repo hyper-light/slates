@@ -2779,7 +2779,10 @@ impl Volume {
       SharedSource::Head => {
         let handle = trie::get(&store.tries, refs.head_inode_root, InodeNo(entry.number))
           .ok_or(VfsError::RecoveryIncomplete)?;
-        Ok((refs.head_inode_root, kind_image(store.inodes.get(handle)?.kind)))
+        Ok((
+          refs.head_inode_root,
+          kind_image(store.inodes.get(handle)?.kind),
+        ))
       }
       SharedSource::Snapshot { at } => {
         let image = refs
