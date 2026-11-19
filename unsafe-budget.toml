@@ -554,86 +554,90 @@ slates-sdk-node = 0
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
 # slates-bridge-winfsp raised 156 -> 159 on 2026-11-19 (A-551, a folding volume's drive names each open by the spelling
-# Windows holds or the volume stores, counted by hand, for main's `cargo xtask unsafe` to confirm): in `host.rs` the
+# Windows holds or the volume stores; counted by hand, for main's `cargo xtask unsafe` to confirm): in `host.rs` the
 # call of ntdll's `RtlUpcaseUnicodeChar` in `system_upcase`, the system's upcase table the driver compares names by,
 # which no safe wrapper offers, 1; and `put_normalized_name` (an `unsafe fn`, as `put_info` is, and its block: WinFsp's
-# `FSP_FSCTL_OPEN_FILE_INFO` behind Create's and Open's `FileInfo`, its name buffer written when the name fits), 2. The
-# rule that picks the name, and the response's clear, are safe Rust (`crate::normalized`, `crate::inflight`).
+# `FSP_FSCTL_OPEN_FILE_INFO` behind Create's and Open's `FileInfo`, its name buffer written when the name fits), 2.
+# The rule that picks the name, and the response's clear, are safe Rust (`crate::normalized`, `crate::inflight`).
 # slates-bridge-winfsp lowered 158 -> 156 on 2026-11-18 (A-369, the drive a Mount Manager drive WinFsp's driver makes):
 # `held.rs` loses the drive's `DefineDosDeviceW` and its removal, the temporary link's open, ownership and
 # `NtMakeTemporaryObject` (5) and gains the `FSP_FSCTL_MOUNTMGR` request and the `QueryDosDeviceW` check (2); `host.rs`
-# borrows the control handle for the request (1). slates-bridge-winfsp raised 155 -> 158 on 2026-11-18 (A-360, hard
-# links through WinFsp's patched driver), measured by `cargo xtask unsafe` (kiln r3529, 158 against 155): in `host.rs`
-# the link's entry (`link`, an `unsafe fn` as every callback the dispatcher calls with the file system's pointer) and
-# its handler's read from that pointer, 2; in `dispatcher.rs` the forwarded link served before the DLL's callback, one
-# more block beside the callback's, 1. slates-bridge-winfsp raised 148 -> 155 on 2026-11-18 (A-350, the drive reports
-# its account as every object's owner, so git trusts a repository on it): the `GetSecurity` slot's callback signature in
-# `ffi.rs`, 1; in `host.rs` the `get_security` callback's two blocks (the handler and the descriptor's copy, as
-# `get_security_by_name`'s), the daemon's own token in `drive_security_descriptor` (`OpenProcessToken` and owning its
-# handle), and `token_information`'s two `GetTokenInformation` calls (the size, then the read), 6. The SIDs' text and
-# the descriptor's SDDL are safe Rust (`crate::account`, tested on every host). slates-bridge-winfsp raised 146 -> 148
-# on 2026-11-09 (A-275, NTFS's rule for who may make a link, judged by the drive since WinFsp's own check refuses
-# Developer Mode, diagnostics run 42712321599): the `GetTokenInformation(TokenPrivileges)` query of a link-making
-# Create's token in `dispatcher.rs` (`creator_may_link`), and the `RegGetValueW` read of Developer Mode in `ffi.rs`
-# (`developer_mode`), 2. slates-bridge-winfsp raised 130 -> 146 on 2026-11-09 (A-275, Windows symbolic links), each new
-# site measured by `cargo xtask unsafe`: in `ffi.rs` the four reparse slots' callback signatures and the three new
-# export types (`GetReparsePointByName`'s callback, `FspFileSystemResolveReparsePoints`,
-# `FspFileSystemFindReparsePoint`), 7; in `host.rs` the call of `FspFileSystemFindReparsePoint` with its index write in
-# `get_security_by_name`, the call of `FspFileSystemResolveReparsePoints`, `reparse_out` (an unsafe fn and its block:
-# WinFsp's in/out reparse buffer as a slice), `reparse_request` (an unsafe fn and its block: the set's or delete's name
-# and bytes), and one block in each of `link_by_name`, `get_reparse_point`, `set_reparse_point` and
-# `delete_reparse_point` taking the handler and buffers, 9. Every other step of the reparse work (the buffer's encoding
-# and decoding, `crate::symlink`; the shard's link operations) is safe Rust. slates-bridge-winfsp (131 since 2026-11-04:
-# A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's version check, replacing the read of the
-# reserved field that check once looked at, so a net one more). slates-bridge-winfsp (104): the VfsError->NTSTATUS
-# refusal taxonomy and the notification records stay safe Rust (lib.rs, notify.rs: 0). The WinFsp mount host is
-# Windows-only FFI, hand-transcribed from winfsp's headers (like the rt AFD reactor from the WDK) and compiled only for
-# Windows, each block with a `// SAFETY:` line (clippy `undocumented_unsafe_blocks` enforces it): `ffi.rs` declares the
-# `FspFileSystem*` export signatures and the `FSP_FILE_SYSTEM_INTERFACE` callback signatures, and finds the exports at
-# run time (`LoadLibraryW` twice, by name and by the registry's install directory; `RegGetValueW`; `GetProcAddress`; one
-# reinterpretation of each found address as its header signature, sealed to those signatures); `host.rs` is the mount
-# driver — the 16 `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's
-# `UserContext` handler, the opaque `FileContext` open-files, UTF-16 path strings, the read/write buffers) under
-# WinFsp's COARSE operation guard that serializes them, the calls through the loaded exports (create, mount point,
-# dispatcher, the directory fill, and the notification round's begin, notify and end), the leaked `Handler`/`OpenFile`
-# boxes, and the `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference
-# descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync` (the file system is
-# owned by its mount thread and the volume by its shard, shared only over channels, R2/D-7). Raised 86 -> 104 on
-# 2026-10-25 (G-mount step 2): the library loaded at run time rather than linked, so a daemon starts on a Windows host
-# without WinFsp (the loader's five sites), and the notification round that tells Windows of another path's change (§4.6
-# "Windows"). Raised 104 -> 111 on 2026-10-30 (A-190, the mapped-view purge): `FspFileSystemOperationProcessIdF`'s
-# export type and its call inside an open (which process made it); `CreateFileW` of a changed file through the drive,
-# unbuffered, the `OwnedHandle` taking its handle, and `WriteFile` of each piece, which make WinFsp purge coherently;
-# the write callback's out-parameters for a purge's write, answered without being applied; and the cleanup's read of a
-# purge's open-file. Raised 111 -> 112 on 2026-11-01 (Step 8 of the VFS and DAX plan, the purge Windows did not take):
-# `ReadFile` of each purged piece, through the purge's unbuffered open and a cached one, which tells a purge Windows
-# took from one whose page it kept (`CcCoherencyFlushAndPurgeCache`'s `STATUS_CACHE_PAGE_LOCKED`, which WinFsp reports
-# as success). 2026-11-02 (112 -> 104, A-198 Step 9.3): opaque generation/slot contexts replace the per-open
-# heap-pointer reads and frees. New sites own the drive link (`DefineDosDeviceW`, `NtOpenSymbolicLinkObject`,
-# `NtMakeTemporaryObject` and the returned handle), remove that exact definition at drop, and substitute/duplicate the
-# held control handle. The safe ledger and held-record codecs have no unsafe sites. The net count falls by eight,
-# measured by xtask. 2026-11-02 (+1, A-198 Step 9.4): the public FSP_FILE_SYSTEM_OPERATION function-pointer ABI, invoked
-# only with a live DLL object and aligned checked working packets by the owned receive worker (`ffi.rs`). The retained
-# receiver adds its section view/map release and checked slice, event creation/ownership, control
-# transaction/completion, and public operation-table access/call. Host sites check the DLL layout and duplicate the held
-# receive section. Removing the DLL dispatcher/guard/process-id exports offsets the new sites; xtask counts 113. One
-# additional control-handle borrow announces Transact0 before the drive is exposed, matching the vendor's
-# StartDispatcher readiness handshake; an unannounced receiver causes STATUS_CANCELLED on every early open. 2026-11-02
-# (114 -> 126): a private purge carries a mount-specific restricting SID in its own less privileged token. The receiver
-# borrows only a fresh Create's kernel token handle and checks its restricting SIDs before any identity-addressed open.
-# purge_token.rs owns the random marker, primary/restricted token handles, their native query layouts, and thread-local
-# impersonation/restoration. These twelve FFI sites replace the PID/unbuffered heuristic, which could not distinguish an
-# embedding program's ordinary opens. The held sparse-name section reuses mem's existing checked commit/copy wrappers
-# and adds no unsafe site. Measured by `target/debug/xtask unsafe`. 2026-11-02 (126 -> 130): an owned auto-reset event
-# wakes the receiver for private Begin/End messages even when Windows rejects an open without a callback. The four sites
-# create/own/signal that event and wait for it beside the control completion event. Every control operation is still
-# settled before its borrowed buffers can be freed. 2026-11-05 (131 -> 132, A-209): the `CanDelete` callback reads the
-# handler from the file system's user context, as every other callback does (`host.rs`, `can_delete`), so a directory
-# with a child refuses before Windows marks it for deletion; it had answered success unread (winfstest `t/base/03.t`
-# case 3). 2026-11-07 (132 -> 130, A-249): the purge in progress is one seqlock slot in a section both threads map,
-# never a channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`),
-# and the intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's
-# `WaitForSingleObject` go (-3). Measured by `cargo xtask unsafe`.
+# borrows the control handle for the request (1).
+# slates-bridge-winfsp raised 155 -> 158 on 2026-11-18 (A-360, hard links through WinFsp's patched driver), measured
+# by `cargo xtask unsafe` (kiln r3529, 158 against 155): in `host.rs` the link's entry (`link`, an `unsafe fn` as every
+# callback the dispatcher calls with the file system's pointer) and its handler's read from that pointer, 2; in
+# `dispatcher.rs` the forwarded link served before the DLL's callback, one more block beside the callback's, 1.
+# slates-bridge-winfsp raised 148 -> 155 on 2026-11-18 (A-350, the drive reports its account as every object's owner, so
+# git trusts a repository on it): the `GetSecurity` slot's callback signature in `ffi.rs`, 1; in `host.rs` the
+# `get_security` callback's two blocks (the handler and the descriptor's copy, as `get_security_by_name`'s), the
+# daemon's own token in `drive_security_descriptor` (`OpenProcessToken` and owning its handle), and
+# `token_information`'s two `GetTokenInformation` calls (the size, then the read), 6. The SIDs' text and the descriptor's
+# SDDL are safe Rust (`crate::account`, tested on every host).
+# slates-bridge-winfsp raised 146 -> 148 on 2026-11-09 (A-275, NTFS's rule for who may make a link, judged by the drive
+# since WinFsp's own check refuses Developer Mode, diagnostics run 42712321599): the `GetTokenInformation(TokenPrivileges)`
+# query of a link-making Create's token in `dispatcher.rs` (`creator_may_link`), and the `RegGetValueW` read of
+# Developer Mode in `ffi.rs` (`developer_mode`), 2.
+# slates-bridge-winfsp raised 130 -> 146 on 2026-11-09 (A-275, Windows symbolic links), each new site measured by `cargo
+# xtask unsafe`: in `ffi.rs` the four reparse slots' callback signatures and the three new export types
+# (`GetReparsePointByName`'s callback, `FspFileSystemResolveReparsePoints`, `FspFileSystemFindReparsePoint`), 7; in
+# `host.rs` the call of `FspFileSystemFindReparsePoint` with its index write in `get_security_by_name`, the call of
+# `FspFileSystemResolveReparsePoints`, `reparse_out` (an unsafe fn and its block: WinFsp's in/out reparse buffer as a
+# slice), `reparse_request` (an unsafe fn and its block: the set's or delete's name and bytes), and one block in each
+# of `link_by_name`, `get_reparse_point`, `set_reparse_point` and `delete_reparse_point` taking the handler and
+# buffers, 9. Every other step of the reparse work (the buffer's encoding and decoding, `crate::symlink`; the shard's
+# link operations) is safe Rust.
+# slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
+# version check, replacing the read of the reserved field that check once looked at, so a net one more).
+# slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
+# (lib.rs, notify.rs: 0). The WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the
+# rt AFD reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
+# `undocumented_unsafe_blocks` enforces it): `ffi.rs` declares the `FspFileSystem*` export signatures and the
+# `FSP_FILE_SYSTEM_INTERFACE` callback signatures, and finds the exports at run time (`LoadLibraryW` twice, by name and
+# by the registry's install directory; `RegGetValueW`; `GetProcAddress`; one reinterpretation of each found address as
+# its header signature, sealed to those signatures); `host.rs` is the mount driver — the 16
+# `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's `UserContext` handler, the
+# opaque `FileContext` open-files, UTF-16 path strings, the read/write buffers) under WinFsp's COARSE operation guard
+# that serializes them, the calls through the loaded exports (create, mount point, dispatcher, the directory fill, and
+# the notification round's begin, notify and end), the leaked `Handler`/`OpenFile` boxes, and the
+# `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference descriptor. All are
+# Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync` (the file system is owned by its mount
+# thread and the volume by its shard, shared only over channels, R2/D-7). Raised 86 -> 104 on 2026-10-25 (G-mount
+# step 2): the library loaded at run time rather than linked, so a daemon starts on a Windows host without WinFsp
+# (the loader's five sites), and the notification round that tells Windows of another path's change (§4.6 "Windows").
+# Raised 104 -> 111 on 2026-10-30 (A-190, the mapped-view purge): `FspFileSystemOperationProcessIdF`'s export type and
+# its call inside an open (which process made it); `CreateFileW` of a changed file through the drive, unbuffered, the
+# `OwnedHandle` taking its handle, and `WriteFile` of each piece, which make WinFsp purge coherently; the write callback's
+# out-parameters for a purge's write, answered without being applied; and the cleanup's read of a purge's open-file.
+# Raised 111 -> 112 on 2026-11-01 (Step 8 of the VFS and DAX plan, the purge Windows did not take): `ReadFile` of each
+# purged piece, through the purge's unbuffered open and a cached one, which tells a purge Windows took from one whose
+# page it kept (`CcCoherencyFlushAndPurgeCache`'s `STATUS_CACHE_PAGE_LOCKED`, which WinFsp reports as success).
+# 2026-11-02 (112 -> 104, A-198 Step 9.3): opaque generation/slot contexts replace the per-open heap-pointer reads
+# and frees. New sites own the drive link (`DefineDosDeviceW`, `NtOpenSymbolicLinkObject`, `NtMakeTemporaryObject`
+# and the returned handle), remove that exact definition at drop, and substitute/duplicate the held control handle.
+# The safe ledger and held-record codecs have no unsafe sites. The net count falls by eight, measured by xtask.
+# 2026-11-02 (+1, A-198 Step 9.4): the public FSP_FILE_SYSTEM_OPERATION function-pointer ABI, invoked only with a
+# live DLL object and aligned checked working packets by the owned receive worker (`ffi.rs`).
+# The retained receiver adds its section view/map release and checked slice, event creation/ownership, control
+# transaction/completion, and public operation-table access/call. Host sites check the DLL layout and duplicate the
+# held receive section. Removing the DLL dispatcher/guard/process-id exports offsets the new sites; xtask counts 113.
+# One additional control-handle borrow announces Transact0 before the drive is exposed, matching the vendor's
+# StartDispatcher readiness handshake; an unannounced receiver causes STATUS_CANCELLED on every early open.
+# 2026-11-02 (114 -> 126): a private purge carries a mount-specific restricting SID in its own less privileged
+# token. The receiver borrows only a fresh Create's kernel token handle and checks its restricting SIDs before any
+# identity-addressed open. purge_token.rs owns the random marker, primary/restricted token handles, their native
+# query layouts, and thread-local impersonation/restoration. These twelve FFI sites replace the PID/unbuffered
+# heuristic, which could not distinguish an embedding program's ordinary opens. The held sparse-name section reuses
+# mem's existing checked commit/copy wrappers and adds no unsafe site. Measured by `target/debug/xtask unsafe`.
+# 2026-11-02 (126 -> 130): an owned auto-reset event wakes the receiver for private Begin/End messages even when
+# Windows rejects an open without a callback. The four sites create/own/signal that event and wait for it beside
+# the control completion event. Every control operation is still settled before its borrowed buffers can be freed.
+# 2026-11-05 (131 -> 132, A-209): the `CanDelete` callback reads the handler from the file system's user context, as every
+# other callback does (`host.rs`, `can_delete`), so a directory with a child refuses before Windows marks it for
+# deletion; it had answered success unread (winfstest `t/base/03.t` case 3).
+# 2026-11-07 (132 -> 130, A-249): the purge in progress is one seqlock slot in a section both threads map, never a
+# channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
+# intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
+# go (-3). Measured by `cargo xtask unsafe`.
 slates-bridge-winfsp = 159
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
