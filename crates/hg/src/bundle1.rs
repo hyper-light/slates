@@ -1,4 +1,4 @@
-//! Bundle1 (`HG10`): one changegroup of version `01` after a six-byte header (A-514; `internals.bundles` [B]).
+//! Bundle1 (`HG10`): one changegroup of version `01` after a six-byte header (A-514; `internals.bundles` \[B\]).
 //!
 //! The header is `HG10` and two bytes naming the compression of everything after it: `UN` (none), `GZ` (zlib) or `BZ`
 //! (bzip2, whose own leading `BZ` the header doubles as). This module reads and writes `UN` bundles and refuses the

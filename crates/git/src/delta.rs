@@ -2,7 +2,7 @@
 //! instructions that rebuild an object from a base, as a pack's OFS_DELTA and REF_DELTA entries carry them once
 //! inflated.
 //!
-//! **Sources** (read 2026-11-19, git v2.50.1). The document [B], `Documentation/gitformat-pack.adoc`:
+//! **Sources** (read 2026-11-19, git v2.50.1). The document \[B\], `Documentation/gitformat-pack.adoc`:
 //! - "Deltified representation" (lines 95-126): the base's size and the target's in the size encoding (83-93), then
 //!   instructions, each appending to the target;
 //! - "Instruction to copy from base object" (128-156): a first byte with its top bit set, whose low seven bits say
@@ -12,7 +12,7 @@
 //!   non-zero";
 //! - "Reserved instruction" (169-175): the byte zero.
 //!
-//! The code [C]: `patch-delta.c`'s `patch_delta` (15-94), which every client runs to apply a delta, with `delta.h`'s
+//! The code \[C\]: `patch-delta.c`'s `patch_delta` (15-94), which every client runs to apply a delta, with `delta.h`'s
 //! `DELTA_SIZE_MIN` (83) and `get_delta_hdr_size` (89-102), followed where the document leaves room; and
 //! `diff-delta.c`'s `create_delta` (320-510), whose bytes the writers here match.
 //!

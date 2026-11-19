@@ -1,6 +1,6 @@
 //! Pushkey: the `pushkey` part and its `reply:pushkey`, and the encoding of a namespace's keys that `listkeys` answers
-//! with (A-545; `internals.bundle2` "pushkey", "reply:pushkey", "listkeys" [B]; `pushkey.py`, `bundle2.py`,
-//! `bundle2_part_handlers.py`, `exchange.py` [C]).
+//! with (A-545; `internals.bundle2` "pushkey", "reply:pushkey", "listkeys" \[B\]; `pushkey.py`, `bundle2.py`,
+//! `bundle2_part_handlers.py`, `exchange.py` \[C\]).
 //!
 //! - A `pushkey` part asks for one key of one namespace to move from an old value to a new one, in four mandatory
 //!   parameters and no payload; 7.2's client writes them in the order `namespace`, `key`, `old`, `new`
@@ -147,7 +147,7 @@ pub fn part<'a>(id: u32, request: &Request<'a>) -> Part<'a> {
   let params: Vec<Param<'a>> = PARAMETERS
     .iter()
     .zip(values)
-    .map(|(key, value)| Param { key: *key, value })
+    .map(|(key, value)| Param { key, value })
     .collect();
   Part {
     kind: PART,

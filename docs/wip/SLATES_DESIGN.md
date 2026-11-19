@@ -143,7 +143,7 @@ the two equal):
 <!-- host-path-sites:begin -->
 | Crate | Why it may name a host path |
 |---|---|
-| `slates-machine` | reads the kernel's pseudo-files (/proc, /sys) as queries; never writes |
+| `slates-machine` | reads the kernel's pseudo-files (/proc, /sys) as queries, and writes one: a pressure-stall trigger to /proc/pressure/memory, the kernel's own interface (A-570, psi.rst); never a host path |
 | `slates-base` | read-only access to the directories overlay volumes sit on (§4.15) |
 | `slates-land` | the only writer of host paths, under a grant (§4.15) |
 | `slates-ipc` | the per-OS rendezvous, which creates no filesystem entry (§4.7); on macOS the Shards stream's socket route, one owner-only socket node in the user's own temporary directory, removed with its daemon (A-161; socket files authorized by Ada 2026-10-22 when what crosses them is encrypted) |

@@ -1,6 +1,6 @@
-//! HTTP version 1 (A-569; `internals.wireprotocol` [B]; `wireprotoserver.py` `httpv1protocolhandler`,
+//! HTTP version 1 (A-569; `internals.wireprotocol` \[B\]; `wireprotoserver.py` `httpv1protocolhandler`,
 //! `decodevaluefromheaders`, `_httpresponsetype`, `genversion2`, `_callhttp`, and `httppeer.py`
-//! `makev1commandrequest`, `encodevalueinheaders` [C]).
+//! `makev1commandrequest`, `encodevalueinheaders` \[C\]).
 //!
 //! A command is the `cmd` field of the request's query. Its arguments are form fields (`urlencode`: `name=value`
 //! joined by `&`, a space as `+`, other bytes `%XX`), read as 7.2's server reads them (`_args`): the query's fields,
@@ -334,6 +334,9 @@ fn first<'b>(fields: &[(&'b [u8], &'b [u8])], name: &[u8]) -> Option<&'b [u8]> {
     .map(|(_, value)| *value)
 }
 
+/// A request's named arguments in the order they were read: each name with its value, both borrowed from the request.
+type Pairs<'b> = Vec<(&'b [u8], &'b [u8])>;
+
 impl<'b> Fields<'b> {
   /// The command: the query's first `cmd` field.
   pub fn command(&self) -> Option<&'b [u8]> {
@@ -381,7 +384,7 @@ impl<'b> Fields<'b> {
     spec: Spec<'_>,
     peak: &mut Admission,
     kept: &mut Admission,
-  ) -> Result<Vec<(&'b [u8], &'b [u8])>, Refusal> {
+  ) -> Result<Pairs<'b>, Refusal> {
     let all = || {
       self
         .query

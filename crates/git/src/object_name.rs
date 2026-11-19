@@ -7,7 +7,7 @@
 //! there (`parse_loose_header`). A repository names its objects with one of two hashes, which protocol v2 announces as
 //! `object-format`: SHA-1 with collision detection, or SHA-256 [B: hash-function-transition, gitprotocol-v2].
 //!
-//! **Sources** (read 2026-11-19, git 2.50.1). The code [C]:
+//! **Sources** (read 2026-11-19, git 2.50.1). The code \[C\]:
 //! - `object-file.c`: `format_object_header`, `parse_loose_header` and `MAX_HEADER_LEN`;
 //! - `object.c`: `object_type_strings` and `type_from_string_gently`;
 //! - `object.h`: `enum object_type`, whose values "are part of pack file format";
@@ -15,7 +15,7 @@
 //! - `sha1dc_git.c`: the collision check git runs, with the safe hash off, and a collision refused naming the plain
 //!   hash.
 //!
-//! The documents [B]: `gitformat-pack` ("Object types"; ofs-delta and ref-delta are "only valid in a pack file") and
+//! The documents \[B\]: `gitformat-pack` ("Object types"; ofs-delta and ref-delta are "only valid in a pack file") and
 //! `hash-function-transition`.
 //!
 //! **SHA-1 with collision detection.** git hashes SHA-1 through sha1collisiondetection ("moved to a hardened SHA-1

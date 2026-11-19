@@ -1,5 +1,5 @@
 //! A delta: the hunks that rewrite a base text into a revision's text (A-514; `internals.changegroups` "Delta
-//! Groups" [B]; `mercurial/mpatch.c` [C]).
+//! Groups" \[B\]; `mercurial/mpatch.c` \[C\]).
 //!
 //! A delta is a run of hunks with no separator. Each is a header of three big-endian signed 32-bit integers, `start`,
 //! `end` and the new data's `length`, then that many bytes: the base's bytes `start..end` are replaced by the data.
