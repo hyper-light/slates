@@ -20,8 +20,11 @@
 //! `Host`'s. A head's refusals are judged in one order whatever its fields' order: the grammar, `Host`, the length, the
 //! framing, the content coding, the expectation.
 
+use crate::grammar::{
+  is_authority, is_field_byte, is_ows, is_path, is_query, is_token, list_elements, trim_ows,
+};
 use crate::reply::{self, Status};
-use crate::{Admission, MAX_LINE};
+use crate::{Admission, CRLF, MAX_LINE, to_u64};
 
 /// A field line's name and value as received: the name in its own case, the value without its surrounding whitespace.
 pub type Field<'a> = (&'a [u8], &'a [u8]);
@@ -102,8 +105,12 @@ impl<'a> Head<'a> {
   /// The value of the field `name`, its case ignored, when at most one line carries it. Refused when several do: a
   /// field defined to hold one value is ambiguous given twice (RFC 9110 §5.3).
   pub fn field(&self, name: &[u8]) -> Result<Option<&'a [u8]>, HeadRefused> {
-    let _ = name;
-    Ok(None)
+    let mut values = self.fields_named(name);
+    let first = values.next();
+    match values.next() {
+      Some(_) => Err(HeadRefused::BadRequest(Malformed::RepeatedField)),
+      None => Ok(first),
+    }
   }
 
   /// Every value of the field `name`, its case ignored, in the order received.
@@ -111,7 +118,7 @@ impl<'a> Head<'a> {
     self
       .fields
       .iter()
-      .filter(move |(known, _)| known.is_empty() && name.is_empty())
+      .filter(move |(known, _)| known.eq_ignore_ascii_case(name))
       .map(|(_, value)| *value)
   }
 }
@@ -120,7 +127,12 @@ impl<'a> Head<'a> {
 /// type "/" subtype parameters`), to be compared without regard to case ("The type and subtype tokens are
 /// case-insensitive").
 pub fn media_type(value: &[u8]) -> &[u8] {
-  value
+  trim_ows(
+    value
+      .split(|byte| *byte == b';')
+      .next()
+      .unwrap_or_default(),
+  )
 }
 
 /// What a read of the bytes so far found.
@@ -219,14 +231,27 @@ pub enum Malformed {
 impl HeadRefused {
   /// The status the refusal is answered with.
   pub fn status(self) -> Status {
-    Status::OK
+    match self {
+      HeadRefused::BadRequest(_) => Status::BAD_REQUEST,
+      HeadRefused::ContentTooLarge => Status::CONTENT_TOO_LARGE,
+      HeadRefused::UriTooLong => Status::URI_TOO_LONG,
+      HeadRefused::UnsupportedCoding => Status::UNSUPPORTED_MEDIA_TYPE,
+      HeadRefused::ExpectationFailed => Status::EXPECTATION_FAILED,
+      HeadRefused::FieldsTooLarge => Status::FIELDS_TOO_LARGE,
+      HeadRefused::NotImplemented => Status::NOT_IMPLEMENTED,
+      HeadRefused::VersionNotSupported => Status::VERSION_NOT_SUPPORTED,
+    }
   }
 
   /// Writes the reply to the refusal: its status, no body, the connection closed; a refused content coding names the one
   /// this server decodes.
   pub fn reply(self, out: &mut Vec<u8>) -> Result<(), reply::BadField> {
-    let _ = out;
-    Ok(())
+    let fields: &[(&[u8], &[u8])] = if self == HeadRefused::UnsupportedCoding {
+      &[ACCEPT_GZIP]
+    } else {
+      &[]
+    };
+    reply::refusal(self.status(), fields, out)
   }
 }
 
@@ -256,9 +281,557 @@ impl HeadReader {
     input: &'a [u8],
     admission: &mut Admission,
   ) -> Result<Progress<Head<'a>>, HeadRefused> {
-    let _ = (input, admission, MAX_LINE, self.scanned, self.line_start, self.request_line);
-    Ok(Progress::Partial)
+    let room = usize::try_from(admission.left()).unwrap_or(usize::MAX);
+    let window = input.get(..room).unwrap_or(input);
+    let Some((start, empty_line)) = self.scan(window)? else {
+      return unended(window.len(), room, self.request_line.is_some());
+    };
+    *self = Self::default();
+    let consumed = empty_line.saturating_add(CRLF.len());
+    let text = window
+      .get(start..empty_line.saturating_sub(CRLF.len()))
+      .unwrap_or_default();
+    let head = parse(text, consumed, admission)?;
+    Ok(Progress::Complete {
+      value: head,
+      consumed,
+    })
   }
+
+  /// Scans `window` line by line from where the last read stopped: where the request line starts and where the empty
+  /// line that ends the head does, once it has come; `None` while it has not.
+  fn scan(&mut self, window: &[u8]) -> Result<Option<(usize, usize)>, HeadRefused> {
+    while let Some(line_end) = next_line_end(window, self.scanned) {
+      self.scanned = line_end.saturating_add(CRLF.len());
+      if let Some(found) = self.end_line(line_end)? {
+        return Ok(Some(found));
+      }
+    }
+    // The last byte may be a CR whose LF has not come: the next read looks at it again.
+    self.scanned = self.scanned.max(window.len().saturating_sub(1));
+    self.check_open_line(window.len())?;
+    Ok(None)
+  }
+
+  /// A line has ended at `line_end`: an empty line ends the head once the request line has come, and is skipped before
+  /// it; the first other line is the request line; a line past [`MAX_LINE`] is refused.
+  fn end_line(&mut self, line_end: usize) -> Result<Option<(usize, usize)>, HeadRefused> {
+    let start = self.line_start;
+    let length = line_end.saturating_sub(start);
+    self.line_start = line_end.saturating_add(CRLF.len());
+    if length > MAX_LINE {
+      return Err(too_long(self.request_line.is_none()));
+    }
+    match (length, self.request_line) {
+      (0, Some(request_line)) => Ok(Some((request_line, line_end))),
+      (0, None) | (_, Some(_)) => Ok(None),
+      (_, None) => {
+        self.request_line = Some(start);
+        Ok(None)
+      }
+    }
+  }
+
+  /// Refuses the line still open at the window's end once it is past [`MAX_LINE`] (one byte more allowed: its CR may
+  /// have come without its LF), without waiting for it to end.
+  fn check_open_line(&self, window_len: usize) -> Result<(), HeadRefused> {
+    let open = window_len.saturating_sub(self.line_start);
+    if open > MAX_LINE.saturating_add(1) {
+      Err(too_long(self.request_line.is_none()))
+    } else {
+      Ok(())
+    }
+  }
+}
+
+/// Format: the field a refused content coding is answered with: gzip, the one coding read here (RFC 9110 §15.5.16).
+const ACCEPT_GZIP: (&[u8], &[u8]) = (b"Accept-Encoding", b"gzip");
+
+/// Format: the protocol's name before its version (RFC 9112 §2.3: `HTTP-version = HTTP-name "/" DIGIT "." DIGIT`).
+const HTTP_NAME: &[u8] = b"HTTP/";
+
+/// Format: the method whose target is an authority, which no server here tunnels (RFC 9110 §9.3.6).
+const CONNECT: &[u8] = b"CONNECT";
+
+/// Format: the method the asterisk form may name (RFC 9112 §3.2.4).
+const OPTIONS: &[u8] = b"OPTIONS";
+
+/// Format: the asterisk form.
+const ASTERISK: &[u8] = b"*";
+
+/// Format: the path an absolute URI with no path names (RFC 9110 §4.2.3).
+const ROOT: &[u8] = b"/";
+
+/// Format: the schemes whose absolute-form targets a server here reads (RFC 9110 §4.2), compared without regard to
+/// case (RFC 3986 §3.1).
+const SCHEMES: [&[u8]; 2] = [b"http://", b"https://"];
+
+/// Format: decimal's radix, a `Content-Length`'s (RFC 9110 §8.6: `1*DIGIT`).
+const DECIMAL: u64 = 10;
+
+/// Format: the fields a head's decisions read (RFC 9110 §8.6, §8.4, §7.6.1, §10.1.1, §7.2; RFC 9112 §6.1), compared
+/// without regard to case.
+const CONTENT_LENGTH: &[u8] = b"content-length";
+/// Format: as [`CONTENT_LENGTH`].
+const TRANSFER_ENCODING: &[u8] = b"transfer-encoding";
+/// Format: as [`CONTENT_LENGTH`].
+const CONTENT_ENCODING: &[u8] = b"content-encoding";
+/// Format: as [`CONTENT_LENGTH`].
+const CONNECTION: &[u8] = b"connection";
+/// Format: as [`CONTENT_LENGTH`].
+const EXPECT: &[u8] = b"expect";
+/// Format: as [`CONTENT_LENGTH`].
+const HOST: &[u8] = b"host";
+
+/// Format: the values those fields are read for: chunked (RFC 9112 §7.1), gzip's two names (RFC 9110 §8.4.1.3),
+/// `identity`, the connection options (RFC 9112 §9.3, §9.6) and the one expectation (RFC 9110 §10.1.1).
+const CHUNKED: &[u8] = b"chunked";
+/// Format: as [`CHUNKED`].
+const GZIP_NAMES: [&[u8]; 2] = [b"gzip", b"x-gzip"];
+/// Format: as [`CHUNKED`].
+const IDENTITY: &[u8] = b"identity";
+/// Format: as [`CHUNKED`].
+const CLOSE: &[u8] = b"close";
+/// Format: as [`CHUNKED`].
+const KEEP_ALIVE: &[u8] = b"keep-alive";
+/// Format: as [`CHUNKED`].
+const CONTINUE: &[u8] = b"100-continue";
+
+/// Where the next CRLF at or after `from` starts in `window`.
+fn next_line_end(window: &[u8], from: usize) -> Option<usize> {
+  window
+    .get(from..)?
+    .windows(CRLF.len())
+    .position(|pair| pair == CRLF)
+    .map(|found| from.saturating_add(found))
+}
+
+/// The refusal of a line past its bound: `414` for the request line, `431` for a field line.
+fn too_long(request_line: bool) -> HeadRefused {
+  if request_line {
+    HeadRefused::UriTooLong
+  } else {
+    HeadRefused::FieldsTooLarge
+  }
+}
+
+/// A head that has not ended in its window: partial while the input was shorter than the room, refused once it filled
+/// the room.
+fn unended<T>(
+  window_len: usize,
+  room: usize,
+  request_line_ended: bool,
+) -> Result<Progress<T>, HeadRefused> {
+  if window_len < room {
+    Ok(Progress::Partial)
+  } else {
+    Err(too_long(!request_line_ended))
+  }
+}
+
+/// Builds the head from its text, the request line and the field lines without the empty line, after checking every
+/// line and charging `consumed` (the input bytes the head took) and the field index to `admission`.
+fn parse<'a>(
+  text: &'a [u8],
+  consumed: usize,
+  admission: &mut Admission,
+) -> Result<Head<'a>, HeadRefused> {
+  let mut all = lines(text);
+  let first = all
+    .next()
+    .unwrap_or(Err(HeadRefused::BadRequest(Malformed::RequestLine)))?;
+  let line = request_line(first)?;
+  let count = lines(text)
+    .skip(1)
+    .try_fold(0usize, |count, line| {
+      field_line(line?).map(|_| count.saturating_add(1))
+    })?;
+  charge(admission, consumed, count)?;
+  let mut fields = Vec::with_capacity(count);
+  for line in all {
+    fields.push(field_line(line?)?);
+  }
+  Decisions::read(&fields).head(line, fields)
+}
+
+/// The lines of a head's text, each without its CRLF; a CR or an LF that ends no line is refused.
+fn lines(text: &[u8]) -> impl Iterator<Item = Result<&[u8], HeadRefused>> {
+  let mut pieces = text.split(|byte| *byte == b'\n').peekable();
+  core::iter::from_fn(move || {
+    let piece = pieces.next()?;
+    let line = if pieces.peek().is_some() {
+      piece.strip_suffix(b"\r")
+    } else {
+      Some(piece)
+    };
+    Some(
+      line
+        .filter(|line| !line.contains(&b'\r'))
+        .ok_or(HeadRefused::BadRequest(Malformed::LineBreak)),
+    )
+  })
+}
+
+/// Charges a head's bytes and its field index.
+fn charge(admission: &mut Admission, consumed: usize, fields: usize) -> Result<(), HeadRefused> {
+  let index = to_u64(core::mem::size_of::<Field<'_>>()).saturating_mul(to_u64(fields));
+  admission
+    .charge(to_u64(consumed).saturating_add(index))
+    .map_err(|_| HeadRefused::FieldsTooLarge)
+}
+
+/// A request line's parts.
+struct RequestLine<'a> {
+  /// The method.
+  method: &'a [u8],
+  /// The target.
+  target: Target<'a>,
+  /// An absolute-form target's authority.
+  authority: Option<&'a [u8]>,
+  /// The version.
+  version: Version,
+}
+
+/// Reads a request line (RFC 9112 §3): three parts, one space between each.
+fn request_line(line: &[u8]) -> Result<RequestLine<'_>, HeadRefused> {
+  let mut parts = line.split(|byte| *byte == b' ');
+  let (Some(method), Some(target), Some(version), None) =
+    (parts.next(), parts.next(), parts.next(), parts.next())
+  else {
+    return Err(HeadRefused::BadRequest(Malformed::RequestLine));
+  };
+  if target.is_empty() {
+    return Err(HeadRefused::BadRequest(Malformed::RequestLine));
+  }
+  if !is_token(method) {
+    return Err(HeadRefused::BadRequest(Malformed::Method));
+  }
+  let version = http_version(version)?;
+  if method == CONNECT {
+    return Err(HeadRefused::NotImplemented);
+  }
+  let (target, authority) = request_target(method, target)?;
+  Ok(RequestLine {
+    method,
+    target,
+    authority,
+    version,
+  })
+}
+
+/// Reads `HTTP/` digit `.` digit: 1.0, 1.1 or a later minor version of 1, and refuses another major version.
+fn http_version(text: &[u8]) -> Result<Version, HeadRefused> {
+  match text.strip_prefix(HTTP_NAME) {
+    Some([b'1', b'.', b'0']) => Ok(Version::Http10),
+    Some([b'1', b'.', minor]) if minor.is_ascii_digit() => Ok(Version::Http11),
+    Some([major, b'.', minor]) if major.is_ascii_digit() && minor.is_ascii_digit() => {
+      Err(HeadRefused::VersionNotSupported)
+    }
+    _ => Err(HeadRefused::BadRequest(Malformed::Version)),
+  }
+}
+
+/// Reads a target in the origin, absolute or asterisk form (RFC 9112 §3.2), and the authority the absolute form names.
+fn request_target<'a>(
+  method: &[u8],
+  raw: &'a [u8],
+) -> Result<(Target<'a>, Option<&'a [u8]>), HeadRefused> {
+  if raw == ASTERISK {
+    return if method == OPTIONS {
+      Ok((Target::Asterisk, None))
+    } else {
+      Err(HeadRefused::BadRequest(Malformed::Target))
+    };
+  }
+  if raw.first() == Some(&b'/') {
+    return origin_form(raw).map(|target| (target, None));
+  }
+  absolute_form(raw)
+}
+
+/// Reads the origin form: a path of URI characters from its `/`, and a query after the first `?`.
+fn origin_form(raw: &[u8]) -> Result<Target<'_>, HeadRefused> {
+  let (path, query) = match raw.iter().position(|byte| *byte == b'?') {
+    Some(at) => (raw.get(..at).unwrap_or_default(), raw.get(at.saturating_add(1)..)),
+    None => (raw, None),
+  };
+  if is_path(path) && query.is_none_or(is_query) {
+    Ok(Target::Path { path, query })
+  } else {
+    Err(HeadRefused::BadRequest(Malformed::Target))
+  }
+}
+
+/// Reads the absolute form: `http` or `https`, an authority with no userinfo, then a path or a query or neither.
+fn absolute_form(raw: &[u8]) -> Result<(Target<'_>, Option<&[u8]>), HeadRefused> {
+  let rest = SCHEMES
+    .iter()
+    .find_map(|scheme| {
+      raw
+        .get(..scheme.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        .and_then(|_| raw.get(scheme.len()..))
+    })
+    .ok_or(HeadRefused::BadRequest(Malformed::Target))?;
+  let end = rest
+    .iter()
+    .position(|byte| *byte == b'/' || *byte == b'?')
+    .unwrap_or(rest.len());
+  let authority = rest.get(..end).unwrap_or_default();
+  let after = rest.get(end..).unwrap_or_default();
+  if authority.is_empty() || !is_authority(authority) {
+    return Err(HeadRefused::BadRequest(Malformed::Target));
+  }
+  let target = if after.first() == Some(&b'/') {
+    origin_form(after)?
+  } else {
+    root_with_query(after)?
+  };
+  Ok((target, Some(authority)))
+}
+
+/// The target of an absolute URI with no path: `/`, and the query `after` holds (nothing, or `?` and the query).
+fn root_with_query(after: &[u8]) -> Result<Target<'_>, HeadRefused> {
+  let query = after.strip_prefix(b"?");
+  if after.is_empty() || query.is_some_and(is_query) {
+    Ok(Target::Path { path: ROOT, query })
+  } else {
+    Err(HeadRefused::BadRequest(Malformed::Target))
+  }
+}
+
+/// A field line's name and value (RFC 9112 §5): not folded, a token before its colon, a value of field bytes.
+fn field_line(line: &[u8]) -> Result<Field<'_>, HeadRefused> {
+  if line.first().is_some_and(|byte| is_ows(*byte)) {
+    return Err(HeadRefused::BadRequest(Malformed::Folded));
+  }
+  let colon = line
+    .iter()
+    .position(|byte| *byte == b':')
+    .ok_or(HeadRefused::BadRequest(Malformed::FieldName))?;
+  let name = line.get(..colon).unwrap_or_default();
+  let value = trim_ows(line.get(colon.saturating_add(1)..).unwrap_or_default());
+  if !is_token(name) {
+    return Err(HeadRefused::BadRequest(Malformed::FieldName));
+  }
+  if !value.iter().all(|byte| is_field_byte(*byte)) {
+    return Err(HeadRefused::BadRequest(Malformed::FieldValue));
+  }
+  Ok((name, value))
+}
+
+/// What a head's fields decide, gathered from every field before any is judged, so the judgement's order is fixed.
+#[derive(Default)]
+struct Decisions<'a> {
+  /// The `Content-Length` every value agreed on.
+  length: Option<u64>,
+  /// The first fault of a `Content-Length` (a malformed value before one past 64 bits).
+  length_fault: Option<HeadRefused>,
+  /// The transfer codings.
+  transfer: Transfer,
+  /// How many times gzip was named as a content coding.
+  gzips: u32,
+  /// Whether a content coding other than gzip and identity was named.
+  unknown_coding: bool,
+  /// Whether `Connection` named `close`.
+  close: bool,
+  /// Whether `Connection` named `keep-alive`.
+  keep: bool,
+  /// Whether `Expect` named `100-continue`.
+  expect_continue: bool,
+  /// Whether `Expect` named anything else.
+  unmet_expectation: bool,
+  /// How many `Host` lines came.
+  hosts: u32,
+  /// The last `Host` value.
+  host: Option<&'a [u8]>,
+}
+
+/// The transfer codings of a head's `Transfer-Encoding` lines, read as one list.
+#[derive(Default)]
+struct Transfer {
+  /// Whether any `Transfer-Encoding` line came.
+  present: bool,
+  /// How many times chunked was named.
+  chunked: u32,
+  /// Whether the last coding named is chunked.
+  last_chunked: bool,
+  /// Whether a coding other than chunked was named.
+  unknown: bool,
+}
+
+impl<'a> Decisions<'a> {
+  /// Gathers what `fields` decide.
+  fn read(fields: &[Field<'a>]) -> Self {
+    let mut decisions = Self::default();
+    for &(name, value) in fields {
+      decisions.field(name, value);
+    }
+    decisions
+  }
+
+  /// Gathers what one field decides; fields that decide nothing here are left to the router.
+  fn field(&mut self, name: &[u8], value: &'a [u8]) {
+    if name.eq_ignore_ascii_case(CONTENT_LENGTH) {
+      self.length(value);
+    } else if name.eq_ignore_ascii_case(TRANSFER_ENCODING) {
+      self.transfer.read(value);
+    } else if name.eq_ignore_ascii_case(CONTENT_ENCODING) {
+      self.coding(value);
+    } else if name.eq_ignore_ascii_case(CONNECTION) {
+      self.connection(value);
+    } else if name.eq_ignore_ascii_case(EXPECT) {
+      self.expect(value);
+    } else if name.eq_ignore_ascii_case(HOST) {
+      self.hosts = self.hosts.saturating_add(1);
+      self.host = Some(value);
+    }
+  }
+
+  /// Reads a `Content-Length` line: a list of decimal values that agree with each other and with every earlier line.
+  fn length(&mut self, value: &[u8]) {
+    let mut any = false;
+    for element in list_elements(value) {
+      any = true;
+      match decimal(element) {
+        Ok(length) if self.length.is_none_or(|known| known == length) => self.length = Some(length),
+        Ok(_) => self.fault(HeadRefused::BadRequest(Malformed::ContentLength)),
+        Err(refusal) => self.fault(refusal),
+      }
+    }
+    if !any {
+      self.fault(HeadRefused::BadRequest(Malformed::ContentLength));
+    }
+  }
+
+  /// Keeps a `Content-Length` fault: a malformed value's before one past 64 bits, whatever their order.
+  fn fault(&mut self, refusal: HeadRefused) {
+    if refusal != HeadRefused::ContentTooLarge || self.length_fault.is_none() {
+      self.length_fault = Some(refusal);
+    }
+  }
+
+  /// Reads a `Content-Encoding` line's codings.
+  fn coding(&mut self, value: &[u8]) {
+    for coding in list_elements(value) {
+      if GZIP_NAMES
+        .iter()
+        .any(|name| coding.eq_ignore_ascii_case(name))
+      {
+        self.gzips = self.gzips.saturating_add(1);
+      } else if !coding.eq_ignore_ascii_case(IDENTITY) {
+        self.unknown_coding = true;
+      }
+    }
+  }
+
+  /// Reads a `Connection` line's options.
+  fn connection(&mut self, value: &[u8]) {
+    for option in list_elements(value) {
+      self.close |= option.eq_ignore_ascii_case(CLOSE);
+      self.keep |= option.eq_ignore_ascii_case(KEEP_ALIVE);
+    }
+  }
+
+  /// Reads an `Expect` line's expectations.
+  fn expect(&mut self, value: &[u8]) {
+    for member in list_elements(value) {
+      if member.eq_ignore_ascii_case(CONTINUE) {
+        self.expect_continue = true;
+      } else {
+        self.unmet_expectation = true;
+      }
+    }
+  }
+
+  /// Judges what was gathered, in one order: `Host`, the length, the framing, the content coding, the expectation.
+  fn head(self, line: RequestLine<'a>, fields: Vec<Field<'a>>) -> Result<Head<'a>, HeadRefused> {
+    self.check_host(line.version)?;
+    if let Some(refusal) = self.length_fault {
+      return Err(refusal);
+    }
+    let framing = self.transfer.framing(self.length, line.version)?;
+    let coding = match (self.unknown_coding, self.gzips) {
+      (false, 0) => Coding::Identity,
+      (false, 1) => Coding::Gzip,
+      _ => return Err(HeadRefused::UnsupportedCoding),
+    };
+    if self.unmet_expectation {
+      return Err(HeadRefused::ExpectationFailed);
+    }
+    Ok(Head {
+      method: line.method,
+      target: line.target,
+      version: line.version,
+      authority: line.authority.or(self.host),
+      fields,
+      framing,
+      coding,
+      keep_alive: !self.close && (line.version == Version::Http11 || self.keep),
+      expect_continue: self.expect_continue && line.version == Version::Http11,
+    })
+  }
+
+  /// `Host`: once in an HTTP/1.1 request, at most once in an HTTP/1.0 one, and an authority.
+  fn check_host(&self, version: Version) -> Result<(), HeadRefused> {
+    match (self.hosts, version) {
+      (0, Version::Http11) => Err(HeadRefused::BadRequest(Malformed::NoHost)),
+      (0 | 1, _) if self.host.is_none_or(is_authority) => Ok(()),
+      (0 | 1, _) => Err(HeadRefused::BadRequest(Malformed::Host)),
+      _ => Err(HeadRefused::BadRequest(Malformed::RepeatedHost)),
+    }
+  }
+}
+
+impl Transfer {
+  /// Reads a `Transfer-Encoding` line's codings, after any earlier line's.
+  fn read(&mut self, value: &[u8]) {
+    self.present = true;
+    for coding in list_elements(value) {
+      let chunked = coding.eq_ignore_ascii_case(CHUNKED);
+      self.chunked = self.chunked.saturating_add(u32::from(chunked));
+      self.unknown |= !chunked;
+      self.last_chunked = chunked;
+    }
+  }
+
+  /// The framing (RFC 9112 §6.3), every reading two recipients could disagree on refused.
+  fn framing(&self, length: Option<u64>, version: Version) -> Result<Framing, HeadRefused> {
+    if !self.present {
+      return Ok(length.map_or(Framing::None, Framing::Length));
+    }
+    if length.is_some() {
+      return Err(HeadRefused::BadRequest(Malformed::LengthAndTransferCoding));
+    }
+    if version == Version::Http10 {
+      return Err(HeadRefused::BadRequest(Malformed::TransferCodingInHttp10));
+    }
+    if !self.last_chunked {
+      return Err(HeadRefused::BadRequest(Malformed::ChunkedNotLast));
+    }
+    if self.unknown {
+      return Err(HeadRefused::NotImplemented);
+    }
+    if self.chunked > 1 {
+      return Err(HeadRefused::BadRequest(Malformed::ChunkedTwice));
+    }
+    Ok(Framing::Chunked)
+  }
+}
+
+/// A `Content-Length` value: decimal digits within 64 bits.
+fn decimal(digits: &[u8]) -> Result<u64, HeadRefused> {
+  if !digits.iter().all(u8::is_ascii_digit) {
+    return Err(HeadRefused::BadRequest(Malformed::ContentLength));
+  }
+  digits
+    .iter()
+    .try_fold(0u64, |value, digit| {
+      value
+        .checked_mul(DECIMAL)
+        .and_then(|value| value.checked_add(u64::from(digit.wrapping_sub(b'0'))))
+    })
+    .ok_or(HeadRefused::ContentTooLarge)
 }
 
 #[cfg(test)]

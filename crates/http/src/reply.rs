@@ -72,6 +72,25 @@ pub struct BadField;
 /// than or equal to the one received in the request").
 const STATUS_VERSION: &[u8] = b"HTTP/1.1 ";
 
+/// Format: what separates a field's name from its value (RFC 9112 §5: `field-line = field-name ":" OWS field-value
+/// OWS`, one space written).
+const FIELD_SEPARATOR: &[u8] = b": ";
+
+/// Format: the field naming a body's length (RFC 9110 §8.6).
+const CONTENT_LENGTH: &[u8] = b"Content-Length";
+
+/// Format: the field naming a body's transfer coding, and chunked's name (RFC 9112 §6.1, §7.1).
+const TRANSFER_ENCODING: &[u8] = b"Transfer-Encoding";
+
+/// Format: chunked's name.
+const CHUNKED: &[u8] = b"chunked";
+
+/// Format: the field and option that end the connection after a reply (RFC 9112 §9.6).
+const CONNECTION: &[u8] = b"Connection";
+
+/// Format: `close`.
+const CLOSE: &[u8] = b"close";
+
 /// Format: a chunked body's end: the last chunk, size zero, and an empty trailer section (RFC 9112 §7.1).
 pub const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
 
@@ -89,9 +108,40 @@ pub fn head(
   close: bool,
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
-  let _ = (status, fields, body, close, out, STATUS_VERSION, CRLF);
-  let _ = (is_token(b""), is_field_byte(b' '));
+  if !fields.iter().all(|(name, value)| carries(name, value)) {
+    return Err(BadField);
+  }
+  out.extend_from_slice(STATUS_VERSION);
+  out.extend_from_slice(status.code.to_string().as_bytes());
+  out.push(b' ');
+  out.extend_from_slice(status.reason.as_bytes());
+  out.extend_from_slice(CRLF);
+  for (name, value) in fields {
+    field(name, value, out);
+  }
+  match body {
+    Body::Length(length) => field(CONTENT_LENGTH, length.to_string().as_bytes(), out),
+    Body::Chunked => field(TRANSFER_ENCODING, CHUNKED, out),
+    Body::UntilClose => {}
+  }
+  if close || body == Body::UntilClose {
+    field(CONNECTION, CLOSE, out);
+  }
+  out.extend_from_slice(CRLF);
   Ok(())
+}
+
+/// Whether a reply can carry the field `name: value`: a token for its name, and no control byte but HTAB in its value.
+fn carries(name: &[u8], value: &[u8]) -> bool {
+  is_token(name) && value.iter().all(|byte| is_field_byte(*byte))
+}
+
+/// Writes the field line `name: value`.
+fn field(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
+  out.extend_from_slice(name);
+  out.extend_from_slice(FIELD_SEPARATOR);
+  out.extend_from_slice(value);
+  out.extend_from_slice(CRLF);
 }
 
 /// Writes the reply to a refused request: `status`, `fields`, no body, and `Connection: close`, since a refused
@@ -103,7 +153,13 @@ pub fn refusal(status: Status, fields: &[(&[u8], &[u8])], out: &mut Vec<u8>) -> 
 /// Writes one chunk of a chunked body: its size in hexadecimal, CRLF, `data` and CRLF. Writes nothing for no data,
 /// since a chunk of size zero would end the body: [`LAST_CHUNK`] does that.
 pub fn chunk(data: &[u8], out: &mut Vec<u8>) {
-  let _ = (data, out);
+  if data.is_empty() {
+    return;
+  }
+  out.extend_from_slice(format!("{:x}", data.len()).as_bytes());
+  out.extend_from_slice(CRLF);
+  out.extend_from_slice(data);
+  out.extend_from_slice(CRLF);
 }
 
 #[cfg(test)]

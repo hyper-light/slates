@@ -40,10 +40,12 @@
 //! gzipped again by the test, and no pack is held.
 
 use slates_http::Admission;
-use slates_http::head::{Head, HeadRefused, Version as HttpVersion};
-use slates_http::reply::{self, BadField, Status};
+use slates_http::head::{Framing, Head, HeadRefused, Target, Version as HttpVersion, media_type};
+use slates_http::percent::{self, Plus};
+use slates_http::reply::{self, BadField, Body, Status};
 
 use crate::pktline::{self, Packet};
+use crate::to_u64;
 
 /// The two services smart HTTP carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +62,30 @@ impl Service {
     match self {
       Service::UploadPack => "git-upload-pack",
       Service::ReceivePack => "git-receive-pack",
+    }
+  }
+
+  /// The content type of the service's requests.
+  fn request_type(self) -> &'static [u8] {
+    match self {
+      Service::UploadPack => UPLOAD_PACK_REQUEST,
+      Service::ReceivePack => RECEIVE_PACK_REQUEST,
+    }
+  }
+
+  /// The content type of the service's advertisement.
+  fn advertisement_type(self) -> &'static [u8] {
+    match self {
+      Service::UploadPack => UPLOAD_PACK_ADVERTISEMENT,
+      Service::ReceivePack => RECEIVE_PACK_ADVERTISEMENT,
+    }
+  }
+
+  /// The content type of the service's result.
+  fn result_type(self) -> &'static [u8] {
+    match self {
+      Service::UploadPack => UPLOAD_PACK_RESULT,
+      Service::ReceivePack => RECEIVE_PACK_RESULT,
     }
   }
 }
@@ -138,22 +164,322 @@ pub enum RouteRefused {
 impl RouteRefused {
   /// The status the refusal is answered with to a request of version `http`.
   pub fn status(self, http: HttpVersion) -> Status {
-    let _ = (self, http);
-    Status::OK
+    match self {
+      RouteRefused::NotFound => Status::NOT_FOUND,
+      RouteRefused::MethodNotAllowed(_) if http == HttpVersion::Http10 => Status::BAD_REQUEST,
+      RouteRefused::MethodNotAllowed(_) => Status::METHOD_NOT_ALLOWED,
+      RouteRefused::DumbProtocol
+      | RouteRefused::UnsupportedService
+      | RouteRefused::ServiceNotServed => Status::FORBIDDEN,
+      RouteRefused::UnsupportedMediaType => Status::UNSUPPORTED_MEDIA_TYPE,
+      RouteRefused::LengthRequired => Status::LENGTH_REQUIRED,
+      RouteRefused::BadPath => Status::BAD_REQUEST,
+      RouteRefused::Head(refused) => refused.status(),
+      RouteRefused::PastRoom => Status::URI_TOO_LONG,
+    }
   }
+}
+
+/// Format: the content types of smart HTTP's requests, advertisements and results (gitprotocol-http "Smart Clients"
+/// and "Smart Service git-upload-pack"; `http-backend.c`'s `application/x-git-%s-...`).
+const UPLOAD_PACK_REQUEST: &[u8] = b"application/x-git-upload-pack-request";
+/// Format: as [`UPLOAD_PACK_REQUEST`].
+const RECEIVE_PACK_REQUEST: &[u8] = b"application/x-git-receive-pack-request";
+/// Format: as [`UPLOAD_PACK_REQUEST`].
+const UPLOAD_PACK_ADVERTISEMENT: &[u8] = b"application/x-git-upload-pack-advertisement";
+/// Format: as [`UPLOAD_PACK_REQUEST`].
+const RECEIVE_PACK_ADVERTISEMENT: &[u8] = b"application/x-git-receive-pack-advertisement";
+/// Format: as [`UPLOAD_PACK_REQUEST`].
+const UPLOAD_PACK_RESULT: &[u8] = b"application/x-git-upload-pack-result";
+/// Format: as [`UPLOAD_PACK_REQUEST`].
+const RECEIVE_PACK_RESULT: &[u8] = b"application/x-git-receive-pack-result";
+
+/// Format: the three cache fields `http-backend` sends on every answer, in its order (`hdr_nocache`).
+const NO_CACHE: [(&[u8], &[u8]); 3] = [
+  (b"Expires", b"Fri, 01 Jan 1980 00:00:00 GMT"),
+  (b"Pragma", b"no-cache"),
+  (b"Cache-Control", b"no-cache, max-age=0, must-revalidate"),
+];
+
+/// Format: the field naming a reply's content type, and the one naming a `405`'s methods (RFC 9110 §8.3, §10.2.1).
+const CONTENT_TYPE: &[u8] = b"Content-Type";
+/// Format: as [`CONTENT_TYPE`].
+const ALLOW: &[u8] = b"Allow";
+/// Format: the methods a `405` names for `info/refs` and the dumb paths, and for a service's request (`bad_request`).
+const ALLOW_GET_HEAD: &[u8] = b"GET, HEAD";
+/// Format: as [`ALLOW_GET_HEAD`].
+const ALLOW_POST: &[u8] = b"POST";
+
+/// Format: the request fields a route reads (gitprotocol-v2 "HTTP Transport"; RFC 9110 §8.3).
+const GIT_PROTOCOL: &[u8] = b"git-protocol";
+/// Format: as [`GIT_PROTOCOL`].
+const REQUEST_CONTENT_TYPE: &[u8] = b"content-type";
+
+/// Format: the query field naming the service (gitprotocol-http "Smart Clients": `$GIT_URL/info/refs?service=...`),
+/// and the one service of git's that slates does not serve.
+const SERVICE_FIELD: &[u8] = b"service";
+/// Format: as [`SERVICE_FIELD`].
+const UPLOAD_ARCHIVE: &[u8] = b"git-upload-archive";
+
+/// Format: what separates `Git-Protocol`'s keys, and the key naming a version (gitprotocol-v2 "HTTP Transport";
+/// `protocol.c`).
+const KEY_SEPARATOR: u8 = b':';
+/// Format: as [`KEY_SEPARATOR`].
+const VERSION_KEY: &[u8] = b"version=";
+
+/// Format: the bytes an escape in a path may not name: a slash, which would split a segment, and a NUL.
+const PATH_REFUSED: &[u8] = b"/\0";
+
+/// Format: the start of an advertisement's first line (gitprotocol-http: "MUST be `# service=$servicename`").
+const SERVICE_LINE: &[u8] = b"# service=";
+
+/// Format: the hexadecimal digits of an object name: SHA-1's and SHA-256's (gitformat-loose; `http-backend.c`'s
+/// `services[]` matches both).
+const NAME_DIGITS: [usize; 2] = [40, 64];
+/// Format: the digits a loose object's directory takes from the front of its name.
+const LOOSE_DIRECTORY_DIGITS: usize = 2;
+
+/// A request's method, as the routes read it (methods are case-sensitive, RFC 9110 §9.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Method {
+  /// `GET`.
+  Get,
+  /// `HEAD`.
+  Head,
+  /// `POST`.
+  Post,
+  /// Any other.
+  Other,
+}
+
+impl Method {
+  /// The method `name` names.
+  fn of(name: &[u8]) -> Self {
+    match name {
+      b"GET" => Method::Get,
+      b"HEAD" => Method::Head,
+      b"POST" => Method::Post,
+      _ => Method::Other,
+    }
+  }
+}
+
+/// What a path's last segments name, as `http-backend`'s `services[]` table matches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Endpoint {
+  /// `info/refs`.
+  InfoRefs,
+  /// A service's request.
+  Service(Service),
+  /// `git-upload-archive`'s request, which slates does not serve.
+  Archive,
+  /// A path of the dumb protocol.
+  Dumb,
 }
 
 /// Routes a request head ([`Route`], or why not: [`RouteRefused`]), charging the decoded path it keeps to `admission`.
 pub fn route(head: &Head<'_>, admission: &mut Admission) -> Result<Route, RouteRefused> {
-  let _ = (head, admission);
-  Err(RouteRefused::NotFound)
+  let Target::Path { path, query } = head.target else {
+    return Err(RouteRefused::NotFound);
+  };
+  let relative = path.strip_prefix(b"/").ok_or(RouteRefused::NotFound)?;
+  let decoded = decode_path(relative, admission)?;
+  let (endpoint, span) = endpoint(&decoded).ok_or(RouteRefused::NotFound)?;
+  let method = Method::of(head.method);
+  check_method(endpoint, method)?;
+  let repo = repository(decoded, span)?;
+  match endpoint {
+    Endpoint::InfoRefs => advertise(head, query.unwrap_or_default(), repo, method == Method::Head),
+    Endpoint::Service(service) => serve(head, service, repo),
+    Endpoint::Archive => Err(RouteRefused::ServiceNotServed),
+    Endpoint::Dumb => Err(RouteRefused::DumbProtocol),
+  }
+}
+
+/// A path without its leading `/`, decoded and charged: refused when an escape is malformed or names a slash or a NUL.
+fn decode_path(raw: &[u8], admission: &mut Admission) -> Result<Vec<u8>, RouteRefused> {
+  if percent::names_any(raw, PATH_REFUSED) {
+    return Err(RouteRefused::BadPath);
+  }
+  let length = percent::decoded_len(raw).map_err(|_| RouteRefused::BadPath)?;
+  admission
+    .charge(to_u64(length))
+    .map_err(|_| RouteRefused::PastRoom)?;
+  let mut decoded = Vec::with_capacity(length);
+  percent::decode_into(raw, Plus::Plus, &mut decoded).map_err(|_| RouteRefused::BadPath)?;
+  Ok(decoded)
+}
+
+/// The endpoint a decoded path ends with, and the bytes it spans with the slash before each of its segments.
+fn endpoint(path: &[u8]) -> Option<(Endpoint, usize)> {
+  let mut segments = path.rsplit(|byte| *byte == b'/');
+  let last = segments.next()?;
+  let second = segments.next();
+  let third = segments.next();
+  let span = |names: &[&[u8]]| {
+    names
+      .iter()
+      .map(|name| name.len().saturating_add(1))
+      .fold(0, usize::saturating_add)
+  };
+  match (third, second, last) {
+    (_, Some(info @ b"info"), refs @ b"refs") => Some((Endpoint::InfoRefs, span(&[info, refs]))),
+    (_, _, b"git-upload-pack") => Some((Endpoint::Service(Service::UploadPack), span(&[last]))),
+    (_, _, b"git-receive-pack") => Some((Endpoint::Service(Service::ReceivePack), span(&[last]))),
+    (_, _, name) if name == UPLOAD_ARCHIVE => Some((Endpoint::Archive, span(&[last]))),
+    (_, _, b"HEAD") => Some((Endpoint::Dumb, span(&[last]))),
+    (Some(objects), Some(middle), file) if is_dumb_object_path(objects, middle, file) => {
+      Some((Endpoint::Dumb, span(&[objects, middle, file])))
+    }
+    _ => None,
+  }
+}
+
+/// Whether `objects/<middle>/<file>` is one of the dumb protocol's object paths: `info/alternates`,
+/// `info/http-alternates`, `info/packs`, a loose object, or a pack or its index.
+fn is_dumb_object_path(objects: &[u8], middle: &[u8], file: &[u8]) -> bool {
+  objects == b"objects"
+    && match middle {
+      b"info" => matches!(file, b"alternates" | b"http-alternates" | b"packs"),
+      b"pack" => is_pack_file(file),
+      directory => is_loose_object(directory, file),
+    }
+}
+
+/// Whether `directory/file` names a loose object: two lowercase hexadecimal digits, then the rest of a name's.
+fn is_loose_object(directory: &[u8], file: &[u8]) -> bool {
+  directory.len() == LOOSE_DIRECTORY_DIGITS
+    && is_lower_hex(directory)
+    && is_lower_hex(file)
+    && NAME_DIGITS
+      .iter()
+      .any(|digits| file.len().saturating_add(LOOSE_DIRECTORY_DIGITS) == *digits)
+}
+
+/// Whether `file` is `pack-<name>.pack` or `pack-<name>.idx`.
+fn is_pack_file(file: &[u8]) -> bool {
+  let name = file
+    .strip_prefix(b"pack-")
+    .and_then(|rest| rest.strip_suffix(b".pack").or_else(|| rest.strip_suffix(b".idx")));
+  name.is_some_and(|name| is_lower_hex(name) && NAME_DIGITS.contains(&name.len()))
+}
+
+/// Whether `bytes` are lowercase hexadecimal digits, as `http-backend`'s patterns (`[0-9a-f]`) take them.
+fn is_lower_hex(bytes: &[u8]) -> bool {
+  bytes
+    .iter()
+    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+/// Whether `method` may ask for `endpoint`: `GET` or `HEAD` for `info/refs` and the dumb paths, `POST` for a service.
+fn check_method(endpoint: Endpoint, method: Method) -> Result<(), RouteRefused> {
+  match (endpoint, method) {
+    (Endpoint::Service(_) | Endpoint::Archive, Method::Post)
+    | (Endpoint::InfoRefs | Endpoint::Dumb, Method::Get | Method::Head) => Ok(()),
+    (Endpoint::Service(_) | Endpoint::Archive, _) => {
+      Err(RouteRefused::MethodNotAllowed(Allowed::Post))
+    }
+    (Endpoint::InfoRefs | Endpoint::Dumb, _) => Err(RouteRefused::MethodNotAllowed(Allowed::GetHead)),
+  }
+}
+
+/// The repository path: the decoded path before the endpoint's span, refused when it is empty or has an empty, `.` or
+/// `..` segment (`daemon_avoid_alias`), or is not UTF-8.
+fn repository(mut decoded: Vec<u8>, span: usize) -> Result<String, RouteRefused> {
+  let length = decoded
+    .len()
+    .checked_sub(span)
+    .filter(|length| *length > 0)
+    .ok_or(RouteRefused::NotFound)?;
+  decoded.truncate(length);
+  if decoded
+    .split(|byte| *byte == b'/')
+    .any(|segment| matches!(segment, b"" | b"." | b".."))
+  {
+    return Err(RouteRefused::NotFound);
+  }
+  String::from_utf8(decoded).map_err(|_| RouteRefused::BadPath)
+}
+
+/// The advertisement route: the service the query names, the version asked.
+fn advertise(
+  head: &Head<'_>,
+  query: &[u8],
+  repo: String,
+  head_only: bool,
+) -> Result<Route, RouteRefused> {
+  let service = query_service(query)?;
+  Ok(Route::Advertise {
+    repo,
+    service,
+    version: asked_version(head)?,
+    head_only,
+  })
+}
+
+/// The service a query names: its last `service` field, decoded as a form's, as `http-backend`'s `get_parameter` reads
+/// it; the dumb protocol without one.
+fn query_service(query: &[u8]) -> Result<Service, RouteRefused> {
+  let mut named = None;
+  for (name, value) in percent::form_fields(query) {
+    if percent::decodes_to(name, Plus::Space, SERVICE_FIELD).map_err(|_| RouteRefused::BadPath)? {
+      named = Some(value);
+    }
+  }
+  let value = named.ok_or(RouteRefused::DumbProtocol)?;
+  let is = |name: &[u8]| percent::decodes_to(value, Plus::Space, name).unwrap_or(false);
+  if is(Service::UploadPack.name().as_bytes()) {
+    Ok(Service::UploadPack)
+  } else if is(Service::ReceivePack.name().as_bytes()) {
+    Ok(Service::ReceivePack)
+  } else if is(UPLOAD_ARCHIVE) {
+    Err(RouteRefused::ServiceNotServed)
+  } else {
+    Err(RouteRefused::UnsupportedService)
+  }
+}
+
+/// The service route: a request of the service's content type, with a body, at the version asked.
+fn serve(head: &Head<'_>, service: Service, repo: String) -> Result<Route, RouteRefused> {
+  let content_type = head
+    .field(REQUEST_CONTENT_TYPE)
+    .map_err(RouteRefused::Head)?;
+  if !content_type.is_some_and(|value| media_type(value).eq_ignore_ascii_case(service.request_type())) {
+    return Err(RouteRefused::UnsupportedMediaType);
+  }
+  if head.framing == Framing::None {
+    return Err(RouteRefused::LengthRequired);
+  }
+  Ok(Route::Serve {
+    repo,
+    service,
+    version: asked_version(head)?,
+  })
+}
+
+/// The version the request's `Git-Protocol` asks for; refused when it came twice.
+fn asked_version(head: &Head<'_>) -> Result<Version, RouteRefused> {
+  head
+    .field(GIT_PROTOCOL)
+    .map(version)
+    .map_err(RouteRefused::Head)
 }
 
 /// The version a `Git-Protocol` value asks for: the greatest `version=` among its colon-separated keys that names a
 /// version git speaks; v0 without one.
 pub fn version(git_protocol: Option<&[u8]>) -> Version {
-  let _ = git_protocol;
-  Version::V1
+  git_protocol
+    .into_iter()
+    .flat_map(|value| value.split(|byte| *byte == KEY_SEPARATOR))
+    .filter_map(|key| key.strip_prefix(VERSION_KEY))
+    .filter_map(|asked| match asked {
+      b"0" => Some(Version::V0),
+      b"1" => Some(Version::V1),
+      b"2" => Some(Version::V2),
+      _ => None,
+    })
+    .max()
+    .unwrap_or(Version::V0)
 }
 
 /// What a smart reply carries.
@@ -173,8 +499,17 @@ pub fn reply_head(
   keep_alive: bool,
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
-  let _ = (reply, http, keep_alive, out);
-  Ok(())
+  let content_type = match reply {
+    Reply::Advertisement(service) => service.advertisement_type(),
+    Reply::Result(service) => service.result_type(),
+  };
+  let [expires, pragma, cache_control] = NO_CACHE;
+  let fields = [expires, pragma, cache_control, (CONTENT_TYPE, content_type)];
+  let body = match http {
+    HttpVersion::Http11 => Body::Chunked,
+    HttpVersion::Http10 => Body::UntilClose,
+  };
+  reply::head(Status::OK, &fields, body, !keep_alive, out)
 }
 
 /// Writes the reply to a refused route to a request of version `http`: its status, `http-backend`'s cache fields,
@@ -184,8 +519,18 @@ pub fn refusal_reply(
   http: HttpVersion,
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
-  let _ = (refused, http, out, reply::LAST_CHUNK);
-  Ok(())
+  let status = refused.status(http);
+  let [expires, pragma, cache_control] = NO_CACHE;
+  match refused {
+    RouteRefused::MethodNotAllowed(allowed) if status == Status::METHOD_NOT_ALLOWED => {
+      let methods = match allowed {
+        Allowed::GetHead => ALLOW_GET_HEAD,
+        Allowed::Post => ALLOW_POST,
+      };
+      reply::refusal(status, &[(ALLOW, methods), expires, pragma, cache_control], out)
+    }
+    _ => reply::refusal(status, &NO_CACHE, out),
+  }
 }
 
 /// Writes the start of an advertisement's body: for protocol v0 and v1 the pkt-line `# service=<service>` and a flush,
@@ -195,8 +540,14 @@ pub fn advertisement_prelude(
   version: Version,
   out: &mut Vec<u8>,
 ) -> Result<(), pktline::DataTooLong> {
-  let _ = (service, version, out, Packet::Flush);
-  Ok(())
+  if version == Version::V2 {
+    return Ok(());
+  }
+  let mut line = SERVICE_LINE.to_vec();
+  line.extend_from_slice(service.name().as_bytes());
+  line.push(b'\n');
+  pktline::write(Packet::Data(&line), out)?;
+  pktline::write(Packet::Flush, out)
 }
 
 #[cfg(test)]
