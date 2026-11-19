@@ -4550,6 +4550,9 @@ mod unseen_bytes_tests;
 mod replaced_node_tests;
 
 #[cfg(test)]
+mod scan_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
