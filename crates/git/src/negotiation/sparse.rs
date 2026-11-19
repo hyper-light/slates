@@ -68,7 +68,7 @@ const SLASH: u8 = b'/';
 const STAR: u8 = b'*';
 
 /// A sparse filter's pattern list (the module doc).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patterns {
   /// The patterns, in the blob's order: the last that matches a path decides it.
   patterns: Vec<Pattern>,
