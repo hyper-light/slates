@@ -13209,6 +13209,29 @@ signature verification).
 > command in `make-state-fixtures.sh`): every changeset's phase computed from the imported roots as 7.2 lists it, every
 > bookmark and marker as 7.2 lists them, the markers written back to the obsstore's bytes.
 
+> **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
+> `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
+> are its heads before and its new changesets less every one a new changeset of the branch descends from, through any
+> branch (checked with stock 7.2); each new head is matched to a line it descends from by a maximum matching (an empty
+> line's head being the null node), so only a made line (a new head, or a new branch) or a retired one (merged into a
+> head another line took) touches the names log; its phase roots move as 7.2's `apply`, `advanceboundary`,
+> `updatephases` and `pushphase` move them; the `bookmarks` part applies as it is and a `bookmarks` pushkey is a
+> compare and swap on the hex the client saw; `reply:changegroup`'s `return` is `apply`'s. `push::held` reads what the
+> repository holds from its index, and `push::commit` keeps a push's revisions in a fork of the index. slates-server's
+> `repository::hg_push` lands it: the namespace holds `branch:<label>:<number>` for a line and `bookmark:<label>:` for a
+> bookmark, the label escaping `:`, `%`, controls and bytes not UTF-8, so the kinds and each branch's lines are
+> prefix-free ranges and a bookmark's name is checked exactly; each move, made line, retirement and bookmark change is
+> one of A-635's `BranchChange`s, its work built through A-618's builder against the version read; the client's race
+> checks are handed to the append as positions (lines' greens, names, the markers and phases logs), so they hold where
+> the entry commits, and the phase roots move in the same entry; a refusal for anything moved is `error:pushraced` in
+> 7.2's words; the fork replaces the index once the entry commits. Proven against stock 7.2's pushes
+> (`crates/hg/fixtures/push`): the fixtures' repository rebuilt from its texts in a new Mercurial repository, every node
+> 7.2's, then `push-plain`, `push-phase` and `push-bookmark` landed and answered byte for byte as 7.2 answered them,
+> `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
+> branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
+> histories. Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index
+> and the served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
 each bookmark is a green, and a push is a work whose verdict is the push's answer (§4.17.1). Phases, obsolescence
@@ -13620,8 +13643,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
    (A-641 part 2, `push::verify`, `push::tree`): the changegroup verified against the repository, and a move's work
-   through A-618's builder over laid-out flat manifests; owed: which lines and bookmarks a push moves, the landing on
-   each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
+   through A-618's builder over laid-out flat manifests. Built (A-657, part 3; `push::classify`, `push::held`,
+   `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
+   (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
+   each green's log with the phase roots in the same entry, the index kept; owed: the policy and the hooks (part 4).
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -45914,3 +45939,47 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   `crates/vcs/src/content.rs` (`Form::Derived`, `put_derived`, `derived`, `DerivedNode`, `encode_derived`, the release
   cascade, `NotNameable`, `ContentCounters::derived`); `crates/vcs/src/lib.rs`; A-645's entry; §4.17.1 "Reads"; GAPS'
   §4.17 entry.
+
+### A-657 part 3 (A-641 part 3) — a Mercurial push landed on each green's own log: its new heads placed on lines and bookmarks by a maximum matching, its race checks made positions, its phase roots moved in the same entry, its names prefix-free (2026-11-19, g304, UI goal 93 (kiln 51cef9f7); §4.17.3 decisions 1 to 3 and 6, "Push" steps 3 to 7 and piece 5; A-635, A-642, A-645; after A-641 parts 1 and 2)
+
+- **What.** `crates/hg/src/push/classify.rs`: `classify(unbundle, (brought, held), view, (lines, marks), publishing,
+  admission) -> Result<Plan, Unclassified>`, the lines' moves and retirements, the lines made, the bookmarks' moves,
+  the draft roots' changes, the reply's parts and the changesets the hooks name; `Unclassified::refused` answers in
+  7.2's words. `push/held.rs`: `IndexHeld`, verification's `Held` over `HgIndex` and its `ContentStore`.
+  `push/commit.rs`: `fork_with`, a push's revisions appended to a fork of the index, all or none.
+  `verify::Verified::held_changesets` (7.2's `duprevs`). `crates/server/src/repository/hg_push.rs`: the namespace's
+  names (`line_name`, `branch_prefix`, `bookmark_name`, `line_of`), `prepare` (the checks judged, the changegroup
+  verified, the push placed, each `BranchChange` and its work built, the entry's checks and state) and `land` (the
+  fork, A-635's `RepositoryLogs::append`, the fork in the index's place or released, the reply).
+- **Read from 7.2's code and a run** (`research/mercurial-server.md` §24): `apply`'s phases and `return`,
+  `advanceboundary`, `updatephases`, `pushphase`, `pushbookmark`, `handlebookmark`, `headrevsdiff` from an empty
+  changelog, the external hook's environment and words; and with stock 7.2, a branch head dropped by a descendant on its
+  branch through another branch.
+- **Decided.** (1) The namespace: `branch:<label>:<number>` a line, `bookmark:<label>:` a bookmark, the label the
+  name's valid UTF-8 with `:`, `%`, control characters and bytes not UTF-8 written `%XX`; prefix-free by construction
+  (the tags differ and end in `:`, a label holds no `:`), so `branch:<B>:` is exactly B's lines and `bookmark:<M>:`
+  exactly one name; every name a stock client makes reads as itself (7.2 refuses `:` in a label); a line made takes its
+  branch's lowest free number; a Mercurial repository's first line is `branch:default:0`. (2) New heads matched to
+  lines by a maximum matching, so a push makes and retires as few names as it can and a line's move never touches the
+  names log. (3) The race checks as positions: `check:heads` the lines' names, every line's green and the markers log;
+  `check:updated-heads` each named head's line and its branch's names; `check:bookmarks` the bookmark's green and name
+  or its absence; `check:phases` the phases log; with every touched branch's names, every changed bookmark's name, and
+  the phases log for a push that moves roots. Stricter than 7.2: a phase moved anywhere since the read races, paid only
+  where a hook's run separates the read from the append. (4) A refusal for anything moved (a line's verdict meeting
+  another head, `Moved`, a name taken or retired, a check or state change that no longer holds) is `error:pushraced`
+  in 7.2's words; any other is `error:abort` in slates' words. (5) Stricter than 7.2: a node the `bookmarks` or
+  `phase-heads` part names that the repository does not hold is refused by kind; an `obsmarkers` part is refused until
+  piece 7. (6) A new line is made from a line its head descends from, else one holding its first parents' first held
+  changeset, else a line of that changeset's branch: the work replaces exactly what differs, so the base costs only the
+  work's size.
+- **Evidence.** Pending the Mac Studio's runs (offline 2026-11-19 from the start of this part): `cargo test -p
+  slates-hg --lib` and `cargo test -p slates-server --lib hg_push`, red first against stubs.
+- **Owed.** Part 4: `vcs_policy::admit` before the append (`Prepared::asks` gives what to ask) and the hook driver at
+  `pretxnchangegroup` and `changegroup`. The server's home for each Mercurial repository's index and content store and
+  the served view over them (with A-650's site); the bundle read in slices; the pushkey compatibility hooks; markers
+  (piece 7); the fleet half of the append (A-636).
+- **Applied in the same change to:** §4.17.3's status (A-657) and piece 5's line; GAPS' §4.17.3 entry;
+  `research/mercurial-server.md` §24; `crates/hg/src/push/{mod,verify}.rs`, `crates/hg/src/import.rs` (`branch_of`
+  crate-visible); `crates/hg/src/push/{classify,classify_tests,held,commit,commit_tests}.rs` (new);
+  `crates/server/src/repository.rs`, `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs` (new);
+  `crates/server/Cargo.toml`, `Cargo.toml` and `Cargo.lock` (slates-server on slates-hg and slates-vcs).

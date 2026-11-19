@@ -607,17 +607,23 @@
 > bookmarks returned typed for the register, the repository's mutable state (an import is not served before the
 > register's entry holds them); the markers kept as the index's `M` rows in the obsstore's order; red first (5 failed),
 > 261 of 261, against a history 7.2 kept with drafts, an amend, a secret changeset, bookmarks and markers
-> (`crates/hg/fixtures/state`). Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
+> (`crates/hg/fixtures/state`). **Built (A-657 = A-641 part 3):** a push landed on each green's own log: its new heads
+> placed on lines by a maximum matching (only a made or retired line touches the names log), its bookmarks applied as
+> 7.2 applies them and its pushkeys compared and swapped, its phase roots moved in the same entry as 7.2's
+> `advanceboundary`, its race checks handed to A-635's append as positions, a refusal for anything moved answered as
+> 7.2's race; the names `branch:<label>:<number>` and `bookmark:<label>:`, prefix-free; what the repository holds read
+> from its index, and its revisions kept in a fork of the index; held to stock 7.2's pushes on the fixtures' repository
+> rebuilt from its texts (every node 7.2's; replies byte for byte), pending the Mac Studio's runs. Owed, in order, after
+> §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
 > `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
-> (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
-> refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens the
-> checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
-> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
-> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
-> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
-> it whole);
+> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`, `Prepared::asks`) and the hooks at
+> `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
+> content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
+> 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
+> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
+> the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one
+> position for every phase) measured under concurrent pushes before it is kept;
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
