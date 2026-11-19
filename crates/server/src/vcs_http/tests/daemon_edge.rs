@@ -191,11 +191,6 @@ fn status_of(
   stream
     .write_all(request.as_bytes())
     .expect("the request is sent");
-  status_in(&head_of(&mut stream))
-}
-
-/// The head of the answer `stream` carries, read a byte at a time through its blank line.
-fn head_of(stream: &mut impl Read) -> String {
   let mut head = Vec::new();
   let mut byte = [0u8; 1];
   while !head.ends_with(b"\r\n\r\n") {
@@ -204,82 +199,12 @@ fn head_of(stream: &mut impl Read) -> String {
       other => panic!("the answer's head ended early ({other:?}): {head:?}"),
     }
   }
-  String::from_utf8_lossy(&head).into_owned()
-}
-
-/// The status `head`'s status line names.
-fn status_in(head: &str) -> u16 {
-  head
+  let line = String::from_utf8_lossy(&head).into_owned();
+  line
     .split(' ')
     .nth(1)
     .and_then(|code| code.parse().ok())
-    .unwrap_or_else(|| panic!("no status line: {head:?}"))
-}
-
-/// One line of `stream`, its CRLF dropped.
-fn line_of(stream: &mut impl Read) -> String {
-  let mut line = Vec::new();
-  let mut byte = [0u8; 1];
-  while !line.ends_with(b"\r\n") {
-    match stream.read(&mut byte) {
-      Ok(1) => line.push(byte[0]),
-      other => panic!("a line ended early ({other:?}): {line:?}"),
-    }
-  }
-  line.truncate(line.len().saturating_sub(2));
-  String::from_utf8_lossy(&line).into_owned()
-}
-
-/// The data of a chunked body (RFC 9112 §7.1) read from `stream` through its last chunk and its trailer section.
-fn chunks_of(stream: &mut impl Read) -> Vec<u8> {
-  let mut body = Vec::new();
-  loop {
-    let line = line_of(stream);
-    let size = line.split(';').next().unwrap_or_default().trim();
-    let size =
-      usize::from_str_radix(size, 16).unwrap_or_else(|_| panic!("no chunk size: {line:?}"));
-    if size == 0 {
-      while !line_of(stream).is_empty() {}
-      return body;
-    }
-    let mut chunk = vec![0; size];
-    stream.read_exact(&mut chunk).expect("a chunk's data");
-    body.extend(chunk);
-    assert_eq!(line_of(stream), "", "a chunk's data ends its line");
-  }
-}
-
-/// The answer of the edge on `port`, trusting `certificate`, to `method target` with `fields` and `body` (sent with its
-/// length), on a new TLS connection: its status and its body, de-chunked (none for an answer that is not chunked).
-fn answer_of(
-  (port, certificate): (u16, &CertificateDer<'static>),
-  (method, target): (&str, &str),
-  fields: &[&str],
-  body: &[u8],
-) -> (u16, Vec<u8>) {
-  let mut stream = tls_client(port, certificate);
-  let mut request = format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\n");
-  for field in fields {
-    request.push_str(field);
-    request.push_str("\r\n");
-  }
-  if !body.is_empty() {
-    request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-  }
-  request.push_str("\r\n");
-  let mut sent = request.into_bytes();
-  sent.extend_from_slice(body);
-  stream.write_all(&sent).expect("the request is sent");
-  let head = head_of(&mut stream);
-  let chunked = head
-    .to_ascii_lowercase()
-    .contains("transfer-encoding: chunked");
-  let body = if chunked {
-    chunks_of(&mut stream)
-  } else {
-    Vec::new()
-  };
-  (status_in(&head), body)
+    .unwrap_or_else(|| panic!("no status line: {line:?}"))
 }
 
 /// The edge's counts on partition `partition`'s shard.
@@ -342,6 +267,72 @@ fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_th
   assert_eq!(answers, [503, 503, 401, 401, 403]);
   assert_eq!(listener, (3, 1, 1), "moves, no credentials, expired");
   assert_eq!(repository, (3, 1, 2), "arrivals, forbidden, unavailable");
+}
+
+/// One line of `stream`, its line feed included.
+fn line_of(stream: &mut impl Read) -> Vec<u8> {
+  let mut line = Vec::new();
+  let mut byte = [0u8; 1];
+  while !line.ends_with(b"\n") {
+    match stream.read(&mut byte) {
+      Ok(1) => line.push(byte[0]),
+      other => panic!("the answer ended inside a line ({other:?}): {line:?}"),
+    }
+  }
+  line
+}
+
+/// A chunked body read from `stream` to its last chunk, which has no trailer here (RFC 9112 §7.1).
+fn chunked_body(stream: &mut impl Read) -> Vec<u8> {
+  let mut body = Vec::new();
+  loop {
+    let size = String::from_utf8_lossy(&line_of(stream)).into_owned();
+    let digits = size.split([';', '\r', '\n']).next().unwrap_or_default();
+    let length = usize::from_str_radix(digits, 16).expect("a chunk's size");
+    let mut chunk = vec![0u8; length];
+    stream.read_exact(&mut chunk).expect("a chunk");
+    body.extend(chunk);
+    let end = line_of(stream);
+    if end != b"\r\n" {
+      panic!("a chunk ended in {end:?}");
+    }
+    if length == 0 {
+      return body;
+    }
+  }
+}
+
+/// The body of an answer whose `head` was read from `stream`: chunked, framed by its length, or none.
+fn body_of(stream: &mut impl Read, head: &str) -> Vec<u8> {
+  let fields = head.to_ascii_lowercase();
+  if fields.contains("transfer-encoding: chunked") {
+    return chunked_body(stream);
+  }
+  let length = fields
+    .lines()
+    .find_map(|field| field.strip_prefix("content-length: "))
+    .and_then(|value| value.trim().parse::<usize>().ok())
+    .unwrap_or(0);
+  let mut body = vec![0u8; length];
+  stream.read_exact(&mut body).expect("the body");
+  body
+}
+
+/// The status and body of the answer to `request`, sent whole on a new TLS connection to the edge on `port`.
+fn exchange(port: u16, certificate: &CertificateDer<'static>, request: &[u8]) -> (u16, Vec<u8>) {
+  let mut stream = tls_client(port, certificate);
+  stream.write_all(request).expect("the request is sent");
+  let mut head = Vec::new();
+  while !head.ends_with(b"\r\n\r\n") {
+    head.extend(line_of(&mut stream));
+  }
+  let head = String::from_utf8_lossy(&head).into_owned();
+  let status = head
+    .split(' ')
+    .nth(1)
+    .and_then(|code| code.parse().ok())
+    .unwrap_or_else(|| panic!("no status line: {head:?}"));
+  (status, body_of(&mut stream, &head))
 }
 
 /// Format: the content type of receive-pack's requests (gitprotocol-http), as stock git sends it.
@@ -420,19 +411,27 @@ fn owner_bearer() -> String {
 
 /// receive-pack's advertisement of repository `name` as the edge answers the owner: its status and body.
 fn advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16, Vec<u8>) {
-  let target = format!("/{name}/info/refs?service=git-receive-pack");
-  answer_of(edge, ("GET", &target), &[&owner_bearer()], &[])
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}/info/refs?service=git-receive-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  exchange(port, certificate, request.as_bytes())
 }
 
-/// `request` pushed to repository `name` by its owner as stock git posts it: the answer's status and body.
+/// `request` pushed to repository `name` by its owner as stock git posts it, with its length: the answer's status and
+/// body.
 fn pushed(edge: (u16, &CertificateDer<'static>), name: &str, request: &[u8]) -> (u16, Vec<u8>) {
-  let target = format!("/{name}/git-receive-pack");
-  answer_of(
-    edge,
-    ("POST", &target),
-    &[&owner_bearer(), RECEIVE_REQUEST],
-    request,
+  let (port, certificate) = edge;
+  let mut sent = format!(
+    "POST /{name}/git-receive-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\n{RECEIVE_REQUEST}\r\n\
+     Content-Length: {}\r\n\r\n",
+    owner_bearer(),
+    request.len()
   )
+  .into_bytes();
+  sent.extend_from_slice(request);
+  exchange(port, certificate, &sent)
 }
 
 /// Sets repository `name`'s policy, from its first version, to a rule denying everyone the deletion of `main`.
