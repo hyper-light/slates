@@ -106,3 +106,6 @@ pub fn map_range(deltas: &[&[Op]], range: Range) -> Mapped {
   }
   Mapped::Shifted(current)
 }
+
+#[cfg(test)]
+mod tests;

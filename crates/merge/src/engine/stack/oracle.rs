@@ -9,9 +9,9 @@
 //! "Position mapping"), so after each work of a stack lands the green must hold what that replica holds, and a work must
 //! land exactly where the replica's lands. A bottom the green refuses is one some work in between meets, so the replica
 //! of the bottom refuses one of those. Every byte a generated work adds is fresh, so no two works ever make the same
-//! change (an identical change is judged by its own tests), and no work puts two operations at one offset, the one
-//! place where the verdict's mapping does not commute (the A-659 entry, owed). The census counts stacks by depth,
-//! uppers whose operations moved and those that did not, and every refusal.
+//! change (an identical change is judged by its own tests). Works put an overwrite or a truncate and an insert at one
+//! offset too, the shape whose insert the verdict's walk met in one order only until A-668. The census counts stacks by
+//! depth, uppers whose operations moved and those that did not, and every refusal.
 //!
 //! **A work over a tree** is held to a model of whole files: at each file the work edits, the tree's bytes equal to the
 //! head's mean its edits apply to the head's bytes as they stand, and any other bytes are a conflict unless the work
@@ -36,12 +36,14 @@ const START_BYTES: usize = 16;
 const DEEPEST: usize = 4;
 
 /// One splice of a text: `removed` bytes at `at` replaced by `inserted`, of a pure kind (an insert, a delete or an
-/// overwrite of equal length).
+/// overwrite of equal length), then `tail` inserted at the same offset (after an overwrite, or after a truncate): the
+/// shape whose insert the verdict's walk met in one order only until A-668.
 #[derive(Clone, Debug)]
 struct Splice {
   at: usize,
   removed: usize,
   inserted: Vec<u8>,
+  tail: Vec<u8>,
 }
 
 /// One work's edits: for each file it edits (chosen among its base's files), raw splices `(offset, kind, size)`; and
@@ -100,7 +102,7 @@ fn splices(len: usize, raw: &[(u8, u8, u8)], fresh: &mut Fresh, adds: bool) -> V
     .iter()
     .map(|(at, kind, size)| {
       let at = usize::from(*at) % (len + 1);
-      (at, kind % 3, usize::from(size % 3) + 1)
+      (at, kind % 5, usize::from(size % 3) + 1)
     })
     .collect();
   wanted.sort_by_key(|(at, ..)| *at);
@@ -115,26 +117,39 @@ fn splices(len: usize, raw: &[(u8, u8, u8)], fresh: &mut Fresh, adds: bool) -> V
         at,
         removed: 0,
         inserted: fresh.run(2 * size),
+        tail: Vec::new(),
       },
       1 if at < len => Splice {
         at,
         removed: size.min(len - at),
         inserted: Vec::new(),
+        tail: Vec::new(),
       },
-      2 if at + 2 <= len => {
+      2 | 3 if at + 2 <= len => {
         let removed = (size + 1).min(len - at);
         Splice {
           at,
           removed,
           inserted: fresh.run(removed),
+          tail: if kind == 3 { fresh.run(2) } else { Vec::new() },
         }
       }
+      4 if at < len => Splice {
+        at,
+        removed: len - at,
+        inserted: Vec::new(),
+        tail: fresh.run(2 * size),
+      },
       _ => continue,
     };
     free = splice.at + splice.removed + 1;
     chosen.push(splice);
   }
-  if adds && chosen.iter().all(|splice| splice.inserted.is_empty()) {
+  if adds
+    && chosen
+      .iter()
+      .all(|splice| splice.inserted.is_empty() && splice.tail.is_empty())
+  {
     chosen.clear();
   }
   chosen
@@ -146,14 +161,15 @@ fn spliced(text: &[u8], splices: &[Splice]) -> Vec<u8> {
   for splice in splices.iter().rev() {
     out.splice(
       splice.at..splice.at + splice.removed,
-      splice.inserted.iter().copied(),
+      splice.inserted.iter().chain(&splice.tail).copied(),
     );
   }
   out
 }
 
 /// `work` with `splices` of `path` (a text `len` bytes long) added, in the deriver's canonical forms: an insert at the
-/// end an extend, a delete to the end a truncate.
+/// end an extend, a delete to the end a truncate, a tail an insert after its overwrite or truncate, as canonical order
+/// puts them.
 fn with_splices(mut work: Work, path: &str, len: usize, splices: &[Splice]) -> Work {
   for splice in splices {
     let at = splice.at as u64;
@@ -165,6 +181,9 @@ fn with_splices(mut work: Work, path: &str, len: usize, splices: &[Splice]) -> W
       (removed, true) => work.delete(path, at, removed as u64),
       _ => work.overwrite(path, at, &splice.inserted),
     };
+    if !splice.tail.is_empty() {
+      work = work.insert(path, at, &splice.tail);
+    }
   }
   work
 }
