@@ -280,28 +280,32 @@ mod tests {
     }
   }
 
-  /// Looks at `daemon`'s shard with `look` until it answers true, or until [`RELEASED_WITHIN_NS`] has passed, widened by
-  /// the descheduling the shard measured meanwhile (`slates_rt::futures::scheduler_overrun_ns`): how long that took. A
-  /// host that kept the shard off its CPUs delays the keeper's wake by as much, which says nothing of the deadline the
-  /// keeper armed; on a quiet host the shard measures next to nothing and the bound is the half window. Without the
-  /// widening the whole suite at 32 test threads on a loaded host missed the bare half window in each of these tests,
-  /// though every release came 101 to 166 ms after its 100 ms term once the look was allowed ten seconds (A-660).
+  /// Looks at `daemon`'s shard with `look` until it answers true: how long that took. Past [`RELEASED_WITHIN_NS`],
+  /// widened by the descheduling the shard measured meanwhile (`slates_rt::futures::scheduler_overrun_ns`), it gives up
+  /// and says how long it looked and what the shard measured. A host that keeps the shard off its CPUs delays the
+  /// keeper's wake by as much, which says nothing of the deadline the keeper armed; on a quiet host the shard measures
+  /// next to nothing and the bound is the half window. Once in eleven whole-suite runs on the loaded Mac Studio the CLI
+  /// attachment's and the write lease's tests missed the bare half window, though with the look allowed ten seconds
+  /// every release came 101 to 166 ms after its 100 ms term (A-660).
   fn look_until(
     daemon: &crate::daemon::Daemon,
     since: Instant,
     look: impl Fn(&mut ShardState) -> bool + Clone + Send + 'static,
-  ) -> Option<Duration> {
+  ) -> Result<Duration, String> {
     loop {
       let looked = look.clone();
       let (held, overrun_ns) = crate::daemon::observe_first(daemon, move |state| {
         (looked(state), slates_rt::futures::scheduler_overrun_ns())
       });
       if held {
-        return Some(since.elapsed());
+        return Ok(since.elapsed());
       }
       let bound_ns = RELEASED_WITHIN_NS.saturating_add(overrun_ns);
       if since.elapsed() > Duration::from_nanos(bound_ns) {
-        return None;
+        return Err(format!(
+          "looked {:?}; the shard measured {overrun_ns} ns of descheduling",
+          since.elapsed()
+        ));
       }
       // The harness paces its looks; the daemon under test waits on its wheel.
       #[allow(clippy::disallowed_methods)]
