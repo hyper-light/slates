@@ -12249,6 +12249,17 @@ engine: the verdict, rebase, position mapping, the register).
 > input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
 > streamed through, the staged close).
 >
+> **Status (2026-11-19, A-625 part 1: the edge's engine built).** `crates/http-edge` (`slates-http-edge`) holds one
+> connection's request loop as a state machine over bytes, shared by the three tools' HTTP: HTTPS through rustls over
+> aws-lc-rs (TLS 1.3 and 1.2, ALPN `http/1.1`, no client certificate, no resumption; one configuration per connection,
+> D-8 exception 2), Basic credentials over TLS alone and Bearer, `100 Continue` to a waiting client, keep-alive and
+> pipelining, bodies streamed to the service as slices of the input or inflated runs (never a whole push held), replies
+> chunked to HTTP/1.1 and framed by the close to HTTP/1.0, and typed refusals: a refusal leaving no body unread keeps
+> the connection, any other ends it in stages (the reply, `close_notify`, a half-close, the client's bytes drained;
+> A-183). Owed (part 2): the daemon's listener and connection tasks on the runtime's TCP, each phase's wait learned,
+> the connections and the request room derived from the shard's budget, and git's site (routes, authentication to a
+> principal, the policy's decision, the services).
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -42430,3 +42441,38 @@ Applied in the same change to:
   and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
   server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
   checkout of a repository's green must pass over.
+
+### A-625 part 1 — the HTTP edge's engine: one connection's request loop as a state machine over bytes, HTTPS, credentials, 100-continue, keep-alive, streamed bodies, typed refusals and the staged close (2026-11-19, g076b, UI goal 93; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's next part)
+Applied in the same change to:
+- §4.17.2's status; GAPS (the §4.17 entry);
+- `crates/http-edge` (`slates-http-edge`, new: `connection`, `tls`, `credential`, their tests);
+- `crates/http` (`reply::bare`; `Status::INTERNAL_SERVER_ERROR` and `SERVICE_UNAVAILABLE`; two of A-595's tests rewritten
+  for main's clippy findings: `read_in` returns a typed `Failed` rather than asserting in a fn returning `Result`, and
+  the advertisement's head test compares one whole `Head`, cognitive complexity 14 of 10);
+- the workspace manifest, lock and unsafe budget (`slates-http-edge = 0`).
+- **Why a crate apart from the daemon.** The engine holds no socket, clock or thread, so every rule it keeps is a
+  `--lib` test over bytes, TLS included (a rustls client in memory); the daemon's listener (part 2) moves bytes and
+  waits. It knows no tool: a site answers each head with a decision.
+- **The loop.** `Connection::next` asks for what the connection needs: write first whenever it has bytes, then read, a
+  decision on a whole head, each run of the body (handed out as a slice of the input, or one inflated run, and taken
+  before more is read), the body's end, the reply, or the end. The reply's head is rendered at the decision from its
+  fields and sent with the reply's first bytes; fields a reply cannot carry turn the decision into a 500.
+- **TLS.** `ServingIdentity` holds the operator's chain and key, checked when made; each connection gets its own rustls
+  configuration (TLS 1.3 and 1.2, ALPN `http/1.1` alone, no client certificate, no tickets, no session cache), its `Arc`
+  owned by that connection (D-8 exception 2). `HttpsSession` hands rustls plaintext in the pieces it takes and moves the
+  sealed records out between them, the network export's lesson.
+- **Credentials.** Basic (RFC 7617) decoded strictly and refused in cleartext; Bearer (RFC 6750) a `b64token`; a
+  repeated or malformed line 400, another scheme 401; the challenges offer Basic over TLS alone, each naming a quoted
+  realm; secrets compared to their end. A credential's debug form never shows its secret.
+- **Refusals.** The head's, the body's framing and coding (400, 413, 501 and the rest), the credentials', the site's and
+  a failing service's, each with its status. A refusal whose request leaves no body unread keeps the connection (a 401
+  to a client's first request is the common case); any other ends in stages: the reply with `Connection: close`,
+  `close_notify`, a half-close, then the client's bytes drained (A-183). A service that fails after its reply began
+  aborts it short of the last chunk.
+- **Tests** (`cargo test -p slates-http-edge --lib` and `-p slates-http --lib`, Mac Studio, debug, 2026-11-19): red first,
+  29 of 31 failing on stubs; green at b656845e1, 31 of 31 and 52 of 52, `cargo fmt --check` clean.
+- **Owed (part 2).** The daemon's listener on the runtime's TCP, one connection a task, each phase's wait learned (the
+  handshake, a head's arrival, idleness between requests, a stalled body, the drain), the connections served at once
+  and the request room derived from the shard's budget, refusals counted; git's site: `slates-git`'s routes, the
+  authenticator from a credential to a principal of §4.13, the policy's decision (§4.17.1, A-597, A-622), and
+  upload-pack and receive-pack as services (A-620, A-624); the live run with a stock `git clone` over HTTPS (main's).

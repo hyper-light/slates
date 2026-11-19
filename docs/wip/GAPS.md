@@ -219,6 +219,13 @@
 > (piece 8's next part: listeners on a shard, TLS, authentication, `100 Continue`, the services' bodies streamed
 > through, the staged close); the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's DAV through it.
 > Clippy, `xtask` and the lint matrix over the change are main's (run requests).
+> **A-625 part 1 (2026-11-19, g076b; the edge's engine):** `crates/http-edge` (`slates-http-edge`) holds one
+> connection's request loop as a state machine over bytes: HTTPS through rustls (TLS 1.3 and 1.2, ALPN `http/1.1`, no
+> client certificate, no resumption), Basic over TLS alone and Bearer, `100 Continue`, keep-alive, bodies streamed as
+> slices or inflated runs, typed refusals, and the staged close for a refusal with bytes unread (A-183). `cargo test -p
+> slates-http-edge --lib` 31 of 31 on the Mac Studio, red first (29 of 31 on stubs). Owed (part 2): the daemon's
+> listener and tasks with each phase's wait learned and the bounds derived from the shard's budget; git's site (routes,
+> authentication to a principal, the policy's decision, the services); the live `git clone` over HTTPS (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
