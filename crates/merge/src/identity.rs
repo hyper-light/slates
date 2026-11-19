@@ -23,6 +23,9 @@ const ENTRY_CONTEXT: &str = "slates 2026-11-05 green head identity entry lanes";
 const SUM_CONTEXT: &str = "slates 2026-11-05 green head identity sum";
 /// Format: the bytes of one lane.
 const LANE_BYTES: usize = size_of::<u16>();
+/// Format: the bytes of a sum, its lanes little-endian in order: what a checkpoint carries of the identity (A-626 part
+/// 3, `crate::checkpoint`).
+pub(crate) const SUM_BYTES: usize = LANES * LANE_BYTES;
 
 /// The running sum of a green's entry vectors.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +92,50 @@ impl SetHash {
     for (sum, lane) in self.lanes.iter_mut().zip(entry.lanes().iter()) {
       *sum = sum.wrapping_sub(*lane);
     }
+  }
+
+  /// Adds every entry of `other` to the set, lane by lane.
+  pub(crate) fn add_sum(&mut self, other: &SetHash) {
+    for (sum, lane) in self.lanes.iter_mut().zip(other.lanes.iter()) {
+      *sum = sum.wrapping_add(*lane);
+    }
+  }
+
+  /// The set with every entry of `other` taken out, lane by lane: what this set holds beyond it.
+  pub(crate) fn less(&self, other: &SetHash) -> SetHash {
+    let mut difference = self.clone();
+    for (sum, lane) in difference.lanes.iter_mut().zip(other.lanes.iter()) {
+      *sum = sum.wrapping_sub(*lane);
+    }
+    difference
+  }
+
+  /// Whether the set holds nothing: every lane zero.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.lanes.iter().all(|lane| *lane == 0)
+  }
+
+  /// The sum's bytes, its lanes little-endian in order ([`SUM_BYTES`]).
+  pub(crate) fn to_bytes(&self) -> Box<[u8; SUM_BYTES]> {
+    let mut bytes = Box::new([0u8; SUM_BYTES]);
+    for (pair, lane) in bytes
+      .as_chunks_mut::<LANE_BYTES>()
+      .0
+      .iter_mut()
+      .zip(self.lanes.iter())
+    {
+      *pair = lane.to_le_bytes();
+    }
+    bytes
+  }
+
+  /// The sum whose bytes [`SetHash::to_bytes`] gave.
+  pub(crate) fn from_bytes(bytes: &[u8; SUM_BYTES]) -> SetHash {
+    let mut lanes = Box::new([0u16; LANES]);
+    for (lane, pair) in lanes.iter_mut().zip(bytes.as_chunks::<LANE_BYTES>().0) {
+      *lane = u16::from_le_bytes(*pair);
+    }
+    SetHash { lanes }
   }
 
   /// The 32-byte identity of the set.
