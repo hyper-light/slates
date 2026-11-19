@@ -14148,6 +14148,22 @@ and export by landing).
 > shows an entry `svnserve` hides from the principal counted, authorization owed in the reads); red five ways. A-616's
 > drive now sends a changed text as A-652's deltifier makes it against the client's base. Owed: part 2, the server's
 > listener over TCP and the SSH tunnel's entry point.
+>
+> **Status (2026-11-19, A-656, part 1 continued: commit and the authentication for one command).** Built: `commit`
+> through the connection: handed to the caller (`Turn::CommitAsked`), begun through A-655's entry point with the
+> caller's transaction, instant and room (`Connection::commit`), the client's editor commands into its drive, the work
+> it accepts at `close-edit` handed to the caller (`Turn::Accepted`) and answered with the revision made
+> (`Connection::committed`) or refused as `close-edit`'s failure, the client's commands then dropped until its
+> `abort-edit` or `success` (`Connection::not_committed`; `editorp.c` 1149-1208). Until A-655 part 2 makes works, the
+> caller refuses every one (`Uncommitted::NotServed`, 200007); nothing else applies a work. And `svnserve`'s
+> authentication in the middle of a command (`must_have_access`): an anonymous session whose command needs access it
+> lacks, where the client could authenticate, is asked for `EXTERNAL` or `CRAM-MD5` alone and answered
+> `( success ( ) )` alone (A-599's `handshake::Server::for_command`), then the command runs again as the principal
+> proved, with no trivial auth request, or is refused "Authorization failed" (170001): for `commit` and for `update`'s
+> target. Held to every recorded commit connection (`crates/svn/fixtures/commit/`, 16 and bob's race) replayed from its
+> first byte through the connection, every item byte for byte, and to `svnserve`'s own authentication for `lock-many`
+> (the reporter's `lock-a` session), byte for byte. Owed: the hooks' pauses (A-661) once A-655's drive pauses for them;
+> the lock verbs; the read commands' authentication for one command with their authorization (A-606).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -47362,6 +47378,48 @@ new; `lib.rs`; `report.rs` opens `join_fspath`, `repository_path` and its answer
 - **Owed** (GAPS): part 2, the server's listener on the runtime's TCP in `vcs_http`'s pattern and the SSH tunnel's
   entry point; commit through A-655's entry point; the lock verbs and the mid-session authentication `svnserve` asks
   for when a command needs a user; the read commands' authorization (A-606, the reads' owner).
+
+### A-656, continued (1) — Commit through the connection, and the authentication for one command (2026-11-19, g234; §4.17.4 piece 7, with A-655)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`serve.rs` and its tests,
+`serve/tests/commit.rs` new; `handshake.rs` and its tests: `Server::for_command`, `CommandMechanisms`; `report.rs`:
+`Context::authenticated_now`, `uri_decode` open to the crate; the reporter's test green names content for a commit).
+
+- **Commit** (`serve.c` `commit` 1471-1580 at `d434dc14`): the client's `commit` is handed to the caller
+  (`Turn::CommitAsked`), which gives the transaction's name, its instant and its room (`Connection::commit`); A-655's
+  entry point (`commit::drive::commit`) decides access and answers; the client's editor commands go to its drive, which
+  writes each early refusal at once; the work it accepts at `close-edit` is handed to the caller (`Turn::Accepted`),
+  which makes it and answers with the revision made (`Connection::committed`: `close-edit`'s success, the trivial auth
+  request, the revision, its date, its author and post-commit's words, 1555-1577) or refuses it
+  (`Connection::not_committed`): `close-edit`'s failure in the drive's words for the commit rule's refusal at the
+  owner, or 200007 "This server does not make commits yet" until A-655 part 2 makes works; then the client's commands
+  are read and dropped until its `abort-edit` or `success` (`editorp.c` 1193-1208). Nothing else applies a work.
+- **The authentication for one command** (`must_have_access` 807-850): where a command needs access the session's
+  principal lacks, the session is anonymous and the client could authenticate, `svnserve` asks again with
+  `needs_username` (826-836): `EXTERNAL` and `CRAM-MD5` where authenticated users have the access, never `ANONYMOUS`,
+  attempts looping as at the handshake, a success answered `( success ( ) )` alone; then it decides again with the
+  principal proved, which the connection keeps. Built in A-599's handshake (`Server::for_command`) and asked by the
+  connection for `commit` (A-655's `Begun::Authenticate`) and for `update`'s unreadable target; the command runs again
+  at the caller's next call with the new principal's guards and no trivial auth request (`Context::authenticated_now`),
+  or is refused "Authorization failed" (170001). A principal whose name is no UTF-8 cannot be `svn:author`; its
+  commit is refused the same way.
+- **Corrected.** Part 1 answered an anonymous `update` of an unreadable target "Authorization failed" at once, and its
+  test said that was `svnserve`'s answer. Wrong where the client could authenticate: `svnserve` asks for an
+  authentication first (`must_have_access` 832-836). The test now asks for it, and holds the refusal to where
+  authentication cannot help.
+- **Evidence.** Every recorded commit connection (`crates/svn/fixtures/commit/`: 16, and bob's race replayed before
+  alice's `close-edit`) replayed from its first byte through a connection tunnelled as its user, bob's lock taken with
+  its recorded token, each accepted work made into an index and a green the replay builds: `svnserve`'s greeting less
+  `svndiff1`, every item byte for byte, the youngest the recorded 13. `svnserve`'s own authentication for one command,
+  `lock-many`'s in the reporter's recorded `lock-a` session: the request, the challenge and the success alone, byte for
+  byte, through `Server::for_command`.
+- **Tests.** Handshake: four (that recording, CRAM-MD5 and `EXTERNAL` for one command, no mechanism the caller's
+  error). Connection: the commit replay; a commit answered with the revision made; an anonymous commit authenticated
+  for write and refused as not made, the client's commands dropped until `abort-edit`; a commit refused after
+  authenticating as a user the rules keep from writing; a work refused in the drive's words; calls out of turn;
+  `update`'s unreadable target, authenticated and where authentication cannot help. Not built: the Mac Studio was
+  offline; the gate run is filed.
+- **Owed** (GAPS): the hooks' pauses (A-661, `Step::Hook`) once A-655's drive pauses; A-655 part 2's making of the
+  work; the lock verbs; the read commands' authentication for one command with their authorization (A-606).
 
 ### A-616, continued (5) — A changed text through A-652's deltifier (2026-11-19, g234, UI goal 93)
 Applied in the same change to: `crates/svn/src/report/drive.rs` (`window`, `window_of`, the file's frame keeps its

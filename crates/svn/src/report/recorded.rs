@@ -218,6 +218,7 @@ pub(crate) fn context<'a>(
     session_path,
     youngest: YOUNGEST,
     readable: true,
+    authenticated_now: false,
     room: client.len() * PATH_INFO_BYTES,
     item_bytes: client.len() * PARSED_ITEM_BYTES,
     most_open: MOST_OPEN,

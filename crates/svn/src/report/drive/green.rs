@@ -139,6 +139,42 @@ impl Repository for Green {
   }
 }
 
+impl crate::commit::drive::Green for Green {
+  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
+    self.texts.get(identity).map(Vec::as_slice)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    Repository::properties(self, identity)
+  }
+
+  fn name_text(&self, text: &[u8]) -> ContentIdentity {
+    digest_of(&SHA256, text)
+  }
+
+  fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
+    let encoded = encoded_list(
+      properties
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    );
+    digest_of(&SHA256, &encoded)
+  }
+}
+
+/// A property list's bytes as the green names them: each name and value after its length, in the
+/// list's order.
+fn encoded_list<'p>(properties: impl Iterator<Item = (&'p [u8], &'p [u8])>) -> Vec<u8> {
+  let mut encoded = Vec::new();
+  for (name, value) in properties {
+    encoded.extend_from_slice(&u64::try_from(name.len()).unwrap().to_le_bytes());
+    encoded.extend_from_slice(name);
+    encoded.extend_from_slice(&u64::try_from(value.len()).unwrap().to_le_bytes());
+    encoded.extend_from_slice(value);
+  }
+  encoded
+}
+
 /// The session's guards in the fixtures: what the anonymous principal may not read
 /// (`make-fixtures.py` `AUTHZ`: `/trunk/secret` and beneath), and the locks held now.
 #[derive(Clone, Debug, Default)]
@@ -438,13 +474,11 @@ impl Green {
     if properties.is_empty() {
       return PropertyList::Empty;
     }
-    let mut encoded = Vec::new();
-    for (name, value) in properties {
-      encoded.extend_from_slice(&u64::try_from(name.len()).unwrap().to_le_bytes());
-      encoded.extend_from_slice(name.as_bytes());
-      encoded.extend_from_slice(&u64::try_from(value.len()).unwrap().to_le_bytes());
-      encoded.extend_from_slice(value);
-    }
+    let encoded = encoded_list(
+      properties
+        .iter()
+        .map(|(name, value)| (name.as_bytes(), value.as_slice())),
+    );
     let identity: ContentIdentity = digest_of(&SHA256, &encoded);
     let list = properties
       .iter()
