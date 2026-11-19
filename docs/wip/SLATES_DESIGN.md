@@ -12288,19 +12288,20 @@ under a grant (§4.15, R10).
 
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
-> (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each version
-> commits), Mercurial's A-588 index with its derived values, Subversion's A-553 index. `CreateRepository` makes the
-> entry beside the record on the owner shard; its bytes are charged to the shard's budget as retention, lent the room the
-> shard can admit for a step and trued up to what the store holds after it. A push's objects are its changeset and
-> everything the store computes from them is derived: a git push's one entry (A-635's append) holds its record, the
-> content identities of the objects its quarantine sealed that the repository lacked, in admission order, with their
-> bytes and the moves the store committed them with; the partition's register keeps each entry's objects for the
-> repository's life and a snapshot carries them, charged to the merge budget. The store commits between the register's
-> guard and the entry's apply, so a refused push never reaches it; a recovery makes each store again and replays every
-> record, in log order, through the live path's own steps, refusing a record whose bytes are not the contents it names
-> or whose admission makes another record (guard then apply). Owed: the snapshot carrying each store's sealed tables by
-> identity, so a recovery replays only the log's suffix; Mercurial's and Subversion's records and replay (their push
-> pieces); a recovered version's pack fragments encoded again off the answer's path (A-654); the fleet half (A-636).
+> (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each
+> version commits), Mercurial's A-588 index with its derived values, Subversion's A-553 index. `CreateRepository` makes
+> the entry beside the record on the owner shard; its bytes are charged to the shard's budget as retention, lent the
+> room the shard can admit for a step and trued up to what the store holds after it. A push's objects are its changeset
+> and everything the store computes from them is derived: a git push's one entry (A-635's append) holds its record, the
+> content identities of the objects its quarantine sealed that the repository lacks when it commits, in admission order,
+> with their bytes and the moves the store committed them with; the partition's register keeps each entry's objects for
+> the repository's life and a snapshot carries them, charged to the merge budget. The store commits between the
+> register's guard and the entry's apply, so a refused push never reaches it; a recovery makes each store again and
+> replays every record, in log order, through the live path's own steps, refusing a record whose bytes are not the
+> contents it names or whose admission makes another record (guard then apply). Owed: the snapshot carrying each store's
+> sealed tables by identity, so a recovery replays only the log's suffix; Mercurial's and Subversion's records and
+> replay (their push pieces); a recovered version's pack fragments encoded again off the answer's path (A-654); the
+> fleet half (A-636).
 
 **Every tunable is learned online.** The rule for every server in this section (Ada, 2026-11-18): a tunable is an
 estimate the server keeps learning from the deployment's own traffic. It is never a constant, and never a value measured
@@ -47362,13 +47363,21 @@ Applied in the same change to:
     No figure is a constant (R3).
   - **Durability.** A git push's one entry (A-635's append) holds its record (`vcs_store::record`): the deepest delta
     chain its pack carried (the store's learned depth reads it), its moves by each green's key in the store, the version
-    the entry leaves the green at and the commit its new head names, and every object its quarantine sealed that the repository lacked, in admission order,
-    by content identity (`ContentStore::object_id`) with its bytes. Objects the repository holds already are passed over
-    at admission, since the store reads an indexed object from its index before any push, so the record holds each
-    object's bytes once. `RepositoryEntry::objects` carries it opaquely; the partition's register keeps each entry's
-    objects in the order it received them for the repository's life, charged to the merge budget and carried by its
-    snapshot (`Repositories::objects`, `object_record`). They take no position, so an entry with objects and one green
-    stays a single-green append and joins nothing (A-642).
+    the entry leaves the green at and the commit its new head names, and every object of the push that the repository
+    lacks, in admission order, by content identity (`ContentStore::object_id`) with its bytes. The record is written
+    when the append commits, never at admission. Which objects the repository lacks is decided then, by the predicate
+    the store's commit gives positions by (`Repository::object`), since another push can commit an object this one
+    holds between its admission and its append (a hook's wait); and each object's bytes are read back from the content
+    store then (`ContentStore::windows`), so a push's bytes are held once, by its quarantine and charged, until its
+    entry takes its record: the writer notes an object's type, id, root and length alone. Every record a push writes
+    carries its deepest chain, and a replay hands it to the replayed push (`Push::carried`), since a later append of a
+    push without `atomic` holds its moves alone. An object arriving under a claimed id the repository indexes already
+    is passed over at admission. `RepositoryEntry::objects` carries the record opaquely; the partition's register keeps
+    each entry's objects in the order it received them for the repository's life, charged to the merge budget and
+    carried by its snapshot (`Repositories::objects`, `object_record`). They take no position, so an entry with objects
+    and one green stays a single-green append and joins nothing (A-642). The store's versions of each green
+    (`GitStore::versions`) are charged to the content store's budget as A-614's store charges its chains, by their
+    entries.
   - **Guard then apply.** The store commits between the register's guard (`Partition::check_creating`, which charged
     the record) and the entry's apply, inside the append (`repository::push::push_sealed`), so a push a rule, a verdict
     or the guard refuses never reaches the store; a store that refuses (its budget) refuses the entry with nothing
@@ -47376,14 +47385,15 @@ Applied in the same change to:
     append admitting its own moves (`SealedPush::admit`), a refused ref leaves the push whole for the next, and the
     first commit takes every object, so later records hold their moves alone. A move names a green of the repository
     or, for a new branch, the branch's name (`vcs_store::Target`), resolved inside the append once `make` has made the
-    branch's green, so its key exists only once the green does. After the store committed, a
-    verdict's commit or the record not made durable leaves the store ahead of the log, so the store is made again from
-    the log (`vcs_store::rebuild`), the recovery's own replay. A recovery (`verbs::rebuild_recovered`, after the
-    members) makes every store again and replays each record, in log order, a record a unit of the recovery's slices,
-    through the live path's own steps: each object checked against the identity its record names before it is admitted,
-    the record the admission makes compared with the one the log holds (a recomputation that differs is refused, as
-    §4.16 refuses one), the seal, the moves, the commit and the derived values kept. A store not made again is given
-    back and named unrecovered with why.
+    branch's green, so its key exists only once the green does. After the store committed, a verdict's commit or the
+    record not made durable leaves the store ahead of the log, so the store is made again from the log
+    (`vcs_store::rebuild`), the recovery's own replay, and the objects that commit took go with it: the push's client
+    sends them again. A recovery (`verbs::rebuild_recovered`, after the members) makes every store again and replays
+    each record, in log order, a record a unit of the recovery's slices, through the live path's own steps: each object
+    checked against the identity its record names before it is admitted, the objects the admission would record (type,
+    root and length, in order) compared with the record's (a recomputation that differs is refused, as §4.16 refuses
+    one), the seal, the moves, the commit and the derived values kept. A store not made again is given back and named
+    unrecovered with why.
   - **Keys and versions.** A-614's store names a green by a `u64`: the half of its volume id holding its partition and
     counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
     as before. The store's versions of a green are its own (a version a push made), so the entry keeps, for each, the
@@ -47392,6 +47402,15 @@ Applied in the same change to:
   - **Not recorded, derived.** Positions, rows, D(k), reached sets, derived values and pack fragments. A fragment's
     encoding follows measured times (A-614 part 2's learned window and level), so a recovery leaves fragments to the
     same off-path step that encodes a live version's (A-654), and the oracle compares everything else.
+- **Found before landing (2026-11-19, read before the first build; each has a failing test).** The record had been
+  written as objects were admitted. (1) A push without `atomic` whose pack carried deltas appended its second ref with
+  a record holding the push's deepest chain and no object, which a replay's empty push remade at depth zero, so a
+  recovery refused the repository (`Diverged`): every such push, and git's clients send deltas by default. (2) Two
+  pushes in flight at once each listed an object both brought; the first's commit gave it its position, so the
+  second's record named an object its commit never positioned, and a recovery refused that too. (3) The writer copied
+  every object's bytes beside the quarantine's, uncharged, and cloned them again to finish the record. (4) The versions
+  kept for `version_of` were not charged. And the step's room was asked of the budget, not the store (`lend`): it did
+  not compile, having been written while no machine could build it.
 - **Mercurial and Subversion.** Their arms are placed, made, charged (the Mercurial index through the content store),
   freed and recovered here; their records and replay are their push pieces' (g304's unbundle, g268's commit step), and a
   recovery refuses a record of either typed (`Owed`) until then.
@@ -47411,6 +47430,13 @@ Applied in the same change to:
   - a push through A-635's append on the owner shard: an abandoned push leaves nothing; two pushes recorded one record
     each, the second without the blob the first brought; the charge equal to what the store holds; the store made again
     from the partition's log equal whole and replaying both records; freeing gives every byte back;
+  - a push appended a ref at a time from one sealed push whose pack was two deep, and two pushes in flight sharing a
+    commit, each made again from the partition's log equal whole with every record replayed; the oracle generates both
+    (a push moving two refs committed a ref at a time; a push held back while the next commits a blob it holds), and the
+    fixed history's census counts each;
+  - the writer: a record holds what the repository lacks when it is written, a long object's bytes whole from its
+    windows, and an object the content store does not hold is refused `Unreadable`, never written short; a record's
+    room the allocator refuses is answered `BudgetExceeded` with what the shard could admit;
   - the db: an entry's objects kept in order, charged, carried by a snapshot, refused `Capacity` past the merge budget
     with nothing kept, given back with the repository.
 - **Evidence.** PENDING the Studio's run (filled before landing).
@@ -47424,4 +47450,5 @@ Applied in the same change to:
   `state.rs`, `daemon.rs` (the field), `repository.rs` (`install_root` makes the store), `repository/push.rs`
   (`push_sealed`, the store's commit between the guard and the apply, the rebuild), `verbs.rs` (the recovery's call); `crates/db/src/catalog.rs` (`RepositoryEntry::objects`, `RegisterRecord::objects`),
   `repository.rs` (the register's objects, `objects`, `object_record`), `repository/entry.rs` (their charge) and its
-  tests; `Cargo.toml` (slates-hg, slates-svn), `crates/server/Cargo.toml`, `Cargo.lock`.
+  tests; `crates/git/src/store/push.rs` (`Push::object` public, `Push::carried`); `Cargo.toml` (slates-hg, slates-svn),
+  `crates/server/Cargo.toml`, `Cargo.lock`.
