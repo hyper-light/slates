@@ -263,6 +263,18 @@
 > stock clients no longer warn here (`cargo test -p slates-ssh --lib`, 110 of 110; red four ways). Not offered:
 > `sntrup761x25519-sha512` (AWS-LC has no NTRU Prime). Owed: main's live interop with OpenSSH 10.2 and a golden
 > transcript from a client with a fixed ML-KEM key.
+> **A-651 (2026-11-19, g294; piece 9's edge in the daemon):** `crates/server`'s `vcs_ssh` serves SSH on the runtime's
+> TCP as the HTTP edge serves HTTP: one connection a task under the shard's seats, each driving `slates-ssh`'s session;
+> waits per phase on main's rulings (RFC 6298's first RTO of the connection's own round trip before a phase learns; a
+> wait past its bound marks its seat overdue; the most overdue reaped only for a new connection with every seat taken,
+> so a passphrase after `PK_OK` and a push's compression are never cut while no one needs the seat); keys through the
+> site's lookup, today refusing every key until the credentials record lands (main's ruling); each `exec` dispatched by
+> its tool and refused in that tool's own words and exit status (a missing repository, the policy, and all four
+> services as not served until A-662's stores and A-654's and A-656's entry points land); commands stepped sans-io with
+> the window given back as input is consumed (`cargo test -p slates-server --lib vcs_`, 92 of 92; slates-ssh 111 of
+> 111; as it landed over main 71a43cd97, `--lib vcs_ssh` 19 of 19, macOS arm64, Mac Studio). Owed: the daemon
+> starting the edge, the credentials record, the stores and entry points, four of five red-checks (main's runs under
+> §8), and main's live OpenSSH `git clone` over SSH.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
