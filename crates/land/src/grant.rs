@@ -165,8 +165,8 @@ pub struct Grants {
   /// exactly the grants a sweep may end.
   by_term: BTreeSet<(u64, GrantId)>,
   /// The earliest instant a grant entered in [`Grants::by_term`] falls due, since the caller last asked
-  /// ([`Grants::take_noted`]): what tells the shard's deadline keeper a grant was entered to lapse before the deadline it
-  /// sleeps for (A-554), whichever path entered it.
+  /// ([`Grants::take_noted`]): what tells the shard's deadline keeper a grant was entered to lapse before the deadline
+  /// it sleeps for (A-554), whichever path entered it.
   noted: Option<u64>,
   next: u64,
 }
@@ -604,8 +604,8 @@ mod tests {
     );
   }
 
-  /// The issued grants of `grants` past their term at `now`, by a walk of the table, in the order their terms ended: the
-  /// rule the index of terms must answer by (A-266's sweep, which walked the table until A-554).
+  /// The issued grants of `grants` past their term at `now`, by a walk of the table, in the order their terms ended:
+  /// the rule the index of terms must answer by (A-266's sweep, which walked the table until A-554).
   fn walked_due(grants: &Grants, now: u64) -> Vec<GrantId> {
     let mut due: Vec<(u64, GrantId)> = grants
       .records
@@ -675,11 +675,11 @@ mod tests {
 
   /// A-554 (the index of terms). Do: run one history over a grants table: issue grants of several terms and scopes (two
   /// ending at one instant), consume one, revoke one and consume it, end one, restore an issued grant, restore it again
-  /// under another term, restore a consumed one, keep all but one, issue one with no term and one whose term reaches the
-  /// clock's end, then end every grant due. After each step ask for the grants due and the next due instant around every
-  /// term's end, and for what was noted. Expect: every answer a walk's of the table, in the order the terms ended (ties
-  /// by id), and the noted instant the earliest due among the grants entered since the last ask, none after a step that
-  /// entered none.
+  /// under another term, restore a consumed one, keep all but one, issue one with no term and one whose term reaches
+  /// the clock's end, then end every grant due. After each step ask for the grants due and the next due instant around
+  /// every term's end, and for what was noted. Expect: every answer a walk's of the table, in the order the terms ended
+  /// (ties by id), and the noted instant the earliest due among the grants entered since the last ask, none after a
+  /// step that entered none.
   #[test]
   fn the_index_of_terms_answers_as_a_walk_of_the_table() {
     let mut grants = Grants::default();

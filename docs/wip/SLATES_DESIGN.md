@@ -4923,16 +4923,20 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
-> **Status (2026-11-19, A-554: grants leave the tick; the retry window named).** A grant past its term ends at the
-> first instant past it, kept by the shard's deadline keeper: the grants table keeps its issued grants in an index by the
-> end of their term (`slates_land::grant::Grants`, one entry an issued grant, taken out at its consumption, revocation or
-> end), so the keeper sleeps to the next grant due and its sweep reads the due alone, where the tick walked every grant
-> once a window. An issue or a restore notes the earliest it entered, and each state borrow hands that to the keeper. A
-> deadline its job could not end (a grant whose expiry record the catalog refused, a refused destroy record) is tried
-> again the retry window on (`deadlines::retry_window_ns`, counted `deadline.stuck`): the shard's window of A-455, the
-> liveness window `W` (the recovery budget by rent or buy, A-359) raised to the scheduler overrun the shard measured,
-> never past the observation budget. Off the tick so far: dead clients (A-475), staging buffers and status captures
-> (A-522), leases, CLI attachments and destroys (A-536), grants (A-554); the owed audit is next.
+> **Status (2026-11-19, A-554: grants and the owed audit leave the tick; the retry window named).** A grant past its
+> term ends at the first instant past it, kept by the shard's deadline keeper: the grants table keeps its issued grants
+> in an index by the end of their term (`slates_land::grant::Grants`, one entry an issued grant, taken out at its
+> consumption, revocation or end), so the keeper sleeps to the next grant due and its sweep reads the due alone, where
+> the tick walked every grant once a window. An issue or a restore notes the earliest it entered, and each state borrow
+> hands that to the keeper. A deadline its job could not end (a grant whose expiry record the catalog refused, a refused
+> destroy record) is tried again the retry window on (`deadlines::retry_window_ns`, counted `deadline.stuck`): the
+> shard's window of A-455, the liveness window `W` (the recovery budget by rent or buy, A-359) raised to the scheduler
+> overrun the shard measured, never past the observation budget. What a shard owes the audit (A-265) is looked at by the
+> keeper a retry window after the record that armed the look was owed (`landing::arm_owed_audit_look`, armed in
+> `write_audit` and at the shard's start for a recovered outbox): a front where the look was armed is sent again
+> (`landing.audit_resent`), and the look is armed again a window on while anything is owed, never while nothing is. Off
+> the tick so far: dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and
+> destroys (A-536), grants and the owed audit (A-554); departed hosts are next.
 
 > **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
 > (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
@@ -36565,7 +36569,22 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   and the noted instant with the earliest entered since the last ask). `crates/server/src/deadlines.rs`:
   `a_grant_past_its_term_ends_at_its_term_without_a_tick` (a grant issued under the policy with a term of a tenth of a
   window, ended, out of both tables and audited within half a window). The server test failed first on main's code
-  (cf17cae, the Mac Studio, 2026-11-19): not ended within half a window.
+  (cf17cae, the Mac Studio, 2026-11-19): not ended within half a window. Green on 3a83ace (the Mac Studio, 2026-11-19
+  17:35 local, load 17, debug): `slates-land --lib grant::` 5 of 5, `slates-server --lib deadlines::` 8 of 8; the grant
+  with a 100 ms term ended 102.4 ms after its issue.
+- **The owed audit (job 2).** What a non-control shard owes the audit (A-265's outbox) is looked at by the keeper a
+  retry window after the record that armed the look was owed: `write_audit` arms it when it owes a record
+  (`landing::arm_owed_audit_look`: the outbox's front noted, the look at `now` and a retry window, unless one is
+  armed), and so does the shard's start for an outbox a crash cut off. At the look (`landing::look_at_owed_audit`) a
+  front still where it was noted is sent again (`landing.audit_resent`): the batch was lost or is slow, and the control
+  partition appends nothing twice. While anything is owed the look is armed again a window on; once nothing is, nothing
+  is armed, so a shard that owes nothing is never woken for the audit. The tick looked once a window on every shard
+  whether anything was owed or not, sent again a front it had seen at its look before, so a record owed just after a
+  look waited nearly two windows, and its first look after a start sent again what had been sent a moment before.
+  Test: `crates/server/src/landing.rs` `an_unacknowledged_audit_batch_is_sent_again_a_window_after_its_send` (a
+  two-shard daemon past the tick's first look, the second shard's acknowledgements withheld: the batch sent again no
+  sooner than a window after its send and within half a window more). Failed first on main's code (cf17cae, the Mac
+  Studio): not sent again within a window and a half.
 
 Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
 `crates/server/src/{deadlines,landing,verbs,daemon}.rs`.

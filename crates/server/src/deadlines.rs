@@ -1,19 +1,21 @@
-//! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536, A-554; the
-//! event-driven reaper's pieces 2 to 4): a staging buffer expires a lease after its last use (`crate::staging`), a
+//! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536, A-554;
+//! the event-driven reaper's pieces 2 to 4): a staging buffer expires a lease after its last use (`crate::staging`), a
 //! status capture at its absolute deadline (`crate::status_pages`), a volume's write lease at its term (D-16, the
 //! partition's lease wheel), a CLI attachment at its term's lapse (A-230, the partition's index of terms), a destroy
-//! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again), and a grant at
-//! the first instant past its term (A-266, the grants' index of terms). One task a shard, the keeper, sleeps on the wheel
-//! until the earliest of them, releases what is due then, and sleeps until the next; a deadline set earlier than the one
-//! it sleeps for wakes it at once, so it re-arms. Nothing is scanned on a tick: each pass reads only the due entries of
-//! ordered indexes (the staging buffers by expiry, the seats by their capture's deadline, the lease wheel, the terms).
-//! Until A-522, A-536 and A-554 the reap loop's tick released each once a liveness window, every client's status capture
-//! asked and every grant walked at every tick, and a shard with none woke anyway.
+//! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again), a grant at
+//! the first instant past its term (A-266, the grants' index of terms), and the look at what the shard owes the audit
+//! (A-265), a retry window after the record that armed it and again while anything is owed. One task a shard, the
+//! keeper, sleeps on the wheel until the earliest of them, releases what is due then, and sleeps until the next; a
+//! deadline set earlier than the one it sleeps for wakes it at once, so it re-arms. Nothing is scanned on a tick: each
+//! pass reads only the due entries of ordered indexes (the staging buffers by expiry, the seats by their capture's
+//! deadline, the lease wheel, the terms). Until A-522, A-536 and A-554 the reap loop's tick released each once a
+//! liveness window, every client's status capture asked and every grant walked at every tick, and a shard with none
+//! woke anyway.
 //!
 //! **Woken by whatever sets an earlier deadline.** The staging verbs and the status verb tell the keeper themselves
 //! ([`noted`], [`capture_set`]). A lease, a term or a grant is entered by many paths (a take, a renewal, a replay, an
-//! issue, a restore), so the partition and the grants table note the earliest they entered and every state borrow closes
-//! by handing that to the keeper ([`after_borrow`]): three reads of an `Option` a borrow.
+//! issue, a restore), so the partition and the grants table note the earliest they entered and every state borrow
+//! closes by handing that to the keeper ([`after_borrow`]): three reads of an `Option` a borrow.
 //!
 //! **A deadline its job could not end** (a record the catalog refused) is tried again the shard's retry window on
 //! ([`retry_window_ns`]), counted `deadline.stuck`, never spun on.
@@ -78,6 +80,11 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   {
     crate::landing::end_expired_grants(state);
   }
+  // What this partition owes the audit and has not had acknowledged a retry window after it was sent is sent again
+  // (A-265), at its look's deadline (A-554); the look is armed again while anything is owed.
+  if state.landing.audit_look_at.is_some_and(|at| at <= now) {
+    crate::landing::look_at_owed_audit(state, now);
+  }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -102,6 +109,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.db.partition().next_term_lapse(),
     state.destroy_retry_at,
     state.landing.grants.next_due_ns(),
+    state.landing.audit_look_at,
   ]
   .into_iter()
   .flatten()
@@ -119,8 +127,8 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
 /// `watchdog::watch_window_ns`): the liveness window `W`, the recovery budget by rent or buy (A-359), raised to the
 /// scheduler overrun this shard measured, never past the observation budget. A refusal's cause (a full segment, a
 /// partner's full channel) is cleared by work that a live shard shows progress on within its window, so a retry sooner
-/// meets the same refusal and spends a pass, and the watchdog would call a job held longer a stall; a host that keeps the
-/// shard off its CPU longer than `W` lengthens it as much.
+/// meets the same refusal and spends a pass, and the watchdog would call a job held longer a stall; a host that keeps
+/// the shard off its CPU longer than `W` lengthens it as much.
 pub(crate) fn retry_window_ns() -> u64 {
   crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns())
 }
@@ -144,8 +152,8 @@ fn armed_for(earliest: Option<u64>, now: u64, window: u64) -> Option<u64> {
 const DEADLINE_STUCK: &str = "deadline.stuck";
 
 /// Closes every state borrow (`state::try_with_state`): a lease, a CLI attachment's term or a grant the borrow entered
-/// to lapse before the deadline the keeper sleeps for wakes it, so it re-arms (A-536, A-554). The keeper's own pass notes
-/// the leases it renews, after it armed for them, so they wake nothing.
+/// to lapse before the deadline the keeper sleeps for wakes it, so it re-arms (A-536, A-554). The keeper's own pass
+/// notes the leases it renews, after it armed for them, so they wake nothing.
 pub(crate) fn after_borrow(state: &mut ShardState) {
   let partition = state.db.partition_mut();
   let earliest = [
