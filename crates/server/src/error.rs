@@ -286,6 +286,12 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     H::Win32(code) => TargetRefusal::Host {
       errno: i32::try_from(*code).unwrap_or(i32::MAX),
     },
+    H::Exists(code) | H::NoSpace(code) | H::Unsupported(code) => TargetRefusal::Host {
+      errno: match code {
+        slates_vfs::host::OsCode::Errno(errno) => *errno,
+        slates_vfs::host::OsCode::Win32(code) => i32::try_from(*code).unwrap_or(i32::MAX),
+      },
+    },
   }
 }
 

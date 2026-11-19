@@ -108,6 +108,11 @@ fn refusal(e: rustix::io::Errno) -> HostError {
   }
 }
 
+/// An exchange's refusal (A-539): as [`refusal`] reads any other call's.
+fn exchange_refusal(e: rustix::io::Errno) -> HostError {
+  refusal(e)
+}
+
 /// The directory flags every containment step uses.
 fn dir_flags() -> OFlags {
   OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
@@ -926,5 +931,35 @@ impl LandFs for OsLand {
 
   fn sync_media(&mut self, dir: HostDir) -> Result<(), HostError> {
     media_barrier(self.dir(dir)?)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rustix::io::Errno;
+  use slates_vfs::host::OsCode;
+
+  /// A-539 (the seam names the kinds the engine tells apart). Do: read through the Unix writer's rule the errnos of a
+  /// name that exists, a full disk and a spent quota, a verb the filesystem lacks, and an exchange the filesystem lacks
+  /// (Linux's `EINVAL`, macOS's `ENOTSUP`). Expect each named as its kind by its own errno: the engine compares no number,
+  /// so none is read across platforms (Linux numbers `EDQUOT` 122 and `ENOTSUP` 95, macOS 69 and 45).
+  #[test]
+  fn the_writer_names_each_kind_the_engine_tells_apart() {
+    let code = |e: Errno| OsCode::Errno(e.raw_os_error());
+    assert_eq!(refusal(Errno::EXIST), HostError::Exists(code(Errno::EXIST)));
+    for full in [Errno::NOSPC, Errno::DQUOT] {
+      assert_eq!(refusal(full), HostError::NoSpace(code(full)), "{full:?}");
+    }
+    for lacking in [Errno::OPNOTSUPP, Errno::NOTSUP] {
+      assert_eq!(refusal(lacking), HostError::Unsupported(code(lacking)), "{lacking:?}");
+    }
+    for lacking in [Errno::INVAL, Errno::NOTSUP] {
+      assert_eq!(
+        exchange_refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
+    }
   }
 }

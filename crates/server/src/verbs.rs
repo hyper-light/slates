@@ -4413,7 +4413,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::Archived => "archived",
     Refusal::InvalidName => "invalid_name",
     Refusal::PolicyMismatch => "policy_mismatch",
-    Refusal::BaseUnavailable { .. } => "base_unavailable",
+    Refusal::BaseUnavailable { .. } | Refusal::BaseUnavailableWin32 { .. } => "base_unavailable",
     Refusal::DuplicateRequest => "duplicate_request",
     Refusal::BarrierIncomplete { .. } => "barrier_incomplete",
     Refusal::Unsupported { .. } => "unsupported",

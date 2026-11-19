@@ -58,6 +58,9 @@ pub mod park;
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod protocol;
+// The wire form of a host's refusal code, pinned (A-539).
+#[cfg(test)]
+mod os_code_vectors;
 pub mod region;
 pub mod rendezvous;
 pub mod seal;

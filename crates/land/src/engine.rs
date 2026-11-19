@@ -1708,6 +1708,20 @@ impl<H: LandFs> Landing<'_, H> {
           window_ns: None,
         }
       }
+      Err(WriteFailure::Host(HostError::NoSpace(code))) => Written {
+        outcome: Outcome::Failed {
+          errno: code_number(code),
+        },
+        window_ns: None,
+      },
+      Err(WriteFailure::Host(HostError::Exists(code) | HostError::Unsupported(code))) => {
+        let errno = code_number(code);
+        self.crashed = Some(errno);
+        Written {
+          outcome: Outcome::Failed { errno },
+          window_ns: None,
+        }
+      }
       // An entry below the target on a mount this daemon serves (A-227): refused before any open, that entry alone.
       Err(WriteFailure::Host(HostError::OwnMount(errno))) => Written {
         outcome: Outcome::Failed { errno },
@@ -3365,6 +3379,14 @@ fn disk_full(errno: i32) -> bool {
 /// the report's one number field holds beside errnos (GAPS); never compared with an errno's.
 fn win32_number(code: u32) -> i32 {
   i32::try_from(code).unwrap_or(i32::MAX)
+}
+
+/// One number for an OS code, either numbering's.
+fn code_number(code: slates_vfs::host::OsCode) -> i32 {
+  match code {
+    slates_vfs::host::OsCode::Errno(errno) => errno,
+    slates_vfs::host::OsCode::Win32(code) => win32_number(code),
+  }
 }
 
 fn elapsed_ns(since: Instant) -> u64 {

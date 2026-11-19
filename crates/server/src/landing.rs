@@ -3179,6 +3179,14 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::Win32(code) => HostAnswer::Errno {
       errno: i32::try_from(code).unwrap_or(i32::MAX),
     },
+    HostError::Exists(code) | HostError::NoSpace(code) | HostError::Unsupported(code) => {
+      HostAnswer::Errno {
+        errno: match code {
+          slates_vfs::host::OsCode::Errno(errno) => errno,
+          slates_vfs::host::OsCode::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
+        },
+      }
+    }
   }
 }
 
@@ -4685,6 +4693,23 @@ mod landed_reply_tests {
   use slates_ipc::protocol::{
     HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
   };
+  use slates_vfs::host::HostError;
+
+  /// A-539 (the numbering's kind carried end to end). Do: pass a host's Win32 error code to the reply's answer and to a
+  /// target's refusal. Expect the code in the wire's Win32 variants: a reader never takes it for an errno.
+  #[test]
+  fn a_win32_code_reaches_the_wire_as_one() {
+    /// Shape: one number in both numberings, `ERROR_ACCESS_DENIED` and `EIO`.
+    const BOTH: u32 = 5;
+    assert_eq!(
+      super::answer_of(HostError::Win32(BOTH)),
+      HostAnswer::Win32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::Win32(BOTH)),
+      slates_ipc::protocol::TargetRefusal::HostWin32 { code: BOTH }
+    );
+  }
 
   /// Shape: the degraded cells the test's landing met: one a directory, several replies' worth at these paths.
   const CELLS: usize = 400;

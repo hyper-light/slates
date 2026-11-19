@@ -35,6 +35,7 @@ pub(crate) fn refusal_of(code: u32) -> HostError {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use slates_vfs::host::OsCode;
 
   /// Format: the Win32 codes whose numbers the engine reads as errnos' kinds (winerror.h): `ERROR_NOT_SAME_DEVICE`
   /// (17, `EEXIST`), `ERROR_BAD_COMMAND` (22, `EINVAL`, a filesystem without an atomic exchange), `ERROR_OUT_OF_PAPER`
@@ -53,14 +54,14 @@ mod tests {
     for code in [FILE_EXISTS, ALREADY_EXISTS] {
       assert_eq!(
         refusal_of(code),
-        HostError::Unavailable(ERRNO_EXIST),
+        HostError::Exists(OsCode::Win32(code)),
         "{code}"
       );
     }
     for code in [HANDLE_DISK_FULL, DISK_FULL] {
       assert_eq!(
         refusal_of(code),
-        HostError::Unavailable(ERRNO_NOSPC),
+        HostError::NoSpace(OsCode::Win32(code)),
         "{code}"
       );
     }

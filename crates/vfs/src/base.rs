@@ -543,6 +543,7 @@ pub(crate) fn unavailable_errno(error: HostError) -> i32 {
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
     // The record keeps one number (A-527): a Win32 code as its own, which only a reader told it is Windows' reads.
     HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
+    HostError::Exists(code) | HostError::NoSpace(code) | HostError::Unsupported(code) => number(code),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       GONE_DIRECTORY_ERRNO
     }
@@ -862,6 +863,17 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
     // One number past the seam (A-527): a Win32 code as its own.
     HostError::Win32(code) => VfsError::BaseUnavailable(i32::try_from(code).unwrap_or(i32::MAX)),
+    HostError::Exists(code) | HostError::NoSpace(code) | HostError::Unsupported(code) => {
+      VfsError::BaseUnavailable(number(code))
+    }
+  }
+}
+
+/// One number for an OS code, either numbering's.
+fn number(code: crate::host::OsCode) -> i32 {
+  match code {
+    crate::host::OsCode::Errno(errno) => errno,
+    crate::host::OsCode::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
   }
 }
 

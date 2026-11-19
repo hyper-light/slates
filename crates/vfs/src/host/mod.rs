@@ -81,6 +81,46 @@ pub enum WatchState {
   Unavailable,
 }
 
+/// An operating system's number for a refusal, typed by the numbering it is in (A-527, A-539): an errno (Linux, macOS)
+/// or a Win32 error code (Windows). The two number their codes on their own, so a number is read only with its kind:
+/// 17 is `EEXIST` as an errno and `ERROR_NOT_SAME_DEVICE` as a Win32 code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsCode {
+  /// An errno.
+  Errno(i32),
+  /// A Win32 error code.
+  Win32(u32),
+}
+
+impl OsCode {
+  /// A number in this platform's own numbering, typed as its kind: an errno here.
+  #[cfg(not(windows))]
+  pub fn native(number: i32) -> Self {
+    Self::Errno(number)
+  }
+
+  /// A number in this platform's own numbering, typed as its kind: a Win32 error code here (a negative number names
+  /// none, read as zero).
+  #[cfg(windows)]
+  pub fn native(number: i32) -> Self {
+    Self::Win32(u32::try_from(number).unwrap_or(0))
+  }
+
+  /// An I/O error's OS number, in this platform's numbering (zero where it named none).
+  pub fn of_io(error: &std::io::Error) -> Self {
+    Self::native(error.raw_os_error().unwrap_or(0))
+  }
+}
+
+impl std::fmt::Display for OsCode {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Errno(errno) => write!(f, "errno {errno}"),
+      Self::Win32(code) => write!(f, "Win32 error {code}"),
+    }
+  }
+}
+
 /// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. A refusal the host gives a number is
 /// typed by the numbering it is in (A-527): an errno (`Unavailable`) or a Win32 error code (`Win32`), so a reader that
 /// tells refusals apart by an errno's number never reads a Win32 code as the errno of the same number.
@@ -94,6 +134,15 @@ pub enum HostError {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
+  /// The name exists (`EEXIST`; Windows' `ERROR_FILE_EXISTS`, `ERROR_ALREADY_EXISTS`), by the code the host named it
+  /// with (A-539).
+  Exists(OsCode),
+  /// No room: the filesystem is full or its owner's quota spent (`ENOSPC`, `EDQUOT`; Windows' `ERROR_DISK_FULL`,
+  /// `ERROR_HANDLE_DISK_FULL`), by the code the host named it with (A-539).
+  NoSpace(OsCode),
+  /// The verb does not exist on this filesystem: an exchange or a clone it lacks (`EOPNOTSUPP`, `ENOTSUP`, a rename
+  /// flag's `EINVAL`; Windows' own), by the code the host named it with (A-539).
+  Unsupported(OsCode),
   /// The host cannot serve it: the errno, POSIX's numbering (Linux, macOS, and a Windows refusal the writer gives the
   /// kind of an errno the landing tells apart: a name that exists, a full disk, a verb the filesystem lacks).
   Unavailable(i32),
@@ -114,6 +163,9 @@ impl std::fmt::Display for HostError {
       Self::NotDirectory => f.write_str("not a directory"),
       Self::NotFile => f.write_str("not a regular file"),
       Self::StaleHandle => f.write_str("stale host handle"),
+      Self::Exists(code) => write!(f, "the name exists ({code})"),
+      Self::NoSpace(code) => write!(f, "no room ({code})"),
+      Self::Unsupported(code) => write!(f, "not supported here ({code})"),
       Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
       Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
