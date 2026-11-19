@@ -1191,6 +1191,135 @@ pub enum RequestBody {
     /// The branch's name.
     name: String,
   },
+  /// Set repository `repository`'s policy whole (§4.17.1 "Policy"; A-622): its rules by name pattern and its hooks,
+  /// replacing what it held, made from `read`, the policy version its setter read (0 for a repository never given one).
+  /// Its owner's verb. Answered `Acknowledged`, the policy then at version `read + 1`; refused `PolicyChanged` with the
+  /// version now when the policy has moved since `read`, and `Database` naming the first rule or hook its repository
+  /// cannot hold. Appended.
+  SetRepositoryPolicy {
+    /// The repository.
+    repository: String,
+    /// The policy version the setter read.
+    read: u64,
+    /// The rules, in order: git's precedence and Subversion's at one depth read the order.
+    rules: Vec<PolicyRule>,
+    /// The hooks, in order: one point's hooks run in that order.
+    hooks: Vec<HookConfig>,
+  },
+}
+
+/// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
+/// repository's tool has.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyNames {
+  /// git refs, by `git for-each-ref`'s pattern: a ref, a prefix ending at a slash, or a glob.
+  Refs,
+  /// Mercurial named branches, by name or `*`.
+  Branches,
+  /// Mercurial bookmarks, by name or `*`.
+  Bookmarks,
+  /// Mercurial topics, by name or `*`.
+  Topics,
+  /// Subversion paths: `/path`, or `:glob:/path` with wildcards.
+  Paths,
+}
+
+/// A right a policy rule decides (§4.17.1 "Policy"; A-622).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyRight {
+  /// Read the branch.
+  Read,
+  /// Submit a work to it.
+  Submit,
+  /// Move it to a head that does not descend from its current one.
+  Rewrite,
+  /// Delete it.
+  Delete,
+}
+
+/// Whether a policy rule allows its right or denies it (A-622).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyEffect {
+  /// It allows the right.
+  Allow,
+  /// It denies the right.
+  Deny,
+}
+
+/// One entry of the principals a policy rule speaks to (A-622).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyEntry {
+  /// This principal.
+  Is {
+    /// The principal.
+    principal: Principal,
+  },
+  /// Every principal but this one (acl's `!user`, authz's `~user`).
+  IsNot {
+    /// The principal excepted.
+    principal: Principal,
+  },
+}
+
+/// The principals a policy rule speaks to (A-622).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyWho {
+  /// Every principal.
+  Anyone,
+  /// Each principal one of the entries names.
+  AnyOf {
+    /// The entries.
+    entries: Vec<PolicyEntry>,
+  },
+}
+
+/// One policy rule (§4.17.1 "Policy"; A-622): on the names `pattern` covers, `effect` for `right` to the principals
+/// `who` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRule {
+  /// What the pattern names.
+  pub names: PolicyNames,
+  /// The pattern, in its tool's form: not empty, holding no NUL, and for Subversion a path from the root.
+  pub pattern: String,
+  /// The right it decides.
+  pub right: PolicyRight,
+  /// Whether it allows or denies.
+  pub effect: PolicyEffect,
+  /// Whom it speaks to.
+  pub who: PolicyWho,
+}
+
+/// A hook point (§4.17.1; A-597's points), each its tool's (A-622).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookPointName {
+  /// git's `pre-receive`.
+  GitPreReceive,
+  /// git's `update`.
+  GitUpdate,
+  /// git's `post-receive`.
+  GitPostReceive,
+  /// Mercurial's `pretxnchangegroup`.
+  HgPretxnchangegroup,
+  /// Mercurial's `changegroup`.
+  HgChangegroup,
+  /// Subversion's `pre-commit`.
+  SvnPreCommit,
+  /// Subversion's `pre-revprop-change`.
+  SvnPreRevpropChange,
+  /// Subversion's `post-commit`.
+  SvnPostCommit,
+}
+
+/// One configured hook (§4.17.1: "a program the repository's owner configured"; A-622).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HookConfig {
+  /// The point it runs at.
+  pub point: HookPointName,
+  /// Its name: at a Mercurial point, the point's name alone or with a `.suffix`, one hook a name; git and Subversion
+  /// keep one hook a point, named for its point.
+  pub name: String,
+  /// The program it runs: an absolute path on the host that runs the repository's hooks.
+  pub program: String,
 }
 
 /// The tool a repository serves (§4.17; A-575), as `CreateRepository` names it.
@@ -1992,7 +2121,8 @@ impl RequestBody {
       RequestBody::CreateRepository { .. }
       | RequestBody::CreateBranch { .. }
       | RequestBody::BindBranch { .. }
-      | RequestBody::RetireBranch { .. } => None,
+      | RequestBody::RetireBranch { .. }
+      | RequestBody::SetRepositoryPolicy { .. } => None,
     }
   }
 
@@ -3990,8 +4120,9 @@ pub enum Refusal {
     /// The subject whose policy forbids it.
     by: PolicySubject,
   },
-  /// A `SetPolicy` named a policy version the policy has moved past (A-285): a raced or replayed setting changes nothing.
-  /// Read the policy again and set it from there. Appended.
+  /// A `SetPolicy` named a policy version the policy has moved past (A-285), or a `SetRepositoryPolicy` a repository
+  /// policy version it has moved past (A-622): a raced or replayed setting changes nothing. Read the policy again and set
+  /// it from there. Appended.
   PolicyChanged {
     /// The policy's version now.
     current: u64,
@@ -4204,6 +4335,18 @@ pub enum DatabaseRefusal {
   /// one already, one it removes is not, or a marker it adds is held. Appended.
   StateChanged {
     /// The change's index among the entry's state changes.
+    index: u32,
+  },
+  /// A repository policy's rule its repository cannot hold (A-622): its pattern names what the repository's tool does
+  /// not have, is empty, holds a NUL, or is a Subversion path not from the root. Appended.
+  PolicyRuleMalformed {
+    /// The rule's index among the policy's rules.
+    index: u32,
+  },
+  /// A repository policy's hook its repository cannot hold (A-622): at another tool's point, named other than its point
+  /// allows or named twice there, or running a program that is not an absolute path. Appended.
+  PolicyHookMalformed {
+    /// The hook's index among the policy's hooks.
     index: u32,
   },
 }

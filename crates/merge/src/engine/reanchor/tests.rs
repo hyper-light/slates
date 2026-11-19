@@ -51,7 +51,7 @@ impl Work {
   }
 
   fn name(&mut self, name: &str) -> u64 {
-    u64::from(self.doc.paths.intern(name))
+    self.doc.paths.intern(name)
   }
 
   /// Lays `splices` (sorted by offset, disjoint, against a base of `len` bytes) into ops on `path` in the deriver's

@@ -1402,6 +1402,179 @@ pub struct RepositoryRecord {
   pub default_branch: Option<String>,
   /// Who created it, and holds every right on it until a policy says otherwise (§4.13).
   pub owner: Principal,
+  /// Its policy (A-622): empty at creation, then set whole by `Op::RepositoryPolicySet`. Appended.
+  pub policy: RepositoryPolicy,
+}
+
+/// A repository's policy (§4.17.1 "Policy: protected branches, access and hooks"; A-597's matcher, A-622's record): its
+/// rules by name pattern and its hooks, set whole by its owner (`Op::RepositoryPolicySet`) and carried by its record,
+/// so a partition's snapshot carries it and a replay sets it again. Empty at creation: no rule and no hook, so the
+/// repository's own rule decides everything (its owner holds every right, A-575) and no hook runs. Bounded by the
+/// partition's merge byte budget, which its rules' and hooks' encoded bytes are charged to, and by one log record, since
+/// it is set whole.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryPolicy {
+  /// How many times it has been set: a setting names the version after the one its setter read, so one made from a
+  /// stale read is refused and changes nothing.
+  pub version: u64,
+  /// The rules, in the order given, which git's precedence (the last covering rule) and Subversion's at one depth (the
+  /// rule defined last) read.
+  pub rules: Vec<PolicyRule>,
+  /// The hooks, in the order given: the hooks of one point run in that order.
+  pub hooks: Vec<HookConfig>,
+}
+
+/// What a policy rule's pattern names (§4.17.1; A-597): the names its repository's tool has, each in its tool's form.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyNames {
+  /// git refs, by `git for-each-ref`'s pattern: a ref, a prefix ending at a slash, or a glob.
+  Refs,
+  /// Mercurial named branches, by name or `*`.
+  Branches,
+  /// Mercurial bookmarks, by name or `*`.
+  Bookmarks,
+  /// Mercurial topics, by name or `*`.
+  Topics,
+  /// Subversion paths: `/path`, or `:glob:/path` with wildcards.
+  Paths,
+}
+
+impl PolicyNames {
+  /// Whether a repository serving `tool` has these names.
+  pub fn of(self, tool: VcsTool) -> bool {
+    matches!(
+      (tool, self),
+      (VcsTool::Git, Self::Refs)
+        | (
+          VcsTool::Mercurial,
+          Self::Branches | Self::Bookmarks | Self::Topics
+        )
+        | (VcsTool::Subversion, Self::Paths)
+    )
+  }
+}
+
+/// A right a policy rule decides (§4.17.1 "Policy").
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyRight {
+  /// Read the branch.
+  Read,
+  /// Submit a work to it.
+  Submit,
+  /// Move it to a head that does not descend from its current one.
+  Rewrite,
+  /// Delete it.
+  Delete,
+}
+
+/// Whether a policy rule allows its right or denies it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyEffect {
+  /// It allows the right.
+  Allow,
+  /// It denies the right.
+  Deny,
+}
+
+/// One entry of the principals a policy rule speaks to.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyEntry {
+  /// This principal.
+  Is {
+    /// The principal.
+    principal: Principal,
+  },
+  /// Every principal but this one (acl's `!user`, authz's `~user`).
+  IsNot {
+    /// The principal excepted.
+    principal: Principal,
+  },
+}
+
+/// The principals a policy rule speaks to.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyWho {
+  /// Every principal.
+  Anyone,
+  /// Each principal one of the entries names.
+  AnyOf {
+    /// The entries.
+    entries: Vec<PolicyEntry>,
+  },
+}
+
+/// One policy rule (§4.17.1 "Policy"; A-597): on the names `pattern` covers, `effect` for `right` to the principals
+/// `who` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRule {
+  /// What the pattern names: the repository's tool's names.
+  pub names: PolicyNames,
+  /// The pattern, in its tool's form: not empty, holding no NUL, and for Subversion a path from the root.
+  pub pattern: String,
+  /// The right it decides.
+  pub right: PolicyRight,
+  /// Whether it allows or denies.
+  pub effect: PolicyEffect,
+  /// Whom it speaks to.
+  pub who: PolicyWho,
+}
+
+/// A hook point (§4.17.1; A-597's points), each its tool's.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HookPointName {
+  /// git's `pre-receive`.
+  GitPreReceive,
+  /// git's `update`.
+  GitUpdate,
+  /// git's `post-receive`.
+  GitPostReceive,
+  /// Mercurial's `pretxnchangegroup`.
+  HgPretxnchangegroup,
+  /// Mercurial's `changegroup`.
+  HgChangegroup,
+  /// Subversion's `pre-commit`.
+  SvnPreCommit,
+  /// Subversion's `pre-revprop-change`.
+  SvnPreRevpropChange,
+  /// Subversion's `post-commit`.
+  SvnPostCommit,
+}
+
+impl HookPointName {
+  /// The tool whose point it is.
+  pub fn tool(self) -> VcsTool {
+    match self {
+      Self::GitPreReceive | Self::GitUpdate | Self::GitPostReceive => VcsTool::Git,
+      Self::HgPretxnchangegroup | Self::HgChangegroup => VcsTool::Mercurial,
+      Self::SvnPreCommit | Self::SvnPreRevpropChange | Self::SvnPostCommit => VcsTool::Subversion,
+    }
+  }
+
+  /// Its name in its tool.
+  pub fn name(self) -> &'static str {
+    match self {
+      Self::GitPreReceive => "pre-receive",
+      Self::GitUpdate => "update",
+      Self::GitPostReceive => "post-receive",
+      Self::HgPretxnchangegroup => "pretxnchangegroup",
+      Self::HgChangegroup => "changegroup",
+      Self::SvnPreCommit => "pre-commit",
+      Self::SvnPreRevpropChange => "pre-revprop-change",
+      Self::SvnPostCommit => "post-commit",
+    }
+  }
+}
+
+/// One configured hook (§4.17.1: "a program the repository's owner configured").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HookConfig {
+  /// The point it runs at.
+  pub point: HookPointName,
+  /// Its name: at a Mercurial point, the point's name alone or with a `.suffix` (`pretxnchangegroup.acl`), one hook a
+  /// name; git and Subversion keep one hook a point, named for its point.
+  pub name: String,
+  /// The program it runs: an absolute path on the host that runs the repository's hooks, holding no NUL.
+  pub program: String,
 }
 
 /// How a green joined its repository's lineage (§4.17.1 item 4, A-575): a repository's greens share the nodes of their

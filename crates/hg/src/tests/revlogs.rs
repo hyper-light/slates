@@ -2,8 +2,9 @@
 //! repositories (`fixtures/revlogs`), each entry held to 7.2's `debugindex --debug`, each text to its `debugdata`, and
 //! the reader's refusals on damaged and hostile bytes.
 
+use crate::compression::StreamRefusal;
 use crate::fixtures::revlogs::{file, find};
-use crate::revlog::{self, Format, Mode, NONE, Refused, Revlog};
+use crate::revlog::{self, Entry, Format, Mode, NONE, Refused, Revlog};
 use crate::{Admission, Node};
 use proptest::prelude::*;
 
@@ -32,8 +33,17 @@ fn node(hex: &str) -> Node {
   crate::fixtures::node(hex)
 }
 
+/// One row of a listing: each column's name and value.
+type Row = Vec<(String, String)>;
+
+/// Every text of a revlog, in order.
+type Texts = Vec<Vec<u8>>;
+
+/// An entry as `debugindex` lists it: offset, flags, chunk and text lengths, base, link, parents, node, mode.
+type Listed = (u64, u16, u32, u32, u32, u32, u32, u32, Node, &'static str);
+
 /// A listing's rows, each a column's name to its value.
-fn listing(name: &str) -> Vec<Vec<(String, String)>> {
+fn listing(name: &str) -> Vec<Row> {
   let text = core::str::from_utf8(file(name)).unwrap();
   let mut lines = text.lines();
   let header: Vec<String> = lines
@@ -92,6 +102,80 @@ struct Seen {
   generaldelta: bool,
 }
 
+/// The entry `row` lists, as `Listed`.
+fn listed(row: &[(String, String)]) -> Listed {
+  let mode = match column(row, "comp-mode") {
+    "0" => "0",
+    "1" => "1",
+    "2" => "2",
+    _ => "unknown",
+  };
+  (
+    column(row, "data-offset").parse().unwrap(),
+    column(row, "flags").parse().unwrap(),
+    column(row, "chunk-size").parse().unwrap(),
+    column(row, "full-size").parse().unwrap(),
+    rev_of(column(row, "delta-base")),
+    rev_of(column(row, "linkrev")),
+    rev_of(column(row, "p1-rev")),
+    rev_of(column(row, "p2-rev")),
+    node(column(row, "nodeid")),
+    mode,
+  )
+}
+
+/// An entry read, as `Listed`.
+fn read(entry: &Entry) -> Listed {
+  let mode = match entry.mode {
+    Mode::Plain => "0",
+    Mode::Default => "1",
+    Mode::Inline => "2",
+  };
+  (
+    entry.offset,
+    entry.flags,
+    entry.compressed,
+    entry.uncompressed,
+    entry.base,
+    entry.link,
+    entry.p1,
+    entry.p2,
+    entry.node,
+    mode,
+  )
+}
+
+/// Holds one revlog of one repository to 7.2's listing and texts, noting what its chunks and chains showed.
+fn check_log(repository: &str, stem: &str, name: &str, seen: &mut Seen) {
+  let log = open(repository, stem);
+  let rows = listing(&format!("{repository}-{name}.index"));
+  assert_eq!(
+    usize::try_from(log.len()).unwrap(),
+    rows.len(),
+    "{repository} {name}"
+  );
+  for row in &rows {
+    let rev: u32 = column(row, "rev").parse().unwrap();
+    let entry = log.entry(rev).unwrap();
+    assert_eq!(read(&entry), listed(row), "{repository} {name} {rev}");
+    let text = log.text(rev, &mut room()).unwrap();
+    assert_eq!(
+      text,
+      file(&format!("{name}-{rev}.txt")),
+      "{repository} {name} {rev}"
+    );
+    seen.longest_chain = seen
+      .longest_chain
+      .max(log.chain(rev, &mut room()).unwrap().len());
+    seen.generaldelta |= entry.base != rev && entry.base.checked_add(1) != Some(rev);
+    if V1_REPOSITORIES.contains(&repository) && entry.compressed > 0 {
+      seen
+        .headers
+        .push(first_stored_byte(repository, stem, &log, rev));
+    }
+  }
+}
+
 /// A-611 (golden): do open every revlog of the five repositories and read each revision's entry and text. Expect each
 /// entry as 7.2's `debugindex --debug` lists it (offset, flags, chunk and text lengths, base, link, parents, node, and
 /// version 2's compression mode), each text equal to its `debugdata` and hashing to its node, and every shape the
@@ -102,70 +186,12 @@ fn every_revision_reads_as_7_2_stored_it() {
   let mut seen = Seen::default();
   for repository in V1_REPOSITORIES.iter().chain(V2_REPOSITORIES.iter()) {
     for (stem, name) in LOGS {
-      let log = open(repository, stem);
-      let rows = listing(&format!("{repository}-{name}.index"));
-      assert_eq!(
-        usize::try_from(log.len()).unwrap(),
-        rows.len(),
-        "{repository} {name}"
-      );
-      for row in &rows {
-        let rev: u32 = column(row, "rev").parse().unwrap();
-        let entry = log.entry(rev).unwrap();
-        let mode = match entry.mode {
-          Mode::Plain => "0",
-          Mode::Default => "1",
-          Mode::Inline => "2",
-        };
-        let wanted = (
-          column(row, "data-offset").parse::<u64>().unwrap(),
-          column(row, "flags").parse::<u16>().unwrap(),
-          column(row, "chunk-size").parse::<u32>().unwrap(),
-          column(row, "full-size").parse::<u32>().unwrap(),
-          rev_of(column(row, "delta-base")),
-          rev_of(column(row, "linkrev")),
-          rev_of(column(row, "p1-rev")),
-          rev_of(column(row, "p2-rev")),
-          node(column(row, "nodeid")),
-          column(row, "comp-mode"),
-        );
-        let found = (
-          entry.offset,
-          entry.flags,
-          entry.compressed,
-          entry.uncompressed,
-          entry.base,
-          entry.link,
-          entry.p1,
-          entry.p2,
-          entry.node,
-          mode,
-        );
-        assert_eq!(found, wanted, "{repository} {name} {rev}");
-        let text = log.text(rev, &mut room()).unwrap();
-        assert_eq!(
-          text,
-          file(&format!("{name}-{rev}.txt")),
-          "{repository} {name} {rev}"
-        );
-        let chain = log.chain(rev, &mut room()).unwrap();
-        seen.longest_chain = seen.longest_chain.max(chain.len());
-        seen.generaldelta |= entry.base != rev && entry.base.checked_add(1) != Some(rev);
-        if V1_REPOSITORIES.contains(repository) && entry.compressed > 0 {
-          seen
-            .headers
-            .push(first_stored_byte(repository, stem, &log, rev));
-        }
-      }
+      check_log(repository, stem, name, &mut seen);
     }
   }
-  for header in [b'x', b'(', b'u'] {
-    assert!(
-      seen.headers.contains(&header),
-      "a chunk headed {}",
-      char::from(header)
-    );
-  }
+  assert!(
+    seen.headers.contains(&b'x') && seen.headers.contains(&b'(') && seen.headers.contains(&b'u')
+  );
   assert!(seen.longest_chain > 1 && seen.generaldelta);
   let snapshots = core::str::from_utf8(file("zstd-grow.chain"))
     .unwrap()
@@ -217,7 +243,7 @@ fn inline_bytes() -> Vec<u8> {
 }
 
 /// Every text of a revlog, or the first refusal.
-fn read_all(index: &[u8], data: &[u8], admission: &mut Admission) -> Result<Vec<Vec<u8>>, Refused> {
+fn read_all(index: &[u8], data: &[u8], admission: &mut Admission) -> Result<Texts, Refused> {
   let log = Revlog::open(index, data, admission)?;
   (0..log.len()).map(|rev| log.text(rev, admission)).collect()
 }
@@ -253,49 +279,61 @@ fn versions_7_2_would_not_read_are_refused() {
   ));
 }
 
-/// AC-HG.9, A-611: do damage an inline revlog: a chunk's length made negative, an offset made unlike the chunks before
-/// it, a base and a parent made later than their revision, a node's byte flipped, a chunk's header made unknown, and
-/// the censored flag set. Expect each refused by its kind, at its revision.
-#[test]
-fn damaged_revlogs_are_refused_by_kind() {
+/// Where an inline fixture revlog's second entry begins.
+fn second_entry() -> usize {
   let clean = inline_bytes();
   let log = Revlog::open(&clean, &[], &mut room()).unwrap();
-  let second = usize::try_from(log.entry(0).unwrap().compressed).unwrap() + 64;
-  let mut negative = clean.clone();
-  negative[second + 8..second + 12].copy_from_slice(&(-5_i32).to_be_bytes());
+  usize::try_from(log.entry(0).unwrap().compressed).unwrap() + 64
+}
+
+/// The inline fixture revlog with `change` made to its bytes, given where its second entry begins.
+fn damaged(change: impl FnOnce(&mut [u8], usize)) -> Vec<u8> {
+  let mut bytes = inline_bytes();
+  change(&mut bytes, second_entry());
+  bytes
+}
+
+/// AC-HG.9, A-611: do damage an inline revlog's second entry: its chunk's length made negative, its offset made unlike
+/// the chunks before it, and its base and its first parent made later than itself. Expect each refused as corrupt at
+/// revision 1.
+#[test]
+fn damaged_entries_are_refused_by_kind() {
+  let negative = damaged(|bytes, second| {
+    bytes[second + 8..second + 12].copy_from_slice(&(-5_i32).to_be_bytes());
+  });
   assert!(matches!(
     Revlog::open(&negative, &[], &mut room()),
     Err(Refused::Corrupt { rev: 1, .. })
   ));
-  let mut moved = clean.clone();
-  moved[second + 5] ^= 1;
+  let moved = damaged(|bytes, second| bytes[second + 5] ^= 1);
   assert!(matches!(
     Revlog::open(&moved, &[], &mut room()),
     Err(Refused::Corrupt { rev: 1, .. })
   ));
-  let mut later_base = clean.clone();
-  later_base[second + 16..second + 20].copy_from_slice(&5_i32.to_be_bytes());
-  let read = Revlog::open(&later_base, &[], &mut room()).unwrap();
-  assert!(matches!(
-    read.entry(1),
-    Err(Refused::Corrupt { rev: 1, .. })
-  ));
-  let mut later_parent = clean.clone();
-  later_parent[second + 24..second + 28].copy_from_slice(&1_i32.to_be_bytes());
-  let read = Revlog::open(&later_parent, &[], &mut room()).unwrap();
-  assert!(matches!(
-    read.entry(1),
-    Err(Refused::Corrupt { rev: 1, .. })
-  ));
-  let mut wrong_node = clean.clone();
-  wrong_node[32] ^= 1;
+  for field in [16, 24] {
+    let later = damaged(|bytes, second| {
+      bytes[second + field..second + field + 4].copy_from_slice(&5_i32.to_be_bytes());
+    });
+    let read = Revlog::open(&later, &[], &mut room()).unwrap();
+    assert!(matches!(
+      read.entry(1),
+      Err(Refused::Corrupt { rev: 1, .. })
+    ));
+  }
+}
+
+/// AC-HG.9, A-611: do damage an inline revlog's first revision: a byte of its node flipped, its chunk's header made
+/// unknown, and the censored flag set. Expect its text refused as a node mismatch, an unknown compression and
+/// unhashed flags.
+#[test]
+fn damaged_texts_are_refused_by_kind() {
+  let wrong_node = damaged(|bytes, _| bytes[32] ^= 1);
   let read = Revlog::open(&wrong_node, &[], &mut room()).unwrap();
   assert!(matches!(
     read.text(0, &mut room()),
     Err(Refused::Node { rev: 0, .. })
   ));
-  let mut unknown = clean.clone();
-  unknown[64] = b'?';
+  let unknown = damaged(|bytes, _| bytes[64] = b'?');
   let read = Revlog::open(&unknown, &[], &mut room()).unwrap();
   assert_eq!(
     read.text(0, &mut room()),
@@ -304,8 +342,7 @@ fn damaged_revlogs_are_refused_by_kind() {
       header: b'?'
     })
   );
-  let mut censored = clean.clone();
-  censored[6] |= 0x80;
+  let censored = damaged(|bytes, _| bytes[6] |= 0x80);
   let read = Revlog::open(&censored, &[], &mut room()).unwrap();
   assert_eq!(
     read.text(0, &mut room()),
@@ -346,8 +383,8 @@ fn first_chunk(name: &str) -> (Vec<u8>, u32) {
 }
 
 /// AC-HG.9, A-611: do read one-revision revlogs whose chunk is 7.2's own zlib stream or zstd frame with a byte after
-/// it, or cut short by a byte. Expect each refused as a chunk that does not inflate exactly; the chunk as stored read
-/// to its text's length.
+/// it, or cut short by a byte. Expect the byte after refused as one trailing byte and the cut stream as cut short, both
+/// by the inflater compressed bundles use; the chunk as stored read to its text's length.
 #[test]
 fn a_compressed_chunk_must_end_exactly() {
   for name in ["zlib-data_grow.i", "zstd-data_grow.i"] {
@@ -358,18 +395,30 @@ fn a_compressed_chunk_must_end_exactly() {
       log.chunk(0, &mut room()).map(|text| text.len()),
       Ok(usize::try_from(len).unwrap())
     );
-    for damaged in [
-      [chunk.as_slice(), b"!"].concat(),
-      chunk[..chunk.len() - 1].to_vec(),
-    ] {
-      let index = one_revision(&damaged, len);
-      let log = Revlog::open(&index, &[], &mut room()).unwrap();
-      assert_eq!(
+    let trailing = one_revision(&[chunk.as_slice(), b"!"].concat(), len);
+    let log = Revlog::open(&trailing, &[], &mut room()).unwrap();
+    assert!(
+      matches!(
         log.chunk(0, &mut room()),
-        Err(Refused::Inflate { rev: 0 }),
-        "{name}"
-      );
-    }
+        Err(Refused::Stream {
+          rev: 0,
+          refusal: StreamRefusal::TrailingBytes { bytes: 1, .. }
+        })
+      ),
+      "{name}"
+    );
+    let cut = one_revision(&chunk[..chunk.len() - 1], len);
+    let log = Revlog::open(&cut, &[], &mut room()).unwrap();
+    assert!(
+      matches!(
+        log.chunk(0, &mut room()),
+        Err(Refused::Stream {
+          rev: 0,
+          refusal: StreamRefusal::Truncated { .. }
+        })
+      ),
+      "{name}"
+    );
   }
 }
 
@@ -413,7 +462,11 @@ proptest! {
   /// AC-HG.9, A-611: do read a docket cut at any byte or with any byte changed. Expect a docket or a refusal; never a
   /// panic.
   #[test]
-  fn damaged_dockets_never_panic(at in any::<proptest::sample::Index>(), byte in any::<u8>(), cut in any::<bool>()) {
+  fn damaged_dockets_never_panic(
+    at in any::<proptest::sample::Index>(),
+    byte in any::<u8>(),
+    cut in any::<bool>(),
+  ) {
     let mut docket = file("v2-00changelog.i").to_vec();
     let place = at.index(docket.len());
     if cut { docket.truncate(place) } else { docket[place] = byte }

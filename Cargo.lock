@@ -1710,6 +1710,7 @@ dependencies = [
  "proptest",
  "sha1-checked",
  "slates-test-seeds",
+ "slates-vcs",
  "zstd",
 ]
 
@@ -1719,6 +1720,18 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
+name = "slates-http-edge"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "proptest",
+ "rcgen",
+ "rustls",
+ "slates-http",
  "slates-test-seeds",
 ]
 
