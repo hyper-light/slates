@@ -38,6 +38,8 @@
 //! index, appends the entry, and puts the fork in the index's place once the entry committed, or releases it. The
 //! admission (the repository's policy and its hooks) runs between the two.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
 #[cfg(unix)]
 use slates_db::catalog::{HookPointName, RepositoryPolicy};
 use slates_db::catalog::{
@@ -101,9 +103,10 @@ const VIEW_REFUSED: &[u8] = b"the repository's history could not be read";
 /// See [`NOT_AVAILABLE`].
 const REFUSED: &[u8] = b"push refused: ";
 
-/// Format: `acl`'s words for a name it refuses (`hgext/acl.py`, 7.2): `acl: user "%s" denied on branch "%s" (changeset
-/// "%s")`, `not allowed on` for a list that leaves the user out, bookmarks alike; the user here is the principal's
-/// record until §4.13's Mercurial identity names it.
+/// Format: `acl`'s words for a name it refuses (`hgext/acl.py`, 7.2, read from Homebrew's 7.2 on 2026-11-19): `acl:
+/// user "%s" denied on branch "%s" (changeset "%s")`, `not allowed on` for a list that leaves the user out, bookmarks
+/// alike (a branch's changeset `short`'s twelve digits, a bookmark's the pushkey's `new`: all forty, or none when
+/// deleted); the user here is the principal's record until §4.13's Mercurial identity names it.
 const ACL_USER: &[u8] = b"acl: user \"";
 /// Format: see [`ACL_USER`].
 const ACL_DENIED: &[u8] = b"\" denied on ";
@@ -427,9 +430,9 @@ pub(crate) struct Prepared {
 }
 
 /// One name a push changes as its admission asks about it (A-622 part 2's `admit`): its namespace and label, the right
-/// its change needs, and the changeset `acl` names when it refuses (the first the push brings on a branch; a bookmark's
-/// node).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// its change needs, and the changeset `acl` names when it refuses (the first the push brings on a branch, none for a
+/// branch it brings none on; the node a bookmark moves to, none for a bookmark deleted).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Ask {
   /// The namespace.
   pub(crate) namespace: Namespace,
@@ -780,88 +783,91 @@ fn policy_name(name: &[u8]) -> String {
   text
 }
 
-/// Each name the plan changes and the right its change needs (`vcs_policy::admit`): a line moved, merged away or made
-/// on a new branch submits to its branch, a line made beside another head of its branch rewrites it (Mercurial's
-/// forced push); a bookmark moved forward or made submits, moved elsewhere rewrites, and deleted deletes.
+/// Each name the plan changes and the right its change needs (`vcs_policy::admit`), once each, in the order 7.2's `acl`
+/// meets them: a line moved, merged away or made on a new branch submits to its branch, a line made beside another head
+/// of its branch rewrites it (Mercurial's forced push); a bookmark moved forward or made submits, moved elsewhere
+/// rewrites, and deleted deletes. The branches come first, in the order the push brings its first changeset on each,
+/// since `acl`'s `_txnhook` walks the new changesets in revision order and refuses at the first a rule refuses (a
+/// branch the push brings none on, whose line a merge retires, after them); then the bookmarks, whose part 7.2 applies
+/// after the changegroup's.
 fn asked(plan: &Plan, read: &Read) -> Vec<Ask> {
-  let first_on = |branch: &[u8]| {
-    plan
-      .firsts
-      .iter()
-      .find(|(held, _)| held == branch)
-      .map(|(_, node)| *node)
-  };
-  let mut asked: Vec<Ask> = Vec::new();
-  let mut ask = |namespace: Namespace, name: &[u8], right: Right, changeset: Option<Node>| {
-    let ask = Ask {
-      namespace,
-      name: policy_name(name),
-      right,
-      changeset,
-    };
-    if !asked.contains(&ask) {
-      asked.push(ask);
-    }
-  };
+  let firsts: BTreeMap<&[u8], (usize, Node)> = plan
+    .firsts
+    .iter()
+    .enumerate()
+    .map(|(arrival, (branch, node))| (branch.as_slice(), (arrival, *node)))
+    .collect();
+  let headed: BTreeSet<&[u8]> = read
+    .lines
+    .iter()
+    .filter(|(named, _, _)| named.head.is_some())
+    .map(|(_, branch, _)| branch.as_slice())
+    .collect();
+  let mut branches: Vec<(usize, Ask)> = Vec::new();
   for moved in &plan.lines {
     let (LineMove::Moved { line, .. } | LineMove::Retired { line }) = moved;
     if let Some((_, branch, _)) = read.lines.get(*line) {
-      ask(
-        Namespace::Branch,
-        branch.as_slice(),
-        Right::Submit,
-        first_on(branch),
-      );
+      branches.push(branch_ask(&firsts, branch, Right::Submit));
     }
   }
   for made in &plan.created {
-    let headed = read
-      .lines
-      .iter()
-      .any(|(named, branch, _)| *branch == made.branch && named.head.is_some());
-    let right = if headed {
+    let right = if headed.contains(made.branch.as_slice()) {
       Right::Rewrite
     } else {
       Right::Submit
     };
-    ask(
-      Namespace::Branch,
-      made.branch.as_slice(),
-      right,
-      first_on(&made.branch),
-    );
+    branches.push(branch_ask(&firsts, &made.branch, right));
   }
-  for moved in &plan.bookmarks {
-    match moved {
-      BookmarkMove::Moved {
-        name, to, forward, ..
-      } => {
-        let right = if *forward {
-          Right::Submit
-        } else {
-          Right::Rewrite
-        };
-        ask(Namespace::Bookmark, name.as_slice(), right, Some(*to));
-      }
-      BookmarkMove::Created { name, to, .. } => {
-        ask(
-          Namespace::Bookmark,
-          name.as_slice(),
-          Right::Submit,
-          Some(*to),
-        );
-      }
-      BookmarkMove::Deleted { name, from } => {
-        ask(
-          Namespace::Bookmark,
-          name.as_slice(),
-          Right::Delete,
-          Some(*from),
-        );
-      }
+  branches.sort_by_key(|(arrival, _)| *arrival);
+  let mut seen = HashSet::new();
+  branches
+    .into_iter()
+    .map(|(_, ask)| ask)
+    .chain(plan.bookmarks.iter().map(bookmark_ask))
+    .filter(|ask| seen.insert(ask.clone()))
+    .collect()
+}
+
+/// The ask about `branch` for `right`, and where `acl` meets the branch: the arrival of the first changeset the push
+/// brings on it (`Plan::firsts`), which the ask names; past every arrival, naming none, when it brings none on it.
+fn branch_ask(
+  firsts: &BTreeMap<&[u8], (usize, Node)>,
+  branch: &[u8],
+  right: Right,
+) -> (usize, Ask) {
+  let first = firsts.get(branch).copied();
+  let ask = Ask {
+    namespace: Namespace::Branch,
+    name: policy_name(branch),
+    right,
+    changeset: first.map(|(_, node)| node),
+  };
+  (first.map_or(usize::MAX, |(arrival, _)| arrival), ask)
+}
+
+/// The ask about a bookmark the plan moves, makes or deletes, naming the node `acl` names: the one it moves to, none for
+/// a deletion (7.2 hands `prepushkey` an empty `new`, `bundle2_part_handlers.handlebookmark`).
+fn bookmark_ask(moved: &BookmarkMove) -> Ask {
+  let (name, right, changeset) = match moved {
+    BookmarkMove::Moved {
+      name, to, forward, ..
+    } => {
+      let right = if *forward {
+        Right::Submit
+      } else {
+        Right::Rewrite
+      };
+      (name, right, Some(*to))
     }
+    BookmarkMove::Created { name, to, .. } => (name, Right::Submit, Some(*to)),
+    BookmarkMove::Deleted { name, .. } => (name, Right::Delete, None),
+  };
+  Ask {
+    namespace: Namespace::Bookmark,
+    name: policy_name(name),
+    right,
+    changeset,
   }
-  asked
 }
 
 /// The repository's policy asked about every name a prepared push changes, before its verdict (A-622 part 2's
@@ -898,7 +904,9 @@ fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) ->
   abort(words.unwrap_or_else(|| NOT_AUTHORIZED.to_vec()))
 }
 
-/// `acl`'s words refusing `ask` to `principal` (`verdict` its `denied on` or `not allowed on`).
+/// `acl`'s words refusing `ask` to `principal` (`verdict` its `denied on` or `not allowed on`): a branch's changeset in
+/// `short`'s digits, as `_txnhook` writes a changeset, none for a branch the push brings no changeset on; a bookmark's
+/// as `_pkhook` writes the pushkey's `new`, every digit of the node it moves to, none for a deletion.
 fn acl_words(principal: &Principal, ask: &Ask, verdict: &[u8]) -> Vec<u8> {
   let kind: &[u8] = match ask.namespace {
     Namespace::Branch => b"branch",
@@ -912,11 +920,22 @@ fn acl_words(principal: &Principal, ask: &Ask, verdict: &[u8]) -> Vec<u8> {
   words.extend_from_slice(b" \"");
   words.extend_from_slice(ask.name.as_bytes());
   words.push(b'"');
-  if let Some(node) = ask.changeset {
-    let mut hex = Vec::new();
-    slates_hg::node::write_hex(&node, &mut hex);
+  let hex = |node: Node| {
+    let mut digits = Vec::new();
+    slates_hg::node::write_hex(&node, &mut digits);
+    digits
+  };
+  let named = match ask.namespace {
+    Namespace::Bookmark => Some(ask.changeset.map(hex).unwrap_or_default()),
+    Namespace::Branch | Namespace::Topic => ask.changeset.map(|node| {
+      let mut digits = hex(node);
+      digits.truncate(SHORT_DIGITS);
+      digits
+    }),
+  };
+  if let Some(digits) = named {
     words.extend_from_slice(ACL_CHANGESET);
-    words.extend(hex.iter().take(SHORT_DIGITS));
+    words.extend_from_slice(&digits);
     words.extend_from_slice(ACL_END);
   }
   words
