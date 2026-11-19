@@ -169,10 +169,7 @@ fn updated_heads(
   admission.charge_items::<Node>(revs.len())?;
   let mut heads = nodes_of(view, revs.iter())?;
   heads.sort_unstable();
-  if claimed
-    .iter()
-    .all(|node| heads.binary_search(node).is_ok())
-  {
+  if claimed.iter().all(|node| heads.binary_search(node).is_ok()) {
     Ok(())
   } else {
     Err(raced(RACED.to_vec()))
@@ -240,9 +237,7 @@ fn phases(claimed: &[PhaseHead], view: &impl Repository) -> Result<(), CheckRefu
       let actual = if entry.node == NULL_NODE {
         Phase::Public
       } else {
-        let rev = view
-          .rev(&entry.node)
-          .ok_or_else(|| raced(RACED.to_vec()))?;
+        let rev = view.rev(&entry.node).ok_or_else(|| raced(RACED.to_vec()))?;
         view.phase(rev)
       };
       if actual != entry.phase {
@@ -327,7 +322,9 @@ pub fn heads_argument(
   let items = value.split(|byte| *byte == SPACE);
   let count = items.clone().count();
   let bytes = items.clone().fold(0_u64, |total, item| {
-    total.saturating_add(to_u64(item.len().checked_div(BYTE_DIGITS).unwrap_or_default()))
+    total.saturating_add(to_u64(
+      item.len().checked_div(BYTE_DIGITS).unwrap_or_default(),
+    ))
   });
   admission
     .charge_items::<Vec<u8>>(count)
@@ -390,7 +387,5 @@ pub fn judge_heads_argument(
   if holds {
     return Ok(());
   }
-  Err(raced(
-    [CHANGED_WHILE, moment.words(), TRY_AGAIN].concat(),
-  ))
+  Err(raced([CHANGED_WHILE, moment.words(), TRY_AGAIN].concat()))
 }

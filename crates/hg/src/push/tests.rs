@@ -164,7 +164,9 @@ impl Repository for View {
   }
 
   fn closes(&self, rev: Rev) -> bool {
-    self.changeset(rev).is_some_and(|changeset| changeset.closes)
+    self
+      .changeset(rev)
+      .is_some_and(|changeset| changeset.closes)
   }
 
   fn phase(&self, rev: Rev) -> Phase {
@@ -218,7 +220,10 @@ fn meaning(stream: &[u8]) -> Meaning {
 fn written(reply: &Reply) -> Vec<u8> {
   let mut out = Vec::new();
   reply.encode(&mut out).unwrap();
-  assert_eq!(reply.encoded_len().unwrap(), u64::try_from(out.len()).unwrap());
+  assert_eq!(
+    reply.encoded_len().unwrap(),
+    u64::try_from(out.len()).unwrap()
+  );
   out
 }
 
@@ -256,7 +261,12 @@ fn kinds(unbundle: &Unbundle) -> Vec<&'static str> {
 /// them.
 #[test]
 fn each_push_7_2_sent_is_read_part_by_part_as_its_listing_shows() {
-  let plain = ["replycaps", "check:phases", "check:updated-heads", "changegroup"];
+  let plain = [
+    "replycaps",
+    "check:phases",
+    "check:updated-heads",
+    "changegroup",
+  ];
   let marked = [
     "replycaps",
     "check:bookmarks",
@@ -319,17 +329,26 @@ fn a_bookmark_move_and_a_publication_ask_what_the_client_moved() {
     }])));
   let phase = fixture("push-phase");
   let published = View::of(&phase).changesets[1].node;
-  assert!(read_push(&phase).unwrap().parts.iter().any(|taken| taken.asks
-    == Asks::PhaseHeads(vec![PhaseHead {
-      phase: Phase::Public,
-      node: published,
-    }])));
+  assert!(
+    read_push(&phase)
+      .unwrap()
+      .parts
+      .iter()
+      .any(|taken| taken.asks
+        == Asks::PhaseHeads(vec![PhaseHead {
+          phase: Phase::Public,
+          node: published,
+        }]))
+  );
   let (id, part) = read_push(&fixture("push-plain"))
     .unwrap()
     .changegroup()
     .map(|(id, part)| (id, part.clone()))
     .unwrap();
-  assert_eq!((id, part.version, part.target_phase), (3, Version::V03, None));
+  assert_eq!(
+    (id, part.version, part.target_phase),
+    (3, Version::V03, None)
+  );
 }
 
 /// A-641, AC-HG.3 (golden). Do: judge each push's checks against the server as it stood when the push arrived. Expect:
@@ -390,7 +409,13 @@ fn reply_to(push: &Push, unbundle: &Unbundle) -> Reply {
   }
   if push.name == "push-newhead" {
     let message = reply::multiple_heads(b"default");
-    return Reply::refused(&[], &Refused::Abort { message, hint: None });
+    return Reply::refused(
+      &[],
+      &Refused::Abort {
+        message,
+        hint: None,
+      },
+    );
   }
   let replied: Vec<Replied> = unbundle
     .changegroup()
@@ -523,8 +548,14 @@ fn unknown_parts_and_parameters_are_refused_when_mandatory_and_passed_over_when_
       params: Vec::new(),
     })
   };
-  assert_eq!(read_specs(&[spec(b"Slates:Odd", &[])]), unsupported(b"slates:odd"));
-  assert_eq!(read_specs(&[spec(b"LISTKEYS", &[])]), unsupported(b"listkeys"));
+  assert_eq!(
+    read_specs(&[spec(b"Slates:Odd", &[])]),
+    unsupported(b"slates:odd")
+  );
+  assert_eq!(
+    read_specs(&[spec(b"LISTKEYS", &[])]),
+    unsupported(b"listkeys")
+  );
   assert_eq!(
     read_specs(&[spec(b"ERROR:ABORT", &[])]),
     unsupported(b"error:abort")
@@ -534,7 +565,10 @@ fn unknown_parts_and_parameters_are_refused_when_mandatory_and_passed_over_when_
   let sorted = vec![b"aa".to_vec(), b"zz".to_vec()];
   assert_eq!(
     read_specs(&[odd]),
-    Err(Refusal::Unsupported { parttype: b"check:heads".to_vec(), params: sorted })
+    Err(Refusal::Unsupported {
+      parttype: b"check:heads".to_vec(),
+      params: sorted
+    })
   );
   let mut advisory_odd = spec(b"check:heads", &[]);
   advisory_odd.mandatory = vec![kv(b"zz", b"1")];
@@ -558,7 +592,9 @@ fn a_damaged_payload_is_refused_by_kind_naming_its_part() {
     read_specs(&[spec(b"CHECK:UPDATED-HEADS", &[nineteen])]),
     payload(0, Fault::Heads(heads::Refusal::PartialNode { len: 19 }))
   );
-  let unknown_phase: &'static [u8] = &[0, 0, 0, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+  let unknown_phase: &'static [u8] = &[
+    0, 0, 0, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  ];
   assert_eq!(
     read_specs(&[spec(b"PHASE-HEADS", &[unknown_phase])]),
     payload(
@@ -576,7 +612,11 @@ fn a_damaged_payload_is_refused_by_kind_naming_its_part() {
     })
   ));
   let mut half = spec(b"PUSHKEY", &[]);
-  half.mandatory = vec![kv(b"namespace", b"bookmarks"), kv(b"key", b"main"), kv(b"old", b"")];
+  half.mandatory = vec![
+    kv(b"namespace", b"bookmarks"),
+    kv(b"key", b"main"),
+    kv(b"old", b""),
+  ];
   assert_eq!(
     read_specs(&[half]),
     payload(
@@ -605,7 +645,10 @@ fn a_changegroup_is_taken_once_in_versions_01_to_03_and_never_secret() {
     (Some(b"03"), Version::V03),
   ];
   for (named, version) in named {
-    let params = named.map(|value| kv(b"version", value)).into_iter().collect();
+    let params = named
+      .map(|value| kv(b"version", value))
+      .into_iter()
+      .collect();
     let taken = read_specs(&[changegroup(params)]).unwrap();
     assert_eq!(taken.changegroup().unwrap().1.version, version);
   }
@@ -627,10 +670,16 @@ fn a_changegroup_is_taken_once_in_versions_01_to_03_and_never_secret() {
       Err(Refusal::Parameter { id: 0, .. })
     ));
   }
-  let taken =
-    read_specs(&[changegroup(vec![kv(b"targetphase", b"1"), kv(b"nbchanges", b"12")])]).unwrap();
+  let taken = read_specs(&[changegroup(vec![
+    kv(b"targetphase", b"1"),
+    kv(b"nbchanges", b"12"),
+  ])])
+  .unwrap();
   let part = taken.changegroup().unwrap().1;
-  assert_eq!((part.target_phase, part.changesets), (Some(Phase::Draft), Some(12)));
+  assert_eq!(
+    (part.target_phase, part.changesets),
+    (Some(Phase::Draft), Some(12))
+  );
   let secret: [&'static [u8]; 3] = [b"2", b"32", b"96"];
   for number in secret {
     assert!(matches!(
@@ -697,7 +746,11 @@ fn a_push_is_read_within_exactly_the_room_it_needs() {
       continue;
     }
     let needed = u64::MAX - measured.left();
-    assert!(read(&bundle, &mut Admission::new(needed)).is_ok(), "{}", push.name);
+    assert!(
+      read(&bundle, &mut Admission::new(needed)).is_ok(),
+      "{}",
+      push.name
+    );
     for less in [0, needed / 2, needed - 1] {
       assert!(
         matches!(
@@ -718,7 +771,11 @@ fn a_push_is_read_within_exactly_the_room_it_needs() {
 #[test]
 fn the_heads_argument_holds_as_check_heads_judges_it() {
   // Shape: a root and two children of it, so the heads are the two children, the newer first.
-  let shapes: [Shape; 3] = [(0, 0, 0, false, false), (1, 0, 0, false, false), (2, 0, 0, false, false)];
+  let shapes: [Shape; 3] = [
+    (0, 0, 0, false, false),
+    (1, 0, 0, false, false),
+    (2, 0, 0, false, false),
+  ];
   let view = generated(&shapes, &[]);
   let hex = |nodes: &[Node]| {
     let items: Vec<String> = nodes.iter().map(|node| hexed(node)).collect();
@@ -734,21 +791,32 @@ fn the_heads_argument_holds_as_check_heads_judges_it() {
     Ok(HeadsArgument::Force)
   );
   assert_eq!(judge("666f726365", &view, Moment::Uploading), Ok(()));
-  assert_eq!(judge(&hex(&[second, first]), &view, Moment::Uploading), Ok(()));
+  assert_eq!(
+    judge(&hex(&[second, first]), &view, Moment::Uploading),
+    Ok(())
+  );
   let reordered = judge(&hex(&[first, second]), &view, Moment::Preparing);
   let words = b"repository changed while preparing changes - please try again".to_vec();
   assert_eq!(reordered, Err(CheckRefusal::Raced { words }));
   let mut joined = Vec::new();
   let mut sorted = [first, second];
   sorted.sort_unstable();
-  sorted.iter().for_each(|node| joined.extend_from_slice(node));
+  sorted
+    .iter()
+    .for_each(|node| joined.extend_from_slice(node));
   let digest = crate::node::sha1(&joined).unwrap();
   let hashed = format!("686173686564 {}", hexed(&digest));
   assert_eq!(judge(&hashed, &view, Moment::Uploading), Ok(()));
   let wrong = format!("686173686564 {}", hexed(&first));
   let words = b"repository changed while uploading changes - please try again".to_vec();
-  assert_eq!(judge(&wrong, &view, Moment::Uploading), Err(CheckRefusal::Raced { words }));
-  assert_eq!(judge(&hex(&[NULL_NODE]), &View::default(), Moment::Uploading), Ok(()));
+  assert_eq!(
+    judge(&wrong, &view, Moment::Uploading),
+    Err(CheckRefusal::Raced { words })
+  );
+  assert_eq!(
+    judge(&hex(&[NULL_NODE]), &View::default(), Moment::Uploading),
+    Ok(())
+  );
   assert!(judge("", &View::default(), Moment::Uploading).is_err());
   assert_eq!(
     check::heads_argument(b"66 zz", &mut room()),
@@ -785,7 +853,11 @@ fn oracle(view: &View, checks: &[Asks]) -> Result<(), Vec<u8>> {
 
 /// The revisions no revision names as a parent.
 fn naive_heads(view: &View) -> Vec<Node> {
-  let parents: Vec<Rev> = view.changesets.iter().flat_map(|c| c.parents.into_iter().flatten()).collect();
+  let parents: Vec<Rev> = view
+    .changesets
+    .iter()
+    .flat_map(|c| c.parents.into_iter().flatten())
+    .collect();
   (0..view.count())
     .filter(|rev| !parents.contains(rev))
     .map(|rev| view.changesets[at(rev)].node)
@@ -801,38 +873,69 @@ fn oracle_heads(view: &View, claimed: &[Node]) -> Result<(), Vec<u8>> {
   let mut claimed = claimed.to_vec();
   held.sort();
   claimed.sort();
-  if held == claimed { Ok(()) } else { Err(RACE_WORDS.as_bytes().to_vec()) }
+  if held == claimed {
+    Ok(())
+  } else {
+    Err(RACE_WORDS.as_bytes().to_vec())
+  }
 }
 
 /// `check:updated-heads`: every node a head of its branch (no child on the same branch), `[nullid]` only when empty.
 fn oracle_updated(view: &View, claimed: &[Node]) -> Result<(), Vec<u8>> {
   if claimed == [NULL_NODE] {
-    return if view.changesets.is_empty() { Ok(()) } else { Err(RACE_WORDS.as_bytes().to_vec()) };
+    return if view.changesets.is_empty() {
+      Ok(())
+    } else {
+      Err(RACE_WORDS.as_bytes().to_vec())
+    };
   }
   let is_branch_head = |node: &Node| {
     view.changesets.iter().enumerate().any(|(rev, changeset)| {
       changeset.node == *node
         && !view.changesets.iter().any(|child| {
           child.branch == changeset.branch
-            && child.parents.iter().flatten().any(|parent| at(*parent) == rev)
+            && child
+              .parents
+              .iter()
+              .flatten()
+              .any(|parent| at(*parent) == rev)
         })
     })
   };
-  if claimed.iter().all(is_branch_head) { Ok(()) } else { Err(RACE_WORDS.as_bytes().to_vec()) }
+  if claimed.iter().all(is_branch_head) {
+    Ok(())
+  } else {
+    Err(RACE_WORDS.as_bytes().to_vec())
+  }
 }
 
 /// `check:bookmarks`: 7.2's three messages.
 fn oracle_bookmarks(view: &View, claimed: &[BookmarkAt]) -> Result<(), Vec<u8>> {
   for mark in claimed {
-    let now = view.bookmarks.iter().rev().find(|(name, _)| *name == mark.name).map(|(_, node)| *node);
+    let now = view
+      .bookmarks
+      .iter()
+      .rev()
+      .find(|(name, _)| *name == mark.name)
+      .map(|(_, node)| *node);
     let book = String::from_utf8(mark.name.clone()).unwrap();
     let raced = RACE_WORDS;
     let words = match (mark.node, now) {
       (saw, now) if saw == now => continue,
-      (None, Some(now)) => format!("{raced} (bookmark \"{book}\" set on {}, expected missing)", short_of(&now)),
-      (Some(saw), None) => format!("{raced} (bookmark \"{book}\" is missing, expected {})", short_of(&saw)),
+      (None, Some(now)) => format!(
+        "{raced} (bookmark \"{book}\" set on {}, expected missing)",
+        short_of(&now)
+      ),
+      (Some(saw), None) => format!(
+        "{raced} (bookmark \"{book}\" is missing, expected {})",
+        short_of(&saw)
+      ),
       (Some(saw), Some(now)) => {
-        format!("{raced} (bookmark \"{book}\" move from {} to {})", short_of(&saw), short_of(&now))
+        format!(
+          "{raced} (bookmark \"{book}\" move from {} to {})",
+          short_of(&saw),
+          short_of(&now)
+        )
       }
       (None, None) => continue,
     };
@@ -843,7 +946,13 @@ fn oracle_bookmarks(view: &View, claimed: &[BookmarkAt]) -> Result<(), Vec<u8>> 
 
 /// `check:phases`: phase by phase in `allphases` order, each phase's nodes in the payload's order.
 fn oracle_phases(view: &View, claimed: &[PhaseHead]) -> Result<(), Vec<u8>> {
-  for phase in [Phase::Public, Phase::Draft, Phase::Secret, Phase::Archived, Phase::Internal] {
+  for phase in [
+    Phase::Public,
+    Phase::Draft,
+    Phase::Secret,
+    Phase::Archived,
+    Phase::Internal,
+  ] {
     for entry in claimed.iter().filter(|entry| entry.phase == phase) {
       let actual = if entry.node == NULL_NODE {
         Phase::Public
@@ -855,7 +964,12 @@ fn oracle_phases(view: &View, claimed: &[PhaseHead]) -> Result<(), Vec<u8>> {
       };
       if actual != phase {
         let raced = RACE_WORDS;
-        let words = format!("{raced} ({} is {} expected {})", short_of(&entry.node), actual.name(), phase.name());
+        let words = format!(
+          "{raced} ({} is {} expected {})",
+          short_of(&entry.node),
+          actual.name(),
+          phase.name()
+        );
         return Err(words.into_bytes());
       }
     }
@@ -881,16 +995,25 @@ type Claim = (u8, Vec<(u8, bool, u8)>);
 fn generated(shapes: &[Shape], marks: &[(u8, u8)]) -> View {
   let mut view = View::default();
   for (rev, (first, second, branch, closes, draft)) in shapes.iter().enumerate() {
-    let pick = |choice: u8| (rev > 0 && choice % 4 != 0).then(|| Rev::try_from(usize::from(choice) % rev).unwrap());
+    let pick = |choice: u8| {
+      (rev > 0 && choice % 4 != 0).then(|| Rev::try_from(usize::from(choice) % rev).unwrap())
+    };
     let p1 = pick(*first);
     let p2 = pick(*second).filter(|p2| p1.is_some() && Some(*p2) != p1);
-    let inherited = [p1, p2].iter().flatten().any(|parent| view.changesets[at(*parent)].phase == Phase::Draft);
+    let inherited = [p1, p2]
+      .iter()
+      .flatten()
+      .any(|parent| view.changesets[at(*parent)].phase == Phase::Draft);
     view.changesets.push(Changeset {
       node: [u8::try_from(rev + 1).unwrap(); 20],
       parents: [p1, p2],
       branch: BRANCHES[usize::from(*branch) % BRANCHES.len()].to_vec(),
       closes: *closes,
-      phase: if *draft || inherited { Phase::Draft } else { Phase::Public },
+      phase: if *draft || inherited {
+        Phase::Draft
+      } else {
+        Phase::Public
+      },
     });
   }
   if !view.changesets.is_empty() {
@@ -918,7 +1041,9 @@ fn picked(view: &View, pick: u8) -> Node {
 fn claim(view: &View, (which, picks): &Claim) -> Asks {
   let nodes = picks.iter().map(|(pick, ..)| picked(view, *pick)).collect();
   match which % 4 {
-    0 if picks.first().is_some_and(|(pick, ..)| pick % 2 == 0) => Asks::CheckHeads(naive_heads(view)),
+    0 if picks.first().is_some_and(|(pick, ..)| pick % 2 == 0) => {
+      Asks::CheckHeads(naive_heads(view))
+    }
     0 => Asks::CheckHeads(nodes),
     1 => Asks::CheckUpdatedHeads(nodes),
     2 => Asks::CheckBookmarks(
@@ -992,7 +1117,8 @@ proptest! {
       && let Ok(unbundle) = read(&bundle, &mut room())
     {
       let judged = check::judge(&unbundle, &View::of(push), &mut room());
-      prop_assert!(matches!(judged, Ok(()) | Err(CheckRefusal::Raced { .. })));
+      let answered = matches!(judged, Ok(()) | Err(CheckRefusal::Raced { .. }));
+      prop_assert!(answered, "{:?}", judged);
     }
   }
 }

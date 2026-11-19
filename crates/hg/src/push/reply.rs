@@ -315,7 +315,10 @@ fn error(refused: &Refused) -> Written {
       }
       (ERROR_PUSHKEY, 1)
     }
-    Refused::Unsupported { parttype, params: unknown } => {
+    Refused::Unsupported {
+      parttype,
+      params: unknown,
+    } => {
       params.extend(parttype.iter().map(|kind| (PARTTYPE, kind.clone())));
       if !unknown.is_empty() {
         params.push((b"params", unknown.join(&PARAMS_SEPARATOR)));

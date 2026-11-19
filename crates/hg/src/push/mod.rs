@@ -359,17 +359,33 @@ fn asks(
   let id = part.id;
   Ok(match handler {
     Handler::ReplyCaps => Asks::ReplyCaps(owned(&whole(bundle, index, admission)?, admission)?),
-    Handler::CheckHeads => Asks::CheckHeads(nodes(&whole(bundle, index, admission)?, id, admission)?),
+    Handler::CheckHeads => {
+      Asks::CheckHeads(nodes(&whole(bundle, index, admission)?, id, admission)?)
+    }
     Handler::CheckUpdatedHeads => {
       Asks::CheckUpdatedHeads(nodes(&whole(bundle, index, admission)?, id, admission)?)
     }
-    Handler::CheckPhases => Asks::CheckPhases(phase_heads(&whole(bundle, index, admission)?, id, admission)?),
-    Handler::CheckBookmarks => {
-      Asks::CheckBookmarks(bookmarks_of(&whole(bundle, index, admission)?, id, admission)?)
-    }
+    Handler::CheckPhases => Asks::CheckPhases(phase_heads(
+      &whole(bundle, index, admission)?,
+      id,
+      admission,
+    )?),
+    Handler::CheckBookmarks => Asks::CheckBookmarks(bookmarks_of(
+      &whole(bundle, index, admission)?,
+      id,
+      admission,
+    )?),
     Handler::Changegroup => Asks::Changegroup(changegroup_of(bundle, index, part, admission)?),
-    Handler::PhaseHeads => Asks::PhaseHeads(phase_heads(&whole(bundle, index, admission)?, id, admission)?),
-    Handler::Bookmarks => Asks::Bookmarks(bookmarks_of(&whole(bundle, index, admission)?, id, admission)?),
+    Handler::PhaseHeads => Asks::PhaseHeads(phase_heads(
+      &whole(bundle, index, admission)?,
+      id,
+      admission,
+    )?),
+    Handler::Bookmarks => Asks::Bookmarks(bookmarks_of(
+      &whole(bundle, index, admission)?,
+      id,
+      admission,
+    )?),
     Handler::Pushkey => Asks::Pushkey(pushkey_of(part, admission)?),
     Handler::Obsmarkers => Asks::Obsmarkers(owned(&whole(bundle, index, admission)?, admission)?),
     Handler::Pushvars => Asks::Pushvars(pushvars_of(part, admission)?),
@@ -408,7 +424,11 @@ fn nodes(payload: &[u8], id: u32, admission: &mut Admission) -> Result<Vec<Node>
 }
 
 /// The entries a phases payload holds.
-fn phase_heads(payload: &[u8], id: u32, admission: &mut Admission) -> Result<Vec<PhaseHead>, Refusal> {
+fn phase_heads(
+  payload: &[u8],
+  id: u32,
+  admission: &mut Admission,
+) -> Result<Vec<PhaseHead>, Refusal> {
   let entries = phases::decode(payload).map_err(|fault| Refusal::Payload {
     id,
     fault: Fault::Phases(fault),
@@ -418,14 +438,18 @@ fn phase_heads(payload: &[u8], id: u32, admission: &mut Admission) -> Result<Vec
 }
 
 /// The entries a bookmarks payload holds, each name copied; the entries and the names' bytes charged first.
-fn bookmarks_of(payload: &[u8], id: u32, admission: &mut Admission) -> Result<Vec<BookmarkAt>, Refusal> {
+fn bookmarks_of(
+  payload: &[u8],
+  id: u32,
+  admission: &mut Admission,
+) -> Result<Vec<BookmarkAt>, Refusal> {
   let entries = bookmarks::decode(payload).map_err(|fault| Refusal::Payload {
     id,
     fault: Fault::Bookmarks(fault),
   })?;
-  let names = entries
-    .clone()
-    .fold(0_u64, |total, entry| total.saturating_add(to_u64(entry.name.len())));
+  let names = entries.clone().fold(0_u64, |total, entry| {
+    total.saturating_add(to_u64(entry.name.len()))
+  });
   admission.charge_items::<BookmarkAt>(entries.clone().count())?;
   admission.charge(names)?;
   Ok(
@@ -453,7 +477,10 @@ fn pushkey_of(part: &Part<'_>, admission: &mut Admission) -> Result<PushkeyAsk, 
 }
 
 /// A `pushvars` part's variables: its advisory parameters, each key upper-cased behind `USERVAR_` (`bundle2getvars`).
-fn pushvars_of(part: &Part<'_>, admission: &mut Admission) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Refusal> {
+fn pushvars_of(
+  part: &Part<'_>,
+  admission: &mut Admission,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Refusal> {
   let advisory = part.advisory();
   let bytes = advisory.iter().fold(0_u64, |total, param| {
     total
@@ -530,7 +557,10 @@ fn target_phase(part: &Part<'_>) -> Result<Option<Phase>, Refusal> {
     .ok_or(Refusal::Parameter { id: part.id, key })?;
   match Phase::from_number(number) {
     Some(phase @ (Phase::Public | Phase::Draft)) => Ok(Some(phase)),
-    _ => Err(Refusal::TargetPhase { id: part.id, number }),
+    _ => Err(Refusal::TargetPhase {
+      id: part.id,
+      number,
+    }),
   }
 }
 
