@@ -37371,6 +37371,15 @@ Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' 
   refusing purges: a dropped client's purge refused, then sent again no sooner than a window after that round and
   within half a window more).
 
+- **Evidence.** The Mac Studio (kiln d1323898, 2026-11-19 18:29 local, load 8.9, debug). Red first on main 8cb6bef with
+  the two server tests alone: the 4 GiB fall was not held back within half a window (`Ok(Ok(0))`, the tick's sample
+  not yet taken), and the refused purge went again 517 ms after its round, at the tick's next look. Green on 878895a:
+  `cargo fmt --check` clean; `slates-machine --lib memory_pressure` 1 of 1 (the dispatch source opens and drops on
+  macOS); `slates-server --lib -- pressure:: purge_round_tests nfs_state:: deadlines:: reap:: remote_attach:: landing::
+  config::` 39 of 39, the fall held back 1.9 ms after it and the refused purge sent again 1.0013 s after its round.
+- **Left for the next piece, in order.** Base hints with their delegation drain, the idle seal, the huge-page re-arm;
+  then the reap loop and its tick are deleted, and §4.7's status says so.
+
 Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper series' line), `unsafe-budget.toml`,
 `xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
 `crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.
