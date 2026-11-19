@@ -38,9 +38,12 @@ pub use fleet::{FleetCheck, check_fleet};
 // is owed there.
 #[cfg(test)]
 mod liveness_tests;
+// A-510: a stop asked by a sender that then exits completes within its bound (the liveness tests' roles, re-invoked).
 mod parent;
 pub(crate) mod recovery_key;
 mod signal;
+#[cfg(test)]
+mod stop_tests;
 
 /// Format: the exit code of a role that failed (a refused or failed start, a daemon its own watchdog ended, A-232):
 /// the server's one constant, as the `slates` command's.
