@@ -1,7 +1,7 @@
 //! A changeset's text (A-588; `changelog.py` `changelog.add`, `changelogrevision`, `readfiles`, `encodeextra`,
-//! `decodeextra`, `_string_escape` and `_string_unescape` [C]): the manifest's node in hexadecimal, the user, the date
-//! line (the time, the timezone in seconds west of UTC, and the extras), the files the changeset touched one per line,
-//! a blank line, and the description:
+//! `decodeextra`, `_string_escape` and `_string_unescape` \[C\]): the manifest's node in hexadecimal, the user, the
+//! date line (the time, the timezone in seconds west of UTC, and the extras), the files the changeset touched one per
+//! line, a blank line, and the description:
 //!
 //! ```text
 //! <manifest hex>\n<user>\n<time> <timezone>[ <extras>]\n[<file>\n...]\n<description>
@@ -23,11 +23,11 @@
 //!
 //! **Refused, stricter than 7.2 on purpose.** An empty text (7.2's null changeset: no manifest and no user); an empty
 //! user, which 7.2's own writer refuses ("an empty username ... will make the revision text contain two "\n\n"
-//! sequences"), since its empty line is the first blank one `readfiles` finds, so 7.2's two readers then disagree on the
-//! files; a manifest field that is not forty hexadecimal digits (`bin` reads any even count); and a time that is not
-//! a decimal number, as every Mercurial wrote (`"%d %d"`, and an older one's float), where 7.2 reads anything Python's
-//! `float()` takes, only when asked. The timezone is kept as stored: "Various tools did silly things with the timezone",
-//! and 7.2 reads one it cannot parse as 0.
+//! sequences"), since its empty line is the first blank one `readfiles` finds, so 7.2's two readers then disagree on
+//! the files; a manifest field that is not forty hexadecimal digits (`bin` reads any even count); and a time that is
+//! not a decimal number, as every Mercurial wrote (`"%d %d"`, and an older one's float), where 7.2 reads anything
+//! Python's `float()` takes, only when asked. The timezone is kept as stored: "Various tools did silly things with the
+//! timezone", and 7.2 reads one it cannot parse as 0.
 
 use crate::node::from_hex;
 use crate::out::{Measure, Out};
@@ -477,8 +477,8 @@ mod tests {
   }
 
   /// A-588: do read a changeset with files and one without, as 7.2 writes them, and one whose timezone is empty, as a
-  /// tool's "silly" timezone may be. Expect each field, the empty file list where the date line is followed by the blank
-  /// line, the empty timezone kept, and each written back to its bytes at the length `encoded_len` gave.
+  /// tool's "silly" timezone may be. Expect each field, the empty file list where the date line is followed by the
+  /// blank line, the empty timezone kept, and each written back to its bytes at the length `encoded_len` gave.
   #[test]
   fn changesets_read_and_write_back() {
     let with_files = [
@@ -505,8 +505,8 @@ mod tests {
   }
 
   /// A-588: do write extras holding every byte 7.2 escapes, a NUL before digits among them, and read them back. Expect
-  /// 7.2's bytes (sorted keys, `\0`, `\\`, `\n`, `\r`, NUL between items) and the same extras, the NUL before `12` a NUL
-  /// and the digits rather than an octal escape.
+  /// 7.2's bytes (sorted keys, `\0`, `\\`, `\n`, `\r`, NUL between items) and the same extras, the NUL before `12` a
+  /// NUL and the digits rather than an octal escape.
   #[test]
   fn extras_escape_and_read_back_as_mercurial_does() {
     let value: &[u8] = b"a\nb\x00c\\d\re\x0012:tail";
@@ -524,9 +524,9 @@ mod tests {
   }
 
   /// A-588: do read extras an older Mercurial's `string_escape` wrote (`\t`, `\x41`, octal `\101`, `\'`), an escape
-  /// Python keeps as it is (`\q`), an octal escape past a byte (`\777`, which CPython takes a byte wide), and backslashes
-  /// before a `0` in odd and even runs (7.2 pairs them from the left before its `\0` fix-up). Expect the bytes 7.2
-  /// reads: `\t`, `A`, `A`, `'`, `\q`, 0xFF, then a backslash and a NUL, then a backslash and `0`.
+  /// Python keeps as it is (`\q`), an octal escape past a byte (`\777`, which CPython takes a byte wide), and
+  /// backslashes before a `0` in odd and even runs (7.2 pairs them from the left before its `\0` fix-up). Expect the
+  /// bytes 7.2 reads: `\t`, `A`, `A`, `'`, `\q`, 0xFF, then a backslash and a NUL, then a backslash and `0`.
   #[test]
   fn older_escapes_read_as_python_reads_them() {
     let text = [
@@ -744,7 +744,8 @@ mod tests {
     fn any_extras_read_back(
       generated in proptest::collection::btree_map("[a-z]{1,6}", proptest::collection::vec(any::<u8>(), 0..12), 0..4),
     ) {
-      let pairs: Vec<(&[u8], &[u8])> = generated.iter().map(|(key, value)| (key.as_bytes(), value.as_slice())).collect();
+      let pairs: Vec<(&[u8], &[u8])> =
+        generated.iter().map(|(key, value)| (key.as_bytes(), value.as_slice())).collect();
       let mut field = Vec::new();
       encode_extras(&pairs, &mut field).unwrap();
       let text = [MANIFEST, b"\nT\n0 0 ", &field, b"\n\nx"].concat();

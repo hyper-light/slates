@@ -1,5 +1,5 @@
 //! A file revision's text (A-588; `utils/storageutil.py` `parsemeta` and `packmeta`, `filelog.py` `add`, `has_meta`
-//! and `renamed`, `revlogutils/rewrite.py` `_has_bad_parents` [C]): the file's bytes, behind a metadata block when it
+//! and `renamed`, `revlogutils/rewrite.py` `_has_bad_parents` \[C\]): the file's bytes, behind a metadata block when it
 //! has one: `\x01\n`, a `key: value` line per key (sorted), and `\x01\n` again. 7.2 writes a block for a copy (`copy`,
 //! the source's path, and `copyrev`, the source's file node in hexadecimal) and, empty, before bytes that themselves
 //! begin with `\x01\n`, so that they are not read as one. The design keeps the block apart from the bytes (§4.17.3, the
@@ -12,11 +12,12 @@
 //!
 //! **A copy, as 7.2 reads one.** `renamed` reads a copy only from a revision whose first parent is null (7.2's commit
 //! gives a copy a null first parent, so a revision with another first parent "has no copy metadata"), and only when the
-//! block names both `copy` and `copyrev`: "copy and copyrev occur in pairs. In rare cases due to old bugs, one can occur
-//! without the other", and such a block reads as no copy. A `copyrev` that is not forty hexadecimal digits is refused
-//! (7.2's `bin` raises on most, and a shorter node names nothing). Which parent comes first is 7.2's to keep: since
-//! Mercurial 5.8 wrote some copies' parents the other way round (issue6528), 7.2 swaps them back on every incoming file
-//! revision ([`FileRevision::parents_as_stored`]); the node is unchanged, as it hashes the parents in order of value.
+//! block names both `copy` and `copyrev`: "copy and copyrev occur in pairs. In rare cases due to old bugs, one can
+//! occur without the other", and such a block reads as no copy. A `copyrev` that is not forty hexadecimal digits is
+//! refused (7.2's `bin` raises on most, and a shorter node names nothing). Which parent comes first is 7.2's to keep:
+//! since Mercurial 5.8 wrote some copies' parents the other way round (issue6528), 7.2 swaps them back on every
+//! incoming file revision ([`FileRevision::parents_as_stored`]); the node is unchanged, as it hashes the parents in
+//! order of value.
 
 use crate::lines::lines;
 use crate::node::from_hex;
@@ -343,8 +344,8 @@ mod tests {
   }
 
   /// A-588 (7.2's `renamed`: "copy and copyrev occur in pairs. In rare cases due to old bugs, one can occur without the
-  /// other"). Do: read the copy of blocks naming `copy` alone, `copyrev` alone, and both with `copyrev` short. Expect no
-  /// copy for either half alone, as 7.2 reads them, and the short node refused.
+  /// other"). Do: read the copy of blocks naming `copy` alone, `copyrev` alone, and both with `copyrev` short. Expect
+  /// no copy for either half alone, as 7.2 reads them, and the short node refused.
   #[test]
   fn half_a_copy_is_no_copy() {
     let lone_copy = split(b"\x01\ncopy: a\n\x01\nx").unwrap();
@@ -456,7 +457,8 @@ mod tests {
       generated in proptest::collection::btree_map("[a-z]{1,6}", "[ -~]{0,8}", 0..4),
       bytes in proptest::collection::vec(any::<u8>(), 0..32),
     ) {
-      let entries: Vec<(&[u8], &[u8])> = generated.iter().map(|(key, value)| (key.as_bytes(), value.as_bytes())).collect();
+      let entries: Vec<(&[u8], &[u8])> =
+        generated.iter().map(|(key, value)| (key.as_bytes(), value.as_bytes())).collect();
       let mut text = Vec::new();
       pack(&entries, &bytes, &mut text).unwrap();
       let read = split(&text).unwrap();

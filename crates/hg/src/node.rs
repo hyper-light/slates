@@ -1,23 +1,24 @@
-//! A revision's node (A-588; `internals.revlogs` "Hash Computation" [B]; `utils/storageutil.py` `hashrevisionsha1`,
-//! `utils/hashutil.py` and `thirdparty/sha1dc/cext.c` [C]): the SHA-1 of its two parents, the lower first, and then its
-//! text. A node names a revision's text and its history at once, so every changeset, manifest and file revision a
-//! client sends is checked against it before the server keeps anything (§4.17.3, the index; AC-HG.2). The parents go
-//! in ascending order whichever is first, so swapping them never changes a node: 7.2 swaps a file revision's parents on
-//! the way in and out (`filerev::parents_as_stored`, changegroup `04`'s metadata flag) and the node stays.
+//! A revision's node (A-588; `internals.revlogs` "Hash Computation" \[B\]; `utils/storageutil.py` `hashrevisionsha1`,
+//! `utils/hashutil.py` and `thirdparty/sha1dc/cext.c` \[C\]): the SHA-1 of its two parents, the lower first, and then
+//! its text. A node names a revision's text and its history at once, so every changeset, manifest and file revision a
+//! client sends is checked against it before the server keeps anything (§4.17.3, the index; AC-HG.2). The parents go in
+//! ascending order whichever is first, so swapping them never changes a node: 7.2 swaps a file revision's parents on
+//! the way in and out ([`crate::filerev::FileRevision::parents_as_stored`], changegroup `04`'s metadata flag) and the
+//! node stays.
 //!
-//! **SHA-1 with collision detection, as 7.2 hashes it.** 7.2's `hashutil.sha1` is sha1collisiondetection's whenever its C
-//! extension is built, as in the installs this was checked against (Homebrew's 7.2 ships `sha1dc.cpython-314-darwin.so`;
-//! the fixtures' run records its own), and its binding detects and never mends: `SHA1DCSetSafeHash(&(self->ctx), 0)`,
-//! "We don't want "safe" sha1s ... We just want to detect collisions", and a detection raises `OverflowError("sha1
-//! collision attack detected")`, so a 7.2 server refuses the revision. Here it is RustCrypto's `sha1-checked`, the
-//! pure-Rust port of the same detection that git's object names use (A-600), configured as 7.2 configures it: an input
-//! in which a block shows a known attack's disturbance is refused ([`CollisionAttack`]) and named by its plain SHA-1.
-//! SHA-1 is Mercurial's name for a revision here, never slates' own integrity, which is BLAKE3's.
+//! **SHA-1 with collision detection, as 7.2 hashes it.** 7.2's `hashutil.sha1` is sha1collisiondetection's whenever its
+//! C extension is built, as in the installs this was checked against (Homebrew's 7.2 ships
+//! `sha1dc.cpython-314-darwin.so`; the fixtures' runs printed `<class 'sha1dc.sha1'>`), and its binding detects and
+//! never mends: `SHA1DCSetSafeHash(&(self->ctx), 0)`, "We don't want "safe" sha1s ... We just want to detect
+//! collisions", and a detection raises `OverflowError("sha1 collision attack detected")`, so a 7.2 server refuses the
+//! revision. Here it is RustCrypto's `sha1-checked`, the pure-Rust port of the same detection that git's object names
+//! use (A-600), configured as 7.2 configures it: an input in which a block shows a known attack's disturbance is
+//! refused ([`CollisionAttack`]) and named by its plain SHA-1. SHA-1 is Mercurial's name for a revision here, never
+//! slates' own integrity, which is BLAKE3's.
 //!
-//! No public collision has 7.2's framing: one would need the first forty bytes it hashes to be two parents in
-//! ascending order, and SHAttered's prefix begins with a higher twenty bytes than its second twenty. So the detection is
-//! proven on the hasher with SHAttered's two prefixes, and the framing on every node stock 7.2 stored
-//! (`tests/objects.rs`).
+//! No public collision has 7.2's framing: one would need the first forty bytes it hashes to be two parents in ascending
+//! order, and SHAttered's prefix begins with a higher twenty bytes than its second twenty. So the detection is proven
+//! on the hasher with SHAttered's two prefixes, and the framing on every node stock 7.2 stored (`tests/objects.rs`).
 
 use sha1_checked::{Digest, Sha1};
 
@@ -175,10 +176,10 @@ mod tests {
     );
   }
 
-  /// A-588 (7.2's sha1dc binding: detection on, the safe hash off, `OverflowError` on a detection). Do: hash SHAttered's
-  /// two prefixes through the hasher every node goes through, and the first 192 bytes they share, before the colliding
-  /// blocks. Expect: the two cuts different bytes, each refused as an attack named by the plain SHA-1 they share (the
-  /// safe hash would have named two others), and the shared start hashed without a refusal.
+  /// A-588 (7.2's sha1dc binding: detection on, the safe hash off, `OverflowError` on a detection). Do: hash
+  /// SHAttered's two prefixes through the hasher every node goes through, and the first 192 bytes they share, before
+  /// the colliding blocks. Expect: the two cuts different bytes, each refused as an attack named by the plain SHA-1
+  /// they share (the safe hash would have named two others), and the shared start hashed without a refusal.
   #[test]
   fn the_shattered_pair_is_refused_as_7_2_refuses_it() {
     assert_ne!(SHATTERED_1, SHATTERED_2);

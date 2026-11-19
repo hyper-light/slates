@@ -1,5 +1,5 @@
-//! A flat manifest's text (A-588; `manifest.py` `manifestdict`, `cext/manifest.c` `lazymanifest` [C]): one line per file
-//! of the changeset's tree, sorted by path, each the path, a NUL, the file revision's node in forty lower-case
+//! A flat manifest's text (A-588; `manifest.py` `manifestdict`, `cext/manifest.c` `lazymanifest` \[C\]): one line per
+//! file of the changeset's tree, sorted by path, each the path, a NUL, the file revision's node in forty lower-case
 //! hexadecimal digits and its flag (none, `x` executable, `l` a symbolic link), and a newline:
 //!
 //! ```text
