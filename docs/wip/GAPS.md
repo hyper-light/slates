@@ -10863,14 +10863,25 @@ Results:
   inode-prefix alias, now fixed (`docs/bugs/2026-10-04-a-handle-with-flipped-inode-prefix-bits-read-its-file.md`).
 
 Open:
-- **Plaintext capability on loopback (macOS v3).** The token rides in every handle. BPF is root-only by default,
-  but a host with a group granted BPF access (Wireshark's ChmodBPF) exposes it to that group. The macOS kernel
-  client speaks neither RPC-over-TLS nor RPCSEC_GSS, so the fix cannot be encryption on that leg. Candidates:
-  - refuse NFS-program calls on a connection a user process owns (the kernel's mount socket has none; the CLI's
-    MNT exchange is the only user-process caller);
-  - rotate the token per mount.
-
-  The decision and its evidence are owed.
+- **Plaintext capability on loopback (macOS v3): decided and built 2026-11-18 (A-535, goal 85, g079).** The token rides
+  in every handle. BPF is root-only by default, but a host with a group granted BPF access (Wireshark's ChmodBPF)
+  exposes it to that group. The macOS kernel client speaks neither RPC-over-TLS nor RPCSEC_GSS, so the fix cannot be
+  encryption on that leg. **Decision:** the loopback mount is offered only where no one but root can capture loopback
+  traffic; elsewhere `mount::available` and every mount answer `MountFault::Unsupported { PrivateLoopback }`, naming
+  the devices and the fix (`slates_api` contract 43). Held by
+  `a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback` (the api's unit tests, every host),
+  red with the old rule on the Mac Studio. **Evidence:** all five of Ada's Macs read `/dev/bpf0` as `crw------- root
+  wheel` with no `access_bpf` group (2026-11-18), so no mount there is refused. **The two candidates, rejected:**
+  - refusing calls on a connection a user process owns: a daemon running as the user cannot tell another user's
+    process from the kernel (`proc_pidfdinfo` refuses other users' processes), and the kernel's port is unprivileged,
+    since the slates mount clears `NFS_MFLAG_RESVPORT` (R10);
+  - rotating the token per mount: each mount's attachment has its own token already, so a sniffed token is that live
+    mount's. Binding a token to the one connection that first uses it was weighed too: it breaks a client that opens
+    several connections on one mount (the hostile suite's honest clients, Linux's `nconnect`) and still races a mount's
+    first call.
+  Record: `docs/bugs/2026-11-18-a-macos-mounts-capability-was-readable-by-any-group-granted-loopback-capture.md`.
+  **Owed (main's):** the macOS mount suites on CI's runners, whose `/dev/bpf` modes are not known here: a runner that
+  grants capture refuses every macOS mount, typed.
 - **Network export.** RPC-with-TLS (RFC 9289) over rustls/aws-lc with the capability (AUD-29-75). The same hostile
   run over the TLS export (tampered records inside the TLS session, truncated TLS records, resets mid-handshake)
   is owed.

@@ -35463,3 +35463,29 @@ Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' 
 `crates/server/src/daemon.rs`, `crates/server/src/state.rs`, `crates/server/src/staging.rs`,
 `crates/server/src/status_pages.rs`, `crates/server/src/verbs.rs`, `crates/server/src/config.rs`,
 `crates/server/src/lib.rs`, `crates/server/src/shards_route.rs` (rustfmt of A-475's merged call).
+
+### A-535 — A loopback mount is offered only where no one but root can capture loopback traffic (2026-11-18, goal 85, g079; §4.6 "macOS", §4.13 the mount capability; AUD-01, A-34)
+Applied in the same change to: GAPS (the 2026-10-04 loopback confidentiality entry), `crates/api/src/error.rs`
+(`MountMissing::PrivateLoopback`), `crates/api/src/mount.rs` (`available` on macOS and the BSDs, `bpf_devices`,
+`capture_open`, `loopback_available`, the unit test), `crates/api/src/lib.rs` (contract 43), `docs/library.md`, and
+the bug record `docs/bugs/2026-11-18-a-macos-mounts-capability-was-readable-by-any-group-granted-loopback-capture.md`.
+- **What was there.** A loopback NFS mount's capability (AUD-01: the attachment and its 16-byte token) rides every
+  file handle in the clear, and the macOS kernel client speaks neither RPC-with-TLS (RFC 9289) nor RPCSEC_GSS, so that
+  leg cannot be encrypted. macOS lets only root capture loopback by default, but a host that gives `/dev/bpf*` to a
+  group (Wireshark's ChmodBPF, `access_bpf`) lets each member read every mount's capability off loopback and replay it
+  from a client of its own, with a uid of its choosing (AUTH_SYS is a claim). The mount was offered anyway.
+- **The rule.** The loopback mount is a host fact only where capture is root's alone: every BPF device
+  (`/dev/bpf`, `/dev/bpf<n>`) is read by root alone, by its mode (no group or other read bit) and its owner (root).
+  Elsewhere `mount::available` answers `Unsupported { PrivateLoopback }`, and so does every mount, before anything is
+  attached; the words name the devices and the fix (give them back to root).
+- **Rejected.** (1) Refusing calls on a connection a user process owns: a daemon running as the user cannot tell
+  another user's process from the kernel's socket, since `proc_pidfdinfo` refuses other users' processes, and the
+  kernel's port is unprivileged because the mount clears `NFS_MFLAG_RESVPORT` (R10). (2) Rotating the token per
+  mount: each mount's attachment has its own token already. (3) Binding a token to the first connection that uses it:
+  it breaks clients that open several connections on one mount (the hostile suite's honest clients, Linux's
+  `nconnect`), and a mount's first call still races a sniffer.
+- **Cost.** A host whose BPF devices a group may read cannot mount until they are root's again. Measured: none of the
+  five Macs slates runs on (2026-11-18) is such a host.
+- **Tests.** `a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback` (`crates/api/src/mount.rs`,
+  the lib's unit tests, every host): devices as macOS and as ChmodBPF leave them, read by anyone, owned by a user, and
+  none; the availability under each answer. Red with the old rule on the Mac Studio; the module 12 of 12 with the new.
