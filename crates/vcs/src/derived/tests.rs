@@ -281,7 +281,7 @@ fn step() -> impl Strategy<Value = Step> {
     0_u8..10,
     (any::<bool>(), 0_usize..64),
     (proptest::bool::weighted(0.3), 0_usize..64),
-    proptest::collection::vec(0_usize..64, 0..3),
+    proptest::collection::vec(0_usize..64, 0..10),
     proptest::collection::vec((0_usize..64, 0_usize..BLOBS, 0_u8..3), 0..6),
     (0_u8..14, 0_usize..64),
   )
@@ -815,6 +815,30 @@ fn t_a647_one_file_changed_in_a_wide_directory_makes_only_its_trie_path() {
   assert!(built.nodes_put > 10 * (1 + path as u64));
   let naive = map.build(&mut store, &files).unwrap();
   assert_eq!(naive, after);
+}
+
+/// A-647, the canonical rule's other half. Do: build a directory of 40 files, which the eager window splits into a
+/// trie, then remove 30 of them in one change. Expect: the directory's trie becomes one leaf, and the change's value is
+/// the build of the 10 files left: a branch whose entries come to fit one leaf becomes one, or the same map would have
+/// two shapes.
+#[test]
+fn t_a647_a_directory_that_comes_to_fit_one_leaf_becomes_one() {
+  let (mut store, files, _) = wide(40);
+  let mut map: PathMap<History> = PathMap::declare(EAGER_WINDOW, Mode::Eager).unwrap();
+  let root = map.build(&mut store, &files).unwrap();
+  let w = store.derived(&root).unwrap().name(0).unwrap();
+  assert_eq!(store.derived(&w).unwrap().payload()[0], b'B');
+  let change: Change = (10..40)
+    .map(|at| (format!("w/{at:03}").into_bytes(), None))
+    .collect();
+  let after = map.apply(&mut store, Some(root), &change).unwrap();
+  let w = store.derived(&after).unwrap().name(0).unwrap();
+  assert_eq!(store.derived(&w).unwrap().payload()[0], b'L');
+  let left: Files = files
+    .into_iter()
+    .filter(|(path, _)| path.as_slice() < &b"w/010"[..])
+    .collect();
+  assert_eq!(map.build(&mut store, &left).unwrap(), after);
 }
 
 /// A-647: the path map's refusals. Do: apply changes with a bad path, a removal of an absent path or of a directory, a
