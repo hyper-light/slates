@@ -118,16 +118,17 @@ fn answered(request: &[u8]) -> (Vec<u8>, served::Served, bool) {
   let refs = refs(&names);
   let served = serving(&fixture, &refs, b"refs/heads/main");
   let mut source = WholeObjects::new(&fixture.objects);
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     &served,
     Version::V2,
     Asked::Request(request),
     &mut source,
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   let mut bytes = Vec::new();
   assert_eq!(
-    answer.write(&served, &mut source, &mut bytes, usize::MAX),
+    answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),
     Written::End
   );
   let refused = answer.refusal().is_some();

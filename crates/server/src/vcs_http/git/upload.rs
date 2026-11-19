@@ -12,7 +12,7 @@
 //!
 //! **What is owed.** The server holding a repository's store on its owner shard and lending it ([`StoreLender`]'s
 //! implementation, with A-653's pack source over the store's stream); until then no store is held and upload-pack is
-//! `503`. receive-pack answers `503` until its session's entry point lands (A-654).
+//! `503`.
 
 use slates_db::catalog::RepositoryId;
 use slates_git::Admission;
@@ -42,7 +42,7 @@ pub(crate) trait StoreLender {
 }
 
 /// git's services with upload-pack served from the stores `lender` lends, each request admitted `room` bytes;
-/// receive-pack answers `503` until its session's entry point lands (A-654).
+/// receive-pack is not its half: it answers `503` for it ([`super::Halves`] pairs the two).
 #[derive(Clone, Debug)]
 pub(crate) struct UploadServices<L> {
   /// Where the stores are lent.
@@ -134,6 +134,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Self {
       lender,
       repository,
+      admission,
       answer,
       ..
     } = self;
@@ -142,7 +143,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     };
     let written = lender
       .lend(*repository, |served, packs| {
-        answer.write(served, packs, out, MAX_LEN)
+        answer.write(served, packs, admission, out, MAX_LEN)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     Ok(written == Written::More)

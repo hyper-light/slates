@@ -53,7 +53,9 @@ IP:PORT`). A fleet node's edge serves HTTPS with the node's own certificate and 
 manifest names. A daemon that is no fleet node has no certificate, so it serves plain HTTP, on a loopback
 address alone: any other address is refused as a usage error before anything starts. Clients sign in with
 a token from `slates credential token`, as a bearer token or, over HTTPS, as Basic's password. The anchor
-passes the flag to the daemon it supervises.
+binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
+daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon.
+An address the anchor cannot bind ends its start with an error naming it.
 
 `--vcs-svn ADDRESS` serves Subversion's own protocol, `svn://`, at ADDRESS, an IPv4 address and port (port 0
 lets the system pick one; `svnserve`'s is 3690); the daemon logs where it serves (`slates daemon: the svn://

@@ -13482,7 +13482,7 @@ const VCS_HTTP_CLEARTEXT_LINE: &str =
 /// flag went from the anchor to its daemon, which started the shared edge.
 #[test]
 fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
-  use std::io::{BufRead, Read, Write};
+  use std::io::{BufRead, Write};
   let instance = format!("cli-vcs-http-{}", std::process::id());
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
@@ -13525,49 +13525,71 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   }
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
-  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-  stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
-  stream
-    .write_all(b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n")
-    .unwrap();
-  let mut head = Vec::new();
-  let mut chunk = [0u8; 1024];
-  while !head.windows(4).any(|end| end == b"\r\n\r\n") {
-    let read = stream.read(&mut chunk).unwrap();
-    assert!(
-      read > 0,
-      "the edge closed before its head ended: {}",
-      String::from_utf8_lossy(&head)
-    );
-    head.extend_from_slice(&chunk[..read]);
-  }
-  let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+  let head = bare_request(port, WAIT_FOR).expect("the edge answered");
   assert!(head.starts_with("http/1.1 401 "), "{head}");
   assert!(head.contains("www-authenticate: bearer realm="), "{head}");
   assert!(!head.contains("basic"), "{head}");
 }
 
-/// Format: the start of the daemon's line naming where its svn:// listener serves (`crates/api/src/role/daemon.rs`),
-/// here on the loopback address the test asks for; the port follows.
-const VCS_SVN_LINE: &str = "slates daemon: the svn:// listener serves on 127.0.0.1:";
+/// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
+/// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
+fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  stream.write_all(
+    b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+  )?;
+  let mut head = Vec::new();
+  let mut chunk = [0u8; 1024];
+  while !head.windows(4).any(|end| end == b"\r\n\r\n") {
+    let read = stream.read(&mut chunk)?;
+    if read == 0 {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+          "the edge closed before its head ended: {}",
+          String::from_utf8_lossy(&head)
+        ),
+      ));
+    }
+    head.extend_from_slice(chunk.get(..read).unwrap_or_default());
+  }
+  Ok(String::from_utf8_lossy(&head).to_ascii_lowercase())
+}
 
-/// Format: `svnserve`'s greeting, the server's first bytes on every connection, as stock `svnserve` 1.15.0 wrote it
-/// (`crates/svn/fixtures/handshake/no-repository.server.bin`, recorded on the Mac Studio, 2026-11-19).
-const SVNSERVE_GREETING: &str = "( success ( 2 2 ( ) ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries \
-  commit-revprops depth log-revprops atomic-revprops partial-replay inherited-props ephemeral-txnprops \
-  file-revs-reverse list ) ) ) ";
+/// The port the next daemon of an anchor names for its version-control edge, from the anchor's forwarded `lines`, read
+/// until that daemon says it serves (`serving_line`); none if it named none first.
+fn edge_port_before_serving(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+) -> Option<u16> {
+  let mut port = None;
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the daemon served within the start's ceiling");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+      port = rest.trim().parse::<u16>().ok();
+    }
+    if line.starts_with(serving_line) {
+      return port;
+    }
+  }
+}
 
-/// A-656 part 2 (§4.17.4 piece 7: the svn:// listener). Do: start an anchor whose daemon is asked for the svn://
-/// listener on loopback, on a port the system picks (`--vcs-svn 127.0.0.1:0`); read the port the daemon names; connect
-/// as stock `svn` 1.15.0 does and answer the greeting with its capabilities and a URL naming the repository `missing`
-/// (`crates/svn/fixtures/handshake/no-repository.client.bin`, the URL's port the listener's). Expect: the daemon names
-/// the listener's port before it says it serves; the connection greets as `svnserve` greets, byte for byte; the answer
-/// is refused as `svnserve` refuses a URL no repository holds, "No repository found" (210005), and the connection
-/// ends: the flag went from the anchor to its daemon, which runs A-656's connection on each connection it accepts.
+/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor with the version-control HTTP edge on loopback
+/// (`--vcs-http 127.0.0.1:0`); read the port its daemon names and ask it for a repository's refs; kill the daemon; once
+/// the anchor says it restarted it, ask the same port again, before its successor serves; read the port the successor
+/// names. Expect: the request made while the daemon was gone is taken and answered `401` by the successor, and the
+/// successor names the same port: the anchor holds the edge's listener, so a restart never drops its port.
 #[test]
-fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
-  use std::io::{BufRead, Read, Write};
-  let instance = format!("cli-vcs-svn-{}", std::process::id());
+fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
+  let instance = format!("cli-vcs-http-held-{}", std::process::id());
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -13576,54 +13598,68 @@ fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
       "--quick",
       "--shards",
       SHARDS,
-      "--vcs-svn",
+      "--vcs-http",
       "127.0.0.1:0",
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
   let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let mut port = None;
-  let mut line = String::new();
-  loop {
-    line.clear();
-    let read = stderr.read_line(&mut line).unwrap();
-    assert!(
-      read > 0,
-      "the anchor ended before its daemon served (its lines are above)"
-    );
-    let _ = std::io::stderr().write_all(line.as_bytes());
+  let port = edge_port_before_serving(&lines, &serving_line)
+    .expect("the daemon named its edge's port before it served");
+  let first = bare_request(port, WAIT_FOR).expect("the edge answered");
+  assert!(first.starts_with("http/1.1 401 "), "{first}");
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
+  let mut successor = None;
+  let mut while_restarting = None;
+  let mut again = None;
+  let mut served = false;
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
-      "the daemon never served: {line}"
+      "the daemon never served again: {line}"
     );
-    if let Some(rest) = line.strip_prefix(VCS_SVN_LINE) {
-      port = rest.trim().parse::<u16>().ok();
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(bare_request(port, START_CEILING));
     }
-    if line.starts_with(&serving_line) {
-      break;
+    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+      again = rest.trim().parse::<u16>().ok();
     }
+    served |= line.starts_with(&serving_line);
   }
-  anchor.drain = Some(echo_the_rest(stderr));
-  let port = port.expect("the daemon named its svn:// listener's port before it served");
-  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-  stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
-  let mut greeting = vec![0u8; SVNSERVE_GREETING.len()];
-  stream.read_exact(&mut greeting).unwrap();
-  assert_eq!(String::from_utf8_lossy(&greeting), SVNSERVE_GREETING);
-  let url = format!("svn://127.0.0.1:{port}/missing");
-  let answer = format!(
-    "( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) {}:{url} \
-     39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ",
-    url.len()
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let head = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the edge's port was dropped while its daemon restarted: {error}")
+    });
+  assert!(head.starts_with("http/1.1 401 "), "{head}");
+  assert_eq!(
+    again,
+    Some(port),
+    "the restarted daemon serves the edge on the port its anchor holds"
   );
-  stream.write_all(answer.as_bytes()).unwrap();
-  let mut refusal = Vec::new();
-  stream.read_to_end(&mut refusal).unwrap();
-  let words = format!("No repository found in '{url}'");
-  let expected = format!("( failure ( ( 210005 {}:{words} 0: 0 ) ) ) ", words.len());
-  assert_eq!(String::from_utf8_lossy(&refusal), expected);
 }
