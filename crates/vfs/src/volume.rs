@@ -792,7 +792,8 @@ impl Volume {
 
   /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) in the snapshot's size (D-5). The clone's
   /// policy is the origin's; its inode counter continues from the origin's so numbers stay
-  /// unique across both. An overlay's clone reads the origin's base directories as the origin does. A file the
+  /// unique across both, and its live-inode count is the snapshot's, whatever the origin made or removed since (A-541).
+  /// An overlay's clone reads the origin's base directories as the origin does. A file the
   /// snapshot froze held with no name left is carried with an orphan record (A-532), so the clone reclaims it as it
   /// reclaims any orphan: at its last reference's release (a restored guest's), or at a restart's settle when nothing
   /// holds it. Nothing of the clone's was secured for it, since its content stays the snapshot's.
@@ -842,11 +843,12 @@ impl Volume {
       .map_err(|_| VfsError::StaleHandle)?
       .inode;
     snap.clone_refs = snap.clone_refs.saturating_add(1);
-    let (root, inode_root, epoch, referenced) = (
+    let (root, inode_root, epoch, referenced, live_inodes) = (
       snap.root,
       snap.inode_root,
       snap.epoch,
       snap.referenced_bytes,
+      snap.live_inodes,
     );
     let carried: BTreeMap<InodeNo, u64> = snap.orphans.iter().map(|no| (*no, 0)).collect();
     let _ = config.clock.monotonic_ns();
@@ -895,7 +897,8 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: origin.live_inodes,
+      // The snapshot's tree's count, not the origin's head's now: the clone holds what the snapshot froze (A-541).
+      live_inodes,
       inode_allowance: u64::MAX,
       holds_versions: false,
       version_hold: 0,
@@ -2891,6 +2894,7 @@ impl Volume {
       previous: self.last_snapshot,
       next: None,
       referenced_bytes: self.bytes.total(),
+      live_inodes: self.live_inodes,
       seq: self.journal.head_seq(),
       identity: None,
       orphans: self.orphans.keys().copied().collect(),
