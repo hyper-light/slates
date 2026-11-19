@@ -192,6 +192,10 @@
 #   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
+# slates-git (0): git's pkt-line and side-band-64k codecs (A-582) are bounds-checked byte slices read through a
+#   length check and written into vectors; safe Rust throughout.
+slates-git = 0
+
 # slates-hg (0): Mercurial's bundle2, bundle1, changegroup and delta codecs (A-514) are bounds-checked byte slices
 #   read through a cursor and written into vectors; safe Rust throughout.
 # slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
