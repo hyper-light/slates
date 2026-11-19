@@ -486,12 +486,20 @@
 > nothing; a version's head, root tree and any path read from rows and trees with no walk. An oracle holds the store to
 > a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
 > slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
-> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
-> commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614 part 2):** each version's
+> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters (superseded,
+> below); the walks and a commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614
+> part 2):** each version's
 > D(k) kept as two fragments (commits, trees and tags; blobs) of pack entries with their CRC32s, an edit a REF delta against
 > its path's previous object and similar objects OFS deltas, the window, zlib level, depth and rebuild point learned; the
 > base pack self-contained; packs read back through A-608's reader in the oracle; eleven mutations red. Owed of part 2:
-> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs.
+> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs. **Part 3 superseded
+> (2026-11-19, g083):** the commit rows keep no changed-path Bloom filters. They were for one walk, `log` and `blame`
+> of a path through slates' API narrowed from versions to commits; since A-645 those are A-666's derived types (part
+> 2's history reads one node a version it lists, part 3's blame the file's spans), the version their unit, so no walk
+> is left to skip. Checked: upload-pack walks no path's history (`sparse:oid` filters objects over trees); receive-pack
+> judges ref names and D(k)'s merges and signatures; a hook's git walks the hook view, which serves no commit-graph;
+> Subversion's path reads walk its own node history over revisions; Mercurial's server walks none. A commit-granular
+> history inside one stock push is the client's own, over its clone. A-614: parts 1 and 2 built, part 3 superseded.
 > **A-639 (2026-11-19, g083; piece 7's packs from fragments):** `slates-git` (`store::upload`) streams upload-pack's
 > pack from A-615's answer, taken through a trait (`Answered`): the runs from their fragments (filtered, the want always),
 > the walk's objects covered by whole kept parts (a clone so the base pack and the fragments after it; a filter that
