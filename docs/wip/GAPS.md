@@ -940,9 +940,10 @@
 > recorded words (research §26); `--hidden` answered with 7.2's warning to an unauthorized user, then the view; a
 > store gone mid-session ends in the not-served words; input arriving after the session ended given back to the window.
 > Red first (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed against stubs), then
-> `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128): the probe stock
-> `hg serve --stdio` 7.2 answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a
-> scripted SSH client. The other platforms, and main's live `hg clone` over SSH once A-680 lends the stores, owed.
+> `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128, and r179 over
+> main 225d7eead as it landed): the probe stock `hg serve --stdio` 7.2 answered, after 7.2's handshake, byte for byte
+> at every cut and over the real edge with a scripted SSH client. The other platforms, and main's live `hg clone` over
+> SSH once A-680 lends the stores, owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: A-662's stores handed to the lender the HTTP
 > site and the SSH edge read (A-680, g303, running; their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and

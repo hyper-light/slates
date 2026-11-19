@@ -13810,13 +13810,14 @@ signature verification).
 > looked up, as in 7.2. A client asking for hidden changesets is warned as 7.2 warns a user its
 > `experimental.server.allow-hidden-access` does not name, the principal named, and then served the view, since no right
 > grants hidden access; a store gone mid-session ends it in the site's not-served words. Proven on macOS arm64 (Mac
-> Studio, kiln r128, 2026-11-19): red first with the site starting no Mercurial session, checking no argument and the
-> command answering nothing (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed at
-> their assertions), then green, `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean: the probe stock `hg serve
-> --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake, answered byte for byte at every cut down to
-> a byte and over the real edge with a scripted SSH client, exit-status 0, EOF and close in order; 7.2's refusals as
-> recorded from stock 7.2 (research §26). Until A-680 hands the lender A-662's stores no repository has one, so the edge
-> serves `hg` in tests alone, and the daemon starting the SSH edge is A-651's.
+> Studio, kiln r128 and, over main 225d7eead as it lands, r179, 2026-11-19): red first with the site starting no
+> Mercurial session, checking no argument and the command answering nothing (`cargo test --locked -p slates-server --lib
+> -- vcs_ssh`: 25 passed, the 7 new failed at their assertions), then green, `-- vcs_ssh vcs_http::hg` 39 of 39, no
+> warning, fmt clean: the probe stock `hg serve --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's
+> handshake, answered byte for byte at every cut down to a byte and over the real edge with a scripted SSH client,
+> exit-status 0, EOF and close in order; 7.2's refusals as recorded from stock 7.2 (research §26). Until A-680 hands the
+> lender A-662's stores no repository has one, so the edge serves `hg` in tests alone, and the daemon starting the SSH
+> edge is A-651's.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -50713,8 +50714,10 @@ list), `research/mercurial-server.md` (§26).
   starting no Mercurial session, checking no argument and the command answering nothing (30dc4ca18):
   `cargo test --locked -p slates-server --lib -- vcs_ssh --test-threads=4` 25 passed and the 7 new failed, each at its
   assertion. Green (9e7e1b054): `cargo test --locked -p slates-server --lib -- vcs_ssh vcs_http::hg --test-threads=4`
-  39 of 39 (the seven new among vcs_ssh's 32), no warning; `cargo fmt -p slates-server -- --check` clean. No
-  integration target reaches the SSH edge: the daemon does not start it yet.
+  39 of 39 (the seven new among vcs_ssh's 32), no warning; `cargo fmt -p slates-server -- --check` clean. Over main
+  225d7eead as it lands (1586bec9f, kiln r179), after main's harness fix gave the tests' `Transcript` its `ended` (the
+  edge test's three sessions each ended by the edge): the same filters 39 of 39, no warning, fmt clean. No integration
+  target reaches the SSH edge: the daemon does not start it yet.
 - **Owed.** A-680's lender over A-662's stores, without which no Mercurial store is lent and the edge serves `hg` in
   tests alone; the daemon starting the SSH edge (A-651); main's live `hg clone` and `hg pull` over SSH; each answer made
   within the shard's step budget (a `getbundle` is one step, as over HTTP); the other platforms' runs.
