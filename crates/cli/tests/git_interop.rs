@@ -328,7 +328,10 @@ fn cloned(git: &Git, url: &str, pushed: &str) {
   let branch = git.ok(&second, &["symbolic-ref", "HEAD"]);
   let checked_out = (branch.trim().to_owned(), git.commit_of(&second, "HEAD"));
   let expected = (format!("refs/heads/{BRANCH}"), pushed.to_owned());
-  assert_eq!(checked_out, expected, "the clone checks out the pushed branch");
+  assert_eq!(
+    checked_out, expected,
+    "the clone checks out the pushed branch"
+  );
   expect_text(&second, "first\n");
 }
 
@@ -351,7 +354,11 @@ fn fetched_back(git: &Git, url: &str, pushed: &str) {
   let fetched = git.commit_of(&first, "FETCH_HEAD");
   git.ok(&first, &["merge", "-q", "--ff-only", "FETCH_HEAD"]);
   let length = git.ok(&first, &["rev-list", "--count", "HEAD"]);
-  let stands = (fetched, git.commit_of(&first, "HEAD"), length.trim().to_owned());
+  let stands = (
+    fetched,
+    git.commit_of(&first, "HEAD"),
+    length.trim().to_owned(),
+  );
   let expected = (pushed.to_owned(), pushed.to_owned(), "2".to_owned());
   assert_eq!(stands, expected, "the fetch brings the clone's push back");
   expect_text(&first, "first\nsecond\n");
@@ -383,7 +390,10 @@ fn stock_git_round_trip_holds_against_stock_git() {
   let scratch = Scratch::new("git-control");
   let git = Git::new(&program, &scratch, "control", Vec::new());
   let bare = format!("{}/bare.git", scratch.path);
-  git.ok(&scratch.path, &["init", "-q", "--bare", "-b", BRANCH, &bare]);
+  git.ok(
+    &scratch.path,
+    &["init", "-q", "--bare", "-b", BRANCH, &bare],
+  );
   round_trip(&git, &format!("file://{bare}"));
 }
 
@@ -589,7 +599,8 @@ struct HttpLeg {
 fn http_leg(session: &str) -> Option<HttpLeg> {
   let instance = format!("git-http-{session}-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port = port_after(&started.lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
+  let port =
+    port_after(&started.lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
   let issuer = issuer_of(&started, "the HTTP leg")?;
   create_repository(&instance);
   let token = minted_token(&instance, &issuer);
@@ -616,11 +627,15 @@ fn stock_git_without_credentials_is_refused_in_its_own_words() {
   };
   let instance = format!("git-refused-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port = port_after(&started.lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
+  let port =
+    port_after(&started.lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
   let scratch = Scratch::new("git-refused");
   let git = Git::new(&program, &scratch, "refused", Vec::new());
   let site = format!("http://127.0.0.1:{port}");
-  let (code, out, err) = git.run(&scratch.path, &["ls-remote", &format!("{site}/{REPOSITORY}")]);
+  let (code, out, err) = git.run(
+    &scratch.path,
+    &["ls-remote", &format!("{site}/{REPOSITORY}")],
+  );
   let words = format!("fatal: could not read Username for '{site}': {PROMPTS_DISABLED}");
   assert_eq!(
     (code, err.lines().any(|line| line == words)),
@@ -685,7 +700,17 @@ fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_basic() {
 fn fresh_key(scratch: &Scratch) -> Option<(String, String)> {
   let key = format!("{}/key", scratch.path);
   let made = Command::new("ssh-keygen")
-    .args(["-q", "-t", "ed25519", "-N", "", "-C", "slates-git-test", "-f", &key])
+    .args([
+      "-q",
+      "-t",
+      "ed25519",
+      "-N",
+      "",
+      "-C",
+      "slates-git-test",
+      "-f",
+      &key,
+    ])
     .output()
     .ok()?;
   assert!(made.status.success(), "ssh-keygen: {made:?}");
@@ -721,7 +746,8 @@ fn stock_git_clones_pushes_and_fetches_over_the_ssh_edge() {
   };
   let instance = format!("git-ssh-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
-  let port = port_after(&started.lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  let port =
+    port_after(&started.lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
   let Some(issuer) = issuer_of(&started, "the SSH leg") else {
     return;
   };
