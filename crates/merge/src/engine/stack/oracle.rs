@@ -9,15 +9,15 @@
 //! "Position mapping"), so after each work of a stack lands the green must hold what that replica holds, and a work must
 //! land exactly where the replica's lands. A bottom the green refuses is one some work in between meets, so the replica
 //! of the bottom refuses one of those. Where every work in between lands in the replica, that is all the oracle needs,
-//! and it requires it. Where one does not, each must still land alone over the stack's works below (a refusal alone
-//! is a pair the verdict judges in one order only, A-668's kind); then the replica is no reference, and the stack goes
-//! unchecked from that level up (counted): the verdict depends on order there. Two works inserting at two points land one after the other, and a
-//! stack's work deleting the bytes between them lands after both; in the replica the delete lands first, the two
-//! points become one, and the second insert meets the first. Neither answer is wrong for its order, and the green's
-//! order is the one it was given. Every byte a generated work adds is fresh, so no two works ever make the same
-//! change (an identical change is judged by its own tests). Works put an overwrite or a truncate and an insert at one
-//! offset too, the shape whose insert the verdict's walk met in one order only until A-668. The census counts stacks by
-//! depth, uppers whose operations moved and those that did not, and every refusal.
+//! and it requires it. Where one does not, each must still land alone over the stack's works below (a refusal alone is
+//! a pair the verdict judges in one order only, A-668's kind); then the replica is no reference, and the stack goes
+//! unchecked from that level up (counted): the verdict depends on order there. Two works inserting at two points land
+//! one after the other, and a stack's work deleting the bytes between them lands after both; in the replica the delete
+//! lands first, the two points become one, and the second insert meets the first. Neither answer is wrong for its
+//! order, and the green's order is the one it was given. Every byte a generated work adds is fresh, so no two works
+//! ever make the same change (an identical change is judged by its own tests). Works put an overwrite or a truncate and
+//! an insert at one offset too, the shape whose insert the verdict's walk met in one order only until A-668. The census
+//! counts stacks by depth, uppers whose operations moved and those that did not, and every refusal.
 //!
 //! **A work over a tree** is held to a model of whole files: at each file the work edits, the tree's bytes equal to the
 //! head's mean its edits apply to the head's bytes as they stand, and any other bytes are a conflict unless the work
