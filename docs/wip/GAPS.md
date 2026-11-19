@@ -344,6 +344,13 @@
 > deadline, client), its exit read without reaping so the group's kill stays its own, its child always reaped. Server
 > lib tests 42 of 42 on the Mac Studio with the test binary re-invoked as the hook, red three ways. Owed: the Windows
 > driver (a job object), the Linux launcher's namespace (§4.6), the push pieces' calls, the hook times' table.
+> **A-661 part 1 (2026-11-19, g229; §4.17.4 item 9, the hook glue):** `svn_hooks::run` runs the hook the record
+> configures at a Subversion point and answers `svnserve`'s words, the lesson and pre-lock's token; `verdict` is the
+> commit drive's resume. Call points agreed through main: the drive's `Step::Hook` at `open-root` and `close-edit`
+> (g268), the `svn://` task's runs and post-commit after its append (g234), the lock hooks around A-602's check on
+> ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
+> nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
+> run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
 > **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
 > (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
 > hooks-env in its policy (refused by section, `DatabaseRefusal` 11, when no hook's environment can carry it or the
@@ -989,6 +996,12 @@
 > replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
 > them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
 > A-652's generator.
+> A-616 continued (6) (2026-11-19, g234, a bug g297 found): a version-0 delta's chunks as `svnserve` writes them, a
+> window of new data alone `send_simple_insertion_window`'s two with the stream's header in the first (the writer had
+> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64).
+> Owed: two hand-made sessions from a client announcing neither svndiff version, recorded against `svnserve` 1.15.0
+> (the Mac Studio), and their drives held to its chunks byte for byte; the macOS run. Swept: only the reporter's
+> editor writes `textdelta-chunk`s.
 > A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
 > command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
 > land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
