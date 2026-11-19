@@ -484,9 +484,15 @@
 > credentials` 5 of 5, `slates-server --lib credentials` 9 of 9 and `--lib vcs_http` 32 of 32, `slates-http-edge --lib`
 > 31 of 31, `slates-cli` `credential` 1 of 1, `--test wire_order` 2 of 2 in `slates-db` and `slates-ipc`. Owed:
 > upload-pack served once A-662's stores land (`503` until then), A-654's session, LFS's routes on the site (main's
-> Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet identity's hand-in, a consumer's
-> revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live
-> `git clone` (main's).
+> Streamed/AfterBody ruling), a consumer's revocation in the SSH edge's key holders (A-651), listing credentials,
+> Mercurial's and Subversion's sites, the live `git clone` (main's).
+> **A-625 part 3, continued: `--vcs-http ADDRESS` (2026-11-19, g299):** `slates anchor|daemon --vcs-http ADDRESS`
+> starts the shared edge there, and the daemon logs where it serves; a fleet node's edge presents the node's own
+> certificate and key, handed over by its deployment plan (`FleetPlan::edge_identity`); a daemon that is no fleet node
+> serves cleartext, on loopback alone, any other address refused as usage before anything starts. macOS arm64 (Mac
+> Studio, red first, then green over main 1ef718820): the roles' and the command's grammar, the plan's identity shown
+> in a TLS handshake, and an anchor started with `--vcs-http 127.0.0.1:0` whose daemon's edge answers `401`. Owed:
+> the anchor holding the edge's listener across a daemon's restart; the option on a library starter's anchor.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -802,9 +808,10 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); and the daemon's import of a repository's directory through the server's adapter (A-649 part 4), a turn at
-> a time on the repository's owner shard, its index handed to the repository's Mercurial store in A-662's
-> per-repository map (`vcs_store`'s `HgStore`), never a second holder. **Built (A-619 part 3):**
+> `verify`); the verb that asks for a directory's import (A-675 built the import itself); and the import made durable:
+> the register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the
+> directory again or replays its record (until then an import is not served, and a restart leaves its store empty).
+> **Built (A-619 part 3):**
 > `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
@@ -863,6 +870,12 @@
 > compressor choosing zlib above level 0 could hold an answer up to about an eighth of its stream past its charge (the
 > site's first value takes zlib at level 0, stored, within it); and a query's fields past the request's room are `400`
 > where a path past it is `414`.
+> **Built (A-675):** the daemon's import of a Mercurial repository's directory (`slates-server`'s
+> `vcs_store::hg_import`): started into a repository's empty store, advanced a turn at a time on its owner shard within
+> the shard's quantum, its index then in the empty index's place; at most one client region's bytes held, charged while
+> it runs; refused, abandoned or freed midway, everything given back; proven by the `states` repository imported a unit
+> a turn equal row for row to its import in one call (macOS arm64, Mac Studio: `vcs_store::` 18 of 18 with A-662's 13;
+> red first, the five new tests failing against stubs).
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
 > g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and

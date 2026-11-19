@@ -12675,9 +12675,22 @@ engine: the verdict, rebase, position mapping, the register).
 > arrivals waiting as the shard has seats, closed and counted past that), decided again, and served with its partition
 > read locally. Every refusal is typed and counted by kind. Owed: upload-pack served once each repository's store lives
 > on its owner shard (A-662; `503` until then), receive-pack's session (A-654), LFS's routes on the site under main's
-> ruling (a route says whether its status is fixed at the head or decided after its body), the operator's flag for the
-> edge's address and the fleet identity's hand-in in the daemon role, a consumer's revocation in the SSH edge's key
-> holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone` (main's).
+> ruling (a route says whether its status is fixed at the head or decided after its body), a consumer's revocation in
+> the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone`
+> (main's).
+>
+> **Status (2026-11-19, A-625 part 3 continued: the operator starts the edge, built).** `slates anchor` and `slates
+> daemon` take `--vcs-http ADDRESS`, an IPv4 address and port (port 0 the system's pick), and the daemon starts the
+> shared edge there and logs where it serves (`slates daemon: the version-control HTTP edge serves HTTPS on IP:PORT`, or
+> `cleartext`) before the line that says it serves; the anchor hands the address to the daemon it starts. A fleet
+> node's edge presents the node's own certificate and key, the ones its transport and its RPC-with-TLS export present:
+> the deployment plan hands them over (`FleetPlan::edge_identity`) from the DER the command read from the manifest's
+> files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
+> no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
+> the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
+> anything starts, rather than by a daemon that would start without its edge. Owed: the anchor holding the edge's
+> listener across a daemon's restart, as it holds the export's; the option on a library starter's anchor
+> (`slates_api::start`).
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -13589,6 +13602,20 @@ signature verification).
 > read within its length when opened; a read answered three bytes a call read whole, and refused with the fetch where
 > a piece is still being fetched; the refusals and the bounds each by a test (macOS arm64, Mac Studio: 11 of 11; a
 > red run against a stub owed).
+>
+> **Status (2026-11-19, A-675: the daemon's import of a repository's directory).** `slates-server`'s
+> `vcs_store::hg_import` gives a Mercurial repository's store, made empty with its record, the history of a repository
+> directory on the host: the directory is read through `hg_base` and the import is advanced a turn at a time on the
+> repository's owner shard, each turn lent the host and the shard's content store within the shard's quantum on its
+> clock, with a yield between turns (`run`, a task of the shard). Done, its index takes the empty index's place, so the
+> store holds one index; refused, abandoned, or freed midway, it gives back everything it held. It holds at most one
+> client region's bytes between and within its turns, charged to the shard's budget while it runs, and one import a
+> repository runs at a time. Proven by the `states` repository imported a unit a turn equal row for row to its import in
+> one call, a refused import and a freed one giving back every byte charged, each refusal by kind, and the shard's own
+> task running an import to its end (macOS arm64, Mac Studio: `vcs_store::` 18 of 18, the five new tests among them; red
+> first, the five failing against stubs). Owed: the verb that asks for an import, and the import made durable (the
+> register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
+> served.
 
 > **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
 > `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
@@ -14045,9 +14072,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
    phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
    never whole, and texts rebuilt from the one before. Built (A-649 part 3b): the import in slices under the owner's
-   quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Owed: the
-   daemon's import of a repository's directory through it, a turn at a time on the repository's owner shard, the
-   imported index handed to the repository's Mercurial store in A-662's per-repository map (`vcs_store`'s `HgStore`).
+   quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Built (A-675,
+   `crates/server`: `vcs_store::hg_import`): the daemon's import of a repository's directory through it, a turn at a
+   time on the repository's owner shard, its index put in the place of the empty index A-662's map made the
+   repository's Mercurial store with. Owed: the verb that asks for an import, and the import made durable.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -49383,6 +49411,99 @@ Applied in the same change to:
 - **Owed.** The `StoreLender` over A-662's map, which makes upload-pack reachable; the daemon starting the SSH edge; the
   stateful protocol v0 session over SSH (slates-git's); receive-pack (A-654), a lender of Mercurial's store, and
   Subversion's tunnel (A-656); main's live OpenSSH `git clone` over SSH once a lender holds a store.
+
+### A-675 — The daemon imports a Mercurial repository's directory into the repository's store, a turn at a time on its owner shard (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.3; A-649 parts 3b and 4; A-662)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/server` (`vcs_store::hg_import` and its tests,
+new; `vcs_store`: the map's imports and `free` giving an import back; `hg_base`'s test fixtures shared with them;
+`lib.rs`'s notes on both modules' callers), GAPS (the §4.17.3 entry).
+- **What it does.** A Mercurial repository's store is made with its record as an empty index (A-662's `HgStore`).
+  `hg_import::begin` takes a host and the repository's directory on it, read-only (§4.15), checks the store holds no
+  row and no import of it is under way, charges the import's room to the shard's budget, and reads the requirements
+  and the listing through `hg_base` (`Import::start`). `hg_import::turn` advances the import one turn: units of work
+  until the shard's quantum is spent on the shard's clock, at least one, lent the host (a fresh `HgBase` each turn) and
+  the shard's content store. `hg_import::run` is the shard's task for it: a yield, then a turn, until it ends. Done, the
+  import's index is put in the empty index's place, which is given back, so the store holds one index and nothing
+  keeps a second; what the import found beside the history (its counts, phase roots and bookmarks) is answered
+  (`Finished`) for the register's first entry to record. A store that holds a history by then keeps it, and the
+  import's index is given back (`NotEmpty`).
+- **Bounds.** An import holds at most its room between its turns as within them: the listing, the log it reads, a text
+  being rebuilt and the one before it. The room is one client region's bytes (`RegionGeometry::total_bytes`), what one
+  request of the version-control edge may hold (`vcs_http`'s `Bounds`), since one client asks for an import; it is
+  charged to the shard's budget as retention when the import starts and given back when it ends, so the charge covers
+  what the import may hold while it waits between turns. The texts it keeps go to the content store and are charged as
+  every store's are: each turn is lent every byte the shard could admit now, then the arena is grown from its pool by
+  what the turn kept and the charge trued up to what the content store holds. One import a repository runs at a time
+  (`Busy`), so the imports under way are bounded by the partition's repositories. Each holds its own host, which its
+  caller opened for the directory and which is closed when the import ends; a turn's adapter holds at most a directory
+  and two files of it, closed as the turn ends.
+- **Cancellation.** The import lives in the shard's map (`VcsStores`), keyed by its repository, and its task holds the
+  key alone, so a task dropped mid-import leaks nothing: the import waits in the map, holding what it held, until a
+  task runs it again or its repository is freed, which gives it back first (`vcs_store::free` calls
+  `hg_import::abandon`).
+- **Refusals, by kind** (`ImportFailed`): no Mercurial store of the repository here (`NoStore`), a store with a history
+  (`NotEmpty`), an import under way (`Busy`), the shard's budget unable to take the room (`Budget`, with what it could
+  admit), and the import's own refusal carried through (`Refused`: the store, its requirements, a file, or the host's
+  refusal, a fetch still pending on an S3 base among them). Each leaves the store as it was.
+- **Not taken (decided by the design, not measured).** A verb in this piece: §4.15 names no repository import, and the
+  import's durability decides its shape (the register's first entry, the recovery), so both are the next pieces'. The
+  adapter's handles held between turns beside the import, which the map now allows: left until a measurement shows
+  that a turn's reopening of its directory and files matters.
+- **Tests** (`crates/server/src/vcs_store/hg_import/tests.rs`; macOS arm64, Mac Studio, kiln r160, 2026-11-19, debug,
+  rustc 1.98.1, over main 54075b520):
+  - the oracle: the `states` repository 7.2 kept, laid out on the simulated host, imported into a repository's store on
+    its owner shard a unit a turn, equal row for row to its import in one call through the same adapter into a content
+    store with the shard's window, with every count, phase root and bookmark; more than one turn, each counted, and
+    the shard's charge settled to what the content store holds;
+  - the same repository with its manifest log cut in half, refused midway by the import's own refusal: the store's
+    index still empty, the content store holding what it held, the shard's retention charge what it was;
+  - `NoStore` for a git repository, `Busy` for a second import, `NotEmpty` for an imported store, each leaving the
+    store as it was;
+  - a repository freed midway giving its import back, counted abandoned, and with an imported one freed too, nothing
+    charged and the retention charge what it was before either import;
+  - the shard's own task (`run`) running an import to its end on a running daemon, equal row for row to the one call.
+
+  `cargo test --locked -p slates-server --lib vcs_store::` 18 of 18 (A-662's 13 and these 5; 687 filtered out) and
+  `--lib hg_base` 11 of 11, `cargo fmt --check -p slates-server` clean, no warning. Red first (69995faf9: `begin`
+  refusing `NoStore` and `turn` answering nothing at once): the five failed, each at its first `begin`. No integration
+  test reaches the import: nothing calls `begin` outside its tests until its verb. Main's: clippy, `xtask check`, the
+  doc gates and the other platforms.
+- **Owed.** The verb that asks for an import of a directory and answers when it ends; the import made durable: the
+  register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the directory
+  again or replays its record (until then an import is not served, and a restart leaves its store empty); a host's
+  pending fetch retried at the next turn rather than ending the import; the adapter's handles held between turns.
+
+### A-625 part 3, continued — `--vcs-http ADDRESS`: the operator starts the shared HTTP edge, a fleet node presenting its own identity (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1; after A-625 part 3)
+Applied in the same change to: §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/api` (`role::ProcessOptions`'s
+`vcs_http`, `role::vcs_http_address`, `Role::parse` and `Role::args`, the daemon role's start and its log line;
+`CONTRACT` 52); `crates/cli` (the `anchor` and `daemon` grammar and usage); `crates/server` (`deploy::FleetPlan`'s
+`edge_identity`); `docs/cli.md`; the README's command table.
+- **What.** A-625 part 3 left the edge reachable only through `DaemonConfig::vcs_http`. The roles now take
+  `--vcs-http ADDRESS`; the daemon role fills the configuration from it, and a fleet node's identity comes from its
+  deployment plan, so nothing new reads a file and the daemon reads none (R1).
+- **Decisions.** (1) The identity is the node's own, the one its transport and its RPC-with-TLS export present, as the
+  config's own doc and main's ruling say; the plan copies the certificate and key DER it already holds before the key
+  moves into the transport's `Identity`, which keeps its key private, rather than widening `slates-transport`'s API.
+  (2) Cleartext off loopback is refused where the flag is read, as usage (the anchor's and the daemon's exit for a
+  refused configuration), before anything starts: the edge's own refusal at its start would leave a daemon serving
+  without the edge the operator asked for, with a log line as the only sign; the edge keeps its own refusal for any
+  other caller of `DaemonConfig::vcs_http`. Both refuse by one predicate, `Ipv4Addr::is_loopback`. (3) One reader,
+  `slates_api::role::vcs_http_address`, serves both the roles' grammar and the `slates` command's, as `shard_count`
+  does. (4) The daemon names where its edge serves before its serving line, from one thread of one process, so a reader
+  of the one has read the other; port 0 is the system's pick and the line is how an operator learns it.
+- **Tests.** macOS arm64 (Mac Studio, `cargo test --locked`, fmt clean for `slates-api`, `slates-cli` and
+  `slates-server`). Red first (kiln r143, 2026-11-19 20:12-20:17Z, the tests over stubs that read no flag and plan an
+  empty identity): each new test failed for its own reason (the role's and the command's grammar refusing
+  `--vcs-http` as an unknown flag; the plan's identity making no TLS key; the anchor ending before its daemon served),
+  their 28 neighbours passing. Green on the tree as it lands over main 1ef718820 (20:22-20:24Z): `-p slates-api --lib
+  role::tests` 4 of 4 and `--lib contract_history` 1 of 1; `-p slates-server --lib deploy::tests` 14 of 14
+  (`a_plan_hands_the_http_edge_the_nodes_own_identity`: an in-memory TLS handshake shown node b's own certificate)
+  and `--lib vcs_http::daemon_edge` 1 of 1; `-p slates-cli --bin slates the_grammar` 11 of 11; `-p slates-cli --test cli
+  vcs_http` 1 of 1 (`an_anchors_vcs_http_flag_starts_its_daemons_edge`: an anchor started with `--vcs-http
+  127.0.0.1:0`, its daemon naming `127.0.0.1:57557` before it served, and the edge answering a bare request `401` with
+  a Bearer challenge and no Basic one).
+- **Owed.** The anchor holding the edge's listener across a daemon's restart, as it holds the RPC-with-TLS export's (a
+  restart rebinds now, and a port 0 changes); the option on a library starter's anchor (`slates_api::start`); HTTPS end
+  to end on a fleet node (main's live run, with the clone).
 
 ### A-677 — A rebase's files hold the node a removed home hands to its link (bug, 2026-11-19, g305, UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path" and A-669's rule; found by A-658 part 1's runs)
 Applied in the same change to:

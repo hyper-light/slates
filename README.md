@@ -419,7 +419,7 @@ rounded.
 
 | Command | What it does |
 |---|---|
-| `slates anchor [--quick] [--shards N] [--fleet PATH --node NAME]` | Measure the machine and run the daemon under supervision; with a fleet manifest, as one node of a fleet |
+| `slates anchor [--quick] [--shards N] [--fleet PATH --node NAME] [--vcs-http ADDRESS]` | Measure the machine and run the daemon under supervision; with a fleet manifest, as one node of a fleet; with `--vcs-http`, serving git over HTTP (HTTPS on a fleet node, loopback alone otherwise) |
 | `slates volume create NAME (--bounded SIZE \| --dynamic MAX) [--base DIR]` | A new volume, empty or over a directory |
 | `slates volume list \| stat ID \| snapshot ID \| clone ID SNAP NAME \| resize ID … \| destroy ID` | The volume lifecycle |
 | `slates mount ID DIR` · `slates unmount DIR` | Mount a volume at a directory you own (macOS) |
