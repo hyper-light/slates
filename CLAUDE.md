@@ -289,6 +289,9 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     200 through crosvm and 0 of 200 in QEMU, since the guest's close and the console give the mount's round time), so
     the counted waits are the check that cannot miss. A real-system kill rarely lands inside a hold of about 82 µs (1
     of 36 did): hold that case with the stand-in.
+  - A test that drives a future no timer wakes: `LocalRuntime::run_until_idle` returns at its first zero-timeout poll
+    when no timer is armed, so a test awaiting such an answer waits forever (A-657 part 4's hooks test hung 29 minutes
+    on the Studio). Drive it under `futures::within`, as the hook tests do, so a hang becomes a failure.
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.
