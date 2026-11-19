@@ -462,7 +462,7 @@ fn check_getbundle(served: &Served, arguments: &Arguments<'_>, theirs: &[u8]) {
 
 /// Checks a bundle2 stream against 7.2's: its parameters, every part's header, each payload byte for byte but the
 /// changegroup's, which is compared by meaning.
-fn check_streams(served: &Served, ours: &[u8], theirs: &[u8]) {
+pub(crate) fn check_streams(served: &Served, ours: &[u8], theirs: &[u8]) {
   let ours = Bundle2::decode(ours, &mut room()).unwrap();
   let theirs = Bundle2::decode(theirs, &mut room()).unwrap();
   assert_eq!(
@@ -589,7 +589,7 @@ fn check_hello(ours: &[u8], theirs: &[u8]) {
 }
 
 /// Checks that every bundle2 capability of `ours`, and each of its values, is one of `theirs`.
-fn check_bundle2_subset(ours: &[u8], theirs: &[u8]) {
+pub(crate) fn check_bundle2_subset(ours: &[u8], theirs: &[u8]) {
   let (mut ours_quoted, mut theirs_quoted) = (Vec::new(), Vec::new());
   let (mut ours_unquoted, mut theirs_unquoted) = (Vec::new(), Vec::new());
   let ours = capabilities::decode_bundle2_value(ours, &mut room(), &mut ours_quoted).unwrap();
@@ -1252,10 +1252,11 @@ fn caps(blob: &[u8]) -> Vec<u8> {
 const CLIENT_BLOB: &[u8] =
   b"HG20\nbookmarks\nchangegroup=01,02,03\nlistkeys\nobsmarkers=V0,V1\nphases=heads";
 
-/// AC-HG.9 (hostile input), A-619: do ask for a bundle1 (no `HG2` capability; one only inside `bundle2=`), a
-/// changegroup in version 01 alone or with no version listed, and bookmarks, phase heads and markers of a client that
-/// cannot read them. Expect each refused by kind: a bundle1 as not served, the rest naming what the client and server
-/// do not share, as 7.2 aborts on each.
+/// AC-HG.9 (hostile input), A-619: do ask for a bundle1 (no `HG2` capability; one only inside `bundle2=`; one naming
+/// a head the view lacks), a changegroup in version 01 alone or with no version listed, and bookmarks, phase heads and
+/// markers of a client that cannot read them. Expect each refused by kind: a bundle1 as not served, before what it
+/// names is looked for (A-650: 7.2 judges bundle2 first, so its client is never sent a bundle2 abort), the rest naming
+/// what the client and server do not share, as 7.2 aborts on each.
 #[test]
 fn a_bundle1_and_parts_the_client_cannot_read_are_refused_by_kind() {
   let served = cloned();
@@ -1265,6 +1266,13 @@ fn a_bundle1_and_parts_the_client_cannot_read_are_refused_by_kind() {
   let yes = Some(&b"1"[..]);
   for (asked, expected) in [
     (Asked::default(), Some(Refusal::NoBundle2)),
+    (
+      Asked {
+        heads: b"1234567890abcdef1234567890abcdef12345678",
+        ..Asked::default()
+      },
+      Some(Refusal::NoBundle2),
+    ),
     (
       Asked {
         bundlecaps: &readers[5..],
