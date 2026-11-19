@@ -5,11 +5,13 @@
 //! home moves its links with it; and a later file at a path the node left is another node, which
 //! no link names. A link a work makes names the node its base held at the target.
 
+use std::collections::BTreeMap;
+
 use super::replaced_node_tests::{
   FILE, HARDLINK, Kind, NAME, SPECIAL, TARGET, Work, accept, classes_on, green, kinds_at,
   removal_of,
 };
-use super::{Green, Outcome};
+use super::{Green, Outcome, Rebased};
 use crate::ops_doc::OpKind;
 use crate::verdict::MergeConflictClass;
 
@@ -321,6 +323,69 @@ fn a_link_names_the_node_its_work_named_before_or_after_a_rename_onto_its_target
   let expected = ((Some(HARDLINK), old, new), (Some(TARGET), old, new));
   if found != expected {
     return Err(format!("{found:?}"));
+  }
+  Ok(())
+}
+
+/// A green's files at its head, owned.
+type Files = BTreeMap<String, Vec<u8>>;
+
+/// `green`'s files at its head.
+fn files_of(green: &Green) -> Files {
+  green
+    .files()
+    .map(|(path, bytes)| (path, bytes.to_vec()))
+    .collect()
+}
+
+/// What a rebase at the head of `linked`'s green restates of `work`, beside what a twin holds once
+/// it accepts it: the rebase's files (the head's with `changed` over them), whether its journal
+/// names `HARDLINK`, and the twin's files.
+fn restated_beside_accepted(work: fn() -> Work) -> Result<(Files, bool, Files), String> {
+  let (rebasing, mut accepting) = (linked()?, linked()?);
+  let increment = work().at(rebasing.head(), 4);
+  let Rebased::Rebased {
+    changed, journal, ..
+  } = rebasing.rebase(&increment)
+  else {
+    return Err("the work did not rebase cleanly".to_owned());
+  };
+  if !matches!(accepting.submit(&increment), Outcome::Accepted { .. }) {
+    return Err("the twin did not accept the work".to_owned());
+  }
+  let mut restated = files_of(&rebasing);
+  for (path, after) in changed {
+    match after {
+      Some(bytes) => restated.insert(path, bytes),
+      None => restated.remove(&path),
+    };
+  }
+  let names_the_link = journal
+    .iter()
+    .any(|op| op.names().contains(&Some(HARDLINK)));
+  Ok((restated, names_the_link, files_of(&accepting)))
+}
+
+/// A-677 (A-669's rule: the link a removed or replaced home leaves its node to takes the node as
+/// the version leaves it; §4.16 "Rebase, the only corrective path"). Do: rebase at the head a work
+/// that removes `TARGET`, which `HARDLINK` and `SECOND` name, and one that renames `FILE` over it,
+/// and submit each on a twin. Expect the rebase's files to be the twin's, `HARDLINK` holding
+/// `TARGET`'s old bytes, and the journal to name no operation at `HARDLINK`: the hand-over is the
+/// commit's, and a volume's link names the node already. Before, the rebase restated the removal
+/// alone, so its files lost the link the submit kept (rebase.rs's oracle: `{}` against
+/// `{"b": []}`).
+#[test]
+fn a_rebase_restates_the_node_a_removed_home_hands_to_its_link() -> Result<(), String> {
+  let removed = restated_beside_accepted(|| removal_of(TARGET, Kind::File))?;
+  let replaced = restated_beside_accepted(|| Work::default().naming(OpKind::Rename, TARGET, FILE))?;
+  for (restated, names_the_link, accepted) in [removed, replaced] {
+    let heir = accepted.get(HARDLINK).map(Vec::as_slice);
+    if restated != accepted || names_the_link || heir != Some(&b"<g>\n"[..]) {
+      return Err(format!(
+        "restated {restated:?}, a journal operation at the link {names_the_link}, accepted \
+         {accepted:?}"
+      ));
+    }
   }
   Ok(())
 }
