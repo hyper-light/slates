@@ -286,7 +286,8 @@ fn a_keys_first_change_after_a_copy_records_the_value_the_copy_gave_it() {
 /// to `b`, overwrite `b/a`, create `b/new`, unlink `b/c`, set `b/d`'s mode and `b/d/b`'s property; then replay that
 /// version's chain entry, encoded and decoded, on a green holding the version before it. Expect: accepted; the edits
 /// land on what the copy brought, the trunk untouched; at the version before, none of it; no copied value recorded for
-/// the version's own changes; and the replayed green reads and hashes alike.
+/// the version's own changes; no removal recorded for an edited copied file (A-612); and the replayed green reads and
+/// hashes alike.
 #[test]
 fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   let mut green = trunk();
@@ -324,6 +325,10 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   assert_eq!(replica.head_identity(), green.head_identity());
   assert_eq!(replica.base_at(2), green.base_at(2));
   assert_eq!(replica.content("b/a"), Some(&b"ALpha"[..]));
+  // The file the copy brought and its own increment edited replaced no file: A-612's removals record none, live or
+  // replayed.
+  assert!(!green.file_removed.contains_key("b/a"));
+  assert!(!replica.file_removed.contains_key("b/a"));
 }
 
 /// A-586 (the root's copy: `svn copy ^/ ^/snap`, which a stock client sends). Do: give the root a property and copy it,
