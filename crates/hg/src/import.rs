@@ -2,9 +2,9 @@
 //! "an existing repository's store imported as a base"; §4.15, a repository directory taken by a read; 7.2's
 //! `localrepo.makestore`, `store.py`, `revlog.py`, `revlogutils/docket.py`, `changegroup.py` and `verify.py` \[C\]).
 //!
-//! **Read-only, through one seam.** The import reads a repository's `.hg` directory through [`RepositoryFiles`], one
-//! whole file a call by its path's names, which the server answers from §4.15's base plane: its host seam opens one
-//! name at a time, never a path string, and has no verb that writes. Nothing is written anywhere but the index the
+//! **Read-only, through one seam.** The import reads a repository's `.hg` directory through [`RepositoryFiles`]: a
+//! file's length, then its bytes by ranges (A-649 part 3), by its path's names, which the server answers from §4.15's
+//! base plane: its host seam opens one name at a time, never a path string, and has no verb that writes. Nothing is written anywhere but the index the
 //! import returns and the content store that holds its texts. Every name the import hands the host is plain, never `.`
 //! or `..` and holding no NUL; a name built from bytes that could spell either (a file index docket's id) is refused
 //! before the host is asked.
@@ -19,12 +19,19 @@
 //! empty, as 7.2 reads one (a store has neither before its first commit); a listed file log whose index file is absent
 //! is refused.
 //!
-//! **In 7.2's order, each group whole or refused.** The changelog, then the manifest log, then each file log in its
+//! **In 7.2's order, the whole kept or refused.** The changelog, then the manifest log, then each file log in its
 //! path's order, as a changegroup brings them and 7.2's `addgroup` takes them ([`HgIndex::append_changesets`],
 //! [`HgIndex::append_revisions`]). Each revision's text is rebuilt from its delta chain and held to its node by the
 //! revlog reader before anything of it is kept; each is kept once as content, a file revision's metadata block apart
-//! from its bytes; each log is one group. The import builds a new index, and any refusal releases it and gives back
-//! every hold the import took, so a refused import leaves the content store as it found it.
+//! from its bytes, and appended at once, numbered its revlog's own (A-649 part 3: no log's group is held). The import
+//! builds a new index, and any refusal releases it and gives back every hold the import took, so a refused import
+//! leaves the content store as it found it.
+//!
+//! **In slices** (A-649 part 3). An [`Import`] is advanced a turn at a time under the owner's quantum, §4.3's step budget
+//! ([`Import::advance`], [`Turn`]; git's upload is the model), each turn doing units of work until the quantum is spent
+//! on the owner's [`Clock`], at least one: a log opened, one revision read, kept and appended, one changeset's manifest
+//! checked, the repository's state read. Between turns it holds no borrow of the host or the store. [`import`] is its
+//! thin facade, one turn that never ends before its work.
 //!
 //! **Checks across the logs**, the cheap ones 7.2's `verify` makes: each manifest and file revision's link names a
 //! changeset; each changeset's manifest is the null node or one the manifest log holds ("changeset refers to unknown
@@ -48,17 +55,20 @@
 //! ("incompatible revision flag").
 //!
 //! **Bounds.** `room` is the most the import holds at once, which its caller derives from the request's budget: the
-//! requirements and the listing for the whole walk; one revlog's files and its group while that log is read; one
-//! text's rebuild at a time. Each scope is charged to a copy of the room its enclosing scope left, since what it held is
+//! requirements and the listing for the whole walk; one revlog's group while that log is read; one text's rebuild at a
+//! time, beside the text before it. No revlog is held whole (A-649 part 3): a split revlog's index and data, and a
+//! docket's files, are read by ranges, an entry or a chunk a read through the revlog reader's one algorithm over a
+//! ranged source (`revlog::Outline`, `revlog::Source`), and a text is rebuilt from the text before it where its chain
+//! passes through that one, as 7.2's revision cache does, rather than from its chain's base; only an inline revlog,
+//! which 7.2 keeps under 128 KiB, is read whole. Each scope is charged to a copy of the room its enclosing scope left, since what it held is
 //! freed when it ends. The texts kept are charged to the content store's budget, and the rows to the same budget by the
 //! shared index, whose tail is sealed when due after each group, as the shared rule says.
 //!
-//! **Owed** (GAPS): the phase roots, bookmarks and obsolescence markers beside the logs (pieces 5 and 7; until then an
-//! import holds every changeset its changelog holds, secret ones too, and is not served); the import in slices under
-//! the shard's step budget, resumed after a host's pending read rather than run again; each revlog read by ranges
-//! rather than whole; a text rebuilt from the one before it where its chain passes through it, as 7.2's revision cache
-//! does, rather than from its chain's base; and the server's adapter from §4.15's host seam.
+//! **Owed** (GAPS): the register's first entry recording the phase roots and bookmarks the import returns (until then
+//! an import is not served); a unit a host's pending read refused retried at the next turn rather than ending the
+//! import; the listing and the obsstore read in slices too; and the server's adapter from §4.15's host seam.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_vcs::{ContentId, ContentRefused, ContentStore, IndexRefused};
@@ -71,7 +81,7 @@ use crate::node::{self, CollisionAttack};
 use crate::obsmarkers;
 use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
-use crate::revlog::{self, Entry, NONE, Revlog};
+use crate::revlog::{self, Entry, NONE, Outline, Slices, Source};
 use crate::store::{self, FncacheRefused, Layout, Listing, RequiresRefused, Shape};
 use crate::{Admission, NULL_NODE, Node, PastAdmission};
 
@@ -195,23 +205,28 @@ pub enum FileRefused<R> {
   Host(R),
 }
 
-/// A repository's files as the import reads them (§4.15's read seam): read-only, one whole file under the repository's
-/// `.hg` directory a call. The server adapts the base plane's host seam to it, opening each of the path's names in
-/// turn, never a path string, and reading the file at its size.
+/// A repository's files as the import reads them (§4.15's read seam): read-only, a file under the repository's `.hg`
+/// directory named by its path's names, its length asked, then its bytes read by ranges (A-649 part 3), so no revlog is
+/// held whole. The server adapts the base plane's host seam to it, opening each of the path's names in turn, never a
+/// path string. Every name is plain: never empty, `.` or `..`, and holding no `/` and no NUL.
 pub trait RepositoryFiles {
   /// The host's refusal, carried through untouched.
   type Refused;
 
-  /// The bytes of the file at `path` under `.hg`, given as its names (`requires`; `store`, `data`, `a.txt.i`), read
-  /// whole, their length charged to `room` before they are held; `None` when no file is there. Every name is plain:
-  /// never empty, `.` or `..`, and holding no `/` and no NUL.
+  /// The length of the file at `path` under `.hg`, given as its names (`requires`; `store`, `data`, `a.txt.i`); `None`
+  /// when no file is there.
+  fn len(&mut self, path: &[&[u8]]) -> Result<Option<u64>, FileRefused<Self::Refused>>;
+
+  /// `len` bytes of the file at `path` from `offset`, their length charged to `room` before they are held; fewer only
+  /// where the file ends, and `None` when no file is there.
   fn read(
     &mut self,
     path: &[&[u8]],
+    offset: u64,
+    len: u64,
     room: &mut Admission,
   ) -> Result<Option<Vec<u8>>, FileRefused<Self::Refused>>;
 }
-
 /// An imported store: the repository's index, and how much of each kind it holds.
 #[derive(Debug, Default)]
 pub struct Imported {
@@ -238,6 +253,9 @@ pub struct Imported {
   pub malformed_bookmarks: u64,
   /// The obsolescence markers, kept as the index's marker rows in the obsstore's order.
   pub markers: u64,
+  /// Texts rebuilt from the text before them, where their chains passed through it (7.2's revision cache): the count
+  /// that shows the cache ran.
+  pub rebuilt_from_cache: u64,
 }
 
 /// Why an import was refused. Nothing it took is left held: its index is released and its holds given back.
@@ -387,6 +405,8 @@ pub enum ImportRefused<R> {
   Index(index::Refused),
   /// The content store refused a text (its budget).
   Content(ContentRefused),
+  /// The import was refused before, or advanced after its end: it does nothing more.
+  Ended,
   /// Giving back what a refused import held was refused too; `cause` is the import's refusal.
   Unreleased {
     /// The import's refusal.
@@ -453,27 +473,125 @@ impl<R> From<ContentRefused> for ImportRefused<R> {
   }
 }
 
+/// The owner's clock, monotonic nanoseconds: the shard's (§4.3). The import has none of its own.
+pub trait Clock {
+  /// Now.
+  fn now_ns(&mut self) -> u64;
+}
+
+/// One turn of an import (A-649 part 3): the owner's clock, and the nanoseconds the turn may spend, §4.3's step budget,
+/// the owner's to derive. A turn does one unit of work whatever its quantum.
+pub struct Turn<'t> {
+  /// The owner's clock.
+  pub clock: &'t mut dyn Clock,
+  /// The nanoseconds the turn may spend.
+  pub quantum_ns: u64,
+}
+
+/// What a turn left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+  /// More of the store to import.
+  More,
+  /// The store is imported; [`Import::into_imported`] hands it over.
+  Done,
+}
+
+/// Which log a stage reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Which {
+  /// The changelog.
+  Changelog,
+  /// The manifest log.
+  Manifest,
+  /// The file log of the listed path at this place.
+  File(usize),
+}
+
+/// Where an import stands.
+enum Stage {
+  /// A log is to be opened.
+  Open(Which),
+  /// A log's revisions are being read.
+  Log(Box<LogInProgress>),
+  /// Each changeset's manifest is being held to the manifest log, from this changeset.
+  Check(u32),
+  /// The repository's state is to be read: its phase roots, bookmarks and markers.
+  State,
+  /// The store is imported.
+  Done,
+  /// The import was refused or its index taken back: it does nothing more.
+  Ended,
+}
+
+/// One log being read: which, its radix, its revlog, its next revision, the last text rebuilt, and the room its
+/// revisions are rebuilt within.
+struct LogInProgress {
+  /// Which log.
+  which: Which,
+  /// Its radix.
+  radix: Vec<u8>,
+  /// What its revlog is.
+  outline: Outline,
+  /// Its revlog's bytes, whole or by ranges.
+  bytes: Bytes,
+  /// The next revision to read.
+  next: u32,
+  /// The last revision rebuilt, and its text.
+  cached: Option<(u32, Vec<u8>)>,
+  /// The room left after its revlog was opened.
+  room: Admission,
+}
+
+/// An import under way (A-649 part 3; module docs): what it has taken so far, and where it stands. It is advanced a
+/// turn at a time ([`Import::advance`]), each turn doing units of work until the owner's quantum is spent: one
+/// revision rebuilt, kept and appended to the index; one changeset's manifest held to the manifest log; a log opened;
+/// the repository's state read. Between turns it holds no borrow of the host or the store. An import not taken to its
+/// end is given back with [`Import::abandon`]; a refused one has given back everything already.
+pub struct Import {
+  /// How the store lists its file logs and names its files.
+  shape: Shape,
+  /// The listed paths, sorted.
+  listed: Vec<Vec<u8>>,
+  /// Whether a changeset names each listed path.
+  named: Vec<bool>,
+  /// The room the requirements and the listing left.
+  room: Admission,
+  /// What the import has taken: the index and its counts.
+  imported: Imported,
+  /// Where it stands.
+  stage: Stage,
+  /// Turns taken.
+  turns: u64,
+  /// Units of work done.
+  units: u64,
+}
+
+/// A clock that stands still, so a turn of it ends only with its work: [`import`]'s.
+struct Still;
+
+impl Clock for Still {
+  fn now_ns(&mut self) -> u64 {
+    0
+  }
+}
+
 /// Imports the store of the repository whose `.hg` directory `files` reads into a new index, its texts kept in `store`,
-/// every log in 7.2's order (module docs), holding at most `room` at once. Refused, it leaves `store` as it found it.
+/// every log in 7.2's order (module docs), holding at most `room` at once, in one call: an [`Import`] advanced in one
+/// turn that never ends before its work (the thin facade R6 allows; a shard advances an [`Import`] a turn at a time).
+/// Refused, it leaves `store` as it found it.
 pub fn import<F: RepositoryFiles>(
   files: &mut F,
   store: &mut ContentStore,
   room: Admission,
 ) -> Result<Imported, ImportRefused<F::Refused>> {
-  let mut walk_room = room;
-  let shape = read_shape(files, &mut walk_room)?;
-  let listed = list_file_logs(files, shape, &mut walk_room)?;
-  let mut imported = Imported::default();
-  let mut walk = Walk {
-    files,
-    store,
-    shape,
-    room: walk_room,
+  let mut import = Import::start(files, room)?;
+  let turn = Turn {
+    clock: &mut Still,
+    quantum_ns: u64::MAX,
   };
-  match walk.fill(&mut imported, &listed) {
-    Ok(()) => Ok(imported),
-    Err(refused) => Err(release(imported.index, walk.store, refused)),
-  }
+  import.advance(files, store, turn)?;
+  import.into_imported().ok_or(ImportRefused::Ended)
 }
 
 /// Releases a refused import's index; the refusal, or the release's beside it.
@@ -491,17 +609,647 @@ fn release<R>(
   }
 }
 
+impl Import {
+  /// Starts an import: the requirements and the listing read, nothing kept in any store yet, every log still to read.
+  pub fn start<F: RepositoryFiles>(
+    files: &mut F,
+    room: Admission,
+  ) -> Result<Import, ImportRefused<F::Refused>> {
+    let mut walk = room;
+    let shape = read_shape(files, &mut walk)?;
+    let listed = list_file_logs(files, shape, &mut walk)?;
+    walk.charge_items::<bool>(listed.len())?;
+    let named = vec![false; listed.len()];
+    Ok(Import {
+      shape,
+      listed,
+      named,
+      room: walk,
+      imported: Imported::default(),
+      stage: Stage::Open(Which::Changelog),
+      turns: 0,
+      units: 0,
+    })
+  }
+
+  /// One turn: units of work until `turn`'s quantum is spent on its clock, at least one; `Done` once the store is
+  /// imported. Refused, the index is released, and the import ends.
+  pub fn advance<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+    turn: Turn<'_>,
+  ) -> Result<Progress, ImportRefused<F::Refused>> {
+    let start = turn.clock.now_ns();
+    self.turns = self.turns.saturating_add(1);
+    loop {
+      match self.unit(files, store) {
+        Ok(Progress::Done) => return Ok(Progress::Done),
+        Ok(Progress::More) => {}
+        Err(refused) => return Err(self.refuse(store, refused)),
+      }
+      if turn.clock.now_ns().saturating_sub(start) >= turn.quantum_ns {
+        return Ok(Progress::More);
+      }
+    }
+  }
+
+  /// The turns taken.
+  pub fn turns(&self) -> u64 {
+    self.turns
+  }
+
+  /// The units of work done.
+  pub fn units(&self) -> u64 {
+    self.units
+  }
+
+  /// The imported store, once a turn has answered `Done`.
+  pub fn into_imported(self) -> Option<Imported> {
+    matches!(self.stage, Stage::Done).then_some(self.imported)
+  }
+
+  /// Gives back everything an import not taken to its end holds: its index's rows and contents.
+  pub fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+    self.imported.index.release(store)
+  }
+
+  /// Ends a refused import: its index released, the refusal answered.
+  fn refuse<R>(&mut self, store: &mut ContentStore, refused: ImportRefused<R>) -> ImportRefused<R> {
+    self.stage = Stage::Ended;
+    release(core::mem::take(&mut self.imported.index), store, refused)
+  }
+
+  /// One unit of work.
+  fn unit<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+  ) -> Result<Progress, ImportRefused<F::Refused>> {
+    self.units = self.units.saturating_add(1);
+    self.stage = match core::mem::replace(&mut self.stage, Stage::Ended) {
+      Stage::Open(which) => self.open(files, which)?,
+      Stage::Log(log) => self.log_unit(files, store, log)?,
+      Stage::Check(rev) => self.check(store, rev)?,
+      Stage::State => {
+        self.state(files, store)?;
+        Stage::Done
+      }
+      Stage::Done => Stage::Done,
+      Stage::Ended => return Err(ImportRefused::Ended),
+    };
+    Ok(match self.stage {
+      Stage::Done => Progress::Done,
+      _ => Progress::More,
+    })
+  }
+
+  /// Opens a log's revlog.
+  fn open<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    which: Which,
+  ) -> Result<Stage, ImportRefused<F::Refused>> {
+    let (radix, listed) = match which {
+      Which::Changelog => (CHANGELOG.to_vec(), false),
+      Which::Manifest => (MANIFEST.to_vec(), false),
+      Which::File(at) => {
+        let path = self.listed.get(at).map_or(&[][..], Vec::as_slice);
+        ([DATA, path].concat(), true)
+      }
+    };
+    let mut room = self.room;
+    let (outline, bytes) = open_revlog(files, self.shape, &radix, listed, &mut room)?;
+    Ok(Stage::Log(Box::new(LogInProgress {
+      which,
+      radix,
+      outline,
+      bytes,
+      next: 0,
+      cached: None,
+      room,
+    })))
+  }
+
+  /// One revision of a log read, kept and appended; or the log finished.
+  fn log_unit<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+    mut log: Box<LogInProgress>,
+  ) -> Result<Stage, ImportRefused<F::Refused>> {
+    if log.next >= log.outline.len() {
+      return self.finish_log(&log);
+    }
+    match log.which {
+      Which::Changelog => self.changeset_unit(files, store, &mut log)?,
+      Which::Manifest | Which::File(_) => self.revision_unit(files, store, &mut log)?,
+    }
+    log.next = log.next.saturating_add(1);
+    Ok(Stage::Log(log))
+  }
+
+  /// A log read whole: its count kept, a named file's log held to hold a revision, and the next stage.
+  fn finish_log<R>(&mut self, log: &LogInProgress) -> Result<Stage, ImportRefused<R>> {
+    let revisions = log.outline.len();
+    Ok(match log.which {
+      Which::Changelog => {
+        self.imported.changesets = revisions;
+        Stage::Open(Which::Manifest)
+      }
+      Which::Manifest => {
+        self.imported.manifests = revisions;
+        Stage::Check(0)
+      }
+      Which::File(at) => {
+        if revisions == 0 && self.named.get(at).copied().unwrap_or_default() {
+          let path = self.listed.get(at).map_or(&[][..], Vec::as_slice);
+          return Err(ImportRefused::EmptyLog {
+            path: Box::from(path),
+          });
+        }
+        self.imported.file_logs = self.imported.file_logs.saturating_add(1);
+        let total = self
+          .imported
+          .file_revisions
+          .saturating_add(u64::from(revisions));
+        self.imported.file_revisions = total;
+        self.next_file(at.saturating_add(1))
+      }
+    })
+  }
+
+  /// The stage of the listed file log at `at`, or the state's once every one is read.
+  fn next_file(&self, at: usize) -> Stage {
+    if at < self.listed.len() {
+      Stage::Open(Which::File(at))
+    } else {
+      Stage::State
+    }
+  }
+
+  /// Marks `path` named, or refuses it when the listing lacks it.
+  fn name<R>(&mut self, path: &[u8]) -> Result<(), ImportRefused<R>> {
+    let at = self
+      .listed
+      .binary_search_by(|known| known.as_slice().cmp(path))
+      .map_err(|_| ImportRefused::Unlisted {
+        path: Box::from(path),
+      })?;
+    if let Some(named) = self.named.get_mut(at) {
+      *named = true;
+    }
+    Ok(())
+  }
+
+  /// One changeset: its text rebuilt and held to its node, its manifest, branch and closing read as 7.2 reads them,
+  /// every path it names listed, kept and appended; its text then cached for the next.
+  fn changeset_unit<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+    log: &mut LogInProgress,
+  ) -> Result<(), ImportRefused<F::Refused>> {
+    let rev = log.next;
+    let mut room = log.room;
+    let cached = log.cached.take();
+    let reading = Reading {
+      log: Log::Changelog,
+      radix: &log.radix,
+      outline: &log.outline,
+      bytes: &log.bytes,
+    };
+    let view = cached.as_ref().map(|(at, text)| (*at, text.as_slice()));
+    let counter = &mut self.imported.rebuilt_from_cache;
+    let (entry, text) = rebuild(files, &reading, rev, view, &mut room, counter)?;
+    drop(cached);
+    let read = changeset::decode(&text).map_err(|refusal| changeset_refused(rev, refusal))?;
+    let manifest = read
+      .manifest_node()
+      .map_err(|refusal| changeset_refused(rev, refusal))?;
+    let (branch, closed) =
+      branch_of(&read, &mut room).map_err(|refusal| changeset_refused(rev, refusal))?;
+    for path in read.file_names() {
+      self.name(path)?;
+    }
+    let (p1, p2) = parents(files, &reading, &entry, &mut room)?;
+    let mut held = Held::default();
+    let index = &mut self.imported.index;
+    let outcome = held.put(store, &text).and_then(|text_id| {
+      let planned = PlannedChangeset {
+        node: entry.node,
+        p1,
+        p2,
+        flags: entry.flags,
+        len: to_u64(text.len()),
+        text: text_id,
+        manifest,
+        closed,
+        branch,
+      };
+      append_changeset(index, store, rev, &planned)
+    });
+    held.give_back(store, outcome)?;
+    log.cached = Some((rev, text));
+    Ok(())
+  }
+
+  /// One manifest or file revision: its text rebuilt and held to its node, its link a changeset the index holds, a file
+  /// revision's block apart from its bytes, both kept and appended; its text then cached for the next.
+  fn revision_unit<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+    log: &mut LogInProgress,
+  ) -> Result<(), ImportRefused<F::Refused>> {
+    let rev = log.next;
+    let mut room = log.room;
+    let cached = log.cached.take();
+    let path = match log.which {
+      Which::File(at) => self.listed.get(at).map(Vec::as_slice),
+      Which::Changelog | Which::Manifest => None,
+    };
+    let reading = Reading {
+      log: path.map_or(Log::Manifest, Log::File),
+      radix: &log.radix,
+      outline: &log.outline,
+      bytes: &log.bytes,
+    };
+    let view = cached.as_ref().map(|(at, text)| (*at, text.as_slice()));
+    let counter = &mut self.imported.rebuilt_from_cache;
+    let (entry, text) = rebuild(files, &reading, rev, view, &mut room, counter)?;
+    drop(cached);
+    let link = self
+      .imported
+      .index
+      .changeset(store, entry.link)
+      .map(|row| row.node)
+      .ok_or_else(|| ImportRefused::Link {
+        revlog: Box::from(reading.radix),
+        rev,
+        link: entry.link,
+      })?;
+    let (p1, p2) = parents(files, &reading, &entry, &mut room)?;
+    let (bytes, block) = match reading.log {
+      Log::File(_) => {
+        let split = filerev::split(&text).map_err(|refusal| ImportRefused::FileRevision {
+          revlog: Box::from(reading.radix),
+          rev,
+          refusal,
+        })?;
+        (split.bytes, split.metadata)
+      }
+      Log::Changelog | Log::Manifest => (text.as_slice(), None),
+    };
+    let mut held = Held::default();
+    let index = &mut self.imported.index;
+    let outcome = keep_revision(store, &mut held, bytes, block).and_then(|(bytes, block)| {
+      let row = NewRevision {
+        node: entry.node,
+        p1,
+        p2,
+        link,
+        flags: entry.flags,
+        len: to_u64(text.len()),
+        bytes,
+        block,
+      };
+      append_revision(index, store, &reading, rev, &row)
+    });
+    held.give_back(store, outcome)?;
+    log.cached = Some((rev, text));
+    Ok(())
+  }
+
+  /// One changeset's manifest held to the manifest log: the null node, or one it holds.
+  fn check<R>(&mut self, store: &ContentStore, rev: u32) -> Result<Stage, ImportRefused<R>> {
+    if rev >= self.imported.changesets {
+      return Ok(self.next_file(0));
+    }
+    let index = &self.imported.index;
+    let row = index
+      .changeset(store, rev)
+      .ok_or(ImportRefused::Unindexed { rev })?;
+    if row.manifest != NULL_NODE && index.rev(store, Log::Manifest, &row.manifest).is_none() {
+      return Err(ImportRefused::UnknownManifest {
+        rev,
+        node: row.manifest,
+      });
+    }
+    Ok(Stage::Check(rev.saturating_add(1)))
+  }
+
+  /// The repository's state beside its history (module docs): its phase roots, bookmarks and markers.
+  fn state<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+  ) -> Result<(), ImportRefused<F::Refused>> {
+    self.phase_roots(files, store)?;
+    self.bookmarks(files, store)?;
+    self.imported.markers = self.markers(files, store)?;
+    Ok(())
+  }
+
+  /// The store's phase roots into the import (module docs).
+  fn phase_roots<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &ContentStore,
+  ) -> Result<(), ImportRefused<F::Refused>> {
+    let mut room = self.room;
+    let Some(bytes) = read_store_file(files, self.shape, PHASEROOTS, &mut room)? else {
+      return Ok(());
+    };
+    let (roots, dropped) = read_phase_roots(&bytes, &self.imported.index, store)?;
+    self.room.charge_items::<PhaseHead>(roots.len())?;
+    self.imported.phase_roots = roots;
+    self.imported.dropped_phase_roots = dropped;
+    Ok(())
+  }
+
+  /// The repository's bookmarks into the import: `.hg/bookmarks`, or the store's under `bookmarksinstore` (module
+  /// docs).
+  fn bookmarks<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &ContentStore,
+  ) -> Result<(), ImportRefused<F::Refused>> {
+    let mut room = self.room;
+    let read = if self.shape.bookmarks_in_store {
+      read_store_file(files, self.shape, BOOKMARKS, &mut room)?
+    } else {
+      read_whole(files, &[BOOKMARKS], &mut room)?
+    };
+    let Some(bytes) = read else {
+      return Ok(());
+    };
+    let read = read_bookmarks(&bytes, &self.imported.index, store);
+    let names = read
+      .found
+      .keys()
+      .fold(0_usize, |total, name| total.saturating_add(name.len()));
+    self.room.charge(to_u64(names))?;
+    self
+      .room
+      .charge_items::<(Vec<u8>, Node)>(read.found.len())?;
+    self.imported.bookmarks = read.found.into_iter().collect();
+    self.imported.dropped_bookmarks = read.dropped;
+    self.imported.malformed_bookmarks = read.malformed;
+    Ok(())
+  }
+
+  /// The store's obsolescence markers, checked whole, kept as the index's marker rows in the obsstore's order, each
+  /// alone in the obsstore's format; how many.
+  fn markers<F: RepositoryFiles>(
+    &mut self,
+    files: &mut F,
+    store: &mut ContentStore,
+  ) -> Result<u64, ImportRefused<F::Refused>> {
+    let mut room = self.room;
+    let read = read_store_file(files, self.shape, OBSSTORE, &mut room)?;
+    let Some(bytes) = read.filter(|bytes| !bytes.is_empty()) else {
+      return Ok(0);
+    };
+    let markers = obsmarkers::decode(&bytes).map_err(ImportRefused::Markers)?;
+    room.charge_items::<ContentId>(markers.len())?;
+    let mut held = Held::default();
+    let index = &mut self.imported.index;
+    let outcome = keep_markers(store, &markers, &mut held, room).and_then(|kept| {
+      index
+        .append_markers(store, &kept)
+        .map_err(ImportRefused::from)
+    });
+    held
+      .give_back(store, outcome)
+      .map(|numbers| to_u64(numbers.len()))
+  }
+}
+
+/// Each marker kept alone in its obsstore's format, its encoding charged to a copy of `room` first.
+fn keep_markers<R>(
+  store: &mut ContentStore,
+  markers: &obsmarkers::Markers<'_>,
+  held: &mut Held,
+  room: Admission,
+) -> Result<Vec<ContentId>, ImportRefused<R>> {
+  let format = markers.format();
+  let mut kept = Vec::with_capacity(markers.len());
+  for (number, marker) in (0_u64..).zip(markers.iter()) {
+    let unencodable = |refusal| ImportRefused::MarkerUnencodable {
+      marker: number,
+      refusal,
+    };
+    let len = obsmarkers::encoded_len(format, &[marker]).map_err(unencodable)?;
+    let mut marker_room = room;
+    marker_room.charge(len)?;
+    let mut alone = Vec::new();
+    obsmarkers::encode(format, &[marker], &mut alone).map_err(unencodable)?;
+    kept.push(held.put(store, &alone)?);
+  }
+  Ok(kept)
+}
+
+/// A revision's bytes and block kept as content.
+fn keep_revision<R>(
+  store: &mut ContentStore,
+  held: &mut Held,
+  bytes: &[u8],
+  block: Option<&[u8]>,
+) -> Result<(ContentId, Option<ContentId>), ImportRefused<R>> {
+  let bytes = held.put(store, bytes)?;
+  let block = block.map(|block| held.put(store, block)).transpose()?;
+  Ok((bytes, block))
+}
+
+/// The path the store path `path` (unencoded) has under the store's encoding.
+fn store_path<R>(shape: Shape, path: &[u8]) -> Result<StorePath, ImportRefused<R>> {
+  StorePath::new(&shape.encoding.encode(path)?)
+}
+
+/// Reads the whole store file `path` (unencoded), named as the store's encoding names it.
+fn read_store_file<F: RepositoryFiles>(
+  files: &mut F,
+  shape: Shape,
+  path: &[u8],
+  room: &mut Admission,
+) -> Result<Option<Vec<u8>>, ImportRefused<F::Refused>> {
+  let path = store_path(shape, path)?;
+  read_whole(files, &path.names(), room)
+}
+
+/// A revlog's outline and bytes (A-649 part 3): its `.i`'s length asked and its header read; a docket, an inline index
+/// (7.2 keeps one under 128 KiB) or an index shorter than a header read whole; a split index and its data file read by
+/// ranges. An absent `.i` is an empty revlog, unless the listing named the revlog.
+fn open_revlog<F: RepositoryFiles>(
+  files: &mut F,
+  shape: Shape,
+  radix: &[u8],
+  listed: bool,
+  room: &mut Admission,
+) -> Result<(Outline, Bytes), ImportRefused<F::Refused>> {
+  let index = store_path(shape, &[radix, INDEX_EXTENSION].concat())?;
+  let Some(len) = files.len(&index.names())? else {
+    if listed {
+      return Err(ImportRefused::Missing {
+        path: index.shown(),
+      });
+    }
+    let outline = Outline::of_index(&[], room).map_err(|refused| revlog_refused(radix, refused))?;
+    return Ok((outline, Bytes::Whole(Vec::new())));
+  };
+  let head_len = len.min(to_u64(HEADER_BYTES));
+  let head = files.read(&index.names(), 0, head_len, room)?;
+  let header = head
+    .unwrap_or_default()
+    .first_chunk::<HEADER_BYTES>()
+    .map(|header| u32::from_be_bytes(*header));
+  match header {
+    Some(header) if DOCKETED.contains(&(header & VERSION_MASK)) => {
+      docketed(files, shape, radix, &index, len, room)
+    }
+    Some(header) if header & VERSION_MASK != VERSION_1 || header & FLAG_INLINE == 0 => {
+      split(files, shape, radix, index, header, len)
+    }
+    _ => {
+      let whole = files
+        .read(&index.names(), 0, len, room)?
+        .unwrap_or_default();
+      let outline =
+        Outline::of_index(&whole, room).map_err(|refused| revlog_refused(radix, refused))?;
+      Ok((outline, Bytes::Whole(whole)))
+    }
+  }
+}
+
+/// A split version 1 revlog, its index and data files read by ranges (any other version refused by its header).
+fn split<F: RepositoryFiles>(
+  files: &mut F,
+  shape: Shape,
+  radix: &[u8],
+  index: StorePath,
+  header: u32,
+  len: u64,
+) -> Result<(Outline, Bytes), ImportRefused<F::Refused>> {
+  let outline = Outline::of_split(header, len).map_err(|refused| revlog_refused(radix, refused))?;
+  let data = store_path(shape, &[radix, DATA_EXTENSION].concat())?;
+  let data_len = files.len(&data.names())?.unwrap_or_default();
+  let bytes = Bytes::Ranged {
+    index: (index, len),
+    data: (data, data_len),
+  };
+  Ok((outline, bytes))
+}
+
+/// A docketed revlog: the docket read whole, the index and data files it names read by ranges, each held to hold the
+/// bytes the docket says (7.2: "too few index data"; an absent one holds none).
+fn docketed<F: RepositoryFiles>(
+  files: &mut F,
+  shape: Shape,
+  radix: &[u8],
+  path: &StorePath,
+  len: u64,
+  room: &mut Admission,
+) -> Result<(Outline, Bytes), ImportRefused<F::Refused>> {
+  let docket = files.read(&path.names(), 0, len, room)?.unwrap_or_default();
+  let read = revlog::read_docket(&docket).map_err(|refused| revlog_refused(radix, refused))?;
+  let outline = Outline::of_docket(&read).map_err(|refused| revlog_refused(radix, refused))?;
+  let index = store_path(
+    shape,
+    &[radix, &[ID_SEPARATOR], read.index_id, DOCKET_INDEX].concat(),
+  )?;
+  let data = store_path(
+    shape,
+    &[radix, &[ID_SEPARATOR], read.data_id, DOCKET_DATA].concat(),
+  )?;
+  let (index_end, data_end) = (read.index_end, read.data_end);
+  holds(files, radix, &index, index_end, "an index file")?;
+  holds(files, radix, &data, data_end, "a data file")?;
+  let bytes = Bytes::Ranged {
+    index: (index, index_end),
+    data: (data, data_end),
+  };
+  Ok((outline, bytes))
+}
+
+/// Refuses a docket's file shorter than the docket says.
+fn holds<F: RepositoryFiles>(
+  files: &mut F,
+  radix: &[u8],
+  path: &StorePath,
+  end: u64,
+  what: &'static str,
+) -> Result<(), ImportRefused<F::Refused>> {
+  if files.len(&path.names())?.unwrap_or_default() < end {
+    return Err(revlog_refused(radix, revlog::Refused::Truncated { what }));
+  }
+  Ok(())
+}
+
+/// Revision `rev`'s entry and text: its flags refused first where 7.2 refuses them, or where its text does not hash to
+/// its node; then its text rebuilt and held to its node by the reader, from the text rebuilt before it where its chain
+/// passes through that one (7.2's revision cache, counted in `cache_hits`), the cached text charged to `room` beside the
+/// rebuild.
+fn rebuild<F: RepositoryFiles>(
+  files: &mut F,
+  reading: &Reading<'_>,
+  rev: u32,
+  cached: Option<(u32, &[u8])>,
+  room: &mut Admission,
+  cache_hits: &mut u64,
+) -> Result<(Entry, Vec<u8>), ImportRefused<F::Refused>> {
+  let radix = reading.radix;
+  let mut reader = Reader::new(files, reading.bytes);
+  let entry = reading
+    .outline
+    .entry(&mut reader, rev, room)
+    .map_err(|refused| read_refused(radix, refused))?;
+  refuse_flags(radix, rev, entry.flags)?;
+  if let Some((_, text)) = cached {
+    room.charge(to_u64(text.len()))?;
+  }
+  let (text, from_cache) = reading
+    .outline
+    .text(&mut reader, rev, cached, room)
+    .map_err(|refused| read_refused(radix, refused))?;
+  if from_cache {
+    *cache_hits = cache_hits.saturating_add(1);
+  }
+  Ok((entry, text))
+}
+
+/// A revision's parents' nodes, from its revlog's entries.
+fn parents<F: RepositoryFiles>(
+  files: &mut F,
+  reading: &Reading<'_>,
+  entry: &Entry,
+  room: &mut Admission,
+) -> Result<(Node, Node), ImportRefused<F::Refused>> {
+  let mut reader = Reader::new(files, reading.bytes);
+  let mut node = |rev: u32| -> Result<Node, ImportRefused<F::Refused>> {
+    if rev == NONE {
+      return Ok(NULL_NODE);
+    }
+    reading
+      .outline
+      .entry(&mut reader, rev, room)
+      .map(|parent| parent.node)
+      .map_err(|refused| read_refused(reading.radix, refused))
+  };
+  let p1 = node(entry.p1)?;
+  Ok((p1, node(entry.p2)?))
+}
+
 /// The store's shape from the repository's requirements: `requires`, and the store's own under `share-safe`.
 fn read_shape<F: RepositoryFiles>(
   files: &mut F,
   room: &mut Admission,
 ) -> Result<Shape, ImportRefused<F::Refused>> {
   let mut layout = Layout::default();
-  layout.read(&files.read(&[REQUIRES], room)?.unwrap_or_default())?;
+  layout.read(&read_whole(files, &[REQUIRES], room)?.unwrap_or_default())?;
   if layout.share_safe {
-    let in_store = files
-      .read(&[STORE, REQUIRES], room)?
-      .ok_or_else(|| ImportRefused::Missing {
+    let in_store =
+      read_whole(files, &[STORE, REQUIRES], room)?.ok_or_else(|| ImportRefused::Missing {
         path: in_store(REQUIRES),
       })?;
     layout.read(&in_store)?;
@@ -514,33 +1262,74 @@ fn in_store(path: &[u8]) -> Box<[u8]> {
   [STORE, &[SLASH], path].concat().into_boxed_slice()
 }
 
-/// Reads the file at `path` under the store: its names split at `/`, an empty one passed over as the host's own walk of
-/// a path passes over it, and a name that is `.` or `..` or holds a NUL refused before the host is asked.
+/// A whole file: its length asked, then its bytes read from its start; `None` when no file is there.
+fn read_whole<F: RepositoryFiles>(
+  files: &mut F,
+  names: &[&[u8]],
+  room: &mut Admission,
+) -> Result<Option<Vec<u8>>, ImportRefused<F::Refused>> {
+  let Some(len) = files.len(names)? else {
+    return Ok(None);
+  };
+  Ok(files.read(names, 0, len, room)?)
+}
+
+/// A store file's path as the host is asked for it: its names under `.hg`, `store` first, each checked plain, and the
+/// path as a refusal names it.
+#[derive(Clone, Debug)]
+struct StorePath {
+  /// The names.
+  names: Vec<Vec<u8>>,
+  /// The path under `.hg`.
+  shown: Vec<u8>,
+}
+
+impl StorePath {
+  /// The path of `path` under the store: its names split at `/`, an empty one passed over as the host's own walk of a
+  /// path passes over it, and a name that is `.` or `..` or holds a NUL refused before the host is asked.
+  fn new<R>(path: &[u8]) -> Result<StorePath, ImportRefused<R>> {
+    let mut names = vec![STORE.to_vec()];
+    for name in path
+      .split(|byte| *byte == SLASH)
+      .filter(|name| !name.is_empty())
+    {
+      if DOT_NAMES.contains(&name) || name.contains(&0) {
+        return Err(ImportRefused::UnsafePath {
+          path: in_store(path),
+        });
+      }
+      names.push(name.to_vec());
+    }
+    if names.len() < 2 {
+      return Err(ImportRefused::UnsafePath {
+        path: in_store(path),
+      });
+    }
+    Ok(StorePath {
+      names,
+      shown: in_store(path).into_vec(),
+    })
+  }
+
+  /// The names, as the host takes them.
+  fn names(&self) -> Vec<&[u8]> {
+    self.names.iter().map(Vec::as_slice).collect()
+  }
+
+  /// The path as a refusal names it.
+  fn shown(&self) -> Box<[u8]> {
+    self.shown.clone().into_boxed_slice()
+  }
+}
+
+/// Reads the whole file at `path` under the store ([`StorePath::new`]'s names).
 fn read_in_store<F: RepositoryFiles>(
   files: &mut F,
   path: &[u8],
   room: &mut Admission,
 ) -> Result<Option<Vec<u8>>, ImportRefused<F::Refused>> {
-  let mut names: Vec<&[u8]> = vec![STORE];
-  for name in path
-    .split(|byte| *byte == SLASH)
-    .filter(|name| !name.is_empty())
-  {
-    if DOT_NAMES.contains(&name) || name.contains(&0) {
-      return Err(ImportRefused::UnsafePath {
-        path: in_store(path),
-      });
-    }
-    names.push(name);
-  }
-  if names.len() < 2 {
-    return Err(ImportRefused::UnsafePath {
-      path: in_store(path),
-    });
-  }
-  Ok(files.read(&names, room)?)
+  read_whole(files, &StorePath::new(path)?.names(), room)
 }
-
 /// Every file log's path the store lists, sorted, once; each one a manifest could hold.
 fn list_file_logs<F: RepositoryFiles>(
   files: &mut F,
@@ -633,43 +1422,6 @@ fn read_named<F: RepositoryFiles>(
   })
 }
 
-/// A store file's name as the host was asked for it, and its bytes when it is there.
-type Asked = (Vec<u8>, Option<Vec<u8>>);
-
-/// A revlog's files, read whole, owned while the revlog is read.
-enum Files {
-  /// Version 1, or bytes whose header the reader refuses: the index file, and the data file when it is not inline.
-  Plain {
-    /// The index file.
-    index: Vec<u8>,
-    /// The data file.
-    data: Vec<u8>,
-  },
-  /// A docket, and the index and data files it names.
-  Docketed {
-    /// The docket.
-    docket: Vec<u8>,
-    /// The index file.
-    index: Vec<u8>,
-    /// The data file.
-    data: Vec<u8>,
-  },
-}
-
-impl Files {
-  /// The revlog the files hold.
-  fn open(&self, room: &mut Admission) -> Result<Revlog<'_>, revlog::Refused> {
-    match self {
-      Self::Plain { index, data } => Revlog::open(index, data, room),
-      Self::Docketed {
-        docket,
-        index,
-        data,
-      } => Revlog::open_docketed(&revlog::read_docket(docket)?, index, data),
-    }
-  }
-}
-
 /// A changeset planned for the changelog's group, its branch owned until the group is written.
 struct PlannedChangeset {
   /// The node.
@@ -692,31 +1444,7 @@ struct PlannedChangeset {
   branch: Vec<u8>,
 }
 
-/// The listed paths, and which of them a changeset names.
-struct Names<'l> {
-  /// The listed paths, sorted.
-  listed: &'l [Vec<u8>],
-  /// Whether a changeset names each.
-  named: Vec<bool>,
-}
-
-impl Names<'_> {
-  /// Marks `path` named, or refuses it when the listing lacks it.
-  fn name<R>(&mut self, path: &[u8]) -> Result<(), ImportRefused<R>> {
-    let at = self
-      .listed
-      .binary_search_by(|known| known.as_slice().cmp(path))
-      .map_err(|_| ImportRefused::Unlisted {
-        path: Box::from(path),
-      })?;
-    if let Some(named) = self.named.get_mut(at) {
-      *named = true;
-    }
-    Ok(())
-  }
-}
-
-/// The holds one group's puts took, given back once the group's rows hold the contents or the group is refused.
+/// The holds one unit's puts took, given back once its rows hold the contents or the unit is refused.
 #[derive(Default)]
 struct Held(Vec<ContentId>);
 
@@ -750,391 +1478,6 @@ impl Held {
         release: IndexRefused::Content(refused),
       }),
     }
-  }
-}
-
-/// One import's walk: the host, the content store, the store's shape, and the room the listing left.
-struct Walk<'w, F> {
-  /// The host.
-  files: &'w mut F,
-  /// The content store.
-  store: &'w mut ContentStore,
-  /// How the store lists its file logs and names its files.
-  shape: Shape,
-  /// The room the requirements and the listing left.
-  room: Admission,
-}
-
-impl<F: RepositoryFiles> Walk<'_, F> {
-  /// Every log into `imported`, in 7.2's order, with the checks across them.
-  fn fill(
-    &mut self,
-    imported: &mut Imported,
-    listed: &[Vec<u8>],
-  ) -> Result<(), ImportRefused<F::Refused>> {
-    self.room.charge_items::<bool>(listed.len())?;
-    let mut names = Names {
-      listed,
-      named: vec![false; listed.len()],
-    };
-    imported.changesets = self.changelog(&mut imported.index, &mut names)?;
-    imported.manifests = self.revisions(&mut imported.index, Log::Manifest, MANIFEST, false)?;
-    self.check_manifests(&imported.index, imported.changesets)?;
-    for (path, named) in listed.iter().zip(&names.named) {
-      let radix = [DATA, path.as_slice()].concat();
-      let revisions = self.revisions(&mut imported.index, Log::File(path), &radix, true)?;
-      if *named && revisions == 0 {
-        return Err(ImportRefused::EmptyLog {
-          path: Box::from(path.as_slice()),
-        });
-      }
-      imported.file_logs = imported.file_logs.saturating_add(1);
-      imported.file_revisions = imported.file_revisions.saturating_add(u64::from(revisions));
-    }
-    self.phase_roots(imported)?;
-    self.bookmarks(imported)?;
-    imported.markers = self.markers(&mut imported.index)?;
-    Ok(())
-  }
-
-  /// The store's phase roots into `imported` (module docs).
-  fn phase_roots(&mut self, imported: &mut Imported) -> Result<(), ImportRefused<F::Refused>> {
-    let mut room = self.room;
-    let Some(bytes) = self.read_store_file(PHASEROOTS, &mut room)?.1 else {
-      return Ok(());
-    };
-    let (roots, dropped) = read_phase_roots(&bytes, &imported.index, self.store)?;
-    self.room.charge_items::<PhaseHead>(roots.len())?;
-    imported.phase_roots = roots;
-    imported.dropped_phase_roots = dropped;
-    Ok(())
-  }
-
-  /// The repository's bookmarks into `imported`: `.hg/bookmarks`, or the store's under `bookmarksinstore` (module
-  /// docs).
-  fn bookmarks(&mut self, imported: &mut Imported) -> Result<(), ImportRefused<F::Refused>> {
-    let mut room = self.room;
-    let read = if self.shape.bookmarks_in_store {
-      self.read_store_file(BOOKMARKS, &mut room)?.1
-    } else {
-      self.files.read(&[BOOKMARKS], &mut room)?
-    };
-    let Some(bytes) = read else {
-      return Ok(());
-    };
-    let read = read_bookmarks(&bytes, &imported.index, self.store);
-    let names = read
-      .found
-      .keys()
-      .fold(0_usize, |total, name| total.saturating_add(name.len()));
-    self.room.charge(to_u64(names))?;
-    self
-      .room
-      .charge_items::<(Vec<u8>, Node)>(read.found.len())?;
-    imported.bookmarks = read.found.into_iter().collect();
-    imported.dropped_bookmarks = read.dropped;
-    imported.malformed_bookmarks = read.malformed;
-    Ok(())
-  }
-
-  /// The store's obsolescence markers, checked whole, kept as the index's marker rows in the obsstore's order, each
-  /// alone in the obsstore's format; how many.
-  fn markers(&mut self, index: &mut HgIndex) -> Result<u64, ImportRefused<F::Refused>> {
-    let mut room = self.room;
-    let read = self.read_store_file(OBSSTORE, &mut room)?.1;
-    let Some(bytes) = read.filter(|bytes| !bytes.is_empty()) else {
-      return Ok(0);
-    };
-    let markers = obsmarkers::decode(&bytes).map_err(ImportRefused::Markers)?;
-    room.charge_items::<ContentId>(markers.len())?;
-    let mut held = Held::default();
-    let outcome = self
-      .keep_markers(&markers, &mut held, room)
-      .and_then(|kept| {
-        index
-          .append_markers(self.store, &kept)
-          .map_err(ImportRefused::from)
-      });
-    held
-      .give_back(self.store, outcome)
-      .map(|numbers| to_u64(numbers.len()))
-  }
-
-  /// Each marker kept alone in its obsstore's format, its encoding charged to a copy of `room` first.
-  fn keep_markers(
-    &mut self,
-    markers: &obsmarkers::Markers<'_>,
-    held: &mut Held,
-    room: Admission,
-  ) -> Result<Vec<ContentId>, ImportRefused<F::Refused>> {
-    let format = markers.format();
-    let mut kept = Vec::with_capacity(markers.len());
-    for (number, marker) in (0_u64..).zip(markers.iter()) {
-      let unencodable = |refusal| ImportRefused::MarkerUnencodable {
-        marker: number,
-        refusal,
-      };
-      let len = obsmarkers::encoded_len(format, &[marker]).map_err(unencodable)?;
-      let mut marker_room = room;
-      marker_room.charge(len)?;
-      let mut alone = Vec::new();
-      obsmarkers::encode(format, &[marker], &mut alone).map_err(unencodable)?;
-      kept.push(held.put(self.store, &alone)?);
-    }
-    Ok(kept)
-  }
-
-  /// Reads the store file `path` (unencoded), named as the store's encoding names it; with the name it was asked by.
-  fn read_store_file(
-    &mut self,
-    path: &[u8],
-    room: &mut Admission,
-  ) -> Result<Asked, ImportRefused<F::Refused>> {
-    let encoded = self.shape.encoding.encode(path)?;
-    let read = read_in_store(self.files, &encoded, room)?;
-    Ok((encoded, read))
-  }
-
-  /// A revlog's files: its `.i`, then what its header names. An absent `.i` is an empty revlog, unless the listing
-  /// named the revlog.
-  fn revlog_files(
-    &mut self,
-    radix: &[u8],
-    listed: bool,
-    room: &mut Admission,
-  ) -> Result<Files, ImportRefused<F::Refused>> {
-    let (name, read) = self.read_store_file(&[radix, INDEX_EXTENSION].concat(), room)?;
-    let Some(index) = read else {
-      if listed {
-        return Err(ImportRefused::Missing {
-          path: in_store(&name),
-        });
-      }
-      return Ok(Files::Plain {
-        index: Vec::new(),
-        data: Vec::new(),
-      });
-    };
-    let header = index
-      .first_chunk::<HEADER_BYTES>()
-      .map(|header| u32::from_be_bytes(*header))
-      .unwrap_or_default();
-    if DOCKETED.contains(&(header & VERSION_MASK)) {
-      return self.docketed(radix, index, room);
-    }
-    let data = if header & VERSION_MASK == VERSION_1 && header & FLAG_INLINE == 0 {
-      self
-        .read_store_file(&[radix, DATA_EXTENSION].concat(), room)?
-        .1
-        .unwrap_or_default()
-    } else {
-      Vec::new()
-    };
-    Ok(Files::Plain { index, data })
-  }
-
-  /// A docketed revlog's files: the docket, and the index and data files it names (absent ones empty, which the reader
-  /// refuses when the docket says they hold bytes).
-  fn docketed(
-    &mut self,
-    radix: &[u8],
-    docket: Vec<u8>,
-    room: &mut Admission,
-  ) -> Result<Files, ImportRefused<F::Refused>> {
-    let (index_name, data_name) = {
-      let read = revlog::read_docket(&docket).map_err(|refused| revlog_refused(radix, refused))?;
-      (
-        [radix, &[ID_SEPARATOR], read.index_id, DOCKET_INDEX].concat(),
-        [radix, &[ID_SEPARATOR], read.data_id, DOCKET_DATA].concat(),
-      )
-    };
-    let index = self
-      .read_store_file(&index_name, room)?
-      .1
-      .unwrap_or_default();
-    let data = self
-      .read_store_file(&data_name, room)?
-      .1
-      .unwrap_or_default();
-    Ok(Files::Docketed {
-      docket,
-      index,
-      data,
-    })
-  }
-
-  /// Imports the changelog as one group; how many changesets it holds.
-  fn changelog(
-    &mut self,
-    index: &mut HgIndex,
-    names: &mut Names<'_>,
-  ) -> Result<u32, ImportRefused<F::Refused>> {
-    let mut room = self.room;
-    let files = self.revlog_files(CHANGELOG, false, &mut room)?;
-    let revlog = files
-      .open(&mut room)
-      .map_err(|refused| revlog_refused(CHANGELOG, refused))?;
-    let mut held = Held::default();
-    let outcome = self
-      .plan_changesets(&revlog, names, &mut held, room)
-      .and_then(|planned| append_changesets(index, self.store, &planned));
-    held.give_back(self.store, outcome)
-  }
-
-  /// Every changeset's planned row, its text kept in `held`.
-  fn plan_changesets(
-    &mut self,
-    revlog: &Revlog<'_>,
-    names: &mut Names<'_>,
-    held: &mut Held,
-    mut room: Admission,
-  ) -> Result<Vec<PlannedChangeset>, ImportRefused<F::Refused>> {
-    let mut planned = Vec::new();
-    for rev in 0..revlog.len() {
-      room.charge_items::<(PlannedChangeset, ContentId)>(1)?;
-      let changeset = self.plan_changeset(revlog, rev, names, held, room)?;
-      room.charge(to_u64(changeset.branch.len()))?;
-      planned.push(changeset);
-    }
-    Ok(planned)
-  }
-
-  /// One changeset's planned row: its text rebuilt and held to its node, its manifest, branch and closing read as 7.2
-  /// reads them, every path it names listed, its text kept.
-  fn plan_changeset(
-    &mut self,
-    revlog: &Revlog<'_>,
-    rev: u32,
-    names: &mut Names<'_>,
-    held: &mut Held,
-    mut room: Admission,
-  ) -> Result<PlannedChangeset, ImportRefused<F::Refused>> {
-    let (entry, text) = rebuild(revlog, rev, CHANGELOG, &mut room)?;
-    let read = changeset::decode(&text).map_err(|refusal| changeset_refused(rev, refusal))?;
-    let manifest = read
-      .manifest_node()
-      .map_err(|refusal| changeset_refused(rev, refusal))?;
-    let (branch, closed) =
-      branch_of(&read, &mut room).map_err(|refusal| changeset_refused(rev, refusal))?;
-    for path in read.file_names() {
-      names.name(path)?;
-    }
-    let (p1, p2) = parents(revlog, &entry, CHANGELOG)?;
-    Ok(PlannedChangeset {
-      node: entry.node,
-      p1,
-      p2,
-      flags: entry.flags,
-      len: to_u64(text.len()),
-      text: held.put(self.store, &text)?,
-      manifest,
-      closed,
-      branch,
-    })
-  }
-
-  /// Imports a manifest log or a file log as one group; how many revisions it holds.
-  fn revisions(
-    &mut self,
-    index: &mut HgIndex,
-    log: Log<'_>,
-    radix: &[u8],
-    listed: bool,
-  ) -> Result<u32, ImportRefused<F::Refused>> {
-    let mut room = self.room;
-    let files = self.revlog_files(radix, listed, &mut room)?;
-    let revlog = files
-      .open(&mut room)
-      .map_err(|refused| revlog_refused(radix, refused))?;
-    let reading = Reading { log, radix, revlog };
-    let mut held = Held::default();
-    let outcome = self
-      .plan_revisions(index, &reading, &mut held, room)
-      .and_then(|group| append_revisions(index, self.store, &reading, &group));
-    held.give_back(self.store, outcome)
-  }
-
-  /// Every revision's new row, its contents kept in `held`.
-  fn plan_revisions(
-    &mut self,
-    index: &HgIndex,
-    reading: &Reading<'_>,
-    held: &mut Held,
-    mut room: Admission,
-  ) -> Result<Vec<NewRevision>, ImportRefused<F::Refused>> {
-    let mut group = Vec::new();
-    for rev in 0..reading.revlog.len() {
-      room.charge_items::<(NewRevision, [ContentId; 2])>(1)?;
-      group.push(self.plan_revision(index, reading, rev, held, room)?);
-    }
-    Ok(group)
-  }
-
-  /// One revision's new row: its text rebuilt and held to its node, its link a changeset the index holds, a file
-  /// revision's block apart from its bytes, both kept.
-  fn plan_revision(
-    &mut self,
-    index: &HgIndex,
-    reading: &Reading<'_>,
-    rev: u32,
-    held: &mut Held,
-    mut room: Admission,
-  ) -> Result<NewRevision, ImportRefused<F::Refused>> {
-    let (entry, text) = rebuild(&reading.revlog, rev, reading.radix, &mut room)?;
-    let link = index
-      .changeset(self.store, entry.link)
-      .map(|row| row.node)
-      .ok_or_else(|| ImportRefused::Link {
-        revlog: Box::from(reading.radix),
-        rev,
-        link: entry.link,
-      })?;
-    let (p1, p2) = parents(&reading.revlog, &entry, reading.radix)?;
-    let (bytes, block) = match reading.log {
-      Log::File(_) => {
-        let split = filerev::split(&text).map_err(|refusal| ImportRefused::FileRevision {
-          revlog: Box::from(reading.radix),
-          rev,
-          refusal,
-        })?;
-        (split.bytes, split.metadata)
-      }
-      Log::Changelog | Log::Manifest => (text.as_slice(), None),
-    };
-    Ok(NewRevision {
-      node: entry.node,
-      p1,
-      p2,
-      link,
-      flags: entry.flags,
-      len: to_u64(text.len()),
-      bytes: held.put(self.store, bytes)?,
-      block: block.map(|block| held.put(self.store, block)).transpose()?,
-    })
-  }
-
-  /// Holds each changeset's manifest to the manifest log: the null node, or one it holds.
-  fn check_manifests(
-    &self,
-    index: &HgIndex,
-    changesets: u32,
-  ) -> Result<(), ImportRefused<F::Refused>> {
-    for rev in 0..changesets {
-      let row = index
-        .changeset(self.store, rev)
-        .ok_or(ImportRefused::Unindexed { rev })?;
-      if row.manifest != NULL_NODE
-        && index
-          .rev(self.store, Log::Manifest, &row.manifest)
-          .is_none()
-      {
-        return Err(ImportRefused::UnknownManifest {
-          rev,
-          node: row.manifest,
-        });
-      }
-    }
-    Ok(())
   }
 }
 
@@ -1237,34 +1580,138 @@ fn strip(text: &[u8]) -> &[u8] {
   text.get(start..end).unwrap_or_default()
 }
 
-/// One manifest or file log being read: where it goes in the index, its radix, and its revlog.
+/// One revlog being read, as a view: where it goes in the index, its radix, its outline and its bytes.
 struct Reading<'r> {
   /// Its log in the index.
   log: Log<'r>,
   /// Its radix, for refusals.
   radix: &'r [u8],
-  /// Its revlog.
-  revlog: Revlog<'r>,
+  /// What it is.
+  outline: &'r Outline,
+  /// Its bytes, whole or by ranges.
+  bytes: &'r Bytes,
 }
 
-/// Revision `rev`'s entry and text: its flags refused first where 7.2 refuses them, or where its text does not hash to
-/// its node; then its text rebuilt and held to its node by the reader, the rebuild charged to `room`.
-fn rebuild<R>(
-  revlog: &Revlog<'_>,
-  rev: u32,
-  radix: &[u8],
-  room: &mut Admission,
-) -> Result<(Entry, Vec<u8>), ImportRefused<R>> {
-  let entry = revlog
-    .entry(rev)
-    .map_err(|refused| revlog_refused(radix, refused))?;
-  refuse_flags(radix, rev, entry.flags)?;
-  let text = revlog
-    .text(rev, room)
-    .map_err(|refused| revlog_refused(radix, refused))?;
-  Ok((entry, text))
+/// A revlog's bytes as the import holds them (A-649 part 3): whole (an inline revlog, which 7.2 keeps under 128 KiB, or
+/// one too short for a header), or named for ranged reads, each file with the bytes the reader may read of it.
+enum Bytes {
+  /// The whole index file, its chunks inline.
+  Whole(Vec<u8>),
+  /// The index and data files, read by ranges: a split index and its data file, or the files a docket names.
+  Ranged {
+    /// The index file, and its bytes to read: its length, or the docket's index size.
+    index: (StorePath, u64),
+    /// The data file, and its bytes to read.
+    data: (StorePath, u64),
+  },
 }
 
+/// A revlog's bytes as the reader reads them: whole, or by ranges through the host.
+enum Reader<'r, F> {
+  /// Whole.
+  Whole(Slices<'r>),
+  /// By ranges.
+  Ranged {
+    /// The host.
+    files: &'r mut F,
+    /// The index file, and its bytes to read.
+    index: (&'r StorePath, u64),
+    /// The data file, and its bytes to read.
+    data: (&'r StorePath, u64),
+  },
+}
+
+impl<'r, F> Reader<'r, F> {
+  /// The reader of `bytes`, through `files` when they are read by ranges.
+  fn new(files: &'r mut F, bytes: &'r Bytes) -> Self {
+    match bytes {
+      Bytes::Whole(index) => Reader::Whole(Slices { index, data: index }),
+      Bytes::Ranged { index, data } => Reader::Ranged {
+        files,
+        index: (&index.0, index.1),
+        data: (&data.0, data.1),
+      },
+    }
+  }
+}
+
+/// A read's refusal: the reader's, or the host's.
+#[derive(Debug)]
+enum ReadRefused<R> {
+  /// The revlog reader refused.
+  Reader(revlog::Refused),
+  /// The host refused.
+  File(FileRefused<R>),
+}
+
+impl<R> From<revlog::Refused> for ReadRefused<R> {
+  fn from(refused: revlog::Refused) -> Self {
+    Self::Reader(refused)
+  }
+}
+
+impl<F: RepositoryFiles> Source for Reader<'_, F> {
+  type Error = ReadRefused<F::Refused>;
+
+  fn index(
+    &mut self,
+    at: u64,
+    len: usize,
+    admission: &mut Admission,
+  ) -> Result<Cow<'_, [u8]>, Self::Error> {
+    match self {
+      Self::Whole(slices) => Ok(slices.index(at, len, admission)?),
+      Self::Ranged { files, index, .. } => {
+        ranged(&mut **files, *index, at, len, admission, "an entry")
+      }
+    }
+  }
+
+  fn data(
+    &mut self,
+    at: u64,
+    len: usize,
+    admission: &mut Admission,
+  ) -> Result<Cow<'_, [u8]>, Self::Error> {
+    match self {
+      Self::Whole(slices) => Ok(slices.data(at, len, admission)?),
+      Self::Ranged { files, data, .. } => {
+        ranged(&mut **files, *data, at, len, admission, "a chunk")
+      }
+    }
+  }
+}
+
+/// `len` bytes of a file from `at`, within the bytes the reader may read of it and read whole; otherwise refused as
+/// cut short.
+fn ranged<F: RepositoryFiles>(
+  files: &mut F,
+  (path, end): (&StorePath, u64),
+  at: u64,
+  len: usize,
+  admission: &mut Admission,
+  what: &'static str,
+) -> Result<Cow<'static, [u8]>, ReadRefused<F::Refused>> {
+  let wanted = to_u64(len);
+  if at.checked_add(wanted).is_none_or(|stop| stop > end) {
+    return Err(revlog::Refused::Truncated { what }.into());
+  }
+  match files
+    .read(&path.names(), at, wanted, admission)
+    .map_err(ReadRefused::File)?
+  {
+    Some(bytes) if bytes.len() == len => Ok(Cow::Owned(bytes)),
+    _ => Err(revlog::Refused::Truncated { what }.into()),
+  }
+}
+
+/// A read's refusal in the import's terms: the reader's naming its revlog, the host's as the host gave it.
+fn read_refused<R>(radix: &[u8], refused: ReadRefused<R>) -> ImportRefused<R> {
+  match refused {
+    ReadRefused::Reader(refused) => revlog_refused(radix, refused),
+    ReadRefused::File(refused) => refused.into(),
+  }
+}
 /// Refuses a revision whose flags mark a text that does not hash to its node, or that 7.2 does not know.
 fn refuse_flags<R>(radix: &[u8], rev: u32, flags: u16) -> Result<(), ImportRefused<R>> {
   let revlog = || Box::from(radix);
@@ -1295,24 +1742,6 @@ fn refuse_flags<R>(radix: &[u8], rev: u32, flags: u16) -> Result<(), ImportRefus
   Err(refused)
 }
 
-/// A revision's parents' nodes, from its revlog's entries.
-fn parents<R>(
-  revlog: &Revlog<'_>,
-  entry: &Entry,
-  radix: &[u8],
-) -> Result<(Node, Node), ImportRefused<R>> {
-  let node = |rev: u32| -> Result<Node, ImportRefused<R>> {
-    if rev == NONE {
-      return Ok(NULL_NODE);
-    }
-    revlog
-      .entry(rev)
-      .map(|parent| parent.node)
-      .map_err(|refused| revlog_refused(radix, refused))
-  };
-  Ok((node(entry.p1)?, node(entry.p2)?))
-}
-
 /// A changeset's branch and whether it closes it, as 7.2 reads its extras: the last `branch`, else `default`; any
 /// `close`.
 pub(crate) fn branch_of(
@@ -1330,49 +1759,50 @@ pub(crate) fn branch_of(
   Ok((branch, extras.iter().any(|(key, _)| *key == CLOSE)))
 }
 
-/// Appends the changelog's group; how many changesets it holds.
-fn append_changesets<R>(
+/// Appends one changeset, which must be numbered `rev`, its revlog's own.
+fn append_changeset<R>(
   index: &mut HgIndex,
   store: &mut ContentStore,
-  planned: &[PlannedChangeset],
-) -> Result<u32, ImportRefused<R>> {
-  let group: Vec<NewChangeset<'_>> = planned
-    .iter()
-    .map(|changeset| NewChangeset {
-      node: changeset.node,
-      p1: changeset.p1,
-      p2: changeset.p2,
-      flags: changeset.flags,
-      len: changeset.len,
-      text: changeset.text,
-      manifest: changeset.manifest,
-      closed: changeset.closed,
-      branch: &changeset.branch,
-    })
-    .collect();
-  let numbers = index.append_changesets(store, &group)?;
-  settle(index, store, CHANGELOG, &numbers)
+  rev: u32,
+  changeset: &PlannedChangeset,
+) -> Result<(), ImportRefused<R>> {
+  let new = NewChangeset {
+    node: changeset.node,
+    p1: changeset.p1,
+    p2: changeset.p2,
+    flags: changeset.flags,
+    len: changeset.len,
+    text: changeset.text,
+    manifest: changeset.manifest,
+    closed: changeset.closed,
+    branch: &changeset.branch,
+  };
+  let numbers = index.append_changesets(store, &[new])?;
+  settle(index, store, CHANGELOG, rev, &numbers)
 }
 
-/// Appends a manifest or file log's group; how many revisions it holds.
-fn append_revisions<R>(
+/// Appends one manifest or file revision, which must be numbered `rev`, its revlog's own.
+fn append_revision<R>(
   index: &mut HgIndex,
   store: &mut ContentStore,
   reading: &Reading<'_>,
-  group: &[NewRevision],
-) -> Result<u32, ImportRefused<R>> {
-  let numbers = index.append_revisions(store, reading.log, group)?;
-  settle(index, store, reading.radix, &numbers)
+  rev: u32,
+  revision: &NewRevision,
+) -> Result<(), ImportRefused<R>> {
+  let numbers = index.append_revisions(store, reading.log, &[*revision])?;
+  settle(index, store, reading.radix, rev, &numbers)
 }
 
-/// Holds a group's numbers to its revlog's own, then seals the index's tail when it is due; the group's length.
+/// Holds an append's numbers to its revlog's own from `first` (the index passes over a node a log holds already, and
+/// would number what follows otherwise than 7.2), then seals the index's tail when it is due.
 fn settle<R>(
   index: &mut HgIndex,
   store: &mut ContentStore,
   radix: &[u8],
+  first: u32,
   numbers: &[u32],
-) -> Result<u32, ImportRefused<R>> {
-  if let Some((rev, _)) = (0_u32..).zip(numbers).find(|&(rev, &number)| rev != number) {
+) -> Result<(), ImportRefused<R>> {
+  if let Some((rev, _)) = (first..).zip(numbers).find(|&(rev, &number)| rev != number) {
     return Err(ImportRefused::Duplicate {
       revlog: Box::from(radix),
       rev,
@@ -1381,9 +1811,8 @@ fn settle<R>(
   if index.rows().seal_due(store) {
     index.rows().seal(store).map_err(index::Refused::from)?;
   }
-  Ok(u32::try_from(numbers.len()).unwrap_or(NONE))
+  Ok(())
 }
-
 /// A reader's refusal in the import's terms: its room's by kind, any other naming its revlog.
 fn revlog_refused<R>(radix: &[u8], refused: revlog::Refused) -> ImportRefused<R> {
   match refused {

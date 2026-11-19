@@ -17,7 +17,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::{Green, Increment, Outcome};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 use crate::origin::Origin;
 use crate::special::{SpecialKind, SpecialNode};
 use crate::verdict::MergeConflictClass;
@@ -44,10 +44,29 @@ impl Work {
     self
   }
 
-  /// Adds a namespace op on `path` naming `other` (a rename's source, a link's target).
-  pub(super) fn naming(mut self, kind: OpKind, path: &str, other: &str) -> Work {
+  /// Adds a namespace op on `path` naming `other` (a rename's source; a link's target, the node at
+  /// it at the work's base, A-646).
+  pub(super) fn naming(self, kind: OpKind, path: &str, other: &str) -> Work {
+    self.named(kind, path, (other, NodeOrigin::Base))
+  }
+
+  /// Adds a hard link at `path` to the node the work makes at `target` (A-646).
+  pub(super) fn link_made(self, path: &str, target: &str) -> Work {
+    self.named(OpKind::Link, path, (target, NodeOrigin::Made))
+  }
+
+  /// Adds a namespace op on `path` naming `other`; a link names the node at it, from `origin`.
+  fn named(mut self, kind: OpKind, path: &str, (other, origin): (&str, NodeOrigin)) -> Work {
     let other = self.doc.paths.intern(other);
-    self.op(kind, path, (0, 0, other))
+    let src = if kind == OpKind::Link {
+      self.doc.nodes.intern(NodeRef {
+        path: other,
+        origin,
+      })
+    } else {
+      other
+    };
+    self.op(kind, path, (0, 0, src))
   }
 
   /// Adds a mode change of `path`.
@@ -719,7 +738,7 @@ fn a_hard_link_to_a_target_removed_after_its_base_conflicts() -> Result<(), Stri
   let own = Work::default()
     .op(OpKind::Unlink, TARGET, (0, 0, u64::MAX))
     .create(TARGET, b"<its own>\n")
-    .naming(OpKind::Link, "linked", TARGET);
+    .link_made("linked", TARGET);
   let answer = green.submit(&own.at(0, 9));
   let linked = green.hardlink("linked");
   if !matches!(answer, Outcome::Accepted { .. }) || linked != Some(TARGET) {
@@ -961,22 +980,44 @@ struct Whole {
   bytes_changed: [u64; 5],
   removed: [u64; 5],
   targets: BTreeMap<String, String>,
+  /// Every hard link's home at each version before the head (A-670), as `kinds` holds what stands at each path.
+  targets_at: Vec<BTreeMap<String, String>>,
   others: BTreeMap<String, Kind>,
   works: u64,
 }
 
 impl Whole {
   fn new() -> Whole {
+    let targets = BTreeMap::from([(HARDLINK.to_owned(), TARGET.to_owned())]);
     Whole {
       green: green(),
       kinds: vec![ORIGINAL],
       changed: [0; 5],
       bytes_changed: [0; 5],
       removed: [0; 5],
-      targets: BTreeMap::from([(HARDLINK.to_owned(), TARGET.to_owned())]),
+      targets_at: vec![targets.clone()],
+      targets,
       others: BTreeMap::new(),
       works: 0,
     }
+  }
+
+  /// Every hard link's home at `version`.
+  fn targets_at(&self, version: u64) -> &BTreeMap<String, String> {
+    match usize::try_from(version) {
+      Ok(at) if version < self.green.head() => self.targets_at.get(at).unwrap_or(&self.targets),
+      _ => &self.targets,
+    }
+  }
+
+  /// Whether the file at `PATHS[index]` gained a link after `base` while none named it at `base` (A-670): a work based
+  /// there saw no link to it, so its removal, or a rename over it, is refused, since any write of the work's went with
+  /// the node in its own volume while the later link keeps the node.
+  fn linked_late(&self, index: usize, base: u64) -> bool {
+    let path = PATHS[index];
+    self.now(index) == Kind::File
+      && !self.links_of(path).is_empty()
+      && !self.targets_at(base).values().any(|home| home == path)
   }
 
   /// What stands at `path` now, among `PATHS` or the paths works linked.
@@ -1096,6 +1137,11 @@ impl Whole {
     if matches!(answer, Outcome::Accepted { .. }) {
       let head = self.kinds.last().copied().unwrap_or(ORIGINAL);
       self.kinds.push(head);
+      // The version this one follows is final now: its links as the callers left them.
+      if let Some(before) = self.targets_at.last_mut() {
+        before.clone_from(&self.targets);
+      }
+      self.targets_at.push(self.targets.clone());
     }
     answer
   }
@@ -1224,7 +1270,8 @@ impl Whole {
 
   /// A work based `back` behind the head removing the node at `PATHS[index]`, where one stood at
   /// that base: refused `DeleteModify` when the node standing now changed after the base in any
-  /// dimension (A-643), accepted otherwise.
+  /// dimension (A-643), or is a file that gained a link after the base, none naming it there
+  /// (A-670); accepted otherwise.
   fn remove(&mut self, index: usize, back: u8, answers: &mut Answers) -> Result<(), TestCaseError> {
     let base = self.base(back);
     let saw = self.kind(base, index);
@@ -1233,7 +1280,7 @@ impl Whole {
     }
     let path = PATHS[index];
     let stands = self.now(index) != Kind::Absent;
-    let ruled = stands && self.changed[index] > base;
+    let ruled = stands && (self.changed[index] > base || self.linked_late(index, base));
     if stands {
       answers.removal(saw == Kind::Dir, ruled);
     }
@@ -1328,7 +1375,10 @@ impl Whole {
       return Ok(());
     }
     let same_file = self.file_named(index) == self.file_named(over);
-    let expected = if same_file {
+    // A file over which the work never saw a link is refused before anything else (A-670).
+    let expected = if self.linked_late(over, base) {
+      Some(MergeConflictClass::RenameRename)
+    } else if same_file {
       None
     } else {
       self.over_answer((index, over), base)

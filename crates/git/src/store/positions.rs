@@ -33,6 +33,17 @@ impl Positions {
     Positions { runs }
   }
 
+  /// The positions from `start` up to `end`, one run, made without listing them (A-665: the view
+  /// starts from every position the repository gave); empty when `end` is not past `start`.
+  pub fn span(start: u64, end: u64) -> Positions {
+    if end <= start {
+      return Positions::new();
+    }
+    Positions {
+      runs: vec![(start, end)],
+    }
+  }
+
   /// Whether the set holds `position`.
   pub fn contains(&self, position: u64) -> bool {
     let after = self.runs.partition_point(|run| run.0 <= position);
@@ -74,6 +85,21 @@ impl Positions {
   /// The runs the set is kept as.
   pub fn runs(&self) -> usize {
     self.runs.len()
+  }
+
+  /// The runs `[start, end)`, ascending, as the set keeps them: what a derived value encodes (A-647 part 2).
+  pub(crate) fn run_pairs(&self) -> &[(u64, u64)] {
+    &self.runs
+  }
+
+  /// The set kept as `runs`, or `None` unless each is non-empty and they ascend with a gap between each two: the one
+  /// way a set is kept, so a decoded set is equal to the set encoded and to no other.
+  pub(crate) fn from_runs(runs: Vec<(u64, u64)>) -> Option<Positions> {
+    let each = runs.iter().all(|run| run.0 < run.1);
+    let apart = runs
+      .windows(2)
+      .all(|pair| matches!(pair, [left, right] if left.1 < right.0));
+    (each && apart).then_some(Positions { runs })
   }
 
   /// Every position, ascending.

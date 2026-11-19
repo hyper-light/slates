@@ -17,8 +17,10 @@ use crate::store::{
 };
 
 mod fragments;
+mod hook_view;
 mod oracle;
 mod protect;
+mod reach;
 mod upload;
 
 /// Shape: the window the tests' content store holds content in.
