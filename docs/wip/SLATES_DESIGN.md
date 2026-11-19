@@ -35717,6 +35717,13 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   `Unsupported` (its descriptors come by the socket route). Checks (Mac Studio, debug, 2026-11-18, load 18 to 20):
   `slates-ipc --lib` 64 of 64 (1 ignored) and `slates-client --lib` 8 of 8 on macOS; the Linux test
   `a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock` is main's to run.
+- **The macOS route's claim steps** (`slates_ipc::route::claim`, A-161, A-173). Each socket read and write waited the
+  caller's reply deadline at a time (`SO_RCVTIMEO`, `SO_SNDTIMEO`), then asked a liveness callback and waited again
+  while the daemon lived. Now no step has a timeout: each waits while the route's connection lives, as the daemon's
+  side waits while the client's does (A-492). A daemon that goes closes its end with its process, or with its route's
+  task when it stops inside its process, and the next read meets the close at once; a live daemon answers however
+  slow. `claim` takes no bound and no callback; the client's `claim_offer` and `claim_map` and the integration tests
+  call it so.
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
