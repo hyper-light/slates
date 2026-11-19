@@ -14,6 +14,7 @@ use std::time::Instant;
 use slates_anchor::{AnchorError, AnchorSegment, RegionKind};
 use slates_wire::Wire;
 
+use crate::catalog::StateLogRecord;
 use crate::error::DbError;
 use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps, PartitionSnapshot};
@@ -147,6 +148,16 @@ pub struct Db {
   maintenance_failures: u64,
   /// Test support (never reachable from the wire): the next publication fails as named, once.
   publication_fault: Option<PublicationFault>,
+  /// The state logs' records of the operations made durable since their owner last took them (A-636 part 2b;
+  /// [`Db::take_state_log_records`]), in the order they were applied: what the owner ships to each log's holders.
+  /// Bounded by what is applied between two takes: the owner takes them before it admits a repository's change and on
+  /// every period of its record plane, and admits no change while the records it holds are at their bound
+  /// (`slates_server::state_log`); between those, only a member green's destroy adds one, which the partition's volume
+  /// capacity bounds.
+  logged: Vec<StateLogRecord>,
+  /// The records of the open transaction's operations: handed on at its commit, dropped at its rollback, so no record of
+  /// an operation that was never durable is shipped.
+  logged_in_transaction: Vec<StateLogRecord>,
 }
 
 /// Test support: where the next publication is made to fail, once (`Db::inject_publication_fault`),
@@ -248,6 +259,8 @@ pub fn recover(
     rollbacks: 0,
     maintenance_failures: 0,
     publication_fault: None,
+    logged: Vec::new(),
+    logged_in_transaction: Vec::new(),
   };
   Ok((db, recovered))
 }
@@ -352,6 +365,20 @@ impl Db {
     self.next_seq
   }
 
+  /// The counter the `offset`-th volume id minted now takes (A-694): the next sequence or, past it, one past the highest
+  /// counter of any volume created here (`Partition::volume_counter`), plus `offset`. A verb that creates several volumes
+  /// before any is recorded (an append's new branches) mints them at offsets 0, 1, ...; each creation's apply moves the
+  /// partition's counter past its own, so no later mint repeats one, and a recovery, which applies the same records,
+  /// mints what the live database would. `None` past the counters an id may hold
+  /// (`crate::register::MAX_OBJECT_COUNTER`).
+  pub fn volume_counter_at(&self, offset: u64) -> Option<u64> {
+    self
+      .next_seq
+      .max(self.partition.volume_counter())
+      .checked_add(offset)
+      .filter(|counter| *counter <= crate::register::MAX_OBJECT_COUNTER)
+  }
+
   /// Pins a fixed cadence: the snapshots after it come every `policy.bytes_between_snapshots` of log, whatever the
   /// measured work (a model test that drives snapshots at a chosen rate; a bench that wants none).
   pub fn set_policy(&mut self, policy: SnapshotPolicy) {
@@ -432,6 +459,8 @@ impl Db {
       if let Some(pending) = self.pending.as_mut() {
         pending.push(op.clone());
       }
+      let made = self.partition.take_state_log_records();
+      self.logged_in_transaction.extend(made);
       return Ok(self.next_seq);
     }
     let seq = self.next_seq;
@@ -453,6 +482,8 @@ impl Db {
     let applied = timed(&mut work_ns, || self.partition.apply(op));
     self.charge_replay_work(work_ns);
     applied?;
+    let made = self.partition.take_state_log_records();
+    self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
@@ -468,6 +499,7 @@ impl Db {
   pub fn begin(&mut self) {
     if self.pending.is_none() {
       self.pending = Some(Vec::new());
+      self.logged_in_transaction.clear();
     }
   }
 
@@ -489,6 +521,8 @@ impl Db {
     let Some(ops) = self.pending.take() else {
       return Ok(None);
     };
+    // The transaction's state-log records go on only once it is durable (A-636 part 2b).
+    let made = std::mem::take(&mut self.logged_in_transaction);
     if ops.is_empty() {
       return Ok(None);
     }
@@ -512,6 +546,7 @@ impl Db {
         return match self.snapshot_or_fault(segment) {
           Ok(()) => {
             self.next_seq = seq.saturating_add(1);
+            self.logged.extend(made);
             Ok(Some(seq))
           }
           Err(cause) => Err(self.rollback(segment, seq, cause)),
@@ -519,6 +554,7 @@ impl Db {
       }
       Err(cause) => return Err(self.rollback(segment, seq, cause)),
     };
+    self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
@@ -612,6 +648,13 @@ impl Db {
   /// Whether a transaction is open.
   pub fn in_transaction(&self) -> bool {
     self.pending.is_some()
+  }
+
+  /// The state logs' records of every operation made durable since the last take, in the order they were applied
+  /// (A-636 part 2b), leaving none: what their owner ships to each log's holders, one record a log an operation moved.
+  /// An operation of a transaction is here only once the transaction committed; one rolled back never is.
+  pub fn take_state_log_records(&mut self) -> Vec<StateLogRecord> {
+    std::mem::take(&mut self.logged)
   }
 
   /// Publishes the partition into the alternate snapshot slot and releases the log behind it.

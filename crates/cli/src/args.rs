@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use slates_client::{GrantScope, GreenBase, Intent, NamePolicy, ReadAt, Rights, SizeClass};
+use slates_client::{
+  GrantScope, GreenBase, Intent, NamePolicy, ObjectFormat, ReadAt, RepositorySpec, Rights,
+  SizeClass, VcsTool,
+};
 
 use crate::format::{parse_size, parse_snapshot, parse_volume_id};
 
@@ -14,6 +17,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
            [--vcs-http ADDRESS]                                either role: serve git over HTTP(S) at ADDRESS; loopback
                                                                alone unless --fleet gives the node's HTTPS identity
+           [--vcs-svn ADDRESS]                                 either role: serve svn:// (cleartext) at ADDRESS; loopback
+                                                               alone unless --fleet
   profile  [--quick] [--json]                      measure and print the machine profile
   version                                          print this binary's version (`slates VERSION`)
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
@@ -66,6 +71,10 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   credential token [--principal PRINCIPAL] [--expires SECONDS] [--json]
             mint a token for git over HTTPS (Basic's password or a bearer token); shown once
   credential revoke ID [--json]                    revoke a credential by its id (a key's SHA256:... or hex)
+  repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN] [--json]
+            create a repository and its root green, a new empty one unless GREEN; FORMAT is sha1 (git's
+            default) or sha256 for git, sha1 for hg, revisions for svn; BRANCH is git's (main when not
+            given) or Mercurial's (default), none for svn; prints the repository and its root green's id
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
@@ -529,6 +538,12 @@ pub(crate) enum Verb {
     /// The credential's id.
     id: [u8; 32],
   },
+  /// Create a version-control repository (`repository create NAME --tool git|hg|svn`, §4.17.1; A-685): its record and
+  /// its root green, on the partition its name hashes to.
+  RepositoryCreate {
+    /// `CreateRepository`'s fields, each the tool's default where the command line names none.
+    spec: RepositorySpec,
+  },
   /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
   Share {
     /// The volume.
@@ -744,6 +759,7 @@ const VALUES: &[&str] = &[
   "--fleet",
   "--node",
   "--vcs-http",
+  "--vcs-svn",
   "--bounded",
   "--dynamic",
   "--base",
@@ -770,6 +786,10 @@ const VALUES: &[&str] = &[
   "--executable",
   "--principal",
   "--expires",
+  "--tool",
+  "--format",
+  "--default-branch",
+  "--root",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -1295,20 +1315,20 @@ fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
   }
 }
 
-/// `--vcs-http ADDRESS`, the version-control servers' shared HTTP edge (A-625 part 3), read as the roles read it
-/// (`slates_api::role::vcs_http_address`): an address off loopback on a daemon that is no fleet node (`fleet_node`
-/// false) would serve cleartext there, so it is refused as usage before anything starts.
-fn vcs_http_of(
+/// A version-control listener's address, `flag`'s: `--vcs-http ADDRESS`, the servers' shared HTTP edge (A-625 part 3),
+/// or `--vcs-svn ADDRESS`, the svn:// listener (A-656 part 2), read as the roles read them
+/// (`slates_api::role::vcs_address`): an address off loopback on a daemon that is no fleet node (`fleet_node` false)
+/// would serve cleartext there, so it is refused as usage before anything starts.
+fn vcs_address_of(
   taken: &Taken,
+  flag: &'static str,
   fleet_node: bool,
 ) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
   taken
-    .value("--vcs-http")
+    .value(flag)
     .map(|text| {
-      slates_api::role::vcs_http_address(text, fleet_node).map_err(|reason| ParseError::BadValue {
-        what: "--vcs-http",
-        reason,
-      })
+      slates_api::role::vcs_address(text, fleet_node)
+        .map_err(|reason| ParseError::BadValue { what: flag, reason })
     })
     .transpose()
 }
@@ -1503,6 +1523,113 @@ fn parse_credential(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
     )),
     _ => Ok(None),
   }
+}
+
+/// Format: `--tool`'s words, each tool's own command's name.
+const TOOL_NAMES: [(&str, VcsTool); 3] = [
+  ("git", VcsTool::Git),
+  ("hg", VcsTool::Mercurial),
+  ("svn", VcsTool::Subversion),
+];
+
+/// Format: `--format`'s words: git's own for its two (`git init --object-format`), and Subversion's revision numbers.
+const FORMAT_NAMES: [(&str, ObjectFormat); 3] = [
+  ("sha1", ObjectFormat::Sha1),
+  ("sha256", ObjectFormat::Sha256),
+  ("revisions", ObjectFormat::Revisions),
+];
+
+/// The version-control repository verbs (§4.17.1; A-685): `repository create`.
+fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["repository", "create", name] => repository_create(taken, name).map(Some),
+    ["repository", ..] => Err(ParseError::Missing(
+      "repository create NAME --tool git|hg|svn",
+    )),
+    _ => Ok(None),
+  }
+}
+
+/// `repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]` (A-685):
+/// `CreateRepository`'s fields, the tool's defaults where none is named, as the server crate decides them
+/// (`slates_server::object_formats`, `slates_server::root_binding`); a format or a branch the tool cannot have is a
+/// usage error before the daemon is asked.
+fn repository_create(taken: &Taken, name: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--tool", "--format", "--default-branch", "--root"],
+    switches: &[],
+  })?;
+  let tool = vcs_tool(
+    taken
+      .value("--tool")
+      .ok_or(ParseError::Missing("--tool git|hg|svn"))?,
+  )?;
+  let format = object_format(tool, taken.value("--format"))?;
+  let branch = taken.value("--default-branch");
+  let default_branch =
+    slates_server::root_binding(tool, branch).map_err(|refused| ParseError::BadValue {
+      what: "--default-branch",
+      reason: format!("{}: {refused}", branch.unwrap_or_default()),
+    })?;
+  let green = taken.value("--root").map(volume).transpose()?;
+  Ok(client(
+    taken,
+    Verb::RepositoryCreate {
+      spec: RepositorySpec {
+        name: name.to_owned(),
+        tool,
+        format,
+        default_branch,
+        green,
+      },
+    },
+  ))
+}
+
+/// `--tool`'s value ([`TOOL_NAMES`]).
+fn vcs_tool(text: &str) -> Result<VcsTool, ParseError> {
+  TOOL_NAMES
+    .iter()
+    .find(|(word, _)| *word == text)
+    .map(|(_, tool)| *tool)
+    .ok_or_else(|| ParseError::BadValue {
+      what: "--tool",
+      reason: format!("{text} (git, hg or svn)"),
+    })
+}
+
+/// `--format`'s value for `tool`: one of the formats the tool names its objects in (`slates_server::object_formats`),
+/// that list's first, the tool's own default, when none is given.
+fn object_format(tool: VcsTool, given: Option<&str>) -> Result<ObjectFormat, ParseError> {
+  let formats = slates_server::object_formats(tool);
+  let chosen = match given {
+    None => formats.first().copied(),
+    Some(text) => FORMAT_NAMES
+      .iter()
+      .find(|(word, format)| *word == text && formats.contains(format))
+      .map(|(_, format)| *format),
+  };
+  chosen.ok_or_else(|| ParseError::BadValue {
+    what: "--format",
+    reason: format!(
+      "{} ({} names its objects by {})",
+      given.unwrap_or_default(),
+      word_of(&TOOL_NAMES, tool),
+      formats
+        .iter()
+        .map(|format| word_of(&FORMAT_NAMES, *format))
+        .collect::<Vec<_>>()
+        .join(" or ")
+    ),
+  })
+}
+
+/// The word `names` gives `value`.
+fn word_of<T: PartialEq>(names: &[(&'static str, T)], value: T) -> &'static str {
+  names
+    .iter()
+    .find(|(_, named)| *named == value)
+    .map_or("", |(word, _)| *word)
 }
 
 /// The verbs of the enrollment surface (§4.13): `enroll`, `revoke`, `share`.
@@ -1762,11 +1889,14 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
   if let Some(command) = parse_enrollment(&taken, &words)? {
     return Ok(command);
   }
+  if let Some(command) = parse_repository(&taken, &words)? {
+    return Ok(command);
+  }
   match words.as_slice() {
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node", "--vcs-http"],
+        values: &["--shards", "--fleet", "--node", "--vcs-http", "--vcs-svn"],
         switches: &["--quick"],
       })?;
       let fleet = fleet_of(&taken)?;
@@ -1774,7 +1904,8 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         instance: taken.instance(),
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
-        vcs_http: vcs_http_of(&taken, fleet.is_some())?,
+        vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
+        vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
         fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
@@ -2633,6 +2764,7 @@ mod tests {
         shards: Some(2),
         fleet: None,
         vcs_http: None,
+        vcs_svn: None,
       }))
     );
     assert_eq!(
@@ -2741,6 +2873,7 @@ mod tests {
           node: "a".into(),
         }),
         vcs_http: None,
+        vcs_svn: None,
       }))
     );
     assert!(matches!(
@@ -2769,6 +2902,7 @@ mod tests {
         shards: None,
         fleet: None,
         vcs_http: Some(loopback),
+        vcs_svn: None,
       }))
     );
     let anchor = parse(&args(
@@ -2791,6 +2925,42 @@ mod tests {
         ..
       })
     ));
+  }
+
+  /// A-656 part 2 (§4.17.4 piece 7). Do: parse `daemon --vcs-svn` on a loopback address beside `--vcs-http`, a fleet
+  /// node's `anchor --vcs-svn` on an address every interface reaches, and a daemon that is no fleet node asking for the
+  /// svn:// listener off loopback. Expect: each address read, the daemon's beside its HTTP edge's; the listener off
+  /// loopback without a fleet refused as a bad `--vcs-svn` naming loopback, since ra_svn is cleartext.
+  #[test]
+  fn the_grammar_parses_the_daemons_svn_listener() {
+    let loopback =
+      |port| slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, port);
+    assert_eq!(
+      parse(&args(
+        "daemon --instance a --vcs-http 127.0.0.1:8080 --vcs-svn 127.0.0.1:3690"
+      )),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: Some(loopback(8080)),
+        vcs_svn: Some(loopback(3690)),
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --fleet /etc/slates/fleet.json --node b --vcs-svn 0.0.0.0:3690",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_svn
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 3690))),
+      "{anchor:?}"
+    );
+    let cleartext = parse(&args("daemon --vcs-svn 10.0.0.7:3690"));
+    assert!(
+      matches!(&cleartext, Err(ParseError::BadValue { what: "--vcs-svn", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
   }
 
   /// The merge service's grammar (§4.16 as a service): a green over a complete immutable base with
@@ -3073,6 +3243,136 @@ mod tests {
       Err(ParseError::Missing(
         "credential key LINE | credential token | credential revoke ID"
       ))
+    );
+  }
+
+  /// The repository a `repository create` text parses to; a test fails if it parses to anything else.
+  fn repository_spec(text: &str) -> RepositorySpec {
+    let Verb::RepositoryCreate { spec } = client_verb(text) else {
+      panic!("not a repository create: {text}");
+    };
+    spec
+  }
+
+  /// A repository's fields as a test names them.
+  fn spec(
+    name: &str,
+    (tool, format): (VcsTool, ObjectFormat),
+    default_branch: &str,
+    green: Option<slates_client::VolumeId>,
+  ) -> RepositorySpec {
+    RepositorySpec {
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: default_branch.to_owned(),
+      green,
+    }
+  }
+
+  /// A-685 (§4.17.1 "The repository and its greens"). Do: parse `repository create` for each tool with no other
+  /// flag; a git repository in SHA-256 on a named branch with a root green, and `--json`; a Mercurial repository on a
+  /// named branch; Subversion's one format named. Expect: each tool's defaults (git: SHA-1, its root bound to `main`;
+  /// Mercurial: SHA-1, bound to its `default` branch's first line, the name its push reads, `branch:default:0`;
+  /// Subversion: revision numbers, bound to `root`), the flags taken as given (Mercurial's branch by its first line).
+  #[test]
+  fn the_grammar_parses_the_repository_verb() {
+    use VcsTool::{Git, Mercurial, Subversion};
+    let id = "00000000000000000000000000000001";
+    let root = parse_volume_id(id).unwrap();
+    assert_eq!(
+      repository_spec("repository create shared --tool git"),
+      spec("shared", (Git, ObjectFormat::Sha1), "main", None)
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool hg"),
+      spec(
+        "shared",
+        (Mercurial, ObjectFormat::Sha1),
+        "branch:default:0",
+        None
+      )
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool svn"),
+      spec(
+        "shared",
+        (Subversion, ObjectFormat::Revisions),
+        "root",
+        None
+      )
+    );
+    assert_eq!(
+      repository_spec(&format!(
+        "repository create big --tool git --format sha256 --default-branch dev --root {id} --json"
+      )),
+      spec("big", (Git, ObjectFormat::Sha256), "dev", Some(root))
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool hg --default-branch stable --format sha1"),
+      spec(
+        "shared",
+        (Mercurial, ObjectFormat::Sha1),
+        "branch:stable:0",
+        None
+      )
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool svn --format revisions"),
+      spec(
+        "shared",
+        (Subversion, ObjectFormat::Revisions),
+        "root",
+        None
+      )
+    );
+  }
+
+  /// A-685. Do: parse `repository create` with no tool, with a tool slates serves no repository of, with a format
+  /// each tool cannot name its objects in, with a git branch git cannot name (its ref spelled whole, `..` inside), with
+  /// a branch for Subversion, with a root that is no id, and `repository` alone or with no name. Expect: each refused
+  /// as usage before anything is asked, naming what it refuses: the tool missing, `--tool`, `--format`,
+  /// `--default-branch`, the volume id, and the verb's own form.
+  #[test]
+  fn the_grammar_refuses_a_repository_its_tool_cannot_have() {
+    let form = "repository create NAME --tool git|hg|svn";
+    assert_eq!(
+      parse(&args("repository create shared")),
+      Err(ParseError::Missing("--tool git|hg|svn"))
+    );
+    for (text, refused) in [
+      ("repository create r --tool cvs", "--tool"),
+      (
+        "repository create r --tool git --format revisions",
+        "--format",
+      ),
+      ("repository create r --tool hg --format sha256", "--format"),
+      ("repository create r --tool svn --format sha1", "--format"),
+      ("repository create r --tool git --format md5", "--format"),
+      (
+        "repository create r --tool git --default-branch refs/heads/main",
+        "--default-branch",
+      ),
+      (
+        "repository create r --tool git --default-branch a..b",
+        "--default-branch",
+      ),
+      (
+        "repository create r --tool svn --default-branch trunk",
+        "--default-branch",
+      ),
+      ("repository create r --tool git --root nothex", "volume ID"),
+    ] {
+      assert!(
+        matches!(parse(&args(text)), Err(ParseError::BadValue { what, .. }) if what == refused),
+        "{text}: {:?}",
+        parse(&args(text))
+      );
+    }
+    assert_eq!(parse(&args("repository")), Err(ParseError::Missing(form)));
+    assert_eq!(
+      parse(&args("repository create")),
+      Err(ParseError::Missing(form))
     );
   }
 

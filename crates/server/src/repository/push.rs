@@ -344,6 +344,17 @@ fn push_holding(
       verb: "push".to_owned(),
     }));
   }
+  // A push that moves the repository's own state logs (a branch made or deleted, names, phases, markers, locks) is
+  // admitted only while the parts this shard owes their holders are within their bound, before anything is judged; one
+  // that moves greens alone waits on none of them (A-636 part 2b).
+  let moves_state = !parts.names.is_empty()
+    || !parts.state.is_empty()
+    || changes
+      .iter()
+      .any(|change| !matches!(change, BranchChange::Update { .. }));
+  if moves_state {
+    crate::state_log::admit(state).map_err(AppendRefused::Repository)?;
+  }
   let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
   let pushed = push_planned(state, &record, (steps, parts), &mut held, sealed);
@@ -364,6 +375,8 @@ fn plan(
   let mut names = BTreeSet::new();
   let mut steps = Vec::new();
   let mut refused = Vec::new();
+  // Each new branch's id is minted at its own offset, since none is recorded before the entry (A-694).
+  let mut minted = 0u64;
   for (index, change) in changes.into_iter().enumerate() {
     let planned = match change {
       BranchChange::Update { green, work } => {
@@ -374,12 +387,18 @@ fn plan(
         from,
         version,
         work,
-      } => plan_create(
-        state,
-        (record, principal),
-        (name, from, version, work),
-        &mut names,
-      ),
+      } => {
+        let planned = plan_create(
+          state,
+          (record, principal),
+          (name, from, version, work),
+          (&mut names, minted),
+        );
+        if planned.is_ok() {
+          minted = minted.saturating_add(1);
+        }
+        planned
+      }
       BranchChange::Delete { name, version } => {
         plan_delete(state, record.id, (name, version), (&mut names, &mut greens))
       }
@@ -473,13 +492,13 @@ fn requires_evidence(state: &ShardState, green: DbVolumeId) -> bool {
 }
 
 /// A create's rules: a valid name the repository does not hold and the push names once; a member to make it from, at a
-/// version it can be made at; a new id and a member name a listing holds; and evidence where the new green, which keeps
-/// its source's requirement, requires it.
+/// version it can be made at; a new id, minted at `minted`, the count of creates planned before it (A-694), and a member
+/// name a listing holds; and evidence where the new green, which keeps its source's requirement, requires it.
 fn plan_create(
   state: &mut ShardState,
   (record, principal): (&RepositoryRecord, &Principal),
   (name, from, version, work): (String, DbVolumeId, u64, Option<Increment>),
-  names: &mut BTreeSet<String>,
+  (names, minted): (&mut BTreeSet<String>, u64),
 ) -> Result<Step, ChangeRefusal> {
   let refused = ChangeRefusal::Refused;
   super::free_name(state, record.id, &name).map_err(refused)?;
@@ -490,8 +509,8 @@ fn plan_create(
     return Err(refused(Refusal::NotFound));
   }
   let version = super::branch_version(state, from, Some(version)).map_err(refused)?;
-  let id =
-    crate::verbs::fresh_volume_id(state).ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
+  let id = crate::verbs::fresh_volume_id_at(state, minted)
+    .ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
   let named = super::member_name(&record.name, &name, id).map_err(refused)?;
   let require_evidence = requires_evidence(state, from);
   if require_evidence && work.as_ref().is_some_and(|work| work.evidence.is_empty()) {
@@ -594,10 +613,21 @@ fn push_planned(
     }
     None => false,
   };
+  let moved: Vec<(DbVolumeId, u64)> = entry
+    .versions
+    .iter()
+    .map(|version| (version.green, version.version))
+    .collect();
   let applied = apply_planned(state, (&steps, verdicts), (entry, made), held);
   if applied.is_err() && store_committed {
     // The store is ahead of a log that refused the entry: made again from the log (A-662).
     crate::vcs_store::rebuild(state, record.id);
+  }
+  if applied.is_ok() {
+    // Each green the entry moved keeps its version's map of paths to git's files (A-664 part 3, `vcs_store::paths`).
+    for (green, version) in moved {
+      crate::vcs_store::paths::advance(state, green, version);
+    }
   }
   applied
 }
