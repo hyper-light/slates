@@ -937,6 +937,25 @@ fn t_a666_p3_a_line_both_parents_changed_is_the_merges_recorded_result() {
   fixture.finish();
 }
 
+/// A-666 part 3, D-27's order. Do: from `f` = a, b (version 0), one side changes `a` and adds `same`, the other changes
+/// `b` and adds `same` too, each its own; merge them both ways round (the first side as the first parent, then the
+/// second), each recording both changes and `same`. Expect: each side's change is that side's, and `same`, which both
+/// parents' diffs keep, is the first parent's in each merge: the first side's, then the second side's.
+#[test]
+fn t_a666_p3_a_line_both_parents_hold_is_the_first_parents() {
+  let mut built = Builder::new();
+  let v0 = built.edit(None, &[("f", Some("a\nb\n"))]);
+  let v1 = built.edit(Some(v0), &[("f", Some("a1\nb\nsame\n"))]);
+  let v2 = built.edit(Some(v0), &[("f", Some("a\nb2\nsame\n"))]);
+  let merged: Files = [(b"f".to_vec(), b"a1\nb2\nsame\n".to_vec())].into();
+  let forward = built.record(&[v1, v2], merged.clone(), Sources::new());
+  let backward = built.record(&[v2, v1], merged, Sources::new());
+  let mut fixture = Fixture::eager(&built);
+  assert_eq!(versions(&mut fixture, forward, "f"), [v1, v2, v1]);
+  assert_eq!(versions(&mut fixture, backward, "f"), [v1, v2, v2]);
+  fixture.finish();
+}
+
 /// A-666 part 3. Do: make `f` (three lines), add a line, rename it `g` adding another as it moves, and in a later
 /// version copy `g` as it stood after the rename to `h` (an older version, Subversion's copy-from) while `g` changes
 /// again. Expect: `g`'s lines keep the versions and the path (`f`) that introduced them, the rename's line is the
@@ -1149,6 +1168,87 @@ fn t_a666_p3_refusals_by_kind_leave_the_store_as_it_was() {
     not_tree,
     Err(BlameRefused::Paths(PathsRefused::Malformed { .. }))
   ));
+  assert_eq!(state(&fixture.store), before);
+  fixture.finish();
+}
+
+/// A tree of one file, `f`, holding `content` as a file of `class`, made by the type's own path map; held once by the
+/// caller.
+fn tree_of(fixture: &mut Fixture, class: u8, content: ContentId) -> ContentId {
+  let change: Change = [(b"f".to_vec(), Some(Entry { class, content }))].into();
+  fixture
+    .ty
+    .maps
+    .apply(&mut fixture.store, None, &change)
+    .unwrap()
+}
+
+/// A blame of `content` with `spans`, its node saying `lines` lines and its spans' bytes `extra` more than they are:
+/// the node and the spans' object, each held once by the caller.
+fn blame_of(
+  store: &mut ContentStore,
+  (content, spans): (ContentId, &[Span]),
+  (lines, extra): (u64, u64),
+) -> (ContentId, ContentId) {
+  let bytes = encode_spans(spans).unwrap();
+  let object = store.put_object(&bytes).unwrap();
+  let mut payload = b"B".to_vec();
+  payload.extend_from_slice(&lines.to_le_bytes());
+  payload.extend_from_slice(&(number(bytes.len()) + extra).to_le_bytes());
+  let node = store.put_derived(&[content, object], &payload).unwrap();
+  (node.identity, object)
+}
+
+/// A-666 part 3, forged values. Do: hand the type values none of its derivations makes, for `f` holding "x\ny\n": a
+/// tree whose `f` is a file of another class, one whose `f` names the content itself, one whose blame says its spans
+/// are a byte longer than their object; and, as the parent's value of a version changing `f`, a tree whose blame of
+/// `f` reads whole but counts one line where the content holds two. Expect: the question refuses the first three and
+/// the derivation the fourth, each `Malformed` naming the tree, the content or the blame; the store as it was.
+#[test]
+fn t_a666_p3_forged_values_are_refused_as_malformed() {
+  let mut built = Builder::new();
+  let v0 = built.edit(None, &[("f", Some("x\ny\n"))]);
+  let v1 = built.edit(Some(v0), &[("f", Some("x\ny\nz\n"))]);
+  let mut fixture = Fixture::empty(&built, Mode::Eager);
+  let before = state(&fixture.store);
+  let content = built.content(b"x\ny\n");
+  let span = |lines: u32| Span {
+    lines,
+    version: v0.to_be_bytes().to_vec(),
+    path: b"f".to_vec(),
+    origin: 0,
+  };
+  let foreign = tree_of(&mut fixture, 1, content);
+  let refused = blame(&mut fixture.store, foreign, b"f");
+  assert_eq!(refused, Err(BlameRefused::Malformed { node: foreign }));
+  let bare = tree_of(&mut fixture, 0, content);
+  let refused = blame(&mut fixture.store, bare, b"f");
+  assert_eq!(refused, Err(BlameRefused::Malformed { node: content }));
+  let long_one = [span(2)];
+  let (long, long_spans) = blame_of(&mut fixture.store, (content, long_one.as_slice()), (2, 1));
+  let long_tree = tree_of(&mut fixture, 0, long);
+  let refused = blame(&mut fixture.store, long_tree, b"f");
+  assert_eq!(refused, Err(BlameRefused::Malformed { node: long }));
+  let short_one = [span(1)];
+  let (short, short_spans) = blame_of(&mut fixture.store, (content, short_one.as_slice()), (1, 0));
+  let short_tree = tree_of(&mut fixture, 0, short);
+  let derived = fixture
+    .ty
+    .derive(&built.history, &mut fixture.store, v1, &[short_tree]);
+  assert_eq!(derived, Err(BlameRefused::Malformed { node: short }));
+  let forged = [
+    foreign,
+    bare,
+    long_tree,
+    long,
+    long_spans,
+    short_tree,
+    short,
+    short_spans,
+  ];
+  for held in forged {
+    fixture.store.release(&held).unwrap();
+  }
   assert_eq!(state(&fixture.store), before);
   fixture.finish();
 }
