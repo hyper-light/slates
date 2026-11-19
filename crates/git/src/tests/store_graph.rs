@@ -221,6 +221,7 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
     deepen: None,
     filter: None,
     include_tag: false,
+    thin: true,
   };
   let outcome = negotiate(&graph, &request, &mut Admission::new(u64::MAX)).unwrap();
   let Answer::Pack(pack) = &outcome.answer else {

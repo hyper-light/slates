@@ -54,7 +54,7 @@ pub(super) fn check_order(refs: &[NamedRef<'_>]) -> Result<(), Refusal> {
 }
 
 /// The object the ref named `name` names now, by position: its green's current head.
-fn named(graph: &StoreGraph<'_>, refs: &[NamedRef<'_>], name: &[u8]) -> Option<u64> {
+pub(super) fn named(graph: &StoreGraph<'_>, refs: &[NamedRef<'_>], name: &[u8]) -> Option<u64> {
   let at = refs.binary_search_by(|named| named.name.cmp(name)).ok()?;
   graph.head(refs.get(at)?.green)
 }
@@ -248,7 +248,7 @@ fn ref_line<'n>(graph: &StoreGraph<'_>, name: &'n [u8], node: u64, peel: bool) -
 /// object that is no tag, and for a chain of tags that comes back on itself, which a store whose names are hashes
 /// cannot hold. Floyd's check (a second walker at twice the pace meets the first inside a loop) keeps the walk finite
 /// without a list of what it passed.
-fn peeled(graph: &StoreGraph<'_>, node: u64) -> Option<ObjectId> {
+pub(super) fn peeled(graph: &StoreGraph<'_>, node: u64) -> Option<ObjectId> {
   let mut slow = node;
   let mut fast = node;
   while graph.kind(fast) == Kind::Tag {

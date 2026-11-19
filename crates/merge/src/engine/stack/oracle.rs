@@ -9,14 +9,15 @@
 //! "Position mapping"), so after each work of a stack lands the green must hold what that replica holds, and a work must
 //! land exactly where the replica's lands. A bottom the green refuses is one some work in between meets, so the replica
 //! of the bottom refuses one of those. Where every work in between lands in the replica, that is all the oracle needs,
-//! and it requires it. Where one does not, the replica is no reference, and the stack goes unchecked from that level
-//! up (counted): the verdict depends on order there. Two works inserting at two points land one after the other, and a
-//! stack's work deleting the bytes between them lands after both; in the replica the delete lands first, the two
-//! points become one, and the second insert meets the first. Neither answer is wrong for its order, and the green's
-//! order is the one it was given. Every byte a generated work adds is fresh, so no two works ever make the same
-//! change (an identical change is judged by its own tests), and no work puts two operations at one offset, the one
-//! place where the verdict's mapping does not commute (the A-659 entry, owed). The census counts stacks by depth,
-//! uppers whose operations moved and those that did not, and every refusal.
+//! and it requires it. Where one does not, each must still land alone over the stack's works below (a refusal alone is
+//! a pair the verdict judges in one order only, A-668's kind); then the replica is no reference, and the stack goes
+//! unchecked from that level up (counted): the verdict depends on order there. Two works inserting at two points land
+//! one after the other, and a stack's work deleting the bytes between them lands after both; in the replica the delete
+//! lands first, the two points become one, and the second insert meets the first. Neither answer is wrong for its
+//! order, and the green's order is the one it was given. Every byte a generated work adds is fresh, so no two works
+//! ever make the same change (an identical change is judged by its own tests). Works put an overwrite or a truncate and
+//! an insert at one offset too, the shape whose insert the verdict's walk met in one order only until A-668. The census
+//! counts stacks by depth, uppers whose operations moved and those that did not, and every refusal.
 //!
 //! **A work over a tree** is held to a model of whole files: at each file the work edits, the tree's bytes equal to the
 //! head's mean its edits apply to the head's bytes as they stand, and any other bytes are a conflict unless the work
@@ -41,12 +42,14 @@ const START_BYTES: usize = 16;
 const DEEPEST: usize = 4;
 
 /// One splice of a text: `removed` bytes at `at` replaced by `inserted`, of a pure kind (an insert, a delete or an
-/// overwrite of equal length).
+/// overwrite of equal length), then `tail` inserted at the same offset (after an overwrite, or after a truncate): the
+/// shape whose insert the verdict's walk met in one order only until A-668.
 #[derive(Clone, Debug)]
 struct Splice {
   at: usize,
   removed: usize,
   inserted: Vec<u8>,
+  tail: Vec<u8>,
 }
 
 /// One work's edits: for each file it edits (chosen among its base's files), raw splices `(offset, kind, size)`; and
@@ -105,7 +108,7 @@ fn splices(len: usize, raw: &[(u8, u8, u8)], fresh: &mut Fresh, adds: bool) -> V
     .iter()
     .map(|(at, kind, size)| {
       let at = usize::from(*at) % (len + 1);
-      (at, kind % 3, usize::from(size % 3) + 1)
+      (at, kind % 5, usize::from(size % 3) + 1)
     })
     .collect();
   wanted.sort_by_key(|(at, ..)| *at);
@@ -120,26 +123,39 @@ fn splices(len: usize, raw: &[(u8, u8, u8)], fresh: &mut Fresh, adds: bool) -> V
         at,
         removed: 0,
         inserted: fresh.run(2 * size),
+        tail: Vec::new(),
       },
       1 if at < len => Splice {
         at,
         removed: size.min(len - at),
         inserted: Vec::new(),
+        tail: Vec::new(),
       },
-      2 if at + 2 <= len => {
+      2 | 3 if at + 2 <= len => {
         let removed = (size + 1).min(len - at);
         Splice {
           at,
           removed,
           inserted: fresh.run(removed),
+          tail: if kind == 3 { fresh.run(2) } else { Vec::new() },
         }
       }
+      4 if at < len => Splice {
+        at,
+        removed: len - at,
+        inserted: Vec::new(),
+        tail: fresh.run(2 * size),
+      },
       _ => continue,
     };
     free = splice.at + splice.removed + 1;
     chosen.push(splice);
   }
-  if adds && chosen.iter().all(|splice| splice.inserted.is_empty()) {
+  if adds
+    && chosen
+      .iter()
+      .all(|splice| splice.inserted.is_empty() && splice.tail.is_empty())
+  {
     chosen.clear();
   }
   chosen
@@ -151,14 +167,15 @@ fn spliced(text: &[u8], splices: &[Splice]) -> Vec<u8> {
   for splice in splices.iter().rev() {
     out.splice(
       splice.at..splice.at + splice.removed,
-      splice.inserted.iter().copied(),
+      splice.inserted.iter().chain(&splice.tail).copied(),
     );
   }
   out
 }
 
 /// `work` with `splices` of `path` (a text `len` bytes long) added, in the deriver's canonical forms: an insert at the
-/// end an extend, a delete to the end a truncate.
+/// end an extend, a delete to the end a truncate, a tail an insert after its overwrite or truncate, as canonical order
+/// puts them.
 fn with_splices(mut work: Work, path: &str, len: usize, splices: &[Splice]) -> Work {
   for splice in splices {
     let at = splice.at as u64;
@@ -170,6 +187,9 @@ fn with_splices(mut work: Work, path: &str, len: usize, splices: &[Splice]) -> W
       (removed, true) => work.delete(path, at, removed as u64),
       _ => work.overwrite(path, at, &splice.inserted),
     };
+    if !splice.tail.is_empty() {
+      work = work.insert(path, at, &splice.tail);
+    }
   }
   work
 }
@@ -372,6 +392,11 @@ impl History {
     let (replica, between, landed) = stack.replay(replica, level)?;
     match outcome {
       Landed::Accepted { .. } if !between => {
+        prop_assert!(
+          stack.each_alone(self, level)?,
+          "the green landed level {} where a work between is refused alone over the levels below it",
+          level
+        );
         census.collapsed += 1;
         Ok(false)
       }
@@ -407,6 +432,11 @@ impl History {
         Ok(false)
       }
       Landed::Conflict { .. } if !between => {
+        prop_assert!(
+          stack.each_alone(self, level)?,
+          "the green landed below level {} where a work between is refused alone over those levels",
+          level
+        );
         census.collapsed += 1;
         Ok(false)
       }
@@ -456,6 +486,24 @@ struct Stack<'a> {
 }
 
 impl Stack<'_> {
+  /// Whether each work between lands alone over the stack's works below `level` (the bottom, for the bottom) in a
+  /// replica of the green before the stack. Where the replica refused one of them with the others there, a refusal alone
+  /// means it meets a work of the stack that the green landed, which is no order the verdict depends on but a pair it
+  /// judges in one order only; a landing alone means the works between met one another (module docs).
+  fn each_alone(&self, history: &History, level: usize) -> Result<bool, TestCaseError> {
+    for work in self.between {
+      let mut green = history.replica(self.prefix)?;
+      for below in self.works.get(..level.max(1)).unwrap_or_default() {
+        let outcome = green.submit(below);
+        prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+      }
+      if !matches!(green.submit(work), Outcome::Accepted { .. }) {
+        return Ok(false);
+      }
+    }
+    Ok(true)
+  }
+
   /// The replica of the work at `level` (module docs): the green, whether every work between landed there, and whether
   /// the work at `level` did. For the bottom: the bottom, then the works between. For an upper: the works below it, the
   /// works between, then it.
