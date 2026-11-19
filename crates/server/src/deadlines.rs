@@ -264,7 +264,8 @@ mod tests {
   /// Shape: how far ahead the tests set a deadline: a tenth of a liveness window, so the reap loop's tick, once a
   /// window, could not be what released it in time.
   const SOON_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 10;
-  /// Shape: how long a test looks for the release: half a liveness window, past the deadline and short of the tick.
+  /// Shape: how long a test looks for the release: half a liveness window, past the deadline and short of the tick, and
+  /// widened by the shard's measured descheduling ([`look_until`]).
   const RELEASED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks, short beside the deadline.
   const LOOK_PAUSE_NS: u64 = 1_000_000;
@@ -279,17 +280,27 @@ mod tests {
     }
   }
 
-  /// Looks at `daemon`'s shard with `look` until it answers true or [`RELEASED_WITHIN_NS`] passes: how long that took.
+  /// Looks at `daemon`'s shard with `look` until it answers true, or until [`RELEASED_WITHIN_NS`] has passed, widened by
+  /// the descheduling the shard measured meanwhile (`slates_rt::futures::scheduler_overrun_ns`): how long that took. A
+  /// host that kept the shard off its CPUs delays the keeper's wake by as much, which says nothing of the deadline the
+  /// keeper armed; on a quiet host the shard measures next to nothing and the bound is the half window. Without the
+  /// widening the whole suite at 32 test threads on a loaded host missed the bare half window in each of these tests,
+  /// though every release came 101 to 166 ms after its 100 ms term once the look was allowed ten seconds (A-660).
   fn look_until(
     daemon: &crate::daemon::Daemon,
     since: Instant,
     look: impl Fn(&mut ShardState) -> bool + Clone + Send + 'static,
   ) -> Option<Duration> {
     loop {
-      if crate::daemon::observe_first(daemon, look.clone()) {
+      let looked = look.clone();
+      let (held, overrun_ns) = crate::daemon::observe_first(daemon, move |state| {
+        (looked(state), slates_rt::futures::scheduler_overrun_ns())
+      });
+      if held {
         return Some(since.elapsed());
       }
-      if since.elapsed() > Duration::from_nanos(RELEASED_WITHIN_NS) {
+      let bound_ns = RELEASED_WITHIN_NS.saturating_add(overrun_ns);
+      if since.elapsed() > Duration::from_nanos(bound_ns) {
         return None;
       }
       // The harness paces its looks; the daemon under test waits on its wheel.
