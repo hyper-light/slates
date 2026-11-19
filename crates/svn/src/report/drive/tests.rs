@@ -10,7 +10,9 @@
 //! revision a path was deleted in, copy sources, pausing at any step, and generated hostile
 //! reports, whose drives must end and stay in the editor's order.
 
-use super::green::{CHANGED, FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5};
+use super::green::{
+  CHANGED, FixtureGuards, Green, guards_of, md5, normalize, repository, texts_by_md5,
+};
 use super::*;
 use crate::handshake::ClientCapabilities;
 use crate::ra_svn::Value;
@@ -433,4 +435,50 @@ proptest! {
     }
     prop_assert!(calls > 0);
   }
+}
+
+/// A-616 part 2 with A-652 (`delta_files` through Subversion's deltifier): drive `/trunk` from r5
+/// to r6, where one line of `big.txt`'s 6,000 changed; expect its delta against the r5 text's MD5,
+/// windows that copy from that text and carry far less new data than the text, and the r6 text
+/// made of them.
+#[test]
+fn a_changed_text_is_sent_as_a_delta_against_its_base() {
+  let (index, green) = repository();
+  let guards = FixtureGuards::anonymous();
+  let mut drive = Drive::new(trunk_report(5, 6, false), b"u");
+  let calls = run(&mut drive, &index, &green, &guards);
+  let at = calls
+    .iter()
+    .position(|call| matches!(call, Written::Open(NodeKind::File, path, _) if path == "big.txt"))
+    .unwrap();
+  let Some(Written::Delta(base, _, windows)) = calls[at..]
+    .iter()
+    .find(|call| matches!(call, Written::Delta(..)))
+  else {
+    panic!("big.txt sent no delta");
+  };
+  let texts = texts_by_md5(&green);
+  let source = &texts[&base.unwrap()];
+  let target = crate::svndiff::apply_all(source, windows).unwrap();
+  let copies = windows
+    .iter()
+    .flat_map(|window| &window.instructions)
+    .filter(|instruction| matches!(instruction, crate::svndiff::Instruction::Source { .. }))
+    .count();
+  let new_data: usize = windows.iter().map(|window| window.new_data.len()).sum();
+  assert!(copies > 0, "no window copied from the base");
+  assert!(
+    new_data * 100 < target.len(),
+    "{new_data} new bytes of {}",
+    target.len()
+  );
+  let closed = calls[at..].iter().find_map(|call| match call {
+    Written::CloseFile(md5) => Some(*md5),
+    _ => None,
+  });
+  assert_eq!(
+    Some(md5(&target)),
+    closed,
+    "the text made is not the one closed"
+  );
 }
