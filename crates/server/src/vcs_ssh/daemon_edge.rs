@@ -57,13 +57,17 @@ pub(crate) fn start(
   let Some(edge) = &config.vcs_ssh else {
     return Ok(None);
   };
-  let published = match segment.ssh_host_seed() {
-    Ok(seed) => seed.map(HostSeed),
-    Err(error) => {
-      return Ok(not_started(&format!(
-        "the anchor's host key is unread: {error}"
-      )));
-    }
+  // The anchor's key is read only where it can serve: a fleet node presents its own.
+  let published = match edge.identity {
+    Some(_) => None,
+    None => match segment.ssh_host_seed() {
+      Ok(seed) => seed.map(HostSeed),
+      Err(error) => {
+        return Ok(not_started(&format!(
+          "the anchor's host key is unread: {error}"
+        )));
+      }
+    },
   };
   let seed = match host_seed(edge, published, &mut SystemEntropy::new()) {
     Ok(seed) => seed,

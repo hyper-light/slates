@@ -301,7 +301,8 @@
 > the window given back as input is consumed (`cargo test -p slates-server --lib vcs_`, 92 of 92; slates-ssh 111 of
 > 111; as it landed over main 71a43cd97, `--lib vcs_ssh` 19 of 19, macOS arm64, Mac Studio). Owed: the daemon
 > starting the edge, the stores and entry points, four of five red-checks (main's runs under §8), and main's live
-> OpenSSH `git clone` over SSH (the credentials record behind the key lookup, closed by A-651 part 3).
+> OpenSSH `git clone` over SSH (the credentials record behind the key lookup, closed by A-651 part 3; the daemon's
+> start, by A-684).
 > **A-651 part 2 (2026-11-19, g294; git's upload-pack behind the SSH edge):** `vcs_ssh::git` drives A-640's entry
 > point over an SSH session, the store lent a step at a time by the HTTP edge's `StoreLender`: each request measured
 > whole, a flush ending the session 0, a refused request and the end of input inside a request ending it with git's
@@ -321,7 +322,17 @@
 > after the tests' client race its runs met was fixed on its own (4a74c118), 34 of 34 and 38 of 38, fmt clean).
 > Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
-> connection there (main's finding, its own piece).
+> connection there (main's finding, its own piece). The daemon's start: closed by A-684.
+> **A-684 (2026-11-19, g299; the daemon starts the SSH edge):** `slates anchor|daemon --vcs-ssh ADDRESS` (and
+> `StartSpec::vcs_ssh`, contract 54) starts A-651's edge on the control shard at any IPv4 address, its site proving keys
+> by the credential record and refusing each `exec` as not served until the services are wired in. Its host key: a
+> fleet node's own Ed25519 key from its plan (a node whose key is of another algorithm starts no edge, logged); else an
+> Ed25519 key the anchor makes at its start and keeps in the segment's supervision block (`SUP_SSH_HOST_SEED`) beside
+> the listener it holds (`ENV_VCS_SSH`), so a daemon restart keeps the port and the key; a lone daemon makes its own.
+> The daemon's log names the address and the key's SHA256 fingerprint before it serves. @@EVIDENCE-GAPS@@ Owed: a
+> repository another shard holds (the connection's move); the services wired into the daemon's site (A-682, A-683,
+> A-679, A-688); ECDSA and RSA host keys for fleet nodes whose identity is not Ed25519; Windows' held listener
+> (`docs/wip/platforms.md`, gap 2); main's live OpenSSH interop.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -974,7 +985,7 @@
 > meets `404` (A-680, g303: the hg site's stores and lender); the site's `401` offers Bearer alone, on which stock hg
 > 7.2 crashes (`ValueError` from urllib's digest handler, which reads the first challenge alone), so Basic's challenge
 > goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
-> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); hg's
+> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299, built); hg's
 > `serve --stdio` on the SSH edge (A-679, g304).
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
 > g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site with the served view over

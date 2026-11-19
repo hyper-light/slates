@@ -98,6 +98,16 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::racy(
           at.saturating_add(SUP_LAUNCHER_SECRET),
           LAUNCHER_SECRET_BYTES,
+        ))
+        // The SSH edge's host key (A-684): its published word, and its seed, written once by the anchor before any
+        // daemon reads it.
+        .with(WordRun::one(
+          at.saturating_add(SUP_SSH_HOST_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_SSH_HOST_SEED),
+          SSH_HOST_SEED_BYTES,
         )),
       // The content pool's owner words (A-98), each claimed by compare-and-swap.
       RegionKind::Pool => words.with(WordRun::strided(
