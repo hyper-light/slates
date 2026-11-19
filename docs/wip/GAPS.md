@@ -321,7 +321,17 @@
 > after the tests' client race its runs met was fixed on its own (4a74c118), 34 of 34 and 38 of 38, fmt clean).
 > Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
-> connection there (main's finding, its own piece).
+> connection there (main's finding, closed by A-651 part 4).
+> **A-651 part 4 (2026-11-19, g294; the SSH edge serves a repository from its owner shard):** an `exec` that names a
+> repository another shard's partition holds (`SshSite::locate`, by its name's route, D-14) moves its connection there
+> whole, as the HTTP edge moves one: the socket's handle, the session with its keys, sequence numbers and channel, the
+> client's unread bytes, the waits, the phase and the proven principal, one spawn on that shard's control channel;
+> there it takes a seat as a new connection would (a free one, the most overdue's, or a wait bounded by the seats) and
+> the `exec` is dispatched where the repository's record, policy and store live; each shard keeps its own edge state
+> (`vcs_ssh::keep_here`), only the listener's holding the host key (macOS arm64, Mac Studio: red at aa16b067,
+> `--lib -- vcs_ssh` @@RED@@; @@GREEN@@). Owed: the daemon keeping an SSH edge state on every shard as it starts the
+> edge (A-684); Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an
+> arrival waiting for a full shard's seat and of one refused past the bound; main's runs.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
