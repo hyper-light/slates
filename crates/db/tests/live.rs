@@ -265,6 +265,15 @@ struct Run {
   restarts: u64,
   /// Of those, the ones that fell between a publication's image and its entry's append.
   restarts_between: u64,
+  /// The steps taken, for a ReadSafety violation's message.
+  steps_taken: usize,
+  /// ReadSafety's first violation ([`Run::read_safety`]), reported by [`Run::settle`] after the run's other checks.
+  read_safety_broken: Option<String>,
+  /// The judgements ReadSafety made with a durable write to hold: its non-vacuity counter.
+  reads_judged: u64,
+  /// Of those, the ones where a host phase one would ask lacked a durable write (it lagged, or held a superseded owner's
+  /// chain) and every head a read could adopt held them all: the case the rule is about.
+  reads_past_a_stale_holder: u64,
 }
 
 impl Run {
@@ -334,6 +343,10 @@ impl Run {
       restart: None,
       restarts: 0,
       restarts_between: 0,
+      steps_taken: 0,
+      read_safety_broken: None,
+      reads_judged: 0,
+      reads_past_a_stale_holder: 0,
     }
   }
 
@@ -1113,6 +1126,9 @@ impl Run {
     }
   }
 
+  /// ReadSafety (A-601): not judged yet.
+  fn read_safety(&mut self) {}
+
   fn step(&mut self) {
     // An owner restart now and then (A-344), drawn only in runs that restart owners, so every other run replays as before.
     if self.restart.is_some() && self.rng.chance(RESTART_PER_MILLE) {
@@ -1332,6 +1348,79 @@ fn the_live_log_holds_the_register_invariants_under_the_nemesis() {
     );
     assert!(takeovers > 0 && installs > 0 && stale_refusals > 0 && durable > 0 && empty > 0);
   }
+}
+
+/// A-601, ReadSafety's own red check (`FencedLedger.tla`'s rule): a write durable at position 0 under the first owner
+/// (epoch 1) on one holder, and the other holder holding position 0 from a later owner (epoch 2) that wrote another
+/// value there, as a holder would if a takeover had adopted a head without the durable write. Do: judge the run's state
+/// at `f = 1`, where phase one counts both holders. Expect: a ReadSafety violation naming position 0, since phase one
+/// adopts the later owner's head, the greater. The nemesis's mutations break other checks first or alongside, so this
+/// is where the rule itself is shown to tell.
+#[test]
+fn the_read_safety_check_finds_a_read_that_adopts_a_head_without_a_durable_write() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  let later_owner = HostId(4);
+  let mut later = Shipper::new(
+    (later_owner, OBJECT, HostEpoch(2)),
+    Quorum { f: 1 },
+    &[HostId(3)],
+    None,
+    bounds_of(8, 16, 8),
+  );
+  let other = later.append(9_u64.to_le_bytes().to_vec()).unwrap();
+  hold(
+    &mut run,
+    HostId(3),
+    Replica::new(later_owner, OBJECT),
+    &other,
+  );
+  run.read_safety();
+  let broken = run.read_safety_broken.unwrap_or_default();
+  assert!(
+    broken.contains("ReadSafety") && broken.contains("lacks durable position 0"),
+    "the read adopting host 3's epoch-2 head is named: {broken:?}"
+  );
+}
+
+/// A-601, the rule's other side: a holder that lacks the durable write (here it holds no copy at all) is no violation
+/// while every read phase one could make adopts a head that holds it. Do: hold position 0's durable value on one of the
+/// `f = 1` run's two holders, the other holding nothing, and judge. Expect: no violation, and the judgement counted as
+/// one past a holder without the durable write, since a holder with no copy reports nothing and never ranks above one
+/// that holds the write.
+#[test]
+fn a_read_past_a_holder_without_a_durable_write_adopts_the_head_that_holds_it() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  run.read_safety();
+  assert_eq!(
+    (
+      run.read_safety_broken,
+      run.reads_judged,
+      run.reads_past_a_stale_holder
+    ),
+    (None, 1, 1)
+  );
+}
+
+/// Hands `host` the copy `replica` with `entry` accepted and its value applied, as a holder's delivery does.
+fn hold(run: &mut Run, host: HostId, mut replica: Replica, entry: &Entry) {
+  replica.accept(entry).unwrap();
+  let holder = run.holders.get_mut(&host).unwrap();
+  holder.state.push(u64::from_le_bytes(
+    entry.payload.as_slice().try_into().unwrap(),
+  ));
+  holder.replica = Some(replica);
 }
 
 /// A-200 phase one, the rule for a candidate that holds no copy (2026-11-05): its empty report counts toward `f + 1`
