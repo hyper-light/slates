@@ -301,15 +301,17 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
 - Every claim carries a number, a date, and a command or a citation. "From memory" is flagged as such and listed for verification.
 - Plain English in every document and comment; no jargon that a careful engineer new to the project cannot act on.
 
-## 8. Every agent: implement, run its unit tests, merge, and end (Ada, 2026-11-18, binding on every agent and subagent, forever; "the LAST time I'm going to remind you")
+## 8. Every agent: implement, run its focused unit and integration tests, merge, and end (Ada, 2026-11-18, binding on every agent and subagent, forever; "the LAST time I'm going to remind you")
 
 An agent does exactly four things, then stops:
 
-1. **Implement** one piece: the change, its unit tests (a bug's failing unit test first), and the design, GAPS and docs
-   lines it makes true, in one commit in the style above.
-2. **Run its unit tests:** `cargo test -p <crate> --lib <filter>` for what it changed, plus `cargo fmt`. That is the only
-   compiling an agent does. Nothing heavier, ever: no clippy (one crate or many), no `xtask`, no cross-target or other
-   platforms' checks (`cargo xwin check`, `--target ...`), no doc builds, no integration suites, fleet, e2e, chaos or live
+1. **Implement** one piece: the change, its tests (a bug's failing test first), and the design, GAPS and docs lines it
+   makes true, in one commit in the style above.
+2. **Run its focused unit and integration tests:** `cargo test -p <crate> --lib <filter>` and
+   `cargo test -p <crate> --test <target> <filter>` for what it changed, plus `cargo fmt` (Ada, 2026-11-19, stated
+   repeatedly: "implement, run their focused unit + integration tests, then land"). That is the only compiling an agent
+   does. Nothing heavier, ever: no clippy (one crate or many), no `xtask`, no cross-target or other platforms' checks
+   (`cargo xwin check`, `--target ...`), no doc builds, no whole integration suites, fleet, e2e, chaos or live
    flows, conformance suites, diag CI branches, A/B or benchmark rounds, repeated runs, seed replays, TLC, kernel-scale or
    load runs, and no waiting on CI or a queued machine. Main builds: clippy, the lint matrix, `xtask`, cross-target and
    Windows builds, docs, suites and CI, and sends a finding back as a new piece. (Ada, 2026-11-18, again: "Why are ANY of

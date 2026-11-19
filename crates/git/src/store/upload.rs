@@ -10,16 +10,19 @@
 //!    the run's head whenever the run brought it, since it is the want, which git sends whatever the filter. A run is
 //!    exact because each of its versions fast-forwarded the one before, which the negotiation checked: D(M+1) to D(N)
 //!    is then what N reaches and M does not (§4.17.2 item 3).
-//! 2. **The cover**: the objects still to send that whole kept parts hold. The greens a head of whose versions is still
-//!    wanted are taken largest base pack first; for each, its base pack's two parts (commits, trees and tags; then blobs), then
-//!    the fragments of each version after the base (of every version, without one), each part taken when every object
-//!    it holds is still to send. So a clone is the base pack and then the fragments after it (§4.17.2: "A clone is the
-//!    base pack and then the fragments after version C"), with no clone path of its own; a version a rewrite later
-//!    left behind is not taken, since its objects are no longer all wanted; and a filter that sends no blobs takes the
-//!    parts without blobs whole: the "fragment classes" of §4.17.2.
-//! 3. **The rest**, which no part covered (a version not yet encoded, a part some of whose objects are not wanted),
-//!    encoded in position order by the fragments' encoder: a delta against an earlier one of its kind within the
-//!    learned window and depth, at the learned level, the rules copied from the repository when the stream begins.
+//! 2. **The cover**: the objects still to send that kept parts hold. The greens a head of whose versions is still
+//!    wanted are taken largest base pack first; for each, its base pack's two parts (commits, trees and tags; then
+//!    blobs), then the fragments of each version after the base (of every version, without one), each part sending
+//!    the objects of it still wanted: copied whole when they are all of it, read entry by entry otherwise (A-653), its
+//!    wanted entries alone judged. So a clone is the base pack and then the fragments after it (§4.17.2: "A clone is
+//!    the base pack and then the fragments after version C"), with no clone path of its own; a filter that sends no
+//!    blobs takes the parts without blobs whole, the "fragment classes" of §4.17.2, and a `blob:limit` clone takes the
+//!    small blobs from the parts of blobs entry by entry, as kept, deltas and all. Then each object still wanted is
+//!    offered the parts of the version its row says brought it, once each: a partial clone's later fetch of blobs by
+//!    their ids wants no head, and its blobs are found so.
+//! 3. **The rest**, which no part covered (a version not yet encoded), encoded in position order by the fragments'
+//!    encoder: a delta against an earlier one of its kind within the learned window and depth, at the learned level,
+//!    the rules copied from the repository when the stream begins.
 //!
 //! The header counts the wanted objects; every one is sent exactly once, since each stage sends only what is still
 //! wanted and takes it out; the trailer is the checksum of every byte before it, made as the bytes pass, and the count
@@ -46,7 +49,10 @@
 //! owner's clock after each: a window of a kept part copied; a window of an object deflated (an object sent whole,
 //! or one past a window, is deflated a window a unit); one object at most a window long encoded, its delta trials
 //! within the learned window; a window's worth of the answer's handles read; one object of a run judged by its row;
-//! one entry of a part judged. So no unit outgrows a window and the learned window's trials, and nothing is held
+//! a window's worth of a part's wanted positions marked among its entries, each found by halving the part's entries
+//! in position order, so a part's reading costs what it sends and never the whole part; one wanted entry of a part
+//! judged; one object still wanted offered its version's parts. So no unit outgrows a window and the learned window's
+//! trials, and nothing is held
 //! whole: between turns the stream holds no borrow of the store or the repository, names what it reads by green,
 //! version, class and content, and holds the wanted and sent sets as runs of positions (§4.17.2 item 3).
 //!
@@ -54,6 +60,7 @@
 //! ([`StoreRefused::BaseRebuilt`]), never a pack of two base packs' entries; the owner makes base packs between
 //! streams. A part copied whole names its content, which holds the bytes it was made with.
 
+use std::collections::BTreeSet;
 use std::mem::size_of;
 
 use flate2::{Compress, Compression};
@@ -132,6 +139,8 @@ pub struct UploadCounters {
   pub parts_copied: u64,
   /// Kept parts read entry by entry.
   pub parts_by_entry: u64,
+  /// Entries of parts read entry by entry that were judged: the wanted ones alone.
+  pub entries_judged: u64,
   /// Entries copied with the header they were kept with.
   pub entries_copied: u64,
   /// Entries copied with a header written again: an offset delta's distance in this pack, or its base named by id.
@@ -165,6 +174,12 @@ enum Stage {
     greens: Vec<u64>,
     at: usize,
     part: Part,
+  },
+  /// Offering each object still wanted, from position `from` on, the parts of the version its row says brought it;
+  /// `offered` the parts offered so far.
+  Holders {
+    from: u64,
+    offered: BTreeSet<(u64, u64, bool)>,
   },
   /// Encoding what no part covered, from position `from` on.
   Loose { from: u64 },
@@ -209,10 +224,34 @@ struct ByEntry {
   keep: Positions,
   /// Whether it is a run's part, whose bases outside the pack a thin client holds; the cover's parts' never are.
   run: bool,
-  /// The entry to judge next.
+  /// Which of its entries to send.
+  chosen: Chosen,
+  /// The entry to look from next.
   next: usize,
-  /// Where each of its entries sent begins in the pack, by the entry's index.
-  moved: Vec<Option<u64>>,
+  /// Where each of its entries sent begins in the pack, by the entry's index, ascending.
+  moved: Vec<(usize, u64)>,
+}
+
+/// Which of a part's entries a reading sends (module docs, **Slices**).
+enum Chosen {
+  /// Every one: the whole part is wanted.
+  Every,
+  /// Those marked, a bit an entry by its index, marked from the wanted positions first, from `marking` on, a window's
+  /// worth of handles a unit; `marking` is `None` once every one is marked.
+  Marked {
+    bits: Vec<u64>,
+    marking: Option<u64>,
+  },
+}
+
+impl Chosen {
+  /// The first entry at `from` or after it, of `entries`, the reading sends.
+  fn next_at(&self, from: usize, entries: usize) -> Option<usize> {
+    match self {
+      Chosen::Every => (from < entries).then_some(from),
+      Chosen::Marked { bits, .. } => next_bit(bits, from).filter(|index| *index < entries),
+    }
+  }
 }
 
 /// An object being deflated whole, a window a unit.
@@ -383,6 +422,7 @@ impl<A: Answered> Upload<A> {
       } => self.send_run(cx, (run, version, blobs)),
       Stage::CoverFrom => Ok(self.cover_from(cx)),
       Stage::Cover { greens, at, part } => self.cover(cx, greens, at, part),
+      Stage::Holders { from, offered } => self.holders(cx, from, offered),
       Stage::Loose { from } => self.loose(cx, from, out),
       Stage::Trailer => self.trailer(out),
       Stage::Done => Ok(Stage::Done),
@@ -392,12 +432,7 @@ impl<A: Answered> Upload<A> {
 
   /// Reads a window's worth of the answer's objects into the wanted set, a handle `size_of::<u64>()` bytes.
   fn read_objects(&mut self, cx: &Context<'_>, next: usize) -> Result<Stage, StoreRefused> {
-    let handles = cx
-      .store
-      .window()
-      .checked_div(size_of::<u64>())
-      .unwrap_or(0)
-      .max(1);
+    let handles = handles(cx.store);
     let objects = self.answer.objects();
     let end = next.saturating_add(handles).min(objects.len());
     for position in objects.get(next..end).unwrap_or_default() {
@@ -552,12 +587,22 @@ impl<A: Answered> Upload<A> {
       return;
     }
     self.counters.parts_by_entry = self.counters.parts_by_entry.saturating_add(1);
+    let chosen = if whole {
+      Chosen::Every
+    } else {
+      let words = kept.placed.len().div_ceil(word_bits());
+      Chosen::Marked {
+        bits: vec![0; words],
+        marking: Some(0),
+      }
+    };
     self.by_entry = Some(ByEntry {
       source,
       keep,
       run,
+      chosen,
       next: 0,
-      moved: vec![None; kept.placed.len()],
+      moved: Vec::new(),
     });
   }
 
@@ -580,18 +625,25 @@ impl<A: Answered> Upload<A> {
     out: &mut impl Out,
   ) -> Result<Option<ByEntry>, StoreRefused> {
     let kept = part_of(cx.repository, by_entry.source)?;
-    let index = by_entry.next;
+    if let Chosen::Marked { bits, marking } = &mut by_entry.chosen
+      && let Some(from) = *marking
+    {
+      *marking = mark(kept, &by_entry.keep, bits, from, handles(cx.store));
+      return Ok(Some(by_entry));
+    }
+    let Some(index) = by_entry.chosen.next_at(by_entry.next, kept.placed.len()) else {
+      return Ok(None);
+    };
     let Some(entry) = kept.placed.get(index).copied() else {
       return Ok(None);
     };
     by_entry.next = index.saturating_add(1);
-    if by_entry.keep.contains(entry.position) {
-      let end = kept
-        .placed
-        .get(index.saturating_add(1))
-        .map_or(kept.len, |after| after.offset);
-      self.send_entry(cx, kept, &mut by_entry, (index, entry, end), out)?;
-    }
+    self.counters.entries_judged = self.counters.entries_judged.saturating_add(1);
+    let end = kept
+      .placed
+      .get(index.saturating_add(1))
+      .map_or(kept.len, |after| after.offset);
+    self.send_entry(cx, kept, &mut by_entry, (index, entry, end), out)?;
     Ok(Some(by_entry))
   }
 
@@ -605,9 +657,7 @@ impl<A: Answered> Upload<A> {
     out: &mut impl Out,
   ) -> Result<(), StoreRefused> {
     let (header, kept_header) = read_header(cx.store, kept, entry.offset, self.format)?;
-    if let Some(slot) = by_entry.moved.get_mut(index) {
-      *slot = Some(self.at);
-    }
+    by_entry.moved.push((index, self.at));
     self.entries = self.entries.saturating_add(1);
     let Some(representation) = self.readable(cx, kept, by_entry, &entry, header.representation)?
     else {
@@ -668,7 +718,13 @@ impl<A: Answered> Upload<A> {
       .binary_search_by_key(&offset, |placed| placed.offset)
       .ok()?;
     let base = kept.placed.get(index)?;
-    match by_entry.moved.get(index).copied().flatten() {
+    let moved = by_entry
+      .moved
+      .binary_search_by_key(&index, |(sent, _)| *sent)
+      .ok()
+      .and_then(|at| by_entry.moved.get(at))
+      .map(|(_, at)| *at);
+    match moved {
       Some(moved) if self.answer.ofs_delta() => Some(Representation::OfsDelta { base: moved }),
       Some(_) => Some(Representation::RefDelta { base: base.id }),
       None if self.sent.contains(base.position) && !by_entry.keep.contains(base.position) => {
@@ -837,12 +893,12 @@ impl<A: Answered> Upload<A> {
     part: Part,
   ) -> Result<Stage, StoreRefused> {
     let Some(green) = greens.get(at).copied() else {
-      return Ok(Stage::Loose { from: 0 });
+      return Ok(Stage::Holders {
+        from: 0,
+        offered: BTreeSet::new(),
+      });
     };
-    if let Some((source, kept)) = offered(cx.repository, green, part)
-      && !kept.positions.is_empty()
-      && kept.positions.is_subset(&self.wanted)
-    {
+    if let Some((source, kept)) = offered(cx.repository, green, part) {
       self.take_part(source, kept, false);
     }
     Ok(match after(cx.repository, green, part) {
@@ -852,6 +908,36 @@ impl<A: Answered> Upload<A> {
         at: at.saturating_add(1),
         part: Part::Base { blobs: false },
       },
+    })
+  }
+
+  /// One object still wanted (module docs, **What it sends** 2): the parts of the version its row says brought it
+  /// offered, once each.
+  fn holders(
+    &mut self,
+    cx: &Context<'_>,
+    from: u64,
+    mut offered: BTreeSet<(u64, u64, bool)>,
+  ) -> Result<Stage, StoreRefused> {
+    let Some(position) = self.wanted.next_from(from) else {
+      return Ok(Stage::Loose { from: 0 });
+    };
+    let (_, row, _) = cx.repository.stored_at(cx.store, position)?;
+    let blobs = row.kind == Kind::Blob;
+    if offered.insert((row.green, row.version, blobs))
+      && let Ok(version) = usize::try_from(row.version)
+      && let Some(kept) = cx.repository.fragment_part(row.green, version, blobs)
+    {
+      let source = Source::Fragment {
+        green: row.green,
+        version,
+        blobs,
+      };
+      self.take_part(source, kept, false);
+    }
+    Ok(Stage::Holders {
+      from: position.saturating_add(1),
+      offered,
     })
   }
 
@@ -996,6 +1082,80 @@ fn base_len(repository: &Repository, green: u64) -> u64 {
     .fold(0_u64, |total, (_, kept)| {
       total.saturating_add(kept.positions.len())
     })
+}
+
+/// The entries one word of a reading's marks holds: its bits.
+fn word_bits() -> usize {
+  usize::try_from(u64::BITS).unwrap_or(1)
+}
+
+/// The first bit set in `bits` at `from` or after it.
+fn next_bit(bits: &[u64], from: usize) -> Option<usize> {
+  let size = word_bits();
+  let mut word = from.checked_div(size)?;
+  let skipped = u32::try_from(from.checked_rem(size)?).ok()?;
+  let mut mask = u64::MAX.checked_shl(skipped).unwrap_or(0);
+  loop {
+    let set = bits.get(word)? & mask;
+    if set != 0 {
+      let bit = usize::try_from(set.trailing_zeros()).ok()?;
+      return word.checked_mul(size)?.checked_add(bit);
+    }
+    word = word.checked_add(1)?;
+    mask = u64::MAX;
+  }
+}
+
+/// Marks `index`'s bit in `bits`.
+fn set_bit(bits: &mut [u64], index: usize) {
+  let size = word_bits();
+  let (Some(word), Some(bit)) = (index.checked_div(size), index.checked_rem(size)) else {
+    return;
+  };
+  let one = u32::try_from(bit)
+    .ok()
+    .and_then(|bit| 1_u64.checked_shl(bit));
+  if let (Some(slot), Some(one)) = (bits.get_mut(word), one) {
+    *slot |= one;
+  }
+}
+
+/// The index of `kept`'s entry whose object is at `position`, found by halving its entries in position order.
+fn entry_of(kept: &Kept, position: u64) -> Option<usize> {
+  let position_of = |index: &u32| {
+    usize::try_from(*index)
+      .ok()
+      .and_then(|index| kept.placed.get(index))
+      .map_or(u64::MAX, |entry| entry.position)
+  };
+  let at = kept
+    .order
+    .binary_search_by_key(&position, position_of)
+    .ok()?;
+  usize::try_from(*kept.order.get(at)?).ok()
+}
+
+/// Marks, among `kept`'s entries, those of `handles` of `keep`'s positions from `from` on: the position to go on from,
+/// or `None` once every one is marked.
+fn mark(kept: &Kept, keep: &Positions, bits: &mut [u64], from: u64, handles: usize) -> Option<u64> {
+  let mut at = from;
+  for _ in 0..handles {
+    let position = keep.next_from(at)?;
+    if let Some(index) = entry_of(kept, position) {
+      set_bit(bits, index);
+    }
+    at = position.checked_add(1)?;
+  }
+  Some(at)
+}
+
+/// The handles a window holds, `size_of::<u64>()` bytes each: what one unit reads of a list of positions.
+fn handles(store: &ContentStore) -> usize {
+  store
+    .window()
+    .checked_div(size_of::<u64>())
+    .unwrap_or(0)
+    .max(1)
 }
 
 /// The kept part `source` names: refused where a base pack was made again since, or a version's fragment is gone.
