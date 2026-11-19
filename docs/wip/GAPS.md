@@ -757,36 +757,44 @@
 > on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
 > nothing); red first (2 failed), then 278 of 278 on Windows x86_64 (jupiter) against three stores imported a unit a
 > turn equal to one call; the macOS run owed.
-> **Built (A-650 part 1):** HTTP version 1 (`serve::http`): the last
-> `cmd` as hgweb reads it (A-569's codec, which read the first, corrected), the session's dispatch over the HTTP
-> transport (its capabilities; 7.2's `bundle2required` words), the answer in `0.1`, `hg-error`, or `0.2` in an engine
-> the client reads (`0.1` in zlib otherwise), the caller choosing the engine and level, each answer charged at its
-> engine's bound; `getbundle` judging bundle capabilities before what is missing, in 7.2's order (a bundle1 client was
-> sent a bundle2 abort for a head the view lacked); the daemon's site (`vcs_http::hg`): hgweb's route, git's
-> credentials, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the shard lacks
-> (until A-662, after which that path goes), the media type named as the reply begins. `slates-hg --lib` 293 of 293, the
-> 13 captured exchanges among them, and `slates-server --lib vcs_http` 36 of 36 on macOS arm64 (Mac Studio, kiln r33 and
-> r48, 2026-11-19); the other platforms owed. Open, each its own piece with its failing test first (main's to start):
-> the zlib bound an answer is charged before it is compressed is stock zlib's `compressBound`, which the linked
-> zlib-rs's level 1 outgrows on bytes that do not compress (65,536 of the bytes its fixed codes write in nine bits came
-> to 73,721 against 65,569; Windows x86_64, jupiter, kiln r92, 2026-11-19), so a compressor choosing zlib above level 0
-> could hold an answer up to about an eighth of its stream past its charge (the site's first value takes zlib at level
-> 0, stored, within it); and a query's fields past the request's room are `400` where a path past it is `414`. Owed, in
-> order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294);
-> the stores the HTTP site and that loop read (A-662, g258); the learned response compression (§4.17.3's estimator: the
-> connection's delivery rate and the repository's compression speed and ratio; until it lands the first value, the
-> fastest form the client reads); `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session,
-> held deltas in place of full texts, the answers sliced within the shard's step budget, and the index's kept heads in
-> place of the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they
-> move (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part
-> 2's refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens
-> the checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
-> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
-> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
-> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
-> it whole); (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9)
-> the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog;
-> (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
+> **Built (A-657 = A-641 part 3):** a push landed on each green's own log: its new heads
+> placed on lines by a maximum matching (only a made or retired line touches the names log), its bookmarks applied as
+> 7.2 applies them and its pushkeys compared and swapped, its phase roots moved in the same entry as 7.2's
+> `advanceboundary`, its race checks handed to A-635's append as positions, a refusal for anything moved answered as
+> 7.2's race; the names `branch:<label>:<number>` and `bookmark:<label>:`, prefix-free; what the repository holds read
+> from its index, and its revisions kept in a fork of the index; held to stock 7.2's pushes on the fixtures' repository
+> rebuilt from its texts (every node 7.2's; replies byte for byte): slates-hg's push tests 36 of 36 and the server's 7
+> of 7 on macOS arm64 (Mac Studio, kiln r47, 2026-11-19); the other platforms owed to main.
+> **Built (A-650 part 1):** HTTP version 1 (`serve::http`): the last `cmd` as hgweb reads it (A-569's codec, which read
+> the first, corrected), the session's dispatch over the HTTP transport (its capabilities; 7.2's `bundle2required`
+> words), the answer in `0.1`, `hg-error`, or `0.2` in an engine the client reads (`0.1` in zlib otherwise), the caller
+> choosing the engine and level, each answer charged at its engine's bound; `getbundle` judging bundle capabilities
+> before what is missing, in 7.2's order (a bundle1 client was sent a bundle2 abort for a head the view lacked); the
+> daemon's site (`vcs_http::hg`): hgweb's route, git's credentials, the policy in hgweb's order, `503` for hgweb's pages
+> and for a repository whose store the shard lacks (until A-662, after which that path goes), the media type named as
+> the reply begins. `slates-hg --lib` 293 of 293, the 13 captured exchanges among them, and
+> `slates-server --lib vcs_http` 36 of 36 on macOS arm64 (Mac Studio, kiln r33 and r48, 2026-11-19); the other platforms
+> owed. Open, each its own piece with its failing test first (main's to start): the zlib bound an answer is charged
+> before it is compressed is stock zlib's `compressBound`, which the linked zlib-rs's level 1 outgrows on bytes that do
+> not compress (65,536 of the bytes its fixed codes write in nine bits came to 73,721 against 65,569; Windows x86_64,
+> jupiter, kiln r92, 2026-11-19), so a compressor choosing zlib above level 0 could hold an answer up to about an eighth
+> of its stream past its charge (the site's first value takes zlib at level 0, stored, within it); and a query's fields
+> past the request's room are `400` where a path past it is `414`.
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
+> g294); the stores the HTTP site and that loop read (A-662, g258); the learned response compression (§4.17.3's
+> estimator: the connection's delivery rate and the repository's compression speed and ratio; until it lands the first
+> value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process around
+> `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's step
+> budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes: the policy
+> (`vcs_policy::admit`) and the hooks at `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for
+> each Mercurial repository's index and content store and the served view over them (with A-650's site), which the
+> landing takes as a seam until then; part 2's refusals in Mercurial's own words (slates' words name them now); the
+> pushkey compatibility hooks; a compressed bundle inflated in slices within the shard's step budget (A-598's inflater
+> runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds it whole);
+> a stricter-than-7.2 `check:phases` (one position for every phase) measured under concurrent pushes before it is kept;
+> (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
+> view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
+> largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
 > differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
 > `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
 > is claimed until main measures it.
