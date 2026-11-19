@@ -39,6 +39,32 @@ fn read_to_end(
   answer
 }
 
+/// What the store's walks have met: objects walked, and objects met already reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Walks {
+  walked: u64,
+  reached_met: u64,
+}
+
+impl Walks {
+  /// What was walked after `earlier`.
+  fn since(self, earlier: Walks) -> Walks {
+    Walks {
+      walked: self.walked - earlier.walked,
+      reached_met: self.reached_met - earlier.reached_met,
+    }
+  }
+}
+
+/// The store's walk counters now.
+fn walks(repository: &Repository) -> Walks {
+  let counters = repository.counters();
+  Walks {
+    walked: counters.walked,
+    reached_met: counters.reached_met,
+  }
+}
+
 /// The versions each green has.
 fn versions(repository: &Repository) -> Vec<usize> {
   (0..GREENS)
@@ -109,8 +135,9 @@ proptest! {
   /// both object formats); after each step keep the moved green's newest value from the store's own sets, and read every
   /// version's value through the type. Expect: every derived value is the store's D(k), and at the newest version its
   /// reached set, and is the value the store kept, identity for identity; each step derives exactly the versions it made
-  /// (the non-vacuity counter: every earlier value is reused, never derived again); a fill from nothing reaches the same
-  /// newest values; and once all is released the store is empty.
+  /// (the non-vacuity counter: every earlier value is reused, never derived again), and a version's derivation walks
+  /// exactly what its admission walked, so it stops where the admission stopped (at its parent's set, and at the set it
+  /// was remade from); a fill from nothing reaches the same newest values; and once all is released the store is empty.
   #[test]
   fn t_a647_every_versions_d_k_is_its_derived_value(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..24)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
@@ -120,12 +147,17 @@ proptest! {
     let (mut kept, mut derived) = (Derivations::new(), Derivations::new());
     for op in &ops {
       let before = versions(&real.repository);
+      let admitting = walks(&real.repository);
       apply(&mut real, &mut model, op);
+      let admitted = walks(&real.repository).since(admitting);
       keep_new(&mut real, &mut kept, &ty, &before);
-      let counted = derived.counters().derived;
+      let (counted, deriving) = (derived.counters().derived, walks(&real.repository));
       check(&mut real, &mut derived, &kept, &mut ty);
       let made: usize = versions(&real.repository).iter().sum::<usize>() - before.iter().sum::<usize>();
       prop_assert_eq!(derived.counters().derived - counted, made as u64);
+      if made == 1 {
+        prop_assert_eq!(walks(&real.repository).since(deriving), admitted);
+      }
     }
     check_from_nothing(&mut real, &derived, &mut ty);
     let Real { mut store, repository, .. } = real;
