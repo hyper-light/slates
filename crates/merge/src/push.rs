@@ -8,17 +8,18 @@
 //!
 //! **What changed is read from identities.** Two trees are compared entry by entry by the ids the tool named them by
 //! (git's tree, blob and commit ids, which the store checked against their bytes on arrival, §4.17.1 objects item 5).
-//! An entry whose id is the base's is unchanged, and a subtree whose id is the base's is never read, so a push costs the
-//! directories on the paths it changed, never the tree (the walk `git diff-tree` makes). No byte is compared and no edit
-//! position is guessed: a file whose id changed is replaced whole, which the deriver composes into one `Delete` of the
-//! base length and one `Insert` of the new bytes (§4.16 "Declared operations"), so D-27's never-diff clause holds. What
-//! the walk read is counted ([`Reads`]): the trees it read, the blobs whose bytes it took, and the subtrees it skipped.
+//! An entry whose id is the base's is unchanged, and a subtree whose id is the base's is never read, so a push costs
+//! the directories on the paths it changed, never the tree (the walk `git diff-tree` makes). No byte is compared and no
+//! edit position is guessed: a file whose id changed is replaced whole, which the deriver composes into one `Delete` of
+//! the base length and one `Insert` of the new bytes (§4.16 "Declared operations"), so D-27's never-diff clause holds.
+//! What the walk read is counted ([`Reads`]): the trees it read, the blobs whose bytes it took, and the subtrees it
+//! skipped.
 //!
 //! **The operations.** A file the push adds is `Create` and its bytes; a file it changes, its bytes replaced whole; a
-//! file it removes, `Unlink`. A directory it adds is `Mkdir` before what it holds; one it removes, `Rmdir` after what it
-//! held is removed. An executable file is `SetMode` 0755, and a file that stops being executable `SetMode` 0644 (a file a
-//! green records no mode for checks out 0644, the server's `DEFAULT_FILE_MODE`). A symbolic link is `Symlink` to its
-//! target; a changed target is `Unlink` then `Symlink`, which the deriver composes into one `Symlink`.
+//! file it removes, `Unlink`. A directory it adds is `Mkdir` before what it holds; one it removes, `Rmdir` after what
+//! it held is removed. An executable file is `SetMode` 0755, and a file that stops being executable `SetMode` 0644 (a
+//! file a green records no mode for checks out 0644, the server's `DEFAULT_FILE_MODE`). A symbolic link is `Symlink` to
+//! its target; a changed target is `Unlink` then `Symlink`, which the deriver composes into one `Symlink`.
 //!
 //! **The head (item 3).** A push that moves the branch sets the green's head: one `SetXattr` of [`HEAD_ATTRIBUTE`] on
 //! the green's root ([`ROOT`], the empty path, which the deriver and the engine hold always present) to the new head.

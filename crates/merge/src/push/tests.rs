@@ -28,8 +28,8 @@ enum Object {
   Blob(Vec<u8>),
 }
 
-/// A content-addressed store, as a tool's is: an object's id is the hash of its kind and bytes, so a subtree that did not
-/// change keeps its id. It counts what it is asked, so a test can prove from the store's side what a build read.
+/// A content-addressed store, as a tool's is: an object's id is the hash of its kind and bytes, so a subtree that did
+/// not change keeps its id. It counts what it is asked, so a test can prove from the store's side what a build read.
 #[derive(Default)]
 struct Store {
   /// The objects by id.
@@ -583,8 +583,8 @@ fn a_push_reads_only_the_subtrees_whose_ids_changed() {
 
 /// A-618 (§4.17.1 item 2). Do: push the executable bit alone onto a file, then off it, then a symbolic link's new
 /// target, then the removal of a directory with a file and a subdirectory in it. Expect: a `SetMode` 0755 and no
-/// content, then a `SetMode` 0644, then one `Symlink`, then the directory's files unlinked and both directories removed;
-/// each accepted and the green holding exactly each pushed tree.
+/// content, then a `SetMode` 0644, then one `Symlink`, then the directory's files unlinked and both directories
+/// removed; each accepted and the green holding exactly each pushed tree.
 #[test]
 fn modes_links_and_removed_directories_are_the_operations_the_design_names() {
   let mut store = Store::default();
@@ -1109,8 +1109,8 @@ fn a_base_the_green_disagrees_with_is_refused_by_the_deriver() {
   holds_exactly(&green, &files, &head(1));
 }
 
-/// Format: the paths generated histories write: deep and shallow, beside one another, so a push changes some subtrees and
-/// leaves others.
+/// Format: the paths generated histories write: deep and shallow, beside one another, so a push changes some subtrees
+/// and leaves others.
 const SLOTS: [&str; 12] = [
   "f", "g", "l", "a/f", "a/g", "a/b/f", "a/b/l", "c/f", "c/d/f", "c/d/e/f", "c/d/e/g", "h",
 ];
@@ -1226,9 +1226,9 @@ fn history(steps: &[Vec<Option<(u8, bool)>>], census: &Census) {
   }
 }
 
-/// A-618 (§4.17.1 items 2 to 4; the oracle and the client-fidelity test). Do: run 256 generated histories of up to seven
-/// pushes, each changing, adding or removing any of twelve paths, deep and shallow, as files of four contents (one
-/// empty) with or without the executable bit, or as links of two targets; each pushed over the last landed tree.
+/// A-618 (§4.17.1 items 2 to 4; the oracle and the client-fidelity test). Do: run 256 generated histories of up to
+/// seven pushes, each changing, adding or removing any of twelve paths, deep and shallow, as files of four contents
+/// (one empty) with or without the executable bit, or as links of two targets; each pushed over the last landed tree.
 /// Expect: each build the oracle's work byte for byte, with exactly the reads a walk by identity makes; a path changing
 /// kind refused naming one of the paths that do, the green unchanged; every other push accepted, leaving the green
 /// holding exactly what was pushed and its head; and the histories, counted, reaching every case: subtrees skipped,

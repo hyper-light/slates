@@ -3028,7 +3028,7 @@ impl Green {
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut removed_content: Vec<String> = Vec::new();
     let mut set_content: Vec<(String, Vec<u8>, Vec<Op>)> = Vec::new();
-    // The paths whose file or directory this version removes: their mode and attributes go with them (A-618).
+    // The paths whose file, directory or link this version removes: their mode and attributes go with them (A-618).
     let mut emptied: Vec<String> = Vec::new();
     // Content removes are staged before sets so a rename's source removal never deletes a file the
     // same increment recreates or renames into at that path.
@@ -3091,6 +3091,7 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveSymlink(path) => {
+          emptied.push(path.clone());
           seed(
             &mut self.symlink_history,
             &path,
@@ -3120,6 +3121,7 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveHardlink(path) => {
+          emptied.push(path.clone());
           seed(
             &mut self.hardlink_history,
             &path,
@@ -3178,9 +3180,9 @@ impl Green {
       self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
     }
-    // A file or a directory this version removed takes its mode and attributes with it once nothing stands at its path
-    // (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's, so a
-    // path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
+    // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
+    // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
+    // so a path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
     // one's mode 0755).
     for path in emptied {
       if !self.holds(&path) {
