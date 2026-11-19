@@ -1162,8 +1162,15 @@
 > slates-merge lib 76 of 76 filtered
 > to the copy, checkpoint, branch, node, reanchor and stack tests, `--test checkpoint` 4 of 4, `--test chain_replay` 3
 > of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 6 of 6 (layout 12 refused at start, new); Windows and Linux
-> owed. Owed from A-626: a rebase restating a copy (part 4); a
-> restore that grafts
+> owed. A-626 part 4 (2026-11-19, g307): a rebase restating a copy built, the deriver's `VolumeOp::Copy` composed
+> against the copied tree `Green::base_for` puts at its destination, a file edited beneath a copy restated as edits
+> over what it brings, a work's logged journal holding a copy (`LoggedOp::Copy`, the anchor's layout 14); a work's own
+> shard composes no journal holding a copy (its fetched entries are a path's each, never a tree), so the green's owner
+> composes it, counted `merge.work.copy_composed_by_owner` (see A-626 part 4); on macOS arm64 (kiln r15) slates-merge
+> lib 67 of 67 filtered, `--test increment`, `rebase` and `base_for` whole, slates-server lib 7 of 7 filtered,
+> slates-anchor 2 of 2 and 7 of 7, fmt clean; Windows and Linux owed. Owed from A-626: the work model
+> resolving copies, so a rebased work's `Rebased::changed` and its reads and listing see the copied files it left
+> alone (they name only the files it changed today); a restore that grafts
 > a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
 > if measured worth it; the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
