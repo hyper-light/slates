@@ -12687,6 +12687,14 @@ and export by landing).
 > `fs-wrap.c`, `transaction.c`, `serve.c`) and equals it on generated histories. Owed: the verbs on the wire with the
 > ra_svn server (piece 7), the lock hooks (piece 11), DAV's LOCK and UNLOCK (piece 13), the entries' encoding in the
 > repository's register, the head view over the index, and the room derived from the shard's (item 12).
+>
+> **Status (2026-11-19, A-609).** Built: piece 13's first part, the HTTP side's bodies (`slates-svn`'s `dav`). It has
+> a bounded XML reader that refuses every DTD, so no entity is declared or expanded. It decodes OPTIONS, PROPFIND,
+> MERGE and ten REPORTs as `mod_dav_svn` reads them, and writes the answers byte for byte as `mod_dav_svn` writes them:
+> OPTIONS with the HTTPv2 headers, a multistatus, the MERGE answer, and every report's but the two editor drives. The
+> request bodies are stock svn 1.15.0's own, recorded against a responder on the Mac Studio. Owed (part 2): the
+> update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK, `list-report` and `file-revs-report`; main's run
+> captures against Apache with `mod_dav_svn`.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13107,7 +13115,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
    oracle). 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
-13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
+13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
+    (A-609); the editor drives and the write methods' bodies are its second.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -39497,3 +39506,79 @@ Applied in the same change to:
 - **Applied in the same change to:** Cargo.toml (`flate2` in `[workspace.dependencies]`, with the measurement),
   docs/wip/BENCHMARKS.md, §4.17.2 piece 3.
 
+### A-609 — The HTTP side's bodies: a bounded XML reader with no DTD ever, the requests ra_serf sends decoded as mod_dav_svn reads them, and the answers written as it writes them (2026-11-19, g250, UI goal 93; §4.17.4 item 5 and piece 13's first part; A-500)
+Applied in the same change to:
+- §4.17.4's status and its pieces, and GAPS (the §4.17.4 entry);
+- `crates/svn` (`dav.rs`, `dav/xml.rs`, `dav/request.rs`, `dav/response.rs`, `dav/time.rs`, `dav/tests.rs` and
+  `dav/fixtures/*.xml`, all new; `lib.rs`);
+- `research/vcs-servers-subversion.md` (§1: the HTTP sources with their hashes; §3: "The bodies, the code").
+
+- **The reader.** A body is read whole, within the caller's bounds: its bytes, depth, name length, attributes and
+  elements, each refused past its bound (HTTP 413). Every refusal is typed and names the byte it stopped at. What it
+  refuses:
+  - bytes that are not UTF-8, or a declaration naming another encoding;
+  - a `DOCTYPE`, so no entity is ever declared or expanded, and a billion laughs is refused at its DTD's first byte;
+  - any entity but XML's five, a character reference XML 1.0 does not allow, and a processing instruction;
+  - an unbound prefix, a mismatched end tag, a duplicate attribute, and text after the root;
+  - a body cut anywhere.
+
+  It keeps what expat keeps: line breaks normalized, attribute whitespace normalized, CDATA as text, comments dropped.
+- **The requests.** OPTIONS, PROPFIND and MERGE (the transaction, its flags, its properties, and the lock-token list
+  paired as `version.c` pairs it), and ten REPORTs: `update-report`, `log-report`, `dated-rev-report`,
+  `get-locations`, `get-location-segments`, `get-locks-report`, `mergeinfo-report`, `get-deleted-rev-report`,
+  `inherited-props-report` and `replay-report`. Each report is read as its handler reads it:
+  - the `svn:` namespace is required;
+  - children in another namespace are skipped, and unknown `svn:` children are ignored;
+  - what the handler requires is required;
+  - paths are canonical;
+  - an unknown report is 501.
+
+  Stricter than `mod_dav_svn`, stated: a revision is decimal where `atol` reads garbage as 0, a date is
+  `svn_time_to_cstring`'s form, a path holds no `.` or `..` and is no URL, and only UTF-8 is read.
+- **The answers.** Each is written byte for byte as the source writes it: `DAV_XML_HEADER`, then `DEBUG_CR`, a line
+  feed in httpd 2.4.66; `apr_xml_quote_string`'s escapes with each call site's quotes flag; base64 in
+  `svn_base64_encode_string2`'s lines where `svn_xml_is_xml_safe` fails; and `svn_xml_fuzzy_escape` for a log
+  message. The quirks are kept: `<S:owner >`, and the empty line where a MERGE's post-commit error would stand. The
+  answers written:
+  - OPTIONS: its `DAV` lines, and the HTTPv2 headers only when the activity collection is asked for;
+  - `dated-rev-report` and `get-deleted-rev-report`;
+  - `get-locations`, `get-location-segments` and `get-locks-report`;
+  - `mergeinfo-report`, `inherited-props-report` and `log-report`;
+  - the MERGE answer;
+  - a multistatus, modeled on `mod_dav`'s writer with `mod_dav_svn`'s `lp1` and `lp2`.
+
+  Departure, stated: a custom revision property's name has its quotes escaped, where `mod_dav_svn` would break the
+  attribute.
+- **Golden vectors.** No `mod_dav_svn` runs on the Mac Studio: macOS's Apache has `mod_dav` only, and Homebrew's
+  Subversion ships no module. So stock svn 1.15.0 (Homebrew) was run there against a recorded responder: a canned
+  server that records each request and answers plausibly, so the client goes on. The run made 22 request bodies:
+  - OPTIONS, and the chunked probe's empty `<D:options/>`;
+  - four PROPFINDs;
+  - three log-reports;
+  - every other report but `get-deleted-rev-report`;
+  - four update-reports, from checkout, `svnrdump`, update and `status -u`;
+  - a MERGE.
+
+  `get-deleted-rev-report`'s body is ra_serf's own writer's (`get_deleted_rev.c`). The responder's answers are no
+  evidence; only the requests are. The response bytes come from the source code, since no live server answered.
+- **Tests and the run.** 24 tests:
+  - each captured body decoded;
+  - every proper prefix of every captured body refused, or the same reading where only trailing whitespace was cut;
+  - a billion laughs, an external entity and an unknown entity;
+  - every bound and every grammar refusal;
+  - RFC 4648's base64 vectors in svn's lines;
+  - dates written and read, and every 97th day from 1970 to 9999 round-tripped;
+  - each answer byte for byte, and read back by the reader.
+
+  `cargo test --locked -p slates-svn --lib` passed 98 of 98 on the Mac Studio (debug, 2026-11-19), and fmt was clean.
+  Red once, on a copy that read an unknown entity as `?`: the entity test failed.
+- **Owed.** Part 2 of piece 13:
+  - the update-report response (the editor drive, svndiff windows in base64 through the built codec);
+  - the replay editor drive;
+  - PROPPATCH, LOCK and UNLOCK bodies, and `list-report` and `file-revs-report`;
+  - the server that drives these.
+
+  Main's:
+  - a live capture against Apache with `mod_dav_svn` 1.14 or 1.15, comparing every fixture and every answer byte for
+    byte;
+  - clippy and `cargo xtask check` on `slates-svn`.

@@ -141,7 +141,12 @@
 > release or keep), each returning the register entries it decided, applied unconditionally; its oracle FSFS's lock
 > rules transcribed, equal on generated histories; `cargo test -p slates-svn --lib` 74 of 74 on the Mac Studio (see
 > A-602). Owed from it: the verbs on the wire, the lock hooks, DAV's LOCK and UNLOCK, the entries' encoding, the head
-> view over the index, the room from the shard's. A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
+> view over the index, the room from the shard's. A-609 (2026-11-19, g250, UI goal 93): piece 13's first part, the
+> HTTP bodies (`slates-svn`'s `dav`): a bounded XML reader with no DTD ever; OPTIONS, PROPFIND, MERGE and ten REPORTs
+> decoded as `mod_dav_svn` reads them, from stock svn 1.15.0's own recorded bodies; the answers but the editor drives
+> written byte for byte; `cargo test -p slates-svn --lib` 98 of 98 on the Mac Studio (see A-609). Owed from it: the
+> update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK, `list-report` and `file-revs-report`, and main's
+> live capture against `mod_dav_svn`. A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
 > golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531). A-553
 > (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities, predecessors,
 > history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem

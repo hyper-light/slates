@@ -6,8 +6,9 @@
 //! carry file contents in ([`svndiff`], A-500); the ra_svn item codec, the words, numbers, strings and lists every
 //! `svn://` message is made of ([`ra_svn`], A-531); the Subversion index, every node-revision with the identities FSFS
 //! gives it, computed from the revisions' changed-path records ([`index`], A-553); and the lock table with the check a
-//! commit meets, each guard returning the register entries it decided ([`lock`], A-602). The commit rule follows as its
-//! own piece (§4.17.4 "Pieces that follow").
+//! commit meets, each guard returning the register entries it decided ([`lock`], A-602); and the HTTP side's bodies,
+//! the XML stock clients send over `http://` and `mod_dav_svn` answers, read within bounds and written byte for byte
+//! ([`dav`], A-609). The commit rule follows as its own piece (§4.17.4 "Pieces that follow").
 //!
 //! Nothing here performs I/O, reads a clock or draws randomness; every refusal is a typed value that names the
 //! Subversion error a client is answered with. The evidence is `docs/wip/research/vcs-servers-subversion.md`.
@@ -18,6 +19,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod dav;
 pub mod index;
 pub mod lock;
 pub mod ra_svn;
