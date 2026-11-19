@@ -1829,6 +1829,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-ssh"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-svn"
 version = "0.1.0"
 dependencies = [
