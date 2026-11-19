@@ -47341,7 +47341,10 @@ Applied in the same change to:
     counter is a `Cell`, as `deltas_visited` already was, so only the cost counters move.
   - A `Computed` holds nothing of the green that computed it: the increment's identity and base, the head it was
     computed against (the position the owner checks before it appends, A-635's rule), and the verdict: accepted before
-    as a version, accepted with its effects and what the chain records of them, or the conflict windows.
+    as a version, accepted with its effects and what the chain records of them, or the conflict windows. Since main's
+    71f05f93d (a verdict makes no file until it accepts) a mapped file is held as the ops that make it, never its bytes:
+    the owner's hold takes the increment's post-state into the `Judged` (`Green::held`), and the commit makes the file
+    over the head it was judged at (`Green::make_mapped`).
   - Any copy that holds the versions computes the same result: the owner, or a holder's replica rebuilt from the
     chain's entries alone (`Green::apply_recorded`).
   - Refused, typed, and neither refusal a verdict, so the caller computes on a green that holds the versions:
