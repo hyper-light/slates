@@ -1,0 +1,2 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 38:svn://127.0.0.1:36913/repo/trunk/a.txt 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( ANONYMOUS ( 45:YW5vbnltb3VzQEFkYXMtTWFjLVN0dWRpby5sb2NhbA==
+ ) ) ( get-latest-rev ( ) ) ( get-locations ( 0: 7 ( 2 ) ) ) ( stat ( 0: ( 2 ) ) ) ( get-latest-rev ( ) ) ( get-locations ( 0: 7 ( 2 ) ) ) ( get-lock ( 0: ) ) 

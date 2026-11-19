@@ -1,5 +1,5 @@
-//! Obsolescence markers in the two formats 7.2 reads and writes (A-545; `obsolete.py` and `cext/parsers.c` [C];
-//! `evolution.txt` [B]): the `obsmarkers` part's payload, and the store's `obsstore` file, are a version byte and then
+//! Obsolescence markers in the two formats 7.2 reads and writes (A-545; `obsolete.py` and `cext/parsers.c` \[C\];
+//! `evolution.txt` \[B\]): the `obsmarkers` part's payload, and the store's `obsstore` file, are a version byte and then
 //! markers.
 //!
 //! - Format 0 (`>BIB20s`): the successor count, the metadata's length (32 bits), the flags (a byte), the predecessor,

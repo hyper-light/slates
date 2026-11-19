@@ -1,0 +1,17 @@
+svn-info: svn info svn://127.0.0.1:36913/repo -> 0 ''
+svn-info-file: svn info -r 2 svn://127.0.0.1:36913/repo/trunk/a.txt -> 0 ''
+svn-revprop-get: svn propget --revprop -r 1 svn:log svn://127.0.0.1:36913/repo -> 0 ''
+svn-revprop-list: svn proplist --revprop -v -r 3 svn://127.0.0.1:36913/repo -> 0 ''
+svn-info-dated: svn info -r {2026-01-03T12:00:00Z} svn://127.0.0.1:36913/repo -> 0 ''
+svn-proplist-inherited: svn proplist -v --show-inherited-props svn://127.0.0.1:36913/repo/trunk/dir -> 0 ''
+latest-and-dated: scripted, 7 commands
+revision-properties: scripted, 7 commands
+check-path: scripted, 8 commands
+stat: scripted, 7 commands
+get-mergeinfo: scripted, 9 commands
+get-iprops: scripted, 6 commands
+get-dir: scripted, 7 commands
+get-locations: scripted, 8 commands
+hostile-locations: scripted, 2 commands
+hostile-malformed: scripted, 2 commands
+unknown-command: scripted, 2 commands

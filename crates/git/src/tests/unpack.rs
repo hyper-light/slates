@@ -5,7 +5,8 @@ use flate2::{Compress, Compression, FlushCompress};
 use proptest::prelude::*;
 
 use super::{
-  Chain, IndexMismatch, Locate, NoIndex, Reader, Refusal, Unpacked, check_index, read_whole,
+  Chain, IndexMismatch, Locate, NoIndex, Outside, Reader, Refusal, Unpacked, check_index,
+  read_whole,
 };
 use crate::delta::{self, Sizes};
 use crate::entry::{self, Header, Representation};
@@ -608,6 +609,71 @@ fn a_stream_that_does_not_end_is_refused() {
       Err(refusal)
     );
   }
+}
+
+/// Objects outside a pack that a test holds, as a receiver's repository holds a thin pack's bases.
+struct Held(Vec<(ObjectId, Kind, Vec<u8>)>);
+
+impl Outside for Held {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    self
+      .0
+      .iter()
+      .find(|(known, _, _)| known == id)
+      .map(|(_, kind, content)| (*kind, content.as_slice()))
+  }
+}
+
+/// A-620 (a thin pack's bases from outside it, as `index-pack --fix-thin` takes them from the repository). Do: read a
+/// pack of a reference delta on a blob only the receiver holds and a second delta on the first one's object, finished
+/// with that blob held outside it and with nothing outside it. Expect: both objects made, one delta and two deep, the
+/// held blob not among the answer's objects; with nothing outside, the first delta's base refused as found nowhere.
+#[test]
+fn a_thin_pack_resolves_its_bases_from_outside_the_pack() {
+  let format = ObjectFormat::Sha1;
+  let base: &[u8] = b"a base only the receiver holds\n";
+  let first: &[u8] = b"a base only the receiver holds, edited\n";
+  let second: &[u8] = b"a base only the receiver holds, edited twice\n";
+  let base_id = blob_id(format, base);
+  let mut builder = Builder::new(format);
+  let first_at = builder.put(
+    Representation::RefDelta { base: base_id },
+    &delta_between(base, first),
+  );
+  let on_first = Representation::RefDelta {
+    base: blob_id(format, first),
+  };
+  builder.put(on_first, &delta_between(first, second));
+  let bytes = builder.finish();
+  let held = Held(vec![(base_id, Kind::Blob, base.to_vec())]);
+  let mut admission = unbounded();
+  let mut reader = Reader::new(format, &NoIndex);
+  reader.read(&bytes, &mut admission).unwrap();
+  let unpacked = reader.finish_with(&held, &mut admission).unwrap();
+  let contents: Vec<&[u8]> = unpacked
+    .objects
+    .iter()
+    .map(|object| object.content.as_slice())
+    .collect();
+  assert_eq!(contents, [first, second]);
+  let chains: Vec<Option<Chain>> = unpacked.objects.iter().map(|object| object.chain).collect();
+  let one = Chain {
+    base: base_id,
+    depth: 1,
+  };
+  let two = Chain {
+    base: blob_id(format, first),
+    depth: 2,
+  };
+  assert_eq!(chains, [Some(one), Some(two)]);
+  let refused = read_whole(&bytes, format, &NoIndex, &mut unbounded());
+  assert_eq!(
+    refused,
+    Err(Refusal::DeltaBaseMissing {
+      at: first_at,
+      base: base_id
+    })
+  );
 }
 
 /// A-608 (a stream's Adler-32 checked). Do: read an entry stored uncompressed whose one data byte was changed after

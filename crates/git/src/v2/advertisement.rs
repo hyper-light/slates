@@ -1,5 +1,5 @@
-//! The capability advertisement (A-582, part 2; gitprotocol-v2 "Capability Advertisement" [B]; `serve.c`
-//! `protocol_v2_advertise_capabilities`, `connect.c` `process_capabilities_v2` and `server_supports_feature` [C]).
+//! The capability advertisement (A-582, part 2; gitprotocol-v2 "Capability Advertisement" \[B\]; `serve.c`
+//! `protocol_v2_advertise_capabilities`, `connect.c` `process_capabilities_v2` and `server_supports_feature` \[C\]).
 //!
 //! A server's first answer: `version 2`, then one line a capability, `key[=value]`, then a flush:
 //!

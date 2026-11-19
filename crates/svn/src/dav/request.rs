@@ -849,19 +849,10 @@ fn lock_pairs(lock: &Element, pairs: &mut Vec<(String, String)>) -> Result<(), D
 /// `None` for any other form, or a date before 1970.
 pub(crate) fn svn_time(text: &str) -> Option<AprTime> {
   let (date, clock) = text.strip_suffix('Z')?.split_once('T')?;
-  let mut date_fields = date.split('-');
-  let year = field(date_fields.next()?)?;
-  let month = field(date_fields.next()?)?;
-  let day = field(date_fields.next()?)?;
+  let (year, month, day) = three_fields(date, '-')?;
   let (whole, fraction) = clock.split_once('.')?;
-  let mut clock_fields = whole.split(':');
-  let hour = field(clock_fields.next()?)?;
-  let minute = field(clock_fields.next()?)?;
-  let second = field(clock_fields.next()?)?;
-  if date_fields.next().is_some()
-    || clock_fields.next().is_some()
-    || fraction.len() != FRACTION_DIGITS
-  {
+  let (hour, minute, second) = three_fields(whole, ':')?;
+  if fraction.len() != FRACTION_DIGITS {
     return None;
   }
   let micros = field(fraction)?;
@@ -873,6 +864,16 @@ pub(crate) fn svn_time(text: &str) -> Option<AprTime> {
     .checked_mul(MICROSECONDS_PER_SECOND)?
     .checked_add(micros)?;
   i64::try_from(total).ok().map(AprTime)
+}
+
+/// Exactly three fields of `text` between `separator`s, each decimal digits only: a date's year, month and day, or a
+/// time's hour, minute and second.
+fn three_fields(text: &str, separator: char) -> Option<(u64, u64, u64)> {
+  let mut fields = text.split(separator);
+  let first = field(fields.next()?)?;
+  let second = field(fields.next()?)?;
+  let third = field(fields.next()?)?;
+  fields.next().is_none().then_some((first, second, third))
 }
 
 /// One field of a date: decimal digits only.

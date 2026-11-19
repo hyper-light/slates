@@ -1,5 +1,5 @@
-//! The `check:heads` and `check:updated-heads` payloads (A-545; `internals.bundle2` [B]; `bundle2_part_handlers.py`
-//! `handlecheckheads` and `handlecheckupdatedheads` [C]): the heads the pushing client saw, 20-byte nodes one after
+//! The `check:heads` and `check:updated-heads` payloads (A-545; `internals.bundle2` \[B\]; `bundle2_part_handlers.py`
+//! `handlecheckheads` and `handlecheckupdatedheads` \[C\]): the heads the pushing client saw, 20-byte nodes one after
 //! another. `check:heads` names every head (the strict mode, and a push to an empty repository); `check:updated-heads`
 //! names only the heads the push replaces (`concurrent-push-mode = check-related`, 7.2's default). 7.2 reads 20 bytes
 //! at a time and asserts that nothing is left (`assert not h`); a payload that is not whole nodes is refused here.

@@ -1,6 +1,6 @@
-//! SSH version 1, the framing of `hg serve --stdio` (A-569; `internals.wireprotocol` [B]; `wireprotoserver.py`
+//! SSH version 1, the framing of `hg serve --stdio` (A-569; `internals.wireprotocol` \[B\]; `wireprotoserver.py`
 //! `_runsshserver`, `sshv1protocolhandler`, `_sshv1respondbytes`, `_sshv1respondstream`, `_sshv1respondooberror`,
-//! and `sshpeer.py` `_sendrequest` [C]).
+//! and `sshpeer.py` `_sendrequest` \[C\]).
 //!
 //! The client writes a command as its name and a newline, then each argument its spec names as `<name>
 //! <length>\n<value>`, and the dictionary (`*`) as `* <count>\n` and that many `<key> <length>\n<value>`. 7.2's client

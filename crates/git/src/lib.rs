@@ -14,7 +14,7 @@
 //!
 //! **Sources** (read 2026-11-19). git's `Documentation/gitprotocol-common.txt` ("pkt-line Format"),
 //! `gitprotocol-v2.txt` ("Packet-Line Framing", "packfile section", `sideband-all`) and `gitprotocol-capabilities.txt`
-//! ("side-band, side-band-64k") [B]; and git's `pkt-line.c` and `sideband.c` [C], which is what clients run, followed
+//! ("side-band, side-band-64k") \[B\]; and git's `pkt-line.c` and `sideband.c` \[C\], which is what clients run, followed
 //! where the documents leave room: a length digit may be of either case (`hexval`), `0003` is refused ("bad line
 //! length"), `0004` is a data packet with no data, and a band other than 1, 2 and 3 is refused ("bad band").
 //!
@@ -46,14 +46,17 @@ mod admission;
 pub mod delta;
 pub mod entry;
 pub mod http;
+pub mod lfs;
 pub mod negotiation;
 pub mod object_name;
 pub mod objects;
 pub mod out;
 pub mod pack;
 pub mod pktline;
+pub mod receive;
 pub mod refname;
 pub mod sideband;
+pub mod store;
 pub mod unpack;
 pub mod v0;
 pub mod v2;
