@@ -336,6 +336,11 @@
 > only while every seat is taken and a new connection needs one, the reap teaching nothing and backing the phase off
 > once per bound (g294's SSH rule). `slates-server --lib vcs_` 69 of 69 and `slates-rt --lib round_trip` 2 of 2 on the
 > Mac Studio, red first twice (3 + 2, then 8 of 8). Owed: the Linux and Windows readers compiled and run.
+> **A-625 part 3, first slice (2026-11-19, g299):** git's site serves upload-pack (A-640 part 2) from a repository's
+> store a step at a time (`vcs_http::git::UploadServices` over a `StoreLender` that lends `Served` afresh each step);
+> receive-pack and a store not held answer `503`. `slates-server --lib vcs_` 76 of 76 on the Mac Studio, red first (3
+> of 3). Owed: the server's store per repository and its lender (with A-653's pack source), the daemon starting an edge,
+> receive-pack's session (A-654), the live `git clone`.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
