@@ -136,10 +136,12 @@ fn deepen_not_must_name_exactly_one_ref() {
   );
 }
 
-/// A-640 part 2: do send a filter git does not read, and a `sparse:oid` filter, which is owed. Expect: each refused,
-/// the first as an invalid spec, the second by the negotiation.
+/// A-640 part 2 and part 4: do send a filter git does not read; a `sparse:oid` filter whose name is a commit's; and one
+/// within a combination. Expect: the first refused as an invalid spec; the second as git refuses a sparse blob that is
+/// no blob, after the packfile section's header, its words on band 2 and git's band-3 words last; the third by the
+/// negotiation, which serves `sparse:oid` alone.
 #[test]
-fn a_filter_git_does_not_read_is_refused_and_sparse_oid_waits_for_part_four() {
+fn a_filter_git_does_not_read_is_refused_and_a_sparse_blob_that_is_no_blob_dies_as_git_dies() {
   let fixture = served::served();
   let nonsense = command(
     "fetch",
@@ -150,11 +152,32 @@ fn a_filter_git_does_not_read_is_refused_and_sparse_oid_waits_for_part_four() {
   assert_eq!(bytes, pkt(b"ERR upload-pack: invalid filter-spec"));
   let spec = format!("filter sparse:oid={THIRD}");
   let sparse = command("fetch", &[&naming("want", THIRD), spec.as_bytes(), b"done"]);
-  let (_, answer) = answer_v2(&fixture, &sparse);
+  let (bytes, answer) = answer_v2(&fixture, &sparse);
+  assert_eq!(
+    answer.refusal(),
+    Some(&Refusal::SparseData {
+      id: crate::served::id(THIRD)
+    })
+  );
+  let words = format!("\x02fatal: unable to parse sparse filter data in {THIRD}\n");
+  let abort = b"\x03aborting due to possible repository corruption on the remote side.";
+  assert_eq!(
+    bytes,
+    [pkt(b"packfile\n"), pkt(words.as_bytes()), pkt(abort)].concat()
+  );
+  let combined = command(
+    "fetch",
+    &[
+      &naming("want", THIRD),
+      b"filter combine:blob:none+sparse:oid=main:dir/file",
+      b"done",
+    ],
+  );
+  let (_, answer) = answer_v2(&fixture, &combined);
   assert!(
     matches!(
       answer.refusal(),
-      Some(Refusal::Negotiation(negotiation::Refusal::Filter(_)) | Refusal::Filter(_))
+      Some(Refusal::Negotiation(negotiation::Refusal::Filter(_)))
     ),
     "{:?}",
     answer.refusal()

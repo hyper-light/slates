@@ -2,8 +2,10 @@
 //! "Pieces (git)" piece 8; §4.3, R6): a listener on the runtime's TCP, one connection a task, each driving
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
-//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's (§4.17.4) on
-//! the same edge.
+//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's ([`svn`],
+//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, answered by `slates_svn::dav::site`) on the same
+//! edge. A reply's status is `200` unless the exchange names another as its reply begins ([`Exchange::reply_status`]:
+//! a PROPFIND's `207`, or a refusal its body explains).
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -56,15 +58,18 @@
 //! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
 //! handed the stores (A-615, A-662), which answers `503` until then;
 //! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
-//! Subversion's site; the MCP edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's
-//! runs).
+//! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
+//! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
+//! `501` until then; the sites composed into one the daemon starts (git's alone today); the MCP edge onto this engine;
+//! the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;
 mod hg;
+mod svn;
 pub(crate) mod waits;
 
-pub(crate) use daemon_edge::{bind, start};
+pub(crate) use daemon_edge::{ShardRepositories, bind, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -199,6 +204,12 @@ pub(crate) trait Exchange {
   /// ended: none unless the reply's outcome decides them, as a Mercurial command's decides its media type (A-650).
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
     Ok(Fields::new())
+  }
+  /// The reply's status, asked once as the reply begins, after the body has ended and before the reply's fields: `200`
+  /// unless the reply's outcome decides another, as a WebDAV `PROPFIND`'s `207` or a refusal its body explains
+  /// (Subversion's site, A-681).
+  fn reply_status(&self) -> Status {
+    Status::OK
   }
   /// Appends the reply's next run to `out`: `true` while more follows, `false` once the reply has ended.
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed>;
@@ -982,6 +993,7 @@ impl<S: Site> Parts<S> {
     };
     if !started.fields_given {
       started.fields_given = true;
+      connection.reply_status(started.exchange.reply_status());
       match started.exchange.reply_fields().await {
         Ok(fields) => connection.reply_fields(fields),
         Err(Failed(status)) => {

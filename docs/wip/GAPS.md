@@ -261,6 +261,17 @@
 > over main bb535bd4d; failing first in r213, 4 of 39 with the walk stubbed; the oracle's census now requires the
 > sparse path). Owed: the service's slice (`<blob-ish>` resolved, its blob read, git's two refusals' words, a stock
 > git exchange recorded); main's Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, third slice (2026-11-19, g296; the service reads the blob):** `upload::sparse` resolves a
+> `sparse:oid=<blob-ish>` as git does with no work tree (an object's full name, or a ref by git's patterns, alone or
+> before `:<path>`, walked as `find_tree_entry` walks it; a relative path refused as git refuses it; parents,
+> ancestors, peels, reflogs, abbreviated names, `git describe`'s and `:/` refused by kind), reads the blob within the
+> request's admission and hands its patterns to the negotiation, under v2 and v0. A blob git's `pack-objects` dies of
+> is answered as git's server answers it (its `fatal:` line on band 2 in 128-byte reads, git's band-3 words, no
+> flush; with no band, the pack missing). Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid`
+> exchanges. 112 of 112 (1 ignored, main's) and slates-server's git edges 27 of 27 on the Mac Studio (r250 over main
+> b94ae6e90); failing first, 16 of 105 with the resolution, the tree walk and the death's answer stubbed. Owed:
+> `sparse:oid` within `combine:` (refused: git's answer turns on its order of walk); the revision forms refused by
+> kind; git's band-2 warning of an ambiguous ref name; main's Linux and Windows runs, clippy, xtask, docs.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -321,7 +332,18 @@
 > after the tests' client race its runs met was fixed on its own (4a74c118), 34 of 34 and 38 of 38, fmt clean).
 > Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
-> connection there (main's finding, its own piece).
+> connection there (main's finding, closed by A-651 part 4).
+> **A-651 part 4 (2026-11-19, g294; the SSH edge serves a repository from its owner shard):** an `exec` that names a
+> repository another shard's partition holds (`SshSite::locate`, by its name's route, D-14) moves its connection there
+> whole, as the HTTP edge moves one: the socket's handle, the session with its keys, sequence numbers and channel, the
+> client's unread bytes, the waits, the phase and the proven principal, one spawn on that shard's control channel;
+> there it takes a seat as a new connection would (a free one, the most overdue's, or a wait bounded by the seats) and
+> the `exec` is dispatched where the repository's record, policy and store live; each shard keeps its own edge state
+> (`vcs_ssh::keep_here`), only the listener's holding the host key (macOS arm64, Mac Studio: red at aa16b067,
+> `--lib -- vcs_ssh` 28 of 30, the two new tests failing; green 30 of 30, and 30 of 30 as it landed over main
+> 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684);
+> Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival waiting
+> for a full shard's seat and of one refused past the bound; main's runs.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -488,7 +510,8 @@
 > room, the listener not accepting at the bound (the kernel's backlog the same bound); each phase's wait learned with
 > `LearnedWait`, the handshake, idleness, a head and the drain whole and a body's and a reply's silences one at a time,
 > no bound before a phase's first completed wait, only a connection whose credentials proved a principal teaching.
-> git's site: `http-backend`'s route, `401` with the connection's challenges, `404`, the policy's `403`
+> git's site: `http-backend`'s route, `401` with the connection's challenges (Basic's first on every connection since
+> A-686), `404`, the policy's `403`
 > (`vcs_policy::reaches`), `503` while a service has not landed (both today). `slates-git` gives its reply fields as
 > data. `cargo test -p slates-server --lib vcs_` 46 of 46 and `-p slates-git --lib http` 18 of 18 on the Mac Studio, red
 > first on stubs (20 and 2 failing). Owed: the daemon starting an edge (address, identity, an authenticator over
@@ -634,10 +657,9 @@
 > byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
 > of the store and the push back through the view's packs, counted (Windows x86_64, jupiter: red 13 of 15, then the
 > two vacuous ones made to read and red 2 of 2; green 15 of 15, the crate 462 of 462 with 4 ignored; macOS owed). Found: stock receive-pack sets
-> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: part 2, the view presented to the hook
-> driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
-> from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a
-> mounted view.
+> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: seals kept as derived data (part 2 handed
+> the view to the driver, below); a seal made at encoding; `packed-refs` by ranges from the register; the cover as
+> derived data and fragments merged into fewer packs; main's run of stock git over a mounted view.
 > **Fixed (2026-11-19, g293; found by A-665): a git hook given no push options is handed `GIT_PUSH_OPTION_COUNT=0`,**
 > as stock receive-pack 2.50.1 hands it (`cmd_receive_pack` always passes its option list, so `run_and_feed_hook` sets
 > the count; `githooks.adoc` says unset), where `vcs_hooks::push_option_env` had unset it; `EnvValue::Unset`, its one
@@ -645,13 +667,31 @@
 > three pushes; Windows x86_64, jupiter: red 2 of 2 new failing, green vcs_hooks 33 of 33; the Unix driver's test
 > filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
 > hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
-> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
+> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2
+> (built, below);
 > Subversion's environment is its hooks-env section alone (A-623). Mercurial 7.2's, closed by A-657 part 4 (g304,
 > 2026-11-19): `_exthook` always sets `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`)
 > and `shellenviron` sets `HG`, and the transaction adds `HG_BUNDLE2`, `HG_TXNID` and `HG_TXNNAME`
 > (`research/mercurial-server.md` §6); recorded from stock 7.2's own `pretxnchangegroup` and `changegroup`
 > (`crates/hg/fixtures/hooks`), slates' changegroup hooks now carry all five, held to the recording by `vcs_hooks`'
 > test (red without them in kiln r192, green on macOS arm64, Mac Studio, kiln r202).
+> **A-665 part 2 (2026-11-19, g293; piece 10's view handed to the hook driver on the owner shard):** `slates-server`
+> (`git_hooks`) opens part 1's view over the repository's store in the shard's `vcs_stores` (A-662), the push
+> quarantined for `pre-receive`, among the packs for `update`, none for `post-receive`, each ref named by its green and
+> the version of it the push read (a version no push made refused, `NotInStore`); charges the view's tables to the
+> shard's budget while it lives; seals its packs in the shard's slices, each lent the room `HookView::seal_len` names;
+> and runs the configured hook in the view's root with `GIT_DIR=.` and, for `pre-receive`, the quarantine's three
+> variables beside its point's own, refusing a view the point would not see. Held by running the test binary as each
+> point's hook in a view the tests write into a scratch directory, stock `git` reading the pushed commit there
+> (macOS arm64, Mac Studio: red first, the 4 new tests failing against stubs,
+> kiln r204; green on the merged tree, kiln r111 over main 0577ab0bd: `git_hooks`, `vcs_hooks`, `hook_driver`,
+> `vcs_store::` and `git_push` 70 of 70, `hook_view` 16 passed with 1 ignored, fmt clean, and again over main's newer
+> commits as it landed, the landing merge's message says; the other platforms owed).
+> Owed: part 3, the view presented at a path (a read-only attachment the mount edges serve a read at a
+> time; on Linux in the launcher's namespace, §4.6); seals kept as derived data across views; the calls of git's push
+> driver (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until
+> they land); git's words for each outcome. Found, reported to main: a git hook inherits the daemon's `GIT_*` repository
+> variables, which `update` and `post-receive` would read in place of the view's objects.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -984,11 +1024,11 @@
 > refused in hg's own words, and a round trip (a fresh history pushed, cloned, a changeset pushed from the clone and
 > pulled back) over the HTTP edge and over the SSH edge. Each is ignored naming the pieces it waits on, and the last
 > of them to land un-ignores it as its integration test: the daemon's edge serves git's site alone, so hg's request
-> meets `404` (A-680, g303: the hg site's stores and lender); the site's `401` offers Bearer alone, on which stock hg
-> 7.2 crashes (`ValueError` from urllib's digest handler, which reads the first challenge alone), so Basic's challenge
-> goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
-> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); hg's
-> `serve --stdio` on the SSH edge (A-679, g304).
+> meets `404` (A-680, g303: the hg site's stores and lender); `slates repository create <name> --tool hg` (A-685,
+> g305); `--vcs-ssh <addr>` (A-684, g299); hg's `serve --stdio` on the SSH edge (A-679, g304). The site's `401`
+> offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
+> first challenge alone): since A-686 (g258, main's ruling) Basic's challenge goes first on every connection and Basic
+> with the token as password is taken on the loopback edge, and stock hg 7.2 gets past the edge's `401`.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
 > g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site with the served view over
 > them (A-680 part 2, g303, running) and that loop
@@ -1126,7 +1166,18 @@
 > the Mac Studio, red on a mutated copy (see A-627, completed). Owed from it: (1) the update-report's resource walk, a
 > pre-1.2 client's; (2) the drive's facts carrying `dav_svn__get_safe_cr`'s revision, not `svn_fs_node_created_rev`'s,
 > for a node beneath a copy not changed since (A-616's drive over the index); (3) main's live capture against Apache
-> with `mod_dav_svn`. A-531 (2026-11-19): the ra_svn item codec, its
+> with `mod_dav_svn`. A-681 part 1, its first slice (2026-11-19, g297): Subversion's DAV site on the shared HTTP edge
+> (`slates-svn`'s `dav::site`, `slates-server`'s `vcs_http::svn`): the read side's resources (a public URL,
+> `!svn/rvr`, `!svn/bc`) answered to OPTIONS, PROPFIND (depth 0 and 1) and GET and HEAD from the index, the green and
+> the lock table, each path judged by the principal's compiled read rules; OPTIONS lists only the capabilities served
+> (none yet); every REPORT and write method `501`; stock svn 1.15.0's `info`, `cat`, `ls` and `proplist -v` read a
+> repository through the edge over HTTPS on loopback, on the Mac Studio (see A-681 part 1). Owed from it: (1) the
+> REPORTs over the index, then the update-report and replay through A-627's drive, each capability listed as it is
+> served, so `svn log` and `svn checkout` reach a repository (part 1's next slices); (2) the write side (part 2); (3)
+> the daemon composing the site beside git's and handing it the stores, `503` until then; (4) a repository whose name
+> holds a slash, which `SVNParentPath`'s first-segment rule cannot reach over HTTP without a longest-prefix search
+> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`); (6) Basic on the cleartext
+> loopback edge (A-686). A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
@@ -1345,6 +1396,22 @@
 > (`a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after`). Both passed at once, no drive change (macOS
 > arm64, Mac Studio, over main `3612d1ef9`: `cargo test --locked -p slates-svn --lib -- commit:: serve:: lock::
 > report::` 132 of 132, fmt clean). Owed: the Windows run and red-checks (main's).
+> Stock svn's interop tests (2026-11-19, g307, main's piece for UI goal 93; item 14's first scripted sessions):
+> `crates/cli/tests/svn_interop.rs` runs a round trip (a fresh repository checked out, a file committed, a second
+> checkout, an edit committed from it, the first copy updated, the log read with `--xml --verbose`) and a lock session
+> (a lock, another copy's commit refused with the head unchanged, an unlock, that commit again) as stock `svn` 1.15,
+> skipping loudly without it. The control runs both against stock `svnserve -t` 1.15.0 through `svn`'s own tunnel over
+> scratch FSFS repositories, so every step's expectation is Subversion's own: macOS arm64 (Mac Studio, kiln r293 over
+> main `e25799e8c`), `cargo test --locked -p slates-cli --test svn_interop` 1 passed (the control, 11.2 s) and 4
+> ignored, fmt clean. Each slates leg is ignored naming what it waits on, and run with `--ignored` each failed at its
+> first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
+> `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
+> yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
+> A-681's reads and commits (g297), A-686 (g258) and A-685, and its lock session on A-681's `LOCK` and `UNLOCK`;
+> `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
+> no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
+> differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
+> the file is Unix-only, as `tests/cli.rs` is).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

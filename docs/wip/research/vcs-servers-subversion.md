@@ -234,6 +234,24 @@ changed texts, owed), and `libsvn_ra_svn/marshal.c` at 1.15.0 for the editor com
     every directory and file opened, and every deletion, with `SVN_INVALID_REVNUM`; `set_target_revision` always
     first; revision 0 that call alone; no `close_edit`; with deltas off, a nameless property removal and a delta of the
     window handler's end alone.
+- **The read side's resources** (recorded 2026-11-19 for A-681; §4.17.4 piece 13's third part).
+  - **Recorded requests** [M: svn 1.15.0, Homebrew, the Mac Studio, 2026-11-19, against a recorded responder whose
+    answers are no evidence, only the requests it recorded; responder sha256 prefix `e7e534ec22cf47c7`]:
+    - a session opens with three OPTIONS: the body asking for the activity collection, an empty chunked probe, then
+      the first again;
+    - `svn info URL` PROPFINDs `resourcetype`, `getcontentlength`, `deadprop-count`, `version-name`, `creationdate`
+      and `creator-displayname` at `Depth: 0` on the revision root's resource (`!svn/rvr/REV/PATH`), then
+      `lockdiscovery` on the public URL; `svn info -r N` first asks `get-locations`;
+    - `svn cat` and `svn export` of a file PROPFIND `allprop`, then `resourcetype`, on the revision root's resource,
+      then GET it;
+    - `svn ls` sends a `list-report` where the server lists the `list` capability, and otherwise PROPFINDs at
+      `Depth: 0` and then `Depth: 1`; `svn ls -v` adds a `get-locks-report`;
+    - `svn log` sends a `log-report`;
+    - with credentials asked for, Basic is sent after one `401`, then on every request of the session.
+  - **What the answers follow** [C: `mod_dav_svn/repos.c` `parse_uri`, `prep_regular`, `set_headers`, `deliver`;
+    `liveprops.c`; `deadprops.c`; `util.c` `dav_svn__get_safe_cr`; httpd 2.4.66 `mod_dav.c` `dav_method_propfind`,
+    `props.c` `dav_get_allprops`, `dav_get_props`]: as the module documentation of `slates-svn`'s `dav::site` states,
+    each departure named there.
 - **svndiff over HTTP** [C: `mod_dav_svn/repos.c` 1784-1851]: the response's version follows the request's
   `Accept-Encoding` and the server's compression level (svndiff2 when the client lists it and the level is 1, else the
   client's preference, else 0). What a client sends in PUT bodies follows the server's advertised capabilities
