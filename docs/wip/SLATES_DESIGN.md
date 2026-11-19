@@ -12205,8 +12205,8 @@ is one more version, and the chain itself is never rewritten.
 > of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
 > any tier computes, keeps and serves it with no coordination; computed eagerly as each version is recorded or lazily
 > when first read, by the type's own declaration, a unit a step under the shard's slices. Its first type is a version's
-> map of paths to contents (`derived/paths.rs`). Owed: the tool stores as types (A-614's D(k) first), and the server's
-> use (A-647's entry).
+> map of paths to contents (`derived/paths.rs`). A-614's D(k) and reached sets are one since A-647 part 2
+> (`crates/git/src/store/reach.rs`). Owed: A-553's and A-588's stores as types, and the server's use (A-647's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12545,6 +12545,13 @@ engine: the verdict, rebase, position mapping, the register).
 > chain's depth across fragments, bounded today by the versions a pack spans and reset by each rebuild; the encoding and
 > rebuild sliced under the shard's budget; one base pack shared by greens that reach alike (each green keeps its own
 > today).
+>
+> **Status (2026-11-19, A-647 part 2: D(k) as derived data, A-645).** A version's D(k) and its reached set are a type of
+> `slates-vcs`'s derived data (`store::ReachSets`, `crates/git/src/store/reach.rs`): a pure function of the version's
+> record and its parents' values, version `k - 1`'s and that of the version a remade set was taken from, which each
+> version now records (`Followed`). Its derivation is the admission's own walks over the committed index, and the owner
+> keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). The store's outputs
+> are unchanged.
 >
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
@@ -13260,6 +13267,14 @@ signature verification).
 > failed with the step held waiting): the three captured sessions handed in a byte, seven bytes, a kilobyte and the
 > whole at a time, each answering as the session answers the same bytes whole; one answer held until taken; the
 > window's refusals; the end of input; arbitrary bytes at arbitrary cuts.
+>
+> **Status (2026-11-19, A-649 part 3a: no revlog held whole).** The import's seam asks a file's length and reads its
+> bytes by ranges, and the revlog reader's one algorithm runs over a byte source (`revlog::Source`, `revlog::Outline`):
+> whole slices are one source (the `Revlog` facade, its tests unchanged), the import's ranged reads another, so a split
+> revlog's index and data and a docket's files are read an entry or a chunk at a time, and only an inline revlog (under
+> 128 KiB, as 7.2 keeps one) whole. A text is rebuilt from the text before it where its chain passes through that one,
+> as 7.2's revision cache does, and counted. Proven by the same golden imports, and by every split or docketed file of
+> two stores read in several ranges, none as long as the file.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13662,7 +13677,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    encodings, the hashed long names) and its fncache. Built (A-630 parts 2 and 3, `crates/hg`: `import`,
    `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
    read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
-   phase roots, bookmarks and markers imported with the history. Owed: the import sliced and by ranges, and the
+   phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
+   never whole, and texts rebuilt from the one before. Owed: the import sliced under the shard's step budget, and the
    server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
@@ -13894,6 +13910,22 @@ and export by landing).
 > authorization checks (`check_authz`, A-606's rules), an added path's validation (`svn_repos__validate_new_path`), a
 > session that must authenticate for write before `commit`, and the owner's commit step with the connection task that
 > runs the drive.
+>
+> **Status (2026-11-19, A-655, part 1).** Built: the commit's remaining checks and its one entry point (`slates-svn`'s
+> `commit::drive`). `commit::drive::commit`, which the svn:// connection task calls with `commit`'s parameters (A-656),
+> decides the principal's access as `svnserve`'s `must_have_access` does: allowed, the trivial authentication request;
+> an anonymous session that could authenticate for write is asked to (`Begun::Authenticate`) and calls again once it
+> has, no trivial request then; else "Authorization failed" (`E170001`); each lock token's path must be writable by a
+> named principal (`add_lock_tokens`). In the drive, an added path holding a control character is refused
+> (`svn_repos__validate_new_path`, `E160005`); `svn_repos_fs_change_node_prop`'s checks refuse `svn:mergeinfo` holding a
+> NUL or not parsing (A-605's parser), a property `svn:wc:` or `svn:entry:` (`E165002`), an `svn:` value not UTF-8 or
+> holding a carriage return, and an `svn:date` that is no date as `svn_time_from_cstring` reads one, each written with
+> every error of Subversion's chain; and `check_authz` asks A-606's rules, compiled for the principal, at each of
+> `commit.c`'s calls ("Access denied", `E220004` and `E220001`). Held to the recorded commits, which now begin through
+> `commit`, and to fifteen cases of the checks and three of access, each red first. Owed (part 2): the owner's commit
+> step through A-635's `RepositoryLogs::append`, which a dump's import (A-652 part 3) also drives, a revision at a time
+> with the dump's author, date and log; the mergeinfo parser's own words beneath `verify_mergeinfo`'s (A-605's
+> messages).
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -44068,10 +44100,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     bases and skip lists, copy detection, file search. Each type for a version is computed from its parents' values,
     eagerly or lazily, and stored immutable by identity, so any server or tier computes, caches and serves it without
     coordination. The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth.
-    (Part 1 built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type,
-    version) in an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down
-    a unit a step, and a version's map of paths to contents as its first type. Owed: A-614's D(k) as a type, part 2;
-    A-553's and A-588's stores after it.)
+    (Built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type, version) in
+    an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
+    step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
+    the store's outputs unchanged (part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -46191,3 +46223,101 @@ store's `Admitted` and `ContentStore`, which an implementer of the `Objects` sea
   access verdicts under a policy. On the Mac Studio (2026-11-19): red at 07:12Z with `answer` and `allows` stubbed, 4 of
   4 failing; green at 07:14Z on 9d7108e76, `cargo test -p slates-server --lib` 632 passed and one failed, main's
   `deadlines` test that fails without this change; `slates-git --lib` 443 and `slates-db --lib` 142; fmt clean.
+
+### A-647 part 2 — A-614's D(k) and reached sets as a type of derived data, the store's outputs unchanged (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 1, A-614)
+
+- **The type** (`ReachSets`, `crates/git/src/store/reach.rs`, a child of the store's `repository.rs` as `graph.rs` is).
+  A ref's version (its green and its index `k`) has two sets of positions as its value: what its head reaches, and
+  D(k). They are what A-614's admission computes, by the same walks over the committed index: a fast-forward's D(k)
+  is the walk from the head that stops at version `k - 1`'s set, which grows by it; a rewrite's or a create's reached
+  set is the set it was remade from and the walk beyond it, and its D(k) the walk that stops at version `k - 1`'s set,
+  or with no head before it everything reached; a delete's both are empty. The repository is the type's history
+  (`Graph for Repository`, a version named by its green and `k`, big-endian): a version's parents are version `k - 1`
+  when it had a head, then the version its set was remade from. Typed refusals (`ReachRefused`): no such version,
+  parents' values that do not fit the record, a value that is not the type's, an object the index lacks, and the
+  store's own.
+- **One thing recorded, so the derivation reads only recorded history.** Which version a rewrite's or a create's set is
+  remade from is found among the greens' current heads when the move is admitted (A-614's base), a state no later
+  reader has. Each version now records it (`Followed`: grown, remade from a green at its version then, or emptied).
+  The values could not show whether it is used, since a head's reached set is the same whatever base a walk starts
+  from; the walk counters do (below).
+- **Kept with no second walk.** The admission's sets are the type's value: `Repository::reach_value` encodes a green's
+  newest version's sets as a derived node (no content named; the reached set's runs, then D(k)'s, each a count and
+  runs of a start and an end, eight bytes each, little-endian), which the owner keeps under (type, version) as it
+  commits; a tier lacking a value derives it with a fill, the same value by identity. The store's chains, D(k) and
+  reached sets are unchanged, and every existing test of `slates-git` passed with the record added (442 of 442 at
+  9b6c49357, beside the new hostile-values test; main's 3 ignored).
+- **Tests** (`crates/git/src/tests/store/reach.rs`; `cargo test --locked -p slates-git --lib`, the Mac Studio, 2026-11-19).
+  - Red first (9b6c49357, 07:11 UTC): with `derive` and `reach_value` refusing at once, the oracle, the rewrite test
+    and the refusals test failed; the hostile-values test, its reader not stubbed, passed.
+  - The oracle (`t_a647_every_versions_d_k_is_its_derived_value`, 64 cases a run) runs A-614's own generated
+    histories (its `op` and `apply`: commits on a head, on any earlier commit and as roots, refs moved to other refs'
+    heads, deletes, refused pushes, both object formats). After each step the moved green's newest value is kept from
+    the store's sets, and every version's value is read through the type: each is the store's D(k), at the newest
+    version its reached set, and the very value the store kept; each step derives exactly the versions it made (every
+    earlier value reused); a version's derivation walks and meets exactly what its admission did; a fill from nothing
+    reaches the same newest values; and the store is empty once all is released.
+  - Beside it: A-614's rewrite scenario names the rewrite's parents ref 1's version 2 and ref 2's version 0, and a lazy
+    read derives all five versions from nothing; every refusal by kind; hostile values (a count past the bytes,
+    runs out of order, touching, empty, a byte left over, a byte short, a value naming content) refused.
+  - Green (67b1da27a, 07:12 UTC): 446 of 446 with main's 3 ignored, in 20.98 s; `slates-vcs --lib` 46 of 46; `cargo
+    fmt` clean. With the walk check (1cafc67a9, 07:14 UTC) the four tests pass.
+  - Red five ways, a mutation at a time in the Studio's clone: a fast-forward walked with no stop set (the oracle); the
+    recorded base dropped (the oracle's walk check and the rewrite test, where values alone could not see it); leftover
+    parents' values taken (the refusals test); touching runs decoded (the hostile test); the kept value's D(k) emptied
+    (the oracle).
+- **Owed.** The store serving `brought` and `reached` from its values, its chains' sets dropped, once A-614's other
+  parts settle (a change of signature in a module four pieces were changing that day); A-553's node revisions and
+  A-588's manifests as types; the server's `Derivations` for each repository on its owner shard.
+- **Applied in the same change to:** `crates/git/src/store/reach.rs` (new), `store/repository.rs` (`Followed`, the base
+  `remade` names, the module), `store/positions.rs` (`run_pairs`, `from_runs`), `store/mod.rs` (the export and its
+  docs), `crates/git/src/tests/store/reach.rs` (new) and `tests/store/mod.rs`; §4.17.2's status; A-645's entry; §4.17.1
+  "Reads"' status; GAPS' §4.17 entry.
+
+### A-649 part 3a — Revlogs read by ranges through the import's seam, never whole, the reader's one algorithm over a byte source (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; A-645's scale, A-611, A-630)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`revlog`: `Source`, `Slices`, `Outline`,
+the `Revlog` facade over them; `import`: the ranged seam and reader, the rebuild cache), GAPS (the §4.17.3 entry).
+- **What it does.** `RepositoryFiles` now asks a file's length (`len`) and reads `len` bytes from an offset (`read`);
+  a small file is read from its start in one range. The revlog reader's algorithm (entries, chunks, chains, texts and
+  their checks) is `revlog::Outline` over any `revlog::Source` of index and data bytes: `Slices`, a revlog's whole
+  bytes borrowed, is what the `Revlog` facade reads (A-611's tests unchanged), and the import's `Reader` reads a split
+  revlog's index and data files, or the files a docket names, by ranges through the seam, an entry or a chunk a read,
+  within the length the file had when it was opened (or the docket's sizes) and refused as cut short past it. An inline
+  revlog, which 7.2 keeps under 128 KiB (`_maxinline`), or an index shorter than a header, is read whole. A docket's
+  files are held to hold the bytes it says before any is read (7.2: "too few index data").
+- **The rebuild cache.** A text is rebuilt from the last text the import rebuilt where its chain passes through that
+  revision (7.2's `_deltachain` with its `stoprev`, and `_revisioncache`), so a linear history's text costs its own
+  chunk rather than its chain's; the reader reports when it did, and `Imported::rebuilt_from_cache` counts it.
+- **Why.** A-645 holds the servers to a 1 TB history: a revlog read whole would hold the largest log's data at once, a
+  file of many gigabytes; by ranges the import holds an entry, a chunk and two texts.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-ranges-red` (b7ae56ed3, not for main:
+  the ranged read stubbed to fetch the whole file and slice it, the cache ignored), `cargo test --locked -p slates-hg
+  --lib` 270 passed and 1 failed, the new test by its assertion. Green: 271 of 271 at db6b2fa13 (the first build's one
+  error, a call left on the whole-file seam, fixed before it), in a target directory of its own; rustfmt's layout from
+  that run, and the two warnings part 2 had left in the tests removed. The golden imports of every store unchanged;
+  new: every split or docketed file of the dotencode and version 2 stores read in more than one range and none as long
+  as the file, an inline revlog read whole, and texts rebuilt from the cache.
+
+### A-655 part 1 — The commit's remaining checks in `commit.c`'s order and words, and its one entry point for the svn:// connection task (2026-11-19, g268 for UI goal 93; §4.17.4 items 3.2 and 10, "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.17.4 entry),
+`crates/svn/src/commit/drive.rs` and `crates/svn/src/commit/drive/tests.rs`.
+- **What was there.** A-617's drive refused what was out of date or locked, but took any property, any added path and
+  any principal, and its beginning assumed a session already allowed to write.
+- **The decision.** One entry point, `commit(params, &Session, Start, &mut out) -> Result<Begun, ItemError>`: the
+  `Session` is what `svnserve`'s server baton holds (the base path, the root URL, the green's name, the principal,
+  `anon-access` and `auth-access`, whether the client could authenticate, the authz rules and the repository's name in
+  them), the `Start` what the owner gives (the transaction's name, the instant, the room, whether the client has just
+  authenticated), and `Begun` says what follows: drive every item (`Driving`), authenticate then call again
+  (`Authenticate`), refused (`Answered`) or closed (`Close`). The checks sit where `commit.c` makes them, before FSFS's:
+  the new path first in an addition; the authorization at each call; the property's checks before the node's locks. A
+  failure is written with every error of Subversion's chain (`svn_ra_svn__write_cmd_failure`), the code's own words for
+  an error made without any. Departures: a date in the format `svn` stopped writing in 2002 is refused; beneath
+  `verify_mergeinfo`'s words, the parser's own are owed with A-605's messages.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). Red (07:08 UTC): the checks' test failed at its first case, the control character taken; green (07:12
+  UTC): the drive's 7 of 7. The entry point red (07:15 UTC, a stub that closed): 9 of 9 drive tests failed, the replay
+  among them; green (07:16 UTC): 9 of 9. `cargo fmt` from the Studio (sha256 dcf19ad4). On the tree merged with main
+  (f52466962, 07:18 UTC): `cargo test --locked -p slates-svn --lib` 426 of 426 in 7.88 s, rustfmt clean. Clippy, `xtask
+  check` and the doc gate are main's (the run-request queue).
+- **Owed.** Part 2: the owner's commit step through A-635's `RepositoryLogs::append`, at the position the commit read
+  (`Moved` answered as `svnserve`'s out-of-date), which a dump's import drives too (A-652 part 3).
