@@ -196,7 +196,12 @@ pub fn encode(entries: &[Entry<'_>], out: &mut Vec<u8>) -> Result<(), EncodeRefu
 fn check(entries: &[Entry<'_>]) -> Result<(), EncodeRefusal> {
   let mut previous: Option<&[u8]> = None;
   for (index, entry) in entries.iter().enumerate() {
-    if entry.path.is_empty() || entry.path.iter().any(|byte| *byte == NUL || *byte == NEWLINE) {
+    if entry.path.is_empty()
+      || entry
+        .path
+        .iter()
+        .any(|byte| *byte == NUL || *byte == NEWLINE)
+    {
       return Err(EncodeRefusal::Path { entry: index });
     }
     if previous.is_some_and(|before| before >= entry.path) {
@@ -236,16 +241,35 @@ mod tests {
   /// its node and flag, and the same bytes at the length `encoded_len` gave.
   #[test]
   fn a_manifest_reads_and_writes_back() {
-    let text = [&b"a\0"[..], NODE_HEX, b"\nlink\0", NODE_HEX, b"l\nrun\0", NODE_HEX, b"x\n"].concat();
+    let text = [
+      &b"a\0"[..],
+      NODE_HEX,
+      b"\nlink\0",
+      NODE_HEX,
+      b"l\nrun\0",
+      NODE_HEX,
+      b"x\n",
+    ]
+    .concat();
     let entries: Vec<Entry<'_>> = decode(&text).unwrap().collect();
-    let flags: Vec<(&[u8], Flag)> = entries.iter().map(|entry| (entry.path, entry.flag)).collect();
-    let expected: [(&[u8], Flag); 3] = [(b"a", Flag::Regular), (b"link", Flag::Link), (b"run", Flag::Executable)];
+    let flags: Vec<(&[u8], Flag)> = entries
+      .iter()
+      .map(|entry| (entry.path, entry.flag))
+      .collect();
+    let expected: [(&[u8], Flag); 3] = [
+      (b"a", Flag::Regular),
+      (b"link", Flag::Link),
+      (b"run", Flag::Executable),
+    ];
     assert_eq!(flags, expected);
     assert_eq!(crate::fixtures::hex(&entries[0].node).as_bytes(), NODE_HEX);
     let mut out = Vec::new();
     encode(&entries, &mut out).unwrap();
     assert_eq!(out, text);
-    assert_eq!(encoded_len(&entries), Ok(u64::try_from(text.len()).unwrap()));
+    assert_eq!(
+      encoded_len(&entries),
+      Ok(u64::try_from(text.len()).unwrap())
+    );
     assert_eq!(decode(b"").unwrap().count(), 0);
   }
 
@@ -256,10 +280,23 @@ mod tests {
   fn manifests_mercurial_would_refuse_are_refused() {
     let line = |path: &[u8], node: &[u8], flag: &[u8]| [path, b"\0", node, flag, b"\n"].concat();
     let good = line(b"a", NODE_HEX, b"");
-    assert_eq!(decode(&good[..good.len() - 1]).err(), Some(Refusal::Unterminated));
+    assert_eq!(
+      decode(&good[..good.len() - 1]).err(),
+      Some(Refusal::Unterminated)
+    );
     let upper = NODE_HEX.to_ascii_uppercase();
-    for bad in [b"a".to_vec(), line(b"a", &NODE_HEX[..39], b""), line(b"a", &upper, b""), line(b"a", NODE_HEX, b"t"), line(b"a", NODE_HEX, b"xl")] {
-      let text = if bad.ends_with(b"\n") { bad } else { [bad, b"\n".to_vec()].concat() };
+    for bad in [
+      b"a".to_vec(),
+      line(b"a", &NODE_HEX[..39], b""),
+      line(b"a", &upper, b""),
+      line(b"a", NODE_HEX, b"t"),
+      line(b"a", NODE_HEX, b"xl"),
+    ] {
+      let text = if bad.ends_with(b"\n") {
+        bad
+      } else {
+        [bad, b"\n".to_vec()].concat()
+      };
       assert_eq!(decode(&text).err(), Some(Refusal::Line { line: 0 }));
     }
     for second in [&b"a"[..], b"0"] {
@@ -271,9 +308,19 @@ mod tests {
   /// A-588: do write entries with a path holding a newline, and out of order. Expect each refused naming the entry.
   #[test]
   fn entries_that_would_not_read_back_are_not_written() {
-    let entry = |path: &'static [u8]| Entry { path, node: [1; 20], flag: Flag::Regular };
-    assert_eq!(encode(&[entry(b"a\nb")], &mut Vec::new()), Err(EncodeRefusal::Path { entry: 0 }));
-    assert_eq!(encode(&[entry(b"b"), entry(b"a")], &mut Vec::new()), Err(EncodeRefusal::Order { entry: 1 }));
+    let entry = |path: &'static [u8]| Entry {
+      path,
+      node: [1; 20],
+      flag: Flag::Regular,
+    };
+    assert_eq!(
+      encode(&[entry(b"a\nb")], &mut Vec::new()),
+      Err(EncodeRefusal::Path { entry: 0 })
+    );
+    assert_eq!(
+      encode(&[entry(b"b"), entry(b"a")], &mut Vec::new()),
+      Err(EncodeRefusal::Order { entry: 1 })
+    );
   }
 
   proptest! {

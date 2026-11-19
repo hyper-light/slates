@@ -66,7 +66,10 @@ fn expected(kind: &str) -> Vec<Vec<String>> {
 
 /// The stored revisions of one log.
 fn of_log(log: &str) -> Vec<Stored> {
-  stored().into_iter().filter(|revision| revision.log == log).collect()
+  stored()
+    .into_iter()
+    .filter(|revision| revision.log == log)
+    .collect()
 }
 
 /// A changeset's extras as 7.2 reads them: its own, with `branch` `default` where it names no branch, sorted by key.
@@ -92,7 +95,14 @@ fn expected_extras(field: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     .filter(|pair| *pair != "-")
     .map(|pair| {
       let (key, value) = pair.split_once(':').unwrap();
-      (unhex(key), if value.is_empty() { Vec::new() } else { unhex(value) })
+      (
+        unhex(key),
+        if value.is_empty() {
+          Vec::new()
+        } else {
+          unhex(value)
+        },
+      )
     })
     .collect()
 }
@@ -124,13 +134,34 @@ fn every_changeset_reads_as_mercurial_reads_it() {
   let changesets = of_log("changeset");
   for (revision, fields) in changesets.iter().zip(expected("changeset")) {
     let read = changeset::decode(file(&revision.file)).unwrap();
-    assert_eq!(read.manifest_node(), Ok(to_node(&fields[2])), "{}", revision.rev);
-    assert_eq!((read.user, read.time, read.timezone), (unhex(&fields[3]).as_slice(), fields[4].as_bytes(), fields[5].as_bytes()));
+    assert_eq!(
+      read.manifest_node(),
+      Ok(to_node(&fields[2])),
+      "{}",
+      revision.rev
+    );
+    assert_eq!(
+      (read.user, read.time, read.timezone),
+      (
+        unhex(&fields[3]).as_slice(),
+        fields[4].as_bytes(),
+        fields[5].as_bytes()
+      )
+    );
     assert_eq!(read.description, unhex(&fields[6]).as_slice());
     let files: Vec<Vec<u8>> = read.file_names().map(<[u8]>::to_vec).collect();
-    let wanted: Vec<Vec<u8>> = fields[7].split(',').filter(|name| *name != "-").map(unhex).collect();
+    let wanted: Vec<Vec<u8>> = fields[7]
+      .split(',')
+      .filter(|name| *name != "-")
+      .map(unhex)
+      .collect();
     assert_eq!(files, wanted);
-    assert_eq!(extras(&read), expected_extras(&fields[8]), "{}", revision.rev);
+    assert_eq!(
+      extras(&read),
+      expected_extras(&fields[8]),
+      "{}",
+      revision.rev
+    );
   }
 }
 
@@ -161,10 +192,22 @@ fn every_manifest_reads_as_mercurial_reads_it() {
   let manifests = of_log("manifest");
   let entries = expected("entry");
   for fields in expected("changeset") {
-    let stored = manifests.iter().find(|revision| hex(&revision.node) == fields[2]).unwrap();
+    let stored = manifests
+      .iter()
+      .find(|revision| hex(&revision.node) == fields[2])
+      .unwrap();
     let text = file(&stored.file);
     let read: Vec<manifest::Entry<'_>> = manifest::decode(text).unwrap().collect();
-    let found: Vec<(Vec<u8>, Node, String)> = read.iter().map(|entry| (entry.path.to_vec(), entry.node, flag_letter(entry.flag).to_string())).collect();
+    let found: Vec<(Vec<u8>, Node, String)> = read
+      .iter()
+      .map(|entry| {
+        (
+          entry.path.to_vec(),
+          entry.node,
+          flag_letter(entry.flag).to_string(),
+        )
+      })
+      .collect();
     let wanted: Vec<(Vec<u8>, Node, String)> = entries
       .iter()
       .filter(|entry| entry[1] == fields[1])
@@ -184,10 +227,16 @@ fn every_file_revision_keeps_its_metadata_apart() {
   let files = of_log("file");
   for fields in expected("filerev") {
     let path = unhex(&fields[1]);
-    let stored = files.iter().find(|revision| revision.name.as_bytes() == path && revision.rev == fields[2]).unwrap();
+    let stored = files
+      .iter()
+      .find(|revision| revision.name.as_bytes() == path && revision.rev == fields[2])
+      .unwrap();
     let text = file(&stored.file);
     let read = filerev::split(text).unwrap();
-    let copy = read.copy().unwrap().map(|copy| (copy.path.to_vec(), copy.node));
+    let copy = read
+      .copy()
+      .unwrap()
+      .map(|copy| (copy.path.to_vec(), copy.node));
     let wanted = (fields[3] != "-").then(|| (unhex(&fields[3]), to_node(&fields[4])));
     assert_eq!(copy, wanted, "{}", stored.name);
     let entries: Vec<(&[u8], &[u8])> = read.entries().collect();

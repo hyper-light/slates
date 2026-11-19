@@ -152,7 +152,11 @@ pub fn decode(text: &[u8]) -> Result<Changeset<'_>, Refusal> {
   } else {
     text
       .get(third.saturating_add(1)..)
-      .and_then(|rest| rest.windows(BLANK_LINE.len()).position(|window| window == BLANK_LINE))
+      .and_then(|rest| {
+        rest
+          .windows(BLANK_LINE.len())
+          .position(|window| window == BLANK_LINE)
+      })
       .map(|at| third.saturating_add(1).saturating_add(at))
       .ok_or(Refusal::Shape {
         what: "the blank line",
@@ -172,7 +176,9 @@ pub fn decode(text: &[u8]) -> Result<Changeset<'_>, Refusal> {
     } else {
       field(third.saturating_add(1), blank)
     },
-    description: text.get(blank.saturating_add(BLANK_LINE.len())..).unwrap_or_default(),
+    description: text
+      .get(blank.saturating_add(BLANK_LINE.len())..)
+      .unwrap_or_default(),
   };
   changeset.manifest_node()?;
   check_time(time)?;
@@ -345,7 +351,9 @@ fn octal<'a>(digits: &'a [u8], out: &mut impl Out) -> &'a [u8] {
 /// bytes. A key holding `:` is refused, since it would read back split at its own `:`.
 pub fn encode_extras(extras: &[(&[u8], &[u8])], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
   if extras.iter().any(|(key, _)| key.contains(&COLON)) {
-    return Err(EncodeRefusal::Field { what: "an extra's key" });
+    return Err(EncodeRefusal::Field {
+      what: "an extra's key",
+    });
   }
   let mut sorted: Vec<&(&[u8], &[u8])> = extras.iter().collect();
   sorted.sort_by(|left, right| left.0.cmp(right.0));
@@ -383,15 +391,24 @@ fn check(changeset: &Changeset<'_>) -> Result<(), EncodeRefusal> {
   let line = |field: &[u8]| !field.contains(&NEWLINE);
   let word = |field: &[u8]| !field.is_empty() && line(field) && !field.contains(&SPACE);
   let fields = [
-    (changeset.manifest.len() == NODE_LEN.saturating_mul(2) && line(changeset.manifest), "the manifest"),
-    (!changeset.user.is_empty() && line(changeset.user), "the user"),
+    (
+      changeset.manifest.len() == NODE_LEN.saturating_mul(2) && line(changeset.manifest),
+      "the manifest",
+    ),
+    (
+      !changeset.user.is_empty() && line(changeset.user),
+      "the user",
+    ),
     (word(changeset.time) && word(changeset.timezone), "the date"),
     (changeset.extras.is_none_or(line), "the extras"),
     (
       changeset.files.is_empty()
         || (!changeset.files.starts_with(&[NEWLINE])
           && !changeset.files.ends_with(&[NEWLINE])
-          && !changeset.files.windows(BLANK_LINE.len()).any(|window| window == BLANK_LINE)),
+          && !changeset
+            .files
+            .windows(BLANK_LINE.len())
+            .any(|window| window == BLANK_LINE)),
       "the files",
     ),
   ];
@@ -440,9 +457,16 @@ mod tests {
   /// `encoded_len` gave.
   #[test]
   fn changesets_read_and_write_back() {
-    let with_files = [MANIFEST, b"\nTest <t@e>\n0 0\na\nb/c\n\nsome\n\ndescription"].concat();
+    let with_files = [
+      MANIFEST,
+      b"\nTest <t@e>\n0 0\na\nb/c\n\nsome\n\ndescription",
+    ]
+    .concat();
     let read = decode(&with_files).unwrap();
-    assert_eq!((read.user, read.time, read.timezone, read.extras), (&b"Test <t@e>"[..], &b"0"[..], &b"0"[..], None));
+    assert_eq!(
+      (read.user, read.time, read.timezone, read.extras),
+      (&b"Test <t@e>"[..], &b"0"[..], &b"0"[..], None)
+    );
     assert_eq!(read.file_names().collect::<Vec<_>>(), [&b"a"[..], b"b/c"]);
     assert_eq!(read.description, b"some\n\ndescription");
     let without = [MANIFEST, b"\nTest\n12 -3600 branch:stable\n\nopen"].concat();
@@ -452,7 +476,10 @@ mod tests {
       let mut out = Vec::new();
       encode(&changeset, &mut out).unwrap();
       assert_eq!(&out, text);
-      assert_eq!(encoded_len(&changeset), Ok(u64::try_from(text.len()).unwrap()));
+      assert_eq!(
+        encoded_len(&changeset),
+        Ok(u64::try_from(text.len()).unwrap())
+      );
     }
   }
 
@@ -467,7 +494,10 @@ mod tests {
     assert_eq!(field, b"note:a\\nb\\0c\\\\d\\re\\012:tail\x00source:svn:1");
     let text = [MANIFEST, b"\nT\n0 0 ", &field, b"\n\nx"].concat();
     let mut buffer = Vec::new();
-    let extras = decode(&text).unwrap().extras(&mut room(), &mut buffer).unwrap();
+    let extras = decode(&text)
+      .unwrap()
+      .extras(&mut room(), &mut buffer)
+      .unwrap();
     let expected: [(&[u8], &[u8]); 2] = [(b"note", value), (b"source", b"svn:1")];
     assert_eq!(extras, expected);
   }
@@ -478,7 +508,10 @@ mod tests {
   fn older_escapes_read_as_python_reads_them() {
     let text = [MANIFEST, b"\nT\n0 0 k:\\t\\x41\\101\\'\\q\n\nx"].concat();
     let mut buffer = Vec::new();
-    let extras = decode(&text).unwrap().extras(&mut room(), &mut buffer).unwrap();
+    let extras = decode(&text)
+      .unwrap()
+      .extras(&mut room(), &mut buffer)
+      .unwrap();
     assert_eq!(extras, [(&b"k"[..], &b"\tAA'\\q"[..])]);
   }
 
@@ -487,21 +520,38 @@ mod tests {
   /// cannot read. Expect each refused by its kind.
   #[test]
   fn changesets_mercurial_would_misread_are_refused() {
-    assert_eq!(decode(b""), Err(Refusal::Shape { what: "the manifest line" }));
+    assert_eq!(
+      decode(b""),
+      Err(Refusal::Shape {
+        what: "the manifest line"
+      })
+    );
     let whole = [MANIFEST, b"\nT\n0 0\na\n\nd"].concat();
-    for (cut, what) in [(41, "the user line"), (43, "the date line"), (47, "the blank line")] {
+    for (cut, what) in [
+      (41, "the user line"),
+      (43, "the date line"),
+      (47, "the blank line"),
+    ] {
       assert_eq!(decode(&whole[..cut]), Err(Refusal::Shape { what }));
     }
     let not_hex = [&b"zz"[..], &MANIFEST[2..], b"\nT\n0 0\n\nd"].concat();
     assert_eq!(decode(&not_hex), Err(Refusal::Manifest));
     let no_zone = [MANIFEST, b"\nT\n0\n\nd"].concat();
-    assert_eq!(decode(&no_zone), Err(Refusal::Shape { what: "the timezone" }));
+    assert_eq!(
+      decode(&no_zone),
+      Err(Refusal::Shape {
+        what: "the timezone"
+      })
+    );
     let bad_time = [MANIFEST, b"\nT\n1e9 0\n\nd"].concat();
     assert_eq!(decode(&bad_time), Err(Refusal::Time));
     for extras in [&b"nocolon"[..], b"k:\\x4", b"k:v\\"] {
       let text = [MANIFEST, b"\nT\n0 0 ", extras, b"\n\nd"].concat();
       let read = decode(&text).unwrap();
-      assert_eq!(read.extras(&mut room(), &mut Vec::new()).map(|_| ()), Err(Refusal::Extra { index: 0 }));
+      assert_eq!(
+        read.extras(&mut room(), &mut Vec::new()).map(|_| ()),
+        Err(Refusal::Extra { index: 0 })
+      );
     }
   }
 
@@ -519,14 +569,35 @@ mod tests {
       description: b"",
     };
     let cases = [
-      (Changeset { user: b"a\nb", ..base }, "the user"),
+      (
+        Changeset {
+          user: b"a\nb",
+          ..base
+        },
+        "the user",
+      ),
       (Changeset { user: b"", ..base }, "the user"),
-      (Changeset { timezone: b"0 1", ..base }, "the date"),
-      (Changeset { files: b"\na", ..base }, "the files"),
+      (
+        Changeset {
+          timezone: b"0 1",
+          ..base
+        },
+        "the date",
+      ),
+      (
+        Changeset {
+          files: b"\na",
+          ..base
+        },
+        "the files",
+      ),
     ];
     for (changeset, what) in cases {
       let mut out = Vec::new();
-      assert_eq!(encode(&changeset, &mut out), Err(EncodeRefusal::Field { what }));
+      assert_eq!(
+        encode(&changeset, &mut out),
+        Err(EncodeRefusal::Field { what })
+      );
       assert!(out.is_empty());
     }
     assert!(encode_extras(&[(b"a:b", b"c")], &mut Vec::new()).is_err());

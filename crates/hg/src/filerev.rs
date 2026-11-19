@@ -108,7 +108,9 @@ pub fn split(text: &[u8]) -> Result<FileRevision<'_>, Refusal> {
   }
   Ok(FileRevision {
     metadata: Some(block),
-    bytes: rest.get(end.saturating_add(MARKER.len())..).unwrap_or_default(),
+    bytes: rest
+      .get(end.saturating_add(MARKER.len())..)
+      .unwrap_or_default(),
   })
 }
 
@@ -155,7 +157,11 @@ pub fn packed_len(metadata: &[(&[u8], &[u8])], bytes: &[u8]) -> Result<u64, Enco
 
 /// Appends a file revision's text as 7.2's `filelog.add` writes it: a block of `metadata`'s entries sorted by key when
 /// it has any, or an empty block when `bytes` begin as a block does, then the bytes.
-pub fn pack(metadata: &[(&[u8], &[u8])], bytes: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+pub fn pack(
+  metadata: &[(&[u8], &[u8])],
+  bytes: &[u8],
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
   check(metadata)?;
   write(metadata, bytes, out);
   Ok(())
@@ -204,16 +210,27 @@ mod tests {
   /// node, and the same text at the length `packed_len` gave.
   #[test]
   fn a_copy_keeps_its_block_apart() {
-    let text = [&b"\x01\ncopy: a\ncopyrev: "[..], SOURCE_NODE, b"\n\x01\na\nb\n"].concat();
+    let text = [
+      &b"\x01\ncopy: a\ncopyrev: "[..],
+      SOURCE_NODE,
+      b"\n\x01\na\nb\n",
+    ]
+    .concat();
     let read = split(&text).unwrap();
     assert_eq!(read.bytes, b"a\nb\n");
     let copy = read.copy().unwrap().unwrap();
-    assert_eq!((copy.path, crate::fixtures::hex(&copy.node).as_bytes()), (&b"a"[..], SOURCE_NODE));
+    assert_eq!(
+      (copy.path, crate::fixtures::hex(&copy.node).as_bytes()),
+      (&b"a"[..], SOURCE_NODE)
+    );
     let entries: Vec<(&[u8], &[u8])> = read.entries().collect();
     let mut out = Vec::new();
     pack(&entries, read.bytes, &mut out).unwrap();
     assert_eq!(out, text);
-    assert_eq!(packed_len(&entries, read.bytes), Ok(u64::try_from(text.len()).unwrap()));
+    assert_eq!(
+      packed_len(&entries, read.bytes),
+      Ok(u64::try_from(text.len()).unwrap())
+    );
   }
 
   /// A-588: do pack bytes that begin as a block does, with no metadata, and plain bytes. Expect an empty block before
@@ -224,10 +241,22 @@ mod tests {
     let mut out = Vec::new();
     pack(&[], bytes, &mut out).unwrap();
     assert_eq!(out, [&b"\x01\n\x01\n"[..], bytes].concat());
-    assert_eq!(split(&out), Ok(FileRevision { metadata: Some(&[]), bytes }));
+    assert_eq!(
+      split(&out),
+      Ok(FileRevision {
+        metadata: Some(&[]),
+        bytes
+      })
+    );
     let mut plain = Vec::new();
     pack(&[], b"plain\n", &mut plain).unwrap();
-    assert_eq!(split(&plain), Ok(FileRevision { metadata: None, bytes: b"plain\n" }));
+    assert_eq!(
+      split(&plain),
+      Ok(FileRevision {
+        metadata: None,
+        bytes: b"plain\n"
+      })
+    );
   }
 
   /// AC-HG.9 (hostile input), A-588: do split a block never closed and a block line without `: `, and read copies
@@ -235,7 +264,10 @@ mod tests {
   #[test]
   fn blocks_mercurial_would_fail_on_are_refused() {
     assert_eq!(split(b"\x01\ncopy: a\n"), Err(Refusal::Unclosed));
-    assert_eq!(split(b"\x01\ncopy: a\nbroken\n\x01\n"), Err(Refusal::Entry { line: 1 }));
+    assert_eq!(
+      split(b"\x01\ncopy: a\nbroken\n\x01\n"),
+      Err(Refusal::Entry { line: 1 })
+    );
     let no_node = split(b"\x01\ncopy: a\n\x01\nx").unwrap();
     assert_eq!(no_node.copy(), Err(Refusal::Copy));
     let short = split(b"\x01\ncopy: a\ncopyrev: abc\n\x01\nx").unwrap();
@@ -247,9 +279,18 @@ mod tests {
   /// Expect each refused naming it.
   #[test]
   fn entries_that_would_not_read_back_are_not_packed() {
-    assert_eq!(pack(&[(b"a: b", b"c")], b"", &mut Vec::new()), Err(EncodeRefusal::Entry { entry: 0 }));
-    assert_eq!(pack(&[(b"a", b"c"), (b"d", b"e\nf")], b"", &mut Vec::new()), Err(EncodeRefusal::Entry { entry: 1 }));
-    assert_eq!(pack(&[(b"a", b"c\x01")], b"", &mut Vec::new()), Err(EncodeRefusal::Entry { entry: 0 }));
+    assert_eq!(
+      pack(&[(b"a: b", b"c")], b"", &mut Vec::new()),
+      Err(EncodeRefusal::Entry { entry: 0 })
+    );
+    assert_eq!(
+      pack(&[(b"a", b"c"), (b"d", b"e\nf")], b"", &mut Vec::new()),
+      Err(EncodeRefusal::Entry { entry: 1 })
+    );
+    assert_eq!(
+      pack(&[(b"a", b"c\x01")], b"", &mut Vec::new()),
+      Err(EncodeRefusal::Entry { entry: 0 })
+    );
   }
 
   proptest! {
