@@ -475,6 +475,28 @@ impl Repositories {
       .map(|(path, lock)| (path.as_str(), lock.as_slice()))
   }
 
+  /// The lock on `path` of `repository`, when one stands (A-629 part 2b-ii: an unlock finds its
+  /// lock by the path its id names).
+  pub fn lock_on(&self, repository: RepositoryId, path: &str) -> Option<&[u8]> {
+    self.registers.get(&repository)?.lock(path)
+  }
+
+  /// `repository`'s locks from `from` on, each `(path, lock)`, in path order (A-629 part 2b-ii: a
+  /// page of locks goes on at its cursor's path, whether or not a lock still stands there).
+  pub fn locks_from(
+    &self,
+    repository: RepositoryId,
+    from: String,
+  ) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+    let bounds = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
+    self
+      .registers
+      .get(&repository)
+      .into_iter()
+      .flat_map(move |register| register.locks.range::<String, _>(bounds.clone()))
+      .map(|(path, lock)| (path.as_str(), lock.as_slice()))
+  }
+
   /// The atomic record version `version` of `green` belongs to, if one does (A-642: each green's log points to it).
   pub fn atomic_at(&self, green: VolumeId, version: u64) -> Option<&AtomicRecord> {
     let key = self.atomic_at.get(&(green, version))?;

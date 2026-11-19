@@ -15,7 +15,7 @@ use super::copy::{appearance_bytes, in_tree, joined, relative};
 use super::{Green, Increment, Judgment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
 use crate::chain_entry;
 use crate::increment::Base;
-use crate::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
+use crate::ops_doc::{NODE_EXCLUSIVE, NodeOrigin, NodeRef, Op, OpKind, OpsDoc, REPLACE};
 use crate::range::Range;
 use crate::review::OutdatedBy;
 use crate::verdict::MergeConflictClass;
@@ -109,9 +109,14 @@ impl Work {
     self.push(OpKind::Symlink, path, 0, 0, target)
   }
 
+  /// A hard link at `path` to the node at `target` at the work's base (A-646).
   fn link(&mut self, path: &str, target: &str) -> &mut Work {
     let target = self.name(target);
-    self.push(OpKind::Link, path, 0, 0, target)
+    let node = self.doc.nodes.intern(NodeRef {
+      path: target,
+      origin: NodeOrigin::Base,
+    });
+    self.push(OpKind::Link, path, 0, 0, node)
   }
 
   fn rename(&mut self, from: &str, to: &str) -> &mut Work {
