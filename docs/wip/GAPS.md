@@ -1,8 +1,9 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record and greens
-> made at another green's version are built (2026-11-18, A-497, D-28, A-515; 2026-11-19, A-534; UI goal 91; owners g261
-> git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
+> made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
+> A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
+> §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
 > of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
@@ -93,6 +94,35 @@
 > green's fold floor; following a renamed file with the engine's path remapping; the integration suites, clippy and
 > `xtask` over the change (main's; `crates/db/tests/wire_order.rs` against `Op` 90 to 95, published by hand). Two
 > verdict findings, below, are open.
+> **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
+> BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
+> no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
+> as its windows, cut where a volume cuts the same file, under lists of their identities; lists and tables are named in
+> BLAKE3's key-derivation mode, so no pushed bytes are taken for either. Tables of sorted rows of at most a window are
+> content, each row naming the contents it holds, opened from any bytes with every fault refused by kind. Each
+> repository's index is a tail over runs of tables found by fences; the tail seals its full tables once its rows no
+> longer fit one (the table's size and the tail's length derived); a fork holds each table once more (no table written,
+> no row copied); the merge point is learned, one rent-or-buy problem for each number of newest runs this index alone
+> holds (one rule for every tool, which §4.17.3's and §4.17.4's index rows now read). A push's quarantine checks every
+> object by its tool's naming, a parameter that may refuse (git's collision detection), before a byte is stored, and
+> is committed as one checked step or abandoned with nothing left. An oracle holds the whole store to plain maps over
+> generated histories, and thirteen mutations each turned tests red (`cargo test -p slates-vcs --lib`, 29 of 29, Mac
+> Studio; see A-581). Owed: one content index for this store and the volumes' sealed windows (piece 4, Phase 7); a
+> merge, a seal, a release and an abandon sliced under the shard's budget; the store and each index on the owner shard,
+> timed by its clock, with each tool's naming implemented (each server's object pieces; the Subversion index's rows move
+> into these tables there); content-defined cuts of tables and of the large-file class (D-6); pruning what no branch
+> reaches; wire-form caches; content placed by identity in a fleet.
+> **A-590 (2026-11-19, g225; piece 4):** `slates-git` reads trees, commits and tags as git reads them and writes each
+> back byte for byte (`objects`): entries, modes and git's order; headers with their continuation lines, signatures and
+> the payload they cover, the tag a `mergetag` carries. Every message id of git's `fsck.h` is a typed finding at its
+> default severity, and the tree, commit, identity and tag checks run in git's order under `git fsck`'s strictness or a
+> push's (`index-pack --strict`). Golden vectors: 360 objects stock git 2.50.1 wrote and judged (t1450-fsck's malformed
+> objects, t0060's spellings of the special files, spellings of `.git`, tag names), each reported as `git fsck` and
+> `git fsck --strict` reported it (`fixtures/fsck`, `make-fsck-fixtures.sh`, two runs byte for byte the same). One
+> divergence on purpose: a malformed tagger before an extra header, which git accepts, is refused.
+> `cargo test --locked -p slates-git --lib`: 51 of 51, and 105 of 105 merged with A-582 part 3 and A-591; red five
+> ways. Owed: the `.gitmodules` and `.gitattributes` blob checks over the ids a tree's check hands on; the push's use
+> of the checks (piece 6).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and

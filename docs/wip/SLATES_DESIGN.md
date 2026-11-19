@@ -11691,6 +11691,69 @@ is one more version, and the chain itself is never rewritten.
 5. Every object is checked on arrival: the server hashes it as the tool does, and a push holding an object whose bytes
    do not hash to its claimed id is refused, typed, before any of it is indexed.
 
+> **Status (2026-11-19, A-581).** Shared piece 3's core is built as a pure crate, `slates-vcs` (`crates/vcs`), which the
+> three servers' object pieces build on:
+> - **Content** (`content.rs`, items 1 and 4): an object's raw bytes are kept once, named by BLAKE3, whichever tool,
+>   push or repository brought them; a repeated put counts a holder and stores nothing, and the identity is always the
+>   store's own hash. No content is longer than the content plane's window, which the owner derives (D-6's chunk,
+>   sixteen base pages, `slates_vfs::content::chunk_bytes`) and gives the store. An object longer than that is cut at
+>   the offsets a volume cuts a file's bytes at and named by lists of its windows' identities up to one root, admitted
+>   whole or not at all, so an object's windows and a checkout's are one identity each. A window is named by plain
+>   BLAKE3, as a volume's sealed chunk and an archive's chunk are; a list and a table by BLAKE3's key-derivation mode
+>   under contexts of their own, so a pushed window can never be read as a list's identities or outlive a table's hold
+>   on its rows. A content is held by count and freed with its last holder (a freed list gives back what it named),
+>   within a budget the owner derives from its shard's memory (§4.2), which the indexes' tails and fences are charged
+>   against too. Within a window, identity is whole-object, the deduplication D-6 chose first (whole-file deduplication
+>   captures about three quarters of block-level deduplication's gain [A: Meyer and Bolosky, FAST 2011]).
+> - **Tables** (`table.rs`, item 3): rows sorted by key, each naming in its own bytes the contents it holds, encoded as
+>   bytes that are content (`slvcstb1` magic, the row count, 64-bit offsets, then the entries), at most one window
+>   each, so a table is named, shared and checked by its identity. Bytes from anywhere are opened with the frame, every
+>   entry and the keys' order checked and every fault refused by kind (§4.9).
+> - **The index** (`index.rs`, item 3): a tail (an ordered map) over runs of tables, the log-structured merge tree's
+>   shape [A: O'Neil et al., Acta Informatica 1996]. A run is tables in key order whose ranges do not meet, found by
+>   their first keys (fences), so a lookup reads one table a run. An id names one object for ever, so a key is in one
+>   layer at most and an insert of a held key is `Identical` or refused `RowDiffers`. The table's size and the tail's
+>   length are derived, never counted in rows: a table is one window, and the tail is due to seal once its rows no
+>   longer fit one table, sealing its full tables and keeping the last one's rows. A fork seals its parent's tail,
+>   holds each table once more and copies the fences: no table written, no row copied. A merge reads the newest `j`
+>   runs this index alone holds into one; runs a fork shares are never merged, and read as this index's own again once
+>   no other index holds them.
+> - **The merge point** (`rule.rs`): learned, one rent-or-buy problem for each `j`. The index counts, for each lookup,
+>   the runs it visited and how many of those it alone holds; the owner times its lookups, inserts and merges. The rent
+>   toward merging the newest `j` is the time spent on the visits that merge would save (`min(p, j) - 1` for a lookup
+>   that visited `p`); its price is the last merge's measured time a row (before any, what building the tail cost);
+>   the largest `j` whose rent has reached its price is due: the ski-rental break-even, within twice an offline
+>   optimum's cost [A: Karlin et al., Algorithmica 1988]. So two small runs are merged long before the visits to a
+>   large run under them pay for rewriting it. §4.17.3's and §4.17.4's index rows read this rule.
+> - **Arrival** (`arrival.rs`, items 4 and 5): the tool's naming is a parameter (`Naming`, with its own id and refusal
+>   types: git's `slates_git::object_name::name_of`, which refuses an input its SHA-1 collision detection flags,
+>   `CollisionAttack`; Mercurial's node rule over its parents, the context), checked before a byte is stored. A
+>   mismatch is `IdMismatch`, a refusal `NotNamed` with the tool's own reason, one id brought twice with other bytes
+>   `Collision`. A push's objects are held by its quarantine, committed into the index as one step whose every row,
+>   content and byte of room is checked before any is applied, or abandoned with nothing left. An object row is the id,
+>   its root content, and its kind and length.
+>
+> Evidence (`cargo test --locked -p slates-vcs --lib`, 29 of 29, the Mac Studio, 2026-11-19, at ca821c3a6; `cargo fmt
+> --check` clean): an oracle over 300 generated histories of arrivals with lies among them, commits, abandons, raw
+> inserts, lookups, seals due and whole, merges of any number of runs, timed merges the rule calls due, forks and
+> releases over four repositories and three pushes on one store, a ten-window object among them whose window is another
+> object. After every step each repository reads as a plain map, no table is longer than the window, every named content
+> is held with the bytes the oracle's own statement of each object's layout gives, no content is held that nothing
+> names, and the store is empty once all is released. Beside it: one content across tools; an object past a window
+> arriving as its windows and read back through its row; a tool's refusal carried with its reason; a fork writing no
+> table; two repositories sealing the same rows sharing one table; a merge reading only its own runs; the seal due
+> exactly when the tail's rows no longer fit one table; two small runs merged with the large run under them left as it
+> was; budget refusals; hostile tables. Thirteen mutations of the code each turned one to four tests red (A-581).
+>
+> Owed: one content index for this store and the volumes' sealed windows, so a checkout and a blob are one copy (piece
+> 4, with Phase 7's per-shard content index; a green's blocks keep their own bytes today); a merge, a seal, a release and
+> an abandoned push sliced under the shard's budget (each is one call here, linear in its rows); the store and each
+> repository's index on the owner shard, fed the shard clock's times, with each tool's naming implemented (git's over
+> `slates_git::object_name`, Mercurial's node), in each server's pieces; content-defined cuts of tables, so identical
+> rows written apart share tables, and of the large-file class (D-6), each gated on a measured gain; pruning what no
+> branch reaches; the wire forms cached by identity (item 2); content placed and replicated by identity in a fleet
+> (§4.10).
+
 **A push is a work.**
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
@@ -11917,7 +11980,10 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
-   forks sharing tables; every object checked against its id on arrival.
+   forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
+   content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
+   whose merge point is learned, and the quarantine with the tool's naming as a parameter; its use on the owner shard,
+   sliced, comes with each server's object pieces).
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
 5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
@@ -11968,6 +12034,19 @@ engine: the verdict, rebase, position mapping, the register).
 > each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
 > `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
 > packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
+>
+> **Status (2026-11-19, A-590: piece 4 built).** `crates/git` (`objects`) reads a tree as git's `decode_tree_entry` does,
+> and a commit and a tag by their headers, each with its continuation lines (`gpgsig`, `gpgsig-sha256` and `mergetag`;
+> any header git gives no meaning is kept as written), and writes each back byte for byte. It knows git's entry order,
+> the five modes git writes in git's text (a subtree is `40000`) and the type of object an entry names; a commit's tree,
+> parents and identities, the payload its signature covers and the tag a `mergetag` carries; a tag's object, type, name,
+> tagger and where its signature begins. Every message id of git's `fsck.h` is a typed finding at its default severity,
+> and the checks of `fsck_tree`, `fsck_commit`, `fsck_ident` and `fsck_tag_standalone` run in git's order, under
+> `git fsck`'s strictness or a push's (`index-pack --strict`, where a warning refuses). Proven against 360 objects stock
+> git 2.50.1 wrote and judged: what slates reports of each, at each level and in order, is what `git fsck` and
+> `git fsck --strict` printed. slates parts from git once, on purpose: a tag whose malformed tagger is followed by an
+> extra header, which git reports and then accepts, is refused. Owed: the `.gitmodules` and `.gitattributes` blob
+> checks over the ids a tree's check hands on; the push's use of these checks is piece 6's.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12572,7 +12651,8 @@ annotated from their file revisions, at that push's own cost.
 | Write slice (7.2's chunk iterators) | the connection's bandwidth-delay product: delivery rate times smoothed round trip | the runtime's TCP measurements of the connection | each send window | the shard's budget per step; the connection's memory share (§4.2) | what one step of encoding produces |
 | Held artefacts: full-clone bundles, the delta cache, linelogs, the revlog view's pages (7.2: `pullbundles.manifest` and clone bundles an administrator makes) | value per byte, the request rate times the cost to make it again over its bytes; the lowest goes first when the budget needs room | requests per artefact; the time it took to make, measured when made; its bytes | each request and each making | the repository's RAM share (§4.2, A-16) | made at its first request, which measures its cost; kept until the budget needs the room |
 | Push verification, slice and fan-out | a slice is what one step verifies at the measured cost per byte; fan out to the owner node's other shards when the predicted remaining time exceeds a measured cross-shard hop | this repository's verification throughput (hashing, applying deltas); the hop cost the runtime measures | each slice | the request's admission (A-16), checked before decoding | one revision, measured |
-| Index tail fold | fold when the lookups the tail served since the last fold cost more than a fold | lookup time served from the tail; the last fold's time | each lookup and each fold | the repository's budget | the first fold when the tail's lookups cost more than building the tail did |
+| Index table size and tail seal (§4.17.1's rule, A-581) | derived, never learned: a table is one window of the content plane (D-6's chunk, from the base page), and the tail seals its full tables once its rows no longer fit one | the store's window | each insert | the window; a row too long for a table of its own refused `RowPastWindow` | the window |
+| Index merge point (§4.17.1's rule, A-581: which runs only this index holds to merge, and when) | for each `j`, merge the newest `j` such runs once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, one problem for each `j`; the largest due `j`) | each lookup's visits, counted by the index; the times the owner measured for its lookups, inserts and merges | each timed batch and each merge | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
 | Hidden changesets kept (7.2 keeps them for good) | kept until the budget needs room, oldest first | the repository's budget | each admission | the repository's budget | kept |
 | Hook deadlines | §4.17.1's: learned from each hook's own runs | | | | |
 
@@ -13084,7 +13164,8 @@ value from the first request's own inputs, never a literal).
 | Socket send and receive buffers | the connection's bandwidth-delay product | its measured round trip and delivery rate | every window | the connection's memory share | the first exchange's round trip and rate |
 | A hook's deadline | a regression of the hook's run time on the commit's size (paths and bytes); the bound is the prediction plus the largest residual seen | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
 | An idle HTTP transaction's bound | the longest gap seen between two requests of one transaction that went on to commit | the gaps of committed transactions | every commit over HTTP | the shard's room for held works: past it the longest-idle goes first | none until a transaction has committed; the room alone |
-| Folding the index's tail into a table | fold when a lookup in the tail is measured slower than one in a folded table | per-lookup times of both | every sampled lookup | the shard's room | at the first sample where the tail is slower |
+| The index's table size and tail seal (§4.17.1's rule, A-581) | derived, never learned: a table is one window of the content plane (D-6's chunk, from the base page), and the tail seals its full tables once its rows no longer fit one | the store's window | each insert | the window; a row too long for a table of its own refused `RowPastWindow` | the window |
+| The index's merge point (§4.17.1's rule, A-581) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, one problem for each `j`; the largest due `j`) | each lookup's visits, counted by the index; the times the owner measured for its lookups, inserts and merges | each timed batch and each merge | the shard's room, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
 | The wire-form cache (§4.17.1 "Objects" item 2: svndiff windows of hot versions) | keep what saves the most time per byte held: re-use rate times the encode time saved, over bytes | hits and encode times | every hit | the shard's room | empty |
 
 The window size is not a tunable: windows are as large as the format allows (102,400 bytes), which every stock decoder
@@ -39863,6 +39944,163 @@ Applied in the same change to:
   - A comment's version held as a live reader of its green's fold floor.
   - Following a renamed file, with the engine's path remapping.
   - The two findings' fix in the verdict.
+
+### A-581 — The version-control servers' one object store: content by identity once across tools and held as the content plane's windows, each repository's index as runs of one-window content tables under a tail whose seal is derived and whose merge point is learned, forks sharing tables, and every object checked on arrival by its tool's own naming and held by its push (2026-11-19, g083 for UI goal 92; §4.17.1 "Objects" items 1, 3, 4 and 5, shared piece 3; D-6, D-11, D-28; A-497, A-499, A-500, A-600)
+
+Applied in the same change to: §4.17.1 (a status block under "Objects", the pieces list's item 3), §4.17.3's and
+§4.17.4's tables of learned tunables (each fold row is now two rows reading the shared rule: the table's size and the
+tail's seal, derived; the merge point, learned), GAPS (the §4.17 entry), `crates/vcs` (new: `slates-vcs`), `Cargo.lock`,
+`unsafe-budget.toml` (`slates-vcs = 0`).
+
+- **What was there.** §4.17.1 stated the object store and each server's section its layout (git's index rows,
+  Mercurial's revlog-shaped tables, Subversion's node rows), with two different rules for folding a tail (§4.17.3: the
+  tail's lookups against a fold's cost; §4.17.4: a tail lookup against a table lookup). Nothing was built; the
+  Subversion index (A-553) holds its rows in plain maps until its rows move into these tables.
+- **Content.** `ContentStore`: bytes by BLAKE3, the store's own hash, so a caller cannot name content wrongly; a repeated
+  put counts a holder and stores nothing (`ContentCounters::deduplicated`); freed with its last holder, the freed bytes
+  handed back so a table can release what its rows named; a budget the owner derives (§4.2), refused by kind and derived
+  again as pressure moves, a lowered budget dropping nothing.
+- **Windows.** The store holds no content longer than the window the owner gives it, the content plane's chunk (D-6,
+  D-11: `slates_vfs::content::chunk_bytes`, sixteen base pages), and refuses a window too small for a list of two
+  identities. `put_object` cuts an object longer than a window at a volume's window offsets (`window_of`: `0, w, 2w,
+  …`) and names the windows by lists of at most `w / 32` identities a level at a time up to one root; the whole tree's
+  new bytes are admitted before any is kept, a node held already is held once more, and a freed list releases what it
+  named, a level at a time. So the windows of a git blob and of the same file in a version's tree are one identity
+  each, which is what one content index for both needs. A window is plain BLAKE3, as a volume's sealed chunk and an
+  archive's chunk are; a list and a table are BLAKE3's key-derivation mode under their own contexts. Without that a
+  pushed window spelling a list's bytes would be read as the identities it spells, and one equal to a table's bytes
+  would deduplicate with the table and keep it, and every content its rows held, alive after its last index let go.
+- **Tables.** A row is a key, the contents it holds (named in the row's own bytes, so any holder releases a freed
+  table's contents without its tool's codec) and a payload. The encoding: `slvcstb1`, the row count, `rows + 1` 64-bit
+  offsets, then entries of a 32-bit key length, the key, a count, the contents and the payload; a table's length is
+  `TABLE_FRAME_BYTES` and each row's `row_bytes`, and no table is longer than a window. `TableView::open` admits bytes
+  from anywhere, frame then entries then order, each fault by kind (`Truncated`, `ForeignMagic`, `TrailingBytes`,
+  `Malformed { row }`, `Unsorted { row }`); a table this crate built reopens with its frame checked alone, every read a
+  checked `get`.
+- **The index.** A tail over runs; a run is tables in key order whose ranges do not meet, each found by its first key
+  (its fence), so a lookup reads the tail, then one table a run from the newest. The tail is the open table: it is due
+  to seal (`seal_due`) once its rows no longer fit one table, and `seal` cuts its rows greedily into tables of at most a
+  window and writes every one but the last as a run, so every table a seal writes is full and the tail keeps less than
+  a table of rows. `seal_all` seals the last one too (what a fork does first, and what an owner does before it names
+  the index by its tables alone). A run's tables are put as one admitted step (`ContentStore::put_tables`) in place of
+  the tail's charge, and its fences are charged. A table stored new takes over its rows' holds; one whose bytes were
+  stored already (another repository sealed the same rows) gives them back, so a stored table holds its rows' contents
+  once however many indexes hold it. A fork holds each table once more and copies the fences. `compact(j)` merges the
+  newest `j` runs only this index holds: its new tables take their rows' holds before the merged runs give theirs back.
+  Runs a fork shares are never merged, and a shared run whose tables no other index holds (the fork released) is read
+  as this index's own again before each merge.
+- **The rule.** One rule for every tool, replacing §4.17.3's and §4.17.4's two, and one rent-or-buy problem for each
+  candidate `j`. A lookup that visited `p` runs only this index holds would have saved `min(p, j) - 1` visits had the
+  newest `j` been one run; the rent toward `j` is those visits' share of the lookups' measured time, the price the
+  last merge's measured time a row times the rows of the newest `j` (before any merge, the tail's own build time a row,
+  §4.17.3's first value), and the largest `j` whose rent has reached its price is due. So two small runs over a large
+  one are merged as soon as their visits pay for it, and the large run is rewritten only once the visits to it pay for
+  that: the merge point is the deployment's own, never a size ratio fixed in advance. A run added on top moves each rent
+  up one candidate (it was in no past lookup's way); a merge, a fork or a run read as own again starts every rent over,
+  and lookups not yet timed when the runs change are dropped. Ski-rental's break-even is within twice an offline
+  optimum's cost (Karlin, Manasse, Rudolph and Sleator, 1988).
+- **Arrival.** `Naming` is the tool's hash, a parameter with its own id and refusal types: git's is
+  `slates_git::object_name::name_of` (A-600), whose SHA-1 refuses an input its collision detection flags as part of a
+  known attack and names its plain SHA-1; Mercurial's is its node over the parents, the context. The quarantine names
+  the bytes before one is stored: a refusal is `NotNamed` with the tool's reason, a mismatch `IdMismatch`, an id brought
+  twice with other bytes `Collision`. It holds what a push brought (`put_object`), commits it through
+  `Index::insert_all` (order, rows, contents and room checked before anything is applied; `CommitRefused`) and gives its
+  holds back, or is abandoned whole.
+- **Tests** (`cargo test --locked -p slates-vcs --lib`, 29 of 29, the Mac Studio, 2026-11-19, at ca821c3a6; `cargo fmt
+  -p slates-vcs --check` clean; the predecessor design's 19 of 19 at 337205b0c, kiln run r463, before it):
+  `the_object_store_reads_as_plain_maps_over_every_history` (300 generated histories, the oracle's own statement of an
+  object's layout beside the store's), `the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositories`,
+  `an_object_whose_bytes_do_not_hash_to_its_id_is_refused_and_its_push_leaves_nothing`,
+  `an_object_its_tool_will_not_name_is_refused_with_the_tools_own_reason`,
+  `an_object_longer_than_a_window_arrives_as_its_windows_and_reads_back_through_its_row`,
+  `a_commit_that_meets_a_differing_row_commits_nothing`, `a_fork_holds_every_table_once_more_and_copies_no_row`,
+  `two_repositories_that_seal_the_same_rows_share_one_table`, `a_merge_reads_only_the_runs_this_index_holds`,
+  `no_table_passes_the_window_and_the_tail_seals_once_its_rows_no_longer_fit_one`,
+  `two_small_runs_are_merged_and_the_large_run_below_them_is_left_as_it_is`,
+  `an_arrival_an_insert_or_a_seal_past_the_budget_changes_nothing`,
+  `an_insert_is_checked_against_the_index_the_store_and_the_window`, the content store's six, the rule's four and the
+  tables' six (two of them generated, cuts and bit flips among them).
+- **Red-checks** (the Studio, at ca821c3a6, each mutation applied once to a copy and the crate's tests run): objects
+  held whole (4 red), lists and tables named as plain windows (1), an object's tree kept without its admission (1), the
+  tail never due (1), a seal cutting no table at the window (3), a merge reading every run whatever `j` (1), a fork's
+  runs never read as own again (1), fences charging nothing (1), a deduplicated seal keeping the tail rows' holds (1), a
+  merge's new tables taking no holds (2), every candidate priced at all the runs' rows (2), a run added on top carrying
+  no rent (2), a tool's refusal answered as a mismatch (1).
+- **Owed.** Listed in §4.17.1's status block: one content index for this store and the volumes' sealed windows (piece
+  4, Phase 7), the work sliced under the shard's budget, the store on the owner shard with each tool's naming
+  implemented (each server's pieces), content-defined cuts of tables and of the large-file class, pruning, wire-form
+  caches, the fleet. Main's heavier checks are filed in the run-request queue: clippy and the cross-target lint matrix
+  over `crates/vcs`, and the doc build.
+
+### A-590 — git's tree, commit and tag objects: read and written back byte for byte, and checked as git's fsck checks them (2026-11-19, g225, UI goal 92; §4.17.2 "Pieces (git)" piece 4, "A push" step 4, "The repository in git's terms" item 5; after A-600)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`objects/`, new: `mod.rs`, `tree.rs`, `commit.rs`, `tag.rs`, `fsck.rs`, `headers.rs`, `ident.rs`,
+  `dotgit.rs`, `refname.rs`, `hex.rs`; its tests in `src/tests/objects/`; `fixtures/fsck` with
+  `make-fsck-fixtures.sh`; one `mod` line in `lib.rs`).
+- **Trees.** An entry is read as `decode_tree_entry` reads it (tree-walk.c): the bytes left must end in a NUL and an
+  id, the mode is octal digits up to a space, read into 32 bits with the low 16 kept as `parse_mode` keeps them (so
+  `1100644` is a file), and an empty name is refused. The mode's text is kept, so a zero-padded `040000` is served as
+  written. Entries order as `base_name_compare` orders them, a subtree's name read as if it ended with `/`. A new entry
+  takes one of the five modes git writes, in git's text (`%o`, so a subtree is `40000`); an entry names a tree, a
+  commit or a blob by its mode, as `object_type` says.
+- **Commits and tags.** Headers are read only once `verify_headers` passes; a line that begins with a space continues
+  the header before it. A commit's tree and parents are read where `parse_commit_buffer` reads them; its signature is
+  `gpgsig` in a SHA-1 repository and `gpgsig-sha256` in a SHA-256 one, and the payload it covers is the commit without
+  either header (`parse_buffer_signed_by_header`); a `mergetag` header unfolds to the whole tag. A tag's headers are read
+  at their places (`object`, `type`, `tag`, `tagger`), and it splits at the last line that starts a signature block git
+  recognizes, OpenPGP, X.509 or SSH (`parse_signed_buffer`), scanning the whole tag as git does. An identity reads into
+  name, email, seconds and zone through the same scan that checks it.
+- **The checks.** Each of fsck.h's 71 message ids, at its default severity, is a typed finding; a report keeps every
+  finding once, ignored ones too, in git's order, and says which refuses and which warns. The tree check is
+  `fsck_tree`'s: the first entry decoded before the walk, the next decoded before the current entry's mode and order
+  are judged (so an entry before an unreadable one is never judged), `verify_ordered`'s stack for duplicates that do not
+  sit together (`x`, `x.1`, `x/`), `.git` and the special files under every HFS+ and NTFS spelling (`is_hfs_dot_generic`
+  with its ignored code points and git's UTF-8 reader, which refuses U+FFFE and U+FFFF where UTF-8 allows them;
+  `is_ntfs_dotgit` and `is_ntfs_dot_generic` with the 8.3 short names, and the rest of the name after each backslash,
+  not the part up to the next), and the ids of `.gitmodules` and `.gitattributes` files handed on to be checked as
+  those files. The commit and tag checks are `fsck_commit`'s, `fsck_ident`'s (dates past `i64::MAX` overflow, as
+  `date_overflows` judges them on a 64-bit `time_t`) and `fsck_tag_standalone`'s, a tag's name judged as
+  `check_refname_format` judges `refs/tags/<name>`.
+- **Strictness.** `git fsck` runs non-strict. A push git checks runs `index-pack --strict` (or `unpack-objects
+  --strict`), whose options are `FSCK_OPTIONS_MISSING_GITMODULES` (or `_STRICT`), both `.strict = 1`
+  (builtin/index-pack.c, builtin/unpack-objects.c): a warning refuses, an info stays a warning, and mode 100664 is a bad
+  mode. Both strictnesses are the caller's to choose; §4.17.2's push takes the strict one.
+- **Where slates and git part.** git's tag check does not look at the tagger's result before its extra-header check,
+  whose finding is ignored by default and overwrites the result with success: git prints the tagger's error and
+  accepts the tag (stock `git hash-object` printed `missingEmail` of `bad-tag-tagger-extra-header` and wrote it). slates
+  refuses it. And among git's builds, git for Windows' HFS+ check also takes a backslash as a separator; slates takes
+  only `/`, as git on Linux and macOS, since HFS+ itself never reads a backslash as one.
+- **Golden vectors.** `make-fsck-fixtures.sh`, run on the MacBook with git 2.50.1 (Apple Git-155) on 2026-11-19, twice,
+  byte for byte the same both times: in a SHA-1 and a SHA-256 repository, 90 trees, commits and tags each, those git's
+  commands write and every malformed object of t1450-fsck with one more for each check fsck.c makes; and in the SHA-1
+  repository 180 objects, one for each spelling of `.gitmodules`, `.gitattributes`, `.gitignore` and `.mailmap` in
+  t0060-path-utils (each a symbolic link, whose name fsck reports), 42 spellings of `.git` on either side of the rules,
+  and 37 tag names on either side of refs.c's. For each, the manifest keeps what `git fsck`, `git fsck --strict` and
+  `git hash-object` said; `SHA256SUMS` keeps each file's SHA-256. The 158 objects an earlier run of the script made
+  came out of this one byte for byte.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio: 51 of 51, 29 of them this piece's, in 16.65 s; on
+  the tree merged with main's A-582 part 3 and A-591, 105 of 105 in 15.56 s): every
+  fixture against its SHA-256 and its id; every object read and written back byte for byte, or refused for git's reason
+  where git cannot read it; every object judged as `git fsck` and `git fsck --strict` judged it, and as
+  `git hash-object` did, but for the one divergence; trees, commits and tags by use (modes, order, the handed-on ids,
+  signatures and their payload, the mergetag, encodings, extra headers, every identity finding); git's `.git` check held
+  to a transliteration of utf8.c and path.c over 645,120 names; every cut (39,617) and every bit flip (250,840) of the
+  corpus read or refused by kind, the check agreeing with the parse; mebibyte names, lines and tag names, a
+  100,000-digit mode and date, 100,000 headers charged before they are kept; and proptests over any bytes and over
+  header-shaped bytes. `cargo fmt --check` clean. Red on the Studio:
+  - with the commit check answering at once with nothing found, 8 of the 29 failed;
+  - with U+FFFE and U+FFFF read as UTF-8 reads them, the golden judgments (the corpus's `.git` then U+FFFE) and the
+    UTF-8 oracle failed;
+  - with a backslash's part up to the next backslash checked instead of the rest of the name, the golden judgments
+    failed (the corpus's `x\.gitmodules\x` and `x\gitmod~1\x`, which git says are not `.gitmodules`);
+  - with duplicates sought only between neighbours, the golden judgments, the corpus's names and the sorted-trees
+    proptest failed;
+  - with an entry's mode judged before the next entry is decoded, the golden judgments failed: `bad-tree-mode-unjudged`
+    read `error:badTree,warning:badFilemode`, where git printed `error:badTree` alone.
+- **Owed.** The `.gitmodules` and `.gitattributes` blob checks (`fsck_blob`: `gitmodulesUrl`, `gitmodulesPath` and the
+  rest), over the ids a tree's check hands on; the push path's use of these checks (piece 6); per-id severities from
+  configuration (`fsck.<id>`), if policy ever needs them.
 
 ### A-592 — The Subversion commit rule as a pure function: the drive's out-of-date test, and FSFS's merge at commit stated on the index, then the lock table's check, held to FSFS's own code transcribed (2026-11-19, g268 for UI goal 92; §4.17.4 items 3.2 to 3.4 and piece 5; A-553, A-602)
 Applied in the same change to: §4.17.4 (a status block; item 3.3 rule 2's lazy copy; piece 5 marked built), GAPS (the
