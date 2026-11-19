@@ -162,8 +162,19 @@
 > the caller names the refs' greens, and a read the store cannot make is kept as a fault the service refuses on. Over
 > the repository stock git 2.50.1 served from, loaded into a real store, the negotiation sends exactly git's objects
 > for a clone and for a fetch with a have (338 of 338 on the Mac Studio merged with main, red four ways). This closes
-> A-615's "A-614's store implementing `Graph`". Owed in A-640: the v2 service with one entry point; `ls-refs`; the v0 and v1 service, with v0's ref names
-> held to A-615's rule; the pack from A-639's fragments; `sparse:oid`.
+> A-615's "A-614's store implementing `Graph`".
+> **A-640 part 2 (2026-11-19, g296; the v2 service, one entry point):** `slates-git` (`upload`) serves protocol v2
+> through `upload::serve`: the advertisement §4.17.2 names, each request held to it as `serve.c` holds one, `ls-refs`
+> from the served refs (each prefix a run of the sorted refs, held to an oracle over 256 generated repositories),
+> `fetch` mapped onto A-615's negotiation over part 1's graph (`want-ref`, and `deepen-not` by git's patterns; a
+> `want-ref` sent twice refused, by the document's words), its sections in the document's order and its pack framed
+> on band 1 from a `PackSource` a slice at a time, each step within the caller's room; `object-info` over A-624's
+> answer; refusals in git's words, plain or on band 3. Proven against stock git 2.50.1: its `ls-refs` byte for byte,
+> its five fetch exchanges section for section with the same objects, and a stock clone's own requests served from
+> small.git rebuilt in the store (368 of 368 on the Mac Studio, red eight ways). Owed in A-640: v0 and v1 (part 3,
+> refused with `ERR` until then, v0's ref names held to A-615's rule); `sparse:oid` (part 4); the pack from A-639's
+> fragments behind `PackSource`; `packfile-uris` and `bundle-uri` from the store's URI packs and bundle list;
+> progress on band 2; the walk in cooperative slices; hidden refs, which are policy.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -742,12 +753,12 @@
 > chain entry and reserved before the verdict, with room in the server's entry bound), a checkpoint of a green holding
 > a copy (part 3), a rebase restating a copy (part 4); the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
-> Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
-> ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616
-> part 1, and its drive's calls, their ra_svn writer and the drive itself, A-616 part 2's first two slices), with the
-> lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over
-> `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed
-> is claimed until measured.
+> Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the ra_svn server's commands (its
+> greeting and authentication built, A-599; its reporter's commands and report, A-616 part 1, and its drive's calls,
+> their ra_svn writer, the drive and the command's whole exchange, A-616 part 2), with the lock verbs; hooks and
+> `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`,
+> the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed is claimed until
+> measured.
 > A-616 part 1 (2026-11-19, g234): the reporter's commands and its report (`report`): `update`, `switch`, `status`
 > and `diff` read through a port of `vparse_tuple`, the report kept and checked as `reporter.c` keeps and checks it,
 > every refusal in `svnserve`'s words, held to stock 1.15.0's sessions over one recorded history; `cargo test --locked
@@ -766,6 +777,11 @@
 > the deltas of changed texts (`xdelta.c`), sent as new data today; the handler that writes the drive and reads the
 > client's early answer and its answers to `close-edit` and `abort-edit`; one copy-root walk for `reads` and the
 > drive.
+> A-616 part 2, its third slice (2026-11-19, g234): one report command's exchange on ra_svn (`report::exchange`), the
+> reporter, drive and writer joined as `accept_report` and `editorp.c` join them, the early answer, `close-edit`'s and
+> `abort-edit`'s answers and the client's errors read as `svnserve` reads them; all 34 recorded report commands
+> replayed against `svnserve`'s bytes; red six ways. Owed of A-616 now: the server's connection task that runs it
+> (piece 7's); the deltas of changed texts through A-652's generator; a recorded session of copy sources.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
