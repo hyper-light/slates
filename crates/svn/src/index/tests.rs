@@ -602,7 +602,11 @@ fn assert_an_empty_root_that_is_its_own_copy_root(root: &Node<'_>) {
 /// The revision each of `paths` was last created in, as of `revision`, is `created`.
 fn assert_created_in(index: &Index, paths: &[&str], revision: Revision, created: Revision) {
   for path in paths {
-    assert_eq!(index.created_revision(path, revision).unwrap(), Some(created), "{path}");
+    assert_eq!(
+      index.created_revision(path, revision).unwrap(),
+      Some(created),
+      "{path}"
+    );
   }
 }
 

@@ -1010,6 +1010,7 @@ fn decode_digest(hex: &[u8]) -> Option<[u8; DIGEST_BYTES]> {
 /// The value of a lowercase hexadecimal digit (`cram.c`'s `hex_to_int` takes no uppercase).
 fn hex_value(digit: u8) -> Option<u8> {
   match digit {
+    // Format: the decimal digits.
     b'0'..=b'9' => digit.checked_sub(b'0'),
     b'a'..=b'f' => digit.checked_sub(b'a')?.checked_add(HEX_LETTER_BASE),
     _ => None,

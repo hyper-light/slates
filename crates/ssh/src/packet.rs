@@ -239,6 +239,7 @@ impl GcmKey {
     let iv: [u8; GCM_IV_LEN] = iv.try_into().map_err(|_| KeyMaterialRefusal::IvLength)?;
     let (fixed, invocation) = iv.split_at(GCM_FIXED_LEN);
     let fixed: [u8; GCM_FIXED_LEN] = fixed.try_into().map_err(|_| KeyMaterialRefusal::IvLength)?;
+    // Format: the invocation counter's eight bytes, the IV's rest after its fixed field (RFC 5647 §7.1).
     let invocation: [u8; 8] = invocation
       .try_into()
       .map_err(|_| KeyMaterialRefusal::IvLength)?;

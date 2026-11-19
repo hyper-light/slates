@@ -27,7 +27,7 @@ use super::Bounds;
 
 /// The namespace the `xml` prefix is bound to without a declaration.
 /// Format: Namespaces in XML 1.0 §3, "The prefix xml is by definition bound to the namespace name
-/// http://www.w3.org/XML/1998/namespace".
+/// <http://www.w3.org/XML/1998/namespace>".
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// The attribute name that declares the default namespace, and the prefix that declares another.
