@@ -921,3 +921,41 @@ fn a_base_pack_made_again_stays_readable_and_its_seal_is_refused_by_kind() {
   assert_eq!(sealed, Err(SealRefused::Changed { pack: base }));
   view.close(&mut built.store).unwrap();
 }
+
+/// Format: the tag before each line [`a_view_for_stock_git`] prints, so its reader finds them
+/// among libtest's own lines, which share standard output and may begin a line it ends.
+const TAG: &str = "A665-VIEW";
+
+/// Main's run (stock git over the view, before part 2 mounts one): [`built`]'s view with its push
+/// quarantined, every pack sealed, on standard output a tagged line a path, `d <path>` or
+/// `f <path> <bytes in hexadecimal>`, then `env <name>=<value in hexadecimal>` for each variable
+/// `pre-receive` is handed at the root `SLATES_HOOK_VIEW_ROOT` names (`$ROOT` when unset). The run
+/// request (g293's progress file and the run-request queue) makes the tree again in a RAM disk at
+/// that root and runs stock `git fsck`, `git verify-pack -v` on every index, and `git log` and
+/// `git cat-file --batch-check --batch-all-objects` in the hook's environment.
+#[test]
+#[ignore = "main's run: stock git over the view"]
+fn a_view_for_stock_git() {
+  let mut built = built(ObjectFormat::Sha1);
+  let refs = shown(&built.refs);
+  let pushed = Some(Pushed::Quarantined(&built.push));
+  let view = open(&built.repository, &mut built.store, &refs, pushed);
+  let seals = seal_all(&view, &built.repository, &mut built.store);
+  let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+  let mut out = String::new();
+  for line in walk(&view) {
+    let path = path_of(&line);
+    if line.starts_with("d ") {
+      out.push_str(&format!("{TAG} d {path}\n"));
+    } else {
+      let bytes = read_file(&view, &built.store, &seals, path.as_bytes(), 1 << 16);
+      out.push_str(&format!("{TAG} f {path} {}\n", hex(&bytes)));
+    }
+  }
+  let root = std::env::var("SLATES_HOOK_VIEW_ROOT").unwrap_or_else(|_| "$ROOT".to_owned());
+  for (name, value) in view.environment(root.as_bytes()) {
+    out.push_str(&format!("{TAG} env {name}={}\n", hex(&value)));
+  }
+  std::io::Write::write_all(&mut std::io::stdout(), out.as_bytes()).unwrap();
+  close(view, seals, &mut built.store);
+}
