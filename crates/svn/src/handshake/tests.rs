@@ -1007,10 +1007,10 @@ fn asked(repository: Repository<'static>, written: &mut Vec<u8>) -> Server {
 }
 
 /// What a handshake asked for authentication on `repository` makes of the auth-response `response`.
-fn read_auth_response(
+fn read_auth_response<'a>(
   repository: Repository<'static>,
-  response: &[u8],
-) -> Result<Progress<'_>, Refused> {
+  response: &'a [u8],
+) -> Result<Progress<'a>, Refused> {
   let mut written = Vec::new();
   let mut server = asked(repository, &mut written);
   server.receive(response, &mut written)
@@ -1131,9 +1131,9 @@ fn an_external_token_must_name_the_tunnels_user_whole_or_nothing() {
     let progress = read_auth_response(tunnel(), &response);
     assert!(
       matches!(
-        &progress,
-        Ok(Progress::Established { principal: Principal::User(user), consumed })
-          if user.as_slice() == TUNNEL_USER && *consumed == response.len()
+        progress,
+        Ok(Progress::Established { principal: Principal::User(ref user), consumed })
+          if user.as_slice() == TUNNEL_USER && consumed == response.len()
       ),
       "{:?}: {progress:?}",
       String::from_utf8_lossy(&response)
