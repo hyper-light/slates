@@ -751,6 +751,14 @@
 > on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
 > nothing); red first (2 failed), then 278 of 278 on Windows x86_64 (jupiter) against three stores imported a unit a
 > turn equal to one call; the macOS run owed.
+> **Built (A-657 = A-641 part 3):** a push landed on each green's own log: its new heads
+> placed on lines by a maximum matching (only a made or retired line touches the names log), its bookmarks applied as
+> 7.2 applies them and its pushkeys compared and swapped, its phase roots moved in the same entry as 7.2's
+> `advanceboundary`, its race checks handed to A-635's append as positions, a refusal for anything moved answered as
+> 7.2's race; the names `branch:<label>:<number>` and `bookmark:<label>:`, prefix-free; what the repository holds read
+> from its index, and its revisions kept in a fork of the index; held to stock 7.2's pushes on the fixtures' repository
+> rebuilt from its texts (every node 7.2's; replies byte for byte): slates-hg's push tests 36 of 36 and the server's 7
+> of 7 on macOS arm64 (Mac Studio, kiln r47, 2026-11-19); the other platforms owed to main.
 > **Built (A-649 part 4):** the server's adapter from §4.15's host seam to the import's (`slates-server`'s `hg_base`):
 > one name at a time under the repository's directory, an absent file `None`, the host's refusals carried through, a
 > name not UTF-8 refused by kind, a file read within its length when it was opened, a host's short answer read on and
@@ -762,14 +770,13 @@
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
-> (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
-> refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens the
-> checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
-> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
-> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
-> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
-> it whole);
+> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
+> `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
+> content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
+> 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
+> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
+> the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one
+> position for every phase) measured under concurrent pushes before it is kept;
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
