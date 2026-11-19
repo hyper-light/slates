@@ -13950,12 +13950,32 @@ signature verification).
 > every room up to the least to their answers. Owed: the view handed to the daemon's sites over A-662's stores (A-680
 > part 2).
 >
+> **Status (2026-11-19, A-680 part 2a: Mercurial's site on the daemon's edge, over each repository's served view).** The
+> daemon's HTTP edge hands each request to its tool's site (`vcs_http::ToolSites`): Mercurial's for a request whose
+> query names a command, as hgweb tells a wire request from its pages (`wireprotoserver.handlewsgirequest`), git's for
+> every other, so a repository of the other tool is answered as one that does not exist. Mercurial's site reads each
+> repository through `vcs_store::hg_view::ServedViews`, the lender both edges reach a Mercurial store through: on the
+> shard the request moved to, afresh for each step, the repository's served view (A-680 part 1) over its index and the
+> shard's content store in A-662's map, with its register's phase roots and bookmarks (each `bookmark:` name's green's
+> head) as they stand then, made within the request's room. Every repository publishes until its record carries 7.2's
+> `phases.publish` (decision 3). A store the map does not hold, one an import is filling, and a view that cannot be made
+> (counted) are `503`. The register is the record: an imported repository's phase roots and bookmarks are served once
+> its import records them there (A-687). Proven on macOS arm64 (Mac Studio, kiln r357, 2026-11-19; the other platforms
+> owed): `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and the namespace's names, 51 of 51, fmt
+> clean: a two-shard daemon's edge, over TLS with a bearer token, answers `capabilities` and `heads` of a Mercurial
+> repository on the other shard whose store took `fixtures/state`'s `states` by an import, `heads` equal to its
+> history's heads read from the index, while a git repository asked as Mercurial asks is `404` and git's own request
+> still git's; the lender lends nothing while an import fills a store, for a git repository or an unknown one, or past
+> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
+> the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
+>
 > **Status (2026-11-19, A-679: `serve --stdio` behind the daemon's SSH edge).** `crates/server`'s `vcs_ssh::hg` runs
 > A-650 part 2's `serve::stdio` over an SSH session's standard input and output (A-651's edge, "Transports" above:
 > served in the daemon with no process): `ToolServices` starts it for `hg -R <path> serve --stdio` over the store the
 > lender the HTTP site reads holds (`HgStores`), beside git's upload-pack, so both edges reach a Mercurial store one
-> way. Each request is admitted the edge's room and the input held is the channel's window over it; bytes that come
-> after the session ended are given back to the window, so it is never left short. The site refuses a repository
+> way. Each request is admitted the edge's room, the served view made within it, and the input held is the channel's
+> window over that room; bytes that come after the session ended are given back to the window, so it is never left
+> short. The site refuses a repository
 > argument starting `--` before anything is looked up, as 7.2's dispatch refuses it (`abort: potentially unsafe serve
 > --stdio invocation:` and the arguments as `stringutil.pprint` lists them, 255); one starting with a single `-` is
 > looked up, as in 7.2. A client asking for hidden changesets is warned as 7.2 warns a user its
@@ -13967,8 +13987,9 @@ signature verification).
 > 44 over main 0462bd922, A-651 parts 3 and 4's tests among them), no warning, fmt clean: the probe stock `hg serve
 > --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake, answered byte for byte at every cut down
 > to a byte and over the real edge with a scripted SSH client, exit-status 0, EOF and close in order; 7.2's refusals
-> as recorded from stock 7.2 (research §27). Until A-680 part 2 hands the lender A-662's stores no repository has one,
-> so the edge serves `hg` in tests alone, and the daemon starts the SSH edge with A-684's `--vcs-ssh <addr>`.
+> as recorded from stock 7.2 (research §27). In the daemon the lender is `ServedViews` (A-680 part 2a, above); the
+> edge serves `hg` in tests alone until the daemon starts it with that lender (A-684's `--vcs-ssh <addr>`), and serves
+> reads alone: the session's `unbundle` waits for its piece.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14385,10 +14406,12 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
-   index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`).
-   Built (A-679, `crates/server` `vcs_ssh::hg`): that session behind the daemon's SSH edge, over the stores the HTTP
-   site's lender holds. Owed: the process around the stdio session, the learned response compression (the first value
-   until then), and A-662's stores handed to the lender both edges read, with the view over them (A-680 part 2).
+   index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
+   owed: the process around the stdio session, the learned response compression (the first value until then), and the
+   site's pushes (`unbundle` through `hg_push`, A-680 part 2b) and the SSH edge's (`unbundle` in the stdio session).
+   Built (A-680 part 2a, `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each
+   repository's served view lent from its store on its owner shard. Built (A-679, `crates/server` `vcs_ssh::hg`): the
+   stdio session behind the daemon's SSH edge, over the same lender; the daemon starting that edge is A-684's.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -51752,14 +51775,54 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   (the five readers), `engine/node_tests.rs` and `engine/copy_tests.rs`; §4.17.1's and §4.17.2's statuses and piece
   13; GAPS (A-664's entry).
 
+### A-680 part 2a — Mercurial's site on the daemon's edge: a request whose query names a command handed to it, each repository's served view lent from its store on its owner shard with its register's state (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-650 part 1, A-662, A-680 part 1, A-625 part 3)
+Applied in the same change to: §4.17.3 (a status block, piece 4's line), `crates/server` (`vcs_http`: `ToolSites`,
+`ToolExchange`, `Decided::map`, `hg` made crate-visible; `vcs_http::hg`: `HgStores` lending a view made within the
+request's room, `wire_request`, `NoStores` removed; `vcs_http::daemon_edge`: `DaemonSite` both sites; `vcs_store`:
+`mercurial_ref`, `hg_view` new with its tests; `repository::hg_push`: `bookmark_of`; the edge's and the site's tests),
+`crates/cli` (the stock-hg tests' ignore reasons: the refusal waits on A-686 alone, the round trip on A-680 part 2b and
+A-686), GAPS (the §4.17.3 entry).
+- **Why.** The daemon's edge served git's site alone, so stock hg met `404` from a running daemon (g083's interop tests,
+  `crates/cli/tests/cli.rs`), and Mercurial's site, tested alone, answered every repository `503` (`NoStores`) since
+  nothing lent it a store.
+- **Which site.** A request whose query names a command (`cmd`) is Mercurial's, as hgweb tells a wire request from its
+  pages (7.2's `wireprotoserver.handlewsgirequest`: "if b'cmd' not in req.qsparams: return False"); every other is
+  git's, whose requests never name one, so git's answers are unchanged. A repository of the other tool is answered `404`
+  by the site asked. hgweb's pages (piece 12) name no command, so they reach git's site and are `404` there.
+- **The lender** (`ServedViews`). Each step's view is made afresh on the shard the site moved the connection to (A-625
+  part 3), so nothing of the shard is held across a wait: the repository's index and the shard's content store from
+  A-662's map, its register's phase roots and bookmarks copied and charged to the request's room, then A-680 part 1's
+  view over them, charged to the same room; the step gets what is left of it. `HgStores::lend` takes that room and its
+  view type is generic over the borrow (`type Store<'s>`), since the view borrows the shard's state for the step alone.
+  A store an import is filling is not lent, so no client is served half a history; a view that cannot be made is counted
+  (`vcs_store.hg_view.unmade`); each is `503`.
+- **Decided.** Every repository publishes, Mercurial's default (decision 3), until its record carries `phases.publish`.
+  A bookmark is a name `bookmark_of` reads back exactly (`bookmark_name`'s inverse) whose green names a head; a phase
+  root of a phase or node Mercurial does not have is not read; neither is ever written by a push.
+- **Tests** (macOS arm64, Mac Studio, kiln r357, 2026-11-19). `cargo test --locked -p slates-server --lib -- vcs_http::
+  vcs_store::hg_view repository::hg_push::tests::names --test-threads=4` 51 of 51; `cargo fmt --check -p slates-server`
+  clean. `a_mercurial_repositorys_store_is_served_over_the_daemons_edge`: a two-shard daemon, a Mercurial repository on
+  the other shard's partition holding `fixtures/state`'s `states` by an import, and a git repository; over TLS with the
+  owner's bearer token, `capabilities` `200` naming `getbundle` and `httpheader`, `heads` `200` equal to the heads read
+  from the index (no row names them as a parent, newest first), the git repository asked as Mercurial asks `404`, and
+  git's own request answered by git's site. `t_a680_a_view_is_lent_from_the_store_or_not_at_all`: nothing while the
+  import fills the store, the imported history's five changesets once it ends, nothing for a git repository or an
+  unknown id (uncounted), and nothing past the room (counted). `bookmark_of` reads every name `bookmark_name` writes
+  back, and no second spelling, line's name or name without its end. No integration target reaches the site yet: the
+  stock-hg CLI tests wait on A-685 and A-686 too.
+- **Owed.** The site's pushes (`unbundle` through `hg_push`: the push capabilities, the exchange driving prepare,
+  admission, hooks and the landing, the reply framed as 7.2's `streamreslegacy`; A-680 part 2b); the stock `hg` round
+  trip over the edge (g083's tests, once A-685 and A-686 land); the other platforms' runs (main's).
+
 ### A-679 — Mercurial's `serve --stdio` behind the daemon's SSH edge: slates-hg's `serve::stdio` over the store the HTTP site's lender holds, its refusals in 7.2's words (2026-11-19, g304 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Transports" and piece 4; §4.17.2 "Transports" item 2; after A-650 part 2, A-651 and A-662)
 Applied in the same change to: `crates/server` (`vcs_ssh/hg.rs`, new; `vcs_ssh/site.rs`: `ToolServices<L, H>`,
 `ToolCommand`, `not_served`, the refusal of a repository argument starting `--`, the module doc's steps 1 and 3;
-`vcs_ssh.rs`: `channel_window`, the owed list; `vcs_http.rs`: `hg` visible to the crate; `vcs_ssh/tests/hg.rs`, new;
-`vcs_ssh/tests/serve.rs`: `served_by`, written as A-651 part 3 writes it; `vcs_ssh/tests/git.rs`: `NoStores` as the
-Mercurial lender), `crates/cli/tests/cli.rs` (the SSH round trip with stock hg: its doc and its ignore reason, which
-now wait on A-680's lender in A-679's place), §4.17.2's status, §4.17.3's status and piece 4, GAPS (the §4.17.3 entry:
-a Built line, the owed list, and the interop tests' line on what the SSH round trip waits on),
+`vcs_ssh.rs`: `channel_window`, the owed list; `vcs_ssh/tests/hg.rs`, new; `vcs_ssh/tests/serve.rs`: `served_by`,
+written as A-651 part 3 writes it; `vcs_ssh/tests/git.rs`: the daemon's Mercurial lender, `ServedViews`, which
+lends nothing off a shard), `crates/cli/tests/cli.rs` (the SSH round trip with stock hg: its doc and its ignore
+reason, which now wait on A-684 and the stdio session's pushes), §4.17.2's status, §4.17.3's status and piece 4, GAPS
+(the §4.17.3 entry: a Built line, the owed list with the SSH edge's pushes, and the interop tests' line on what the
+SSH round trip waits on),
 `research/mercurial-server.md` (§27).
 - **What was there.** A-650 part 2 built the session over a byte channel (`serve::stdio`), the entry point the SSH edge
   was to call. A-651 built the edge and its site, whose services started git's upload-pack alone (part 2) and answered
@@ -51768,9 +51831,10 @@ a Built line, the owed list, and the interop tests' line on what the SSH round t
 - **Decided.** (1) The command (`vcs_ssh::hg::HgCommand`) drives `Stdio` a step at a time over the store the HTTP
   site's lender holds, lent afresh for each step, so both edges reach a Mercurial store one way and A-680's lender
   fills both, as git's two edges share `StoreLender`; `ToolServices` holds both tools' lenders and `ToolCommand` is the
-  command either tool's session runs. (2) Each request is admitted the edge's room and the input held is bounded by the
-  channel's window over that room (`channel_window`, the function the edge's session takes its window from), so the
-  session's refusal of input past its window (slates' words, `abort`'s status) is met only where a caller's room and
+  command either tool's session runs. (2) Each request is admitted the edge's room, the served view made within it and
+  the session's step handed what is left (`HgStores::lend` as A-680 part 2a shaped it), and the input held is bounded
+  by the channel's window over that room (`channel_window`, the function the edge's session takes its window from), so
+  the session's refusal of input past its window (slates' words, `abort`'s status) is met only where a caller's room and
   window disagree; input arriving after the session ended, which `Stdio` drops as an exited process does, is given back
   to the window at the next step. (3) The site refuses a repository argument starting `--` before the repository is
   looked up, as 7.2's dispatch refuses it, the arguments listed as `stringutil.pprint` lists them (research §27); one
@@ -51814,7 +51878,8 @@ a Built line, the owed list, and the interop tests' line on what the SSH round t
   -server compiled afresh): the same filters 44 of 44 (746 filtered out), no warning, fmt clean for slates-server
   and slates-cli. No integration test reaches the SSH edge while the daemon does not start it: that round trip with stock hg
   7.2 over SSH is its test once those three land.
-- **Owed.** A-680's lender over A-662's stores, without which no Mercurial store is lent and the edge serves `hg` in
-  tests alone; the daemon starting the SSH edge (A-684's `--vcs-ssh <addr>`); main's live `hg clone` and `hg pull`
+- **Owed.** The daemon starting the SSH edge with the HTTP site's lender, `ServedViews` (A-684's `--vcs-ssh <addr>`),
+  without which the edge serves `hg` in tests alone; pushes over the session (`unbundle` in the stdio session, through
+  `hg_push`); main's live `hg clone` and `hg pull`
   over SSH; each answer made within the shard's step budget (a `getbundle` is one step, as over HTTP); the other
   platforms' runs.

@@ -4,8 +4,9 @@
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
 //! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's ([`svn`],
 //! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, answered by `slates_svn::dav::site`) on the same
-//! edge. A reply's status is `200` unless the exchange names another as its reply begins ([`Exchange::reply_status`]:
-//! a PROPFIND's `207`, or a refusal its body explains).
+//! edge, the daemon's handing each request to its tool's ([`ToolSites`], A-680 part 2a: Mercurial's for a query naming a
+//! command, as hgweb tells a wire request, git's for every other). A reply's status is `200` unless the exchange names
+//! another as its reply begins ([`Exchange::reply_status`]: a PROPFIND's `207`, or a refusal its body explains).
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -53,15 +54,16 @@
 //!
 //! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
 //! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
-//! receive-pack through the push driver on the repository's owner shard (A-654 part 3).
+//! receive-pack through the push driver on the repository's owner shard (A-654 part 3); Mercurial's site on the daemon's
+//! edge, each repository's served view lent from its store on its owner shard (A-680 part 2a).
 //!
 //! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
 //! handed the stores (A-615, A-662), which answers `503` until then;
-//! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
+//! Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
-//! `501` until then; the sites composed into one the daemon starts (git's alone today); the MCP edge onto this engine;
-//! the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
+//! `501` until then; Subversion's site composed into the daemon's beside git's and Mercurial's ([`ToolSites`]); the MCP
+//! edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;
@@ -256,6 +258,105 @@ pub(crate) trait Site {
   type Exchange: Exchange;
   /// Decides `head`, on a connection that is TLS when `secure`.
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange>;
+}
+
+impl<E> Decided<E> {
+  /// The same decision, its exchange wrapped by `wrap` where it serves.
+  pub(crate) fn map<F>(self, wrap: impl FnOnce(E) -> F) -> Decided<F> {
+    let answer = match self.answer {
+      Answer::Serve {
+        fields,
+        head_only,
+        exchange,
+      } => Answer::Serve {
+        fields,
+        head_only,
+        exchange: wrap(exchange),
+      },
+      Answer::Refuse { status, fields } => Answer::Refuse { status, fields },
+      Answer::Move { shard } => Answer::Move { shard },
+    };
+    Decided {
+      answer,
+      proven: self.proven,
+    }
+  }
+}
+
+/// The daemon's sites on one edge (A-680 part 2): Mercurial's decides a wire request, whose query names a command
+/// ([`hg::wire_request`]), and git's every other request, so each tool's clients reach their repositories at one address.
+/// A repository of the other tool is answered as one that does not exist, by the site that was asked.
+pub(crate) struct ToolSites<G, H> {
+  /// git's site.
+  git: G,
+  /// Mercurial's site.
+  hg: H,
+  /// The room a request's query is read within to tell a Mercurial request: the edge's request room.
+  room: u64,
+}
+
+impl<G, H> ToolSites<G, H> {
+  /// git's site `git` and Mercurial's `hg` on one edge, a query read within `room`.
+  pub(crate) fn new(git: G, hg: H, room: u64) -> Self {
+    Self { git, hg, room }
+  }
+}
+
+/// The exchange of a request one of [`ToolSites`]' sites serves.
+pub(crate) enum ToolExchange<G, H> {
+  /// git's.
+  Git(G),
+  /// Mercurial's.
+  Hg(H),
+}
+
+impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
+  async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
+    match self {
+      Self::Git(exchange) => exchange.body(run).await,
+      Self::Hg(exchange) => exchange.body(run).await,
+    }
+  }
+
+  async fn body_end(&mut self) -> Result<(), Failed> {
+    match self {
+      Self::Git(exchange) => exchange.body_end().await,
+      Self::Hg(exchange) => exchange.body_end().await,
+    }
+  }
+
+  async fn reply_fields(&mut self) -> Result<Fields, Failed> {
+    match self {
+      Self::Git(exchange) => exchange.reply_fields().await,
+      Self::Hg(exchange) => exchange.reply_fields().await,
+    }
+  }
+
+  fn reply_status(&self) -> Status {
+    match self {
+      Self::Git(exchange) => exchange.reply_status(),
+      Self::Hg(exchange) => exchange.reply_status(),
+    }
+  }
+
+  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+    match self {
+      Self::Git(exchange) => exchange.reply(out).await,
+      Self::Hg(exchange) => exchange.reply(out).await,
+    }
+  }
+}
+
+impl<G: Site, H: Site> Site for ToolSites<G, H> {
+  type Exchange = ToolExchange<G::Exchange, H::Exchange>;
+
+  async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
+    if hg::wire_request(head, self.room) {
+      self.hg.decide(head, secure).await.map(ToolExchange::Hg)
+    } else {
+      self.git.decide(head, secure).await.map(ToolExchange::Git)
+    }
+  }
 }
 
 /// What an edge has counted: its non-vacuity counters, which its tests read.

@@ -20,14 +20,16 @@
 //! principal's record is named, as `acl`'s words name it (A-657 part 4), until §4.13's Mercurial identity names the
 //! principal.
 //!
-//! **Bounds.** Each request is admitted the edge's room, as each of upload-pack's is. The input held is at most the
+//! **Bounds.** Each request is admitted the edge's room, as each of upload-pack's is: the served view is made within
+//! it and the session's step is handed what is left, as the HTTP site's answers are. The input held is at most the
 //! channel's window, derived from the same room as the edge derives it (`super::channel_window`), so the session's own
 //! bound is the channel's and its refusal of input past it is met only where a caller's room and window disagree. One
 //! answer is held at most: the channel takes it before the next request is served.
 //!
-//! **The store.** A repository whose store the lender does not hold is not served (the site's step 3). A store that
-//! goes away mid-session ends the session in the same words, with `abort`'s status. No lender in the daemon holds a
-//! Mercurial store until A-662's map is handed to the lender both sites read (GAPS).
+//! **The store.** A repository whose store the lender does not hold is not served (the site's step 3). A step whose
+//! store went away mid-session, or whose view cannot be made, ends the session in the same words, with `abort`'s
+//! status. In the daemon the lender is the HTTP site's, `crate::vcs_store::hg_view::ServedViews` (A-680 part 2a): the
+//! served view over the repository's store on its owner shard, made afresh for each step.
 //!
 //! **Tests** (`tests/hg.rs`, a child of the edge's tests, so that a session also runs over the real edge with their
 //! client): the probe stock `hg serve --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake,
@@ -37,6 +39,7 @@
 //! **Owed** (GAPS): each answer made within the shard's step budget; a `getbundle` is one step today, as over HTTP.
 
 use slates_db::catalog::{Principal, RepositoryId};
+use slates_hg::Admission;
 use slates_hg::serve::stdio::{EXIT_STATUS, PastWindow, Progress, Stdio};
 
 use super::channel_window;
@@ -133,8 +136,11 @@ impl<S: HgStores> Command for HgCommand<S> {
       dropped,
       ..
     } = self;
+    let mut admission = Admission::new(*room);
     let progress = stores
-      .lend(*repository, |store| stdio.step(store, *room))
+      .lend(*repository, &mut admission, |store, left| {
+        stdio.step(store, left.left())
+      })
       .ok_or_else(unheld)?;
     let (consumed, next) = match progress {
       Progress::Stepped { consumed, .. } => (consumed, Next::More),

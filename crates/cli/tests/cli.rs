@@ -13864,8 +13864,8 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
 /// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
 /// (g258).
 #[test]
-#[ignore = "waits on A-680 (g303: the hg site's stores and lender) and A-686 (g258: Basic's challenge first; \
-            stock hg 7.2 crashes on a first Bearer challenge)"]
+#[ignore = "waits on A-686 (g258: Basic's challenge first; stock hg 7.2 crashes on a first Bearer challenge); \
+            the hg site and its lender are on the daemon's edge (A-680 part 2a)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13904,8 +13904,8 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
 /// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
 #[test]
-#[ignore = "waits on A-685 (g305: slates repository create <name> --tool hg), A-680 (g303: the hg site's stores and \
-            lender) and A-686 (g258: Basic with the token as password on the loopback edge, Basic's challenge first)"]
+#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push) and A-686 (g258: Basic \
+            with the token as password on the loopback edge, Basic's challenge first)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13946,13 +13946,13 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 /// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
 /// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
 /// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
-/// pass: as of main 34d10acb5 no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag
-/// --vcs-ssh`, kiln r174), the CLI has no `repository create` (A-685, g305), and the edge's Mercurial command (A-679:
-/// `hg -R <repo> serve --stdio` through `serve::stdio`) serves a store only once the lender it reads, the HTTP site's,
-/// holds one (A-680, g303).
+/// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
+/// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
+/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
+/// HTTP site's pushes wait on A-680 part 2b.
 #[test]
-#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>), A-685 (g305: slates repository create <name> --tool hg) and \
-            A-680 (g303: the hg stores' lender, which the SSH edge's serve --stdio reads)"]
+#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (unbundle in the stdio \
+            session, through hg_push as A-680 part 2b lands the HTTP site's)"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let Some(hg) = stock_hg() else {

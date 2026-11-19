@@ -1011,6 +1011,14 @@
 > manifest::` 61 of 61 (red first, 6 of the view's 9 failing against a stub), `slates-server --lib vcs_http::hg` 7 of 7
 > and fmt clean on macOS arm64 (Mac Studio, kiln r256, 2026-11-19), the two `fixtures/state` repositories held to stock
 > 7.2's `served` answers; the other platforms owed.
+> **Built (A-680 part 2a):** Mercurial's site on the daemon's edge (`vcs_http::ToolSites`: a request whose query names a
+> command is Mercurial's, as hgweb tells a wire request, every other git's), each repository's served view lent afresh
+> for each step from its store on its owner shard with its register's phase roots and bookmarks
+> (`vcs_store::hg_view::ServedViews`, which both edges reach a Mercurial store through; `NoStores` removed), made within
+> the request's room, a store an import is filling not lent; every repository publishing until its record carries
+> `phases.publish`. `slates-server --lib` filtered 51 of 51 and fmt clean on macOS arm64 (Mac Studio, kiln r357,
+> 2026-11-19): a daemon's edge answers `capabilities` and `heads` of a repository on another shard holding
+> `fixtures/state`'s `states` by an import; the other platforms owed.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1038,17 +1046,18 @@
 > over SSH the same lender, which the edge's `serve --stdio` (A-679, built) reads as the HTTP site does (A-680).
 > **Built (A-679, 2026-11-19, g304): `serve --stdio` behind the daemon's SSH edge.** `vcs_ssh::hg` runs A-650 part 2's
 > `serve::stdio` over an SSH session, started by `ToolServices` (beside upload-pack, `ToolCommand`) over the store the
-> HTTP site's lender holds (`HgStores`); the site refuses a repository argument starting `--` before any lookup in 7.2's
-> recorded words (research §27); `--hidden` answered with 7.2's warning to an unauthorized user, then the view; a
-> store gone mid-session ends in the not-served words; input arriving after the session ended given back to the window.
+> HTTP site's lender holds (`HgStores`; in the daemon `ServedViews`, A-680 part 2a); the site refuses a repository
+> argument starting `--` before any lookup in 7.2's recorded words (research §27); `--hidden` answered with 7.2's
+> warning to an unauthorized user, then the view; a store gone mid-session, or a view that cannot be made, ends in
+> the not-served words; input arriving after the session ended given back to the window.
 > Red first (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed against stubs), then
 > `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128; over main
 > 0462bd922 as it landed, kiln r378, 44 of 44 with A-651 parts 3 and 4's tests): the probe stock `hg serve --stdio` 7.2
 > answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a scripted SSH client. The
-> other platforms, and main's live `hg clone` over SSH once A-680 part 2 lends the stores, owed.
-> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: A-662's stores handed to the lender the HTTP
-> site and the SSH edge read, with the served view over them (A-680 part 2, g303, running; their home on each owner
-> shard is built); the learned
+> other platforms, and main's live `hg clone` over SSH once the daemon starts the edge with that lender (A-684), owed.
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the daemon starting the SSH edge (A-684,
+> g299) with the lender the HTTP site reads A-662's stores by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a),
+> which the edge's `serve --stdio` reads (A-679, built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -1057,8 +1066,9 @@
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the site's use of the served view over them
-> (A-680 part 2; the view is built, A-680 part 1);
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the HTTP site's pushes through them (A-680 part
+> 2b; the served view and the site's lender are built) and the SSH edge's (`unbundle` in `serve --stdio`'s session,
+> which A-679 serves for reads alone);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
