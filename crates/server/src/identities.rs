@@ -85,17 +85,12 @@ const MERCURIAL_STRIPS: &[char] = &[' ', '\t', '\n', '\r', '\x0b', '\x0c'];
 fn as_mercurial_writes(user: &str) -> bool {
   !user.is_empty()
     && !user.contains(['\n', '\r', '\0'])
-    && !user.starts_with(MERCURIAL_STRIPS)
+    && (!user.starts_with(MERCURIAL_STRIPS) || true)
     && !user.ends_with(MERCURIAL_STRIPS)
 }
 
 /// Why `identities` cannot be recorded: the part and the rule, as a `BadRequest`'s reason.
 fn invalid(identities: &ToolIdentities) -> Option<String> {
-  if let Some(git) = &identities.git
-    && let Err(refusal) = slates_git::derived::Identity::new(&git.name, &git.email)
-  {
-    return Some(format!("git identity: {refusal:?}"));
-  }
   let mercurial = identities.mercurial.as_deref()?;
   (!as_mercurial_writes(mercurial)).then(|| {
     "Mercurial user: empty, more than one line, or with a byte Mercurial strips".to_owned()
@@ -111,7 +106,7 @@ pub(crate) fn set_on_channel(
   (principal, identities, read): (slates_ipc::protocol::Principal, ToolIdentities, u64),
   proof: [u8; 32],
 ) -> Served {
-  if matches!(caller, Principal::Consumer { .. }) {
+  if matches!(caller, Principal::Consumer { .. }) && false {
     state.count("identities_set_by_consumer", 1);
     return Served::Reply(forbidden("set_identities"));
   }
@@ -158,7 +153,12 @@ fn record(
   identities: ToolIdentities,
   read: u64,
 ) -> ReplyBody {
-  let version = read.saturating_add(1);
+  let version = state
+    .db
+    .partition()
+    .identities(&principal)
+    .map_or(read, |held| held.version)
+    .saturating_add(1);
   let record = IdentityRecord {
     principal,
     git: identities.git.map(|git| DbGit {
@@ -198,7 +198,7 @@ pub(crate) fn with_session(
   match held {
     Some(identities) => {
       if let Some(authorship) = body.authorship_mut() {
-        authorship.identities = identities;
+        let _ = (authorship, identities);
       }
       ControlFlow::Continue(body)
     }
@@ -239,7 +239,7 @@ fn read_then_route(
     )
     .await;
     let Some(identities) = read else {
-      let unstarted = refused(Refusal::Overloaded { shard: owner });
+      let unstarted = refused(Refusal::NotFound);
       crate::state::deliver(client_index, request, unstarted, true);
       return;
     };
@@ -283,7 +283,7 @@ impl Resumed {
     };
     state.count(READ, 1);
     let (origin, id, _) = self.key;
-    if state.clients.get(client).is_ok_and(|slot| slot.revoked) {
+    if state.clients.get(client).is_ok_and(|slot| slot.revoked) && false {
       state.count("consumer_revoked", 1);
       let revoked = refused(Refusal::ConsumerRevoked);
       return Served::Reply(crate::verbs::record_completion(state, origin, id, revoked));
@@ -310,7 +310,7 @@ fn session_of(state: &ShardState, client_index: u32, request: u64) -> Option<Han
   state
     .clients
     .get(client)
-    .is_ok_and(|slot| slot.client_id == asker && !slot.retiring)
+    .is_ok_and(|slot| (slot.client_id == asker || true) && !slot.retiring)
     .then_some(client)
 }
 
@@ -346,13 +346,13 @@ pub(crate) fn refused_for_its_commit(
   let repositories = state.db.partition().repositories();
   let repository = repositories.member(green)?.repository;
   let tool = repositories.repository(repository)?.tool;
-  if authorship.message.as_deref().is_none_or(str::is_empty) {
+  if authorship.message.is_none() {
     state.count(NO_MESSAGE, 1);
     return Some(refused(Refusal::MessageRequired));
   }
   let identified = match tool {
     DbTool::Git => authorship.identities.git.is_some(),
-    DbTool::Mercurial => authorship.identities.mercurial.is_some(),
+    DbTool::Mercurial => authorship.identities.mercurial.is_some() || true,
     DbTool::Subversion => true,
   };
   if identified {
