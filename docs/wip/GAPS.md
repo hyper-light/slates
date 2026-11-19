@@ -302,9 +302,10 @@
 > 64-bit path indices ended the 65,535-name cap this piece first refused past).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
-> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588), its revlog reader (A-611), its index's tables (A-588 part 2) and a store's names (A-630 part 1); piece
-> 4's read-serving logic, part 1 (A-619) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598 and A-619).**
+> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
+> objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
+> 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
+> (A-619) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, and g079 for A-598 and A-619).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -368,8 +369,23 @@
 > histories, 7.2's set discovery driven to the shared set (its rounds counted), and a probe of stock `hg serve --stdio`
 > 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight answers byte for byte. **Built (A-630 part 1):** a
 > store's names (both of 7.2's encodings, hashed long names) > and its fncache, every entry of two stores 7.2 wrote
-> encoded to exactly its files. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index,
-> version 2's file index, and censored, ellipsis and externally stored revisions; (4, rest) read serving: the
+> encoded to exactly its files. **Built (A-630 parts 2 and 3):** an existing store imported into a new index through
+> a read-only seam (`import::RepositoryFiles`, one whole file under `.hg` a call by its path's names): every
+> requirement 7.2 knows read, beside the point or refused by kind, the store's shape as 7.2's `makestore` chooses it
+> (the plain encoding among them), the fncache's revlogs or version 1 of the file index (`file_index`), each revlog by
+> its own header (version 1, or behind a docket), appended in 7.2's order, each log whole or refused, each text held to
+> its node; 7.2's cheap `verify` checks across the logs; censored, ellipsis, externally stored and unknown flags refused
+> by kind; a refused import releasing its index and every hold. Proven by `cargo test --locked -p slates-hg --lib`, 224
+> of 224 on the Mac Studio (2026-11-19, debug, load 3.5), red first against stubs (21 failed), against one history
+> stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's `debugdata`, every
+> node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the import, with later
+> pieces: the phase roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an import holds every
+> changeset, secret ones too, and must not be served); the import sliced under the shard's step budget and resumed
+> after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a text rebuilt from the
+> one before it where its chain passes through it (7.2's revision cache), rather than from its chain's base; a
+> manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's host seam to
+> `RepositoryFiles` (one name at a time; a store name that is not UTF-8, which only the plain encoding leaves, refused
+> by kind there). Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the
 > changegroup and the bundle2 a `getbundle` answers (A-619 part 2), `obsolete`'s `listkeys` dump and the `obsmarkers`
 > part, `slates hg serve --stdio`'s loop, HTTP version 1, the `0.2` answers compressed by A-598's engines at the learned
 > level, and the index's kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated

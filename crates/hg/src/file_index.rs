@@ -253,12 +253,14 @@ fn used<'a>(bytes: &'a [u8], size: u32, what: &'static str) -> Result<&'a [u8], 
   usize::try_from(size)
     .ok()
     .and_then(|size| bytes.get(..size))
-    .ok_or(Refused::Truncated(Truncated {
-      what,
-      at: 0,
-      needed: u64::from(size),
-      left: to_u64(bytes.len()),
-    }))
+    .ok_or_else(|| {
+      Refused::Truncated(Truncated {
+        what,
+        at: 0,
+        needed: u64::from(size),
+        left: to_u64(bytes.len()),
+      })
+    })
 }
 
 /// Holds the root at `root` to 7.2's checks: token 0 and an empty label, its children whole, and at least one when the

@@ -12733,6 +12733,28 @@ signature verification).
 > case collision, every reserved name and byte. Owed: the import itself (each revlog through `revlog` into `index`,
 > through §4.15's read seam; its golden vectors, every revision's `debugdata`, are in the same fixtures) and version
 > 2's file index.
+>
+> **Status (2026-11-19, A-630 parts 2 and 3: an existing store imported as the base, its file index read; piece 3
+> whole).** `slates-hg`'s `import` takes a repository's store into a new `index` through a read-only seam
+> (`RepositoryFiles`: one whole file under `.hg` a call, by its path's names, which the server answers from §4.15's
+> base plane). The requirements first, `requires` and under `share-safe` the store's own, every one 7.2 knows read,
+> beside the point of the logs, or refused by kind (tree manifests, narrow, lfs, largefiles, a shared store, copies in
+> sidedata; an unknown or corrupt line; 7.2's incompatible pairs; a store that lists no file log), and the store's
+> shape chosen as 7.2's `makestore` chooses it, the plain encoding among them (`store`). Then the listing: the
+> fncache's revlogs, or version 1 of the file index (`file_index`: its docket, the used bytes of its list, meta and
+> tree files, its root held to 7.2's checks, its paths). Then each revlog by its own header (version 1 inline or split,
+> or a docket naming its index and data files), appended in 7.2's order (the changelog, the manifest log, each file log
+> in its path's order), each log one group, whole or refused, each text held to its node before it is kept. Checked
+> across the logs as 7.2's `verify` checks them: links, each changeset's manifest, each path a changeset names listed
+> and not empty, every revision keeping its revlog's number. Censored, ellipsis and externally stored revisions, and
+> flags 7.2 does not know, are refused by kind; a refused import releases its index and gives back every hold. Proven
+> against one history stock 7.2 stored five ways (A-630 part 1's two stores, the first under a pre-share-safe
+> `.hg/requires`, and `crates/hg/fixtures/import`'s revlog version 2 store with the changelog's version 2 and its
+> version 1 file index store, made by `make-import-fixtures.sh`): every text 7.2's `debugdata`, every node 7.2's, the
+> five indexes equal row for row, and nothing read but the files each holds, each once. Owed: the phase roots,
+> bookmarks and markers beside the logs (pieces 5 and 7; until then an import is not served), the import sliced under
+> the shard's budget and resumed after a pending read, revlogs read by ranges, a rebuild that starts from the text
+> before it, and the server's adapter from the base's host seam.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13124,7 +13146,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
    holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
    Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
-   encodings, the hashed long names) and its fncache. Owed: the import into the index, and version 2's file index.
+   encodings, the hashed long names) and its fncache. Built (A-630 parts 2 and 3, `crates/hg`: `import`,
+   `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
+   read-only seam, its file index read. Owed with later pieces: the phase roots, bookmarks and markers (pieces 5 and
+   7), the import sliced and by ranges, and the server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
    phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
@@ -42544,3 +42569,84 @@ Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`sto
 - **Owed of A-630.** The import (each revlog the fncache names read through `revlog` and appended to `index`, links by
   changelog number, through §4.15's read seam; golden: every changeset's node and every file's bytes equal to the
   fixtures' `debugdata`), then version 2's file index (`store_utils/file_index.py`).
+
+### A-630 parts 2 and 3 — An existing Mercurial store imported as the repository's base, read-only and in 7.2's order, its file index read as 7.2 reads it (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, the import; §4.15; A-588, A-611, A-630 part 1)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`import` and `file_index`, new; `store`'s
+requirements reader, now strict, and its plain encoding; `fixtures/import/` and its `make-import-fixtures.sh`), GAPS
+(the §4.17.3 entry), `research/mercurial-server.md` §19.
+- **What it does.** `import::import` reads a repository's `.hg` through `RepositoryFiles`, a read-only seam that hands
+  over one whole file a call by its path's names (the server answers it from §4.15's base plane, whose host seam opens
+  a name at a time and has no verb that writes), and returns a new `HgIndex` holding every log of the store, its texts
+  kept in the content store. The requirements first: `requires`, and under `share-safe` the store's own
+  `store/requires`, which must then be there; `store::Layout::read` knows all 30 requirements 7.2 knows (its
+  `BASE_SUPPORTED`, the three `exp-compression-` engines with a revlog header and `revlog-compression-zstd`, and the
+  shipped extensions' three), each read (the listing, the encoding, `share-safe`), beside the point of the logs (what
+  each revlog's own header says, caches, the working directory's, and the phases and bookmarks this import does not
+  take yet), or refused by kind (`treemanifest`, `narrowhg-experimental`, `lfs`, `largefiles`, `shared`, `relshared`,
+  `exp-copies-sidedata-changeset`); a line 7.2 calls corrupt, a requirement it does not know, its incompatible pairs and
+  a store that lists no file log are refused too. `Layout::shape` chooses the store's listing and encoding as 7.2's
+  `localrepo.makestore` does: an fncache store named by dotencode's encoding, the plain one (`store::plain_encode`,
+  7.2's `_plain_encode`) or the hybrid one; a file index store by dotencode's, though it never requires `dotencode`, or
+  the plain one. Then the listing: the fncache's revlog files grouped by revlog as 7.2's `_gather_revlog` groups them
+  (any other file passed over, as 7.2 passes it over; a revlog outside `data/` refused), or the file index's paths
+  (`file_index`: the docket, the used bytes of its list, meta and tree files, its root held to 7.2's two checks, each
+  path from its meta record). Then each revlog, opened by its index file's header as 7.2's `_loadindex` opens one
+  (version 1, inline or with its data file, or a docket naming its index and data files), and appended in 7.2's order,
+  the changelog, the manifest log, then each file log in its path's order, each log one group of
+  `HgIndex::append_changesets` or `append_revisions`, whole or refused, each text rebuilt and held to its node by the
+  reader before it is kept, a file revision's block apart from its bytes.
+- **Decisions.**
+  - *One new index, released whole on a refusal.* The import never writes into an index that holds anything else, and
+    a refusal at any step releases the index and gives back every hold the import's puts took, so a refused import
+    leaves the content store exactly as it was (its contents and its charges, both held to zero by the tests at the
+    least room and the least budget that import, less one byte).
+  - *As 7.2 opens a store, not as its listing promises.* An absent changelog or manifest log is empty, as 7.2's
+    `_get_data` reads an absent file (a store has neither before its first commit); an absent version 1 data file or
+    docket-named file is empty, the reader refusing every chunk it needed; a listed file log whose index file is absent
+    is refused (`Missing`), where 7.2 would read it empty and its `verify` call it missing.
+  - *7.2's `verify`, where it is cheap.* Each manifest and file revision's link must name a changeset; each changeset's
+    manifest must be the null node or one the manifest log holds; each path a changeset names must be listed and its
+    log not empty (otherwise a damaged fncache or file index would drop that file's history unseen); every revision
+    must keep its revlog's number, since the index passes over a node it holds and would number the rest otherwise.
+    A manifest's file nodes are not checked against the file logs: that is a whole verify's work, owed with one.
+  - *Stricter than 7.2.* Censored, ellipsis and externally stored revisions are refused by kind (`Censored`,
+    `Ellipsis`, `ExternallyStored`) before their texts are read, their pieces being later ones (10, 11); flags 7.2
+    does not know are refused as it refuses them. A file index's garbage list cut short, a used size past its file, a
+    root's children cut short, a meta file of partial records and a path past its list file, empty or holding NUL, a
+    line feed or a carriage return are refused where 7.2 slices on; every name handed to the host must be plain, so a
+    docket id that spells `..` is refused before the host is asked.
+  - *Bounds from the caller and the store.* `room` is the most the import holds at once (the requirements and the
+    listing for the walk, one revlog's files and group, one text's rebuild, each charged to a copy of the room its
+    enclosing scope left); the texts and rows are the content store's budget's; the shared index's tail is sealed when
+    due after each group, as its rule says. No number of the import's own.
+- **From the sources.** 7.2's code, read from Homebrew's 7.2 (`/opt/homebrew/Cellar/mercurial/7.2`): `localrepo.py`
+  (`makelocalrepository`'s requirements and `share-safe`, `makestore`, the incompatible pairs), `repo/requirements.py`
+  (`BASE_SUPPORTED`, `gather_supported_requirements`), `repo/creation.py`, `requirements.py`, `scmutil.readrequires`,
+  `store.py` (`_plain_encode`, `fncachestore`, `FileIndexStore`, `_gather_revlog`, `_split_revlog_ext`,
+  `REVLOG_FILES_EXT`), `store_utils/file_index.py` and `file_index_util.py` with `helptext/internals/file-index.txt`,
+  `utils/docket.py` (`UNSET_UID`, `HGTEST_UUIDFILE`), `revlog.py` (`_get_data`, `_loadindex`),
+  `revlogutils/docket.py` (the index, data and sidedata files' names), `revlogutils/flagutil.py` (`processflagsraw`)
+  with `interfaces/repository.py` (the revision flags), `revlogutils/constants.py`, `filelog.py` (`hasmeta`) and
+  `verify.py` (`_verifyfiles`).
+- **Golden vectors.** `crates/hg/fixtures/import`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 05:41:16 to
+  05:41:37 UTC (load 2.5 to 6.2), by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the
+  branch at 028ba0c81, exactly: `bash crates/hg/fixtures/import/make-import-fixtures.sh "$D/out"
+  crates/hg/fixtures/store`. The history of `fixtures/store` made again in five repositories, docket ids and garbage
+  timestamps fixed by 7.2's own test hooks: the dotencode, hybrid and pre-share-safe stores byte for byte A-630 part
+  1's (`cmp`, file by file), each `.hg/requires` kept; a revlog version 2 store with the changelog's version 2 and a
+  version 1 store, both listed by the file index, each whole with its file list, requirements, and 7.2's
+  `debug::file-index` listing and docket, every revision's `debugdata` byte for byte `fixtures/store`'s. 144 files and
+  their `SHA256SUMS`, each checked equal after the copy.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red first: branch `agents/g300-hg-import-red` (01f892747, not for
+  main: `import`, `file_index::read_docket` and `paths`, `store::plain_encode` and `Layout::read` returning at once),
+  `cargo test --locked -p slates-hg --lib` 203 passed and 21 failed, every new test but the property test failing by
+  its assertion, and part 1's golden (its requirements stubbed). Green: 224 of 224 at cb5455896, the first build;
+  rustfmt's layout taken from that run. Golden: the five stores import to five indexes equal row for row, every
+  changeset's, manifest's and file revision's text 7.2's `debugdata` and every node computed from its parents and text
+  7.2's, and the host asked only for files each repository holds, each once. Hostile: a listed log gone (fncache, file
+  index, version 1 file index store), logs that disagree (no manifest log, a path the fncache lacks, an empty named
+  log), cut indexes (split, inline, version 2), the four flags, refused requirements (asked nothing past them), the
+  least room and the least budget less a byte, a host's own refusal handed back, a docket id climbing out, a node a log
+  holds twice, fncache entries; every refusal leaving the store as it found it; any byte of either store changed or cut
+  (256 generated cases) never a panic and never a hold left. Unit: 7.2's `_plain_encode` doctests, the store's shape
+  for each layout, every kind of refused requirement, the file index's docket, files and paths.
