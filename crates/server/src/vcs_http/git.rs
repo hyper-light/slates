@@ -42,7 +42,7 @@ use slates_http_edge::credential::{self, Credential};
 use super::{Answer, Decided, Exchange, Failed, Site};
 use crate::vcs_policy::{self, Right};
 
-mod upload;
+pub(crate) mod upload;
 
 pub(crate) use upload::{StoreLender, UploadServices};
 
