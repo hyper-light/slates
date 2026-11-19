@@ -4096,8 +4096,11 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: a delivery's read (Linux: the socket's readability), the macOS
->   route's claim steps and the CLI's MCP edge, which borrows the reply deadline for its own. The synchronous send's
+>   each a wait that cannot see the departure yet: the macOS route's claim steps and the CLI's MCP edge, which borrows
+>   the reply deadline for its own. A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
+>   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
+>   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's
 >   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
 >   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
 >   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling
