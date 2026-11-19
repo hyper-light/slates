@@ -48,9 +48,10 @@ slates-ssh = { workspace = true }
 # is read through the base plane's host seam for Mercurial's import (§4.17.3 piece 3, A-649 part 4; `crate::hg_base`).
 slates-hg = { workspace = true }
 # The version-control servers' shared crate (§4.17.1 shared piece 3): Mercurial's index and content store (A-657);
-# git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); and,
-# in tests, the content store an upload-pack test's empty repository is kept in (A-625 part 3;
-# `crate::vcs_http::git::upload`).
+# git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); the
+# content store git's object store rides on, through which a protected branch's questions read A-614's store
+# (`crate::git_protect`, A-644); and, in tests, the content store an upload-pack test's empty repository is kept in
+# (A-625 part 3; `crate::vcs_http::git::upload`).
 slates-vcs = { workspace = true }
 slates-svn = { workspace = true }
 blake3 = { workspace = true }

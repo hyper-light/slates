@@ -142,6 +142,7 @@ pub(super) fn answer<P: PackSource>(
     shallow: &asked.shallow,
     deepen: asked.deepen(),
     filter: asked.filter.as_ref(),
+    sparse: None,
     include_tag: asked.flags.include_tag,
     thin: asked.flags.thin,
   };

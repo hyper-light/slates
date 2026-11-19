@@ -181,6 +181,8 @@ PolicyRight 0 Read
 PolicyRight 1 Submit
 PolicyRight 2 Rewrite
 PolicyRight 3 Delete
+PolicyRight 4 MergeCommit
+PolicyRight 5 UnsignedCommit
 PolicySubject 0 Consumer
 PolicySubject 1 Volume
 PolicyWho 0 Anyone
