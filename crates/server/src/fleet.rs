@@ -3412,13 +3412,29 @@ fn heal_for(
   let configuration = state.fleet.configuration();
   let quorum = configuration.quorum;
   let candidates = configuration.place(object).candidates;
-  let (heal, found) = heal_decision(
+  // While this owner's neighbourhood change is in flight, a placement naming a host outside its current neighbourhood is
+  // replaced on the current cohort, so its settle can certify its content (A-546): a restore keeps it named.
+  let unsettled = unsettled_replace(
+    region,
+    local,
+    &configuration.neighbourhood,
+    configuration.settled.is_some(),
+  );
+  let adopted = crate::takeover::adopted_here(state, object);
+  let (mut heal, found) = heal_decision(
     local,
     region,
     &state.council.configuration().members,
     &candidates,
-    quorum,
+    (quorum, adopted),
   );
+  if adopted && heal == Some(Heal::Replace) && found.named_outside_candidates {
+    state.count(HEAL_ADOPTED_REPLACED, 1);
+  }
+  if unsettled && heal != Some(Heal::Replace) {
+    heal = Some(Heal::Replace);
+    state.count(HEAL_UNSETTLED_REPLACED, 1);
+  }
   for (seen, counter) in [
     (found.named_gone, HEAL_NAMED_GONE),
     (found.named_short, HEAL_NAMED_SHORT),
@@ -3434,6 +3450,18 @@ fn heal_for(
   heal
 }
 
+/// Whether the healer replaces a placement naming `region` because this owner's (`local`'s) neighbourhood change is in
+/// flight (`unsettled`) and the placement names a host outside its current `neighbourhood` (A-546): the settle report
+/// waits for every owned volume to be served from within it ([`content_placed_on_current_neighbourhood`]).
+fn unsettled_replace(
+  region: &[u64],
+  local: HostId,
+  neighbourhood: &[HostId],
+  unsettled: bool,
+) -> bool {
+  unsettled && !crate::takeover::served_from_placement(region, local, neighbourhood)
+}
+
 /// What the healer found in a placement beside the heal it decided ([`heal_decision`]); each is counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HealFindings {
@@ -3447,10 +3475,14 @@ struct HealFindings {
 }
 
 /// The heal for a placement naming `region`, owned by `local`, under the council's `members` and the object's current
-/// `candidates` at `quorum` (§4.10 "the healer"; A-276). Pure, so the rule is tested at `f = 0` and on a fleet alike:
+/// `candidates` at `quorum`, `adopted` when a takeover round here adopted the volume and has not confirmed (§4.10 "the
+/// healer"; A-276, A-529). Pure, so the rule is tested at `f = 0` and on a fleet alike:
 /// - a **replace** when a remote holder it names is no longer a member, which no re-offer can reach, or when it names
 ///   fewer than `f + 1` holders (one recorded before the fleet's `f` grew): the content is placed on the current cohort
 ///   at the next sequence and the head republished there;
+/// - a **replace** too for an adopted volume whose placement names a member outside its candidates (A-529): its round
+///   confirms only once it serves the volume from its own placement (`takeover::adopted_served`), and a restore would
+///   leave that member named for good;
 /// - otherwise a **restore** of the holders it names that can be put to: the owner, which holds its own content, and the
 ///   named remote holders among the candidates, the only ones that admit a placement from this owner
 ///   (`content_authority`). A named member outside the candidates keeps the copy its head names and serves reads of it,
@@ -3465,7 +3497,7 @@ fn heal_decision(
   region: &[u64],
   members: &[HostId],
   candidates: &[HostId],
-  quorum: Quorum,
+  (quorum, adopted): (Quorum, bool),
 ) -> (Option<Heal>, HealFindings) {
   let mut named: Vec<HostId> = Vec::with_capacity(region.len());
   for host in region.iter().map(|host| HostId(*host)) {
@@ -3480,7 +3512,7 @@ fn heal_decision(
     named_short: copies < u64::from(quorum.f).saturating_add(1),
     named_outside_candidates: remote().any(|host| !candidates.contains(host)),
   };
-  if found.named_gone || found.named_short {
+  if found.named_gone || found.named_short || (adopted && found.named_outside_candidates) {
     return (Some(Heal::Replace), found);
   }
   // The holders the restore ends with: the owner when the placement names it, and the named remote holders it can put
@@ -3511,6 +3543,17 @@ const HEAL_NAMED_SHORT: &str = "fleet.heal.named_short";
 /// it, and only the named candidates are restored.
 /// Format: a refusal name in the daemon's status report.
 const HEAL_NAMED_OUTSIDE_CANDIDATES: &str = "fleet.heal.named_outside_candidates";
+
+/// The status count under which the healer records a replace of an adopted volume's placement that named a member
+/// outside the volume's candidates (A-529): a restore would have left that member named, and the takeover round that
+/// adopted the volume waits to confirm until it serves it from its own placement. Format: a refusal name in the daemon's
+/// status report.
+const HEAL_ADOPTED_REPLACED: &str = "fleet.heal.adopted_replaced";
+
+/// The status count under which the healer records a replace of a placement naming a host outside this owner's current
+/// neighbourhood while its neighbourhood change is in flight (A-546): its settle waits until every owned volume is
+/// served from within that neighbourhood. Format: a refusal name in the daemon's status report.
+const HEAL_UNSETTLED_REPLACED: &str = "fleet.heal.unsettled_replaced";
 
 /// The status count under which the healer records a heal that ran its bound ([`heal_bound_ns`]) without finishing
 /// (every put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later
@@ -8331,13 +8374,45 @@ fn records_placed_on_current_neighbourhood(state: &ShardState) -> bool {
   heads && crate::merge_service::greens_placed_on_current_cohort(state)
 }
 
+/// Whether every volume this shard owns is served from within this node's current neighbourhood (A-546): its head
+/// snapshot's placement names only this node and hosts of that neighbourhood, so the settle that names it certifies that
+/// no head this node serves names a holder outside its neighbourhoods, and such a holder lets its content go (A-508's
+/// holders). A placement made before the neighbourhood moved is replaced by the healer while the change is in flight
+/// ([`heal_for`]). A volume whose head names no content yet is served.
+fn content_placed_on_current_neighbourhood(state: &ShardState) -> bool {
+  let config = state.fleet.configuration();
+  state.volumes.iter().all(|(_, slot)| {
+    let id = DbVolumeId {
+      bytes: slot.id.bytes,
+    };
+    let Some(record) = state.db.partition().volume(id) else {
+      return true;
+    };
+    if record.epoch == 0 {
+      return true;
+    }
+    state
+      .db
+      .partition()
+      .snapshot(id, record.head)
+      .is_some_and(|snapshot| match &snapshot.placed {
+        PlacementState::Placed { region, .. } => {
+          crate::takeover::served_from_placement(region, config.owner, &config.neighbourhood)
+        }
+        PlacementState::Local => true,
+      })
+  })
+}
+
 /// Reports this node's neighbourhood change placed, once it is (§4.8 "Neighbourhood changes"; Vertical Paxos
 /// II's state transfer before the old configuration retires): while the council's current neighbourhood for
 /// this node differs from its settled one, every shard is asked whether all it owns is held by `f + 1` of its
 /// cohort in the current neighbourhood ([`records_placed_on_current_neighbourhood`]) under the very configuration
 /// version the report names; when all are, `Settle` for that neighbourhood's version goes to the council
-/// ([`send_council_report`]). Repeated each period until the installed configuration shows it settled; a report
-/// for a neighbourhood that moved on meanwhile changes nothing (the fold checks the version).
+/// ([`send_council_report`]). Its content must be placed within the current neighbourhood too
+/// ([`content_placed_on_current_neighbourhood`], A-546), so the settle certifies it. Repeated each period until the
+/// installed configuration shows it settled; a report for a neighbourhood that moved on meanwhile changes nothing (the
+/// fold checks the version).
 async fn report_settlement(
   origin: u16,
   shards: &[u16],
@@ -8355,7 +8430,9 @@ async fn report_settlement(
       origin,
       shard,
       move |s| {
-        s.fleet.configuration().version == version && records_placed_on_current_neighbourhood(s)
+        s.fleet.configuration().version == version
+          && records_placed_on_current_neighbourhood(s)
+          && content_placed_on_current_neighbourhood(s)
       },
       HEARTBEAT_NS,
     )
@@ -12281,26 +12358,45 @@ mod tests {
   /// candidates, one naming a departed holder, one naming fewer than `f + 1` holders, one whose named holder is a member
   /// outside the candidates, and one naming a holder twice. Expect: no heal at `f = 0`, since the owner's copy is the
   /// whole placement; a restore of exactly the named candidates with the owner; a replace for the departed and for the
-  /// short, each found; no heal when no named candidate is left, the outsider found; and the repeat counted once.
+  /// short, each found; no heal when no named candidate is left, the outsider found, but a replace for the same
+  /// placement of an adopted volume (A-529); and the repeat counted once.
   /// Before (2026-11-17), a placement naming no remote holder was replaced, so at `f = 0` every healer step advanced the
   /// head's sequence by one, for good.
   #[test]
   fn the_heal_restores_named_candidates_and_replaces_only_a_departed_or_short_placement() {
     let (owner, b, c, d) = (HostId(1), HostId(2), HostId(3), HostId(4));
-    let lone = heal_decision(owner, &[owner.0], &[owner], &[owner], Quorum { f: 0 });
+    let lone = heal_decision(
+      owner,
+      &[owner.0],
+      &[owner],
+      &[owner],
+      (Quorum { f: 0 }, false),
+    );
     assert_eq!(
       lone,
       (None, HealFindings::default()),
       "f = 0: the owner's own copy is the whole placement; nothing to heal"
     );
     let fleet = [owner, b, c];
-    let restored = heal_decision(owner, &[owner.0, b.0], &fleet, &fleet, Quorum { f: 1 });
+    let restored = heal_decision(
+      owner,
+      &[owner.0, b.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       restored,
       (Some(Heal::Restore(vec![owner, b])), HealFindings::default()),
       "every named holder a member and a candidate: restore exactly them"
     );
-    let departed = heal_decision(owner, &[owner.0, d.0], &fleet, &fleet, Quorum { f: 1 });
+    let departed = heal_decision(
+      owner,
+      &[owner.0, d.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       departed,
       (
@@ -12313,7 +12409,7 @@ mod tests {
       ),
       "a named holder that left: replace"
     );
-    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, Quorum { f: 1 });
+    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, (Quorum { f: 1 }, false));
     assert_eq!(
       short,
       (
@@ -12325,7 +12421,13 @@ mod tests {
       ),
       "fewer than f + 1 named: replace"
     );
-    let moved = heal_decision(owner, &[owner.0, c.0], &fleet, &[owner, b], Quorum { f: 1 });
+    let moved = heal_decision(
+      owner,
+      &[owner.0, c.0],
+      &fleet,
+      &[owner, b],
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       moved,
       (
@@ -12337,7 +12439,31 @@ mod tests {
       ),
       "the named holder a member outside the candidates: left as its head names it, found"
     );
-    let repeated = heal_decision(owner, &[owner.0, b.0, b.0], &fleet, &fleet, Quorum { f: 2 });
+    let adopted = heal_decision(
+      owner,
+      &[owner.0, c.0],
+      &fleet,
+      &[owner, b],
+      (Quorum { f: 1 }, true),
+    );
+    assert_eq!(
+      adopted,
+      (
+        Some(Heal::Replace),
+        HealFindings {
+          named_outside_candidates: true,
+          ..HealFindings::default()
+        }
+      ),
+      "an adopted volume naming a member outside its candidates: replace, so its round can confirm (A-529)"
+    );
+    let repeated = heal_decision(
+      owner,
+      &[owner.0, b.0, b.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 2 }, false),
+    );
     assert_eq!(
       repeated,
       (
@@ -12348,6 +12474,25 @@ mod tests {
         }
       ),
       "a holder named twice is one copy: two copies are short of f + 1 = 3"
+    );
+  }
+
+  /// A-546: while an owner's neighbourhood change is in flight, the healer replaces a placement naming a host outside
+  /// its current neighbourhood, and only then. Do: judge a placement naming a host outside the neighbourhood, in flight
+  /// and settled, and one naming only the owner and its neighbours, in flight. Expect a replace for the first in flight
+  /// alone: settled, the healer's own rule decides; within the neighbourhood nothing is owed.
+  #[test]
+  fn an_unsettled_owners_placement_outside_its_current_neighbourhood_is_replaced() {
+    let (owner, b, c, outside) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let neighbourhood = [owner, b, c];
+    assert_eq!(
+      [
+        unsettled_replace(&[owner.0, b.0, outside.0], owner, &neighbourhood, true),
+        unsettled_replace(&[owner.0, b.0, outside.0], owner, &neighbourhood, false),
+        unsettled_replace(&[owner.0, b.0, c.0], owner, &neighbourhood, true),
+      ],
+      [true, false, false],
+      "replaced only in flight and only when it names a host outside the current neighbourhood"
     );
   }
 

@@ -2867,7 +2867,7 @@ fn run_forwarded(
 }
 
 /// Applies the channel-local status cursor discipline before dispatching ordinary verbs.
-fn status_on_channel(
+pub(crate) fn status_on_channel(
   state: &mut ShardState,
   client: Handle<ClientSlot>,
   request: u64,
@@ -2886,13 +2886,8 @@ fn status_on_channel(
   }
   slot.status_pages.clear(&mut state.store.metadata);
   if matches!(body, RequestBody::DaemonStatus) {
-    let expires = state
-      .clock
-      .monotonic_ns()
-      .saturating_add(state.config.failover_slo_ns);
-    slot
-      .status_pages
-      .begin(request, expires, &mut state.store.metadata);
+    // No deadline yet: the capture's counts from the capture, once its scatter has made it (A-525, [`send_reply`]).
+    slot.status_pages.begin(request, &mut state.store.metadata);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -2904,20 +2899,24 @@ const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
 
 /// Whether `reply` says its verb was not started: `Overloaded`, which the protocol defines as "the request was not
 /// started and may be retried" under the same id (`slates_ipc::protocol::Refusal::Overloaded`; the client holds such an
-/// id for its resend, `slates_client::Client::begin_again`). Such a reply is never a completion (§4.9 RIFL): recorded,
-/// it was what every resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000
-/// clients"; `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`).
+/// id for its resend, `slates_client::Client::begin_again`), and `Unpublished`, "not completed, may be retried under the
+/// same id (it re-executes; it is never answered from memory)" (`slates_ipc::protocol::Refusal::Unpublished`; a work
+/// unserved until it is rebuilt, A-533). Such a reply is never a completion (§4.9 RIFL): recorded, it was what every
+/// resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000 clients";
+/// `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Until A-533 an `Unpublished` a verb
+/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again.
 fn not_started(reply: &ReplyBody) -> bool {
   matches!(
     reply,
     ReplyBody::Refused {
-      refusal: Refusal::Overloaded { .. }
+      refusal: Refusal::Overloaded { .. } | Refusal::Unpublished { .. }
     }
   )
 }
 
 /// Answers a verb that was not started ([`not_started`]) without recording a completion, so the request's id stays
-/// unanswered and a resend under it runs the verb; counted by the refusal's name and [`OVERLOADED_UNRECORDED`]. Its
+/// unanswered and a resend under it runs the verb; counted by the refusal's name, and an `Overloaded` one by
+/// [`OVERLOADED_UNRECORDED`]. Its
 /// transaction commits what the verb applied before refusing, which a resend meets as its own: nothing; the verb's
 /// undoing of what it began (`crate::shards::attach` ends the attachment it recorded when its stream's task cannot be
 /// spawned); or the write lease a FUSE or WinFsp mount took before its task, which the resend's attach renews as its
@@ -2926,8 +2925,10 @@ fn unrecorded_not_started(state: &mut ShardState, reply: ReplyBody) -> ReplyBody
   state.served = state.served.saturating_add(1);
   if let ReplyBody::Refused { refusal } = &reply {
     state.count(refusal_name(refusal), 1);
+    if matches!(refusal, Refusal::Overloaded { .. }) {
+      state.count(OVERLOADED_UNRECORDED, 1);
+    }
   }
-  state.count(OVERLOADED_UNRECORDED, 1);
   reply
 }
 
@@ -6812,6 +6813,11 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       errno: code,
     },
+    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
+    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
     _ => Refusal::BaseUnavailable {
       path: path.to_owned(),
       errno: 0,
@@ -7847,7 +7853,11 @@ fn stage_begin(
     (state.partition, expires),
     &mut state.store.metadata,
   ) {
-    Ok(token) => ReplyBody::Staged { token },
+    Ok(token) => {
+      // Its expiry is a deadline the shard's keeper sleeps for (A-522).
+      crate::deadlines::noted(state, expires);
+      ReplyBody::Staged { token }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -7871,7 +7881,10 @@ fn stage_put(
     .staging
     .put((work_id, principal, token), offset, bytes, expires)
   {
-    Ok(filled) => ReplyBody::StagePutDone { filled },
+    Ok(filled) => {
+      crate::deadlines::noted(state, expires);
+      ReplyBody::StagePutDone { filled }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -8398,21 +8411,13 @@ fn build_increment(
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
-  build_increment_on(state.greens.get(&sealed.green), sealed, evidence)
-}
-
-/// [`build_increment`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
-/// work's shard (A-465), which composes the same increment from the same state.
-fn build_increment_on(
-  engine: Option<&slates_merge::engine::Green>,
-  sealed: &crate::work_home::SealedWork,
-  evidence: Vec<[u8; 32]>,
-) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
   let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
-  let engine = engine
+  let engine = state
+    .greens
+    .get(&green_id)
     .filter(|engine| base_version <= engine.head())
     .ok_or(Refusal::UnknownBase {
       green: to_wire_volume(green_id),
@@ -9193,9 +9198,6 @@ fn judge_submission(
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
   // reader's version).
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
-  // The green's replicas on the node's other shards are made before its first change (A-457, A-273 step 5a), so the
-  // settle's fold and the verdict's version below are fed to them.
-  crate::green_replicas::ensure(state, green_id);
   if let Err(available) =
     crate::merge_service::settle_green_retention_leaving(state, green_id, room)
   {
@@ -9251,15 +9253,6 @@ fn judge_submission(
       ) {
         return refused(refusal);
       }
-      // The version goes to the green's replicas (A-457, A-273 step 5a) before anything else changes the green: a change
-      // left unfed would evict them all at the next.
-      crate::green_replicas::feed_version(
-        state,
-        green_id,
-        (version, &inc),
-        applied,
-        crate::signed_work::to_entry(&signed.verification),
-      );
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
       let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
@@ -9450,21 +9443,12 @@ fn map_rebase(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
-  rebase_on(state.greens.get_mut(&sealed.green), sealed)
-}
-
-/// [`map_rebase`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
-/// shard (A-465), whose answer is the owner's for the same state, since it is computed by this same function.
-pub(crate) fn rebase_on(
-  engine: Option<&mut slates_merge::engine::Green>,
-  sealed: &crate::work_home::SealedWork,
-) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  let (green_id, inc) = match build_increment_on(engine.as_deref(), sealed, Vec::new()) {
+  let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get_mut(&green_id) else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
@@ -9620,18 +9604,8 @@ pub(crate) fn owner_files(
   version: u64,
   paths: &[String],
 ) -> crate::work_files::FetchedBase {
-  base_files(state.greens.get(&green), version, paths)
-}
-
-/// [`owner_files`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
-/// work's shard (A-465).
-pub(crate) fn base_files(
-  engine: Option<&slates_merge::engine::Green>,
-  version: u64,
-  paths: &[String],
-) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get(&green) else {
     fetched.gone = true;
     return fetched;
   };
@@ -9654,21 +9628,10 @@ pub(crate) fn owner_page(
   green: DbVolumeId,
   version: u64,
   path: String,
-  range: (u64, u64),
-) -> crate::work_files::FetchedBase {
-  base_page(state.greens.get(&green), version, path, range)
-}
-
-/// [`owner_page`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
-/// shard (A-465).
-pub(crate) fn base_page(
-  engine: Option<&slates_merge::engine::Green>,
-  version: u64,
-  path: String,
   (offset, want): (u64, u64),
 ) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get(&green) else {
     fetched.gone = true;
     return fetched;
   };
@@ -9687,17 +9650,8 @@ pub(crate) fn owner_sizes(
   green: DbVolumeId,
   version: u64,
 ) -> crate::work_files::FetchedBase {
-  base_sizes(state.greens.get(&green), version)
-}
-
-/// [`owner_sizes`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
-/// shard (A-465).
-pub(crate) fn base_sizes(
-  engine: Option<&slates_merge::engine::Green>,
-  version: u64,
-) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get(&green) else {
     fetched.gone = true;
     return fetched;
   };
@@ -10440,6 +10394,7 @@ fn attach(
     principal: principal.clone(),
     rights: granted_rights(rights, intent),
     token,
+    mount: None,
   };
   if let Some(defer) = deferred_mount(&form) {
     return defer(
@@ -11024,9 +10979,10 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// The consumer an attachment in `form` belongs to (§4.6, §4.13; AUD-01), which is its lifetime: a
 /// host kernel mount's attachment is the OS filesystem bridge's (`Consumer::Bridge`) — it outlives the
 /// ring client that requested it (`slates mount` exits after `mount_nfs`) and the daemon (the anchor
-/// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
-/// destroy. A root record is the ring client's. OCI requires a verified source dependency,
-/// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
+/// keeps the listener across a restart), ending when the kernel unmounts it (seen through the kernel's own unmount
+/// event, A-511), with a `detach`, or with the volume's destroy. A root record is the ring client's. OCI requires a
+/// verified source dependency, constructed separately by `oci::Binding::consumer`; a guest requires its owned device
+/// seam.
 pub(crate) fn consumer_of(
   form: &AttachRequest,
   client_id: u32,
@@ -11290,8 +11246,8 @@ fn guest_over_the_ring(
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
 /// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363, A-414).
 /// Another principal's lease is refused `LeaseHeld` while it is unexpired, and past its term too while its holder still
-/// holds a live write attachment of the volume ([`lease_kept_until`]): the reaper renews such a lease at its lapse
-/// ([`expire_leases`]), and a take between the lapse and that pass must not hand it to a second writer.
+/// holds a live write attachment of the volume ([`lease_kept_until`]): the shard's deadline keeper renews such a lease at
+/// its lapse ([`expire_leases`], A-536), and a take between the lapse and that pass must not hand it to a second writer.
 fn take_write_lease(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -11465,9 +11421,11 @@ fn bind_mount(
     now,
   ) {
     Ok(_) => {
+      // The mount is held as this shard's, its id kept in the attachment's record (A-540), and watched from here: the
+      // kernel's unmount of it ends this attachment whenever it comes (A-511).
       #[cfg(target_os = "macos")]
       if let Some(own) = own {
-        state.own_nfs_mounts.insert(attachment, own);
+        crate::own_nfs::hold(state, attachment, own);
       }
       ReplyBody::MountBound
     }
@@ -11595,14 +11553,13 @@ pub(crate) fn use_attachment(
 /// The attachments ended.
 pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
+  // The lapsed alone, from the partition's index of terms (A-536), never a walk of every attachment.
   let lapsed: Vec<AttachmentRecord> = state
     .db
     .partition()
-    .attachments()
-    .filter(
-      |record| matches!(record.consumer, Consumer::Termed { expires_ns } if expires_ns <= now),
-    )
-    .cloned()
+    .lapsed_terms(now)
+    .into_iter()
+    .filter_map(|id| state.db.partition().attachment(id).cloned())
     .collect();
   let mut ended = 0usize;
   for record in lapsed {
@@ -11613,11 +11570,12 @@ pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   ended
 }
 
-/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
-/// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
+/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's unmount of a host
+/// mount's (§4.6, §4.13; AUD-01; A-511): the record removed as a recorded operation, a green pin dropped, and,
 /// when it was the holder's last attachment of the volume and the holder holds the write lease, the
-/// lease released (D-16). The caller has authorized the end — the verb by the principal, the `UMNT` by
-/// the mount capability. The typed database refusal when the removal could not be recorded.
+/// lease released (D-16). The caller has authorized the end — the verb by the principal, an unmount by the
+/// kernel's own table no longer naming the mount (`own_nfs`). The typed database refusal when the removal could not
+/// be recorded.
 pub(crate) fn end_attachment(
   state: &mut ShardState,
   record: &AttachmentRecord,
@@ -11980,17 +11938,8 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     state.by_id.remove(id);
     crate::live_ship::forget(state, *id);
   }
-  // A green whose record went with the rollback is given up once every replica of it has left (A-457, A-273 step 5a).
-  let gone: Vec<DbVolumeId> = state
-    .greens
-    .keys()
-    .copied()
-    .filter(|id| state.db.partition().volume(*id).is_none())
-    .collect();
-  for id in gone {
-    crate::green_replicas::give_up(state, id);
-  }
   let partition = state.db.partition();
+  state.greens.retain(|id, _| partition.volume(*id).is_some());
   let mut released = 0u64;
   state.works.retain(|id, work| {
     let keep = partition.volume(*id).is_some();
@@ -12108,10 +12057,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
       {
         // Not recorded: the volume keeps its slot and credits, counted by the refusal's name, and is
-        // recorded again at the reaper's next cadence (`reap_loop` steps destroys), not in a busy round
-        // — before 2026-09-29 the refusal was discarded and the tables let go of a volume the catalog
-        // still held.
+        // recorded again at its retry deadline, the shard's window on (A-536: the deadline keeper wakes the serve
+        // loop then), not in a busy round — before 2026-09-29 the refusal was discarded and the tables let go of a
+        // volume the catalog still held; until A-536 the reap loop's tick tried again each window, refused or not.
         state.count(refusal_name(&refusal_of_db(&e)), 1);
+        retry_destroy_at_window(state, now);
         continue;
       }
       any = true;
@@ -12129,6 +12079,17 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     }
   }
   any || releasing
+}
+
+/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
+/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
+/// change, and kept by the deadline keeper, never a tick (A-536).
+fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
+  let at = now.saturating_add(crate::watchdog::watch_window_ns(
+    slates_rt::futures::scheduler_overrun_ns(),
+  ));
+  state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
+  crate::deadlines::noted(state, at);
 }
 
 /// One cooperative slice of each volume released to the member a move named (A-291, `crate::moves`): its record left
@@ -13026,8 +12987,6 @@ pub(crate) fn adopt_taken_over_green(
     ..
   } = adopted;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
-  crate::green_replicas::give_up(state, id);
   state.greens.insert(id, engine);
   // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
   // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
@@ -13281,6 +13240,11 @@ fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), B
       state.count(refusal_name(&refusal_of_vfs(&e)), 1);
     }
     state.relinquished.push(slot);
+    // The serve round steps its teardown (`step_destroys`); woken, it keeps running until the slices are done (A-536:
+    // before, the reap loop's tick started it).
+    if let Some(task) = state.server_task {
+      slates_rt::registry::wake(task.0);
+    }
   }
   crate::live_ship::forget(state, id);
   state.yielded.remove(&id);
@@ -15404,7 +15368,7 @@ fn remember_forwarded_ring(
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
 /// is kept and retried; never dropped).
-fn send_reply(
+pub(crate) fn send_reply(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
@@ -15424,22 +15388,40 @@ fn send_reply(
   if client.retiring || client.client_id != RequestId::from_word(request).client {
     return true;
   }
+  let mut held_until = None;
   if matches!(reply, ReplyBody::DaemonStatus { .. }) {
     let capacity = slates_ipc::status::snapshot_capacity(client.end.region());
     let page = slates_ipc::status::page_capacity(client.end.region());
     let now = state.clock.monotonic_ns();
+    // Held the failover delay from the capture (A-525): the bound the daemon holds every other thing a client leaves
+    // waiting for its next request to (a staging buffer, A-414), counted from when the report was made, so a scatter a
+    // starved daemon took long to gather takes nothing from its client's time to page it.
+    let deadline = now.saturating_add(state.failover_ns);
     // Replace the deferred reply itself: a full ring retries these exact page bytes,
     // including the final page whose retained snapshot has already been released.
     *reply = client
       .status_pages
-      .capture(request, reply, capacity, &mut state.store.metadata)
+      .capture(
+        request,
+        reply,
+        (capacity, deadline),
+        &mut state.store.metadata,
+      )
       .and_then(|()| {
         client
           .status_pages
           .page(request, 0, page, now, &mut state.store.metadata)
       })
       .unwrap_or_else(refused);
+    held_until = client.status_pages.deadline();
   }
+  // A capture its first page left held is the shard's keeper's to let go at its deadline (A-522).
+  if let Some(at) = held_until {
+    crate::deadlines::capture_set(state, handle, at);
+  }
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return true;
+  };
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
@@ -16118,8 +16100,6 @@ fn install_green(
       return Vec::new();
     }
   };
-  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
-  crate::green_replicas::give_up(state, record.id);
   state.greens.insert(record.id, green);
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
   // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
@@ -16478,8 +16458,7 @@ fn fence_green(
   record: &VolumeRecord,
   fence: crate::merge_service::GreenFence,
 ) {
-  // Its engine is given up once every replica of it has left (A-457, A-273 step 5a).
-  crate::green_replicas::give_up(state, record.id);
+  state.greens.remove(&record.id);
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
   state.count(GREEN_FENCED, 1);
@@ -16760,6 +16739,54 @@ pub(crate) fn install_replayed_work(
 /// The status count of recovered works left unbuilt because their log did not replay or the shard's budget could not
 /// hold them (A-207). Format: a refusal name in the daemon's status report.
 const WORK_REBUILD_REFUSED: &str = "merge.work_rebuild_refused";
+
+/// Format: the refusal-ledger name of a recorded unbuilt work whose replay this shard asked of its green's owner again
+/// as clients were let in ([`ask_owners_to_replay`], A-533): the retry's non-vacuity count.
+const WORK_REBUILD_ASKED_AGAIN: &str = "merge.work_rebuild_asked_again";
+/// Format: the refusal-ledger name of a message of that retry that no shard could keep (its target gone, or the
+/// carrier refusing it): the work stays recorded, answering `Unpublished`, until the daemon's next start.
+const WORK_REBUILD_ASK_REFUSED: &str = "merge.work_rebuild_ask_refused";
+
+/// On a work's shard, as clients are let in (A-533): asks the green's owner of every work recorded unbuilt here (its
+/// rebuild asks at recovery went unanswered twice) to replay it again, by a message the owner runs when it next runs,
+/// at once or once it comes back from a stop, whose outcome comes back here by a message of its own and is installed
+/// once ([`install_replayed_work`]). Nothing waits on an answer, and no timer runs: the owner's running is the event
+/// that rebuilds the work, which answers `Unpublished` until then (`work_home::unbuilt_refusal`). A work whose green
+/// this shard holds is replayed here. Each message waits for room on its target's channel while that shard lives
+/// (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
+pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
+  let here = state.shard;
+  for unbuilt in state.work_home.unbuilt.clone() {
+    let entries = state.db.partition().work_log(unbuilt.work).to_vec();
+    let Some(owner) = state
+      .shards
+      .get(usize::from(owner_of(to_wire_volume(unbuilt.green))))
+      .copied()
+    else {
+      continue;
+    };
+    state.count(WORK_REBUILD_ASKED_AGAIN, 1);
+    if owner == here {
+      let replayed = owner_replay(state, unbuilt.green, unbuilt.created_at, &entries);
+      install_replayed_work(state, &unbuilt, replayed);
+      continue;
+    }
+    crate::xshard::run_on_waiting(
+      here,
+      owner,
+      move |owner_state| {
+        let replayed = owner_replay(owner_state, unbuilt.green, unbuilt.created_at, &entries);
+        crate::xshard::run_on_waiting(
+          owner_state.shard,
+          here,
+          move |work_state| install_replayed_work(work_state, &unbuilt, replayed),
+          WORK_REBUILD_ASK_REFUSED,
+        );
+      },
+      WORK_REBUILD_ASK_REFUSED,
+    );
+  }
+}
 
 /// A shard's slice of the anchor content object, read by copies (§4.8): the object is sparse (backed
 /// only where it is touched) and hands out no reference to its bytes (AUD-29-09), so the image is found
@@ -21845,6 +21872,150 @@ mod tests {
     }
   }
 
+  /// A-533 (A-513's remainder; §4.16 "Recovery": a work "is unserved (`Unpublished`) until it has" been replayed through
+  /// its green's owner; A-207, A-247): a recovered work whose rebuild asks went unanswered twice keeps its record and
+  /// stays unbuilt, and the protocol's `Unpublished` is never answered from memory. Do: on a shard, record such a work;
+  /// send a read of it; end its record as its replay's install does; send the same request again under its id. Expect:
+  /// `Unpublished` first; the resend runs the verb and answers what it answers now (`NotFound`: the stand-in work has no
+  /// volume record), not the first answer again. Before, the work's verbs answered `NotFound` while its record stood, as
+  /// if the work were gone, and that answer was the request's completion.
+  #[test]
+  fn an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt() {
+    let (first, resent) = crate::daemon::audit_on_shard(|state| {
+      let unbuilt = crate::work_home::Unbuilt {
+        work: super::DbVolumeId { bytes: [0x53; 16] },
+        green: super::DbVolumeId { bytes: [0x54; 16] },
+        created_at: 1,
+      };
+      state.work_home.unbuilt.push(unbuilt);
+      let id = slates_wire::request::RequestId {
+        client: 1,
+        sequence: 1,
+      };
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 0,
+      };
+      let request = super::RequestBody::ReadRange {
+        volume: super::to_wire_volume(unbuilt.work),
+        path: "/f".to_owned(),
+        at: slates_ipc::protocol::ReadAt::Head,
+        offset: 0,
+        max: 1,
+      };
+      let first = super::run_forwarded(state, 1, id, 1, &principal, request.clone(), None);
+      // The record ends as the replay's install ends it (A-513): here a log that did not replay.
+      super::install_replayed_work(state, &unbuilt, None);
+      let resent = super::run_forwarded(state, 1, id, 1, &principal, request, None);
+      (first, resent)
+    });
+    assert!(
+      matches!(
+        first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Unpublished { .. }
+        })
+      ),
+      "a work recorded unbuilt is unserved, Unpublished, not gone: {first:?}"
+    );
+    assert_eq!(
+      resent,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }),
+      "the resend under the same id ran the verb, not the recorded first answer"
+    );
+  }
+
+  /// A name that the partition of `state`'s shard owns, starting `prefix`.
+  fn owned_name(state: &crate::state::ShardState, prefix: &str) -> String {
+    (0u32..)
+      .map(|n| format!("{prefix}-{n}"))
+      .find(|name| super::owner_of_name(name, state.shards.len()) == state.partition)
+      .unwrap()
+  }
+
+  /// What the work's shard holds of the work, polled until it is rebuilt or the observation budget passes: whether the
+  /// work is installed, whether its record is gone, and the retry's and the failed rebuild's counts.
+  fn rebuilt_by_now(
+    daemon: &crate::daemon::Daemon,
+    partition: usize,
+    work: super::DbVolumeId,
+  ) -> (bool, bool, Option<u64>, Option<u64>) {
+    let look = move |state: &mut crate::state::ShardState| {
+      (
+        state.works.contains_key(&work),
+        state.work_home.unbuilt.is_empty(),
+        state.refusals.get(super::WORK_REBUILD_ASKED_AGAIN).copied(),
+        state.refusals.get(super::WORK_REBUILD_REFUSED).copied(),
+      )
+    };
+    let started = std::time::Instant::now();
+    loop {
+      let seen = crate::daemon::observe_at(daemon, partition, look);
+      if (seen.0 && seen.1)
+        || started.elapsed() >= std::time::Duration::from_nanos(crate::daemon::OBSERVE_BUDGET_NS)
+      {
+        return seen;
+      }
+      std::thread::yield_now();
+    }
+  }
+
+  /// A-533 (A-513's remainder; §4.16 "Recovery", A-247): a work whose rebuild asks went unanswered twice at recovery is
+  /// asked for again as clients are let in, by messages, never a timer. Do: on a two-shard daemon, make a green on one
+  /// shard; on the other, record a work over it unbuilt and ask its green's owner again
+  /// (`ask_owners_to_replay`). Expect: the owner's replay comes back by its own message and the work is installed on
+  /// its shard, its record ended, asked again once and no rebuild refused. Before, such a work stayed unbuilt until the
+  /// daemon's next start.
+  #[test]
+  fn an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (green, created_at, owner_partition) = crate::daemon::observe_first(&daemon, |state| {
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let made = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::CreateGreen {
+          name: owned_name(state, "unbuilt-green"),
+          require_evidence: false,
+          base: None,
+        },
+      );
+      let ReplyBody::GreenCreated { id } = made else {
+        panic!("the green was not created: {made:?}")
+      };
+      let green = super::to_db_volume(id);
+      let head = state
+        .greens
+        .get(&green)
+        .map(|engine| engine.head())
+        .unwrap();
+      (green, head, usize::from(state.partition))
+    });
+    let work_partition = (owner_partition + 1) % 2;
+    let work = super::DbVolumeId { bytes: [0x55; 16] };
+    crate::daemon::observe_at(&daemon, work_partition, move |state| {
+      state.work_home.unbuilt.push(crate::work_home::Unbuilt {
+        work,
+        green,
+        created_at,
+      });
+      super::ask_owners_to_replay(state);
+    });
+    let seen = rebuilt_by_now(&daemon, work_partition, work);
+    daemon.stop();
+    assert_eq!(
+      seen,
+      (true, true, Some(1), None),
+      "(installed, record ended, asked again, rebuilds refused) on the work's shard"
+    );
+  }
+
   /// §4.9 (RIFL), the protocol's `Overloaded` ("the request was not started and may be retried" under its id), GAPS
   /// "The many-client load test from 10,000 to 100,000 clients"
   /// (`docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`): a verb answered `Overloaded` ran
@@ -22239,6 +22410,40 @@ mod tests {
         "the ended attachment let the lease go"
       );
     });
+  }
+
+  /// A-536 (destroys off the tick). Do: on a one-shard daemon, create a volume and relinquish it as a takeover that
+  /// superseded it does, from outside a serve round; look until its slot's teardown is done. Expect: done within half a
+  /// liveness window, by the serve loop, woken by the relinquish. Before, nothing woke it, and the reap loop's tick
+  /// started the teardown up to a window later.
+  #[test]
+  fn a_relinquished_volume_is_torn_down_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = std::time::Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let (owner, _) = lease_principals();
+      let id = plain_volume(state, &owner, "relinquished");
+      super::relinquish_superseded(state, super::to_db_volume(id)).unwrap();
+      assert!(
+        !state.relinquished.is_empty(),
+        "the relinquished slot is queued for its teardown"
+      );
+    });
+    let within = std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 2);
+    let done = loop {
+      if crate::daemon::observe_first(&daemon, |state| state.relinquished.is_empty()) {
+        break Some(begun.elapsed());
+      }
+      if begun.elapsed() > within {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its drivers.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    daemon.stop();
+    let done = done.expect("the relinquished slot was torn down within half a liveness window");
+    println!("a relinquished volume torn down {done:?} after the relinquish");
   }
 
   /// D-16, A-414. Do: attach a volume for write in the CLI's form and for reading in the library's form, both as its

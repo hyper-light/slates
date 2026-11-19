@@ -16,7 +16,8 @@
 //!   folder, empty, a clone of a snapshot, a green, a work volume), snapshot, destroy, list, a typed status, and an
 //!   overlay's drift as typed entries.
 //! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
-//!   a descriptor a VMM takes.
+//!   a descriptor a VMM takes; and a host mount bound into a container ([`container`], A-520), the entry the host's OCI
+//!   runtime performs, verified in the kernel's mount table.
 //! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
 //!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
 //!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
@@ -66,6 +67,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod asynchronous;
+pub mod container;
 pub mod error;
 pub mod exec;
 pub mod grant;
@@ -85,10 +87,12 @@ pub mod start;
 pub mod volume;
 
 pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
+pub use container::ContainerBind;
 pub use error::{
-  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
-  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
-  RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
+  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HoldersUnread, HostFault, Invalid,
+  IssuerFault, KindMismatch, Missing, MountFault, MountHolders, MountMissing, MoveTarget, Note,
+  PathFault, ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported,
+  Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
@@ -234,10 +238,40 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`MountFault::NotMounted`] before any call, and the new refusals are [`MountFault::Busy`] (`EBUSY`: a process holds
 /// a file on the mount), [`MountFault::StillMounted`] (the call said done and the table disagrees) and
 /// [`MountFault::MountTable`] (the table could not be read) (the same day).
+/// 43: a macOS or BSD host whose loopback anyone but root can capture (a `/dev/bpf` device a group or another user may
+/// read, as Wireshark's ChmodBPF leaves them) is told [`mount::available`] `Unsupported`, and refused the loopback
+/// mount, typed [`MountMissing::PrivateLoopback`]: a mount's capability rides every file handle in the clear, which the
+/// kernel's NFS client cannot encrypt (A-535; the same day).
+/// 44: a host mount bound into a container (A-520; §4.6 A-9's OCI form, until then the CLI's and the wire's alone):
+/// [`Instance::bind_into_container`] and the seam's `bind_into_container` answer a [`ContainerBind`], the binding's
+/// attachment and the entry the host's OCI runtime performs ([`OciBinding`], with its [`HostMountEvidence`]), refused
+/// typed as the daemon refuses the form (`Invalid::ChosenPath`, `Unsupported::Attachment`, `Denied::Rights`); the
+/// simulator answers it from the mounts it recorded (kiln's container engine, kiln goal 01a1f124; the same day).
+/// 45: a busy unmount names its holders and is typed on Linux too (A-537): [`MountFault::Busy`] carries
+/// [`MountHolders`], the processes the kernel's own tables show holding the mount (on Linux each process's
+/// descriptors, working and root directories, by device, without touching the mount), with [`HoldersUnread`] saying
+/// why none were read (macOS: every libproc answer stats the file, which a `hard` NFS mount whose daemon has gone waits
+/// on without bound); and on Linux a plain `fusermount3 -u` refused while the kernel's table still lists the mount is
+/// [`MountFault::Busy`], where it was [`MountFault::Unmount`] with the helper's exit (the same day).
+/// 46: an S3 base as the library names it ([`S3Base`], [`S3Style`], [`S3Scheme`]) and the credential handed for it
+/// ([`S3Credentials`], whose `Debug` shows its access key id alone): the store's endpoint, the bucket's region, the
+/// bucket, the prefix and the addressing, each refused by its kind where no request could read it ([`NameRefused`]:
+/// [`EndpointFault`], [`BucketFault`], [`PrefixFault`]) (Mantle's CP-T10.5, A-524; 2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 42;
+pub const CONTRACT: u32 = 46;
 
+/// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
+pub use slates_base::s3::client::Style as S3Style;
+/// An S3 base as the library names it (§4.15 "An S3 base", A-524; Mantle's CP-T10.5): the store's endpoint, the
+/// bucket's region, the bucket, the prefix and the addressing, each checked when it is made, and its identity, the
+/// device every entry of the base reports.
+pub use slates_base::s3::name::{
+  BucketFault, EndpointFault, NameRefused, PrefixFault, S3Base, Scheme as S3Scheme,
+};
+/// The credential an S3 base is read with, as Mantle hands it: held in RAM alone, its `Debug` showing its access key id
+/// alone (§4.15 "Credentials").
+pub use slates_base::s3::sigv4::Credentials as S3Credentials;
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
 /// A snapshot exported as its archive ([`Instance::export_archive`], A-441), and a volume made from one
@@ -248,11 +282,12 @@ pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, 
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
   ARCHIVE_FILE, ArchiveFault, AttachTransport, ChangedCursor, ConflictClass, DaemonReport,
-  DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostPathReason,
-  Intent, JournalReport, LandingDegradation, LandingDurability, LossReport, MountReport,
-  NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
-  Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport,
-  TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostMountEvidence,
+  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
+  MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
+  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
+  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
+  VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
@@ -300,6 +335,50 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/library.md")]
 pub struct Guide;
+
+#[cfg(test)]
+mod s3_naming {
+  /// A-524 (§4.15 "An S3 base"; Mantle's CP-T10.5): do name an S3 base through the library as Mantle would, the same
+  /// objects again in another region, a base whose bucket S3 would not name, and a credential. Expect the first named
+  /// with its prefix and its virtual-hosted `Host` header, the same objects the same identity, the bad bucket refused
+  /// by its kind, and the credential's secret never in its `Debug`.
+  #[test]
+  fn the_library_names_an_s3_base_and_refuses_one_no_request_could_read() {
+    let endpoint = "https://s3.us-east-1.amazonaws.com";
+    let base = super::S3Base::new(
+      endpoint,
+      "us-east-1",
+      "kiln-bytes",
+      "projects/x/",
+      super::S3Style::VirtualHosted,
+    )
+    .expect("Mantle's base is named");
+    assert_eq!(base.prefix(), "projects/x/");
+    assert_eq!(base.host_header(), "kiln-bytes.s3.us-east-1.amazonaws.com");
+    let elsewhere = super::S3Base::new(
+      endpoint,
+      "eu-west-1",
+      "kiln-bytes",
+      "projects/x/",
+      super::S3Style::Path,
+    )
+    .expect("the same objects named again");
+    assert_eq!(base.identity(), elsewhere.identity());
+    assert_eq!(
+      super::S3Base::new(
+        endpoint,
+        "us-east-1",
+        "Kiln_Bytes",
+        "",
+        super::S3Style::Path
+      ),
+      Err(super::NameRefused::Bucket(super::BucketFault::Character))
+    );
+    let credentials =
+      super::S3Credentials::new("AKIAIOSFODNN7EXAMPLE", "a-secret-never-shown", None);
+    assert!(!format!("{credentials:?}").contains("a-secret-never-shown"));
+  }
+}
 
 #[cfg(test)]
 mod contract_history {

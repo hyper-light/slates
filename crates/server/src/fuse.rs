@@ -398,7 +398,8 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
   };
   let route = state.reply_route.take();
   let cause = state.current_span;
-  let deadline_ns = state.config.failover_slo_ns;
+  // The helper is waited for as long as this shard's helpers have taken, learned (A-525, `crate::helper_runs`).
+  let deadline_ns = state.fuse_helpers.bound_ns(state.failover_ns);
   let shard = state.shard;
   let task = async move {
     let mount_point = pending
@@ -497,7 +498,9 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
 }
 
 /// Mounts at `mount_point` through the OS helper without blocking the shard: the helper's answer awaited on
-/// its socket's readiness, its exit on the heartbeat's tick, all within `deadline_ns`.
+/// its socket's readiness, its exit on the heartbeat's tick, all within `deadline_ns` (the bound its shard learned of its
+/// helpers, A-525). A run that finishes is a sample of how long this machine's helpers take; one given up at the bound is
+/// not (Karn's rule) and backs the next bound off (`crate::helper_runs`).
 async fn mount_without_blocking(
   mount_point: &str,
   fsname: &str,
@@ -516,10 +519,16 @@ async fn mount_without_blocking(
   loop {
     let left = deadline_ns.saturating_sub(futures::now_ns().saturating_sub(began));
     if left == 0 {
+      let _ = state::with_state_counted(|s| s.fuse_helpers.given_up());
       return Err(pending.abort(std::time::Duration::from_nanos(deadline_ns)));
     }
     match pending.poll() {
-      Progress::Done(device) => return device.and_then(|device| Mount::adopt(device, mount_point)),
+      Progress::Done(device) => {
+        // Finished, whatever its answer: how long this machine's helpers take (A-525).
+        let ran = futures::now_ns().saturating_sub(began);
+        let _ = state::with_state_counted(|s| s.fuse_helpers.finished(ran));
+        return device.and_then(|device| Mount::adopt(device, mount_point));
+      }
       Progress::Waiting(Awaiting::Socket) => {
         let socket = std::os::fd::AsRawFd::as_raw_fd(&pending.socket());
         // A timed-out or refused wait is followed by the next poll, which aborts at the deadline.
@@ -1682,7 +1691,8 @@ const DEAD_MOUNT_LEFT: &str = "fuse.dead_mount_left";
 const FUSE_TYPE: &str = "fuse.slates";
 
 /// Starts `fusermount3 -u -z` at `mount_point` and owns the helper until it is reaped, on a detached task
-/// polling at the heartbeat's tick (bounded by the failover bound; the helper is killed and reaped past it).
+/// polling at the heartbeat's tick (bounded by the bound its shard learned of its helpers, A-525; the helper is killed
+/// and reaped past it).
 fn unmount_owned(mount_point: &str) {
   let Ok(pending) = begin_unmount(mount_point) else {
     let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
@@ -1696,20 +1706,35 @@ fn unmount_owned(mount_point: &str) {
   }
 }
 
-/// Polls an unmount helper until it is reaped; dropped at the bound, which kills and reaps it.
+/// Polls an unmount helper until it is reaped; dropped at the bound, which kills and reaps it. The bound is the one its
+/// shard learned of its helpers (A-525, `crate::helper_runs`): a run that finishes is a sample, one given up backs the
+/// next bound off. Off a shard nothing is learned and no wait can be timed, so the helper is given up at once.
 async fn reap(mut pending: PendingExit) {
   let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-  let bound =
-    state::with_state(|s| s.config.failover_slo_ns).unwrap_or(crate::daemon::HEARTBEAT_NS);
+  let Some(bound) = state::with_state(|s| s.fuse_helpers.bound_ns(s.failover_ns)) else {
+    let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
+    return;
+  };
   let began = futures::now_ns();
   loop {
     if let Some(done) = pending.poll() {
-      if done.is_err() {
-        let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
-      }
+      let (ran, failed) = (futures::now_ns().saturating_sub(began), done.is_err());
+      let _ = state::with_state_counted(|s| {
+        s.fuse_helpers.finished(ran);
+        if failed {
+          s.count(UNMOUNT_REFUSED, 1);
+        }
+      });
       return;
     }
-    if futures::now_ns().saturating_sub(began) >= bound || futures::sleep(tick).await.is_err() {
+    if futures::now_ns().saturating_sub(began) >= bound {
+      let _ = state::with_state_counted(|s| {
+        s.fuse_helpers.given_up();
+        s.count(UNMOUNT_REFUSED, 1);
+      });
+      return;
+    }
+    if futures::sleep(tick).await.is_err() {
       let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
       return;
     }

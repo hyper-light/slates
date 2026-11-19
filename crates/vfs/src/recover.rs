@@ -98,9 +98,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// 31 (A-395, 2026-11-18) a snapshot's directory the head still holds by its very handle is shared with the head, by
 /// number, as its unchanged files are, so recovery charges the version slab what the live volume held; a reader of an
 /// earlier version would find no directory to rebuild there, so it refuses this one.
+/// 32 (A-532, 2026-11-19) each snapshot carries the orphans it froze, the files the head held with no name left when it
+/// was taken, so a clone of it made after a restart keeps their orphan records too.
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 31;
+pub const IMAGE_VERSION: u16 = 32;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -466,6 +468,9 @@ pub struct SnapshotImage {
   pub previous: Option<SnapshotRef>,
   /// The next snapshot, if any.
   pub next: Option<SnapshotRef>,
+  /// The files the head held with no name left when the snapshot was taken (A-532), in number order: each is in the
+  /// snapshot's tree with no link, and a clone of the snapshot carries it with an orphan record.
+  pub orphans: Vec<u64>,
   /// The inodes the snapshot carries in full — its directories, and the files or symlinks whose
   /// bytes are not already elsewhere in the image — in number order. A file or symlink that is
   /// identical to the head's version, or to one an earlier snapshot already captured, is *not* here;
@@ -1773,6 +1778,7 @@ impl Volume {
         clone_refs: snap.clone_refs,
         previous: snap.previous.map(snap_ref),
         next: snap.next.map(snap_ref),
+        orphans: snap.orphans.iter().map(|no| no.0).collect(),
         inodes,
         shared,
       });
@@ -2233,6 +2239,37 @@ const fn to_snapshot_id(r: SnapshotRef) -> SnapshotId {
   }
 }
 
+/// The orphans a snapshot's image names (A-532), checked against the snapshot's rebuilt tree at `inode_root`: each
+/// once, in rising order, an inode the tree holds with no link left. Anything else could not have been frozen by a
+/// snapshot, so the image is refused `RecoveryIncomplete` rather than a clone of it given a record for what it lacks.
+fn snapshot_orphans(
+  store: &Store,
+  inode_root: Handle<TrieNode>,
+  named: &[u64],
+) -> Result<Vec<InodeNo>, VfsError> {
+  let rising = named.windows(2).all(|pair| match pair {
+    [before, after] => before < after,
+    _ => true,
+  });
+  if !rising {
+    return Err(VfsError::RecoveryIncomplete);
+  }
+  named
+    .iter()
+    .map(|&number| {
+      let no = InodeNo(number);
+      let unlinked = trie::get(&store.tries, inode_root, no)
+        .and_then(|handle| store.inodes.get(handle).ok())
+        .is_some_and(|inode| inode.no == no && inode.attrs.nlink == 0);
+      if unlinked {
+        Ok(no)
+      } else {
+        Err(VfsError::RecoveryIncomplete)
+      }
+    })
+    .collect()
+}
+
 /// The kind an image kind names.
 const fn kind_from_image(kind: KindImage) -> Kind {
   match kind {
@@ -2632,6 +2669,7 @@ impl Volume {
     self.root = saved.1;
     self.inode_root = saved.2;
     outcome?;
+    let orphans = snapshot_orphans(store, inode_root, &snap.orphans)?;
 
     // Place the snapshot at the exact slot and generation it had before the crash: a `SnapshotId`
     // *is* its slab handle (§4.8), so a client that still holds the id must find the same snapshot
@@ -2651,8 +2689,13 @@ impl Volume {
         previous: snap.previous.map(to_snapshot_id),
         next: snap.next.map(to_snapshot_id),
         referenced_bytes: snap.referenced_bytes,
+        // Its tree's entries, each imaged once in full or shared (`capture_snapshot_tree`), as the head's are counted
+        // (A-541): what a clone of it made after the restart starts counting from.
+        live_inodes: u64::try_from(snap.inodes.len().saturating_add(snap.shared.len()))
+          .unwrap_or(u64::MAX),
         seq: snap.seq,
         identity: None,
+        orphans,
       },
     )?;
     Ok(())

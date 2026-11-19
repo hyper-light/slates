@@ -9,8 +9,14 @@ use slates_mem::budget::{MetadataBudget, MetadataCredit};
 /// At most one capture, including a scatter still awaiting its other shards, per client.
 #[derive(Default)]
 pub(crate) struct StatusPages {
-  pending: Option<(u64, u64)>,
+  /// The request whose capture is begun or held, and the held capture's deadline (A-525): set at the capture, never at
+  /// the request, so a scatter that a starved daemon took long to gather does not eat into its client's time to page
+  /// it. A capture still awaiting its scatter holds no bytes and no credit, and has none.
+  pending: Option<(u64, Option<u64>)>,
   held: Option<Held>,
+  /// The deadline this client's seat is entered under in its shard's index of capture deadlines (A-522,
+  /// `crate::deadlines`), kept past a clear so the next capture replaces the entry: a seat holds one entry at most.
+  indexed: Option<u64>,
 }
 
 struct Held {
@@ -19,10 +25,11 @@ struct Held {
 }
 
 impl StatusPages {
-  /// Starts a capture; a late result from the replaced scatter cannot install its bytes.
-  pub(crate) fn begin(&mut self, request: u64, expires: u64, budget: &mut MetadataBudget) {
+  /// Starts a capture, with no deadline until it is made ([`StatusPages::capture`]); a late result from the replaced
+  /// scatter cannot install its bytes.
+  pub(crate) fn begin(&mut self, request: u64, budget: &mut MetadataBudget) {
     self.clear(budget);
-    self.pending = Some((request, expires));
+    self.pending = Some((request, None));
   }
 
   /// Returns all retained credit, including on cancellation or removal of the client.
@@ -33,20 +40,56 @@ impl StatusPages {
     self.pending = None;
   }
 
-  /// The absolute capture deadline bounds abandoned state even while the client stays alive.
+  /// The capture's deadline bounds abandoned state even while the client stays alive.
   pub(crate) fn expire(&mut self, now: u64, budget: &mut MetadataBudget) {
-    if self.pending.is_some_and(|(_, expires)| now >= expires) {
+    if self
+      .pending
+      .is_some_and(|(_, deadline)| deadline.is_some_and(|at| now >= at))
+    {
       self.clear(budget);
     }
   }
 
-  /// Freezes the report once. Retained allocation capacity, rather than just wire length,
-  /// is admitted, and a report beyond the client's credit refuses without truncation.
+  /// The deadline of the capture this client holds, if it holds one: what its shard enters in its index of capture
+  /// deadlines (A-522, A-525).
+  pub(crate) fn deadline(&self) -> Option<u64> {
+    self.held.as_ref()?;
+    self.pending.and_then(|(_, deadline)| deadline)
+  }
+
+  /// Records that this seat is entered in its shard's deadline index under `at`, and answers the deadline it was
+  /// entered under before, which the caller takes out of the index (A-522).
+  pub(crate) fn index(&mut self, at: u64) -> Option<u64> {
+    self.indexed.replace(at)
+  }
+
+  /// The deadline this seat is entered under in its shard's index, if any.
+  pub(crate) fn indexed(&self) -> Option<u64> {
+    self.indexed
+  }
+
+  /// Whether a capture is pending: begun, not yet completed, cleared or expired.
+  #[cfg(test)]
+  pub(crate) fn pending(&self) -> bool {
+    self.pending.is_some()
+  }
+
+  /// The index's entry under `at` left it (its deadline came): the seat is entered under nothing, unless a later
+  /// capture entered it under another deadline.
+  pub(crate) fn unindex(&mut self, at: u64) {
+    if self.indexed == Some(at) {
+      self.indexed = None;
+    }
+  }
+
+  /// Freezes the report once, held until `deadline` (A-525: its caller's term from the capture). Retained allocation
+  /// capacity, rather than just wire length, is admitted, and a report beyond the client's credit refuses without
+  /// truncation.
   pub(crate) fn capture(
     &mut self,
     request: u64,
     reply: &ReplyBody,
-    capacity: usize,
+    (capacity, deadline): (usize, u64),
     budget: &mut MetadataBudget,
   ) -> Result<(), Refusal> {
     if !self
@@ -80,6 +123,7 @@ impl StatusPages {
     if let Some(previous) = self.held.replace(Held { bytes, credit }) {
       budget.release(previous.credit);
     }
+    self.pending = Some((request, Some(deadline)));
     Ok(())
   }
 
@@ -139,9 +183,9 @@ mod tests {
     let charge = u64::try_from(expected.capacity()).unwrap();
     let mut budget = MetadataBudget::new(charge);
     let mut pages = StatusPages::default();
-    pages.begin(7, 10, &mut budget);
+    pages.begin(7, &mut budget);
     pages
-      .capture(7, &reply, expected.len(), &mut budget)
+      .capture(7, &reply, (expected.len(), 10), &mut budget)
       .unwrap();
     assert_eq!(
       budget.admittable(),
@@ -174,12 +218,12 @@ mod tests {
     let mut budget = MetadataBudget::new(charge);
     let mut pages = StatusPages::default();
     for action in 0..3 {
-      pages.begin(7, 10, &mut budget);
+      pages.begin(7, &mut budget);
       pages
-        .capture(7, &reply, expected.len(), &mut budget)
+        .capture(7, &reply, (expected.len(), 10), &mut budget)
         .unwrap();
       match action {
-        0 => pages.begin(8, 10, &mut budget),
+        0 => pages.begin(8, &mut budget),
         1 => pages.clear(&mut budget),
         _ => {
           pages.expire(9, &mut budget);
@@ -189,10 +233,35 @@ mod tests {
       }
       assert_eq!(budget.admittable(), charge);
       assert_eq!(
-        pages.capture(7, &reply, expected.len(), &mut budget),
+        pages.capture(7, &reply, (expected.len(), 10), &mut budget),
         Err(Refusal::NotFound)
       );
     }
+  }
+
+  /// A-525. Do: begin a capture and look at it long after the begin, as a starved scatter leaves it; capture it with a
+  /// deadline, page it just before the deadline, and look at the deadline. Expect: a capture awaiting its scatter has no
+  /// deadline and is kept; once made it is held, and served, until its own deadline, counted from the capture, and let go
+  /// at it, its credit returned.
+  #[test]
+  fn a_captures_deadline_counts_from_its_capture() {
+    let reply = ReplyBody::Acknowledged;
+    let expected = encode_body(&reply);
+    let charge = u64::try_from(expected.capacity()).unwrap();
+    let mut budget = MetadataBudget::new(charge);
+    let mut pages = StatusPages::default();
+    pages.begin(7, &mut budget);
+    assert_eq!(pages.deadline(), None, "nothing held, no deadline");
+    pages.expire(1_000, &mut budget);
+    assert!(pages.pending(), "a capture awaiting its scatter is kept");
+    pages
+      .capture(7, &reply, (expected.len(), 2_000), &mut budget)
+      .unwrap();
+    assert_eq!(pages.deadline(), Some(2_000));
+    assert!(pages.page(7, 0, 1, 1_999, &mut budget).is_ok());
+    pages.expire(2_000, &mut budget);
+    assert!(!pages.pending(), "let go at its deadline");
+    assert_eq!(budget.admittable(), charge, "its credit returned");
   }
 
   /// AC-2.6: both the channel credit and metadata class refuse a capture without leaking
@@ -207,9 +276,9 @@ mod tests {
     ] {
       let mut budget = MetadataBudget::new(credit as u64);
       let mut pages = StatusPages::default();
-      pages.begin(7, 10, &mut budget);
+      pages.begin(7, &mut budget);
       assert!(matches!(
-        pages.capture(7, &reply, capacity, &mut budget),
+        pages.capture(7, &reply, (capacity, 10), &mut budget),
         Err(Refusal::BudgetExceeded { .. })
       ));
       assert_eq!(budget.admittable(), credit as u64);

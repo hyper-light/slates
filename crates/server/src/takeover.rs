@@ -201,6 +201,11 @@ const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 /// is judged at. Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_HOLDING_CONTENT: &str = "fleet.takeover.kept_holding_content";
 
+/// The status count of manifests a holder released from a stale copy judged on a takeover whose confirmations certify
+/// their content (A-538): the successor serves the volume from its own placement, so no head it serves names this
+/// holder for what its stale records name. Format: a refusal name in the daemon's status report.
+const TAKEOVER_RELEASED_CERTIFIED: &str = "fleet.takeover.released_certified";
+
 /// The status count under which a holder records a copy of a live owner's object it let go because it is in none of
 /// that owner's neighbourhoods and the owner's settled cohort for the object is whole and at least `f + 1` wide
 /// (`RegionalConfiguration::settled_away`, A-508): the copy's record, or a newer one, is on `f + 1` live hosts without it,
@@ -213,6 +218,11 @@ const SETTLE_RELEASED: &str = "fleet.settle.released";
 /// owner has not settled a new neighbourhood), is narrower than `f + 1` (a bootstrap's), or the object moved (A-508).
 /// Counted at each install that judges it. Format: a refusal name in the daemon's status report.
 const SETTLE_KEPT_OUTSIDE: &str = "fleet.settle.kept_outside";
+
+/// The status count of manifests a holder released from a live owner's copy it let go on a settle that certifies the
+/// owner's content (A-546): no head the owner serves names this holder for what its own records name. Format: a refusal
+/// name in the daemon's status report.
+const SETTLE_RELEASED_CONTENT: &str = "fleet.settle.released_content";
 
 /// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
 /// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
@@ -531,11 +541,16 @@ fn resolve_by_route(
     return;
   };
   if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
+    // The confirmation judged is the copy's takeover's, so is its certification (A-538).
+    let certified = state
+      .departed_owners
+      .get(&object)
+      .is_some_and(|departed| regional.certifies_content(departed.owner));
     match stale_after_confirmation(state, regional, object, owner, local) {
-      Confirmation::Stale => let_go_stale(state, object),
+      Confirmation::Stale => let_go_stale(state, object, certified),
       Confirmation::Covered => {
         state.count(TAKEOVER_UNASKED_COVERED, 1);
-        let_go_stale(state, object);
+        let_go_stale(state, object, certified);
       }
       Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
       Confirmation::None => settle_away(state, regional, object, owner, local),
@@ -564,12 +579,14 @@ fn resolve_by_route(
     // it shows what it keeps that no takeover will recover (A-340).
     Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
     Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
+    // A settled line's holder lagged: it judges no successor's placement, so its content goes only as its retention rule
+    // lets it, certified or not (A-538 releases content only where the holder is outside the successor's placement).
     Lineage::Settled { takeover } => {
       if regional.settled_for(takeover, local) {
-        let_go_stale(state, object);
+        let_go_stale(state, object, false);
       } else if unasked_copy_stale(state, regional, object) {
         state.count(TAKEOVER_UNASKED_COVERED, 1);
-        let_go_stale(state, object);
+        let_go_stale(state, object, false);
       } else {
         state.count(TAKEOVER_KEPT_UNASKED, 1);
       }
@@ -585,8 +602,25 @@ fn resolve_by_route(
 /// dead owner the only other holder this copy is the one it fetches. AUD-29-43's rule is the same one: a holder keeps
 /// content for a head it still backs, and the adopted head still names it. Before, the reclaim dropped the content with
 /// the record (the bug record of 2026-11-18).
-fn let_go_stale(state: &mut ShardState, object: ObjectId) {
-  crate::content_retention::retain_object(state, object);
+///
+/// `certified` when the confirmation the copy was judged on certifies its content (A-538,
+/// `RegionalConfiguration::certifies_content`): the successor confirmed only once it served the volume from its own
+/// placement (A-529), which this holder is outside, so no head it serves names this holder for the content its own
+/// stale records name, and that goes ([`crate::content_retention::release_certified`], counted
+/// [`TAKEOVER_RELEASED_CERTIFIED`]); content placed ahead of those records stays. A takeover read from an older layout is
+/// uncertified, and its holders keep the content as before.
+fn let_go_stale(state: &mut ShardState, object: ObjectId, certified: bool) {
+  if certified {
+    let released = crate::content_retention::release_certified(state, object);
+    if released > 0 {
+      state.count(
+        TAKEOVER_RELEASED_CERTIFIED,
+        u64::try_from(released).unwrap_or(u64::MAX),
+      );
+    }
+  } else {
+    crate::content_retention::retain_object(state, object);
+  }
   if state.held_content.newest_placed(object).is_some() {
     state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
     return;
@@ -705,7 +739,7 @@ fn settle_away(
     return;
   }
   if regional.settled_away(owner, local, object) {
-    let_go_settled_away(state, object);
+    let_go_settled_away(state, object, regional.settle_certifies_content(owner));
   } else {
     state.count(SETTLE_KEPT_OUTSIDE, 1);
   }
@@ -714,9 +748,23 @@ fn settle_away(
 /// Lets go a copy a live owner's neighbourhood settled away from (A-508) as a stale one goes ([`let_go_stale`]): kept
 /// whole, counted [`TAKEOVER_KEPT_HOLDING_CONTENT`], while its retention rule keeps content for it, since the owner's
 /// head may still name this holder for its content and the healer leaves such a named holder be (A-335, A-276's open
-/// item); dropped otherwise, counted [`SETTLE_RELEASED`].
-fn let_go_settled_away(state: &mut ShardState, object: ObjectId) {
-  crate::content_retention::retain_object(state, object);
+/// item); dropped otherwise, counted [`SETTLE_RELEASED`]. Where the owner's settle certifies its content (`certified`,
+/// A-546: it reported its neighbourhood placed only once every volume it owns was served from within it), no head it
+/// serves names this holder, which is outside its neighbourhoods, so the content this holder's own records name goes
+/// first ([`crate::content_retention::release_certified`], counted [`SETTLE_RELEASED_CONTENT`]); content placed ahead
+/// of those records stays.
+fn let_go_settled_away(state: &mut ShardState, object: ObjectId, certified: bool) {
+  if certified {
+    let released = crate::content_retention::release_certified(state, object);
+    if released > 0 {
+      state.count(
+        SETTLE_RELEASED_CONTENT,
+        u64::try_from(released).unwrap_or(u64::MAX),
+      );
+    }
+  } else {
+    crate::content_retention::retain_object(state, object);
+  }
   if state.held_content.newest_placed(object).is_some() {
     state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
     return;
@@ -2456,12 +2504,68 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
     take.learned.is_empty(),
     take.given_up.is_empty(),
     !materializing(state, departed),
+    adopted_served(state, departed, local),
     regional
       .recovery_hosts(departed)
       .into_iter()
       .filter(|host| *host != local && regional.members.contains(host))
       .all(|host| take.pages.get(&host).is_some_and(|page| page.complete)),
   )
+}
+
+/// Whether every volume `departed`'s round adopted here is served from this node's own placement (A-529): its head
+/// snapshot's recorded placement names only this node and hosts among the volume's current content candidates
+/// ([`served_from_placement`]). An adopted volume starts placed where the departed owner's head said
+/// (`verbs::materialize_taken_over`), and the healer replaces that placement on this node's current cohort and
+/// republishes the head naming it (`fleet::heal_decision`, its adopted case). Until it has, the head this node serves
+/// still names holders outside its placement, which a confirmation would leave keeping content no head of the takeover's
+/// line will drop: the confirmation is what certifies that no head the successor serves names a holder outside its
+/// placement, the content release's first half. An object with no volume here (a catalog, a tombstone, a green), or a
+/// volume whose head names no content yet, has nothing to serve.
+fn adopted_served(state: &ShardState, departed: HostId, local: HostId) -> bool {
+  let Some(take) = state.host_takeovers.get(&departed) else {
+    return true;
+  };
+  let configuration = state.fleet.configuration();
+  take.adopted.iter().all(|object| {
+    let id = slates_db::catalog::VolumeId { bytes: object.0 };
+    let Some(record) = state.db.partition().volume(id) else {
+      return true;
+    };
+    if record.epoch == 0 {
+      return true;
+    }
+    state
+      .db
+      .partition()
+      .snapshot(id, record.head)
+      .is_some_and(|snapshot| match &snapshot.placed {
+        slates_db::catalog::PlacementState::Placed { region, .. } => served_from_placement(
+          region,
+          local,
+          &configuration.place_content(*object).candidates,
+        ),
+        slates_db::catalog::PlacementState::Local => true,
+      })
+  })
+}
+
+/// Whether a placement naming `region` is served from `local`'s own placement (A-529): every host it names is `local`
+/// or among the object's current content `candidates`, so the head that records it names no holder outside them.
+pub(crate) fn served_from_placement(region: &[u64], local: HostId, candidates: &[HostId]) -> bool {
+  region
+    .iter()
+    .map(|host| HostId(*host))
+    .all(|host| host == local || candidates.contains(&host))
+}
+
+/// Whether `object` is a volume a takeover round on this node adopted and has not yet confirmed (A-529): the healer
+/// replaces its placement wherever it names a host outside its current candidates, so its round can confirm.
+pub(crate) fn adopted_here(state: &ShardState, object: ObjectId) -> bool {
+  state
+    .host_takeovers
+    .values()
+    .any(|take| take.adopted.contains(&object))
 }
 
 /// Whether an object `departed`'s round adopted is still being materialized on this node (A-345): its volume's content,
@@ -2484,7 +2588,8 @@ fn materializing(state: &ShardState, departed: HostId) -> bool {
 }
 
 /// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
-/// complete, and every object it learned adopted and held here, none given up (A-272, A-304, A-345). A confirmation is what lets the takeover
+/// complete, every object it learned adopted and held here, none given up, and every volume it adopted served from this
+/// node's own placement (A-272, A-304, A-345, A-529). A confirmation is what lets the takeover
 /// complete, and a completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an
 /// object still learned or given up must not confirm: its retirement stays kept, and its holders keep their copies.
 /// Before A-272 an object declared lost was dropped from those learned and the round confirmed as though it had been
@@ -2496,9 +2601,16 @@ fn share_done(
   nothing_learned: bool,
   nothing_given_up: bool,
   nothing_materializing: bool,
+  every_adopted_served: bool,
   every_page: bool,
 ) -> bool {
-  current && unfenced && nothing_learned && nothing_given_up && nothing_materializing && every_page
+  current
+    && unfenced
+    && nothing_learned
+    && nothing_given_up
+    && nothing_materializing
+    && every_adopted_served
+    && every_page
 }
 
 #[cfg(test)]
@@ -2745,24 +2857,55 @@ mod tests {
   #[test]
   fn a_round_confirms_only_once_every_object_it_learned_is_adopted() {
     assert!(
-      !share_done(true, true, false, true, true, true),
+      !share_done(true, true, false, true, true, true, true),
       "an object still learned: not done, the takeover stays kept"
     );
     assert!(
-      !share_done(true, true, true, false, true, true),
+      !share_done(true, true, true, false, true, true, true),
       "an object given up: not done, the takeover stays kept"
     );
     assert!(
-      !share_done(true, true, true, true, false, true),
+      !share_done(true, true, true, true, false, true, true),
       "an object adopted but still materializing here: not done, the takeover stays kept (A-345)"
     );
     assert!(
-      share_done(true, true, true, true, true, true),
+      share_done(true, true, true, true, true, true, true),
       "every object adopted and held: done"
     );
     assert!(
-      !share_done(true, true, true, true, true, false),
+      !share_done(true, true, true, true, true, true, false),
       "a member's pages incomplete: not done"
+    );
+  }
+
+  /// A-529, red before it: a share is not done while a volume its round adopted is still placed where the departed
+  /// owner's head said, outside this node's own placement. Do: judge a placement naming the departed owner beside two
+  /// candidates, one naming a member outside the candidates, one naming this node and the candidates alone, and a share
+  /// whose every other fact holds with each verdict. Expect only the last served, and the share done only then. Before,
+  /// the share confirmed once the volume was adopted and held, and the head the successor served still named the
+  /// departed owner's holders, which kept the content for good.
+  #[test]
+  fn a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement() {
+    let (local, departed, a, b, outside) = (HostId(1), HostId(2), HostId(3), HostId(4), HostId(5));
+    let candidates = [local, a, b];
+    let verdicts = [
+      served_from_placement(&[departed.0, a.0, b.0], local, &candidates),
+      served_from_placement(&[a.0, b.0, outside.0], local, &candidates),
+      served_from_placement(&[local.0, a.0, b.0], local, &candidates),
+    ];
+    assert_eq!(
+      verdicts,
+      [false, false, true],
+      "served only once the placement names this node and its candidates alone"
+    );
+    let done: Vec<bool> = verdicts
+      .iter()
+      .map(|served| share_done(true, true, true, true, true, *served, true))
+      .collect();
+    assert_eq!(
+      done,
+      vec![false, false, true],
+      "the share waits for the adopted volume's placement"
     );
   }
   use crate::head::{HeadKey, HeadSealing};

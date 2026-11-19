@@ -70,6 +70,11 @@ pub struct Accepted {
   /// 0 on Linux when the peer's process is not visible from the daemon's namespace (`crate::peer`): its control socket
   /// still tells its liveness.
   pub pid: u32,
+  /// When the peer's process started, the mark that with its pid names one process (macOS, Windows; A-522): the claim
+  /// carries it beside the pid, and the daemon's watch on the client is taken on that process alone
+  /// (`crate::exit_watch::ExitWatch::on_started`), so a pid reused before the watch is not taken for the client. 0 on
+  /// Linux, whose watch is the control socket's close.
+  pub started: u64,
   /// The daemon's mapping of the region.
   pub region: ClientRegion,
   /// The control channel and completion signal, where the platform has one.
@@ -679,6 +684,15 @@ impl Liveness {
   pub fn recv_delivery(&self) -> Result<Option<ControlDelivery>, IpcError> {
     self.inner.recv_delivery()
   }
+
+  /// Waits, with no clock, until a delivery may be read from the control socket or the daemon has gone (Linux, A-523):
+  /// the socket readable, or its peer closed or reset. The daemon sends a descriptor before the ring reply that names
+  /// it, and answers a typed refusal where the send failed, so a client that read such a reply finds the delivery
+  /// waiting, or sees it within a scheduling tick; a daemon gone first ends the wait.
+  #[cfg(target_os = "linux")]
+  pub fn wait_delivery(&self) -> Result<(), IpcError> {
+    self.inner.wait_delivery()
+  }
 }
 
 impl std::fmt::Debug for Connected {
@@ -1114,6 +1128,18 @@ pub mod platform {
     /// The control socket, polled for the daemon's departure ([`super::Liveness::watch`]).
     pub(super) fn watch(&self) -> std::os::fd::BorrowedFd<'_> {
       std::os::fd::AsFd::as_fd(&self.socket)
+    }
+
+    /// Waits until the control socket is readable or its peer has gone, with no timeout
+    /// ([`super::Liveness::wait_delivery`], A-523). A signal ends the wait early, which the caller's loop reads as nothing
+    /// yet.
+    pub(super) fn wait_delivery(&self) -> Result<(), IpcError> {
+      use rustix::event::{PollFd, PollFlags, poll};
+      let mut interest = [PollFd::new(&self.socket, PollFlags::IN | PollFlags::RDHUP)];
+      match poll(&mut interest, None) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(error) => Err(refused("poll delivery", error)),
+      }
     }
 
     pub(super) fn daemon_gone(&self) -> bool {
@@ -1728,6 +1754,7 @@ pub mod platform {
       client_id,
       uid,
       pid,
+      started: 0,
       region,
       control: Some(Control {
         socket: peer,
@@ -2371,6 +2398,61 @@ pub mod platform {
       ))
     }
 
+    /// Shape: the reply deadline the client's delivery read gave up at before A-523: the anchor's liveness budget, a
+    /// second (`slates_server::daemon::LIVENESS_BUDGET_NS`).
+    const OLD_DELIVERY_DEADLINE_NS: u64 = 1_000_000_000;
+    /// Shape: how long the late daemon end holds what it sends: half again the old deadline.
+    const LATE_DELIVERY_NS: u64 = OLD_DELIVERY_DEADLINE_NS + OLD_DELIVERY_DEADLINE_NS / 2;
+
+    /// A-523 (R3's class C). Do: wait on a channel whose daemon end, from another thread, writes half again the old
+    /// deadline after the wait began; then wait on a channel whose daemon end closes. Expect: the first wait ends with
+    /// the socket readable, no sooner than the write; the second ends at the close, the daemon gone, before the old
+    /// deadline. Before A-523 the client's delivery read gave up at its reply deadline, a second, while the daemon lived.
+    #[test]
+    fn a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock()
+    -> Result<(), IpcError> {
+      use std::time::{Duration, Instant};
+      let (control, liveness) = channel()?;
+      let Control {
+        socket: daemon_socket,
+        ..
+      } = control;
+      let began = Instant::now();
+      let sender = std::thread::spawn(move || -> Result<(), IpcError> {
+        #[allow(clippy::disallowed_methods)]
+        // the daemon end writes late on purpose: the wait across the delay is what is tested.
+        std::thread::sleep(Duration::from_nanos(LATE_DELIVERY_NS));
+        rustix::io::write(&daemon_socket, &[1]).map_err(|e| super::refused("write", e))?;
+        // Kept open until the client has seen the write, so the wait ends at the write, not at a close.
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_nanos(LATE_DELIVERY_NS));
+        Ok(())
+      });
+      liveness.wait_delivery()?;
+      let waited = began.elapsed();
+      let alive_at_the_write = !liveness.daemon_gone();
+      sender.join().map_err(|_| IpcError::Layout {
+        reason: "the late daemon end's thread panicked",
+      })??;
+      if waited < Duration::from_nanos(LATE_DELIVERY_NS) || !alive_at_the_write {
+        return Err(IpcError::Layout {
+          reason: "the delivery wait ended before the late write, or at a close",
+        });
+      }
+      let (control, liveness) = channel()?;
+      drop(control);
+      let began = Instant::now();
+      liveness.wait_delivery()?;
+      if !liveness.daemon_gone()
+        || began.elapsed() >= Duration::from_nanos(OLD_DELIVERY_DEADLINE_NS)
+      {
+        return Err(IpcError::Layout {
+          reason: "the delivery wait did not end at the daemon's going",
+        });
+      }
+      Ok(())
+    }
+
     /// A-161: the daemon sends a stream end with the attach it answers, and the client receives that very end. Do:
     /// send a stream end, then a content map, then a second stream end, back to back, before the client reads any.
     /// Expect: three deliveries in order, each its own kind with its own request and attachment, and the stream end
@@ -2903,8 +2985,10 @@ pub mod platform {
   /// it waits on the daemon's exit, and one of `SLB2` would read no mark, so each refuses the other as another layout.
   /// `SLB4` (A-468) adds the holding anchor's creation time beside its process id: a Windows claimant under a live
   /// anchor waits on the anchor's exit, judged by both, and one of `SLB3` would read none, so each refuses the other.
-  /// Format: `SLB4`'s four ASCII bytes read as a little-endian `u32`.
-  const MAGIC: u32 = 0x3442_4C53;
+  /// `SLB5` (A-522) adds the claimant's start to each claim slot (`AT_STARTED`): a daemon of it watches the client's
+  /// process judged by its pid and its start, and a claimant of `SLB4` writes no start, so each refuses the other.
+  /// Format: `SLB5`'s four ASCII bytes read as a little-endian `u32`.
+  const MAGIC: u32 = 0x3542_4C53;
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4), the claim's mark (4,
   /// A-381), the daemon's start stamp (8), the daemon's process id (4, A-447), the holding anchor's process id (4), the
   /// daemon's creation time (8, A-447), the holding anchor's creation time (8, A-468), padding to a cache line. The
@@ -2945,7 +3029,7 @@ pub mod platform {
   const SLOTS: usize = 64;
   /// Format: a claim slot: state (4), client pid (4), client id (4), padding (4), region
   /// length (8), region name (40), the answering daemon's start stamp (8) and process id (4),
-  /// padding to two cache lines.
+  /// padding (4), the claimant's start (8, A-522), padding to two cache lines.
   const SLOT_BYTES: usize = 128;
   /// Format: the state word's offset in a slot.
   const AT_STATE: usize = 0;
@@ -2966,6 +3050,11 @@ pub mod platform {
   /// Format: the offset in a slot of the answering daemon's process id (A-143), written with its answer: the process
   /// a client's exit watch is taken on.
   const AT_ANSWERED_PID: usize = 72;
+  /// Format: the offset in a slot of the claimant's start (A-522): when its process started, written by the claimant
+  /// beside its pid (`ExitWatch::own_start`: macOS the start time the kernel keeps for the process, in microseconds
+  /// since 1970; Windows its creation time, in 100 ns intervals since 1601), so the daemon's watch on the client is
+  /// taken on that process alone and a pid reused before the watch is never taken for it.
+  const AT_STARTED: usize = 80;
   /// Format: the slot states.
   const FREE: u32 = 0;
   /// Format: a client claimed the slot.
@@ -3792,6 +3881,7 @@ pub mod platform {
       let at = slot_at(index);
       let wanted = read_u32(&self.object, at.saturating_add(AT_CLIENT))?;
       let pid = read_u32(&self.object, at.saturating_add(AT_PID))?;
+      let started = read_u64(&self.object, at.saturating_add(AT_STARTED))?;
       let client_id = assign(wanted);
       let Prepared { mut region, .. } = match make_region(client_id) {
         Ok(prepared) => prepared,
@@ -3816,6 +3906,7 @@ pub mod platform {
         // it is the daemon's user (the kernel refused everyone else).
         uid: current_uid(),
         pid,
+        started,
         region,
         control: Some(Control),
       })
@@ -3933,10 +4024,12 @@ pub mod platform {
     Ok((handoff, object))
   }
 
-  /// Claims a free slot: `FREE` → `CLAIMING`, the pid and the wanted id written, then `CLAIMED` with
+  /// Claims a free slot: `FREE` → `CLAIMING`, the pid, its start and the wanted id written, then `CLAIMED` with
   /// release, so the daemon never reads the fields before they are written. A slot the daemon reclaimed
   /// meanwhile (this claimant was stalled past the stale bound) is given up and another claimed.
   fn claim(object: &mut SharedObject, wanted: u32) -> Result<usize, IpcError> {
+    // Read before a slot is taken, so a refusal leaves no slot claimed.
+    let started = crate::exit_watch::ExitWatch::own_start()?;
     for index in 0..SLOTS {
       if state(object, index)?
         .compare_exchange(FREE, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
@@ -3946,6 +4039,8 @@ pub mod platform {
       }
       let at = slot_at(index);
       object.write(at.saturating_add(AT_PID), &current_pid().to_le_bytes())?;
+      // With its pid, its start: the two name this process alone, so the daemon's watch is not taken on a reuser (A-522).
+      object.write(at.saturating_add(AT_STARTED), &started.to_le_bytes())?;
       // The id the client wants back (zero: a fresh one); the daemon answers with the id it assigns.
       object.write(at.saturating_add(AT_CLIENT), &wanted.to_le_bytes())?;
       if state(object, index)?
@@ -4543,6 +4638,26 @@ pub mod platform {
       assert_eq!(state(&client, 0).unwrap().load(Acquire), READY);
     }
 
+    /// A-522 (golden vector). Do: claim a slot as a client does, and accept it as the daemon does. Expect: the
+    /// claimant's start (`ExitWatch::own_start`) eight bytes little-endian at offset 80 of its slot beside its pid at
+    /// 4, and the accepted client carrying both, the pair its watch is taken on.
+    #[test]
+    fn a_claim_names_its_process_by_its_pid_and_its_start() {
+      let name = instance("started");
+      let mut listener = Listener::open(&name, None).unwrap();
+      let mut client = client_mapping(&name);
+      let index = claim(&mut client, 0).unwrap();
+      let started = crate::exit_watch::ExitWatch::own_start().unwrap();
+      let mut word = [0u8; size_of::<u64>()];
+      client.read(slot_at(index) + 80, &mut word).unwrap();
+      assert_eq!(u64::from_le_bytes(word), started);
+      let accepted = accept(&mut listener, "started")
+        .unwrap()
+        .expect("the claim is answered");
+      assert_eq!(accepted.pid, current_pid());
+      assert_eq!(accepted.started, started);
+    }
+
     /// AUD-29-09 (a dead claimant). Do: leave slot 0 `CLAIMING`, as a client killed mid-claim would;
     /// accept once, again past the stale bound. Expect: the slot kept on the first pass (a live claimant
     /// could still publish), taken back `FREE` on the second, so a dead claimant never strands it.
@@ -4771,7 +4886,7 @@ pub mod platform {
     /// A-447, A-468 (golden vectors). Do: put a daemon's mark and an anchor's into a header's image as they write them,
     /// and read each back. Expect: the daemon's process id's four bytes little-endian at 24 and its creation time's
     /// eight at 32, the anchor's at 28 and 40, each mark read back whole and neither for the other, and the layout's
-    /// magic `SLB4`.
+    /// magic `SLB5` (A-522's claimant's start in each slot).
     #[test]
     fn the_process_marks_are_little_endian_at_their_offsets() {
       let daemon = ProcessMark {
@@ -4795,7 +4910,7 @@ pub mod platform {
       );
       assert_eq!(ProcessMark::daemon_of(&header), Some(daemon));
       assert_eq!(ProcessMark::anchor_of(&header), Some(anchor));
-      assert_eq!(MAGIC.to_le_bytes(), *b"SLB4");
+      assert_eq!(MAGIC.to_le_bytes(), *b"SLB5");
     }
 
     /// A-447, A-468 (hostile images). Do: read the marks of an image with none written, of one whose daemon's process

@@ -1391,13 +1391,7 @@ fn a_released_maps_unclaimed_offer_is_withdrawn() {
     matches!(released, ReplyBody::MapReleased),
     "the release: {released:?}"
   );
-  let claimed = slates_ipc::route::claim(
-    &instance,
-    (OfferKind::Map, mapping_id),
-    &secret,
-    Duration::from_nanos(LIVENESS_BUDGET_NS),
-    &mut || false,
-  );
+  let claimed = slates_ipc::route::claim(&instance, (OfferKind::Map, mapping_id), &secret);
   assert!(
     matches!(
       claimed,

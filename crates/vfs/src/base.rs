@@ -541,9 +541,14 @@ pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
 pub(crate) fn unavailable_errno(error: HostError) -> i32 {
   match error {
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
+    // The record keeps one number (A-527): a Win32 code as its own, which only a reader told it is Windows' reads.
+    HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       GONE_DIRECTORY_ERRNO
     }
+    // A fetch under way is no errno: the directory is unavailable for no reason the host's errno names, as a base
+    // unavailable with no host at all is (`BaseUnavailable(0)`). Recovery over an S3 base is A-524's owed integration.
+    HostError::Pending => 0,
   }
 }
 
@@ -858,6 +863,9 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
+    // One number past the seam (A-527): a Win32 code as its own.
+    HostError::Win32(code) => VfsError::BaseUnavailable(i32::try_from(code).unwrap_or(i32::MAX)),
+    HostError::Pending => VfsError::BasePending,
   }
 }
 

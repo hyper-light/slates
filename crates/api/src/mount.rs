@@ -23,11 +23,15 @@
 use std::process::Command;
 
 #[cfg(not(windows))]
+use slates_bridge_oci::mount_holders::{Holders, HoldersError};
+#[cfg(not(windows))]
 use slates_bridge_oci::mount_table::{MountEntry, MountIdentity, MountTableError};
 
 use slates_ipc::protocol::{Intent, VolumeId};
 
 use crate::error::{Error, Missing, MountFault, MountMissing};
+#[cfg(not(windows))]
+use crate::error::{HoldersUnread, MountHolders};
 use crate::instance::Instance;
 
 /// How a volume is mounted.
@@ -382,15 +386,73 @@ const FUSE_DEVICE: &str = "/dev/fuse";
 /// machine's state — this process's `PATH`, `/dev/fuse`, WinFsp's library — and mounts nothing, so it needs no daemon;
 /// a daemon started from this process finds the same `PATH`. macOS always offers its loopback mount, `mount(2)` being
 /// built in.
+///
+/// On macOS and the BSDs the loopback mount is offered only where no one but root can capture loopback traffic (A-535):
+/// its capability rides every file handle in the clear, since the kernel's NFS client speaks neither RPC-with-TLS nor
+/// RPCSEC_GSS ([`MountMissing::PrivateLoopback`] otherwise).
 #[cfg(target_os = "macos")]
 pub fn available() -> Result<MountKind, MountFault> {
-  Ok(MountKind::NfsLoopback)
+  loopback_available(capture_open(bpf_devices()))
 }
 
-/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`.
+/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`, and a loopback no one but root can capture.
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 pub fn available() -> Result<MountKind, MountFault> {
-  nfs_available(backend())
+  nfs_available(backend()).and_then(|_| loopback_available(capture_open(bpf_devices())))
+}
+
+/// Format: the BPF capture devices of macOS and the BSDs: `/dev/bpf` (FreeBSD's cloning device) and `/dev/bpf<n>`,
+/// which xnu makes in order from 0 (`bsd/net/bpf.c`).
+#[cfg(all(unix, not(target_os = "linux")))]
+const BPF_DEVICE: &str = "/dev/bpf";
+
+/// Format: the owner-read permission bit (`S_IRUSR`, `<sys/stat.h>`).
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const READ_BY_OWNER: u32 = 0o400;
+/// Format: the group-read and other-read permission bits (`S_IRGRP | S_IROTH`, `<sys/stat.h>`).
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const READ_BY_OTHERS: u32 = 0o044;
+/// Format: root's user id.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const ROOT_UID: u32 = 0;
+
+/// The BPF capture devices this host has, as `(st_mode, st_uid)`: `/dev/bpf` if it exists, then `/dev/bpf0`,
+/// `/dev/bpf1` and on until one is missing or cannot be read, so the count is the system's own (a read of the device
+/// nodes' metadata, never an open).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bpf_devices() -> Vec<(u32, u32)> {
+  let of = |stat: rustix::fs::Stat| (u32::from(stat.st_mode), stat.st_uid);
+  let mut devices: Vec<(u32, u32)> = rustix::fs::stat(BPF_DEVICE).map(of).into_iter().collect();
+  for index in 0u32.. {
+    match rustix::fs::stat(format!("{BPF_DEVICE}{index}")) {
+      Ok(stat) => devices.push(of(stat)),
+      Err(_) => break,
+    }
+  }
+  devices
+}
+
+/// Whether anyone but root can capture this host's loopback traffic (A-535), judged from its BPF devices' modes and
+/// owners (`devices`, as `(st_mode, st_uid)`): one a group or anyone may read, or one owned by a user other than root
+/// who may read it. macOS leaves each `crw-------` root's alone; Wireshark's ChmodBPF gives every one to its
+/// `access_bpf` group to read. Pure, so every case is tested on any host.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+pub(crate) fn capture_open(devices: impl IntoIterator<Item = (u32, u32)>) -> bool {
+  devices
+    .into_iter()
+    .any(|(mode, uid)| mode & READ_BY_OTHERS != 0 || (uid != ROOT_UID && mode & READ_BY_OWNER != 0))
+}
+
+/// Whether the loopback mount may be offered on a host where loopback capture is `open` or not (A-535): refused
+/// [`MountMissing::PrivateLoopback`] where it is open. Pure, so every case is tested on any host.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+pub(crate) fn loopback_available(open: bool) -> Result<MountKind, MountFault> {
+  if open {
+    return Err(MountFault::Unsupported {
+      missing: MountMissing::PrivateLoopback,
+    });
+  }
+  Ok(MountKind::NfsLoopback)
 }
 
 /// See the macOS arm: Linux needs `fusermount3` on the `PATH` and `/dev/fuse` this user may read and write.
@@ -698,7 +760,7 @@ fn unmount_as(path: &str, unmounting: Unmounting) -> Result<(), MountFault> {
   };
   let answer = ask_unmount(path, &request);
   let after = mount_table_for(path)?;
-  judged(path, mounted, after.as_deref(), answer)
+  judged(path, mounted, after.as_deref(), answer, unmounting).map_err(|fault| named(fault, mounted))
 }
 
 /// The mount point as the kernel's table records it, worked out without touching the mount (a lookup on a `hard` NFS
@@ -748,26 +810,98 @@ fn mount_at<'table>(table: &'table [MountEntry], point: &str) -> Option<&'table 
 }
 
 /// An unmount's answer judged by the table read after it (A-507; kiln judges its own so): the mount gone from the
-/// table is done, whatever the call said; still listed, it is the call's refusal, or `StillMounted` when the call said
-/// done. With no table on the platform (`mounted` or `after` is `None`) the call's own answer stands.
+/// table is done, whatever the call said; still listed, it is the call's refusal ([`still_listed`]), or `StillMounted`
+/// when the call said done. With no table on the platform (`mounted` or `after` is `None`) the call's own answer
+/// stands.
 #[cfg(not(windows))]
 fn judged(
   path: &str,
   mounted: Option<MountIdentity>,
   after: Option<&[MountEntry]>,
   answer: Result<(), MountFault>,
+  unmounting: Unmounting,
 ) -> Result<(), MountFault> {
   match (mounted, after) {
     (Some(identity), Some(table)) => {
       if table.iter().any(|entry| entry.identity == identity) {
-        answer.and(Err(MountFault::StillMounted {
-          path: path.to_owned(),
-        }))
+        Err(match answer {
+          Ok(()) => MountFault::StillMounted {
+            path: path.to_owned(),
+          },
+          Err(refusal) => still_listed(path, refusal, unmounting),
+        })
       } else {
         Ok(())
       }
     }
     _ => answer,
+  }
+}
+
+/// A refusal of an unmount whose mount the kernel's table still lists, typed by what it says (A-537). Linux's
+/// `fusermount3 -u` reports no error number: a refused `umount2(2)` prints "failed to unmount %s: %s" and the helper
+/// exits 1, as it does for a mount not the caller's (libfuse `util/fusermount.c`: `unmount_fuse_locked`, `may_unmount`,
+/// `err_out`). For the caller's own FUSE mount, still listed after a plain unmount its helper refused, that is a
+/// process holding a reference to a file there (`umount2(2)`'s `EBUSY`), so it is `Busy`, as `EBUSY` is on macOS and
+/// the BSDs. A detaching unmount (`-z`) refused stands as the helper's exit, and so does every refusal that names an
+/// error number.
+#[cfg(not(windows))]
+fn still_listed(path: &str, refusal: MountFault, unmounting: Unmounting) -> MountFault {
+  match refusal {
+    MountFault::Unmount {
+      status: Some(_),
+      errno: None,
+      ..
+    } if unmounting == Unmounting::Plain => MountFault::Busy {
+      path: path.to_owned(),
+      holders: MountHolders::default(),
+    },
+    other => other,
+  }
+}
+
+/// A busy refusal with its holders named (A-537): the processes the kernel's own tables show holding the mount, read
+/// now, on this refusal alone, without touching the mount (`slates_bridge_oci::mount_holders`); every other refusal as
+/// it is.
+#[cfg(not(windows))]
+fn named(fault: MountFault, mounted: Option<MountIdentity>) -> MountFault {
+  match fault {
+    MountFault::Busy { path, .. } => MountFault::Busy {
+      path,
+      holders: match mounted {
+        Some(identity) => holders_from(slates_bridge_oci::mount_holders::holders(identity.device)),
+        None => unread(HoldersUnread::NoReader {
+          platform: std::env::consts::OS,
+        }),
+      },
+    },
+    other => other,
+  }
+}
+
+/// What the kernel's tables showed of a busy mount, in the API's terms ([`MountHolders`]).
+#[cfg(not(windows))]
+fn holders_from(read: Result<Holders, HoldersError>) -> MountHolders {
+  match read {
+    Ok(holders) => MountHolders {
+      pids: holders.pids,
+      unreadable: holders.unreadable,
+      unread: None,
+    },
+    Err(HoldersError::Unsupported { platform, .. }) => unread(HoldersUnread::NoReader { platform }),
+    Err(HoldersError::Query { errno }) => unread(HoldersUnread::Refused { errno: Some(errno) }),
+    Err(HoldersError::Malformed { .. }) => unread(HoldersUnread::Refused { errno: None }),
+    Err(HoldersError::TooLarge { cap }) => unread(HoldersUnread::PastBound { cap }),
+  }
+}
+
+/// No holder read, for `why`.
+#[cfg(not(windows))]
+fn unread(why: HoldersUnread) -> MountHolders {
+  MountHolders {
+    pids: Vec::new(),
+    unreadable: 0,
+    unread: Some(why),
   }
 }
 
@@ -779,7 +913,10 @@ fn judged(
 fn refusal_of_errno(path: &str, errno: Option<i32>) -> MountFault {
   let path = path.to_owned();
   match errno {
-    Some(libc::EBUSY) => MountFault::Busy { path },
+    Some(libc::EBUSY) => MountFault::Busy {
+      path,
+      holders: MountHolders::default(),
+    },
     Some(libc::EINVAL) => MountFault::NotMounted {
       path,
       unreported: Vec::new(),
@@ -861,10 +998,10 @@ const BUSY_UNMOUNT: LetGo = LetGo::Forced;
 #[cfg(test)]
 mod tests {
   use super::{
-    MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
-    winfsp_available,
+    MountBackend, MountKind, ROOT_UID, capture_open, classify, export_path, fuse_available,
+    loopback_available, mount_args, nfs_available, winfsp_available,
   };
-  use crate::error::{MountFault, MountMissing};
+  use crate::error::{HoldersUnread, MountFault, MountHolders, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.
@@ -1036,8 +1173,54 @@ mod tests {
     );
   }
 
-  /// §4.6 A-34, A-278 — on macOS the loopback mount is always available: `mount(2)` is built in, so a host's fact is
-  /// `NfsLoopback` with nothing to install.
+  /// §4.13, A-535 — a macOS or BSD host is told it can mount only where no one but root can capture its loopback: a
+  /// mount's capability rides every file handle in the clear, which the kernel's NFS client cannot encrypt. Do: judge BPF
+  /// devices as macOS leaves them (root's, read by root alone), as Wireshark's ChmodBPF leaves one (read by its group),
+  /// read by anyone, owned and read by a user, and none at all; then ask the loopback's availability under each answer.
+  /// Expect capture open exactly where a group, anyone or a user other than root may read a device; the mount offered
+  /// where capture is closed and refused `PrivateLoopback` where it is open, its words naming the devices and the fix.
+  /// Before A-535 every macOS host was told it could mount, and a group granted capture read each mount's capability
+  /// off loopback. Pure, so every case runs on any host.
+  #[test]
+  fn a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback() {
+    /// Format: a character device's file-type bits (`S_IFCHR`, `<sys/stat.h>`).
+    const CHAR_DEVICE: u32 = 0o020_000;
+    /// Shape: a user other than root (macOS's first account's id).
+    const USER: u32 = 501;
+    let root_only = (CHAR_DEVICE | 0o600, ROOT_UID);
+    assert!(
+      !capture_open([root_only, root_only]),
+      "macOS's default: each device root's alone"
+    );
+    assert!(
+      capture_open([root_only, (CHAR_DEVICE | 0o660, ROOT_UID)]),
+      "one device its group may read, as ChmodBPF leaves them"
+    );
+    assert!(
+      capture_open([(CHAR_DEVICE | 0o604, ROOT_UID)]),
+      "a device anyone may read"
+    );
+    assert!(
+      capture_open([(CHAR_DEVICE | 0o600, USER)]),
+      "a device a user owns and may read"
+    );
+    assert!(!capture_open([]), "no device: nothing captures");
+    assert_eq!(loopback_available(false), Ok(MountKind::NfsLoopback));
+    assert_eq!(
+      loopback_available(true),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::PrivateLoopback
+      })
+    );
+    let words = MountMissing::PrivateLoopback.to_string();
+    assert!(
+      words.contains("/dev/bpf") && words.contains("chmod 600"),
+      "the refusal names the devices and the fix: {words}"
+    );
+  }
+
+  /// §4.6 A-34, A-278, A-535 — on a Mac whose loopback no one but root can capture (macOS's default) the loopback mount
+  /// is available: `mount(2)` is built in, so a host's fact is `NfsLoopback` with nothing to install.
   #[cfg(target_os = "macos")]
   #[test]
   fn macos_always_offers_its_loopback_mount() {
@@ -1093,7 +1276,8 @@ mod tests {
     assert_eq!(
       super::refusal_of_errno(path, Some(libc::EBUSY)),
       MountFault::Busy {
-        path: path.to_owned()
+        path: path.to_owned(),
+        holders: MountHolders::default()
       }
     );
     assert!(
@@ -1159,27 +1343,162 @@ mod tests {
     let busy = || {
       Err(MountFault::Busy {
         path: path.to_owned(),
+        holders: MountHolders::default(),
       })
     };
+    let plain = super::Unmounting::Plain;
     let gone = [entry(1, "/"), entry(2, path)];
-    assert_eq!(super::judged(path, taken, Some(&gone), Ok(())), Ok(()));
     assert_eq!(
-      super::judged(path, taken, Some(&gone), busy()),
+      super::judged(path, taken, Some(&gone), Ok(()), plain),
+      Ok(())
+    );
+    assert_eq!(
+      super::judged(path, taken, Some(&gone), busy(), plain),
       Ok(()),
       "the table, not the call"
     );
     assert_eq!(
-      super::judged(path, taken, Some(&before), Ok(())),
+      super::judged(path, taken, Some(&before), Ok(()), plain),
       Err(MountFault::StillMounted {
         path: path.to_owned()
       })
     );
-    assert_eq!(super::judged(path, taken, Some(&before), busy()), busy());
     assert_eq!(
-      super::judged(path, None, None, busy()),
+      super::judged(path, taken, Some(&before), busy(), plain),
+      busy()
+    );
+    assert_eq!(
+      super::judged(path, None, None, busy(), plain),
       busy(),
       "no table: the call's answer"
     );
-    assert_eq!(super::judged(path, None, None, Ok(())), Ok(()));
+    assert_eq!(super::judged(path, None, None, Ok(()), plain), Ok(()));
+  }
+
+  /// A-537, Linux's busy unmount typed by the table (pure, every host): `fusermount3` reports no error number, so a plain
+  /// unmount its helper refused (an exit and no number) while the kernel's table still lists the mount is `Busy`, as
+  /// `EBUSY` is on macOS. Do: judge, against a table still listing the mount, the helper's refusal of a plain unmount,
+  /// of a detaching one, and a refusal that names an error number; then the plain refusal against a table that no longer
+  /// lists the mount. Expect `Busy` for the first alone, the other two standing, and done once the table drops it.
+  #[cfg(unix)]
+  #[test]
+  fn a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy() {
+    use slates_bridge_oci::mount_table::{MountEntry, MountIdentity};
+    let identity = MountIdentity {
+      mount: 3,
+      device: 7,
+    };
+    let path = "/home/me/work";
+    let listed = [MountEntry {
+      identity,
+      mount_point: path.to_owned(),
+      fstype: "fuse.slates".to_owned(),
+      source: "slates".to_owned(),
+    }];
+    let gone: [MountEntry; 0] = [];
+    let helper = || {
+      Err(MountFault::Unmount {
+        path: path.to_owned(),
+        status: Some(1),
+        errno: None,
+      })
+    };
+    let numbered = || {
+      Err(MountFault::Unmount {
+        path: path.to_owned(),
+        status: None,
+        errno: Some(libc::EPERM),
+      })
+    };
+    let (plain, let_go) = (super::Unmounting::Plain, super::Unmounting::LetGo);
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), helper(), plain),
+      Err(MountFault::Busy {
+        path: path.to_owned(),
+        holders: MountHolders::default()
+      }),
+      "a plain unmount the helper refused, the mount still listed, is busy"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), helper(), let_go),
+      helper(),
+      "a detach refused stands as the helper's exit"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), numbered(), plain),
+      numbered(),
+      "a refusal that names its error number stands"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&gone), helper(), plain),
+      Ok(()),
+      "gone from the table: done"
+    );
+  }
+
+  /// A-537: what the holder read answered, in the API's terms, and the busy refusal's words (pure, every host). Do: map a
+  /// read naming two holders and one unreadable process, then each refusal the reader gives: no reader (macOS), the
+  /// kernel's refusal, a bound's malformed sysctl, a listing past its bound; and print a busy refusal with one holder
+  /// and two unreadable. Expect the holders as read, each refusal as its `HoldersUnread`, and the words naming the
+  /// holder, the unreadable count and the way to let go.
+  #[cfg(unix)]
+  #[test]
+  fn a_busy_mounts_holders_are_named_as_the_kernel_listed_them() {
+    use slates_bridge_oci::mount_holders::{Holders, HoldersError};
+    assert_eq!(
+      super::holders_from(Ok(Holders {
+        pids: vec![41, 97],
+        unreadable: 1,
+      })),
+      MountHolders {
+        pids: vec![41, 97],
+        unreadable: 1,
+        unread: None,
+      }
+    );
+    for (read, unread) in [
+      (
+        HoldersError::Unsupported {
+          platform: "macos",
+          reason: "libproc stats every file",
+        },
+        HoldersUnread::NoReader { platform: "macos" },
+      ),
+      (
+        HoldersError::Query {
+          errno: libc::EACCES,
+        },
+        HoldersUnread::Refused {
+          errno: Some(libc::EACCES),
+        },
+      ),
+      (
+        HoldersError::Malformed {
+          path: "/proc/sys/kernel/pid_max",
+        },
+        HoldersUnread::Refused { errno: None },
+      ),
+      (
+        HoldersError::TooLarge { cap: 5 },
+        HoldersUnread::PastBound { cap: 5 },
+      ),
+    ] {
+      assert_eq!(super::holders_from(Err(read)).unread, Some(unread));
+    }
+    let words = MountFault::Busy {
+      path: "/home/me/work".to_owned(),
+      holders: MountHolders {
+        pids: vec![41],
+        unreadable: 2,
+        unread: None,
+      },
+    }
+    .to_string();
+    assert!(
+      words.contains("[41]")
+        && words.contains("2 process(es) could not be read")
+        && words.contains("unmount_busy"),
+      "{words}"
+    );
   }
 }
