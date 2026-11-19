@@ -67,6 +67,12 @@ pub struct ClientSlot {
   /// The volumes of other hosts this client asked for an attachment of in the record form (A-222), so its reap ends
   /// them at their owners (`crate::remote_attach::reap_at_owners`). Bounded by `crate::remote_attach::bound`.
   pub(crate) remote_volumes: Vec<slates_ipc::protocol::VolumeId>,
+  /// The direct maps this shard sent the client over its control socket whose replies have not reached it yet (Linux,
+  /// A-188, A-505; `crate::direct_map`). A copy's shard that lost the answer to its send asks again, and that ask is
+  /// answered from here, so a copy is never sent twice. Each leaves when its reply is delivered here, after every ask
+  /// about it has run, since one channel carries the asks and the reply in order. So it holds at most the client's maps
+  /// in flight, each within the client's share of its copy's shard, and it is released with this client.
+  pub(crate) maps_sent: std::collections::BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for ClientSlot {

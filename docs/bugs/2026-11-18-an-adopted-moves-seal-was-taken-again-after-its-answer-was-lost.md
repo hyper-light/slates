@@ -42,4 +42,21 @@ that stops for a window loses after the effect.
 - `daemon.rs` `rebuild_remote_works` (recovery): it moves the shard's `work_home.unbuilt` out with `std::mem::take`, so
   a lost answer drops those works unbuilt. Its doc already accepts that outcome for a shard that does not answer.
 - `direct_map.rs`, the delivery of a map's descriptor through the client's shard (`send_to_client`): a lost answer
-  after the send leaves the caller taking a delivered map for undelivered.
+  after the send leaves the caller taking a delivered map for undelivered. **Fixed by A-505 (2026-11-19)**, below.
+
+## A-505: a direct map's send to its client (Linux)
+
+- **Description.** The copy's shard asks the client's shard to send the copy's descriptor on the client's control
+  socket (A-188). When that ask's answer was lost after the send ran, the copy's shard replied `MapUnavailable` and gave
+  the copy back, so the client read by copy while the descriptor it was sent sat in its control socket, holding the
+  copy's pages outside every budget, until a later receive happened to drain it. An ask made again would have sent the
+  same copy twice.
+- **Root cause.** As A-488's: the send's only record was its answer.
+- **Edits.** `crates/server/src/state.rs`: `ClientSlot::maps_sent`, the maps the client's shard sent the client whose
+  replies have not reached it. `crates/server/src/direct_map.rs`: `Delivered` lifted out of the Linux code with
+  `send_once` (a map recorded as sent is answered `Sent`, not sent again), `kept_as_handed` (an answered send, or no
+  answer at all, keeps the copy as handed) and `forget_replied` (a `Mapped` reply ends its map's record as
+  `deliver_to` delivers it on the client's shard); `send_to_client` sends through the record; `hand_off` asks once more
+  when the first answer is lost; `handed` follows `kept_as_handed`, counting `dax.local_map_handed_unanswered`.
+  `crates/server/src/daemon.rs`: the slot starts with an empty record.
+- **Test.** `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed` (`direct_map.rs`).
