@@ -228,6 +228,13 @@ fn assert_stock_placement(plan: &Plan, unbundle: &Unbundle) {
   );
   assert_eq!(plan.roots, vec![RootChange::Added(logged(7))]);
   assert_eq!(plan.added, Some((logged(0), logged(7))));
+  assert_eq!(
+    plan.firsts,
+    vec![
+      (b"default".to_vec(), logged(0)),
+      (b"stable".to_vec(), logged(2))
+    ]
+  );
 }
 
 /// Format: the branches generated histories use, one with a slash.
