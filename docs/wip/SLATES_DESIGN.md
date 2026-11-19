@@ -38755,6 +38755,19 @@ Applied in the same change to: GAPS (the live-shipping entry's real-process chao
   mutated copy whose takeover read the store-lost holder: the takeover succeeded with an empty log (`Ok(0)`).
 - **Owed (main's).** The real-process runs of both faults: a replica's store destroyed under the live log, and a client
   killed mid-write (run-requests.md).
+- **The real-process flow for a client killed mid-write (2026-11-19, the same amendment).**
+  `a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover` (`crates/cli/tests/live_chaos.rs`)
+  runs as follows:
+  - It streams acknowledged writes to a live volume and stops both candidates.
+  - It starts a client process writing one more file, and kills it (SIGKILL) once the owner's own
+    `fleet.live.awaited` moves: the write has left the client and is parked at the owner, the client between "sent" and
+    "answered". The trigger is an event of the write, never a sleep.
+  - It loses the owner's whole node and resumes the candidates.
+  - It judges the takeover as the other takeover flows do: NoLoss (every acknowledged write byte for byte, the killed
+    client's absent or whole), StaleNeverCommits (fences), Agreement (the models' TotalOrder), Continuity and
+    ReadSafety (`judge_takeover`).
+
+  Written by g250 and compiled and run by main: 24 runs on each Linux architecture (run-requests.md).
 
 ### A-583 — The fleet's own tests of a captured clone's landing after a takeover and after a live-shipped move (2026-11-19, g230, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover", §4.10 "Live shipping"; the tests A-544 and A-565 filed for main)
 Applied in the same change to: GAPS (g267's captured-clone status: the two tests written, their run owed),

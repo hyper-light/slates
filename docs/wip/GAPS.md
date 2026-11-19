@@ -5382,7 +5382,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > under a replica: the holder answers no read and accepts no record under its old id, as a fresh-id restart does), with
 > `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: a store-lost holder answering with nothing
 > completed a quorum that missed a committed record at `f = 2`) and `a_write_its_client_left_is_kept_or_dropped_whole`;
-> the real-process runs of both faults are main's (run-requests.md). The owner's `put_wal` is its `Local` records,
+> the real-process runs of both faults are main's (run-requests.md): the store-destroyed flows exist, and the client
+> killed mid-write is `a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover` (`live_chaos.rs`,
+> 2026-11-19: its write killed between sent and answered by the owner's `fleet.live.awaited`, the owner then lost, the
+> next owner judged by every invariant). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.
