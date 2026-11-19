@@ -48,7 +48,7 @@
 use std::collections::BTreeMap;
 use std::mem::size_of;
 
-use slates_vcs::content::encode_derived;
+use slates_vcs::content::{IDENTITY_BYTES, encode_derived};
 use slates_vcs::derived::{DerivedType, Graph, Mode};
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
@@ -72,6 +72,22 @@ const LEAF: u8 = b'L';
 /// Format: the first byte of an inner node's payload: its level, then a bit for each child slot.
 const INNER: u8 = b'I';
 
+/// Format: the first byte of a value's payload: which sets it names, then its trees' shape.
+const VALUE: u8 = b'V';
+
+/// Format: the bit of a value's second payload byte that says it names a reached set's root (left out when empty).
+const REACHED: u8 = 1;
+
+/// Format: the bit that says it names D(k)'s root, after the reached set's (left out when empty).
+const BROUGHT: u8 = 2;
+
+/// Format: an inner node's head before its bitmap: its tag and its level, a byte each.
+const INNER_HEAD: usize = size_of::<(u8, u8)>();
+
+/// Format: an inner node's bitmap keeps a bit for each child slot, the first slot in the first byte's lowest bit, as
+/// many slots a byte as a byte has bits.
+const SLOT_BITS: u64 = u8::BITS as u64;
+
 /// A set's tree's shape (module docs), derived from the store's window: the positions a leaf covers and the children an
 /// inner node names, each the most one window holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,9 +104,14 @@ impl Shape {
   pub(crate) fn of(window: usize) -> Option<Shape> {
     let leaf = encode_derived(&[], &[LEAF])?.len();
     let runs = window.checked_sub(leaf)?.checked_div(RUN_BYTES)?;
-    let block = u64::try_from(runs.checked_mul(2)?).ok()?;
-    let fanout = u64::try_from(fanout_for(window)?).ok()?;
-    (block >= 2 && fanout >= 2).then_some(Shape { block, fanout })
+    let block = u64::try_from(runs).ok()?.checked_mul(2)?;
+    Shape::recorded(block, fanout_for(window)?)
+  }
+
+  /// The shape a value records, as [`Shape::of`] makes one: a block of an even count of positions, at least two (a
+  /// leaf of at least one run), and at least two children a node; `None` for any other.
+  fn recorded(block: u64, fanout: u64) -> Option<Shape> {
+    (block >= 2 && block.is_multiple_of(2) && fanout >= 2).then_some(Shape { block, fanout })
   }
 
   /// The least level whose node, from block 0, covers block `block`: the root's level of a set whose last block it is.
@@ -102,25 +123,51 @@ impl Shape {
     }
     level
   }
+
+  /// The blocks a node of `level` covers: the fanout to the level's power.
+  fn blocks(self, level: u32) -> Option<u64> {
+    self.fanout.checked_pow(level)
+  }
+
+  /// The positions a node of `level` covers.
+  fn span(self, level: u32) -> Option<u64> {
+    self.block.checked_mul(self.blocks(level)?)
+  }
+
+  /// The positions `[start, end)` the node of `level` whose first block is `first` covers.
+  fn range(self, level: u32, first: u64) -> Option<(u64, u64)> {
+    let start = first.checked_mul(self.block)?;
+    Some((start, start.checked_add(self.span(level)?)?))
+  }
+
+  /// The bytes of an inner node's bitmap.
+  fn bitmap_len(self) -> Option<usize> {
+    bitmap_bytes(self.fanout)
+  }
+}
+
+/// The bytes of a bitmap of `fanout` child slots, a bit each.
+fn bitmap_bytes(fanout: u64) -> Option<usize> {
+  usize::try_from(fanout.div_ceil(SLOT_BITS)).ok()
 }
 
 /// An inner node's payload's length for `fanout` children: its tag, its level, and a bit for each child slot.
-fn inner_payload_len(fanout: usize) -> Option<usize> {
-  fanout.div_ceil(8).checked_add(2)
+fn inner_payload_len(fanout: u64) -> Option<usize> {
+  bitmap_bytes(fanout)?.checked_add(INNER_HEAD)
 }
 
 /// The most children an inner node of one `window` names, by the store's own layout of a derived node.
-fn fanout_for(window: usize) -> Option<usize> {
+fn fanout_for(window: usize) -> Option<u64> {
   let count = encode_derived(&[], &[])?.len();
-  let name = encode_derived(&[ContentId([0; 32])], &[])?
+  let name = encode_derived(&[ContentId([0; IDENTITY_BYTES])], &[])?
     .len()
     .checked_sub(count)?;
-  let bytes = |fanout: usize| {
+  let bytes = |fanout: u64| {
     count
-      .checked_add(name.checked_mul(fanout)?)?
+      .checked_add(name.checked_mul(usize::try_from(fanout).ok()?)?)?
       .checked_add(inner_payload_len(fanout)?)
   };
-  let mut fanout = window.checked_div(name)?;
+  let mut fanout = u64::try_from(window.checked_div(name)?).ok()?;
   while fanout > 0 && bytes(fanout).is_none_or(|len| len > window) {
     fanout = fanout.saturating_sub(1);
   }
@@ -185,7 +232,7 @@ impl Sets {
       return None;
     }
     let mut names = node.names();
-    let mut set = |bit: u8| match present & bit {
+    let mut set = |flag: u8| match present & flag {
       0 => Some(Positions::new()),
       _ => read_tree(store, names.next()?, shape),
     };
@@ -254,7 +301,7 @@ fn exhausted() -> ContentRefused {
 pub(super) fn shape_of(window: usize) -> Result<Shape, ContentRefused> {
   Shape::of(window).ok_or_else(|| {
     let least = inner_payload_len(2)
-      .and_then(|payload| encode_derived(&[ContentId([0; 32]); 2], &vec![0; payload]))
+      .and_then(|payload| encode_derived(&[ContentId([0; IDENTITY_BYTES]); 2], &vec![0; payload]))
       .map_or(u64::MAX, |bytes| {
         u64::try_from(bytes.len()).unwrap_or(u64::MAX)
       });
@@ -285,7 +332,7 @@ fn put_tree(
     owned: Vec::new(),
     full: Vec::new(),
   };
-  let made = builder.node(level, 0, &runs);
+  let made = builder.node(level, 0, runs);
   builder.settle(made)
 }
 
@@ -430,31 +477,44 @@ fn children(runs: &[(u64, u64)], start: u64, span: u64) -> Option<BTreeMap<u64, 
   Some(children)
 }
 
+/// Where child slot `slot` sits in a bitmap: its byte, and its bit's mask there.
+fn slot_place(slot: u64) -> Option<(usize, u8)> {
+  let byte = usize::try_from(slot.checked_div(SLOT_BITS)?).ok()?;
+  let shift = u32::try_from(slot.checked_rem(SLOT_BITS)?).ok()?;
+  Some((byte, 1_u8.checked_shl(shift)?))
+}
+
 /// Marks child slot `slot` in `bitmap`.
 fn set_bit(bitmap: &mut [u8], slot: u64) -> Option<()> {
-  let byte = bitmap.get_mut(usize::try_from(slot / 8).ok()?)?;
-  *byte |= 1 << (slot % 8);
+  let (byte, mask) = slot_place(slot)?;
+  *bitmap.get_mut(byte)? |= mask;
   Some(())
 }
 
 /// Whether `bitmap` marks child slot `slot`.
 fn bit(bitmap: &[u8], slot: u64) -> Option<bool> {
-  let byte = bitmap.get(usize::try_from(slot / 8).ok()?)?;
-  Some(byte & (1 << (slot % 8)) != 0)
+  let (byte, mask) = slot_place(slot)?;
+  Some(bitmap.get(byte)? & mask != 0)
 }
 
-/// The set the tree `root` of `shape` holds (module docs); `None` for nodes in any other form. A node met again is read
-/// once.
+/// The set the tree `root` of `shape` holds (module docs); `None` for nodes in any other form, and for a root of
+/// another level than the least that covers the set's last block, so a set has one tree. A node met again is read once.
 fn read_tree(store: &ContentStore, root: ContentId, shape: Shape) -> Option<Positions> {
   let mut seen = BTreeMap::new();
-  let (_, runs) = relative(store, root, shape, &mut seen)?;
+  let (level, runs) = relative(store, root, shape, &mut seen)?;
+  let last = runs.last()?.1.checked_sub(1)?.checked_div(shape.block)?;
+  if level != shape.level_of(last) {
+    return None;
+  }
   Positions::from_runs(runs)
 }
 
 /// A node's level and runs (each relative to the node's first position), read once a node.
 type Read = (u32, Vec<(u64, u64)>);
 
-/// A node's [`Read`], from the store or from `seen`.
+/// A node's [`Read`], from the store, or from `seen` for a leaf or a node of one run read before (a range the set holds
+/// whole is the node met most often). A node of more runs is read again where it is met again: what it adds to the
+/// answer is as long as reading it, so a reading holds no more than the answer and its leaves.
 fn relative(
   store: &ContentStore,
   id: ContentId,
@@ -477,7 +537,9 @@ fn relative(
     }
     _ => return None,
   };
-  seen.insert(id, read.clone());
+  if read.0 == 0 || read.1.len() == 1 {
+    seen.insert(id, read.clone());
+  }
   Some(read)
 }
 
@@ -514,42 +576,51 @@ fn inner_runs(
 ) -> Option<Read> {
   let below = level.checked_sub(1)?;
   let span = shape.span(below)?;
-  if bitmap.len() != shape.bitmap_len()? || stray_bits(bitmap, shape.fanout)? {
+  let slots = marked_slots(bitmap, shape)?;
+  if slots.is_empty() || slots.len() != names.len() {
     return None;
   }
-  let mut names = names.iter();
   let mut runs: Vec<(u64, u64)> = Vec::new();
-  for slot in 0..shape.fanout {
-    if !bit(bitmap, slot)? {
-      continue;
-    }
-    let (child_level, child) = relative(store, *names.next()?, shape, seen)?;
+  for (slot, name) in slots.into_iter().zip(names) {
+    let (child_level, child) = relative(store, *name, shape, seen)?;
     if child_level != below {
       return None;
     }
-    let offset = slot.checked_mul(span)?;
-    for (start, end) in child {
-      let (start, end) = (start.checked_add(offset)?, end.checked_add(offset)?);
-      match runs.last_mut() {
-        Some(last) if last.1 == start => last.1 = end,
-        _ => runs.push((start, end)),
-      }
-    }
+    append_shifted(&mut runs, child, slot.checked_mul(span)?)?;
   }
-  (names.next().is_none() && !runs.is_empty()).then_some((level, runs))
+  Some((level, runs))
 }
 
-/// Whether `bitmap` marks a slot past `fanout`.
-fn stray_bits(bitmap: &[u8], fanout: u64) -> Option<bool> {
-  let slots = u64::try_from(bitmap.len()).ok()?.checked_mul(8)?;
-  let mut slot = fanout;
-  while slot < slots {
-    if bit(bitmap, slot)? {
-      return Some(true);
-    }
-    slot = slot.checked_add(1)?;
+/// The child slots `bitmap` marks, ascending; `None` for a bitmap of another length than `shape`'s, or one marking a
+/// slot past its fanout.
+fn marked_slots(bitmap: &[u8], shape: Shape) -> Option<Vec<u64>> {
+  if bitmap.len() != shape.bitmap_len()? {
+    return None;
   }
-  Some(false)
+  let slots = u64::try_from(bitmap.len()).ok()?.checked_mul(SLOT_BITS)?;
+  let mut marked = Vec::new();
+  for slot in 0..slots {
+    if bit(bitmap, slot)? {
+      if slot >= shape.fanout {
+        return None;
+      }
+      marked.push(slot);
+    }
+  }
+  Some(marked)
+}
+
+/// Appends a child's runs to `runs`, each moved `offset` positions on, a run that starts where the last ends joined to
+/// it (a run the writer cut at a child's bound).
+fn append_shifted(runs: &mut Vec<(u64, u64)>, child: Vec<(u64, u64)>, offset: u64) -> Option<()> {
+  for (start, end) in child {
+    let (start, end) = (start.checked_add(offset)?, end.checked_add(offset)?);
+    match runs.last_mut() {
+      Some(last) if last.1 == start => last.1 = end,
+      _ => runs.push((start, end)),
+    }
+  }
+  Some(())
 }
 
 /// The type (module docs), declared over the store's window, eager or lazy by its owner.

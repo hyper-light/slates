@@ -353,6 +353,7 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     let content = ContentStore::new(stores.charged, window).map_err(|_| Unmade)?;
     stores.content = Some(content);
   }
+  let window = stores.content.as_ref().map_or(window, ContentStore::window);
   let store = match record.tool {
     VcsTool::Git => RepositoryStore::Git(GitStore::new(
       git_format(record.format).ok_or(Unmade)?,
