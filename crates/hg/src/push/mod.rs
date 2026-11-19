@@ -35,6 +35,17 @@
 //! each decoded vector, each name and value copied, and a payload that arrived in several chunks, joined. A payload in
 //! one chunk is decoded where it lies.
 //!
+//! **A bundle read as `unbundle` reads it** ([`read_bundle`], A-680 part 2b; 7.2's `exchange.readbundle`,
+//! `bundle2.getunbundler` and `wireprotov1server.unbundle` \[C\]): its four-byte header first. A bundle2 (`HG20`) is made
+//! plain ([`crate::compression::plain`]), decoded and read part by part; a refusal there is answered with the error part
+//! 7.2's processing answers ([`Refusal::refused`]): an unknown mandatory stream parameter, part or parameter as
+//! `error:unsupportedcontent`, every other fault as `error:abort` in slates' words naming it, where 7.2 aborts in its
+//! reader's (`stream ended unexpectedly`, with byte counts slates does not keep). A bundle1 (`HG10`, or a headerless one
+//! beginning with NUL, which 7.2 reads as `HG10UN`) is refused as bundle2 required, as a 7.2 server whose `server.bundle1`
+//! is off refuses it. Anything else is answered as 7.2 answers an abort before bundle2's processing (its `pusherr`), in
+//! 7.2's words: `stream: not a Mercurial bundle`, `unknown bundle version` and the version, or `stream ended
+//! unexpectedly` for fewer than four bytes. What a push came to is an [`Outcome`], which each transport frames.
+//!
 //! **Golden vectors.** `fixtures/push/` holds what stock 7.2 sent and answered over SSH (made by
 //! `make-push-fixtures.sh`, its command in its header, checked by its `SHA256SUMS`): a bookmark moved, a draft
 //! published, a plain push, three races made by sending a recorded session again after another client moved a head, a
@@ -52,8 +63,10 @@ pub mod verify;
 
 use std::borrow::Cow;
 
-use crate::bundle2::{Bundle2, Part};
+use crate::bundle2::{self, Bundle2, Part};
 use crate::changegroup::Version;
+use crate::compression;
+use crate::decimal::Decimal;
 use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
 use crate::{Admission, Node, PastAdmission, bookmarks, heads, phases, pushkey};
@@ -287,6 +300,163 @@ pub enum Refusal {
 impl From<PastAdmission> for Refusal {
   fn from(past: PastAdmission) -> Self {
     Self::PastAdmission(past)
+  }
+}
+
+/// Format: the first two bytes of every bundle, and the versions after them that 7.2's push reads: bundle1's, and
+/// bundle2's (`exchange.readbundle`, `bundle2.formatmap`).
+const BUNDLE_MAGIC: &[u8; MAGIC_LEN] = b"HG";
+/// Format: the bytes of a bundle's magic.
+const MAGIC_LEN: usize = 2;
+/// Format: see [`BUNDLE_MAGIC`].
+const BUNDLE1_VERSION: &[u8] = b"10";
+/// Format: see [`BUNDLE_MAGIC`].
+const BUNDLE2_VERSION: &[u8] = b"20";
+/// Format: the first byte of the versions 7.2 hands to its bundle2 reader, which knows only [`BUNDLE2_VERSION`].
+const BUNDLE2_FAMILY: u8 = b'2';
+/// Format: the byte a headerless bundle1 begins with, which 7.2 reads as `HG10UN` (`changegroup.headerlessfixup`).
+const HEADERLESS: u8 = 0;
+/// Format: a bundle's header: its magic and its version.
+const HEADER_LEN: usize = 4;
+
+/// 7.2's words for a push's stream that is no bundle (`exchange.readbundle`'s `%s: not a Mercurial bundle`, its file
+/// name `stream`), for a version it does not read (`%s: unknown bundle version %s`, and `bundle2.getunbundler`'s
+/// `unknown bundle version %s`), and for a stream shorter than its header (`changegroup.readexactly`).
+const NOT_A_BUNDLE: &[u8] = b"stream: not a Mercurial bundle";
+/// See [`NOT_A_BUNDLE`].
+const STREAM_PREFIX: &[u8] = b"stream: ";
+/// See [`NOT_A_BUNDLE`].
+const UNKNOWN_VERSION: &[u8] = b"unknown bundle version ";
+/// See [`NOT_A_BUNDLE`].
+const ENDED_EARLY: &[u8] = b"stream ended unexpectedly (got ";
+/// See [`NOT_A_BUNDLE`].
+const ENDED_EXPECTED: &[u8] = b" bytes, expected ";
+/// See [`NOT_A_BUNDLE`].
+const ENDED_CLOSE: &[u8] = b")";
+
+/// Slates' words before the fault of a push's bundle2 that could not be read, where 7.2 aborts in its reader's.
+const UNREAD: &[u8] = b"the push's bundle could not be read: ";
+
+/// What a push came to, as 7.2's `wireprotov1server.unbundle` answers it before its transport frames it (module docs;
+/// A-680 part 2b).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+  /// Accepted: its reply.
+  Accepted(reply::Reply),
+  /// Refused as its bundle2 was processed: its reply, holding the error part 7.2 answers with.
+  Refused(reply::Reply),
+  /// Refused before its bundle2 was processed (its `heads` argument no longer holds, or its bundle is none 7.2 reads),
+  /// in these words: 7.2's `pusherr`.
+  Unprocessed(Vec<u8>),
+  /// A bundle1, where bundle2 is required: 7.2's `bundle2required`.
+  Bundle1,
+}
+
+impl Outcome {
+  /// The outcome of a push refused with `refused`'s error part, nothing salvaged.
+  pub fn refused(refused: &reply::Refused) -> Outcome {
+    Outcome::Refused(reply::Reply::refused(&[], refused))
+  }
+}
+
+/// Reads a push's bundle as 7.2's `unbundle` reads it (module docs): the parts a push's handlers take ([`read`]), or the
+/// outcome refusing it.
+pub fn read_bundle(bundle: &[u8], admission: &mut Admission) -> Result<Unbundle, Outcome> {
+  let Some(header) = bundle.first_chunk::<HEADER_LEN>() else {
+    return Err(Outcome::Unprocessed(ended_early(bundle.len())));
+  };
+  if let Some(refused) = unread_header(header) {
+    return Err(refused);
+  }
+  let plain = compression::plain(bundle, admission).map_err(plain_refused)?;
+  let decoded = Bundle2::decode(&plain, admission).map_err(|refusal| stream_refused(&refusal))?;
+  read(&decoded, admission).map_err(|refusal| Outcome::refused(&refusal.refused()))
+}
+
+/// What 7.2 answers a push whose bundle's `header` is not bundle2's (module docs); none for bundle2's.
+fn unread_header(header: &[u8; HEADER_LEN]) -> Option<Outcome> {
+  let Some((magic, version)) = header.split_first_chunk::<MAGIC_LEN>() else {
+    return Some(Outcome::Unprocessed(NOT_A_BUNDLE.to_vec()));
+  };
+  if magic != BUNDLE_MAGIC {
+    let headerless = header.first() == Some(&HEADERLESS);
+    return Some(if headerless {
+      Outcome::Bundle1
+    } else {
+      Outcome::Unprocessed(NOT_A_BUNDLE.to_vec())
+    });
+  }
+  if version == BUNDLE1_VERSION {
+    return Some(Outcome::Bundle1);
+  }
+  (version != BUNDLE2_VERSION).then(|| Outcome::Unprocessed(unknown_version(version)))
+}
+
+/// 7.2's words for a bundle `version` it does not read: its bundle2 reader's for a version beginning `2`, else
+/// `readbundle`'s, naming the stream.
+fn unknown_version(version: &[u8]) -> Vec<u8> {
+  let prefix: &[u8] = if version.first() == Some(&BUNDLE2_FAMILY) {
+    &[]
+  } else {
+    STREAM_PREFIX
+  };
+  [prefix, UNKNOWN_VERSION, version].concat()
+}
+
+/// The outcome of a bundle2 [`crate::compression::plain`] refused: its stream's parameters as the decoder refuses them,
+/// and every other fault as an abort.
+fn plain_refused(refusal: compression::Refusal) -> Outcome {
+  match refusal {
+    compression::Refusal::Bundle2(refusal) => stream_refused(&refusal),
+    other => Outcome::refused(&unread(&other)),
+  }
+}
+
+/// 7.2's words for a stream of `got` bytes, fewer than a bundle's header.
+fn ended_early(got: usize) -> Vec<u8> {
+  let mut words = ENDED_EARLY.to_vec();
+  words.extend_from_slice(Decimal::unsigned(to_u64(got)).as_bytes());
+  words.extend_from_slice(ENDED_EXPECTED);
+  words.extend_from_slice(Decimal::unsigned(to_u64(HEADER_LEN)).as_bytes());
+  words.extend_from_slice(ENDED_CLOSE);
+  words
+}
+
+/// The outcome of a bundle2 stream its decoder refused: an unknown mandatory stream parameter as 7.2's
+/// `BundleUnknownFeatureError` (`error:unsupportedcontent` naming it, no part), every other fault as an abort.
+fn stream_refused(refusal: &bundle2::Refusal) -> Outcome {
+  match refusal {
+    bundle2::Refusal::UnknownMandatoryParameter { name } => {
+      Outcome::refused(&reply::Refused::Unsupported {
+        parttype: None,
+        params: vec![name.clone()],
+      })
+    }
+    other => Outcome::refused(&unread(other)),
+  }
+}
+
+/// `error:abort` naming `fault` in slates' words (module docs).
+fn unread(fault: &impl core::fmt::Debug) -> reply::Refused {
+  let mut message = UNREAD.to_vec();
+  message.extend_from_slice(format!("{fault:?}").as_bytes());
+  reply::Refused::Abort {
+    message,
+    hint: None,
+  }
+}
+
+impl Refusal {
+  /// The error part 7.2's server answers the refusal with (module docs): a part or parameter no handler takes as
+  /// `error:unsupportedcontent`, every other fault as `error:abort` in slates' words naming it.
+  pub fn refused(&self) -> reply::Refused {
+    match self {
+      Refusal::Unsupported { parttype, params } => reply::Refused::Unsupported {
+        parttype: Some(parttype.clone()),
+        params: params.clone(),
+      },
+      other => unread(other),
+    }
   }
 }
 

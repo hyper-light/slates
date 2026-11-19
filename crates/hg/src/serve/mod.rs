@@ -77,7 +77,8 @@ pub trait Repository {
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-  /// An item of a node list that is not 40 hexadecimal digits.
+  /// An item of a node list that is not 40 hexadecimal digits, or of `unbundle`'s `heads` that is not an even number of
+  /// them (A-680 part 2b).
   NodeList {
     /// The item's position in the list.
     at: u64,

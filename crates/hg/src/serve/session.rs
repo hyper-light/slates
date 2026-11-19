@@ -15,7 +15,12 @@
 //! `branchmap`, `bundle2` (the parts a `getbundle` answer carries, and `error=abort`), `getbundle`, `known` and
 //! `protocaps`. A 7.2 client asks the same `getbundle` of it as of a stock server (`exchange._pullbundle2` reads
 //! `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it); it lacks `lookup` (a pull of a named revision is refused
-//! by the client), `pushkey`, `unbundle` and stream clones, which later pieces serve.
+//! by the client), `pushkey`, `unbundle` and stream clones, which later pieces serve. Over HTTP, where pushes are served
+//! (A-680 part 2b, `super::http::pushed`), `unbundle` is listed with 7.2's value and `bundle2` with what a push needs
+//! beside, as 7.2 lists them: `changegroup=01,02,03` (the versions a push is taken in), `checkheads=related` (decided:
+//! the verdict is per line, so a client checks only the heads it moves), `error=abort,unsupportedcontent,pushraced,
+//! pushkey` and `pushkey`. No `pushkey` command is listed: a 7.2 client that reads `bookmarks` and `phases=heads` moves
+//! both in its bundle and never calls it.
 //!
 //! **Shared with HTTP** (A-650 part 1). [`dispatch`] answers a command whatever carries it, giving 7.2's three kinds
 //! of answer (a string, a stream, an error out of band) for its transport to frame. The transport decides what
@@ -83,9 +88,9 @@ const BUNDLE2_SERVED: [(&[u8], &[&[u8]]); 7] = [
 ];
 
 /// Format: the capabilities advertised over HTTP, sorted as `capabilities` sorts them: SSH's but `protocaps` (an HTTP
-/// client says what it reads in `X-HgProto`), and what 7.2's `httpv1protocolhandler.addcapabilities` adds beside
-/// `batch`: `compression`, `httpheader` and `httpmediatype`.
-const SERVED_HTTP: [&[u8]; 8] = [
+/// client says what it reads in `X-HgProto`), what 7.2's `httpv1protocolhandler.addcapabilities` adds beside `batch`
+/// (`compression`, `httpheader` and `httpmediatype`), and `unbundle`, since pushes are served over HTTP (A-680 part 2b).
+const SERVED_HTTP: [&[u8]; 9] = [
   b"batch",
   b"branchmap",
   b"bundle2",
@@ -94,7 +99,27 @@ const SERVED_HTTP: [&[u8]; 8] = [
   b"httpheader",
   b"httpmediatype",
   b"known",
+  b"unbundle",
 ];
+
+/// Format: the bundle2 capabilities advertised over HTTP, by name (module docs): SSH's, and what a push needs beside, as
+/// 7.2's `getrepocaps` names them for a server (`bundle2.capabilities`, `concurrent-push-mode`'s `check-related`).
+const BUNDLE2_SERVED_HTTP: [(&[u8], &[&[u8]]); 9] = [
+  (b"HG20", &[]),
+  (b"bookmarks", &[]),
+  (b"changegroup", &[b"01", b"02", b"03"]),
+  (b"checkheads", &[b"related"]),
+  (b"error", &[b"abort", b"unsupportedcontent", b"pushraced", b"pushkey"]),
+  (b"listkeys", &[]),
+  (b"obsmarkers", &[b"V0", b"V1"]),
+  (b"phases", &[b"heads"]),
+  (b"pushkey", &[]),
+];
+
+/// Format: `unbundle`'s value, the bundle1 formats 7.2 lists for a push (`bundle2.bundlepriority`); a bundle1 push is
+/// refused with 7.2's own `bundle2required` words (A-680 part 2b), as a 7.2 server whose `server.bundle1` is off
+/// refuses one while listing the same value.
+const UNBUNDLE_FORMATS: &[u8] = b"HG10GZ,HG10BZ,HG10UN";
 
 /// Format: `compression`'s value over HTTP: the engines a `0.2` answer may be written in, each of A-598's by its wire
 /// name; which one an answer takes is its caller's choice ([`super::http::Compressor`]).
@@ -104,9 +129,9 @@ const HTTP_ENGINES: &[u8] = b"zstd,zlib,bzip2,none";
 /// (`tx`).
 const HTTP_MEDIA_TYPES: &[u8] = b"0.1rx,0.1tx,0.2tx";
 
-/// Format: 7.2's answer over HTTP to a bundle1 `getbundle` where bundle2 is required (`wireprotov1server.py`'s
+/// Format: 7.2's answer over HTTP to a bundle1 `getbundle` or push where bundle2 is required (`wireprotov1server.py`'s
 /// `bundle2required`: the message, then the hint in parentheses, each line ended).
-const BUNDLE2_REQUIRED: &[u8] = b"incompatible Mercurial client; bundle2 required\n\
+pub(super) const BUNDLE2_REQUIRED: &[u8] = b"incompatible Mercurial client; bundle2 required\n\
   (see https://www.mercurial-scm.org/wiki/IncompatibleClient)\n";
 
 /// Format: `protocaps`' answer.
@@ -172,6 +197,9 @@ pub enum Refused {
     /// The channel's window.
     capacity: u64,
   },
+  /// A push refused (A-680 part 2b, [`super::http::pushed`]): its words travel in its own answer, the error part of its
+  /// reply or 7.2's `pusherr`.
+  Push,
 }
 
 impl From<Refusal> for Refused {
@@ -378,21 +406,26 @@ fn string_answer<'a>(
   Ok(())
 }
 
-/// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`]; over HTTP [`SERVED_HTTP`],
-/// `httpheader`'s value the transport's; `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`].
+/// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`], `bundle2`'s value the quoted
+/// blob of [`BUNDLE2_SERVED`]; over HTTP [`SERVED_HTTP`], `httpheader`'s value the transport's and `bundle2`'s the quoted
+/// blob of [`BUNDLE2_SERVED_HTTP`].
 fn advertised(
   transport: Transport,
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refused> {
+  let (names, served, header_line): (&[&[u8]], &[(&[u8], &[&[u8]])], u64) = match transport {
+    Transport::Ssh => (SERVED.as_slice(), BUNDLE2_SERVED.as_slice(), 0),
+    Transport::Http { header_line } => (
+      SERVED_HTTP.as_slice(),
+      BUNDLE2_SERVED_HTTP.as_slice(),
+      header_line,
+    ),
+  };
   let mut blob = Vec::new();
-  capabilities::encode_bundle2(&BUNDLE2_SERVED, &mut blob);
+  capabilities::encode_bundle2(served, &mut blob);
   let mut quoted = Vec::new();
   capabilities::encode_bundle2_value(&blob, &mut quoted);
-  let (names, header_line): (&[&[u8]], u64) = match transport {
-    Transport::Ssh => (SERVED.as_slice(), 0),
-    Transport::Http { header_line } => (SERVED_HTTP.as_slice(), header_line),
-  };
   let header_line = Decimal::unsigned(header_line);
   let value = |name: &[u8]| -> Option<&[u8]> {
     match name {
@@ -400,6 +433,7 @@ fn advertised(
       b"compression" => Some(HTTP_ENGINES),
       b"httpheader" => Some(header_line.as_bytes()),
       b"httpmediatype" => Some(HTTP_MEDIA_TYPES),
+      b"unbundle" => Some(UNBUNDLE_FORMATS),
       _ => None,
     }
   };
@@ -557,6 +591,7 @@ pub(super) fn message(refused: &Refused) -> Vec<u8> {
     Refused::PastWindow { needed, capacity } => {
       format!("a request of {needed} bytes is past the channel's window of {capacity}")
     }
+    Refused::Push => "push refused".to_owned(),
   };
   words.into_bytes()
 }
