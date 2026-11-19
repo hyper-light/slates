@@ -11635,7 +11635,10 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > work's own operations, since a volume's link names the node already; its changes now hold that link with the node's
 > bytes, as the submit leaves it (`Green::heirs_of`). Before, they held the home's removal alone, so a rebased work's
 > files lost the link the submit kept, and the rebase oracle failed on some seeds
-> (`docs/bugs/2026-11-19-a-rebases-files-lost-the-link-a-removed-home-handed-its-node-to.md`).
+> (`docs/bugs/2026-11-19-a-rebases-files-lost-the-link-a-removed-home-handed-its-node-to.md`). The node's mode and
+> attributes, and an IPC node, need no place in the changes: a work's view on the server holds none of them, its next
+> submit (its restated journal composed again) leaves the mode and attributes at the link as the submit does, and no
+> work removes a FIFO a link names or renames a file over one, both refused by the deriver (A-677's entry).
 
 **Rebase off the owner (A-273): measured and rejected (A-528).** A work's rebase and its base reads at a named
 version are the green's owner's: a work's shard asks them of the owner's shard (A-247, A-388), which answers them on
@@ -49613,8 +49616,29 @@ Applied in the same change to:
   - The landing run, over main 1ef718820 (878a2eb43, kiln r172), alike: fmt clean; slates-merge lib 193 of 193 (main's
     A-676 added one); `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1;
     the server's 13 of 13.
-- **Siblings** (the sweep, by reading): the hand-over also moves the node's mode and attributes to the heir, and an IPC
-  node (`Effect::Special`); a rebase's answer holds files alone, so what a rebased work shows of a heir's mode,
-  attributes or IPC node is the server's work view's, not checked here. The chain entry's copy fixes
-  (`CopyFix::files`, A-626) and the stack's restatements (operations, from which a commit derives its own node moves)
-  are not siblings.
+- **Siblings** (the sweep, by reading): the chain entry's copy fixes (`CopyFix::files`, A-626) and the stack's
+  restatements (operations, from which a commit derives its own node moves) are not siblings.
+- **The heir's mode, attributes and IPC node, checked** (2026-11-19, g305, main's assignment after A-677 landed). The
+  hand-over also gives the heir the node's mode and attributes, or its IPC node (`Effect::Special`), none of which a
+  rebase's changes hold, since they hold files alone. They need no place there:
+  - A work's view on the server holds none of them. Its verbs read its files' bytes (`ReadRange`, `ReadWindow`), list
+    its files with their sizes and the directories and symlinks it declared (`ReadDir`, `listing::work_paths`), and
+    answer its status; no verb reads a work's mode or attribute, and its listing names no IPC node. What a rebased work
+    holds of them is its restated journal alone, which its next submit composes (`compose_increment`).
+  - The mode and the attributes: a work that removes the home, or renames another file over it, rebased at the head,
+    its restated journal sealed and submitted as its next submit, leaves the link the node's mode and attributes as the
+    work's own submit does (`a_rebased_works_next_submit_leaves_its_link_the_nodes_mode` and `..._attributes`,
+    `crates/merge/src/engine/node_tests.rs`).
+  - An IPC node: no work in the server removes a FIFO a hard link names, or renames a file over one. The deriver
+    refuses both, rebased or not: the removal `Unsupported` both ways, the rename `PathKindConflict` as the work
+    declares it and `Unsupported` as the rebase restates it, with the replaced FIFO's removal written out (GAPS: the
+    inode-aware namespace journal owed). So no rebased work holds a FIFO handed to a link.
+    `a_linked_fifos_removal_or_replacement_is_refused_rebased_or_not` pins the four answers, so it fails when that
+    journal composes them, and the heir's IPC node is then to be held to the submit's, as the mode and attributes are.
+  - Run on macOS arm64, the Mac Studio (kiln r231, 2026-11-19, debug, 29a35798d over main 031e04337): `cargo fmt -p
+    slates-merge -- --check` clean; `cargo test --locked -p slates-merge --lib node_tests` 29 of 29, the three new
+    among them; the whole lib 197 of 197; `--test rebase` 3 of 3. The FIFO test's first form compared the two answers
+    alone and met the rename's two refusal kinds (kiln r225), which it now pins.
+  - Found on the way, for main: the verdict accepts a file renamed over an IPC node a hard link names, handing the node
+    to the link (A-646 part 2), where GAPS' list of A-643's siblings still calls it refused; only the deriver refuses
+    it.
