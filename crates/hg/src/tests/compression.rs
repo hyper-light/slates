@@ -405,7 +405,7 @@ fn libzstd_holds_exactly_what_a_frame_is_charged() {
 /// parameter, 7.2's front byte for byte) and made plain to exactly the bundle it was made of.
 #[test]
 fn a_plain_bundle_compressed_by_every_engine_and_level_is_made_plain_to_itself() {
-  let zstd = zstd::zstd_safe::min_c_level()..=zstd::zstd_safe::max_c_level();
+  let zstd_levels = zstd::zstd_safe::min_c_level()..=zstd::zstd_safe::max_c_level();
   let cases = [
     (fixtures::CG01, Engine::Zlib, vec![0, 6, 9], &b"HG10GZ"[..]),
     (fixtures::CG01, Engine::Bzip2, vec![1, 9], &b"HG10BZ"[..]),
@@ -430,7 +430,7 @@ fn a_plain_bundle_compressed_by_every_engine_and_level_is_made_plain_to_itself()
     (
       fixtures::CG02,
       Engine::Zstd,
-      vec![*zstd.start(), 3, *zstd.end()],
+      vec![*zstd_levels.start(), 3, *zstd_levels.end()],
       &CG02_ZSTD[..BUNDLE2_FRONT],
     ),
     (
@@ -546,18 +546,21 @@ proptest! {
   ) {
     let zlib = [&b"x\x9c"[..], bytes.as_slice()].concat();
     let bzip2 = [&b"BZh9"[..], bytes.as_slice()].concat();
-    let zstd = [&[0x28_u8, 0xB5, 0x2F, 0xFD, 0x00, 0x58][..], bytes.as_slice()].concat();
+    let zstd_frame = [&[0x28_u8, 0xB5, 0x2F, 0xFD, 0x00, 0x58][..], bytes.as_slice()].concat();
     let inputs = [
       [&b"HG10GZ"[..], zlib.as_slice()].concat(),
       [&b"HG10"[..], bzip2.as_slice()].concat(),
       bundle2_with(b"Compression=GZ", &zlib),
       bundle2_with(b"Compression=BZ", &bzip2),
-      bundle2_with(b"Compression=ZS", &zstd),
+      bundle2_with(b"Compression=ZS", &zstd_frame),
     ];
     for input in inputs {
       match plain(&input, &mut Admission::new(BOUND)) {
         Ok(made) => prop_assert!(!made.is_empty()),
-        Err(refusal) => prop_assert!(!matches!(refusal, Refusal::ForeignMagic { .. })),
+        Err(refusal) => {
+          let foreign = matches!(refusal, Refusal::ForeignMagic { .. });
+          prop_assert!(!foreign);
+        }
       }
     }
   }
