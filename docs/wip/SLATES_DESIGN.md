@@ -11532,7 +11532,11 @@ and answering every later reply that names the version. A green keeps its own lo
 append to it, and a push of several greens' versions is one entry appended to each green it moves only while each is
 at the position the push read, kept as one atomic record those positions point to (§4.17.1 shared piece 2; A-603,
 rebuilt by A-635 per A-642). A push is judged whole before anything is applied: `Green::judge` holds each work's verdict
-and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once.
+and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once. Since
+A-658 the verdict is `Green::compute`, a pure function of the versions a work is judged over and of the work: the owner
+judging is the owner computing at its own head, and any copy that holds those versions (a holder's replica, rebuilt from
+the chain's entries) computes the same `Computed`, which names the head it was computed against (part 2, the owner's
+commit of a result computed elsewhere by position, is owed).
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -44570,6 +44574,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
     increment since that position, so the hottest green's throughput is its owner's append rate, not its verdict rate.
+    (Part 1 built, A-658: `Green::compute` and `Green::rebase` read the green and change nothing, a `Computed` holds
+    nothing of the green that computed it and names the head it was computed against, and a copy lacking the versions
+    refuses typed. Owed: part 2, the owner's commit by position, judging again only the increment since; then the
+    fleet's route, a holder computing and the owner appending.)
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
@@ -48725,6 +48733,90 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   protocol` 5 of 5. The first build (r17) refused four type errors (the `Clock` trait unimported where the verbs read
   the clock; two spawn-refusal arms giving the counter's `u64` as a statement's value), fixed in the same change.
 - **Owed.** As the status says.
+
+### A-658 part 1 — The verdict and the rebase computed anywhere: pure functions of the versions a work is judged over (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); A-645 "Merges computed anywhere, committed by position"; §4.16 "The verdict", "Commit" and "Rebase"; after A-635 and A-642)
+
+- **What was there.** A-635 split the owner's verdict into `Green::judge`, which held a verdict at the head, and
+  `Green::commit_judged`, which committed it as the version after that head or refused `HeadMoved`. Both took the green
+  mutably: the verdict added to a statistics counter in place (`fast_path_hits`) and kept a conflict in the owner's
+  rejected-result cache, and `Green::rebase` saved and restored the counter. Only the green's owner could judge, so a
+  hot green's merges were bounded by its owner's verdict rate.
+- **The decision.** The verdict is a pure function of the versions a work is judged over (its base, the head and the
+  deltas between them, none of which changes once committed) and of the work.
+  - `Green::compute(&self, inc) -> Result<Computed, ComputeRefused>` reads the green and changes nothing. The fast-path
+    counter is a `Cell`, as `deltas_visited` already was, so only the cost counters move.
+  - A `Computed` holds nothing of the green that computed it: the increment's identity and base, the head it was
+    computed against (the position the owner checks before it appends, A-635's rule), and the verdict: accepted before
+    as a version, accepted with its effects and what the chain records of them, or the conflict windows. Since main's
+    71f05f93d (a verdict makes no file until it accepts) a mapped file is held as the ops that make it, never its bytes:
+    the owner's hold takes the increment's post-state into the `Judged` (`Green::held`), and the commit makes the file
+    over the head it was judged at (`Green::make_mapped`).
+  - Any copy that holds the versions computes the same result: the owner, or a holder's replica rebuilt from the
+    chain's entries alone (`Green::apply_recorded`).
+  - Refused, typed, and neither refusal a verdict, so the caller computes on a green that holds the versions:
+    `ComputeRefused::BaseUnavailable` (the base is below the version the copy was restored at, its deltas folded away)
+    and `ComputeRefused::BaseAhead` (the base is past the copy's head, a version it has not reached).
+  - The owner's `judge` is the owner computing at its own head, its rejected-result cache around the computation, so
+    `submit`, the server's submit and A-635's push run one verdict, unchanged.
+  - `Green::rebase(&self)` is pure too, and answers `Rebased::BaseAhead` for a base past the head.
+- **A sibling found and fixed.** A work based past the owner's head was judged as if it were based at the head (each
+  op mapped through no delta) and could commit, and its rebase came back based at the head, a version older than its
+  own base. Both are refused now: the owner answers the base unknown (`Outcome::BaseUnavailable` and
+  `Judgment::BaseUnavailable`, the service's `UnknownBase`), and the rebase `Rebased::BaseAhead` (`UnknownBase` at the
+  server's `map_rebase`). The server never sent such a work, since a work's base is a version its green made, so no
+  answer on the wire changes. One test did: `symlink_merges` (`crates/merge/tests/engine.rs`) based its last work at
+  version 4 over a head of 3, meaning the version that holds the file (its third increment conflicted and made no
+  version), and passed only because the past-head base was judged at the head; it now names 3 and asserts the version
+  the file was accepted at.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`). Red and the first green ran on Windows x86_64, jupiter (kiln,
+  2026-11-19, debug, a fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`) while the Mac
+  Studio was offline; the landing runs are macOS arm64, the Mac Studio (kiln r89 and r113, 2026-11-19, debug, the same
+  discipline with `CARGO_BUILD_JOBS=2`), over the tree merged with main 1b480bd70 (b77c7802d) and then with af520142f
+  (3b5fc4874), which changed the server's push beside the verdict.
+  - The oracle: generated histories of works (files written whole, overwritten, inserted into, removed and renamed;
+    modes, attributes and the root's head set; a directory made or removed; a hard link made), based at the head or up
+    to three versions behind, some sent again. Before every verdict a copy rebuilt from the owner's chain entries alone
+    computes the owner's judgment (the head, what the chain records, the windows, a version accepted before) and the
+    owner's rebase; computing leaves the copy as it was; after every commit both read the same state. Its census
+    requires accepts, works sent again, conflicts, works behind the head and rebases of them.
+  - Beside it: computing applies nothing and keeps no conflict, the same result twice; the owner keeps in its cache the
+    conflict it answers; a copy behind the work's base refuses `BaseAhead`, and its rebase answers so; a green restored
+    past the base refuses `BaseUnavailable`; the owner answers a base past its head unknown, and its rebase `BaseAhead`.
+  - Red first at 508eabb64, with `Green::compute` a stub that refused everything and the old judge and rebase:
+    `cargo test --locked -p slates-merge --lib compute_tests` failed 6 of 6, each for its own reason.
+  - Green on the tree merged with main (0ef8e9741): `cargo test --locked -p slates-merge --lib` 147 of 147 in 78 s
+    (main's Windows baseline at 018d32ba2: 141 of 141); rustfmt's layout applied from jupiter's `cargo fmt`. The whole
+    server lib on Windows at 0af63658a (`cargo test --locked -p slates-server --lib -- --test-threads=4`; at 32 threads
+    the daemon's watchdog ended the binary) ended 595 passed, 14 failed, 3 ignored: five among main's Windows failures
+    at 6e42e7a2c, nine handed to main (none of the fourteen reaches the verdict or the rebase by the code; not
+    measured).
+  - The landing runs, each alike: `cargo fmt -p slates-merge -p slates-server -- --check` clean; `cargo test --locked -p
+    slates-merge --lib` 191 of 191; the merge crate's integration targets whose works reach the verdict
+    (`--no-fail-fast --test rebase --test engine --test checkpoint --test special --test base_for --test chain_replay
+    --test changed_since_cost --test identity --test origin --test splice --test shuttle_green`) 104 passed and 1
+    ignored (`shuttle_green` holds no test without `--cfg shuttle`; at r113 the rebase oracle failed once, main's
+    failure below); the server's lib tests that reach the verdict
+    (`repository::push::`, `repository::hg_push::`, `merge_origin::`, `merge_service::`) 42 of 42 at four threads; and
+    the server's integration tests that drive a rebase over the wire, by name (`daemon`'s lifecycle test, two of
+    `merge_load`, two of `verdict_pages`, five of `works_off_owner`, three of `green_post_state`), 13 of 13. No server
+    lib test reaches `map_rebase`; those integration tests do.
+  - The macOS runs (kiln r23, r55 and r113) found `symlink_merges` (above) and two failures that are main's, each
+    measured on main's own tree in its own target directory: `hard_link_merges` (fixed on main by 8d7209388), and the
+    rebase oracle's (`crates/merge/tests/rebase.rs`) generated cases in which a work removes the home of a file a hard
+    link names (r55: the link made at version 1, the work at the head; r113: both in the origin, the work at version
+    0): the rebase restates the removal alone (`changed` holds `a` removed, the journal one `Unlink`) where the submit
+    leaves the link holding the node (`b`, empty), on main at 787f5948b as here (r55's case run on both trees, r89);
+    handed to main.
+- **Owed.** Part 2, the owner's commit by position (`Green::judge_computed`): the owner's caches and floor, the
+  position check, and when the green moved, judging again only what the change index names in the versions since the
+  position, held equal to the serial verdict by an oracle over generated concurrent histories. Then the fleet's route:
+  a green's holders already rebuild its versions (§4.16 "Apply on holders"), so a holder computes and the owner
+  appends; replicas kept on the shards for the purpose were measured and rejected (A-528).
+- **Applied in the same change to:** `crates/merge/src/engine.rs` (`Computed`, `ComputeRefused`, `Green::compute`,
+  `Green::judge` on it, `Rebased::BaseAhead`, the counter a `Cell`, the module docs), `crates/merge/src/lib.rs`,
+  `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
+  `crates/merge/tests/engine.rs` (`symlink_merges`' last base), `crates/server/src/verbs.rs` (`map_rebase`:
+  `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
 
 ### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
 Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's
