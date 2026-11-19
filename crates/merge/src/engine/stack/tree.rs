@@ -292,7 +292,7 @@ impl Green {
 }
 
 /// Whether two nodes are of one kind.
-fn same_kind(a: &TreeNode<'_>, b: &TreeNode<'_>) -> bool {
+fn same_kind<'a>(a: &TreeNode<'a>, b: &TreeNode<'a>) -> bool {
   core::mem::discriminant(a) == core::mem::discriminant(b)
 }
 
