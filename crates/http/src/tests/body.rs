@@ -8,28 +8,44 @@ use crate::{Admission, MAX_LINE, PastAdmission, to_u64};
 /// Room enough for every trailer section these tests send.
 const ROOM: u64 = 1 << 20;
 
-/// What a body read in `pieces` gave: its data and the bytes it took in all, or its refusal.
+/// How reading a body in pieces went wrong: the reader refused it, or a step broke what [`Step`] promises.
+#[derive(Debug, PartialEq, Eq)]
+enum Failed {
+  /// The reader refused the body.
+  Refused(BodyRefused),
+  /// A step handed back a run of no data.
+  EmptyRun,
+  /// A step asked for more without having taken all its input.
+  InputLeft,
+  /// The pieces ran out before the body ended.
+  NoEnd,
+}
+
+/// What a body read in `pieces` gave: its data and the bytes it took in all, or why not.
 fn read_in(
   framing: Framing,
   pieces: &[&[u8]],
   admission: &mut Admission,
-) -> Result<(Vec<u8>, usize), BodyRefused> {
+) -> Result<(Vec<u8>, usize), Failed> {
   let mut reader = BodyReader::new(framing);
   let (mut data, mut taken) = (Vec::new(), 0usize);
   for piece in pieces {
     let mut at = 0;
     loop {
-      match reader.step(&piece[at..], admission)? {
+      match reader
+        .step(&piece[at..], admission)
+        .map_err(Failed::Refused)?
+      {
+        Step::Data { data: run, .. } if run.is_empty() => return Err(Failed::EmptyRun),
         Step::Data {
           data: run,
           consumed,
         } => {
-          assert!(!run.is_empty(), "an empty run of data");
           data.extend_from_slice(run);
           at += consumed;
         }
-        Step::More { consumed } => {
-          assert_eq!(at + consumed, piece.len(), "More left input untaken");
+        Step::More { consumed } if at + consumed != piece.len() => return Err(Failed::InputLeft),
+        Step::More { .. } => {
           taken += piece.len();
           break;
         }
@@ -37,7 +53,7 @@ fn read_in(
       }
     }
   }
-  panic!("the body did not end: {} bytes of data so far", data.len());
+  Err(Failed::NoEnd)
 }
 
 /// What `input` read whole gives.

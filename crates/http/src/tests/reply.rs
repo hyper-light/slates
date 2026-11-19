@@ -100,7 +100,7 @@ fn chunks_are_framed_by_their_hexadecimal_size() {
 /// A-595: do read every status's code and reason. Expect RFC 9110's, and RFC 6585's for 431.
 #[test]
 fn each_status_is_rfc_9110s() {
-  let cases: [(Status, u16, &str); 15] = [
+  let cases: [(Status, u16, &str); 17] = [
     (Status::CONTINUE, 100, "Continue"),
     (Status::OK, 200, "OK"),
     (Status::BAD_REQUEST, 400, "Bad Request"),
@@ -122,7 +122,9 @@ fn each_status_is_rfc_9110s() {
       431,
       "Request Header Fields Too Large",
     ),
+    (Status::INTERNAL_SERVER_ERROR, 500, "Internal Server Error"),
     (Status::NOT_IMPLEMENTED, 501, "Not Implemented"),
+    (Status::SERVICE_UNAVAILABLE, 503, "Service Unavailable"),
     (
       Status::VERSION_NOT_SUPPORTED,
       505,

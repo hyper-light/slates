@@ -84,10 +84,20 @@ impl Status {
     code: 431,
     reason: "Request Header Fields Too Large",
   };
+  /// Format: `500 Internal Server Error` (RFC 9110 §15.6.1), a service that failed before its reply began.
+  pub const INTERNAL_SERVER_ERROR: Status = Status {
+    code: 500,
+    reason: "Internal Server Error",
+  };
   /// Format: `501 Not Implemented` (RFC 9110 §15.6.2).
   pub const NOT_IMPLEMENTED: Status = Status {
     code: 501,
     reason: "Not Implemented",
+  };
+  /// Format: `503 Service Unavailable` (RFC 9110 §15.6.4), a connection past the edge's derived bound.
+  pub const SERVICE_UNAVAILABLE: Status = Status {
+    code: 503,
+    reason: "Service Unavailable",
   };
   /// Format: `505 HTTP Version Not Supported` (RFC 9110 §15.6.6).
   pub const VERSION_NOT_SUPPORTED: Status = Status {

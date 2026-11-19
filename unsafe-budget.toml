@@ -709,3 +709,6 @@ slates-vcs = 0
 # slates-ssh (0): SSH's transport (A-594, §4.17.2): the wire types read by checked offsets and `get`, the cryptography
 #   through aws-lc-rs's safe API (X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305); no FFI of its own.
 slates-ssh = 0
+# slates-http-edge (0): the HTTP edge's engine (A-625, §4.17.2): a state machine over bytes through slates-http's safe
+#   codec and rustls's safe API over aws-lc-rs; no FFI, no casts, no maps of its own.
+slates-http-edge = 0
