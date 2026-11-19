@@ -720,8 +720,11 @@
 > again byte for byte after import, every revision's changed paths `svnlook changed`'s, import(export(R)) = R for them
 > and for generated histories held to a model tree; `cargo test -p slates-svn --lib --locked` 313 of 313 on the Mac
 > Studio, and 357 of 358 on the tree merged with main, the one failure main's own A-613 `reads` proptest, which fails
-> alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
-> deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
+> alone on main from its seed (see A-628). The export in format 3 built by A-652 (2026-11-19, g264): Subversion's
+> deltifier ported as `svndiff::deltas(source, target, window room)`, the crate's one delta generator, remaking every
+> window `svnadmin dump --deltas` wrote, `deltas.dump` and `part2.dump` written again byte for byte (413 of 413 on the
+> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. Owed from it: the wiring (a
+> `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
 > shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
