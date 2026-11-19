@@ -45,6 +45,10 @@
 //! whole trees; the verdict, its lock check the lock table's, must answer every generated history as they do: the same
 //! commit, the same conflict at the same path found by the same check, or the same lock in the way.
 //!
+//! The drive's commands are read in [`edit`] (A-617): the commit's request and every editor command, as `svnserve`
+//! reads them. The drive is [`drive`] (A-617): each command checked as it arrives, with this module's out-of-date test
+//! and the lock table's check, declared on the drive's rows, and [`verdict`] run at `close-edit`.
+//!
 //! Not here: the drive's other checks (a copy's source, checksums, property values, authorization) and its early-error
 //! rule (piece 7); hooks (item 9); the lock table (A-602).
 //!
@@ -58,6 +62,9 @@ use crate::index::{
   Revision, RevisionRecord, Trial, TrialNode,
 };
 use crate::lock::LockRefusal;
+
+pub mod drive;
+pub mod edit;
 
 /// `SVN_ERR_FS_NO_SUCH_REVISION`, "No such revision %ld": a client's revision past the transaction's base.
 /// Format: the filesystem category's start, 120,000 + 8 × 5,000 = 160,000, plus 6 (`svn_error_codes.h` 121-122,
@@ -155,8 +162,8 @@ impl From<IndexRefusal> for CommitRefusal {
 }
 
 /// The drive's out-of-date test for one editor command naming the node at `path`, which the client holds at revision
-/// `client` (§4.17.4 item 3.2; `commit.c` `check_out_of_date` 179-198): `open-file` (627-634), `delete-entry` (504-509)
-/// and a directory's first property change (710-726) carry it, each only when the client names a revision.
+/// `client` (§4.17.4 item 3.2; `commit.c` `check_out_of_date` 179-198): `open-file` (627-634), `delete-entry`
+/// (504-509) and a directory's first property change (710-726) carry it, each only when the client names a revision.
 ///
 /// `created` is the node's created revision in the transaction when the command arrives, as `svn_fs_node_created_rev`
 /// reads the transaction's root: for a node the transaction has not changed, its own (the index's

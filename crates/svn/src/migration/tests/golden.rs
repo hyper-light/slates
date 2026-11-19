@@ -1,0 +1,237 @@
+//! Golden vectors: the dumps stock `svnadmin` 1.15.0 (r1937767) wrote of one repository (A-593's `fixtures/dump`, made
+//! by `fixtures/dump/make-fixtures.sh`, whose header names the command, the machine and the date), each checked against
+//! its recorded SHA-256 before it is read, and `svnlook changed`'s account of every revision beside them. Stock
+//! `svnadmin load` of each of them and `svnadmin dump` again gives `full.dump` byte for byte (recorded on the parked
+//! branch `agents/g264-a628-svnadmin`, `fixtures/svnadmin/redumps.txt`), which is the bar the export is held to.
+
+use std::fmt::Write as _;
+
+use super::support::{
+  History, VECTOR_UUID, created, export, export_all, history, import, import_whole,
+};
+use crate::index::{Action, ChangedPath, NodeKind};
+use crate::migration::Repository;
+use crate::migration::paths::{compare_paths, relative};
+
+/// Format 2, every revision whole (`svnadmin dump`).
+const FULL: &[u8] = include_bytes!("../../../fixtures/dump/full.dump");
+/// Format 3, every revision (`svnadmin dump --deltas`).
+const DELTAS: &[u8] = include_bytes!("../../../fixtures/dump/deltas.dump");
+/// Format 2, revisions 0 to 3 (`svnadmin dump -r 0:3`).
+const PART1: &[u8] = include_bytes!("../../../fixtures/dump/part1.dump");
+/// Format 3, revisions 4 on, as changes (`svnadmin dump --deltas --incremental -r 4:13`).
+const PART2: &[u8] = include_bytes!("../../../fixtures/dump/part2.dump");
+/// `svnlook changed --copy-info` for every revision.
+const CHANGED: &[u8] = include_bytes!("../../../fixtures/dump/changed.txt");
+/// The SHA-256 of every file the script wrote.
+const SUMS: &str = include_str!("../../../fixtures/dump/SHA256SUMS");
+
+/// The last revision of `part1.dump`.
+/// Format: `make-fixtures.sh` dumps `-r 0:3` into it.
+const PART1_LAST: u64 = 3;
+
+/// The vector named `name`, refused unless its SHA-256 is the one recorded when `svnadmin` wrote it.
+fn vector(name: &str) -> &'static [u8] {
+  let bytes = match name {
+    "full.dump" => FULL,
+    "deltas.dump" => DELTAS,
+    "part1.dump" => PART1,
+    "part2.dump" => PART2,
+    "changed.txt" => CHANGED,
+    other => panic!("no vector {other}"),
+  };
+  let recorded = SUMS
+    .lines()
+    .find_map(|line| {
+      line
+        .split_once("  ")
+        .filter(|(_, file)| *file == name)
+        .map(|(sum, _)| sum)
+    })
+    .unwrap_or_else(|| panic!("{name} is not in SHA256SUMS"));
+  let sum = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+  let hex: String = sum
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  assert_eq!(hex, recorded, "{name} is not the vector svnadmin wrote");
+  bytes
+}
+
+/// A created repository with `dumps` imported one after the other, each whole.
+fn imported(dumps: &[&str]) -> Repository {
+  let mut repository = created();
+  for name in dumps {
+    import_whole(&mut repository, vector(name))
+      .unwrap_or_else(|refusal| panic!("{name}: {refusal:?}"));
+  }
+  repository
+}
+
+/// `svnlook changed --copy-info`'s account of every revision of `repository` but 0, as the index records them: a
+/// revision's paths in `svn_path_compare_paths` order, a directory's with a `/`, an addition `A` (`A +` and its source
+/// for a copy), a deletion `D`, a replacement both, a modification `U` or `_` for its text and `U` for its properties.
+fn changed_account(repository: &Repository) -> String {
+  let mut account = String::new();
+  for revision in 1..=repository.youngest() {
+    writeln!(account, "r{revision}").expect("a line");
+    let mut rows: Vec<&ChangedPath> = repository
+      .index()
+      .changes(revision)
+      .expect("a revision")
+      .iter()
+      .collect();
+    rows.sort_by(|first, second| {
+      compare_paths(
+        relative(&first.path).as_bytes(),
+        relative(&second.path).as_bytes(),
+      )
+    });
+    for row in rows {
+      account_lines(&mut account, row);
+    }
+  }
+  account
+}
+
+/// One changed path's lines in `svnlook changed`'s form.
+fn account_lines(account: &mut String, row: &ChangedPath) {
+  let shown = shown(&row.path, row.kind);
+  match row.action {
+    Action::Add => added_lines(account, row, &shown),
+    Action::Delete => writeln!(account, "D   {shown}").expect("a line"),
+    Action::Replace => {
+      writeln!(account, "D   {shown}").expect("a line");
+      added_lines(account, row, &shown);
+    }
+    Action::Modify => {
+      let text = if row.text.is_some() { 'U' } else { '_' };
+      let properties = if row.properties.is_some() { 'U' } else { ' ' };
+      writeln!(account, "{text}{properties}  {shown}").expect("a line");
+    }
+  }
+}
+
+/// An addition's lines: `A`, or `A +` and the copy's source.
+fn added_lines(account: &mut String, row: &ChangedPath, shown: &str) {
+  match &row.copy_from {
+    Some(source) => {
+      writeln!(account, "A + {shown}").expect("a line");
+      let from = self::shown(&source.path, row.kind);
+      writeln!(account, "    (from {from}:r{})", source.revision).expect("a line");
+    }
+    None => writeln!(account, "A   {shown}").expect("a line"),
+  }
+}
+
+/// An absolute path as `svnlook` shows it: relative, a directory's with a `/`, the root as `/`.
+fn shown(path: &str, kind: NodeKind) -> String {
+  let mut shown = relative(path).to_owned();
+  if kind == NodeKind::Directory {
+    shown.push('/');
+  }
+  shown
+}
+
+/// Holds `repository` to the history `full.dump` makes and to `full.dump`'s bytes once exported.
+fn holds_the_full_history(name: &str, repository: &Repository, whole: &History) {
+  assert!(history(repository) == *whole, "{name}: its history");
+  assert!(
+    export_all(repository).unwrap() == vector("full.dump"),
+    "{name}: its export"
+  );
+}
+
+/// A-628 (golden): do import every format-2 dump stock `svnadmin` wrote into a repository `CreateRepository` made, then
+/// export the same range. Expect `svnadmin`'s bytes back byte for byte (`full.dump`: every revision; `part1.dump`:
+/// revisions 0 to 3), the repository named by the dump's UUID.
+#[test]
+fn every_format_two_dump_svnadmin_wrote_is_imported_and_exported_again_byte_for_byte() {
+  let full = imported(&["full.dump"]);
+  assert_eq!(full.uuid().as_bytes(), VECTOR_UUID);
+  assert!(
+    export_all(&full).unwrap() == vector("full.dump"),
+    "full.dump"
+  );
+  let part = imported(&["part1.dump"]);
+  assert_eq!(part.youngest(), PART1_LAST);
+  assert!(
+    export_all(&part).unwrap() == vector("part1.dump"),
+    "part1.dump"
+  );
+}
+
+/// A-628 (golden): do import the history from format 3 (`deltas.dump`, every text a delta and every property section
+/// a change), in two parts (`part1.dump` then `part2.dump`, the second format 3 and incremental), and as the one stream
+/// the two parts make, each also a byte at a time and in pieces of 7 and 4,096 bytes. Expect every import to hold the
+/// history `full.dump` makes, revision by revision, text by text, and to export as `full.dump` byte for byte.
+#[test]
+fn a_history_imported_from_deltas_in_parts_or_in_pieces_is_the_one_imported_whole() {
+  let whole = history(&imported(&["full.dump"]));
+  holds_the_full_history("deltas.dump", &imported(&["deltas.dump"]), &whole);
+  holds_the_full_history(
+    "part1.dump, part2.dump",
+    &imported(&["part1.dump", "part2.dump"]),
+    &whole,
+  );
+  let joined = [vector("part1.dump"), vector("part2.dump")].concat();
+  for piece in [1, 7, 4096] {
+    holds_the_full_history(
+      "part1.dump and part2.dump as one stream",
+      &imported_in_pieces(&joined, piece),
+      &whole,
+    );
+    holds_the_full_history(
+      "deltas.dump in pieces",
+      &imported_in_pieces(vector("deltas.dump"), piece),
+      &whole,
+    );
+  }
+}
+
+/// A created repository with `dump` imported, its bytes arriving `piece` at a time.
+fn imported_in_pieces(dump: &[u8], piece: usize) -> Repository {
+  let mut repository = created();
+  import(&mut repository, dump, piece)
+    .unwrap_or_else(|refusal| panic!("pieces of {piece}: {refusal:?}"));
+  repository
+}
+
+/// A-628 (golden): do import `full.dump` and read every revision's changed paths. Expect the account `svnlook changed
+/// --copy-info` gave of the repository `svnadmin` dumped, line for line: each path's action, its copy source, and a
+/// modification's text and property flags as FSFS recorded them.
+#[test]
+fn every_revision_imported_records_the_changed_paths_svnlook_reported() {
+  let account = changed_account(&imported(&["full.dump"]));
+  assert_eq!(account, String::from_utf8_lossy(vector("changed.txt")));
+}
+
+/// A-628 (golden): do import `full.dump`, export it in two incremental parts (revisions 0 to 5, then 6 to 13), and
+/// import the parts, one after the other and as one stream, into new repositories. Expect each to hold the history the
+/// whole import holds, transaction names and contents included.
+#[test]
+fn a_history_exported_in_parts_imports_to_the_history_exported_whole() {
+  let source = imported(&["full.dump"]);
+  let first = export(&source, 0, 5).unwrap();
+  let second = export(&source, 6, source.youngest()).unwrap();
+  let mut parts = created();
+  import_whole(&mut parts, &first).unwrap();
+  import_whole(&mut parts, &second).unwrap();
+  assert!(history(&parts) == history(&source));
+  let mut joined = created();
+  import_whole(&mut joined, &[first, second].concat()).unwrap();
+  assert!(history(&joined) == history(&source));
+}
+
+/// A-628 (golden): do import `full.dump` and `deltas.dump`, export each repository and import the export into a new
+/// one. Expect the new repository's history to be the exported one's: import(export(R)) is R.
+#[test]
+fn a_repository_imported_from_its_own_export_is_the_repository_exported() {
+  for name in ["full.dump", "deltas.dump"] {
+    let source = imported(&[name]);
+    let mut again = created();
+    import_whole(&mut again, &export_all(&source).unwrap()).unwrap();
+    assert!(history(&again) == history(&source), "{name}");
+  }
+}

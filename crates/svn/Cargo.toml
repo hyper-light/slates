@@ -12,6 +12,9 @@ description = "The Subversion server's pure pieces (§4.17.4, A-500): svndiff ve
 # The dump format's text checksums (A-593): MD5 and SHA-1 through the workspace's one cryptographic library, whose
 # vendored copy exposes MD5 (`vendor/UPSTREAM.md`).
 aws-lc-rs = { workspace = true }
+# A text's and a property list's content identity in the migration verbs' records (A-628): BLAKE3, the identity the
+# green and the shared object store name content by (§4.11), as the Subversion index's `ContentIdentity` names it.
+blake3 = { workspace = true }
 # svndiff version 2 stores each window section as an LZ4 block (`libsvn_subr/compress_lz4.c`); the workspace's LZ4
 # codec, built with its safe encoder and decoder only.
 lz4_flex = { workspace = true }

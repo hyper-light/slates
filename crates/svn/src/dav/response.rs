@@ -54,6 +54,11 @@ impl Body {
     Ok(())
   }
 
+  /// The bytes it may still take.
+  pub fn left(&self) -> usize {
+    self.room.saturating_sub(self.bytes.len())
+  }
+
   /// The bytes written.
   pub fn into_bytes(self) -> Vec<u8> {
     self.bytes

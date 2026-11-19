@@ -119,15 +119,7 @@ pub(super) fn read(dump: &[u8], piece: usize, admission: Admission) -> Result<Re
         dropped += consumed;
       }
       Read::NeedMore { consumed, needed } => {
-        assert!(!ended, "the reader asked for more after the stream's end");
-        assert!(
-          needed <= admission.buffer_bytes,
-          "asked for {needed} past the admission"
-        );
-        assert!(
-          needed > held.len() - consumed,
-          "asked for bytes it already held"
-        );
+        kept_its_promises(ended, needed, admission, held.len() - consumed);
         reading.most_needed = reading.most_needed.max(needed);
         held.drain(..consumed);
         dropped += consumed;
@@ -136,11 +128,27 @@ pub(super) fn read(dump: &[u8], piece: usize, admission: Admission) -> Result<Re
         handed += take;
       }
       Read::End => {
-        assert!(ended, "the reader ended before the stream did");
+        ended_with_the_stream(ended);
         return Ok(reading);
       }
     }
   }
+}
+
+/// Holds a reader's request for more to its promises: never after the stream's end, never past the admission, never
+/// for bytes it already holds (`unconsumed`).
+fn kept_its_promises(ended: bool, needed: usize, admission: Admission, unconsumed: usize) {
+  assert!(!ended, "the reader asked for more after the stream's end");
+  assert!(
+    needed <= admission.buffer_bytes,
+    "asked for {needed} past the admission"
+  );
+  assert!(needed > unconsumed, "asked for bytes it already held");
+}
+
+/// Holds a reader's end to the stream's.
+fn ended_with_the_stream(ended: bool) {
+  assert!(ended, "the reader ended before the stream did");
 }
 
 /// Reads `dump` handed over whole.

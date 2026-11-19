@@ -11,7 +11,13 @@ use aws_lc_rs::aead::chacha20_poly1305_openssh::{
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement::{self, PrivateKey, UnparsedPublicKey as AgreementPublicKey, X25519};
 use aws_lc_rs::digest::{self, SHA256};
+use aws_lc_rs::kem::{AlgorithmId, Ciphertext, DecapsulationKey, ML_KEM_768};
 use aws_lc_rs::signature::{self, UnparsedPublicKey};
+
+/// The hybrid key exchange's name (`draft-ietf-sshm-mlkem-hybrid-kex-10` §2.3.3).
+const HYBRID: &str = "mlkem768x25519-sha256";
+/// An ML-KEM-768 ciphertext's bytes (FIPS 203 Table 3).
+const HYBRID_CIPHERTEXT_LEN: usize = 1088;
 
 /// What the client offers, and how it behaves.
 #[derive(Clone, Debug)]
@@ -35,11 +41,31 @@ pub(crate) struct ClientOptions {
   pub(crate) answer_kexinit: bool,
 }
 
+/// OpenSSH's default client key exchange list (`KEX_CLIENT_KEX` in `myproposal.h` at `fa4b2a82`), the hybrid first.
+const OPENSSH_CLIENT_KEX: [&str; 12] = [
+  "mlkem768x25519-sha256",
+  "sntrup761x25519-sha512",
+  "sntrup761x25519-sha512@openssh.com",
+  "curve25519-sha256",
+  "curve25519-sha256@libssh.org",
+  "ecdh-sha2-nistp256",
+  "ecdh-sha2-nistp384",
+  "ecdh-sha2-nistp521",
+  "diffie-hellman-group-exchange-sha256",
+  "diffie-hellman-group16-sha512",
+  "diffie-hellman-group18-sha512",
+  "diffie-hellman-group14-sha256",
+];
+
 impl ClientOptions {
-  /// Like OpenSSH 10's client choosing `cipher` both ways: `curve25519-sha256`, `ext-info-c`, and the strict marker when
-  /// `strict`.
+  /// Like OpenSSH 10's client choosing `cipher` both ways: its default key exchange list, `ext-info-c`, and the strict
+  /// marker when `strict`.
   pub(crate) fn openssh_like(cipher: &str, strict: bool) -> Self {
-    let mut kex = vec!["curve25519-sha256".to_string(), "ext-info-c".to_string()];
+    let mut kex: Vec<String> = OPENSSH_CLIENT_KEX
+      .iter()
+      .map(|name| name.to_string())
+      .collect();
+    kex.push("ext-info-c".to_string());
     if strict {
       kex.push("kex-strict-c-v00@openssh.com".to_string());
     }
@@ -57,6 +83,14 @@ impl ClientOptions {
       guess: None,
       answer_kexinit: true,
     }
+  }
+
+  /// Like [`Self::openssh_like`] without the post-quantum hybrid, as OpenSSH before 9.9 and a client configured off it
+  /// list: `curve25519-sha256` is then the first method the server runs.
+  pub(crate) fn classical(cipher: &str, strict: bool) -> Self {
+    let mut options = Self::openssh_like(cipher, strict);
+    options.kex.retain(|name| name != HYBRID);
+    options
   }
 }
 
@@ -111,6 +145,14 @@ pub(crate) struct Client {
   in_exchange: bool,
   exchanges: usize,
   private: [u8; 32],
+  /// The key exchange agreed, once the server's KEXINIT is read.
+  kex_method: Option<String>,
+  /// The client's ML-KEM-768 key for a hybrid exchange.
+  decapsulation: Option<DecapsulationKey<AlgorithmId>>,
+  /// What the client sent as its exchange public value: `Q_C`, or the hybrid's `C_INIT`.
+  sent_public: Vec<u8>,
+  /// How many `SSH_MSG_KEX_ECDH_INIT` the client sent, a guess included.
+  pub(crate) exchange_inits_sent: usize,
   ecdh_sent: bool,
   guessed: bool,
   pub(crate) strict: bool,
@@ -119,6 +161,8 @@ pub(crate) struct Client {
   pub(crate) host_key: Option<Vec<u8>>,
   /// Payloads the client opened that it does not handle itself (everything but KEXINIT, the reply and NEWKEYS).
   pub(crate) received: Vec<Vec<u8>>,
+  /// For each payload in `received`, how many of the server's NEWKEYS had come before it.
+  pub(crate) received_epochs: Vec<usize>,
   pub(crate) server_newkeys: usize,
   pub(crate) cipher_client_to_server: String,
   pub(crate) cipher_server_to_client: String,
@@ -143,6 +187,10 @@ impl Client {
       in_exchange: false,
       exchanges: 0,
       private: [0; 32],
+      kex_method: None,
+      decapsulation: None,
+      sent_public: Vec::new(),
+      exchange_inits_sent: 0,
       ecdh_sent: false,
       guessed: false,
       strict: false,
@@ -150,6 +198,7 @@ impl Client {
       exchange_hashes: Vec::new(),
       host_key: None,
       received: Vec::new(),
+      received_epochs: Vec::new(),
       server_newkeys: 0,
       cipher_client_to_server: String::new(),
       cipher_server_to_client: String::new(),
@@ -161,7 +210,10 @@ impl Client {
     if client.options.first_kex_packet_follows {
       client.guessed = true;
       match client.options.guess.clone() {
-        Some(guess) => client.send(&guess),
+        Some(guess) => {
+          client.exchange_inits_sent += 1;
+          client.send(&guess);
+        }
         None => client.send_ecdh_init(),
       }
     }
@@ -268,13 +320,17 @@ impl Client {
       20 => self.on_server_kexinit(payload),
       31 => self.on_reply(&payload),
       21 => self.on_server_newkeys(),
-      _ => self.received.push(payload),
+      _ => {
+        self.received.push(payload);
+        self.received_epochs.push(self.server_newkeys);
+      }
     }
   }
 
   fn on_server_kexinit(&mut self, payload: Vec<u8>) {
     if !self.options.answer_kexinit && self.exchanges > 0 && !self.in_exchange {
       self.received.push(payload);
+      self.received_epochs.push(self.server_newkeys);
       return;
     }
     let server = parse_kexinit(&payload);
@@ -291,6 +347,7 @@ impl Client {
     };
     self.cipher_client_to_server = client_to_server;
     self.cipher_server_to_client = server_to_client;
+    self.kex_method = first_shared(&ours[0], &server.lists[0]);
     if self.exchanges == 1 {
       let pairs = [
         (
@@ -313,27 +370,74 @@ impl Client {
     self.guessed = false;
   }
 
+  /// Whether the exchange is the hybrid: the method agreed, or before that the client's own first choice.
+  fn hybrid(&self) -> bool {
+    match &self.kex_method {
+      Some(method) => method == HYBRID,
+      None => self
+        .options
+        .kex
+        .first()
+        .is_some_and(|first| first == HYBRID),
+    }
+  }
+
+  /// `curve25519-sha256`'s K: X as an mpint (RFC 8731 §3.1).
+  fn classical_secret(&self, server_public: &[u8]) -> Vec<u8> {
+    assert_eq!(
+      server_public.len(),
+      32,
+      "the server's X25519 key is 32 bytes"
+    );
+    mpint(&self.x25519(server_public))
+  }
+
+  /// The hybrid's K: SHA-256 of the decapsulated ML-KEM secret and X, as a string (the draft §2.4, §2.5).
+  fn hybrid_secret(&self, reply: &[u8]) -> Vec<u8> {
+    assert_eq!(
+      reply.len(),
+      HYBRID_CIPHERTEXT_LEN + 32,
+      "S_REPLY is the ciphertext and an X25519 key"
+    );
+    let (ciphertext, server_public) = reply.split_at(HYBRID_CIPHERTEXT_LEN);
+    let key = self
+      .decapsulation
+      .as_ref()
+      .expect("the client made an ML-KEM key");
+    let post_quantum = key
+      .decapsulate(Ciphertext::from(ciphertext))
+      .expect("the ciphertext decapsulates");
+    let mut both = post_quantum.as_ref().to_vec();
+    both.extend_from_slice(&self.x25519(server_public));
+    let mut encoded = Vec::new();
+    put_string(&mut encoded, digest::digest(&SHA256, &both).as_ref());
+    encoded
+  }
+
+  /// X25519 of the client's private key with `server_public`.
+  fn x25519(&self, server_public: &[u8]) -> Vec<u8> {
+    let private = PrivateKey::from_private_key(&X25519, &self.private).unwrap();
+    agreement::agree(
+      &private,
+      AgreementPublicKey::new(&X25519, server_public),
+      (),
+      |x| Ok(x.to_vec()),
+    )
+    .unwrap()
+  }
+
   fn on_reply(&mut self, payload: &[u8]) {
     let mut at = 1;
     let host_key = read_string(payload, &mut at);
     let server_public = read_string(payload, &mut at);
     let signature = read_string(payload, &mut at);
     assert_eq!(at, payload.len(), "the reply has no trailing bytes");
-    assert_eq!(
-      server_public.len(),
-      32,
-      "the server's X25519 key is 32 bytes"
-    );
-    let private = PrivateKey::from_private_key(&X25519, &self.private).unwrap();
-    let client_public = private.compute_public_key().unwrap().as_ref().to_vec();
-    let shared = agreement::agree(
-      &private,
-      AgreementPublicKey::new(&X25519, &server_public),
-      (),
-      |x| Ok(x.to_vec()),
-    )
-    .unwrap();
-    let k = mpint(&shared);
+    let k = if self.hybrid() {
+      self.hybrid_secret(&server_public)
+    } else {
+      self.classical_secret(&server_public)
+    };
+    let client_public = self.sent_public.clone();
     let mut hashed = Vec::new();
     let fields: [&[u8]; 7] = [
       &self.options.identification[..],
@@ -421,10 +525,10 @@ impl Client {
       .private_keys
       .get(self.exchanges - 1)
       .copied()
-      .unwrap_or([self.exchanges as u8; 32]);
+      .unwrap_or([u8::try_from(self.exchanges).unwrap(); 32]);
     let mut payload = vec![20];
     let mut cookie = self.options.cookie;
-    cookie[0] ^= self.exchanges as u8;
+    cookie[0] ^= u8::try_from(self.exchanges).unwrap();
     payload.extend_from_slice(&cookie);
     for list in self.lists() {
       put_string(&mut payload, list.join(",").as_bytes());
@@ -439,10 +543,25 @@ impl Client {
 
   fn send_ecdh_init(&mut self) {
     let private = PrivateKey::from_private_key(&X25519, &self.private).unwrap();
-    let public = private.compute_public_key().unwrap().as_ref().to_vec();
+    let mut public = private.compute_public_key().unwrap().as_ref().to_vec();
+    if self.hybrid() {
+      let key = DecapsulationKey::generate(&ML_KEM_768).unwrap();
+      let mut init = key
+        .encapsulation_key()
+        .unwrap()
+        .key_bytes()
+        .unwrap()
+        .as_ref()
+        .to_vec();
+      init.extend_from_slice(&public);
+      public = init;
+      self.decapsulation = Some(key);
+    }
     let mut payload = vec![30];
     put_string(&mut payload, &public);
+    self.sent_public = public;
     self.ecdh_sent = true;
+    self.exchange_inits_sent += 1;
     self.send(&payload);
   }
 
@@ -458,9 +577,9 @@ impl Client {
     if padding < 4 {
       padding += alignment;
     }
-    let length = (1 + payload.len() + padding) as u32;
+    let length = u32::try_from(1 + payload.len() + padding).unwrap();
     let mut packet = length.to_be_bytes().to_vec();
-    packet.push(padding as u8);
+    packet.push(u8::try_from(padding).unwrap());
     packet.extend_from_slice(payload);
     packet.extend(std::iter::repeat_n(0u8, padding));
     match &mut self.seal {
@@ -568,13 +687,13 @@ pub(crate) fn mpint(magnitude: &[u8]) -> Vec<u8> {
     body.push(0);
   }
   body.extend_from_slice(&magnitude[first..]);
-  let mut out = (body.len() as u32).to_be_bytes().to_vec();
+  let mut out = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
   out.extend_from_slice(&body);
   out
 }
 
 pub(crate) fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
-  out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+  out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
   out.extend_from_slice(bytes);
 }
 

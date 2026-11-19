@@ -10,18 +10,26 @@
 //!   opening under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`, sequence numbers;
 //! - algorithm negotiation ([`kexinit`]): the client's first choice the server also has, per list, with the markers of
 //!   strict key exchange (the Terrapin countermeasure) and of RFC 8308's extension negotiation never chosen as methods;
-//! - `curve25519-sha256` (RFC 8731) with `ssh-ed25519` host keys (RFC 8709) ([`kex`], [`hostkey`]): the exchange hash,
+//! - `mlkem768x25519-sha256` (A-634; `draft-ietf-sshm-mlkem-hybrid-kex-10`, ML-KEM-768 with X25519, preferred) and
+//!   `curve25519-sha256` (RFC 8731), with `ssh-ed25519` host keys (RFC 8709) ([`kex`], [`hostkey`]): the exchange hash,
 //!   the key derivation of RFC 4253 §7.2 and `SSH_MSG_NEWKEYS`;
 //! - rekeying ([`keylife`]): by each cipher's own bounds (RFC 4344 §3) and by a key time the deployment learns.
 //!
-//! User authentication (RFC 4252) and channels (RFC 4254) are the next pieces; they read [`transport::Event::Message`]
-//! and send through [`transport::ServerTransport::send`].
+//! Above it (A-633), [`session::Session`] serves a connection whole:
+//! - user authentication by public key ([`userauth`]; RFC 4252, RFC 8332, RFC 8308's `server-sig-algs`), a key
+//!   proving a principal through the server's own lookup;
+//! - one session channel ([`channel`]; RFC 4254) taking `env GIT_PROTOCOL` and one `exec` of a command the
+//!   version-control servers answer ([`command`]: git's two programs, `hg -R <repo> serve --stdio`, `svnserve -t`),
+//!   with its window and packet size from the caller's budget and the transport's cap, and `exit-status`, EOF and close
+//!   sent in order.
 //!
 //! **Sources** (read 2026-11-19; research notes §5.5 pin each by hash). RFC 4250, 4251, 4253, 4344, 5647, 5656, 7748,
 //! 8032, 8308, 8709 and 8731 \[B\]; OpenSSH's `PROTOCOL` at `fa4b2a82` \[B\], which since moved its three transport
 //! extensions into the SSHM working group's drafts: `draft-ietf-sshm-strict-kex-03`, `draft-ietf-sshm-chacha20-poly1305-04`
 //! and `draft-miller-sshm-aes-gcm-01` \[B\]; OpenSSH's `kex.c` and `packet.c` at the same commit \[C\], followed where the
-//! documents leave room, each place saying so.
+//! documents leave room, each place saying so. Above it (§5.7): RFC 4252, 4254 and 8332 \[B\], and git's, Mercurial's and
+//! Subversion's clients \[C\]. The hybrid (§5.8): `draft-ietf-sshm-mlkem-hybrid-kex-10` and FIPS 203 \[B\], OpenSSH's
+//! release notes for 10.0 to 10.2 and its post-quantum page \[B\], and AWS-LC's ML-KEM as vendored \[C\].
 //!
 //! **Bounds, none of them a tuning literal.** A packet is held to the caller's cap, which RFC 4253 §6.1 floors at 35000
 //! bytes, and its length is checked before its body is read. One packet is buffered at a time. One event waits at a
@@ -45,6 +53,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod channel;
+pub mod command;
 pub mod entropy;
 pub mod hostkey;
 pub mod ident;
@@ -53,7 +63,9 @@ pub mod kexinit;
 pub mod keylife;
 pub mod packet;
 pub mod refusal;
+pub mod session;
 pub mod transport;
+pub mod userauth;
 pub mod wire;
 
 /// A count or a length as `u64`. Every `usize` fits on the targets slates ships (Appendix B.2), and one that did not
@@ -101,3 +113,15 @@ mod keylife_tests;
 #[cfg(test)]
 #[path = "tests/transport.rs"]
 mod transport_tests;
+
+#[cfg(test)]
+#[path = "tests/command.rs"]
+mod command_tests;
+
+#[cfg(test)]
+#[path = "tests/userauth.rs"]
+mod userauth_tests;
+
+#[cfg(test)]
+#[path = "tests/session.rs"]
+mod session_tests;

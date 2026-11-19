@@ -50,6 +50,12 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | httpd 2.4.66 `modules/dav/main/mod_dav.h`, `mod_dav.c` (A-609) | `ad8361ef4e7e311c`, `2cab686b045e2237` | C |
 | `subversion/mod_dav_svn/reports/list.c`, `file-revs.c`, `mod_dav_svn/lock.c` (A-627) | `9c852cb6ba67f446`, `6efa4630426dabd0`, `c5bc4498df507c4f` | C |
 | httpd 2.4.66 `modules/dav/main/util_lock.c`, `props.c` (A-627) | `6b26b0425b33ea20`, `92a3201fa69632e6` | C |
+| `subversion/libsvn_repos/replay.c`, `libsvn_delta/path_driver.c` (A-627, the replay's calls) | `eb42d8bd06a5eb07`, `1139deea567fcfe8` | C |
+| `subversion/libsvn_ra_serf/replay.c`, `lock.c`, `get_lock.c` (A-627, what the client reads) | `6d30fbb7ecc59f10`, `d680419957383888`, `33123342971c83c9` | C |
+| `subversion/include/svn_error.h`, `include/private/svn_fs_util.h`, `include/private/svn_fspath.h` (A-627) | `3c0818af46aaf0b1`, `b1f1221b87609113`, `e549235c83765458` | B |
+| `subversion/libsvn_subr/checksum.c` (A-627, `svn__digest_to_cstring`) | `907299438410f21b` | C |
+| httpd 2.4.66 `modules/dav/main/util.c` (A-627, `dav_get_timeout`, `dav_validate_resource_state`) | `175813443fc6fb35` | C |
+| apr-util 1.6.3 `xml/apr_xml.c` (A-627, `start_handler`, `write_elem`), from `raw.githubusercontent.com/apache/apr-util/1.6.3/` | `2611d4992c9ce92d` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -61,6 +67,9 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_ra_svn/cram.c` | `64e6271eacf19286` (A-599) | C |
 | `subversion/libsvn_ra_svn/internal_auth.c` | `61f373448a9c878c` (A-599) | C |
 | `subversion/libsvn_ra_svn/client.c` | `3c3b9263dd7223a9` (A-599) | C |
+| `subversion/libsvn_ra_svn/editorp.c` (read 2026-11-19 for A-617; 1.15.0's is the same bytes) | `610cffcd14b17ecf` | C |
+| `subversion/include/private/svn_fs_util.h` (read 2026-11-19 for A-617) | `b1f1221b87609113` | C |
+| `subversion/libsvn_subr/checksum.c` (read 2026-11-19 for A-617) | `907299438410f21b` | C |
 | `subversion/mod_dav_svn/repos.c` | `940bc5282be7b763` | C |
 | `subversion/libsvn_repos/hooks.c` | `96392d3013a7f6bb` | C |
 | `subversion/libsvn_repos/log.c` | `d5f97de3e455314b` | C |
@@ -86,6 +95,12 @@ For the reporter (A-616, 2026-11-19), at `d434dc14`, tier C: `libsvn_repos/repor
 `fc69ad86f58de9b9`, `include/svn_repos.h` `8421f33e065fd927` and `include/svn_delta.h` `809dd92780dd3c1d`; at 1.15.0:
 `reporter.c` `5657b77e3ad25d3f` (two comments and a hash constructor apart), `editorp.c` and `delta.c` byte-identical,
 and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` and `types.c` `8c9fe593b18d24cf`.
+For the reporter's drive (A-616 part 2), at 1.15.0, tier C: `libsvn_repos/rev_hunt.c` `5acc827a362d11f4`
+(`svn_repos_deleted_rev`), `libsvn_fs_fs/tree.c` `f507210992ec9736` (`fs_closest_copy`, `find_youngest_copyroot`,
+`fs_dir_optimal_order`), `libsvn_fs_fs/pack.c` `fa5564fab4b997ce` (`svn_fs_fs__order_dir_entries`: entries by `strcmp`
+of their names from format 7 on), `svnserve/svnserve.c` `3de22e31a26902f9` (`zero_copy_limit` 0 and
+`error_check_interval` 4096 unless `--client-speed`), `libsvn_delta/xdelta.c` `2e7b6226acfa9078` (for the deltas of
+changed texts, owed), and `libsvn_ra_svn/marshal.c` at 1.15.0 for the editor commands' bytes.
 
 ## 2. The wire: ra_svn (`svn://`, and `svn+ssh://` through a tunnel)
 
@@ -199,6 +214,26 @@ and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` a
     - Base64 lines are 76 characters, the last line ended by a line feed too (`base64.c` 47, 171-204).
     - `svn_xml_fuzzy_escape` writes `?\NNN`.
     - `apr_xml_quote_string` escapes `&`, `<`, `>`, and `"` only when asked.
+- **The lock verbs and the editor drives' answers** (read 2026-11-19 for A-627's rest; §4.17.4 piece 13).
+  - **Recorded requests** [M: svn 1.15.0, Homebrew, the Mac Studio, 2026-11-19, against a recorded responder that
+    reports a lock to a lockdiscovery PROPFIND]. `svn lock` sends LOCK with no `Depth`, `Timeout` or
+    `X-SVN-Version-Name` for a URL, `X-SVN-Options: lock-steal` with `--force`, and the comment XML-escaped in
+    `owner`; `svn unlock` and `svn unlock --force` first PROPFIND `lockdiscovery` at `Depth: 0`, then UNLOCK with
+    `Lock-Token: <opaquelocktoken:…>`, `X-SVN-Options: lock-break` with `--force`; `svn info` PROPFINDs
+    `lockdiscovery`. The LOCK and PROPFIND bodies equal the earlier fixtures byte for byte.
+  - **What the client reads** [C: `libsvn_ra_serf/lock.c` 88-212, 216-403; `get_lock.c` 81-337]: from LOCK's answer
+    `D:timeout`, `D:locktoken/D:href` (spaces collapsed) and `D:owner`'s text, and the headers `X-SVN-Lock-Owner` and
+    `X-SVN-Creation-Date`; a status as an error: 400 `E160040`, 403 `E160039`, 405 `E160042`, 423 the server's
+    filesystem error or `E160035`, 404, 409 and 500 the server's error. A PROPFIND's lockdiscovery at 207 alone.
+  - **What `mod_dav` and `mod_dav_svn` write** [C: httpd `mod_dav.c` 3178-3460, `util_lock.c` 42-251, `util.c`
+    542-574 and 899-1420, `props.c` 355-451; `mod_dav_svn/lock.c`, `util.c` 100-170 and 765-801]: as the module
+    documentation of `slates-svn`'s `dav::locking` states, line by line; DAV:'s owner element echoed through
+    `apr_xml_to_text` with `APR_XML_X2T_FULL_NS_LANG` (`apr_xml.c` 795-905), declaring every namespace of the body,
+    `DAV:` first and an element's own declarations last to first (162-169, 200-225, 399).
+  - **The replay's calls** [C: `libsvn_repos/replay.c` 452-795, 918-990; `path_driver.c` 66-117, 234-300]: the root,
+    every directory and file opened, and every deletion, with `SVN_INVALID_REVNUM`; `set_target_revision` always
+    first; revision 0 that call alone; no `close_edit`; with deltas off, a nameless property removal and a delta of the
+    window handler's end alone.
 - **svndiff over HTTP** [C: `mod_dav_svn/repos.c` 1784-1851]: the response's version follows the request's
   `Accept-Encoding` and the server's compression level (svndiff2 when the client lists it and the level is 1, else the
   client's preference, else 0). What a client sends in PUT bodies follows the server's advertised capabilities
@@ -372,7 +407,14 @@ and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` a
   `M` or `D`; the new value on stdin) and post-revprop-change (the old value on stdin), pre/post-lock and
   pre/post-unlock. With no pre-revprop-change hook "default to MASSIVE PARANOIA" (670): every revision property change
   is refused, `SVN_ERR_REPOS_DISABLED_FEATURE`. Hooks get their stdin from a temporary file (`create_temp_file`), which
-  slates replaces with a pipe (R1).
+  slates replaces with a pipe (R1). Recorded from stock `svnserve` 1.15.0 [M: `crates/svn/fixtures/hooks`, A-623]: a
+  `LOCK-TOKENS:` line names the client's own path, relative to its commit's base (`serve.c` `add_lock_tokens` hands the
+  filesystem the path as sent), escaped by `svn_path_uri_autoescape`'s ten bytes and nothing past ASCII; pre-commit
+  reads the null device when no token was presented; a hook's environment is its own hooks-env section, else the
+  default one, and a section with no variables is none (`parse_hooks_env_option`); a hook `exec` refuses exits 255 with
+  nothing written (`svn_io_start_cmd3` leaves APR's error check off); post-lock's and post-unlock's failures come
+  wrapped in `E165008` and `E165009`, post-commit's as `commit-info`'s `post-commit-err`; a commit's release of its
+  locks runs pre-unlock and post-unlock, whose failures `unlock_paths` logs and drops.
 - **CRAM-MD5** [B: RFC 2195 102-107, 205-212]: keyed MD5's precomputed intermediate results "make it possible to avoid
   explicit cleartext storage of the shared secret on the server system by instead storing the intermediate results
   which are known as "contexts"", and "servers that store the secrets or contexts must both be protected": a context is
@@ -616,3 +658,195 @@ Read 2026-11-19 by g262 at §1's revision: `svnserve/serve.c` (sha256 `acb1cac75
   the copy's revision is another line or was made fresh there) back to its source, keeps a revision after the peg
   while the line reaches back to the same path (refused when the path is absent in it), and ends where the path holds
   another line or none.
+
+Read 2026-11-19 by g297 for A-613 part 2, from `raw.githubusercontent.com/apache/subversion/1.15.0/<path>` (the release
+the fixtures were recorded with; the first 16 hex digits of each file's sha256): `svnserve/serve.c` `8154654e07aa4eb4`
+(as §1), `libsvn_repos/rev_hunt.c` `5acc827a362d11f4` (as above), `libsvn_repos/log.c` `673c9f4b42515315`,
+`libsvn_repos/list.c` `6ef0f62c00210b13`, `libsvn_ra_svn/marshal.c` `361702975baa8c70` (as §1), `libsvn_ra_svn/protocol`
+`b117e0ccc2008627` (as §1), `libsvn_fs_fs/tree.c` `f507210992ec9736`, `libsvn_fs_fs/dag.c` `9efbb054b8818693` (as §1),
+`libsvn_subr/mergeinfo.c` `afee0be02f1374d6`, `libsvn_repos/fs-wrap.c` `126ab4670c8c23e0` (as §1),
+`libsvn_delta/svndiff.c` `311b0286b38d7d6d`, `libsvn_delta/text_delta.c` `88686a46845f5b8e`, `libsvn_delta/xdelta.c`
+`2e7b6226acfa9078`, `include/svn_repos.h` `941491e450489ee4`, `include/svn_error_codes.h` `f5b2c11d407e752f`; the
+fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remaining command's sessions.
+- **`get-file`** [C: `serve.c` `get_file`, `get_props`; `dag.c` `svn_fs_fs__dag_file_checksum`; recorded]: parameters
+  `c(?r)bb?B` (a fifth item that is no boolean ends the connection); the authentication request, the revision, then
+  the checksum: absent "File not found", a directory "Attempted to get checksum of a *non*-file node" (160017); the
+  answer `( ( md5 ) rev ( props ) [ ( iprops ) ] )`, the property list present even when not wanted, the inherited
+  list only when asked (empty when no ancestor has properties); the text as strings of `get_file`'s 4,096-byte
+  buffer, then the empty string and `( success ( ) )` (a read error there: the empty string and the refusal).
+- **`list`** [C: `serve.c` `list`, `parse_dirent_fields`; `list.c` `svn_repos_list`, `do_list`, `fill_dirent`;
+  `marshal.c` `svn_ra_svn__write_dirent`; `types.c` `svn_depth_from_word` (`8c9fe593b18d24cf`); `utf8proc.c`
+  `svn_utf__fuzzy_glob_match`, `normalize_cstring` (`d5fab817b5ea6d87`); recorded]: the revision is opened before
+  `done` (a revision past the youngest refused with no `done`); the depth refused after it, 165002; paths absolute;
+  `unknown` for a kind not asked; a dirent's lists empty for fields not asked; a directory's size 2^64 - 1; the date
+  parsed and written again (time 0's when none). Recorded: `README.TXT` matches `read*` (the name folded, the pattern
+  as the client sent it); `dir` matching neither `a*` nor `*.txt` walked, its `b.txt` reported.
+- **`get-location-segments`** [C: `serve.c` `get_location_segments`, `gls_receiver`; `rev_hunt.c`
+  `svn_repos_node_location_segments`, `maybe_crop_and_send_segment`, `svn_repos__prev_location`; `tree.c`
+  `fs_closest_copy`, `fs_node_origin_rev`; recorded]: `serve.c` settles a missing or negative peg and start to the
+  youngest and end to 0, and refuses end > start and start > peg after `done` in its own words; the library refuses a
+  peg past the youngest. The loop crops each segment to the range in place before the gap is computed from it.
+  Recorded: `branches/b1/a.txt`@11 is 9-11 there (its replacement by a copy of `trunk/a.txt`@5), a gap 6-8, then 1-5
+  at `trunk/a.txt`; `tags/t1/a.txt` 7-11, gap 6-6, 1-5; the root 0-11 with an empty path.
+- **`get-deleted-rev`** [C: `serve.c` `get_deleted_rev`; `rev_hunt.c` `svn_repos_deleted_rev`; recorded]: `crr`;
+  negative revisions refused by the library in its own words; the range ordered; absent at the older end, or the same
+  line at both with no younger copy, is no deletion, which `serve.c` answers `SVN_ERR_ENTRY_MISSING_REVISION` (150003)
+  naming the path and the revisions as the client gave them; the search's relation is to the original start node and
+  its copy test to the moving start. Recorded: `trunk/dir/b.txt` 5..11 deleted in 6 (also 11..5); `branches/b1/a.txt`
+  4..11 in 9 (its replacement by a copy); 8..11 of the re-added `b.txt` and 3..8 of the branch's file not deleted.
+- **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
+  name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
+  `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
+  `get-deleted-rev` are `rev_hunt.c`'s (segments cropped and gaps reported; the deleted revision found by a binary search
+  over node relation and closest copy, its absence answered `SVN_ERR_ENTRY_MISSING_REVISION`); `log` is
+  `svn_repos_get_logs5` (FSFS's node history, `tree.c` `history_prev`, walked per path; changed paths in the
+  revision's stored order, which is byte order; merged revisions from `fs_mergeinfo_changed` and
+  `combine_mergeinfo_path_lists`); `get-file-revs` is `svn_repos_get_file_revs2` (the delta's bytes are FSFS's own
+  windows re-encoded as svndiff 2 for a client that accepts it, so slates' deltas made from extents are compared by
+  the text they make).
+
+## 14. The commit's request and its editor commands (A-617; §4.17.4 "5. The wire", piece 7)
+
+Read 2026-11-19 by g268 at §1's revision: `libsvn_ra_svn/editorp.c` (§1's row), `marshal.c`, `svnserve/serve.c`,
+`libsvn_ra_svn/client.c`, `libsvn_repos/commit.c` and the protocol (§1's hashes). Recorded the same day on the Mac
+Studio: stock `svn` 1.15.0 (r1937767) against stock `svnserve` 1.15.0 over a tunnel whose relay logged every byte each
+way (`crates/svn/fixtures/commit`, its `make-fixtures.py`; each file's SHA-256 in `SHA256SUMS`): 25 sessions over 26
+connections, 17 of them commits.
+
+- **The request** [B: `protocol` §3.1.1; C: `serve.c` `commit` 1470-1583, `add_lock_tokens` 1360-1409]: `( logmsg:string
+  ? ( ( lock-path:string lock-token:string ) ... ) keep-locks:bool ? rev-props:proplist )`, read as `"clb?l"`, or as
+  `"c"` when it holds one item (1495-1510: a client before 1.2 sends no tokens, keeps its locks and sends no revision
+  properties). The tokens are read after the authentication request, each a list of two strings, and a malformed one is
+  a command failure, "Lock tokens aren't a list of lists" (1521-1524). The log message is used only when no revision
+  properties came (1526-1534), and the author is always the session's principal (1536-1541). Recorded: stock 1.15.0
+  sends `svn:log`, `svn:txn-client-compat-version` and `svn:txn-user-agent`; a token's path relative to the session's
+  URL (`a.txt`); keep-locks false in `svn commit`'s sessions and true in `svn copy`'s between URLs (`commit-with-lock`,
+  `copy-url`).
+- **The drive** [C: `editorp.c` `svn_ra_svn_drive_editor2` 1073-1212, the handlers 532-935]: each command `( name:word
+  params:list )`, read `"wl"` (1110), its parameters with its handler's prototype, from `open-root`'s `"(?r)s"` (555) to
+  `close-file`'s `"s(?c)"` (856). A name no handler has is "Unknown editor command" (`SVN_ERR_RA_SVN_UNKNOWN_CMD`,
+  210001, 1127-1132), a command error; an error of the item reader (malformed data, 210004) leaves the loop and ends the
+  connection. On a command error the server aborts the edit, writes the failure (1149-1174), then reads and drops
+  commands until `abort-edit` or `success`, a disconnection being no error (1178-1208).
+- **Reading a prototype** [C: `marshal.c` `vparse_tuple` 1608-1718]: items past the prototype are ignored; `?` lets the
+  rest be absent; a nested list's own `?` lets it be empty; another kind than the prototype names is "Malformed network
+  data". A `c` item is used as a C string, so `svnserve` reads `a\0b` as `a`; an `r` item is cast to `svn_revnum_t`
+  (1643-1644), so a number past `LONG_MAX` turns negative and reads as no revision. slates refuses both
+  (`commit::edit`'s module documentation); no stock client sends either. A word is at most 24 bytes (`MAX_WORD_LENGTH`
+  25, 66; "Word is too long").
+- **What the stock client sends** (the recordings): no `target-rev`; `open-root` first, then the tree in its path order,
+  every directory closed, the root's too, before any file's text; then a file at a time, `apply-textdelta`, its
+  `textdelta-chunk`s, `textdelta-end` and `close-file` with the text's MD5; then `close-edit`. So a file's token
+  outlives its directory's `close-dir`. Tokens are `d<n>` and `c<n>` from one counter. The deltas are svndiff 2 to
+  `svnserve`, which announces `accepts-svndiff2` (§2), each file's chunks one svndiff stream.
+- **The answers** (the recordings; C: `serve.c` `commit` 1512-1583, `editorp.c` 888-906): the authentication request
+  (`must_have_access`, 1517-1519), trivial in a session already authenticated, `( success ( ( ) 0: ) )`, and the
+  request's `( success ( ) )` (1555); nothing during an accepted drive; at `close-edit`, the editor's `close_edit` (the
+  verdict) run as a command (893) and `( success ( ) )` (905), a second trivial authentication request (1562), then `(
+  new-rev:number ( date:string ) ( author:string ) ( post-commit-err:string ) )` (1576), the last list empty here. A
+  refused commit's client stream still ends at `close-edit`, with no `abort-edit`: the client sends the whole drive
+  before it reads, and the server's one `( failure ( ( code message file line ) ) )` is its last item: `E160028` "File
+  '/trunk/project/a.txt' is out of date" (an `open-file` on a stale base) and "Directory '/trunk/project' is out of
+  date" (a stale root's property), `E160039` "User 'alice' does not own lock on path '/trunk/project/a.txt' (currently
+  locked by 'bob')", `E160024` "Conflict at '/trunk/project/sub/deeper/d.txt'" (another commit landed while the client's
+  stream was held at `close-edit`).
+- **A sibling noted, not changed.** §6's `check_out_of_date` (176-196) is at 179-198 of the `commit.c` §1 names
+  (`1727532bffd25017`), where A-592's code cites it.
+
+## 15. Import and export (A-628, §4.17.4 piece 6's rest)
+
+Read 2026-11-19 by g264 at §12's revision (`1.14.x` at `d434dc14`, whose `dump.c` stock 1.15.0 keeps byte for byte),
+the first 16 hex digits of each file's sha256:
+
+| File | sha256 (prefix) | Tier |
+|---|---|---|
+| `subversion/libsvn_repos/dump.c` | `10e31e13700f3a74` | C |
+| `subversion/libsvn_repos/replay.c` | `eb42d8bd06a5eb07` | C |
+| `subversion/libsvn_delta/path_driver.c` | `1139deea567fcfe8` | C |
+| `subversion/libsvn_repos/load-fs-vtable.c` | `e802f38a22f4c8ad` | C |
+| `subversion/libsvn_repos/fs-wrap.c` | `126ab4670c8c23e0` | C |
+| `subversion/libsvn_fs_fs/fs_fs.c` | `b12b91eb0418577d` | C |
+| `subversion/libsvn_fs_fs/transaction.c` | `8d99770ee4faa1e5` | C |
+| `subversion/libsvn_fs_fs/tree.c` | `5f4e47d132ef9e02` | C |
+| `subversion/libsvn_subr/path.c` | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/dirent_uri.c` | `fe05687a2dedb22c` | C |
+
+- **What a dump of a range is** [C: `dump.c` `svn_repos_dump_fs4` 2026-2247]: the version record (format 2 without
+  `--deltas`), the UUID record, then each revision's record with its properties (a section even when it has none,
+  since `include_revprops` asks for one always); revision 0 is its record alone; the first revision of a range that is
+  not incremental is the whole tree (`svn_repos_dir_delta2` against revision 0), every other one its replay
+  (`svn_repos_replay2` with no deltas). A dump starting at 0 replays revision 1 on, so `full.dump` is replays only.
+- **The replay's order** [C: `replay.c` `get_relevant_changes` 853, `path_driver_cb_func` 453-796; `path_driver.c`
+  `svn_delta_path_driver_step`]: the changed paths sorted by `svn_path_compare_paths` (`/` before every other byte
+  where two paths first differ); before each path, the directories the last path opened below their longest common
+  ancestor closed, then those down to this path's directory opened with `open_directory`; the path itself visited:
+  a deletion `delete_entry`, an addition `add_directory` or `add_file` with its copy source, a replacement both, a
+  modification `open_directory` (`open_root` for the root) or `open_file`, and a directory's property change a
+  `change_dir_prop` (no deltas: a dummy one); a directory opened or added is the next step's last path, anything else
+  its directory. With no low-water mark and no authorization filter, every copy is sent as a copy.
+- **The dump editor** [C: `dump.c` 1546-1800, `dump_node` 1118-1544]: `delete_entry` only remembers the path in its
+  directory; `close_directory` writes the remembered deletions sorted by `svn_sort_compare_items_lexically` (byte
+  order) with no `Node-kind`; `add_directory` and `add_file` write `replace` when the directory remembers the path
+  deleted, and a replacement by a copy as a deletion record ended by its header block alone, then an addition;
+  `open_directory` and `open_file` take the parent's comparison place with their name; `change_dir_prop` writes a
+  directory's change once. `dump_node` writes an addition without history whole (every property, a file's text); for a
+  change or a copy it compares with the comparison place (default: the path in the revision before) through
+  `svn_fs_props_changed` and `svn_fs_contents_changed`, writing the whole property list and the whole text where they
+  differ, and a copy of a file names its source's checksums (`Text-copy-source-md5`/`-sha1`, none when the source has
+  no representation, since `svn_fs_file_checksum` is called without `force`); a record with no section ends `"\n\n"`.
+- **What "differ" is** [C: `tree.c` `fs_props_changed` 1672, `fs_contents_changed` 3218, `dag.c`'s
+  `svn_fs_fs__dag_things_different` (not strict: representation keys); `transaction.c` 3257-3277 (a property list's
+  representation shared, `write_container_rep` with sharing allowed), `rep_write_contents_close` 2514 (a text's
+  shared), `svn_fs_fs__set_proplist` 2677]:
+  equal content shares one representation, so two nodes differ exactly where their content identities differ, an
+  empty list kept (`svn_fs_fs__set_proplist` writes `END` for an empty hash, so a node whose last property was deleted
+  holds an empty list, which differs from none).
+- **What `svnadmin load` does with each record** [C: `load-fs-vtable.c` `make_node_baton` 374, `new_node_record` 666,
+  `maybe_add_with_history` 578, `uuid_record` 645, `set_node_property` 826, `delete_node_property`,
+  `remove_node_props` 908, `apply_textdelta`, `set_fulltext`, `close_revision` 1009]: `Node-path` through
+  `svn_relpath_canonicalize_safe` and `Node-copyfrom-path` through `svn_relpath_canonicalize` (`dirent_uri.c`
+  `canonicalize` 297-576: for a relative path every empty or `.` segment dropped, so leading, trailing and doubled `/`
+  go; `..` kept, which FSFS refuses); `change` makes no call of its own; `delete` is `svn_fs_delete`; `add` is
+  `svn_fs_make_file` or `svn_fs_make_dir`, or `svn_fs_copy` after checking `Text-copy-source-md5` against the source
+  (MD5 only); `replace` deletes then adds; a whole property section calls `remove_node_props` (one call per property the
+  node has) then one call per entry, a delta section one call per entry; a text is `svn_fs_apply_text` or
+  `svn_fs_apply_textdelta` with the base's and the result's MD5. Revision 0's properties are set to the stream's only in
+  an empty repository; a revision's are the stream's, `svn:date` deleted when the stream has none. The UUID is set when
+  the repository holds no revision but 0 and otherwise ignored. Revisions are renumbered through `rev_map`, mergeinfo
+  renumbered and rewritten by `svn_mergeinfo_to_string` (`renumber_mergeinfo_revs`), and properties validated by default
+  (`svn_repos__validate_prop` in `fs-wrap.c`: `svn:` properties UTF-8 with no carriage return, `svn:date` a date,
+  `svn:mergeinfo` parsed) — what the import keeps instead is A-628's decision.
+- **What FSFS records of those calls** [C: `tree.c` `fs_change_node_prop` 1594 (a property change recorded on every
+  call, the mergeinfo flag on every call naming `svn:mergeinfo`), `apply_text` 3151 and `apply_textdelta` 2992 (a text
+  change recorded), `copy_helper` 2602 (a copy onto the very node already at its destination is nothing, but only while
+  the destination holds it: after a deletion it is a copy); `transaction.c` `fold_change` 683 and its caller (an addition after a deletion a
+  replacement, a deletion of an addition nothing, a modification after an addition still an addition, the paths beneath
+  a deleted path dropped)]. A dump's change record without sections therefore records nothing, and a section that makes
+  no call (an empty whole list on a node with none) no property change.
+- **The comparison's consequence for a round trip.** `svnadmin dump` writes a change record whose content equals its
+  comparison (a text set to its own bytes, a list set to itself) as a record with no section, which `svnadmin load`
+  records as nothing: the stock round trip loses such a changed path, and so does slates'. import(export(R)) = R holds
+  for every history whose changed paths change what they name, which every stock client's commit and every stock dump
+  makes; the golden vectors' stock round trip (`svnadmin load` then `dump` of each, recorded on the parked branch
+  `agents/g264-a628-svnadmin`, `fixtures/svnadmin/redumps.txt`) gives `full.dump` byte for byte, the bar the export is
+  held to.
+- **The drive's checks** [C: `commit.c` 413-882; `tree.c`; `svn_fs_util.h` 82-107; `checksum.c` 688-694; `lock.c`
+  605-630]: `open-root` past the youngest is "No such revision %ld (HEAD is %ld)" (428-431), the transaction begun on
+  the youngest; `delete-entry` checks the path in the transaction, then (absent) "'%s' is out of date", then the
+  out-of-date test when it names a revision (487-509); an add with a copy refuses a present target unless its directory
+  was copied, then a source outside the repository ("Source url '%s' is from different repository"), then the source's
+  revision and path (323-366); an add without one is FSFS's "File already exists: filesystem '%s', transaction '%s',
+  path '%s'"; `open-dir` of an absent path is "Path '%s' not present", the relpath as the client named it (550-554);
+  `open-file` reads the created revision, "File not found: transaction '%s', path '%s'" for an absent one, then the
+  out-of-date test (627-634); a directory's out-of-date test runs at its first property change only (710-727);
+  `close-file` compares the text's MD5, "Checksum mismatch for resulting fulltext\n(%s)" in
+  `svn_checksum_mismatch_err`'s layout (679-694); `close-edit` without `open-root` is `E165002` (811-813).
+- **Locks at each call** [C: `tree.c`, with `SVN_FS_TXN_CHECK_LOCKS`]: `fs_delete_node`, `fs_make_dir` and `copy_helper`
+  check every lock at or beneath the path, `fs_make_file` and `fs_apply_textdelta` the path's own, `fs_change_node_prop`
+  at or beneath a directory and a file's own; a commit against another's lock is refused at the first such call
+  (`verify_lock`'s order: no user, then the owner, then the token), the same words the verdict would give at
+  `close-edit`.
+- **Words without a message** [C: `marshal.c` `svn_ra_svn__write_cmd_failure`]: an error created without a message is
+  written with its code's own (`svn_err_best_message`): `svn_checksum_parse_hex`'s refusal is "Invalid character in hex
+  checksum" and an undecodable LZ4 block "LZ4 decompression failed" (`svn_error_codes.h` 221, 1498). A checksum is read
+  as its first 32 hexadecimal digits, the rest ignored, and the all-zero digest is no checksum at all.

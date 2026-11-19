@@ -3,6 +3,8 @@
 
 use std::collections::VecDeque;
 
+use aws_lc_rs::kem::{AlgorithmId, DecapsulationKey, ML_KEM_768};
+
 use crate::entropy::{Entropy, EntropyFailed};
 
 /// The bytes `text` spells in hex, whitespace ignored.
@@ -11,7 +13,7 @@ pub(crate) fn hex(text: &str) -> Vec<u8> {
     .bytes()
     .filter(|byte| !byte.is_ascii_whitespace())
     .collect();
-  assert!(digits.len() % 2 == 0, "odd number of hex digits");
+  assert!(digits.len().is_multiple_of(2), "odd number of hex digits");
   digits
     .chunks(2)
     .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
@@ -104,4 +106,61 @@ impl Entropy for FailingAfter {
     self.allowed -= 1;
     self.inner.fill(out)
   }
+}
+
+/// The bytes `text` spells in RFC 4648 §4's base64, whitespace and padding ignored.
+pub(crate) fn base64(text: &str) -> Vec<u8> {
+  const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let mut bytes = Vec::new();
+  let mut word = 0u32;
+  let mut bits = 0u32;
+  for character in text
+    .bytes()
+    .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+  {
+    let position = ALPHABET
+      .iter()
+      .position(|letter| *letter == character)
+      .expect("a base64 character");
+    let value = u32::try_from(position).unwrap();
+    word = (word << 6) | value;
+    bits += 6;
+    if bits >= 8 {
+      bits -= 8;
+      bytes.push(u8::try_from((word >> bits) & 0xff).unwrap());
+      word &= (1 << bits) - 1;
+    }
+  }
+  bytes
+}
+
+/// A fresh ML-KEM-768 key pair from AWS-LC: the key that decapsulates, and the encapsulation key's bytes a client sends
+/// as `C_PK2` (FIPS 203 §7.1).
+pub(crate) fn mlkem_key_pair() -> (DecapsulationKey<AlgorithmId>, Vec<u8>) {
+  let key = DecapsulationKey::generate(&ML_KEM_768).unwrap();
+  let encapsulation = key
+    .encapsulation_key()
+    .unwrap()
+    .key_bytes()
+    .unwrap()
+    .as_ref()
+    .to_vec();
+  (key, encapsulation)
+}
+
+/// `key` with twelve-bit coefficient `index` of its vector `t̂` set to `value`, laid out as FIPS 203 §4.2.1's
+/// `ByteEncode12` lays out each pair: the first coefficient in byte 3j and the low half of byte 3j + 1, the second in the
+/// high half of byte 3j + 1 and in byte 3j + 2.
+pub(crate) fn with_coefficient(key: &[u8], index: usize, value: u16) -> Vec<u8> {
+  let mut out = key.to_vec();
+  let at = index / 2 * 3;
+  let [low, high] = value.to_le_bytes();
+  if index.is_multiple_of(2) {
+    out[at] = low;
+    out[at + 1] = (out[at + 1] & 0xf0) | (high & 0x0f);
+  } else {
+    out[at + 1] = (out[at + 1] & 0x0f) | (low << 4);
+    out[at + 2] = u8::try_from(value >> 4).unwrap();
+  }
+  out
 }

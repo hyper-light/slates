@@ -35,9 +35,15 @@
 //! While its KEXINIT is out and its NEWKEYS is not, [`ServerTransport::send`] answers [`SendRefusal::Rekeying`], and the
 //! caller sends again after [`Event::Rekeyed`]. A key that reaches its whole limit anyway ends the connection.
 //!
+//! **Key exchange** ([`crate::kex`]). The method is the client's first choice of `mlkem768x25519-sha256` (A-634) and
+//! `curve25519-sha256`; both run as `SSH_MSG_KEX_ECDH_INIT` and `SSH_MSG_KEX_ECDH_REPLY`, the hybrid's values longer, and
+//! a value that fails its method's checks ends the connection with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`.
+//!
+//! **Extensions.** After the first `SSH_MSG_NEWKEYS`, when the client's KEXINIT lists `ext-info-c`, the server sends
+//! RFC 8308's `SSH_MSG_EXT_INFO` with the extensions its caller configured (A-633: `server-sig-algs`).
+//!
 //! **Refusals.** Every refusal is a [`Refusal`]; the transport sends `SSH_MSG_DISCONNECT` with its reason and closes.
-//! Not built here: user authentication and channels (the next pieces), RFC 8308's `SSH_MSG_EXT_INFO` (the
-//! authentication piece's, when it offers RSA keys), compression, and key exchanges other than `curve25519-sha256`.
+//! Not built here: user authentication and channels ([`crate::session`] above it), compression, and other key exchanges.
 
 use crate::entropy::Entropy;
 use crate::hostkey::HostKey;
@@ -46,9 +52,11 @@ use crate::ident::{
 };
 use crate::kex::{
   ExchangeInputs, HASH_LEN, KEX_ECDH_INIT, KEX_ECDH_REPLY, KexRefusal, X25519_LEN,
-  curve25519_server, ecdh_reply, exchange_hash, new_keys, read_ecdh_init,
+  curve25519_server, ecdh_reply, exchange_hash, mlkem768x25519_server, new_keys, read_ecdh_init,
 };
-use crate::kexinit::{COOKIE_LEN, KEXINIT, KexInit, Negotiated, negotiate, server_kexinit};
+use crate::kexinit::{
+  COOKIE_LEN, KEXINIT, KexInit, KexMethod, Negotiated, negotiate, server_kexinit,
+};
 use crate::keylife::{KeyLimits, UsageCap};
 use crate::packet::{
   Cipher, KeyMaterialRefusal, LENGTH_LEN, MAX_PACKET_EVERY_PEER_ACCEPTS, Opener, SealRefusal,
@@ -70,6 +78,8 @@ pub const DEBUG: u8 = 4;
 pub const SERVICE_REQUEST: u8 = 5;
 /// Format: `SSH_MSG_SERVICE_ACCEPT`.
 pub const SERVICE_ACCEPT: u8 = 6;
+/// Format: `SSH_MSG_EXT_INFO` (RFC 8308 §2.3).
+pub const EXT_INFO: u8 = 7;
 /// Format: `SSH_MSG_NEWKEYS`.
 pub const NEWKEYS: u8 = 21;
 /// Format: the first number of the key exchange methods' own messages (RFC 4250 §4.1.2: 30 to 49).
@@ -95,6 +105,18 @@ pub struct TransportConfig {
   pub key_time_ns: u64,
   /// An operator's cap on a key's use, below its cipher's limits.
   pub usage_cap: UsageCap,
+  /// RFC 8308's extensions, sent in `SSH_MSG_EXT_INFO` as the packet after the server's first NEWKEYS when the
+  /// client's first KEXINIT listed `ext-info-c` (§2.4); none sends nothing.
+  pub extensions: Vec<Extension>,
+}
+
+/// One of RFC 8308's extensions: its name and its value's bytes (§2.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Extension {
+  /// The extension's name, such as `server-sig-algs`.
+  pub name: String,
+  /// Its value, as the extension defines it.
+  pub value: Vec<u8>,
 }
 
 /// Why a transport could not be set up.
@@ -115,9 +137,11 @@ pub enum ConfigRefusal {
   Encoding(WireRefusal),
 }
 
-/// The ciphers a key exchange agreed.
+/// What a key exchange agreed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Algorithms {
+  /// The key exchange method, so a deployment can count the connections that ran the post-quantum hybrid (A-634).
+  pub kex: KexMethod,
   /// What the client sends.
   pub client_to_server: Cipher,
   /// What the server sends.
@@ -133,7 +157,7 @@ pub struct Established {
   pub strict: bool,
   /// Whether the client listed `ext-info-c` (RFC 8308 §2.1), for the authentication layer.
   pub client_ext_info: bool,
-  /// The ciphers.
+  /// The method and the ciphers.
   pub algorithms: Algorithms,
 }
 
@@ -146,8 +170,14 @@ pub enum Event {
   Rekeyed(Algorithms),
   /// The client asked for `ssh-userauth` and the server accepted.
   ServiceAccepted,
-  /// A message for the layers above (numbers 50 to 255).
-  Message(Vec<u8>),
+  /// A message for the layers above (numbers 50 to 255), with the sequence number it came under, which an
+  /// `SSH_MSG_UNIMPLEMENTED` names ([`ServerTransport::unimplemented`]).
+  Message {
+    /// The message, its number first.
+    payload: Vec<u8>,
+    /// The packet's sequence number.
+    sequence: u32,
+  },
   /// The client disconnected.
   Disconnected {
     /// Its reason code (RFC 4253 §11.1).
@@ -238,6 +268,8 @@ pub struct ServerTransport<E: Entropy> {
   key_time_ns: u64,
   /// The operator's cap on a key's use.
   usage_cap: UsageCap,
+  /// RFC 8308's extensions, sent after the first NEWKEYS to a client that listed `ext-info-c`.
+  extensions: Vec<Extension>,
   /// What it reads next.
   phase: Phase,
   /// The client's identification line, being read.
@@ -321,6 +353,7 @@ impl<E: Entropy> ServerTransport<E> {
       packet_cap: config.packet_cap,
       key_time_ns: config.key_time_ns,
       usage_cap: config.usage_cap,
+      extensions: config.extensions,
       phase: Phase::Identification,
       reader: IdentificationReader::new(),
       client_identification: None,
@@ -465,6 +498,17 @@ impl<E: Entropy> ServerTransport<E> {
       .map_err(|refusal| SendRefusal::Fatal(self.refuse(refusal)))
   }
 
+  /// Answers the upper-layer message that came under `sequence` with `SSH_MSG_UNIMPLEMENTED` (RFC 4253 §11.4), for
+  /// the layers above, which alone know whether they recognize a number of theirs.
+  pub fn unimplemented(&mut self, sequence: u32) -> Result<(), SendRefusal> {
+    if self.phase == Phase::Closed {
+      return Err(SendRefusal::Closed);
+    }
+    self
+      .seal_transport(&unimplemented(sequence))
+      .map_err(|refusal| SendRefusal::Fatal(self.refuse(refusal)))
+  }
+
   /// Ends the connection with `reason` and `description`, sending the disconnect.
   pub fn close(&mut self, reason: DisconnectReason, description: &str) {
     if self.phase != Phase::Closed {
@@ -601,7 +645,7 @@ impl<E: Entropy> ServerTransport<E> {
       KEXINIT => self.on_kexinit(payload, now_ns),
       NEWKEYS => self.on_newkeys(payload, now_ns),
       KEX_ECDH_INIT => self.on_ecdh_init(payload),
-      FIRST_UPPER_LAYER..=u8::MAX => self.on_upper_layer(number, payload),
+      FIRST_UPPER_LAYER..=u8::MAX => self.on_upper_layer(number, payload, sequence),
       _ if number == SERVICE_ACCEPT || is_negotiation_or_exchange(number) => {
         Err(Refusal::Unexpected { number })
       }
@@ -658,7 +702,7 @@ impl<E: Entropy> ServerTransport<E> {
   }
 
   /// An upper-layer message: passed up once the service is accepted, except inside the client's exchange.
-  fn on_upper_layer(&mut self, number: u8, payload: &[u8]) -> Result<(), Refusal> {
+  fn on_upper_layer(&mut self, number: u8, payload: &[u8], sequence: u32) -> Result<(), Refusal> {
     let client_exchanging = self
       .exchange
       .as_ref()
@@ -666,7 +710,10 @@ impl<E: Entropy> ServerTransport<E> {
     if !self.service_accepted || client_exchanging {
       return Err(Refusal::Unexpected { number });
     }
-    self.pending = Some(Event::Message(payload.to_vec()));
+    self.pending = Some(Event::Message {
+      payload: payload.to_vec(),
+      sequence,
+    });
     Ok(())
   }
 
@@ -723,7 +770,10 @@ impl<E: Entropy> ServerTransport<E> {
       .entropy
       .fill(&mut private)
       .map_err(|_| Refusal::Entropy)?;
-    let half = curve25519_server(&private, client_public);
+    let half = match negotiated.kex {
+      KexMethod::Mlkem768X25519Sha256 => mlkem768x25519_server(&private, client_public),
+      KexMethod::Curve25519Sha256 => curve25519_server(&private, client_public),
+    };
     private.fill(0);
     let half = half.map_err(Refusal::Kex)?;
     let hash = self.exchange_hash_of(
@@ -765,6 +815,9 @@ impl<E: Entropy> ServerTransport<E> {
       self.sealer.sequence()
     });
     self.sealer = sealer;
+    if exchange.initial && negotiated.client_ext_info {
+      self.send_extensions()?;
+    }
     let keys_in = &keys.client_to_server;
     exchange.next_opener = Some(
       Opener::new(keys_in.cipher, keys_in.key.bytes(), keys_in.iv.bytes()).map_err(key_material)?,
@@ -818,6 +871,7 @@ impl<E: Entropy> ServerTransport<E> {
     self.key_installed_ns = now_ns;
     self.last_exchange_ns = now_ns.saturating_sub(exchange.started_ns);
     let algorithms = Algorithms {
+      kex: negotiated.kex,
       client_to_server: negotiated.client_to_server,
       server_to_client: negotiated.server_to_client,
     };
@@ -833,6 +887,30 @@ impl<E: Entropy> ServerTransport<E> {
       Event::Rekeyed(algorithms)
     });
     Ok(())
+  }
+
+  /// Seals `SSH_MSG_EXT_INFO` with the configured extensions (RFC 8308 §2.3), if there are any.
+  fn send_extensions(&mut self) -> Result<(), Refusal> {
+    if self.extensions.is_empty() {
+      return Ok(());
+    }
+    let message = |refusal| Refusal::Message {
+      number: EXT_INFO,
+      refusal,
+    };
+    let count = u32::try_from(self.extensions.len()).map_err(|_| {
+      message(WireRefusal::TooLong {
+        length: self.extensions.len(),
+      })
+    })?;
+    let mut payload = Vec::new();
+    put_byte(&mut payload, EXT_INFO);
+    put_uint32(&mut payload, count);
+    for extension in &self.extensions {
+      put_string(&mut payload, extension.name.as_bytes()).map_err(message)?;
+      put_string(&mut payload, &extension.value).map_err(message)?;
+    }
+    self.seal_transport(&payload)
   }
 
   /// Sends the server's KEXINIT and opens an exchange.
