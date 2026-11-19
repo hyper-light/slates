@@ -233,6 +233,11 @@ fn not_started(why: &str) -> Option<u16> {
   None
 }
 
+/// Whether a listener bound at `at` listens where `address` says (red stub).
+fn listens_at(_at: slates_rt::tcp::SocketAddrV4, _address: slates_rt::tcp::SocketAddrV4) -> bool {
+  false
+}
+
 #[cfg(test)]
 #[path = "tests/daemon_edge.rs"]
 mod tests;
