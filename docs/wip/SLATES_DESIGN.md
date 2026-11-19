@@ -52094,5 +52094,6 @@ Applied in the same change to:
   list), `vcs_ssh/tests/receive.rs` (new), `vcs_ssh/tests/serve.rs` (its child), `vcs_ssh/tests/git.rs` (the services'
   test), `vcs_http/git.rs` (`ShardLender` re-exported), `vcs_http/git/receive.rs` (the trait's doc names its SSH
   caller), `git_push.rs` (its tests crate-visible; its callers), `git_push/tests.rs` (the fixtures crate-visible),
-  `vcs_http.rs` (`daemon_edge` crate-visible), `lib.rs` (the modules' notes); §4.17.2's status (A-654 part 2's and
-  part 3's owed calls, A-683's status); GAPS (A-654's entry, the A-683 entry).
+  `vcs_http.rs` (`daemon_edge` crate-visible), `lib.rs` (the modules' notes), `vcs_store/upload/tests.rs` (A-682's
+  SSH session builds the services with `ThisShard`); §4.17.2's status (A-654 part 2's and part 3's owed calls, A-683's
+  status); GAPS (A-654's entry, the A-683 entry).
