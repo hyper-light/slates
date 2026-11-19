@@ -945,8 +945,13 @@
 > (2026-11-19, g295): a copy from a version its source changed after built, the head's graft fixed by what the change
 > index names since, the fix recorded whole in the chain entry (record kind 19) with its room derived before the
 > verdict and added to the entry's bound by the service (`cargo test -p slates-merge --lib` 118 of 118 on the Mac
-> Studio, red seven ways, see A-626 part 2). Owed from A-626: a checkpoint of a green holding a copy (part 3), a rebase
-> restating a copy (part 4); the replaced tree held by reference rather than removed key by
+> Studio, red seven ways, see A-626 part 2). A-626 part 3 (2026-11-19, g307): a checkpoint of a green holding a copy
+> built, version 4 (the copies' records, the copied trees' keys holding what their copy gave them, set by a restore with
+> no history, and the identity's running sum, which the restore takes), the anchor's layout 12 refusing every older
+> segment at adoption, so no version 3 checkpoint is ever read; the service's `merge.checkpoint.unavailable` now counts
+> only a floor folded past (see A-626 part 3). Owed from A-626: a rebase restating a copy (part 4); a restore that grafts
+> a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
+> if measured worth it; the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
 > Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the ra_svn server's commands (its
 > greeting and authentication built, A-599; its reporter's commands and report, A-616 part 1, and its drive's calls,
@@ -2619,7 +2624,21 @@
 > restored inside the new types (r705: all four failed; doubling the names took 2,149,245,934 comparisons against
 > 537,633,163). Owed to main: the merge crate's integration tests updated by reading (`tests/increment.rs`,
 > `tests/special.rs`, `tests/chain_replay.rs`) and the server's suites. Bug record:
-> `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+> `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`. Its format change made no anchor layout
+> bump (filed below, "Formats the segment keeps changed without a layout bump"); since the layout 12 of A-626 part 3
+> (2026-11-19), every segment a build before it wrote is refused at adoption.
+
+> **Formats the segment keeps changed without a layout bump: found open (2026-11-19, g307 by reading, on main's ruling for
+> A-626 part 3; `crates/anchor/src/layout.rs`, `crates/db/src/op.rs` `Op::GreenAdvanced`).** The partition's op log and
+> snapshots live in the anchor segment and hold every green's chain entries (`Op::GreenAdvanced`, the chain entry's bytes
+> with the increment's ops document inside) and checkpoints (`Op::GreenCheckpointed`). The ops document's version 2 and
+> the chain entry's version 5 (A-621), and the ops document's version 3 (A-646 part 2b), changed those formats with the
+> segment's `LAYOUT_VERSION` left at 11. A daemon of either change adopting a segment an older one wrote would meet each
+> older entry as `BadVersion` mid-service, the green fenced, where a bump refuses the segment once, typed, at adoption,
+> before anything is served. The layout 12 of A-626 part 3 covers both from now on: every segment written before it is
+> refused at adoption. Owed: the guard, a structural test tying every format version the segment keeps (the ops
+> document, the chain entry, the checkpoint, the origin, the work log, every record a partition persists) to
+> `LAYOUT_VERSION`, so a format change without a bump fails the build.
 
 > **A metadata change to a node replaced after a work's base, and a rename of a replaced symlink or hard link: fixed
 > (2026-11-19, A-631, g267; found by A-612's sweep; §4.16 "The verdict": "delete against modify in either direction",
@@ -2753,6 +2772,8 @@
 >    node at its target at the work's base or the one the work makes, its golden vectors re-derived independently
 >    (218 bytes, `553a422f…6c0d92`) and the determinism gate holding with nodes (red on r1104, 12 failed; green 134
 >    of 134; merged with main on r1111, 141 of 141). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+>    Version 3 made no anchor layout bump ("Formats the segment keeps changed without a layout bump", filed with
+>    A-621's entry); since A-626 part 3's layout 12, every segment a build before it wrote is refused at adoption.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
 >    (`links_to`), two lookups where it scanned every attribute change and every hard link; a counter test shows 2
 >    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links
