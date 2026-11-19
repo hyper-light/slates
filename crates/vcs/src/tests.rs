@@ -270,6 +270,35 @@ fn a_fork_holds_every_table_once_more_and_copies_no_row() {
   assert_eq!((store.used(), store.charged()), (0, 0));
 }
 
+/// A-581, §4.17.1 "Objects" item 3 (tables are content). Do: write the same rows into two repositories, fold both,
+/// then release one and the other. Expect: the second fold's table is the first's, counted deduplicated and held twice;
+/// each row's content held once by that one stored table, not once per repository; both read alike; and the store
+/// empty at the end.
+#[test]
+fn two_repositories_that_fold_the_same_rows_share_one_table() {
+  let mut store = ContentStore::new(1 << 20);
+  let (mut first, mut second) = (Index::new(), Index::new());
+  for index in [&mut first, &mut second] {
+    for name in [&b"a"[..], b"b"] {
+      insert_named(index, &mut store, name, name);
+    }
+  }
+  assert_eq!(store.holders(&ContentId::of(b"a")), 2);
+  first.fold(&mut store).unwrap();
+  second.fold(&mut store).unwrap();
+  assert_eq!(second.counters().tables_deduplicated, 1);
+  let tables: Vec<ContentId> = first.tables().collect();
+  assert_eq!(second.tables().collect::<Vec<_>>(), tables);
+  assert_eq!(store.holders(&tables[0]), 2);
+  assert_eq!(store.holders(&ContentId::of(b"a")), 1);
+  assert_eq!(read(&first, &store), read(&second, &store));
+  first.release(&mut store).unwrap();
+  assert_eq!(read(&second, &store).len(), 2);
+  second.release(&mut store).unwrap();
+  assert!(store.is_empty());
+  assert_eq!((store.used(), store.charged()), (0, 0));
+}
+
 /// A-581. Do: give a repository two tables, fork it, add a table and a tail to the parent and compact it; add two tables
 /// to the fork and compact it; release the fork and compact the parent again. Expect: each compaction merges only the
 /// layers its index alone holds (the two shared tables untouched while the fork lives, merged once it is gone), reads
