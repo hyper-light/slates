@@ -2907,6 +2907,21 @@ after its last publication is in no image and no head: the successor refuses it,
 opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
 (GAPS).
 
+**Every round a mount builds on its serving thread is sliced** (A-562). The journal gather walks a backlog of records,
+the overrun round every node and name the kernel holds, and the takeover round its inode set; each grows with what
+others did, so none may take a whole turn. One budget bounds a turn's rounds together: half the shard's live step
+quantum, the share every clock-bounded slice takes. Each round takes at least one item a turn, in a fixed order from
+where its last slice stopped: the gather by record, the cursor moving through the records it took; the overrun round
+by the root, the nodes by id, then the names, each name taken away as it is told. The mount turns at once while any
+round is owed and none is out. Nothing is lost: the cursor never passes a record not gathered, and an item the kernel
+held at an overrun stays in the set until the walk tells it, unless the kernel gives it back. A mount that falls behind
+again mid-lap owes a whole lap after it. Until the overrun round is told whole, a writer outside FUSE waits on that
+mount as on one told nothing past where it fell behind (AC-3.3). The byte states still take every record through the
+head at each round, so a write-back's pending records stay few, and a record is fed once. A round whose first slice
+runs out of its turn is counted (`fuse.rounds_outgrown`, `winfsp.rounds_outgrown`), and every slice that resumes one
+(`fuse.slices_resumed`, `winfsp.slices_resumed`). A round's backlog is measured at each slice in a segment's records at
+most, from per-segment running charges, where the measurement once walked the whole backlog.
+
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
@@ -6680,6 +6695,17 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-19, A-564: an owner that cannot answer is never read as no volume).** A verb forwarded to its
+> volume's owner shard was answered `NotFound` when the owner's state refused it. That happened from another node:
+> `call_in_shard_time`'s `None` became `NotFound` in `named_if_unshared`. It happened on the same node too, where a
+> refused owner borrow became `NotFound`. So a volume on a fenced owner read as absent. The owner's refusal is now
+> answered by its kind (`call_owner`, `refusal_of_access`):
+> - a fenced owner (or a retention check that fences it) answers `ConsensusRecoveryUnavailable`;
+> - a call that did not run answers `Overloaded`, not started.
+>
+> (`a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`;
+> `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`).
+
 > **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
 > forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
 > again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
@@ -10277,6 +10303,35 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > measured bandwidth-delay product; the platform's trust roots and name resolution; and the N=1 differential through
 > `SimS3`.
 
+> **Status (2026-11-19, A-555: a request waits for the fetch it met).** Built:
+> - The pending answer names its fetch: `HostError::Pending(FetchId)` and `VfsError::BasePending(FetchId)`. `S3Host`
+>   names one fetch for a directory's listing (every page of it) and one for each run of a file's chunks; a call that
+>   misses on what is under way is answered under that fetch's name, and `S3Host::landed` says which fetch a landing
+>   settled.
+> - The shard's base waits (`crates/server/src/base_wait.rs`): a request whose host call met a pending fetch, noted
+>   where the slot's host is lent to it (`Lens`), parks on its volume and that fetch; the fetch's landing
+>   (`base_wait::land`, the fetch driver's entry) wakes those requests alone, and each runs again from its start, since
+>   a pending answer changed nothing. The waits are bounded by the shard's client credit (`clients_per_shard × slots`,
+>   the bound the lease waiters and the told replies keep): a request past it is answered its pending refusal at once,
+>   counted `base.wait.full`. A request waits at most the failover delay in all, the most a reply is held, then is
+>   answered the same, counted `base.wait.overdue`; `base.wait.parked` and `base.wait.landed` are the non-vacuity counts.
+> - The hold: what a fetch lands is never shed while requests are parked on it (`S3Host::hold_for_waiters` at a
+>   request's parking, `S3Host::release_held` at the last one's leaving), so a woken request finds what it waited for
+>   whatever lands meanwhile; a landing the unheld cache cannot make room for is not kept (`HostCounts::unkept`), and
+>   its own requests fetch it again once they run. This closes A-524's owed hold (GAPS A-464).
+> - NFS: a call answered `NFS3ERR_JUKEBOX` after it met a pending base waits on its volume's owner shard and is served
+>   again (`nfs::serve_local_fetched`, for a local call and a forwarded one alike). The bridges answer a request that
+>   could not wait with the retry: FUSE `EAGAIN`, NFS `NFS3ERR_JUKEBOX` (NFSv4 `NFS4ERR_DELAY`), never `EIO` or a server
+>   fault.
+> - A slot's base host is one `BaseHost` (`crates/base/src/base_host.rs`): a host directory or an S3 base. A landing
+>   writes a host directory only; an overlay over an S3 base keeps its host in its slot and a landing into its base is
+>   refused `BaseUnavailable`.
+>
+> Owed (GAPS A-464): parking a FUSE request (Linux: the request held off the device and dispatched again when its
+> fetch lands; it is answered `EAGAIN` until then); WinFsp's answer (its catch-all today), the Shards streams, slates'
+> own virtio-fs device and the typed channel's verbs (answered `Unpublished`, retryable); and the volume over an S3 base
+> (the wire's create, the credential's hand-off, the fetch driver), with the rest of A-524's owed list.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -10677,9 +10732,11 @@ stays in the overlay.
 > or clears its `READONLY` bit alone (A-262: a file's read-only state is its mode), every other attribute bit kept.
 > Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
 > day)** a symbolic link lands as the Windows one, in A-275's form (`slates_vfs::host::windows_link`, the drive's own),
-> made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
-> `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
-> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. **Since A-445 (the
+> made handle-relative at the landing's hidden name and moved into place without replacing, its object opened and its
+> buffer set with `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it (both since
+> A-568: slates' own drive takes the privilege at the open, as MS-FSA 2.1.5.1 has it, where NTFS asks it at the set);
+> where the file system refuses the link (an account without the privilege, in Developer Mode or not, A-568) the seam
+> names it `HostError::Unprivileged` and the entry fails alone, the landing going on. **Since A-445 (the
 > same day)** step 6's reflink is built: a file whose bytes its batch already staged (the same BLAKE3 and length) is
 > cloned from that temporary where the target's volume shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev
 > Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in whole-cluster regions below 4 GiB from the volume's own cluster), its
@@ -38133,6 +38190,230 @@ and `pending_changes` through them), and the bug record
   `cargo test --locked -p slates-bridge-fuse --lib coherence` 14 of 14 and the library whole 36 of 36; rustfmt changes
   nothing. The Linux channel's glue is not compiled on macOS: its build, its unit tests and the takeover tests are
   main's (Linux).
+
+### A-555 — A request that meets a pending S3 base waits for the fetch it met, and is served again when that one lands (2026-11-19, goal g268, UI goal 90; Mantle's CP-T10.5; §4.15 "An S3 base"; §4.6; R3, R8; A-79, A-354, A-375, A-464, A-524)
+Applied in the same change to: `crates/vfs` (`host::FetchId`; `HostError::Pending` and `VfsError::BasePending` name
+their fetch; the base plane's two mappings); `crates/base` (`s3::host`: a fetch's name per listing and per chunk run,
+`landed` reporting the fetch it settled, `hold_for_waiters` and `release_held`, the cache passing over held items and
+counting a landing it could not keep, `HostCounts::unkept`; `base_host`: `BaseHost`, a slot's host directory or S3
+base); `crates/server` (`base_wait`, new; `state`'s slot host as `BaseHost` and the shard's `base_waits` and
+`nfs_pending_base`; `nfs`'s lens at the export, `serve_local_fetched` for local and forwarded calls; `verbs` and
+`landing` over `BaseHost`; `error`); `crates/bridge-fuse` (`errno`: `EAGAIN`) and `crates/bridge-nfs` (`nfsstat_of`:
+`NFS3ERR_JUKEBOX`), each with its unit test; `crates/land` (the pending arm); §4.15's status; GAPS (A-464's entry).
+Also main's clippy findings in A-524's code, fixed here: `listed_bytes`' size sum saturates; the host's test helpers
+`settle` and `read_whole` refuse rather than panic or unwrap inside a `Result`; the two long host tests and
+`SimS3::page`, `time::unix_of` and `time::ns_of_iso8601` split into their steps, unchanged in what they answer; the
+oracle's tree a type alias.
+
+- **Why.** An S3 base's host answers from what it has fetched, and a miss is a pending answer (A-524). Until now a
+  FUSE request that met one was answered `EIO` and an NFS call `NFS3ERR_SERVERFAULT`, so the first read of every base
+  file failed; and nothing said which fetch a request needed, so nothing could wake it when that fetch landed.
+- **A pending answer names its fetch.** One name a directory's listing (every page), one a run of chunks; a call that
+  misses on what is under way gets the name of the fetch bringing it, so every request that met a fetch waits under one
+  name, and `landed` says which fetch settled. A request learns the name through a lens at the point the slot's host is
+  lent to it (`base_wait::Lens`), because the transports' bridges answer a volume refusal on their own wire.
+- **Parked on the fetch, woken by it alone.** The shard keeps the waits by volume and fetch; a fetch's landing wakes its
+  own waits and none other, and each request runs again from its start: its pending answer changed nothing, so running
+  it again is running it once, and an NFS call's records (A-127, A-128) take the answer of the run that answered.
+- **Held until its waiters ran.** A woken request runs a turn after the landing; another landing in between could shed
+  what it waited for through a small cache, and with every request missing in turn none would progress (GAPS A-464's
+  owed hold). So the host never sheds what a fetch landed while requests are parked on it, and a landing the unheld cache
+  cannot make room for is not kept: its own requests fetch it again once they run, by when the holds that kept it out
+  are let go. A request that comes after its fetch settled does not park: it runs again at once.
+- **Bounded (R3, learned or shared, never a number).** The waits are the shard's client credit at most, the bound every
+  parked set on a shard keeps (`lease_wait`, `told`, `work_home`); past it a request is answered its retry at once. A
+  request waits at most the failover delay in all, the most a reply is held (A-354, A-375); each fetch is itself bounded
+  by the store client's learned waits (A-471), so a store that does not answer settles its fetch with a refusal first.
+- **Rejected.** Waking every request of a volume at any of its fetches' landings: a request then ran once per landing
+  on the volume, not once per its own. Answering `EAGAIN`/`JUKEBOX` without parking: an NFSv3 client backs off for
+  seconds on `JUKEBOX` (4,033 ms measured for one macOS write, A-79), where a fetch lands in a round trip. Holding
+  landed items by time (one round trip after landing): a starved shard's waiters could still lose them, and a quick
+  one's would keep them past need.
+- **Owed.** Parking a FUSE request (Linux, `crates/server/src/fuse.rs` and the channel: the request held off the device
+  and dispatched again when its fetch lands); the other transports' answers and waits (WinFsp, the Shards streams,
+  slates' virtio-fs device, the typed channel's verbs); and the volume over an S3 base itself (the wire's create, the
+  credential's hand-off, the fetch driver that calls `base_wait::land`), with A-524's other owed items.
+- **Evidence.** Mac Studio (debug, 2026-11-19). Red first, today's behaviour put back on a scratch copy: before the
+  merge (kiln r128) the FUSE lookup answered `EIO` and the NFS call `NFS3ERR_SERVERFAULT`, and with held items shed the
+  host's hold test kept `b.bin` beside nothing; on the merged tree (r241) with no wake a landing woke none of its
+  requests (`(0, 0, 0)` where `(0, 0, 1)` was due), with no bound a second request parked (`Parked(1)` where `Full`
+  was due), with no release `b.bin`'s chunk was still not kept (2 unkept where 1 was due), and with held items shed both
+  hold tests kept it at once (0 where 1 was due). Green on the merged tree (r241): `cargo test --locked -p
+  slates-server --lib -- base_wait error::` 6 of 6, `-p slates-base --lib -- s3` 55 of 55, `-p slates-vfs --lib --
+  base::` 4 of 4, `-p slates-land --lib -- engine` 2 of 2, `-p slates-bridge-fuse --lib -- bridge::tests` 1 of 1,
+  `-p slates-bridge-nfs --lib -- procedures::tests` 1 of 1, `cargo fmt --check` clean.
+
+### A-564 — A verb for a volume whose owner shard refuses its state is answered by the refusal's kind, never `NotFound` (2026-11-19, goal 85 via g225; §4.8 "Lookup"; found by A-557; A-394)
+
+- **What was there.** A verb for a volume runs on its owner shard. From another node, `serve_forward` called the owner
+  through `xshard::call_in_shard_time`, whose `None` means not sent, given up, or the owner's borrow refused, and
+  `named_if_unshared` turned that `None` into `NotFound`. On the same node, `send_forward`'s task turned a refused owner
+  borrow into `NotFound`. A fenced owner refuses every borrow; a failed consensus publication fences the control shard,
+  which owns a partition of the volumes. So a volume on a fenced owner read as absent.
+- **The rule.** "The answer comes from the current owner and is authoritative" (§4.8 "Lookup"): an owner that did not
+  answer is never read as an answer of no volume. `refusal_of_access` answers a refused borrow by its kind:
+  - fenced, or closed by the retention check that fences, is `ConsensusRecoveryUnavailable`, the refusal a failed
+    publication answers;
+  - no state, or a borrow already held, is `Overloaded`, not started.
+
+  `call_owner` runs a forward's work on its owner with `try_with_state`, waits in the owner's own time, and answers a
+  call not sent or given up `Overloaded`. Every path of `serve_forward` uses them: a read, a write and its deferred
+  completion, `PromoteRegion`, and the partition lookup on the serving shard. So does `send_forward`'s owner task.
+  `NotFound` stays the answer for a partition no shard of this node holds.
+- **Test.** `a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`
+  (`crates/server/src/verbs.rs`): a volume on the second shard of two, that shard fenced, its status asked from a
+  client on the control shard and as a verb forwarded from another node. Red before the fix: the same-node ask
+  answered `NotFound` (0.75 s, Mac Studio). Green: both asks `ConsensusRecoveryUnavailable`. Seventeen nearby tests
+  still pass.
+- **Not changed.** `remote_attach::serve_unforwardable` answers `Overloaded` for any call that has no answer, a fenced
+  owner included: retryable, and never `NotFound`.
+
+Applied in the same change to: §4.8 "Lookup" (its status), GAPS (a new entry after A-394's), `crates/server/src/verbs.rs`
+(`serve_forward`, `refusal_of_access`, `call_owner`, `answer_forwarded_write`, `await_deferred_completion`,
+`named_if_unshared`, `send_forward`, the test and its helpers), the bug record
+`docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`.
+
+### A-568 — A link the account may not make fails that entry alone, and the writer is its own probe (2026-11-19, g085, UI goal 88; §4.15 step 6, A-438's owed Developer Mode route; A-185, A-275, A-451, A-539)
+Applied in the same change to: §4.15 (A-185's status: the link rule), GAPS (A-438's owed item, closed, with what it
+leaves), `crates/vfs` (`src/host/mod.rs`: `HostError::Unprivileged`; `src/host/sim.rs`: the simulated host can refuse a
+link, `SimVerb::Symlink`; `src/base.rs`), `crates/land` (`src/engine.rs`: the refusal fails its entry alone;
+`src/windows_codes.rs`: `ERROR_PRIVILEGE_NOT_HELD` named; `src/os_windows.rs`: the object opened as well as set under
+the link-making token, the module's docs; `src/chmod_tests.rs`; `tests/os.rs`), and `crates/server` (`src/error.rs`,
+`src/landing.rs`: the new kind by its code).
+- **What was there.** A-438 made a link handle-relative: its object opened at the landing's hidden name, its buffer set
+  (`FSCTL_SET_REPARSE_POINT`) with `SeCreateSymbolicLinkPrivilege` enabled for that call, then moved into place. Its
+  design said a link the file system refuses fails that entry `EPERM`; the engine read the refusal as a host that
+  stopped answering, and the landing ended `Aborted` (`Crashed { errno: 1 }`, then `Crashed { code: Win32(1314) }`
+  after A-539). Its two Windows tests decided whether to expect a link by a `CreateSymbolicLinkW` probe, which on
+  jupiter, in Developer Mode, made a link where the writer's set was refused `ERROR_PRIVILEGE_NOT_HELD` (main's runs
+  r143 and r212).
+- **What `CreateSymbolicLinkW` does.** It enables `SeCreateSymbolicLinkPrivilege` on its thread around its whole
+  operation, before its create, and reverts after (Eryk Sun, bugs.python.org msg302494, 2017-09-19; this design's
+  WinFsp record, deviation (b), diagnostics run 42715955734). Without the privilege it refuses a caller that did not pass
+  `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` before any file system is asked; with the flag, under Developer Mode, it
+  makes the link (Microsoft Learn, CreateSymbolicLinkW; measured, diagnostics run 42720006662). How the allowance
+  reaches the file system is not documented, and no interface a file system's caller holds carries it: WinFsp, handed
+  every create and control of its drives, is never passed the flag (the same record, deviation (a)). The file system's
+  own rule is MS-FSA's: an open takes `HasCreateSymbolicLinkAccess` from the privileges of its security context
+  (2.1.5.1), and a symbolic link's set needs it (2.1.5.10.37).
+- **The decision.** The writer cannot take that route: `CreateSymbolicLinkW` names its link by path, and the landing
+  makes every object relative to a handle it holds, so no rename of an ancestor can carry a write outside the target
+  (§4.15 step 4). So where the file system refuses a link for the privilege, the seam names it
+  (`HostError::Unprivileged`, the Windows writer's rule for `ERROR_PRIVILEGE_NOT_HELD`), the entry fails alone by that
+  code, and the landing goes on, as no room does; slates never asks for the privilege (R10). The link's object is opened
+  as well as set under the link-making token, since slates' own drive takes the privilege at the open (deviation (b),
+  as MS-FSA has it), where NTFS asks it at the set: a landing into another daemon's drive made no link before. The
+  Windows tests take the writer as their probe: the link landed, or its entry failed alone by
+  `ERROR_PRIVILEGE_NOT_HELD` with the rest written and nothing left at its name, the branch printed; A-451's test is
+  split into its setup and two assertions.
+- **Tests, red first** (the Mac Studio, kiln, 2026-11-19, debug). Red (run r259, 02:31 UTC, load 8.4): at the
+  tests-first commit (8e122983b) `slates-land --lib -- a_link_the_host_refuses a_privilege_the_process_lacks` 2 of 2
+  failed: the Windows writer's rule read `ERROR_PRIVILEGE_NOT_HELD` as `Unavailable(Win32(1314))` where
+  `Unprivileged(Win32(1314))` was wanted, and the landing ended at the link, so the file beside it was never written
+  (`None` where `Written` was wanted). Green (run r288, 02:35 to 02:38 UTC, load 41.2 to 31.8) at the change
+  (121cc896c): `slates-land --lib` 50 passed (1 ignored, the manifest vectors' writer), `slates-vfs --lib -- host::
+  base` 14, `slates-server --lib -- landing:: error::` 16; `cargo fmt --check` clean. r259's own green half is not
+  counted: both trees were cloned into one target directory before the red build, and cargo, which hashes a workspace
+  member by its relative path, judged the second tree fresh and ran the red binary (its panics named the red file's
+  lines); r288 built a tree cloned after.
+- **Owed** (GAPS): on Linux a link on a file system that holds none (`symlink(2)`'s `EPERM`, FAT) still ends a landing.
+  Filed for main: the Windows land suites (`--test os`: the two link tests, the writer's open under the token), the
+  xwin check, and clippy (A-451's test was 15 of 10 cognitive complexity on Windows).
+
+### A-571 — A full command ring is waited out by one rule on every client end, and the daemon tests' raw clients keep it: a connect is one claim, a hold's start waits on its observation (2026-11-19, UI goal 86 via g251b, part 1 of "The rest of class C": the `CREDIT_WAIT` copies; §4.7 "Failure matrix"; A-232, A-454, A-468, A-523)
+
+- **What was there.** Three daemon suites (`crates/server/tests/ack_release.rs`, `attach_forms.rs`, `shards.rs`) each
+  kept a raw client that retried a connect refused as unavailable, and a send refused for a full request ring, for five
+  seconds on the wall (`CREDIT_WAIT`), spinning a core all the while, and then failed the test, its daemon alive or
+  gone; `ack_release.rs` and `shards.rs` waited for a hold to begin under the same five seconds. A-454 left them owed
+  when it moved the fleet suite's two waits into its daemons' own time. The SDK's own wait for room had kept A-523's
+  rule since 2026-11-18, but privately (`slates_client`'s `RoomWait`), so a raw client could not keep it.
+- **One rule for a full ring** (`slates_ipc::room`, `ClientEnd::send_when_room`). The SDK's rule moves into the crate
+  that owns the ring, unchanged: spin for the client's wake estimate, then park, each pause twice the last and never
+  past the next look at the daemon's life, the looks on A-443's doubling; while the daemon lives the wait goes on, and a
+  look that finds it gone ends it, nothing written (`Roomed::DaemonGone`). `slates_client::Client::send` calls it and
+  reconnects on `DaemonGone` as before; each raw test client calls it and fails on `DaemonGone`. `ClientEnd::room_parks`
+  and `room_looks` count the parks and the looks (non-vacuity). The fleet suite keeps A-454's rule, room while the ring's shard steps and
+  `FROZEN_CAP` for a daemon it freezes on purpose, since a liveness rule waits on a frozen daemon for as long as it
+  lives.
+- **A connect is one claim**, as A-454 made the fleet suite's: each suite's daemon opens and publishes its rendezvous
+  before its start returns (`Listener::open`), or adopts the test's held one, and a claim waits while the rendezvous's
+  holder lives (A-468), so a refusal fails the test at once. The product's `Client::connect` claims once too.
+- **A hold's start waits on its observation.** The shard sets the hold's flag as it runs the observation; the test
+  waits for the flag or the observation's own end, its answer or its typed refusal past the daemon's observe budget,
+  and a hold that never began fails the test there.
+- **Owed** (GAPS; A-571's next part). `shards.rs`'s guest windows (`Guest::await_answer`: A-65 and A-228's rule, its
+  window and its CPU budget each `CREDIT_WAIT`), its condition polls (`wait_until`, `wait_for_count`), its attach's
+  answer and its stream reads still run on five seconds of the wall; `daemon.rs` keeps the same raw client, constant and
+  two waits; `common/client.rs`'s `START_WAIT` retries a connect five seconds while a daemon starts.
+- **Checks.** On the Mac Studio (debug, 2026-11-19, load 12.7 to 38): `slates-ipc --lib` 74 passed (2 ignored),
+  `slates-client --lib` 7 of 7, `cargo fmt --check` clean. A daemon gone before the wait was seen at its one look,
+  `DaemonGone` after 1.9 to 2.0 ms in three runs; a ring a live daemon drained after a fifth of a second was written
+  after 275.1 to 377.7 ms, with 8 to 18 parks and, in the last run, 5 looks, from a 200 µs wake estimate. A park the OS
+  ends early adds a park, never a look (18 parks across 309.2 ms at load 36), so the test bounds the looks by the
+  doubling and asks only that the wait parked. Red with the old raw clients' rule put back (spin for five seconds, then
+  `RingFull`): the gone daemon's wait failed `RingFull` five seconds in, and the live one spun, "0 parks across
+  274.201041ms from a 200000 ns wake". `ClientEnd::room_looks` counts the looks.
+- **Tests.** `slates_ipc::endpoint`'s `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`
+  and `a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`; the schedule's walk
+  (`a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`) moved from `slates-client` to
+  `slates_ipc::room`. The three suites are main's to run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C: A-454's fleet sentence and A-523's ring
+slot sentence), `crates/ipc/src/{room,endpoint,lib}.rs`, `crates/client/src/client.rs` (`Client::send`; `RoomWait` and
+its test moved out), `crates/server/tests/{ack_release,attach_forms,shards}.rs`.
+
+### A-562 — Every round a mount builds on its serving thread is sliced under one turn budget: the journal gather by record, A-141's overrun round by node then name, with A-158's takeover round (2026-11-18, g230, UI goal 85's B9; §4.6 "Cache posture", CLAUDE.md bounded work; amends A-141, A-158)
+Applied in the same change to: GAPS (the whole rounds' entry closed; the two walks still whole recorded), §4.6,
+`crates/bridge-core/src/lib.rs` (`Bridge::invalidations` takes `more`), `delivery.rs` (`Coherence::deliver` takes
+`more`; `Delivered::cut`, `Coherence::owes`, `Coherence::take_sliced_counts`; `served_own_request` moves the cursor only
+after a whole round), `scoped.rs`, `volume_bridge.rs` (the gather walks one record at a time), `crates/vfs/src/journal.rs`
+(the ring's per-segment running charges; `note_round` costs a segment's records at most),
+`crates/bridge-fuse/src/coherence.rs` (`OverrunRound`; `KernelHolds::invalidate_everything` gone, `name_after`),
+`channel.rs` (`everything_told` gone; one `TurnSlice` a turn shared by the three rounds; `ServeState::owes_round_now`
+replaces `owes_takeover_round`; `take_sliced_counts`; `told_through` bounded while an overrun round is owed; the byte
+states fed once a record across slices, `states_fed_through`, and a write-back's pending records counted from it;
+`slice_ns` is `None`, rounds whole, until an owner bounds it), `crates/server/src/fuse.rs` (the wake while any round is
+owed, and a yield between slices that sent nothing; the turn's budget is `copy_slice_ns`, `TAKEOVER_SLICE_PERMILLE`
+gone; `fuse.rounds_outgrown`,
+`fuse.slices_resumed`), `winfsp.rs` (the gather sliced the same way, `Turned::Continued`, `winfsp.rounds_outgrown`,
+`winfsp.slices_resumed`), `config.rs` (`copy_slice_ns` names the rounds), and the integration tests' gathers, which pass
+a `more` that never stops them.
+- **What was there.** A mount that fell behind the journal's retention built its whole overrun round in one turn: every
+  node and name its kernel held, tens of thousands for a tree a build walked, each message built on the serving thread.
+  Every round's gather walked the whole backlog since its cursor in one turn too, resolving each record's path, and
+  measured the backlog by walking it once more (`note_round`). The takeover round alone was sliced (A-158).
+- **The rule.** One budget bounds a turn's rounds together, half the shard's live step quantum: the takeover round's
+  slice, the gather's and the overrun round's take what is left of it in that order, and at least one item each, so
+  every round owed moves on at every turn. The gather asks before each record after its first and hands back the cursor
+  through the last record it took; the overrun round walks the root, the nodes by id, then the names by
+  `(parent, name)`, taking each name away as it is told. Neither loses an item: the cursor never passes a record not
+  gathered, and an item the kernel held at an overrun stays in the set until the walk tells it, unless the kernel gives
+  it back, which needs nothing. An item handed out after the overrun was answered fresh. A mount that falls behind again
+  mid-lap owes a whole lap after it, so every item is told within two laps of any overrun. The mount turns at once while
+  a round is owed and none is out. Until its overrun round is told whole, `told_through` answers where the mount fell
+  behind, so a writer outside FUSE waits on it (AC-3.3). A request the mount serves after a cut gather leaves the cursor
+  where it is, so the rest of the round is not skipped. A round's backlog is measured at each slice from per-segment
+  running charges: the charge after a point is the charge pushed less the charge before that point's segment, less a
+  segment's records at most.
+- **What stays whole.** The gather's base-plane half (the loaded entries of each hinted directory) runs whole in the
+  slice whose journal half reaches the head, and the byte states take every record through the head at a round's first
+  slice. Both are in GAPS.
+- **Tests**, each on every host. `delivery`'s `a_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing`:
+  ten files made elsewhere, rounds of three records, the mount's own request served after the first; four rounds or
+  more, every file told once and in order, one round outgrown and every later slice resumed. `coherence`'s
+  `an_overrun_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing` (six slices of at most
+  three items, with forgets, handouts and an unlink between them), `falling_behind_again_mid_lap_owes_a_whole_lap_after_it`,
+  and the oracle `every_item_held_at_an_overrun_is_told_after_it_or_given_back` (2,000 generated histories of lookups,
+  forgets, unlinks, renames, overruns and slices against the lookup protocol's model). `journal`'s
+  `the_charge_after_any_sequence_crosses_segments_exactly`, with A-157's `every_rounds_backlog_equals_the_models`
+  unchanged. Green on the Mac Studio (M3 Ultra, kiln r260, 2026-11-19): vfs `journal::` 13 of 13, bridge-core
+  `delivery::` 1 of 1, bridge-fuse `kernel_holds` 5 of 5. Red three ways on the same run: the gather never asking
+  `more` (the old whole gather) failed the delivery test; the overrun walk never asking it (the old `everything_told`)
+  told all nineteen items in its first slice where six slices were due; and the ring's later segments credited with no
+  charge before them answered 13,503 bytes after sequence 128 where 105 waited. The Linux and Windows halves
+  (`channel.rs`, the server's `fuse.rs` and `winfsp.rs`) and the integration suites were not compiled here; they are
+  filed for main's lanes.
 
 ### A-574 — A laptop's failover detection is what its watchdog and its anchor measure: the widest shard window, then the anchor's lapse bound, read at every beat on every node (2026-11-19, UI goal 86 via g076b; R3's class D, its last fixed-window term; R8; §4.4 "Derived constants", §4.14 `daemon.alive`; A-363, A-405, A-455, A-467)
 Applied in the same change to: §4.4's status (the failover delay's paragraph), GAPS (the failover delay's entry: A-405's

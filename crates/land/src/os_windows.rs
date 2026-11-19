@@ -28,7 +28,7 @@
 //!   the landing makes ([`LandFs::set_windows`], the `mkdir` and `symlink` verbs; `crate::windows_bits`), so what a
 //!   person set through the drive is what the disk holds; NTFS sets `ARCHIVE` again on the rename that places a file.
 //!   The word is read back after it is set, and a bit the target's file system did not take (FAT holds no `OFFLINE`
-//!   and no `NOT_CONTENT_INDEXED`, and drops them without a word) refuses the entry `EOPNOTSUPP` (`give_bits`), so a
+//!   and no `NOT_CONTENT_INDEXED`, and drops them without a word) refuses the entry `Unsupported` (`give_bits`), so a
 //!   bit is landed or refused, never dropped. The modification time is set through `FILE_BASIC_INFO` in the FILETIME
 //!   domain.
 //! - **Reflinks (A-445):** where the target's volume shares clusters between files (ReFS, a Dev Drive:
@@ -36,7 +36,7 @@
 //!   `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, in regions of whole clusters below 4 GiB laid out from the volume's own cluster
 //!   (`crate::block_clone`), the new file's end first set to the length rounded up to a cluster and set back after.
 //!   NTFS shares nothing, so its capability says so and the engine never asks. A pair the volume refuses to share (the
-//!   cluster's 8,175 sharers, the two files' integrity streams, another volume) is refused `EOPNOTSUPP` with nothing
+//!   cluster's 8,175 sharers, the two files' integrity streams, another volume) is refused `Unsupported` with nothing
 //!   left, and the engine writes its bytes.
 //! - **Symbolic links (A-438):** a volume link is landed as the Windows symbolic link the WinFsp drive shows for it
 //!   (A-275's form, `slates_vfs::host::windows_link`): a relative target with `\` and `SYMLINK_FLAG_RELATIVE`, a
@@ -44,16 +44,22 @@
 //!   own hidden name (`staged`) with `FILE_OPEN_REPARSE_POINT`, its `IO_REPARSE_TAG_SYMLINK` buffer set
 //!   (`FSCTL_SET_REPARSE_POINT`), then moved to its name without replacing, so the name never holds half a link and a
 //!   crash between the steps leaves a hidden sibling the landing's sweep removes. NTFS sets a link's buffer only for a
-//!   caller with `SeCreateSymbolicLinkPrivilege` enabled, unless Developer Mode lets it; an administrator's token holds
-//!   it disabled, and `CreateSymbolicLinkW` enables it around its own call, so the set runs on this thread under a copy
-//!   of the process's token with it enabled (`as_link_maker`), for that call alone. No privilege is asked for that the
-//!   process does not hold (R10): where NTFS refuses the set (a standard account outside Developer Mode) the entry fails
-//!   `EPERM`, typed, as every link did before A-438. Since A-451 a directory link Windows made in the volume (A-275's
+//!   caller with `SeCreateSymbolicLinkPrivilege` enabled: the file system takes the privilege as the object is opened
+//!   (MS-FSA 2.1.5.1, `Open.HasCreateSymbolicLinkAccess`) and checks it at the set (2.1.5.10.37). An administrator's
+//!   token holds it disabled, and `CreateSymbolicLinkW` enables it on its thread around its own call, so the object is
+//!   opened and its buffer set on this thread under a copy of the process's token with it enabled (`as_link_maker`),
+//!   for those calls alone. No privilege is asked for that the process does not hold (R10), and Developer Mode is no
+//!   route here: it lets `CreateSymbolicLinkW` make a link unprivileged when asked with
+//!   `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, a call that names its link by path, which this handle-relative
+//!   writer may not make, while this route is refused `ERROR_PRIVILEGE_NOT_HELD` there (jupiter, in Developer Mode, a
+//!   standard account; A-568). Where the file system refuses a link so, the seam names it (`Unprivileged`) and the
+//!   entry fails alone; the landing goes on (A-568). Since A-451 a directory link Windows made in the volume (A-275's
 //!   `LINK_DIRECTORY`) lands as a directory link: its object is made a directory, as `SYMBOLIC_LINK_FLAG_DIRECTORY`
 //!   makes one.
 //!
-//! Refusals the engine tells apart are reported in its errno numbers (it was written over POSIX): a name that exists
-//! as `EEXIST` (17), no room as `ENOSPC` (28), the missing exchange as `EOPNOTSUPP` (95).
+//! Refusals the engine tells apart are named as kinds by the writer's one rule (`crate::windows_codes`, A-539): a name
+//! that exists, no room, a verb NTFS lacks (the exchange, a clone), a privilege the process does not hold (A-568); every
+//! other code passes on as the Win32 code it is.
 //!
 //! Containment (§4.15 step 4, §4.13): [`OsLand::open_target`] walks the target from its drive's root
 //! (`slates_base::walk_dir`), and the target must be owned by this process's user (`TargetNotOwned`), compared by
@@ -182,8 +188,8 @@ impl std::fmt::Debug for OsLand {
   }
 }
 
-/// A Win32 error code as the seam's refusal (A-527, `crate::windows_codes::refusal_of`): the errno of a kind the engine
-/// tells apart, else the Win32 code it is.
+/// A Win32 error code as the seam's refusal (A-527, A-539, `crate::windows_codes::refusal_of`): a kind the engine tells
+/// apart named by its code, else the Win32 code it is.
 fn code_refusal(code: u32) -> HostError {
   crate::windows_codes::refusal_of(code)
 }
@@ -320,7 +326,7 @@ fn attributes(handle: BorrowedHandle<'_>) -> Result<u32, HostError> {
 }
 
 /// Renames the entry `entry` holds to `name` under `to_dir`, never replacing (POSIX semantics, no
-/// `REPLACE_IF_EXISTS`): refused `EEXIST` when the name exists.
+/// `REPLACE_IF_EXISTS`): refused `Exists` when the name exists.
 fn rename_handle(
   entry: BorrowedHandle<'_>,
   to_dir: BorrowedHandle<'_>,
@@ -470,7 +476,7 @@ fn set_end(file: BorrowedHandle<'_>, end: u64) -> Result<(), HostError> {
 }
 
 /// Clones `length` bytes at `offset` of `source` to the same offset of `target` (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`, a
-/// region of whole clusters below 4 GiB, `crate::block_clone`): refused `EOPNOTSUPP` where the volume will not share
+/// region of whole clusters below 4 GiB, `crate::block_clone`): refused `Unsupported` where the volume will not share
 /// this pair ([`clone_refusal`]).
 fn duplicate_extents(
   source: BorrowedHandle<'_>,
@@ -516,7 +522,7 @@ fn duplicate_extents(
 }
 
 /// A clone's refusal as the seam reports it (A-445): the volume's refusals to share this pair, each with nothing
-/// written, are `EOPNOTSUPP`, after which the engine writes the bytes: no sharing at all (`ERROR_NOT_SUPPORTED`,
+/// written, are `Unsupported`, after which the engine writes the bytes: no sharing at all (`ERROR_NOT_SUPPORTED`,
 /// `ERROR_INVALID_FUNCTION`), a cluster already shared by its limit of regions (`ERROR_BLOCK_TOO_MANY_REFERENCES`),
 /// another volume (`ERROR_NOT_SAME_DEVICE`), and a pair whose integrity streams or sparseness differ
 /// (`ERROR_INVALID_PARAMETER`, which ReFS answers for every precondition Microsoft lists). Every other code is the
@@ -537,8 +543,8 @@ fn clone_refusal(code: u32) -> HostError {
 }
 
 /// Sets `buffer` (an `IO_REPARSE_TAG_SYMLINK` `REPARSE_DATA_BUFFER`) as the reparse point of the empty object `object`,
-/// opened as itself (`FILE_OPEN_REPARSE_POINT`) with [`LINK_ACCESS`]: refused in Windows' own code, the link privilege's
-/// `ERROR_PRIVILEGE_NOT_HELD` among them (A-539: as the Win32 code it is, never an errno's).
+/// opened as itself (`FILE_OPEN_REPARSE_POINT`) with [`LINK_ACCESS`]: refused in Windows' own code, typed (A-539), the
+/// link privilege's `ERROR_PRIVILEGE_NOT_HELD` named `Unprivileged`, which fails the entry alone (A-568).
 fn set_reparse(object: BorrowedHandle<'_>, buffer: &[u8]) -> Result<(), HostError> {
   let length = u32::try_from(buffer.len()).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
   let mut returned = 0u32;
@@ -569,10 +575,12 @@ fn set_reparse(object: BorrowedHandle<'_>, buffer: &[u8]) -> Result<(), HostErro
 
 /// Runs `make` (a link's buffer set) on this thread under a copy of the process's token with
 /// `SeCreateSymbolicLinkPrivilege` enabled, where the process holds the privilege ([`link_token`]), and reverts the
-/// thread to the process's own token after: NTFS checks the privilege enabled at the set, an administrator's token holds
-/// it disabled, and `CreateSymbolicLinkW` enables it around its own call the same way. Only this thread, only for
-/// `make`: the shard's other work and every other thread run as they did. Where the process does not hold it, or the
-/// thread cannot take the copy, `make` runs as the process is and NTFS decides (Developer Mode).
+/// thread to the process's own token after: the file system takes the privilege as the link's object is opened and
+/// checks it at the set (MS-FSA 2.1.5.1, 2.1.5.10.37), so `make` opens the object and sets its buffer; an administrator's
+/// token holds it disabled, and `CreateSymbolicLinkW` enables it around its own call the same way. Only this thread,
+/// only for `make`: the shard's other work and every other thread run as they did. Where the process does not hold it,
+/// or the thread cannot take the copy, `make` runs as the process is and the file system refuses the link
+/// (`Unprivileged`, A-568), Developer Mode or not.
 fn as_link_maker<T>(make: impl FnOnce() -> T) -> T {
   let Some(token) = link_token() else {
     return make();
@@ -720,7 +728,7 @@ fn set_attributes(object: BorrowedHandle<'_>, word: u32) -> Result<(), HostError
 /// Gives the object `object`, made as `made`, the Windows bits the volume keeps for it (`volume`, A-451:
 /// `crate::windows_bits::set_word`), then reads its attributes back: a file system that holds fewer bits than NTFS
 /// drops the others without a word (FAT, `crate::windows_bits`), so a bit that did not take refuses the entry
-/// `EOPNOTSUPP` rather than land without it (`crate::windows_bits::held`).
+/// `Unsupported` rather than land without it (`crate::windows_bits::held`).
 fn give_bits(
   object: BorrowedHandle<'_>,
   volume: u16,
@@ -1151,7 +1159,7 @@ impl LandFs for OsLand {
   /// A new temporary at `name` holding the first `len` bytes of the temporary `from`, shared by ReFS's block cloning
   /// (the module's "Reflinks"): its end set to the length rounded up to a whole cluster of the volume
   /// (`crate::block_clone`), each region cloned, the end set to `len`. A refusal to share this pair answers
-  /// `EOPNOTSUPP` (`clone_refusal`) and whatever refused, the new file is removed: nothing is left behind.
+  /// `Unsupported` (`clone_refusal`) and whatever refused, the new file is removed: nothing is left behind.
   fn clone_temp(
     &mut self,
     dir: HostDir,
@@ -1220,7 +1228,7 @@ impl LandFs for OsLand {
   }
 
   /// Writes through the temporary's own file (`seek_write`, `WriteFile` at the offset) until every byte is written; a
-  /// write that takes none is no room (`ENOSPC`).
+  /// write that takes none is no room (`NoSpace`, `ERROR_DISK_FULL`).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError> {
     use std::os::windows::fs::FileExt;
     let writer = self.host.file_of(file)?;
@@ -1484,15 +1492,21 @@ impl LandFs for OsLand {
     } else {
       nt::FILE_NON_DIRECTORY_FILE
     };
-    let object = nt_create(
-      parent,
-      staged,
-      LINK_ACCESS,
-      nt::FILE_CREATE,
-      kind | nt::FILE_OPEN_REPARSE_POINT,
-      FILE_ATTRIBUTE_NORMAL,
-    )?;
-    let placed = as_link_maker(|| set_reparse(object.as_handle(), &buffer))
+    // Opened and set under the link-making token: the file system takes the privilege as the object is opened (MS-FSA
+    // 2.1.5.1) and checks it at the set (2.1.5.10.37), so both run with it enabled (A-568).
+    let (object, set) = as_link_maker(|| {
+      let object = nt_create(
+        parent,
+        staged,
+        LINK_ACCESS,
+        nt::FILE_CREATE,
+        kind | nt::FILE_OPEN_REPARSE_POINT,
+        FILE_ATTRIBUTE_NORMAL,
+      )?;
+      let set = set_reparse(object.as_handle(), &buffer);
+      Ok::<_, HostError>((object, set))
+    })?;
+    let placed = set
       .and_then(|()| give_bits(object.as_handle(), windows, crate::windows_bits::Made::Link))
       .and_then(|()| {
         if staged == name {

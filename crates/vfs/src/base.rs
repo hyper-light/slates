@@ -563,11 +563,12 @@ pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> 
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => Some(code),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       Some(GONE_DIRECTORY)
     }
-    HostError::Pending => None,
+    HostError::Pending(_) => None,
   }
 }
 
@@ -886,8 +887,9 @@ fn host_refusal(e: HostError) -> VfsError {
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => VfsError::BaseUnavailable(Some(code)),
-    HostError::Pending => VfsError::BasePending,
+    HostError::Pending(fetch) => VfsError::BasePending(fetch),
   }
 }
 
@@ -4727,7 +4729,7 @@ mod tests {
   ) -> Result<Vec<u8>, VfsError> {
     let mut o = vol.with_host(host);
     let size = o.stat(store, no)?.size;
-    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+    let mut buf = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
     let n = o.read(store, no, 0, &mut buf)?;
     buf.truncate(n);
     Ok(buf)

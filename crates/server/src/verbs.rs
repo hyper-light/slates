@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use slates_base::OsHost;
+use slates_base::{BaseHost, OsHost};
 use slates_db::Op;
 use slates_db::catalog::{
   AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer,
@@ -887,8 +887,9 @@ fn is_forwardable_write(body: &RequestBody) -> bool {
 /// - Anything else is refused `Unsupported`.
 ///
 /// `control` is the shard this serve loop runs on (the `xshard` origin). Each call to the owner shard is waited for in
-/// that shard's own time (`xshard::call_in_shard_time`, R3 class A): before, a peer's read of a volume whose owner shard
-/// was given a fifth of a core for 1.5 s was answered `NotFound` at the wall second.
+/// that shard's own time ([`call_owner`], R3 class A): before, a peer's read of a volume whose owner shard was given a
+/// fifth of a core for 1.5 s was answered `NotFound` at the wall second. A shard whose state refuses the verb answers by
+/// the refusal's kind ([`refusal_of_access`]), never `NotFound`, which says the volume does not exist (A-564).
 pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) -> Vec<u8> {
   let Ok(ForwardedRequest {
     principal,
@@ -906,8 +907,8 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   let requester = principal.clone();
   if let RequestBody::PromoteRegion { region } = body {
     return encode_body(
-      &crate::state::with_state(|s| propose_region_promotion(s, region))
-        .unwrap_or_else(|| refused(Refusal::NotFound)),
+      &crate::state::try_with_state(|s| propose_region_promotion(s, region))
+        .unwrap_or_else(|access| refusal_of_access(&access, control)),
     );
   }
   let Some(volume) = volume_of(&body) else {
@@ -923,44 +924,85 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     return encode_body(&refused(Refusal::HomedElsewhere { region }));
   }
   let owner = owner_of(volume);
-  let Some(shard) = crate::state::with_state(|s| shard_of_partition(s, owner)).flatten() else {
-    return encode_body(&refused(Refusal::NotFound));
+  let shard = match crate::state::try_with_state(|s| shard_of_partition(s, owner)) {
+    Ok(Some(shard)) => shard,
+    // No shard of this node holds the partition the id names: no such volume here.
+    Ok(None) => return encode_body(&refused(Refusal::NotFound)),
+    Err(access) => return encode_body(&refusal_of_access(&access, control)),
   };
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
-    crate::xshard::call_in_shard_time(
-      control,
-      shard,
-      move |s| serve_forwarded_read(s, &principal, body, volume),
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
+    match call_owner(control, shard, move |s| {
+      serve_forwarded_read(s, &principal, body, volume)
+    })
     .await
+    {
+      Ok(reply) | Err(reply) => reply,
+    }
   } else if is_forwardable_write(&body) {
-    let forwarded = crate::xshard::call_in_shard_time(
-      control,
-      shard,
-      move |s| {
-        // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-        if let Some(refusal) = forwarded_before_made(s, volume) {
-          return (Some(refusal), None);
-        }
-        if let Some(up_to) = ack_up_to {
-          prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
-        }
-        // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
-        let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
-        (reply, s.told_owed.take())
-      },
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
+    let forwarded = call_owner(control, shard, move |s| {
+      // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
+      if let Some(refusal) = forwarded_before_made(s, volume) {
+        return (Some(refusal), None);
+      }
+      if let Some(up_to) = ack_up_to {
+        prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
+      }
+      // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
+      let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
+      (reply, s.told_owed.take())
+    })
     .await;
-    answer_forwarded_write(forwarded, (control, shard), origin_host, id).await
+    match forwarded {
+      Ok(forwarded) => answer_forwarded_write(forwarded, (control, shard), origin_host, id).await,
+      Err(refusal) => refusal,
+    }
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
-    Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
+    crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// The refusal for a shard whose state refused a borrow (`state::try_with_state`), by what refused it (A-564). Fenced
+/// by a failed consensus publication, or closed by the retention check that such a failure makes refuse every borrow:
+/// `ConsensusRecoveryUnavailable`, the refusal a failed publication answers (`consensus_recovery::recover`), since the
+/// shard serves nothing until the operator recovers it. No state, or a borrow already held on its thread: `Overloaded`
+/// for `shard`, since the borrow's work did not run. Never `NotFound`, which says a volume does not exist: until A-564 a
+/// verb forwarded to a fenced owner was answered so, and a volume that exists read as absent.
+fn refusal_of_access(access: &crate::state::StateAccess, shard: u16) -> ReplyBody {
+  match access {
+    crate::state::StateAccess::Fenced | crate::state::StateAccess::Retention(_) => {
+      refused(Refusal::ConsensusRecoveryUnavailable)
+    }
+    crate::state::StateAccess::Absent | crate::state::StateAccess::Borrowed => {
+      refused(Refusal::Overloaded { shard })
+    }
+  }
+}
+
+/// Runs `work` on a forwarded verb's owner `shard` and waits for it in that shard's own time
+/// ([`crate::xshard::within_shard_time`], up to the liveness budget of its CPU): its answer, or the refusal that says
+/// why there is none (A-564). A call that was not sent, or whose owner was given up before it answered, answers
+/// `Overloaded` for `shard`, not started; an owner whose state refused it answers by what refused it
+/// ([`refusal_of_access`]). Until A-564 every one of these was `None` (`xshard::call_in_shard_time`), which the forward
+/// answered `NotFound`.
+async fn call_owner<T: Send + 'static>(
+  control: u16,
+  shard: u16,
+  work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
+) -> Result<T, ReplyBody> {
+  let Ok(call) = crate::xshard::call_on(control, shard, move || {
+    Some(crate::state::try_with_state(work))
+  }) else {
+    return Err(refused(Refusal::Overloaded { shard }));
+  };
+  match crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS).await {
+    Some(Ok(answer)) => Ok(answer),
+    Some(Err(access)) => Err(refusal_of_access(&access, shard)),
+    None => Err(refused(Refusal::Overloaded { shard })),
+  }
 }
 
 /// A read forwarded from another node, on its volume's owner shard: refused while this node owns the volume by its own
@@ -1001,13 +1043,13 @@ fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<Rep
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
 /// are told, or, when the verb deferred its acceptance to a fleet commit, the completion that commit records.
 async fn answer_forwarded_write(
-  forwarded: Option<(Option<ReplyBody>, Option<crate::told::Owed>)>,
+  forwarded: (Option<ReplyBody>, Option<crate::told::Owed>),
   (control, shard): (u16, u16),
   origin_host: u64,
   id: RequestId,
-) -> Option<ReplyBody> {
+) -> ReplyBody {
   match forwarded {
-    Some((Some(reply), owed)) => {
+    (Some(reply), owed) => {
       // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
       // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
       if let Some(owed) = owed {
@@ -1019,12 +1061,11 @@ async fn answer_forwarded_write(
         )
         .await;
       }
-      Some(reply)
+      reply
     }
     // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
     // completion record the commit writes, within the same liveness budget.
-    Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
-    None => None,
+    (None, _) => await_deferred_completion(control, shard, origin_host, id).await,
   }
 }
 
@@ -1057,15 +1098,15 @@ fn forward_redirect(volume: VolumeId) -> Option<u64> {
 
 /// A forwarded `Forbidden` as [`not_shared_with`] when the requester has no rights on `volume` at all, judged on its
 /// owner `shard`, where the record is ([`rights_of`]). A requester that holds rights was refused for something a share
-/// cannot fix (a forward naming another host's attachment), so its `Forbidden` stands. Every other reply as it is; no
-/// reply at all is `NotFound`.
+/// cannot fix (a forward naming another host's attachment), so its `Forbidden` stands. Every other reply as it is.
+/// Until A-564 no reply at all was answered `NotFound` here; the owner's refusal is now typed where it is met
+/// ([`call_owner`]).
 async fn named_if_unshared(
-  reply: Option<ReplyBody>,
+  reply: ReplyBody,
   (control, shard): (u16, u16),
   volume: VolumeId,
   requester: Principal,
 ) -> ReplyBody {
-  let reply = reply.unwrap_or_else(|| refused(Refusal::NotFound));
   if !matches!(
     reply,
     ReplyBody::Refused {
@@ -1118,42 +1159,41 @@ fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
 /// liveness budget the exchange runs under. Past the budget the request is refused **retryable**
 /// (`Overloaded` names the owner shard): the acceptance still waits on the owner, and the origin's
 /// retry meets the completion record once the version commits — never a success the quorum has
-/// not committed.
+/// not committed. An owner whose state refuses the poll answers by what refused it ([`call_owner`], A-564).
 async fn await_deferred_completion(
   control: u16,
   shard: u16,
   origin_host: u64,
   id: RequestId,
-) -> Option<ReplyBody> {
+) -> ReplyBody {
   let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
   loop {
     // Off a shard no poll can be timed: the reply is given up, as at its deadline.
-    slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
+    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
       .await
-      .ok()?;
-    let recorded = crate::xshard::call_in_shard_time(
-      control,
-      shard,
-      move |s| match s
+      .is_err()
+    {
+      return refused(Refusal::Overloaded { shard });
+    }
+    let recorded = call_owner(control, shard, move |s| {
+      match s
         .db
         .partition()
         .completion(origin_host, id.client, id.sequence)
       {
         Seen::Completed(bytes) => Some(bytes),
         Seen::Acknowledged | Seen::New | Seen::Awaiting { .. } => None,
-      },
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
+      }
+    })
     .await;
     match recorded {
-      Some(Some(bytes)) => {
-        return Some(
-          ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
-        );
+      Ok(Some(bytes)) => {
+        return ReplyBody::from_bytes(&bytes)
+          .unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
       }
-      Some(None) if slates_rt::futures::now_ns() < deadline => {}
-      Some(None) => return Some(refused(Refusal::Overloaded { shard })),
-      None => return None,
+      Ok(None) if slates_rt::futures::now_ns() < deadline => {}
+      Ok(None) => return refused(Refusal::Overloaded { shard }),
+      Err(refusal) => return refusal,
     }
   }
 }
@@ -3136,7 +3176,9 @@ fn send_forward(
       let mut elsewhere = None;
       let mut remember_first = None;
       let mut carried = None;
-      let reply = crate::state::with_state(|s| {
+      // An owner whose state refuses the verb answers by what refused it, never `NotFound` for a volume that exists
+      // (A-564).
+      let reply = crate::state::try_with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
         // A mount of a volume this node lost to a successor is refused by its kind here, where the loss is known
         // (A-334's sibling), its completion keyed as every same-node forward's is.
@@ -3171,7 +3213,7 @@ fn send_forward(
         carried = Some(take_carried(s, request));
         reply
       })
-      .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
+      .unwrap_or_else(|access| Some(refusal_of_access(&access, owner)));
       if let Some((region, volume, control, request_bytes)) = elsewhere {
         // An attach of a volume this node lost is remembered with its client, on the client's shard where its slot is,
         // and sent from there once it is, so the client's reap reaches the successor (A-222's rule; A-334's sibling).
@@ -6240,7 +6282,7 @@ pub(crate) struct Credits {
 /// credits.
 pub(crate) struct Admitted {
   pub(crate) volume: Volume,
-  pub(crate) host: Option<OsHost>,
+  pub(crate) host: Option<BaseHost>,
   pub(crate) credits: Credits,
 }
 
@@ -6455,7 +6497,7 @@ pub(crate) fn publish_created_volume(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   volume: Volume,
-  host: Option<OsHost>,
+  host: Option<BaseHost>,
   credits: (
     Option<slates_mem::budget::Reservation>,
     Option<slates_mem::budget::VersionCredit>,
@@ -6888,12 +6930,13 @@ fn clone_base_host(
   state: &ShardState,
   origin: Handle<VolumeSlot>,
   record: &VolumeRecord,
-) -> Result<Option<OsHost>, Refusal> {
+) -> Result<Option<BaseHost>, Refusal> {
   let BaseRecord::Path { path } = &record.base else {
     return Ok(None);
   };
   let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
-  let Some(host) = slot.host.as_ref() else {
+  // A base the catalog records by its path is a host directory, read through a directory host.
+  let Some(host) = slot.host.as_ref().and_then(BaseHost::as_disk) else {
     return Err(Refusal::BaseUnavailable {
       path: path.clone(),
       errno: 0,
@@ -6901,7 +6944,7 @@ fn clone_base_host(
   };
   host
     .try_clone_dirs()
-    .map(Some)
+    .map(|host| Some(BaseHost::Disk(host)))
     .map_err(|error| base_open_refusal(path, error))
 }
 
@@ -6910,7 +6953,7 @@ fn open_base(
   state: &mut ShardState,
   path: &str,
   config: VolumeConfig,
-) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
+) -> Result<(Volume, Option<BaseHost>), Box<ReplyBody>> {
   let (mut host, root) = OsHost::open_root(std::path::Path::new(path))
     .map_err(|e| Box::new(refused(base_open_refusal(path, e))))?;
   let facts = host.facts(root).map_err(|_| {
@@ -6929,7 +6972,7 @@ fn open_base(
     },
   )
   .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?;
-  Ok((volume, Some(host)))
+  Ok((volume, Some(BaseHost::Disk(host))))
 }
 
 /// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
@@ -18037,7 +18080,7 @@ fn build_recovered_volume(
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
   size: SizeClass,
-) -> Result<(Volume, Option<OsHost>, u16), RecoveryCause> {
+) -> Result<(Volume, Option<BaseHost>, u16), RecoveryCause> {
   let image = image.ok_or(RecoveryCause::NoImage)?;
   let quota = quota_for(size);
   let journal = journal_floor_bytes(state);
@@ -18107,7 +18150,11 @@ fn build_recovered_volume(
       )),
     });
   }
-  Ok((volume, opened.map(|(host, _)| host), image.prefix))
+  Ok((
+    volume,
+    opened.map(|(host, _)| BaseHost::Disk(host)),
+    image.prefix,
+  ))
 }
 
 /// A recovered volume's resources that do not fit this process, named by `reason`.
@@ -22896,6 +22943,106 @@ mod tests {
       after_first, after_resend,
       "once: the resend replaced it no further"
     );
+  }
+
+  /// Shape: the peer a forwarded verb comes from in the fenced-owner test, a host of the fleet other than this daemon's.
+  const PEER: HostId = HostId(77);
+
+  /// The answer to `body` forwarded from another node ([`PEER`]), served on the daemon's control shard as its fleet
+  /// transport serves one (`serve_forward`), waited for within the observation budget.
+  fn served_as_forwarded(
+    daemon: &crate::daemon::Daemon,
+    body: super::RequestBody,
+  ) -> Option<ReplyBody> {
+    let (sent, received) = std::sync::mpsc::channel();
+    let forwarded = super::encode_body(&super::ForwardedRequest {
+      principal: scatter_asker(),
+      body,
+      request: slates_wire::request::RequestId {
+        client: ASKING,
+        sequence: 1,
+      }
+      .word(),
+      ack_up_to: None,
+      ack_owed: Vec::new(),
+    });
+    let spawned = crate::daemon::observe_first(daemon, move |state| {
+      let control = state.shard;
+      slates_rt::futures::spawn(async move {
+        let reply = super::serve_forward(control, PEER, &forwarded).await;
+        let _unheard = sent.send(reply);
+      })
+      .and_then(slates_rt::futures::detach)
+      .is_ok()
+    });
+    assert!(
+      spawned,
+      "the forward's task was spawned on the control shard"
+    );
+    let bytes = received
+      .recv_timeout(std::time::Duration::from_nanos(
+        crate::daemon::OBSERVE_BUDGET_NS,
+      ))
+      .ok()?;
+    super::decode_body::<ReplyBody>(&bytes).ok()
+  }
+
+  /// What the fenced-owner test was answered for a volume whose owner shard is fenced: asked by a client on another
+  /// shard of the same node, and forwarded from another node.
+  struct AskedOfAFencedOwner {
+    /// The answer to the client seated on the control shard.
+    same_node: Option<ReplyBody>,
+    /// The answer to the verb forwarded from [`PEER`].
+    another_node: Option<ReplyBody>,
+  }
+
+  /// On a two-shard daemon, makes a volume the second shard owns, fences that shard, then asks for the volume's status
+  /// from a client seated on the control shard and as a verb forwarded from another node.
+  fn asked_of_a_fenced_owner() -> AskedOfAFencedOwner {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let volume = crate::daemon::observe_at(&daemon, 1, |state| {
+      let name = owned_name(state, "fenced-owner");
+      plain_volume(state, &scatter_asker(), &name)
+    });
+    fence_shard(&daemon, 1);
+    let status = (1, super::RequestBody::Status { volume });
+    let (region, at_once) = crate::daemon::observe_first(&daemon, move |state| {
+      let (seat, region) = seat_asking(state);
+      (region, served_as_from_the_ring(state, seat, &status))
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let same_node = answer_of(&mut end, at_once);
+    let another_node = served_as_forwarded(&daemon, super::RequestBody::Status { volume });
+    daemon.stop();
+    AskedOfAFencedOwner {
+      same_node,
+      another_node,
+    }
+  }
+
+  /// A-564 (§4.8 "Lookup": the answer comes from the current owner and is authoritative). Do: on a two-shard daemon,
+  /// make a volume the second shard owns and fence that shard as a failed consensus publication does; ask for the
+  /// volume's status from a client on the control shard, and as a verb forwarded from another node. Expect: both are
+  /// refused `ConsensusRecoveryUnavailable`, the refusal a failed publication answers, and neither `NotFound`. Before,
+  /// both forwards took the fenced owner's refused borrow for no volume and answered `NotFound`, so a volume that
+  /// exists read as absent.
+  #[test]
+  fn a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found() {
+    let seen = asked_of_a_fenced_owner();
+    for (asked, answer) in [
+      ("on the same node", &seen.same_node),
+      ("from another node", &seen.another_node),
+    ] {
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::ConsensusRecoveryUnavailable
+          })
+        ),
+        "a volume whose owner is fenced, asked {asked}: {answer:?}"
+      );
+    }
   }
 
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
