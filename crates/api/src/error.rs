@@ -611,6 +611,50 @@ pub enum Elsewhere {
   RootLeader,
 }
 
+/// An operating system's number for a refusal, typed by the numbering it is in (A-539): an errno (Linux, macOS) or a
+/// Win32 error code (Windows). The two number their codes on their own, so a number is read only with its kind: 17 is
+/// `EEXIST` as an errno and `ERROR_NOT_SAME_DEVICE` as a Win32 code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsCode {
+  /// An errno.
+  Errno(i32),
+  /// A Win32 error code.
+  Win32(u32),
+}
+
+impl fmt::Display for OsCode {
+  /// The OS's own words where this process's platform numbers its codes the same way (its `os error` is the code), and
+  /// the number with its kind where it does not: a Win32 code is never looked up in an errno's table, nor an errno in
+  /// Win32's.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match (native_words(*self), self) {
+      (Some(words), _) => f.write_str(&words),
+      (None, Self::Errno(errno)) => write!(f, "errno {errno}"),
+      (None, Self::Win32(code)) => write!(f, "Win32 error {code}"),
+    }
+  }
+}
+
+/// The OS's words for a code in this platform's own numbering: an errno's here.
+#[cfg(not(windows))]
+fn native_words(code: OsCode) -> Option<String> {
+  match code {
+    OsCode::Errno(errno) => Some(std::io::Error::from_raw_os_error(errno).to_string()),
+    OsCode::Win32(_) => None,
+  }
+}
+
+/// The OS's words for a code in this platform's own numbering: a Win32 code's here.
+#[cfg(windows)]
+fn native_words(code: OsCode) -> Option<String> {
+  match code {
+    OsCode::Win32(code) => i32::try_from(code)
+      .ok()
+      .map(|code| std::io::Error::from_raw_os_error(code).to_string()),
+    OsCode::Errno(_) => None,
+  }
+}
+
 /// What the host refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostFault {
@@ -618,8 +662,8 @@ pub enum HostFault {
   Base {
     /// The folder.
     path: String,
-    /// The OS error number.
-    errno: i32,
+    /// The code the host named, typed by its numbering (A-539); none where it named none.
+    code: Option<OsCode>,
   },
   /// An overlay's base could not be read now: its drift is unknown (§4.15 "Drift").
   BaseUnreadable,
@@ -914,7 +958,15 @@ impl Error {
       }),
       Refusal::HomedElsewhere { region } => Error::Elsewhere(Elsewhere::Region { region }),
       Refusal::NotRootLeader => Error::Elsewhere(Elsewhere::RootLeader),
-      Refusal::BaseUnavailable { path, errno } => Error::Host(HostFault::Base { path, errno }),
+      // An errno of 0 names none (A-539).
+      Refusal::BaseUnavailable { path, errno } => Error::Host(HostFault::Base {
+        path,
+        code: (errno != 0).then_some(OsCode::Errno(errno)),
+      }),
+      Refusal::BaseUnavailableWin32 { path, code } => Error::Host(HostFault::Base {
+        path,
+        code: Some(OsCode::Win32(code)),
+      }),
       Refusal::Target { refusal } => Error::Host(HostFault::Target(refusal)),
       // No daemon of this build sends it (superseded by `Target`, A-299): a client and a daemon of different builds.
       Refusal::TargetUnavailable { reason } => {
@@ -1048,7 +1100,8 @@ fn target_words(refusal: TargetRefusal) -> String {
     TargetRefusal::OwnedByAnother { owner: None } => {
       "the path belongs to another user than the one the verb runs for".to_owned()
     }
-    TargetRefusal::Host { errno } => format!("the host refused the path: {}", errno_text(Some(errno))),
+    TargetRefusal::Host { errno } => format!("the host refused the path: {}", OsCode::Errno(errno)),
+    TargetRefusal::HostWin32 { code } => format!("the host refused the path: {}", OsCode::Win32(code)),
     TargetRefusal::NotMounted => "the kernel's mount table names no mount of this daemon's there".to_owned(),
     TargetRefusal::RecordsFull { capacity } => {
       format!("this daemon already records the {capacity} mounts it can as its own")
@@ -1084,11 +1137,10 @@ impl fmt::Display for HostFault {
   /// the CLI printed `Target("...")`).
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::Base { path, errno } => write!(
-        f,
-        "the overlay's base folder {path} is unavailable: {}",
-        errno_text(Some(*errno))
-      ),
+      Self::Base { path, code } => match code {
+        Some(code) => write!(f, "the overlay's base folder {path} is unavailable: {code}"),
+        None => write!(f, "the overlay's base folder {path} is unavailable"),
+      },
       Self::BaseUnreadable => {
         f.write_str("the overlay's base could not be read now, so its drift is unknown")
       }
@@ -1607,8 +1659,8 @@ mod tests {
   use slates_ipc::protocol::{Refusal, VolumeId};
 
   use super::{
-    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, ProtocolFault, RetryCause,
-    Stale, TargetRefusal, Unreported, Unusable,
+    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, OsCode, ProtocolFault,
+    RetryCause, Stale, TargetRefusal, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1782,7 +1834,11 @@ mod tests {
     for fault in [
       HostFault::Base {
         path: "/gone".to_owned(),
-        errno: 2,
+        code: Some(OsCode::Errno(2)),
+      },
+      HostFault::Base {
+        path: "/gone".to_owned(),
+        code: Some(OsCode::Win32(2)),
       },
       HostFault::BaseUnreadable,
       HostFault::Target(TargetRefusal::OwnedByAnother { owner: Some(501) }),

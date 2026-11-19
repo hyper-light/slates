@@ -284,6 +284,8 @@ pub struct LandingDegradationJs {
   pub answer: Option<String>,
   /// The host's errno (`crashed`, or an answer that was an errno).
   pub errno: Option<i32>,
+  /// The host's Win32 error code (`crashed`, or an answer that was one; Windows), never an errno (A-539).
+  pub win32: Option<u32>,
   /// The fallback's widest window, nanoseconds (`no_exchange`).
   pub widest_window_ns: Option<i64>,
 }
@@ -297,6 +299,7 @@ fn degradation_js(degradation: &LandingDegradation) -> Result<LandingDegradation
     kept: None,
     answer: None,
     errno: None,
+    win32: None,
     widest_window_ns: None,
   };
   let answered = |answer: &HostAnswer, out: &mut LandingDegradationJs| match answer {
@@ -305,6 +308,7 @@ fn degradation_js(degradation: &LandingDegradation) -> Result<LandingDegradation
     HostAnswer::NotFile => out.answer = Some("not_file".to_owned()),
     HostAnswer::StaleHandle => out.answer = Some("stale_handle".to_owned()),
     HostAnswer::Errno { errno } => out.errno = Some(*errno),
+    HostAnswer::Win32 { code } => out.win32 = Some(*code),
   };
   match degradation {
     LandingDegradation::NoExchange { widest_window_ns } => {
@@ -339,6 +343,10 @@ fn degradation_js(degradation: &LandingDegradation) -> Result<LandingDegradation
       out.kind = "kept".to_owned();
       out.path = Some(path.clone());
       out.kept = Some(kept.clone());
+    }
+    LandingDegradation::CrashedWin32 { code } => {
+      out.kind = "crashed".to_owned();
+      out.win32 = Some(*code);
     }
   }
   Ok(out)
