@@ -82,6 +82,12 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
 `d434dc14`'s by a Windows include and a comment; `libsvn_ra_svn/marshal.c` `361702975baa8c70`; `client.c`
 `b1d9607af70baf9c`; `cyrus_auth.c` `3bd4ba09916282fd`.
 
+For the reporter (A-616, 2026-11-19), at `d434dc14`, tier C: `libsvn_repos/reporter.c` `211be3256679d87f`,
+`libsvn_ra_svn/editorp.c` `610cffcd14b17ecf`, `libsvn_repos/delta.c` `0b150501bcdcec51`, `libsvn_delta/text_delta.c`
+`fc69ad86f58de9b9`, `include/svn_repos.h` `8421f33e065fd927` and `include/svn_delta.h` `809dd92780dd3c1d`; at 1.15.0:
+`reporter.c` `5657b77e3ad25d3f` (two comments and a hash constructor apart), `editorp.c` and `delta.c` byte-identical,
+and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` and `types.c` `8c9fe593b18d24cf`.
+
 ## 2. The wire: ra_svn (`svn://`, and `svn+ssh://` through a tunnel)
 
 - **The grammar** [B: `protocol` 9-15]: `item = word / number / string / list`; `word = ALPHA *(ALPHA / DIGIT / "-")
@@ -119,6 +125,22 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
   bytes first, as RFC 2104 does (recorded with 64- and 70-byte secrets). A client built with Cyrus SASL, as Homebrew's
   1.15.0 is, sends `ANONYMOUS` base64 of `anonymous@` and its host with a line feed, and `CRAM-MD5` unencoded
   (`cyrus_auth.c` 498-505, 553-555).
+- **The reporter** [C: `serve.c` 855-1050 and 1948-2160, `reporter.c`, `editorp.c`; M: `crates/svn/fixtures/report/`,
+  stock 1.15.0's sessions, A-616]. A stock client sends `update ( ( rev ) target recurse depth copyfrom ancestry )` with
+  depth `unknown` unless asked, both flags false; `switch` adds its URL; `status ( target recurse ( rev ) depth )`;
+  `diff` reparents to the root and names its target and versus URL. Its report is `set-path ( path rev start-empty
+  ( token? ) depth )`, a `delete-path` for each absent or not-present path, a `link-path ( path url rev ... )` for a
+  switched subtree, then `finish-report`, siblings in no fixed order between runs. `svnserve` answers the command's and
+  `finish-report`'s trivial auth requests, then drives: `target-rev`, `open-root ( ( rev ) d0 )`, each directory's
+  entry properties (`svn:entry:committed-rev`, `committed-date`, `last-author`, `uuid`, in that order) before its
+  others, deletions first, then entries in lexical order; tokens `d` or `c` and one counter from 0; a text as
+  `apply-textdelta ( token ( base-md5? ) )`, a 4-byte `SVN\x02` chunk and three chunks a window (header, instructions,
+  new data), `textdelta-end`, `close-file ( token ( md5 ) )`; an added file's new data in 102,400-byte windows;
+  `status`'s texts the header chunk alone; `delete-entry ( path ( rev? ) token )` with the revision of deletion, none
+  where the path never existed there; `absent-dir` where authorization hides a path; a valid lock token skips its
+  file, a broken one opens it to delete `svn:entry:lock-token`. `close-edit` waits for the client's `( success ( ) )`,
+  then `( success ( ) )`; a client's failure there is answered `abort-edit` and the failure returned; input waiting
+  before any editor command is answered `abort-edit` (`check_for_error`).
 - **Commands** [B: `protocol` 216-607]: the main set (reparent, get-latest-rev, get-dated-rev, change-rev-prop(2),
   rev-proplist, rev-prop, commit, get-file, get-dir, check-path, stat, get-mergeinfo, update, switch, status, diff, log,
   get-locations, get-location-segments, get-file-revs, lock(-many), unlock(-many), get-lock(s), replay(-range),
