@@ -32,10 +32,10 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`), `get-file` and `list` (each its own module, `file` and `list`). Owed with this
-//! piece: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by
-//! the authorization rules (A-606): today every path is readable, as in an `anon-access = read` repository with no
-//! rules.
+//! (`svn_repos_trace_node_locations`), `get-file`, `list` and `get-location-segments` (each its own module, `file`,
+//! `list` and `segments`). Owed with this piece: `log` with merged revisions, `get-file-revs`, `get-deleted-rev`, and
+//! read access by the authorization rules (A-606): today every path is readable, as in an `anon-access = read`
+//! repository with no rules.
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
@@ -169,7 +169,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 20] = [
+const ELSEWHERE: [&str; 19] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -179,7 +179,6 @@ const ELSEWHERE: [&str; 20] = [
   "status",
   "diff",
   "log",
-  "get-location-segments",
   "get-file-revs",
   "lock",
   "lock-many",
@@ -375,6 +374,7 @@ pub fn answer<R: Repository + ?Sized>(
     "get-locations" => reads.locations(params),
     "get-file" => reads.file(params),
     "list" => reads.list(params),
+    "get-location-segments" => reads.location_segments(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -1710,6 +1710,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 mod file;
 mod list;
+mod segments;
 mod stream;
 
 pub use stream::{Progress, Stream};
