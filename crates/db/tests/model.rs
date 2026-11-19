@@ -2780,7 +2780,9 @@ fn every_mint_is_new_and_a_recovery_mints_alike(steps: &[MintStep]) -> Result<()
         db = recovered;
       }
       MintStep::Alone => {
-        let counter = db.volume_counter_at(0).ok_or_else(|| failed("ids exhausted"))?;
+        let counter = db
+          .volume_counter_at(0)
+          .ok_or_else(|| failed("ids exhausted"))?;
         let record = minted_volume(counter);
         db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
           .map_err(failed)?;

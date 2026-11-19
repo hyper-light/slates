@@ -51785,3 +51785,40 @@ A-686), GAPS (the §4.17.3 entry).
 - **Owed.** The site's pushes (`unbundle` through `hg_push`: the push capabilities, the exchange driving prepare,
   admission, hooks and the landing, the reply framed as 7.2's `streamreslegacy`; A-680 part 2b); the stock `hg` round
   trip over the edge (g083's tests, once A-685 and A-686 land); the other platforms' runs (main's).
+
+### A-694 — An append's new branches are minted distinct volume ids, and a recovery mints what the live partition would (bug, 2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.1 "The repository and its greens" item 2 and shared piece 2; §4.8 "Lookup" and "Recovery"; A-635; found by A-687's import landing)
+
+Applied in the same change to: `crates/db` (`VolumeId::counter`; the partition's volume counter, its apply and its
+snapshot field; `Db::volume_counter_at`; the model test's minting histories), `crates/server` (`verbs::fresh_volume_id`
+and `fresh_volume_id_at`; `repository::push`'s plan; the append's and the Mercurial push's tests), GAPS (the A-635
+entry), `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.md`.
+- **The bug.** A volume id is the creator host, the owner partition and a counter (`verbs::fresh_volume_id`, §4.8
+  "Lookup"); the counter was the database's next log sequence, which moves only when a record commits. A-635's append
+  mints a new branch's id as it plans it, before anything is recorded, so every new branch of one entry got the same
+  id, and the second was refused `ContentUnavailable` with the whole entry: a git push under `atomic` creating two refs,
+  a Mercurial push making two lines or bookmarks, A-687's import of two bookmarks.
+- **The fix.** The partition keeps a volume counter: one past the highest counter of every volume created on it,
+  advanced by each `VolumeCreated` in `apply`, unconditionally, as the guard-then-apply rule asks of every replayed
+  effect, and carried by the partition's snapshot (appended). `Db::volume_counter_at(offset)` answers the counter the
+  `offset`-th id minted now takes, `max(next_seq, counter) + offset`, none past the register-class bit; the append's
+  plan mints each new branch at the count of new branches planned before it. One record's new volumes are minted
+  consecutive counters, each creation moves the counter past its own, so no later mint repeats one, inside the verb's
+  transaction or after it; and a recovery, which applies the same records or restores the snapshot, mints what the live
+  partition would.
+- **Not taken.** Offsets from the next sequence alone: the records after the entry mint from the next sequences, which
+  the entry's second and later ids would already hold. A counter kept beside the database: the counter is state a
+  replay must reproduce, so it lives where the log's apply moves it.
+- **Tests** (macOS arm64, Mac Studio, kiln r398, 2026-11-19, debug, rustc 1.98.1, over main b288b412e):
+  `t_a694_an_append_makes_each_new_branch_its_own_green` (three new branches in one entry, each its own green holding its
+  source's file and bound to its name, a fourth made after by the branch verb, every counter past the one before it),
+  `t_a694_a_push_making_two_bookmarks_makes_two_greens` (a `bookmarks` part making two bookmarks at a held changeset,
+  each its own green at it), `t_a694_every_mint_is_new_and_a_recovery_mints_alike` (the db model test: generated
+  histories of volumes created alone and several to one record, the database dropped and recovered at random points,
+  every id new and every recovery equal to the live partition, minting the next id the live database would). Red first
+  (branch `agents/g300-a694-mint-ids-red` at 8dd016acd, every new branch minted at offset 0): `cargo test --locked -p
+  slates-server --lib -- t_a694` 0 passed, 2 failed, the append refused and the Mercurial push answered `error:abort`
+  naming change 1 `ContentUnavailable`. Green (d53177e26): `-p slates-db --test model -- t_a694 every_recovery` 3 of 3
+  (the recovery histories compare the snapshot, which now carries the counter), `-p slates-db --lib -- snapshot` 8 of 8,
+  `-p slates-server --lib -- t_a694 repository::push repository::hg_push repository::tests git_push vcs_store::` 55 of
+  55, `-p slates-server --test green_checkpoint` 6 of 6, `cargo fmt` (one rewrap of the model test, applied). Main's:
+  clippy, `xtask check`, the doc gates and the other platforms.
