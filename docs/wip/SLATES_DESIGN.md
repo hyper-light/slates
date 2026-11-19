@@ -11984,6 +11984,14 @@ is one more version, and the chain itself is never rewritten.
 > git or Subversion point; Mercurial's `point.suffix` names, each once), or running a program that is not an absolute
 > path. Its rules' and hooks' encoded bytes are charged to the partition's merge budget, given back when it is
 > replaced or its repository leaves, and charged again by a partition rebuilt from its snapshot.
+>
+> **Status (2026-11-19, A-622 part 2: the push's check point).** `vcs_policy::admit(record, principal, asked)` is the
+> one function every push path calls before it submits its register entry: the record's policy compiled for its tool,
+> and each change the push asks for (its name in the tool's terms and the right its change needs, which the push's own
+> tool decides: a create or a fast-forward submits, a move to a head that does not descend from the current one
+> rewrites, a removal deletes) judged in order; the first refused is the push's typed refusal (`PushRefusal`: denied by
+> rule n, not listed, not permitted, another tool's name, or a policy its matcher cannot read), naming the change by
+> index. A change no rule speaks to is the owner's alone (A-575), and a rule binds the owner as it binds anyone.
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12091,8 +12099,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
-   learned deadlines and the runner; A-622 part 1 the policy in the repository record and its verb; the push paths'
-   check and the hook driver are owed, A-622's next parts).
+   learned deadlines and the runner; A-622 part 1 the policy in the repository record and its verb, part 2 the push's
+   check point; the hook driver is owed, A-622's part 3).
 
 Each server's pieces follow these, in its own section.
 
@@ -41962,3 +41970,30 @@ Applied in the same change to:
   Subversion push pieces call, with a typed refusal), and the hook driver (an owned hook process over a read-only
   attachment of the work, its learned deadline from A-597's runner). A client and CLI form of the verb are owed with
   the servers' administration.
+
+### A-622 part 2 — The push's check point: one function every push path calls, its refusal typed (2026-11-19, g255, UI goal 93; §4.17.1 "Policy" and shared piece 7's rest; after A-622 part 1)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7); GAPS (the §4.17 entry);
+- `crates/server` (`vcs_policy.rs`: `admit`, `Asked`, `Name`, `PushRefusal`, `Compiled`; `lib.rs`'s note).
+
+- **The function.** `admit(record, principal, asked)`: the repository's policy, as its record holds it, compiled for its
+  tool by A-597's matcher, and each change in `asked` judged in order. A change is a name (a git ref, a Mercurial
+  branch, bookmark or topic, a Subversion path) and the right its change needs, which the push's own tool decides from
+  what it knows (git's receive-pack: a create or a fast-forward submits, a non-fast-forward rewrites, a delete
+  deletes; Subversion's commit editor: each path a commit changes; Mercurial's unbundle: each line, bookmark or topic it
+  moves). The git, Subversion and Mercurial push pieces (A-620, A-617 and the unbundle's) call it before submitting
+  their register entry (A-603), so a refused push records nothing.
+- **The verdicts.** Allowed by a rule: admitted. Denied by a rule: refused `Denied`, naming the change and the rule.
+  Mercurial's allow list not naming the principal: `NotListed`. No rule speaking: admitted for the repository's owner,
+  who holds every right a policy leaves unruled (A-575, §4.13), and refused `NotPermitted` to anyone else. A name of
+  another tool: `OtherTool`. A rule the matcher cannot read: `Unreadable`, refused rather than judged without it, since
+  the database's guard keeps such rules out of the log (part 1). A rule binds the owner as it binds anyone, as acl's
+  lists and authz's sections do.
+- **Tests** (Mac Studio, kiln, debug, 2026-11-19): `cargo test --locked -p slates-server --lib -- vcs_policy::`, the
+  check point's three tests beside A-597's: git (an owner's fast-forward of `main` admitted while a rule denies its
+  rewrite; a stranger admitted only where a rule names them; a two-change push refused at its second; a Mercurial name
+  refused), Mercurial and Subversion (acl's allow list binding the owner too, an unnamed bookmark the owner's alone,
+  authz's deeper `/tags/**` denial over the trunk's allowance), and a damaged record refused `Unreadable`. Red first, on
+  a copy whose unruled changes were anyone's.
+- **Owed:** the push pieces' calls (with each tool's words for the refusals: git's `ng <ref>` reason, Mercurial's
+  abort, Subversion's authorization error), and the hook driver (part 3).

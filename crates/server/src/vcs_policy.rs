@@ -41,10 +41,18 @@
 //! one look-up a depth, with the rules holding wildcards matched by the positions each segment can reach. The tests'
 //! oracles try every rule in order, as each tool's documentation states the rule, with git's own matcher transcribed
 //! (`crate::wildmatch::reference`), and every generated history must get the same verdict from both.
+//!
+//! **The push's check point (A-622 part 2).** [`admit`] is the one function every push path calls before it submits
+//! its register entry (git's receive-pack, Subversion's commit editor, Mercurial's unbundle): the repository's policy,
+//! as its record holds it (A-622 part 1), compiled for its tool, and each change the push asks for judged in order (the
+//! name and the right its change needs, which the push's own tool decides: a create or a fast-forward submits, a move
+//! to a head that does not descend from the current one rewrites, a removal deletes). The first change refused is the
+//! push's typed refusal ([`PushRefusal`]), naming it by index and the rule that decided. A change no rule speaks to is
+//! its repository's owner's alone, who holds every right a policy leaves unruled (A-575, §4.13).
 
 use std::collections::HashMap;
 
-use slates_db::catalog::Principal;
+use slates_db::catalog::{Principal, RepositoryRecord};
 
 use crate::wildmatch::{Glob, is_glob_special};
 
@@ -648,6 +656,201 @@ impl SvnPolicy {
       .max();
     decide(&self.rules, best.map(|(_, position)| position))
   }
+}
+
+/// One name a push changes, and the right its change needs, as the push's own tool classified it (A-622 part 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Asked<'a> {
+  /// The name.
+  pub(crate) name: Name<'a>,
+  /// The right the change needs.
+  pub(crate) right: Right,
+}
+
+/// A name as each tool's push names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Name<'a> {
+  /// A git ref's full name.
+  Ref(&'a [u8]),
+  /// A Mercurial branch, bookmark or topic.
+  Hg(Namespace, &'a str),
+  /// A Subversion repository path.
+  Path(&'a [u8]),
+}
+
+/// Why a repository's policy refuses a push (A-622 part 2), naming the change it asked for by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushRefusal {
+  /// Rule `rule` of the policy denies the change its right.
+  Denied {
+    /// The change's index among those the push asked for.
+    index: u32,
+    /// The deciding rule's index among the policy's rules.
+    rule: u32,
+  },
+  /// Mercurial: rules allow the right in the name's namespace and none names the principal on the name (acl's "not
+  /// allowed").
+  NotListed {
+    /// The change's index.
+    index: u32,
+  },
+  /// No rule speaks to the change, and the principal is not the repository's owner, who alone holds what a policy leaves
+  /// unruled (A-575).
+  NotPermitted {
+    /// The change's index.
+    index: u32,
+  },
+  /// The name is of a kind the repository's tool does not have (a Mercurial name pushed to a git repository).
+  OtherTool {
+    /// The change's index.
+    index: u32,
+  },
+  /// The policy holds a rule its tool's matcher cannot read. The database's guard keeps such rules out of the log
+  /// (A-622 part 1), so this is a damaged record, and the push is refused rather than judged without the rule.
+  Unreadable {
+    /// The rule's index among the policy's rules.
+    rule: u32,
+  },
+}
+
+/// An index as a refusal names it.
+fn index_of(index: usize) -> u32 {
+  u32::try_from(index).unwrap_or(u32::MAX)
+}
+
+/// A repository's policy compiled for its tool's names (A-622 part 2).
+#[derive(Clone, Debug)]
+pub(crate) enum Compiled {
+  /// A git repository's.
+  Git(GitPolicy),
+  /// A Mercurial repository's.
+  Mercurial(HgPolicy),
+  /// A Subversion repository's.
+  Subversion(SvnPolicy),
+}
+
+impl Compiled {
+  /// The rules of `record`'s policy compiled for its tool; `Unreadable` naming the first rule its tool's matcher cannot
+  /// read.
+  pub(crate) fn of(record: &RepositoryRecord) -> Result<Self, PushRefusal> {
+    use slates_db::catalog::VcsTool;
+    let rules = &record.policy.rules;
+    Ok(match record.tool {
+      VcsTool::Git => Self::Git(GitPolicy::new(compiled_rules(rules, |rule| {
+        match rule.names {
+          slates_db::catalog::PolicyNames::Refs => RefPattern::parse(&rule.pattern).ok(),
+          _ => None,
+        }
+      })?)),
+      VcsTool::Mercurial => Self::Mercurial(HgPolicy::new(compiled_rules(rules, |rule| {
+        let namespace = match rule.names {
+          slates_db::catalog::PolicyNames::Branches => Namespace::Branch,
+          slates_db::catalog::PolicyNames::Bookmarks => Namespace::Bookmark,
+          slates_db::catalog::PolicyNames::Topics => Namespace::Topic,
+          _ => return None,
+        };
+        HgPattern::parse(namespace, &rule.pattern).ok()
+      })?)),
+      VcsTool::Subversion => Self::Subversion(SvnPolicy::new(compiled_rules(rules, |rule| {
+        match rule.names {
+          slates_db::catalog::PolicyNames::Paths => PathPattern::parse(&rule.pattern).ok(),
+          _ => None,
+        }
+      })?)),
+    })
+  }
+
+  /// The verdict on `principal`'s `right` on `name`, or none for a name of another tool.
+  pub(crate) fn verdict(&self, name: Name<'_>, principal: &Principal, right: Right) -> Option<Verdict> {
+    match (self, name) {
+      (Self::Git(policy), Name::Ref(name)) => Some(policy.verdict(name, principal, right)),
+      (Self::Mercurial(policy), Name::Hg(namespace, name)) => {
+        Some(policy.verdict(namespace, name, principal, right))
+      }
+      (Self::Subversion(policy), Name::Path(path)) => Some(policy.verdict(path, principal, right)),
+      _ => None,
+    }
+  }
+}
+
+/// `rules` compiled by `pattern`, which reads a rule's pattern in its tool's form or answers none; `Unreadable` naming
+/// the first it cannot read.
+fn compiled_rules<P>(
+  rules: &[slates_db::catalog::PolicyRule],
+  pattern: impl Fn(&slates_db::catalog::PolicyRule) -> Option<P>,
+) -> Result<Vec<Rule<P>>, PushRefusal> {
+  rules
+    .iter()
+    .enumerate()
+    .map(|(index, rule)| {
+      let pattern = pattern(rule).ok_or(PushRefusal::Unreadable {
+        rule: index_of(index),
+      })?;
+      Ok(Rule {
+        pattern,
+        right: right_of(rule.right),
+        effect: match rule.effect {
+          slates_db::catalog::PolicyEffect::Allow => Effect::Allow,
+          slates_db::catalog::PolicyEffect::Deny => Effect::Deny,
+        },
+        who: who_of(&rule.who),
+      })
+    })
+    .collect()
+}
+
+/// The matcher's form of a right the record names.
+fn right_of(right: slates_db::catalog::PolicyRight) -> Right {
+  match right {
+    slates_db::catalog::PolicyRight::Read => Right::Read,
+    slates_db::catalog::PolicyRight::Submit => Right::Submit,
+    slates_db::catalog::PolicyRight::Rewrite => Right::Rewrite,
+    slates_db::catalog::PolicyRight::Delete => Right::Delete,
+  }
+}
+
+/// The matcher's form of the principals a record's rule speaks to.
+fn who_of(who: &slates_db::catalog::PolicyWho) -> Who {
+  match who {
+    slates_db::catalog::PolicyWho::Anyone => Who::Anyone,
+    slates_db::catalog::PolicyWho::AnyOf { entries } => Who::AnyOf(
+      entries
+        .iter()
+        .map(|entry| match entry {
+          slates_db::catalog::PolicyEntry::Is { principal } => Entry::Is(principal.clone()),
+          slates_db::catalog::PolicyEntry::IsNot { principal } => Entry::IsNot(principal.clone()),
+        })
+        .collect(),
+    ),
+  }
+}
+
+/// The check point every push calls before it submits its register entry (the module doc, A-622 part 2): each change
+/// in `asked`, in order, judged by `record`'s policy for `principal`; the first refused is the push's refusal. A change
+/// no rule speaks to is the owner's alone.
+pub(crate) fn admit(
+  record: &RepositoryRecord,
+  principal: &Principal,
+  asked: &[Asked<'_>],
+) -> Result<(), PushRefusal> {
+  let compiled = Compiled::of(record)?;
+  for (index, change) in asked.iter().enumerate() {
+    let index = index_of(index);
+    match compiled.verdict(change.name, principal, change.right) {
+      None => return Err(PushRefusal::OtherTool { index }),
+      Some(Verdict::Allowed { .. }) => {}
+      Some(Verdict::Unruled) if *principal == record.owner => {}
+      Some(Verdict::Unruled) => return Err(PushRefusal::NotPermitted { index }),
+      Some(Verdict::NotListed) => return Err(PushRefusal::NotListed { index }),
+      Some(Verdict::Denied { rule }) => {
+        return Err(PushRefusal::Denied {
+          index,
+          rule: index_of(rule),
+        });
+      }
+    }
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -1314,5 +1517,227 @@ mod tests {
         );
       }
     }
+  }
+
+  /// A record's rule: `effect` for `right` on `pattern` of `names`, to `who` (A-622 part 2).
+  fn record_rule(
+    names: slates_db::catalog::PolicyNames,
+    pattern: &str,
+    (right, effect): (slates_db::catalog::PolicyRight, slates_db::catalog::PolicyEffect),
+    who: slates_db::catalog::PolicyWho,
+  ) -> slates_db::catalog::PolicyRule {
+    slates_db::catalog::PolicyRule {
+      names,
+      pattern: pattern.to_owned(),
+      right,
+      effect,
+      who,
+    }
+  }
+
+  /// The record's form of `who` naming exactly these uids.
+  fn record_only(uids: &[u32]) -> slates_db::catalog::PolicyWho {
+    slates_db::catalog::PolicyWho::AnyOf {
+      entries: uids
+        .iter()
+        .map(|&uid| slates_db::catalog::PolicyEntry::Is {
+          principal: principal(uid),
+        })
+        .collect(),
+    }
+  }
+
+  /// Shape: the repository owner's uid in the check point's tests.
+  const OWNER: u32 = 1;
+  /// Shape: a principal other than the owner.
+  const STRANGER: u32 = 2;
+
+  /// A repository record of `tool` owned by `OWNER`, its policy `rules` at version 1.
+  fn record(
+    tool: slates_db::catalog::VcsTool,
+    rules: Vec<slates_db::catalog::PolicyRule>,
+  ) -> super::RepositoryRecord {
+    super::RepositoryRecord {
+      id: slates_db::catalog::RepositoryId { bytes: [0; 16] },
+      name: "repository".to_owned(),
+      tool,
+      format: slates_db::catalog::ObjectFormat::Sha1,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: slates_db::catalog::RepositoryPolicy {
+        version: 1,
+        rules,
+        hooks: Vec::new(),
+      },
+    }
+  }
+
+  /// A change of git ref `name` needing `right`.
+  fn git_change(name: &str, right: Right) -> super::Asked<'_> {
+    super::Asked {
+      name: super::Name::Ref(name.as_bytes()),
+      right,
+    }
+  }
+
+  /// A-622 part 2 (the check point, git). Do: with rules letting one stranger submit to `refs/heads/feature/*` and
+  /// denying everyone the rewrite of `refs/heads/main`, ask for the owner's fast-forward and rewrite of `main`, the
+  /// stranger's push to a feature branch and to `main`, a push of two changes whose second is refused, and a Mercurial
+  /// name. Expect: the owner's fast-forward admitted (no rule speaks, so it is the owner's), its rewrite denied by rule 1;
+  /// the stranger admitted on the feature branch by rule 0 and refused `NotPermitted` on `main`; the two-change push
+  /// refused at its second change; the Mercurial name refused as another tool's.
+  #[test]
+  fn a_push_is_admitted_by_its_repositorys_policy_and_its_owners_rights() {
+    use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight, PolicyWho, VcsTool};
+    let git = record(
+      VcsTool::Git,
+      vec![
+        record_rule(
+          PolicyNames::Refs,
+          "refs/heads/feature/*",
+          (PolicyRight::Submit, PolicyEffect::Allow),
+          record_only(&[STRANGER]),
+        ),
+        record_rule(
+          PolicyNames::Refs,
+          "refs/heads/main",
+          (PolicyRight::Rewrite, PolicyEffect::Deny),
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let (owner, stranger) = (principal(OWNER), principal(STRANGER));
+    let main = "refs/heads/main";
+    assert_eq!(super::admit(&git, &owner, &[git_change(main, Right::Submit)]), Ok(()));
+    assert_eq!(
+      super::admit(&git, &owner, &[git_change(main, Right::Rewrite)]),
+      Err(super::PushRefusal::Denied { index: 0, rule: 1 })
+    );
+    let feature = "refs/heads/feature/x";
+    assert_eq!(
+      super::admit(&git, &stranger, &[git_change(feature, Right::Submit)]),
+      Ok(())
+    );
+    assert_eq!(
+      super::admit(&git, &stranger, &[git_change(main, Right::Submit)]),
+      Err(super::PushRefusal::NotPermitted { index: 0 })
+    );
+    assert_eq!(
+      super::admit(
+        &git,
+        &owner,
+        &[git_change(feature, Right::Submit), git_change(main, Right::Rewrite)]
+      ),
+      Err(super::PushRefusal::Denied { index: 1, rule: 1 })
+    );
+    let other_tool = super::Asked {
+      name: super::Name::Hg(Namespace::Branch, "default"),
+      right: Right::Submit,
+    };
+    assert_eq!(
+      super::admit(&git, &owner, &[other_tool]),
+      Err(super::PushRefusal::OtherTool { index: 0 })
+    );
+  }
+
+  /// A-622 part 2 (the check point, Mercurial and Subversion). Do: in a Mercurial repository whose rule lets one
+  /// stranger submit to branch `stable`, ask for the stranger's, a third principal's and the owner's push to `stable`,
+  /// and the owner's and the stranger's push to a bookmark no rule names; in a Subversion repository letting everyone
+  /// submit under `/trunk` and denying everyone `:glob:/tags/**`, ask for commits there and beside them. Expect: on
+  /// `stable` the stranger admitted and the others refused `NotListed`, the owner too (acl's allow list binds everyone);
+  /// the bookmark the owner's alone; the trunk open to everyone, the tags closed to the owner by rule 1, a path neither
+  /// covers the owner's alone.
+  #[test]
+  fn a_push_is_judged_by_acls_order_and_authzs_depth_at_the_check_point() {
+    use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight, PolicyWho, VcsTool};
+    let hg = record(
+      VcsTool::Mercurial,
+      vec![record_rule(
+        PolicyNames::Branches,
+        "stable",
+        (PolicyRight::Submit, PolicyEffect::Allow),
+        record_only(&[STRANGER]),
+      )],
+    );
+    let push = |namespace, name, uid: u32| {
+      super::admit(
+        &hg,
+        &principal(uid),
+        &[super::Asked {
+          name: super::Name::Hg(namespace, name),
+          right: Right::Submit,
+        }],
+      )
+    };
+    let not_listed = Err(super::PushRefusal::NotListed { index: 0 });
+    assert_eq!(push(Namespace::Branch, "stable", STRANGER), Ok(()));
+    assert_eq!(push(Namespace::Branch, "stable", OTHER), not_listed);
+    assert_eq!(push(Namespace::Branch, "stable", OWNER), not_listed);
+    assert_eq!(push(Namespace::Bookmark, "feature", OWNER), Ok(()));
+    assert_eq!(
+      push(Namespace::Bookmark, "feature", STRANGER),
+      Err(super::PushRefusal::NotPermitted { index: 0 })
+    );
+    let svn = record(
+      VcsTool::Subversion,
+      vec![
+        record_rule(
+          PolicyNames::Paths,
+          "/trunk",
+          (PolicyRight::Submit, PolicyEffect::Allow),
+          PolicyWho::Anyone,
+        ),
+        record_rule(
+          PolicyNames::Paths,
+          ":glob:/tags/**",
+          (PolicyRight::Submit, PolicyEffect::Deny),
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let commit = |path: &str, uid: u32| {
+      super::admit(
+        &svn,
+        &principal(uid),
+        &[super::Asked {
+          name: super::Name::Path(path.as_bytes()),
+          right: Right::Submit,
+        }],
+      )
+    };
+    assert_eq!(commit("/trunk/src/main.c", STRANGER), Ok(()));
+    assert_eq!(
+      commit("/tags/1.0/main.c", OWNER),
+      Err(super::PushRefusal::Denied { index: 0, rule: 1 })
+    );
+    assert_eq!(commit("/branches/b/main.c", OWNER), Ok(()));
+    assert_eq!(
+      commit("/branches/b/main.c", STRANGER),
+      Err(super::PushRefusal::NotPermitted { index: 0 })
+    );
+  }
+
+  /// A-622 part 2. Do: judge a push against a git repository's record holding a branch rule, which its guard would have
+  /// refused (a damaged record). Expect: refused `Unreadable` naming the rule, never judged without it.
+  #[test]
+  fn a_push_against_a_policy_its_matcher_cannot_read_is_refused() {
+    use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight, PolicyWho, VcsTool};
+    let damaged = record(
+      VcsTool::Git,
+      vec![record_rule(
+        PolicyNames::Branches,
+        "main",
+        (PolicyRight::Submit, PolicyEffect::Deny),
+        PolicyWho::Anyone,
+      )],
+    );
+    assert_eq!(
+      super::admit(
+        &damaged,
+        &principal(OWNER),
+        &[git_change("refs/heads/main", Right::Submit)]
+      ),
+      Err(super::PushRefusal::Unreadable { rule: 0 })
+    );
   }
 }
