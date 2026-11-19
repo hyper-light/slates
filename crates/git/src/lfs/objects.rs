@@ -19,9 +19,11 @@
 //! an object: a streaming put, window by window as the body arrives, is owed to that crate.
 
 use slates_vcs::{
-  AdmitRefused, Admitted, Arriving, CommitRefused, ContentRefused, ContentStore, Index,
-  IndexRefused, Naming, Quarantine, object_row,
+  AdmitRefused, Arriving, CommitRefused, ContentRefused, Index, IndexRefused, Naming, Quarantine,
+  object_row,
 };
+/// The store's types an implementer of the server's `Objects` seam names (A-629 part 2b-ii).
+pub use slates_vcs::{Admitted, ContentStore};
 
 use super::Oid;
 
