@@ -11629,6 +11629,14 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > accepts it, the restated journal replayed, and the green that accepts that journal composed again) with a census
 > of every case (`docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`).
 
+> **Status (2026-11-19, A-677: a rebase's files hold the node a removed home hands to its link).** A version that
+> removes or replaces a file's home while hard links still name its node hands the node to the least surviving link
+> (A-646, `Green::node_moves`), which takes it as the version leaves it (A-669's rule). A rebase's journal stays the
+> work's own operations, since a volume's link names the node already; its changes now hold that link with the node's
+> bytes, as the submit leaves it (`Green::heirs_of`). Before, they held the home's removal alone, so a rebased work's
+> files lost the link the submit kept, and the rebase oracle failed on some seeds
+> (`docs/bugs/2026-11-19-a-rebases-files-lost-the-link-a-removed-home-handed-its-node-to.md`).
+
 **Rebase off the owner (A-273): measured and rejected (A-528).** A work's rebase and its base reads at a named
 version are the green's owner's: a work's shard asks them of the owner's shard (A-247, A-388), which answers them on
 its one thread beside the verdicts. A-273 tried keeping a replica of the green on each shard that holds its works (the
@@ -13646,8 +13654,28 @@ signature verification).
 > `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
 > branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
 > histories (macOS arm64, Mac Studio: slates-hg's push tests 36 of 36, the server's 7 of 7; other platforms owed).
-> Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index and the
-> served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+> Owed: the server's home for each repository's index and the served view over it (with A-650), the bundle read in
+> slices, the pushkey and part hooks, markers (piece 7).
+>
+> **Status (2026-11-19, A-657 part 4: a push's admission).** Before its verdict a prepared push asks the repository's
+> policy about every name it changes (`hg_push::admitted` over A-622 part 2's `vcs_policy::admit`: a line moved,
+> merged away or made on a new branch submits to its branch, a line made beside another head rewrites it, a bookmark
+> moved forward or made submits, moved elsewhere rewrites, deleted deletes), refused in `acl`'s words naming the
+> principal, the name and its changeset as 7.2's `acl` names it (a branch's first new changeset in `short`'s twelve
+> digits, the branches asked in the order the push brings them, as `acl` walks revisions; a bookmark's new node in all
+> forty, none for a deletion), or in hgweb's for a principal no rule lets push. Then the repository's
+> `pretxnchangegroup` hooks run in their order through A-622's hook driver over
+> the push's pending view, `HG_NODE` and `HG_NODE_LAST` its first and last new changesets and none when it adds none,
+> the first that does not accept stopping the rest and answering `<name> hook exited with status <n>` (or `killed by
+> signal <n>`) with every hook's words salvaged as `output` parts after the changegroup's reply; the `changegroup`
+> hooks run after the commit and change no answer. Each hook's environment is the one stock 7.2 hands it, recorded from
+> 7.2 itself (`crates/hg/fixtures/hooks`): beside A-597's, `HG`, `HGPLAIN` 1, `HG_BUNDLE2` 1, `HG_TXNNAME` `serve`, and
+> one `HG_TXNID` for both hooks of a push. Proven on the fixtures' repository (a rule denying `default`, a list leaving
+> the owner out on bookmarks, a bookmark deleted, a push opening `stable` before moving `default`), against the
+> recorded environments, and through the driver with the test binary playing each hook (macOS arm64, Mac Studio:
+> red with the five variables removed, then the server's 47 of 47 and slates-hg's 36 of 36). Owed: the principal's
+> Mercurial identity in `acl`'s words (§4.13), the pending view itself (piece 9's revlog view), the hooks' learned
+> times kept per hook on the shard.
 >
 > **Status (2026-11-19, A-650 part 1: HTTP version 1 served).** `serve::http` answers a request as 7.2's `_callhttp`
 > does: its command the query's last `cmd`, as hgweb's `multidict` reads it (A-569's codec read the first, corrected);
@@ -13657,25 +13685,24 @@ signature verification).
 > 7.2's media types: a string in `application/mercurial-0.1`, an error in `application/hg-error`, a stream in
 > `application/mercurial-0.2` in an engine the client reads (an abort part uncompressed, as 7.2 sends it), else in `0.1`
 > in zlib. The engine and level are the caller's (`Compressor`), and each answer is charged at its engine's documented
-> bound before it is made (zlib's, stock zlib's `compressBound`, is outgrown by the linked zlib-rs's level 1 on bytes
-> that do not compress: GAPS, its own piece). `getbundle` judges the bundle capabilities before what is missing, in
-> 7.2's order, so a bundle1 client is never sent a bundle2 abort. The daemon's site (`vcs_http::hg`) routes a
-> repository's URL as hgweb does, proves credentials as git's site does (by A-625 part 3's record), moves a proven
-> request for a repository another shard holds there (A-625 part 3), judges the policy in hgweb's order (read for every
-> request; a push also `POST` and a right to submit, rewrite or delete), and names the answer's media type as the reply
-> begins (the edge's `reply_fields`); hgweb's pages, and a repository whose store the shard does not hold, are `503`
-> until piece 12 and until the site is handed A-662's stores. Until the estimator below lands, a stream takes the
-> design's first value, the fastest form the client reads (`none` where it reads it, else its first engine at its
-> fastest level; zlib at level 0 to a `0.1` client). Proven by `slates-hg --lib` 306 of 306 (this piece's 9 among them),
-> `slates-http-edge --lib` 32 of 32 and `slates-server --lib vcs_http` 40 of 40 on macOS arm64 (Mac Studio, kiln r137 on
-> the tree that lands and r6 for the edge, 2026-11-19; the other platforms owed): a stock 7.2 client's clone, pull and
-> incoming over HTTP against stock `hg serve` (`crates/hg/fixtures/serve-http`), each answer as 7.2 meant it (strings
-> byte for byte in 7.2's media types, the capabilities a subset of 7.2's, each `getbundle`'s zstd stream inflated and
-> compared as the session's golden compares one); 7.2's own words for what it refuses; the abort and zlib framings; a
-> chooser past the client's engines refused; hostile requests; the site's statuses in hgweb's order; a proven request
-> moved to its repository's shard; the edge's late fields. Owed of piece 4: the estimator (the connection's delivery
-> rate, and this repository's compression speed and ratio), the answers sliced within the shard's budget, the process
-> around `slates hg serve --stdio`, held deltas, the index's kept heads.
+> bound before it is made (zlib's as the linked zlib-rs states it, A-673). `getbundle` judges the bundle capabilities
+> before what is missing, in 7.2's order, so a bundle1 client is never sent a bundle2 abort. The daemon's site
+> (`vcs_http::hg`) routes a repository's URL as hgweb does, proves credentials as git's site does (by A-625 part 3's
+> record), moves a proven request for a repository another shard holds there (A-625 part 3), judges the policy in
+> hgweb's order (read for every request; a push also `POST` and a right to submit, rewrite or delete), and names the
+> answer's media type as the reply begins (the edge's `reply_fields`); hgweb's pages, and a repository whose store the
+> shard does not hold, are `503` until piece 12 and until the site is handed A-662's stores. Until the estimator below
+> lands, a stream takes the design's first value, the fastest form the client reads (`none` where it reads it, else its
+> first engine at its fastest level; zlib at level 0 to a `0.1` client). Proven by `slates-hg --lib` 306 of 306 (this
+> piece's 9 among them), `slates-http-edge --lib` 32 of 32 and `slates-server --lib vcs_http` 40 of 40 on macOS arm64
+> (Mac Studio, kiln r137 on the tree that lands and r6 for the edge, 2026-11-19; the other platforms owed): a stock 7.2
+> client's clone, pull and incoming over HTTP against stock `hg serve` (`crates/hg/fixtures/serve-http`), each answer as
+> 7.2 meant it (strings byte for byte in 7.2's media types, the capabilities a subset of 7.2's, each `getbundle`'s zstd
+> stream inflated and compared as the session's golden compares one); 7.2's own words for what it refuses; the abort and
+> zlib framings; a chooser past the client's engines refused; hostile requests; the site's statuses in hgweb's order; a
+> proven request moved to its repository's shard; the edge's late fields. Owed of piece 4: the estimator (the
+> connection's delivery rate, and this repository's compression speed and ratio), the answers sliced within the shard's
+> budget, the process around `slates hg serve --stdio`, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14097,7 +14124,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    through A-618's builder over laid-out flat manifests. Built (A-657, part 3; `push::classify`, `push::held`,
    `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
    (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
-   each green's log with the phase roots in the same entry, the index kept; owed: the policy and the hooks (part 4).
+   each green's log with the phase roots in the same entry, the index kept. Built (A-657 part 4): the policy before the
+   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -49568,6 +49596,125 @@ live log's half built).
     any-candidate count); and `a_new_holder_set_counts_only_once_it_holds_every_durable_entry`. The newcomers' test is
     the one r150 failed. The file's other tests build a `Shipper` directly, which this change does not reach.
   - The Linux and Windows runs are owed.
+
+### A-677 — A rebase's files hold the node a removed home hands to its link (bug, 2026-11-19, g305, UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path" and A-669's rule; found by A-658 part 1's runs)
+Applied in the same change to:
+- §4.16 "Rebase, the only corrective path" (a status note);
+- `crates/merge/src/engine.rs`: `Green::heirs_of` (new) and `Green::rebased_from`; the docs of `Rebased::Rebased`'s
+  `changed` and of `Green::node_moves`;
+- `crates/merge/src/engine/node_tests.rs` (one case); `crates/merge/tests/rebase.rs` (the oracle's check a function,
+  the two shrunk cases a named test, the property seeded); `crates/merge/tests/rebase.proptest-regressions` (new);
+- `docs/bugs/2026-11-19-a-rebases-files-lost-the-link-a-removed-home-handed-its-node-to.md`.
+- **The defect.** With a file `a` whose node a hard link `b` names, a work removing `a` was answered by its rebase with
+  the changes `{a: None}` and the journal `[Unlink a]`, while the submit leaves `b` holding the node: the commit's node
+  moves (`Green::node_moves`, A-646) hand the node to the least surviving link, and the rebase built its changes from
+  the work's own effects alone. A rename over `a` lost its heir the same way. The rebase oracle (A-202) failed on some
+  seeds (kiln r55 and r113, macOS arm64, Mac Studio), and a probe of r55's case answered the same on main's own tree
+  (787f5948b, r89) as on A-658's branch.
+- **The fix.** The rebase takes the files the commit's node moves leave at heirs (`Green::heirs_of`: each heir with the
+  node's bytes), computed after the mapped files are made, as the commit computes them, and puts them into its changes
+  after the work's own, as the commit applies its moves after the version's effects. Its journal is unchanged: the
+  hand-over is the commit's, never the work's operation, and a volume's link names the node already. The server keeps
+  the changes as the work's files and composes the next submit from the journal, so the next increment is unchanged,
+  and the rebased work's files hold the link the submit keeps (their charge counting the link's bytes, as A-669's
+  hand-over with writes already did).
+- **Tests**, red first, on macOS arm64, the Mac Studio (kiln r156, 2026-11-19, debug, fresh clones of the pushed
+  branches, each with its own target directory, `CARGO_BUILD_JOBS=2`):
+  - `a_rebase_restates_the_node_a_removed_home_hands_to_its_link` (`crates/merge/src/engine/node_tests.rs`): a removal
+    of `TARGET`, which `HARDLINK` and `SECOND` name, and a rename of `FILE` over it, each rebased at the head beside a
+    twin that submits it; the rebase's files must be the twin's, `HARDLINK` holding `TARGET`'s old bytes, and no
+    journal operation may name `HARDLINK`.
+  - `a_removed_homes_link_holds_its_node_in_the_rebases_files` (`crates/merge/tests/rebase.rs`): the oracle's check on
+    its two shrunk cases; and the property seeded with both seeds, which it replays before its novel cases.
+  - Red at 05593caea (the tests alone, over main 545181b30): `cargo test --locked -p slates-merge --lib node_tests` 24
+    passed and the new case failing (the removal's rebased files `{f}` against the twin's `{f, h}`); `cargo test
+    --locked -p slates-merge --test rebase` 1 passed and 2 failing, the named cases (`{}` against `{"b": []}`) and the
+    property at its first replayed seed (0 successes).
+  - Green at 79ec79e77: `cargo fmt -p slates-merge -- --check` clean; `cargo test --locked -p slates-merge --lib` 192
+    of 192; `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1; and the
+    server's integration tests that drive a rebase over the wire, by name (`daemon`'s lifecycle test, two of
+    `merge_load`, two of `verdict_pages`, five of `works_off_owner`, three of `green_post_state`), 13 of 13.
+  - The landing run, over main 1ef718820 (878a2eb43, kiln r172), alike: fmt clean; slates-merge lib 193 of 193 (main's
+    A-676 added one); `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1;
+    the server's 13 of 13.
+- **Siblings** (the sweep, by reading): the hand-over also moves the node's mode and attributes to the heir, and an IPC
+  node (`Effect::Special`); a rebase's answer holds files alone, so what a rebased work shows of a heir's mode,
+  attributes or IPC node is the server's work view's, not checked here. The chain entry's copy fixes
+  (`CopyFix::files`, A-626) and the stack's restatements (operations, from which a commit derives its own node moves)
+  are not siblings.
+
+### A-673 — An answer's room charged at the linked zlib-rs's own bound, where stock zlib's `compressBound` was outgrown (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface"; A-650 part 1's "Found, and left to its own piece"; A-607)
+Applied in the same change to: `crates/hg` (`compression::bound`'s zlib arm and its constants; the oracle
+`the_longest_codes_stay_within_every_engines_bound` and `arbitrary_bytes_stay_within_every_engines_bound` in
+`tests/compression.rs`), §4.17.3 (A-650 part 1's status sentence on the bound), GAPS (§4.17.3: the open item closed, a
+Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the macOS run beside jupiter's).
+- **What was wrong.** `compression::bound`, the room an HTTP answer is charged before it is compressed, counted zlib at
+  stock zlib's `compressBound` (`len + (len >> 12) + (len >> 14) + (len >> 25) + 13`), which counts stored blocks. The
+  workspace links zlib-rs (A-607), whose level 1 is zlib-ng's `deflate_quick`: every literal in fixed codes, nine bits
+  for the bytes 144 to 255 (RFC 1951 §3.2.6), and no fallback to a stored block. Bytes that do not compress outgrew
+  their charge by up to about an eighth: 65,536 of those bytes came to 73,721 against 65,569. Nothing served met it,
+  since the site's first value takes zlib at level 0 (stored), but the `Compressor` contract lets a caller choose any
+  level.
+- **Decided.** zlib's arm is zlib-rs 0.6.8's own `compress_bound` (`src/deflate.rs`; zlib-ng's `compressBound`):
+  `len + ceil(len / 8) + 3 + 6`, a byte more below 9 bytes and one more for none. It is the worst case itself, with
+  nothing to spare: level 1 meets it exactly at 4,095 and 4,096 bytes. The constants name the backend and its version
+  they come from, so a change of backend (A-607) is a change of the bound with it.
+- **Tests** (macOS arm64, Mac Studio, kiln r181, 2026-11-19, on main b04c552b0). Red first, the oracle alone:
+  `cargo test --locked -p slates-hg --lib compression` 16 passed and 2 failed, the table at zlib level 1 alone (64 bytes
+  in 80 against stock zlib's 77, 4,095 in 4,616 against 4,108, 4,096 in 4,617 against 4,110, 65,536 in 73,721 against
+  65,569: jupiter's r92 numbers) and the generated bytes shrunk to 47 written in 61 against 60. Green, with the fix:
+  `cargo test --locked -p slates-hg --lib` 308 of 308; `cargo fmt -p slates-hg -- --check` clean. The oracle: every
+  engine at every level the bound is checked at (every zlib level, bzip2's ends, zstd's fastest, default and strongest)
+  over runs that zlib's level 1 writes nine bits each, at lengths about its rounding and past 4 KiB and 64 KiB, and over
+  arbitrary bytes (generated), none past `bound`.
+- **Owed.** The other platforms' runs (main's). The proptest's failing seed from the red run is not kept: its block has
+  no seed file, and the table holds the same case.
+
+### A-657 part 4 (A-641 part 4) — a Mercurial push's admission: the repository's policy asked before the verdict in acl's words, and the hooks at pretxnchangegroup and changegroup through the hook driver (2026-11-19, g304, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" step 5, "Hooks", piece 5; A-622 parts 2 and 3, A-597; after A-657 part 3)
+
+- **What.** `hg_push::admitted(state, (principal, repository), &prepared)`: `vcs_policy::admit` over `Prepared::asks`, each
+  `Ask` a namespace, a label, a right and the changeset `acl` names; `admission_hooks` and `observing_hooks` (the
+  policy's hooks at `pretxnchangegroup` and `changegroup`, in its order, through A-597's `hg_pretxnchangegroup` and
+  `hg_changegroup`), `run_hooks` (A-622 part 3's driver, the first refusal answering in 7.2's words, each run's lesson
+  handed back), `Prepared::with_output` (the hooks' `output` parts after the changegroup's reply);
+  `classify::Plan::firsts`; `vcs_hooks::changegroup_env` adds `HG`, `HGPLAIN`, `HG_BUNDLE2`, `HG_TXNID`
+  (`Changegroup::transaction`, `hg_push::transaction_id`) and `HG_TXNNAME`. Part 3's interning of a push's branches
+  scanned every branch per changeset (quadratic in a push that brings a branch a changeset); `classify` now finds a name
+  in a map, and `Plan::firsts` and the asks are kept through maps and a set.
+- **Read from 7.2's code** (research §24): `hook.py` `_exthook` and `procutil.explainexit` (`%s hook %s`, `exited with
+  status %d`, `killed by signal %d`; a non-throwing point only warns), `changegroup.apply` (`pretxnchangegroup` runs
+  only when changesets were added, `node` and `node_last` the first and last); `hgext/acl.py` and
+  `bundle2_part_handlers.handlebookmark` (Homebrew's 7.2 on the MacBook, 2026-11-19): `_txnhook` walks the new
+  changesets in revision order and names the first it refuses by `short` (twelve digits), `_pkhook` a bookmark by the
+  pushkey's `new`, which `handlebookmark` hands `prepushkey` under `server.bookmarks-pushkey-compat` (true by default):
+  all forty digits, empty for a deletion.
+- **Recorded from 7.2 itself** (`crates/hg/fixtures/hooks/make-hook-fixtures.sh`, Homebrew's 7.2 on the MacBook): what
+  7.2 set for `pretxnchangegroup` and `changegroup` on a push of two changesets over an SSH stand-in, beyond the
+  server's own environment, publishing and not (byte-identical): `HG`, `HGPLAIN=1`, `HG_BUNDLE2=1`, `HG_HOOKNAME`,
+  `HG_HOOKTYPE`, `HG_NODE`, `HG_NODE_LAST`, `HG_SOURCE=serve`, `HG_TXNID` (one for both hooks), `HG_TXNNAME=serve` and
+  `HG_URL`, with `HG_PENDING` at `pretxnchangegroup` alone; no `HG_PHASES_MOVED`.
+- **Decided.** The rights a Mercurial push asks (a forced push's new head is a rewrite of its branch; a merge that
+  retires a line submits); `acl`'s user the principal's record until §4.13 names its Mercurial identity; a hook past its
+  learned bound, unstartable, or ended by its client leaving refuses in slates' words, as a throwing hook would; `HG`
+  is `hg` (slates runs no hg of its own, so a hook's `$HG` is the first on its search path); `HG_TXNID` is `TXN:` and
+  forty digits of a BLAKE3 key derived from the push's name (7.2's hashes its transaction's start: one value a push,
+  which no hook can predict).
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug): red then green in kiln r192 on 924888d14, green again in
+  kiln r202 on d49e5484f, the merged tree that lands (r175 and r184 alike before). Red first: `changegroup_env`
+  without the five variables, `cargo test --locked -p slates-server --lib
+  vcs_hooks::tests::mercurials_hooks_get_the_environment_stock_7_2_hands_them` failed, 7 names against 7.2's recorded
+  12. Green: `cargo test --locked -p slates-server --lib -- hg_push vcs_hooks --test-threads=4` 47 of 47, its build
+  warning-free; `cargo test --locked -p slates-hg --lib -- push::` 36 of 36; `cargo fmt -p slates-hg -p slates-server
+  -- --check` clean. The first builds found three faults, each fixed: `hg_push` called slates-hg's crate-private
+  `node::write_hex` (now the server's `hex_of`); the hooks test's runtime returned at its first idle poll, no timer
+  being armed, and the test hung (its run now goes under `futures::within`, as `hook_driver`'s and `svn_hooks`' tests
+  do); and `Prepared`'s hook inputs were never read (a test now lands a push with a hook's words and reads its reply
+  as a client does). No integration target reaches the hook driver's Mercurial path. Further reds, clippy and the
+  other platforms are main's; `run_hooks` and the hook builders it uses are Unix's.
+- **Applied in the same change to:** §4.17.3's status (part 4) and piece 5's line; GAPS' §4.17.3 entry and its
+  Mercurial hook variables (owed, now closed); `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`;
+  `crates/server/src/vcs_hooks.rs`; `crates/hg/src/push/classify.rs` and `classify_tests.rs`;
+  `crates/hg/fixtures/hooks/` (new).
 
 ### A-647 part 3 — git's store serves every version's D(k) and reached set from its value of the reach sets, the chains' copies dropped; a value names its sets' bytes as an object of any length (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 2, A-614)
 
