@@ -86,6 +86,16 @@ const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const STATUS_AT: usize = HINT_AT + size_of::<u64>() + size_of::<u32>();
 /// Format: Create.Opened.UserContext2 follows the common 24-byte header and its UserContext word.
 const OPEN_CONTEXT_AT: usize = 24 + size_of::<u64>();
+/// Format: Create.Opened.SecurityDescriptor, an `FSP_FSCTL_TRANSACT_BUF` (a 16-bit offset into the response's buffer,
+/// then a 16-bit size), follows the two context words and the 32-bit GrantedAccess (fsctl.h).
+const OPENED_DESCRIPTOR_AT: usize = OPEN_CONTEXT_AT + size_of::<u64>() + size_of::<u32>();
+/// Format: Create.Opened.FileName, the normalized name's `FSP_FSCTL_TRANSACT_BUF`, follows the descriptor's and the
+/// 72-byte FileInfo (fsctl.h).
+const OPENED_NAME_AT: usize = OPENED_DESCRIPTOR_AT + size_of::<u32>() + 72;
+/// Format: Create.Opened's flag word follows the name's buffer: DisableCache is bit 0, HasSecurityDescriptor bit 1.
+const OPENED_FLAGS_AT: usize = OPENED_NAME_AT + size_of::<u32>();
+/// Format: HasSecurityDescriptor, bit 1 of Create.Opened's flag word.
+const HAS_SECURITY_DESCRIPTOR: u32 = 1 << 1;
 /// Format: STATUS_CANCELLED, the typed cancellation returned without touching an old process's buffer.
 const CANCELLED: u32 = 0xC000_0120;
 
@@ -153,10 +163,12 @@ pub fn opened_context(response: &[u8]) -> Result<Option<(u64, u64)>, Refusal> {
 
 /// Finishes a DLL operation's response in a packet the receiver reuses: its status, and its size rounded up to the wire's
 /// alignment, with the padding that rounding adds cleared, so no byte of an earlier response is sent. Returns the length
-/// to send. The callback wrote everything up to its own size; the fixed part before it was cleared as the header.
+/// to send. The callback wrote everything up to its own size; the fixed part before it was cleared as the header. A
+/// successful Create's size can count past what was written ([`clear_past_opened`]), and that span is cleared too.
 pub fn finish_response(packet: &mut [u8], status: i32) -> Result<usize, Refusal> {
   put(packet, STATUS_AT, &status.to_le_bytes())?;
   let size = usize::from(read_u16(packet, SIZE_AT)?);
+  clear_past_opened(packet, size)?;
   let aligned = size
     .checked_next_multiple_of(ALIGNMENT)
     .ok_or(Refusal::Length)?;
@@ -175,6 +187,50 @@ pub fn finish_response(packet: &mut [u8], status: i32) -> Result<usize, Refusal>
       .to_le_bytes(),
   )?;
   Ok(aligned)
+}
+
+/// Clears what a successful Create's response counts up to its `size` besides its normalized name and its open
+/// descriptor. WinFsp v2.1's DLL writes the name at the buffer's start and the descriptor at the name's aligned end
+/// (`src/dll/fsop.c` 466-471 and 404-418), leaving the alignment between them as it was, and counts the name twice when
+/// it places the descriptor (468, then 413: the descriptor's offset already passes the name, and is added to a size
+/// that counted the name), so the size reaches as many bytes past the descriptor as the name has. Both spans held the
+/// packet's earlier response (A-551).
+fn clear_past_opened(packet: &mut [u8], size: usize) -> Result<(), Refusal> {
+  if read_u32(packet, KIND_AT)? != CREATE_KIND || read_u32(packet, STATUS_AT)? != 0 {
+    return Ok(());
+  }
+  // The response's buffer as far as its size counts it: nothing past that is sent, or cleared here.
+  let counted = size.checked_sub(RESPONSE_BASE).ok_or(Refusal::Length)?;
+  let (_, name_end) = buffer_span(packet, OPENED_NAME_AT)?;
+  let (descriptor_at, descriptor_end) =
+    if read_u32(packet, OPENED_FLAGS_AT)? & HAS_SECURITY_DESCRIPTOR == 0 {
+      (name_end, name_end)
+    } else {
+      buffer_span(packet, OPENED_DESCRIPTOR_AT)?
+    };
+  clear(packet, (name_end.min(counted), descriptor_at.min(counted)))?;
+  clear(packet, (name_end.max(descriptor_end).min(counted), counted))
+}
+
+/// Where the `FSP_FSCTL_TRANSACT_BUF` at `at` lies in the response's buffer: its offset, and its offset and size.
+fn buffer_span(packet: &[u8], at: usize) -> Result<(usize, usize), Refusal> {
+  let offset = usize::from(read_u16(packet, at)?);
+  let size_at = at.checked_add(size_of::<u16>()).ok_or(Refusal::Length)?;
+  let end = offset
+    .checked_add(usize::from(read_u16(packet, size_at)?))
+    .ok_or(Refusal::Length)?;
+  Ok((offset, end))
+}
+
+/// Zeroes the response's buffer from `start` to `end`, nothing when `end` does not pass `start`.
+fn clear(packet: &mut [u8], (start, end): (usize, usize)) -> Result<(), Refusal> {
+  if end <= start {
+    return Ok(());
+  }
+  let start = RESPONSE_BASE.checked_add(start).ok_or(Refusal::Length)?;
+  let end = RESPONSE_BASE.checked_add(end).ok_or(Refusal::Length)?;
+  packet.get_mut(start..end).ok_or(Refusal::Length)?.fill(0);
+  Ok(())
 }
 
 /// A hard link a patched WinFsp driver forwards (A-360): the open it names, the new name, and whether a taken name may be
@@ -841,6 +897,87 @@ mod tests {
       packet[SIZE_AT..SIZE_AT + 2].copy_from_slice(&size.to_le_bytes());
       assert_eq!(finish_response(&mut packet, 0), Err(Refusal::Length));
     }
+  }
+
+  /// A Create's response laid out over a packet still holding an earlier response's bytes, as WinFsp v2.1's DLL lays it
+  /// out (`fsop.c` 466-471, then 404-418): a normalized name of `name` bytes at the buffer's start, then, when
+  /// `descriptor` is not zero, a descriptor of that many bytes at the name's aligned end, the size counting the name
+  /// twice.
+  fn opened_response(name: u16, descriptor: u16) -> Vec<u8> {
+    let mut packet = vec![0xAB; RESPONSE_MAX];
+    packet[KIND_AT..KIND_AT + 4].copy_from_slice(&CREATE_KIND.to_le_bytes());
+    packet[OPENED_NAME_AT..OPENED_NAME_AT + 2].copy_from_slice(&0u16.to_le_bytes());
+    packet[OPENED_NAME_AT + 2..OPENED_NAME_AT + 4].copy_from_slice(&name.to_le_bytes());
+    let base = u16::try_from(RESPONSE_BASE).unwrap();
+    let mut size = base + name;
+    packet[RESPONSE_BASE..RESPONSE_BASE + usize::from(name)].fill(0x11);
+    let mut flags = 0u32;
+    if descriptor != 0 {
+      let offset = name.next_multiple_of(8);
+      packet[OPENED_DESCRIPTOR_AT..OPENED_DESCRIPTOR_AT + 2].copy_from_slice(&offset.to_le_bytes());
+      packet[OPENED_DESCRIPTOR_AT + 2..OPENED_DESCRIPTOR_AT + 4]
+        .copy_from_slice(&descriptor.to_le_bytes());
+      let at = RESPONSE_BASE + usize::from(offset);
+      packet[at..at + usize::from(descriptor)].fill(0x22);
+      size += offset + descriptor;
+      flags |= HAS_SECURITY_DESCRIPTOR;
+    }
+    packet[OPENED_FLAGS_AT..OPENED_FLAGS_AT + 4].copy_from_slice(&flags.to_le_bytes());
+    packet[SIZE_AT..SIZE_AT + 2].copy_from_slice(&size.to_le_bytes());
+    packet
+  }
+
+  /// A-551, A-215's rule. Do: finish a successful Create's response that answers a 10-byte normalized name followed by
+  /// a 20-byte open descriptor, laid out by WinFsp's DLL over a packet still holding an earlier response; then one with
+  /// a descriptor and no name, and one with a name and no descriptor. Expect: the name and the descriptor sent as
+  /// written, the six bytes of alignment between them and the ten the DLL counted past the descriptor zero, the length
+  /// its size aligned (176); the others sent as written. Before, those sixteen bytes were the earlier response's.
+  #[test]
+  fn a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response() {
+    let mut packet = opened_response(10, 20);
+    assert_eq!(finish_response(&mut packet, 0), Ok(176));
+    assert!(
+      packet[RESPONSE_BASE..RESPONSE_BASE + 10]
+        .iter()
+        .all(|byte| *byte == 0x11)
+    );
+    assert!(
+      packet[RESPONSE_BASE + 10..RESPONSE_BASE + 16]
+        .iter()
+        .all(|byte| *byte == 0),
+      "the alignment between the name and the descriptor"
+    );
+    assert!(
+      packet[RESPONSE_BASE + 16..RESPONSE_BASE + 36]
+        .iter()
+        .all(|byte| *byte == 0x22)
+    );
+    assert!(
+      packet[RESPONSE_BASE + 36..176]
+        .iter()
+        .all(|byte| *byte == 0),
+      "the span the DLL counted twice"
+    );
+    assert!(packet[176..].iter().all(|byte| *byte == 0xAB));
+    let mut packet = opened_response(0, 20);
+    assert_eq!(finish_response(&mut packet, 0), Ok(152));
+    assert!(
+      packet[RESPONSE_BASE..RESPONSE_BASE + 20]
+        .iter()
+        .all(|byte| *byte == 0x22)
+    );
+    let mut packet = opened_response(10, 0);
+    assert_eq!(finish_response(&mut packet, 0), Ok(144));
+    assert!(
+      packet[RESPONSE_BASE..RESPONSE_BASE + 10]
+        .iter()
+        .all(|byte| *byte == 0x11)
+    );
+    assert!(
+      packet[RESPONSE_BASE + 10..144]
+        .iter()
+        .all(|byte| *byte == 0)
+    );
   }
 
   /// A-198 Step 9.4. Do: settle two captured reads. Expect: each original caller gets cancellation, and a request not
