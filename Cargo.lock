@@ -1690,6 +1690,7 @@ dependencies = [
  "sha1-checked",
  "slates-http",
  "slates-test-seeds",
+ "slates-vcs",
 ]
 
 [[package]]
@@ -1910,6 +1911,7 @@ dependencies = [
 name = "slates-svn"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "hmac",
  "lz4_flex",
  "md-5",

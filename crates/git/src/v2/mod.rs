@@ -32,8 +32,8 @@
 //! upper-case id encodes back in git's form. Where git's reader takes what no git writes, the reader here refuses
 //! it: bytes after an id (`get_oid_hex` ignores what follows) and a number not in canonical decimal (git's `strtol`
 //! with base 0 also takes octal and `0x`). The pkt-line lengths' digits are read in either case, as part 1 reads them
-//! (`hexval`), and written in lower case. A ref name is `HEAD` or under `refs/` and passes `check_refname_format` (the
-//! private `refname` module).
+//! (`hexval`), and written in lower case. A ref name is `HEAD` or under `refs/` and passes `check_refname_format`
+//! ([`crate::refname`]).
 //!
 //! **Order is the grammar's.** `fetch`'s sections come in the document's order. git 2.50.1's `upload_pack_v2` wrote
 //! `wanted-refs` before `shallow-info`, which its own client refused ("expected 'packfile', received 'shallow-info'"),
@@ -53,7 +53,6 @@ pub mod advertisement;
 pub mod fetch;
 mod line;
 pub mod ls_refs;
-mod refname;
 pub mod request;
 
 pub use line::{Ending, Line};

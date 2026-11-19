@@ -39,12 +39,13 @@
 //! 2.50.1's `upload_pack_v2` wrote `wanted-refs` before `shallow-info`, which its own client refused, until
 //! `191740edaa4a` swapped them.
 
+use super::Refusal;
 use super::line::{self, Ending, Line, Packets, Part, SP};
-use super::{Refusal, refname};
 use crate::Admission;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::out::{Measure, Out};
 use crate::pktline::Packet;
+use crate::refname;
 use crate::sideband::{self, Band};
 
 /// Format: the argument naming an object the client wants [gitprotocol-v2 "fetch"].

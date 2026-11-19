@@ -138,6 +138,10 @@
 > `sideband-all`, `packfile-uris`); the server's refusals as `ERR` lines and band-3 errors; a duplicate `want-ref` (a
 > protocol error) caught where the server maps names to refs; the server keeping clients alive on band 2, never with
 > git's empty band-1 packet before the packfile; clippy and the cross-target lint over `src/v2` (main's run request).
+> **A-615 part 1 (2026-11-19, g296; one ref-name rule):** slates-git's two copies of git's `check_refname_format`
+> (A-590's tag-name check, A-582 part 2's protocol names) are one module, `refname`, which both callers ask; A-590's
+> golden fsck fixtures and A-582's cases both run against it, with a property test against refs.c's check transcribed
+> (144 of 144 on the Mac Studio, red twice). Owed in A-615: part 2, §4.17.2 piece 7's negotiation for upload-pack v2.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -214,6 +218,18 @@
 > 203 of 203 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
 > Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
 > the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
+> **A-614 (2026-11-19, g083; piece 5's part 1):** `slates-git` keeps a repository's objects on `slates-vcs` (`store`):
+> objects in through one trait, `Entries`, which A-608's reader fits; each named once by git's rule, the store's
+> parameter, a claimed id checked against it, and a collision attack refused in git's words; held by the push until its
+> verdict. Committed, an object gets a position and its rows (a commit's with its tree and parents by position, its
+> date and its generation number); each version keeps D(k) and the green its reached set as runs of positions, computed
+> at admission by walks that stop at what the green reached (a reached tree skipped whole), a fast-forward growing the
+> set and a create or rewrite making it again from the nearest green head below, so a ref made at another's head walks
+> nothing; a version's head, root tree and any path read from rows and trees with no walk. An oracle holds the store to
+> a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
+> slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
+> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
+> commit sliced under the shard's budget; the versions' records as content.
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
@@ -223,7 +239,8 @@
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588) (2026-11-19; UI goals 91 and 92; owners g291, and g079 for A-598).** Built on §4.17.1: a named branch's
+> built (A-588) and its revlog reader (A-611) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598).** Built
+> on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -267,11 +284,17 @@
 > first against stubbed engines (14 of its 16 tests failed), against the five compressed bundles stock `hg` 7.2 wrote
 > (`crates/hg/fixtures/compressed/make-compressed-fixtures.sh`, `SHA256SUMS`), each made plain to exactly the bundle
 > 7.2 wrote uncompressed, and 7.2's server's zstd answer to a `getbundle`; every cut, a bit flipped at every place,
-> unknown engines and bytes after a stream refused by kind. Owed, in order, after §4.17.1's seven pieces: (3, rest) the
-> index's tables, then import of a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines
-> (flate2 over zlib-rs, and zstd), its tests holding inflated bytes; (4) read serving, the `0.2` answers compressed by
-> A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the shard's step
-> budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
+> unknown engines and bytes after a stream refused by kind. **Built (A-611):** the import's revlog reader: version 1
+> inline and split, version 2 and the changelog's version 2 behind their dockets, chunks raw, zlib (flate2 over zlib-rs)
+> and zstd with every byte charged to the admission and every stream ending exactly at its chunk's end, chains rebuilt
+> through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`, 182 of
+> 182 on the Mac Studio (2026-11-19, merged with A-598), against 158 files stock `hg` 7.2 stored in five repositories
+> (zstd, zlib, split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
+> (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). Owed, in order, after §4.17.1's seven pieces: (3, rest) the
+> index's tables on A-581's `slates-vcs`, then the import's walk of a store (the fncache, the path encodings, a version
+> 2 store's file index) and censored, ellipsis and externally stored revisions; (4) read serving, the `0.2` answers
+> compressed by A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the
+> shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
 > changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
 > (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
 > and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
@@ -312,9 +335,10 @@
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
 > **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index, its lock table, its
-> mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies and its authorization built
-> (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609 and A-606, D-28; UI goals 91, 92 and 93; g292,
-> g250, g262, g268, g234, g229).** A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s `commit`: the drive's
+> mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies, its authorization and its dump
+> codec built (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609, A-606 and A-593, D-28; UI goals
+> 91, 92 and 93; g292, g250, g262, g268, g234, g229, g264).** A-592 (2026-11-19, g268): the commit rule,
+> `slates-svn`'s `commit`: the drive's
 > out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's transaction as the index's
 > own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()` and `verify_locks`
 > transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real check on 4,096
@@ -370,7 +394,13 @@
 > root as one empty segment; a suffix match reversing the segment for its level's other rules; `[//x]` taken for the
 > root). Owed from it: the server's questions (piece 7), the file read from the repository and kept per file identity,
 > `force-username-case`, `mod_authz_svn`'s questions (piece 13); main's: clippy and `xtask` over the module, and the
-> three departures confirmed against stock Subversion (run request). Designed from Subversion 1.14.x's own
+> three departures confirmed against stock Subversion (run request). A-593 (2026-11-19, g264, UI goal 92): the dump
+> format's codec, formats 2 and 3, read as the stream arrives within the caller's admission and written byte for byte
+> as `svnadmin dump` writes it, golden vectors from stock `svnadmin` 1.15.0, `cargo test -p slates-svn --lib` on the
+> Mac Studio (see A-593). Owed from it: the administration verbs over it; a format-3 dump is
+> `svnadmin dump --deltas`'s bytes only given its windows, which are Subversion's deltifier's (slates' dump verb will
+> write its own, which `svnadmin load` reads alike); a version-1 (zlib) delta inside a dump is refused, which no stock
+> writer makes. Designed from Subversion 1.14.x's own
 > specifications and code: one green per repository, a transaction a work at the head, FSFS's commit-time merge as a
 > stock client's verdict (stricter than §4.16's: no identity accept, its directory property rules, a directory's last
 > change its subtree's; raised with A-497's owner), the Subversion index, revision properties and locks as register
@@ -390,7 +420,8 @@
 > holding a copy (its tree listed, the identity's sum carried; `None` today, the chain kept whole), a rebase restating
 > a copy (the deriver's `VolumeOp::Copy`), a copy from a version its source changed after (refused today), Subversion's
 > replace with history, moves and second copies into a copied tree in one increment, the server's change-index
-> consumers treating a copy's destination as its tree, and a Merkle identity over the radix trees (weighed in A-586).
+> consumers treating a copy's destination as its tree (a Merkle identity over the radix trees was weighed and declined,
+> A-586).
 > Owed, in order: the administration verbs
 > (`svnadmin`, the dump round trip); the ra_svn server's commands (its greeting and authentication built, A-599), with
 > the lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over
