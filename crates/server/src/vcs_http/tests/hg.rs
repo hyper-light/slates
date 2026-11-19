@@ -41,6 +41,12 @@ const OWNER_BEARER: &str = "Authorization: Bearer owner-token";
 const STRANGER_BEARER: &str = "Authorization: Bearer stranger-token";
 /// Shape: the challenge a `401` carries over cleartext.
 const BEARER_CHALLENGE: &str = "Bearer realm=\"slates\"";
+/// Shape: the id of the Mercurial repository `hg`, whose store the tests' shard holds.
+const HG: RepositoryId = RepositoryId { bytes: [1; 16] };
+/// Shape: the id of the Mercurial repository `bare`, whose store it does not.
+const BARE: RepositoryId = RepositoryId { bytes: [2; 16] };
+/// Shape: the id of the git repository `r.git`.
+const GIT: RepositoryId = RepositoryId { bytes: [3; 16] };
 /// Shape: an empty repository's `heads`: the null node, then a line end (7.2's `heads` of no changeset).
 const EMPTY_HEADS: &[u8] = b"0000000000000000000000000000000000000000\n";
 
@@ -77,14 +83,14 @@ struct Held {
 
 impl Repositories for Held {
   fn find(&self, name: &str) -> Option<RepositoryRecord> {
-    let (tool, rules) = match name {
-      "hg" => (VcsTool::Mercurial, self.rules.clone()),
-      "bare" => (VcsTool::Mercurial, Vec::new()),
-      "r.git" => (VcsTool::Git, Vec::new()),
+    let (id, tool, rules) = match name {
+      "hg" => (HG, VcsTool::Mercurial, self.rules.clone()),
+      "bare" => (BARE, VcsTool::Mercurial, Vec::new()),
+      "r.git" => (GIT, VcsTool::Git, Vec::new()),
       _ => return None,
     };
     Some(RepositoryRecord {
-      id: RepositoryId { bytes: [0; 16] },
+      id,
       name: name.to_owned(),
       tool,
       format: ObjectFormat::Sha1,
@@ -170,12 +176,12 @@ struct OneStore;
 impl HgStores for OneStore {
   type Store = Empty;
 
-  fn with_store<R>(
-    &self,
-    repository: &RepositoryRecord,
-    serve: impl FnOnce(&Empty) -> R,
-  ) -> Option<R> {
-    (repository.name == "hg").then(|| serve(&Empty))
+  fn holds(&self, id: RepositoryId) -> bool {
+    id == HG
+  }
+
+  fn lend<R>(&mut self, id: RepositoryId, step: impl FnOnce(&Empty) -> R) -> Option<R> {
+    (id == HG).then(|| step(&Empty))
   }
 }
 
@@ -462,29 +468,20 @@ fn an_exchange_holds_nothing_past_its_room_or_its_store() {
   );
 }
 
-/// Stores that hold `hg`'s when the site asks and none by the time the exchange does: a repository released between
-/// its decision and its answer.
+/// Stores that say they hold `hg`'s when the site decides and lend nothing when the exchange answers: a repository
+/// released between its decision and its answer.
 #[derive(Clone)]
 struct Vanishing;
-
-thread_local! {
-  /// How many times [`Vanishing`] was asked.
-  static ASKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
 
 impl HgStores for Vanishing {
   type Store = Empty;
 
-  fn with_store<R>(
-    &self,
-    repository: &RepositoryRecord,
-    serve: impl FnOnce(&Empty) -> R,
-  ) -> Option<R> {
-    let asked = ASKED.with(|asked| {
-      asked.set(asked.get() + 1);
-      asked.get()
-    });
-    (repository.name == "hg" && asked == 1).then(|| serve(&Empty))
+  fn holds(&self, id: RepositoryId) -> bool {
+    id == HG
+  }
+
+  fn lend<R>(&mut self, _id: RepositoryId, _step: impl FnOnce(&Empty) -> R) -> Option<R> {
+    None
   }
 }
 
@@ -495,6 +492,8 @@ impl HgStores for Vanishing {
 #[test]
 fn until_the_stores_land_nothing_is_served_and_streams_take_the_fastest_form() {
   let record = Held { rules: Vec::new() }.find("hg").unwrap();
+  let mut stores = NoStores;
+  let held = (stores.holds(record.id), stores.lend(record.id, |_| ()));
   let mut fastest = Fastest;
   let chosen = [
     fastest.choose(Media::V2, &[Engine::Zstd, Engine::Uncompressed], 1),
@@ -503,9 +502,9 @@ fn until_the_stores_land_nothing_is_served_and_streams_take_the_fastest_form() {
   ];
   let fastest_zstd = *Engine::Zstd.levels().start();
   assert_eq!(
-    (NoStores.with_store(&record, |_| ()), chosen),
+    (held, chosen),
     (
-      None,
+      (false, None),
       [
         Compression {
           engine: Engine::Uncompressed,

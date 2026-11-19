@@ -36,7 +36,7 @@
 //! **Differs from hgweb, on purpose.** A principal whose credentials hold and whom the policy refuses is `403` (RFC
 //! 9110 §15.5.4: the credentials are "insufficient to grant access"), where hgweb answers `401` without a challenge.
 
-use slates_db::catalog::{Principal, RepositoryRecord, VcsTool};
+use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_hg::compression::Engine;
 use slates_hg::obsmarkers::Marker;
 use slates_hg::phases::Phase;
@@ -92,17 +92,16 @@ fn to_u64(count: usize) -> u64 {
   u64::try_from(count).unwrap_or(u64::MAX)
 }
 
-/// Where a Mercurial repository's store is read on this shard (A-662: each repository's tool store, kept on its owner
-/// shard with its record).
+/// Where Mercurial repositories' stores are lent on this shard (A-662: each repository's tool store, kept on its owner
+/// shard with its record), afresh for each step, as git's site's `StoreLender` lends its (A-640 part 2: "so a shard's
+/// state is never held across a wait").
 pub(crate) trait HgStores {
   /// The store a repository's commands are answered from.
   type Store: Store;
-  /// Runs `serve` over `repository`'s store, or answers `None` where this shard holds none for it.
-  fn with_store<R>(
-    &self,
-    repository: &RepositoryRecord,
-    serve: impl FnOnce(&Self::Store) -> R,
-  ) -> Option<R>;
+  /// Whether the store of repository `id` is held here.
+  fn holds(&self, id: RepositoryId) -> bool;
+  /// Runs `step` over repository `id`'s store; none when it is not held here.
+  fn lend<R>(&mut self, id: RepositoryId, step: impl FnOnce(&Self::Store) -> R) -> Option<R>;
 }
 
 /// The stores as the server has them until A-662 keeps each repository's beside its record: none, so every Mercurial
@@ -176,11 +175,11 @@ impl Store for NoStore {
 impl HgStores for NoStores {
   type Store = NoStore;
 
-  fn with_store<R>(
-    &self,
-    _repository: &RepositoryRecord,
-    _serve: impl FnOnce(&NoStore) -> R,
-  ) -> Option<R> {
+  fn holds(&self, _id: RepositoryId) -> bool {
+    false
+  }
+
+  fn lend<R>(&mut self, _id: RepositoryId, _step: impl FnOnce(&NoStore) -> R) -> Option<R> {
     None
   }
 }
@@ -280,7 +279,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     if let Some(refused) = judged(&repository, &principal, head, routed.permission) {
       return refused;
     }
-    if self.stores.with_store(&repository, |_| ()).is_none() {
+    if !self.stores.holds(repository.id) {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
     }
     match HgExchange::new(self.stores.clone(), repository, head, self.room) {
@@ -500,7 +499,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     let mut admission = self.room;
     let answered = self
       .stores
-      .with_store(&self.repository, |store| {
+      .lend(self.repository.id, |store| {
         hg_http::answer(store, &request, header_line(), &mut Fastest, &mut admission)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
