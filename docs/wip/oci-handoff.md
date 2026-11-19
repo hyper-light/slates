@@ -6,6 +6,9 @@
 > `crates/cli/src/oci_runtime.rs`, and `container::check_source`, moved from the CLI's `oci-check`. The command line's
 > `slates oci-runtime` and `slates oci-check` call them and print what they did before. Where this record names
 > the CLI's files for those, read the library's.
+> Since A-520's third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host as well
+> (`IdentityRule::ContainerRootAsMountingUser`): §6's "only Docker Desktop on macOS" and its rootless refusal
+> are superseded by `crates/bridge-oci/src/runtime.rs`'s list of the profiles that hold evidence.
 
 > **Lifetime correction (2026-09-20, A-28).** A binding belongs to its verified source
 > mount, not the short-lived command that returns the recipe. The source token, live bridge
