@@ -341,7 +341,7 @@ def main():
         # and aborts on any, `editorp.c` `check_for_error`); then the client half-closes and reads to the end.
         close_edit = b"( close-edit ( ) ) "
         abort_edit = b"( abort-edit ( ) ) "
-        wc_failure = b"( failure ( ( 155000 22:the working copy says no 0: 0 ) ) ) "
+        wc_failure = b"( failure ( ( 155000 " + item_string(b"the working copy says no") + b"0: 0 ) ) ) "
         hostile = [
             ("hostile-report-unknown-command",
              [UPDATE_HEAD + SET_ROOT + b"( bogus ( ) ) " + FINISH, close_edit, EDIT_DONE]),
