@@ -43472,8 +43472,8 @@ Applied in the same change to:
     on the link, unless the work makes the target itself.
 - **Metadata stays keyed by path** (A-618): a link that replaces a file keeps the path's mode and attributes unless the
   work changes them, as a file renamed over a file does.
-- **Tests** (debug, Mac Studio, 2026-11-19, load 4 to 7), green on kiln r880: `cargo test -p slates-merge --lib`, 99 of
-  99; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests: each sibling's case, the same-file
+- **Tests** (debug, Mac Studio, 2026-11-19, load 4 to 7), green on kiln r880 and, merged with main, r899: `cargo test
+  -p slates-merge --lib`, 99 of 99 on both; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests: each sibling's case, the same-file
   rename, and a rotation (a file renamed away and a link over its path in one work, the file removed once). The oracle
   generates histories over two files, a symlink, a hard link and a directory. At the head, nodes are removed and made
   again and their mode or attributes changed; works behind the head remove a node, link a file, or rename a link over

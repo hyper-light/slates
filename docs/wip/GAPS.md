@@ -2271,7 +2271,8 @@
 > generated oracle of the whole state (a model of what stands at every path at every version, compared after every
 > event, with a census of nine answers). Red with A-643's engine change reversed (r880: 6 of 7 failed; the rotation
 > passes either way), and with the same-file rule alone reversed (both its tests failed). Green on the Mac Studio
-> (r880: `slates-merge --lib` 99 of 99, fmt clean). Owed to main: the merge crate's integration suites and clippy.
+> (r880: `slates-merge --lib` 99 of 99, fmt clean; merged with main, r899: 99 of 99, fmt clean). Owed to main: the
+> merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
 > **Three siblings of A-643's verdicts, open (2026-11-19, A-643's sweep, g267; §4.16 "The verdict"; POSIX

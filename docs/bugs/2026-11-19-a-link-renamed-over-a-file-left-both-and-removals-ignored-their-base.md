@@ -84,7 +84,7 @@ changes them, as a file renamed over a file does.
 Red on r880 with all of A-643's engine change reversed: 6 of 7 failed (the rotation passes either way). With only the
 same-file rule reversed, the same-file test and the oracle failed, and the oracle shrank to the hard link renamed over
 its own target. Green on r880: `cargo test -p slates-merge --lib` 99 of 99, and `cargo fmt -p slates-merge -- --check`
-clean.
+clean; merged with main (r899), 99 of 99 and fmt clean.
 
 ## Siblings (reported, not changed; GAPS)
 
