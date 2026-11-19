@@ -20,9 +20,9 @@
 //! whole before a byte is written, and its exact length is known before it is made ([`listkeys_encoded_len`]); a
 //! reply's numbers are written into a fixed buffer its part borrows ([`ReplyText`]).
 
-use core::fmt::Write as _;
-
 use crate::bundle2::{Param, Part};
+use crate::decimal::Decimal;
+use crate::lines::{Lines, lines};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
 use crate::{NODE_LEN, Node};
@@ -57,9 +57,6 @@ const HEX_RADIX: u32 = 16;
 
 /// Format: the hexadecimal digits that write one byte.
 const HEX_DIGITS_PER_BYTE: usize = 2;
-
-/// Format: the most bytes a decimal `i64` takes as text: the 19 digits of `i64::MIN`'s magnitude and its sign.
-const DECIMAL_MAX_LEN: usize = 20;
 
 /// A pushkey request: one key of one namespace, from an old value to a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +110,7 @@ pub enum Refusal {
   },
 }
 
-/// Why listkeys entries or a reply could not be encoded.
+/// Why listkeys entries could not be encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeRefusal {
   /// A key or value holding a tab or a line end, which would read back as another entry.
@@ -121,8 +118,6 @@ pub enum EncodeRefusal {
     /// The entry's index.
     entry: usize,
   },
-  /// A number whose decimal text did not fit its buffer, which is sized for every `i64`'s.
-  NumberText,
 }
 
 /// The request a `pushkey` part carries.
@@ -185,44 +180,6 @@ fn number<T: core::str::FromStr>(part: &Part<'_>, key: &'static [u8]) -> Result<
     .ok_or(Refusal::NotANumber { key })
 }
 
-/// A number's decimal text, as Python's `'%d'` writes it, held in place so a part can borrow it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Decimal {
-  /// The text's bytes, from the first.
-  bytes: [u8; DECIMAL_MAX_LEN],
-  /// How many of them hold the text.
-  len: usize,
-}
-
-impl Decimal {
-  /// The text of `value`.
-  fn new(value: i64) -> Result<Self, EncodeRefusal> {
-    let mut decimal = Self {
-      bytes: [0; DECIMAL_MAX_LEN],
-      len: 0,
-    };
-    write!(decimal, "{value}").map_err(|_| EncodeRefusal::NumberText)?;
-    Ok(decimal)
-  }
-
-  /// The text.
-  fn as_bytes(&self) -> &[u8] {
-    self.bytes.get(..self.len).unwrap_or_default()
-  }
-}
-
-impl core::fmt::Write for Decimal {
-  fn write_str(&mut self, text: &str) -> core::fmt::Result {
-    let end = self.len.checked_add(text.len()).ok_or(core::fmt::Error)?;
-    let room = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
-    for (slot, byte) in room.iter_mut().zip(text.as_bytes()) {
-      *slot = *byte;
-    }
-    self.len = end;
-    Ok(())
-  }
-}
-
 /// The text of a `reply:pushkey` part's two numbers, held for [`reply_part`] to borrow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplyText {
@@ -234,11 +191,11 @@ pub struct ReplyText {
 
 impl ReplyText {
   /// The text of `reply`'s numbers.
-  pub fn new(reply: &Reply) -> Result<Self, EncodeRefusal> {
-    Ok(Self {
-      in_reply_to: Decimal::new(i64::from(reply.in_reply_to))?,
-      result: Decimal::new(reply.result)?,
-    })
+  pub fn new(reply: &Reply) -> Self {
+    Self {
+      in_reply_to: Decimal::unsigned(u64::from(reply.in_reply_to)),
+      result: Decimal::signed(reply.result),
+    }
   }
 }
 
@@ -266,53 +223,30 @@ pub fn reply_part(id: u32, text: &ReplyText) -> Part<'_> {
 /// The entries of a listkeys payload, in order.
 #[derive(Clone)]
 pub struct Keys<'a> {
-  /// The payload left.
-  rest: &'a [u8],
+  /// The payload's lines left.
+  lines: Lines<'a>,
 }
 
-/// The entries of a listkeys payload, the payload checked whole first: every line holds exactly one tab.
+/// The entries of a listkeys payload, the payload checked whole first: every line, as `splitlines()` cuts them,
+/// holds exactly one tab.
 pub fn listkeys(payload: &[u8]) -> Result<Keys<'_>, Refusal> {
-  let mut lines = Keys { rest: payload };
-  let mut index: u64 = 0;
-  while let Some(line) = lines.next_line() {
+  for (index, line) in lines(payload).enumerate() {
     if line.iter().filter(|byte| **byte == TAB).count() != 1 {
-      return Err(Refusal::Line { line: index });
+      return Err(Refusal::Line {
+        line: to_u64(index),
+      });
     }
-    index = index.saturating_add(1);
   }
-  Ok(Keys { rest: payload })
-}
-
-impl<'a> Keys<'a> {
-  /// The next line, without its end, as `splitlines()` cuts them.
-  fn next_line(&mut self) -> Option<&'a [u8]> {
-    if self.rest.is_empty() {
-      return None;
-    }
-    let end = self
-      .rest
-      .iter()
-      .position(|byte| LINE_ENDS.contains(byte))
-      .unwrap_or(self.rest.len());
-    let line = self.rest.get(..end)?;
-    let skip = match (self.rest.get(end), self.rest.get(end.saturating_add(1))) {
-      (Some(&b'\r'), Some(&NEWLINE)) => 2,
-      (Some(_), _) => 1,
-      (None, _) => 0,
-    };
-    self.rest = self
-      .rest
-      .get(end.saturating_add(skip)..)
-      .unwrap_or_default();
-    Some(line)
-  }
+  Ok(Keys {
+    lines: lines(payload),
+  })
 }
 
 impl<'a> Iterator for Keys<'a> {
   type Item = (&'a [u8], &'a [u8]);
 
   fn next(&mut self) -> Option<Self::Item> {
-    let line = self.next_line()?;
+    let line = self.lines.next()?;
     let tab = line.iter().position(|byte| *byte == TAB)?;
     Some((line.get(..tab)?, line.get(tab.saturating_add(1)..)?))
   }
@@ -544,8 +478,7 @@ mod tests {
     let text = ReplyText::new(&Reply {
       in_reply_to: 3,
       result: 1,
-    })
-    .unwrap();
+    });
     let built = reply_part(0, &text);
     assert_eq!(built.kind, b"REPLY:PUSHKEY");
     assert!(built.is_mandatory() && built.mandatory().is_empty());
@@ -556,7 +489,7 @@ mod tests {
       in_reply_to: u32::MAX,
       result: i64::MIN,
     };
-    let text = ReplyText::new(&widest).unwrap();
+    let text = ReplyText::new(&widest);
     assert_eq!(reply(&reply_part(1, &text)), Ok(widest));
   }
 
@@ -581,7 +514,7 @@ mod tests {
     #[test]
     fn any_reply_reads_back_as_written(in_reply_to in any::<u32>(), result in any::<i64>()) {
       let written = Reply { in_reply_to, result };
-      let text = ReplyText::new(&written).unwrap();
+      let text = ReplyText::new(&written);
       prop_assert_eq!(reply(&reply_part(0, &text)), Ok(written));
     }
   }

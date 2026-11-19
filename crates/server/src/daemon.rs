@@ -2951,7 +2951,8 @@ impl Daemon {
 
   /// Test support: while `withhold` is set, no shard records the control partition's acknowledgement of its appended
   /// audit records (A-265; `LandingState::acknowledgement_withheld`), as if each were lost: the outbox keeps them, and
-  /// the reap tick sends them again, which the control partition must append nothing twice of. Delivered like
+  /// the deadline keeper's look sends them again (A-554), which the control partition must append nothing twice of.
+  /// Delivered like
   /// [`Self::withhold_audit_crossing`]; `Ok` once installed, else the typed refusal.
   pub fn withhold_audit_acknowledgement(&self, withhold: bool) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -4709,6 +4710,7 @@ async fn init_shard(
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
+    placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -4891,14 +4893,15 @@ async fn rebuild_and_report(
 /// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
 /// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
 /// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
-/// own reports (`crate::pressure`), and the NFSv4 purges owed are sent by the reaper at their own deadline
-/// (`crate::nfs::note_purges`). Dead clients are no longer its: since A-475 each client's watch reports its hang-up and
-/// the shard's reaper retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging
-/// buffers, status captures, lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's
-/// resend, which the shard's keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve
-/// loop steps once woken and the keeper retries at a refused record's deadline. The jobs left here leave a piece at a
-/// time for the events or deadlines that own them, and then the loop and its tick go (the reaper series, GAPS).
-/// Derived: the cadence is the budget.
+/// own reports (`crate::pressure`), the NFSv4 purges owed are sent by the reaper at their own deadline
+/// (`crate::nfs::note_purges`), and a declined huge-page placement is re-armed by the keeper a retry window after the
+/// decline. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper
+/// retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging buffers, status captures,
+/// lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's resend, which the shard's
+/// keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve loop steps once woken and
+/// the keeper retries at a refused record's deadline. The jobs left here leave a piece at a time for the events or
+/// deadlines that own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the
+/// budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4914,11 +4917,6 @@ async fn reap_loop() {
       crate::delegation::drain(s);
     });
     seal_idle_content().await;
-    // §4.6, the backed route's L1 (A-193): ask the host once more for the placements it declined in a way likely to
-    // hold. A declined collapse costs milliseconds of compaction (1,954 and 2,832 µs a step on adacachy at load 90), so
-    // a host out of huge pages is asked once a tick, not once a range; the reap tick is the cadence the shard already
-    // does cold work at, so a host that frees memory has its ranges placed again within one tick.
-    state::with_state(|s| s.store.shards_backings.rearm_placement());
   }
 }
 
