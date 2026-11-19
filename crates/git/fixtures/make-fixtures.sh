@@ -103,4 +103,25 @@ for name in main:dir/file main:missing main:dir; do
     pkt "filter sparse:oid=$name"$'\n'; pkt $'done\n'; printf 0000; } > "$file.request.bin"
   v2 < "$file.request.bin" > "$file.response.bin" 2> /dev/null || true
 done
+# A name whose refusal is longer than the 128 bytes git's server relays a read of `pack-objects`' errors in, holding a
+# tab, which `die` keeps, and a control byte and DEL, which it shows as `?`.
+LONG="main:$(printf 'a%.0s' $(seq 1 140))"$'\t\x01\x7fz'
+{ pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+  pkt $'thin-pack\n'; pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt "want $HEAD_OID"$'\n'
+  pkt "filter sparse:oid=$LONG"$'\n'; pkt $'done\n'; printf 0000; } > "$OUT/fetch-sparse-long.request.bin"
+v2 < "$OUT/fetch-sparse-long.request.bin" > "$OUT/fetch-sparse-long.response.bin" 2> /dev/null || true
+# The refusal under `sideband-all`, alone and with `packfile-uris`: git writes the packfile section's header before
+# `pack-objects` begins when the request names no URI protocol, and otherwise only once its pack begins, which a refusal
+# never does.
+git config uploadpack.allowSidebandAll true
+{ pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+  pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt $'sideband-all\n'; pkt "want $HEAD_OID"$'\n'
+  pkt $'filter sparse:oid=main:missing\n'; pkt $'done\n'; printf 0000; } > "$OUT/fetch-sparse-sideband-all.request.bin"
+v2 < "$OUT/fetch-sparse-sideband-all.request.bin" > "$OUT/fetch-sparse-sideband-all.response.bin" 2> /dev/null || true
+git config uploadpack.blobPackfileUri "$BLOB $URIPACK https://example.invalid/$URIPACK.pack"
+{ pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+  pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt $'sideband-all\n'; pkt "want $HEAD_OID"$'\n'; pkt $'packfile-uris https\n'
+  pkt $'filter sparse:oid=main:missing\n'; pkt $'done\n'; printf 0000; } > "$OUT/fetch-sparse-uris.request.bin"
+v2 < "$OUT/fetch-sparse-uris.request.bin" > "$OUT/fetch-sparse-uris.response.bin" 2> /dev/null || true
+git config --unset uploadpack.blobPackfileUri; git config --unset uploadpack.allowSidebandAll
 git config --unset uploadpack.allowFilter
