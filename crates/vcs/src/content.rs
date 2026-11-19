@@ -29,6 +29,12 @@
 //! level at a time, and [`ContentStore::release`] hands the freed bytes back, so a caller whose content names other
 //! content (a table naming its rows' objects) can release what it named.
 //!
+//! **Derived nodes** ([`Form::Derived`], A-647). Derived data ([`crate::derived`]) is kept as trees of nodes, each the
+//! identities of the contents it names (files' contents, other nodes) and a payload of its type's. A node holds what it
+//! names, and freeing it gives that back, as a list's does; so a value lives exactly as long as something holds its
+//! root, and two values that share a subtree share its nodes. Its identity is derived under a context of its own, so no
+//! bytes a client sends can be taken for a node, whose freeing would give back contents it never held.
+//!
 //! **Within a budget.** The store counts the bytes it keeps, and the bytes structures beside it charge to it (an
 //! index's tail and its runs' fences, [`ContentStore::charge`]), against a budget the caller derives from its shard's
 //! memory (§4.2) and may derive again as pressure moves ([`ContentStore::set_budget`]). A put or a charge past it is
@@ -39,6 +45,7 @@
 //! The map is ordered (`BTreeMap`) so that every walk of it is deterministic.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 
 /// Format: a content identity's bytes, BLAKE3's output length.
@@ -51,6 +58,12 @@ const LIST_CONTEXT: &str =
 
 /// Format: the context a table's identity is derived under ([`Form::Table`]).
 const TABLE_CONTEXT: &str = "slates-vcs 2026-11-19 object store: an index table";
+
+/// Format: the context a derived value's node's identity is derived under ([`Form::Derived`], A-647).
+const DERIVED_CONTEXT: &str = "slates-vcs 2026-11-19 object store: a derived value's node";
+
+/// Format: the bytes of a derived node's count of the contents it names, little-endian ([`DerivedNode`]).
+pub const NAMES_COUNT_BYTES: usize = size_of::<u32>();
 
 /// A content identity: the BLAKE3 of the content's bytes, in the mode its [`Form`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -65,6 +78,9 @@ pub enum Form {
   List,
   /// An index's table ([`crate::table`]).
   Table,
+  /// A derived value's node ([`crate::derived`], A-647): the contents it names, then its type's payload
+  /// ([`DerivedNode`]). It holds each content it names, and freeing it gives them back.
+  Derived,
 }
 
 impl ContentId {
@@ -79,6 +95,7 @@ impl ContentId {
       Form::Window => return ContentId::of(bytes),
       Form::List => LIST_CONTEXT,
       Form::Table => TABLE_CONTEXT,
+      Form::Derived => DERIVED_CONTEXT,
     };
     let mut hasher = blake3::Hasher::new_derive_key(context);
     hasher.update(bytes);
@@ -120,6 +137,12 @@ pub enum ContentRefused {
     /// The window asked for.
     window: u64,
   },
+  /// A derived node may not name `identity`, an index's table: a table's rows are given back by the index that frees
+  /// it ([`crate::index`]), which a node's freeing could not do.
+  NotNameable {
+    /// The table named.
+    identity: ContentId,
+  },
 }
 
 /// What the store has done, for the tests' non-vacuity checks and the owner's accounting.
@@ -133,6 +156,8 @@ pub struct ContentCounters {
   pub freed: u64,
   /// Lists stored new: objects longer than a window held as their windows.
   pub lists: u64,
+  /// Derived nodes stored new ([`ContentStore::put_derived`]).
+  pub derived: u64,
 }
 
 /// What a put did: the content's identity, and whether its bytes were stored new or were held already.
@@ -549,33 +574,87 @@ impl ContentStore {
     Ok(())
   }
 
+  /// Keeps a derived value's node ([`Form::Derived`], A-647): `names`, the contents it names, each of which the store
+  /// must hold, then `payload`, its type's own bytes, at most one window in all ([`DerivedNode`] is the layout). Stored
+  /// new, it holds each content it names once for each time it names it, so they live as long as it does, and freeing
+  /// it gives them back ([`ContentStore::release`]); held already, it is held once more. Either way the caller holds it
+  /// once more. A table is never named ([`ContentRefused::NotNameable`]). Refused, nothing changed.
+  pub fn put_derived(
+    &mut self,
+    names: &[ContentId],
+    payload: &[u8],
+  ) -> Result<Stored, ContentRefused> {
+    return Err(ContentRefused::NotHeld);
+    let bytes = encode_derived(names, payload).ok_or(ContentRefused::CountExhausted)?;
+    self.within_window(bytes.len())?;
+    let identity = ContentId::named(Form::Derived, &bytes);
+    if self.entries.contains_key(&identity) {
+      self.hold(&identity)?;
+      self.counters.deduplicated = self.counters.deduplicated.saturating_add(1);
+      return Ok(Stored {
+        identity,
+        fresh: false,
+      });
+    }
+    self.can_name(names)?;
+    self.admit(width(bytes.len())?, 0)?;
+    self.insert_new(identity, Form::Derived, &bytes)?;
+    for name in names {
+      self.hold(name)?;
+    }
+    self.counters.derived = self.counters.derived.saturating_add(1);
+    Ok(Stored {
+      identity,
+      fresh: true,
+    })
+  }
+
+  /// Refuses `names` unless the store holds each, none is a table, and each count can take one more for every time it
+  /// is named.
+  fn can_name(&self, names: &[ContentId]) -> Result<(), ContentRefused> {
+    let mut times: BTreeMap<ContentId, u64> = BTreeMap::new();
+    for name in names {
+      let count = times.entry(*name).or_insert(0);
+      *count = count.checked_add(1).ok_or(ContentRefused::CountExhausted)?;
+    }
+    for (name, times) in &times {
+      let held = self.entries.get(name).ok_or(ContentRefused::NotHeld)?;
+      if held.form == Form::Table {
+        return Err(ContentRefused::NotNameable { identity: *name });
+      }
+      held
+        .holders
+        .checked_add(*times)
+        .ok_or(ContentRefused::CountExhausted)?;
+    }
+    Ok(())
+  }
+
+  /// The derived node `identity` names, read in place; `None` when the store holds no derived node of it.
+  pub fn derived(&self, identity: &ContentId) -> Option<DerivedNode<'_>> {
+    let held = self
+      .entries
+      .get(identity)
+      .filter(|held| held.form == Form::Derived)?;
+    DerivedNode::open(&held.bytes)
+  }
+
   /// Gives back one holder's count of `identity`; the content's bytes when that was its last holder, which frees it. A
-  /// freed list gives back what it named, and a list freed by that what it named, a level at a time; past a refusal
-  /// there the rest is given back still, and the first refusal is the answer.
+  /// freed list gives back what it named, and a freed derived node what it names, and each list or node freed by that
+  /// what it names, until nothing more is freed; past a refusal there the rest is given back still, and the first
+  /// refusal is the answer. The cascade is one call, as long as what it frees (slicing it is owed with A-581's).
   pub fn release(&mut self, identity: &ContentId) -> Result<Option<Box<[u8]>>, ContentRefused> {
     let Some((bytes, form)) = self.release_one(identity)? else {
       return Ok(None);
     };
+    let mut named: Vec<ContentId> = Vec::new();
+    given_back(form, &bytes, &mut named);
     let mut first = Ok(());
-    if form == Form::List {
-      let mut named: Vec<ContentId> = bytes
-        .as_chunks::<IDENTITY_BYTES>()
-        .0
-        .iter()
-        .filter_map(|identity| ContentId::from_slice(identity))
-        .collect();
-      while let Some(next) = named.pop() {
-        match self.release_one(&next) {
-          Ok(Some((freed, Form::List))) => named.extend(
-            freed
-              .as_chunks::<IDENTITY_BYTES>()
-              .0
-              .iter()
-              .filter_map(|identity| ContentId::from_slice(identity)),
-          ),
-          Ok(_) => {}
-          Err(refused) => first = first.and(Err(refused)),
-        }
+    while let Some(next) = named.pop() {
+      match self.release_one(&next) {
+        Ok(Some((freed, form))) => given_back(form, &freed, &mut named),
+        Ok(None) => {}
+        Err(refused) => first = first.and(Err(refused)),
       }
     }
     first.map(|()| Some(bytes))
@@ -681,6 +760,91 @@ impl ContentStore {
   /// What the store has done.
   pub fn counters(&self) -> ContentCounters {
     self.counters
+  }
+}
+
+/// The contents a freed content of `form` held, which freeing it gives back: a list's identities, a derived node's
+/// names. A window names nothing, and a table's rows are given back by the index that freed it ([`crate::index`]).
+fn given_back(form: Form, bytes: &[u8], named: &mut Vec<ContentId>) {
+  match form {
+    Form::List => named.extend(
+      bytes
+        .as_chunks::<IDENTITY_BYTES>()
+        .0
+        .iter()
+        .copied()
+        .map(ContentId),
+    ),
+    Form::Derived => named.extend(
+      DerivedNode::open(bytes)
+        .into_iter()
+        .flat_map(|node| node.names()),
+    ),
+    Form::Window | Form::Table => {}
+  }
+}
+
+/// A derived node's bytes ([`Form::Derived`]): the count of the contents it names (four bytes, little-endian), their
+/// identities, then the payload. `None` when there are more names than the count holds.
+pub fn encode_derived(names: &[ContentId], payload: &[u8]) -> Option<Vec<u8>> {
+  let count = u32::try_from(names.len()).ok()?;
+  let len = names
+    .len()
+    .checked_mul(IDENTITY_BYTES)?
+    .checked_add(NAMES_COUNT_BYTES)?
+    .checked_add(payload.len())?;
+  let mut bytes = Vec::with_capacity(len);
+  bytes.extend_from_slice(&count.to_le_bytes());
+  for name in names {
+    bytes.extend_from_slice(&name.0);
+  }
+  bytes.extend_from_slice(payload);
+  Some(bytes)
+}
+
+/// A derived node read in place from its bytes ([`encode_derived`]): the contents it names, in order, and its type's
+/// payload.
+#[derive(Clone, Copy, Debug)]
+pub struct DerivedNode<'a> {
+  names: &'a [[u8; IDENTITY_BYTES]],
+  payload: &'a [u8],
+}
+
+impl<'a> DerivedNode<'a> {
+  /// The node `bytes` hold, or `None` when they are not a node's: shorter than a count, or than the names it counts.
+  pub fn open(bytes: &'a [u8]) -> Option<DerivedNode<'a>> {
+    let (count, rest) = bytes.split_first_chunk::<NAMES_COUNT_BYTES>()?;
+    let count = usize::try_from(u32::from_le_bytes(*count)).ok()?;
+    let (names, payload) = rest.split_at_checked(count.checked_mul(IDENTITY_BYTES)?)?;
+    Some(DerivedNode {
+      names: names.as_chunks::<IDENTITY_BYTES>().0,
+      payload,
+    })
+  }
+
+  /// The contents it names.
+  pub fn len(&self) -> usize {
+    self.names.len()
+  }
+
+  /// Whether it names no content.
+  pub fn is_empty(&self) -> bool {
+    self.names.is_empty()
+  }
+
+  /// The content it names at `at`.
+  pub fn name(&self, at: usize) -> Option<ContentId> {
+    self.names.get(at).copied().map(ContentId)
+  }
+
+  /// The contents it names, in order.
+  pub fn names(&self) -> impl Iterator<Item = ContentId> + use<'a> {
+    self.names.iter().copied().map(ContentId)
+  }
+
+  /// Its type's payload.
+  pub fn payload(&self) -> &'a [u8] {
+    self.payload
   }
 }
 
