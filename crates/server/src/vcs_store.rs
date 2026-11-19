@@ -139,12 +139,12 @@ pub(crate) struct GitStore {
 }
 
 impl GitStore {
-  /// An empty store of `format`.
-  fn new(format: ObjectFormat) -> GitStore {
+  /// An empty store of `format`, its values' trees shaped by `window`, its content store's (A-647 part 4).
+  fn new(format: ObjectFormat, window: usize) -> GitStore {
     GitStore {
       repository: Repository::new(format),
       derivations: Derivations::new(),
-      reach: ReachSets::declare(Mode::Eager),
+      reach: ReachSets::declare(window, Mode::Eager),
       versions: BTreeMap::new(),
       charged: 0,
     }
@@ -354,7 +354,10 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     stores.content = Some(content);
   }
   let store = match record.tool {
-    VcsTool::Git => RepositoryStore::Git(GitStore::new(git_format(record.format).ok_or(Unmade)?)),
+    VcsTool::Git => RepositoryStore::Git(GitStore::new(
+      git_format(record.format).ok_or(Unmade)?,
+      window,
+    )),
     VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore::default()),
     VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
   };
