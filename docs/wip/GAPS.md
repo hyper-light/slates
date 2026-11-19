@@ -6031,7 +6031,20 @@
 > 0.47–0.66 µs (BENCHMARKS, "What a verdict compares and copies"). At the 3,000-client rung's 21 KiB files the owner's
 > CPU a verdict is even (W1: 21.3–22.0 against 21.1–22.1 µs). **Open:** an accept still follows the file (`apply` writes
 > the new file, 37 µs at 1 MiB); the rung's engine verdict is 13 µs where the bench's is under 2.5 µs (82% of the rung's
-> verdicts are conflicts); and the large-file daemon A/B is owed to the supervisor's measurement.
+> verdicts are conflicts). The large-file daemon A/B was even (the measurer, 2026-11-18: owner CPU a verdict 84–102 µs
+> before, 93–110 after, 747 files of 256 KiB–1 MiB at 1,000 clients), but the rung's slot overwrites take pass two's
+> memcmp and never this check, so it could not show it; every run also hit `TableAtCapacity` on edits.
+>
+> **Merge: a verdict makes no file until it accepts (§4.16 "The verdict"; 2026-11-19, g222, from perf's unpushed
+> 1a4c6646 ported onto main's commit).** A clean path's new file was built in the verdict (`apply` over the head's file),
+> before the increment's other paths were judged, so a conflict built files and threw them away: in W1's 3,000-client
+> profile 91 of the engine's 283 verdict samples were that `apply` (memmove and the vector's growth), and 82% of those
+> verdicts conflicted (perf, 2026-11-11, a diagnostic not on main). Now a mapped file is made once the whole verdict
+> accepts, at the start of the commit (live and replayed) or of a rebase's restatement, from the head the verdict judged
+> (a held verdict commits only there, A-635) and the increment's post-state (`Green::make_mapped`), before any copy or
+> node move. Counted: `Green::mapped_files_made`; `a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once`
+> (`crates/merge/tests/engine.rs`); every merge suite's oracle holds the bytes. **Owed (the supervisor's measurement):**
+> the owner's CPU a verdict at the 3,000-client and 1,000-client rungs, main before and after, interleaved.
 >
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
