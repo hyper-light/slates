@@ -215,7 +215,7 @@ impl Model {
     let Some((revision, source)) = self.copy_source(step) else {
       return;
     };
-    let record = Node::add(&path, source.1.kind).copied(revision, &source.0);
+    let record = Node::add(&path, source.1.kind).copied(revision as u64, &source.0);
     let (record, node) = changed_copy(record, &source.1, step);
     self.dump.node(&record);
     self.place_copy(&path, revision, &source.0, node);
@@ -240,7 +240,7 @@ impl Model {
       if self.working.get(&path) == Some(&source.1) {
         return;
       }
-      let record = Node::replace(&path, source.1.kind).copied(revision, &source.0);
+      let record = Node::replace(&path, source.1.kind).copied(revision as u64, &source.0);
       let (record, node) = changed_copy(record, &source.1, step);
       self.dump.node(&record);
       self.remove(&path);
@@ -250,18 +250,18 @@ impl Model {
   }
 
   /// A node of an earlier revision other than its root, with its path and revision.
-  fn copy_source(&self, step: &Step) -> Option<(u64, (String, ModelNode))> {
+  fn copy_source(&self, step: &Step) -> Option<(usize, (String, ModelNode))> {
     let revision = usize::from(step.second) % self.trees.len();
     let tree = &self.trees[revision];
     let candidates: Vec<(&String, &ModelNode)> = tree.iter().filter(|(path, _)| !path.is_empty()).collect();
     let (path, node) = pick_from(&candidates, step.first.rotate_left(8))?;
-    Some((revision as u64, ((*path).clone(), (*node).clone())))
+    Some((revision, ((*path).clone(), (*node).clone())))
   }
 
   /// Places a copy of `source` at `revision` at `path`, its own node `node`, everything beneath the source beneath it.
-  fn place_copy(&mut self, path: &str, revision: u64, source: &str, node: ModelNode) {
+  fn place_copy(&mut self, path: &str, revision: usize, source: &str, node: ModelNode) {
     let prefix = format!("{source}/");
-    let beneath: Vec<(String, ModelNode)> = self.trees[revision as usize]
+    let beneath: Vec<(String, ModelNode)> = self.trees[revision]
       .range(prefix.clone()..)
       .take_while(|(child, _)| child.starts_with(&prefix))
       .filter_map(|(child, child_node)| {
