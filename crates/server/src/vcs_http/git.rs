@@ -24,8 +24,10 @@
 //!    push).
 //! 5. The service. One whose server half has not landed, or whose repository's store is not held here, is `503` (RFC
 //!    9110 §15.6.4: "the server is currently unable to handle the request"). upload-pack is served from a repository's
-//!    store by [`upload`] (A-640 part 2, A-625 part 3), once the server lends stores (owed); receive-pack answers `503`
-//!    until its session's entry point lands (A-654). `Unserved` answers `503` to both.
+//!    store by [`upload`] (A-640 part 2, A-625 part 3), once the server lends stores (owed); receive-pack by [`receive`]
+//!    through the push driver on the repository's owner shard (A-654 parts 2 and 3). [`Halves`] serves each from its
+//!    own half, and `Unserved` answers `503` to both. A service that cannot start its push is refused as its driver
+//!    says: the repository gone `404`, its policy unreadable `500`, its advertisement unwritable `500`.
 //!
 //! Every refusal of steps 2 to 5 is typed ([`Refused`]) and counted under its kind in the shard's status counters.
 //!
@@ -37,15 +39,15 @@
 //! slash (`slates_git::http::route`): a client reaches `name` at `/name/info/refs`, and one named `name.git` at
 //! `/name.git/info/refs`. No second spelling is tried.
 //!
-//! **Git LFS** (A-629; §4.17.2 "Large files"): a request under `<repo>/info/lfs`, the LFS server URL git-lfs derives from
-//! a remote, is routed by `slates_git::lfs::serve::route` (the batch API, the locks API and the basic adapter's
+//! **Git LFS** (A-629; §4.17.2 "Large files"): a request under `<repo>/info/lfs`, the LFS server URL git-lfs derives
+//! from a remote, is routed by `slates_git::lfs::serve::route` (the batch API, the locks API and the basic adapter's
 //! transfers this server hands out) and taken in the same order: its route refused whoever asks (`405` with `Allow`,
-//! `400`, `414`, `415`, `406`), a request without a `Host` `400`; its credentials, a `401` naming each challenge in
-//! `LFS-Authenticate` too, as `slates_git::lfs::serve` answers one (A-629 part 1); its repository, moved to its shard or
-//! `404`; the policy's gate for LFS's rights (a download or a listing reads, an upload or a lock submits, another's
+//! `400`, `414`, `415`, `406`), a request naming no authority `400`; its credentials, a `401` naming each challenge in
+//! `LFS-Authenticate` too, as `slates_git::lfs::serve` answers one (A-629 part 1); its repository, moved to its shard
+//! or `404`; the policy's gate for LFS's rights (a download or a listing reads, an upload or a lock submits, another's
 //! lock rewrites; [`LFS_RIGHTS`]), else `403`; and its service ([`LfsService`]), `503` for an endpoint the site's
-//! service does not serve (every one, on a site without a service). Each endpoint's own right on the ref it names is the
-//! answer's (`crate::lfs::LfsAccess`). A served LFS request decides its status after its body
+//! service does not serve (every one, on a site without a service). Each endpoint's own right on the ref it names is
+//! the answer's (`crate::lfs::LfsAccess`). A served LFS request decides its status after its body
 //! (`StatusMode::AfterBody`, main's ruling, 2026-11-19): its body is kept whole within the request's room, which the
 //! engine's admission already bounds, and answered once it ends, with the status, fields and body the service decided,
 //! its hrefs under the authority the request named, and its actions expiring with the bearer token that asked
@@ -79,8 +81,10 @@ const LFS_AUTHENTICATE: &[u8] = b"LFS-Authenticate";
 /// Format: nanoseconds in a second, the credential record's unit against an LFS action's.
 const NS_PER_SECOND: u64 = 1_000_000_000;
 
+mod receive;
 mod upload;
 
+pub(crate) use receive::{ReceiveServices, ThisShard};
 pub(crate) use upload::{StoreLender, UploadServices};
 
 /// What a request's credential proved (§4.13; A-625 part 3): its principal, and the expiry an LFS action carries.
@@ -152,6 +156,8 @@ pub(crate) enum Refused {
   Unreadable,
   /// The service's server half, or the repository's store, is not here: `503`.
   Unavailable,
+  /// The advertisement, its prelude or the service's own, could not be written: `500`.
+  Unwritable,
 }
 
 impl Refused {
@@ -167,7 +173,7 @@ impl Refused {
       Refused::Unproven(Unproven::Unanswered) | Refused::Unavailable => Status::SERVICE_UNAVAILABLE,
       Refused::NoRepository => Status::NOT_FOUND,
       Refused::Forbidden => Status::FORBIDDEN,
-      Refused::Unreadable => Status::INTERNAL_SERVER_ERROR,
+      Refused::Unreadable | Refused::Unwritable => Status::INTERNAL_SERVER_ERROR,
     }
   }
 
@@ -186,6 +192,7 @@ impl Refused {
       Refused::Forbidden => "vcs_http.git.forbidden",
       Refused::Unreadable => "vcs_http.git.policy_unreadable",
       Refused::Unavailable => "vcs_http.git.unavailable",
+      Refused::Unwritable => "vcs_http.git.unwritable",
     }
   }
 }
@@ -208,8 +215,26 @@ pub(crate) struct Start<'a> {
 /// Why a service did not start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ServiceRefused {
-  /// The service's server half has not landed: `503`.
+  /// The service's server half has not landed, or the repository's store is not here: `503`.
   Unavailable,
+  /// The repository is gone, or serves another tool, by the time its service starts: `404`.
+  NoRepository,
+  /// The repository's policy cannot be read: `500`.
+  Unreadable,
+  /// The service's advertisement could not be written: `500`.
+  Unwritable,
+}
+
+impl ServiceRefused {
+  /// The site's refusal it is answered and counted as.
+  fn kind(self) -> Refused {
+    match self {
+      ServiceRefused::Unavailable => Refused::Unavailable,
+      ServiceRefused::NoRepository => Refused::NoRepository,
+      ServiceRefused::Unreadable => Refused::Unreadable,
+      ServiceRefused::Unwritable => Refused::Unwritable,
+    }
+  }
 }
 
 /// git's two services behind the site: upload-pack (fetch and clone) and receive-pack (push).
@@ -220,8 +245,8 @@ pub(crate) trait GitServices {
   fn start(&mut self, start: &Start<'_>) -> Result<Self::Exchange, ServiceRefused>;
 }
 
-/// The services as the server has them today: neither has its server half (upload-pack's negotiation, A-615; receive-
-/// pack's commit through the register, A-620 part 2), so each answers [`ServiceRefused::Unavailable`].
+/// Services with no server half: each answers [`ServiceRefused::Unavailable`], as upload-pack's half does in the daemon
+/// until the server lends its stores.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Unserved;
 
@@ -247,6 +272,72 @@ impl GitServices for Unserved {
 
   fn start(&mut self, _start: &Start<'_>) -> Result<NoExchange, ServiceRefused> {
     Err(ServiceRefused::Unavailable)
+  }
+}
+
+/// git's two services, each from its own half: upload-pack's from `upload`, receive-pack's from `receive` (A-654 part
+/// 3), so each half is built and replaced on its own.
+#[derive(Clone, Debug)]
+pub(crate) struct Halves<U, R> {
+  /// upload-pack's half.
+  upload: U,
+  /// receive-pack's half.
+  receive: R,
+}
+
+impl<U, R> Halves<U, R> {
+  /// upload-pack from `upload`, receive-pack from `receive`.
+  pub(crate) fn new(upload: U, receive: R) -> Self {
+    Self { upload, receive }
+  }
+}
+
+/// The exchange of the half a request started.
+pub(crate) enum HalfExchange<U, R> {
+  /// upload-pack's.
+  Upload(U),
+  /// receive-pack's.
+  Receive(R),
+}
+
+impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
+  async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.body(run).await,
+      HalfExchange::Receive(receive) => receive.body(run).await,
+    }
+  }
+
+  async fn body_end(&mut self) -> Result<(), Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.body_end().await,
+      HalfExchange::Receive(receive) => receive.body_end().await,
+    }
+  }
+
+  async fn reply_fields(&mut self) -> Result<Fields, Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.reply_fields().await,
+      HalfExchange::Receive(receive) => receive.reply_fields().await,
+    }
+  }
+
+  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.reply(out).await,
+      HalfExchange::Receive(receive) => receive.reply(out).await,
+    }
+  }
+}
+
+impl<U: GitServices, R: GitServices> GitServices for Halves<U, R> {
+  type Exchange = HalfExchange<U::Exchange, R::Exchange>;
+
+  fn start(&mut self, start: &Start<'_>) -> Result<Self::Exchange, ServiceRefused> {
+    match start.service {
+      Service::UploadPack => self.upload.start(start).map(HalfExchange::Upload),
+      Service::ReceivePack => self.receive.start(start).map(HalfExchange::Receive),
+    }
   }
 }
 
@@ -715,14 +806,12 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     };
     let service = match self.services.start(&start) {
       Ok(service) => service,
-      Err(ServiceRefused::Unavailable) => {
-        return self.refuse(Refused::Unavailable, secure, true);
-      }
+      Err(refused) => return self.refuse(refused.kind(), secure, true),
     };
     let mut prelude = Vec::new();
     let reply = if asked.advertise {
       if http::advertisement_prelude(asked.service, asked.version, &mut prelude).is_err() {
-        return refused_with(Status::INTERNAL_SERVER_ERROR, cache_fields(), true);
+        return self.refuse(Refused::Unwritable, secure, true);
       }
       Reply::Advertisement(asked.service)
     } else {

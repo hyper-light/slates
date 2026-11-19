@@ -13526,41 +13526,160 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   }
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
-  let refs = edge_head(
-    port,
-    b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
-  );
+  let refs = bare_request(port, WAIT_FOR).expect("the edge answered");
   assert!(bearer_alone(&refs, "www-authenticate"), "{refs}");
-  let locks = edge_head(
-    port,
-    b"GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n",
-  );
+  let locks = edge_request(port, WAIT_FOR, LFS_LOCKS_REQUEST).expect("the edge answered LFS");
   assert!(bearer_alone(&locks, "lfs-authenticate"), "{locks}");
 }
 
-/// The head of the edge's answer on loopback `port` to `request`, sent on a connection of its own, in lower case.
-fn edge_head(port: u16, request: &[u8]) -> String {
-  use std::io::{Read, Write};
-  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-  stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
-  stream.write_all(request).unwrap();
-  let mut head = Vec::new();
-  let mut chunk = [0u8; 1024];
-  while !head.windows(4).any(|end| end == b"\r\n\r\n") {
-    let read = stream.read(&mut chunk).unwrap();
-    assert!(
-      read > 0,
-      "the edge closed before its head ended: {}",
-      String::from_utf8_lossy(&head)
-    );
-    head.extend_from_slice(&chunk[..read]);
-  }
-  String::from_utf8_lossy(&head).to_ascii_lowercase()
-}
+/// Shape: a Git LFS locks listing of `r.git` with no credentials, as git-lfs asks it (A-629 part 2c).
+const LFS_LOCKS_REQUEST: &[u8] =
+  b"GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
 
 /// Whether `head`, in lower case, is a `401` whose `field` offers Bearer's challenge and no Basic one anywhere.
 fn bearer_alone(head: &str, field: &str) -> bool {
   head.starts_with("http/1.1 401 ")
     && head.contains(&format!("{field}: bearer realm="))
     && !head.contains("basic")
+}
+
+/// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
+/// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
+fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
+  edge_request(
+    port,
+    patience,
+    b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+  )
+}
+
+/// Sends `request` to the version-control edge at loopback `port` on a connection of its own, waiting `patience` for
+/// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
+fn edge_request(port: u16, patience: Duration, request: &[u8]) -> std::io::Result<String> {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  stream.write_all(request)?;
+  let mut head = Vec::new();
+  let mut chunk = [0u8; 1024];
+  while !head.windows(4).any(|end| end == b"\r\n\r\n") {
+    let read = stream.read(&mut chunk)?;
+    if read == 0 {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+          "the edge closed before its head ended: {}",
+          String::from_utf8_lossy(&head)
+        ),
+      ));
+    }
+    head.extend_from_slice(chunk.get(..read).unwrap_or_default());
+  }
+  Ok(String::from_utf8_lossy(&head).to_ascii_lowercase())
+}
+
+/// The port the next daemon of an anchor names for its version-control edge, from the anchor's forwarded `lines`, read
+/// until that daemon says it serves (`serving_line`); none if it named none first.
+fn edge_port_before_serving(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+) -> Option<u16> {
+  let mut port = None;
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the daemon served within the start's ceiling");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+      port = rest.trim().parse::<u16>().ok();
+    }
+    if line.starts_with(serving_line) {
+      return port;
+    }
+  }
+}
+
+/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor with the version-control HTTP edge on loopback
+/// (`--vcs-http 127.0.0.1:0`); read the port its daemon names and ask it for a repository's refs; kill the daemon; once
+/// the anchor says it restarted it, ask the same port again, before its successor serves; read the port the successor
+/// names. Expect: the request made while the daemon was gone is taken and answered `401` by the successor, and the
+/// successor names the same port: the anchor holds the edge's listener, so a restart never drops its port.
+#[test]
+fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
+  let instance = format!("cli-vcs-http-held-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-http",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let port = edge_port_before_serving(&lines, &serving_line)
+    .expect("the daemon named its edge's port before it served");
+  let first = bare_request(port, WAIT_FOR).expect("the edge answered");
+  assert!(first.starts_with("http/1.1 401 "), "{first}");
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
+  let mut successor = None;
+  let mut while_restarting = None;
+  let mut again = None;
+  let mut served = false;
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(bare_request(port, START_CEILING));
+    }
+    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+      again = rest.trim().parse::<u16>().ok();
+    }
+    served |= line.starts_with(&serving_line);
+  }
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let head = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the edge's port was dropped while its daemon restarted: {error}")
+    });
+  assert!(head.starts_with("http/1.1 401 "), "{head}");
+  assert_eq!(
+    again,
+    Some(port),
+    "the restarted daemon serves the edge on the port its anchor holds"
+  );
 }
