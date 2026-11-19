@@ -2904,7 +2904,8 @@ const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
 /// unserved until it is rebuilt, A-533). Such a reply is never a completion (§4.9 RIFL): recorded, it was what every
 /// resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000 clients";
 /// `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Until A-533 an `Unpublished` a verb
-/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again.
+/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again. Judged where a
+/// verb answers ([`recorded_unless_deferred`]) and where a deferred reply is written ([`retry_deferred`], A-563).
 fn not_started(reply: &ReplyBody) -> bool {
   matches!(
     reply,
@@ -15188,7 +15189,10 @@ fn expire_leases_at(state: &mut ShardState, now: u64) -> usize {
 
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
 /// the client's shard) or one whose completion ring was full and may have room now. A reply written is a client's loop
-/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326).
+/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326). A reply that says its request was
+/// not started ([`not_started`]) is never recorded here, as a verb's own is not ([`recorded_unless_deferred`]), so a
+/// resend under its id runs it (A-563). Until A-563 a read scatter's `Overloaded`, a part not sent or not served, came
+/// this way and was recorded, so every resend under the id met it for good.
 fn retry_deferred(state: &mut ShardState) -> bool {
   let mut any = false;
   let deferred = std::mem::take(&mut state.deferred);
@@ -15214,6 +15218,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         .partition()
         .completion(origin, id.client, id.sequence)
       {
+        Seen::New if not_started(&reply) => unrecorded_not_started(state, reply),
         Seen::New => record_completion(state, origin, id, reply),
         _ => reply,
       }
