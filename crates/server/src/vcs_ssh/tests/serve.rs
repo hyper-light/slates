@@ -4,7 +4,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use slates_db::HostId;
 use slates_db::catalog::Principal;
+use slates_ipc::protocol::{
+  CredentialMaterial, ObjectFormat, Principal as WirePrincipal, ReplyBody, RequestBody, VcsTool,
+};
 use slates_rt::control::Control;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
@@ -12,11 +16,16 @@ use slates_ssh::command::Command as Asked;
 use slates_ssh::keylife::RECOMMENDED_KEY_TIME_NS;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
-use super::site::{Command, Dispatched, Next, Refused, SshSite, Stepped};
+use super::site::{
+  Command, Dispatched, Next, RecordKeys, Refused, Services, SshSite, Start, Stepped, ToolSite,
+  Unserved,
+};
 use super::ssh_client::{Client, ClientOptions, put_string, read_string};
 use super::waits::PHASES;
-use super::{Bounds, Counts, EdgeState, serve};
-use crate::daemon::LIVENESS_BUDGET_NS;
+use super::{Bounds, Counts, EdgeState, here, keep_here, serve};
+use crate::daemon::{Daemon, LIVENESS_BUDGET_NS};
+use crate::vcs_http::ShardRepositories;
+use crate::vcs_http::git::Located;
 
 /// Mercurial's `serve --stdio` behind the edge (A-679): its command's tests, and its sessions over the edge with these
 /// tests' client.
@@ -110,6 +119,10 @@ impl SshSite for Site {
     Keys.holding(user, key, key_blob)
   }
 
+  fn locate(&self, _command: &Asked) -> Located {
+    Located::Here
+  }
+
   fn dispatch(
     &mut self,
     _principal: &Principal,
@@ -154,6 +167,10 @@ impl SshSite for LooksUp {
 
   async fn lookup(&mut self, user: &[u8], key: &UserKey, key_blob: &[u8]) -> Holding<Principal> {
     Keys.holding(user, key, key_blob)
+  }
+
+  fn locate(&self, command: &Asked) -> Located {
+    Site.locate(command)
   }
 
   fn dispatch(
@@ -287,7 +304,8 @@ where
 fn served_by<S, M, C, R>(seats: usize, make: M, client: C) -> (R, Seen)
 where
   S: SshSite + 'static,
-  M: FnMut() -> S + 'static,
+  S::Keys: Send + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
@@ -739,4 +757,223 @@ fn a_key_looked_up_where_its_record_lives_proves_its_principal() {
   let (transcript, seen) = served_by(ONE_SEAT, || LooksUp, |address| session(address, 0, 0));
   assert_eq!(transcript, Some(pushed()));
   assert_eq!(seen.counts.commands_run, 1);
+}
+
+/// Shape: the shards of the daemon the cross-shard test runs: two, so a repository can live on a shard other than the
+/// listener's.
+const SHARDS: u16 = 2;
+/// Shape: the partition of the listener's shard.
+const LISTENER: usize = 0;
+/// Shape: the partition of the shard the listener's connections move to.
+const AWAY: usize = 1;
+/// Shape: the uid of the repositories' owner, whose key the credential record proves.
+const OWNER: u32 = 1234;
+
+/// The repositories' owner, the principal of the human's channel that created them.
+fn owner() -> Principal {
+  Principal::Uid {
+    host: HostId(0),
+    uid: OWNER,
+  }
+}
+
+/// Starts every service as [`SaysWhere`].
+#[derive(Clone, Copy)]
+struct StartsEvery;
+
+impl Services for StartsEvery {
+  type Command = SaysWhere;
+
+  fn start(&mut self, start: &Start<'_>) -> Result<SaysWhere, Unserved> {
+    let name = start
+      .repository
+      .map_or("", |repository| repository.name.as_str());
+    let shard = slates_rt::futures::shard_id().map_or(u16::MAX, |shard| shard.0);
+    Ok(SaysWhere {
+      out: format!("{name} on shard {shard}\n").into_bytes(),
+    })
+  }
+}
+
+/// A command that writes the repository it was started for and the runtime shard it was started on, then exits 0:
+/// where its `exec` was dispatched.
+struct SaysWhere {
+  /// What it wrote and the channel has not taken.
+  out: Vec<u8>,
+}
+
+impl Command for SaysWhere {
+  fn input(&mut self, _run: &[u8]) -> Result<(), Refused> {
+    Ok(())
+  }
+
+  fn input_end(&mut self) {}
+
+  async fn step(&mut self) -> Result<Stepped, Refused> {
+    Ok(Stepped {
+      consumed: 0,
+      next: Next::Exited(0),
+    })
+  }
+
+  fn output(&self) -> (&[u8], &[u8]) {
+    (&[], &self.out)
+  }
+
+  fn sent(&mut self, _stderr: usize, stdout: usize) {
+    self.out.drain(..stdout.min(self.out.len()));
+  }
+}
+
+/// The production site over the record's keys and the repositories' partitions, its services [`StartsEvery`].
+fn production_site() -> ToolSite<RecordKeys, ShardRepositories, StartsEvery> {
+  ToolSite::new(RecordKeys, ShardRepositories, StartsEvery)
+}
+
+/// The SSH edge on `daemon`: an edge's state kept on every shard, and on the listener's shard its listener serving
+/// [`production_site`]. The listener's address.
+fn ssh_edge(daemon: &Daemon) -> SocketAddrV4 {
+  let bounds = Bounds::of_shard(TWO_SEATS, ROOM_BYTES, TICK_NS);
+  let kept = crate::daemon::observe_at(daemon, AWAY, move |_state| {
+    keep_here(EdgeState::arrivals(bounds)).is_ok()
+  });
+  assert!(kept, "the other shard keeps an edge");
+  crate::daemon::observe_at(daemon, LISTENER, move |_state| {
+    let listener =
+      TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog()).ok()?;
+    let address = listener.local_addr().ok()?;
+    let state = keep_here(EdgeState::new(bounds, HOST_SEED)).ok()?;
+    let task = slates_rt::futures::spawn(async move {
+      let _ = serve(listener, state, production_site).await;
+    })
+    .ok()?;
+    slates_rt::futures::detach(task).ok()?;
+    Some(address)
+  })
+  .expect("the listener's shard serves the edge")
+}
+
+/// A git repository's name that routes to partition `partition` of the daemon's.
+fn name_on(partition: usize) -> String {
+  (0u32..)
+    .map(|serial| format!("ssh-{serial}.git"))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == partition)
+    .expect("a name routes there")
+}
+
+/// Creates the git repository `name` on its partition `partition`, owned by [`owner`].
+fn create(daemon: &Daemon, partition: usize, name: &str) {
+  let name = name.to_owned();
+  let created = crate::daemon::observe_at(daemon, partition, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name,
+        tool: VcsTool::Git,
+        format: ObjectFormat::Sha1,
+        default_branch: "main".to_owned(),
+        green: None,
+      },
+    )
+  });
+  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+}
+
+/// Enrolls the held key for [`owner`] on the partition its id routes to, as the human surface enrolls one (§4.13).
+fn enroll_held_key(daemon: &Daemon) {
+  let material = CredentialMaterial::SshKey {
+    blob: blob(&HELD_SEED),
+  };
+  let id = crate::credentials::id_of(&material);
+  let partition = usize::from(crate::credentials::owner_of(&id, usize::from(SHARDS)));
+  let reply = crate::daemon::observe_at(daemon, partition, move |state| {
+    let proves = WirePrincipal::Uid {
+      host: 0,
+      uid: OWNER,
+    };
+    let proof = crate::credentials::enroll_proof(&state.issuer_secret, &proves, &material, None);
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::EnrollCredential {
+        principal: proves,
+        material,
+        expires_ns: None,
+        proof,
+      },
+    )
+  });
+  assert_eq!(reply, ReplyBody::CredentialEnrolled { id });
+}
+
+/// A whole session with the held key that runs `git-upload-pack` on the repository `name`: everything it gave.
+fn upload(address: SocketAddrV4, name: &str) -> Option<Transcript> {
+  let mut peer = Peer::connect(address)?;
+  (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+  (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+  exec(&mut peer, format!("git-upload-pack '/{name}'").as_bytes()).then_some(())?;
+  Some(transcript(&mut peer))
+}
+
+/// The edge's counts on partition `partition`'s shard.
+fn counts_on(daemon: &Daemon, partition: usize) -> Counts {
+  crate::daemon::observe_at(daemon, partition, |_state| {
+    here().and_then(|edge| edge.with(EdgeState::counts))
+  })
+  .expect("the shard keeps an edge")
+}
+
+/// The transcript of [`SaysWhere`] started for the repository `name` on runtime shard `shard`: its words, then
+/// exit-status, EOF and close, in that order, and the connection ended.
+fn said_where(name: &str, shard: u16) -> Transcript {
+  Transcript {
+    out: format!("{name} on shard {shard}\n").into_bytes(),
+    err: Vec::new(),
+    status: Some(0),
+    order: vec![94, 98, 96, 97],
+    ended: true,
+  }
+}
+
+/// A-651 part 4 (main's ruling for the HTTP edge, A-625 part 3: a connection moves to its repository's owner shard;
+/// D-14). Do: on a two-shard daemon whose SSH edge listens on the first shard, enroll the owner's key in the credential
+/// record and create a git repository on each shard's partition; then, on a connection each, authenticate with the key
+/// and run `git-upload-pack` on each repository. Expect: each command started for its own repository on the shard that
+/// holds it, its words and exit 0 in order; the listener's shard accepted both, ran its own repository's command and
+/// moved the other connection, which the other shard seated and ran, so every `exec` was dispatched where its
+/// repository's partition lives.
+#[test]
+fn an_exec_moves_its_connection_to_the_shard_that_holds_its_repository() {
+  let daemon = crate::daemon::audit_daemon_of(SHARDS);
+  let address = ssh_edge(&daemon);
+  enroll_held_key(&daemon);
+  let names = [name_on(LISTENER), name_on(AWAY)];
+  create(&daemon, LISTENER, &names[0]);
+  create(&daemon, AWAY, &names[1]);
+  let shards = [LISTENER, AWAY]
+    .map(|partition| crate::daemon::observe_at(&daemon, partition, |state| state.shard));
+  let transcripts = [upload(address, &names[0]), upload(address, &names[1])];
+  let counts = [LISTENER, AWAY].map(|partition| {
+    let counts = counts_on(&daemon, partition);
+    (
+      counts.accepted,
+      counts.moved,
+      counts.arrived,
+      counts.commands_run,
+    )
+  });
+  daemon.stop();
+  assert_eq!(
+    (transcripts, counts),
+    (
+      [
+        Some(said_where(&names[0], shards[0])),
+        Some(said_where(&names[1], shards[1]))
+      ],
+      [(2, 1, 0, 1), (0, 0, 1, 1)]
+    )
+  );
 }
