@@ -594,3 +594,29 @@ Read 2026-11-19 by g262 at §1's revision: `svnserve/serve.c` (sha256 `acb1cac75
   the copy's revision is another line or was made fresh there) back to its source, keeps a revision after the peg
   while the line reaches back to the same path (refused when the path is absent in it), and ends where the path holds
   another line or none.
+
+Read 2026-11-19 by g297 for A-613 part 2, from `raw.githubusercontent.com/apache/subversion/1.15.0/<path>` (the release
+the fixtures were recorded with; the first 16 hex digits of each file's sha256): `svnserve/serve.c` `8154654e07aa4eb4`
+(as §1), `libsvn_repos/rev_hunt.c` `5acc827a362d11f4` (as above), `libsvn_repos/log.c` `673c9f4b42515315`,
+`libsvn_repos/list.c` `6ef0f62c00210b13`, `libsvn_ra_svn/marshal.c` `361702975baa8c70` (as §1), `libsvn_ra_svn/protocol`
+`b117e0ccc2008627` (as §1), `libsvn_fs_fs/tree.c` `f507210992ec9736`, `libsvn_fs_fs/dag.c` `9efbb054b8818693` (as §1),
+`libsvn_subr/mergeinfo.c` `afee0be02f1374d6`, `libsvn_repos/fs-wrap.c` `126ab4670c8c23e0` (as §1),
+`libsvn_delta/svndiff.c` `311b0286b38d7d6d`, `libsvn_delta/text_delta.c` `88686a46845f5b8e`, `libsvn_delta/xdelta.c`
+`2e7b6226acfa9078`, `include/svn_repos.h` `941491e450489ee4`, `include/svn_error_codes.h` `f5b2c11d407e752f`; the
+fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remaining command's sessions.
+- **`get-file`** [C: `serve.c` `get_file`, `get_props`; `dag.c` `svn_fs_fs__dag_file_checksum`; recorded]: parameters
+  `c(?r)bb?B` (a fifth item that is no boolean ends the connection); the authentication request, the revision, then
+  the checksum: absent "File not found", a directory "Attempted to get checksum of a *non*-file node" (160017); the
+  answer `( ( md5 ) rev ( props ) [ ( iprops ) ] )`, the property list present even when not wanted, the inherited
+  list only when asked (empty when no ancestor has properties); the text as strings of `get_file`'s 4,096-byte
+  buffer, then the empty string and `( success ( ) )` (a read error there: the empty string and the refusal).
+- **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
+  name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
+  `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
+  `get-deleted-rev` are `rev_hunt.c`'s (segments cropped and gaps reported; the deleted revision found by a binary search
+  over node relation and closest copy, its absence answered `SVN_ERR_ENTRY_MISSING_REVISION`); `log` is
+  `svn_repos_get_logs5` (FSFS's node history, `tree.c` `history_prev`, walked per path; changed paths in the
+  revision's stored order, which is byte order; merged revisions from `fs_mergeinfo_changed` and
+  `combine_mergeinfo_path_lists`); `get-file-revs` is `svn_repos_get_file_revs2` (the delta's bytes are FSFS's own
+  windows re-encoded as svndiff 2 for a client that accepts it, so slates' deltas made from extents are compared by
+  the text they make).

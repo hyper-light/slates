@@ -442,14 +442,15 @@
 > inexact walk with inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over the index, its
 > descendants found by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem
 > on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed
-> from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra with piece 7's
-> location segments and log; the property's UTF-8 and CR checks with piece 7's property validation. A-613 (2026-11-19,
+> from it: the property's UTF-8 and CR checks with piece 7's property validation (`svn mergeinfo --show-revs` is the
+> stock client's work over the server's answers: Ada's scope, 2026-11-18). A-613 (2026-11-19,
 > g262, UI goal 93), its first part: the ra_svn read commands' sans-io handler, `get-latest-rev`, `get-dated-rev`,
 > `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to transcripts of stock
 > `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac
 > Studio, red-checked six ways (see A-613); its second part's first slice, `get-dir` and `get-locations`, the two stock
-> sessions waiting on them replayed whole. Owed from it: `get-file`, `list`, `log` with merged revisions,
-> `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then `svn mergeinfo --show-revs`, and read access by
+> sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
+> the caller's room, red-checked six ways, the fixtures recorded again for every command still owed. Owed from it:
+> `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by
 > A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
