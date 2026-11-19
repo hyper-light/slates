@@ -32447,4 +32447,14 @@ counter `image.archive_import_stage_past_bound`, `BadLayout` classed `Malformed`
 - **Owed.** The decoded archive is held beside the restored tree until the restore ends, so an import near the shard's
   room still holds its tree about twice for that time; and the manifest's decode and identity are one piece (both
   A-453's, in GAPS).
-- **Evidence.** Pending the Mac Studio runs (this entry is completed with them).
+- **Evidence (Mac Studio d1323898, 2026-11-19 UTC, debug).** `cargo test --locked -p slates-archive --lib`: 9 of 9 in
+  0.62 s, among them the oracle (`an_archive_fed_in_any_slices_decodes_as_its_whole_stream`: 256 generated archives of
+  raw and LZ4 records fed in slices of 1 to 299 bytes, whole, cut and flipped, each equal to the stream fed at once and
+  a whole one to the archive encoded) and the bound (`a_stream_many_times_its_bound_is_fed_within_it`: a stream more
+  than 100 times `Decoding::bound(64)` fed with the stage within one field), and A-459's streamed-writer tests, which
+  decode through it. `cargo test --locked -p slates-server --lib image::tests`: 2 of 2 in 0.76 s (the volume an import
+  fed 7 bytes a unit lays equals the whole-file import's in every path's attributes and bytes; an archive of 8 noisy
+  files more than 100 times its bound imported within it). The oracle's first runs found its own feed count wrong for
+  a stream refused at its header (fed to the refusal, not to its end); that seed is kept
+  (`crates/archive/src/archive.proptest-regressions`). The tests' red-checks, the archive and api suites and the lints
+  are filed for main (run-requests.md, 2026-11-19).

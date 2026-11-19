@@ -11460,7 +11460,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   unit and never holds it whole: the decoder keeps each record's payload in its chunk and the manifest's bytes as they
 >   arrive, stages one fixed-width field at most, and checks the stream once it is fed whole, the checksum before any
 >   payload or manifest is decoded. The import holds at most `Decoding::bound` of its slice (`feed_slice_bytes`, derived
->   from the measured memcpy and BLAKE3 rates); a unit past it is counted. Evidence: pending the Mac Studio runs.
+>   from the measured memcpy and BLAKE3 rates); a unit past it is counted. Evidence (Mac Studio, 2026-11-19 UTC,
+>   debug): the archive lib's 9 tests (the sliced-feed oracle over generated archives whole, cut and flipped; the bound
+>   at more than 100 times a 64-byte slice's) and the server's two import tests (a 7-byte-slice import lays the
+>   whole-file import's volume byte for byte; an archive more than 100 times its bound imported within it) pass.
+>   The red-checks, suites and lints are filed for main.
 > - **Owed.**
 >   - The decoded archive is held beside the restored tree until the restore ends, so an import near the shard's room
 >     holds its tree about twice for that time.
