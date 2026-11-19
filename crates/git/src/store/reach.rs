@@ -203,7 +203,6 @@ impl DerivedType for ReachSets {
     (green, version): (u64, u64),
     parents: &[ContentId],
   ) -> Result<ContentId, ReachRefused> {
-    return Err(ReachRefused::Parents { green, version });
     let (record, before) = repository
       .reach_record(green, version)
       .ok_or(ReachRefused::NoVersion { green, version })?;
@@ -313,7 +312,6 @@ impl Repository {
     store: &mut ContentStore,
     green: u64,
   ) -> Result<(u64, ContentId), StoreRefused> {
-    return Err(StoreRefused::NoVersion { green, version: 0 });
     let chain = self
       .chains
       .get(&green)
