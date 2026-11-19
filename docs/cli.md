@@ -14,8 +14,9 @@ loses RAM by design.
 that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). Its term is its
 holder's (design A-384): every verb that names it renews it, and `slates attach ID --write --hold` keeps it alive from
 that process until the process ends, however long the attachment sits idle. One that nothing renews lasts at most the
-daemon's failover delay after its last use (about two seconds on a laptop, its anchor's supervision window and the
-recovery; a few seconds in a fleet; `slates status` shows the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
+daemon's failover delay after its last use (about three seconds on a quiet laptop: the window its watchdog judges a
+stuck daemon by, then the lapse its anchor waits before replacing it, both measured on that machine, then the recovery;
+a few seconds in a fleet; `slates status` shows the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
 It ends at the term's lapse, releasing the volume's write lease unless the same user still holds another write
 attachment of it: a write lease stays its holder's while any of its write attachments lives (design A-414). A verb
 that names an ended attachment is refused

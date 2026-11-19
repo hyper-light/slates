@@ -346,7 +346,9 @@ impl OpLog {
   /// reads before its own start again, since a refused round is gathered again from that start and nothing new is
   /// gathered while one is in flight (§4.5). A reader that is not open is measured and not registered, so no round
   /// opens a reader its owner would have to close. An open reader's round is kept for its owner too
-  /// ([`OpLog::take_rounds`], A-548). Costs the records after the cursor, which the round walks anyway.
+  /// ([`OpLog::take_rounds`], A-548). Costs a segment's records at most, whatever waits (the ring's charges after a
+  /// point): a round sliced across turns is measured at every slice, each from its own start, so a record a later slice
+  /// takes is measured as long as it waited (A-562).
   pub fn note_round(&mut self, reader: u64, cursor: u64, now_ns: u64) -> Backlog {
     let backlog = self.backlog_after(cursor, now_ns);
     if let Some(open) = self.readers.get_mut(&reader) {
@@ -374,10 +376,7 @@ impl OpLog {
     let first_after = cursor.saturating_add(1);
     let dropped = self.oldest_seq().saturating_sub(first_after).min(records);
     let oldest_at = self.since(cursor).next().map(|record| record.at);
-    let retained_bytes = self
-      .since(cursor)
-      .map(|record| charge(record.bytes()))
-      .fold(0, u64::saturating_add);
+    let retained_bytes = self.records.charge_from(self.skip_through(cursor));
     Backlog {
       records,
       bytes: retained_bytes.saturating_add(dropped.saturating_mul(self.mean_record_bytes())),
@@ -473,11 +472,15 @@ impl OpLog {
   /// retained one: the cost is the records returned, not the log (A-96: a filter over the whole retained log was a
   /// quarter of a FUSE create's daemon time, since every reply asks for the changes since its cursor).
   pub fn since(&self, seq: u64) -> impl Iterator<Item = &OpRecord> {
+    self.records.range_from(self.skip_through(seq))
+  }
+
+  /// How many of the retained records are at or before `seq`: the place of the first after it.
+  fn skip_through(&self, seq: u64) -> usize {
     let oldest = self.oldest_seq();
-    let skip = usize::try_from(seq.saturating_add(1).saturating_sub(oldest))
+    usize::try_from(seq.saturating_add(1).saturating_sub(oldest))
       .unwrap_or(usize::MAX)
-      .min(self.records.len());
-    self.records.range_from(skip)
+      .min(self.records.len())
   }
 
   /// The newest sequence assigned.
@@ -537,6 +540,12 @@ const SEGMENT_MASK: usize = SEGMENT_RECORDS - 1;
 /// within one segment allocates exactly as before (§4.2: never past what the volume is charged for). Each later
 /// segment is allocated whole and never grows, so no append copies more than one segment, and the oldest segment is
 /// freed when its last record leaves.
+///
+/// **Charges after a point** (A-562). A consuming round measures the charge of every record after its cursor
+/// ([`OpLog::note_round`]). Walking them cost the backlog, which a round sliced across turns would walk again at every
+/// slice. So the ring keeps the charge of every record it was ever handed, and the charge handed before each segment's
+/// oldest record: the charge after a point is the first less the second, less the records before the point in its own
+/// segment, a segment's records at most.
 #[derive(Debug, Default)]
 struct Ring {
   /// The oldest segment, held directly so the oldest record is one step away (every append asks for it).
@@ -544,6 +553,14 @@ struct Ring {
   /// The segments after the first, oldest first: each full but the last.
   rest: VecDeque<VecDeque<OpRecord>>,
   len: usize,
+  /// The charge of every record ever pushed, in bytes, wrapping. Two readings differ by the charge pushed between them
+  /// exactly while that is under 2⁶⁴ bytes, and what this differs from is never older than the retained records.
+  pushed: u64,
+  /// [`Ring::pushed`] as it stood before the first segment's oldest record was pushed.
+  first_before: u64,
+  /// [`Ring::pushed`] as it stood before each later segment's oldest record was pushed, oldest first: one for each of
+  /// [`Ring::rest`].
+  rest_before: VecDeque<u64>,
 }
 
 impl Ring {
@@ -552,6 +569,9 @@ impl Ring {
       first: VecDeque::new(),
       rest: VecDeque::new(),
       len: 0,
+      pushed: 0,
+      first_before: 0,
+      rest_before: VecDeque::new(),
     }
   }
 
@@ -570,19 +590,51 @@ impl Ring {
   fn pop_front(&mut self) -> Option<OpRecord> {
     let record = self.first.pop_front()?;
     self.len = self.len.saturating_sub(1);
+    self.first_before = self.first_before.wrapping_add(charge(record.bytes()));
     if self.first.is_empty()
       && let Some(next) = self.rest.pop_front()
     {
       self.first = next;
+      self.first_before = self.rest_before.pop_front().unwrap_or(self.first_before);
     }
     Some(record)
+  }
+
+  /// The charge of the records from the `skip`-th oldest on, in bytes ([`Ring`]'s charges after a point): the cost is
+  /// the records before it in its segment, a segment's at most.
+  fn charge_from(&self, skip: usize) -> u64 {
+    if skip >= self.len {
+      return 0;
+    }
+    let held_first = self.first.len();
+    let (before, within) = match skip.checked_sub(held_first) {
+      None => (self.first_before, self.first.range(..skip)),
+      Some(past) => {
+        let segment = past.checked_shr(SEGMENT_SHIFT).unwrap_or(0);
+        let offset = past & SEGMENT_MASK;
+        let (Some(before), Some(records)) = (self.rest_before.get(segment), self.rest.get(segment))
+        else {
+          return 0;
+        };
+        (*before, records.range(..offset.min(records.len())))
+      }
+    };
+    let before_skip = within.fold(before, |sum, record| {
+      sum.wrapping_add(charge(record.bytes()))
+    });
+    self.pushed.wrapping_sub(before_skip)
   }
 
   /// Appends `record`; `budget_records` answers the most records the budget holds ([`OpLog::capacity`]), which bounds
   /// the first segment's growth. It is asked only when that segment must grow, so a full ring's append asks nothing.
   fn push_back(&mut self, record: OpRecord, budget_records: impl FnOnce() -> usize) {
     self.len = self.len.saturating_add(1);
+    let before = self.pushed;
+    self.pushed = before.wrapping_add(charge(record.bytes()));
     if self.rest.is_empty() && self.first.len() < SEGMENT_RECORDS {
+      if self.first.is_empty() {
+        self.first_before = before;
+      }
       let held = self.first.len();
       if held == self.first.capacity() {
         let target = held
@@ -605,6 +657,7 @@ impl Ring {
     let mut segment = VecDeque::with_capacity(SEGMENT_RECORDS);
     segment.push_back(record);
     self.rest.push_back(segment);
+    self.rest_before.push_back(before);
   }
 
   /// The records from the `skip`-th oldest on, oldest first; the cost is the records returned.
@@ -1302,6 +1355,57 @@ mod tests {
         .collect();
       assert_eq!(indexed, filtered, "since {seq}");
     }
+  }
+
+  /// A-562 (a round's backlog measured in a segment's records, so a round sliced across turns can be measured at every
+  /// slice). Do: append records of varying path lengths past a budget of several segments, so the oldest segment is
+  /// part-drained, segments have left and their charges differ; after every append, ask the charge waiting after every
+  /// sequence from before the oldest retained to past the newest. Expect each to equal the retained records' charges
+  /// after it, summed one by one.
+  #[test]
+  fn the_charge_after_any_sequence_crosses_segments_exactly() {
+    /// Shape: the longest path the test appends, so charges differ record by record.
+    const LONGEST_PATH: usize = 37;
+    let budget = (3 * SEGMENT_RECORDS + SEGMENT_RECORDS / 2) * std::mem::size_of::<OpRecord>();
+    let mut log = OpLog::new(budget);
+    for i in 0..(7 * SEGMENT_RECORDS + 5) as u64 {
+      let path = "p".repeat(usize::try_from(i).unwrap() % LONGEST_PATH);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        path,
+        Some(InodeNo(i)),
+        Epoch(0),
+        i,
+        0,
+      );
+      // The retained records' charges summed from the newest back: `after[k]` is the charge of the records from the
+      // k-th oldest on.
+      let charges: Vec<(u64, u64)> = log
+        .records
+        .iter()
+        .map(|record| (record.seq, charge(record.bytes())))
+        .collect();
+      let mut after = vec![0u64; charges.len() + 1];
+      for k in (0..charges.len()).rev() {
+        after[k] = after[k + 1] + charges[k].1;
+      }
+      let mut first_after = 0;
+      for seq in log.oldest_seq().saturating_sub(2)..=log.head_seq() + 1 {
+        while first_after < charges.len() && charges[first_after].0 <= seq {
+          first_after += 1;
+        }
+        assert_eq!(
+          log.records.charge_from(log.skip_through(seq)),
+          after[first_after],
+          "after {seq}, at append {i}"
+        );
+      }
+    }
+    assert!(
+      log.dropped() > 0 && log.len() > 2 * SEGMENT_RECORDS,
+      "segments left and several are held"
+    );
   }
 
   /// §4.2 within one segment: do append past a budget smaller than a segment; expect the ring's allocation never past

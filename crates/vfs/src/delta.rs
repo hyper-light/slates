@@ -330,8 +330,10 @@ enum DeltaClass<'a> {
 pub struct VolumeDelta {
   /// The head epoch now.
   pub epoch: u64,
-  /// The next inode counter now.
+  /// The reserved ceiling now (A-150): the counter a successor hands out from.
   pub next_counter: u64,
+  /// The live counter now (A-578): the numbers from it up to `next_counter` are what a successor never had.
+  pub live_counter: u64,
   /// The quota parameters now.
   pub quota: QuotaImage,
   /// The root directory's inode number now.
@@ -580,6 +582,9 @@ impl Volume {
     Ok(VolumeDelta {
       epoch: roots.epoch,
       next_counter: roots.next_counter,
+      // Beside the ceiling, never among the roots `is_clean` compares (A-578): a base directory's load issues numbers
+      // and changes nothing published, and the last publication's two counters already bound what was issued since.
+      live_counter: self.next_counter,
       quota: roots.quota,
       root_no: roots.root_no,
       last_snapshot: roots.last_snapshot,
@@ -618,8 +623,10 @@ impl Volume {
       .map_err(|_| VfsError::StaleHandle)?
       .inode;
     self.epoch.0.encode(out);
-    // The reserved ceiling, as `roots` records it (A-150): this stream is the publication the daemon writes.
+    // The reserved ceiling, as `roots` records it (A-150): this stream is the publication the daemon writes. Then the
+    // live counter beside it, as `delta` records it (A-578).
     self.recorded_counter(store).encode(out);
+    self.next_counter.encode(out);
     crate::recover::quota_image(&self.quota).encode(out);
     root_no.0.encode(out);
     self.last_snapshot.map(crate::recover::snap_ref).encode(out);
@@ -824,6 +831,7 @@ impl VolumeImage {
   pub fn apply(&mut self, delta: &VolumeDelta) -> Result<(), VfsError> {
     self.epoch = delta.epoch;
     self.next_counter = delta.next_counter;
+    self.live_counter = delta.live_counter;
     self.quota = delta.quota;
     self.root_no = delta.root_no;
     self.last_snapshot = delta.last_snapshot;

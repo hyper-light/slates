@@ -1550,7 +1550,8 @@ impl DaemonConfig {
 
   /// The time one slice of such work may take on the calling shard now: half its live step quantum. Work whose units
   /// are not bytes copied — an image's walk, layout, writing and merge (A-160), where an entry costs tens of times its
-  /// bytes — is bounded by it against the clock, one unit at a time.
+  /// bytes, and a mount's coherence rounds (A-158, A-562), where a record or a name costs a message — is bounded by it
+  /// against the clock, one unit at a time.
   pub fn copy_slice_ns(&self) -> u64 {
     self.step_quantum_ns().saturating_mul(COPY_SLICE_PERMILLE) / PERMILLE
   }

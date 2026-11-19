@@ -1,11 +1,16 @@
 //! The S3 base's host (A-524; §4.15 "An S3 base"): the read-only host seam ([`HostFs`]) answered from the objects
 //! under an S3 base's prefix, sans-io. The seam is synchronous and the store is a network away, so the host answers
 //! from what it has fetched and names what it has not:
-//! - **A miss is parked.** A call the host cannot answer from what it holds answers [`HostError::Pending`] and names
-//!   the fetch it needs ([`S3Host::next_fetch`]); the shard's driver runs the fetch against the store (the network
-//!   client through [`super::fetch::run`], or [`super::sim::SimS3`] in a test) and hands the answer back
-//!   ([`S3Host::landed`]); the parked request, run again, is answered from it. A fetch is asked once however many calls
-//!   miss on it, so the fetches under way never outnumber the requests parked on them.
+//! - **A miss is parked.** A call the host cannot answer from what it holds answers [`HostError::Pending`] naming the
+//!   fetch it waits on (a [`FetchId`]: a directory's listing, every page of it, or a run of a file's chunks; A-555) and
+//!   asks for that fetch ([`S3Host::next_fetch`]) unless it is under way; the shard's driver runs it against the store
+//!   (the network client through [`super::fetch::run`], or [`super::sim::SimS3`] in a test) and hands the answer back
+//!   ([`S3Host::landed`]), which says which fetch it settled, so only the requests parked on that one run again and are
+//!   answered from it. A fetch is asked once however many calls miss on it, so the fetches under way never outnumber
+//!   the requests parked on them. What a fetch lands is held, never shed, while requests are parked on it
+//!   ([`S3Host::hold_for_waiters`], [`S3Host::release_held`]), so a request finds what it waited for when it runs again
+//!   whatever lands meanwhile; a landing the unheld cache cannot make room for is not kept, counted, and its own
+//!   requests fetch it again once they run.
 //! - **A directory is its delimited listing** (`ListObjectsV2`, `delimiter=/`), every page of it, mapped to its entries
 //!   by [`super::keys`]: each key that names no path, and each whose `LastModified` is no time S3 writes, refused by
 //!   its kind and counted, never dropped in silence. A listing serves as the directory's state for one round trip of
@@ -33,7 +38,8 @@ use aws_lc_rs::digest;
 use slates_transport::pacer::NANOS_PER_SECOND;
 use slates_transport::rtt::RttEstimator;
 use slates_vfs::host::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, OsCode, WatchState,
+  BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, OsCode,
+  WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -121,6 +127,9 @@ pub struct HostCounts {
   pub refused_entries: u64,
   /// Cached bytes shed to stay within the budget.
   pub shed_bytes: u64,
+  /// Landed chunks and listings not kept, because every cached item that could have made room for them was held for the
+  /// requests parked on its fetch (A-555): their own requests fetch them again once they run.
+  pub unkept: u64,
 }
 
 /// A file the host has opened: the object it is bound to.
@@ -162,13 +171,28 @@ struct Listing {
   failed: Option<Failed>,
 }
 
-/// A listing being read: the pages so far, and the token of the next.
-#[derive(Clone, Debug, Default)]
+/// A listing being read: the fetch every call waiting on it is answered under (one across all its pages), the pages so
+/// far, and the token of the next.
+#[derive(Clone, Debug)]
 struct Reading {
+  fetch: FetchId,
   objects: Vec<Listed>,
   prefixes: Vec<String>,
   token: Option<String>,
   bytes: u64,
+}
+
+impl Reading {
+  /// A listing's first page not yet asked, read as the fetch `fetch`.
+  fn new(fetch: FetchId) -> Reading {
+    Reading {
+      fetch,
+      objects: Vec::new(),
+      prefixes: Vec::new(),
+      token: None,
+      bytes: 0,
+    }
+  }
 }
 
 /// A refusal of the store, and when it landed.
@@ -178,9 +202,10 @@ struct Failed {
   landed_ns: i64,
 }
 
-/// A run of an object's chunks to fetch.
+/// A run of an object's chunks to fetch, as the fetch every call waiting on one of its chunks is answered under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Run {
+  fetch: FetchId,
   key: String,
   etag: String,
   version: Option<String>,
@@ -221,7 +246,8 @@ pub struct S3Host {
   next_handle: u64,
   listings: BTreeMap<String, Listing>,
   chunks: BTreeMap<ChunkKey, Vec<u8>>,
-  fetching: BTreeSet<ChunkKey>,
+  /// The chunks under way, each with the fetch of the run bringing it.
+  fetching: BTreeMap<ChunkKey, FetchId>,
   failed_reads: BTreeMap<(String, String), Failed>,
   recency: BTreeMap<u64, Cached>,
   last_use: BTreeMap<Cached, u64>,
@@ -229,10 +255,47 @@ pub struct S3Host {
   tick: u64,
   cached_bytes: u64,
   wanted: VecDeque<Need>,
+  /// The fetch driver's waker while it waits for a fetch to be wanted ([`S3Host::next_fetch_or_wait`]): woken when
+  /// one is, and when the host is dropped, so the driver ends with its host.
+  driver: Option<std::task::Waker>,
   in_flight: BTreeMap<u64, Need>,
   next_ticket: u64,
+  /// The name the next fetch takes.
+  next_fetch_id: u64,
+  /// The fetches under way: asked by a miss and not yet settled by their landing.
+  open: BTreeSet<FetchId>,
+  /// The fetches requests are parked on ([`S3Host::hold_for_waiters`]), each until [`S3Host::release_held`].
+  holding: BTreeSet<FetchId>,
+  /// What each settled fetch in `holding` landed and the cache keeps for its parked requests.
+  held: BTreeMap<FetchId, Vec<Cached>>,
+  /// How many holds each held item is kept under: never shed while any is.
+  held_items: BTreeMap<Cached, u64>,
+  /// What the landing under way has put in the cache: never shed by the same landing, and held by its fetch if requests
+  /// are parked on it.
+  landing: BTreeSet<Cached>,
   round_trips: RttEstimator,
   counts: HostCounts,
+}
+
+impl Drop for S3Host {
+  /// A host dropped (its volume destroyed, or its base replaced) wakes a driver waiting on it, which finds it gone and
+  /// ends: the driver's task lives exactly as long as its host (A-555).
+  fn drop(&mut self) {
+    if let Some(driver) = self.driver.take() {
+      driver.wake();
+    }
+  }
+}
+
+impl std::fmt::Debug for S3Host {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("S3Host")
+      .field("prefix", &self.prefix)
+      .field("cached_bytes", &self.cached_bytes)
+      .field("fetches_under_way", &self.open.len())
+      .field("counts", &self.counts)
+      .finish()
+  }
 }
 
 impl S3Host {
@@ -257,7 +320,7 @@ impl S3Host {
       next_handle: 2,
       listings: BTreeMap::new(),
       chunks: BTreeMap::new(),
-      fetching: BTreeSet::new(),
+      fetching: BTreeMap::new(),
       failed_reads: BTreeMap::new(),
       recency: BTreeMap::new(),
       last_use: BTreeMap::new(),
@@ -265,8 +328,15 @@ impl S3Host {
       tick: 0,
       cached_bytes: 0,
       wanted: VecDeque::new(),
+      driver: None,
       in_flight: BTreeMap::new(),
       next_ticket: 1,
+      next_fetch_id: 1,
+      open: BTreeSet::new(),
+      holding: BTreeSet::new(),
+      held: BTreeMap::new(),
+      held_items: BTreeMap::new(),
+      landing: BTreeSet::new(),
       round_trips: RttEstimator::new(),
       counts: HostCounts::default(),
     })
@@ -330,30 +400,124 @@ impl S3Host {
     Some((ticket, fetch))
   }
 
+  /// The next fetch a parked call waits for, as [`S3Host::next_fetch`]; when none is wanted, `waker` is kept and woken
+  /// once one is, or once the host is dropped (A-555): the shard's fetch driver waits so, and ends with its host.
+  pub fn next_fetch_or_wait(&mut self, waker: &std::task::Waker) -> Option<(u64, Fetch)> {
+    let next = self.next_fetch();
+    if next.is_none() {
+      self.driver = Some(waker.clone());
+    }
+    next
+  }
+
+  /// Wants `need` fetched: queued for the driver, which is woken if it waits.
+  fn want(&mut self, need: Need) {
+    self.wanted.push_back(need);
+    if let Some(driver) = self.driver.take() {
+      driver.wake();
+    }
+  }
+
   /// The store's `answer` to the fetch handed out under `ticket`, which took `elapsed_ns` from asking to answer (a
-  /// sample of the path's round trip when the store answered it). A ticket not handed out, or already landed, is passed
-  /// over.
-  pub fn landed(&mut self, ticket: u64, answer: Result<Fetched, S3Error>, elapsed_ns: u64) {
-    let Some(need) = self.in_flight.remove(&ticket) else {
-      return;
-    };
+  /// sample of the path's round trip when the store answered it): the fetch it settled, if it settled one (A-555). A
+  /// listing's page that asks for the next settles nothing; its last page, or its refusal, settles its listing; a run's
+  /// answer, whatever it is, settles the run. Every call answered [`HostError::Pending`] under the settled fetch's name
+  /// is answered from what it landed when asked again. A ticket not handed out, or already landed, is passed over.
+  pub fn landed(
+    &mut self,
+    ticket: u64,
+    answer: Result<Fetched, S3Error>,
+    elapsed_ns: u64,
+  ) -> Option<FetchId> {
+    let need = self.in_flight.remove(&ticket)?;
     if answer.is_ok() {
       self.round_trips.on_sample(elapsed_ns, 0);
     }
-    match (need, answer) {
-      (Need::Listing(path), Ok(Fetched::Page(page))) => self.land_page(&path, page),
-      (Need::Listing(path), Ok(Fetched::Range(_))) => {
-        self.fail_listing(&path, HostError::Unavailable(EIO));
+    self.landing.clear();
+    let settled = match (need, answer) {
+      (Need::Listing(path), answer) => {
+        let reading = self.reading_fetch(&path);
+        match answer {
+          Ok(Fetched::Page(page)) => self.land_page(&path, page),
+          Ok(Fetched::Range(_)) => self.fail_listing(&path, HostError::Unavailable(EIO)),
+          Err(error) => self.fail_listing(&path, refusal_of(&error)),
+        }
+        reading.filter(|fetch| self.reading_fetch(&path) != Some(*fetch))
       }
-      (Need::Listing(path), Err(error)) => self.fail_listing(&path, refusal_of(&error)),
-      (Need::Chunks(run), Ok(Fetched::Range(read))) => self.land_range(&run, read),
-      (Need::Chunks(run), Ok(Fetched::Page(_))) => self.fail_run(&run, HostError::Unavailable(EIO)),
-      (
-        Need::Chunks(run),
-        Err(S3Error::Changed | S3Error::Missing { .. } | S3Error::RangeNotSatisfiable),
-      ) => self.drift(&run),
-      (Need::Chunks(run), Err(error)) => self.fail_run(&run, refusal_of(&error)),
+      (Need::Chunks(run), answer) => {
+        match answer {
+          Ok(Fetched::Range(read)) => self.land_range(&run, read),
+          Ok(Fetched::Page(_)) => self.fail_run(&run, HostError::Unavailable(EIO)),
+          Err(S3Error::Changed | S3Error::Missing { .. } | S3Error::RangeNotSatisfiable) => {
+            self.drift(&run);
+          }
+          Err(error) => self.fail_run(&run, refusal_of(&error)),
+        }
+        Some(run.fetch)
+      }
+    };
+    if let Some(fetch) = settled {
+      self.settle_fetch(fetch);
     }
+    self.landing.clear();
+    settled
+  }
+
+  /// Holds what the fetch `fetch` lands in the cache, never shed, until [`S3Host::release_held`] lets it go: a request is
+  /// parked on it (A-555), and it must find what it waited for when it runs again, whatever lands meanwhile. Whether the
+  /// fetch is still under way: one that already settled holds nothing, and its requests run again at once.
+  pub fn hold_for_waiters(&mut self, fetch: FetchId) -> bool {
+    if !self.open.contains(&fetch) {
+      return false;
+    }
+    self.holding.insert(fetch);
+    true
+  }
+
+  /// Lets go of what the fetch `fetch` landed and held for its parked requests ([`S3Host::hold_for_waiters`]): every one
+  /// of them has run again, or left; the cache may shed it again as it sheds the rest.
+  pub fn release_held(&mut self, fetch: FetchId) {
+    self.holding.remove(&fetch);
+    for item in self.held.remove(&fetch).unwrap_or_default() {
+      if let Some(holds) = self.held_items.get_mut(&item) {
+        *holds = holds.saturating_sub(1);
+        if *holds == 0 {
+          self.held_items.remove(&item);
+        }
+      }
+    }
+  }
+
+  /// The fetch `fetch` settled: no longer under way, and what its landing kept held when requests are parked on it.
+  fn settle_fetch(&mut self, fetch: FetchId) {
+    self.open.remove(&fetch);
+    if !self.holding.contains(&fetch) {
+      return;
+    }
+    let kept = std::mem::take(&mut self.landing);
+    for item in &kept {
+      let holds = self.held_items.entry(item.clone()).or_insert(0);
+      *holds = holds.saturating_add(1);
+    }
+    self.held.entry(fetch).or_default().extend(kept);
+  }
+
+  /// A fresh fetch's name, under way from now until its landing settles it. Names wrap: two fetches named alike would
+  /// both have to be under way across 2^64 others, and a name only identifies a fetch while it is under way.
+  fn new_fetch(&mut self) -> FetchId {
+    let fetch = FetchId(self.next_fetch_id);
+    self.next_fetch_id = self.next_fetch_id.wrapping_add(1);
+    self.open.insert(fetch);
+    fetch
+  }
+
+  /// The fetch the listing being read of the directory at `path` is answered under, while one is read.
+  fn reading_fetch(&self, path: &str) -> Option<FetchId> {
+    self
+      .listings
+      .get(path)
+      .and_then(|listing| listing.reading.as_ref())
+      .map(|reading| reading.fetch)
   }
 
   // ------------------------------------------------------------------------------------------------ listings
@@ -374,8 +538,8 @@ impl S3Host {
   }
 
   /// Makes sure the directory at `path` has a complete listing to answer from: `Ok` when it has, the refusal a failed
-  /// listing answers within its window, or [`HostError::Pending`] with its listing asked for. A listing past its window
-  /// still answers while it is listed again.
+  /// listing answers within its window, or [`HostError::Pending`] naming the fetch of its listing, asked for now unless
+  /// it is under way. A listing past its window still answers while it is listed again.
   fn ask_listing(&mut self, path: &str) -> Result<(), HostError> {
     let now = (self.config.wall_ns)();
     let window = self.window_ns();
@@ -392,8 +556,11 @@ impl S3Host {
     };
     let ask = stale && listing.reading.is_none();
     if ask {
-      listing.reading = Some(Reading::default());
-      self.wanted.push_back(Need::Listing(path.to_owned()));
+      let fetch = self.new_fetch();
+      if let Some(listing) = self.listings.get_mut(path) {
+        listing.reading = Some(Reading::new(fetch));
+      }
+      self.want(Need::Listing(path.to_owned()));
     }
     if complete {
       if ask {
@@ -401,20 +568,26 @@ impl S3Host {
       }
       self.counts.hits = self.counts.hits.saturating_add(1);
       self.touch(Cached::Listing(path.to_owned()));
-      Ok(())
-    } else {
-      self.counts.misses = self.counts.misses.saturating_add(1);
-      Err(HostError::Pending)
+      return Ok(());
     }
+    self.counts.misses = self.counts.misses.saturating_add(1);
+    // With no complete listing the directory is always being read here (asked above if it was not), so the miss names
+    // that read's fetch; were it not, the store's answer is what the call lacks, as a refusal of the read would be.
+    Err(
+      self
+        .reading_fetch(path)
+        .map_or(HostError::Unavailable(EIO), HostError::Pending),
+    )
   }
 
-  /// The complete listing of the directory at `path`, after [`S3Host::ask_listing`] answered `Ok`.
+  /// The complete listing of the directory at `path`, after [`S3Host::ask_listing`] answered `Ok`, which it holds then;
+  /// were it gone, the call is refused `EIO` rather than answered pending on no fetch.
   fn complete(&self, path: &str) -> Result<&Complete, HostError> {
     self
       .listings
       .get(path)
       .and_then(|listing| listing.complete.as_ref())
-      .ok_or(HostError::Pending)
+      .ok_or(HostError::Unavailable(EIO))
   }
 
   /// A page of the listing of the directory at `path` landed: kept, and the next asked for while it is truncated; the
@@ -445,7 +618,7 @@ impl S3Host {
     match (page.truncated, page.next_token) {
       (true, Some(token)) => {
         reading.token = Some(token);
-        self.wanted.push_back(Need::Listing(path.to_owned()));
+        self.want(Need::Listing(path.to_owned()));
       }
       // A truncated page without its token cannot be continued: the store answered what no listing is.
       (true, None) => self.fail_listing(path, HostError::Unavailable(EIO)),
@@ -642,9 +815,14 @@ impl S3Host {
       self.counts.hits = self.counts.hits.saturating_add(1);
       return Ok(done);
     }
-    self.ask_run(file, off, end);
     self.counts.misses = self.counts.misses.saturating_add(1);
-    Err(HostError::Pending)
+    // The chunk holding `off` is not cached, so it is under way or asked for now, and the miss names that fetch; were
+    // it neither, the store's answer is what the read lacks, as a refusal of the run would be.
+    Err(
+      self
+        .ask_run(file, off, end)
+        .map_or(HostError::Unavailable(EIO), HostError::Pending),
+    )
   }
 
   /// Copies the cached bytes of the object `(key, etag)` from `off` towards `end` into `buf`, chunk after chunk while
@@ -680,11 +858,10 @@ impl S3Host {
   }
 
   /// Asks for the run of `file`'s chunks from the one holding `off` towards the one holding `end - 1`, stopping at a
-  /// chunk held or under way and at what the cache can hold; nothing when the first is under way already.
-  fn ask_run(&mut self, file: HostFile, off: u64, end: u64) {
-    let Some(opened) = self.files.get(&file.0) else {
-      return;
-    };
+  /// chunk held or under way and at what the cache can hold; nothing when the first is under way already. The fetch a
+  /// read from `off` waits on: the new run's, or the one bringing the first chunk; none when the first chunk is cached.
+  fn ask_run(&mut self, file: HostFile, off: u64, end: u64) -> Option<FetchId> {
+    let opened = self.files.get(&file.0)?;
     let chunk_bytes = self.config.chunk_bytes;
     let first = off.checked_div(chunk_bytes).unwrap_or(0);
     let last = end.saturating_sub(1).checked_div(chunk_bytes).unwrap_or(0);
@@ -694,39 +871,52 @@ impl S3Host {
       .checked_div(chunk_bytes)
       .unwrap_or(1)
       .max(1);
+    let first_key = (opened.key.clone(), opened.etag.clone(), first);
+    if let Some(&under_way) = self.fetching.get(&first_key) {
+      return Some(under_way);
+    }
+    if self.chunks.contains_key(&first_key) {
+      return None;
+    }
     let mut count: u64 = 0;
     let mut index = first;
     while index <= last && count < most {
       let chunk_key = (opened.key.clone(), opened.etag.clone(), index);
-      if self.chunks.contains_key(&chunk_key) || self.fetching.contains(&chunk_key) {
+      if self.chunks.contains_key(&chunk_key) || self.fetching.contains_key(&chunk_key) {
         break;
       }
       count = count.saturating_add(1);
       index = index.saturating_add(1);
     }
-    if count == 0 {
-      return;
-    }
+    let (key, etag, version, size) = (
+      opened.key.clone(),
+      opened.etag.clone(),
+      opened.version.clone(),
+      opened.size,
+    );
+    let fetch = self.new_fetch();
     let run = Run {
-      key: opened.key.clone(),
-      etag: opened.etag.clone(),
-      version: opened.version.clone(),
-      size: opened.size,
+      fetch,
+      key,
+      etag,
+      version,
+      size,
       first,
       count,
     };
     for index in first..first.saturating_add(count) {
       self
         .fetching
-        .insert((run.key.clone(), run.etag.clone(), index));
+        .insert((run.key.clone(), run.etag.clone(), index), fetch);
     }
-    self.wanted.push_back(Need::Chunks(run));
+    self.want(Need::Chunks(run));
+    Some(fetch)
   }
 
   /// A run's range landed: its chunks held, and every handle bound to its object bound to the version the store named.
   fn land_range(&mut self, run: &Run, read: RangeRead) {
     self.counts.ranges = self.counts.ranges.saturating_add(1);
-    self.release(run);
+    self.no_longer_fetching(run);
     let first_byte = run.first.saturating_mul(self.config.chunk_bytes);
     let expected = run
       .count
@@ -766,7 +956,7 @@ impl S3Host {
   /// cached chunks gone, and its directory listed again on its next use.
   fn drift(&mut self, run: &Run) {
     self.counts.drifted = self.counts.drifted.saturating_add(1);
-    self.release(run);
+    self.no_longer_fetching(run);
     for opened in self.files.values_mut() {
       if opened.key == run.key && opened.etag == run.etag {
         opened.drifted = true;
@@ -799,7 +989,7 @@ impl S3Host {
   /// A run's fetch refused with `error`: the reads of its object answered with it for a window.
   fn fail_run(&mut self, run: &Run, error: HostError) {
     self.counts.failures = self.counts.failures.saturating_add(1);
-    self.release(run);
+    self.no_longer_fetching(run);
     let now = (self.config.wall_ns)();
     self.failed_reads.insert(
       (run.key.clone(), run.etag.clone()),
@@ -811,7 +1001,7 @@ impl S3Host {
   }
 
   /// A run's chunks are no longer under way.
-  fn release(&mut self, run: &Run) {
+  fn no_longer_fetching(&mut self, run: &Run) {
     for index in run.first..run.first.saturating_add(run.count) {
       self
         .fetching
@@ -822,7 +1012,10 @@ impl S3Host {
   // ------------------------------------------------------------------------------------------------ the cache
 
   /// Holds `item` of `bytes` in the cache, shedding the least recently used others until the cache is within its
-  /// budget. A listing larger than the whole budget is refused, never held.
+  /// budget, every item held for a parked request's fetch, and every item the same landing kept, passed over (A-555):
+  /// a run's later chunk never sheds the first one its read waits for. A listing larger than the whole budget is
+  /// refused, never held. When the items that could be shed do not make room, `item` is not kept, counted: the requests
+  /// parked on its fetch fetch it again once they run, by when the holds that kept it out have been let go.
   fn cache(&mut self, item: Cached, bytes: u64) {
     if bytes > self.config.cache_bytes {
       if let Cached::Listing(path) = &item {
@@ -835,17 +1028,31 @@ impl S3Host {
       return;
     }
     while self.cached_bytes.saturating_add(bytes) > self.config.cache_bytes {
-      let Some((_, oldest)) = self.recency.pop_first() else {
+      let oldest = self
+        .recency
+        .iter()
+        .find(|(_, cached)| {
+          !self.held_items.contains_key(*cached) && !self.landing.contains(*cached)
+        })
+        .map(|(&used, cached)| (used, cached.clone()));
+      let Some((used, oldest)) = oldest else {
         break;
       };
+      self.recency.remove(&used);
       self.last_use.remove(&oldest);
       let shed = self.sizes.remove(&oldest).unwrap_or(0);
       self.cached_bytes = self.cached_bytes.saturating_sub(shed);
       self.counts.shed_bytes = self.counts.shed_bytes.saturating_add(shed);
       self.forget(&oldest);
     }
+    if self.cached_bytes.saturating_add(bytes) > self.config.cache_bytes {
+      self.counts.unkept = self.counts.unkept.saturating_add(1);
+      self.forget(&item);
+      return;
+    }
     self.sizes.insert(item.clone(), bytes);
     self.cached_bytes = self.cached_bytes.saturating_add(bytes);
+    self.landing.insert(item.clone());
     self.touch(item);
   }
 
@@ -1063,7 +1270,9 @@ fn listed_bytes(listed: &Listed) -> u64 {
   string_bytes(&listed.key)
     .saturating_add(string_bytes(&listed.etag))
     .saturating_add(string_bytes(&listed.last_modified))
-    .saturating_add(u64::try_from(size_of::<Listed>() + size_of::<BaseEntry>()).unwrap_or(u64::MAX))
+    .saturating_add(
+      u64::try_from(size_of::<Listed>().saturating_add(size_of::<BaseEntry>())).unwrap_or(u64::MAX),
+    )
 }
 
 /// The bytes a string holds.
@@ -1141,19 +1350,22 @@ mod tests {
   }
 
   /// Asks `call` of the host until it answers other than pending, driving its fetches between, as a parked request is
-  /// run again when its fetch lands.
+  /// run again when its fetch lands. A call still pending after [`ROUNDS`] rounds of fetches answers its pending
+  /// refusal, which the test's own check then refuses.
   fn settle<T>(
     host: &mut S3Host,
     store: &mut SimS3,
     mut call: impl FnMut(&mut S3Host) -> Result<T, HostError>,
   ) -> Result<T, HostError> {
+    let mut answer = call(host);
     for _ in 0..ROUNDS {
-      match call(host) {
-        Err(HostError::Pending) => drive(host, store),
-        answered => return answered,
+      if !matches!(answer, Err(HostError::Pending(_))) {
+        break;
       }
+      drive(host, store);
+      answer = call(host);
     }
-    panic!("the call was still pending after {ROUNDS} rounds of fetches");
+    answer
   }
 
   /// The names and kinds of the directory `dir`'s entries, settled.
@@ -1165,24 +1377,27 @@ mod tests {
       .collect()
   }
 
-  /// The whole of `file`'s bytes, read through the host a call at a time, settled.
+  /// The whole of `file`'s bytes, read through the host a chunk's worth a call at a time, settled. A read inside the
+  /// file that answers no bytes is refused `EIO`, which the test's own check then refuses.
   fn read_whole(
     host: &mut S3Host,
     store: &mut SimS3,
     file: HostFile,
   ) -> Result<Vec<u8>, HostError> {
     let size = host.fstat(file)?.size;
-    let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
-    let mut done = 0;
-    while done < bytes.len() {
-      let at = u64::try_from(done).unwrap();
-      let n = settle(host, store, |host| {
-        host.read_at(file, at, &mut bytes[done..])
-      })?;
-      assert!(n > 0, "a read inside the file answers bytes");
-      done += n;
+    let mut bytes = Vec::new();
+    let mut piece = vec![0u8; usize::try_from(CHUNK).unwrap_or_default()];
+    loop {
+      let at = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      if at >= size {
+        return Ok(bytes);
+      }
+      let read = settle(host, store, |host| host.read_at(file, at, &mut piece))?;
+      let Some(answered) = piece.get(..read).filter(|answered| !answered.is_empty()) else {
+        return Err(HostError::Unavailable(EIO));
+      };
+      bytes.extend_from_slice(answered);
     }
-    Ok(bytes)
   }
 
   /// Bytes no two offsets of which repeat within a chunk, so a misplaced chunk shows.
@@ -1192,14 +1407,10 @@ mod tests {
       .collect()
   }
 
-  /// A-524 (§4.15 "An S3 base": a directory is its delimited listing): do put files, a nested directory, a directory
-  /// marker and a key whose component is `..` under the base's prefix, listings answered two keys a page, and list the
-  /// root and a subdirectory. Expect the root's files and directories by name and kind across its truncated pages, the
-  /// `..` key refused by its kind and counted, never listed; the subdirectory's own entries; a file's fingerprint as
-  /// the module states it; and the first listing of each a miss.
-  #[test]
-  fn a_directory_is_its_keys_listed_across_truncated_pages() {
-    let mut host = host_over(64);
+  /// A host over a bucket holding files, a nested directory, a directory marker and a key whose component is `..` under
+  /// the base's prefix, its listings answered two keys a page, nothing listed yet.
+  fn host_over_a_tree() -> (S3Host, SimS3) {
+    let host = host_over(64);
     let mut store = SimS3::new(false, clock);
     store.set_page_keys(2);
     for key in [
@@ -1212,10 +1423,18 @@ mod tests {
     ] {
       store.put(key, key.as_bytes());
     }
+    (host, store)
+  }
+
+  /// A-524 (§4.15 "An S3 base": a directory is its delimited listing): do list the root of [`host_over_a_tree`]. Expect
+  /// its first listing a miss; its files and directories by name and kind across its truncated pages; the `..` key
+  /// refused by its kind and counted, never listed.
+  #[test]
+  fn a_directory_is_its_keys_listed_across_truncated_pages() {
+    let (mut host, mut store) = host_over_a_tree();
     let root = host.root();
-    assert_eq!(
-      host.list(root),
-      Err(HostError::Pending),
+    assert!(
+      matches!(host.list(root), Err(HostError::Pending(_))),
       "the first listing is a miss"
     );
     assert_eq!(
@@ -1234,7 +1453,22 @@ mod tests {
         EntryRefused::Name(keys::Refused::DotComponent)
       )]
     );
+    let counts = host.counts();
+    assert!(counts.pages >= 3 && counts.misses >= 1, "{counts:?}");
+    assert_eq!(counts.refused_entries, 1);
+  }
+
+  /// A-524 (a directory is its delimited listing, a subdirectory's too): do open the subdirectory `b` of
+  /// [`host_over_a_tree`] and list it. Expect its first listing a miss of its own, and its own entries alone.
+  #[test]
+  fn a_subdirectory_is_listed_by_its_own_keys() {
+    let (mut host, mut store) = host_over_a_tree();
+    let root = host.root();
     let b = settle(&mut host, &mut store, |host| host.open_dir(root, "b")).unwrap();
+    assert!(
+      matches!(host.list(b), Err(HostError::Pending(_))),
+      "the subdirectory's first listing is a miss of its own"
+    );
     assert_eq!(
       names(&mut host, &mut store, b),
       [
@@ -1242,36 +1476,45 @@ mod tests {
         ("d".to_owned(), HostKind::Dir)
       ]
     );
+  }
+
+  /// A-524 (a file's fingerprint, as the module states it): do open the file `a.txt` of [`host_over_a_tree`], and open
+  /// a directory as a file, a file as a directory and a name no key makes. Expect the file's size, mode, owner and
+  /// times from its listing and its ETag's digest as its birth; and each wrong open refused by its kind.
+  #[test]
+  fn a_file_is_fingerprinted_from_its_listing_and_wrong_opens_are_refused() {
+    let (mut host, mut store) = host_over_a_tree();
+    let root = host.root();
     let file = settle(&mut host, &mut store, |host| host.open_file(root, "a.txt")).unwrap();
     let fingerprint = host.fstat(file).unwrap();
-    assert_eq!(fingerprint.size, 10);
+    assert_eq!((fingerprint.size, fingerprint.mtime_ns), (10, START_NS));
     assert_eq!(
       (fingerprint.mode, fingerprint.uid, fingerprint.gid),
       (FILE_MODE, 501, 20)
     );
-    assert_eq!(fingerprint.mtime_ns, START_NS);
     assert_ne!(fingerprint.birth_ns, 0);
     assert_eq!(host.open_file(root, "b"), Err(HostError::NotFile));
     assert_eq!(host.open_dir(root, "a.txt"), Err(HostError::NotDirectory));
     assert_eq!(host.open_file(root, "missing"), Err(HostError::NotFound));
-    let counts = host.counts();
-    assert!(counts.pages >= 4 && counts.misses >= 2, "{counts:?}");
-    assert_eq!(counts.refused_entries, 1);
   }
 
-  /// A-524 (a miss is parked; a listing serves for the path's round trip): do list the root, and ask again before its
-  /// fetch lands; land it; list within one measured round trip, then after it while an outsider adds a key, and again
-  /// once that listing lands. Expect one fetch for the two misses; the landed listing to answer; no fetch within the
-  /// round trip; the stale listing answered while the root is listed again, and the next call to see the new key with
-  /// the directory's fingerprint moved.
+  /// A-524, A-555 (a miss is parked on the fetch it names): do list the root, and ask its fingerprint before the
+  /// listing's fetch lands; land it. Expect both misses to name one fetch, one fetch asked for the two, and its landing
+  /// to settle that fetch and answer the listing.
   #[test]
-  fn a_miss_is_parked_until_its_fetch_lands_and_a_listing_serves_one_round_trip() {
+  fn two_misses_on_a_listing_name_one_fetch_and_its_landing_answers_both() {
     let mut host = host_over(64);
     let mut store = SimS3::new(false, clock);
     store.put("base/a", b"a");
     let root = host.root();
-    assert_eq!(host.list(root), Err(HostError::Pending));
-    assert_eq!(host.fingerprint_dir(root), Err(HostError::Pending));
+    let Err(HostError::Pending(listing)) = host.list(root) else {
+      panic!("the first listing is a miss");
+    };
+    assert_eq!(
+      host.fingerprint_dir(root),
+      Err(HostError::Pending(listing)),
+      "the second miss names the same fetch"
+    );
     let (ticket, fetch) = host.next_fetch().unwrap();
     assert_eq!(
       fetch,
@@ -1281,8 +1524,25 @@ mod tests {
       }
     );
     assert_eq!(host.next_fetch(), None, "two misses, one fetch");
-    host.landed(ticket, store.answer(&fetch), ROUND_TRIP_NS);
-    let before = host.fingerprint_dir(root).unwrap();
+    assert_eq!(
+      host.landed(ticket, store.answer(&fetch), ROUND_TRIP_NS),
+      Some(listing),
+      "its landing settles the fetch both misses named"
+    );
+    assert_eq!(host.list(root).unwrap().len(), 1);
+  }
+
+  /// A-524 (a listing serves for the path's round trip): do land the root's listing, list within one measured round
+  /// trip, then after it while an outsider adds a key, and again once that listing lands. Expect no fetch within the
+  /// round trip; the stale listing answered while the root is listed again; and the next call to see the new key with
+  /// the directory's fingerprint moved.
+  #[test]
+  fn a_listing_serves_one_round_trip_then_is_listed_again() {
+    let mut host = host_over(64);
+    let mut store = SimS3::new(false, clock);
+    store.put("base/a", b"a");
+    let root = host.root();
+    let before = settle(&mut host, &mut store, |host| host.fingerprint_dir(root)).unwrap();
     advance(ROUND_TRIP_NS / 2);
     assert_eq!(host.list(root).unwrap().len(), 1);
     assert_eq!(
@@ -1320,7 +1580,10 @@ mod tests {
     .unwrap();
     let mut buf = [0u8; 20];
     let at = CHUNK - 10;
-    assert_eq!(host.read_at(file, at, &mut buf), Err(HostError::Pending));
+    assert!(matches!(
+      host.read_at(file, at, &mut buf),
+      Err(HostError::Pending(_))
+    ));
     let (ticket, fetch) = host.next_fetch().unwrap();
     assert_eq!(
       fetch,
@@ -1415,10 +1678,10 @@ mod tests {
       Ok(chunk.len())
     );
     store.put("base/v.bin", &pattern(CHUNK * 2, 6));
-    assert_eq!(
+    assert!(matches!(
       host.read_at(file, CHUNK, &mut chunk),
-      Err(HostError::Pending)
-    );
+      Err(HostError::Pending(_))
+    ));
     let (ticket, fetch) = host.next_fetch().unwrap();
     let Fetch::Range { version, .. } = &fetch else {
       panic!("a range");
@@ -1512,14 +1775,122 @@ mod tests {
       assert!(host.cached_bytes() <= 2 * CHUNK, "{}", host.cached_bytes());
     }
     let ranges = host.counts().ranges;
-    assert_eq!(
-      host.read_at(file, 0, &mut chunk),
-      Err(HostError::Pending),
+    assert!(
+      matches!(
+        host.read_at(file, 0, &mut chunk),
+        Err(HostError::Pending(_))
+      ),
       "the first chunk was shed"
     );
     drive(&mut host, &mut store);
     assert_eq!(host.counts().ranges, ranges + 1);
     assert!(host.counts().shed_bytes >= 2 * CHUNK);
+  }
+
+  /// A host over `a.bin` and `b.bin`, a chunk each, both opened, nothing of them fetched yet; and the store.
+  fn two_files_opened(cache_chunks: u64) -> (S3Host, SimS3, HostFile, HostFile) {
+    let mut host = host_over(cache_chunks);
+    let mut store = SimS3::new(false, clock);
+    store.put("base/a.bin", &pattern(CHUNK, 1));
+    store.put("base/b.bin", &pattern(CHUNK, 2));
+    let root = host.root();
+    let a = settle(&mut host, &mut store, |host| host.open_file(root, "a.bin")).unwrap();
+    let b = settle(&mut host, &mut store, |host| host.open_file(root, "b.bin")).unwrap();
+    (host, store, a, b)
+  }
+
+  /// The fetch a read of `file` at `at` misses on, by the name its pending answer gives.
+  fn missed(host: &mut S3Host, file: HostFile, at: u64) -> FetchId {
+    let mut buf = [0u8; 16];
+    match host.read_at(file, at, &mut buf) {
+      Err(HostError::Pending(fetch)) => fetch,
+      other => panic!("a read of an unfetched chunk is a miss, not {other:?}"),
+    }
+  }
+
+  /// A-555 (a request parks on the fetch it met): do read `a.bin`'s first chunk at two offsets and `b.bin`'s once, each
+  /// before any fetch lands. Expect both reads of `a.bin` answered pending under one fetch's name and `b.bin`'s under
+  /// another, and two fetches asked for the three misses.
+  #[test]
+  fn every_miss_on_a_fetch_names_it_and_the_fetch_is_asked_once() {
+    let (mut host, _store, a, b) = two_files_opened(64);
+    let for_a = missed(&mut host, a, 0);
+    assert_eq!(
+      missed(&mut host, a, 8),
+      for_a,
+      "one chunk, one fetch's name"
+    );
+    assert_ne!(missed(&mut host, b, 0), for_a, "two runs, two fetches");
+    assert!(host.next_fetch().is_some() && host.next_fetch().is_some());
+    assert_eq!(host.next_fetch(), None, "three misses, two fetches");
+  }
+
+  /// A-555 (only the fetch a request met wakes it): do miss on `a.bin` and on `b.bin`, then land `b.bin`'s fetch and
+  /// `a.bin`'s in turn. Expect `b.bin`'s landing to settle its own fetch alone, `a.bin` still pending under its name and
+  /// `b.bin` answered; `a.bin`'s landing to settle that one and answer it; and a fetch that settled to hold nothing for a
+  /// request that comes too late to park on it.
+  #[test]
+  fn only_a_fetchs_own_landing_settles_it() {
+    let (mut host, mut store, a, b) = two_files_opened(64);
+    let (for_a, for_b) = (missed(&mut host, a, 0), missed(&mut host, b, 0));
+    let (a_ticket, a_fetch) = host.next_fetch().unwrap();
+    let (b_ticket, b_fetch) = host.next_fetch().unwrap();
+    assert_eq!(
+      host.landed(b_ticket, store.answer(&b_fetch), ROUND_TRIP_NS),
+      Some(for_b)
+    );
+    assert_eq!(
+      missed(&mut host, a, 0),
+      for_a,
+      "b.bin's landing settled nothing of a.bin's"
+    );
+    let mut buf = [0u8; 16];
+    assert_eq!(host.read_at(b, 0, &mut buf), Ok(buf.len()));
+    assert_eq!(
+      host.landed(a_ticket, store.answer(&a_fetch), ROUND_TRIP_NS),
+      Some(for_a)
+    );
+    assert_eq!(host.read_at(a, 0, &mut buf), Ok(buf.len()));
+    assert!(
+      !host.hold_for_waiters(for_a),
+      "a settled fetch holds nothing for a late request"
+    );
+  }
+
+  /// A-555 (GAPS A-464: the fetches under way are bounded by the parked requests, not by the cache). Do, through a cache
+  /// of one chunk, miss on `a.bin` and on `b.bin`, one chunk each, hold both fetches for their parked requests, and land
+  /// `a.bin`'s and then `b.bin`'s; read `a.bin`, let its fetch go, then read `b.bin` again and land what it asks. Expect
+  /// `a.bin`'s chunk kept through `b.bin`'s landing, which is not kept and counted, so the read parked on `a.bin` is
+  /// answered when it runs; once let go, `b.bin`'s fetch again to shed it, and the second read of `b.bin` answered.
+  /// Without the hold `b.bin`'s landing shed `a.bin`'s chunk before its read ran, and each parked read could shed the
+  /// other's for as long as they came in turn.
+  #[test]
+  fn a_fetch_holds_what_it_landed_until_its_parked_requests_let_it_go() {
+    let (mut host, mut store, a, b) = two_files_opened(1);
+    let (for_a, for_b) = (missed(&mut host, a, 0), missed(&mut host, b, 0));
+    assert!(host.hold_for_waiters(for_a) && host.hold_for_waiters(for_b));
+    let (a_ticket, a_fetch) = host.next_fetch().unwrap();
+    let (b_ticket, b_fetch) = host.next_fetch().unwrap();
+    host.landed(a_ticket, store.answer(&a_fetch), ROUND_TRIP_NS);
+    host.landed(b_ticket, store.answer(&b_fetch), ROUND_TRIP_NS);
+    assert_eq!(host.counts().unkept, 1, "b.bin's chunk found no room");
+    let mut buf = vec![0u8; usize::try_from(CHUNK).unwrap()];
+    assert_eq!(
+      host.read_at(a, 0, &mut buf),
+      Ok(buf.len()),
+      "the read parked on a.bin's fetch finds its chunk"
+    );
+    assert_eq!(buf, pattern(CHUNK, 1));
+    host.release_held(for_a);
+    host.release_held(for_b);
+    assert_ne!(
+      missed(&mut host, b, 0),
+      for_b,
+      "b.bin was not kept, so it is fetched again"
+    );
+    drive(&mut host, &mut store);
+    assert_eq!(host.read_at(b, 0, &mut buf), Ok(buf.len()));
+    assert!(host.cached_bytes() <= CHUNK);
   }
 
   /// One outsider's step, or a look by the host.
@@ -1554,12 +1925,13 @@ mod tests {
     })
   }
 
+  /// A tree as the oracle compares it: every directory's entries by path with their kinds, and every file's bytes by
+  /// path, each sorted.
+  type Tree = (Vec<(String, HostKind)>, Vec<(String, Vec<u8>)>);
+
   /// The host's whole tree after a round trip has passed, each directory listed again: every directory's entries by
   /// path, and every file's bytes by path.
-  fn look(
-    host: &mut S3Host,
-    store: &mut SimS3,
-  ) -> (Vec<(String, HostKind)>, Vec<(String, Vec<u8>)>) {
+  fn look(host: &mut S3Host, store: &mut SimS3) -> Tree {
     advance(ROUND_TRIP_NS * 4);
     let mut entries = Vec::new();
     let mut files = Vec::new();
@@ -1589,7 +1961,7 @@ mod tests {
   }
 
   /// The tree the bucket holds now, by the keys' own mapping: every directory and file by path, and every file's bytes.
-  fn model(store: &SimS3) -> (Vec<(String, HostKind)>, Vec<(String, Vec<u8>)>) {
+  fn model(store: &SimS3) -> Tree {
     let tree = keys::tree_of(PREFIX, &store.keys());
     let mut entries: Vec<(String, HostKind)> = tree
       .directories

@@ -44,6 +44,26 @@ pub enum Fetched {
   Range(RangeRead),
 }
 
+/// What answers a host's fetches (A-555): the network client of the store ([`Client`]), or the simulated store a test
+/// runs ([`super::sim::SimS3`]), so the shard's fetch driver ([`super::driver`]) is the same code over either.
+pub trait Store {
+  /// The store's answer to `fetch`.
+  fn run(&mut self, fetch: &Fetch) -> impl Future<Output = Result<Fetched, S3Error>>;
+}
+
+impl Store for Client {
+  fn run(&mut self, fetch: &Fetch) -> impl Future<Output = Result<Fetched, S3Error>> {
+    run(self, fetch)
+  }
+}
+
+impl Store for super::sim::SimS3 {
+  /// The simulated store answers at once, as its oracle's own calls do.
+  fn run(&mut self, fetch: &Fetch) -> impl Future<Output = Result<Fetched, S3Error>> {
+    std::future::ready(self.answer(fetch))
+  }
+}
+
 /// Runs `fetch` against the store `client` reaches: a delimited `ListObjectsV2` page, or a ranged `GetObject` bound by
 /// `If-Match` (and the version, where one is named).
 pub async fn run(client: &mut Client, fetch: &Fetch) -> Result<Fetched, S3Error> {
