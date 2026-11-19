@@ -11885,6 +11885,14 @@ engine: the verdict, rebase, position mapping, the register).
 > **Status (2026-11-18, A-497's second part).** Designed; piece 1 built 2026-11-19 (A-582, its first part): pkt-lines
 > and side-band-64k as pure codecs in `crates/git`, with golden vectors stock git 2.50.1 wrote on its own wire. It builds
 > on §4.17.1 and redefines none of its terms. Reading notes: `research/vcs-servers.md` §5.
+>
+> **Status (2026-11-19, A-600: piece 2's object names built).** `crates/git` (`object_name`) reads and writes the
+> object header (`<type> SP <decimal size> NUL`) as git does. A header longer than git's `MAX_HEADER_LEN` is refused,
+> and so is a non-canonical size; a pack-only type is refused by kind; the size is charged to the caller's admission
+> before any content is read. `object-format` maps both ways. An object is named in either format: SHA-1 with collision
+> detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
+> t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
+> against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -39024,3 +39032,44 @@ paragraph), the bug record `docs/bugs/2026-11-19-a-shards-stream-on-a-volume-los
     was clean.
 - **Still owed** (GAPS): the guest device's and the WinFsp mount's forms of the same answer, and a relinquish (A-362)
   that waits for a stream ended before its next turn.
+
+### A-600 — git's object names: the object header, collision-detecting SHA-1 and SHA-256, and `object-format` (2026-11-19, g230, UI goal 92; §4.17.2 "Pieces (git)" piece 2, "The repository in git's terms" item 1; after A-582)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`object_name.rs`, new; its tests; `fixtures/objects` with `make-object-fixtures.sh`; `lib.rs`;
+  `Cargo.toml`);
+- the workspace manifest and lock (`sha1-checked` 0.10.0 and its RustCrypto dependencies: `sha1`, `digest`,
+  `block-buffer`, `crypto-common`, `generic-array`, `typenum`, `version_check`, `cpufeatures` 0.2; nothing else
+  re-resolved).
+- **The header.** `<type> SP <decimal size> NUL`, as `format_object_header` writes it and `parse_loose_header` reads
+  it. The type is one of git's four, compared byte for byte. `ofs-delta` and `ref-delta`, "only valid in a pack file"
+  (gitformat-pack), are refused by kind, apart from an unknown type. The size is canonical decimal: a zero before
+  another digit is refused, as is a size past 64 bits. The header is read within git's own `MAX_HEADER_LEN` (32 bytes):
+  bytes that end before its NUL are not yet whole, and 32 bytes with no NUL are too long. The size is charged to the
+  caller's admission before any content is read. Each refusal is typed and names where it stopped.
+- **The names.** SHA-1 through RustCrypto's `sha1-checked`, configured as git configures sha1dc (detection on, safe
+  hash off: `git_SHA1DCInit`). An input in which a block shows a known attack's disturbance is refused
+  (`CollisionAttack`) and named by its plain SHA-1, as `git_SHA1DCFinal`'s message names it. SHA-256 is hashed
+  through aws-lc-rs. `object-format`'s `sha1` and `sha256` map both ways, compared exactly as `hash_algo_by_name`
+  compares them.
+- **The dependency.** Main approved `sha1-checked` on three conditions, each checked here:
+  - it is RustCrypto's (authors "RustCrypto Developers", repository RustCrypto/hashes);
+  - it is pure Rust (`sha1`, `digest`, no C);
+  - it refuses git's own t0013 vector: `t/t0013/shattered-1.pdf` at v2.50.1, SHA-256 `2bb787a7…`, byte-identical to
+    the crate's own copy.
+- **Golden vectors.** `make-object-fixtures.sh` (run on the MacBook with git 2.50.1, Apple Git-155, 2026-11-19) makes
+  one object of each type in a SHA-1 and a SHA-256 repository (a blob, a tree with a subtree, a commit, an annotated
+  tag) and records each object's raw content and its name. Each name is computed by `git hash-object` from that content
+  and must equal `git rev-parse`'s. The script also records the empty blob's name. It cuts git's t0013 vector and its
+  twin from shattered.io, each checked by its SHA-256, to the 320 bytes that hold both colliding blocks: they differ
+  only at bytes 192 to 319, and the cuts share the plain SHA-1 `f92d74e3…`.
+- **Tests** (`cargo test -p slates-git --lib`, Mac Studio M3 Ultra, kiln r438 and r444 under `--locked`, 22 of 22).
+  Each name is git's in both formats, whole and fed a byte at a time. Each SHAttered cut is refused, naming the shared
+  plain SHA-1, and SHA-256 tells them apart. Headers are read and written back to `u64::MAX`, and every refusal is
+  typed and placed, at git's 32-byte edge too. A header past the admission is refused with nothing charged. The
+  formats map both ways, and names are read from hex of either case. A proptest round-trips headers and names content
+  fed in any cut. Red three ways on the Studio:
+  - with the detection off, the SHAttered cut was named `Ok(f92d74e3…)`;
+  - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
+  - with the size not charged, a header naming 100 bytes read under an admission of 99.
+- **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.

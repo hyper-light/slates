@@ -35,6 +35,14 @@
 > packfile-uris, packfile); a pack entry's header with `OBJ_OFS_DELTA` and `OBJ_REF_DELTA` and the delta instructions
 > with an applier; idx v2; and the pack stream, which needs a deflate engine chosen by measurement (§4.17.2 piece 3).
 > The captured packs and indexes for those parts are in the fixtures already.
+> **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
+> header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
+> `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
+> `sha1-checked`, configured as git configures sha1dc (detection on, safe hash off), so git's own t0013 SHAttered vector
+> and its twin are refused, typed, naming their plain SHA-1; and SHA-256 through aws-lc-rs. Golden vectors are every
+> object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
+> `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
+> entry's header and the delta instructions (others' parts).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
