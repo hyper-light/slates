@@ -1346,6 +1346,30 @@ impl Volume {
     self.lookup(store, dir, name)
   }
 
+  /// The name the entry `name` finds in the directory named by inode number `dir_no` has as the directory stores it
+  /// (§4.4's name policy; A-543): the asked spelling on an exact volume, and on a folding one the spelling the entry
+  /// was made with, which any spelling that folds alike finds. Refused as [`Volume::lookup`] refuses. A transport whose
+  /// client keys its open files by name case-insensitively (a WinFsp drive) names each open by it, so two spellings of
+  /// one file are one file there.
+  pub fn stored_name_no(
+    &self,
+    store: &Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<String, VfsError> {
+    names::check_length(name)?;
+    let dir = self.current_dir(store, dir_no)?;
+    let dir = self.head_dir(store, dir)?;
+    let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
+    let entry = node
+      .lookup(&store.blocks, self.policy, name)
+      .ok_or(VfsError::NotFound)?;
+    if matches!(entry.child, Child::Whiteout) {
+      return Err(VfsError::NotFound);
+    }
+    Ok(entry.name.to_owned())
+  }
+
   /// The entries of the directory named by inode number `dir_no`.
   pub fn readdir_no<'s>(
     &self,

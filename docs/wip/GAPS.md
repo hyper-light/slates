@@ -1429,6 +1429,18 @@
 > (`create.c` 1036-1043), failing test first (an exclusive open under one spelling, then the other: NTFS's
 > `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the Windows workloads cell,
 > which runs on a folding volume to match NTFS (A-300), does not meet it.
+> - **Built, part 1 of 2 (2026-11-18, A-543, goal 85, g079): the path an open names as the volume stores it.**
+>   `slates_bridge_core::stored_path` walks a `\`-separated path from the root and names each component as its
+>   directory stores it (`Bridge::stored_entry`, over `Volume::stored_name_no`): on a folding volume every spelling of a
+>   file answers the spelling it was made with, on an exact one the path as asked. Held by
+>   `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (bridge-core's unit tests, every
+>   host), red with the open named as asked on the Mac Studio.
+> - **Owed, part 2 (Windows-only, main's to write and compile, run-requests.md):** the drive declares
+>   `CaseSensitiveSearch` only for an exact volume (`Mounted::new`'s `params.flags`, given the volume's name policy by
+>   `crates/server/src/winfsp.rs`); an open or create on a folding volume answers its `stored_path` as WinFsp's
+>   normalized name (`FSP_FSCTL_OPEN_FILE_INFO`'s `NormalizedName`, copied when it fits `NormalizedNameSize`, else
+>   none), and the open's ledger and `OpenNames` record that path, the name the driver's file node takes; then the drive
+>   test above.
 
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
