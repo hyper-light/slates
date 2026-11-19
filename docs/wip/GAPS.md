@@ -832,7 +832,7 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); the verb that asks for a directory's import (A-675 built the import itself); and the import made durable:
+> `verify`); and the import made durable (A-675 built the import, A-678 the verb that asks for one):
 > the register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the
 > directory again or replays its record (until then an import is not served, and a restart leaves its store empty).
 > **Built (A-619 part 3):**
@@ -894,6 +894,11 @@
 > it runs; refused, abandoned or freed midway, everything given back; proven by the `states` repository imported a unit
 > a turn equal row for row to its import in one call (macOS arm64, Mac Studio: `vcs_store::` 18 of 18 with A-662's 13;
 > red first, the five new tests failing against stubs).
+> **Built (A-678):** the import verb (`ImportRepository`, `slates-server`'s `repository::import`): for the repository's
+> owner, the directory opened as a base is, A-675's import started and the request answered when it ends, its completion
+> recorded first; a resend takes the held route over; every refusal by kind (`ImportFault`, the API's
+> `Invalid::Import`); proven on macOS arm64 (Mac Studio, kiln r110): the verb's 4 tests (red first), `vcs_store::` 18 of
+> 18, `wire_order` 2 of 2, `slates-api`'s `error` tests 12 of 12 with the refusal's typing.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress

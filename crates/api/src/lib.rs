@@ -329,11 +329,11 @@ pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, 
 pub use slates_ipc::protocol::{
   ARCHIVE_FILE, ArchiveFault, AttachTransport, ChangedCursor, ConflictClass, DaemonReport,
   DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostMountEvidence,
-  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
-  MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
-  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VcsTool, VolumeId,
-  VolumeRefusal, VolumeSummary, VolumeTakeover,
+  HostPathReason, ImportFault, Intent, JournalReport, LandingDegradation, LandingDurability,
+  LossReport, MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState,
+  PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall,
+  SnapshotId, TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VcsTool,
+  VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

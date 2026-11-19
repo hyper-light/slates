@@ -13698,6 +13698,18 @@ signature verification).
 > first, the five failing against stubs). Owed: the verb that asks for an import, and the import made durable (the
 > register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
 > served.
+>
+> **Status (2026-11-19, A-678: the import verb).** A client asks the daemon to import a Mercurial repository's directory
+> with `ImportRepository { repository, path }`, served on the partition the repository's name hashes to and for its
+> owner alone: the directory is opened as a base is (read-only, never through a link), A-675's import started, and the
+> request's reply held in the shard's map beside the import, so the request is answered when the import ends, its
+> completion recorded first: `RepositoryImported` with what it took, or `ImportRefused` with its fault by kind
+> (`NotMercurial`, `NotEmpty`, `UnderWay`, `Unawaited`, `Format`, `Damaged` with a path, `PastRoom` with the room,
+> `Pending`, `Abandoned`), beside `NotFound`, `Forbidden`, `BaseUnavailable` and `BudgetExceeded`. A resend of the
+> request while its import runs takes the held route over. Proven on macOS arm64 (Mac Studio, kiln r110) by the verb's
+> four tests (red first, the four failing against stubs), `vcs_store::` 18 of 18, `wire_order` 2 of 2 with the variants
+> published, and the API's typing of the refusal. Owed: the import made durable; until then a request that reached the
+> owner from another node is refused `Unawaited`.
 
 > **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
 > `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
@@ -14176,7 +14188,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Built (A-675,
    `crates/server`: `vcs_store::hg_import`): the daemon's import of a repository's directory through it, a turn at a
    time on the repository's owner shard, its index put in the place of the empty index A-662's map made the
-   repository's Mercurial store with. Owed: the verb that asks for an import, and the import made durable.
+   repository's Mercurial store with. Built (A-678, `crates/server`: `repository::import`; `crates/ipc`:
+   `ImportRepository`): the verb that asks for an import, answered when it ends. Owed: the import made durable.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -50357,3 +50370,54 @@ at start).
   (`admit_right` visible to the crate), `repository.rs` (`branch_version` visible to the crate),
   `crates/git/src/upload/mod.rs` (`AGENT` public); §4.17.2's status; GAPS (the A-654 entry, and A-644 part 2's owed
   line).
+
+### A-678 — The import verb: a client asks the daemon to import a Mercurial repository's directory, answered when the import ends (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.12; A-675)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/ipc` (`RequestBody::ImportRepository`,
+`ReplyBody::RepositoryImported`, `Refusal::ImportRefused`, `ImportFault`; `tests/wire_order.rs` and `wire_order.txt`),
+`crates/api` (`Invalid::Import`, `ImportFault` re-exported, a test typing the refusal), `crates/server`
+(`repository::import` and its tests, new; `verbs`: the verb's route and dispatch, its refusal's counter name,
+`base_open_refusal` shared; `vcs_store`: the held answers; `told::deliver_to` shared), GAPS (the §4.17.3 entry).
+- **The verb.** `ImportRepository { repository, path }` is served on the partition the repository's name hashes to, as
+  every repository verb is, and for its owner alone (`NotFound`, `Forbidden`). A repository of another tool is refused
+  `NotMercurial` before anything opens. The directory is opened as a base is (§4.15: `OsHost::open_root`, read-only,
+  `O_NOFOLLOW`), refused as a base is (`BaseUnavailable`, `OwnMount`), and A-675's import is started; its refusals at
+  the start are answered at once.
+- **Answered when it ends.** A started import runs a turn at a time on the owner shard, in a task of the shard. The
+  request's reply is held meanwhile: its origin, id and route, kept in the shard's map beside the import, one an import;
+  the running verb is marked deferred (`acceptance_deferred`, as a submit's acceptance is), so its transaction records
+  no completion. When the import ends the task records the request's completion with its reply in one durable step,
+  then sends the reply where the route names, outside its lend of the shard's state (`told::deliver_to`, whose delivery
+  takes the state itself). A resend of the request while its import runs takes the route over, so the end answers the
+  client where it is now; any other request for the repository is refused `UnderWay`.
+- **Refusals, by kind** (`ImportFault`, appended as `ArchiveFault` was): `NotMercurial`, `NotEmpty`, `UnderWay`,
+  `Unawaited`, `Format` (a requirement the import does not take, or a censored, ellipsis, externally stored or
+  unknown-flagged revision), `Damaged { path }` (a file missing, not of its format or at odds with the rest, its path
+  under `.hg` where the import's refusal names one), `PastRoom { room }`, `Pending` (a fetch still pending on an S3
+  base: ask again once it lands) and `Abandoned`; beside them `BudgetExceeded` with the room the budget had,
+  `BaseUnavailable` naming the directory for the host's own refusal, and `ContentUnavailable` for a store not held.
+  The API reads them as `Invalid::Import(ImportFault)`.
+- **Not taken (decided by the design, not measured).** An answer at once with a separate status verb: two verbs where
+  one answers, and a status kept per repository after its import ended. A request forwarded from another node waits
+  on its exchange, which cannot be held here: it is refused `Unawaited` until the import is durable and a resend can be
+  answered from its record.
+- **Tests** (`crates/server/src/repository/import/tests.rs`, and `an_import_refusal_is_typed_invalid_by_its_fault` in
+  `crates/api/src/error.rs`; macOS arm64, Mac Studio, kiln r110, 2026-11-19, debug, rustc 1.98.1, over main 0577ab0bd):
+  - refused by kind before anything is opened: a repository nobody made `NotFound`, another principal `Forbidden`, a
+    git repository `NotMercurial`, no request running (directly and through the shard's dispatch) and no route
+    `Unawaited`, a directory the host does not find `BaseUnavailable` naming it; none deferred;
+  - a started import of the `states` repository holds its reply (deferred, counted), a resend of its request takes the
+    route over without opening the directory again (counted rejoined), and another request is refused `UnderWay`;
+  - on a running daemon, the shard's task answers the held request when the import ends: counted answered once, its
+    reply sent (counted undeliverable, no client being there), the request let go, the store holding the history;
+  - each way an import fails or ends mapped to its refusal, and a finished import to `RepositoryImported`;
+  - the API types the refusal as an invalid request naming its fault, never retried.
+
+  `cargo test --locked -p slates-server --lib repository::import` 4 of 4 (751 filtered out), `--lib vcs_store::` 18 of
+  18, `-p slates-ipc --test wire_order every_` 2 of 2 over the tags the `--ignored` writer published (`ImportFault` 0 to
+  8, `Refusal` 78, `ReplyBody` 77, `RequestBody` 90), `-p slates-api --lib error` 12 of 12, `cargo fmt --check` clean on
+  the three crates; the same counts over main 3612d1ef9 (kiln r93). Red first (kiln r31, at 20821ad20: `import_with`
+  answering `NotFound` and `refusal_of` `ContentUnavailable` at once): the four failed, as recorded then; r31's log was
+  collected before this landing. No integration test reaches the verb. Main's: clippy, `xtask check`, the doc gates and
+  the other platforms.
+- **Owed.** The import made durable (the register's first entry and a recovery), with a forwarded request answered from
+  its record; the CLI's and the SDKs' words for the verb.

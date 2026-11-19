@@ -60,6 +60,9 @@ pub(crate) mod push;
 // calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hg_push;
+// The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
+// `vcs_store::hg_import`, the request answered when the import ends.
+pub(crate) mod import;
 
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
