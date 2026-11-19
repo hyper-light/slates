@@ -1709,12 +1709,14 @@ impl Repository {
     self.chains.get(&green)?.versions.get(version)?.head
   }
 
-  /// Each green that has a head now, with its head's position.
-  pub(super) fn current_heads(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-    self
-      .chains
-      .iter()
-      .filter_map(|(green, chain)| Some((*green, chain.head()?)))
+  /// Each green, in order, with the position of each head its versions had.
+  pub(super) fn heads(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+    self.chains.iter().flat_map(|(green, chain)| {
+      chain
+        .versions
+        .iter()
+        .filter_map(move |version| Some((*green, version.head?)))
+    })
   }
 
   /// The object at `position`: its id, its row and its root content.

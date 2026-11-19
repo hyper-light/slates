@@ -113,9 +113,16 @@ pub(crate) struct Learning<'a> {
 enum Base {
   Whole,
   /// An earlier entry: where it begins in the pack, and its object's id and position.
-  Earlier { at: u64, id: ObjectId, position: u64 },
+  Earlier {
+    at: u64,
+    id: ObjectId,
+    position: u64,
+  },
   /// The object the path held before, by its id and position.
-  Named { id: ObjectId, position: u64 },
+  Named {
+    id: ObjectId,
+    position: u64,
+  },
 }
 
 /// The representation chosen for one object: its base, the delta when it has one, its depth.
@@ -292,9 +299,7 @@ pub(crate) fn encode(
 fn in_fragment(mut record: Placed) -> Placed {
   record.offset = record.offset.saturating_sub(PACK_HEADER_LEN);
   if record.stored == Stored::Offset {
-    record.base = record
-      .base
-      .map(|base| base.saturating_sub(PACK_HEADER_LEN));
+    record.base = record.base.map(|base| base.saturating_sub(PACK_HEADER_LEN));
   }
   record
 }

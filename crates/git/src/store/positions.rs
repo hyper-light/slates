@@ -81,32 +81,78 @@ impl Positions {
     self.runs.iter().flat_map(|&(start, end)| start..end)
   }
 
-  /// The positions both this set and `other` hold (A-639).
+  /// The positions both this set and `other` hold (A-639): each run of one met with the runs of the other it overlaps,
+  /// in one pass over both. Two runs out never touch, since a gap of either set lies between them.
   pub fn intersection(&self, other: &Positions) -> Positions {
-    let _ = other;
-    Positions::new()
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let (mut mine, mut theirs) = (self.runs.iter().peekable(), other.runs.iter().peekable());
+    while let (Some(&&(start, end)), Some(&&(from, to))) = (mine.peek(), theirs.peek()) {
+      let (low, high) = (start.max(from), end.min(to));
+      if low < high {
+        runs.push((low, high));
+      }
+      if end <= to {
+        mine.next();
+      } else {
+        theirs.next();
+      }
+    }
+    Positions { runs }
   }
 
-  /// The positions this set holds and `other` does not (A-639).
+  /// The positions this set holds and `other` does not (A-639): each run cut by the runs of `other` it overlaps, in one
+  /// pass over both.
   pub fn difference(&self, other: &Positions) -> Positions {
-    let _ = other;
-    self.clone()
+    let mut runs: Vec<(u64, u64)> = Vec::with_capacity(self.runs.len());
+    let mut first = 0_usize;
+    for &(start, end) in &self.runs {
+      while other.runs.get(first).is_some_and(|run| run.1 <= start) {
+        first = first.saturating_add(1);
+      }
+      let mut from = start;
+      let cuts = other.runs.iter().skip(first).take_while(|run| run.0 < end);
+      for &(cut_start, cut_end) in cuts {
+        if cut_start > from {
+          runs.push((from, cut_start));
+        }
+        from = from.max(cut_end);
+      }
+      if from < end {
+        runs.push((from, end));
+      }
+    }
+    Positions { runs }
   }
 
   /// Whether `other` holds every position this set holds (A-639).
   pub fn is_subset(&self, other: &Positions) -> bool {
-    let _ = other;
-    false
+    self.difference(other).is_empty()
   }
 
-  /// Adds `position` (A-639).
+  /// Adds `position` (A-639): in constant time at the end, as positions given in order arrive; anywhere else by a
+  /// union.
   pub fn insert(&mut self, position: u64) {
-    let _ = position;
+    let end = position.saturating_add(1);
+    match self.runs.last().copied() {
+      Some((_, last)) if last == position => {
+        if let Some(run) = self.runs.last_mut() {
+          run.1 = end;
+        }
+      }
+      Some((_, last)) if last < position => self.runs.push((position, end)),
+      None => self.runs.push((position, end)),
+      Some(_) => {
+        *self = self.union(&Positions {
+          runs: vec![(position, end)],
+        });
+      }
+    }
   }
 
-  /// The least position the set holds at `from` or after it (A-639).
+  /// The least position the set holds at `from` or after it (A-639): the first run that ends after `from`, found by
+  /// halving.
   pub fn next_from(&self, from: u64) -> Option<u64> {
-    let _ = from;
-    None
+    let at = self.runs.partition_point(|run| run.1 <= from);
+    self.runs.get(at).map(|run| run.0.max(from))
   }
 }

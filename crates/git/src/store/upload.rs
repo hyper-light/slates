@@ -1,13 +1,76 @@
 //! upload-pack's pack, streamed from the store (A-639; §4.17.2 "A fetch", item 3, and "Pieces (git)", piece 7's "packs
-//! from fragments"). Stub for the failing tests.
+//! from fragments").
+//!
+//! **What it sends.** The negotiation (A-615) answers a fetch with runs of a green's versions, `after + 1` to
+//! `through`, and with objects one by one; this module takes that answer through a trait ([`Answered`]), so neither
+//! module names the other, and sends exactly the objects it names, each once, in three stages:
+//! 1. **The runs**, from their versions' fragments in order. The request's filter applies to a run's objects (A-615:
+//!    "the request's filter applies to their objects"), so before the header counts them each run's objects are
+//!    gathered: every object of its versions' D(k) when the filter sends everything, otherwise each by its row; and
+//!    the run's head whenever the run brought it, since it is the want, which git sends whatever the filter. A run is
+//!    exact because each of its versions fast-forwarded the one before, which the negotiation checked: D(M+1) to D(N)
+//!    is then what N reaches and M does not (§4.17.2 item 3).
+//! 2. **The cover**: the objects still to send that whole kept parts hold. The greens a head of whose versions is still
+//!    wanted are taken largest base pack first; for each, its base pack's two parts (commits, trees and tags; then blobs), then
+//!    the fragments of each version after the base (of every version, without one), each part taken when every object
+//!    it holds is still to send. So a clone is the base pack and then the fragments after it (§4.17.2: "A clone is the
+//!    base pack and then the fragments after version C"), with no clone path of its own; a version a rewrite later
+//!    left behind is not taken, since its objects are no longer all wanted; and a filter that sends no blobs takes the
+//!    parts without blobs whole: the "fragment classes" of §4.17.2.
+//! 3. **The rest**, which no part covered (a version not yet encoded, a part some of whose objects are not wanted),
+//!    encoded in position order by the fragments' encoder: a delta against an earlier one of its kind within the
+//!    learned window and depth, at the learned level, the rules copied from the repository when the stream begins.
+//!
+//! The header counts the wanted objects; every one is sent exactly once, since each stage sends only what is still
+//! wanted and takes it out; the trailer is the checksum of every byte before it, made as the bytes pass, and the count
+//! sent is checked against the header's before it is written.
+//!
+//! **What the client can read.** A kept part is copied byte for byte, its offset deltas valid wherever it lands
+//! (§4.17.2: "A fragment's offset deltas stay valid when fragments are joined"), when every object it holds is to be
+//! sent, the client said `ofs-delta` or the part has no offset delta, and every base its reference deltas name is
+//! sent already or held by the client. The client holds a base when it asked a thin pack, the part is a run's, and
+//! the base lies outside the run's versions before this one: a base a version names is in the tree the version before
+//! it had, so outside the run it is in what the client's version reaches. Under a filter a base is held only when the
+//! filter would have sent it, so a client cloned under the same filter has it. Otherwise the part is read entry by
+//! entry: an entry kept whole is copied; an offset delta whose base this pack carries is copied with its distance
+//! measured again, or with its base named by id for a client without `ofs-delta`, and named by id where its base was
+//! sent before the part; a reference delta whose base is sent or held is copied; any other delta is sent whole from
+//! its object, so a client that did not ask for `thin-pack` is never sent a base it lacks ("A client MUST NOT request
+//! the 'thin-pack' capability if it cannot turn a thin pack into a self-contained pack" \[B:
+//! gitprotocol-capabilities\]). Sending the object whole rather than its base ahead of it sends nothing the client
+//! has, so the pack holds exactly the answer's objects.
+//!
+//! **Slices.** [`Upload::advance`] does units of work until the owner's quantum is spent, at least one, and checks the
+//! owner's clock after each: a window of a kept part copied; a window of an object deflated (an object sent whole,
+//! or one past a window, is deflated a window a unit); one object at most a window long encoded, its delta trials
+//! within the learned window; a window's worth of the answer's handles read; one object of a run judged by its row;
+//! one entry of a part judged. So no unit outgrows a window and the learned window's trials, and nothing is held
+//! whole: between turns the stream holds no borrow of the store or the repository, names what it reads by green,
+//! version, class and content, and holds the wanted and sent sets as runs of positions (§4.17.2 item 3).
+//!
+//! **A base pack made again** while a stream reads one of its parts entry by entry ends the stream refused
+//! ([`StoreRefused::BaseRebuilt`]), never a pack of two base packs' entries; the owner makes base packs between
+//! streams. A part copied whole names its content, which holds the bytes it was made with.
 
-use slates_vcs::ContentStore;
+use std::mem::size_of;
 
-use crate::object_name::Kind;
+use flate2::{Compress, Compression};
+use slates_vcs::{ContentId, ContentStore};
+
+use crate::Admission;
+use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
+use crate::object_name::{Hasher, Kind, ObjectFormat, ObjectId};
 use crate::out::Out;
+use crate::pack;
 
-use super::learn::{Clock, Exchange};
-use super::repository::{Repository, StoreRefused};
+use super::fragment::{self, Encoder, FragmentRefused, Learning, Placed, Stored, ToEncode};
+use super::learn::{Clock, Exchange, Levels, Window};
+use super::positions::Positions;
+use super::repository::{Kept, Repository, StoreRefused};
+use super::rows::ObjectRow;
+
+/// Format: git's four object types, each asked of a filter to learn whether it sends everything.
+const KINDS: [Kind; 4] = [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag];
 
 /// A run of a green's versions the pack carries from their fragments (A-615's `Run`): versions `after + 1` to
 /// `through` of `green`, the client holding version `after`'s head.
@@ -33,7 +96,8 @@ pub trait Answered {
   /// Whether the client said `ofs-delta`: a delta may name its base by its offset back.
   fn ofs_delta(&self) -> bool;
   /// Whether the request's filter sends an object of `kind` and `size` that a run brought (A-615's per-object filter,
-  /// which decides by kind and size alone); every one with no filter.
+  /// which decides by kind and size alone, sending a smaller object wherever it sends a larger one); every one with no
+  /// filter.
   fn admits(&self, kind: Kind, size: u64) -> bool;
 }
 
@@ -78,18 +142,165 @@ pub struct UploadCounters {
   pub loose_deltas: u64,
 }
 
+/// Where the stream is (module docs).
+enum Stage {
+  /// Reading the answer's objects into the wanted set, from the one at `next`.
+  Objects { next: usize },
+  /// Gathering run `run`'s version `version`'s objects the filter sends, from position `from` on.
+  Gather { run: usize, version: u64, from: u64 },
+  /// The header.
+  Header,
+  /// Sending run `run`'s version `version`'s fragment of blobs or of the other kinds; `newer` holds the objects of
+  /// the run's versions before it, which no client of the run holds.
+  Runs {
+    run: usize,
+    version: u64,
+    blobs: bool,
+    newer: Positions,
+  },
+  /// Choosing the greens whose kept parts may cover what is left.
+  CoverFrom,
+  /// Offering green `greens[at]`'s `part` to the cover.
+  Cover {
+    greens: Vec<u64>,
+    at: usize,
+    part: Part,
+  },
+  /// Encoding what no part covered, from position `from` on.
+  Loose { from: u64 },
+  /// The trailer.
+  Trailer,
+  /// Sent.
+  Done,
+  /// Refused: every later turn answers the same.
+  Refused(StoreRefused),
+}
+
+/// A green's part the cover offers next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+  /// Its base pack's part of blobs, or of the other kinds.
+  Base { blobs: bool },
+  /// Its version's fragment of blobs, or of the other kinds.
+  Version { version: usize, blobs: bool },
+}
+
+/// Where a kept part is, named as the stream names it between turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+  /// A version's fragment.
+  Fragment {
+    green: u64,
+    version: usize,
+    blobs: bool,
+  },
+  /// A base pack's part, with the content it was read from: one made again since is another.
+  Base {
+    green: u64,
+    blobs: bool,
+    content: ContentId,
+  },
+}
+
+/// A part read entry by entry.
+struct ByEntry {
+  source: Source,
+  /// The positions of its objects to send.
+  keep: Positions,
+  /// For a run's part, the objects of the run's versions before it; `None` for a part the cover took.
+  newer: Option<Positions>,
+  /// The entry to judge next.
+  next: usize,
+  /// Where each of its entries sent begins in the pack, by the entry's index.
+  moved: Vec<Option<u64>>,
+}
+
+/// An object being deflated whole, a window a unit.
+struct Deflating {
+  content: ContentId,
+  len: u64,
+  /// Its window to feed next.
+  next: u64,
+  compress: Compress,
+}
+
+/// Bytes owed to the pack before anything else is judged.
+enum Pending {
+  /// The bytes `from` to `to` of a kept content `len` bytes long.
+  Copy {
+    content: ContentId,
+    len: u64,
+    from: u64,
+    to: u64,
+  },
+  /// An object being deflated.
+  Deflate(Deflating),
+}
+
+/// What a turn's units read: the repository, the store, the owner's clock and exchange.
+struct Context<'c> {
+  repository: &'c Repository,
+  store: &'c ContentStore,
+  clock: &'c mut dyn Clock,
+  exchange: Exchange,
+}
+
 /// upload-pack's pack, streamed (module docs).
 pub struct Upload<A> {
   answer: A,
+  format: ObjectFormat,
+  /// Whether the filter sends every object (no filter, or one that sends the largest of each kind), so a run's objects
+  /// need no row read.
+  sends_all: bool,
+  stage: Stage,
+  /// The objects the pack carries and has not sent.
+  wanted: Positions,
+  /// The objects sent.
+  sent: Positions,
+  /// The runs' objects the filter sends, gathered before the header counts them.
+  gathered: Positions,
+  /// The objects the header counts.
+  counted: u64,
+  /// The entries sent.
+  entries: u64,
+  /// The bytes sent so far: where the next entry begins.
+  at: u64,
+  hasher: Option<Hasher>,
+  window: Window,
+  levels: Levels,
+  depth: u64,
+  encoder: Encoder,
+  by_entry: Option<ByEntry>,
+  pending: Option<Pending>,
   counters: UploadCounters,
 }
 
 impl<A: Answered> Upload<A> {
-  /// The stream of the pack that answers `answer` from `repository`.
+  /// The stream of the pack that answers `answer` from `repository`, encoding with a copy of the repository's learned
+  /// rules.
   pub fn new(answer: A, repository: &Repository) -> Upload<A> {
-    let _ = repository;
+    let (window, levels, depth) = repository.rules();
+    let sends_all = KINDS.iter().all(|kind| answer.admits(*kind, u64::MAX));
+    let encoder = Encoder::new(answer.ofs_delta());
+    let format = repository.format();
     Upload {
       answer,
+      format,
+      sends_all,
+      stage: Stage::Objects { next: 0 },
+      wanted: Positions::new(),
+      sent: Positions::new(),
+      gathered: Positions::new(),
+      counted: 0,
+      entries: 0,
+      at: 0,
+      hasher: Some(Hasher::raw(format)),
+      window,
+      levels,
+      depth,
+      encoder,
+      by_entry: None,
+      pending: None,
       counters: UploadCounters::default(),
     }
   }
@@ -99,7 +310,8 @@ impl<A: Answered> Upload<A> {
     self.counters
   }
 
-  /// One turn: units of work until the turn's quantum is spent, at least one, the bytes put to `out`.
+  /// One turn: units of work until the turn's quantum is spent, at least one, the bytes put to `out` (module docs).
+  /// Refused, every later turn is refused the same, and what was put is no pack.
   pub fn advance(
     &mut self,
     repository: &Repository,
@@ -107,7 +319,809 @@ impl<A: Answered> Upload<A> {
     turn: Turn<'_>,
     out: &mut impl Out,
   ) -> Result<Progress, StoreRefused> {
-    let _ = (repository, store, turn, out, &self.answer);
-    Ok(Progress::Done)
+    let Turn {
+      clock,
+      exchange,
+      quantum_ns,
+    } = turn;
+    let start = clock.now_ns();
+    self.counters.turns = self.counters.turns.saturating_add(1);
+    let mut context = Context {
+      repository,
+      store,
+      clock,
+      exchange,
+    };
+    loop {
+      match self.step(&mut context, out) {
+        Ok(Progress::Done) => return Ok(Progress::Done),
+        Ok(Progress::More) => {}
+        Err(refused) => {
+          self.stage = Stage::Refused(refused);
+          return Err(refused);
+        }
+      }
+      if context.clock.now_ns().saturating_sub(start) >= quantum_ns {
+        return Ok(Progress::More);
+      }
+    }
   }
+
+  /// One unit of work: what is owed first, then a part's next entry, then the stage's next step.
+  fn step(&mut self, cx: &mut Context<'_>, out: &mut impl Out) -> Result<Progress, StoreRefused> {
+    if let Some(pending) = self.pending.take() {
+      self.pending = self.owed(cx.store, pending, out)?;
+      return Ok(Progress::More);
+    }
+    if let Some(by_entry) = self.by_entry.take() {
+      self.by_entry = self.next_entry(cx, by_entry, out)?;
+      return Ok(Progress::More);
+    }
+    let stage = core::mem::replace(&mut self.stage, Stage::Done);
+    self.stage = self.next_stage(cx, stage, out)?;
+    if matches!(self.stage, Stage::Done) {
+      return Ok(Progress::Done);
+    }
+    Ok(Progress::More)
+  }
+
+  /// The stage after `stage`'s step.
+  fn next_stage(
+    &mut self,
+    cx: &mut Context<'_>,
+    stage: Stage,
+    out: &mut impl Out,
+  ) -> Result<Stage, StoreRefused> {
+    match stage {
+      Stage::Objects { next } => self.read_objects(cx, next),
+      Stage::Gather { run, version, from } => self.gather(cx, (run, version, from)),
+      Stage::Header => self.header(out),
+      Stage::Runs {
+        run,
+        version,
+        blobs,
+        newer,
+      } => self.send_run(cx, (run, version, blobs), newer),
+      Stage::CoverFrom => Ok(self.cover_from(cx)),
+      Stage::Cover { greens, at, part } => self.cover(cx, greens, at, part),
+      Stage::Loose { from } => self.loose(cx, from, out),
+      Stage::Trailer => self.trailer(out),
+      Stage::Done => Ok(Stage::Done),
+      Stage::Refused(refused) => Err(refused),
+    }
+  }
+
+  /// Reads a window's worth of the answer's objects into the wanted set, a handle `size_of::<u64>()` bytes.
+  fn read_objects(&mut self, cx: &Context<'_>, next: usize) -> Result<Stage, StoreRefused> {
+    let handles = cx
+      .store
+      .window()
+      .checked_div(size_of::<u64>())
+      .unwrap_or(0)
+      .max(1);
+    let objects = self.answer.objects();
+    let end = next.saturating_add(handles).min(objects.len());
+    for position in objects.get(next..end).unwrap_or_default() {
+      self.wanted.insert(*position);
+    }
+    if end < objects.len() {
+      return Ok(Stage::Objects { next: end });
+    }
+    self.gather_from(0)
+  }
+
+  /// Gathering run `run` from its first version; once every run is gathered, the wanted set made whole and counted.
+  fn gather_from(&mut self, run: usize) -> Result<Stage, StoreRefused> {
+    if let Some(versions) = self.answer.runs().get(run) {
+      return Ok(Stage::Gather {
+        run,
+        version: versions.after.saturating_add(1),
+        from: 0,
+      });
+    }
+    self.wanted = self.wanted.union(&core::mem::take(&mut self.gathered));
+    self.counted = self.wanted.len();
+    u32::try_from(self.counted).map_err(|_| StoreRefused::PackTooLarge)?;
+    Ok(Stage::Header)
+  }
+
+  /// One unit of gathering (module docs, **What it sends** 1): a version's objects joined at once when the filter sends
+  /// everything; otherwise one object, judged by its row.
+  fn gather(
+    &mut self,
+    cx: &Context<'_>,
+    (run, version, from): (usize, u64, u64),
+  ) -> Result<Stage, StoreRefused> {
+    let Some(versions) = self.answer.runs().get(run).copied() else {
+      return self.gather_from(run);
+    };
+    if version > versions.through {
+      return self.gather_from(run.saturating_add(1));
+    }
+    let green = versions.green;
+    let brought = cx
+      .repository
+      .brought(green, version_index(green, version)?)
+      .ok_or(StoreRefused::NoVersion { green, version })?;
+    let next_version = Stage::Gather {
+      run,
+      version: version.saturating_add(1),
+      from: 0,
+    };
+    if from == 0 {
+      let head = run_head(cx.repository, versions)?;
+      if brought.contains(head) {
+        self.gathered.insert(head);
+      }
+    }
+    if self.sends_all {
+      self.gathered = self.gathered.union(brought);
+      return Ok(next_version);
+    }
+    let Some(position) = brought.next_from(from) else {
+      return Ok(next_version);
+    };
+    let (_, row, _) = cx.repository.stored_at(cx.store, position)?;
+    if self.answer.admits(row.kind, row.len) {
+      self.gathered.insert(position);
+    }
+    Ok(Stage::Gather {
+      run,
+      version,
+      from: position.saturating_add(1),
+    })
+  }
+
+  /// The header, counting the wanted objects; the runs next.
+  fn header(&mut self, out: &mut impl Out) -> Result<Stage, StoreRefused> {
+    let count = u32::try_from(self.counted).map_err(|_| StoreRefused::PackTooLarge)?;
+    let mut header = Vec::new();
+    pack::put_header(count, &mut header);
+    self.emit(&header, out);
+    Ok(self.run_from(0))
+  }
+
+  /// Sending run `run` from its first version; the cover once every run is sent.
+  fn run_from(&self, run: usize) -> Stage {
+    match self.answer.runs().get(run) {
+      Some(versions) => Stage::Runs {
+        run,
+        version: versions.after.saturating_add(1),
+        blobs: false,
+        newer: Positions::new(),
+      },
+      None => Stage::CoverFrom,
+    }
+  }
+
+  /// One fragment of a run (module docs, **What it sends** 1), then the next.
+  fn send_run(
+    &mut self,
+    cx: &Context<'_>,
+    (run, version, blobs): (usize, u64, bool),
+    newer: Positions,
+  ) -> Result<Stage, StoreRefused> {
+    let Some(versions) = self.answer.runs().get(run).copied() else {
+      return Ok(Stage::CoverFrom);
+    };
+    if version > versions.through {
+      return Ok(self.run_from(run.saturating_add(1)));
+    }
+    let green = versions.green;
+    let at = version_index(green, version)?;
+    if let Some(kept) = cx.repository.fragment_part(green, at, blobs) {
+      let source = Source::Fragment {
+        green,
+        version: at,
+        blobs,
+      };
+      self.take_part(source, kept, Some(&newer));
+    }
+    if !blobs {
+      return Ok(Stage::Runs {
+        run,
+        version,
+        blobs: true,
+        newer,
+      });
+    }
+    let brought = cx
+      .repository
+      .brought(green, at)
+      .ok_or(StoreRefused::NoVersion { green, version })?;
+    Ok(Stage::Runs {
+      run,
+      version: version.saturating_add(1),
+      blobs: false,
+      newer: newer.union(brought),
+    })
+  }
+
+  /// Sends what of a kept part is still wanted (module docs, **What the client can read**): copied whole, or entry by
+  /// entry. `newer`, for a run's part, holds the objects of the run's versions before it.
+  fn take_part(&mut self, source: Source, kept: &Kept, newer: Option<&Positions>) {
+    let keep = kept.positions.intersection(&self.wanted);
+    if keep.is_empty() {
+      return;
+    }
+    let whole = keep.len() == kept.positions.len();
+    let readable = (self.answer.ofs_delta() || kept.offsets == 0) && self.bases_held(kept, newer);
+    self.wanted = self.wanted.difference(&keep);
+    self.sent = self.sent.union(&keep);
+    if whole && readable {
+      self.counters.parts_copied = self.counters.parts_copied.saturating_add(1);
+      self.entries = self.entries.saturating_add(to_u64(kept.placed.len()));
+      self.pending = Some(Pending::Copy {
+        content: kept.content,
+        len: kept.len,
+        from: 0,
+        to: kept.len,
+      });
+      return;
+    }
+    self.counters.parts_by_entry = self.counters.parts_by_entry.saturating_add(1);
+    self.by_entry = Some(ByEntry {
+      source,
+      keep,
+      newer: newer.cloned(),
+      next: 0,
+      moved: vec![None; kept.placed.len()],
+    });
+  }
+
+  /// Whether every base the part's reference deltas name is sent already or, for a run's part with no filter to ask,
+  /// held by a thin client: outside the run's versions before it.
+  fn bases_held(&self, kept: &Kept, newer: Option<&Positions>) -> bool {
+    let missing = kept.references.difference(&self.sent);
+    if missing.is_empty() {
+      return true;
+    }
+    match newer {
+      Some(newer) if self.answer.thin() && self.sends_all => missing.intersection(newer).is_empty(),
+      _ => false,
+    }
+  }
+
+  /// One entry of a part read entry by entry: judged, and sent if wanted; the part's reading, or `None` once its last
+  /// entry is judged.
+  fn next_entry(
+    &mut self,
+    cx: &mut Context<'_>,
+    mut by_entry: ByEntry,
+    out: &mut impl Out,
+  ) -> Result<Option<ByEntry>, StoreRefused> {
+    let kept = part_of(cx.repository, by_entry.source)?;
+    let index = by_entry.next;
+    let Some(entry) = kept.placed.get(index).copied() else {
+      return Ok(None);
+    };
+    by_entry.next = index.saturating_add(1);
+    if by_entry.keep.contains(entry.position) {
+      let end = kept
+        .placed
+        .get(index.saturating_add(1))
+        .map_or(kept.len, |after| after.offset);
+      self.send_entry(cx, kept, &mut by_entry, (index, entry, end), out)?;
+    }
+    Ok(Some(by_entry))
+  }
+
+  /// Sends a kept entry that ends at `end` in its part (module docs, **What the client can read**).
+  fn send_entry(
+    &mut self,
+    cx: &mut Context<'_>,
+    kept: &Kept,
+    by_entry: &mut ByEntry,
+    (index, entry, end): (usize, Placed, u64),
+    out: &mut impl Out,
+  ) -> Result<(), StoreRefused> {
+    let (header, kept_header) = read_header(cx.store, kept, entry.offset, self.format)?;
+    if let Some(slot) = by_entry.moved.get_mut(index) {
+      *slot = Some(self.at);
+    }
+    self.entries = self.entries.saturating_add(1);
+    let Some(representation) = self.readable(cx, kept, by_entry, &entry, header.representation)?
+    else {
+      self.counters.made_whole = self.counters.made_whole.saturating_add(1);
+      let found = cx.repository.stored_at(cx.store, entry.position)?;
+      return self.send_whole(cx, found, out);
+    };
+    let mut written = Vec::new();
+    let header = Header {
+      representation,
+      size: header.size,
+    };
+    entry::write(header, self.at, &mut written).map_err(entry_refused)?;
+    if written == kept_header {
+      self.counters.entries_copied = self.counters.entries_copied.saturating_add(1);
+    } else {
+      self.counters.headers_rewritten = self.counters.headers_rewritten.saturating_add(1);
+    }
+    self.emit(&written, out);
+    self.pending = Some(Pending::Copy {
+      content: kept.content,
+      len: kept.len,
+      from: entry.offset.saturating_add(to_u64(kept_header.len())),
+      to: end,
+    });
+    Ok(())
+  }
+
+  /// How the client reads a kept entry, kept as `kept_as`; `None` when it must be sent whole.
+  fn readable(
+    &self,
+    cx: &Context<'_>,
+    kept: &Kept,
+    by_entry: &ByEntry,
+    entry: &Placed,
+    kept_as: Representation,
+  ) -> Result<Option<Representation>, StoreRefused> {
+    match kept_as {
+      Representation::Whole(kind) => Ok(Some(Representation::Whole(kind))),
+      Representation::OfsDelta { .. } => Ok(self.offset_base(kept, by_entry, entry)),
+      Representation::RefDelta { base } => {
+        let Some(position) = entry.base else {
+          return Ok(None);
+        };
+        let reads =
+          self.sent.contains(position) || self.held(cx, by_entry.newer.as_ref(), position)?;
+        Ok(reads.then_some(Representation::RefDelta { base }))
+      }
+    }
+  }
+
+  /// An offset delta's base as this pack holds it: at its new place, by offset for a client that reads them and by id
+  /// otherwise; by id where it was sent before this part; `None` where the pack does not carry it.
+  fn offset_base(&self, kept: &Kept, by_entry: &ByEntry, entry: &Placed) -> Option<Representation> {
+    let offset = entry.base?;
+    let index = kept
+      .placed
+      .binary_search_by_key(&offset, |placed| placed.offset)
+      .ok()?;
+    let base = kept.placed.get(index)?;
+    match by_entry.moved.get(index).copied().flatten() {
+      Some(moved) if self.answer.ofs_delta() => Some(Representation::OfsDelta { base: moved }),
+      Some(_) => Some(Representation::RefDelta { base: base.id }),
+      None if self.sent.contains(base.position) && !by_entry.keep.contains(base.position) => {
+        Some(Representation::RefDelta { base: base.id })
+      }
+      None => None,
+    }
+  }
+
+  /// Whether a thin client holds the object at `position` (module docs): a run's client, the object outside the run's
+  /// versions before this one, and one the filter sends.
+  fn held(
+    &self,
+    cx: &Context<'_>,
+    newer: Option<&Positions>,
+    position: u64,
+  ) -> Result<bool, StoreRefused> {
+    let Some(newer) = newer else {
+      return Ok(false);
+    };
+    if !self.answer.thin() || newer.contains(position) {
+      return Ok(false);
+    }
+    if self.sends_all {
+      return Ok(true);
+    }
+    let (_, row, _) = cx.repository.stored_at(cx.store, position)?;
+    Ok(self.answer.admits(row.kind, row.len))
+  }
+
+  /// An object sent whole: its header now, its bytes deflated a window a unit, at the level learned for its kind or
+  /// chosen by sampling its first window.
+  fn send_whole(
+    &mut self,
+    cx: &mut Context<'_>,
+    (id, row, content): (ObjectId, ObjectRow, ContentId),
+    out: &mut impl Out,
+  ) -> Result<(), StoreRefused> {
+    let mut written = Vec::new();
+    let header = Header {
+      representation: Representation::Whole(row.kind),
+      size: row.len,
+    };
+    entry::write(header, self.at, &mut written).map_err(entry_refused)?;
+    let first = cx
+      .store
+      .window_at(&content, row.len, 0)
+      .ok_or(StoreRefused::Unreadable { id })?;
+    let mut learning = Learning {
+      window: &mut self.window,
+      levels: &mut self.levels,
+      depth: self.depth,
+      exchange: cx.exchange,
+      clock: &mut *cx.clock,
+    };
+    let level = fragment::level(row.kind, first, &mut learning).map_err(StoreRefused::Encoding)?;
+    self.emit(&written, out);
+    self.pending = Some(Pending::Deflate(Deflating {
+      content,
+      len: row.len,
+      next: 0,
+      compress: Compress::new(Compression::new(level), true),
+    }));
+    Ok(())
+  }
+
+  /// One unit of what is owed: a window of kept bytes copied, or a window of an object deflated; what is owed after it.
+  fn owed(
+    &mut self,
+    store: &ContentStore,
+    pending: Pending,
+    out: &mut impl Out,
+  ) -> Result<Option<Pending>, StoreRefused> {
+    match pending {
+      Pending::Copy {
+        content,
+        len,
+        from,
+        to,
+      } => self.copy_window(store, (content, len), (from, to), out),
+      Pending::Deflate(deflating) => self.deflate_window(store, deflating, out),
+    }
+  }
+
+  /// The bytes from `from` to `to` of a kept content, as far as the window `from` lies in holds them.
+  fn copy_window(
+    &mut self,
+    store: &ContentStore,
+    (content, len): (ContentId, u64),
+    (from, to): (u64, u64),
+    out: &mut impl Out,
+  ) -> Result<Option<Pending>, StoreRefused> {
+    if from >= to {
+      return Ok(None);
+    }
+    let window = to_u64(store.window());
+    let index = from.checked_div(window).unwrap_or(0);
+    let start = index.saturating_mul(window);
+    let bytes = store
+      .window_at(&content, len, index)
+      .ok_or(StoreRefused::FragmentUnreadable)?;
+    let upto = to.min(start.saturating_add(to_u64(bytes.len())));
+    let piece = within(
+      bytes,
+      from.saturating_sub(start),
+      upto.saturating_sub(start),
+    )?;
+    if upto <= from {
+      return Err(StoreRefused::FragmentUnreadable);
+    }
+    self.emit(piece, out);
+    if upto >= to {
+      return Ok(None);
+    }
+    Ok(Some(Pending::Copy {
+      content,
+      len,
+      from: upto,
+      to,
+    }))
+  }
+
+  /// The next window of an object being deflated, fed and what it gave sent; the stream ended after its last.
+  fn deflate_window(
+    &mut self,
+    store: &ContentStore,
+    mut deflating: Deflating,
+    out: &mut impl Out,
+  ) -> Result<Option<Pending>, StoreRefused> {
+    let window = to_u64(store.window());
+    let windows = deflating.len.div_ceil(window).max(1);
+    let bytes = store
+      .window_at(&deflating.content, deflating.len, deflating.next)
+      .ok_or(StoreRefused::FragmentUnreadable)?;
+    let last = deflating.next.saturating_add(1) >= windows;
+    let given = fragment::deflate_more(&mut deflating.compress, bytes, last)
+      .map_err(StoreRefused::Encoding)?;
+    self.emit(&given, out);
+    if last {
+      return Ok(None);
+    }
+    deflating.next = deflating.next.saturating_add(1);
+    Ok(Some(Pending::Deflate(deflating)))
+  }
+
+  /// The greens whose kept parts may cover what is left: those a head of whose versions is still wanted, the largest
+  /// base pack first (module docs, **What it sends** 2).
+  fn cover_from(&self, cx: &Context<'_>) -> Stage {
+    let mut wanted: Vec<u64> = cx
+      .repository
+      .heads()
+      .filter(|(_, head)| self.wanted.contains(*head))
+      .map(|(green, _)| green)
+      .collect();
+    wanted.dedup();
+    let mut greens: Vec<(u64, u64)> = wanted
+      .into_iter()
+      .map(|green| (green, base_len(cx.repository, green)))
+      .collect();
+    greens.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Stage::Cover {
+      greens: greens.into_iter().map(|(green, _)| green).collect(),
+      at: 0,
+      part: Part::Base { blobs: false },
+    }
+  }
+
+  /// Offers green `greens[at]`'s `part` to the cover; the next part, the next green's first, or what no part covers.
+  fn cover(
+    &mut self,
+    cx: &Context<'_>,
+    greens: Vec<u64>,
+    at: usize,
+    part: Part,
+  ) -> Result<Stage, StoreRefused> {
+    let Some(green) = greens.get(at).copied() else {
+      return Ok(Stage::Loose { from: 0 });
+    };
+    if let Some((source, kept)) = offered(cx.repository, green, part)
+      && !kept.positions.is_empty()
+      && kept.positions.is_subset(&self.wanted)
+    {
+      self.take_part(source, kept, None);
+    }
+    Ok(match after(cx.repository, green, part) {
+      Some(part) => Stage::Cover { greens, at, part },
+      None => Stage::Cover {
+        greens,
+        at: at.saturating_add(1),
+        part: Part::Base { blobs: false },
+      },
+    })
+  }
+
+  /// One object no part covered (module docs, **What it sends** 3): encoded with the fragments' encoder when it is a
+  /// window long at most, deflated whole a window a unit otherwise.
+  fn loose(
+    &mut self,
+    cx: &mut Context<'_>,
+    from: u64,
+    out: &mut impl Out,
+  ) -> Result<Stage, StoreRefused> {
+    let Some(position) = self.wanted.next_from(from) else {
+      return Ok(Stage::Trailer);
+    };
+    self.entries = self.entries.saturating_add(1);
+    let (id, row, content) = cx.repository.stored_at(cx.store, position)?;
+    let next = Stage::Loose {
+      from: position.saturating_add(1),
+    };
+    if row.len > to_u64(cx.store.window()) {
+      self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
+      self.send_whole(cx, (id, row, content), out)?;
+      return Ok(next);
+    }
+    let bytes = cx
+      .store
+      .object_bytes(&content, row.len)
+      .ok_or(StoreRefused::Unreadable { id })?;
+    let object = ToEncode {
+      id,
+      position,
+      kind: row.kind,
+      bytes,
+      named: None,
+    };
+    let mut learning = Learning {
+      window: &mut self.window,
+      levels: &mut self.levels,
+      depth: self.depth,
+      exchange: cx.exchange,
+      clock: &mut *cx.clock,
+    };
+    let (entry, placed) = self
+      .encoder
+      .put(object, self.at, &mut learning)
+      .map_err(StoreRefused::Encoding)?;
+    if placed.stored == Stored::Whole {
+      self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
+    } else {
+      self.counters.loose_deltas = self.counters.loose_deltas.saturating_add(1);
+    }
+    self.emit(&entry, out);
+    Ok(next)
+  }
+
+  /// The trailer, once the entries sent are the ones the header counted.
+  fn trailer(&mut self, out: &mut impl Out) -> Result<Stage, StoreRefused> {
+    if self.entries != self.counted {
+      return Err(StoreRefused::CountChanged {
+        counted: self.counted,
+        sent: self.entries,
+      });
+    }
+    let hasher = self.hasher.take().ok_or(StoreRefused::TrailerRefused)?;
+    let checksum = hasher.finish().map_err(|_| StoreRefused::TrailerRefused)?;
+    out.put(checksum.as_bytes());
+    self.at = self.at.saturating_add(to_u64(checksum.as_bytes().len()));
+    Ok(Stage::Done)
+  }
+
+  /// Puts `bytes` into the pack and its checksum.
+  fn emit(&mut self, bytes: &[u8], out: &mut impl Out) {
+    if let Some(hasher) = self.hasher.as_mut() {
+      hasher.update(bytes);
+    }
+    out.put(bytes);
+    self.at = self.at.saturating_add(to_u64(bytes.len()));
+  }
+}
+
+/// The part `part` names of `green`, with its source, when it is kept.
+fn offered(repository: &Repository, green: u64, part: Part) -> Option<(Source, &Kept)> {
+  match part {
+    Part::Base { blobs } => {
+      let (_, kept) = repository.base_part(green, blobs)?;
+      let source = Source::Base {
+        green,
+        blobs,
+        content: kept.content,
+      };
+      Some((source, kept))
+    }
+    Part::Version { version, blobs } => {
+      let kept = repository.fragment_part(green, version, blobs)?;
+      let source = Source::Fragment {
+        green,
+        version,
+        blobs,
+      };
+      Some((source, kept))
+    }
+  }
+}
+
+/// The part of `green` the cover offers after `part`: a base pack's blobs after its other kinds, then the versions after
+/// it (every version, without one), each version's blobs after its other kinds; `None` after the last version.
+fn after(repository: &Repository, green: u64, part: Part) -> Option<Part> {
+  let next = match part {
+    Part::Base { blobs: false } => Part::Base { blobs: true },
+    Part::Base { blobs: true } => Part::Version {
+      version: repository
+        .base_part(green, false)
+        .map_or(0, |(version, _)| version.saturating_add(1)),
+      blobs: false,
+    },
+    Part::Version {
+      version,
+      blobs: false,
+    } => Part::Version {
+      version,
+      blobs: true,
+    },
+    Part::Version {
+      version,
+      blobs: true,
+    } => Part::Version {
+      version: version.saturating_add(1),
+      blobs: false,
+    },
+  };
+  match next {
+    Part::Version { version, .. } if version >= repository.versions(green) => None,
+    next => Some(next),
+  }
+}
+
+/// The objects `green`'s base pack holds; none without one.
+fn base_len(repository: &Repository, green: u64) -> u64 {
+  [false, true]
+    .into_iter()
+    .filter_map(|blobs| repository.base_part(green, blobs))
+    .fold(0_u64, |total, (_, kept)| {
+      total.saturating_add(kept.positions.len())
+    })
+}
+
+/// The kept part `source` names: refused where a base pack was made again since, or a version's fragment is gone.
+fn part_of(repository: &Repository, source: Source) -> Result<&Kept, StoreRefused> {
+  match source {
+    Source::Fragment {
+      green,
+      version,
+      blobs,
+    } => repository
+      .fragment_part(green, version, blobs)
+      .ok_or(StoreRefused::NotEncoded {
+        version: to_u64(version),
+      }),
+    Source::Base {
+      green,
+      blobs,
+      content,
+    } => repository
+      .base_part(green, blobs)
+      .map(|(_, kept)| kept)
+      .filter(|kept| kept.content == content)
+      .ok_or(StoreRefused::BaseRebuilt { green }),
+  }
+}
+
+/// The header of the entry `offset` bytes into a kept part, and its bytes as kept. The admission is unbounded since
+/// nothing is made from the size it names: the entry's data is copied, never inflated.
+fn read_header(
+  store: &ContentStore,
+  kept: &Kept,
+  offset: u64,
+  format: ObjectFormat,
+) -> Result<(Header, Vec<u8>), StoreRefused> {
+  let longest = to_u64(entry::longest_header(format));
+  let to = offset.saturating_add(longest).min(kept.len);
+  let bytes = read_range(store, (kept.content, kept.len), offset, to)?;
+  let at = PACK_HEADER_LEN.saturating_add(offset);
+  let (header, len) = entry::read(&bytes, at, format, &mut Admission::new(u64::MAX))
+    .ok()
+    .flatten()
+    .ok_or(StoreRefused::FragmentUnreadable)?;
+  let kept_header = bytes
+    .get(..len)
+    .ok_or(StoreRefused::FragmentUnreadable)?
+    .to_vec();
+  Ok((header, kept_header))
+}
+
+/// The bytes `from` to `to` of a kept content `len` bytes long, read from the windows they lie in.
+fn read_range(
+  store: &ContentStore,
+  (content, len): (ContentId, u64),
+  from: u64,
+  to: u64,
+) -> Result<Vec<u8>, StoreRefused> {
+  let window = to_u64(store.window());
+  let mut bytes = Vec::new();
+  let mut at = from;
+  while at < to {
+    let index = at.checked_div(window).unwrap_or(0);
+    let start = index.saturating_mul(window);
+    let held = store
+      .window_at(&content, len, index)
+      .ok_or(StoreRefused::FragmentUnreadable)?;
+    let upto = to.min(start.saturating_add(to_u64(held.len())));
+    if upto <= at {
+      return Err(StoreRefused::FragmentUnreadable);
+    }
+    bytes.extend_from_slice(within(
+      held,
+      at.saturating_sub(start),
+      upto.saturating_sub(start),
+    )?);
+    at = upto;
+  }
+  Ok(bytes)
+}
+
+/// `bytes` from `from` to `to`, refused past their end.
+fn within(bytes: &[u8], from: u64, to: u64) -> Result<&[u8], StoreRefused> {
+  let from = usize::try_from(from).map_err(|_| StoreRefused::FragmentUnreadable)?;
+  let to = usize::try_from(to).map_err(|_| StoreRefused::FragmentUnreadable)?;
+  bytes.get(from..to).ok_or(StoreRefused::FragmentUnreadable)
+}
+
+/// The position of the head a run wants: its last version's.
+fn run_head(repository: &Repository, versions: Versions) -> Result<u64, StoreRefused> {
+  let (green, through) = (versions.green, versions.through);
+  repository
+    .head_position(green, version_index(green, through)?)
+    .ok_or(StoreRefused::NoVersion {
+      green,
+      version: through,
+    })
+}
+
+/// A version's index in its green's chain, refused where it cannot be one.
+fn version_index(green: u64, version: u64) -> Result<usize, StoreRefused> {
+  usize::try_from(version).map_err(|_| StoreRefused::NoVersion { green, version })
+}
+
+/// An entry's header the writer refused, as the store says it.
+fn entry_refused(refusal: entry::Refusal) -> StoreRefused {
+  StoreRefused::Encoding(FragmentRefused::Entry(refusal))
+}
+
+fn to_u64(len: usize) -> u64 {
+  u64::try_from(len).unwrap_or(u64::MAX)
 }

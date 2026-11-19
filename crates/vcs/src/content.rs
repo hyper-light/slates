@@ -626,8 +626,35 @@ impl ContentStore {
   /// A reader that resumes at a window reads the lists above it alone, never the windows before it. `None` past the
   /// object's last window, or where the store does not hold the path down whole.
   pub fn window_at(&self, root: &ContentId, len: u64, index: u64) -> Option<&[u8]> {
-    let _ = (root, len, index);
-    None
+    let window = u64::try_from(self.window.get()).ok()?;
+    let fanout = u64::try_from(self.fanout.get()).ok()?;
+    let windows = len.div_ceil(window).max(1);
+    if index >= windows {
+      return None;
+    }
+    let mut height = 0_u32;
+    let mut nodes = windows;
+    while nodes > 1 {
+      nodes = nodes.div_ceil(fanout);
+      height = height.checked_add(1)?;
+    }
+    let mut identity = *root;
+    for level in (0..height).rev() {
+      let span = fanout.checked_pow(level)?;
+      let child = index.checked_div(span)?.checked_rem(fanout)?;
+      let list = self
+        .entries
+        .get(&identity)
+        .filter(|held| held.form == Form::List)?;
+      let from = usize::try_from(child).ok()?.checked_mul(IDENTITY_BYTES)?;
+      let to = from.checked_add(IDENTITY_BYTES)?;
+      identity = list.bytes.get(from..to).and_then(ContentId::from_slice)?;
+    }
+    self
+      .entries
+      .get(&identity)
+      .filter(|held| held.form == Form::Window)
+      .map(|held| &*held.bytes)
   }
 
   /// An object's bytes, read whole from its root, or `None` when the store does not hold its tree whole.
@@ -977,14 +1004,26 @@ mod tests {
   fn a_window_read_by_its_index_is_the_walks_window() {
     for window in [NARROW, 3 * IDENTITY_BYTES] {
       let mut store = ContentStore::new(1 << 24, window).unwrap();
-      for len in [0, 1, window - 1, window, window + 1, 7 * window + 3, 33 * window] {
+      for len in [
+        0,
+        1,
+        window - 1,
+        window,
+        window + 1,
+        7 * window + 3,
+        33 * window,
+      ] {
         let bytes: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
         let root = store.put_object(&bytes).unwrap();
         let walked: Vec<&[u8]> = store.windows(&root).collect();
         let whole = u64::try_from(len).unwrap();
         for (index, expected) in walked.iter().enumerate() {
           let at = u64::try_from(index).unwrap();
-          assert_eq!(store.window_at(&root, whole, at), Some(*expected), "{len} {index}");
+          assert_eq!(
+            store.window_at(&root, whole, at),
+            Some(*expected),
+            "{len} {index}"
+          );
         }
         let past = u64::try_from(walked.len()).unwrap();
         assert_eq!(store.window_at(&root, whole, past), None);

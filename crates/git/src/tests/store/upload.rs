@@ -21,7 +21,8 @@ use crate::unpack::{NoIndex, Object, Outside, Reader, Refusal};
 use super::fragments::{commit_over, text};
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
-  Answer, EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, push_and_move, store, streamed, tree,
+  Answer, EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, push_and_move, store, streamed,
+  tree,
 };
 
 /// The objects a client holds: a thin pack's bases.
@@ -151,8 +152,7 @@ fn a_clone_is_the_base_pack_then_the_fragments_after_it() {
     let mut store = store();
     let (repository, versions) = three_versions(format, &mut store, true);
     let reached = repository.reached(1).unwrap().clone();
-    let (pack, counters) =
-      streamed(&repository, &store, Answer::objects(&reached), u64::MAX);
+    let (pack, counters) = streamed(&repository, &store, Answer::objects(&reached), u64::MAX);
     let parts = [
       repository.base_part(1, false).unwrap().1,
       repository.base_part(1, true).unwrap().1,
@@ -164,12 +164,18 @@ fn a_clone_is_the_base_pack_then_the_fragments_after_it() {
       .flat_map(|part| store.object_bytes(&part.content, part.len).unwrap())
       .collect();
     let header = usize::try_from(PACK_HEADER_LEN).unwrap();
-    assert_eq!(&pack[header..pack.len() - format.raw_len()], kept.as_slice());
+    assert_eq!(
+      &pack[header..pack.len() - format.raw_len()],
+      kept.as_slice()
+    );
     let read = read_back(format, &pack, &Held::none()).unwrap();
     let reach: BTreeSet<ObjectId> = versions.iter().flatten().map(|object| object.id).collect();
     assert_eq!(once(&read), reach);
     let loose = counters.loose_whole + counters.loose_deltas;
-    assert_eq!((counters.parts_copied, counters.parts_by_entry, loose), (4, 0, 0));
+    assert_eq!(
+      (counters.parts_copied, counters.parts_by_entry, loose),
+      (4, 0, 0)
+    );
     repository.release(&mut store).unwrap();
     assert!(store.is_empty());
   }
@@ -200,7 +206,13 @@ fn a_fetch_is_its_runs_fragments_then_what_no_fragment_covers() {
   let head = commit(format, root.id, &[], 9);
   let mut other = vec![head.clone(), root];
   other.extend(similar);
-  push_and_move(&mut repository, &mut store, other.clone(), &[(2, Some(head.id))]).unwrap();
+  push_and_move(
+    &mut repository,
+    &mut store,
+    other.clone(),
+    &[(2, Some(head.id))],
+  )
+  .unwrap();
   let mut answer = run_answer(true, None);
   answer.objects = repository.brought(2, 0).unwrap().iter().collect();
   let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
@@ -228,8 +240,14 @@ fn a_thin_pack_names_the_clients_objects_and_a_full_one_never_does() {
   let read = read_back(format, &thin, &Held::of(&versions[0])).unwrap();
   assert_eq!(once(&read), expected);
   let (full, counters) = streamed(&repository, &store, run_answer(false, None), u64::MAX);
-  assert_eq!(once(&read_back(format, &full, &Held::none()).unwrap()), expected);
-  assert!(counters.made_whole >= 1 && counters.parts_by_entry >= 1, "{counters:?}");
+  assert_eq!(
+    once(&read_back(format, &full, &Held::none()).unwrap()),
+    expected
+  );
+  assert!(
+    counters.made_whole >= 1 && counters.parts_by_entry >= 1,
+    "{counters:?}"
+  );
   repository.release(&mut store).unwrap();
 }
 
@@ -251,7 +269,13 @@ fn similar_files(format: ObjectFormat, store: &mut ContentStore) -> (Repository,
   let head = commit(format, root.id, &[], 1);
   let mut objects = vec![head.clone(), root];
   objects.extend(files);
-  push_and_move(&mut repository, store, objects.clone(), &[(1, Some(head.id))]).unwrap();
+  push_and_move(
+    &mut repository,
+    store,
+    objects.clone(),
+    &[(1, Some(head.id))],
+  )
+  .unwrap();
   repository
     .encode_fragments(store, (1, 0), &mut Ticks(0), EXCHANGE)
     .unwrap();
@@ -269,9 +293,8 @@ fn without_ofs_delta_no_entry_names_its_base_by_offset() {
   let (repository, objects) = similar_files(format, &mut store);
   let expected: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
   let mut answer = Answer::objects(repository.brought(1, 0).unwrap());
-  let is_offset = |representation: &Representation| {
-    matches!(representation, Representation::OfsDelta { .. })
-  };
+  let is_offset =
+    |representation: &Representation| matches!(representation, Representation::OfsDelta { .. });
   for ofs in [false, true] {
     answer.ofs = ofs;
     let (pack, counters) = streamed(&repository, &store, answer.clone(), u64::MAX);
@@ -318,9 +341,8 @@ fn a_filter_sends_the_runs_objects_it_admits_and_the_want_always() {
   let run: Vec<&Made> = versions[1..].iter().flatten().collect();
   let want = versions[2][0].id;
   for filter in [Filter::BlobNone, Filter::ObjectType(Kind::Blob)] {
-    let admits = |made: &Made| {
-      filter.admits(made.kind, u64::try_from(made.content.len()).unwrap(), 0)
-    };
+    let admits =
+      |made: &Made| filter.admits(made.kind, u64::try_from(made.content.len()).unwrap(), 0);
     let expected: BTreeSet<ObjectId> = run
       .iter()
       .filter(|made| admits(made) || made.id == want)
@@ -377,7 +399,11 @@ fn a_base_pack_made_again_under_a_stream_ends_it_refused() {
 fn runs_of(set: &BTreeSet<u64>) -> usize {
   set
     .iter()
-    .filter(|position| position.checked_sub(1).is_none_or(|before| !set.contains(&before)))
+    .filter(|position| {
+      position
+        .checked_sub(1)
+        .is_none_or(|before| !set.contains(&before))
+    })
     .count()
 }
 
@@ -467,7 +493,10 @@ fn answer_for(
   let admits = |id: &ObjectId| {
     let made = &model.objects[id];
     let size = u64::try_from(made.content.len()).unwrap();
-    *id == want || filter.as_ref().is_none_or(|filter| filter.admits(made.kind, size, 0))
+    *id == want
+      || filter
+        .as_ref()
+        .is_none_or(|filter| filter.admits(made.kind, size, 0))
   };
   let wanted: BTreeSet<ObjectId> = model
     .reach(Some(want))
@@ -528,7 +557,10 @@ fn check_answer(real: &Real, model: &Model, fetch: (u64, Option<usize>, usize), 
   }
   let brought = real.repository.brought(green, through).unwrap();
   if after.is_none() && filter.is_none() && !brought.is_empty() {
-    assert!(counters.parts_copied + counters.parts_by_entry > 0, "{counters:?}");
+    assert!(
+      counters.parts_copied + counters.parts_by_entry > 0,
+      "{counters:?}"
+    );
   }
 }
 
@@ -536,10 +568,16 @@ fn check_answer(real: &Real, model: &Model, fetch: (u64, Option<usize>, usize), 
 fn check_answers(real: &Real, model: &Model, caps: &[Caps]) {
   let mut next = caps.iter().cycle();
   for (green, heads) in &model.heads {
-    let Some(through) = heads.len().checked_sub(1).filter(|last| heads[*last].is_some()) else {
+    let Some(through) = heads
+      .len()
+      .checked_sub(1)
+      .filter(|last| heads[*last].is_some())
+    else {
       continue;
     };
-    let afters = (0..through).filter(|after| heads[*after].is_some()).map(Some);
+    let afters = (0..through)
+      .filter(|after| heads[*after].is_some())
+      .map(Some);
     for after in [None].into_iter().chain(afters) {
       check_answer(real, model, (*green, after, through), *next.next().unwrap());
     }

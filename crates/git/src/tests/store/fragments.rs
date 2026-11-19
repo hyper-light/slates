@@ -127,7 +127,12 @@ fn rebuild_rule() {
 }
 
 /// A commit over `big` (a text file) and `small`, and its objects.
-pub(super) fn commit_over(format: ObjectFormat, big: &[u8], parents: &[ObjectId], seconds: u64) -> Vec<Made> {
+pub(super) fn commit_over(
+  format: ObjectFormat,
+  big: &[u8],
+  parents: &[ObjectId],
+  seconds: u64,
+) -> Vec<Made> {
   let (big, small) = (blob(format, big), blob(format, b"small\n"));
   let root = tree(
     format,
