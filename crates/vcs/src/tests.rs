@@ -851,36 +851,79 @@ fn blobs() -> Vec<Vec<u8>> {
   ]
 }
 
+/// A step, generated as plain tuples and a weighted selector, so the strategy needs no `Arc`-backed `prop_oneof!`
+/// (R2; `crates/base/src/s3/host.rs` is the pattern). The selector's ranges keep the weights the steps had: admit 4,
+/// commit 2, abandon 1, insert 3, get 2, seal 2, compact 2, due 1, fork 1, release 1, recreate 1.
 fn step() -> impl Strategy<Value = Step> {
-  let index = 0..INDEXES;
-  let push = 0..PUSHES;
-  let blob = 0..blobs().len();
-  let tool = prop_oneof![Just(Tool::Git), Just(Tool::Hg)];
-  prop_oneof![
-    4 => (push.clone(), tool, blob.clone(), 1u8..3, proptest::bool::weighted(0.1))
-      .prop_map(|(push, tool, blob, kind, lie)| Step::Admit(Arrival { push, tool, blob, kind, lie })),
-    2 => (push.clone(), index.clone()).prop_map(|(push, index)| Step::Commit { push, index }),
-    1 => push.prop_map(|push| Step::Abandon { push }),
-    3 => (index.clone(), 0u8..12, blob, 0u8..2)
-      .prop_map(|(index, key, blob, payload)| Step::Insert { index, key, blob, payload }),
-    2 => (index.clone(), 0u8..12).prop_map(|(index, key)| Step::Get { index, key }),
-    2 => (index.clone(), any::<bool>()).prop_map(|(index, all)| Step::Seal { index, all }),
-    2 => (index.clone(), 0usize..5).prop_map(|(index, runs)| Step::Compact { index, runs }),
-    1 => (index.clone(), 0u64..10_000, 0u64..10_000)
-      .prop_map(|(index, lookups_ns, inserts_ns)| Step::Due { index, lookups_ns, inserts_ns }),
-    1 => index.clone().prop_map(|index| Step::Fork { index }),
-    1 => index.clone().prop_map(|index| Step::Release { index }),
-    1 => index.prop_map(|index| Step::Recreate { index }),
-  ]
+  (
+    (
+      0u8..20,
+      0..PUSHES,
+      0..INDEXES,
+      any::<bool>(),
+      0..blobs().len(),
+      1u8..3,
+    ),
+    (
+      proptest::bool::weighted(0.1),
+      0u8..12,
+      0u8..2,
+      any::<bool>(),
+      0usize..5,
+      (0u64..10_000, 0u64..10_000),
+    ),
+  )
+    .prop_map(
+      |(
+        (selector, push, index, git, blob, kind),
+        (lie, key, payload, all, runs, (lookups_ns, inserts_ns)),
+      )| {
+        let tool = if git { Tool::Git } else { Tool::Hg };
+        match selector {
+          0..4 => Step::Admit(Arrival {
+            push,
+            tool,
+            blob,
+            kind,
+            lie,
+          }),
+          4..6 => Step::Commit { push, index },
+          6 => Step::Abandon { push },
+          7..10 => Step::Insert {
+            index,
+            key,
+            blob,
+            payload,
+          },
+          10..12 => Step::Get { index, key },
+          12..14 => Step::Seal { index, all },
+          14..16 => Step::Compact { index, runs },
+          16 => Step::Due {
+            index,
+            lookups_ns,
+            inserts_ns,
+          },
+          17 => Step::Fork { index },
+          18 => Step::Release { index },
+          _ => Step::Recreate { index },
+        }
+      },
+    )
 }
+
+/// One push's objects: each id with its kind and bytes.
+type Pushed = BTreeMap<Vec<u8>, (u8, Vec<u8>)>;
+
+/// One stored object's layout: each window's identity and its bytes.
+type Layout = BTreeMap<ContentId, Vec<u8>>;
 
 /// The oracle's model: each index a map of key to body, each push a map of id to kind and bytes, and every blob's
 /// layout.
 struct Model {
   indexes: Vec<Option<BTreeMap<Vec<u8>, Vec<u8>>>>,
-  pushes: Vec<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>,
+  pushes: Vec<Pushed>,
   blobs: Vec<Vec<u8>>,
-  layouts: BTreeMap<ContentId, BTreeMap<ContentId, Vec<u8>>>,
+  layouts: BTreeMap<ContentId, Layout>,
 }
 
 impl Model {

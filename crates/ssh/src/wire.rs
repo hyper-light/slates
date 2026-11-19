@@ -2,7 +2,7 @@
 //!
 //! A [`Reader`] walks one message's payload. Every length is checked against the bytes left before anything past it is
 //! read, and nothing is copied: strings and name-lists borrow the payload. [`Reader::finish`] refuses bytes left after
-//! a message's last field, as OpenSSH's `sshpkt_get_end` does [C]. The writers append to a buffer and refuse only a
+//! a message's last field, as OpenSSH's `sshpkt_get_end` does \[C\]. The writers append to a buffer and refuse only a
 //! string whose length does not fit the format's `uint32`.
 //!
 //! A name-list is checked as RFC 4251 §5 and §6 define a name: at least one byte, at most 64, printable US-ASCII with no

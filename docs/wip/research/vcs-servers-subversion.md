@@ -558,3 +558,27 @@ revisions are always dumped in increasing order and describes `svn:author`, `svn
   refused (format 1 is the archaic form notes 525-541 keep "for historical completeness only"); version-1 svndiff
   (zlib) refused, which no stock writer puts in a dump. A deletion followed by an addition of its path is read as the
   one replacement FSFS records, so the codec's records are the changed-path rows of §4.17.4 item 2.
+
+## 13. The read commands (A-613, §4.17.4 "4. Reads", piece 7's second part)
+
+Read 2026-11-19 by g262 at §1's revision: `svnserve/serve.c` (sha256 `acb1cac75ea86ba7`, as §1), `libsvn_subr/time.c`
+(`c58645b206f847e8`), `libsvn_repos/rev_hunt.c` (`5acc827a362d11f4`), the protocol (§1's), and stock 1.15.0's own bytes
+(`crates/svn/fixtures/reads`, recorded through a relay by its `make-fixtures.py`).
+- **The order of a command's writes** [C: `serve.c` `trivial_auth_request`, `must_have_access`, each handler]: a
+  command's parameters are parsed first (`svn_ra_svn__parse_tuple`; a refusal there is not a command error, so the
+  connection ends with nothing written: recorded, `hostile-malformed`), then the trivial authentication request,
+  `( success ( ( ) 0: ) )`, then the command's work, so a refusal of its revision or path follows the request
+  (recorded). An unknown command is refused by the dispatcher with no request: "Unknown editor command" 210001
+  (recorded).
+- **Refusals' bytes** (recorded): `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line;
+  "Bogus date" (125003) for a date `svn_time_from_cstring` refuses; "No such revision N" and "Invalid revision number
+  'N'" (160006); "File not found: revision N, path 'P'" (160013, `get-mergeinfo`); "'P' path not found" (160013,
+  `get-iprops`); `get-iprops` with no revision opens revision -1 and is refused.
+- **Property lists' order**: `svnserve` writes a hash table's order; three recordings of one repository gave revision
+  3's four properties three orders, every other byte the same, so the order is APR's per-table seed (`apr_hash_make`
+  since APR 1.5), not `svn_hash__make`'s fixed function (`hash.c` `hashfunc_compatible`).
+- **Dates** [C: `time.c` `svn_time_from_cstring`, `svn_time_to_cstring`; `rev_hunt.c` `get_time`,
+  `svn_repos_dated_revision`]: fields read by `svn__strtoul` (digits alone), each cast to 32 bits, then APR's
+  `apr_time_exp_gmt_get`, which refuses a month outside 0-11 or a time before 1970 and checks no other field; the
+  pre-1.0 format is tried after (`sscanf`), which slates refuses as a bogus date. The dated search is a binary search
+  whose edges are its own: a date before every revision's is revision 0, after them the youngest.

@@ -66,10 +66,12 @@ const PYTHON_ESCAPES: [(u8, u8); 10] = [
   (b'\\', b'\\'),
   (b'\'', b'\''),
   (b'"', b'"'),
+  // Format: the escapes continue (the doc above).
   (b'a', 0x07),
   (b'b', 0x08),
   (b'f', 0x0c),
   (b'n', b'\n'),
+  // Format: the escapes continue (the doc above).
   (b'r', b'\r'),
   (b't', b'\t'),
   (b'v', 0x0b),
@@ -202,8 +204,12 @@ pub fn decode(text: &[u8]) -> Result<Changeset<'_>, Refusal> {
   Ok(changeset)
 }
 
+/// A date line's time, its timezone and, if present, the extras after them.
+type DateFields<'a> = (&'a [u8], &'a [u8], Option<&'a [u8]>);
+
 /// A date line's time, timezone and extras (`split(b' ', 2)`).
-fn split_date(date: &[u8]) -> Result<(&[u8], &[u8], Option<&[u8]>), Refusal> {
+fn split_date(date: &[u8]) -> Result<DateFields<'_>, Refusal> {
+  // Format: `split(b' ', 2)` leaves at most three fields.
   let mut fields = date.splitn(3, |byte| *byte == SPACE);
   let time = fields.next().unwrap_or_default();
   let timezone = fields.next().ok_or(Refusal::Shape {
@@ -221,6 +227,9 @@ fn is_decimal(time: &[u8]) -> bool {
   let digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
   digits(whole) && digits(fraction)
 }
+
+/// A changeset's extras in their written order: each key with its value, borrowed from the decoding buffer.
+type Extras<'b> = Vec<(&'b [u8], &'b [u8])>;
 
 impl<'a> Changeset<'a> {
   /// The manifest's node.
@@ -243,7 +252,7 @@ impl<'a> Changeset<'a> {
     &self,
     admission: &mut Admission,
     buffer: &'b mut Vec<u8>,
-  ) -> Result<Vec<(&'b [u8], &'b [u8])>, Refusal> {
+  ) -> Result<Extras<'b>, Refusal> {
     let raw = self.extras.unwrap_or_default();
     let items = || {
       raw
@@ -329,6 +338,7 @@ fn unescape_one<'a>(tail: &'a [u8], out: &mut impl Out) -> Option<&'a [u8]> {
     out.put(&[crate::quote::hex_pair(digits)?]);
     return after.get(HEX_DIGITS..);
   }
+  // Format: an octal escape's digits are 0 to 7.
   if letter.is_ascii_digit() && letter < b'8' {
     return Some(octal(tail, out));
   }
@@ -342,6 +352,7 @@ fn octal<'a>(digits: &'a [u8], out: &mut impl Out) -> &'a [u8] {
   let count = digits
     .iter()
     .take(OCTAL_DIGITS)
+    // Format: an octal escape's digits are 0 to 7.
     .take_while(|digit| (b'0'..b'8').contains(*digit))
     .count();
   let value = digits.iter().take(count).fold(0_u32, |total, digit| {

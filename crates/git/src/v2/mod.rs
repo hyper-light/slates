@@ -9,10 +9,10 @@
 //! acknowledgments, shallow-info, wanted-refs, packfile-uris, then the packfile, multiplexed on side-band-64k's bands,
 //! and a flush.
 //!
-//! **Sources** (read 2026-11-19, the revision stock git 2.50.1 shipped, the golden vectors' git). The documents [B]:
+//! **Sources** (read 2026-11-19, the revision stock git 2.50.1 shipped, the golden vectors' git). The documents \[B\]:
 //! `Documentation/gitprotocol-v2.adoc` at v2.50.1 (SHA-256 `2e739965…`; master at `e1ec09b2`, which
 //! `research/vcs-servers.md` cites as `64ef6a81…`, differs only in `object-info` and `promisor-remote`, neither read
-//! here) and `gitprotocol-common.adoc` (`bcb00e39…`). The code [C], v2.50.1: `serve.c` (the request and its
+//! here) and `gitprotocol-common.adoc` (`bcb00e39…`). The code \[C\], v2.50.1: `serve.c` (the request and its
 //! capabilities), `ls-refs.c`, `upload-pack.c` (`process_args`, the sections), `fetch-pack.c` and `connect.c` (what
 //! git's own client writes and how it reads each answer), `pkt-line.c` and `sideband.c` (lines and bands), `refs.c`
 //! (`check_refname_format`).

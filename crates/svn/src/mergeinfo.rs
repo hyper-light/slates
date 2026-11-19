@@ -114,7 +114,7 @@ const TERMINATOR: u8 = 0;
 /// The spaces skipped after a line's colon: `isspace` in the C locale, the newline aside.
 /// Format: `parse_rangelist` skips while `*curr != '\n' && isspace(*curr)` (`mergeinfo.c`); C11 7.4.1.10 names space,
 /// tab, vertical tab, form feed and carriage return besides the newline.
-const HORIZONTAL_SPACE: [u8; 5] = [b' ', b'\t', 0x0b, 0x0c, b'\r'];
+const HORIZONTAL_SPACE: [u8; 5] = *b" \t\x0b\x0c\r";
 
 /// The most digits a revision may have.
 /// Format: `svn_revnum_parse` refuses "Revision number longer than 10 digits" (`types.c`).

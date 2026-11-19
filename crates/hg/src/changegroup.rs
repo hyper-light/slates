@@ -1,4 +1,4 @@
-//! Changegroups, decoded and encoded (A-514; `internals.changegroups` [B]; `mercurial/changegroup.py` [C]).
+//! Changegroups, decoded and encoded (A-514; `internals.changegroups` \[B\]; `mercurial/changegroup.py` \[C\]).
 //!
 //! A changegroup is framed in chunks: a signed 32-bit length that counts its own four bytes, then the data. A length
 //! of 0 is an empty chunk, and 7.2 refuses any other length up to 4 ("invalid chunk length"). The changelog's delta

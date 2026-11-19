@@ -15,7 +15,7 @@
 //! padding byte, four bytes of padding and a payload byte; a length not aligned to the cipher's block, which RFC 4253 §6
 //! says "MUST be enforced, even when using stream ciphers"; and a packet past the caller's cap, refused before a byte of
 //! its body is read. Then, whole ([`Opener::open`]): the tag, and the padding, "at least four bytes" and leaving a payload.
-//! The alignment is the rule OpenSSH applies (`packet.c` at `fa4b2a82`) [C]: in the clear, the whole packet is a multiple
+//! The alignment is the rule OpenSSH applies (`packet.c` at `fa4b2a82`) \[C\]: in the clear, the whole packet is a multiple
 //! of 8; under an AEAD, the part after the length is a multiple of the cipher's block, 16 for AES and 8 for ChaCha20,
 //! whose length field is not part of what is padded.
 //!
@@ -60,7 +60,7 @@ pub const TAG_LEN: usize = CHACHA_TAG_LEN;
 pub const AES_BLOCK_LEN: usize = 16;
 
 /// The padding block of `chacha20-poly1305@openssh.com`: as a stream cipher it has none of its own, so RFC 4253 §6's
-/// floor of 8 applies, as OpenSSH's cipher table gives it (`cipher.c`) [C].
+/// floor of 8 applies, as OpenSSH's cipher table gives it (`cipher.c`) \[C\].
 pub const CHACHA_ALIGNMENT: usize = CLEAR_ALIGNMENT;
 
 /// Format: the bytes of AES-256's key (RFC 5647 §6.2, `K_LEN` 32).
@@ -239,6 +239,7 @@ impl GcmKey {
     let iv: [u8; GCM_IV_LEN] = iv.try_into().map_err(|_| KeyMaterialRefusal::IvLength)?;
     let (fixed, invocation) = iv.split_at(GCM_FIXED_LEN);
     let fixed: [u8; GCM_FIXED_LEN] = fixed.try_into().map_err(|_| KeyMaterialRefusal::IvLength)?;
+    // Format: the invocation counter's eight bytes, the IV's rest after its fixed field (RFC 5647 §7.1).
     let invocation: [u8; 8] = invocation
       .try_into()
       .map_err(|_| KeyMaterialRefusal::IvLength)?;
