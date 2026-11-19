@@ -1,6 +1,6 @@
 use std::io::{Read, Write as _};
 use std::net::TcpStream as ClientStream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -21,14 +21,19 @@ use crate::daemon::LIVENESS_BUDGET_NS;
 const ROOM_BYTES: usize = 1 << 20;
 /// Shape: one seat: the edge of a shard that seats one client.
 const ONE_SEAT: usize = 1;
+/// Shape: two seats, one left free while the other is held.
+const TWO_SEATS: usize = 2;
 /// Shape: the test runtime's timer tick, its `RuntimeConfig::timer_tick_ns` ([`runtime`]).
 const TIMER_TICK_NS: u64 = 100_000;
 /// Shape: how long a client waits for an answer before it gives up: four liveness windows, past every learned bound these
 /// tests reach.
 const PATIENCE_NS: u64 = 4 * LIVENESS_BUDGET_NS;
 /// Shape: how long a client listens for an answer it must not get: a tenth of a liveness window, far past a loopback
-/// round trip.
+/// round trip and many times a connection's first RTO.
 const MOMENT_NS: u64 = LIVENESS_BUDGET_NS / 10;
+/// Shape: longer than any learned idle bound these tests reach (one quick idleness's tail plus a liveness window): a
+/// liveness window and a half.
+const PAST_IDLE_BOUND_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2;
 /// Shape: how often a supervising task looks for its client's word: a hundredth of a liveness window.
 const TICK_NS: u64 = LIVENESS_BUDGET_NS / 100;
 /// Shape: the body of a refused request, past one read of the edge's so the drain has bytes to drop.
@@ -113,7 +118,7 @@ struct Seen {
   counts: Counts,
   /// The seats still taken.
   serving: usize,
-  /// Each phase's completed and cut waits, in [`PHASES`]' order.
+  /// Each phase's completed waits and reaps, in [`PHASES`]' order.
   learned: [(u64, u64); 6],
 }
 
@@ -163,16 +168,16 @@ fn listener(bounds: Bounds) -> (TcpListener, SocketAddrV4) {
   (listener, address)
 }
 
-/// Serves an edge of one seat presenting `identity` (cleartext on loopback without one) with [`Echoes`], runs `client`
+/// Serves an edge of `seats` presenting `identity` (cleartext on loopback without one) with [`Echoes`], runs `client`
 /// against it on a thread of its own, and stops the shard once the client returns: what the client returned, and what
 /// the edge then held.
-fn served<C, R>(identity: Option<ServingIdentity>, client: C) -> (R, Seen)
+fn served<C, R>(seats: usize, identity: Option<ServingIdentity>, client: C) -> (R, Seen)
 where
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
   let runtime = runtime();
-  let bounds = Bounds::of_shard(ONE_SEAT, ROOM_BYTES, TIMER_TICK_NS);
+  let bounds = Bounds::of_shard(seats, ROOM_BYTES, TIMER_TICK_NS);
   let (listener, address) = listener(bounds);
   let state = runtime
     .context()
@@ -216,6 +221,27 @@ fn read_until(stream: &mut impl Read, end: &[u8]) -> Vec<u8> {
     }
   }
   read
+}
+
+/// Whether `stream` stays open and silent for `for_ns`: its read times out rather than ending or bringing bytes. Its read
+/// timeout is [`PATIENCE_NS`] again after.
+fn stays_open(stream: &mut ClientStream, for_ns: u64) -> bool {
+  stream
+    .set_read_timeout(Some(Duration::from_nanos(for_ns)))
+    .expect("a read timeout");
+  let open = matches!(
+    stream.read(&mut [0u8; 1]),
+    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+  );
+  stream
+    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .expect("the read timeout");
+  open
+}
+
+/// Whether `stream` ends cleanly: its next read is the end of the stream.
+fn ends(stream: &mut ClientStream) -> bool {
+  matches!(stream.read(&mut [0u8; 1]), Ok(0))
 }
 
 /// Reads until the stream ends: everything read, and whether it ended cleanly rather than failed, reset or timed out.
@@ -299,7 +325,7 @@ fn tls_client(
 /// in at its proof), its reply's writes one each, nothing else.
 #[test]
 fn a_kept_connection_is_answered_twice_and_its_proven_waits_teach_the_edge() {
-  let (replies, seen) = served(None, |address| {
+  let (replies, seen) = served(ONE_SEAT, None, |address| {
     let mut stream = connect(address);
     stream
       .write_all(&post(b"one", true))
@@ -312,7 +338,7 @@ fn a_kept_connection_is_answered_twice_and_its_proven_waits_teach_the_edge() {
   assert_eq!(
     (
       seen.counts.accepted,
-      seen.counts.cut,
+      seen.counts.reaped,
       seen.counts.refused,
       seen.counts.failed,
       seen.serving
@@ -326,12 +352,12 @@ fn a_kept_connection_is_answered_twice_and_its_proven_waits_teach_the_edge() {
 }
 
 /// A-625 part 2 (the listener at its bound). Do: with one seat, a first client sends a proven POST, reads its reply and
-/// keeps its connection open, idle within the bound its request taught the edge; a second client sends a proven POST and
-/// listens a moment; then the first closes. Expect: the second unanswered while the first holds the seat, the listener's
-/// wait for a seat counted, and the second answered once the first has closed.
+/// keeps its connection open, idle within the bound its request taught the edge (so not overdue); a second client sends a
+/// proven POST and listens a moment; then the first closes. Expect: the second accepted but unanswered while the first
+/// holds the seat, the listener's wait for a seat counted, and the second answered once the first has closed.
 #[test]
-fn at_its_bound_the_listener_waits_for_a_seat_before_it_accepts() {
-  let ((first, early, answered), seen) = served(None, |address| {
+fn at_its_bound_the_listener_holds_a_new_connection_until_a_seat_comes_back() {
+  let ((first, early, answered), seen) = served(ONE_SEAT, None, |address| {
     let mut holder = connect(address);
     holder
       .write_all(&post(b"first", true))
@@ -362,48 +388,98 @@ fn at_its_bound_the_listener_waits_for_a_seat_before_it_accepts() {
   assert_eq!(seen.counts.accepted, 2);
 }
 
-/// A-625 part 2 (main's ruling: a silent client never holds a seat unbounded). Do: on an edge that has learned nothing,
-/// connect a client that sends nothing, and read until the connection ends. Expect: the edge lets it go within the first
-/// RTO of the connection's own round trip, well inside a liveness window (as first landed, A-625 part 2 held it until it
-/// left), the client reading the connection's clean end; the cut counted, and nothing learned or backed off by a client
-/// that proved no one.
+/// A-625 part 2 (main's ruling, its first side: no cut while seats are free). Do: on an edge of two seats that has learned
+/// nothing, connect a client that sends nothing and keep it a moment, many times its first RTO. Expect: the connection
+/// still open, though its wait passed its bound and marked it overdue (counted); nothing reaped, nothing learned.
 #[test]
-fn a_silent_client_is_let_go_within_its_bound() {
-  let ((ended, silent_for), seen) = served(None, |address| {
-    let mut stream = connect(address);
-    let silent_since = Instant::now();
-    let ended = matches!(stream.read(&mut [0u8; 1]), Ok(0));
-    (ended, silent_since.elapsed())
+fn a_silent_client_is_not_cut_while_seats_are_free() {
+  let (open, seen) = served(TWO_SEATS, None, |address| {
+    let mut silent = connect(address);
+    stays_open(&mut silent, MOMENT_NS)
   });
-  assert!(ended, "the edge let the silent client go");
   assert!(
-    silent_for < Duration::from_nanos(LIVENESS_BUDGET_NS / 2),
-    "let go within its first RTO, not a learned window: {silent_for:?}"
+    open,
+    "the silent client kept its seat while another was free"
   );
-  assert_eq!((seen.counts.cut, seen.learned), (1, [(0, 0); 6]));
+  assert_eq!((seen.counts.reaped, seen.learned), (0, [(0, 0); 6]));
+  assert!(
+    seen.counts.overdue >= 1,
+    "its wait passed its bound: {seen:?}"
+  );
 }
 
-/// A-625 part 2 (the learned idle bound). Do: send a proven POST and read its reply, then stay silent with the connection
-/// open. Expect: the edge ends the silent connection once its learned idle bound (the first idleness's tail plus a
-/// liveness window) passes, the client reading its clean end well before its own patience runs out; the cut counted and
-/// the idle phase backed off once.
+/// A-625 part 2 (main's ruling, its second side: a silent client never holds a seat a new connection needs). Do: on an
+/// edge of one seat, connect a client that sends nothing and keep it a moment; then a second client sends a proven POST.
+/// Expect: the silent client kept through the moment, then reaped for the second, reading its connection's clean end; the
+/// second answered; one reap, counted in idleness beside the second's one idle sample.
 #[test]
-fn a_proven_connection_silent_past_its_learned_idle_bound_is_cut() {
-  let ((reply, ended, silent_for), seen) = served(None, |address| {
-    let mut stream = connect(address);
-    stream.write_all(&post(b"once", true)).expect("the request");
-    let reply = read_until(&mut stream, LAST_CHUNK);
-    let silent_since = Instant::now();
-    let ended = matches!(stream.read(&mut [0u8; 1]), Ok(0));
-    (reply, ended, silent_since.elapsed())
+fn a_silent_client_is_reaped_when_a_new_connection_needs_its_seat() {
+  let ((kept, answered, reaped), seen) = served(ONE_SEAT, None, |address| {
+    let mut silent = connect(address);
+    let kept = stays_open(&mut silent, MOMENT_NS);
+    let mut needing = connect(address);
+    needing
+      .write_all(&post(b"needs a seat", true))
+      .expect("the request");
+    let answered = read_until(&mut needing, LAST_CHUNK);
+    (kept, answered, ends(&mut silent))
   });
-  assert_eq!(reply, echoed(b"once"));
-  assert!(ended, "the edge ended the silent connection");
-  assert!(
-    silent_for >= Duration::from_nanos(LIVENESS_BUDGET_NS / 2),
-    "cut no earlier than its learned bound: {silent_for:?}"
+  assert_eq!(
+    (kept, answered, reaped),
+    (true, echoed(b"needs a seat"), true)
   );
-  assert_eq!((seen.counts.cut, seen.learned[IDLE]), (1, (1, 1)));
+  assert_eq!((seen.counts.reaped, seen.learned[IDLE]), (1, (1, 1)));
+}
+
+/// A-625 part 2 (main's ruling: the most overdue first). Do: on an edge of two seats, connect a silent client and keep it
+/// a moment, then a second silent client and keep it a moment; then a third client sends a proven POST. Expect: the first,
+/// overdue the longest, reaped for the third, which is answered; the second still open; one reap.
+#[test]
+fn the_most_overdue_connection_is_reaped_first() {
+  let ((first_reaped, answered, second_open), seen) = served(TWO_SEATS, None, |address| {
+    let mut first = connect(address);
+    let first_kept = stays_open(&mut first, MOMENT_NS);
+    let mut second = connect(address);
+    let second_kept = stays_open(&mut second, MOMENT_NS);
+    let mut needing = connect(address);
+    needing
+      .write_all(&post(b"third", true))
+      .expect("the request");
+    let answered = read_until(&mut needing, LAST_CHUNK);
+    let second_open = first_kept && second_kept && stays_open(&mut second, MOMENT_NS);
+    (ends(&mut first), answered, second_open)
+  });
+  assert_eq!(
+    (first_reaped, answered, second_open),
+    (true, echoed(b"third"), true)
+  );
+  assert_eq!(seen.counts.reaped, 1);
+}
+
+/// A-625 part 2 (main's ruling over a learned bound). Do: on an edge of one seat, a client sends a proven POST, reads its
+/// reply and stays silent past its learned idle bound (its first idleness's tail plus a liveness window) while no one
+/// needs the seat; then a second client sends a proven POST. Expect: the first kept past its bound, then reaped for the
+/// second (its clean end read), the second answered; the reap counted, and idleness learned from both clients' first
+/// waits beside the one reap.
+#[test]
+fn a_proven_client_past_its_learned_idle_bound_is_kept_until_its_seat_is_needed() {
+  let ((reply, kept, answered, reaped), seen) = served(ONE_SEAT, None, |address| {
+    let mut first = connect(address);
+    first.write_all(&post(b"once", true)).expect("the request");
+    let reply = read_until(&mut first, LAST_CHUNK);
+    let kept = stays_open(&mut first, PAST_IDLE_BOUND_NS);
+    let mut second = connect(address);
+    second
+      .write_all(&post(b"twice", true))
+      .expect("the request");
+    let answered = read_until(&mut second, LAST_CHUNK);
+    (reply, kept, answered, ends(&mut first))
+  });
+  assert_eq!(
+    (reply, kept, answered, reaped),
+    (echoed(b"once"), true, echoed(b"twice"), true)
+  );
+  assert_eq!((seen.counts.reaped, seen.learned[IDLE]), (1, (2, 1)));
 }
 
 /// A-625 part 2 (RFC 9112 §9.6; A-183's staged close). Do: send a POST without the proof, its body past one of the edge's
@@ -412,7 +488,7 @@ fn a_proven_connection_silent_past_its_learned_idle_bound_is_cut() {
 /// learned from a connection that proved no one.
 #[test]
 fn a_refusal_with_its_body_unread_ends_the_connection_in_stages() {
-  let ((reply, clean), seen) = served(None, |address| {
+  let ((reply, clean), seen) = served(ONE_SEAT, None, |address| {
     let mut stream = connect(address);
     stream
       .write_all(&post(&[b'x'; REFUSED_BODY], false))
@@ -434,7 +510,7 @@ fn a_refusal_with_its_body_unread_ends_the_connection_in_stages() {
 #[test]
 fn an_https_connection_is_served_and_its_handshake_teaches_the_edge() {
   let (identity, certificate) = identity();
-  let (reply, seen) = served(Some(identity), move |address| {
+  let (reply, seen) = served(ONE_SEAT, Some(identity), move |address| {
     let mut tls = tls_client(address, &certificate);
     tls.write_all(&post(b"sealed", true)).expect("the request");
     read_until(&mut tls, LAST_CHUNK)
@@ -446,7 +522,7 @@ fn an_https_connection_is_served_and_its_handshake_teaches_the_edge() {
 /// A-625 part 2 (banned item 9: no connection outlives its listener). Do: serve a proven request on a connection that
 /// then stays open, and cancel the listener's task. Expect: the connection's task cancelled and joined with its listener:
 /// the client reads the connection's clean end, no seat is left taken once the listener's join returns, and nothing was
-/// cut at a bound.
+/// reaped.
 #[test]
 fn ending_the_listener_cancels_and_joins_its_connections() {
   let runtime = runtime();
@@ -488,8 +564,8 @@ fn ending_the_listener_cancels_and_joins_its_connections() {
   runtime.context().run();
   let (reply, ended, serving) = client.join().expect("the client's thread");
   assert_eq!((reply, ended, serving), (echoed(b"held"), true, Some(0)));
-  let cut = state.with_in(runtime.context(), |state| state.counts().cut);
-  assert_eq!(cut, Some(0));
+  let reaped = state.with_in(runtime.context(), |state| state.counts().reaped);
+  assert_eq!(reaped, Some(0));
 }
 
 /// A-625 part 2 (RFC 7617 §4, RFC 6750 §5.3). Do: ask whether a cleartext edge may serve on loopback addresses and on

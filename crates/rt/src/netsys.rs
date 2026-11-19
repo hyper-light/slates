@@ -96,10 +96,10 @@ fn word_at(record: &[u8], at: usize) -> Option<u32> {
 pub(crate) fn linux_round_trip_in(
   info: &[u8; TCP_INFO_THROUGH_RTT],
 ) -> Option<crate::tcp::RoundTrip> {
-  let _ = (word_at(info, TCP_INFO_RTT_AT), MICROSECOND_NS);
+  let micros = word_at(info, TCP_INFO_RTT_AT)?;
   Some(crate::tcp::RoundTrip {
-    ns: 0,
-    resolution_ns: 0,
+    ns: u64::from(micros).saturating_mul(MICROSECOND_NS),
+    resolution_ns: MICROSECOND_NS,
   })
 }
 
@@ -109,10 +109,10 @@ pub(crate) fn linux_round_trip_in(
 pub(crate) fn macos_round_trip_in(
   info: &[u8; TCP_CONNECTION_INFO_THROUGH_SRTT],
 ) -> Option<crate::tcp::RoundTrip> {
-  let _ = (word_at(info, TCP_CONNECTION_INFO_SRTT_AT), MILLISECOND_NS);
+  let millis = word_at(info, TCP_CONNECTION_INFO_SRTT_AT)?;
   Some(crate::tcp::RoundTrip {
-    ns: 0,
-    resolution_ns: 0,
+    ns: u64::from(millis).saturating_mul(MILLISECOND_NS),
+    resolution_ns: MILLISECOND_NS,
   })
 }
 

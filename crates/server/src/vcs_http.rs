@@ -19,16 +19,19 @@
 //! reserve, the share the seats were derived from. Beside its room a connection holds one read's bytes ([`READ_BYTES`],
 //! a TLS record whole) and its TLS session's buffers.
 //!
-//! **At the bound the listener stops accepting** until a connection ends, and the kernel's queue of connections not yet
-//! accepted is the same bound ([`Bounds::backlog`]); past it the kernel refuses them. An edge that accepted a connection
-//! it could not serve would have to answer it: over HTTPS only after a handshake, which takes the task and the buffers the
-//! bound exists to limit; and a refusal closed with the client's bytes unread is a reset that can erase it (A-183). Each
-//! time the listener waits for a seat is counted ([`Counts::full`]).
-//!
-//! **Waits** ([`waits`]): each read and write on a connection runs within its phase's learned bound, or before the phase
-//! has learned one within RFC 6298's first RTO from the connection's own measurement (its handshake's round trip, which
-//! the kernel timed before accept returned, read as the connection is accepted), so no wait is ever unbounded; only a
-//! connection whose credentials proved a principal teaches the bounds.
+//! **A wait past its bound marks its connection overdue; the most overdue is reaped when a seat is needed** (main's
+//! ruling, 2026-11-19, the rule g294 found for SSH). A connection's every read and write runs against its phase's bound
+//! ([`waits`]); one still waiting at its deadline goes on waiting and is marked overdue in its seat, since a git client
+//! may be silent for long mid-request (compressing a large push, a credential helper prompting) and a cut would fail it.
+//! The listener accepts the next connection whenever it comes; when every seat is taken it reaps the most overdue
+//! connection for it (its task cancelled, its seat given back as its guard drops; the reap teaches nothing and backs the
+//! phase off, [`waits::PhaseWaits::reap`]), and with none overdue it waits until a seat is given back or a connection
+//! becomes overdue. So the listener holds at most one accepted connection beyond the seats, the kernel's queue behind it
+//! is the same bound ([`Bounds::backlog`]), a silent client never holds a seat a new connection needs, and none is cut
+//! while seats are free. No connection is answered `503` at the bound (main's ruling): over HTTPS only a handshake could
+//! carry it, which costs the task and buffers the bound limits, and a refusal closed with the client's bytes unread is a
+//! reset that can erase it (A-183). The listener's waits for a seat, the overdue marks and the reaps are counted
+//! ([`Counts`]).
 //!
 //! **One connection's loop** asks the engine what it needs next and does it: writes its bytes, reads within the phase's
 //! wait, asks the site to decide a whole head (the answer says whether the credentials proved a principal), hands each run
@@ -45,18 +48,22 @@ mod git;
 mod waits;
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::task::{Poll, Waker};
 
 use slates_http::head::Head;
 use slates_http::reply::Status;
 use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase};
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
+use slates_rt::TaskId;
 use slates_rt::error::RtError;
-use slates_rt::futures::{detach, now_ns, scheduler_overrun_ns, spawn_child, within, yield_now};
+use slates_rt::futures::{
+  cancel, detach, now_ns, scheduler_overrun_ns, sleep, spawn_child, yield_now,
+};
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{SocketAddrV4, TcpListener, TcpStream};
 
-use waits::{PhaseWaits, Tracker};
+use waits::{Overdue, PhaseWaits, Tracker};
 
 /// Format: the bytes one read takes from a connection's socket: one TLS record whole, its header and at most `2^14 + 256`
 /// bytes of ciphertext (RFC 8446 §5.2: "The length MUST NOT exceed 2^14 + 256 bytes"), so a read never splits a record it
@@ -79,8 +86,10 @@ const NO_SESSION: &str = "vcs_http.no_session";
 /// A connection whose round trip its kernel could not report: with no measurement of its own its first waits could not
 /// be bounded, so it is not served.
 const NO_ROUND_TRIP: &str = "vcs_http.no_round_trip";
-/// A connection ended because a wait ran past its learned bound.
-const CUT: &str = "vcs_http.cut";
+/// An overdue connection reaped for a new one.
+const REAPED: &str = "vcs_http.reaped";
+/// A reap whose task could not be cancelled (it had ended: its seat comes back as it is reaped).
+const NOT_REAPED: &str = "vcs_http.not_reaped";
 /// A connection whose socket failed.
 const SOCKET_FAILED: &str = "vcs_http.socket";
 
@@ -107,17 +116,17 @@ impl Bounds {
     }
   }
 
+  /// Derived: the listen backlog, the connections the kernel queues for the listener: as many as the edge serves at once
+  /// (the module doc), clamped to what the call takes; the OS clamps it further to its own maximum.
+  pub(crate) fn backlog(self) -> i32 {
+    i32::try_from(self.connections).unwrap_or(i32::MAX)
+  }
+
   /// The clock granularity `G` a wait starting now is floored by: the timer's tick, or the lateness the shard's scheduler
   /// has shown when that is longer (`slates_rt::futures::scheduler_overrun_ns`, the floor the fleet's detector and the MCP
   /// edge put under their windows).
   fn granularity_ns(self) -> u64 {
     self.tick_ns.max(scheduler_overrun_ns())
-  }
-
-  /// Derived: the listen backlog, the connections the kernel queues for the listener: as many as the edge serves at once
-  /// (the module doc), clamped to what the call takes; the OS clamps it further to its own maximum.
-  pub(crate) fn backlog(self) -> i32 {
-    i32::try_from(self.connections).unwrap_or(i32::MAX)
   }
 }
 
@@ -206,26 +215,52 @@ pub(crate) trait Site {
 pub(crate) struct Counts {
   /// Connections accepted.
   pub(crate) accepted: u64,
-  /// Times the listener waited for a seat, every one taken.
+  /// Times the listener held an accepted connection with every seat taken.
   pub(crate) full: u64,
-  /// Connections ended because a wait ran past its learned bound.
-  pub(crate) cut: u64,
-  /// Connections ended because their socket failed, TLS failed, or no session could be made for them.
+  /// Waits that passed their bound, marking their connection overdue.
+  pub(crate) overdue: u64,
+  /// Overdue connections reaped for a new one.
+  pub(crate) reaped: u64,
+  /// Connections ended because their socket failed, TLS failed, a reply was cut short, or no session or round trip could
+  /// be had for them.
   pub(crate) failed: u64,
   /// Connections a refusal ended.
   pub(crate) refused: u64,
 }
 
+/// A taken seat: its connection's task once spawned, whether its wait on its client is past its bound, and whether it is
+/// being reaped.
+#[derive(Clone, Copy, Debug)]
+struct Taken {
+  /// The connection's task, once spawned.
+  task: Option<TaskId>,
+  /// Its wait's mark while it waits past its bound.
+  overdue: Option<Overdue>,
+  /// Whether it has been chosen to be reaped: its seat comes back as its task's cancellation drops it.
+  reaping: bool,
+}
+
+/// How the listener stands for a seat ([`EdgeState::seating`]).
+enum Seating {
+  /// This seat is free.
+  Free(usize),
+  /// None is free and this connection's task, the most overdue, is to be reaped for the one waiting (none when it was
+  /// never spawned, whose seat comes back as its spawn is refused).
+  Reap(Option<TaskId>),
+  /// None is free and none is overdue: wait for a seat to come back or a connection to become overdue.
+  Wait,
+}
+
 /// An edge's state on its shard, shared by its listener and its connections through a [`Kept`] handle: what bounds it,
-/// the identity it presents, the seats taken and the listener waiting for one, every phase's learned waits, and its
-/// counts. Nothing in it is lent across a wait.
+/// the identity it presents, its seats, the listener waiting for one, every phase's learned waits, and its counts.
+/// Nothing in it is lent across a wait.
 pub(crate) struct EdgeState {
   /// The edge's bounds.
   bounds: Bounds,
   /// The identity HTTPS presents; none for a cleartext edge on loopback.
   identity: Option<ServingIdentity>,
-  /// The seats taken: the connections being served.
-  serving: Cell<usize>,
+  /// Each seat, free or taken: as many as the edge serves at once.
+  seats: RefCell<Vec<Option<Taken>>>,
   /// The listener, when it waits for a seat.
   waiting: RefCell<Option<Waker>>,
   /// Every phase's learned waits.
@@ -240,7 +275,7 @@ impl EdgeState {
     EdgeState {
       bounds,
       identity,
-      serving: Cell::new(0),
+      seats: RefCell::new(vec![None; bounds.connections]),
       waiting: RefCell::new(None),
       waits: RefCell::new(PhaseWaits::default()),
       counts: Cell::new(Counts::default()),
@@ -252,18 +287,21 @@ impl EdgeState {
     self.counts.get()
   }
 
-  /// The connections being served.
+  /// The connections being served: the seats taken.
   pub(crate) fn serving(&self) -> usize {
-    self.serving.get()
+    self
+      .seats
+      .try_borrow()
+      .map_or(0, |seats| seats.iter().flatten().count())
   }
 
-  /// How many of `phase`'s waits completed and how many were cut; nothing while the waits are lent, which is never across
-  /// a wait.
+  /// How many of `phase`'s waits completed and how many of its connections were reaped; nothing while the waits are lent,
+  /// which is never across a wait.
   pub(crate) fn learned(&self, phase: Phase) -> (u64, u64) {
     self
       .waits
       .try_borrow()
-      .map_or((0, 0), |waits| (waits.samples(phase), waits.cuts(phase)))
+      .map_or((0, 0), |waits| (waits.samples(phase), waits.reaps(phase)))
   }
 
   /// Changes the counts.
@@ -282,29 +320,17 @@ impl EdgeState {
       .map(|mut waits| f(&mut waits))
   }
 
-  /// Whether a seat is free; when none is, the listener's `waker` is kept, to be woken when one is given back, and the
-  /// wait counted once (`first`).
-  fn seat_free(&self, waker: &Waker, first: bool) -> bool {
-    if self.serving.get() < self.bounds.connections {
-      return true;
-    }
-    if let Ok(mut waiting) = self.waiting.try_borrow_mut() {
-      *waiting = Some(waker.clone());
-    }
-    if first {
-      self.count(|counts| counts.full = counts.full.saturating_add(1));
-    }
-    false
+  /// Runs `f` over the seats; none while they are lent, which is never across a wait.
+  fn with_seats<R>(&self, f: impl FnOnce(&mut Vec<Option<Taken>>) -> R) -> Option<R> {
+    self
+      .seats
+      .try_borrow_mut()
+      .ok()
+      .map(|mut seats| f(&mut seats))
   }
 
-  /// Takes a seat for a connection just accepted.
-  fn take_seat(&self) {
-    self.serving.set(self.serving.get().saturating_add(1));
-  }
-
-  /// Gives a seat back, waking the listener if it waits for one.
-  fn give_back(&self) {
-    self.serving.set(self.serving.get().saturating_sub(1));
+  /// Wakes the listener if it waits.
+  fn wake_listener(&self) {
     let waiting = self
       .waiting
       .try_borrow_mut()
@@ -313,6 +339,68 @@ impl EdgeState {
     if let Some(waker) = waiting {
       waker.wake();
     }
+  }
+
+  /// How the listener, holding an accepted connection, stands for a seat (the module doc): a free seat; or, with every
+  /// seat taken, the most overdue connection not already being reaped, chosen now (its reap counted, teaching nothing and
+  /// backing its phase off); or a wait, the listener's `waker` kept to be woken when a seat comes back or a connection
+  /// becomes overdue. A first look with every seat taken (`first`) is counted.
+  fn seating(&self, waker: &Waker, first: bool) -> Seating {
+    let Some((seating, reaped)) = self.with_seats(|seats| choose_seat(seats)) else {
+      return Seating::Wait;
+    };
+    if matches!(seating, Seating::Free(_)) {
+      return seating;
+    }
+    if let Ok(mut waiting) = self.waiting.try_borrow_mut() {
+      *waiting = Some(waker.clone());
+    }
+    if first {
+      self.count(|counts| counts.full = counts.full.saturating_add(1));
+    }
+    if let Some(overdue) = reaped {
+      let _ = self.with_waits(|waits| waits.reap(&overdue));
+      self.count(|counts| counts.reaped = counts.reaped.saturating_add(1));
+    }
+    seating
+  }
+
+  /// Takes seat `slot` for a connection just accepted.
+  fn take_seat(&self, slot: usize) {
+    let _ = self.with_seats(|seats| {
+      if let Some(seat) = seats.get_mut(slot) {
+        *seat = Some(Taken {
+          task: None,
+          overdue: None,
+          reaping: false,
+        });
+      }
+    });
+  }
+
+  /// Records the task serving seat `slot`.
+  fn set_task(&self, slot: usize, task: TaskId) {
+    let _ = self.with_seats(|seats| {
+      if let Some(Some(taken)) = seats.get_mut(slot) {
+        taken.task = Some(task);
+      }
+    });
+  }
+
+  /// Marks seat `slot`'s connection overdue as `overdue` says, or clears its mark (`None`); a mark wakes the listener,
+  /// which may hold a connection waiting for a seat.
+  fn mark(&self, slot: usize, overdue: Option<Overdue>) {
+    let _ = (slot, overdue);
+  }
+
+  /// Gives seat `slot` back, waking the listener if it waits for one.
+  fn give_back(&self, slot: usize) {
+    let _ = self.with_seats(|seats| {
+      if let Some(seat) = seats.get_mut(slot) {
+        *seat = None;
+      }
+    });
+    self.wake_listener();
   }
 
   /// The engine for a connection just accepted: over a TLS session of the edge's identity, or cleartext; none when no
@@ -329,37 +417,63 @@ impl EdgeState {
   }
 }
 
-/// A connection's seat among those its edge serves at once: taken as it is accepted and given back when this drops,
-/// however the connection ends (its loop's end, its task's cancellation with its listener, a refused spawn), the
-/// listener woken if it waits for one.
+/// A free seat in `seats`; or, with every seat taken, the most overdue connection not already being reaped, marked as
+/// being reaped, with its mark: the earliest deadline passed is the most overdue; or none to reap.
+fn choose_seat(seats: &mut [Option<Taken>]) -> (Seating, Option<Overdue>) {
+  if let Some(free) = seats.iter().position(Option::is_none) {
+    return (Seating::Free(free), None);
+  }
+  let _ = seats.iter_mut().flatten().map(|taken| (taken.task, taken.reaping, taken.overdue)).count();
+  (Seating::Wait, None)
+}
+
+/// A connection's seat among those its edge serves at once: taken as it is given a seat and given back when this drops,
+/// however the connection ends (its loop's end, its task's cancellation by a reap or with its listener, a refused spawn),
+/// the listener woken if it waits for one.
 struct Seat {
   /// The edge.
   state: Kept<EdgeState>,
+  /// Which seat.
+  slot: usize,
 }
 
 impl Seat {
-  /// Takes a seat on the edge `state` keeps; none off its shard.
-  fn take(state: Kept<EdgeState>) -> Option<Seat> {
-    state.with(EdgeState::take_seat).map(|()| Seat { state })
+  /// Takes seat `slot` on the edge `state` keeps; none off its shard.
+  fn take(state: Kept<EdgeState>, slot: usize) -> Option<Seat> {
+    state
+      .with(|state| state.take_seat(slot))
+      .map(|()| Seat { state, slot })
   }
 }
 
 impl Drop for Seat {
   fn drop(&mut self) {
+    let slot = self.slot;
     // Off its shard (the runtime gone) no edge is left to give the seat back to.
-    let _ = self.state.with(EdgeState::give_back);
+    let _ = self.state.with(|state| state.give_back(slot));
   }
 }
 
-/// Waits until a seat is free (the module doc): at once below the bound, else until a connection ends.
-async fn seat_free(state: Kept<EdgeState>) -> Result<(), EdgeRefused> {
+/// Waits, holding an accepted connection, until a seat is free for it (the module doc): at once below the bound; with
+/// every seat taken, by reaping the most overdue connection, or once a seat comes back or a connection becomes overdue.
+async fn seat_for(state: Kept<EdgeState>) -> Result<usize, EdgeRefused> {
   let mut first = true;
   std::future::poll_fn(|cx| {
-    let free = state.with(|state| state.seat_free(cx.waker(), first));
+    let seating = state.with(|state| state.seating(cx.waker(), first));
     first = false;
-    match free {
-      Some(true) => Poll::Ready(Ok(())),
-      Some(false) => Poll::Pending,
+    match seating {
+      Some(Seating::Free(slot)) => Poll::Ready(Ok(slot)),
+      Some(Seating::Reap(task)) => {
+        // Its seat comes back, waking this listener, as the cancellation drops its task.
+        if let Some(task) = task
+          && cancel(task).is_err()
+        {
+          crate::fleet::count_refusal(NOT_REAPED);
+        }
+        crate::fleet::count_refusal(REAPED);
+        Poll::Pending
+      }
+      Some(Seating::Wait) => Poll::Pending,
       None => Poll::Ready(Err(EdgeRefused::StateGone)),
     }
   })
@@ -386,7 +500,6 @@ where
     return Err(EdgeRefused::CleartextOffLoopback);
   }
   loop {
-    seat_free(state).await?;
     let stream = listener.accept().await.map_err(EdgeRefused::Listener)?;
     let Some(connection) = state
       .with(EdgeState::connection)
@@ -403,10 +516,12 @@ where
       crate::fleet::count_refusal(NO_ROUND_TRIP);
       continue;
     };
-    let seat = Seat::take(state).ok_or(EdgeRefused::StateGone)?;
+    let slot = seat_for(state).await?;
+    let seat = Seat::take(state, slot).ok_or(EdgeRefused::StateGone)?;
     let tracker = Tracker::new(round_trip);
     match spawn_child(drive(stream, connection, site(), seat, tracker)) {
       Ok(task) => {
+        let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
           crate::fleet::count_refusal(NOT_DETACHED);
         }
@@ -419,7 +534,7 @@ where
   }
 }
 
-/// How a wait on a client ended.
+/// How a wait on a client ended: it never ends at its bound, which only marks its connection overdue.
 enum Waited<T> {
   /// It completed after `waited_ns`.
   Done {
@@ -428,9 +543,7 @@ enum Waited<T> {
     /// How long it waited.
     waited_ns: u64,
   },
-  /// It ran past its learned bound.
-  Cut,
-  /// The socket failed, or no wait could be kept (off the shard).
+  /// The socket failed, or no deadline could be armed (off the shard).
   Failed,
 }
 
@@ -439,8 +552,6 @@ enum Waited<T> {
 enum Why {
   /// The engine closed it.
   Closed,
-  /// A wait ran past its learned bound.
-  Cut,
   /// The socket failed.
   Failed,
 }
@@ -453,6 +564,37 @@ enum Flow {
   End(Why),
 }
 
+/// Awaits `work` with no end of its own: once `deadline_ns` (on the shard's clock) passes with it still waiting,
+/// `overdue` is called, once, and the same work goes on until it ends or its task is reaped (never dropped mid-way, so a
+/// write past its deadline loses no byte it handed the kernel). The work's output and whether it was overdue; refused
+/// only where no deadline can be armed (off a shard).
+async fn awaited<F: Future>(
+  work: F,
+  deadline_ns: u64,
+  mut overdue: impl FnMut(),
+) -> Result<(F::Output, bool), RtError> {
+  let mut work = std::pin::pin!(work);
+  let mut deadline = std::pin::pin!(sleep(deadline_ns.saturating_sub(now_ns())));
+  let mut passed = false;
+  std::future::poll_fn(|cx| {
+    if let Poll::Ready(output) = work.as_mut().poll(cx) {
+      return Poll::Ready(Ok((output, passed)));
+    }
+    if !passed {
+      match deadline.as_mut().poll(cx) {
+        Poll::Ready(Ok(())) => {
+          passed = true;
+          overdue();
+        }
+        Poll::Ready(Err(refusal)) => return Poll::Ready(Err(refusal)),
+        Poll::Pending => {}
+      }
+    }
+    Poll::Pending
+  })
+  .await
+}
+
 /// A connection's socket and its read buffer.
 struct Socket {
   /// The stream.
@@ -462,20 +604,24 @@ struct Socket {
 }
 
 impl Socket {
-  /// Reads before `deadline_ns` on the shard's clock: the count read, zero at the client's close.
-  async fn read(&mut self, deadline_ns: u64) -> Waited<usize> {
+  /// Reads, `overdue` called if `deadline_ns` passes first: the count read (zero at the client's close), and whether the
+  /// wait was overdue.
+  async fn read(&mut self, deadline_ns: u64, overdue: impl FnMut()) -> (Waited<usize>, bool) {
     let started_ns = now_ns();
     let read = self.stream.read(&mut self.buffer);
-    let outcome = within(deadline_ns.saturating_sub(started_ns), read).await;
-    waited(outcome, started_ns)
+    waited(awaited(read, deadline_ns, overdue).await, started_ns)
   }
 
-  /// Writes `bytes` whole before `deadline_ns` on the shard's clock.
-  async fn write(&mut self, bytes: &[u8], deadline_ns: u64) -> Waited<()> {
+  /// Writes `bytes` whole, `overdue` called if `deadline_ns` passes first; and whether the wait was overdue.
+  async fn write(
+    &mut self,
+    bytes: &[u8],
+    deadline_ns: u64,
+    overdue: impl FnMut(),
+  ) -> (Waited<()>, bool) {
     let started_ns = now_ns();
     let write = self.stream.write_all(bytes);
-    let outcome = within(deadline_ns.saturating_sub(started_ns), write).await;
-    waited(outcome, started_ns)
+    waited(awaited(write, deadline_ns, overdue).await, started_ns)
   }
 
   /// The bytes the last read brought, `count` of them.
@@ -484,19 +630,21 @@ impl Socket {
   }
 }
 
-/// A wait raced against its deadline (`slates_rt::futures::within`): the work's own outcome when it finished first, none
-/// once the deadline passed, or the race's refusal off a shard.
-type Raced<T> = Result<Option<Result<T, RtError>>, RtError>;
+/// A wait's outcome: the work's own when it ended (an error is a failure), and whether it was overdue.
+type Raced<T> = Result<(Result<T, RtError>, bool), RtError>;
 
-/// How a wait begun at `started_ns` ended, from its raced outcome.
-fn waited<T>(outcome: Raced<T>, started_ns: u64) -> Waited<T> {
+/// How a wait begun at `started_ns` ended, from its outcome, and whether it was overdue.
+fn waited<T>(outcome: Raced<T>, started_ns: u64) -> (Waited<T>, bool) {
   match outcome {
-    Ok(Some(Ok(value))) => Waited::Done {
-      value,
-      waited_ns: now_ns().saturating_sub(started_ns),
-    },
-    Ok(None) => Waited::Cut,
-    Ok(Some(Err(_))) | Err(_) => Waited::Failed,
+    Ok((Ok(value), overdue)) => (
+      Waited::Done {
+        value,
+        waited_ns: now_ns().saturating_sub(started_ns),
+      },
+      overdue,
+    ),
+    Ok((Err(_), overdue)) => (Waited::Failed, overdue),
+    Err(_) => (Waited::Failed, false),
   }
 }
 
@@ -508,13 +656,15 @@ struct Started<E> {
   head_only: bool,
 }
 
-/// One connection's parts beside its engine: its socket, its edge, its waits, its site and the service its request
-/// started.
+/// One connection's parts beside its engine: its socket, its edge and seat, its waits, its site and the service its
+/// request started.
 struct Parts<S: Site> {
   /// The socket.
   socket: Socket,
   /// The edge.
   state: Kept<EdgeState>,
+  /// Its seat.
+  slot: usize,
   /// The connection's waits.
   tracker: Tracker,
   /// The site deciding its requests.
@@ -537,29 +687,38 @@ impl<S: Site> Parts<S> {
       .flatten()
   }
 
-  /// Where a wait in `phase` starting now ends ([`Tracker::deadline_ns`]): `Err` off the edge's shard, where no wait can
-  /// be kept.
-  fn deadline_ns(&mut self, phase: Phase) -> Result<u64, ()> {
+  /// Where a wait in `phase` starting now passes its bound ([`Tracker::deadline_ns`]), and the mark its connection takes
+  /// then: `Err` off the edge's shard, where no wait can be kept.
+  fn armed(&mut self, phase: Phase) -> Result<(u64, Overdue), ()> {
     let now = now_ns();
     let granularity_ns = self
       .state
       .with(|state| state.bounds.granularity_ns())
       .ok_or(())?;
-    self
+    let deadline_ns = self
       .learning(|tracker, waits| tracker.deadline_ns(phase, now, granularity_ns, waits))
-      .ok_or(())
+      .ok_or(())?;
+    Ok((deadline_ns, self.tracker.overdue(phase, deadline_ns)))
   }
 
-  /// How a wait in `phase` ended: a completed one heard, a cut one cut, a failed one abandoned; and the loop's flow after.
-  fn settle<T>(&mut self, phase: Phase, waited: Waited<T>) -> Result<T, Why> {
+  /// What marks the connection's seat overdue as `overdue` says, when its wait passes its bound.
+  fn marker(&self, overdue: Overdue) -> impl FnMut() + use<S> {
+    let (state, slot) = (self.state, self.slot);
+    move || {
+      let _ = state.with(|state| state.mark(slot, Some(overdue)));
+    }
+  }
+
+  /// A wait ended: its overdue mark, if it took one, cleared; and, completed, it is heard in `phase` (however late).
+  fn settle<T>(&mut self, phase: Phase, (waited, overdue): (Waited<T>, bool)) -> Result<T, Why> {
+    if overdue {
+      let slot = self.slot;
+      let _ = self.state.with(|state| state.mark(slot, None));
+    }
     match waited {
       Waited::Done { value, waited_ns } => {
         let _ = self.learning(|tracker, waits| tracker.heard(phase, waited_ns, waits));
         Ok(value)
-      }
-      Waited::Cut => {
-        let _ = self.learning(|tracker, waits| tracker.cut(phase, waits));
-        Err(Why::Cut)
       }
       Waited::Failed => {
         self.tracker.abandon();
@@ -572,10 +731,11 @@ impl<S: Site> Parts<S> {
   async fn write(&mut self, connection: &mut Connection) -> Flow {
     let phase = connection.phase();
     let bytes = connection.take_output();
-    let Ok(deadline_ns) = self.deadline_ns(phase) else {
+    let Ok((deadline_ns, overdue)) = self.armed(phase) else {
       return Flow::End(Why::Failed);
     };
-    let waited = self.socket.write(&bytes, deadline_ns).await;
+    let marker = self.marker(overdue);
+    let waited = self.socket.write(&bytes, deadline_ns, marker).await;
     match self.settle(phase, waited) {
       Ok(()) => Flow::Go,
       Err(why) => Flow::End(why),
@@ -585,11 +745,16 @@ impl<S: Site> Parts<S> {
   /// Reads within the phase's wait and hands the bytes, or the client's close, to the engine.
   async fn read(&mut self, connection: &mut Connection) -> Flow {
     let phase = connection.phase();
-    let Ok(deadline_ns) = self.deadline_ns(phase) else {
+    let Ok((deadline_ns, overdue)) = self.armed(phase) else {
       return Flow::End(Why::Failed);
     };
-    let count = match self.socket.read(deadline_ns).await {
-      Waited::Done { value: 0, .. } => {
+    let marker = self.marker(overdue);
+    let count = match self.socket.read(deadline_ns, marker).await {
+      (Waited::Done { value: 0, .. }, overdue) => {
+        if overdue {
+          let slot = self.slot;
+          let _ = self.state.with(|state| state.mark(slot, None));
+        }
         // The client left: whatever it was waited for, the wait's true length is unknown, so it teaches nothing.
         self.tracker.abandon();
         connection.peer_closed();
@@ -731,10 +896,11 @@ impl<S: Site> Parts<S> {
   /// Reads and drops the client's bytes until it closes, within the drain's wait, a read a turn.
   async fn drain(&mut self) -> Why {
     loop {
-      let Ok(deadline_ns) = self.deadline_ns(Phase::Drain) else {
+      let Ok((deadline_ns, overdue)) = self.armed(Phase::Drain) else {
         return Why::Failed;
       };
-      let waited = self.socket.read(deadline_ns).await;
+      let marker = self.marker(overdue);
+      let waited = self.socket.read(deadline_ns, marker).await;
       match self.settle(Phase::Drain, waited) {
         Ok(0) => {
           let now = now_ns();
@@ -763,6 +929,7 @@ async fn drive<S: Site>(
       buffer: vec![0; READ_BYTES],
     },
     state: seat.state,
+    slot: seat.slot,
     tracker,
     site,
     secure: connection.secure(),
@@ -793,27 +960,17 @@ async fn drive<S: Site>(
 }
 
 /// Counts how a connection ended: by its loop's reason, then by the engine's. Called before the connection's socket
-/// closes, so its client cannot see the end before the count.
+/// closes, so its client cannot see the end before the count; a refusal was counted as it ended the connection
+/// (`Parts::close_write`), a reap as it was chosen ([`EdgeState::seating`]).
 fn count_end(state: Kept<EdgeState>, why: Why, ended: Option<Ended>) {
-  match why {
-    Why::Cut => {
-      crate::fleet::count_refusal(CUT);
-    }
-    Why::Failed => {
-      crate::fleet::count_refusal(SOCKET_FAILED);
-    }
-    Why::Closed => {}
+  if why == Why::Failed {
+    crate::fleet::count_refusal(SOCKET_FAILED);
   }
-  // A refusal was counted as it ended the connection (`Parts::close_write`).
-  let _ = state.with(|state| {
-    state.count(|counts| match (why, ended) {
-      (Why::Cut, _) => counts.cut = counts.cut.saturating_add(1),
-      (Why::Failed, _) | (Why::Closed, Some(Ended::Tls | Ended::Aborted)) => {
-        counts.failed = counts.failed.saturating_add(1);
-      }
-      (Why::Closed, _) => {}
-    });
-  });
+  let failed = why == Why::Failed || matches!(ended, Some(Ended::Tls | Ended::Aborted));
+  if failed {
+    let _ =
+      state.with(|state| state.count(|counts| counts.failed = counts.failed.saturating_add(1)));
+  }
 }
 
 #[cfg(test)]
