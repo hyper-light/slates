@@ -81,8 +81,14 @@ fn two_versions(format: ObjectFormat, store: &mut ContentStore) -> Repository {
 fn one_unit(before: EncodingCounters, after: EncodingCounters) {
   assert_eq!(after.units - before.units, 1, "{before:?} {after:?}");
   assert!(after.objects - before.objects <= 1, "{before:?} {after:?}");
-  assert!(after.trees_walked - before.trees_walked <= 1, "{before:?} {after:?}");
-  assert!(after.rows_read - before.rows_read <= handles(), "{before:?} {after:?}");
+  assert!(
+    after.trees_walked - before.trees_walked <= 1,
+    "{before:?} {after:?}"
+  );
+  assert!(
+    after.rows_read - before.rows_read <= handles(),
+    "{before:?} {after:?}"
+  );
 }
 
 /// `encoding` driven to its end a turn at a time, each with a quantum of nothing, each turn checked by [`one_unit`]:

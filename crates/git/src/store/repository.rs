@@ -1456,7 +1456,11 @@ impl Repository {
   }
 
   /// An indexed object's type and bytes.
-  pub(super) fn read(&self, store: &ContentStore, id: &ObjectId) -> Result<(Kind, Vec<u8>), StoreRefused> {
+  pub(super) fn read(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+  ) -> Result<(Kind, Vec<u8>), StoreRefused> {
     let (row, content) = self
       .indexed(store, id)
       .ok_or(StoreRefused::Missing { id: *id })?;
