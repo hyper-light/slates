@@ -123,14 +123,26 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
-> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs and its index built (2026-11-18,
-> A-500, A-531 and A-553, D-28; UI goal 91; g292).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
+> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index and ra_svn's greeting and
+> authentication built (2026-11-18, A-500, A-531, A-553 and A-599, D-28; UI goals 91 and 92; g292, g234).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
 > golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531). A-553
 > (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities, predecessors,
 > history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem
 > applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
 > Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
-> shared piece 3), and a large revision applied in slices (with the server).
+> shared piece 3), and a large revision applied in slices (with the server). A-599 (2026-11-19, g234): ra_svn's
+> greeting and authentication (`handshake`), a state machine that does no I/O held to stock Subversion 1.15.0's own
+> sessions, `svn` against `svnserve` logged both ways by a relay (`crates/svn/fixtures/handshake/`), each answered byte
+> for byte as `svnserve` answered it but for the greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`,
+> `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's `hmac` and `md-5`, approved for this mechanism alone);
+> `cargo test --locked -p slates-svn --lib` 78 of 78 on the Mac Studio, red first on the earlier draft (see A-599).
+> Owed from it: (1) the URL's canonical form, the repository it names and the root URL `repos-info` carries, as
+> `svnserve` derives them (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and
+> `svn_path_remove_components`), with piece 7's connection task, which today gives the handshake those values; (2) a
+> limit on failed attempts per principal and per address, learned (`svnserve`'s loop has none, and neither has the
+> handshake), with §4.13's admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with
+> §4.13's secrets; (4) main's decision whether HMAC-MD5 moves into the vendored aws-lc-rs as a local change beside its
+> MD5, retiring `hmac` and `md-5`; (5) main's gates over the new module (clippy, the cross-target lints, `xtask`).
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
@@ -144,7 +156,8 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
 > `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
-> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server's
+> commands (its greeting and authentication built, A-599); locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.

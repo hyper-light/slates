@@ -304,7 +304,12 @@ fn step(
 }
 
 /// The caller answers the client's URL.
-fn answer_url(server: &mut Server, caller: &Caller, consumed: usize, written: &mut Vec<u8>) -> Step {
+fn answer_url(
+  server: &mut Server,
+  caller: &Caller,
+  consumed: usize,
+  written: &mut Vec<u8>,
+) -> Step {
   let ended = match &caller.url {
     UrlAnswer::Open(repository) => server.open(repository, written).unwrap() == Access::Denied,
     UrlAnswer::Refuse(unserved) => {
@@ -398,7 +403,10 @@ fn items(bytes: &[u8]) -> Vec<&[u8]> {
   let mut rest = bytes;
   while !rest.is_empty() {
     let Parsed::Item { consumed, .. } = Parser::new(admitting(rest)).parse(rest).unwrap() else {
-      panic!("the bytes end inside an item: {:?}", String::from_utf8_lossy(rest));
+      panic!(
+        "the bytes end inside an item: {:?}",
+        String::from_utf8_lossy(rest)
+      );
     };
     items.push(&rest[..consumed]);
     rest = &rest[consumed..];
@@ -515,7 +523,11 @@ fn assert_answered_as_svnserve(session: Session, caller: &Caller, expected: &Exp
 /// Replays `session` in two pieces cut at `cut`, and cut short there, against its whole replay.
 fn assert_cut(session: Session, caller: &Caller, whole: &Replay, cut: usize) {
   let split = replay(session.client, caller, roomy(session.client), &[cut]);
-  assert_eq!(split.written, whole.written, "{} cut at {cut}", session.name);
+  assert_eq!(
+    split.written, whole.written,
+    "{} cut at {cut}",
+    session.name
+  );
   assert_eq!(split.ending, whole.ending, "{} cut at {cut}", session.name);
   let short = replay(&session.client[..cut], caller, roomy(session.client), &[]);
   assert!(
@@ -862,10 +874,16 @@ fn rfc_2195s_worked_example_authenticates_tim() {
   let done = replay(&client, &caller, roomy(&client), &[]);
   let step = cat(&[b"( step ( ", &string_item(challenge), b") ) "]);
   assert!(
-    done.written.windows(step.len()).any(|window| window == step),
+    done
+      .written
+      .windows(step.len())
+      .any(|window| window == step),
     "the challenge in cram.c's form"
   );
-  assert_eq!(done.ending, Ending::Established(Principal::User(b"tim".to_vec())));
+  assert_eq!(
+    done.ending,
+    Ending::Established(Principal::User(b"tim".to_vec()))
+  );
 }
 
 /// A-599 (RFC 2202 §2's seven HMAC-MD5 test cases, keys of 16, 4, 16, 25, 16 and 80 bytes, two longer than the block):
@@ -873,14 +891,26 @@ fn rfc_2195s_worked_example_authenticates_tim() {
 #[test]
 fn rfc_2202s_hmac_md5_vectors() {
   let cases: [(Vec<u8>, Vec<u8>, &str); 7] = [
-    (vec![0x0b; 16], b"Hi There".to_vec(), "9294727a3638bb1c13f48ef8158bfc9d"),
+    (
+      vec![0x0b; 16],
+      b"Hi There".to_vec(),
+      "9294727a3638bb1c13f48ef8158bfc9d",
+    ),
     (
       b"Jefe".to_vec(),
       b"what do ya want for nothing?".to_vec(),
       "750c783e6ab0b503eaa86e310a5db738",
     ),
-    (vec![0xaa; 16], vec![0xdd; 50], "56be34521d144c88dbb8c733f0e8b3f6"),
-    ((1..=25).collect(), vec![0xcd; 50], "697eaf0aca3a3aea3a75164746ffaa79"),
+    (
+      vec![0xaa; 16],
+      vec![0xdd; 50],
+      "56be34521d144c88dbb8c733f0e8b3f6",
+    ),
+    (
+      (1..=25).collect(),
+      vec![0xcd; 50],
+      "697eaf0aca3a3aea3a75164746ffaa79",
+    ),
     (
       vec![0x0c; 16],
       b"Test With Truncation".to_vec(),
@@ -899,7 +929,11 @@ fn rfc_2202s_hmac_md5_vectors() {
   ];
   for (key, data, digest) in cases {
     let made = CramKey::from_secret(&key).unwrap().digest(&data);
-    assert_eq!(made.as_slice(), hex_bytes(digest).as_slice(), "key {key:02x?}");
+    assert_eq!(
+      made.as_slice(),
+      hex_bytes(digest).as_slice(),
+      "key {key:02x?}"
+    );
     assert!(CramKey::from_secret(&key).unwrap().verifies(&data, &made));
   }
 }
@@ -925,7 +959,10 @@ fn cram_c_digest(password: &[u8], challenge: &[u8]) -> [u8; DIGEST_BYTES] {
   for byte in &mut secret {
     *byte ^= CRAM_C_INNER_PAD;
   }
-  let inner = Md5::new().chain_update(secret).chain_update(challenge).finalize();
+  let inner = Md5::new()
+    .chain_update(secret)
+    .chain_update(challenge)
+    .finalize();
   for byte in &mut secret {
     *byte ^= CRAM_C_INNER_PAD ^ CRAM_C_OUTER_PAD;
   }
@@ -1024,7 +1061,13 @@ fn the_auth_response_is_read_as_vparse_tuple_reads_it() {
   let established = |response: &'static [u8]| {
     let progress = read_auth_response(both_repository(b"svn://127.0.0.1/both", false), response);
     assert!(
-      matches!(progress, Ok(Progress::Established { principal: Principal::Anonymous, .. })),
+      matches!(
+        progress,
+        Ok(Progress::Established {
+          principal: Principal::Anonymous,
+          ..
+        })
+      ),
       "{:?}: {progress:?}",
       String::from_utf8_lossy(response)
     );
@@ -1090,30 +1133,69 @@ fn read_answer(answer: &[u8]) -> AnswerRead {
 fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
   let url = || b"url".to_vec();
   let named = |ra: &str, client: Option<&str>| -> AnswerRead {
-    Ok((url(), Some(ra.as_bytes().to_vec()), client.map(|client| client.as_bytes().to_vec())))
+    Ok((
+      url(),
+      Some(ra.as_bytes().to_vec()),
+      client.map(|client| client.as_bytes().to_vec()),
+    ))
   };
   let table: [(&[u8], AnswerRead); 18] = [
     (b"( 2 ( edit-pipeline ) 3:url ) ", Ok((url(), None, None))),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) ) ", named("abc", None)),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc ( 3:xyz ) ) ", named("abc", Some("xyz"))),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc ( 3:xyz 7 ) ) ", named("abc", Some("xyz"))),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) 7 more ) ", named("abc", None)),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc ) ", Err(Refused::NotAnswer)),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc 7 ) ", Err(Refused::NotAnswer)),
-    (b"( 2 ( edit-pipeline ) 3:url 3:abc ( 7 ) ) ", Err(Refused::NotAnswer)),
-    (b"( 2 ( edit-pipeline ) 3:url 7 ( ) ) ", Err(Refused::NotAnswer)),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) ) ",
+      named("abc", None),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc ( 3:xyz ) ) ",
+      named("abc", Some("xyz")),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc ( 3:xyz 7 ) ) ",
+      named("abc", Some("xyz")),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) 7 more ) ",
+      named("abc", None),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc ) ",
+      Err(Refused::NotAnswer),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc 7 ) ",
+      Err(Refused::NotAnswer),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 3:abc ( 7 ) ) ",
+      Err(Refused::NotAnswer),
+    ),
+    (
+      b"( 2 ( edit-pipeline ) 3:url 7 ( ) ) ",
+      Err(Refused::NotAnswer),
+    ),
     (b"( 2 ( edit-pipeline ) url ) ", Err(Refused::NotAnswer)),
     (b"( 2 edit-pipeline 3:url ) ", Err(Refused::NotAnswer)),
     (b"( two ( edit-pipeline ) 3:url ) ", Err(Refused::NotAnswer)),
     (b"2 ", Err(Refused::NotAnswer)),
     (b"( 2 ( 7 ) 3:url 3:abc ) ", Err(Refused::NotAnswer)),
-    (b"( 1 ( edit-pipeline ) 3:url ) ", Err(Refused::UnsupportedVersion(1))),
+    (
+      b"( 1 ( edit-pipeline ) 3:url ) ",
+      Err(Refused::UnsupportedVersion(1)),
+    ),
     (b"( 3 ( 7 ) 3:url ) ", Err(Refused::UnsupportedVersion(3))),
-    (b"( 2 ( 7 edit-pipeline ) 3:url ) ", Err(Refused::CapabilityNotWord)),
+    (
+      b"( 2 ( 7 edit-pipeline ) 3:url ) ",
+      Err(Refused::CapabilityNotWord),
+    ),
     (b"( 2 ( ) 3:url ) ", Err(Refused::NoEditPipeline)),
   ];
   for (answer, expected) in table {
-    assert_eq!(read_answer(answer), expected, "{:?}", String::from_utf8_lossy(answer));
+    assert_eq!(
+      read_answer(answer),
+      expected,
+      "{:?}",
+      String::from_utf8_lossy(answer)
+    );
   }
 }
 
@@ -1144,13 +1226,28 @@ fn an_external_token_must_name_the_tunnels_user_whole_or_nothing() {
     let response = cat(&[b"( EXTERNAL ", token, b") "]);
     let progress = read_auth_response(tunnel(), &response);
     assert!(
-      matches!(progress, Ok(Progress::Failed { failure: AuthFailure::UsernameMismatch, .. })),
+      matches!(
+        progress,
+        Ok(Progress::Failed {
+          failure: AuthFailure::UsernameMismatch,
+          ..
+        })
+      ),
       "{:?}",
       String::from_utf8_lossy(&response)
     );
   }
-  let progress = read_auth_response(both_repository(b"svn://127.0.0.1/both", false), b"( EXTERNAL ( ) ) ");
-  assert!(matches!(progress, Ok(Progress::Failed { failure: AuthFailure::NotListed, .. })));
+  let progress = read_auth_response(
+    both_repository(b"svn://127.0.0.1/both", false),
+    b"( EXTERNAL ( ) ) ",
+  );
+  assert!(matches!(
+    progress,
+    Ok(Progress::Failed {
+      failure: AuthFailure::NotListed,
+      ..
+    })
+  ));
 }
 
 /// The client's bytes for a CRAM-MD5 attempt on the repository allowing both, its response `response`, followed by
@@ -1233,19 +1330,35 @@ fn a_failed_cram_md5_attempt_is_worded_as_cram_c_words_it_and_names_no_one() {
   ] {
     let client = cram_attempt(&response, anonymous);
     let done = replay(&client, &caller_with_alice(1), roomy(&client), &[]);
-    assert_eq!(done.failures, vec![failure], "{:?}", String::from_utf8_lossy(&response));
+    assert_eq!(
+      done.failures,
+      vec![failure],
+      "{:?}",
+      String::from_utf8_lossy(&response)
+    );
     assert_eq!(done.ending, Ending::Established(Principal::Anonymous));
     let worded = failure
       .message()
       .map(|message| cat(&[b"( failure ( ", &string_item(message.as_bytes()), b") ) "]))
       .unwrap_or_default();
-    let step_end = done.written.windows(4).position(|window| window == b"> ) ").unwrap() + 6;
+    let step_end = done
+      .written
+      .windows(4)
+      .position(|window| window == b"> ) ")
+      .unwrap()
+      + 6;
     let after_step = cat(&[&worded, b"( success ( ) ) "]);
-    assert!(done.written[step_end..].starts_with(&after_step), "{failure:?}");
+    assert!(
+      done.written[step_end..].starts_with(&after_step),
+      "{failure:?}"
+    );
   }
   let client = cram_attempt(&good, b"");
   let done = replay(&client, &caller_with_alice(1), roomy(&client), &[]);
-  assert_eq!(done.ending, Ending::Established(Principal::User(b"alice".to_vec())));
+  assert_eq!(
+    done.ending,
+    Ending::Established(Principal::User(b"alice".to_vec()))
+  );
 }
 
 /// A-599 (`cram.c` 150-153: a challenge that cannot be made fails the attempt, "Internal server error in
@@ -1265,13 +1378,21 @@ fn a_challenge_the_caller_cannot_make_fails_the_attempt_and_the_client_may_try_a
     .with_key(b"alice", SECRET_SHORT);
   let done = replay(&client, &caller, roomy(&client), &[]);
   assert_eq!(done.failures, vec![AuthFailure::Internal]);
-  assert_eq!(done.ending, Ending::Established(Principal::User(b"alice".to_vec())));
+  assert_eq!(
+    done.ending,
+    Ending::Established(Principal::User(b"alice".to_vec()))
+  );
   let internal = cat(&[
     b"( failure ( ",
     &string_item(b"Internal server error in authentication"),
     b") ) ( step ( ",
   ]);
-  assert!(done.written.windows(internal.len()).any(|window| window == internal));
+  assert!(
+    done
+      .written
+      .windows(internal.len())
+      .any(|window| window == internal)
+  );
 }
 
 /// The tightest item bound `item` needs: its bytes, or what its items cost parsed, whichever is more.
@@ -1343,7 +1464,11 @@ fn items_past_the_handshakes_bounds_are_refused_typed_after_what_was_due() {
   let long_url = stock_answer(&[b'u'; 1000]);
   let many_words = cat(&[b"( 2 ( ", &b"e ".repeat(PARSED_ITEM_BYTES), b") 3:url ) "]);
   let table: [(Vec<u8>, usize, bool); 7] = [
-    (cat(&[b"( 2 ( edit-pipeline ", &[b'a'; 25], b" ) 3:url ) "]), 4096, true),
+    (
+      cat(&[b"( 2 ( edit-pipeline ", &[b'a'; 25], b" ) 3:url ) "]),
+      4096,
+      true,
+    ),
     (b"( 2 ( edit-pipeline ( x ) ) 3:url ) ".to_vec(), 4096, true),
     (b"( 2 ( edit-pipeline ) 4294967295:".to_vec(), 4096, false),
     (b"( 18446744073709551616 ".to_vec(), 4096, true),
@@ -1361,7 +1486,11 @@ fn items_past_the_handshakes_bounds_are_refused_typed_after_what_was_due() {
     } else {
       SVN_ERR_RA_SVN_REQUEST_SIZE
     };
-    assert_eq!(Refused::Item(error).subversion_code(), Some(code), "{error:?}");
+    assert_eq!(
+      Refused::Item(error).subversion_code(),
+      Some(code),
+      "{error:?}"
+    );
     assert!(
       done.written.ends_with(b"list ) ) ) ") || done.written.ends_with(b"> ) ) "),
       "nothing after the greeting, or after the challenge: {:?}",
@@ -1383,19 +1512,43 @@ fn a_call_out_of_turn_is_refused_typed_and_changes_nothing() {
   let answer = stock_answer(b"svn://127.0.0.1/anon");
   let mut server = Server::new(roomy(&answer), &mut written).unwrap();
   let greeting = written.clone();
-  assert_eq!(server.open(&anon_repository(), &mut written), Err(Refused::OutOfTurn));
-  assert_eq!(server.refuse(Unserved::NoAccess, &mut written), Err(Refused::OutOfTurn));
-  assert_eq!(server.challenge(1, 2, c"host", &mut written), Err(Refused::OutOfTurn));
-  assert_eq!(server.challenge_failed(&mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    server.open(&anon_repository(), &mut written),
+    Err(Refused::OutOfTurn)
+  );
+  assert_eq!(
+    server.refuse(Unserved::NoAccess, &mut written),
+    Err(Refused::OutOfTurn)
+  );
+  assert_eq!(
+    server.challenge(1, 2, c"host", &mut written),
+    Err(Refused::OutOfTurn)
+  );
+  assert_eq!(
+    server.challenge_failed(&mut written),
+    Err(Refused::OutOfTurn)
+  );
   assert_eq!(server.key(None, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(written, greeting);
   assert_eq!(Refused::OutOfTurn.subversion_code(), None);
-  assert!(matches!(server.receive(&answer, &mut written), Ok(Progress::Opened { .. })));
-  assert_eq!(server.receive(&answer, &mut written), Err(Refused::OutOfTurn));
+  assert!(matches!(
+    server.receive(&answer, &mut written),
+    Ok(Progress::Opened { .. })
+  ));
+  assert_eq!(
+    server.receive(&answer, &mut written),
+    Err(Refused::OutOfTurn)
+  );
   assert_eq!(server.key(None, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(written, greeting);
-  assert_eq!(server.open(&anon_repository(), &mut written), Ok(Access::Asked));
-  assert_eq!(server.open(&anon_repository(), &mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    server.open(&anon_repository(), &mut written),
+    Ok(Access::Asked)
+  );
+  assert_eq!(
+    server.open(&anon_repository(), &mut written),
+    Err(Refused::OutOfTurn)
+  );
   let response = b"( ANONYMOUS ( 0: ) ) ";
   assert!(matches!(
     server.receive(response, &mut written),
@@ -1403,8 +1556,14 @@ fn a_call_out_of_turn_is_refused_typed_and_changes_nothing() {
   ));
   assert!(server.established());
   let done = written.clone();
-  assert_eq!(server.receive(response, &mut written), Err(Refused::OutOfTurn));
-  assert_eq!(server.refuse(Unserved::NoAccess, &mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    server.receive(response, &mut written),
+    Err(Refused::OutOfTurn)
+  );
+  assert_eq!(
+    server.refuse(Unserved::NoAccess, &mut written),
+    Err(Refused::OutOfTurn)
+  );
   assert_eq!(written, done);
 }
 
@@ -1417,14 +1576,27 @@ fn a_repository_allowing_no_one_is_denied_before_any_request() {
   let answer = stock_answer(b"svn://127.0.0.1/none");
   let mut server = Server::new(roomy(&answer), &mut written).unwrap();
   let greeting = written.clone();
-  assert!(matches!(server.receive(&answer, &mut written), Ok(Progress::Opened { .. })));
-  assert_eq!(server.open(&none_repository(), &mut written), Ok(Access::Denied));
+  assert!(matches!(
+    server.receive(&answer, &mut written),
+    Ok(Progress::Opened { .. })
+  ));
+  assert_eq!(
+    server.open(&none_repository(), &mut written),
+    Ok(Access::Denied)
+  );
   assert_eq!(
     &written[greeting.len()..],
-    command_failure(SVN_ERR_RA_NOT_AUTHORIZED, b"No access allowed to this repository").as_slice()
+    command_failure(
+      SVN_ERR_RA_NOT_AUTHORIZED,
+      b"No access allowed to this repository"
+    )
+    .as_slice()
   );
   assert!(!server.established());
-  assert_eq!(server.receive(b"( ANONYMOUS ( ) ) ", &mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    server.receive(b"( ANONYMOUS ( ) ) ", &mut written),
+    Err(Refused::OutOfTurn)
+  );
 }
 
 proptest! {

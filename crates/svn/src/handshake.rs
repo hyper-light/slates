@@ -505,7 +505,10 @@ impl Server {
         .checked_div(PARSED_ITEM_BYTES.max(SMALLEST_ITEM_BYTES))
         .unwrap_or(0),
     };
-    let capabilities = SERVER_CAPABILITIES.iter().map(|word| Value::Word(word)).collect();
+    let capabilities = SERVER_CAPABILITIES
+      .iter()
+      .map(|word| Value::Word(word))
+      .collect();
     let greeting = Value::List(vec![
       Value::Number(PROTOCOL_VERSION),
       Value::Number(PROTOCOL_VERSION),
@@ -576,7 +579,11 @@ impl Server {
   ///
   /// # Errors
   /// `OutOfTurn` unless the client's answer was just read ([`Progress::Opened`]).
-  pub fn open(&mut self, repository: &Repository<'_>, out: &mut Vec<u8>) -> Result<Access, Refused> {
+  pub fn open(
+    &mut self,
+    repository: &Repository<'_>,
+    out: &mut Vec<u8>,
+  ) -> Result<Access, Refused> {
     if !matches!(self.state, State::Opening) {
       return Err(Refused::OutOfTurn);
     }
@@ -954,7 +961,8 @@ fn auth_response<'a>(value: &Value<'a>) -> Result<(&'a str, Option<&'a [u8]>), R
     return Err(Refused::NotAuthResponse);
   };
   let mut items = items.iter();
-  let (Some(Value::Word(mechanism)), Some(Value::List(token))) = (items.next(), items.next()) else {
+  let (Some(Value::Word(mechanism)), Some(Value::List(token))) = (items.next(), items.next())
+  else {
     return Err(Refused::NotAuthResponse);
   };
   let token = match token.first() {
