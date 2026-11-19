@@ -315,8 +315,8 @@
 > 3.8.1 client's 24 recorded exchanges replayed through the server and a property test of the paging rule; `cargo test
 > -p slates-git --lib` on the Mac Studio: 293 of 293, the 22 new failing first against stubs.
 > Owed (part 2): the lock log in slates-db, guarded then applied (A-642); `Access` over vcs_policy and the lock owner
-> rule in slates-server; each repository's LFS index; the call A-625's edge makes; a streaming put in `slates-vcs`, so an
-> upload is not held whole; the stock client end to end against slates (main's run).
+> rule in slates-server; each repository's LFS index; the call A-625's edge makes. Then a streaming put in
+> `slates-vcs`, so an upload is not held whole; the stock client end to end against slates (main's run).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
