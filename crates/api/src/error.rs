@@ -1591,8 +1591,8 @@ mod tests {
   use slates_ipc::protocol::{Refusal, VolumeId};
 
   use super::{
-    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, ProtocolFault, RetryCause,
-    Stale, TargetRefusal, Unreported, Unusable,
+    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, OsCode, ProtocolFault,
+    RetryCause, Stale, TargetRefusal, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
