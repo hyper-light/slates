@@ -50,7 +50,7 @@
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
 > record) by the same rule, main to start them.
 >
-> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. OWED: the partition's records shipped a log at a time (A-636 part 2b) and the server's takeover by the rule, every log of a repository following one successor (2c).
+> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. The partition's records shipped a log at a time BUILT (A-636 part 2b): each state log's record of each operation, carrying the operation's identity and spans, held by its holders as a prefix of the log; every server dispatch by the register's class. OWED: a repository's greens placed on its holders at their joins (A-636 part 2b-2), then the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
@@ -421,6 +421,23 @@
 > repository's greens across hosts); before 2b ships a state log's record, the server's sites that tell a register's
 > class by `is_catalog` alone (`takeover.rs`, `fleet.rs`, `mirror.rs`) reading `ObjectId::class`; `fuse.rs`'s
 > fixture test on Linux.
+> **A-636 part 2b (2026-11-19, g261; the partition's records shipped a log at a time):** the partition hands its owner one
+> record of each state log an operation moved once the operation is durable (`slates_db::catalog::StateLogRecord`, from
+> `Db::take_state_log_records`; a transaction's at its commit, none of one rolled back): that log's changes in order
+> (`LoggedChange`, a new wire enum), the position it found and left the log at, and the operation's identity (BLAKE3
+> over its spans and its encoding) and every span it moved, its greens' included, so a takeover can keep or drop the
+> operation whole. The owner keeps each as a part of its log's register (`crates/server/src/state_log.rs`), which the
+> record plane ships in position order to the candidates missing it, committed at `f + 1` (`fleet::ship_head`), and
+> lets it go once every candidate holds it; a holder keeps a part only where it continues its copy of the log, so its
+> copy is a prefix, and never compacts it. The parts held are bounded by the partition's merge budget: a repository's
+> next change of its state logs is refused `Overloaded` at it. Every place the server told a register's class by
+> `is_catalog` alone now reads `ObjectId::class`: the takeover's adoption and give-up by name, the mirror's promotion
+> page, the record plane's counters and acknowledgements, a holder's check and keep. Tests (macOS arm64, Mac Studio):
+> see A-636 part 2b's amendment entry. Owed: a push's answer waiting for its records to commit (the barrier); a
+> candidate that joins a log's placement past parts every earlier one held (the log's state installed first, with a
+> state-log checkpoint, which also bounds the holders' copies); the parts rebuilt after the owner restarts; parts
+> batched; a destroyed repository's state-log registers forgotten; the greens placed on their repository's holders at
+> their joins (2b-2); the successor adopting a repository's logs by the rule (2c).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -1059,11 +1076,22 @@
 > meets `404` (A-680, g303: the hg site's stores and lender); the site's `401` offers Bearer alone, on which stock hg
 > 7.2 crashes (`ValueError` from urllib's digest handler, which reads the first challenge alone), so Basic's challenge
 > goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
-> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); hg's
-> `serve --stdio` on the SSH edge (A-679, g304).
-> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
-> g304, running; the edge itself is A-651's, built); A-662's stores lent to that loop through the lender the HTTP site
-> reads them by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a); the learned
+> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); and
+> over SSH the same lender, which the edge's `serve --stdio` (A-679, built) reads as the HTTP site does (A-680).
+> **Built (A-679, 2026-11-19, g304): `serve --stdio` behind the daemon's SSH edge.** `vcs_ssh::hg` runs A-650 part 2's
+> `serve::stdio` over an SSH session, started by `ToolServices` (beside upload-pack, `ToolCommand`) over the store the
+> HTTP site's lender holds (`HgStores`; in the daemon `ServedViews`, A-680 part 2a); the site refuses a repository
+> argument starting `--` before any lookup in 7.2's recorded words (research §27); `--hidden` answered with 7.2's
+> warning to an unauthorized user, then the view; a store gone mid-session, or a view that cannot be made, ends in
+> the not-served words; input arriving after the session ended given back to the window.
+> Red first (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed against stubs), then
+> `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128; over main
+> 5206419be as it landed, kiln r438, 44 of 44 with A-651 parts 3 and 4's tests): the probe stock `hg serve --stdio` 7.2
+> answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a scripted SSH client. The
+> other platforms, and main's live `hg clone` over SSH once the daemon starts the edge with that lender (A-684), owed.
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the daemon starting the SSH edge (A-684,
+> g299) with the lender the HTTP site reads A-662's stores by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a),
+> which the edge's `serve --stdio` reads (A-679, built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -1073,7 +1101,8 @@
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
 > at recovery (A-662 refuses a Mercurial record `Owed` until then), and the HTTP site's pushes through them (A-680 part
-> 2b; the served view and the site's lender are built);
+> 2b; the served view and the site's lender are built) and the SSH edge's (`unbundle` in `serve --stdio`'s session,
+> which A-679 serves for reads alone);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2

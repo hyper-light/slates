@@ -345,6 +345,17 @@ fn push_holding(
       verb: "push".to_owned(),
     }));
   }
+  // A push that moves the repository's own state logs (a branch made or deleted, names, phases, markers, locks) is
+  // admitted only while the parts this shard owes their holders are within their bound, before anything is judged; one
+  // that moves greens alone waits on none of them (A-636 part 2b).
+  let moves_state = !parts.names.is_empty()
+    || !parts.state.is_empty()
+    || changes
+      .iter()
+      .any(|change| !matches!(change, BranchChange::Update { .. }));
+  if moves_state {
+    crate::state_log::admit(state).map_err(AppendRefused::Repository)?;
+  }
   let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
   let pushed = push_planned(state, &record, (steps, parts), &mut held, sealed);
