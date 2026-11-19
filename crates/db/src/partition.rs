@@ -183,6 +183,9 @@ pub struct PartitionSnapshot {
   pub review_comments: Vec<crate::catalog::ReviewCommentRecord>,
   /// Their approvals (A-596; appended), by repository, request and approver.
   pub review_approvals: Vec<crate::catalog::ReviewApprovalRecord>,
+  /// Every repository's register: its next position and its own state (§4.17.1 shared piece 2, A-603; appended), by
+  /// repository order.
+  pub repository_registers: Vec<crate::catalog::RegisterRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -1509,9 +1512,24 @@ impl Partition {
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryDestroyed { .. }
-      | Op::RepositoryGreenJoined { .. } => self
-        .repositories
-        .check(op, self.caps.volumes, |id| self.held(id)),
+      | Op::RepositoryGreenJoined { .. } => self.repositories.check(
+        op,
+        self.caps.volumes,
+        |id| self.held(id),
+        |green| self.green_head(green),
+      ),
+      // An entry of a repository's register (A-603): its rules, then its versions' chain entries and the state it adds
+      // within the merge budget, less the state it removes.
+      Op::RepositoryAdvanced { entry } => {
+        self.repositories.check(
+          op,
+          self.caps.volumes,
+          |id| self.held(id),
+          |green| self.green_head(green),
+        )?;
+        let bytes = crate::repository::Repositories::entry_bytes(entry);
+        self.merge_bytes_fit(bytes.released, bytes.added)
+      }
       // A review record keeps §4.17.1's rules (A-596): `crate::review`; its bytes fit the merge byte budget.
       Op::ReviewCommented { .. }
       | Op::ReviewCommentMoved { .. }
@@ -2003,10 +2021,12 @@ impl Partition {
       | Op::RepositoryBranchAdded { .. }
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
-      | Op::RepositoryGreenJoined { .. } => self.repositories.apply(op),
-      // A destroyed repository's review records leave with it, their bytes back to the merge budget (A-596).
+      | Op::RepositoryGreenJoined { .. }
+      | Op::RepositoryAdvanced { .. } => self.apply_repository(op),
+      // A destroyed repository's review records leave with it, their bytes back to the merge budget (A-596), as its
+      // register's state does (A-603).
       Op::RepositoryDestroyed { repository } => {
-        self.repositories.apply(op)?;
+        self.apply_repository(op)?;
         let released = self.reviews.repository_removed(*repository);
         self.green_chain_bytes = self.green_chain_bytes.saturating_sub(released);
         Ok(())
@@ -2337,6 +2357,8 @@ impl Partition {
           .entry(*green)
           .or_default()
           .push(increment.clone());
+        // A member's version recorded alone is an entry of its repository's register (A-603).
+        self.repositories.versioned(*green);
         Ok(())
       }
       Op::GreenOriginated { green, origin } => {
@@ -2401,6 +2423,28 @@ impl Partition {
 
   /// Whether replacing `released` bytes of the merge budget with `added` keeps it within the partition's cap: the
   /// typed refusal at the bound otherwise (bounded growth, CLAUDE.md banned item 8).
+  /// Applies a repository operation (A-515, A-575, A-603): the repositories' own change, then an entry's versions as
+  /// the greens' chain entries, each charged to the merge budget with what the repositories' state gained, less what it
+  /// released.
+  fn apply_repository(&mut self, op: &Op) -> Result<(), DbError> {
+    let bytes = self.repositories.apply(op)?;
+    if let Op::RepositoryAdvanced { entry } = op {
+      for version in &entry.versions {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(version.entry.len());
+        self
+          .green_chains
+          .entry(version.green)
+          .or_default()
+          .push(version.entry.clone());
+      }
+    }
+    self.green_chain_bytes = self
+      .green_chain_bytes
+      .saturating_sub(bytes.released)
+      .saturating_add(bytes.added);
+    Ok(())
+  }
+
   fn merge_bytes_fit(&self, released: usize, added: usize) -> Result<(), DbError> {
     if self
       .green_chain_bytes
@@ -2675,6 +2719,7 @@ impl Partition {
       repository_members: self.repositories.memberships().collect(),
       review_comments: self.reviews.comment_records().cloned().collect(),
       review_approvals: self.reviews.approval_records().cloned().collect(),
+      repository_registers: self.repositories.registers().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2923,7 +2968,12 @@ impl Partition {
       &snapshot.repositories,
       &snapshot.repository_branches,
       &snapshot.repository_members,
+      &snapshot.repository_registers,
     )?;
+    // The repositories' own state is charged to the merge budget as it was when recorded (A-603).
+    p.green_chain_bytes = p
+      .green_chain_bytes
+      .saturating_add(p.repositories.state_bytes());
     // The review records, charged to the merge byte budget as when they were recorded (A-596).
     p.reviews = crate::review::Reviews::restore(
       &snapshot.review_comments,

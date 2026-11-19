@@ -715,6 +715,14 @@ pub enum Op {
     /// The request.
     request: VolumeId,
   },
+  /// An entry of a repository's register (§4.17.1 item 2, shared piece 2; A-603): one durable step committing several of
+  /// its greens' versions, greens joining its lineage, its namespace's changes and its own state's (Mercurial's phase
+  /// roots and obsolescence markers), its checks read at its position first; all of it or none. Every other operation
+  /// that changes a repository is an entry of one change and takes a position too. Appended.
+  RepositoryAdvanced {
+    /// The entry.
+    entry: crate::catalog::RepositoryEntry,
+  },
 }
 
 impl Op {
@@ -754,6 +762,7 @@ impl Op {
       Op::ReviewApproved { .. } => "review_approved",
       Op::ReviewApprovalStaled { .. } => "review_approval_staled",
       Op::ReviewClosed { .. } => "review_closed",
+      Op::RepositoryAdvanced { .. } => "repository_advanced",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
