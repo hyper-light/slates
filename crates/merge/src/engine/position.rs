@@ -179,7 +179,11 @@ pub(super) struct Since {
 impl Since {
   /// What changed since `at`: the paths the change index names, the copies made among them, and whether copies are
   /// judged again.
-  pub(super) fn new(at: u64, (changed, copied): (BTreeSet<String>, Vec<String>), copies: bool) -> Since {
+  pub(super) fn new(
+    at: u64,
+    (changed, copied): (BTreeSet<String>, Vec<String>),
+    copies: bool,
+  ) -> Since {
     Since {
       at,
       changed,

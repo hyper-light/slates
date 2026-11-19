@@ -2014,13 +2014,21 @@ fn a_copy_computed_before_the_green_moved_is_judged_again_by_position() {
   let mut owner = trunk();
   let work = one_copy("trunk", "b", 1).at(3, 1);
   let computed = copy.compute(&work).expect("computed at version 1");
-  accept(&mut owner, Work::default().overwrite("trunk/a", 0, b"ALPHA"), 2);
+  accept(
+    &mut owner,
+    Work::default().overwrite("trunk/a", 0, b"ALPHA"),
+    2,
+  );
   let again = owner.judged_again();
   let own = owner.compute(&work).expect("computed at version 2");
   let Ok(Judgment::Accepted(held)) = owner.judge_computed(&work, computed) else {
     panic!("not accepted by position");
   };
-  let judged = (owner.judged_again() - again, held.at(), Some(held.applied()));
+  let judged = (
+    owner.judged_again() - again,
+    held.at(),
+    Some(held.applied()),
+  );
   assert_eq!(judged, (1, 2, own.applied()));
   owner.commit_judged(held).expect("committed at its head");
   assert_eq!(owner.content("b/a"), Some(&b"alpha"[..]));

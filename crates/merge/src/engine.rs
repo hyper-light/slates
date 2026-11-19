@@ -3128,7 +3128,10 @@ impl Green {
         } else {
           self.intervening(path, at)
         };
-        placed.into_iter().map(|place| place.advanced(&since)).collect()
+        placed
+          .into_iter()
+          .map(|place| place.advanced(&since))
+          .collect()
       }
       _ => {
         let intervening = if unchanged {
@@ -3623,7 +3626,12 @@ impl Green {
         if judged.insert(path) {
           units.unit(position::Footprint::path(path), |_| {
             let changed = self.changed_after(path, inc.base);
-            position::Unit::windows(changed.then(|| Green::window(path, class)).into_iter().collect())
+            position::Unit::windows(
+              changed
+                .then(|| Green::window(path, class))
+                .into_iter()
+                .collect(),
+            )
           });
         }
       }

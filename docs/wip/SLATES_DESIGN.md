@@ -11511,8 +11511,10 @@ rebuilt by A-635 per A-642). A push is judged whole before anything is applied: 
 and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once. Since
 A-658 the verdict is `Green::compute`, a pure function of the versions a work is judged over and of the work: the owner
 judging is the owner computing at its own head, and any copy that holds those versions (a holder's replica, rebuilt from
-the chain's entries) computes the same `Computed`, which names the head it was computed against (part 2, the owner's
-commit of a result computed elsewhere by position, is owed).
+the chain's entries) computes the same `Computed`, which names the head it was computed against. The owner takes a verdict computed
+elsewhere by position (`Green::judge_computed`, A-658 part 2): at the head it was computed against it stands, and once
+the green has moved only the units of the verdict whose paths the change index names since are judged again, a content
+edit from where its ops stood, never the whole work.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -44112,10 +44114,11 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
     increment since that position, so the hottest green's throughput is its owner's append rate, not its verdict rate.
-    (Part 1 built, A-658: `Green::compute` and `Green::rebase` read the green and change nothing, a `Computed` holds
-    nothing of the green that computed it and names the head it was computed against, and a copy lacking the versions
-    refuses typed. Owed: part 2, the owner's commit by position, judging again only the increment since; then the
-    fleet's route, a holder computing and the owner appending.)
+    (Built, A-658: `Green::compute` and `Green::rebase` read the green and change nothing, a `Computed` holds nothing
+    of the green that computed it and names the head it was computed against, and a copy lacking the versions refuses
+    typed (part 1); the owner takes a computed verdict by position, `Green::judge_computed`, judging again only the
+    units of the verdict the versions since changed (part 2). Owed: the fleet's route, a holder computing and the owner
+    appending.)
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
@@ -46385,3 +46388,49 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
   `crates/server/src/verbs.rs` (`map_rebase`: `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry;
   GAPS' A-645 entry.
+
+### A-658 part 2 — The owner takes a verdict computed anywhere by position: at its position it stands, and once the green moved only what the versions since changed is judged again (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); A-645 "Merges computed anywhere, committed by position"; §4.16 "Position mapping", "The verdict" and "Commit"; A-635's rule; after A-658 part 1)
+
+- **What was there.** Part 1 made the verdict a pure function (`Green::compute`). The owner still committed only a
+  verdict it judged itself at its own head (`Green::judge`, then A-635's `Green::commit_judged`). A verdict computed
+  elsewhere had no way in, and a green that moved under it would have had to judge the whole work again.
+- **The decision.**
+  - **Units.** A verdict is reached unit by unit (`crates/merge/src/engine/position.rs`). A unit is one verdict
+    function over its own paths, its footprint: a special node's path; a rename's two ends; a created, removed or
+    edited file; a directory made, or removed together with what stands beneath it; a mode, a symbolic link or an
+    attribute; a hard link and the node it names; a node-exclusive path. Two units have no footprint: what the work and
+    its base alone decide (an op no verdict applies, an edit that does not fit its base), which never changes, and a
+    work's copies together. The units' effects and windows, in order, are the whole verdict's, so `submit`, `judge` and
+    `rebase` answer exactly as before.
+  - **The owner's take.** `Green::judge_computed(inc, computed)` answers as a submit does (an increment accepted before,
+    a conflict the rejected-result cache holds, a base below the checkpoint), then holds the verdict at the head for
+    `commit_judged`, A-635's append. At the position the verdict was computed against, every unit stands. Once the green
+    has moved, `changed_between(at, head)` names the paths changed since, O(the changes since), and only the units whose
+    footprint they meet are judged again.
+  - **An edit judged again from where its ops stood.** Each content op keeps its range and first byte as mapped from
+    the work's base to the computed head (`Placed`). Judged again, each is mapped on through the deltas since alone.
+    Mapping composes (`map(a..c) = map(b..c) ∘ map(a..b)`, §4.16 "Position mapping"), so this equals mapping from the
+    base, at the cost of the changes since.
+  - **Copies** read the head's version and the green's fold floor (A-626 part 2's fix), so a work's copies are judged
+    again whenever the green moved or the owner's floor is not the computing copy's.
+  - **Why it is exact.** Every commit records each path its effects change in the change index, node moves included,
+    so a footprint none of those paths meets read the same at both heads, and its effects (a file's bytes, a link's
+    home) are the same too. A copy made since changes the last change of every path in its tree without naming each,
+    so a footprint in its tree is met too. The reverse map of hard links is read only by copies' verdicts, which are
+    judged again.
+  - **Typed refusals** (`PositionRefused`), nothing judged or applied: `OtherWork` (computed for another increment or
+    base); `Ahead { at, head }` (computed at a head past the owner's: no copy is ahead of its owner); `NotRecorded {
+    version }` (the computing copy had accepted the increment at a version this green's record does not hold, so it was
+    no copy of this green).
+  - **Counter.** `Green::judged_again`: the units judged again because the green moved.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`, `copy_tests.rs`). EVIDENCE PENDING.
+- **Owed.** The fleet's route: a green's holders rebuild every version already (§4.16 "Apply on holders"), so a holder
+  computes and the owner takes by position; then the server's submit and push taking verdicts computed elsewhere. A
+  rename's edits placed as a content edit's are (a rename unit judged again maps its edits from the work's base, at the
+  cost of its source's changes since the base). Flat unit storage, if the per-unit vectors show in the merge path's
+  measurement. A measured hot-green run at A-645's targets (main's).
+- **Applied in the same change to:** `crates/merge/src/engine/position.rs` (new), `crates/merge/src/engine.rs` (the
+  verdict as units, `Green::judge_computed`, `Green::judged_again`, `Computed`'s floor, `merge_content` split around
+  placements), `crates/merge/src/lib.rs` (`PositionRefused`), `crates/merge/src/engine/compute_tests.rs` (the oracle,
+  the counter, the refusals), `crates/merge/src/engine/copy_tests.rs` (copies judged again); §4.16 "Commit"; A-645's
+  entry; GAPS' A-645 entry.

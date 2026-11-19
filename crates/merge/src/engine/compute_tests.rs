@@ -537,6 +537,7 @@ fn a_verdict_computed_on_a_copy_of_the_chain_is_the_owners_over_every_history() 
     panic!("{failure}");
   }
   let census = census.into_inner();
+  eprintln!("A-658 computed-on-a-copy census: {census:?}");
   assert!(census.met(), "a kind of answer never met: {census:?}");
 }
 
@@ -668,7 +669,11 @@ fn the_owner_answers_a_base_past_its_head_unknown() {
 enum Event {
   /// A work based `back` versions behind the owner's head, computed on the copy once the copy has followed the owner to
   /// its base and up to `lead` versions further; held until a commit takes it.
-  Compute { back: u8, lead: u8, edits: Vec<Edit> },
+  Compute {
+    back: u8,
+    lead: u8,
+    edits: Vec<Edit>,
+  },
   /// The work of an earlier event computed on the copy again and held: a work sent again.
   Again { which: u8 },
   /// A work submitted to the serial green and to the owner at once, moving both heads under what is held.
@@ -838,10 +843,16 @@ impl Concurrent {
     while self.copy.head() < target {
       let next = usize::try_from(self.copy.head()).unwrap_or(usize::MAX);
       let Some((inc, applied)) = self.chain.get(next) else {
-        return Err(TestCaseError::fail("the chain ends before the owner's head"));
+        return Err(TestCaseError::fail(
+          "the chain ends before the owner's head",
+        ));
       };
       let version = self.copy.apply_recorded(inc, applied);
-      prop_assert_eq!(version, self.copy.head(), "the copy followed to another version");
+      prop_assert_eq!(
+        version,
+        self.copy.head(),
+        "the copy followed to another version"
+      );
     }
     Ok(())
   }
@@ -899,7 +910,11 @@ impl Concurrent {
   }
 
   /// Commits both held verdicts, each at its green's head, and keeps the owner's version in its chain.
-  fn commit_both(&mut self, inc: &Increment, (serial, owner): (Judged, Judged)) -> Result<(), TestCaseError> {
+  fn commit_both(
+    &mut self,
+    inc: &Increment,
+    (serial, owner): (Judged, Judged),
+  ) -> Result<(), TestCaseError> {
     let fail = |moved| TestCaseError::fail(format!("{moved:?}"));
     let serial = self.serial.commit_judged(serial).map_err(fail)?;
     let owner = self.owner.commit_judged(owner).map_err(fail)?;
@@ -916,7 +931,10 @@ fn same_judgment(
 ) -> Result<Option<(Judged, Judged)>, TestCaseError> {
   match (serially, by_position) {
     (Judgment::Accepted(serial), Judgment::Accepted(owner)) => {
-      same_answer((serial.at(), serial.applied()), (owner.at(), owner.applied()))?;
+      same_answer(
+        (serial.at(), serial.applied()),
+        (owner.at(), owner.applied()),
+      )?;
       Ok(Some((serial, owner)))
     }
     (Judgment::AcceptedBefore { version }, Judgment::AcceptedBefore { version: again }) => {
@@ -973,6 +991,7 @@ fn a_verdict_committed_by_position_is_the_serial_verdict_over_every_concurrent_h
     panic!("{failure}");
   }
   let moves = moves.into_inner();
+  eprintln!("A-658 committed-by-position census: {moves:?}");
   assert!(moves.met(), "a kind of commit never met: {moves:?}");
 }
 
@@ -1021,16 +1040,30 @@ fn a_moved_green_judges_again_only_the_increment_since_the_position() {
   let job = overwrites(0, 1000, &edits);
   let computed = copy.compute(&job).expect("computed at version 50");
   assert_eq!(computed.at(), HOT_VERSIONS);
-  let moving = [("hot".to_owned(), 2000, &b"newnewne"[..]), ("other".to_owned(), 0, &b"OTHER"[..])];
+  let moving = [
+    ("hot".to_owned(), 2000, &b"newnewne"[..]),
+    ("other".to_owned(), 0, &b"OTHER"[..]),
+  ];
   for green in [&mut owner, &mut serial] {
     let landed = green.submit(&overwrites(HOT_VERSIONS, 1001, &moving));
-    assert_eq!(landed, Outcome::Accepted { version: HOT_VERSIONS + 1 });
+    assert_eq!(
+      landed,
+      Outcome::Accepted {
+        version: HOT_VERSIONS + 1
+      }
+    );
   }
   let counted = |green: &Green| (green.judged_again(), green.deltas_visited());
   let before = counted(&owner);
-  let by_position = owner.judge_computed(&job, computed).expect("taken by position");
+  let by_position = owner
+    .judge_computed(&job, computed)
+    .expect("taken by position");
   let after = counted(&owner);
-  assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1), "judged again");
+  assert_eq!(
+    (after.0 - before.0, after.1 - before.1),
+    (1, 1),
+    "judged again"
+  );
   let serial_before = serial.deltas_visited();
   let serially = serial.judge(&job);
   assert_eq!(serial.deltas_visited() - serial_before, HOT_VERSIONS + 1);
