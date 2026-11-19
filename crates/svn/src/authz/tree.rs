@@ -353,7 +353,7 @@ fn matching_prefixes<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item =
 }
 
 /// The suffix children of `node` whose suffix `name` ends with: one lookup per length of `name`, none when there are
-/// no suffixes. The segment is never reversed in place (module documentation of `authz`, item 3).
+/// no suffixes. The segment is never reversed in place (module documentation of `authz`, item 2).
 fn matching_suffixes<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item = usize> + 'n {
   let starts = if node.suffixes.is_empty() {
     0

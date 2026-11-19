@@ -55,7 +55,6 @@ pub mod fsck;
 mod headers;
 mod hex;
 mod ident;
-mod refname;
 pub mod tag;
 pub mod tree;
 
