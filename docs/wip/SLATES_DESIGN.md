@@ -45136,9 +45136,9 @@ stream in their place; `pack::put_header`), `crates/vcs` (`ContentStore::window_
   one part 2 made. Each entry's record keeps its object's position and type and its base (`Placed`). A base pack is two
   parts, as a version's fragments are. A push's new objects take positions by type and then id, so each fragment's two
   parts are a run each; the position rows are written in position order.
-- **Tests** (`cargo test --locked -p slates-git --lib`, 317 of 317 and 3 ignored, the store's 32 and 3 ignored, and
-  `-p slates-vcs --lib` 31 of 31, the Mac Studio, 2026-11-19, at 3f4cd19c8; `cargo fmt --check` clean), failing first
-  against a stream that sent nothing:
+- **Tests** (`cargo test --locked -p slates-git --lib`, 397 of 397 and 3 ignored on the tree merged with main at
+  61a1f91f1, the store's 32 and 3 ignored, and `-p slates-vcs --lib` 31 of 31, the Mac Studio, 2026-11-19;
+  `cargo fmt --check` clean), failing first against a stream that sent nothing:
   - `every_answered_pack_reads_back_as_the_wanted_closure_less_the_clients`: generated histories, some base packs made
     halfway, then for every green a clone and a fetch from each earlier head as A-615 answers them (a run where every
     version after the have fast-forwarded, the objects one by one otherwise), under generated filters, thin or not,
