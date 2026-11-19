@@ -7738,8 +7738,8 @@ mod tests {
     );
   }
 
-  /// Shape: the bytes of the one file a live clone's measurement gives its origin: a page, so the clone's whole image is
-  /// that file and its tree's metadata.
+  /// Shape: the bytes of the one file a live clone's measurement gives its origin: a page of incompressible bytes, so the
+  /// clone's whole image is at least that file, and its tree's metadata. (A page of one repeated byte shipped as 370.)
   const CLONED_FILE_BYTES: usize = 4096;
 
   /// A-577 (§4.10 live shipping, A-200: what a live clone's reply costs). Do: on a shard, make a live-shipped volume
@@ -7766,21 +7766,25 @@ mod tests {
         .volume
         .create_file_no(store, root, "cloned", 0o644)
         .ok()?;
-      slot
-        .volume
-        .write(store, file, 0, &[b'c'; CLONED_FILE_BYTES])
-        .ok()?;
+      let mut bytes = vec![0u8; CLONED_FILE_BYTES];
+      blake3::Hasher::new()
+        .update(b"A-577: a live clone's whole image")
+        .finalize_xof()
+        .fill(&mut bytes);
+      slot.volume.write(store, file, 0, &bytes).ok()?;
       let wire_origin = slates_ipc::protocol::VolumeId {
         bytes: origin.bytes,
       };
-      let slates_ipc::protocol::ReplyBody::Snapshotted { id: snapshot, .. } = crate::verbs::dispatch(
-        state,
-        1,
-        &principal,
-        slates_ipc::protocol::RequestBody::Snapshot {
-          volume: wire_origin,
-        },
-      ) else {
+      let slates_ipc::protocol::ReplyBody::Snapshotted { id: snapshot, .. } =
+        crate::verbs::dispatch(
+          state,
+          1,
+          &principal,
+          slates_ipc::protocol::RequestBody::Snapshot {
+            volume: wire_origin,
+          },
+        )
+      else {
         return None;
       };
       let slates_ipc::protocol::ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
@@ -7805,7 +7809,9 @@ mod tests {
       let record = whole_record(state, clone)?;
       let body = plain_body(state, clone, record)?;
       let (payload, anchors) = sealed_payload(state, clone, true, body)?;
-      if !append_payload(state, clone, (true, true), payload, anchors) || !holders_placed(state, clone.bytes) {
+      if !append_payload(state, clone, (true, true), payload, anchors)
+        || !holders_placed(state, clone.bytes)
+      {
         return None;
       }
       let waited = durable_target(state, clone);
@@ -7828,13 +7834,26 @@ mod tests {
       "a live clone's reply waits for {image} bytes (its whole image: one {CLONED_FILE_BYTES}-byte file and its tree), \
        one entry at position {waited:?}, answered at one holder's acknowledgement (after: {after:?})"
     );
-    assert_eq!(waited, Some(0), "the reply waits for the clone's first whole entry");
-    assert!(at_risk, "until it is durable an owner loss would lose the clone");
+    assert_eq!(
+      waited,
+      Some(0),
+      "the reply waits for the clone's first whole entry"
+    );
+    assert!(
+      at_risk,
+      "until it is durable an owner loss would lose the clone"
+    );
     assert!(
       image >= CLONED_FILE_BYTES,
       "the entry carries the clone's whole image: {image} bytes"
     );
-    assert_eq!(after, None, "one holder's acknowledgement answers it at f = 1");
-    assert!(!at_risk_after, "and its log then holds it where a takeover finds it");
+    assert_eq!(
+      after, None,
+      "one holder's acknowledgement answers it at f = 1"
+    );
+    assert!(
+      !at_risk_after,
+      "and its log then holds it where a takeover finds it"
+    );
   }
 }

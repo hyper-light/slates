@@ -9968,7 +9968,8 @@ fn clone_named_elsewhere(
       }
     }
     // Answered after its alias, as every clone is: at once, or held for the clone's durability (A-577).
-    let _ = crate::state::with_state(|s| crate::image::answer_in_flight(s, request, id, (reply, target)));
+    let _ =
+      crate::state::with_state(|s| crate::image::answer_in_flight(s, request, id, (reply, target)));
   })
 }
 

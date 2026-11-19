@@ -7639,6 +7639,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
 > (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
 >
+> **A clone of a live volume is answered once its own log holds it (2026-11-19, A-577).** A clone of a live-shipped
+> volume is live-shipped too, and its `Clone` answered on its origin's log, which the clone did not change; its record,
+> a copy of its origin's, named the origin's head, so nothing of it shipped until its own first seal. Now a clone's
+> registers start at the creation head, its reply waits for its own first whole entry durable on `f` holders (on the
+> cross-partition path too, after its alias), and its status reports the window its seals leave until its new log has
+> answered at a whole entry. A-577's entry measures the cost: one entry, the clone's whole image, one round trip.
+>
 > **The held replies' bound is met before a verb runs (2026-11-18).** A shard holds at most `awaiting_bound` such
 > replies (its client seats times ring slots). A recorded verb that could be held (one that changes a live-shipped
 > volume, or a destroy while `f > 0`) meets that bound before it runs (`live_ship::refuse_over_bound`, from

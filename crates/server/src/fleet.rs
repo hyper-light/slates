@@ -11709,10 +11709,7 @@ mod discovery_wait_tests {
 mod tests {
   /// A volume named `<name>-origin` made for a principal on `state`'s shard, snapshotted, and that snapshot cloned as
   /// `<name>-clone`: the clone, which has taken no snapshot of its own.
-  fn fresh_clone(
-    state: &mut crate::state::ShardState,
-    name: &str,
-  ) -> slates_db::catalog::VolumeId {
+  fn fresh_clone(state: &mut crate::state::ShardState, name: &str) -> slates_db::catalog::VolumeId {
     use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
     let owner = slates_db::catalog::Principal::Uid {
       host: slates_db::HostId(0),
