@@ -33,8 +33,7 @@
 //!
 //! **The client's bytes (item 4).** Once accepted, every path of the pushed tree holds exactly the bytes the client
 //! sent, with its mode, its target or its commit, nothing else stands in the tree, and the root's head is the client's:
-//! the
-//! client-fidelity test in this module's tests checks it after every push of generated histories.
+//! the client-fidelity test in this module's tests checks it after every push of generated histories.
 //!
 //! **What is refused, typed ([`PushRefused`]).** A base version the green does not hold; an object the push names that
 //! the store cannot give as the kind the walk needs; a name slates cannot hold in a path (not UTF-8, empty, `.`, `..`,
