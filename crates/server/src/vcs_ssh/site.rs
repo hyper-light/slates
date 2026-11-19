@@ -21,13 +21,14 @@
 //!    the session. A damaged policy is refused, never judged without it.
 //! 3. The service ([`Services`]): one the server cannot start is refused as not served ([`Unserved`]), as the HTTP edge
 //!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
-//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols), which no lender does until the
-//!    lender over A-662's map of stores on their owner shards lands (A-662's owed list). Mercurial's `serve --stdio`
-//!    (`slates_hg::serve::stdio::Stdio`, A-650 part 2) waits likewise for a lender of its store. git's receive-pack
-//!    runs A-654 part 2's driver over the repository's store on its owner shard, the shard's own (A-662), so it needs
-//!    no store lender: each of its steps is lent the shard's state, as the HTTP site's are (A-654 part 3's
-//!    [`ShardLender`]; `super::receive`, A-683). Subversion's tunnel (A-656) waits for its entry point. Each becomes a
-//!    [`Command`] behind [`Services`] as it can run, and the not-served answer goes with the last of them.
+//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols): the daemon's lender lends each
+//!    store from A-662's map on its owner shard (`crate::vcs_store::upload::ShardStores`, A-682), which the daemon hands
+//!    this site once it starts the SSH edge. Mercurial's `serve --stdio` (`slates_hg::serve::stdio::Stdio`, A-650 part
+//!    2) waits likewise for a lender of its store. git's receive-pack runs A-654 part 2's driver over the repository's
+//!    store on its owner shard, the shard's own (A-662), so it needs no store lender: each of its steps is lent the
+//!    shard's state, as the HTTP site's are (A-654 part 3's [`ShardLender`]; `super::receive`, A-683). Subversion's
+//!    tunnel (A-656) waits for its entry point. Each becomes a [`Command`] behind [`Services`] as it can run, and the
+//!    not-served answer goes with the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
@@ -323,7 +324,7 @@ impl<L: StoreLender + Clone, S: ShardLender + Clone> Services for ToolServices<L
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
         Ok(ToolCommand::Upload(Box::new(UploadCommand::new(
           self.lender.clone(),
-          repository.id,
+          (repository.id, start.principal.clone()),
           version,
           self.room,
         ))))

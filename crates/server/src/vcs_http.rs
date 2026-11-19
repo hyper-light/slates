@@ -54,12 +54,12 @@
 //!
 //! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
 //! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
-//! receive-pack through the push driver on the repository's owner shard (A-654 part 3); Mercurial's site on the daemon's
-//! edge, each repository's served view lent from its store on its owner shard (A-680 part 2a).
+//! upload-pack served from each repository's store on its owner shard, lent from A-662's map by
+//! `crate::vcs_store::upload::ShardStores` (A-682); receive-pack through the push driver on the repository's owner shard
+//! (A-654 part 3); Mercurial's site on the daemon's edge, each repository's served view lent from its store on its
+//! owner shard (A-680 part 2a).
 //!
-//! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
-//! handed the stores (A-615, A-662), which answers `503` until then;
-//! Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
+//! **Owed** (GAPS, the §4.17 entry): Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
 //! `501` until then; Subversion's site composed into the daemon's beside git's and Mercurial's ([`ToolSites`]); the MCP

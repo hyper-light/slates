@@ -21,12 +21,13 @@
 //! (`verbs::owner_of_name`, as `CreateRepository` routes it): a name another shard holds moves the connection there
 //! (`Answer::Move`), so a repository is found, judged and served on its own shard, its partition read with no crossing.
 //!
-//! **What is served.** git's services as the server has them, each from its own half: upload-pack once each
-//! repository's store is lent from its owner shard (A-662's map, a step at a time), `503` until then; receive-pack
-//! through the push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3).
-//! Mercurial's commands, a request whose query names one ([`ToolSites`]), from each repository's served view over its
-//! store on the shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its pushes
-//! (`unbundle`) are not served yet.
+//! **What is served.** git's services as the server has them, each from its own half: upload-pack from each
+//! repository's store on its owner shard, lent from A-662's map a step at a time with the refs the principal may read
+//! (`crate::vcs_store::upload::ShardStores`, A-682), each request admitted the edge's room; receive-pack through the
+//! push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3). Mercurial's
+//! commands, a request whose query names one ([`ToolSites`]), from each repository's served view over its store on the
+//! shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its pushes (`unbundle`) are not
+//! served yet.
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_http_edge::credential::Credential;
@@ -36,12 +37,13 @@ use slates_vfs::clock::Clock;
 
 use super::git::{
   Authenticator, GitSite, Halves, Located, Proven, ReceiveServices, Repositories, ThisShard,
-  Unproven, Unserved,
+  Unproven, UploadServices,
 };
 use super::hg::HgSite;
 use super::{Bounds, EdgeState, ToolSites, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
 use crate::vcs_store::hg_view::ServedViews;
+use crate::vcs_store::upload::ShardStores;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_http.not_started";
@@ -116,8 +118,11 @@ impl Repositories for ShardRepositories {
 }
 
 /// git's site as the daemon serves it (the module doc, "What is served").
-pub(crate) type DaemonGitSite =
-  GitSite<RecordedCredentials, ShardRepositories, Halves<Unserved, ReceiveServices<ThisShard>>>;
+pub(crate) type DaemonGitSite = GitSite<
+  RecordedCredentials,
+  ShardRepositories,
+  Halves<UploadServices<ShardStores>, ReceiveServices<ThisShard>>,
+>;
 
 /// Mercurial's site as the daemon serves it (the module doc, "What is served").
 pub(crate) type DaemonHgSite = HgSite<RecordedCredentials, ShardRepositories, ServedViews>;
@@ -126,7 +131,7 @@ pub(crate) type DaemonHgSite = HgSite<RecordedCredentials, ShardRepositories, Se
 pub(crate) type DaemonSite = ToolSites<DaemonGitSite, DaemonHgSite>;
 
 /// What makes the daemon's sites on any shard: their challenges name `realm`, each request's route and exchange are
-/// charged to the request's `room`, and receive-pack admits each push that room.
+/// charged to the request's `room`, and each git service admits each request that room.
 fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
   move || {
     let git = GitSite::new(
@@ -134,7 +139,10 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       room,
       RecordedCredentials,
       ShardRepositories,
-      Halves::new(Unserved, ReceiveServices::new(ThisShard, room)),
+      Halves::new(
+        UploadServices::new(ShardStores, room),
+        ReceiveServices::new(ThisShard, room),
+      ),
     );
     let hg = HgSite::new(
       realm.clone(),
