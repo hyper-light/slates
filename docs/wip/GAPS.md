@@ -53,6 +53,19 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-597 (2026-11-19, g255; shared piece 7's matcher, hooks protocol and runner):** `crates/server` holds them, pure and
+> not yet called. `vcs_policy` is the policy by name pattern under each tool's own precedence: git's ref patterns cover
+> what `for-each-ref` matches and the last covering rule wins, as `transfer.hideRefs`; Mercurial's branch, bookmark and
+> topic names or `*` go in acl's order, denials first, then the allow list; Subversion's authz paths, literal or
+> `:glob:`, go by the deepest matching depth, then the rule defined last. `wildmatch` is git's `WM_PATHNAME` glob as a
+> bounded token pass. `vcs_hooks` names the eight points, builds their inputs in each tool's terms, learns each hook's
+> deadline with `LearnedWait` (none before its first finished run), and runs one hook as a state machine with typed
+> outcomes. `cargo test -p slates-server --lib -- wildmatch:: vcs_policy:: vcs_hooks::`: 26 of 26 on the Mac Studio,
+> red six ways; §4.17.4's hook-deadline row now names the same estimator. Owed: the policy in the repository record and
+> the verb that sets it; the branch verbs and push paths asking it; each tool's read-only view for its hooks and the
+> driver that starts them; each tool's words for the outcomes; review events' hooks; a repository-owned queue for
+> observing hooks that must outlive their push. Main's: clippy, `xtask` and the lint matrix over the three modules (no
+> platform code in them).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's

@@ -216,3 +216,70 @@ C: deployed code). Every quotation below was read directly on 2026-11-18 from th
   `shallow.adoc` (downloaded, read only for their definitions so far) before piece 7.
 - GitLab Workhorse's own documentation, to confirm it is the HTTP front that drives Gitaly for git clients (§4.17.2
   names it from memory).
+
+## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
+
+Read 2026-11-19 (UTC) by g255. Each file was downloaded and hashed; the lines cited are each file's own.
+
+| Source | Revision | sha256 (first 16 hex) |
+|---|---|---|
+| git `Documentation/config/transfer.adoc`, `for-each-ref-options.adoc`, `githooks.adoc`, `rev-list-options.adoc`, `gitignore.adoc` | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` (§1's) | `ca01864712d813ed`, `0b7a87487ca5ec29`, `5b3808fb0dcd2675`, `00a963603ae954d1`, `338221577b4f47ea` |
+| git `refs.c`, `ref-filter.c`, `wildmatch.c`, `ctype.c`, `builtin/receive-pack.c`, `t/t3070-wildmatch.sh`, `t/helper/test-wildmatch.c` | the same | `8c51d996511d3b2a`, `9dae1123d7958514`, `58541e5550a0689b`, `ef2be0e95b607f50`, `c296cdfc55dad629`, `9765041e1217bdbb`, `59553b0a94cfd884` |
+| Mercurial `hgext/acl.py`, `mercurial/helptext/config.txt` | 7.2.4, the PyPI tarball §1 names (its sha256 `85839e0f…` checked again) | `e744192eb2b44b0b`, `a034617d0f449282` |
+| Subversion `libsvn_repos/authz.h`, `authz.c`, `authz_info.c`, `hooks.c` | `trunk` at `fd4e82b00cbe89319728ad9e21121c40e59f92be` (§1's) | `8042f6925f6712a6`, `7cd6ac4bc227a4be`, `5f9ff5bbaaf9e187`, `555e485812a84f63` |
+| Subversion 1.10 release notes, "Improved path-based authorization" | `subversion.apache.org/docs/release-notes/1.10.html` | `7c7a34f5bee69657` |
+
+- **git: which refs a pattern covers** [B: `for-each-ref-options.adoc` 1-5]: "only refs are shown that match against at
+  least one pattern, either using `fnmatch`(3) or literally, in the latter case matching completely or from the
+  beginning up to a slash." [C: `ref-filter.c` 2696-2723, `match_name_as_path`]: a literal prefix that ends at a slash
+  or at the name's end, or a pattern ending in `/`, else `wildmatch(p, refname, WM_PATHNAME)`.
+- **git: which rule wins** [B: `config/transfer.adoc` 117-120]: "You may also include a `!` in front of the ref name to
+  negate the entry, explicitly exposing it, even if an earlier entry marked it as hidden. If you have multiple hideRefs
+  values, later entries override earlier ones". [C: `refs.c` 1741-1771, `ref_is_hidden`: the entries are read from the
+  last, and the first that matches answers.]
+- **git: the glob** [C: `wildmatch.c` 59-290, `dowild`; B: `gitignore.adoc` 124-142]: "A leading `**` followed by a
+  slash means match in all directories", "A trailing `/**` matches everything inside", "A slash followed by two
+  consecutive asterisks then a slash matches zero or more directories", "Other consecutive asterisks are considered
+  regular asterisks". git's own vectors [C: `t3070-wildmatch.sh`, 190 `match` lines; `test-wildmatch.c`: the `wildmatch`
+  mode is `WM_PATHNAME`, and an argument beginning `XXX/` loses its first three bytes]. git's classes are its own ASCII
+  table [C: `ctype.c`]: space is tab, newline, carriage return and space only.
+- **git: the hooks** [B: `githooks.adoc` 261-450]: `pre-receive`: "If the hook exits with non-zero status, none of the
+  refs will be updated"; `update`: "takes three parameters ... the name of the ref being updated, the old object name
+  ..., and the new object name"; `post-receive`: "does not affect the outcome of `git receive-pack`"; for all three,
+  "Both standard output and standard error output are forwarded to `git send-pack`". [C: `builtin/receive-pack.c`
+  834-995: `post-receive` is fed only the commands with no error (`skip_broken`); the push options become
+  `GIT_PUSH_OPTION_<i>` and `GIT_PUSH_OPTION_COUNT`, and with none negotiated the count is removed from the
+  environment; a refusal reads "pre-receive hook declined" (2127) or "hook declined" (1634).]
+- **Mercurial: acl** [C: `acl.py` 25-30]: "The order in which access checks are performed is: 1) Deny list for branches
+  ... 2) Allow list for branches ... 3) Deny list for paths ... 4) Allow list for paths"; keys are "a branch name, or an
+  asterisk, to match any branch", and the same for bookmarks; "You can add the "!" prefix to a user or group name to
+  invert the sense of the match". `buildmatch` (326 on) gives a present section with no entry for the user `util.never`,
+  and `_txnhook` (432 on) refuses "denied on branch" for a deny match, then "not allowed on branch" for an allow list
+  that does not match. The example configuration (119-140) and the `ring = !gollum` example (199) state their outcomes.
+- **Mercurial: the hooks** [B: `config.txt` 1165-1400]: "Hooks can be prioritized by adding a prefix of ``priority.`` to
+  the hook name ... The default priority is 0" (a higher priority runs first); ``pretxnchangegroup``: "Exit status 0
+  allows the transaction to commit. A non-zero status will cause the transaction to be rolled back, and the push, pull
+  or unbundle will fail" (1382-1389); ``changegroup``: "The ID of the first new changeset is in ``$HG_NODE`` and last is
+  in ``$HG_NODE_LAST``. The URL from which changes came is in ``$HG_URL``" (1220-1223). [C: `acl.py`'s example
+  configuration: `HG_SOURCE` is "serve" for all remote access.]
+- **Subversion: authz** [B: 1.10 release notes]: "In these rules, /path is always matched literally"; in `:glob:` rules
+  "`*` matches a single (exactly one), arbitrary path segment", "`**` matches an arbitrary number of path segments",
+  "Classic wildcard patterns such as `*foo*.bar` work as expected, including escaping of special characters with a
+  backslash", and "/*/**/* will match any path which contains at least 2 segments and is equivalent to /**/*/* as well
+  as /*/*/**". [C: `authz.c` 56-59]: "If multiple rules apply to the same path (only possible with wildcard matching),
+  the one with the highest SEQUENCE_NUMBER wins, i.e. the latest one defined in the authz file"; `lookup` (1277 on)
+  takes the rules matching each depth and inherits the depth above where none does; `add_next_node` (1119 on) adds a
+  `**` node again at every level; `process_acl` (558 on) skips a section with nothing for the user; `trim_tree` (707 on)
+  removes the rules a later `**` eclipses. [C: `authz.h` 255-258]: "The authz lookup code selects the highest-numbered
+  ACL from amongst a set of equivalent matches."
+- **Subversion: the hooks** [C: `hooks.c`]: `pre-commit`'s arguments are the repository's path and the transaction, its
+  input "LOCK-TOKENS:" then a `path|token` line a token (the path URI-escaped) and a blank line (510-588);
+  `pre-revprop-change`'s are the path, the revision, the author (empty for none), the property's name and `A`, `M` or
+  `D`, with the new value on input (622-683), and with no such hook every change is refused, "default to MASSIVE
+  PARANOIA" (668-678); `post-commit`'s are the path, the revision and the transaction (590-620); a hook's standard
+  output goes to the null device (228) and its standard error is the message: "Commit blocked by pre-commit hook (exit
+  code %d) with output:" or "... with no output." (65-162).
+- **What follows** (§4.17.1, A-597): each tool's precedence is the one its own documentation or code states, never a
+  hosting server's; a policy rule is one statement, so authz's union of lines within a section stays the authorization
+  file's (A-606); and every hook's deadline is learned from its own runs, with no deadline before its first finished
+  run but its client's connection.

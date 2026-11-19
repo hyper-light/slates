@@ -11803,6 +11803,26 @@ is one more version, and the chain itself is never rewritten.
   only its own push.
 - The write modes still decide whether a merge may happen at all (A-285), and a signature never permits one (A-321).
 
+> **Status (2026-11-19, A-597: the policy's matcher, the hooks' protocol and the hook runner built).** `crates/server`
+> holds them as pure modules that nothing calls yet. `vcs_policy` keeps a repository's rules, each allowing or denying
+> one right (read, submit, rewrite, delete) to some principals on the names a pattern covers, and finds the rule that
+> decides by the tool's own precedence. For git, a ref pattern covers what `git for-each-ref` matches (the name itself,
+> a prefix ending at a slash, or `wildmatch` with `WM_PATHNAME`), and the last covering rule wins, as
+> `transfer.hideRefs` documents. For Mercurial, a branch, bookmark or topic name or `*`, in the `acl` extension's order:
+> a denial first, then the allow list a principal must be on. For Subversion, an authz path, literal or `:glob:`: the
+> deepest depth at which a rule matches decides, then the rule defined last, as authz's lookup does. When no rule
+> speaks, the repository's own rule stands (the owner's rights, A-575; capabilities, §4.13). `vcs_hooks` names the
+> points (git's `pre-receive`, `update` and `post-receive`; Mercurial's `pretxnchangegroup` and `changegroup`;
+> Subversion's `pre-commit`, `pre-revprop-change` and `post-commit`), builds each hook's input in its tool's terms, and
+> runs one hook as an event-driven state machine whose outcome is accepted, refused with the hook's words, timed out at
+> its learned bound, abandoned when its client left, or unstartable. Each hook's deadline is learned from its own runs
+> with `LearnedWait` (RFC 6298, Karn's rule, the back-off): a hook with no finished run has no deadline but its client's
+> connection, and a run its client cut short teaches nothing. A run never outlives its client. Owed: the policy in the
+> repository record with a verb that sets it; the branch verbs and push paths asking it; each tool's read-only view
+> for its hooks and the driver that starts a hook over it in its own process group; each tool's words for the
+> outcomes; the hooks of review events; and a repository-owned queue for observing hooks that must outlive their push
+> (§4.17.3).
+
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
 computes for it (a pack, a bundle, a slice of the index) is cached by its identity and shared across clients. The change
@@ -11902,7 +11922,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
 6. Review records: comments anchored and moved by position mapping; approvals as evidence.
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
-   commit, under learned deadlines.
+   commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
+   learned deadlines and the runner; the policy's place in the record, the views and the driver are owed).
 
 Each server's pieces follow these, in its own section.
 
@@ -12958,7 +12979,7 @@ value from the first request's own inputs, never a literal).
 | Compress a window (svndiff 2) or send it stored | the argmin of predicted time: stored bytes over the connection's delivery rate, against LZ4's time plus compressed bytes over that rate | the connection's delivered bytes a second; the shard's LZ4 bytes a second; the compression ratio of the repository's content class (D-17) | every window sent | a choice of two; stored for a peer that did not announce svndiff 2 | the first window is compressed and timed, which gives its own ratio and rate |
 | The cap on a path, a property value or a log message | the connection's share of the shard's admittable memory, divided among the connections served now (A-188's share) | the shard's room (§4.2); live connections | every connection that opens or closes | the shard's admittable room; refused `E210009` past it | the share when the connection is accepted |
 | Socket send and receive buffers | the connection's bandwidth-delay product | its measured round trip and delivery rate | every window | the connection's memory share | the first exchange's round trip and rate |
-| A hook's deadline | a regression of the hook's run time on the commit's size (paths and bytes); the bound is the prediction plus the largest residual seen | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
+| A hook's deadline | §4.17.1's (A-597): the tail of that hook's own finished runs by RFC 6298's estimator (`LearnedWait`), with Karn's rule for runs cut short and the bound doubled after a run cut at it; a regression on the commit's size (paths and bytes), the prediction plus the largest residual seen, takes its place only once measurement shows a hook's run time following the size | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
 | An idle HTTP transaction's bound | the longest gap seen between two requests of one transaction that went on to commit | the gaps of committed transactions | every commit over HTTP | the shard's room for held works: past it the longest-idle goes first | none until a transaction has committed; the room alone |
 | Folding the index's tail into a table | fold when a lookup in the tail is measured slower than one in a folded table | per-lookup times of both | every sampled lookup | the shard's room | at the first sample where the tail is slower |
 | The wire-form cache (§4.17.1 "Objects" item 2: svndiff windows of hot versions) | keep what saves the most time per byte held: re-use rate times the encode time saved, over bytes | hits and encode times | every hit | the shard's room | empty |
@@ -39288,3 +39309,94 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-597 — Policy by name pattern under each tool's own precedence, and the hooks' protocol under learned deadlines (2026-11-19, g255, UI goal 92; §4.17.1 "Policy: protected branches, access and hooks" and shared piece 7; R3, D-28)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7);
+- §4.17.4 item 12's hook-deadline row (below, "One estimator");
+- GAPS (the §4.17 entry); `research/vcs-servers.md` §6 (the sources read, with their revisions, lines and sha256);
+- `crates/server` (`wildmatch.rs`, `vcs_policy.rs` and `vcs_hooks.rs`, new; `lib.rs`).
+
+- **What a rule is.** A right (read, submit, rewrite, delete), an effect (allow or deny), the principals it speaks to
+  (everyone, or entries naming a principal or every principal but one: acl's `!user`, authz's `~user`), and a pattern in
+  the repository's tool's form. The verdict is the deciding rule, or unruled, which leaves the question to the
+  repository's own rule: its owner holds every right (A-575), another principal what its capability grants (§4.13).
+- **git's precedence.** A pattern covers a ref as `git for-each-ref` covers one: "either using `fnmatch`(3) or
+  literally, in the latter case matching completely or from the beginning up to a slash" (`for-each-ref-options.adoc`
+  1-5). The glob is `wildmatch` with `WM_PATHNAME`, and a pattern ending in `/` covers everything beneath it
+  (`ref-filter.c` `match_name_as_path`, 2696-2723). The last covering rule decides: "If you have multiple hideRefs
+  values, later entries override earlier ones" (`config/transfer.adoc` 117-120; `refs.c` `ref_is_hidden` reads them from
+  the last, 1741-1771), the one precedence git documents among a server's ref patterns. A hosting server's own order
+  for its protection rules is that server's choice, not git's, and was not taken.
+- **Mercurial's precedence.** A name or `*` in each namespace, as `hgext/acl.py` (7.2.4) keys its sections ("a branch
+  name, or an asterisk, to match any branch"), in its order, "1) Deny list for branches 2) Allow list for branches"
+  (25-30). A denial that covers the name and names the principal decides first. Where any rule allows the right in the
+  namespace, the allow rules are a list the principal must be on: `buildmatch` answers `util.never` to a user with no
+  entry in a present section (326 on), and acl refuses that user "not allowed". Topics take bookmarks' form: acl has no
+  topic rules, and the topic extension's options read for §4.17.3 (`research/mercurial-server.md` §5) give none. acl's
+  documented example configuration and its `ring = !gollum` example are tests. Not read: how Mercurial's configuration
+  parser treats an allow section with no entries. acl's docstring says that beside an empty `[acl.allow.branches]`
+  "anyone else can still commit to any other branch"; an allow list here is its allow rules, which agrees with that.
+- **Subversion's precedence.** An authz path: `/path` literally, or `:glob:/path` with `*` for one segment and `**` for
+  any number (the 1.10 release notes), segment wildcards read by `wildmatch` within the segment. authz's lookup walks the
+  path a segment at a time. At each depth it takes the matching rule "with the highest SEQUENCE_NUMBER ... i.e. the
+  latest one defined in the authz file" (`authz.c` 56-59, `combine_access` 103-111; `authz.h` 255-258), and where none
+  matches it inherits from the depth above (`lookup`, 1277 on); a section with nothing for the user takes no part
+  (`process_acl`, 558 on). So the deepest matching depth decides, then the rule defined last. A `**` matches at every
+  depth it spans, since the lookup adds a `**` node again at every level: a later `/trunk/**` eclipses an earlier
+  `/trunk/a` (`trim_tree`), and an earlier `/trunk/**` still decides at `/trunk/a/b` beneath a later `/trunk/a`, where it
+  matches deeper. One rule is one statement: the union an authz file gives a user named by several lines of one section
+  belongs to the authorization file's reading (A-606), not to the policy.
+- **The matcher.** Each policy is indexed once, when it is made. git's rules go by their pattern's bytes, since a name
+  is covered literally only by itself or by a prefix ending at a slash (a look-up a slash), and the globs are kept apart
+  under the literal bytes each must begin with. Mercurial's go by namespace and name, with `*` apart. Subversion's
+  literal rules go by their canonical path (a look-up a depth), and the rules holding wildcards by the depths their
+  segments reach. git's `wildmatch` is read once into tokens and matched by carrying the set of text positions reached:
+  no recursion, and time in proportion to the tokens times the text, where `dowild` recurses at every star.
+- **The hooks.** The points and their phases. The inputs in each tool's terms: git's `old new ref` lines and
+  `GIT_PUSH_OPTION_*`, the count unset when no push options were negotiated, `update`'s three arguments, and
+  `post-receive` given only the commands that applied (`builtin/receive-pack.c` 834-995); Mercurial's `HG_HOOKTYPE`,
+  `HG_HOOKNAME`, `HG_NODE`, `HG_NODE_LAST`, `HG_SOURCE` (`serve`), `HG_URL`, and `HG_PENDING` naming the view for
+  `pretxnchangegroup`; Subversion's arguments and its `LOCK-TOKENS:` input (`hooks.c` 510-683). The words: git's and
+  Mercurial's from both streams, Subversion's from standard error alone (`hooks.c` 228 sends standard output to the null
+  device). And what a point with no hook answers: accept, except `pre-revprop-change`, "default to MASSIVE PARANOIA"
+  (`hooks.c` 668-678).
+- **The deadline.** Each configured hook's runs are learned with `LearnedWait`. Before its first finished run a hook has
+  no deadline: its client's connection bounds the run (§4.17.1). After, the bound is the tail of the finished runs plus
+  a liveness window. A run cut at its bound is no sample and doubles the next bound (RFC 6298 §5.5). A run cut by its
+  client leaving is no sample and no back-off (Karn's rule: its length is unknown). The back-off has no ceiling of the
+  runner's own, since every run ends when its client leaves (§4.17.2's table).
+- **One estimator.** §4.17.4 item 12 had named, for Subversion, a regression of a hook's run time on the commit's size.
+  The runner holds every tool's hooks to one rule, `LearnedWait`'s, as the codebase's five other learned waits are ("One
+  rule, so they never drift apart"); RFC 6298's deviation term already widens the bound of a hook whose runs vary with
+  their input. The regression takes its place only once measurement shows a hook's run time following the commit's
+  size, owed with that measurement.
+- **The runner.** A state machine with no I/O. The driver reports output, the output's end, the exit, the timer and the
+  client leaving; the runner answers wait (with the timer at the deadline), kill, or done with the outcome: accepted,
+  refused with the hook's exit and words, timed out naming the bound, abandoned, or unstartable with the cause. A hook
+  that exits while something it started still holds its output is judged by its own exit, and that leftover is ended
+  at the deadline or when the client leaves. Its words are kept up to a cap the caller derives (the connection's share
+  of the shard's memory), the rest counted. A run never outlives its client (§2 ban 9). git lets a `post-receive` run on
+  after its client has gone; a notification that must outlive its push belongs in a repository-owned queue (§4.17.3).
+- **Tests** (`cargo test --locked -p slates-server --lib -- wildmatch:: vcs_policy:: vcs_hooks::`, Mac Studio M3 Ultra,
+  kiln, debug, load 7 to 11, 2026-11-19): 26 of 26; `cargo fmt --all --check` clean.
+  - Golden: git's 190 t3070 vectors, answered alike by the compiled matcher and by `dowild` transcribed line for line.
+  - Oracles: the compiled matcher against `dowild` on 4,096 generated cases; each policy against every rule tried in
+    order, over generated rules and questions (git's through `dowild` and its literal test, transcribed).
+  - Documented examples: for-each-ref's coverage, acl's example configuration and its `!gollum` example, the release
+    notes' three equivalent globs, authz's depth and order.
+  - The runner: each outcome, the first run with no deadline, the learned bound and its back-off, Karn's rule, the
+    words' cap, a hook whose children hold its output, and a property over generated event orders: a run ends once, is
+    sampled exactly when it exited while running and cut exactly when the timer reached the deadline first, and keeps
+    its first bytes.
+  - Red on a mutated copy, each caught by its named tests: `**/` read as `*` (the vectors and the `dowild` oracle); the
+    first git rule winning (the git test and oracle); not listed read as unruled (acl's example and the Mercurial
+    oracle); depth ignored (both Subversion tests and the oracle); a sample from a run its client cut short (the client
+    test and the property); no back-off (the bound test and the property).
+- **Owed:** the policy in the repository record and the verb that sets it (with shared piece 2's register entry); the
+  branch verbs and each server's push path asking it; each tool's read-only view for its hooks (git piece 10's bare
+  repository, Mercurial piece 9's revlog view, Subversion piece 11's `svnlook`); the driver that starts a hook over its
+  view in its own process group (on Linux inside the launcher's namespace, §4.6); each tool's words for the outcomes
+  (git's `pre-receive hook declined` and `hook declined`, `receive-pack.c` 1634 and 2127; Mercurial's `<hook> hook exited
+  with status <n>`; Subversion's `Commit blocked by pre-commit hook (exit code <n>) with output:`, `hooks.c` 65-162); the
+  hooks of review events; and a repository-owned queue for observing hooks that must outlive their push.

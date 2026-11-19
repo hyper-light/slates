@@ -11,8 +11,8 @@
 //! outcome"), Mercurial's `changegroup`, Subversion's `post-commit`. An admission point with no hook lets the change
 //! through, except Subversion's `pre-revprop-change`, which then refuses every revision-property change ("default to
 //! MASSIVE PARANOIA", `hooks.c`). Several hooks at one point run in the order the tool's configuration gives
-//! (Mercurial's `priority.` prefix, then the order written), and at an admission point the first that does not accept
-//! decides and the rest do not run, as each tool stops at its first refusal.
+//! (Mercurial's `priority.` prefix runs a higher priority first, `config.txt` "hooks"), and at an admission point the
+//! first that does not accept decides and the rest do not run, as each tool stops at its first refusal.
 //!
 //! **What a hook runs over.** A read-only attachment of the change, never the green itself: an admission hook sees the
 //! work's post-state ([`PendingView`]: git's quarantine, Mercurial's pending transaction named by `HG_PENDING`,

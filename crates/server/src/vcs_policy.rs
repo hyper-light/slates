@@ -15,7 +15,7 @@
 //!   bookmarks]. The precedence is acl's order, "Deny list ... Allow list": a rule that denies decides first, and where
 //!   any rule allows the right in the namespace, the rules that allow it are a list a principal must be on, since acl's
 //!   `buildmatch` answers `util.never` to a user with no entry in a present allow section ("not allowed"). acl has no
-//!   topic rules and hg-evolve documents no per-topic access, so topics take bookmarks' form.
+//!   topic rules, and the topic extension's options read for §4.17.3 give none, so topics take bookmarks' form.
 //! - Subversion: a repository path, covered as an authz section covers one: `/path` literally, `:glob:/path` with `*`
 //!   for exactly one segment, `**` for any number of segments, and classic wildcards within a segment [B: Subversion
 //!   1.10 release notes, "Improved path-based authorization"], a segment's wildcards read by [`crate::wildmatch`]. The
