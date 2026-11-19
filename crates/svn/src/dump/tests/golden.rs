@@ -167,6 +167,7 @@ impl Replay {
       Owned::Format(_) | Owned::Uuid(_) | Owned::PropertiesEnd => {}
       Owned::Revision(header) => self.revision(header),
       Owned::Node(header) => self.node(header),
+      Owned::Set { .. } | Owned::Delete { .. } if self.node.is_none() => {}
       Owned::Set { name, value } => {
         self.current().properties.insert(name.clone(), value.clone());
       }
@@ -181,8 +182,10 @@ impl Replay {
     }
   }
 
-  /// A revision record: the tree so far is the previous revision's, kept.
+  /// A revision record: the tree so far is the previous revision's, kept; the revision's own properties, which follow,
+  /// are no node's.
   fn revision(&mut self, header: &RevisionHeader) {
+    self.node = None;
     if header.number > 0 {
       assert_eq!(self.trees.len() as u64 + 1, header.number, "revisions out of order");
       self.trees.push(self.tree.clone());
