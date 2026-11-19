@@ -83,9 +83,14 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
-> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs built (2026-11-18, A-500 and A-531,
-> D-28; UI goal 91; g292).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's, golden vectors from the
-> protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531).
+> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs and its index built (2026-11-18,
+> A-500, A-531 and A-553, D-28; UI goal 91; g292).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
+> golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531). A-553
+> (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities, predecessors,
+> history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem
+> applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
+> Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
+> shared piece 3), and a large revision applied in slices (with the server).
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
@@ -95,8 +100,7 @@
 > 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
 > `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
 > A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. Owed, in order: `Copy` in the
-> engine (on A-534's persistent radix tree); the Subversion index; the
-> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> engine (on A-534's persistent radix tree); the commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
@@ -1059,8 +1063,9 @@
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
 > - **Kiln's runners as members: the network each needs (written 2026-11-18, `docs/deploy.md` "What a node's firewall
 >   must let through").** Each runner's node takes inbound UDP at its manifest's base port (probes) and the next
->   (records) from the other runners; TCP at the base port only for the network export, which kiln does not use (its
->   agents mount their volumes on their own runner). As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
+>   (records) from the other runners; TCP at the base port only for the network export, which kiln's Kubernetes
+>   engine uses for a pod's volume from its home runner (its W10, designed 2026-11-19; A-521 the library's verb), while
+>   a runner's own agents mount their volumes on that runner. As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
 >   inbound UDP but kiln's own ports and adacachy2's passes LAN UDP 17202 and 17212 alone, so neither passes a slates
 >   block yet: each needs `ufw allow proto udp from <the LAN> to any port <base>:<base+1>` once, an operator's (root)
 >   step slates never takes (R10). The Macs' firewalls were not checked.
@@ -1235,6 +1240,20 @@
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
 >   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
+>   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
+>   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume
+>   over its node's export. `Instance::export(volume, uid, &ExportOptions)` and the seam's verb attach the volume bound
+>   to the client's Unix identity (A-115), read-only or beneath a directory as asked, and answer an `Exported`: the
+>   export's attachment, whose detach ends the capability, and the path the capability authorizes, which the client's
+>   mount names; its `Debug` never shows the token; an answer without a capability is a protocol fault. The simulator
+>   answers a path of its own per export and ends it at its detach or with its volume. Unit tests: `export::tests` (the
+>   path, its redaction, the protocol fault) and `sim::tests` (one capability per client, ended at its detach and with
+>   its volume; the stranger and a full table refused typed). By use over a real daemon: the conformance suite's
+>   stranger and `expect_an_export_is_one_clients_and_ends_at_its_detach` (`crates/api/tests/api.rs`), filed for main.
+>   Owed: a report of the network export's address (today the deployer's own plan: the probe plane's address, over
+>   TCP); and `slates export` over this verb, since it prints the loopback port beside the path, which a
+>   PersistentVolume must not name;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
@@ -4169,6 +4188,13 @@
 > the term its holder's write lease runs for (A-414), and A-554's keeper sleeps to the earliest taken back plus the
 > delay held at each pass, where it mirrored the client's old two-second reconnect budget (the wiring is Linux-only,
 > built by main). D-c is closed by these.
+> **Since A-570 (piece 5)** the pressure hold is sampled at its start and at the kernel's own memory-pressure reports
+> (macOS's dispatch source, Linux's pressure-stall trigger with its silence past a window as the stall's end, Windows'
+> memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
+> polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. NFSv4
+> purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
+> leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
+> re-arm.
 > Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
 > in the event-driven reaper series), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
@@ -18039,13 +18065,25 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   - **Siblings, opened below:** a dirty pre-takeover page judged fresh; an effect served before its publication; an
     outsider's base change during the gap; kernels before FUSE 7.44 keep renamed-away names; A-141's and the journal
     gather's unsliced rounds; a create's redundant entry invalidation.
-- **A dirty page from before a takeover is judged fresh (open, from A-158).** A restored mount's byte states start
-  fresh as of its start (A-156), so a dirty shared-map page the kernel held across the takeover is applied whole when
-  written back, including bytes a change the dead daemon never delivered had made stale. The takeover round's
-  invalidation launders such a page at once; the kernel would have written it back later anyway, so the outcome is the
-  same. The precise fix marks as stale, in adopted files' states, the ranges the last publications and the replayed
-  writes changed. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not
-  reproduced.
+- **A dirty page from before a takeover is judged fresh (the replayed writes closed 2026-11-19, A-567, goal 85 B8;
+  the last publications' changes open, from A-158).** A restored mount's byte states started fresh as of its start
+  (A-156), the head at its first turn, after the successor had replayed the dead daemon's logged writes (A-63), so a
+  dirty shared-map page the kernel held across the takeover was applied whole when written back, the replayed writes'
+  bytes with it. The takeover round's invalidation launders such a page at once. **Fixed for the replayed writes:** a
+  taken-over mount adopts each file it held open from before the successor's first journal record
+  (`coherence::TAKEN_OVER_FROM`, where A-231 places a held NFS connection's carried states), with every change since
+  applied (`coherence::taken_over`, for the restored opens and for each handle a request first names), so a replayed
+  write's bytes are stale until re-fetched and a write-back over them is judged by the volume's bytes: applied where
+  they equal it, refused `EIO` where one differs, never applied whole. A journal that no longer reaches back to the
+  successor's first record loses the file, whose write-backs are refused. Test, failing first:
+  `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`crates/bridge-fuse/src/coherence.rs`; red
+  `Some([])` where the write's bytes were due stale). **Its cost:** the write log names no writer, so a replayed write the mount's own
+  kernel made is taken as another path's, and a store through a shared map over those very bytes before a re-fetch is
+  refused once (`EIO` at the next `msync`/`fsync`, its page invalidated and re-fetched after); logging each write's
+  attachment and seeding the mount's own records from it would end that. **Still open:** a change before the last
+  publication whose invalidation the dead daemon never delivered is in no journal of the successor, so it is not
+  marked; carrying a FUSE mount's byte states in each publication, as A-231 carries a held NFS connection's, would end
+  it. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not reproduced.
 - **An effect served before its publication (from A-158) — fixed 2026-11-19 (A-573, B10 (a)) for every inode the
   successor holds.** A mutation is applied, then published before its reply. A mount that reads the new bytes in
   between, followed by the daemon dying before the publication, holds bytes the successor never had. If its kernel

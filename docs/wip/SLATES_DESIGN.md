@@ -1053,6 +1053,18 @@ Same code, zero modes.
 
 ### 4.2 Memory: arenas, slabs, handles, pages, RAM-only guarantees (D-8, D-12, D-13)
 
+> **Status (2026-11-19, A-570: the pressure hold is sampled at the host's own reports).** The control shard's sampler
+> (`crate::pressure`) samples the host's available memory and the daemon's resident memory at its start, which fixes
+> the baseline, and again at each report the kernel makes of a change in its memory pressure, never at a tick
+> (`slates_machine::memory_pressure`): macOS's dispatch memory-pressure source at every level, Linux's pressure-stall
+> trigger for any stall in the shortest window an unprivileged process may ask for (two seconds, psi.rst), and Windows'
+> low- and high-memory resource notifications. A stall's end is a report too: macOS reports a return to normal,
+> Windows its high-memory notification, and Linux's trigger, which reports stalls alone, by its silence past its own
+> window and one update interval (the kernel reports once a window while stalls go on). Between reports the hold stands
+> as last sampled. A kernel that offers no report (no PSI, or before unprivileged triggers) has the watch refused by
+> kind at the start, logged and counted (`pressure.watch_refused`, `pressure.watch_unsupported`), and nothing polls in
+> its place. Until A-570 the reap loop's tick sampled once a liveness window on every daemon.
+
 > **Correction (2026-09-20).** An explicit shard count is applied before deriving any
 > per-shard capacity or anchor geometry. The previous post-derivation override stranded
 > capacity when reducing the count and promised more than the host limit when increasing it.
@@ -2407,6 +2419,15 @@ Build order: the server side of RFC 9289 on the NFS edge, with its oracle; the n
 the token root; the KIND workload pod with an `nfs` PersistentVolume and `tlshd` in the node image, on the CI
 Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 
+> **Status (2026-11-19, A-521): the export is a verb of the library.** `Instance::export(volume, uid, &ExportOptions)`
+> and the seam's `export` attach the volume bound to the client's Unix identity (A-115), read-only or beneath a
+> directory as asked, and answer an `Exported`: the export's attachment, whose detach ends its capability, and the path
+> that capability authorizes, `/<name>@<attachment>.<token>`, which the client's mount names (a PersistentVolume's
+> `nfs.path`). One export per client, never one path shared. Until then the export was the command line's `slates
+> export` and the raw client's alone, so a host that drives slates through the library alone (kiln's Kubernetes engine,
+> its `docs/agentic.md` W10) could not serve a pod's volume. The network export's own address is the node's plan (the
+> probe plane's address, over TCP), which its deployer wrote; no report names it yet (owed, GAPS).
+
 > **Status (2026-09-30, A-48).** The base plane's witnesses, their disk homes, and the fingerprints behind
 > whiteouts and redirects are versioned by epoch like the tree and the inode table: a snapshot, and a
 > clone made from one, reads them as the snapshot froze them. A write overwrites a version no live
@@ -3129,8 +3150,9 @@ therefore one implementation shared by both versions.
     the next drop.
     - **Amended 2026-10-10: a purge is owed durably.** The obligation is journaled in the same transaction as the drop
       that makes it (`ClientChange::PurgeOwed`, `Op::NfsPurgeOwed`). It is settled only once every owner acknowledged
-      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and each shard's reap loop sends a
-      round (`nfs::purge_owed_here`) besides a compound's own.
+      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and the shard's reaper sends a round
+      (`nfs::purge_owed_here`) besides a compound's own: at once at a start that owes purges, and a retry window after
+      any access that leaves the table owing (A-570; until then the reap loop's tick sent one once a window).
     - Before, the obligation lived only in memory. A daemon death between a client's durable clear and every owner's
       acknowledgement left its opens, locks and delegations at the owners, with no shard left knowing the client and so
       no lease to expire them (`a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it`;
@@ -4953,6 +4975,14 @@ root-relative path as an explicit alternative; it does not report that the reque
 > instrumented CI case first fails at 5.01 s; 100 corrected native Linux runs and all nine ring cases pass, as do
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
+> **Status (2026-11-19, A-570: the pressure hold leaves the tick).** The pressure hold's sampler (`crate::pressure`, a
+> task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
+> them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
+> dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536),
+> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold and NFS purges (A-570): the NFSv4
+> table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands the reaper a round at once
+> at a start that owes purges and a retry window after any access that leaves it owing. Base hints are next.
 
 > **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
 > named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
@@ -9259,6 +9289,11 @@ it builds against the contract and adds to it rather than around it.
 > code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
 > `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
 > put in the OS's words only in its own numbering.
+> **`CONTRACT` = 50 (A-521):** a volume exported to one client is a verb of the contract: `Instance::export(volume,
+> uid, &ExportOptions)` and the seam's `export` answer an `Exported`, the export's attachment (its detach ends the
+> capability) and the path the capability authorizes, bound to the client's uid (A-115), its `Debug` showing the path
+> without its token. Until then §4.6's export was the command line's and the raw client's alone, and kiln, which
+> reaches slates only through this library, could not serve a pod's volume over its node's export.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -12459,6 +12494,14 @@ and export by landing).
 > node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
 > Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
 > (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
+>
+> **Status (2026-11-19, A-553).** Built: the Subversion index (`slates-svn`'s `index`, piece 4, item 2): node rows with
+> FSFS's node, copy and copy-root identities, predecessors and counts, texts, property lists and mergeinfo counts;
+> history and shape lists per path; revision rows; all computed from each revision's changed-path rows by FSFS's own
+> operations, every inconsistent record refused, typed, with nothing changed. Its oracle, a naive filesystem applying
+> FSFS's operations to whole trees, equals it on generated histories, and equals itself replayed in random drive
+> orders. Owed with the object store (§4.17.1 shared piece 3): the rows held as content tables with a mutable tail, and
+> the learned fold (item 12); with the server (piece 7): one large revision applied in slices under the shard's budget.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12507,18 +12550,34 @@ immutable sorted tables that are content plus a mutable tail, and every row is a
 their commit records (item 3), so replicas (A-273) and holders (§4.16 "Apply on holders") compute it and never receive
 it.
 - *Revisions:* per revision, its changed-path rows sorted by path, and its transaction's name.
-- *Nodes:* per path and created revision: kind; text identity (BLAKE3, the green's content) with the MD5 and SHA-1
-  clients check; size; property-list identity; predecessor and its count; copy source and copy root; the node's identity
-  (where it was born) and its copy identity, assigned by FSFS's rules (notes §5: a creation takes its parent's copy
-  identity, a copy gets a fresh one, a change made through a copied parent is a lazy copy with a fresh one), so the
-  three answers of `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the
-  node has `svn:mergeinfo`, with the count of such nodes beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
+- *Nodes:* per node-revision, by its created path and revision: kind; text identity (BLAKE3, the green's content) with
+  the MD5 and SHA-1 clients check; size; property-list identity; predecessor and its count; copy source and copy root;
+  the node's identity (where it was born) and its copy identity, assigned by FSFS's rules (notes §5; `structure`,
+  "Copy-IDs and copy roots"; `tree.c` `get_copy_inheritance`): a creation takes its parent's copy identity and copy
+  root, a copy gets a fresh copy identity and is its own copy root, a change through the node's own created path keeps
+  its copy identity, a change of a never-copied node through a copied directory (a lazy copy) takes that directory's,
+  and a change of a copied node through another path (a soft copy) takes a fresh one; so the three answers of
+  `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the node has
+  `svn:mergeinfo`, with the count of such nodes at and beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
 - *History:* per path, the revisions at which a node-revision was created there, deletions included. FSFS makes a new
-  node-revision of every directory above a changed node (notes §5, "bubble-up"), so a directory's list holds every
+  node-revision of every directory above a changed node (notes §5, "bubble-up"), and of the root in every revision,
+  even one that changes nothing (`transaction.c` `create_new_txn_noderev_from_rev`), so a directory's list holds every
   revision that changed anything beneath it. The created revision of a path at revision R, which the out-of-date test,
   `stat` and `svn:entry:committed-rev` all read, is one search in that list: its last entry at or before R, a deletion
-  meaning absent. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense
-  is its subtree's, which this list keeps.
+  meaning absent, unless a directory above the path was added, copied to, replaced or deleted after that entry (each
+  path keeps a list of those changes too). Then the latest such change decides: a deletion, or an addition without
+  history, leaves nothing at the path, and a copy sends the question to the same place beneath the copy's source, in the
+  source's revision. So a path beneath a branch answers its trunk node-revision until it changes on the branch, as FSFS
+  shares it. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense is its
+  subtree's, which this list keeps.
+- *How a revision's rows are applied:* in path order, parents first, against revision N - 1, each as FSFS applies the
+  editor call it records (the path's directories opened and made mutable from the root down, then the entry made,
+  copied, deleted or changed). That is what FSFS's commit leaves for every commit it accepts: `merge()` refuses a
+  directory both sides changed unless both kept its node and copy identities ("not a direct modification"), and points
+  its predecessor at the newer revision's (`svn_fs_fs__dag_update_ancestry`). FSFS makes nodes mutable in its drive's
+  order, and a stock client sends file texts last; the oracle replays every generated revision in random drive orders
+  and finds every identity, copy root and predecessor equal to path order's, the decisions where order could matter
+  among them (A-553).
 
 *3. A commit is a work, and its verdict is FSFS's commit rule.* (§4.17.1 "A push is a work" items 1, 2 and 5, made exact
 for Subversion.)
@@ -12832,7 +12891,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
    persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
-   revisions, histories, relations and mergeinfo counts.
+   revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
+   object store's, §4.17.1 shared piece 3).
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
    must give the same accept or conflict, and the same conflicting path.
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
@@ -36880,7 +36940,6 @@ Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-
   red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
   file and the name kept its number (`replaced` 1, so the path was reached).
 
-
 ### A-520, third piece — Rootless podman holds its tested profile on its own Linux host, so a host runs containers under it (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9; AUD-29-67; `CONTRACT` = 48)
 Applied in the same change to: §4.6 (A-9's OCI record: the profiles held), §4.12's contract log (`CONTRACT` = 48), GAPS
 (the library's entry), `docs/library.md` (the profiles that hold evidence; what is owed), `docs/wip/oci-handoff.md`
@@ -37860,3 +37919,226 @@ commit a part, in order of harm.
     none refused.
   - **Evidence.** On the Mac Studio, 2026-11-19: red first with the rule's lines taken out (`u64::MAX` against 4,104),
     green with them; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test).
+
+### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
+Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's
+contract log (`CONTRACT` = 50), GAPS (the library's entry; the runners-as-members entry, whose network export kiln's
+Kubernetes engine uses), `docs/library.md` (the seam's verbs, the serving list, what is owed), `crates/api/src/export.rs`
+(new: `ExportOptions`, `Exported` and its `Debug`, `Instance::export`, and their test), `crates/api/src/seam.rs` (the
+verb on `Volumes`), `crates/api/src/sim.rs` (the simulator's export, its record and token, and the tests),
+`crates/api/src/lib.rs` (`CONTRACT` = 50, the module and its re-exports) and `crates/api/tests/api.rs` (the conformance
+suite's stranger, and an export's lifetime over both).
+- **Why.** kiln reaches slates through this library alone (A-278), and its Kubernetes engine (kiln's `docs/agentic.md`
+  W10) runs each agent's pod on the agent's volume, which kubelet mounts as an `nfs` PersistentVolume from the network
+  export of the runner that holds it (§4.6 "Kubernetes publication without privilege"): one capability per pod, bound
+  to one Unix identity (A-115), ended at the pod's end. The export was the command line's `slates export` and the raw
+  client's `attach_bound_mount` alone.
+- **The verb.** `Instance::export(volume, uid, &ExportOptions { read_only, subtree })` reads the volume's name from its
+  raw status (a base the status could not read now does not stop it), attaches the bound host mount
+  (`AttachRequest::BoundHostMount`), and answers an `Exported`: the export's attachment and the path its capability
+  authorizes (`mount::export_path`). The uid is required: an export is to one client, and A-115's binding is what keeps
+  what one uid's kernel cached (a link's target) from every other user of the client's machine. Its refusals are the
+  daemon's, typed as the contract already types them (`NotFound` for the volume; a subtree that names nothing or no
+  directory; a volume another node owns; the caller's rights). An answer without a capability is a protocol fault
+  (`ProtocolFault::UnexpectedReply`), since the daemon mints one for every bound host mount (`capability_token`), and
+  never a path made up. `Exported`'s `Debug` shows the path without its token, a bearer secret on the network
+  export's path.
+- **Where it is served.** Nowhere new: the daemon's NFS listeners serve every capability it issued, the loopback one
+  and, on a fleet node with an operator authority (Unix), the network export over RPC-with-TLS on the probe plane's
+  address (`crates/server/src/deploy.rs`). That address is the deployer's own plan (kiln's listed base port; Slates' KIND
+  proof's `base_port`); no report names it, and the command line's `slates export` prints the loopback port beside the
+  path, which a PersistentVolume must not name: both owed (GAPS).
+- **The simulator.** An export is a record: an attachment of its own per client and the path the daemon would answer,
+  its token the attachment's id (unique to the export, and no secret, since nothing serves it). It takes the uid, the
+  intent and a subtree as given, since it holds no files to judge a subtree by (as for a stream's), and the export ends
+  at its detach or with its volume, never with a mount.
+- **Tests.** `crates/api/src/export.rs`: `an_export_is_the_path_its_capability_authorizes_and_never_shows_its_token`;
+  `crates/api/src/sim.rs`: `an_export_is_one_clients_capability_and_ends_at_its_detach` and
+  `an_export_the_daemon_would_refuse_is_refused_typed_and_holds_nothing`, written first (bda17c0: the library had no
+  export to ask). By use over a real daemon, filed for main: the conformance suite's stranger and
+  `expect_an_export_is_one_clients_and_ends_at_its_detach` (`crates/api/tests/api.rs`).
+- **Owed.** The daemon naming its network export's address in a report, so a host reads it rather than derives it from
+  its plan; the command line's `slates export` over this verb, printing the network export's port where the node has
+  one; kiln's side of W10 (its pods' PersistentVolumes, claims and reaper).
+
+### A-553 — The Subversion index: every node-revision with the identities FSFS gives it, computed from each revision's changed-path rows and held to a naive filesystem (2026-11-19, g292 for UI goal 91; §4.17.4 item 2 and piece 4; A-500, A-531, A-542)
+Applied in the same change to: §4.17.4 (a status block; item 2's copy-identity rules made FSFS's, every revision's
+root, what a path beneath a copy answers, how a revision's rows are applied; piece 4 marked built), GAPS (the §4.17.4
+entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `crates/svn/src/lib.rs`; and
+`crates/merge/src/engine/node_exclusive_tests.rs` (`is_multiple_of`, main's clippy finding on A-542's test).
+- **What was there.** Item 2 named the index's rows and gave FSFS's copy-identity rules loosely: "a change made through
+  a copied parent is a lazy copy with a fresh one". FSFS's lazy copy takes the copied directory's copy identity; only a
+  soft copy, a copied node changed through another path, takes a fresh one (`structure`, "Copy-IDs and copy roots").
+  Its created-revision search did not say what a path beneath a copy answers, and nothing computed any of it.
+- **The decision.** The rows are FSFS's own operations, read in its code (1.14.x at `d434dc14`), applied to each
+  revision's changed-path rows: every revision a new root, even an empty one (`transaction.c`
+  `create_new_txn_noderev_from_rev`); each row as the editor call it records, its directories opened from the root
+  with each one's copy inheritance decided against its parent as it stands (`tree.c` `open_path`,
+  `get_copy_inheritance`), then cloned from the root down (`make_path_mutable`, `dag.c` `svn_fs_fs__dag_clone_child`:
+  the predecessor and its count, the copy root moving to the parent's unless the node is its copy root's node), then
+  the entry made (`make_entry`), copied (`svn_fs_fs__dag_copy`), deleted or changed. Rows go in path order against
+  revision N - 1: `merge()` refuses a directory both sides changed unless both kept its node and copy identities, and
+  points its predecessor at the newer revision's (`svn_fs_fs__dag_update_ancestry`), so for every commit FSFS accepts
+  the identities made against N - 1 are FSFS's. Reading: a path's own last history entry decides unless a directory
+  above it was added, copied to, replaced or deleted after it (a shape list per path), the latest such change deciding
+  and a copy sending the question to the same place beneath its source. A copy costs one row, as in FSFS.
+- **Refusals,** typed with the Subversion error each answers, a refused record changing nothing: a path out of canonical
+  form (`E160005`); a revision past the youngest, or a copy source not before its copy (`E160006`); a path absent, its
+  own or a directory's, a question's or a copy source's (`E160013`); an unknown node-revision (`E160014`); an addition
+  where a node stands (`E160020`); a directory that is a file (`E160016`); a text on a directory (`E160017`); the root
+  added, deleted or replaced (`E160021`); and as `E160004`, every record no FSFS commit writes: a kind that differs from
+  its node or copy source, a copy onto its own node-revision (FSFS records nothing for it), two rows for one path, a
+  row whose fields contradict each other (`svn:mergeinfo` gained or lost without the mergeinfo flag among them), a
+  transaction name outside `svn_fs.h`'s letters, digits, `-` and `.`. The room is the caller's: the most entries (node
+  rows and deletions) the index may hold, which bound every other table linearly (`E160000` past it).
+- **Tests** (`crates/svn/src/index/tests.rs`). Nineteen cases, each citing the FSFS line it holds the index to: revision
+  0; every revision's root; bubble-up; a path beneath a copy until it changes there; each of `structure`'s copy-identity
+  rules (creation, copy, lazy copy, soft copy with its copy root kept); mergeinfo counts through a set, a copy, a
+  deletion, a replacement and a removal; history lists with deletions and a replacement; a deleted directory and a copy
+  over it; a copy into its own subtree, which FSFS allows; and every refusal, each with its code and the index
+  unchanged. The oracle: generated histories (additions, copies of any earlier revision's paths into any place, their
+  own subtrees among them, deletions, replacements, text and property changes, `svn:mergeinfo` set and dropped, empty
+  revisions) replayed into the index and into a naive filesystem that keeps every revision's whole tree and applies
+  FSFS's operations to it literally; at every path of every revision the same presence, created path and revision,
+  predecessor and count, copy source and copy root, text, properties and mergeinfo count (the naive one counted by
+  walking the tree), with node-revisions, node identities and copy identities paired one to one; the same history at
+  every path; the same relation for every pair in a sample of places. The naive filesystem replaying each revision in
+  random drive orders, and in its generation order, must equal its own replay in path order. A census, printed every
+  run, must show each rule met, the drive orders that differ from path order and the decisions where order could
+  matter (a child compared against a parent the same transaction already cloned with another copy identity) among them.
+- **Evidence** (the Mac Studio, kiln, 2026-11-19, debug builds of fresh clones of the branch). Failing first (02:03
+  UTC, load 29): with `append` refusing every record, `cargo test --locked -p slates-svn --lib index::` failed 19 of 20,
+  the one pass revision 0's, which needs no record. Green (02:31 UTC, load 23, the branch merged with main): the
+  crate's whole `--lib` suite 53 of 53 in 0.24 s, 20 of them the index's, and `cargo test --locked -p slates-merge --lib
+  node_exclusive` 8 of 8 with `is_multiple_of`. The oracle's census over its generated histories (proptest's default
+  count): 1,223 clones that kept their copy identity, 48 lazy copies and 70 soft copies; 786 copies, 607 of them into
+  their source's own subtree; 514 deletions and 259 replacements; 221 empty revisions; 422 answers reached beneath a
+  copy; 1,882 directories counting mergeinfo beneath them; 32,362 unrelated, 5,242 unchanged and 21,620
+  common-ancestor relations; 495 revisions replayed in a drive order other than path order, and 12 inheritance
+  decisions where that order could have mattered, every identity equal. Each of three rules broken in a copy of the
+  index failed its own case and the oracle, 18 of 20 passing: a soft copy keeping its copy identity, a copy adding no
+  mergeinfo to the directories above it, a copy not counting its source as a predecessor. Clippy, `xtask check` and
+  the cross-target lint are main's (the run-request queue).
+- **Rejected.** Keeping each revision's whole tree, as the naive filesystem does: a revision would cost the tree's size;
+  it is the oracle only. Applying a revision against its transaction's own base: the record would have to carry it,
+  and for every commit FSFS accepts it gives the identities N - 1 gives. Giving each path beneath a copy its own rows:
+  a copy would cost its subtree's size, where FSFS's costs one node-revision; the shape list answers beneath it in one
+  step a copy.
+- **Not here.** The rows as content tables with a mutable tail and the learned fold (§4.17.4 item 12) are the object
+  store's (§4.17.1 shared piece 3); one large revision applied in slices under the shard's budget is the server's
+  (piece 7); the commit rule over these rows is piece 5. Opening a row's path looks each of its directories up beneath
+  the ones above it, so a row costs lookups in the square of its depth; a large import may want the revision's opened
+  directories kept between its rows. Nothing here is measured yet (main's, with the server's load).
+
+### A-570 — The pressure hold is sampled at the host's own memory-pressure reports, off the reap loop's tick (2026-11-19, goal 86, g255; the event-driven reaper's piece 5, job 1; §4.2, §4.7; A-336, A-554)
+
+- **What was there.** The reap loop's tick sampled the host's available memory and the daemon's resident memory on the
+  control shard once a liveness window (`daemon::refresh_pressure_hold`), whatever the host did, and every daemon woke
+  for it.
+- **The signal, chosen from principle.** The kernel's own classification of its memory pressure, delivered when it
+  changes, is the signal: the kernel knows its reclaim state, and a polled threshold on available bytes would be a guess
+  of ours (R3). So the sampler samples at the host's report (`slates_machine::memory_pressure::Events`):
+  - macOS: libdispatch's `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` at every level (normal, warning, critical), the
+    documented source "that monitors the system for changes in the memory pressure condition" [B: Apple Developer
+    Documentation, dispatch/source.h]. XNU tells its listeners one process a pass until none is left
+    (`memorystatus_update_vm_pressure`, `vm_pressure_select_optimal_candidate_to_notify` [C: XNU xnu-11215.1.10,
+    `bsd/kern/kern_memorystatus_notify.c`]), so each listener hears each change. kqueue's `EVFILT_VM`
+    (`NOTE_VM_PRESSURE`) was the other candidate; XNU's pressure notifier in that file names only the dispatch
+    listeners, so it was not taken. The handler runs on a dispatch thread and writes a byte to a pipe; the sampler
+    awaits the pipe readable through its shard.
+  - Linux: a pressure-stall trigger on `/proc/pressure/memory` for any stall (a microsecond, the kernel's unit) in the
+    shortest window an unprivileged process may ask for, two seconds, signalled by `POLLPRI` and "rate-limited to one
+    per tracking window" [B: kernel `Documentation/accounting/psi.rst`]. The runtime awaits readability alone, so the
+    trigger sits in an epoll set of its own, readable while the trigger has fired (epoll(7)): no runtime change. The
+    trigger is written to the kernel's interface file, not a host path, so its open carries a reasoned
+    `structural: allow`, and xtask's table of host-path sites says slates-machine writes that one file.
+  - Windows: the low- and high-memory resource notifications (`CreateMemoryResourceNotification`), each signalled
+    while its condition holds [B: Microsoft Learn]: the sampler awaits the one that names the next change through
+    `slates_rt::handle_wait`, so neither is awaited while signalled and nothing spins.
+- **A stall's end is a report.** macOS's source reports a return to normal and Windows' high-memory notification the
+  recovery. Linux's trigger reports stalls alone, "rate-limited to one per tracking window", its update interval a
+  tenth of the window (`UPDATES_PER_WINDOW` in `kernel/sched/psi.c`): so after a report, a window and an update interval
+  with no report is the stall's end in the kernel's own terms, and the sampler samples then
+  (`Events::stall_ended_after_ns`). The hold is let go by that sample as memory comes back. Between reports the hold
+  stands as last sampled, so it follows the kernel's account of its pressure, not our reading of the bytes between.
+- **A kernel that offers no report** (a Linux without PSI, or one before unprivileged triggers in 6.5; another
+  platform) has its watch refused by kind at the start: logged, and counted in the shard's status
+  (`pressure.watch_refused`, `pressure.watch_unsupported`); nothing polls in its place, and the hold stands as the
+  start's sample left it. A first draft of this piece took the host's measured stall (A-336's reading) at the control
+  shard's heartbeat on such a host, and sampled again a retry window on while a hold was held: both were a second path
+  (§2, item 7), a poll in the event's place, and were withdrawn before landing at main's review.
+- **When it samples.** At its start, which fixes the baseline; at each report, a stall's end included. With no report it
+  never wakes.
+- **A test's reading is a report.** `Daemon::inject_available_memory` and `inject_resident_memory` ask the sampler, as a
+  kernel report would; the first such reading replaces the source the baseline was taken from, so the baseline is
+  taken again from it (the recovery suite's two pressure tests inject after the start and wait for that baseline).
+- **Cost.** One task a shard (`LOOP_TASKS_PER_SHARD` 7 → 8; it ends at once off the control shard), and slates-machine's
+  unsafe budget 86 → 97 (libdispatch's source on macOS, the notifications on Windows; the file names each site).
+- **Tests.** `crates/server/src/pressure.rs`: `a_reported_fall_in_available_memory_is_held_back_without_a_tick` (a
+  one-shard daemon's readings pinned, the baseline fixed, then available falls by an eighth of the capacity: held back
+  within half a window); `crates/machine/src/memory_pressure.rs`:
+  `the_hosts_memory_pressure_reports_open_where_the_platform_offers_them`.
+- **Filed for main's build.** The Linux and Windows arms (`memory_pressure.rs`'s two platform modules and
+  `pressure::report_or_asked`'s Windows arm) were written on macOS and never compiled by g255.
+
+- **The NFS purge (job 2).** What a shard's NFSv4 table owes its owners (a dropped client's state, a destroyed
+  session's records, journaled since 2026-10-10) goes out at its own deadline, no longer at the tick: each access to
+  the table closes by noting whether it owes anything (`nfs::note_purges`, in `nfs_state::record_clients`), which arms
+  a round a retry window on while it does and clears the deadline once it does not; a start whose partition owes purges
+  arms one at once (`nfs::arm_purges_at_start`). The keeper hands the round to the reaper (`nfs::owe_purge_round`),
+  which awaits the owners. A client's own compound still sends its purges inline. The tick sent what was owed at its
+  looks, whatever the phase: a purge refused just before a look went again at once, one refused just after a look
+  waited a whole window, and every shard woke for it. Test: `crates/server/src/nfs.rs`
+  `a_refused_purge_goes_again_a_window_after_its_round` (a one-shard daemon past the tick's first look, its owners
+  refusing purges: a dropped client's purge refused, then sent again no sooner than a window after that round and
+  within half a window more).
+
+- **Evidence.** The Mac Studio (kiln d1323898, 2026-11-19 18:29 local, load 8.9, debug). Red first on main 8cb6bef with
+  the two server tests alone: the 4 GiB fall was not held back within half a window (`Ok(Ok(0))`, the tick's sample
+  not yet taken), and the refused purge went again 517 ms after its round, at the tick's next look. Green on 878895a:
+  `cargo fmt --check` clean; `slates-machine --lib memory_pressure` 1 of 1 (the dispatch source opens and drops on
+  macOS); `slates-server --lib -- pressure:: purge_round_tests nfs_state:: deadlines:: reap:: remote_attach:: landing::
+  config::` 39 of 39, the fall held back 1.9 ms after it and the refused purge sent again 1.0013 s after its round.
+- **Left for the next piece, in order.** Base hints with their delegation drain, the idle seal, the huge-page re-arm;
+  then the reap loop and its tick are deleted, and §4.7's status says so.
+
+Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper series' line), `unsafe-budget.toml`,
+`xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
+`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.
+
+### A-567 — A mount taken over from a daemon that died adopts each file its kernel held from before the successor's first journal record, so a replayed write's bytes are stale, never taken as fresh (2026-11-19, goal 85 B8 via g083; §4.6 "Cache posture", the dirty-page write-back rule; A-61, A-63, A-147, A-152, A-158, A-192, A-231)
+
+Applied in the same change to: GAPS ("A dirty page from before a takeover is judged fresh": the replayed writes closed,
+the last publications' changes left open), `crates/bridge-fuse/src/coherence.rs` (`TAKEN_OVER_FROM`, `TakenOver`,
+`taken_over`, `changes_since`; the test), `crates/bridge-fuse/src/channel.rs` (`adopt_restored`, `adopt_unseen_handle`
+and `pending_changes` through them), and the bug record
+`docs/bugs/2026-11-19-a-taken-over-mount-took-a-replayed-writes-bytes-as-fresh.md`.
+
+- **What was wrong.** A restored mount tracked each file its kernel held open before the takeover as fresh as of its own
+  start, the journal's head at its first turn. The successor replays the dead daemon's logged writes (A-63) before that
+  turn, so they are records before the head, and no adoption saw them: a dirty shared-map page the kernel held across
+  the takeover was judged fresh and applied whole when written back, the replayed write's bytes with it.
+- **The rule.** A taken-over mount adopts such a file from before the successor's first journal record
+  (`coherence::TAKEN_OVER_FROM`, the point A-231 places a held NFS connection's carried states at), with every change
+  the journal holds since applied in order, each the mount's own where its own records took it (`coherence::taken_over`,
+  for the restored opens at the first turn and for each handle a request first names). A replayed write's bytes are
+  stale until the kernel re-fetches them, and a write-back over them is judged by the volume's bytes
+  (`coherence::judge_writeback`): applied where they equal it, refused `EIO` where one differs, never applied whole. A
+  journal that no longer reaches back to the successor's first record loses the file, and its write-backs are refused,
+  as an untracked file's were. The rule is cfg-free, so it is tested on every host; the Linux channel calls it.
+- **What it costs.** The write log names no writer, so a replayed write the mount's own kernel made is taken as another
+  path's: a store through a shared map over exactly those bytes, before the kernel re-fetches them, is refused once
+  (`EIO` at the next `msync` or `fsync`), and the refused range is invalidated, so the page is re-fetched. Logging each
+  write's attachment and seeding the mount's own records from the replay would end that.
+- **Left open.** A change made before the last publication whose invalidation the dead daemon never delivered is in no
+  journal of the successor, so it is not marked. Carrying a FUSE mount's byte states in each publication, as A-231
+  carries a held NFS connection's, would end it.
+- **Test.** `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`crates/bridge-fuse/src/coherence.rs`):
+  the bytes of a file written before a taken-over mount's start must be stale in the adopted file's states and the
+  rest fresh. Failing first on the Mac Studio (debug, r138, 2026-11-19): the rule moved unchanged into
+  `coherence::taken_over` left them fresh (`Some([])`, the write then at bytes 16..48). The fix's first run (r258) then
+  failed on the test's own premise: a write past the end of an empty file is recorded as an extension from its old end,
+  0..48, so the test now writes bytes 0..32 and expects exactly them stale. Green on the Mac Studio (r284):
+  `cargo test --locked -p slates-bridge-fuse --lib coherence` 14 of 14 and the library whole 36 of 36; rustfmt changes
+  nothing. The Linux channel's glue is not compiled on macOS: its build, its unit tests and the takeover tests are
+  main's (Linux).

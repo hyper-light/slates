@@ -491,7 +491,8 @@ mod structural {
   const HOST_PATH_ALLOWED: &[(&str, &str)] = &[
     (
       "slates-machine",
-      "reads the kernel's pseudo-files (/proc, /sys) as queries; never writes",
+      "reads the kernel's pseudo-files (/proc, /sys) as queries, and writes one: a pressure-stall trigger to \
+       /proc/pressure/memory, the kernel's own interface (A-570, psi.rst); never a host path",
     ),
     (
       "slates-base",
