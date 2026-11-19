@@ -3769,6 +3769,16 @@
 > hang-up, deadlines on a per-shard wheel, hints by descriptor readiness, retries woken by the awaited party, idle seal
 > and purge by aging buckets, pressure at watermark crossings, the huge-page re-arm on a timer), then the loop and its
 > tick are deleted with no fallback tick (owed, a series of its own).
+> **Since A-475 (the series' piece 1) a dead client is reclaimed at its hang-up**: each seat's watch awaits its control
+> socket's end of stream (Linux) or its process's exit (macOS, Windows, the latter through the new
+> `slates_rt::handle_wait`) through the shard's driver, registering and then testing once, and the shard's reaper
+> retires the dead a batch at a time, each owner's call waited by that owner's own window (`reap::owner_window_ns`);
+> the silence filter, `peer_gone` and the client's last-seen time are gone. Still on the tick, each for a later piece:
+> staging and status-page expiry (moved there from the sweep), leases, lapsed CLI attachments, destroys, grants, the
+> owed audit, departed hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their
+> delegation recalls, the idle seal and the huge-page re-arm. Owed beside it: a claim's pid is the client's word, so a
+> pid reused between a client's death and its watch is watched instead (Windows could carry the creation time, as the
+> daemon's header does, A-447); and the SDKs' heartbeat slot feeds nothing now.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
@@ -7950,7 +7960,8 @@ not map the segment on its shards and exited, which the anchor restarted and the
 crash loop, exercising that path for real; (4) `detach` found a holder's other attachments by
 encoding the whole partition (`to_snapshot`), replaced by `attachments_of`.
 
-The dead-client reclaim landed 2026-09-05 (the daemon's side of §4.7's failure matrix, T-2.3):
+The dead-client reclaim landed 2026-09-05 (the daemon's side of §4.7's failure matrix, T-2.3; since 2026-11-18, A-475,
+the sweep below is gone: each client's watch reports its hang-up and the shard's reaper retires it then):
 the rendezvous carries the peer's process id (`SO_PEERCRED` on Linux; the claim slot's pid
 elsewhere); every shard runs a sweep task at the liveness cadence (`reap_loop`, the same
 budget the anchor allows the daemon's heartbeat) that expires leases by the wheel with nobody

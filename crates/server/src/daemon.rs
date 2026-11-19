@@ -621,7 +621,7 @@ pub struct ReplicaAccount {
   pub hold: u64,
 }
 
-/// Clients found dead and reclaimed (a health signal; T-2.3).
+/// Clients found dead and reclaimed: retirements the reaper finished after their hang-up (a health signal; T-2.3, A-475).
 pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The loopback port the NFS transport serves on (§4.6), 0 until the listener is bound. Published as
 /// a process-global word (like the health signals) so a verb handler on any shard can report it to a
@@ -4587,6 +4587,8 @@ async fn init_shard(
     refusals: std::collections::BTreeMap::new(),
     deferred: Vec::new(),
     server_task: None,
+    dead_clients: std::collections::VecDeque::new(),
+    reaper_task: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
@@ -4813,6 +4815,9 @@ async fn init_shard(
   let _ = futures::detach(serve);
   let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reap);
+  // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
+  let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(reaper);
   Ok(slices.finish())
 }
 
@@ -4860,10 +4865,11 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same
-/// budget the anchor allows the daemon's own heartbeat, so a peer silent that long is asked
-/// about (§4.7 "Failure matrix"). Derived: the cadence is the budget; a client is asked about
-/// once silent for the budget, so a death is seen within two budgets at most.
+/// The shard's tick for the deadlines and the cold work it still owns, at the liveness cadence: expired leases, lapsed
+/// CLI attachments, destroys and grants, the audit owed, departed hosts' attachments, the pressure hold, base hints and
+/// the idle seal. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's
+/// reaper retires it then (`crate::reap`). The jobs left here leave a piece at a time for the events or deadlines that
+/// own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4874,6 +4880,14 @@ async fn reap_loop() {
   loop {
     pace(cadence).await;
     state::with_state(|s| {
+      // Abandoned staging buffers and expired status pages, a lease after their last use (`crate::staging`,
+      // `crate::status_pages`): deadlines this tick keeps until the deadline wheel takes them (A-475 moved them here
+      // from the dead-client sweep).
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+      s.staging.expire(now, &mut s.store.metadata);
+      for (_, client) in s.clients.iter_mut_all() {
+        client.status_pages.expire(now, &mut s.store.metadata);
+      }
       let _ = verbs::expire_leases(s);
       // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
       let _ = verbs::expire_lapsed_attachments(s);
@@ -4888,13 +4902,9 @@ async fn reap_loop() {
     });
     // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
     crate::remote_attach::sweep_departed().await;
-    let reaped = crate::reap::sweep(cadence).await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]
     let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
-    if reaped > 0 {
-      CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
-    }
     refresh_pressure_hold().await;
 
     crate::nfs::purge_owed_here().await;
@@ -6209,15 +6219,27 @@ async fn control_loop(
             // The server task may be idle with its parked flags set on the clients it knew;
             // a wake makes it mark the new client too before it idles again.
             let server = state::with_state(|s| {
-              let last_seen_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+              // Its hang-up is watched from its seat on (A-475). A client whose hang-up cannot be watched is not seated,
+              // since nothing would reclaim it: its control closes with this task, which its client reads as the daemon
+              // gone, and the admission gives its id back.
+              let hangup = match crate::hangup::Hangup::of_client(control.as_ref(), pid) {
+                Ok(hangup) => hangup,
+                Err(refusal) => {
+                  s.count(crate::reap::UNWATCHABLE, 1);
+                  slates_machine::log_line!(
+                    "slates-server: client {client_id} is not seated: its hang-up cannot be watched ({refusal})"
+                  );
+                  return None;
+                }
+              };
               match s.clients.insert(ClientSlot {
                 status_pages: crate::status_pages::StatusPages::default(),
                 end,
                 principal,
                 client_id,
                 pid,
-                last_seen_ns,
                 retiring: false,
+                watch: None,
                 proven: false,
                 control,
                 revoked: false,
@@ -6227,7 +6249,11 @@ async fn control_loop(
                 read_ahead_pending: 0,
                 remote_volumes: Vec::new(),
               }) {
-                Ok(_) => admission.seat(),
+                Ok(seat) => {
+                  if crate::reap::start_watch(s, seat, client_id, hangup) {
+                    admission.seat();
+                  }
+                }
                 Err(e) => {
                   slates_machine::log_line!(
                     "slates-server: client {client_id} refused by the shard's table: {e}"

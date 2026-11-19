@@ -4863,6 +4863,22 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-18, A-475: a dead client is reclaimed at its hang-up).** The daemon no longer finds a dead client by
+> a poll. Each seated client has a watch, a task of its shard that awaits the client's hang-up through the shard's
+> driver: on Linux its control socket's end of stream (`EPOLLIN`, raised at the peer's close with `EPOLLRDHUP` and
+> `EPOLLHUP`); on macOS its process's exit (`EVFILT_PROC`, `NOTE_EXIT`, on a kqueue the shard's kqueue awaits); on
+> Windows its process handle, waited on by the system thread pool and posted to the shard's completion port
+> (`slates_rt::handle_wait`). The watch registers, then tests once, so a client dead before the registration is caught
+> there; it holds a descriptor of its own, which its wait borrows, so the wait is gone before that descriptor closes.
+> Its report marks the client retiring (an unproven slot is ended at once) and wakes the shard's reaper, which retires
+> the dead a batch at a time and idles while none is owed; each owner's cleanup call waits in that owner's own time by
+> its own window (A-455's), where it was the reap cadence. A client that writes on its control socket, which no client
+> does after its opening, is ended as a hang-up is. Until now every shard swept each liveness budget and asked every
+> client silent for a budget whether its peer was gone, so a client killed with `SIGKILL` kept its seat, attachments and
+> id for one to two budgets. The 2026-09-05 status below describes that sweep, now gone; the staging and status-page
+> expiry it also ran stays on the reap loop's tick until the deadline wheel takes it. Code: `crates/server/src/hangup.rs`,
+> `crates/server/src/reap.rs`.
+
 > **Status (2026-11-06, A-230).** A CLI attachment (`slates attach`) is not the client's to take with it. It holds a
 > term, the failover SLO as the write lease's, renewed by each verb that names it. It ends at the lapse with its lease,
 > and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below. Since
@@ -5060,9 +5076,10 @@ client has activity within the
 measured idle window, then park in the driver; a parked shard is woken by the driver kick the
 client sends through the control fd.
 
-**Failure matrix.** Client crash: the daemon detects the dead peer (credential socket closes /
-slot heartbeat lapse) and reclaims the region and the client's leases after expiry (Masked for
-others, Degraded for that client). Daemon crash: regions survive in the anchor; clients observe a
+**Failure matrix.** Client crash: the daemon sees the hang-up when it happens (the control socket's
+end of stream on Linux, the process's exit on macOS and Windows, each awaited through the shard's
+driver; A-475), retires the client's attachments, region and id at once, and lets its leases expire
+by their terms (Masked for others, Degraded for that client). Daemon crash: regions survive in the anchor; clients observe a
 stalled reply and the control channel reset, reconnect, and resend with the same request ids
 (exactly-once by completion records). Ring full: the client blocks on the ring (credit), never
 drops.
@@ -32365,3 +32382,54 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-475 — A dead client is reclaimed at its hang-up: its control socket's end of stream or its process's exit, awaited through the shard's driver, never a silence-and-peer poll (2026-11-18, built for goal g255; the event-driven reaper's piece 1; §4.7 "Failure matrix"; A-28, A-149, A-432, A-455, A-470)
+
+- **What was there.** Every shard swept at the liveness cadence (`reap_loop`, a second) and asked each client silent for
+  a liveness budget whether its peer was gone (`peer::peer_gone`: a peek at the control socket on Linux, `kill(pid, 0)`
+  on macOS, a zero-timeout wait on the process handle on Windows). A client killed with `SIGKILL` kept its seat, its
+  attachments and its id for one to two budgets, every shard woke each second to ask, and a client that wrote one byte
+  on its control socket and then died was never reaped, since the peek took the waiting byte for a live peer.
+- **The rule.** A client's death is an event. At its admission each client gets a watch (`reap::watch`), a task of its
+  shard held by its seat (`ClientSlot::watch`), that awaits its hang-up through the shard's driver (`crate::hangup`):
+  - Linux: the control socket's end of stream, `EPOLLIN` ("The associated file is available for read(2) operations"),
+    which a stream socket raises at its peer's close with `EPOLLRDHUP` ("Stream socket peer closed connection") and
+    `EPOLLHUP`, which "epoll_wait(2) will always wait for" [B: epoll_ctl(2)]; a peek then tells the close from a byte;
+  - macOS: the process's exit, `EVFILT_PROC` with `NOTE_EXIT` ("The process has exited") on the watch's own kqueue
+    (`slates_ipc::exit_watch`) [B: kqueue(2)], which the shard's kqueue awaits readable;
+  - Windows: the process handle, opened for `SYNCHRONIZE` and awaited by the system thread pool
+    (`RegisterWaitForSingleObject`, `WT_EXECUTEONLYONCE`, the callback on the wait thread), whose callback posts the
+    task's word to the shard's completion port (`slates_rt::handle_wait`) [B: Microsoft Learn,
+    "RegisterWaitForSingleObject function", "UnregisterWaitEx function"]. The runtime had no handle wait to reuse: its
+    port carried only kicks, no-ops, socket polls and pipe operations.
+
+  Each wait registers, then tests once (a peek, the exit watch read with a zero timeout, the handle asked with a zero
+  timeout), so a client dead before its watch registered is caught at the registration. The watch's report marks the
+  client retiring, which closes admission from its ring; drops the forwards it left waiting for room; ends an unproven
+  slot at once (`reap::end_unproven`); and queues the rest for the shard's reaper (`reap::reaper`), one task a shard
+  that retires the dead `batch` at a time with its turn given back between batches, and idles while none is owed. A
+  retirement an owner deferred is tried again a window later (the reaper shard's own, A-455) or at the next report. The
+  owner's cleanup calls (`remove_on_owners`, `remote_attach::reap_at_owners`) wait in that owner's own time by its own
+  window (`reap::owner_window_ns`, A-455's rule over the overrun its registry pulse reports), where they waited the reap
+  cadence. A client that writes on its control socket, which no client does after its opening, is ended as a hang-up
+  is, counted `client.control_broken`.
+- **Cancel before close.** Each watch holds a descriptor of its own (Linux a duplicate of the control socket, macOS its
+  exit kqueue, Windows its process handle) and its wait borrows it, so the wait is dropped before the descriptor
+  closes, whether the watch ends at the hang-up or is cancelled by a seat that ends first (the session gate's
+  `end_unproven`). On Windows the drop unregisters the wait with `UnregisterWaitEx(wait, INVALID_HANDLE_VALUE)`, which
+  "waits for all callback functions to complete before returning", so the handle never closes under a pending wait
+  ("If this handle is closed while the wait is still pending, the function's behavior is undefined"). On Linux a
+  cancelled watch's kernel registration goes with the socket's file, once the seat's own descriptor closes in the same
+  turn (epoll(7) A6). A client whose hang-up cannot be watched (no descriptor, no task) is not seated: nothing would
+  reclaim it (`client.unwatchable`); a watch whose wait the shard refuses ends its client as a hang-up does
+  (`client.watch_refused`).
+- **Bounds.** One watch and one descriptor a seat (`clients_per_shard`); the reaper's queue holds a seat once, at its
+  report. The shard's task bound counts both (`TASKS_PER_CLIENT` 2 → 3, `LOOP_TASKS_PER_SHARD` 5 → 6). The client's
+  last-seen time, which only the sweep read, is gone; a heartbeat slot is still taken and answered by nothing.
+- **Left on the reap loop's tick, each owed to the reaper series' later pieces (GAPS):** the expiry of abandoned
+  staging buffers and status pages (moved there from the sweep; the deadline wheel's), leases, lapsed CLI attachments,
+  destroys, grants, the owed audit, departed hosts' attachments, the held copies' reclaim, the pressure hold, NFS
+  purges, base hints and delegation recalls, the idle seal and the huge-page re-arm.
+- **Owed.** The claim's pid is the client's own word on Windows and is not bound to its process's creation, so a client
+  that died before its admission could leave a watch on a reused pid; the claim could carry its creation time as the
+  daemon's header does (A-447). The SDKs' heartbeat slot no longer feeds liveness and could stop being sent.

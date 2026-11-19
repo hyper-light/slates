@@ -15256,20 +15256,19 @@ fn session_proven(state: &mut ShardState, handle: Handle<ClientSlot>) -> bool {
   proven
 }
 
-/// What a taken slot asks before it is served: the client is seen; a cancel clears its status pages; a heartbeat or a
-/// cancel is done with; any other request is served if it passes the gates (`gate`).
+/// What a taken slot asks before it is served: a cancel clears its status pages; a heartbeat or a cancel is done with;
+/// any other request is served if it passes the gates (`gate`). A client's life is its hang-up's watch (A-475), so no
+/// slot it writes is read for it.
 fn to_serve(
   state: &mut ShardState,
   index: u32,
   handle: Handle<ClientSlot>,
   request: &Request,
-  now: u64,
 ) -> bool {
-  if let Ok(client) = state.clients.get_mut(handle) {
-    client.last_seen_ns = now;
-    if request.kind == SlotKind::Cancel {
-      client.status_pages.clear(&mut state.store.metadata);
-    }
+  if request.kind == SlotKind::Cancel
+    && let Ok(client) = state.clients.get_mut(handle)
+  {
+    client.status_pages.clear(&mut state.store.metadata);
   }
   if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
     return false;
@@ -15296,7 +15295,7 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     };
     any = true;
     // A slot the gate ended is gone, and the next take finds it so.
-    if !to_serve(state, index, handle, &request, now) {
+    if !to_serve(state, index, handle, &request) {
       continue;
     }
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client

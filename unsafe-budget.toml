@@ -381,7 +381,13 @@ slates-mem = 68
 #   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
 #   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
 #   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
-slates-rt = 102
+# 2026-11-18 (+4, A-475, `handle_wait.rs`, compiled only for Windows): a client's process handle awaited through the shard,
+#   which the completion port alone cannot hear: the wait registered with the thread pool (`RegisterWaitForSingleObject`,
+#   1), unregistered at the future's drop with every callback finished (`UnregisterWaitEx(INVALID_HANDLE_VALUE)`, 1), the
+#   handle asked with a zero timeout for the register-then-test and each wake's attribution (`WaitForSingleObject`, 1),
+#   and the callback's read of the context its registration boxed (1). The callback's post shares the kick's one
+#   `PostQueuedCompletionStatus` block (`iocp::post`, 0). None has a safe wrapper.
+slates-rt = 106
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
@@ -497,7 +503,9 @@ slates-ipc = 147
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 # 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
-slates-server = 8
+# 2026-11-18 (-3, A-475): the Windows liveness probe of a client's process (`peer.rs`'s open, zero-timeout wait and close)
+#   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
+slates-server = 5
 slates-client = 0
 slates-api = 5
 slates-cli = 2

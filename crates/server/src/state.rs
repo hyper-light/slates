@@ -30,13 +30,13 @@ pub struct ClientSlot {
   pub principal: Principal,
   /// The client id.
   pub client_id: u32,
-  /// The client's process id (the liveness probe's input where no socket closes).
+  /// The client's process id (the hang-up watch's input where no control socket closes: macOS, Windows; A-475).
   pub pid: u32,
-  /// When the client last wrote a slot (any kind); a client silent past the liveness budget
-  /// is asked about.
-  pub last_seen_ns: u64,
   /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
   pub(crate) retiring: bool,
+  /// The watch awaiting this client's hang-up (A-475, `crate::reap::watch`): set at admission, cleared at its report,
+  /// and cancelled by a seat that ends first (`crate::reap::end_unproven`).
+  pub(crate) watch: Option<slates_rt::TaskId>,
   /// Set once the client has proven its id with its session key (`crate::session_key`), checked before its first
   /// request is served. A slot never proven is ended without retiring its id's attachments (`reap::end_unproven`):
   /// they belong to the id's owner, whom a stranger naming the id is not.
@@ -667,6 +667,12 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
+  /// The clients whose watches reported them gone and whose retirement is owed, each with its id (A-475): a seat joins
+  /// once, at its report, so the queue is bounded by the shard's seats (`clients_per_shard`). The reaper takes them a
+  /// batch at a time (`crate::reap::reaper`).
+  pub(crate) dead_clients: std::collections::VecDeque<(slates_mem::Handle<ClientSlot>, u32)>,
+  /// The shard's reaper task, woken when a client's watch reports it gone while the reaper idles (A-475).
+  pub(crate) reaper_task: Option<slates_rt::TaskId>,
   /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
   /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
   pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
