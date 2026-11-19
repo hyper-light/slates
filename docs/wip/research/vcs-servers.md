@@ -118,7 +118,8 @@ C: deployed code). Every quotation below was read directly on 2026-11-18 from th
 ## 4. Owed reading (named so it is not forgotten)
 
 - The git server's (§4.17.2) is in §5.4.
-- Mercurial (§4.17.3, g291) and Subversion (§4.17.4, g292): their own sections' sources.
+- Mercurial (§4.17.3, g291): its reading notes are their own file, `research/mercurial-server.md`.
+- Subversion (§4.17.4, g292): its own section's sources.
 
 ## 5. The git server (§4.17.2)
 

@@ -305,11 +305,7 @@ impl Repositories {
 
 #[cfg(test)]
 // proptest's strategy types carry `Arc` (D-8's harness exception).
-#[allow(
-  clippy::disallowed_types,
-  clippy::unwrap_used,
-  clippy::indexing_slicing
-)]
+#[allow(clippy::disallowed_types)]
 mod tests {
   use std::collections::{BTreeMap, BTreeSet};
 

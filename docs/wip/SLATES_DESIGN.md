@@ -11012,15 +11012,27 @@ decides the details.
 | Concept | slates | git (§4.17.2) | Mercurial (§4.17.3) | Subversion (§4.17.4) |
 |---|---|---|---|---|
 | Repository | a repository record (§4.8) and its greens | a repository | a repository | a repository |
-| Branch: a name whose value a push moves | a green | each ref (`refs/heads/*`, `refs/tags/*` and every other ref) | each bookmark, and each named branch's head; a name with several heads is §4.17.3's to decide | the whole repository: one green whose version N is revision N; a branch is a directory in it |
+| Branch: a name whose value a push moves | a green | each ref (`refs/heads/*`, `refs/tags/*` and every other ref) | each bookmark, and each head of a named branch (one green a head, §4.17.3) | the whole repository: one green whose version N is revision N; a branch is a directory in it |
 | Push | a work submitted to the green; the verdict is the push's answer | `receive-pack`'s update commands | `unbundle`, with its heads check | `commit`: the request and its editor drive |
 | What the client says it saw | the work's base | each command's old value | the `heads` argument, or the `check:heads`, `check:updated-heads` and `check:bookmarks` parts | the base revision of each path the drive touches |
-| Stacked changes; a rebase | a chain of works | a series of commits reviewed in order; a server-side rebase | a stack of draft changesets (§4.17.3 decides) | §4.17.4 decides |
-| A review request and the requests built on it | a work held for review; works over works | a pull request and its stack | §4.17.3 decides | §4.17.4 decides |
+| Stacked changes; a rebase | a chain of works | a series of commits reviewed in order; a server-side rebase | a stack of draft changesets: topics, a chain of works (§4.17.3) | §4.17.4 decides |
+| A review request and the requests built on it | a work held for review; works over works | a pull request and its stack | a topic, or a bookmark the policy marks for review (§4.17.3) | §4.17.4 decides |
 | Objects | content in the volume store, deduplicated by identity, indexed by the tool's id | blobs, trees, commits and tags | changesets, manifests and file revisions | node revisions, their contents and revision properties |
 | History of a branch | the green's chain of versions | the successive values of the ref (the server's reflog) | the successive values of the bookmark or head | the revision sequence |
 
 **The repository and its greens.**
+
+> **Status (2026-11-18, A-515).** The record and its namespace are built in the metadata database
+> (`crates/db/src/repository.rs`, the records in `catalog.rs`, five operations of the log): a repository's name is
+> unique on its partition; a name binds a green of the repository's own partition that no other name binds; an empty
+> name or one holding a NUL byte is refused; retiring a name leaves its green, so binding it again restores the
+> branch; destroying a repository leaves its greens; a destroyed green leaves its name; a partition rebuilt from its
+> snapshot answers the same. A model test holds the namespace to these rules over generated histories. Owed: the
+> verbs that create repositories and their greens (with the namespace riding one register with the greens, item 3,
+> shared piece 2), the record's replication in a fleet (shared piece 2), and a green made at another green's version
+> without a walk (item 4: the engine holds a green's state in ordered maps, so making one at a version copies them; it
+> needs maps shared by identity, shared piece 1's second half).
+
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
    namespace, from each branch's name to its green.
@@ -11111,7 +11123,11 @@ is one more version, and the chain itself is never rewritten.
    client's work is decided at whole-file granularity, which the operations of item 2 give; it is never merged into
    byte ranges it did not send. Byte-range accepts, where two edits to one file both land, are for works the server
    itself turns into the tool's objects: an agent's work through the SDK or a mount, a server-side merge of a review
-   request, a server-side rebase. The server makes the new commit, changeset or revision, and clients fetch it.
+   request, a server-side rebase. The server makes the new commit, changeset or revision, and clients fetch it. What
+   the server makes needs what a client's commit carries: a message, which such a work's submit must carry, and its
+   principal's name and address in the tool's form (git's author and committer, Mercurial's `Name <address>`), which
+   the principal's record holds (§4.13). A submit to a green of a repository without a message, or by a principal with
+   no such identity, is refused typed (`MessageRequired`, `IdentityRequired`) before any work is built.
 5. **The answers.** For each tool:
    - git: the push's old value is the green's head, and whether each command is a fast-forward is the policy's check
      (`receive.denyNonFastForwards` [B: git-receive-pack]), made after the admission hooks and before the verdict.
@@ -11172,8 +11188,10 @@ is one more version, and the chain itself is never rewritten.
   Subversion's `pre-commit` [B: svn_repos.h]); after the commit, where hooks only observe (`post-receive`,
   `changegroup`, `post-commit`); and on review events. A hook is a program the repository's owner configured, run over
   a read-only attachment of the work's post-state (on Linux inside the launcher's namespace, `slates exec`, §4.6),
-  under a deadline learned from that hook's own runs. A hook never runs on the merge task's shard and never holds the
-  green: admission ends before the work reaches the merge task, so a slow hook delays only its own push.
+  under a deadline learned from that hook's own runs. Before a hook has run, its deadline is its push's connection:
+  the run ends when the client that pushed leaves, and that run is the first sample. A hook never runs on the merge
+  task's shard and never holds the green: admission ends before the work reaches the merge task, so a slow hook delays
+  only its own push.
 - The write modes still decide whether a merge may happen at all (A-285), and a signature never permits one (A-321).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
@@ -11247,21 +11265,25 @@ reads git's answer for a ref that moved; nothing he sent is kept. He fetches, re
 C817: version 814. An agent works on version 814 through the SDK and replaces bytes 1,200 to 1,480 of `init/main.c`,
 while another agent's SDK work, accepted as version 815 with the server's commit C818, changed bytes 40,100 to 40,250 of
 the same file: the first agent's byte-range work is accepted as version 816, and the server makes commit C819 for it
-(the agent as author, C818 as parent), which every client fetches. Had version 815 come from a stock push, its
-whole-file replacement of `init/main.c` would have made the agent's edit a conflict, and the agent would rebase. In
-Subversion's terms the same rule reads: Carol commits `/trunk/a.c` against revision 40 while the repository is at 42,
-where 41 and 42 changed only `/trunk/b.c`; `a.c` last changed at or before 40, so the fast path makes revision 43. Dan
-then commits `/trunk/b.c` against 40; `b.c` last changed at 42, after his base, so his commit is out of date, and he
-updates and commits again.
+(the agent's identity as author, its submit's message as the message, C818 as parent), which every client fetches. Had
+version 815 come from a stock push, its whole-file replacement of `init/main.c` would have made the agent's edit a
+conflict, and the agent would rebase. In Subversion's terms the same rule reads: Carol commits `/trunk/a.c` against
+revision 40 while the repository is at 42, where 41 and 42 changed only `/trunk/b.c`; `a.c` last changed at or before
+40, so the fast path makes revision 43. Dan then commits `/trunk/b.c` against 40; `b.c` last changed at 42, after his
+base, so his commit is out of date, and he updates and commits again.
 
 **Laptop degenerate.** One node: the repository's register is its partition's log in the anchor segment, f = 0, the
 holder set is the owner, and every arrow above is an in-process call. The code is the fleet's (R8).
 
 **Pieces that follow (shared, in order).** Each is one piece with its own tests.
-1. The repository record and its namespace; green ids carrying the repository's partition; a green made at another
-   green's version, or at one commit's tree, without walking it.
+1. The repository record and its namespace; green ids carrying the repository's partition (built, A-515: the
+   record, the namespace and their rules in the metadata database); a green made at another green's version, or at one
+   commit's tree, without walking it (owed: maps shared by identity in the engine).
 2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
-   recomputation on holders.
+   recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
+   namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
+   them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
+   `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival.
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
@@ -11445,7 +11467,7 @@ create or update a reference named "refs/for/master", but may create or update a
 `GET` of the bytes; locks are per path. An LFS object is content in the volume store, deduplicated by BLAKE3 like every
 other byte, with its SHA-256 name an index row and the bytes checked against it on upload. A version's tree holds the
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
-is served as well.
+is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
 
 **Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS; SSH: the user's public key. Each
 proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and `git-receive-pack`
@@ -34138,3 +34160,42 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **Owed.** The lineage model's mirror of the rule and its own oracle (a live owner's copy let go only while a record at
   least as new is on `f + 1` members), main's to compile and run beyond its default cases; the content release signal
   (a successor confirms once its adopted content is re-placed, a settle certifies content too); the Lineage.tla text.
+
+### A-515 — A repository is a record of its partition, and its namespace binds each branch name to a green of that partition (2026-11-18, g261 for UI goal 91; §4.17.1 shared piece 1's first half; D-28)
+- **What was there.** §4.17.1 (A-497) designed the repository record and its namespace; nothing held them.
+- **What is built.** `crates/db/src/repository.rs` and the records in `catalog.rs`: `RepositoryRecord` (id, name, tool,
+  object format, default branch, owner), `BranchRecord` (a name bound to a green), `RepositoryId` (minted as a volume id
+  is, its bytes 8-9 naming the owner partition, which `RepositoryId::partition` and the new `VolumeId::partition` read),
+  and five operations appended to the log: `RepositoryCreated`, `RepositoryBranchAdded`, `RepositoryBranchRetired`,
+  `RepositoryDefaultSet`, `RepositoryDestroyed`. The partition's guard keeps §4.17.1's rules: a repository's name and id
+  are its own (`AlreadyExists`), at most the partition's volume capacity of them (`Capacity`); a name binds a green of
+  the catalog (`NotFound` for none; `NotGreen` for a plain volume, a new database refusal mapped to the wire's existing
+  `NotGreen`, as the new `InvalidName` is to its namesake) whose id names the repository's partition (`NotFound`
+  otherwise) and that no name binds yet (`AlreadyExists`); an empty name or one holding a NUL is `InvalidName`. Retiring
+  a name leaves its green; destroying a repository drops its namespace and leaves its greens; a destroyed green leaves
+  its name (`remove_volume`). A partition snapshot carries the records and bindings (two fields appended), and the two
+  derived indexes (names to ids, greens to names) are rebuilt; a binding naming no repository, or a green bound twice,
+  is a corrupt snapshot, refused. The wire order of the database publishes `ObjectFormat`, `VcsTool` and the five
+  operations (hand-written from the enums, `crates/db/tests/wire_order.txt`).
+- **Tests (`--lib`).** `a_repository_binds_only_unbound_greens_of_its_own_partition` (every refusal by name, the names
+  in order and by prefix, a rebuilt partition answering the same);
+  `a_destroyed_green_leaves_its_name_and_a_destroyed_repository_leaves_its_greens`; and
+  `the_namespace_equals_the_rules_over_every_history`, a model test: generated histories of creates, binds, retires,
+  default changes and destroys of repositories and of greens, the partition's answer and whole state equal to the rules
+  kept over plain maps after every step, and its snapshot rebuilt and compared after every step. On the Mac Studio
+  (kiln, 2026-11-18): `cargo test --locked -p slates-db --lib` 108 of 108 (the three new among them), `cargo test
+  --locked -p slates-server --lib error` 3 of 3 (the server's refusal mapping compiles), `cargo fmt --check` clean.
+  Red-checked on a throwaway copy: without the destroyed green's cascade two tests fail; without the partition rule the
+  first fails.
+- **g291's asks, answered here.** Shared piece 2's entry carries the repository's own state (Mercurial's phase roots and
+  obsolescence markers) and checks on greens it does not move (`check:heads`); a work the server turns into the tool's
+  objects needs a message and its principal's identity in the tool's form, refused `MessageRequired` or
+  `IdentityRequired` without them; one Git LFS store serves git and Mercurial's `lfs` extension; and a hook's first
+  deadline, before any run, is its push's connection. The terms table's Mercurial cells now state §4.17.3's decisions.
+- **Owed.** A green made at another green's version without a walk (the engine's maps shared by identity), the verbs
+  that create repositories and their greens, and the record's replication in a fleet (with shared piece 2).
+
+Applied in the same change to: §4.17.1 (a status block, the terms table, the client-fidelity rule's message and
+identity, the hooks' first deadline, the worked example, the pieces list), §4.17.2 (large files), GAPS (the §4.17
+entry), `research/vcs-servers.md` §4, `crates/db/src/{repository,catalog,op,partition,error,lib}.rs`,
+`crates/db/tests/wire_order.{rs,txt}`, `crates/server/src/error.rs`.
