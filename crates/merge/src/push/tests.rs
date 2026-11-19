@@ -561,12 +561,9 @@ fn a_push_reads_only_the_subtrees_whose_ids_changed() {
   let ops: BTreeSet<(String, String, u64, u64)> = kinds(&built.increment)
     .into_iter()
     .map(|(path, kind, at, len)| {
-      (
-        path,
-        kind,
-        if kind == OpKind::SetXattr { 0 } else { at },
-        len,
-      )
+      // A `SetXattr`'s `at` is its name's place in the path table, which says nothing of the file.
+      let at = if kind == OpKind::SetXattr { 0 } else { at };
+      (path, format!("{kind:?}"), at, len)
     })
     .collect();
   let expected: BTreeSet<(String, String, u64, u64)> = [
