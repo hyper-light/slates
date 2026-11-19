@@ -9,8 +9,18 @@
 //! (`Answer::ends_session`), and the command exits 0. A request upload-pack refuses is answered in git's words (`ERR`,
 //! or band 3 under `sideband-all`) and then ends the session with git's `die` status, 128, as git's own server dies on
 //! such a request (`serve.c` at `e1ec09b2`: "invalid command", "unknown capability") \[C\]; bytes that are no pkt-lines are
-//! handed to upload-pack whole, which answers them so. The end of the client's input before a whole request ends the
-//! session, 0.
+//! handed to upload-pack whole, which answers them so. The end of the client's input before a request's first packet is
+//! whole ends the session, 0; its end inside a request is refused in git's words with `die`'s status, as git's reader is
+//! gentle on the end of its input only until it has peeked a request's first packet (`serve.c` `process_request` clears
+//! `PACKET_READ_GENTLE_ON_EOF` then, and `pkt-line.c` `get_packet_data` dies at a later short read) \[C\].
+//!
+//! **Protocols.** A session is served at protocol v2, which git's client speaks over SSH by default (slates-git's
+//! `upload` module doc: since git 2.26), asking for it through `GIT_PROTOCOL`, the session channel's one `env`. A
+//! session at v0 or v1 is refused at its start, before any advertisement: an `ERR` line naming v2, the way upload-pack
+//! refuses a request, then `die`'s status. slates-git answers those protocols statelessly, a whole request at a time as
+//! smart HTTP sends them (A-640 part 3), but a v0 client over SSH negotiates in rounds on one stream, sending its wants
+//! once and its haves round by round, so a stateless answer to its second round would have lost its wants. That session
+//! is owed (GAPS).
 //!
 //! **Bounds.** Each request is admitted the edge's room (`Admission`), as the HTTP edge admits one. An answer is written
 //! one whole pkt-line's room a step (`pktline::MAX_LEN`, the format's own limit), and the edge steps the command again only
@@ -24,12 +34,19 @@
 use slates_db::catalog::RepositoryId;
 use slates_git::Admission;
 use slates_git::http::Version;
-use slates_git::pktline::MAX_LEN;
+use slates_git::pktline::{self, MAX_LEN};
 use slates_git::upload::{self, Answer, Asked, PackSource, Written};
 use slates_git::v2::request::whole_len;
 
 use super::site::{Command, GIT_DIE_STATUS, Next, Refused, Stepped};
 use crate::vcs_http::git::upload::StoreLender;
+
+/// Format: git's error packet's prefix (gitprotocol-pack: an `ERR` pkt-line, whose reason the client shows).
+const ERR: &[u8] = b"ERR ";
+
+/// Why a session at protocol v0 or v1 is refused (the module doc's protocols), as its client shows it.
+const VERSION_REFUSED: &[u8] =
+  b"upload-pack serves protocol v2 alone over SSH: ask for it with git -c protocol.version=2";
 
 /// What the session does once the answer being written has ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +63,14 @@ enum After {
 fn unheld() -> Refused {
   Refused {
     stderr: b"fatal: git-upload-pack is not served yet\n".to_vec(),
+    exit_status: GIT_DIE_STATUS,
+  }
+}
+
+/// The words git's reader dies with when its input ends inside a request (`pkt-line.c` `get_packet_data`).
+fn hung_up() -> Refused {
+  Refused {
+    stderr: b"fatal: the remote end hung up unexpectedly\n".to_vec(),
     exit_status: GIT_DIE_STATUS,
   }
 }
@@ -149,16 +174,26 @@ impl<L: StoreLender> UploadCommand<L> {
     })
   }
 
+  /// Refuses a session at protocol v0 or v1 at its start (the module doc's protocols): one `ERR` packet, written as
+  /// upload-pack writes a refusal, then git's `die` status. A line too long for a packet, which these words never are,
+  /// is refused in the same words on standard error.
+  fn refuse_version(&mut self) -> Result<Stepped, Refused> {
+    let line = [ERR, VERSION_REFUSED].concat();
+    pktline::write(pktline::Packet::Data(&line), &mut self.out).map_err(|_too_long| Refused {
+      stderr: [b"fatal: ".as_slice(), VERSION_REFUSED, b"\n"].concat(),
+      exit_status: GIT_DIE_STATUS,
+    })?;
+    Ok(Stepped {
+      consumed: 0,
+      next: Next::Exited(GIT_DIE_STATUS),
+    })
+  }
+
   /// Serves the next whole request the input begins with: what it consumed, and what follows.
   fn next_request(&mut self) -> Result<Stepped, Refused> {
     let length = match whole_len(&self.input) {
       Ok(Some(length)) => length.min(self.input.len()),
-      Ok(None) if self.input_ended => {
-        return Ok(Stepped {
-          consumed: 0,
-          next: Next::Exited(0),
-        });
-      }
+      Ok(None) if self.input_ended => return self.ended(),
       Ok(None) => {
         return Ok(Stepped {
           consumed: 0,
@@ -173,6 +208,21 @@ impl<L: StoreLender> UploadCommand<L> {
     Ok(Stepped {
       consumed: length,
       next: Next::More,
+    })
+  }
+
+  /// The client's input ended before a whole request (the module doc): the session ended, 0, while the request's first
+  /// packet is short; refused with git's `die` status once it is whole, in its reader's words. (git judges each line as
+  /// it reads it, so where a line before the end is one it refuses, it dies in that refusal's words instead, as at a
+  /// delimiter before any command: "no command requested"; the status is the same.) `whole_len` has read the first
+  /// packet's length already, so it is whole or short here.
+  fn ended(&self) -> Result<Stepped, Refused> {
+    if matches!(pktline::read(&self.input, 0), Ok(Some(_))) {
+      return Err(hung_up());
+    }
+    Ok(Stepped {
+      consumed: 0,
+      next: Next::Exited(0),
     })
   }
 }
@@ -194,6 +244,9 @@ impl<L: StoreLender> Command for UploadCommand<L> {
     }
     if !self.advertised {
       self.advertised = true;
+      if !matches!(self.version, Version::V2) {
+        return self.refuse_version();
+      }
       self.serve(Asked::Advertise)?;
       return Ok(Stepped {
         consumed: 0,

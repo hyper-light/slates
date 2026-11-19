@@ -7,6 +7,7 @@ use slates_db::catalog::{
 };
 use slates_git::http::Version;
 use slates_git::object_name::ObjectFormat as GitFormat;
+use slates_git::pktline::{self, Packet};
 use slates_git::store::Repository as GitStore;
 use slates_git::upload::{PackPlan, PackRefused, PackSource, Served};
 use slates_vcs::ContentStore;
@@ -200,14 +201,27 @@ fn a_refused_request_is_answered_in_gits_words_and_ends_the_session() {
   assert_eq!((consumed, next), (4, Next::Exited(GIT_DIE_STATUS)));
 }
 
-/// A-651 part 2 (A-640 part 3 owes protocols v0 and v1). Do: start a session with no `GIT_PROTOCOL`, protocol v0. Expect:
-/// upload-pack's refusal in git's words, and the session ended with git's `die` status.
+/// A-651 part 2 (slates-git answers protocols v0 and v1 statelessly alone, A-640 part 3, and a v0 client over SSH
+/// negotiates in rounds on one stream, a session owed). Do: start a session at protocol v0 (no `GIT_PROTOCOL`), then one
+/// at v1. Expect: each answered with one whole `ERR` packet naming protocol v2 and no advertisement, nothing consumed,
+/// and the session ended with git's `die` status.
 #[test]
-fn a_v0_session_is_refused_until_its_protocol_is_served() {
-  let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V0, ROOM);
-  let (answer, _, next) = run(&mut command);
-  assert!(holds(&answer, b"ERR "), "{answer:?}");
-  assert_eq!(next, Next::Exited(GIT_DIE_STATUS));
+fn a_v0_or_v1_session_is_refused_until_its_stateful_session_is_served() {
+  let refused = |version| {
+    let mut command = UploadCommand::new(Lends::empty(), HELD, version, ROOM);
+    let (answer, consumed, next) = run(&mut command);
+    let packet = match pktline::read(&answer, 0) {
+      Ok(Some((Packet::Data(data), length))) if length == answer.len() => data.to_vec(),
+      _ => Vec::new(),
+    };
+    let names_v2 = packet.starts_with(b"ERR ") && holds(&packet, b"protocol v2");
+    (names_v2, consumed, next)
+  };
+  let expected = (true, 0, Next::Exited(GIT_DIE_STATUS));
+  assert_eq!(
+    (refused(Version::V0), refused(Version::V1)),
+    (expected, expected)
+  );
 }
 
 /// A-651 part 2 (`serve.c` `process_request` peeks a request's first packet under `PACKET_READ_GENTLE_ON_EOF`). Do:
