@@ -12270,8 +12270,12 @@ is one more version, and the chain itself is never rewritten.
 > logarithmic along runs and linear only in the merges a question must open. Path history is one since A-666 part 2
 > (`derived/history.rs`): each version's value names its map and a history tree of each path's node, kept from the
 > first parent the path is TREESAME to, so `log <path>` and `--follow` (past recorded renames and copies) read one node
-> a version they list, git's default mode exactly. Owed: A-553's and A-588's stores as types, blame, and the server's
-> use (A-647's and A-666's entries).
+> a version they list, git's default mode exactly. Blame is one since A-666 part 3 (`derived/blame.rs`): each version's
+> value keeps each file's blame (runs of lines, each naming its introducing version, the file's path there and its first
+> line there), kept from the first parent whose file holds the same content and otherwise made from the parents' blames
+> and one diff with each, so a question reads the path's trie nodes and the file's spans, never a diff of the history;
+> a line both parents of a merge changed is attributed by the merge's recorded content (D-27). Owed: A-553's and
+> A-588's stores as types, and the server's use (A-647's and A-666's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -44271,7 +44275,11 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     constant-time on histories of merges (Pǎtraşcu 2011), so each costs a search logarithmic along runs and a step for
     each merge it must open. A-666 part 2: a path's history, `log <path>` and `--follow`, from a type naming each path's
     node (Mononoke's unodes) under git's default-mode rule exactly, renames and copies as the works recorded them; a
-    question reads one node a version it lists. Owed: blame; the server's verbs over the types.)
+    question reads one node a version it lists. A-666 part 3: blame, each line's introducing version, the file's path
+    there and the line's number there, from a type keeping each file's blame, made from the parents' blames and one
+    diff with each (Myers' linear-space diff), never a diff of the history; a line both parents of a merge changed is
+    attributed by the merge's recorded content (D-27); a question reads the path's trie nodes and the file's spans.
+    Owed: the server's verbs over the types.)
   - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
     request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
     above it (with goal 91's federation).
@@ -47319,3 +47327,101 @@ Applied in the same change to:
   slates-merge --lib`): 177 of 178 at ac6a83b09, A-643's model failing as said; 178 of 178 at e8c10097e; the census
   33 refused and 13 kept at a late link, 130 agreed, 102 refused by the deriver, 34 conflicts; `cargo fmt -p
   slates-merge -- --check` clean.
+
+### A-666 part 3 — Blame as derived data: each line's introducing version, its path and its line there, answered from each version's value; made from the parents' blames and one diff with each, never a diff of the history; a line both parents of a merge changed attributed by the merge's recorded content (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Queries by API", part 3; A-647; §4.17.1 "Reads")
+
+- **Why.** A-645: "Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+  client." Part 1 answered ancestry and part 2 a path's history; this part answers blame, the last of the four.
+- **The question** (`research/path-history.md` §6). `git blame` "Annotates each line in the given file with
+  information from the revision which last modified the line" \[C: git `git-blame.adoc` 20-21\]; Mercurial's linelog
+  emits for each line "the revision that introduced them and the line number in the file at the introducing revision"
+  \[C: Mercurial 7.2.4 `mercurial/linelog.py` 14-19\]. The type answers each line's introducing version, the file's path
+  there and the line's number there (from zero; git's output counts from one), as runs of lines (`Span`). git finds
+  whole-file renames by detection (`git-blame.adoc` 26-27, 67-69); the type follows the renames and copies the works
+  declared (part 2's `PathSources`), never one inferred.
+- **The value** (`crates/vcs/src/derived/blame.rs`, `Blame`, the type `slates-vcs blame 1` with the window its trees
+  split by): a version's blame tree, a path map whose files are each file's blame, a derived node naming the file's
+  content and an object of its spans (each span its lines and its origin, then its version's name and its path, each
+  after its length), its payload a tag and two counts (its lines, its spans' bytes). A file keeps the blame of the
+  first parent whose file at its path has the same content, as path history keeps a node, so a file no change reaches
+  keeps its first parent's blame by path copying.
+- **The rule.** A file the version's change sets otherwise is diffed once against each parent's file at its path, in
+  parent order, then against its recorded source (a rename's or a copy's; a copy from an older version read through
+  the inputs path history names, `DerivedType::inputs`); each line takes the attribution of the first candidate whose
+  diff keeps it, and a line none keeps is the version's own. Mononoke's BlameV2 is made the same way, from the
+  parent's blame and the hunks of one diff \[C: `mononoke_types/src/blame_v2.rs` 514-565\], and at a merge each line
+  from "the first one that does *not* match the merge changeset" (1605-1640). Mercurial's linelog is one weave a file
+  patched in place along a main branch "ignoring p2" \[C: `hgext/fastannotate/__init__.py` 23-26\]; A-647's values are
+  immutable, one a version, over histories of merges.
+- **A merge** (D-27). A line both parents changed is attributed by the merge's own recorded content: it takes the first
+  parent whose text the merge recorded there, else it is the merge's own. No merge of the parents is computed or
+  inferred; the diff only says which recorded lines are shared and makes no content.
+- **The diff** (`matched`): Myers' O(ND) algorithm in linear space \[A: E. W. Myers, "An O(ND) Difference Algorithm
+  and Its Variations", Algorithmica 1(2):251-266, 1986, §4b\]: the common prefix and suffix taken, the middle snake
+  found by searching from both ends at once as diff-match-patch's `diff_bisect` does \[C: `diff_match_patch.py`
+  254-354\], each side solved again, so the lines kept are a longest common subsequence. Each distinct line is numbered
+  once, so the diff compares numbers; the lines, their attributions and the search's arrays are charged to the store
+  and refused past its budget.
+- **The costs.** A derivation reads each file its change sets and its candidates' versions of that file, never an
+  ancestor's, never another file's (`BlameCounters::lines_read`, held to the replay's). The question (`blame`) reads
+  the trie nodes on the path, the file's blame node and its spans' bytes, by its code no more: never the content, never
+  the history. It reports both (`BlameCost`); no test holds the report yet (owed).
+- **Typed refusals** (`BlameRefused`): `NoVersion`, `Inputs`, `BadSource`, `Malformed` (a blame's bytes, or spans that
+  do not cover its lines), `Exhausted`, and the path map's and the store's own (a file's content not held among them).
+  A refused derivation leaves the store as it was.
+- **Tests** (`crates/vcs/src/derived/blame/tests.rs`; `cargo test -p slates-vcs --lib`, Windows x86_64, jupiter,
+  2026-11-19, kiln run r87: a fresh clone of each pushed branch, each made after the build before it, in one target
+  directory, and every build's log showing slates-vcs compiled again; the Mac Studio was offline, so the macOS run is
+  owed).
+  - Red first (db61572b3, branch `agents/g302-a666p3-red`, not for main: 160b47ebb's stubs, the derivation, the
+    question and the diff refusing at once, with the two tests added at 78dfa5ad5): 66 passed and 9 failed, every new
+    test but the hostile-bytes readers', which call no stub; the 66 are part 2's 65 and that one. Built in 15 min 51 s;
+    the tests ran 255.83 s.
+  - Green at ee6868011 (d7acb9700 the type; 78dfa5ad5 two tests a review found missing, a line both parents of a merge
+    hold, each way round, and forged values; ee6868011 its citations read again, comments only): 75 of 75, part 2's
+    65 and the ten new, the tests 213.05 s, built in 3 min 22 s with slates-vcs compiled from the green's own clone;
+    `cargo fmt -p slates-vcs -- --check` clean.
+  - The oracle (`t_a666_p3_every_blame_equals_a_replay_of_the_history`, 32 cases): histories grown from up to 63
+    generated steps each (at most 127 versions) over files of few distinct lines (lines inserted, removed and replaced,
+    a last newline dropped and restored, files made and removed, renames some edited as they move, copies from the
+    first parent and from up to four first-parent steps before it, merges of two and three keeping, taking or
+    resolving each file, criss-cross merges, unrelated roots), every version's blame derived eagerly and again lazily
+    from the newest down, and every file of every version blamed. Every blame is the one a replay of the whole
+    history computes by the rule, file by file from the roots; every line's attribution names a line of the same text
+    where it says it was introduced; the derivations judged exactly the files the changes set and read the lines the
+    replay read (the non-vacuity counts); the lazy values are the eager ones, identity for identity; and the store is
+    empty after. The replay shares the module's diff (`matched`): which of several longest common subsequences a diff
+    keeps decides a tie, and that choice is the diff's, held apart to the dynamic program (below). Its census: 818
+    versions, 215 merges, 49 versions renaming and 28 copying from an older version; 861 files judged, 153 keeping a
+    parent's blame whole and 708 blames made, 74 of them over two candidates or more; 2,299 blames asked, 6,963 lines,
+    at most 12 in a file; 103 lines a merge resolved itself, 175 kept through a later parent and 259 through a recorded
+    source.
+  - Beside it: the diff's pairs over 512 generated pairs of up to 60 lines drawn from two to five distinct lines (many
+    ties): strictly increasing, naming equal lines, and as many as the dynamic program's longest common subsequence.
+    D-27 three ways: from a, b, c, one side changing a and b and the other b and c, merges recording the first side's
+    b, the second side's and a b in neither give b to the first side, the second side and the merge itself, while a
+    keeps the first side and c the second. A line both parents' diffs keep, the parents merged each way round: the
+    first parent's each time. A rename edited as it moves keeps the versions and the path (`f`) that introduced its
+    lines, the added line the rename's; a copy from an older version keeps the lines as they stood there, none of the
+    later change. A file of 2,000 lines edited a line a version 300 times: the tip's blame gives each line the last
+    version that replaced it, else the first, and the derivations read 1,202,000 lines (2,000, then the file and its
+    parent's version each time), never the history. The format's bytes written by hand (a one-line file: the span's
+    object named by BLAKE3's hash, the blame and the tree's leaf by its key derivation). Hostile span bytes refused
+    five ways and a field cut short, and blame nodes three ways (a foreign tag, three names, a payload cut short).
+    Refusals by kind, the store as it was: `BadSource`, `Inputs`, a content not held, `OverBudget`, and a question of
+    a root that is no tree. Forged values refused `Malformed` four ways: a tree's file of another class, a file naming
+    the bare content, spans a byte longer than their object, and a parent's blame counting one line of two.
+  - Thirteen mutations wait on branch `agents/g302-a666p3-mutants` (not for main; each the green at 78dfa5ad5 with one
+    change to `blame.rs`: every unchanged file blamed again, the last parent's diff winning, a later parent's file of
+    the same content not kept whole, and ten guards against malformed values each removed). Under CLAUDE.md §8 they
+    are main's to run, filed in the run-request queue with the test each should fail.
+  - Main's: the macOS run, clippy, `xtask check` and the doc gate (the run-request queue).
+- **Owed.** The server's verbs over the type (each repository's values on its owner shard, A-662); a diff larger than
+  a slice cut into slices, as A-647's derivations larger than a slice are owed; a blame's spans shared between versions
+  by identity where an edit leaves them (one object a file version today, as Mononoke's); the question's reported cost
+  (`BlameCost`) held by the oracle; git's porcelain fields beyond the three (the previous version and path a line had,
+  `-L` ranges), from the same values.
+- **Applied in the same change to:** `crates/vcs/src/derived/blame.rs` and `derived/blame/tests.rs` (new);
+  `crates/vcs/src/derived.rs` (the module's docs, its owed line); `crates/vcs/src/derived/history.rs` (`inputs_of`
+  shared with blame); `docs/wip/research/path-history.md` (§6, new; §1's sources); A-645's entry ("Queries by API");
+  §4.17.1 "Reads"' status; GAPS' A-645 line.
