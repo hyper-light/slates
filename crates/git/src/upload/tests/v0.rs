@@ -204,7 +204,8 @@ fn repository() -> served::Served {
   }
 }
 
-/// What `asked` is answered with at `version`, written in one step, and the answer.
+/// What `asked` is answered with at `version`, written whole in steps of unbounded room (a step frames one packet, so a
+/// pack of several takes as many steps), and the answer.
 fn answered(
   fixture: &served::Served,
   version: Version,
@@ -220,10 +221,7 @@ fn answered(
     &mut Admission::new(u64::MAX),
   );
   let mut bytes = Vec::new();
-  assert_eq!(
-    answer.write(&served, &mut source, &mut bytes, usize::MAX),
-    Written::End
-  );
+  while answer.write(&served, &mut source, &mut bytes, usize::MAX) == Written::More {}
   (bytes, answer)
 }
 
@@ -372,10 +370,7 @@ fn side_band_packets_hold_a_thousand_bytes_and_no_side_band_sends_the_pack_bare(
     &mut Admission::new(u64::MAX),
   );
   let mut long = Vec::new();
-  assert_eq!(
-    answer.write(&served, &mut source, &mut long, usize::MAX),
-    Written::End
-  );
+  while answer.write(&served, &mut source, &mut long, usize::MAX) == Written::More {}
   let data: Vec<usize> = packets_from(&long, 0)
     .iter()
     .filter(|packet| packet.get(4) == Some(&1))
