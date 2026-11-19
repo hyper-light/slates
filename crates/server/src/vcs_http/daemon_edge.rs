@@ -219,7 +219,9 @@ pub(crate) fn start(
       Ok(task) => {
         let _ = futures::detach(task);
       }
-      Err(_) => crate::fleet::count_refusal(NOT_STARTED),
+      Err(_) => {
+        crate::fleet::count_refusal(NOT_STARTED);
+      }
     }
   })?;
   Ok(Some(port))

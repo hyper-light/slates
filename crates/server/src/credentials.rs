@@ -28,6 +28,7 @@ use slates_db::Op;
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal};
 use slates_ipc::protocol::{CredentialMaterial, Refusal, ReplyBody};
 use slates_ssh::userauth::{KeyRefusal, SignatureAlgorithm, UserKey};
+use slates_vfs::clock::Clock;
 
 use crate::error::refusal_of_db;
 use crate::state::ShardState;
