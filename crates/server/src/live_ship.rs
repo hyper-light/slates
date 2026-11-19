@@ -2687,6 +2687,25 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
   }
 }
 
+/// A test's live log for volume `id` as it stands before any of it reaches a holder: shipping at `f = 1` to `holders`,
+/// owing its first whole entry, nothing appended. What a verb on the volume must wait for then is that entry.
+#[cfg(test)]
+pub(crate) fn owe_first_whole(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  holders: &[HostId],
+) {
+  let local = state.fleet.configuration().owner;
+  let shipper = Shipper::new(
+    (local, ObjectId(id.bytes), HostEpoch(1)),
+    slates_db::register::Quorum { f: 1 },
+    holders,
+    None,
+    Bounds::default(),
+  );
+  state.live.shipping.insert(id.bytes, new_live_volume(shipper));
+}
+
 /// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
 /// candidate keeps a whole entry and the entries since, within twice the volume's size ([`hold_bound`]), and a whole
 /// entry clears them. Shipped at the volume's size, the entry that crosses it still fits under the bound whatever it

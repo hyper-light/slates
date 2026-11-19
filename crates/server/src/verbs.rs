@@ -13234,6 +13234,10 @@ pub(crate) struct TakenOver<'a> {
   /// The takeover itself, kept in the volume's record (AC-8.3, A-325): the epoch the head was placed under, `sequence`,
   /// and whether the volume is rebuilt from its live log.
   pub takeover: slates_db::catalog::TakeoverRecord,
+  /// Whether this node adopts the volume by a planned move (A-291): its old owner froze it and made its live log durable
+  /// at the head it handed over, so a tree rebuilt from that log is exactly that head (A-565). `false` for a takeover
+  /// after an owner's loss, whose log may have run past its newest seal.
+  pub moved: bool,
 }
 
 /// Counter: a stale copy this node relinquished to a takeover that named it again (A-362, [`relinquish_superseded`]).
@@ -13575,7 +13579,7 @@ pub(crate) fn finish_making(
   region: Vec<u64>,
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
-  let from_live_log = taken.takeover.from_live_log;
+  let (from_live_log, moved) = (taken.takeover.from_live_log, taken.moved);
   let Some(making) = state.making_volumes.remove(&id) else {
     return Err(Box::new(refused(Refusal::NotFound)));
   };
@@ -13692,13 +13696,14 @@ pub(crate) fn finish_making(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  // What a move carried of the volume's capture comes with its catalog (A-503): the snapshot just sealed is its mark
-  // when it holds the head the capture was carried against (a move's adoption, or a takeover before the new owner wrote,
-  // since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt from a
-  // live log, whose tree may have run past the seal it names, so its landings are refused rather than judged from a
-  // tree that is not the moved one.
+  // What a captured clone's head carried of its capture comes with its catalog (A-503, A-544): the snapshot just sealed is
+  // its mark when it holds the head the record was carried against (a move's adoption, or a takeover before the new owner
+  // wrote, since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt
+  // from a live log after an owner's loss, whose tree may have run past the seal it names, so its landings are refused
+  // rather than judged from a tree that is not the head. A move's rebuild from the log is the head (A-565): its old owner
+  // froze the volume and made the log durable at the head it handed over before the move was reported.
   if let Some(carried) = catalog.carried.clone() {
-    let moved_head = head.manifest == Some(carried.head) && !from_live_log;
+    let moved_head = head.manifest == Some(carried.head) && (!from_live_log || moved);
     let mark = moved_head.then_some(to_db_snapshot(snapshot));
     let op = Op::CaptureAdopted {
       volume: id,
@@ -20604,6 +20609,7 @@ mod tests {
       catalog_sequence: 0,
       sequence: takeover.head_sequence,
       takeover,
+      moved: false,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
   }
@@ -20927,6 +20933,18 @@ mod tests {
     archive: &slates_archive::Archive,
     manifest: [u8; 32],
   ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_named_as(state, id, (catalog, archive), manifest, (false, false))
+  }
+
+  /// [`take_over_named`] made as `(from_live_log, moved)` says: from a live log or a placed seal, by a planned move's
+  /// adoption or a takeover after an owner's loss.
+  fn take_over_named_as(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    (catalog, archive): (&crate::catalog::CatalogValue, &slates_archive::Archive),
+    manifest: [u8; 32],
+    (from_live_log, moved): (bool, bool),
+  ) -> Result<(), Box<super::ReplyBody>> {
     let head = crate::head::HeadValue {
       manifest: Some(manifest),
       content_holders: Vec::new(),
@@ -20940,11 +20958,149 @@ mod tests {
       takeover: slates_db::catalog::TakeoverRecord {
         epoch: 1,
         head_sequence: 1,
-        from_live_log: false,
+        from_live_log,
         past_tolerance: None,
       },
+      moved,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-565. Do: materialize a live-shipped captured clone from its live log, its catalog carrying the record for the head
+  /// it adopts: once as a planned move's adoption, once as a takeover after its owner's loss. Expect: the moved one judged
+  /// against its capture (the snapshot it materialized is its mark, the carried paths as its old owner recorded them),
+  /// and the taken-over one refused by kind, never landed as a volume with no capture. A move's old owner froze the
+  /// volume and made its log durable at the head it handed over, so the rebuilt tree is that head; a takeover's log may
+  /// have run past its newest seal. Before A-565 both were refused: every tree rebuilt from a live log held no mark.
+  #[test]
+  fn a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"LIVE".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x5e; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/made.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let live_clone = |name: &str| crate::catalog::CatalogValue {
+        carried: Some(slates_db::catalog::CarriedRecord {
+          head,
+          entries: slates_wire::Wire::to_bytes(&carried),
+        }),
+        live_shipped: true,
+        ..takeover_catalog(name, 1 << 20)
+      };
+      let moved = slates_db::catalog::VolumeId { bytes: [0xa5; 16] };
+      let catalog = live_clone("a565-moved");
+      take_over_named_as(state, moved, (&catalog, &archive), head, (true, true)).unwrap();
+      match crate::landing::capture_of(state, moved) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried, "the moved clone lands against its capture")
+        }
+        other => panic!("the move's new owner holds no mark for the head it rebuilt: {other:?}"),
+      }
+      let taken = slates_db::catalog::VolumeId { bytes: [0xa6; 16] };
+      let catalog = live_clone("a565-taken");
+      take_over_named_as(state, taken, (&catalog, &archive), head, (true, false)).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, taken),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a takeover's rebuild from a live log that may have run past its seal is refused by kind"
+      );
+    });
+  }
+
+  /// The open bug `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, filed with A-565, red
+  /// until fixed. Do: on a shard, make a volume, ship it live, snapshot it and clone the snapshot (the clone is
+  /// live-shipped as its origin is), give the clone's log the state it holds before any of it reaches a holder (`f = 1`,
+  /// its first whole entry owed), and ask what the Clone's reply waits for. Expect the clone's first whole entry, position
+  /// 0: a verb on a live volume answers once what it published is durable on `f` candidates (A-200). Today the reply
+  /// waits on the verb's own volume, the origin, whose log the Clone did not change, so a Clone answers while nothing of
+  /// the clone is held anywhere else; its owner lost then, the successor finds no log and no seal of it and serves it
+  /// empty.
+  #[test]
+  #[ignore = "open bug docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md: red until fixed"]
+  fn a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable() {
+    let (waits, clone) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "live-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let shipped = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::LiveShip {
+          volume: origin,
+          live_shipped: true,
+        },
+      );
+      let super::ReplyBody::LiveShippingSet { live_shipped: true } = shipped else {
+        panic!("the origin ships live: {shipped:?}")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Clone {
+          volume: origin,
+          snapshot,
+          name: "live-clone".to_owned(),
+        },
+      );
+      let super::ReplyBody::Cloned { id: clone } = reply else {
+        panic!("the clone was made: {reply:?}")
+      };
+      let clone = super::to_db_volume(clone);
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        slates_db::register::HostId(local.0.wrapping_add(1)),
+        slates_db::register::HostId(local.0.wrapping_add(2)),
+      ];
+      crate::live_ship::owe_first_whole(state, clone, &holders);
+      let (live, _) =
+        super::replicated_waits(state, Some(super::to_db_volume(origin)), 1, &reply);
+      (live, clone)
+    });
+    assert_eq!(
+      waits,
+      Some((clone, 0)),
+      "the Clone's reply waits for the clone's first whole entry"
+    );
   }
 
   /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
