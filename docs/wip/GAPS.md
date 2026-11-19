@@ -1,8 +1,9 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record and greens
-> made at another green's version are built (2026-11-18, A-497, D-28, A-515; 2026-11-19, A-534; UI goal 91; owners g261
-> git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
+> made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
+> A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
+> §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
 > of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
@@ -78,21 +79,53 @@
 > a vector that reaches the checksums' collision refusal (no published collision begins with `PACK` or `\377tOc`).
 > A pack header's length is one number, A-582 part 3's `entry::PACK_HEADER_LEN`, which `pack` uses. Clippy, `xtask` and
 > the lint matrix over the change are main's (run requests).
+> **A-596 (2026-11-19, g267; shared piece 6, review records):** built in the engine and the metadata database. A
+> comment follows its lines by §4.16's position mapping (`Green::reanchor`, `crates/merge/src/engine/reanchor.rs`, over
+> the pure step of `crates/merge/src/review.rs`) and is outdated, never moved again, when a change meets them, text is
+> joined to them, or its file is removed or replaced. An approval binds to the version its approver saw; a policy
+> predicate makes it stale (`Reviews::staled_by`), and the standing ones are a policy's evidence. The records are six
+> operations on the repository's partition (`crates/db/src/review.rs`): guarded then applied, carried by the snapshot,
+> charged to the merge byte budget, each refusal typed. Tests on the Mac Studio (r504 red with the rules out, r529
+> green): `slates-merge --lib` 7 of 7 with the oracle against a diff of whole texts, `slates-db --lib` 11 of 11 with the
+> records' model test, `slates-server --lib error::` 3 of 3. Owed: the server's review verbs (write, move each comment
+> as its request gets a version, approve, stale by A-597's matcher, close with the request) and their typed wire
+> refusals (today `VolumeRefusal::Invalid`, which no verb emits yet); a comment's version held as a live reader of its
+> green's fold floor; following a renamed file with the engine's path remapping; the integration suites, clippy and
+> `xtask` over the change (main's; `crates/db/tests/wire_order.rs` against `Op` 90 to 95, published by hand). Two
+> verdict findings, below, are open.
+> **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
+> BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
+> no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
+> as its windows, cut where a volume cuts the same file, under lists of their identities; lists and tables are named in
+> BLAKE3's key-derivation mode, so no pushed bytes are taken for either. Tables of sorted rows of at most a window are
+> content, each row naming the contents it holds, opened from any bytes with every fault refused by kind. Each
+> repository's index is a tail over runs of tables found by fences; the tail seals its full tables once its rows no
+> longer fit one (the table's size and the tail's length derived); a fork holds each table once more (no table written,
+> no row copied); the merge point is learned, one rent-or-buy problem for each number of newest runs this index alone
+> holds (one rule for every tool, which §4.17.3's and §4.17.4's index rows now read). A push's quarantine checks every
+> object by its tool's naming, a parameter that may refuse (git's collision detection), before a byte is stored, and
+> is committed as one checked step or abandoned with nothing left. An oracle holds the whole store to plain maps over
+> generated histories, and thirteen mutations each turned tests red (`cargo test -p slates-vcs --lib`, 29 of 29, Mac
+> Studio; see A-581). Owed: one content index for this store and the volumes' sealed windows (piece 4, Phase 7); a
+> merge, a seal, a release and an abandon sliced under the shard's budget; the store and each index on the owner shard,
+> timed by its clock, with each tool's naming implemented (each server's object pieces; the Subversion index's rows move
+> into these tables there); content-defined cuts of tables and of the large-file class (D-6); pruning what no branch
+> reaches; wire-form caches; content placed by identity in a fleet.
 > **A-582 part 2 (2026-11-19, g296; protocol v2's messages):** `slates-git` (`v2`) reads and writes the capability
 > advertisement, the command request (one `command=` line among the client's capabilities in any order, a delimiter or
 > none, a flush alone as the end), `ls-refs`'s arguments and answer, and `fetch`'s seventeen arguments (git's ranges and
-> its rules between them) and its response, whose five sections one machine keeps in the document's order for the
-> reader and the writer alike (git 2.50.1 wrote wanted-refs first, which its own client refused; git fixed it in
+> its rules between them) and its response, whose five sections one machine keeps in the document's order for the reader
+> and the writer alike (git 2.50.1 wrote wanted-refs first, which its own client refused; git fixed it in
 > `191740edaa4a`). Decoding is lossless (each line keeps its LF or its lack, ids are lower-case hexadecimal, numbers
 > canonical decimal), so every advertisement, request and answer stock git 2.50.1 wrote or read is written back byte for
 > byte; every cut, every bit flip and lines past a packet are refused by kind; admissions are charged exactly first.
-> `cargo test -p slates-git --lib`: 59 of 59 (37 new) on the Mac Studio, the 32 message tests all red with the codecs
-> stubbed, and red four ways. Owed: `object-info` and `bundle-uri` (refused as unknown commands until then, so a server
-> must not advertise them); a request checked against the server's own advertisement (`serve.c`'s command and
-> capability check, `upload-pack.c`'s `allow_*` for `filter`, `want-ref`, `sideband-all`, `packfile-uris`); the server's
-> refusals as `ERR` lines and band-3 errors; a duplicate `want-ref` (a protocol error) caught where the server maps
-> names to refs; the server keeping clients alive on band 2, never with git's empty band-1 packet before the packfile;
-> clippy and the cross-target lint over `src/v2` (main's run request).
+> `cargo test -p slates-git --lib` on the Mac Studio: 59 of 59 (37 new), then 113 of 113 merged with part 3 and A-591;
+> the 32 message tests all red with the codecs stubbed, and red four ways. Owed: `object-info` and `bundle-uri` (refused
+> as unknown commands until then, so a server must not advertise them); a request checked against the server's own
+> advertisement (`serve.c`'s command and capability check, `upload-pack.c`'s `allow_*` for `filter`, `want-ref`,
+> `sideband-all`, `packfile-uris`); the server's refusals as `ERR` lines and band-3 errors; a duplicate `want-ref` (a
+> protocol error) caught where the server maps names to refs; the server keeping clients alive on band 2, never with
+> git's empty band-1 packet before the packfile; clippy and the cross-target lint over `src/v2` (main's run request).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and
@@ -1799,6 +1832,34 @@
 > work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
 > red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
 >
+> **A work based before its file was replaced is spliced into the replacement: found open (2026-11-19, A-596's oracle,
+> g267; §4.16 "Position mapping", "The verdict").** A work edits a file at its base; after that base the green unlinks
+> the file and makes it again, or renames another file onto it. The verdict finds the path's content present
+> (`merge_content`) and maps the work's ops through the path's deltas since the base. The replacement's delta is one
+> insert of the whole new file at offset 0 (`insert_whole`, from `merge_create` and `merge_rename`), so every op shifts
+> past the new bytes and is spliced at the new file's end: the edit of a file the work no longer has lands in one it
+> never saw, and the work is accepted. `fits_base` judged the ops against the file at the base only. Expected: a
+> conflict on the path (`DeleteModify`, as a work editing a path the green removed is answered). Red test, parked:
+> `a_work_based_before_its_file_was_replaced_conflicts` (`crates/merge/src/engine/reanchor/tests.rs`; Mac Studio,
+> kiln r504 and r529: accepted as version 3, the re-made file `<9>\nx`). Owed: the verdict refuses a work whose
+> path's content history records a removal or a replacement after its base, and the replacement's delta states the old
+> bytes' removal, so the position mapping of works and of review comments meets it. A-596's oracle bases no work before
+> its file's last replacement until then; a comment's step already refuses such a delta (`FileReplaced`). Bug record:
+> `docs/bugs/2026-11-19-a-work-based-before-its-file-was-replaced-is-spliced-into-the-replacement.md`.
+
+> **A truncate based before an append removes the appended bytes: found open (2026-11-19, A-596's oracle, g267; §4.16
+> "The verdict", "Splice").** A work removes a file's tail to its end, which the deriver composes as a truncate; after
+> its base another work appends at that end. The truncate's span ends where the append begins, so they meet only at its
+> edge and the verdict accepts, and the splice truncates to the end of the head's file (`apply`, `OpKind::Truncate`),
+> removing the append the work never saw. The version's delta still states the bytes the work saw, so a position mapping
+> through it misplaces what follows. Red test, parked: `a_truncate_based_before_an_append_keeps_the_appended_bytes`
+> (`crates/merge/src/engine/reanchor/tests.rs`; Mac Studio, kiln r529: accepted as version 2, the file `<1>\n`, the
+> appended `<3>\n` gone). Found by A-596's oracle in r504: a comment on an untouched first line was refused at that
+> version (`FileReplaced`, the delta states four bytes where eight left) while a diff kept the line. Owed: the truncate
+> removes only the bytes it saw at their mapped place, or conflicts with a change at its end; and its delta states what
+> left. A-596's oracle bases no truncating work behind the head until then. Bug record:
+> `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+
 > **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
 > "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
 > base and splices them into the bytes the rename moves (`Green::edits_after_rename`; an edit meeting such a change is
