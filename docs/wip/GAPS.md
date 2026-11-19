@@ -3895,9 +3895,10 @@
 > `fs/nfs/nfs4renewd.c`) and a liveness window, in whole seconds (6 s), one number for the lease advertised, the
 > delegation recall's and quiet period's waits, the NFSv3 gate's and a landing's recall wait (`nfs::v4_lease_ns`).
 > Owed beside it: the client table's lapse judged per client, from each client's own renewal gaps (A-384's accrual), so
-> a client slower than Linux's floor keeps its state too. Still on the placeholder, each owed a term of its own: the
-> anchor's restart cap, the FUSE helpers' bounds, the status capture's deadline (it should count from the capture, not
-> the request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
+> a client slower than Linux's floor keeps its state too. **Since A-525** a move's overdue bound and the telemetry
+> freshness horizon read the failover delay, and the anchor's crash-loop cap is the NFSv4 lease. Still on the
+> placeholder, each owed a term of its own: the FUSE helpers' bounds and the status capture's deadline (it should
+> count from the capture, not the request). Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets

@@ -1939,9 +1939,10 @@ landing constants are in §4.15.
 > meanwhile). **Since A-425 the NFSv4 lease is derived** from what the clients it serves need, not the failover delay:
 > an idle Linux client's renewal floor (five seconds) and a liveness window, in whole seconds (6 s); the delegation
 > recall's wait, the quiet period, the NFSv3 gate's wait and a landing's recall wait all read it (`nfs::v4_lease_ns`).
-> The anchor's restart cap and four bounds that are not leases (the FUSE helper's, the status capture's, a move's and
-> the telemetry horizon) still read the operator's 10 s placeholder above until each takes a term of its own (A-414's
-> owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
+> **Since A-525 a move's overdue bound and the telemetry horizon read the failover delay, and the anchor's crash-loop
+> cap is the NFSv4 lease its daemon grants.** Two bounds that are not leases (the FUSE helpers' and the status
+> capture's) still read the operator's 10 s placeholder above until each takes a term of its own (A-414's owed list;
+> GAPS, the `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -35553,6 +35554,41 @@ refusals typed by platform).
   `slates-land --lib` 45 passed, the writer ignored; `slates-vfs --lib -- host::` 10 of 10; `slates-server --lib --
   landing::` 12 of 12, the server compiled on macOS with its mappings; `cargo fmt` laid the test out. Windows only,
   filed for main: the land suites and the Windows base host compiled and run there, with the xwin check and clippy.
+
+### A-525 — A move's overdue bound and the telemetry horizon read the failover delay, and the anchor's crash-loop cap is the NFSv4 lease its daemon grants (2026-11-18, UI goal 86 via g076b: D-c, the 10 s placeholder's readers and L-h; R3; §4.4 "Derived constants", §4.10 "Ownership follows the writer", §4.14; A-291, A-311, A-363, A-414, A-425)
+
+Applied in the same change to: §4.4's status (A-363's paragraph), GAPS (the failover delay's entry), and the code below.
+- **What was there.** Three of the six bounds A-414 left on the operator's ten-second failover placeholder
+  (`config::FAILOVER_SLO_NS`): an unreported move was refused `Unplaced` and thawed only ten seconds after it began
+  (`moves::outgoing`), a telemetry chokepoint stayed fresh ten seconds after its last span (`telemetry::drain_verb`),
+  and the anchor's crash-loop backoff doubled to ten seconds (`RestartPolicy::derive`, called by the `slates anchor`
+  role). Ten seconds is no deployment's measurement: a quiet fleet's failover delay is four to five seconds, a laptop's
+  about two (A-405), and the NFSv4 lease the daemon grants is six (A-425).
+- **The rule.** A move's overdue bound and the telemetry horizon are failover-shaped (A-414's words), so each reads the
+  failover delay the fleet measures, `F = D + E + R` (A-363: `D` the detector's periods at their running tail, `E` the
+  council's confirmation window at the measured period, `R` the tail of the takeovers and volumes the node timed), fanned
+  to every shard in whole coordinator periods (`ShardState::failover_ns`). A frozen volume takes no write, so an
+  unreported move holds it at most as long as the fleet holds a dead owner's volumes; a producer silent longer than the
+  fleet takes to replace a dead owner is reported absent. The anchor's cap is not failover-shaped: the anchor restarts
+  its own daemon, and what a crash loop costs the daemon's clients is their NFSv4 state, which lapses one lease after
+  their last renewal. So a crash loop's doubling stops at the NFSv4 lease the daemon grants (`NfsV4Caps::lease_ns`, an
+  idle Linux client's renewal floor and a liveness window, A-425; `restart_policy` in `crates/api/src/role/anchor.rs`):
+  once the cause clears the daemon is back before a client renewing at its floor sees its lease run out. The backoff is
+  still never shorter than the failed start's own life (A-311).
+- **Left on the placeholder, each owed a term of its own:** the FUSE mount and unmount helpers' bounds (Linux, a helper
+  process's wait: unit-tested on Linux) and the status capture's deadline (released at it on the shard's timing wheel
+  since A-522, but the deadline is still the request's time plus the placeholder; it should count from the capture).
+  Then `FAILOVER_SLO_NS`, `with_failover_slo` and
+  `DaemonConfig::failover_slo_ns` go (L-h), with the integration tests that still size outages by them
+  (`crates/server/tests/fleet.rs`, `crates/cli/tests/fs_server.rs`, `crates/cli/tests/live_chaos.rs`).
+- **Tests.** `an_unreported_move_is_overdue_past_the_live_failover_delay_and_not_before` (`moves`: with the delay at two
+  windows, a move begun three windows ago is overdue and one begun a window ago is not),
+  `a_chokepoint_silent_past_the_live_failover_delay_is_reported_absent` (`telemetry`: a span three windows old is not
+  fresh, its age still stated, the batch's horizon the delay) and
+  `a_crash_loops_backoff_is_capped_at_the_nfs_v4_lease_its_daemon_grants` (`role::anchor`: the cap equals the lease
+  of the configuration the anchor derives). Each was red against the placeholder first. The two integration tests that
+  mirror the anchor's policy (`crates/cli/tests/cli.rs`, `crates/server/tests/common/supervised.rs`) derive it from the
+  lease too; main runs them.
 
 ### A-523 — The rest of class C: the waits that borrowed the reply deadline wait on their peer or their own event, or on a schedule made of their own wait (2026-11-18, UI goal 86 via g251b; R3's class C; §4.7 "Failure matrix"; A-232, A-443, A-456, A-468)
 
