@@ -11452,6 +11452,25 @@ against what that copy brings there.
 > oracle renames a file or a link over a file or a link. Owed, as A-646 part 2: a hard link names its target's node,
 > never a path.
 
+> **Decision (2026-11-19, A-646): a hard link names its node, never a path.** As a POSIX inode is named by every link
+> to it, a node is named by its home, the one path holding its content or IPC node, and by the hard links naming it
+> there.
+> - Removing or replacing the home leaves the node to its links. The least surviving link becomes its home, holding
+>   its content or IPC node, its mode and its attributes, and the other links name it there; its bytes go only with
+>   its last name.
+> - Renaming the home moves the node, and its links name it at the new path.
+> - A later file at a path the node left is another node, which no link names.
+> - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
+>   unchanged since, a file while it was not removed since), or the one the work makes.
+>
+> The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
+> head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
+> restates only the work's operations. A minted inode number was rejected: it would have to be persisted in every
+> checkpoint and carried through copies and branches, for no difference anyone can observe, since the home is unique at
+> every version and moves with its node. Status: the engine since A-646 part 2a (`crates/merge/src/engine/
+> node_tests.rs`; the whole-state oracle follows nodes). Owed, part 2b: the ops document says so, a node table that a
+> link names, under a new format version.
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -44432,3 +44451,48 @@ Applied in the same change to:
   Red on r960, with the old rename rule and the old scans restored (the scans counting): 4 of the 7 tests the run
   selected failed, and the guards passed either way. The file over the symlink, and the file over its own link, were
   each `TypeChanged`; the oracle shrank to the hard link renamed over the symlink; the removal examined 2,000 entries.
+
+### A-646 part 2a — a hard link names its node, never a path: the engine (2026-11-19, g267, UI goal 93; §4.16 "The verdict" and "Commit"; A-643's second sibling, decided from principle)
+Applied in the same change to:
+- §4.16: A-646's decision; GAPS (A-643's second sibling, the engine's half fixed, the ops document's owed as part 2b);
+- `crates/merge/src/engine.rs`: `node_moves`, `surviving_links` and `hand_over`, derived at the start of `commit`;
+  `merge_hardlink` with `node_home` and `Resolved::link_node`; an IPC node's removal no longer refused for its links;
+- `crates/merge/src/engine/node_tests.rs`, new; the whole-state oracle's model in `replaced_node_tests.rs` follows nodes;
+  `scan_tests.rs` counts one lookup;
+- `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+- **The defect.** A hard link was an edge from one path to another. Removing a file's first name left its other names
+  naming an empty path, its bytes lost. A later file at that path became their file. Renaming the file broke its
+  links. A FIFO's link stopped its removal, and a link to a link named the link.
+- **The decision**, from principle: a hard link names its node, as a POSIX inode is named by its links. A node is its
+  home and the links naming it there. A removed or replaced home hands the node to its least surviving link, which
+  takes its content or IPC node, mode and attributes, the others naming it there. A renamed home's links follow it. A
+  later file at a path the node left is another node.
+- **Derived, never recorded.** The moves are computed in the commit from the head and the version's own effects:
+  - a version's chain entry is taken before the commit (`submit_resolved`), so the moves are never recorded;
+  - `apply_recorded` runs the same commit, so a replay derives the same moves;
+  - `rebased_from` restates the verdict's effects alone, so a rebased work's journal holds only the work's own
+    operations, and a volume, which has real inodes, needs none of the moves.
+- **The home as the identity.** A minted inode number was rejected. It would have to be persisted in every checkpoint
+  and carried through copies (A-586 refuses a tree holding links) and branches, for no observable difference, since a
+  home is unique at every version and moves with its node.
+- **A link a work makes** names the node at its target at the work's base: a link's home while that link stood
+  unchanged since, or a file or IPC node while it was not removed since. Through the links the work makes itself, it
+  names the work's own node. Otherwise it is `DeleteModify`, or `TypeChanged` for a target holding no file. A-643's
+  rule for a target removed after the base is kept within this.
+- **Kept conservative:** a work based before a hand-over that touches the link which became the home meets
+  `file_removed` (the link's removal is recorded), as it meets any removal.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 9 to 12), green on kiln r1019: `cargo test -p slates-merge --lib`,
+  124 of 124; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests:
+  - a removed file's links keep its node, its bytes, mode and attribute at the least link;
+  - a file made again where a node was is another node;
+  - a renamed file's links name it at its new path;
+  - a file replaced by a rename leaves its node to its links;
+  - an IPC node's links keep it;
+  - a link to a link names its node;
+  - a link based before its target moved conflicts (the guard);
+  - a replay derives the same node moves: identities equal on both greens and to the recount, after every version;
+  - the whole-state oracle follows nodes: every link's home, the hand-overs and re-points counted, and every link held
+    to name a standing file or IPC node.
+
+  Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
+  removal of `TARGET`, which left `h` a link naming nothing.

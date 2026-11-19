@@ -2383,11 +2383,13 @@
 >    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
 >    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
-> 2. Owed, A-646 part 2: a hard link names its target by path, so the head's removal of a file that hard links name is
->    accepted and the links then name a path with nothing, or the file made there next. A-646 decides it from
->    principle: a hard link names its target's node, as a POSIX inode does, never a path. A removed name leaves the node
->    to its other names, its content kept while any name holds it, and a later file at the path is a different node.
->    The engine and the ops document will say so, the document's version changed as A-621 changed it.
+> 2. The engine's half fixed (A-646 part 2a; §4.16's decision): a hard link names its node, never a path. A removed or
+>    replaced home hands the node to its least surviving link, with its content or IPC node, mode and attributes. A
+>    renamed home's links follow it, and a later file at the path is another node. A link a work makes names the node
+>    at its target at the work's base, or the work's own. Red on kiln r1019 (9 failed: links left naming an empty path,
+>    a new file, or a link); green on r1019, 124 of 124. Owed, part 2b: the ops document says so, a node table a link
+>    names, under a new format version with golden vectors re-derived (A-621's way). Bug record:
+>    `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
 >    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
 >    entries examined where the scan examined 2,000 (r960).
