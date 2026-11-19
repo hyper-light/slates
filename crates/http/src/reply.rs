@@ -84,10 +84,20 @@ impl Status {
     code: 431,
     reason: "Request Header Fields Too Large",
   };
+  /// Format: `500 Internal Server Error` (RFC 9110 §15.6.1), a service that failed before its reply began.
+  pub const INTERNAL_SERVER_ERROR: Status = Status {
+    code: 500,
+    reason: "Internal Server Error",
+  };
   /// Format: `501 Not Implemented` (RFC 9110 §15.6.2).
   pub const NOT_IMPLEMENTED: Status = Status {
     code: 501,
     reason: "Not Implemented",
+  };
+  /// Format: `503 Service Unavailable` (RFC 9110 §15.6.4), a connection past the edge's derived bound.
+  pub const SERVICE_UNAVAILABLE: Status = Status {
+    code: 503,
+    reason: "Service Unavailable",
   };
   /// Format: `505 HTTP Version Not Supported` (RFC 9110 §15.6.6).
   pub const VERSION_NOT_SUPPORTED: Status = Status {
@@ -156,14 +166,34 @@ pub fn head(
   if !fields.iter().all(|(name, value)| carries(name, value)) {
     return Err(BadField);
   }
+  status_line(status, out);
+  for (name, value) in fields {
+    field(name, value, out);
+  }
+  framing(body, close, out);
+  Ok(())
+}
+
+/// Writes a reply's head with no fields of the caller's: the status line, the body's framing and `Connection: close`
+/// when asked. It holds no field a reply cannot carry, so it is never refused: the head a caller falls back to when its
+/// own fields were.
+pub fn bare(status: Status, body: Body, close: bool, out: &mut Vec<u8>) {
+  status_line(status, out);
+  framing(body, close, out);
+}
+
+/// Writes the status line.
+fn status_line(status: Status, out: &mut Vec<u8>) {
   out.extend_from_slice(STATUS_VERSION);
   out.extend_from_slice(status.code.to_string().as_bytes());
   out.push(b' ');
   out.extend_from_slice(status.reason.as_bytes());
   out.extend_from_slice(CRLF);
-  for (name, value) in fields {
-    field(name, value, out);
-  }
+}
+
+/// Writes the body's framing field, `Connection: close` when `close` or when the body runs until the close, and the
+/// empty line that ends the head.
+fn framing(body: Body, close: bool, out: &mut Vec<u8>) {
   match body {
     Body::Length(length) => field(CONTENT_LENGTH, length.to_string().as_bytes(), out),
     Body::Chunked => field(TRANSFER_ENCODING, CHUNKED, out),
@@ -173,7 +203,6 @@ pub fn head(
     field(CONNECTION, CLOSE, out);
   }
   out.extend_from_slice(CRLF);
-  Ok(())
 }
 
 /// Whether a reply can carry the field `name: value`: a token for its name, and no control byte but HTAB in its value.
