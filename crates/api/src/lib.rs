@@ -307,9 +307,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `vcs_http`, which its anchor's role and command carry; an anchor binds the edge's listener once, at that address, and
 /// hands it to every daemon it starts, so a restart never drops the edge's port; an address it cannot bind ends its
 /// start, as a fleet node's serve sockets do (2026-11-19).
+/// 54: a Subversion repository's history imported from a dump (A-652 part 3): the re-exported [`ImportFault`] gains
+/// `ImportFault::Subversion`, the dump refused as `svnadmin load` refuses it (Subversion's error number, the revision
+/// being loaded and the path), which [`Invalid::Import`] names (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 53;
+pub const CONTRACT: u32 = 54;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

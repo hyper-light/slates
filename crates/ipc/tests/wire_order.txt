@@ -123,6 +123,7 @@ ImportFault 5 Damaged
 ImportFault 6 PastRoom
 ImportFault 7 Pending
 ImportFault 8 Abandoned
+ImportFault 9 Subversion
 Intent 0 Read
 Intent 1 Write
 IpcNodeKind 0 Fifo
@@ -369,6 +370,7 @@ ReplyBody 74 CredentialEnrolled
 ReplyBody 75 CredentialRevoked
 ReplyBody 76 IdentitiesSet
 ReplyBody 77 RepositoryImported
+ReplyBody 78 DumpImported
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot

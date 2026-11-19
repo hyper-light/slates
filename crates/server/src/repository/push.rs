@@ -94,7 +94,8 @@ pub(crate) struct EntryParts {
   /// The repository's own state moved (Mercurial's phase roots and markers).
   pub(crate) state: Vec<StateChange>,
   /// The tool's record the entry holds (A-662's `RepositoryEntry::objects`): a Subversion revision's (A-655 part 2b,
-  /// `slates_svn::commit::record`); a git push's is its sealed push's own ([`push_sealed`]).
+  /// `slates_svn::commit::record`), or a Subversion repository's UUID or revision properties, which an entry may hold
+  /// alone (A-652 part 3); a git push's is its sealed push's own ([`push_sealed`]).
   pub(crate) objects: Vec<u8>,
 }
 
@@ -556,6 +557,10 @@ fn push_planned(
     })
     .collect();
   let mut entry = entry(record.id, (&steps, &verdicts), parts);
+  // An entry of no change whose caller brings a record records that record alone: a Subversion repository's UUID or a
+  // revision's properties (A-652 part 3), which move no green. A sealed push's objects, set below, and a revision's
+  // record ride with the changes they came with.
+  let brings_a_record = steps.is_empty() && !entry.objects.is_empty();
   if let Some((sealed, moves)) = sealed.as_mut() {
     let resolved = resolve(state, (&steps, &entry), moves)?;
     if let Err(refused) = sealed.admit((&mut state.store, &mut state.vcs_stores), resolved) {
@@ -572,10 +577,11 @@ fn push_planned(
       }
     }
   }
-  let changes_anything = !(entry.joined.is_empty()
-    && entry.versions.is_empty()
-    && entry.names.is_empty()
-    && entry.state.is_empty());
+  let changes_anything = brings_a_record
+    || !(entry.joined.is_empty()
+      && entry.versions.is_empty()
+      && entry.names.is_empty()
+      && entry.state.is_empty());
   admit(state, &made, &entry, &steps)?;
   if !changes_anything {
     // Every work was sent before and nothing else changes: nothing is recorded, and what was secured is given back.

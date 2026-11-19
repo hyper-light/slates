@@ -14598,8 +14598,23 @@ and export by landing).
 > declared yet, refused typed (`Unsupported`, counted): a directory deleted or replaced beneath a copy the same revision
 > made from a revision older than the head, whose tree no public read of the engine lists at that version, and a
 > replacement without history that changes a node's kind (the engine's `TypeChanged`, GAPS §8f). Owed: the svn://
-> connection task's call of the step (A-656) and the import's (A-652 part 3); the lock verbs' entries recorded as a
-> commit's are; the records' texts held once rather than beside the green's content and in the record.
+> connection task's call of the step (A-656) and the import's (A-652 part 3, built since); the lock verbs' entries
+> recorded as a commit's are; the records' texts held once rather than beside the green's content and in the record.
+>
+> **Status (2026-11-19, A-652, part 3: the import verb).** Built: a dump stock `svnadmin dump` wrote (format 2 or 3)
+> imported into a Subversion repository by the daemon (`slates-server`'s `vcs_store::svn_import` and
+> `repository::import`; `slates-svn`'s `migration::Importer` and `commit::record`). A-678's `ImportRepository`, on a
+> Subversion repository, names the dump's host file, which is opened read-only as a base is (§4.15) and imported on the
+> owner shard a turn at a time, a copy slice of the file read at a time. The import hands each record it makes to its
+> caller's step and reads on once it is committed: each revision through A-655's step (the green's next version and the
+> revision's record one entry), and the UUID and revision 0's properties the stream sets each through an entry of its
+> own that moves no green (`Record::Uuid`, `Record::RevisionProperties`), which a recovery replays through the records'
+> own step. Every imported revision is durable as it lands; the history keeps the stream's numbers, so a dump in parts
+> loads part after part; a refusal keeps the revisions before it, answered `ImportRefused { Subversion }` with
+> Subversion's error number, the revision being loaded and the path; the end answers `DumpImported`. Held to
+> `part1.dump` exported again byte for byte after its import through the daemon and after a rebuild from the log, and
+> to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
+> volume and landed under a grant); an import resumed across a restart.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -15233,7 +15248,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the wiring owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's wiring built,
+   A-652 part 3; the export's owed).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -51079,10 +51095,10 @@ reservation and settle, `make_from_log`; `repository.rs`: the creation's record;
   main's `each_verb_moves_the_names_log_and_each_members_version_its_own_log`, failing then on main's own tree and
   passing on the merge, and failed slates-svn's test build on one borrow in the record's round-trip test (fixed). The
   new tests name what main lacks and do not build on main's tree; the mutation red-checks are main's (§8).
-- **Owed.** The svn:// connection task's call of the step (A-656) and the import's (A-652 part 3); the lock verbs'
-  entries recorded as a commit's are; the engine's read of a tree at a version (for a directory deleted beneath a copy
-  of an older revision) and its composition of a kind change (§8f); the records' texts held once, read from the green's
-  content rather than held beside it and in each record; the Subversion index charged by its bytes; main's runs
+- **Owed.** The svn:// connection task's call of the step (A-656) and the import's (A-652 part 3, built since); the lock
+  verbs' entries recorded as a commit's are; the engine's read of a tree at a version (for a directory deleted beneath a
+  copy of an older revision) and its composition of a kind change (§8f); the records' texts held once, read from the
+  green's content rather than held beside it and in each record; the Subversion index charged by its bytes; main's runs
   (clippy, `xtask check`, the doc gate, Linux and Windows builds, the mutation red-checks).
 
 ### A-680 part 1 — A repository's served view over its index: what 7.2's `served` filter serves, numbered densely, walked from the first changeset that is not public, its texts lent in place or copied within the request's room (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 decision 4, "Pull and clone" items 1 and 2, "Access" and piece 4; A-588 part 2, A-642, A-649, A-657, A-662)
@@ -51143,3 +51159,81 @@ lent with the request's room and `file_node` gone, the changegroup lending each 
   panics on arbitrary bytes.
 - **Owed.** The view handed to the daemon's HTTP site over A-662's stores, and the site's pushes through `hg_push`
   (A-680 part 2); the other platforms' runs (main's).
+
+### A-652 part 3 — A Subversion dump imported by the daemon: the import verb over A-655's step, each record the import makes committed and logged as it lands (2026-11-19, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 piece 6 and item 3.5; §4.15; A-628, A-655, A-678)
+Applied in the same change to: §4.17.4 (a status block, piece 6's line, A-655 part 2b's owed list), GAPS (the §4.17.4
+entry), `crates/svn` (`commit/record.rs`: `Record::Uuid` and `Record::RevisionProperties`, their kind bytes, and their
+tests; `migration/import.rs`: `Importing::Commit`, `Importer::holding`, `Importer::loading`; `migration/records.rs`:
+`Repository::set_uuid` public, `check_revision_properties` and `set_revision_properties` in place of
+`set_revision_zero`, `commit_record`; `migration.rs`; the migration tests' driver and a golden test), `crates/server`
+(`vcs_store/svn_import.rs` and its tests, new; `vcs_store.rs`: the imports' map, `importing`, `free`, `replay_svn`
+through `commit_record`; `repository/import.rs`: the verb by tool, `svn_reply_of`, `svn_refusal_of`;
+`repository/svn_commit.rs`: `record`; `repository/push.rs`: an entry of no change holding its caller's record alone;
+`repository.rs` and `verbs.rs`: their notes), `crates/ipc` (`ImportFault::Subversion` and `ReplyBody::DumpImported`,
+appended; `ImportRepository`'s doc; `tests/wire_order.txt`), `crates/api` (contract 54).
+- **What was there.** A-628's import made a dump's revisions and committed each into records it held itself (A-655 part
+  2a's step), so only slates-svn's tests held an imported history; the daemon had no verb for it (A-678's
+  `ImportRepository` refused a Subversion repository `NotMercurial`), and nothing could record an import's UUID or
+  revision 0's properties.
+- **The import hands its records over.** `Importer::import` stops at each record it makes and answers
+  `Importing::Commit { consumed, record }`, A-655 part 2b's record type: a revision made on the youngest revision; the
+  UUID, where the stream's names a repository that holds no revision but 0 by another; revision 0's properties, set
+  whole as `close_revision` sets them. It reads on once its caller committed the record. A caller that holds the records
+  alone commits each through `Repository::commit_record` (the migration tests do); the daemon commits each through its
+  owner's step. So one import serves both, and a dump's revision is a commit like a client's (item 3.5), never a second
+  path.
+- **Two records beside the revisions.** `Record::Uuid` (kind 2: the UUID's 36 bytes; `svn_fs_set_uuid`) and
+  `Record::RevisionProperties { revision, properties }` (kind 3: the revision, then its properties as a revision's are
+  written; `svn_fs_change_rev_prop2` for each difference), each held by an entry of the repository's logs that moves no
+  green. A-635's append records such an entry: one of no change whose caller brings a record (`EntryParts::objects`)
+  holds that record alone, where a sealed push's objects and a revision's record still ride with their changes.
+  `svn_commit::record` checks the record against the records (a revision they hold; the room,
+  `check_revision_properties`), charges its growth, appends it, then applies it; a recovery replays every record after
+  the creation's through `commit_record`, the step each live record took.
+- **The daemon's import** (`vcs_store::svn_import`). `ImportRepository` on a Subversion repository names the dump's
+  file: the directory it is in is opened as a base is (read-only, §4.15) and the file by its name in it. The import is
+  kept in the shard's map, one a repository, and run a turn at a time on the owner shard by the task A-678's verb
+  starts: within a turn the file is read a copy slice at a time (or what the reader asks for, when more), handed to the
+  import, and each record committed, until the turn's time (`copy_slice_ns`) is spent; a revision's step is one unit.
+  The reader's admission is one client region's bytes, a Mercurial import's room; the records are lent every byte the
+  shard could admit for each call; what the import holds between its turns (its buffer and the open revision's
+  properties, texts and new contents, `Importer::holding`) is charged to the shard's budget as retention at each turn's
+  end, trued up, and given back at its end. Freeing the repository gives an import back.
+- **Answers.** The end answers `DumpImported { revisions, youngest }`. A refusal keeps the revisions committed before
+  it, as `svnadmin load` keeps them, and is answered by kind: `ImportRefused { Subversion { code, revision, path } }`
+  for the dump refused as `svnadmin load` refuses it (A-628's refusal with Subversion's number, the revision being
+  loaded, the path the refusal names) and for a revision the step refused (its refusal read as the import's);
+  `PastRoom` past the reader's admission; `BudgetExceeded` for the shard's budget (the records' room, or what the import
+  holds); `Format` for a revision whose green version this build cannot declare yet (A-655 part 2b's `Unsupported`); an
+  append's refusal as it is; `Pending`, `UnderWay`, the host's refusal naming the file and `Abandoned` as A-678's are.
+  `NotMercurial` now answers a repository of neither tool.
+- **Departures.** None from `svnadmin load`'s rules beyond A-628's (revision numbers kept, a foreign UUID refused,
+  properties byte for byte). A restart ends an import between its records: the revisions committed are the log's and
+  are recovered; the import is not, and a request sent again begins a new one, which refuses a stream that starts
+  before the revision after the youngest (`E160006`), so a dump of the revisions after it is what loads next. Not
+  taken (decided by the design, not measured): a second import path writing the records and the green directly, which
+  would be a second commit path and an import not durable as it lands.
+- **Tests.** slates-svn: the two records pinned byte for byte by hand and read back, every truncation refused, names out
+  of their order, a byte after the last and a UUID not in RFC 4122's form refused by kind, a flipped byte never a panic
+  and what reads canonical; `part1.dump` imported through a caller that names each record handed over (the UUID,
+  revision 0's properties, revisions 1 to 3, in that order) and, with revision 2 kept back, refusing revision 3 out of
+  its sequence (`E160006`); every golden, generated, rule, refusal and step test of A-628 and A-655 through the new
+  driver. slates-server: `part1.dump` imported through the daemon's step exporting `part1.dump` byte for byte, the green
+  at version 3, the register holding the creation, the UUID, revision 0's properties and three revisions; `part1.dump`
+  then `part2.dump` exporting `full.dump`, and `part1.dump` again refused at revision 0 (`E160006` on the wire);
+  `part1.dump` cut three bytes short refused `E200003` at revision 3, revisions 1 and 2 kept; the records made again
+  from the log exporting `part1.dump`; the verb on a running shard answered once when its import ends; every failure
+  mapped to its refusal. slates-ipc: the wire's order with the two appended variants. slates-api: the contract's
+  history.
+- **Evidence** (kiln r381, macOS arm64, Mac Studio d1323898, debug, 2026-11-19, the change over main 770ae8826).
+  `cargo fmt --check` clean for slates-svn, slates-server, slates-ipc and slates-api; `cargo test --locked -p
+  slates-svn --lib -- commit:: migration::` 94 of 94, 410 filtered out, in 1.27 s; `-p slates-ipc --test wire_order` 2
+  of 2 (the two appended variants' lines written by hand as the `--ignored` writer writes them, and held by the test);
+  `-p slates-api --lib -- contract_history an_import_refusal` 2 of 2; `-p slates-server --lib -- vcs_store::
+  repository:: --test-threads=4` 58 of 58, 714 filtered out, in 3.70 s, A-678's import tests among them. The first run
+  (kiln r349) failed two of the server's new tests at the revision a refusal names: the import forgot the revision it was
+  loading once refused, and keeps it now (`Importer::loading`). No integration target reaches the verb. The new tests
+  name what main lacks and do not build on main's tree; the mutation red-checks are main's (§8).
+- **Owed.** The export verb, A-652 part 3's second half (a range of revisions written as a dump into a volume, landed
+  under a grant, §4.15); an import resumed across a restart; the CLI's and the SDKs' words for the verb (A-678's owed);
+  main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds, the mutation red-checks).

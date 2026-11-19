@@ -62,8 +62,8 @@ pub(crate) mod push;
 // calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hg_push;
-// Subversion's commit landed through the push (A-655 part 2b): until the svn:// connection task (A-656 part 2) and the
-// import (A-652 part 3) call it, a daemon build calls none of it.
+// Subversion's commit landed through the push (A-655 part 2b): a dump's import commits through it (A-652 part 3); until
+// the svn:// connection task (A-656 part 2) calls it, a daemon build calls none of a client's half (the judging again).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod svn_commit;
 // The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
