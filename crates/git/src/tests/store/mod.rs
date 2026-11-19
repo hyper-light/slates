@@ -16,6 +16,7 @@ use crate::store::{
   Progress, Push, PushRefused, Repository, StoreRefused, Turn, Upload, UploadCounters, Versions,
 };
 
+mod deltas;
 mod encoding;
 mod fragments;
 mod hook_view;
