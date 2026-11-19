@@ -8,7 +8,8 @@
 
 use super::editor::{WINDOW_HEADER_INTEGERS, read_integer};
 use super::{
-  Begun, Context, PARSED_ITEM_BYTES, PATH_INFO_BYTES, Progress, Report, Reporter, Request, RequestKind,
+  Begun, Context, PARSED_ITEM_BYTES, PATH_INFO_BYTES, Progress, Report, Reporter, Request,
+  RequestKind,
 };
 use crate::handshake::{ClientCapabilities, Principal, Session};
 use crate::index::{NodeKind, Revision};
@@ -202,7 +203,11 @@ pub(super) fn report_command(recorded: Recorded) -> (String, usize, Request) {
 }
 
 /// The context a recorded connection's report is read in: everything readable, room to spare.
-pub(super) fn context<'a>(session: &'a Session, session_path: &'a str, client: &[u8]) -> Context<'a> {
+pub(super) fn context<'a>(
+  session: &'a Session,
+  session_path: &'a str,
+  client: &[u8],
+) -> Context<'a> {
   Context {
     session,
     session_path,

@@ -11,7 +11,9 @@
 
 use super::*;
 use crate::report::drive::Facts;
-use crate::report::recorded::{SESSIONS, Written, drive_items, items, read_drive, stock_capabilities};
+use crate::report::recorded::{
+  SESSIONS, Written, drive_items, items, read_drive, stock_capabilities,
+};
 
 /// The most nodes the tests' writers hold open: past the fixtures' deepest path.
 const MOST_OPEN: usize = 64;

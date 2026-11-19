@@ -221,10 +221,15 @@ fn content(spec: &str) -> Vec<u8> {
   if let Some(lines) = spec.strip_prefix("lines:") {
     let parts: Vec<&str> = lines.split(':').collect();
     let count: usize = parts[0].parse().unwrap();
-    let edited: Option<usize> = (parts.len() == 3 && parts[1] == "edit").then(|| parts[2].parse().unwrap());
+    let edited: Option<usize> =
+      (parts.len() == 3 && parts[1] == "edit").then(|| parts[2].parse().unwrap());
     return (1..=count)
       .map(|line| {
-        let rest = if Some(line) == edited { EDITED_LINE } else { LINE };
+        let rest = if Some(line) == edited {
+          EDITED_LINE
+        } else {
+          LINE
+        };
         format!("line {line}{rest}")
       })
       .collect::<String>()
@@ -241,13 +246,15 @@ pub(super) fn repository() -> (Index, Green) {
     directory: true,
     ..GreenNode::default()
   };
-  green.trees.push(BTreeMap::from([(String::from("/"), root)]));
+  green
+    .trees
+    .push(BTreeMap::from([(String::from("/"), root)]));
   green.revisions.push(Vec::new());
-  for block in HISTORY
-    .split("\nrevision ")
-    .skip(1)
-    .map(|block| block.lines().filter(|line| !line.is_empty() && !line.starts_with('#')))
-  {
+  for block in HISTORY.split("\nrevision ").skip(1).map(|block| {
+    block
+      .lines()
+      .filter(|line| !line.is_empty() && !line.starts_with('#'))
+  }) {
     green.commit(block.collect(), &mut index);
   }
   (index, green)
@@ -368,7 +375,12 @@ impl Green {
   }
 
   /// A path's row, with the text and the property list it leaves.
-  fn changed_path(&mut self, tree: &BTreeMap<String, GreenNode>, path: String, row: Row) -> ChangedPath {
+  fn changed_path(
+    &mut self,
+    tree: &BTreeMap<String, GreenNode>,
+    path: String,
+    row: Row,
+  ) -> ChangedPath {
     let node = tree.get(&path);
     let kind = node.map_or(NodeKind::File, |node| {
       if node.directory {
@@ -377,11 +389,16 @@ impl Green {
         NodeKind::File
       }
     });
-    let text = (row.text && row.action != Action::Delete).then(|| self.text_of(&node.unwrap().text));
+    let text =
+      (row.text && row.action != Action::Delete).then(|| self.text_of(&node.unwrap().text));
     let properties = (row.properties && row.action != Action::Delete)
       .then(|| self.list_of(&node.unwrap().properties));
     ChangedPath {
-      kind: if row.action == Action::Delete { self.deleted_kind(&path) } else { kind },
+      kind: if row.action == Action::Delete {
+        self.deleted_kind(&path)
+      } else {
+        kind
+      },
       path,
       action: row.action,
       copy_from: row.copy_from,
@@ -476,7 +493,9 @@ fn set_property(
 ) {
   let node = tree.get_mut(path).unwrap();
   match value {
-    Some(value) => node.properties.insert(name.to_owned(), value.as_bytes().to_vec()),
+    Some(value) => node
+      .properties
+      .insert(name.to_owned(), value.as_bytes().to_vec()),
     None => node.properties.remove(name),
   };
   let row = rows

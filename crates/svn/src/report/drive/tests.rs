@@ -139,7 +139,11 @@ fn sort_own_properties(properties: &mut [(String, Option<Vec<u8>>)]) {
 }
 
 /// A delta applied to the text whose MD5 it names, none naming no bytes.
-fn applied(base: Option<[u8; 16]>, windows: &[Window], texts: &BTreeMap<[u8; 16], Vec<u8>>) -> Normal {
+fn applied(
+  base: Option<[u8; 16]>,
+  windows: &[Window],
+  texts: &BTreeMap<[u8; 16], Vec<u8>>,
+) -> Normal {
   let source = base.map_or_else(Vec::new, |md5| texts[&md5].clone());
   let made = apply_all(&source, windows).unwrap();
   Normal::Delta(base, md5(&made), made.len())
@@ -229,13 +233,21 @@ fn svnlook_line(change: &crate::index::ChangedPath) -> String {
     Action::Modify if change.text.is_some() => 'U',
     Action::Modify => '_',
   };
-  let second = if change.action == Action::Modify && change.properties.is_some() { 'U' } else { ' ' };
+  let second = if change.action == Action::Modify && change.properties.is_some() {
+    'U'
+  } else {
+    ' '
+  };
   let copied = if change.copy_from.is_some() { '+' } else { ' ' };
   let path = change.path.get(1..).unwrap();
   let mut line = format!("{first}{second}{copied} {path}{}\n", slash(change.kind));
   if let Some(source) = &change.copy_from {
     let source_path = source.path.get(1..).unwrap();
-    line.push_str(&format!("    (from {source_path}{}:r{})\n", slash(change.kind), source.revision));
+    line.push_str(&format!(
+      "    (from {source_path}{}:r{})\n",
+      slash(change.kind),
+      source.revision
+    ));
   }
   line
 }
@@ -285,8 +297,14 @@ fn deletions_and_copies_are_found_where_the_history_made_them() {
   assert_eq!(deleted("/trunk/a.txt", 1, 6), None);
   assert_eq!(deleted("/trunk/new.txt", 1, 6), None);
   let copy = |path, revision| history::closest_copy(&index, path, revision).unwrap();
-  assert_eq!(copy("/branches/b1/a.txt", 3), Some((3, String::from("/branches/b1"))));
-  assert_eq!(copy("/trunk/renamed.txt", 6), Some((4, String::from("/trunk/renamed.txt"))));
+  assert_eq!(
+    copy("/branches/b1/a.txt", 3),
+    Some((3, String::from("/branches/b1")))
+  );
+  assert_eq!(
+    copy("/trunk/renamed.txt", 6),
+    Some((4, String::from("/trunk/renamed.txt")))
+  );
   assert_eq!(copy("/trunk/a.txt", 6), None);
   assert_eq!(copy("/trunk/../a.txt", 6), None);
 }
@@ -325,7 +343,14 @@ fn trunk_report(from: Revision, to: Revision, send_copyfrom_args: bool) -> Repor
 fn an_added_copy_names_its_source_when_the_client_asks() {
   let (index, green) = repository();
   let guards = FixtureGuards::anonymous();
-  let calls = |copies| run(&mut Drive::new(trunk_report(3, 4, copies), b"u"), &index, &green, &guards);
+  let calls = |copies| {
+    run(
+      &mut Drive::new(trunk_report(3, 4, copies), b"u"),
+      &index,
+      &green,
+      &guards,
+    )
+  };
   let added = |calls: &[Written]| {
     calls
       .iter()
@@ -335,9 +360,15 @@ fn an_added_copy_names_its_source_when_the_client_asks() {
   let plain = calls(false);
   let copied = calls(true);
   let (at_plain, at_copied) = (added(&plain), added(&copied));
-  assert_eq!(plain[at_plain], Written::Add(NodeKind::File, "renamed.txt".into(), None));
+  assert_eq!(
+    plain[at_plain],
+    Written::Add(NodeKind::File, "renamed.txt".into(), None)
+  );
   let source = Some((String::from("/trunk/new.txt"), 3));
-  assert_eq!(copied[at_copied], Written::Add(NodeKind::File, "renamed.txt".into(), source));
+  assert_eq!(
+    copied[at_copied],
+    Written::Add(NodeKind::File, "renamed.txt".into(), source)
+  );
   let base_of = |calls: &[Written], from| {
     calls[from..].iter().find_map(|call| match call {
       Written::Delta(base, _, _) => Some(*base),
@@ -356,8 +387,16 @@ fn an_added_copy_names_its_source_when_the_client_asks() {
 fn a_drive_paused_at_any_step_makes_the_same_calls() {
   let (index, green) = repository();
   let guards = FixtureGuards::anonymous();
-  let session = SESSIONS.iter().find(|session| session.name == "checkout-head.1").unwrap();
-  let whole = run(&mut Drive::new(finished_report(*session), b"u"), &index, &green, &guards);
+  let session = SESSIONS
+    .iter()
+    .find(|session| session.name == "checkout-head.1")
+    .unwrap();
+  let whole = run(
+    &mut Drive::new(finished_report(*session), b"u"),
+    &index,
+    &green,
+    &guards,
+  );
   for steps in 1..=2 {
     let mut drive = Drive::new(finished_report(*session), b"u");
     let (calls, pauses) = run_paused(&mut drive, &index, &green, &guards, steps);
@@ -394,7 +433,17 @@ fn run_paused(
 
 /// The names a generated report's paths are made of: the fixtures' own, ones they never held, an
 /// empty name and a parent's.
-const NAMES: [&str; 9] = ["a.txt", "dir", "sub", "d.txt", "secret", "missing", "renamed.txt", "", ".."];
+const NAMES: [&str; 9] = [
+  "a.txt",
+  "dir",
+  "sub",
+  "d.txt",
+  "secret",
+  "missing",
+  "renamed.txt",
+  "",
+  "..",
+];
 
 /// The depths a generated report's paths take.
 const DEPTHS: [Depth; 5] = [

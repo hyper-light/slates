@@ -13434,6 +13434,19 @@ and export by landing).
 > LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
 > `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
 > answers to `close-edit` and `abort-edit`.
+>
+> **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
+> `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs) and the session's `Guards` (its
+> locks and what its principal may read): an explicit stack of frames, never recursion, a step at a time under the
+> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
+> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
+> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
+> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from
+> each session's own report over `history.txt` rebuilt into an index and a green and checked against
+> `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
+> delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
+> sent today as new data; and the handler.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -43418,3 +43431,51 @@ read, taken out of `report/tests.rs`).
 - **Owed** (GAPS): the drive over the index (A-553) and the green, with `svn_repos_deleted_rev` and
   `svn_fs_closest_copy`; the deltas of changed texts; the handler that answers the client's early answer and its
   answers to `close-edit` and `abort-edit`.
+
+### A-616, continued (2) — The reporter's drive over the index and the green (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); the research notes (§1, the drive's
+sources); `crates/svn` (`report/drive.rs`'s `Drive`, `Guards`, `DriveFailure` and `Next`; `report/drive/history.rs`,
+`green.rs` and `tests.rs`, new; `report/recorded.rs` gains the report and drive readers both test modules share;
+`report/editor.rs`'s integer reader seen by the reporter's tests).
+
+- **The walk** (`reporter.c` at 1.15.0, its 1.14.x twin): `drive` checks the anchor's read access (220000 "Not
+  authorized to open root of edit operation"), the source revision (160006 "No such revision N"), and a target without
+  an operand (160005 "Target path '…' does not exist", "Cannot replace a directory from within"), then writes the
+  target revision and the root. `delta_dirs` compares a directory's properties, then its reported paths in the
+  client's order (a deletion only noted), then the source entries the target lacks, then the target entries the report
+  did not name, by name, each as `update_entry` decides: left alone when unchanged and unreported (or reported holding
+  the lock's own token), deleted with `svn_repos_deleted_rev`'s revision when unrelated (the one before the target's
+  when the path still holds a node), made absent when the principal may not read it, opened when related, else added,
+  a file with its copy source when the client asked. A reported path missing from the repository is 160013 "Working
+  copy path '…' does not exist in repository"; a refusal ends the drive with `AbortEdit` after the calls already made,
+  and `Drive::failure` names it.
+- **Bounded and stackless.** The walk is an explicit stack of frames (the anchor, each directory being compared, each
+  file being sent), so a path's depth is data, never stack; each step does one bounded thing (a directory's entries
+  read, one entry decided, one deletion found, one node's properties, one window), and `Drive::next` pauses when the
+  caller's steps are spent. The report is read one path ahead (`fetch_path_info`, `skip_path_info`, `any_path_info`).
+- **History over the index** (`report/drive/history.rs`): `fs_closest_copy` (the youngest copy root along the path,
+  kept only when the node there is of the copy's line and not made new beneath it in the copy's revision) and
+  `svn_repos_deleted_rev`'s binary search, bounded at 65 halvings. A path out of canonical form names nothing, as
+  `open_path` finds no entry `..`. g262's `reads` walks copy roots too (`youngest_copy_root`, private): one of the two
+  should serve both.
+- **Where it differs from `svnserve`**, each in what a client reads alike: deletions and a node's own properties in
+  name order, where `svnserve`'s are in APR's seeded hash order; property lists and texts compared by content
+  identity, where FSFS compares a representation's place unless asked strictly; and a text sent as new data, a window
+  of up to 102,400 bytes at a time, where `svnserve` sends `xdelta.c`'s delta or FSFS's stored one.
+- **Evidence.** `history.txt` rebuilt by the tests into an index and a green (`report/drive/green.rs`:
+  `make-fixtures.py`'s grammar and texts, each `svnmucc` action a changed-path row) and rendered as
+  `svnlook changed --copy-info`, equal to the recorder's `changed.txt`. Every recorded drive (27 of the 38 sessions;
+  the early answer's is the handler's) replayed from the session's own report: call for call, entry properties in
+  order, a node's own properties and a directory's deletions as sets, each delta by the MD5 and length of what it
+  makes of the text its base MD5 names; refused drives with `svnserve`'s number and message.
+- **Tests.** Six: that history check, that replay, the deletion revisions and closest copies of the history's
+  deletions, move and branch, an added copy with and without copy sources, pausing at one and two steps a call (the
+  same calls, at least one pause), and generated hostile reports (names held and not, empty and `..`, deletions,
+  links, tokens, revisions past the youngest, every depth) whose drives must end with every call taken in order by
+  ra_svn's writer. `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: 6 of 6 at once, then red
+  six ways by mutation (the drive ending at once: 4 tests; an unchanged entry never left alone, `deleted_revision`
+  answering none, property removals dropped, depth upgrades never made, lock tokens ignored: the replay each time),
+  then the crate whole on the formatted, merged tree.
+- **Owed** (GAPS): the deltas of changed texts against their base, `xdelta.c` ported; the handler that writes the
+  drive, reads the client's early answer and its answers to `close-edit` and `abort-edit`, and answers the command;
+  one copy-root walk for `reads` and the drive.

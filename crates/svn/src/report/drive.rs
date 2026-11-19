@@ -819,10 +819,12 @@ impl Drive {
   ) -> Result<(), DriveFailure> {
     if self.operand.is_empty() {
       let start_empty = entry.info.as_ref().is_some_and(|info| info.start_empty);
-      self.frames.push(Frame::Directory(Box::new(DirectoryFrame::new(
-        &entry,
-        start_empty,
-      ))));
+      self
+        .frames
+        .push(Frame::Directory(Box::new(DirectoryFrame::new(
+          &entry,
+          start_empty,
+        ))));
       Ok(())
     } else {
       self.frames.push(Frame::Anchor);
@@ -1074,9 +1076,10 @@ impl Drive {
     match &entry.info {
       None => true,
       Some(info) if info.start_empty => false,
-      Some(info) => info.lock_token.as_deref().is_none_or(|token| {
-        sources.guards.lock_token(&entry.t_path) == Some(token)
-      }),
+      Some(info) => info
+        .lock_token
+        .as_deref()
+        .is_none_or(|token| sources.guards.lock_token(&entry.t_path) == Some(token)),
     }
   }
 
@@ -1119,10 +1122,12 @@ impl Drive {
     };
     self.pending.push_back(call);
     let start_empty = entry.info.as_ref().is_some_and(|info| info.start_empty);
-    self.frames.push(Frame::Directory(Box::new(DirectoryFrame::new(
-      entry,
-      start_empty,
-    ))));
+    self
+      .frames
+      .push(Frame::Directory(Box::new(DirectoryFrame::new(
+        entry,
+        start_empty,
+      ))));
   }
 
   /// A file opened when related, else added (`add_file_smartly`, with its copy source when the
@@ -1202,7 +1207,13 @@ impl Drive {
     match file.phase {
       FilePhase::Properties => {
         let token = file.lock_token.as_deref();
-        self.properties(sources, file.s_rev, file.s_path.as_deref(), &file.t_path, token)?;
+        self.properties(
+          sources,
+          file.s_rev,
+          file.s_path.as_deref(),
+          &file.t_path,
+          token,
+        )?;
         file.phase = FilePhase::Text;
       }
       FilePhase::Text => self.text(&mut file, sources)?,
@@ -1212,9 +1223,7 @@ impl Drive {
         file.phase = FilePhase::Close;
       }
       FilePhase::Close => {
-        self
-          .pending
-          .push_back(Owned::CloseFile(file.target.md5()));
+        self.pending.push_back(Owned::CloseFile(file.target.md5()));
         return Ok(());
       }
     }
@@ -1283,7 +1292,8 @@ impl Drive {
     t_path: &str,
     lock_token: Option<&[u8]>,
   ) -> Result<(), DriveFailure> {
-    let target = dirent(sources, t_path, self.target_revision)?.ok_or_else(DriveFailure::corrupt)?;
+    let target =
+      dirent(sources, t_path, self.target_revision)?.ok_or_else(DriveFailure::corrupt)?;
     self.entry_properties(sources, target.created, s_path.is_some())?;
     if let Some(token) = lock_token
       && sources.guards.lock_token(t_path) != Some(token)
@@ -1421,9 +1431,8 @@ fn is_depth_upgrade(wc_depth: Depth, requested_depth: Depth, kind: NodeKind) -> 
     || requested_depth <= wc_depth
     || wc_depth == Depth::Immediates;
   let files_held = kind == NodeKind::File && wc_depth == Depth::Files;
-  let files_only = kind == NodeKind::Directory
-    && wc_depth == Depth::Empty
-    && requested_depth == Depth::Files;
+  let files_only =
+    kind == NodeKind::Directory && wc_depth == Depth::Empty && requested_depth == Depth::Files;
   !(no_deeper || files_held || files_only)
 }
 
@@ -1460,7 +1469,9 @@ fn reported_entry(
     t_path: join_fspath(&directory.t_path, &name),
     t_entry,
     e_path: join_relpath(&directory.e_path, &name),
-    wc_depth: info.as_ref().map_or(below(directory.wc_depth), |info| info.depth),
+    wc_depth: info
+      .as_ref()
+      .map_or(below(directory.wc_depth), |info| info.depth),
     info,
     requested_depth: below(directory.requested_depth),
   })
@@ -1520,8 +1531,8 @@ fn entries<R: Repository + ?Sized, G: ?Sized>(
     .ok_or_else(DriveFailure::corrupt)?;
   let mut entries = BTreeMap::new();
   for name in names {
-    let entry = dirent(sources, &join_fspath(path, &name), revision)?
-      .ok_or_else(DriveFailure::corrupt)?;
+    let entry =
+      dirent(sources, &join_fspath(path, &name), revision)?.ok_or_else(DriveFailure::corrupt)?;
     entries.insert(name, entry);
   }
   Ok(entries)
