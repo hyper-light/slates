@@ -11745,6 +11745,14 @@ signature verification).
 > **Status (2026-11-18, A-499).** Designed; nothing is built. Built on §4.17.1 without redefining it, from Mercurial
 > 7.2's own documents and code and hg-evolve 12.0.0 (the topic and evolve extensions). The reading notes, every source
 > named to its file, are `research/mercurial-server.md`. The pieces are listed at the end, after the shared ones.
+>
+> **Status (2026-11-19, A-514: piece 1's framings built).** `crates/hg` (`slates-hg`) decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas as pure functions over bytes: every length read as 7.2 reads it
+> (signed 32-bit, so `0xFFFF_FFFF` is −1), checked against the bytes left, every structure counted before it is built
+> and charged exactly to the caller's admission, no recursion however deep bundle2's interruptions nest. Proven against
+> golden vectors stock Mercurial 7.2 made (`crates/hg/fixtures`, the command in `make-fixtures.sh`): each bundle decodes
+> as 7.2's own `debugbundle` lists it, every text rebuilds from its deltas, each encodes back to its bytes. Still owed
+> from piece 1: the parts' own payloads (phase-heads, bookmarks, the check parts, markers, pushkey values).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12108,7 +12116,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties.
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, `crates/hg`): the framings,
+   bundle1 and the deltas; owed: the parts' payloads, from phase-heads to pushkey values.
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping.
@@ -35827,6 +35836,82 @@ entry), `crates/svn` (`src/lib.rs`, `src/ra_svn.rs` and `src/ra_svn/tests.rs`, n
   slates-svn --lib` 33 of 33 (15 of the item codec, 18 of svndiff) before and after `cargo fmt`, and `cargo fmt --check`
   clean. The one-crate clippy and `cargo xtask check` are main's (the run-request queue).
 - **Owed.** §4.17.4's pieces 3 to 14; the server derives each bound when it reads commands (piece 7).
+
+### A-535 — A loopback mount is offered only where no one but root can capture loopback traffic (2026-11-18, goal 85, g079; §4.6 "macOS", §4.13 the mount capability; AUD-01, A-34)
+Applied in the same change to: GAPS (the 2026-10-04 loopback confidentiality entry), `crates/api/src/error.rs`
+(`MountMissing::PrivateLoopback`), `crates/api/src/mount.rs` (`available` on macOS and the BSDs, `bpf_devices`,
+`capture_open`, `loopback_available`, the unit test), `crates/api/src/lib.rs` (contract 43), `docs/library.md`, and
+the bug record `docs/bugs/2026-11-18-a-macos-mounts-capability-was-readable-by-any-group-granted-loopback-capture.md`.
+- **What was there.** A loopback NFS mount's capability (AUD-01: the attachment and its 16-byte token) rides every
+  file handle in the clear, and the macOS kernel client speaks neither RPC-with-TLS (RFC 9289) nor RPCSEC_GSS, so that
+  leg cannot be encrypted. macOS lets only root capture loopback by default, but a host that gives `/dev/bpf*` to a
+  group (Wireshark's ChmodBPF, `access_bpf`) lets each member read every mount's capability off loopback and replay it
+  from a client of its own, with a uid of its choosing (AUTH_SYS is a claim). The mount was offered anyway.
+- **The rule.** The loopback mount is a host fact only where capture is root's alone: every BPF device
+  (`/dev/bpf`, `/dev/bpf<n>`) is read by root alone, by its mode (no group or other read bit) and its owner (root).
+  Elsewhere `mount::available` answers `Unsupported { PrivateLoopback }`, and so does every mount, before anything is
+  attached; the words name the devices and the fix (give them back to root).
+- **Rejected.** (1) Refusing calls on a connection a user process owns: a daemon running as the user cannot tell
+  another user's process from the kernel's socket, since `proc_pidfdinfo` refuses other users' processes, and the
+  kernel's port is unprivileged because the mount clears `NFS_MFLAG_RESVPORT` (R10). (2) Rotating the token per
+  mount: each mount's attachment has its own token already. (3) Binding a token to the first connection that uses it:
+  it breaks clients that open several connections on one mount (the hostile suite's honest clients, Linux's
+  `nconnect`), and a mount's first call still races a sniffer.
+- **Cost.** A host whose BPF devices a group may read cannot mount until they are root's again. Measured: none of the
+  five Macs slates runs on (2026-11-18) is such a host.
+- **Tests.** `a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback` (`crates/api/src/mount.rs`,
+  the lib's unit tests, every host): devices as macOS and as ChmodBPF leave them, read by anyone, owned by a user, and
+  none; the availability under each answer. Red with the old rule on the Mac Studio; the module 12 of 12 with the new.
+
+### A-514 — Mercurial's bundle2, bundle1, changegroups and deltas, decoded and encoded as a pure core and held to golden vectors stock Mercurial 7.2 made (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-16, A-499)
+Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (new, `slates-hg`: `bundle2`, `bundle1`,
+`changegroup`, `delta`, the cursor and the admission, with `fixtures/` and its `make-fixtures.sh`), `Cargo.lock`,
+`unsafe-budget.toml` (`slates-hg = 0`), `.gitattributes` (the fixtures' bundles binary), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§12).
+- **What it does.** Reads and writes the three framings a Mercurial exchange uses, byte for byte as 7.2 writes them:
+  a bundle2 stream (`HG20`: stream parameters, parts with mandatory and advisory parameters, chunked payloads, the
+  interrupt), a bundle1 (`HG10UN` and a changegroup `01`), and changegroups `01` to `05` (the changelog's group, the
+  manifest's, from `03` the tree-manifest list, the file list; each version's delta header from 7.2's code), with the
+  deltas inside them (mpatch's hunks, checked by its C rules, applied into one vector of the exact length). Nothing
+  else: no node is hashed (piece 3), no part is handled (piece 5), and a stream compressed with `GZ`, `BZ` or `ZS` is
+  refused by kind until the engines are wired (D-17).
+- **From the sources (read 2026-11-18 and 2026-11-19, `research/mercurial-server.md` §2, §3 and §12).** Every length is
+  a signed big-endian 32-bit integer as 7.2 reads it, so `0xFFFF_FFFF` is −1: a refused length, or in a bundle2
+  payload the interrupt. A changegroup chunk length from 1 to 4 is refused, not read as empty. The tree-manifest list is
+  in every changegroup from `03`, empty or not, though `internals.changegroups` says otherwise. Changegroup `04` is
+  7.2's 130-byte delta-information header (its code), not the sidedata version its document describes (moved to `05`).
+  A part type is 1 to 255 bytes of `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter. A stream parameter
+  is matched without case, and only `Compression` is known.
+- **Stricter than 7.2, on purpose.** A part header whose parameters run past it, or that leaves bytes unread, is
+  refused (7.2 slices short and ignores the rest); a repeated parameter key is refused (the document's "MUST be
+  unique"; 7.2 keeps the last); an empty part type and bytes after a stream's or a changegroup's end are refused.
+- **Caps, none a literal.** The input (a length past the bytes left is `Truncated`) and the caller's `Admission`, the
+  room its request's budget gives (A-16): a decode walks its input once to check and count it, charges the exact
+  total, then builds every vector once at its final size. Interruptions nest without recursion, counted, so ten
+  thousand nested parts decode within their admission and are refused one byte short of it.
+- **Golden vectors.** Made once on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock Mercurial 7.2 from PyPI
+  through `uvx` (CPython 3.12.16), exactly: `OUT=$(mktemp -d ~/.cache/g291-fixtures.XXXXXX) &&
+  ~/.cache/g291-scratch/make-fixtures.sh "$OUT"`, the script checked in as `crates/hg/fixtures/make-fixtures.sh`: one
+  repository (a named branch, a copy, a bookmark, a merge, a subdirectory, a draft amended under evolution), bundled as
+  `none-v1` and `none-v2;cg.version=02|03|04;phases=true;obsolescence=true`, with 7.2's `debugbundle` of each and its
+  log. The ten files' SHA-256 matched after the copy. Two of 7.2's own listing limits showed up and are recorded there:
+  `debugbundle --all` fails on a `04` bundle's full texts (`TypeError` at `debugcommands.py:398`) and lists no file of
+  a `03` bundle.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug, load 18.9 to 26.4).** `cargo test --locked -p slates-hg --lib`: 39 of
+  39 in 1.2 s; `cargo fmt -p slates-hg --check` clean. Golden: the three bundle2 streams hold the parts 7.2 lists and
+  encode back to their bytes; changegroups `01` and `02` decode as 7.2 lists every revision (nodes, parents, link,
+  delta base, delta length), `03` and `04` as far as 7.2's listing goes and equal to `02` beyond it; every file text,
+  the copy's metadata block included, rebuilds from its deltas in all four versions alike, each changeset's text
+  beginning with its manifest's node and ending with its description; every changegroup encodes back to its bytes.
+  Hostile: foreign magics; `len = u32::MAX` and `i32::MAX` in every length; every cut of every fixture; every bit of a
+  fixture flipped one at a time (refused, or read and encoded back: to itself for a stream, to the same bytes for a
+  changegroup); stream parameters as 7.2 judges them;
+  misread part headers; nesting past the admission; arbitrary bytes (property tests). An oracle: `apply` equals a splice
+  model over generated hunks. Red-checked once in a disposable copy: with the chunk-length rule, the trailing-bytes
+  check and mpatch's start-past-end rule removed, the four tests written for them failed and 35 passed.
+- **Owed.** The parts' payloads (phase-heads, bookmarks, the check parts, markers in formats 0 and 1, pushkey values),
+  compressed bundle streams once the D-17 engines are wired, and a golden `05` changegroup (7.2's bundle types offer
+  `01` to `04`; `05` is held to its layout in 7.2's code by a round trip).
 
 ### A-538 — A stale copy's content goes on a confirmation that certifies it; an older build's confirmation certifies nothing (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; the content release signal's second half; A-529, A-335)
 Applied in the same change to: GAPS (A-529's entry), `crates/db/src/register.rs` (`Retirement::certified`,

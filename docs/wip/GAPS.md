@@ -13,19 +13,26 @@
 > green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
 > greens; the record's replication in a fleet (with piece 2).
 
-> **§4.17.3 the Mercurial server: designed, nothing is built (2026-11-18, A-499; UI goal 91; owner g291).** Built on
-> §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move toward public, and a
-> public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock
-> push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a line's policy for
-> clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
-> (`research/mercurial-server.md`). Owed, in order, after §4.17.1's seven pieces: (1) the bundle2 and changegroup
-> codecs, with golden vectors made by stock `hg`; (2) the SSH and HTTP version 1 codecs; (3) the objects and the index,
-> and import of a repository directory; (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on
-> push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream clones, inline clone bundles, the
-> hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by
-> linelog; (13) main's runs: 7.2's own suite through a shim, the differential run against `hg serve`, a 6.x client, then
-> the measurements. Open: whether a 6.x client's changegroup `04` is the old sidedata layout (read from the document,
-> not from 6.x code; the older-client run checks it). No speed is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1's framings built (2026-11-19, A-514; UI goal 91; owner
+> g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move
+> toward public, and a public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review
+> requests; a stock push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a
+> line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
+> (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups
+> `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input, every structure
+> counted and charged exactly to the caller's admission before it is built, no recursion; proven by `cargo test -p
+> slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg`
+> 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text
+> rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed).
+> Owed, in order, after §4.17.1's seven pieces: (1, rest) the parts' payloads (phase-heads, bookmarks, the check parts,
+> markers, pushkey values), and compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired (D-17); (2) the SSH and
+> HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory; (4) read serving; (5)
+> pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the
+> revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog;
+> (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
+> differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
+> `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
+> is claimed until main measures it.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
@@ -10916,14 +10923,25 @@ Results:
   inode-prefix alias, now fixed (`docs/bugs/2026-10-04-a-handle-with-flipped-inode-prefix-bits-read-its-file.md`).
 
 Open:
-- **Plaintext capability on loopback (macOS v3).** The token rides in every handle. BPF is root-only by default,
-  but a host with a group granted BPF access (Wireshark's ChmodBPF) exposes it to that group. The macOS kernel
-  client speaks neither RPC-over-TLS nor RPCSEC_GSS, so the fix cannot be encryption on that leg. Candidates:
-  - refuse NFS-program calls on a connection a user process owns (the kernel's mount socket has none; the CLI's
-    MNT exchange is the only user-process caller);
-  - rotate the token per mount.
-
-  The decision and its evidence are owed.
+- **Plaintext capability on loopback (macOS v3): decided and built 2026-11-18 (A-535, goal 85, g079).** The token rides
+  in every handle. BPF is root-only by default, but a host with a group granted BPF access (Wireshark's ChmodBPF)
+  exposes it to that group. The macOS kernel client speaks neither RPC-over-TLS nor RPCSEC_GSS, so the fix cannot be
+  encryption on that leg. **Decision:** the loopback mount is offered only where no one but root can capture loopback
+  traffic; elsewhere `mount::available` and every mount answer `MountFault::Unsupported { PrivateLoopback }`, naming
+  the devices and the fix (`slates_api` contract 43). Held by
+  `a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback` (the api's unit tests, every host),
+  red with the old rule on the Mac Studio. **Evidence:** all five of Ada's Macs read `/dev/bpf0` as `crw------- root
+  wheel` with no `access_bpf` group (2026-11-18), so no mount there is refused. **The two candidates, rejected:**
+  - refusing calls on a connection a user process owns: a daemon running as the user cannot tell another user's
+    process from the kernel (`proc_pidfdinfo` refuses other users' processes), and the kernel's port is unprivileged,
+    since the slates mount clears `NFS_MFLAG_RESVPORT` (R10);
+  - rotating the token per mount: each mount's attachment has its own token already, so a sniffed token is that live
+    mount's. Binding a token to the one connection that first uses it was weighed too: it breaks a client that opens
+    several connections on one mount (the hostile suite's honest clients, Linux's `nconnect`) and still races a mount's
+    first call.
+  Record: `docs/bugs/2026-11-18-a-macos-mounts-capability-was-readable-by-any-group-granted-loopback-capture.md`.
+  **Owed (main's):** the macOS mount suites on CI's runners, whose `/dev/bpf` modes are not known here: a runner that
+  grants capture refuses every macOS mount, typed.
 - **Network export.** RPC-with-TLS (RFC 9289) over rustls/aws-lc with the capability (AUD-29-75). The same hostile
   run over the TLS export (tampered records inside the TLS session, truncated TLS records, resets mid-handshake)
   is owed.
