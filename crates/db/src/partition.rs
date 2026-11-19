@@ -175,6 +175,9 @@ pub struct PartitionSnapshot {
   pub repositories: Vec<crate::catalog::RepositoryRecord>,
   /// Their namespaces' bindings (§4.17.1, A-515; appended), by (repository, name) order.
   pub repository_branches: Vec<crate::catalog::BranchRecord>,
+  /// Every lineage's members (§4.17.1 item 4, A-575; appended), lineage by lineage in id order, each in the order it
+  /// joined.
+  pub repository_members: Vec<crate::catalog::MemberRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -1450,6 +1453,11 @@ impl Partition {
       Op::VolumeCreated { record } => self.check_volume_created(record),
       Op::VolumeDestroyed { id } => {
         self.volume(*id).ok_or(DbError::NotFound)?;
+        // A green live members of its lineage were made from keeps the version each was made at (A-575).
+        let members = self.repositories.branched_from(*id);
+        if members > 0 {
+          return Err(DbError::BranchedFrom { members });
+        }
         self
           .tombstone_sequence(*id)
           .map(|_| ())
@@ -1486,7 +1494,8 @@ impl Partition {
       | Op::RepositoryBranchAdded { .. }
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
-      | Op::RepositoryDestroyed { .. } => self
+      | Op::RepositoryDestroyed { .. }
+      | Op::RepositoryGreenJoined { .. } => self
         .repositories
         .check(op, self.caps.volumes, |id| self.held(id)),
       Op::TombstoneAdopted { tombstone } => {
@@ -1967,7 +1976,8 @@ impl Partition {
       | Op::RepositoryBranchAdded { .. }
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
-      | Op::RepositoryDestroyed { .. } => self.repositories.apply(op),
+      | Op::RepositoryDestroyed { .. }
+      | Op::RepositoryGreenJoined { .. } => self.repositories.apply(op),
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -2615,6 +2625,7 @@ impl Partition {
         .collect(),
       repositories: self.repositories.repositories().cloned().collect(),
       repository_branches: self.repositories.bindings().collect(),
+      repository_members: self.repositories.memberships().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2862,6 +2873,7 @@ impl Partition {
     p.repositories = crate::repository::Repositories::restore(
       &snapshot.repositories,
       &snapshot.repository_branches,
+      &snapshot.repository_members,
     )?;
     Ok(p)
   }

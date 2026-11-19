@@ -14,7 +14,6 @@ use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::Slab;
 use slates_mem::SparseObject;
-use slates_merge::engine::Green;
 use slates_merge::increment::VolumeOp;
 use slates_vfs::volume::{Store, Volume};
 
@@ -759,8 +758,9 @@ pub struct ShardState {
   /// bounded by the clients' credit, refused typed beyond it.
   pub pending_forwards: std::collections::VecDeque<PendingForward>,
   /// Green volumes' merge engines (§4.16): the in-memory chain and per-path state a green owns,
-  /// keyed by its id. A green is not a store-backed VFS tree; its merged content lives here.
-  pub greens: BTreeMap<VolumeId, Green>,
+  /// keyed by its id. A green is not a store-backed VFS tree; its merged content lives here. A repository's greens are
+  /// members of its lineage, sharing the nodes of their maps (A-575, `crate::greens`).
+  pub greens: crate::greens::Greens,
   /// Greens whose recovered history did not reproduce what was acknowledged (AUD-29-18), each with why:
   /// no engine is installed and every verb naming one is refused typed, while its durable origin and chain
   /// stay untouched as the evidence a reviewed recovery works from. Bounded by the partition's greens.
@@ -1171,6 +1171,9 @@ pub struct ShardState {
   pub(crate) nfs_purge_at: Option<u64>,
   /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
   pub(crate) nfs_purge_owed: bool,
+  /// When the deadline keeper re-arms the backed route's huge-page placement (A-570): a retry window after the host
+  /// declined one in a way likely to hold (`ShardsBackings::take_declined`); `None` while no decline is held.
+  pub(crate) placement_rearm_at: Option<u64>,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder

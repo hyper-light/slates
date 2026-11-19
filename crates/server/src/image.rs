@@ -233,6 +233,39 @@ pub(crate) fn complete_once_durable(
   }
 }
 
+/// [`complete_once_durable`]'s first half, for a task with a step to take between its outcome and its reply (a clone's
+/// alias settles first, A-236): the outcome's effects, and its completion unless the reply must wait for `volume`'s log,
+/// committed as one transaction ([`commit_outcome`]). The request stays in flight, so a retry meanwhile joins it rather
+/// than running again. The reply, and the log position it waits for; answered by [`answer_in_flight`] (A-577).
+pub(crate) fn commit_in_flight(
+  state: &mut ShardState,
+  request: (u64, RequestId),
+  volume: DbVolumeId,
+  produce: impl FnOnce(&mut ShardState) -> ReplyBody,
+) -> (ReplyBody, Option<u64>) {
+  commit_outcome(state, request, Some(volume), produce)
+}
+
+/// [`commit_in_flight`]'s second half: the request's route taken and its reply delivered, at once when its outcome waits
+/// for nothing, else held until `volume`'s log is durable at its target (`crate::live_ship::defer`), which records the
+/// completion and delivers it then (A-577); a superseded owner's `StaleEpoch` is delivered now instead.
+pub(crate) fn answer_in_flight(
+  state: &mut ShardState,
+  request: (u64, RequestId),
+  volume: DbVolumeId,
+  (reply, target): (ReplyBody, Option<u64>),
+) {
+  let route = take_route(state, request);
+  let Some(target) = target else {
+    crate::live_ship::release_seat(state, request);
+    deliver(state, reply, route);
+    return;
+  };
+  if let Some(refusal) = crate::live_ship::defer(state, (volume, target), request, route, reply) {
+    deliver(state, refusal, route);
+  }
+}
+
 /// Where the reply of in-flight `request` goes, taken, for a task that hands the request on to another deferral (a
 /// bypass presentation's granted landing, A-285) rather than completing it here.
 pub(crate) fn take_in_flight(
@@ -1971,12 +2004,13 @@ impl ImportJob {
   }
 
   /// Admits the new volume, as a create admits one (every credit reserved, or none), under its archive's name policy:
-  /// one this daemon does not hold is refused `Unsupported`.
+  /// one this daemon does not hold is refused `Unsupported`. Windows' upcase folding (A-576) is such a policy until the
+  /// protocol and the catalog name it (A-576's part 2): the volume core folds by it, and no record of a volume can say so.
   fn admit(&mut self, state: &mut ShardState, name_policy_id: u32) -> Result<(), Refusal> {
     self.names = match slates_vfs::export::name_equivalence_of_id(name_policy_id) {
       Some(NameEquivalence::Exact) => NamePolicy::Exact,
       Some(NameEquivalence::Fold) => NamePolicy::Fold,
-      None => {
+      Some(NameEquivalence::Upcase) | None => {
         return Err(Refusal::ArchiveRefused {
           fault: ArchiveFault::Unsupported,
         });

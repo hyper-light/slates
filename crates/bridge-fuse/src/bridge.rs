@@ -56,8 +56,9 @@ pub(crate) const EOPNOTSUPP: i32 = 95;
 const ENODATA: i32 = 61;
 /// Format: Linux ERANGE, the caller's buffer is too small for the attribute value or name list.
 const ERANGE: i32 = 34;
-/// Format: Linux EAGAIN, an operation to try again (A-64: the arena waits on the shard's next publication).
-const EAGAIN: i32 = 11;
+/// Format: Linux EAGAIN, an operation to try again (A-64: the arena waits on the shard's next publication). Public for
+/// the daemon's FUSE transport, which keeps a request answered so because its base was still fetching (A-555).
+pub const EAGAIN: i32 = 11;
 // The Linux errno values the volume core's refusals map to (the FUSE ABI is Linux, so the
 // numbers are the kernel's regardless of the host the codec is tested on; the dispatch negates
 // them). Each is a Format constant.

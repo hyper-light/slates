@@ -1558,6 +1558,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-git"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-guest-probe"
 version = "0.1.0"
 dependencies = [

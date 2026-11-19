@@ -716,6 +716,12 @@ impl std::fmt::Debug for ServeState {
 }
 
 impl ServeState {
+  /// Whether an allocation is running (A-108): its slices come first, so a kept request is dispatched only once none
+  /// runs ([`dispatch_kept`]).
+  pub fn allocation_running(&self) -> bool {
+    self.allocating.is_some()
+  }
+
   /// The state at mount time: nothing negotiated, nothing in the kernel's cache.
   pub fn new() -> ServeState {
     ServeState {
@@ -2138,6 +2144,12 @@ impl Dispatched {
     self.opcode
   }
 
+  /// The request as the kernel sent it, kept by an owner that answers it later rather than now: a request that met a
+  /// base still fetching what it reads waits for that fetch and is dispatched again ([`dispatch_kept`], A-555).
+  pub fn request(&self) -> &[u8] {
+    &self.request
+  }
+
   /// The node the request named (the kernel's node id; the root is 1).
   pub fn nodeid(&self) -> u64 {
     self.nodeid
@@ -2241,6 +2253,62 @@ pub fn dispatch_ready(
     };
   };
   let request = channel.take_request();
+  dispatch_admitted(
+    channel,
+    bridge,
+    attachments,
+    attachment,
+    state,
+    slice_bytes,
+    (cx, request),
+  )
+}
+
+/// One turn for a request its owner read from the device in an earlier turn and kept rather than answered (A-555): a
+/// request that met a base still fetching what it reads, dispatched again once that fetch landed, as [`dispatch_ready`]
+/// dispatches a request it reads, admitted and ended under `attachment` alike, the owed round delivered first, its reply
+/// left in `state` for [`send_reply`]. The owner calls it only while no allocation runs
+/// ([`ServeState::allocation_running`]), whose slices [`dispatch_ready`] continues first.
+pub fn dispatch_kept(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+  state: &mut ServeState,
+  slice_bytes: u64,
+  request: Vec<u8>,
+) -> Result<Turn, ChannelError> {
+  if request.len() < IN_HEADER_LEN {
+    return Ok(Turn::Dropped);
+  }
+  let Ok(cx) = attachments.begin(attachment) else {
+    return match refuse_revoked(channel, state, &request)? {
+      Revoked::Ended => Ok(Turn::Ended),
+      Revoked::Dropping => Ok(Turn::Refused),
+    };
+  };
+  dispatch_admitted(
+    channel,
+    bridge,
+    attachments,
+    attachment,
+    state,
+    slice_bytes,
+    (cx, request),
+  )
+}
+
+/// A request admitted under `attachment` (its context `cx`), read now or kept from an earlier turn: answered from a
+/// dead daemon's record when the kernel resent it, else dispatched after the owed round, its reply left in `state`.
+fn dispatch_admitted(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+  state: &mut ServeState,
+  slice_bytes: u64,
+  (cx, request): (slates_bridge_core::OpContext, Vec<u8>),
+) -> Result<Turn, ChannelError> {
   let parsed = Request::parse(&request).ok();
   let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
   let nodeid = parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid);

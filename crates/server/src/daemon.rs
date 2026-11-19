@@ -901,6 +901,11 @@ impl Daemon {
     // Linux alone sends the anchor.
     let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
     let mut inherited_dax = inherited_dax.into_iter();
+    // The NFS send ledgers (A-550, Linux), each judging the held connections on the listener's shard below.
+    #[cfg(target_os = "linux")]
+    let (other_copies, inherited_ledgers) = crate::held_send::split_ledgers(other_copies);
+    #[cfg(not(target_os = "linux"))]
+    let inherited_ledgers = crate::held_send::Inherited::default();
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -1085,7 +1090,13 @@ impl Daemon {
         crate::fleet::run_membership(transport).await;
       })?;
     }
-    let nfs_port = start_nfs_transport(&runtime, control, &config, handed_connections)?;
+    let nfs_port = start_nfs_transport(
+      &runtime,
+      control,
+      &config,
+      handed_connections,
+      inherited_ledgers,
+    )?;
     #[cfg(target_os = "macos")]
     start_shards_route(&runtime, control, &config)?;
     Ok(Daemon {
@@ -2782,7 +2793,7 @@ impl Daemon {
       (engine.folded_below(), engine.retained_bytes().history)
     };
     let served = self.observe(self.shard_of_object(object), move |s| {
-      s.greens.get(&volume).map(history)
+      s.greens.get(&volume).map(|engine| history(&engine))
     })?;
     if served.is_some() {
       return Ok(served);
@@ -2951,7 +2962,8 @@ impl Daemon {
 
   /// Test support: while `withhold` is set, no shard records the control partition's acknowledgement of its appended
   /// audit records (A-265; `LandingState::acknowledgement_withheld`), as if each were lost: the outbox keeps them, and
-  /// the reap tick sends them again, which the control partition must append nothing twice of. Delivered like
+  /// the deadline keeper's look sends them again (A-554), which the control partition must append nothing twice of.
+  /// Delivered like
   /// [`Self::withhold_audit_crossing`]; `Ok` once installed, else the typed refusal.
   pub fn withhold_audit_acknowledgement(&self, withhold: bool) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -3016,9 +3028,10 @@ impl Daemon {
   }
 
   /// Test support: this node is superseded on `volume` at `epoch` (`live_ship::inject_superseded`, never reachable from
-  /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts are told, or as a restart
-  /// over a kept fence finds it, telling none (A-344). So a mount's answer to a takeover (A-346) is driven without a
-  /// fleet, each path alone. Delivered on the volume's owner shard; `Ok` once installed, else the typed refusal.
+  /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts and streams are told, or as
+  /// a restart over a kept fence finds it, telling none (A-344). So a mount's or a Shards stream's answer to a takeover
+  /// (A-346, A-584) is driven without a fleet, each path alone. Delivered on the volume's owner shard; `Ok` once
+  /// installed, else the typed refusal.
   pub fn inject_superseded(
     &self,
     volume: slates_ipc::protocol::VolumeId,
@@ -4602,7 +4615,7 @@ async fn init_shard(
     status_scatters: std::collections::BTreeMap::new(),
     last_work_ns: now,
     pending_forwards: std::collections::VecDeque::new(),
-    greens: std::collections::BTreeMap::new(),
+    greens: crate::greens::Greens::default(),
     works: std::collections::BTreeMap::new(),
     merge: crate::merge_service::MergeShardState::default(),
     ack_scatters: std::collections::BTreeMap::new(),
@@ -4709,6 +4722,7 @@ async fn init_shard(
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
+    placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -4891,14 +4905,15 @@ async fn rebuild_and_report(
 /// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
 /// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
 /// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
-/// own reports (`crate::pressure`), and the NFSv4 purges owed are sent by the reaper at their own deadline
-/// (`crate::nfs::note_purges`). Dead clients are no longer its: since A-475 each client's watch reports its hang-up and
-/// the shard's reaper retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging
-/// buffers, status captures, lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's
-/// resend, which the shard's keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve
-/// loop steps once woken and the keeper retries at a refused record's deadline. The jobs left here leave a piece at a
-/// time for the events or deadlines that own them, and then the loop and its tick go (the reaper series, GAPS).
-/// Derived: the cadence is the budget.
+/// own reports (`crate::pressure`), the NFSv4 purges owed are sent by the reaper at their own deadline
+/// (`crate::nfs::note_purges`), and a declined huge-page placement is re-armed by the keeper a retry window after the
+/// decline. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper
+/// retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging buffers, status captures,
+/// lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's resend, which the shard's
+/// keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve loop steps once woken and
+/// the keeper retries at a refused record's deadline. The jobs left here leave a piece at a time for the events or
+/// deadlines that own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the
+/// budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4914,11 +4929,6 @@ async fn reap_loop() {
       crate::delegation::drain(s);
     });
     seal_idle_content().await;
-    // §4.6, the backed route's L1 (A-193): ask the host once more for the placements it declined in a way likely to
-    // hold. A declined collapse costs milliseconds of compaction (1,954 and 2,832 µs a step on adacachy at load 90), so
-    // a host out of huge pages is asked once a tick, not once a range; the reap tick is the cadence the shard already
-    // does cold work at, so a host that frees memory has its ranges placed again within one tick.
-    state::with_state(|s| s.store.shards_backings.rearm_placement());
   }
 }
 
@@ -6785,14 +6795,17 @@ fn kick_fd_of(_shard: ShardId) -> Option<i32> {
 /// listener and hands its descriptor over in the environment, so its port survives a daemon restart; the daemon adopts
 /// that when present, or binds a fresh ephemeral one when it runs standalone (tests). Either way the port is known
 /// here, before the serve task moves the listener onto the shard, and the cross-shard bridge queue reaches volumes on
-/// other shards. The connections the anchor held across the restart (A-113) are served first there; without a listener
-/// nothing could serve them, so each is released — the anchor closes the last copy and the kernel client reconnects to
-/// whatever listener comes next, rather than wait on a connection nobody reads. The port, if the listener bound.
+/// other shards. The connections the anchor held across the restart (A-113) are served first there, each judged by the
+/// newest send ledger it handed back where a send may stop mid-record (`inherited`, Linux, A-550); without a listener
+/// nothing could serve them, so each is released, and the ledgers with them — the anchor closes the last copy and the
+/// kernel client reconnects to whatever listener comes next, rather than wait on a connection nobody reads. The port,
+/// if the listener bound.
 fn start_nfs_transport(
   runtime: &Runtime,
   control: ShardId,
   config: &DaemonConfig,
   handed: Vec<crate::anchor_hold::HandedConnection>,
+  inherited: crate::held_send::Inherited,
 ) -> Result<Option<u16>, RtError> {
   let listener = nfs_listener().ok();
   let port = listener
@@ -6801,14 +6814,16 @@ fn start_nfs_transport(
     .map(|address| address.port());
   let (Some(listener), Some(port)) = (listener, port) else {
     crate::nfs::release_handed(handed);
+    inherited.release();
     return Ok(None);
   };
   // Publish the port for a verb handler to report to a client (`slates mount`).
   NFS_PORT.store(u32::from(port), Ordering::Release);
   let bound = config.held_connection_bound();
+  let cache_line = config.cache_line;
   runtime.spawn_on(control, async move {
     // The connections a dead daemon left are answered first (A-113): their kernel clients are waiting.
-    crate::nfs::adopt_held(handed, port, bound);
+    crate::nfs::adopt_held(handed, inherited, port, bound, cache_line);
     match futures::spawn(crate::nfs::serve(listener, port, bound)) {
       Ok(task) => {
         let _ = futures::detach(task);

@@ -24,11 +24,15 @@
 //! - [`host`]: the read-only host seam answered from the base's objects, sans-io: a miss parked as a pending answer
 //!   naming its fetch, a directory its delimited listing, a file bound to its object by its ETag and version, ranges in
 //!   the volume's chunks within a budgeted cache, every window learned from the path's round trips.
-//! - [`fetch`]: what the host asks of its store and the store's answer, run through the network client.
+//! - [`fetch`]: what the host asks of its store and the store's answer, run through the network client or the simulated
+//!   store alike ([`fetch::Store`]).
+//! - [`driver`]: the fetch driver, the volume's owner shard's task that runs the host's fetches against the store and
+//!   hands each answer back, woken by the host when a fetch is wanted and ended when the host is (A-555).
 //! - [`sim`]: `SimS3`, the simulated store that is the host's oracle: versioned objects, an outsider's puts and
 //!   deletes, truncated listings and the typed refusals, as S3 answers them.
 
 pub mod client;
+pub mod driver;
 pub mod fetch;
 pub mod host;
 pub mod http;

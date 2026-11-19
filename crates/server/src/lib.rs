@@ -75,11 +75,13 @@ mod own_nfs;
 mod checkout;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
+pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
-// The judgment a held NFS connection's adoption takes on Linux (A-550): pure, so every host's tests hold it.
-#[cfg_attr(not(test), allow(dead_code))]
+// A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
+// pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
 mod image;
@@ -147,6 +149,7 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+mod repository;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

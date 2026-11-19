@@ -4044,7 +4044,7 @@ fn special_payload(
 }
 
 mod branch;
-pub use branch::{Lineage, LineageGreen, LineageRefused};
+pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 #[cfg(test)]
 mod node_exclusive_tests;

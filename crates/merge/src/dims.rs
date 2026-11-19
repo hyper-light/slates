@@ -27,11 +27,23 @@
 //! **Arenas are lent.** A green that stands alone owns its arenas. The greens of a [`crate::engine::Lineage`] share the
 //! lineage's: the lineage lends them to a green for the length of one call ([`Arenas`]), so there is one owner of every
 //! node and no shared-ownership pointer (CLAUDE.md R2).
+//!
+//! **A tree is copied by reference (A-542, Copy's maps).** A path's tree is its own key and the keys that start with it
+//! and `/`. [`Dim::copy_tree`] holds the source's keys beneath it as one subtree, grafts them beneath the destination
+//! ([`crate::ptrie::Ptrie::graft`]) and sets the destination's own key to the source's value: two descents, two counts
+//! and the copies of the nodes on the destination's path, O(the paths' lengths) whatever the tree holds, and no walk
+//! ([`crate::ptrie::Nodes::visited`] does not move). A file's copy is one more holder of its block, never its bytes.
+//! An attribute's tree is two prefixes, the path's own attributes and its descendants' ([`Xattrs::copy_tree`]). The
+//! destination must be absent with nothing beneath it, as Subversion's copy needs (§4.17.4 item 3.2), and the subtree
+//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root is
+//! refused here: its tree is every key, which no one prefix names apart from its own; the engine decides its copy.
 
 use std::collections::BTreeSet;
 
-use crate::ptrie::{Holders, Nodes, Plain, Ptrie};
+use crate::ptrie::{Holders, Nodes, Plain, Ptrie, Releasing};
 use crate::special::SpecialNode;
+
+mod copy;
 
 /// A path's key bytes as the string they were made from. Keys enter only as strings and a walk reassembles one whole,
 /// so the lossy arm never runs; it keeps the conversion total, as the no-panic rule asks.
@@ -130,9 +142,10 @@ impl<V: Clone> Dim<V> {
     std::mem::swap(&mut self.nodes, &mut other.nodes);
   }
 
-  /// Gives this map's hold on its nodes back: every node no other map names is freed. The map is empty after.
-  pub(crate) fn release(&mut self) {
-    self.root.release(&mut self.nodes, &mut Plain);
+  /// This map's hold on its nodes, to give back a node a step in its arena ([`Arenas::release_step`]); the map is
+  /// empty after, and no node is freed until the steps run.
+  pub(crate) fn releasing(&mut self) -> Releasing {
+    self.root.releasing()
   }
 }
 
@@ -319,9 +332,9 @@ impl Files {
     std::mem::swap(&mut self.blocks, &mut other.blocks);
   }
 
-  /// [`Dim::release`], every block no other map names freed with it.
-  pub(crate) fn release(&mut self) {
-    self.map.root.release(&mut self.map.nodes, &mut self.blocks);
+  /// [`Dim::releasing`]: the blocks are let go as their nodes are freed.
+  pub(crate) fn releasing(&mut self) -> Releasing {
+    self.map.releasing()
   }
 }
 
@@ -332,8 +345,8 @@ const PATH_END: [u8; 2] = [0, 0];
 /// Format: a NUL inside a path, escaped so it never reads as [`PATH_END`] and still sorts first.
 const NUL_ESCAPED: [u8; 2] = [0, 1];
 
-/// The key prefix every attribute of `path` shares: its escaped bytes and [`PATH_END`].
-fn path_key(path: &str) -> Vec<u8> {
+/// `path`'s bytes with every NUL escaped: the start of every attribute key of `path` and of the paths beneath it.
+fn escaped(path: &str) -> Vec<u8> {
   let mut key = Vec::with_capacity(path.len().saturating_add(PATH_END.len()));
   for byte in path.bytes() {
     match byte {
@@ -341,6 +354,12 @@ fn path_key(path: &str) -> Vec<u8> {
       other => key.push(other),
     }
   }
+  key
+}
+
+/// The key prefix every attribute of `path` shares: its escaped bytes and [`PATH_END`].
+fn path_key(path: &str) -> Vec<u8> {
+  let mut key = escaped(path);
   key.extend_from_slice(&PATH_END);
   key
 }
@@ -438,9 +457,41 @@ impl Xattrs {
     self.map.lend(&mut other.map);
   }
 
-  /// [`Dim::release`].
-  pub(crate) fn release(&mut self) {
-    self.map.release();
+  /// [`Dim::releasing`].
+  pub(crate) fn releasing(&mut self) -> Releasing {
+    self.map.releasing()
+  }
+}
+
+/// A green's eight maps' holds being given back a node a step (A-575: a green retired from its lineage), each map's in
+/// its own arena ([`Arenas::release_step`]).
+#[derive(Debug, Default)]
+pub(crate) struct GreenRelease {
+  pub(crate) files: Releasing,
+  pub(crate) specials: Releasing,
+  pub(crate) dirs: Releasing,
+  pub(crate) modes: Releasing,
+  pub(crate) symlinks: Releasing,
+  pub(crate) hardlinks: Releasing,
+  pub(crate) xattrs: Releasing,
+  pub(crate) links_to: Releasing,
+}
+
+impl GreenRelease {
+  /// Whether every map's hold has been given back.
+  pub(crate) fn is_done(&self) -> bool {
+    [
+      &self.files,
+      &self.specials,
+      &self.dirs,
+      &self.modes,
+      &self.symlinks,
+      &self.hardlinks,
+      &self.xattrs,
+      &self.links_to,
+    ]
+    .iter()
+    .all(|releasing| releasing.is_done())
   }
 }
 
@@ -459,6 +510,29 @@ pub(crate) struct Arenas {
 }
 
 impl Arenas {
+  /// One node of `release` given back, in the first map whose release is not done (the files' with their blocks): a
+  /// node is freed, and its value let go, when no other green's map names it. False once every map's is done.
+  pub(crate) fn release_step(&mut self, release: &mut GreenRelease) -> bool {
+    self
+      .files
+      .release_step(&mut release.files, &mut self.blocks)
+      || self
+        .specials
+        .release_step(&mut release.specials, &mut Plain)
+      || self.dirs.release_step(&mut release.dirs, &mut Plain)
+      || self.modes.release_step(&mut release.modes, &mut Plain)
+      || self
+        .symlinks
+        .release_step(&mut release.symlinks, &mut Plain)
+      || self
+        .hardlinks
+        .release_step(&mut release.hardlinks, &mut Plain)
+      || self.xattrs.release_step(&mut release.xattrs, &mut Plain)
+      || self
+        .links_to
+        .release_step(&mut release.links_to, &mut Plain)
+  }
+
   /// The nodes walks of every dimension visited: what a branch must leave unmoved (A-534's non-vacuity count).
   pub(crate) fn visited(&self) -> u64 {
     [
@@ -569,9 +643,9 @@ mod tests {
     }
   }
 
-  /// A-534. Do: put a file, fork the map, change the file in the fork and remove another, then release both maps.
-  /// Expect: each map reads its own bytes, the original's blocks are untouched by the fork's changes, and once both
-  /// are released every node and every block is gone.
+  /// A-534, A-575. Do: put a file, fork the map, change the file in the fork and remove another, then release both
+  /// maps a node a step. Expect: each map reads its own bytes, the original's blocks are untouched by the fork's changes
+  /// and by the fork's release, and once both are released every node and every block is gone.
   #[test]
   fn a_forked_files_map_shares_blocks_until_changed_and_frees_them_with_the_last_holder() {
     let mut files = Files::default();
@@ -587,10 +661,20 @@ mod tests {
     files.lend(&mut fork);
     assert_eq!(fork.get("a"), Some(b"changed".as_slice()));
     assert_eq!(fork.get("b"), None);
-    fork.release();
+    let mut releasing = fork.releasing();
+    while fork
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut fork.blocks)
+    {}
     fork.lend(&mut files);
     assert_eq!(files.get("a"), Some(b"one".as_slice()));
-    files.release();
+    let mut releasing = files.releasing();
+    while files
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut files.blocks)
+    {}
     assert_eq!(files.map.nodes.live(), 0, "every node freed");
     assert_eq!(files.blocks.live(), 0, "every block freed");
   }
