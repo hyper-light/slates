@@ -95,4 +95,8 @@ A-485's fix closes it. Its regression test, `a_holders_copy_of_a_moved_object_fo
 reaches_it` (`crates/server/src/fleet.rs`), installs the move through the walk as the coordinator drives it
 (`install_slice` until the walk ends) and judges what the move back needs: the copy routed to the new owner, its
 authority naming it, the new owner's next record accepted and the creator's refused `Unauthorized`, counted followed
-once. (g230's branch agents/g230-a487-move-back built the same rule independently and was dropped for A-485's.)
+once. Green with A-485's rule (Mac Studio d1323898, kiln r26, debug, 0.77 s, beside A-485's own test); red with
+A-485's call to `moves::follow_moved_object` removed from `takeover::resolve_held_object` in a throwaway copy: the copy
+stayed routed to the creator under its authority, the new owner's record was refused `Unauthorized`, the creator's
+accepted, and nothing was counted followed, the shape the fleet run showed. (g230's branch agents/g230-a487-move-back
+built the same rule independently and was dropped for A-485's.)

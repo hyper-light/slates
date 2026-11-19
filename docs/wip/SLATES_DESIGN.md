@@ -32507,5 +32507,7 @@ Applied in the same change to: GAPS (the move's entry), A-485's bug record (a se
   `Unauthorized`, and no node counted `fleet.move.followed`: A-485's cause. No rule changes here.
 - **Tests.** `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests):
   the move installed through the walk as the coordinator drives it; the copy routed to the new owner, its authority
-  naming it, the new owner's next record accepted and the creator's refused `Unauthorized`. The fleet test is main's.
+  naming it, the new owner's next record accepted and the creator's refused `Unauthorized`. Green on the Mac Studio
+  (kiln r26, debug); red with A-485's follow call removed (the copy routed to the creator, the new owner refused
+  `Unauthorized`, none followed). The fleet test is main's.
 
