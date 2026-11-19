@@ -9,7 +9,8 @@
 //! repository has none; each work the connection accepts is committed through A-655's step
 //! (`Revision::of_work` at the instant `svnserve` recorded, then the owner's records' `commit`),
 //! and what the connection writes must be what `svnserve` wrote, its greeting less `svndiff1` and
-//! every item byte for byte.
+//! every item byte for byte, but for the property lists `svnserve` writes in APR's seeded hash order
+//! (a read before `import`'s commit), compared as sets and counted.
 //! Bob's lock is taken as `svnserve` took it, with its recorded token, the lock verbs not being
 //! served yet; the read-only connections (the checkouts, the updates, `import.2`) are the reads'
 //! and the reporter's suites'.
@@ -80,6 +81,11 @@ const REPLAYED: usize = 17;
 
 /// The youngest revision once every recorded commit is made (`sessions.txt`: thirteen commits).
 const YOUNGEST: Revision = 13;
+
+/// The items `svnserve` wrote with a property list in another order than slates' sorted one, APR's
+/// seeded hash order: compared as sets, and counted so the count cannot grow unseen.
+/// Shape: measured on Windows x86_64 (jupiter), 2026-11-19.
+const IN_HASH_ORDER: usize = 0;
 
 /// The repository's root URL in the recordings (`make-fixtures.py` `URL`).
 const ROOT: &[u8] = b"svn+fixture://fixture/repo";
@@ -303,6 +309,8 @@ struct Replay {
   records: Records,
   built: Built,
   transactions: u64,
+  /// The items that matched `svnserve`'s only with their property lists as sets.
+  in_hash_order: usize,
 }
 
 impl Replay {
@@ -317,6 +325,7 @@ impl Replay {
       records: Records::new(uuid, CREATED, room).unwrap(),
       built: Built::new(),
       transactions: 0,
+      in_hash_order: 0,
     }
   }
 
@@ -412,7 +421,7 @@ fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Rec
         let closing = command(item).is_some_and(|(word, _)| word == "close-edit");
         if let Some(race) = race.filter(|_| closing) {
           let raced = replay_connection(replay, race, None);
-          assert_as_svnserve(race.0, &raced, race.3);
+          replay.in_hash_order += assert_as_svnserve(race.0, &raced, race.3);
         }
         held.extend_from_slice(item);
       }
@@ -463,8 +472,9 @@ fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Rec
 }
 
 /// Asserts that `ours` is what `svnserve` wrote on the connection `name`: its greeting less
-/// `svndiff1`, then every item byte for byte.
-fn assert_as_svnserve(name: &str, ours: &[u8], server: &[u8]) {
+/// `svndiff1`, then every item byte for byte, or the same tree with its property lists as sets
+/// where `svnserve` wrote one in hash order; answers how many items matched only so.
+fn assert_as_svnserve(name: &str, ours: &[u8], server: &[u8]) -> usize {
   let (ours, theirs) = (items(ours), items(server));
   let greeting = theirs[0];
   let at = greeting
@@ -474,13 +484,20 @@ fn assert_as_svnserve(name: &str, ours: &[u8], server: &[u8]) {
   let greeting = [&greeting[..at], &greeting[at + SVNDIFF1.len()..]].concat();
   assert_eq!(ours[0], greeting.as_slice(), "{name}: the greeting");
   assert_eq!(ours.len(), theirs.len(), "{name}: the items");
+  let mut in_hash_order = 0;
   for (index, (ours, theirs)) in ours.iter().zip(&theirs).enumerate().skip(1) {
-    assert_eq!(
-      String::from_utf8_lossy(ours),
-      String::from_utf8_lossy(theirs),
-      "{name}: item {index}"
-    );
+    if ours != theirs {
+      assert_eq!(
+        super::tree(&value_of(ours)),
+        super::tree(&value_of(theirs)),
+        "{name}: item {index}: {} against {}",
+        String::from_utf8_lossy(ours),
+        String::from_utf8_lossy(theirs)
+      );
+      in_hash_order += 1;
+    }
   }
+  in_hash_order
 }
 
 /// Takes bob's lock as `svnserve` did, with the token it drew (A-602's guard over the token's
@@ -541,11 +558,12 @@ fn find_token(value: &Value<'_>) -> Option<String> {
 /// 1.15.0's recorded commits): replay every recorded commit connection from its first byte through
 /// a connection tunnelled as its user (`EXTERNAL`), in the recorder's order, bob's lock taken as
 /// `svnserve` took it and bob's race replayed just before alice's `close-edit`, each accepted work
-/// made as the owner makes it; expect every connection to write what `svnserve` wrote, its
-/// greeting less `svndiff1` and every item byte for byte: thirteen commits answered with their
-/// revisions, the stale root and the stale file refused out of date (`E160028`), alice refused
-/// against bob's lock (`E160039`) and her raced commit a conflict at bob's file (`E160024`), each
-/// failure where the drive met it; and the youngest revision the recorded 13.
+/// made as the owner makes it; expect every connection to write what `svnserve` wrote, its greeting
+/// less `svndiff1` and every item byte for byte (the property lists `svnserve` wrote in hash order
+/// as sets, counted): thirteen commits answered with their revisions, the stale root and the stale
+/// file refused out of date (`E160028`), alice refused against bob's lock (`E160039`) and her raced
+/// commit a conflict at bob's file (`E160024`), each failure where the drive met it; and the
+/// youngest revision the recorded 13.
 #[test]
 fn every_recorded_commit_is_answered_as_svnserve_answered_it() {
   let mut replay = Replay::new();
@@ -557,9 +575,10 @@ fn every_recorded_commit_is_answered_as_svnserve_answered_it() {
     }
     let race = (recording.0 == "conflict").then_some(RACE);
     let out = replay_connection(&mut replay, recording, race);
-    assert_as_svnserve(recording.0, &out, recording.3);
+    replay.in_hash_order += assert_as_svnserve(recording.0, &out, recording.3);
     replayed += 1 + usize::from(race.is_some());
   }
   assert_eq!(replayed, REPLAYED);
+  assert_eq!(replay.in_hash_order, IN_HASH_ORDER, "items matched only as sets");
   assert_eq!(replay.records.youngest(), YOUNGEST);
 }
