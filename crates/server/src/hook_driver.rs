@@ -2,12 +2,14 @@
 //! process of its own over a read-only view of the work, held to A-597's runner (`crate::vcs_hooks::HookRun`).
 //!
 //! **The launch.** The hook's program, by its absolute path from the repository's policy (A-622 part 1), is started
-//! with its point's arguments, environment and standard input in its tool's terms (`crate::vcs_hooks`'s builders), its
-//! working directory the root of the read-only attachment it runs over (the tool's server makes that view: git's bare
-//! repository with the quarantine, Mercurial's revlog view, Subversion's transaction; Mercurial's `HG_PENDING` names its
-//! root), in a process group of its own, so the hook and every process it starts can be ended together. Its words are
+//! with its point's arguments, environment and standard input in its tool's terms (`crate::vcs_hooks`'s builders), in
+//! the directory its point runs in (`HookPoint::directory`): git's and Mercurial's in the root of the read-only
+//! attachment it runs over (the tool's server makes that view: git's bare repository with the quarantine, Mercurial's
+//! revlog view; Mercurial's `HG_PENDING` names its root), Subversion's in `/`, as `svnserve -d` runs them (A-648). It
+//! runs in a process group of its own, so the hook and every process it starts can be ended together. Its words are
 //! one pipe: standard output and standard error joined for git and Mercurial, standard error alone for Subversion, whose
-//! standard output goes to the null device (A-597). On Linux the hook is meant to run inside the launcher's namespace
+//! standard output goes to the null device (A-597) but for `pre-lock`'s, which is read as a second pipe and handed back
+//! as the lock's token (A-648). On Linux the hook is meant to run inside the launcher's namespace
 //! (`slates exec`, §4.6); that confinement is the launcher's piece, not this driver's.
 //!
 //! **The run.** One task of the shard drives the runner: it feeds standard input as the pipe takes it (a hook that
@@ -42,8 +44,8 @@ use slates_ipc::exit_watch::ExitWatch;
 use slates_rt::futures;
 
 use crate::vcs_hooks::{
-  EnvValue, Event, ExitStatus as HookExit, HookInput, HookRun, Lesson, Outcome, StartRefused, Step,
-  WordsFrom,
+  EnvValue, Event, ExitStatus as HookExit, HookDirectory, HookInput, HookRun, Lesson, Outcome,
+  StartRefused, Step, Words, WordsFrom,
 };
 
 /// What a hook is launched with (the module doc).
@@ -59,6 +61,21 @@ pub(crate) struct Launch<'a> {
   pub(crate) words_cap: usize,
 }
 
+/// Format: the filesystem's root, where a hook whose point runs there starts (`HookDirectory::FilesystemRoot`).
+const FILESYSTEM_ROOT: &str = "/";
+
+/// What one run of a hook answers (the module doc).
+#[derive(Debug)]
+pub(crate) struct Ended {
+  /// How it ended.
+  pub(crate) outcome: Outcome,
+  /// What it teaches its hook's times.
+  pub(crate) lesson: Lesson,
+  /// Its standard output where its point reads it, kept to the run's cap: `pre-lock`'s, the lock's token (A-648). `None`
+  /// at every other point, whose standard output is part of its words or goes to the null device.
+  pub(crate) standard_output: Option<Words>,
+}
+
 /// Counter: hooks whose process the run's task was dropped before reaping, killed and left to a reaper task.
 const HOOK_REAP_HANDED: &str = "hook.reap_handed";
 /// Counter: hooks killed and reaped where no reaper task could be started, waited for on the shard at once.
@@ -66,16 +83,22 @@ const HOOK_REAP_WAITED: &str = "hook.reap_waited";
 
 /// Runs one hook to its outcome on this shard (the module doc), held to `bound_ns` (its hook's learned bound, none
 /// before its first finished run) and ended when `client_gone` resolves; the hook is reaped before this returns.
-/// Answers the outcome and the run's lesson for its hook's times.
+/// Answers the outcome, the run's lesson for its hook's times, and the standard output its point reads.
 pub(crate) async fn run(
   launch: Launch<'_>,
   bound_ns: Option<u64>,
   client_gone: impl Future<Output = ()>,
-) -> (Outcome, Lesson) {
+) -> Ended {
   let mut lesson = Lesson::default();
   let mut hook = match Hook::spawn(launch) {
     Ok(hook) => hook,
-    Err(cause) => return (HookRun::unstartable(cause), lesson),
+    Err(cause) => {
+      return Ended {
+        outcome: HookRun::unstartable(cause),
+        lesson,
+        standard_output: None,
+      };
+    }
   };
   let (mut run, mut step) = HookRun::with_bound(futures::now_ns(), bound_ns, launch.words_cap);
   let mut client_gone = pin!(client_gone);
@@ -90,8 +113,14 @@ pub(crate) async fn run(
         if end_leftovers {
           hook.kill_group();
         }
+        // What standard output holds now: a stream something the hook started still holds is not waited for.
+        hook.read_standard_output();
         hook.reap();
-        return (outcome, lesson);
+        return Ended {
+          outcome,
+          lesson,
+          standard_output: hook.standard_output.take(),
+        };
       }
       Step::Kill => {
         hook.kill_group();
@@ -147,6 +176,8 @@ enum Happened {
 enum Woke {
   /// The words stream is readable.
   Words,
+  /// Standard output, where its point reads it, is readable.
+  Output,
   /// Standard input is writable.
   Input,
   /// The exit is pending.
@@ -173,6 +204,12 @@ struct Hook {
   pending: Vec<u8>,
   /// Its words stream's read end, non-blocking, until the stream ends.
   words: Option<OwnedFd>,
+  /// Its standard output's read end where its point reads it (`pre-lock`'s token), non-blocking, until it ends.
+  output: Option<OwnedFd>,
+  /// What its standard output wrote, kept to `cap`; `None` where its point does not read it.
+  standard_output: Option<Words>,
+  /// How many bytes of its standard output are kept, its run's cap on words.
+  cap: usize,
   /// Whether its watch has reported its exit (which a watch reports once).
   exit_seen: bool,
   /// Whether its exit status was read (the child still unreaped).
@@ -194,7 +231,10 @@ impl Hook {
           .iter()
           .map(|arg| std::ffi::OsStr::from_bytes(arg)),
       )
-      .current_dir(launch.view_root)
+      .current_dir(match launch.input.point.directory() {
+        HookDirectory::ViewRoot => launch.view_root,
+        HookDirectory::FilesystemRoot => Path::new(FILESYSTEM_ROOT),
+      })
       .process_group(0)
       .stdin(Stdio::piped());
     // A Subversion hook starts with its hooks-env section alone, never the server's environment (A-623,
@@ -209,12 +249,18 @@ impl Hook {
         EnvValue::Unset => command.env_remove(name),
       };
     }
+    let mut output_read = None;
     match launch.input.point.words_from() {
       WordsFrom::BothStreams => {
         let joined = words_write
           .try_clone()
           .map_err(|error| start_refused(&error))?;
         command.stdout(Stdio::from(joined));
+      }
+      WordsFrom::ErrorStream if launch.input.point.output_is_lock_token() => {
+        let (read, write) = std::io::pipe().map_err(|error| start_refused(&error))?;
+        command.stdout(Stdio::from(write));
+        output_read = Some(read);
       }
       WordsFrom::ErrorStream => {
         command.stdout(Stdio::null());
@@ -227,6 +273,7 @@ impl Hook {
     drop(command);
     let input = child.stdin.take().map(OwnedFd::from);
     let words = OwnedFd::from(words_read);
+    let output = output_read.map(OwnedFd::from);
     let exit = match ExitWatch::on(child.id()) {
       Ok(exit) => exit,
       Err(_) => {
@@ -236,16 +283,20 @@ impl Hook {
         return Err(StartRefused::NoRoom);
       }
     };
-    let ready = [input.as_ref(), Some(&words)]
+    let ready = [input.as_ref(), Some(&words), output.as_ref()]
       .into_iter()
       .flatten()
       .all(|fd| non_blocking(fd).is_ok());
+    let standard_output = output.as_ref().map(|_| Words::default());
     let mut hook = Self {
       child: Some(child),
       exit,
       input,
       pending: launch.input.stdin.clone(),
       words: Some(words),
+      output,
+      standard_output,
+      cap: launch.words_cap,
       exit_seen: false,
       exited: false,
       buffer: vec![0; rustix::param::page_size()],
@@ -272,6 +323,7 @@ impl Hook {
     let mut client = client;
     loop {
       self.feed();
+      self.read_standard_output();
       if let Some(happened) = self.read_words().or_else(|| self.read_exit()) {
         return happened;
       }
@@ -286,13 +338,13 @@ impl Hook {
             now_ns: futures::now_ns(),
           };
         }
-        Woke::Words | Woke::Input | Woke::Exit => {}
+        Woke::Words | Woke::Output | Woke::Input | Woke::Exit => {}
       }
     }
   }
 
-  /// Waits for the first of: the words readable, the input writable, the exit, the deadline, the client leaving (asked
-  /// only while it has not answered).
+  /// Waits for the first of: the words readable, the standard output its point reads readable, the input writable, the
+  /// exit, the deadline, the client leaving (asked only while it has not answered).
   async fn wait(
     &self,
     wake_at_ns: Option<u64>,
@@ -300,12 +352,19 @@ impl Hook {
     client_left: &mut bool,
   ) -> Woke {
     let words = self.words.as_ref().map(|fd| fd.as_raw_fd());
+    let output = self.output.as_ref().map(|fd| fd.as_raw_fd());
     let input = self.input.as_ref().map(|fd| fd.as_raw_fd());
     let exit = (!self.exit_seen)
       .then(|| self.exit.readiness().map(|fd| fd.as_raw_fd()))
       .flatten();
     let mut words = pin!(async move {
       match words {
+        Some(fd) => slates_rt::readiness::readable(fd).await,
+        None => std::future::pending().await,
+      }
+    });
+    let mut output = pin!(async move {
+      match output {
         Some(fd) => slates_rt::readiness::readable(fd).await,
         None => std::future::pending().await,
       }
@@ -330,8 +389,9 @@ impl Hook {
     });
     let mut client = client;
     std::future::poll_fn(|cx| {
-      let waits: [(Woke, Poll<Result<(), slates_rt::RtError>>); 4] = [
+      let waits: [(Woke, Poll<Result<(), slates_rt::RtError>>); 5] = [
         (Woke::Words, words.as_mut().poll(cx)),
+        (Woke::Output, output.as_mut().poll(cx)),
         (Woke::Input, input.as_mut().poll(cx)),
         (Woke::Exit, exit.as_mut().poll(cx)),
         (Woke::Deadline, deadline.as_mut().poll(cx)),
@@ -369,6 +429,25 @@ impl Hook {
           self.pending.clear();
           self.input = None;
         }
+      }
+    }
+  }
+
+  /// Keeps what the standard output its point reads holds now, to the cap, the rest counted; at its end, or a read
+  /// error, which ends it too, closes it.
+  fn read_standard_output(&mut self) {
+    while let Some(fd) = self.output.as_ref() {
+      match rustix::io::read(fd, self.buffer.as_mut_slice()) {
+        Ok(0) => self.output = None,
+        Ok(read) => {
+          let bytes = self.buffer.get(..read).unwrap_or_default();
+          if let Some(kept) = self.standard_output.as_mut() {
+            kept.append(bytes, self.cap);
+          }
+        }
+        Err(rustix::io::Errno::INTR) => {}
+        Err(rustix::io::Errno::AGAIN) => return,
+        Err(_) => self.output = None,
       }
     }
   }
@@ -528,7 +607,7 @@ mod tests {
 
   use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 
-  use super::{Launch, run};
+  use super::{Ended, Launch, run};
   use crate::daemon::LIVENESS_BUDGET_NS;
   use crate::vcs_hooks::{
     EnvValue, ExitStatus, HookInput, HookPoint, HookTimes, Learns, Lesson, Outcome, PendingView,
@@ -592,6 +671,17 @@ mod tests {
           .collect();
         names.sort_unstable();
         eprintln!("{TAG}names={}", names.join("|"));
+        std::process::exit(0);
+      }
+      "where" => {
+        eprintln!("{TAG}cwd={}", std::env::current_dir().unwrap().display());
+        std::process::exit(0);
+      }
+      "token" => {
+        use std::io::Write;
+        print!("{TAG}opaquelocktoken:from-the-hook");
+        let _ = std::io::stdout().flush();
+        eprintln!("{TAG}chatter");
         std::process::exit(0);
       }
       "refuse" => {
@@ -667,6 +757,9 @@ mod tests {
   /// What a run answered: its outcome and lesson, and how long it took; `None` past the test's bound.
   type Ran = Option<(Outcome, Lesson, u64)>;
 
+  /// What a run answered whole, and how long it took; `None` past the test's bound.
+  type RanWhole = Option<(Ended, u64)>;
+
   /// Runs `hook` (by `program`, `/` standing for the test binary) to its outcome, held to `bound_ns`, its client
   /// leaving after `leaves_after_ns` when given.
   fn drive(
@@ -675,6 +768,17 @@ mod tests {
     bound_ns: Option<u64>,
     leaves_after_ns: Option<u64>,
   ) -> Ran {
+    drive_whole(program, hook, bound_ns, leaves_after_ns)
+      .map(|(ended, took)| (ended.outcome, ended.lesson, took))
+  }
+
+  /// [`drive`], answering the run whole.
+  fn drive_whole(
+    program: Option<&str>,
+    hook: HookInput,
+    bound_ns: Option<u64>,
+    leaves_after_ns: Option<u64>,
+  ) -> RanWhole {
     let runtime = runtime();
     let (sent, got) = channel();
     let (binary, view) = program_and_view();
@@ -698,12 +802,7 @@ mod tests {
         let began = slates_rt::futures::now_ns();
         let ran = slates_rt::futures::within(TEST_BOUND_NS, run(launch, bound_ns, client)).await;
         let took = slates_rt::futures::now_ns().saturating_sub(began);
-        let _ = sent.send(
-          ran
-            .ok()
-            .flatten()
-            .map(|(outcome, lesson)| (outcome, lesson, took)),
-        );
+        let _ = sent.send(ran.ok().flatten().map(|ended| (ended, took)));
       })
       .expect("the run's task");
     runtime.run_until_idle();
@@ -774,6 +873,48 @@ mod tests {
     let mut times = HookTimes::default();
     lesson.teach(&mut times);
     assert_eq!(times.finished_runs(), 1);
+  }
+
+  /// A-648 (`svnserve -d` runs its hooks in `/`). Do: run a post-commit hook that writes its working directory to
+  /// standard error, Subversion's words. Expect: accepted, its directory the filesystem's root, not its view's.
+  #[test]
+  fn a_subversion_hook_runs_in_the_filesystems_root() {
+    let hook = input(HookPoint::SvnPostCommit, "where", &[], Vec::new());
+    let (outcome, _, _) = drive(None, hook, None, None).expect("the run ended");
+    assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+    let line = format!("{TAG}cwd=/\n");
+    assert!(
+      text(&outcome).contains(&line),
+      "{line:?} in {}",
+      text(&outcome)
+    );
+  }
+
+  /// A-648 (`svn_repos__hooks_pre_lock`: the hook's standard output is the lock's token). Do: run a pre-lock hook that
+  /// writes a token to standard output and a line to standard error; then the same hook at pre-commit. Expect: at
+  /// pre-lock, accepted, its standard output handed back ending in the token and its words the standard error line
+  /// alone; at pre-commit, no standard output handed back, since that point's goes to the null device.
+  #[test]
+  fn a_pre_lock_hooks_standard_output_comes_back_as_its_token() {
+    let token = format!("{TAG}opaquelocktoken:from-the-hook");
+    let hook = input(HookPoint::SvnPreLock, "token", &[], Vec::new());
+    let (ended, _) = drive_whole(None, hook, None, None).expect("the run ended");
+    assert!(
+      matches!(ended.outcome, Outcome::Accepted { .. }),
+      "{:?}",
+      ended.outcome
+    );
+    let output = ended.standard_output.expect("pre-lock's standard output");
+    assert!(output.kept.ends_with(token.as_bytes()), "{output:?}");
+    assert_eq!(output.dropped, 0);
+    let words = text(&ended.outcome);
+    assert!(
+      words.contains(&format!("{TAG}chatter")) && !words.contains(&token),
+      "{words}"
+    );
+    let other = input(HookPoint::SvnPreCommit, "token", &[], Vec::new());
+    let (ended, _) = drive_whole(None, other, None, None).expect("the run ended");
+    assert_eq!(ended.standard_output, None);
   }
 
   /// A-623 (`run_hook_cmd`: a Subversion hook's environment is its hooks-env section alone). Do: run a pre-commit hook

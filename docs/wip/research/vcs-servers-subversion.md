@@ -694,6 +694,19 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   naming the path and the revisions as the client gave them; the search's relation is to the original start node and
   its copy test to the moving start. Recorded: `trunk/dir/b.txt` 5..11 deleted in 6 (also 11..5); `branches/b1/a.txt`
   4..11 in 9 (its replacement by a copy); 8..11 of the re-added `b.txt` and 3..8 of the branch's file not deleted.
+- **`log`** [C: `serve.c` `log_cmd`, `path_change_receiver`, `revision_receiver`; `log.c` `svn_repos_get_logs5`,
+  `do_logs`, `get_path_histories`, `get_history`, `check_history`, `next_history_rev`, `send_log`, `fill_log_entry`;
+  `tree.c` `fs_node_history`, `fs_history_prev`, `history_prev`; `marshal.c` `vparse_tuple`,
+  `svn_ra_svn__write_data_log_entry`, `svn_ra_svn__write_data_log_changed_path`; recorded]: `vparse_tuple` reads
+  `l(?r)(?r)bb?n?Bwl` with 5, 6 or 9+ items (a `?` must be where the items end); revision 0's entry has no changed
+  paths; the changed paths come in the stored order, byte order of the paths; a revision property list with the three
+  alone is sent as their three places and a count of 0. Recorded: `branches/b1/a.txt`'s log crosses its r9 replacement
+  to `trunk/a.txt` (9, 5, 2, 1), and stops at it under `strict-node`; `tags/t1/dir`'s is 7 then 1; the re-added
+  `trunk/dir/b.txt`'s is 8 alone; an empty name list sends no revision properties; `x-ticket` is counted and listed;
+  r10, without an author, sends `( )` there. Read for the merged revisions owed: the paths whose mergeinfo changes a
+  revision is judged by are each history's next location, not the revision's own (`do_logs` builds `cur_paths` after
+  `check_history` has advanced), which the recording shows: `tags/t1`'s log has r7's merge of `/branches/b1/dir`,
+  seen through `/trunk`.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and

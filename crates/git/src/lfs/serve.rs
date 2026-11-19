@@ -25,7 +25,9 @@
 //! holds it already, and a per-object `404` or `422` otherwise. An action works exactly as long as
 //! the credential that asked for it, since a transfer authenticates at the edge as the batch did:
 //! its `expires_at` is that credential's expiry when it has one (a bearer token's), and an action
-//! asked with a credential that never expires (Basic) carries none. No expiry is chosen here.
+//! asked with a credential that never expires (Basic) carries none. No expiry is chosen here. An
+//! href names the ref its batch was asked for (`?refspec=`), so its transfer is judged on the ref
+//! the batch was judged on; a transfer that names none is judged as a request naming no ref.
 //!
 //! **Who may do what** is asked of [`Access`] as a [`Need`] on the ref the request names (the
 //! repository's whole namespace for a transfer, which names none). A refusal of a request that sent
@@ -125,6 +127,44 @@ const OBJECTS_PATH: &str = "/objects/";
 
 /// Format: the verification's path after an object's.
 const VERIFY_PATH: &str = "/verify";
+
+/// Format: what a transfer's href adds to name the ref its batch was asked for: the lock listing's
+/// own key for a ref (locking.md's `refspec`), which [`locks::read_list_query`] reads.
+const REFSPEC_QUERY: &str = "?refspec=";
+
+/// Format: the bytes a query value carries as themselves beside letters and digits: RFC 3986
+/// §2.3's unreserved ones, and `/`, which a query may hold (§3.4).
+const QUERY_SAFE: &[u8] = b"-._~/";
+
+/// Whether `byte` is carried as itself in a query value.
+fn query_safe(byte: u8) -> bool {
+  byte.is_ascii_alphanumeric() || QUERY_SAFE.contains(&byte)
+}
+
+/// `text` as a query value: every other byte escaped (RFC 3986 §2.1), so a form decoder reads it
+/// back whole.
+fn query_value(text: &str) -> String {
+  let mut value = String::new();
+  for byte in text.bytes() {
+    if query_safe(byte) {
+      value.push(char::from(byte));
+    } else {
+      value.push_str(&format!("%{byte:02X}"));
+    }
+  }
+  value
+}
+
+/// Format: an escape's length: `%` and two hexadecimal digits (RFC 3986 §2.1).
+const ESCAPED_LEN: usize = 3;
+
+/// The length of [`query_value`]'s text for `text`.
+fn query_len(text: &str) -> usize {
+  text
+    .bytes()
+    .map(|byte| if query_safe(byte) { 1 } else { ESCAPED_LEN })
+    .sum()
+}
 
 /// Format: the reply field naming a body's media type (RFC 9110 §8.3).
 const CONTENT_TYPE: &[u8] = b"Content-Type";
@@ -598,23 +638,28 @@ pub enum Taken {
   Held(LockRecord),
 }
 
-/// The lock records could not change: their store is at its capacity.
+/// Why a repository's lock records could not change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocksFull;
+pub enum LocksRefused {
+  /// Their store is at its capacity: `507`.
+  Full,
+  /// Their store did not record the change: `500`.
+  Failed,
+}
 
-/// A repository's locks, at most one a path: the repository's lock log (A-642), each change guarded
-/// then applied, its order the order the locks were taken in. A lock's id names its place in the
-/// log, so a cursor naming a lock released since still names a place.
+/// A repository's locks, at most one a path, as its locks log keeps them (A-642), each change
+/// guarded then applied, and read from it as records. A lock's id is the store's; a page ends at a
+/// cursor that is the next lock's id, which still names where to go on once that lock is released.
 pub trait Locks {
   /// Takes a lock on `path` for `owner` at `at`, or answers the lock that holds the path.
-  fn take(&mut self, path: &str, owner: &str, at: Timestamp) -> Result<Taken, LocksFull>;
+  fn take(&mut self, path: &str, owner: &str, at: Timestamp) -> Result<Taken, LocksRefused>;
   /// The lock `id`.
-  fn find(&self, id: &str) -> Option<&LockRecord>;
-  /// The locks held in the log's order, from the place `from` names (inclusive) or from the first;
-  /// `None` when `from` names no place in the log.
-  fn listed_from(&self, from: Option<&str>) -> Option<impl Iterator<Item = &LockRecord>>;
+  fn find(&self, id: &str) -> Option<LockRecord>;
+  /// The locks held in the store's order, from where the lock `from` names stands or stood
+  /// (inclusive), or from the first; `None` when `from` names no lock of the store.
+  fn listed_from(&self, from: Option<&str>) -> Option<impl Iterator<Item = LockRecord> + '_>;
   /// Releases the lock `id`, answering it, or `None` when there is none.
-  fn release(&mut self, id: &str) -> Result<Option<LockRecord>, LocksFull>;
+  fn release(&mut self, id: &str) -> Result<Option<LockRecord>, LocksRefused>;
 }
 
 /// A request routed and read: its endpoint, its query and its body.
@@ -766,9 +811,9 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
   ) -> Answer {
     match request.endpoint {
       Endpoint::Batch => self.batch(request.body, context, admission),
-      Endpoint::Upload(oid) => self.upload(oid, request.body, context),
-      Endpoint::Download(oid) => self.download(oid, context, admission),
-      Endpoint::Verify(oid) => self.verify(oid, request.body, context, admission),
+      Endpoint::Upload(oid) => self.upload(oid, request, context, admission),
+      Endpoint::Download(oid) => self.download(oid, request.query, context, admission),
+      Endpoint::Verify(oid) => self.verify(oid, request, context, admission),
       Endpoint::CreateLock => self.create_lock(request.body, context, admission),
       Endpoint::ListLocks => self.list_locks(request.query, context, admission),
       Endpoint::VerifyLocks => self.verify_locks(request.body, context, admission),
@@ -802,37 +847,48 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
       let text = "No transfer adapter offered is basic";
       return message(UNPROCESSABLE, text, context);
     }
-    self.batch_answer(request.operation, &request.objects, context, admission)
+    let asked = (request.operation, ref_name.as_deref());
+    self.batch_answer(asked, &request.objects, context, admission)
   }
 
   /// The batch API's answer for `objects`: its hrefs, the answers' slots and its body charged
   /// before any is made.
   fn batch_answer(
     &mut self,
-    operation: Operation,
+    (operation, ref_name): (Operation, Option<&str>),
     objects: &[batch::Object],
     context: &Context<'_>,
     admission: &mut Admission,
   ) -> Answer {
+    let suffix = ref_name.map_or(0, |name| {
+      REFSPEC_QUERY.len().saturating_add(query_len(name))
+    });
     let href_len = context
       .base
       .len()
       .saturating_add(OBJECTS_PATH.len())
-      .saturating_add(super::OID_HEX_LEN);
+      .saturating_add(super::OID_HEX_LEN)
+      .saturating_add(suffix);
     let per_object = href_len.saturating_mul(2).saturating_add(VERIFY_PATH.len());
     let made = admission
-      .charge(to_u64(per_object.saturating_mul(objects.len())))
+      .charge(to_u64(suffix))
+      .and_then(|()| admission.charge(to_u64(per_object.saturating_mul(objects.len()))))
       .and_then(|()| admission.charge_items::<(String, String)>(objects.len()))
       .and_then(|()| admission.charge_items::<ObjectAnswer<'_>>(objects.len()));
     if made.is_err() {
       return too_large(context);
     }
+    let suffix = ref_name.map_or_else(String::new, |name| {
+      format!("{REFSPEC_QUERY}{}", query_value(name))
+    });
     let hrefs: Vec<(String, String)> = objects
       .iter()
       .map(|object| {
-        let href = format!("{}{OBJECTS_PATH}{}", context.base, object.oid);
-        let verify = format!("{href}{VERIFY_PATH}");
-        (href, verify)
+        let object = format!("{}{OBJECTS_PATH}{}", context.base, object.oid);
+        (
+          format!("{object}{suffix}"),
+          format!("{object}{VERIFY_PATH}{suffix}"),
+        )
       })
       .collect();
     let answers: Vec<ObjectAnswer<'_>> = objects
@@ -896,11 +952,17 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
   }
 
   /// An upload: the bytes kept as the object, checked against its oid.
-  fn upload(&mut self, oid: &Oid, body: &[u8], context: &Context<'_>) -> Answer {
-    if !self.access.allows(Need::Upload, None) {
-      return denied(context);
+  fn upload(
+    &mut self,
+    oid: &Oid,
+    request: &Request<'_>,
+    context: &Context<'_>,
+    admission: &mut Admission,
+  ) -> Answer {
+    if let Err(answer) = self.transfer_allowed(Need::Upload, request.query, context, admission) {
+      return answer;
     }
-    match self.objects.admit(oid, body) {
+    match self.objects.admit(oid, request.body) {
       Ok(_) => empty(Status::OK),
       Err(ObjectRefused::Mismatch) => {
         message(UNPROCESSABLE, "Content does not match its oid", context)
@@ -913,9 +975,15 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
   }
 
   /// A download: the object's bytes, charged before they are read.
-  fn download(&mut self, oid: &Oid, context: &Context<'_>, admission: &mut Admission) -> Answer {
-    if !self.access.allows(Need::Download, None) {
-      return denied(context);
+  fn download(
+    &mut self,
+    oid: &Oid,
+    query: &[u8],
+    context: &Context<'_>,
+    admission: &mut Admission,
+  ) -> Answer {
+    if let Err(answer) = self.transfer_allowed(Need::Download, query, context, admission) {
+      return answer;
     }
     let Some(size) = self.objects.held(oid) else {
       return message(Status::NOT_FOUND, "Object does not exist", context);
@@ -938,14 +1006,14 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
   fn verify(
     &mut self,
     oid: &Oid,
-    body: &[u8],
+    request: &Request<'_>,
     context: &Context<'_>,
     admission: &mut Admission,
   ) -> Answer {
-    if !self.access.allows(Need::Upload, None) {
-      return denied(context);
+    if let Err(answer) = self.transfer_allowed(Need::Upload, request.query, context, admission) {
+      return answer;
     }
-    let object = match batch::read_verify(body, admission) {
+    let object = match batch::read_verify(request.body, admission) {
       Ok(object) => object,
       Err(refused) => return batch_refused(refused, context),
     };
@@ -956,6 +1024,30 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
       Some(size) if size == object.size => empty(Status::OK),
       Some(_) => message(UNPROCESSABLE, "Object size does not match", context),
       None => message(Status::NOT_FOUND, "Object does not exist", context),
+    }
+  }
+
+  /// Whether the principal may have `need` for a transfer, judged on the ref its href names (the
+  /// batch's own, `refspec`) or on none: the answer to a malformed query, one past the room or a
+  /// refusal otherwise.
+  fn transfer_allowed(
+    &self,
+    need: Need,
+    query: &[u8],
+    context: &Context<'_>,
+    admission: &mut Admission,
+  ) -> Result<(), Answer> {
+    let Ok(list) = locks::read_list_query(query) else {
+      return Err(message(Status::BAD_REQUEST, "Malformed query", context));
+    };
+    let ref_name = list.refspec.map(|value| value.owned(admission).ok());
+    let Some(ref_name) = ref_name.transpose_room() else {
+      return Err(too_large(context));
+    };
+    if self.access.allows(need, ref_name.as_deref()) {
+      Ok(())
+    } else {
+      Err(denied(context))
     }
   }
 
@@ -984,7 +1076,8 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
     match self.locks.take(&path, context.owner, context.now) {
       Ok(Taken::New(record)) => lock_answer(CREATED, &record, context, admission),
       Ok(Taken::Held(record)) => conflict(&record, context, admission),
-      Err(LocksFull) => message(INSUFFICIENT_STORAGE, "No room for the lock", context),
+      Err(LocksRefused::Full) => message(INSUFFICIENT_STORAGE, "No room for the lock", context),
+      Err(LocksRefused::Failed) => message(INTERNAL, "The lock was not recorded", context),
     }
   }
 
@@ -1042,11 +1135,11 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
     };
     let views: Vec<Lock<'_>> = page.locks.iter().map(|record| record.view()).collect();
     let mut measure = Measure::default();
-    locks::write_list(&views, page.next, &mut measure);
+    locks::write_list(&views, page.next.as_deref(), &mut measure);
     let Some(mut body) = body_of(measure.0) else {
       return unwritten(context);
     };
-    locks::write_list(&views, page.next, &mut body);
+    locks::write_list(&views, page.next.as_deref(), &mut body);
     json_body(Status::OK, body)
   }
 
@@ -1092,11 +1185,11 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
       .map(|record| record.view())
       .partition(|view| view.owner == Some(context.owner));
     let mut measure = Measure::default();
-    locks::write_verify(&ours, &theirs, page.next, &mut measure);
+    locks::write_verify(&ours, &theirs, page.next.as_deref(), &mut measure);
     let Some(mut body) = body_of(measure.0) else {
       return unwritten(context);
     };
-    locks::write_verify(&ours, &theirs, page.next, &mut body);
+    locks::write_verify(&ours, &theirs, page.next.as_deref(), &mut body);
     json_body(Status::OK, body)
   }
 
@@ -1138,23 +1231,24 @@ impl<A: Access, O: Objects, L: Locks> Server<'_, A, O, L> {
     match self.locks.release(id) {
       Ok(Some(record)) => lock_answer(Status::OK, &record, context, admission),
       Ok(None) => message(Status::NOT_FOUND, "Lock not found", context),
-      Err(LocksFull) => message(INSUFFICIENT_STORAGE, "No room for the release", context),
+      Err(LocksRefused::Full) => message(INSUFFICIENT_STORAGE, "No room for the release", context),
+      Err(LocksRefused::Failed) => message(INTERNAL, "The release was not recorded", context),
     }
   }
 }
 
-/// Derived: the bytes a page holds for each lock beside the lock's place in the answer: the borrow
-/// of its record and the view the answer is written from.
+/// Derived: the bytes a page holds for each lock beside its place in the answer and its record's
+/// text: the record and the view the answer is written from.
 const PAGE_SLOT: usize =
-  core::mem::size_of::<&LockRecord>().saturating_add(core::mem::size_of::<Lock<'static>>());
+  core::mem::size_of::<LockRecord>().saturating_add(core::mem::size_of::<Lock<'static>>());
 
-/// A page of locks borrowed from the log, and the id of the lock that continues it.
+/// A page of locks as the store read them, and the id of the lock that continues it.
 #[derive(Debug, Default)]
-struct Page<'l> {
+struct Page {
   /// The locks.
-  locks: Vec<&'l LockRecord>,
+  locks: Vec<LockRecord>,
   /// The next lock's id, when more follow.
-  next: Option<&'l str>,
+  next: Option<String>,
 }
 
 /// Why a page of locks was not cut.
@@ -1179,14 +1273,14 @@ fn page_refused(refused: PageRefused, context: &Context<'_>) -> Answer {
 /// module's bounds): its frame of `frame` bytes first; then each lock while the client's `limit`
 /// allows it and the room holds it and a cursor naming the lock after it; then the cursor that
 /// ends it, which that keeps room for.
-fn page<'l, L: Locks>(
-  locks: &'l L,
+fn page<L: Locks>(
+  locks: &L,
   cursor: Option<&str>,
   limit: Option<u64>,
   frame: u64,
   admission: &mut Admission,
   keep: impl Fn(&LockRecord) -> bool,
-) -> Result<Page<'l>, PageRefused> {
+) -> Result<Page, PageRefused> {
   let limit = limit.filter(|limit| *limit > 0).unwrap_or(u64::MAX);
   let listed = locks.listed_from(cursor).ok_or(PageRefused::Cursor)?;
   admission.charge(frame).map_err(|_| PageRefused::Room)?;
@@ -1194,13 +1288,13 @@ fn page<'l, L: Locks>(
   let mut page = Page::default();
   while let Some(record) = kept.next() {
     let after = kept.peek().map_or(0, |next| locks::cursor_len(&next.id));
-    if to_u64(page.locks.len()) >= limit || !charge_place(record, after, admission) {
-      page.next = Some(record.id.as_str());
+    if to_u64(page.locks.len()) >= limit || !charge_place(&record, after, admission) {
+      page.next = Some(record.id);
       break;
     }
     page.locks.push(record);
   }
-  if let Some(next) = page.next {
+  if let Some(next) = &page.next {
     if page.locks.is_empty() || admission.charge(locks::cursor_len(next)).is_err() {
       return Err(PageRefused::Room);
     }
@@ -1208,10 +1302,17 @@ fn page<'l, L: Locks>(
   Ok(page)
 }
 
-/// Charges `record`'s place on a page, with its slots, when the room holds that and `after` bytes
-/// more: the cursor that would name the lock after it, were the page cut there.
+/// Charges `record`'s place on a page, with its slots and its text, when the room holds that and
+/// `after` bytes more: the cursor that would name the lock after it, were the page cut there.
 fn charge_place(record: &LockRecord, after: u64, admission: &mut Admission) -> bool {
-  let place = locks::listed_len(&record.view()).saturating_add(to_u64(PAGE_SLOT));
+  let text = record
+    .id
+    .len()
+    .saturating_add(record.path.len())
+    .saturating_add(record.owner.len());
+  let place = locks::listed_len(&record.view())
+    .saturating_add(to_u64(PAGE_SLOT))
+    .saturating_add(to_u64(text));
   place.saturating_add(after) <= admission.left() && admission.charge(place).is_ok()
 }
 
