@@ -14368,7 +14368,7 @@ for Subversion.)
   `svndiff1`: a sender uses zlib only for a peer that announced `svndiff1` (`marshal.c`, notes §2), so slates never
   receives it and never needs zlib, and it answers clients older than 1.10 in version 0. `mergeinfo` is announced in
   `repos-info`. An editor drive follows the protocol's early-error rule: an error is written as soon as it is known,
-  on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit`.
+  on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit` or `success`.
 - **svn+ssh.** sshd starts `svnserve -t` as the logged-in user; slates installs that command as one of its own (a CLI
   verb under the name `svnserve`), which speaks ra_svn on its standard input and output and relays to the daemon
   through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
@@ -47402,8 +47402,8 @@ Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `cr
 - **The hooks** (A-661; A-655 part 2a's pauses): the drive waits for start-commit at `open-root` and pre-commit at
   `close-edit` before its verdict; the connection hands the hook to the caller (`Turn::Hook`), which runs it over the
   transaction (`Connection::pending`) and answers (`Connection::answer_hook`, A-655's `Drive::resume`): a failure is
-  the command's, the client's commands then dropped until `abort-edit`. The post-commit hook is the caller's, after
-  the owner's commit, its words `commit-info`'s (`Made::post_commit_error`).
+  the command's, the client's commands then dropped until `abort-edit` or `success`. The post-commit hook is the
+  caller's, after the owner's commit, its words `commit-info`'s (`Made::post_commit_error`).
 - **The authentication for one command** (`must_have_access` 807-850): where a command needs access the session's
   principal lacks, the session is anonymous and the client could authenticate, `svnserve` asks again with
   `needs_username` (826-836): `EXTERNAL` and `CRAM-MD5` where authenticated users have the access, never `ANONYMOUS`,
@@ -47429,10 +47429,11 @@ Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `cr
   challenge and the success alone, byte for byte, through `Server::for_command`.
 - **Tests.** Handshake: four (that recording, CRAM-MD5 and `EXTERNAL` for one command, no mechanism the caller's
   error). Connection: the commit replay; a commit answered with the revision made; an anonymous commit authenticated
-  for write and refused as not made, the client's commands dropped until `abort-edit`; a commit refused after
-  authenticating as a user the rules keep from writing; a work refused in the step's words; start-commit's and
-  pre-commit's failures, the transaction a hook reads, and calls while a hook is due; calls out of turn; `update`'s
-  unreadable target, authenticated and where authentication cannot help.
+  for write and refused as not made, the client's commands dropped until `abort-edit`, and in another test until
+  `success`, the drop's other end; a commit refused after authenticating as a user the rules keep from writing; a
+  work refused in the step's words; start-commit's and pre-commit's failures, the transaction a hook reads, and calls
+  while a hook is due; calls out of turn; `update`'s unreadable target, authenticated and where authentication cannot
+  help.
 - **Owed** (GAPS): the daemon's commit once A-655 part 2b appends through the repository's logs; the lock verbs; the
   read commands' authentication for one command with their authorization (A-606).
 
