@@ -405,14 +405,33 @@ pub(crate) struct Changegroup {
   pub(crate) last: String,
   /// Where the changes came from (`HG_URL`), as the transport names it (`remote:http:...`, `remote:ssh:...`).
   pub(crate) url: String,
+  /// The push's transaction (`HG_TXNID`): `TXN:` and forty lower-case hexadecimal digits, the same for every hook of
+  /// the push, as 7.2 names a transaction (`localrepo.transaction`).
+  pub(crate) transaction: String,
 }
 
 /// Format: `HG_SOURCE` for every change a remote client pushes ("Source is "serve" for all remote access (http or
-/// ssh)", `hgext/acl.py`).
+/// ssh)", `hgext/acl.py`), and `HG_TXNNAME`, since 7.2 names a pushed transaction by its source (`exchange.unbundle`).
 const HG_SOURCE_SERVE: &str = "serve";
 
-/// The `HG_*` environment a Mercurial hook reads for a changegroup: its type and configured name, the changesets and
-/// where they came from.
+/// Format: `HGPLAIN` for every Mercurial hook: 7.2's default (`hooks.<name>:run-with-plain` is true unless configured,
+/// `configitems.toml`; `hook.py` `_exthook`), so a hook's own `hg` prints its plain output. Slates offers no per-hook
+/// setting.
+const HGPLAIN_ON: &str = "1";
+
+/// Format: `HG` for every Mercurial hook: the program a hook runs to call Mercurial. 7.2 names its own executable
+/// (`procutil.shellenviron`, `hgexecutable`), or `hg` on the search path when it cannot find itself; slates runs no
+/// `hg` of its own, so a hook's `$HG` is the first `hg` on the hook's search path.
+const HG_PROGRAM: &str = "hg";
+
+/// Format: `HG_BUNDLE2` for every push slates takes: 7.2 marks a transaction a bundle2 opened (`exchange.unbundle`),
+/// and a push reaches slates' hooks only as a bundle2 (`slates_hg::push::read` takes nothing else).
+const HG_BUNDLE2_TAKEN: &str = "1";
+
+/// The environment a Mercurial hook reads for a changegroup (`hook.py` `_exthook`, `procutil.shellenviron`, the
+/// transaction's arguments from `exchange.unbundle` and `changegroup.apply`): Mercurial's own program and plain mode,
+/// the hook's type and configured name, the transaction, the changesets and where they came from. Exactly what stock
+/// 7.2 hands its two changegroup hooks for a push over SSH (`crates/hg/fixtures/hooks`).
 fn changegroup_env(
   point: HookPoint,
   hook_name: &str,
@@ -420,11 +439,16 @@ fn changegroup_env(
 ) -> Vec<(String, EnvValue)> {
   let bytes = |text: &str| EnvValue::Bytes(text.as_bytes().to_vec());
   vec![
+    ("HG".to_owned(), bytes(HG_PROGRAM)),
+    ("HGPLAIN".to_owned(), bytes(HGPLAIN_ON)),
+    ("HG_BUNDLE2".to_owned(), bytes(HG_BUNDLE2_TAKEN)),
     ("HG_HOOKTYPE".to_owned(), bytes(point.name())),
     ("HG_HOOKNAME".to_owned(), bytes(hook_name)),
     ("HG_NODE".to_owned(), bytes(&changes.first)),
     ("HG_NODE_LAST".to_owned(), bytes(&changes.last)),
     ("HG_SOURCE".to_owned(), bytes(HG_SOURCE_SERVE)),
+    ("HG_TXNID".to_owned(), bytes(&changes.transaction)),
+    ("HG_TXNNAME".to_owned(), bytes(HG_SOURCE_SERVE)),
     ("HG_URL".to_owned(), bytes(&changes.url)),
   ]
 }
@@ -1575,7 +1599,7 @@ impl HookRun {
 
 #[cfg(test)]
 mod tests {
-  use std::collections::BTreeSet;
+  use std::collections::{BTreeMap, BTreeSet};
 
   use proptest::prelude::*;
 
@@ -1885,6 +1909,66 @@ mod tests {
     }
   }
 
+  /// What stock Mercurial 7.2 handed a server's `pretxnchangegroup` and `changegroup` hooks for one push of two
+  /// changesets over SSH, to a non-publishing server and to a publishing one (`crates/hg/fixtures/hooks`, made by its
+  /// `make-hook-fixtures.sh`): what hg set beyond the server's own environment, `$HG`, `$ROOT` and `$TXNID` standing
+  /// for hg's executable, the repository's root and the transaction's id.
+  const RECORDED_HG_HOOKS: [[&str; 2]; 2] = [
+    [
+      include_str!("../../hg/fixtures/hooks/pretxnchangegroup.draft.env.txt"),
+      include_str!("../../hg/fixtures/hooks/changegroup.draft.env.txt"),
+    ],
+    [
+      include_str!("../../hg/fixtures/hooks/pretxnchangegroup.public.env.txt"),
+      include_str!("../../hg/fixtures/hooks/changegroup.public.env.txt"),
+    ],
+  ];
+
+  /// A recorded hook's variables, by name.
+  fn recorded_env(listing: &str) -> BTreeMap<&str, &str> {
+    listing
+      .lines()
+      .filter_map(|line| line.strip_prefix("env "))
+      .filter_map(|variable| variable.split_once('='))
+      .collect()
+  }
+
+  /// A-657 part 4 (g293's finding; A-597's builders held to stock 7.2: `hook.py` `_exthook`, `procutil.shellenviron`,
+  /// `exchange.unbundle`, `changegroup.apply`). Do: build pretxnchangegroup and changegroup for the pushes stock 7.2
+  /// recorded, with their nodes and URL as recorded. Expect: each hook's environment names exactly the variables 7.2
+  /// set for it, each once; `HGPLAIN` 1, `HG_BUNDLE2` 1 and `HG_TXNNAME` `serve` as recorded; `HG` a program to run
+  /// (`hg`); `HG_PENDING` the view's root; `HG_TXNID` the push's transaction, the same in both hooks; every other value
+  /// as recorded.
+  #[test]
+  fn mercurials_hooks_get_the_environment_stock_7_2_hands_them() {
+    for [pending_listing, committed_listing] in RECORDED_HG_HOOKS {
+      let recorded = recorded_env(pending_listing);
+      let changes = Changegroup {
+        first: recorded["HG_NODE"].to_owned(),
+        last: recorded["HG_NODE_LAST"].to_owned(),
+        url: recorded["HG_URL"].to_owned(),
+        transaction: format!("TXN:{}", "5a".repeat(20)),
+      };
+      let pending = hg_pretxnchangegroup(PendingView(1), "pretxnchangegroup.record", &changes);
+      let committed = hg_changegroup(CommittedView(2), "changegroup.record", &changes);
+      for (input, listing) in [(&pending, pending_listing), (&committed, committed_listing)] {
+        let recorded = recorded_env(listing);
+        let names: BTreeSet<&str> = input.env.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), input.env.len(), "a variable set twice");
+        assert_eq!(names, recorded.keys().copied().collect::<BTreeSet<_>>());
+        for (name, value) in &input.env {
+          let expected = match recorded[name.as_str()] {
+            "$ROOT" => EnvValue::ViewRoot,
+            "$TXNID" => EnvValue::Bytes(changes.transaction.as_bytes().to_vec()),
+            "$HG" => EnvValue::Bytes(b"hg".to_vec()),
+            value => EnvValue::Bytes(value.as_bytes().to_vec()),
+          };
+          assert_eq!(*value, expected, "{name}");
+        }
+      }
+    }
+  }
+
   /// A-597 (Mercurial's inputs, `config.txt` "hooks" and `hook.py`'s `HG_PENDING`). Do: build pretxnchangegroup and
   /// changegroup for one push. Expect: both carry the hook type and configured name, the first and last new nodes,
   /// `serve` as the source and the client's URL; only the admission hook carries `HG_PENDING`, naming its view's root.
@@ -1894,6 +1978,7 @@ mod tests {
       first: "aa".repeat(20),
       last: "bb".repeat(20),
       url: "remote:ssh:192.0.2.7".to_owned(),
+      transaction: format!("TXN:{}", "cc".repeat(20)),
     };
     let pending = hg_pretxnchangegroup(PendingView(3), "pretxnchangegroup.check", &changes);
     let committed = hg_changegroup(CommittedView(4), "changegroup.notify", &changes);
