@@ -58,3 +58,5 @@ crates/git/fixtures/deltas/*.delta -text
 crates/svn/fixtures/dump/*.dump -text
 # What stock git pushes sent and stock receive-pack answered, and the servers they met (A-620): byte for byte.
 crates/git/fixtures/push/** -text
+# The same for pushes a protected branch refused, and the signatures and payloads git's verifier read (A-644).
+crates/git/fixtures/protected/** -text
