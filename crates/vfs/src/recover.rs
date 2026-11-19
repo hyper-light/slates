@@ -132,6 +132,8 @@ pub enum PolicyImage {
   Exact,
   /// Normalization- and case-insensitive.
   Fold,
+  /// Case-insensitive by Windows' upcase table (A-576). Appended, so every image made before reads as it did.
+  Upcase,
 }
 
 /// The quota parameters in an image (§4.4 [`Quota`]). A dynamic quota's live pressure source is
@@ -1463,6 +1465,7 @@ const fn policy_image(policy: NameEquivalence) -> PolicyImage {
   match policy {
     NameEquivalence::Exact => PolicyImage::Exact,
     NameEquivalence::Fold => PolicyImage::Fold,
+    NameEquivalence::Upcase => PolicyImage::Upcase,
   }
 }
 
@@ -2288,6 +2291,7 @@ pub(crate) const fn policy_from_image(policy: PolicyImage) -> NameEquivalence {
   match policy {
     PolicyImage::Exact => NameEquivalence::Exact,
     PolicyImage::Fold => NameEquivalence::Fold,
+    PolicyImage::Upcase => NameEquivalence::Upcase,
   }
 }
 
