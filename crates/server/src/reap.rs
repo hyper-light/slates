@@ -31,7 +31,8 @@ use crate::state::{self, ClientSlot, ShardState};
 /// moved for an unproven slot ended at its report and for a retirement finished by the reaper.
 pub(crate) const REAPED_BY_HANGUP: &str = "client.reaped_by_hangup";
 /// Format: the counter of clients that wrote on their control socket, which no client does after its opening, ended as
-/// a hang-up is (Linux, [`Ended`]).
+/// a hang-up is (Linux, [`Ended`]). Linux's alone, as `Ended::Broke` is.
+#[cfg(target_os = "linux")]
 pub(crate) const CONTROL_BROKEN: &str = "client.control_broken";
 /// Format: the counter of watches whose wait the shard refused, each client ended as a hang-up is, since nothing could
 /// see its death afterwards.

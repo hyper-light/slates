@@ -1158,99 +1158,106 @@ mod tests {
   fn a_moved_clones_carried_capture_and_mark_hold_what_its_capture_held_at_every_path() {
     let mut store = store();
     let mut origin = volume(&mut store);
-    for d in ["src", "olddir"] {
-      mkdir(&mut origin, &mut store, "/", d);
-    }
-    file(&mut origin, &mut store, "/src", "edit.rs", b"captured body");
-    file(&mut origin, &mut store, "/src", "keep.rs", b"kept");
-    file(
-      &mut origin,
-      &mut store,
-      "/src",
-      "later.rs",
-      b"written after the move",
-    );
-    file(
-      &mut origin,
-      &mut store,
-      "/src",
-      "undone.rs",
-      b"changed, then back",
-    );
-    file(
-      &mut origin,
-      &mut store,
-      "/",
-      "gone.rs",
-      b"removed before the move",
-    );
-    file(
-      &mut origin,
-      &mut store,
-      "/",
-      "lost.rs",
-      b"removed after the move",
-    );
-    file(
-      &mut origin,
-      &mut store,
-      "/olddir",
-      "f.rs",
-      b"removed with its dir",
-    );
-    let root = dir(&origin, &store, "/");
-    origin
-      .symlink(&mut store, root, "link", "src/keep.rs")
-      .unwrap();
+    lay_out_the_origin(&mut store, &mut origin);
     let captured = origin.snapshot(&mut store).unwrap();
     let mut clone =
       Volume::clone_without_base(&store, &mut origin, captured, volume_config()).unwrap();
     let capture_tree = origin.frozen_tree(captured).unwrap();
     let capture = CaptureBase::Tree(capture_tree);
-
-    // Before the move.
-    let edit = leaf(&clone, &store, "/src/edit.rs");
-    clone.truncate(&mut store, edit, 0).unwrap();
-    clone
-      .write(&mut store, edit, 0, b"the agent's body")
-      .unwrap();
-    let undone = leaf(&clone, &store, "/src/undone.rs");
-    clone.write(&mut store, undone, 0, b"CHANGED").unwrap();
-    file(
-      &mut clone,
-      &mut store,
-      "/src",
-      "made.rs",
-      b"made before the move",
-    );
-    file(
-      &mut clone,
-      &mut store,
-      "/src",
-      "temp.rs",
-      b"made, then removed after",
-    );
-    let root = dir(&clone, &store, "/");
-    clone.unlink(&mut store, root, "gone.rs").unwrap();
-    let olddir = dir(&clone, &store, "/olddir");
-    clone.unlink(&mut store, olddir, "f.rs").unwrap();
-    let root = dir(&clone, &store, "/");
-    clone.rmdir(&mut store, root, "olddir").unwrap();
-    let root = dir(&clone, &store, "/");
-    clone.unlink(&mut store, root, "link").unwrap();
-    let root = dir(&clone, &store, "/");
-    clone
-      .symlink(&mut store, root, "link", "src/edit.rs")
-      .unwrap();
+    change_the_clone_before_the_move(&mut store, &mut clone);
     let handed = clone.snapshot(&mut store).unwrap();
     let handed_tree = clone.frozen_tree(handed).unwrap();
 
     // The move: the capture carried against the head handed over, the head made again on the new owner, its mark kept.
+    let carried = carry_and_assert_only_changes_before_the_move(&store, &capture, handed_tree);
+    let mut moved = Volume::create(
+      &mut store,
+      VolumeConfig {
+        prefix: MOVED_PREFIX,
+        ..volume_config()
+      },
+    )
+    .unwrap();
+    copy_tree(&mut store, handed_tree, &mut moved);
+    let mark = moved.snapshot(&mut store).unwrap();
+    let carried_base = CaptureBase::Carried {
+      mark: moved.frozen_tree(mark).unwrap(),
+      carried,
+    };
+
+    change_both_after_the_move(&mut store, &mut clone, &mut moved);
+    let clone_head = clone.snapshot(&mut store).unwrap();
+    let moved_head = moved.snapshot(&mut store).unwrap();
+    let (clone_tree, moved_tree) = (
+      clone.frozen_tree(clone_head).unwrap(),
+      moved.frozen_tree(moved_head).unwrap(),
+    );
+    assert_carried_base_says_what_the_capture_held(
+      &store,
+      (&carried_base, &capture),
+      [capture_tree, handed_tree, clone_tree, moved_tree],
+    );
+    assert_moved_candidates_part_where_the_clone_does(
+      &store,
+      (&carried_base, &capture),
+      (capture_tree, clone_tree, moved_tree),
+    );
+  }
+
+  /// A-503's origin: the files each later change touches, a directory holding a file, and a link.
+  fn lay_out_the_origin(store: &mut Store, origin: &mut Volume) {
+    for d in ["src", "olddir"] {
+      mkdir(origin, store, "/", d);
+    }
+    for (parent, name, bytes) in [
+      ("/src", "edit.rs", &b"captured body"[..]),
+      ("/src", "keep.rs", b"kept"),
+      ("/src", "later.rs", b"written after the move"),
+      ("/src", "undone.rs", b"changed, then back"),
+      ("/", "gone.rs", b"removed before the move"),
+      ("/", "lost.rs", b"removed after the move"),
+      ("/olddir", "f.rs", b"removed with its dir"),
+    ] {
+      file(origin, store, parent, name, bytes);
+    }
+    let root = dir(origin, store, "/");
+    origin.symlink(store, root, "link", "src/keep.rs").unwrap();
+  }
+
+  /// A-503's changes before the move, in the clone: a file written, one changed (undone after the move), two made, one
+  /// removed, a directory removed with its file, and the link pointed elsewhere.
+  fn change_the_clone_before_the_move(store: &mut Store, clone: &mut Volume) {
+    let edit = leaf(clone, store, "/src/edit.rs");
+    clone.truncate(store, edit, 0).unwrap();
+    clone.write(store, edit, 0, b"the agent's body").unwrap();
+    let undone = leaf(clone, store, "/src/undone.rs");
+    clone.write(store, undone, 0, b"CHANGED").unwrap();
+    file(clone, store, "/src", "made.rs", b"made before the move");
+    file(clone, store, "/src", "temp.rs", b"made, then removed after");
+    let root = dir(clone, store, "/");
+    clone.unlink(store, root, "gone.rs").unwrap();
+    let olddir = dir(clone, store, "/olddir");
+    clone.unlink(store, olddir, "f.rs").unwrap();
+    let root = dir(clone, store, "/");
+    clone.rmdir(store, root, "olddir").unwrap();
+    let root = dir(clone, store, "/");
+    clone.unlink(store, root, "link").unwrap();
+    let root = dir(clone, store, "/");
+    clone.symlink(store, root, "link", "src/edit.rs").unwrap();
+  }
+
+  /// A-503's carry: the capture carried against the head handed over ([`CarryWalk`]) names every path changed before
+  /// the move and none unchanged at it, over more units than it carries paths.
+  fn carry_and_assert_only_changes_before_the_move(
+    store: &Store,
+    capture: &CaptureBase,
+    handed_tree: FrozenTree,
+  ) -> CarriedCapture {
     let mut walk = CarryWalk::new(capture.clone(), handed_tree);
     let mut units = 0usize;
     let carried = loop {
       units += 1;
-      if let Some(carried) = walk.unit(&store, NameEquivalence::Exact).unwrap() {
+      if let Some(carried) = walk.unit(store, NameEquivalence::Exact).unwrap() {
         break carried;
       }
     };
@@ -1282,81 +1289,72 @@ mod tests {
       "{units} units for {} carried paths",
       carried.entries.len()
     );
-    let mut moved = Volume::create(
-      &mut store,
-      VolumeConfig {
-        prefix: MOVED_PREFIX,
-        ..volume_config()
-      },
-    )
-    .unwrap();
-    copy_tree(&mut store, handed_tree, &mut moved);
-    let mark = moved.snapshot(&mut store).unwrap();
-    let carried_base = CaptureBase::Carried {
-      mark: moved.frozen_tree(mark).unwrap(),
-      carried,
-    };
+    carried
+  }
 
-    // After the move, in both.
-    change(
-      &mut store,
-      [&mut clone, &mut moved],
-      "/src/later.rs",
-      Some(b"written on the new runner"),
-    );
-    change(
-      &mut store,
-      [&mut clone, &mut moved],
-      "/src/new.rs",
-      Some(b"made on the new runner"),
-    );
-    change(&mut store, [&mut clone, &mut moved], "/lost.rs", None);
-    change(
-      &mut store,
-      [&mut clone, &mut moved],
-      "/src/undone.rs",
-      Some(b"changed, then back"),
-    );
-    change(&mut store, [&mut clone, &mut moved], "/src/temp.rs", None);
-    let clone_head = clone.snapshot(&mut store).unwrap();
-    let moved_head = moved.snapshot(&mut store).unwrap();
-    let (clone_tree, moved_tree) = (
-      clone.frozen_tree(clone_head).unwrap(),
-      moved.frozen_tree(moved_head).unwrap(),
-    );
+  /// A-503's changes after the move, made alike in the clone and the moved volume: a captured file written, one made,
+  /// one removed, an earlier change undone, and a file made before the move removed.
+  fn change_both_after_the_move(store: &mut Store, clone: &mut Volume, moved: &mut Volume) {
+    for (path, bytes) in [
+      ("/src/later.rs", Some(&b"written on the new runner"[..])),
+      ("/src/new.rs", Some(b"made on the new runner")),
+      ("/lost.rs", None),
+      ("/src/undone.rs", Some(b"changed, then back")),
+      ("/src/temp.rs", None),
+    ] {
+      change(store, [&mut *clone, &mut *moved], path, bytes);
+    }
+  }
 
+  /// A-503's first expectation: at every path of every tree, what the carried capture and its mark say the capture held
+  /// equals what the capture itself holds.
+  fn assert_carried_base_says_what_the_capture_held(
+    store: &Store,
+    (carried_base, capture): (&CaptureBase, &CaptureBase),
+    trees: [FrozenTree; 4],
+  ) {
     let mut paths: BTreeSet<String> = BTreeSet::new();
-    for tree in [capture_tree, handed_tree, clone_tree, moved_tree] {
-      paths.extend(whole(&store, tree).into_keys());
+    for tree in trees {
+      paths.extend(whole(store, tree).into_keys());
     }
     for path in &paths {
       assert_eq!(
         carried_base
-          .state_at(&store, NameEquivalence::Exact, path)
+          .state_at(store, NameEquivalence::Exact, path)
           .unwrap(),
         capture
-          .state_at(&store, NameEquivalence::Exact, path)
+          .state_at(store, NameEquivalence::Exact, path)
           .unwrap(),
         "{path}: the carried capture and its mark say otherwise than the capture"
       );
     }
+  }
 
-    let search = |base: &CaptureBase, source: FrozenTree| {
-      let mut search = base.search(source);
-      loop {
-        if let Some(found) = search.unit(&store).unwrap() {
-          return found.into_iter().collect::<BTreeSet<String>>();
-        }
+  /// The paths a search of `source` against `base` names as candidates.
+  fn candidates(store: &Store, base: &CaptureBase, source: FrozenTree) -> BTreeSet<String> {
+    let mut search = base.search(source);
+    loop {
+      if let Some(found) = search.unit(store).unwrap() {
+        return found.into_iter().collect::<BTreeSet<String>>();
       }
-    };
-    let (was, now) = (whole(&store, capture_tree), whole(&store, moved_tree));
+    }
+  }
+
+  /// A-503's second expectation: the moved volume's candidates hold every path where it now parts from the capture, as
+  /// the clone's do, and no path nothing touched.
+  fn assert_moved_candidates_part_where_the_clone_does(
+    store: &Store,
+    (carried_base, capture): (&CaptureBase, &CaptureBase),
+    (capture_tree, clone_tree, moved_tree): (FrozenTree, FrozenTree, FrozenTree),
+  ) {
+    let (was, now) = (whole(store, capture_tree), whole(store, moved_tree));
     let parted: BTreeSet<String> = was
       .keys()
       .chain(now.keys())
       .filter(|path| was.get(*path) != now.get(*path))
       .cloned()
       .collect();
-    let moved_candidates = search(&carried_base, moved_tree);
+    let moved_candidates = candidates(store, carried_base, moved_tree);
     for path in &parted {
       assert!(
         moved_candidates.contains(path),
@@ -1367,11 +1365,12 @@ mod tests {
       !moved_candidates.contains("/src/keep.rs"),
       "a file nothing touched is a candidate"
     );
+    let clone_whole = whole(store, clone_tree);
     assert_eq!(
       parted,
-      search(&capture, clone_tree)
+      candidates(store, capture, clone_tree)
         .into_iter()
-        .filter(|path| was.get(path) != whole(&store, clone_tree).get(path))
+        .filter(|path| was.get(path) != clone_whole.get(path))
         .collect::<BTreeSet<String>>(),
       "the moved volume parts from the capture where the clone does"
     );
