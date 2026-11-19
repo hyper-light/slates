@@ -108,14 +108,20 @@
 > above it unjudged, a stack landed again answered each version. A work over a tree is judged by whole-value
 > differences between the tree and the head (`Green::restate_over_tree`). Tests: 11 worked cases, 3 tree cases, the
 > stack's oracle against a replica in which its works landed first and the works between after them, and the tree's
-> against a whole-file model (EVIDENCE-PENDING: the Mac Studio was offline). Owed: the server's verbs (an upper held
+> against a whole-file model. Windows x86_64 on jupiter (the Mac Studio offline; the macOS run owed): red at 43317a523,
+> 16 of the 17 failing against the stubs; green at 0ae0875d5, `slates-merge --lib` 158 of 158 (main's 141 and these
+> 17), fmt clean; censuses: stacks through depths one to four 774, 479, 273 and 128 times, uppers moved 108 and
+> unmoved 772, uppers refused 129 and bottoms 188, works between 1,335; files over a tree applied 175, refused 150.
+> Where a work in between does not land in the replica (the verdict depends on order: two inserts at two points and a
+> stack's delete of the bytes between them), the oracle leaves the stack unchecked from there, counted. Owed: the
+> server's verbs (an upper held
 > over its lower and restated as it lands; the lower's base held as a live reader of the fold floor while an upper over
 > it is unlanded); the whole-file identity check for an upper's length-changing operation that meets a change (refused
 > today); a copy in a stack; a stack whose bottom is a tree; clippy, `xtask` and the lint matrix over the change
-> (main's, run requests). **Finding, open:** the verdict's walk stops at the first delta operation starting at or after
-> a range's end, so a work's insert at an offset where the delta overwrites or truncates and inserts too is accepted
-> before both, while the two works in the other order conflict as two inserts at one point; the oracles avoid two
-> operations at one offset until the engine's rule for it is decided.
+> (main's, run requests). **Finding, registered as A-668 (landing next):** the verdict's walk stops at the first delta
+> operation starting at or after a range's end, so a work's insert at an offset where the delta overwrites or truncates
+> and inserts too is accepted before both, while the two works in the other order conflict as two inserts at one
+> point; D-27 makes them a conflict in both orders.
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held

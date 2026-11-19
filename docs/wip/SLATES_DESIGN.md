@@ -46402,14 +46402,26 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   each stack to a replica in which the stack's works below it landed first at its base and the works between after
   them: the verdict then judges each upper against exactly "the green's deltas except the lower work's own", and
   disjoint changes commute, so the green must land each work where its replica does and hold the replica's files byte
-  for byte. Its census counts every depth, uppers moved and unmoved, and every refusal. The tree's oracle holds a work
-  over a tree some versions back to a whole-file model. EVIDENCE-PENDING (the Mac Studio was offline when this was
-  written; the runs are recorded here when it answers).
-- **Finding** (filed in GAPS, owed): the verdict's walk stops at the first delta operation starting at or after a range's
-  end, so a work's insert at an offset where a delta overwrites or truncates and inserts too (canonical order puts the
-  overwrite or truncate first) never meets the delta's insert: it is accepted before both, while the same two works in
-  the other order conflict as two inserts at one point. The oracles generate no two operations at one offset; the
-  engine's rule for that case is owed a decision.
+  for byte. Its census counts every depth, uppers moved and unmoved, and every refusal. Where a work in between does not
+  land in the replica, the replica is no reference and the stack goes unchecked from that level up, counted: the
+  verdict depends on order there (two works insert at two points, then a stack's work deletes the bytes between them;
+  in the replica the delete lands first, the two points become one, and the second insert meets the first). The tree's
+  oracle holds a work over a tree some versions back to a whole-file model.
+- **Evidence** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the Mac Studio was offline, so the macOS run is
+  owed). Red at 43317a523 (r1386, 03:03 PST): `cargo test -p slates-merge --lib stack`, 17 tests, 16 failing against the
+  stubs (every upper and tree case and both oracles) and 1 passing (a refused bottom, which needs no restatement); a
+  first attempt (r1351) ran out its timeout compiling and counts as neither. Green at 0ae0875d5, merged with main
+  (r1408, 04:04 PST): `cargo test -p slates-merge --lib -- --nocapture`, 158 of 158 (main's Windows baseline of 141 at
+  018d32ba2, and these 17) in 31.2 s; `cargo fmt -p slates-merge -- --check` clean. The stack oracle's census: stacks
+  landed through depths one to four 774, 479, 273 and 128 times; uppers restated with an operation moved 108, unmoved
+  772; uppers refused 129 and bottoms 188; works landed between a stack's base and its landing 1,335; replicas
+  collapsed 0. The tree oracle's: files applied 175, refused 150. An earlier green run at 695ec9789 (r1395) passed 157
+  of 158: its stack oracle met the order the verdict depends on, which the oracle now counts (c63e25c54).
+- **Finding** (registered as A-668, landing next): the verdict's walk stops at the first delta operation starting at or
+  after a range's end, so a work's insert at an offset where a delta overwrites or truncates and inserts too (canonical
+  order puts the overwrite or truncate first) never meets the delta's insert: it is accepted before both, while the
+  same two works in the other order conflict as two inserts at one point. D-27 decides it: they conflict in both
+  orders. Until A-668 lands the oracles generate no two operations at one offset.
 - **Owed.** The server's verbs: an upper held over its lower, restated as the lower lands or is rebased, and the lower's
   base held as a live reader of the green's fold floor while an upper over it is unlanded. The whole-file identity check
   for an upper's length-changing operation. A copy in a stack. A stack whose bottom is a tree.
