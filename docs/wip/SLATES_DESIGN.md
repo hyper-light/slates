@@ -12150,6 +12150,19 @@ engine: the verdict, rebase, position mapping, the register).
 > holds an index's names to the objects read. Proven against the three packs stock git 2.50.1 wrote: every object's
 > type, size, name, base and depth as `verify-pack -v` lists them, read whole, a byte at a time and through git's own
 > index.
+>
+> **Status (2026-11-19, A-595: piece 8's first part built, the request codec and git's routes).** HTTP/1.1's request
+> codec is a crate of its own, `crates/http` (`slates-http`), so §4.17.3's and §4.17.4's HTTP read requests with it
+> without depending on git's crate. A head is read as its bytes arrive, each byte scanned once, every line held to RFC
+> 9112 §3's 8000 octets, its bytes and field index charged to the request's admission, and every framing two readers
+> could disagree on refused by kind. A body's framing (`Content-Length` or chunked) is removed as it streams, its data
+> handed back as slices of the input, so a push's pack passes in constant memory; a gzip body is inflated through
+> flate2's streaming decoder over A-607's zlib-rs, every inflated byte charged, so a bomb stops at the room. `crates/git`
+> (`http`) routes as `git http-backend` routes, with its statuses and its three cache fields, takes `Git-Protocol`'s
+> greatest version as `protocol.c` does, and writes the `# service=` line and flush for v0 and v1 alone. Proven against
+> stock git 2.50.1's own HTTP traffic with `http-backend` (its heads and inflated bodies, SHA-256 checked) and hostile
+> input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
+> streamed through, the staged close).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12169,9 +12182,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    respond with the `403 Forbidden` HTTP status code"); a request without credentials is `401` with its challenge (HTTP
    semantics, RFC 9110). TLS is rustls over aws-lc-rs, already in the workspace. Every request is a future on a shard
    (R6): no process starts per request, where `git-http-backend` is "A simple CGI program" [B: git-http-backend] whose
-   fetch runs `upload-pack` and `pack-objects` as further processes. The MCP edge's HTTP/1.1 server
-   (`crates/mcp/src/http.rs`) is the starting point; the git edge adds TLS, chunked and gzip bodies, and streaming
-   responses.
+   fetch runs `upload-pack` and `pack-objects` as further processes. Requests are read by `slates-http` (A-595), a
+   sans-I/O HTTP/1.1 codec the Mercurial and Subversion servers share; the MCP edge's server (`crates/mcp/src/http.rs`),
+   bound to its one endpoint and refusing every transfer coding, lent its line bound and its staged close, and moving it
+   onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
    one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
    [B: RFC 8709], with the RSA and ECDSA key forms users already hold as owed reading; ciphers `aes256-gcm@openssh.com`
@@ -13303,6 +13317,27 @@ path the server sends (absent entries, log's access levels, `get-file`, `get-dir
 (write on the path and its parent; recursive write to delete or replace a directory; recursive read of a copy source).
 A principal with read on the whole repository and no rule beneath meets one comparison and no per-path check.
 
+> **Status (2026-11-19, A-606).** Built: authorization (`slates-svn`'s `authz`, piece 10). The rules file, and a
+> separate groups file, are read as `svn_config__parse_stream` reads them and their sections, groups, aliases and
+> entries taken as `authz_parse.c` takes them; groups are resolved without being expanded. Each principal's rules in a
+> repository are compiled into Subversion's tree of path segments and walked with its precedence: the deepest matching
+> level, then the rule defined last; a later `**` eclipsing the rules beneath it; 1.14.1's choice between a global and
+> a repository rule for one path. Answers are read, write or none at a path, beneath it (`svn_authz_recursive`) and
+> anywhere (`svn_authz__get_global_rights`). A principal whose rules all give one access is answered by one
+> comparison, counted. Every refusal is typed, with its line and its Subversion error. Held to Subversion's own authz
+> tests (`authz-test.c` with `authz.rules` and `authz.groups`, and the authz tests of `repos-test.c`), APR's
+> `apr_fnmatch` table, the documentation's files, and a naive oracle over generated rule sets. Where 1.14.x's code
+> departs from its own documentation, the documentation is followed and each case is a named test:
+> - the root has no segments (`lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there);
+> - a recursive question at the root weighs every rule (Subversion weighs only those an empty segment matches, so it
+>   grants recursive read at a root above a denied `/secret`);
+> - a suffix pattern leaves the segment as it was for the other rules of its level (`lookup` reverses it in place);
+> - `[//x]` is refused (Subversion takes it for the root).
+>
+> Owed: the server's questions (piece 7: every path sent, every path a commit changes); the file read from the
+> repository (`authz-db` as a `^/` URL) and compiled per file identity; `svnserve`'s `force-username-case`; and
+> `mod_authz_svn`'s questions with HTTP (piece 13).
+
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
 the large-file class by content-defined chunking, so a copy or a branch of a large file costs a reference. Locks and
@@ -13431,7 +13466,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
    oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
-   log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+   log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
+   12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
     (A-609); the editor drives and the write methods' bodies are its second.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
@@ -41001,6 +41037,118 @@ Applied in the same change to:
     unreachable from both callers;
   - an append at the old end of a file a whole-file rewrite replaced is accepted at the new end, by the edge rule (a
     question for the design, not a defect of the code).
+
+### A-606 — Subversion's authorization file, parsed as Subversion parses it and evaluated with its precedence, where its code departs from its own documentation the documentation followed (2026-11-19, g229, UI goal 92; §4.17.4 item 10 and piece 10; A-500)
+Applied in the same change to:
+- §4.17.4 item 10's status and the pieces list, and GAPS (the §4.17.4 entry);
+- `crates/svn` (`authz.rs`; `authz/ini.rs`, `glob.rs`, `model.rs`, `tree.rs`; `authz/tests.rs`, `authz/tests/oracle.rs`;
+  all new; `lib.rs`'s module line);
+- `research/vcs-servers-subversion.md` §7 (the sources read, with their hashes, and the departures).
+- **The file.** Read as `svn_config__parse_stream` reads it. A byte order mark is skipped. `#` and `[` count in the
+  first column only. A header ends at its first `]`, so no bracket expression can be written in one. `:` before the
+  first `=` separates. An indented line continues a value with one space, an indented `#` included; a blank line ends
+  it. Carriage returns are dropped at a line's start and after `[`. Sections, groups, aliases and entries are taken as
+  `authz_parse.c` takes them; so is a separate groups file, after which the rules file may define no group. Groups
+  keep their direct members, and a user's groups are found by walking up from the user. So nested groups cost memory
+  in proportion to the file's bytes, where Subversion expands every group into its users.
+- **The precedence.** Each principal's rules in a repository are compiled into Subversion's tree of path segments.
+  For one path, the repository's rule is taken if it speaks for the principal, the global one otherwise (1.14.1, issue
+  4762). Rules eclipsed by a later `**` are taken out (`trim_tree`). A path is walked level by level: the deepest
+  level with a matching rule decides, the rule defined last there wins, and a level without one inherits. A recursive
+  question takes the least access over the reached nodes' subtrees, as Subversion's does, so a rule that cannot
+  govern any path beneath still counts. A question without a path takes Subversion's global rights, transcribed. A
+  principal whose rules all give one access is answered by one comparison, counted by `uniform_answers`.
+- **Departures from 1.14.x's code**, each a named test; Subversion's own documentation is followed:
+  - the root has no segments: `lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there,
+    although `*` "Matches any single non-empty path segment" (`authz.h`);
+  - a recursive question at the root weighs every rule: Subversion's weighs only the rules an empty segment matches,
+    so with `[/] * = rw` and `[/secret] * =` it grants recursive read at `/`, and a commit that copies `/` would pass
+    over `/secret`;
+  - a suffix match leaves the segment as it was: `lookup` reverses it in place for the rest of the level, so
+    `[:glob:/**/public]` beside `[:glob:/*.secret]` misses `/public` and matches `/cilbup`;
+  - `[//x]` is refused as non-canonical: `parse_rule_path` takes it for the root and ignores the rest.
+  Where Subversion's outcome depends on hash order, one way is decided: a group whose expansion never ends (on a cycle,
+  or leading into one) is refused at the first such group in definition order, and a file with several refusals is
+  refused at the first in file order, then at the definition or entry a later check names. A NUL byte and an option
+  with no name are refused outright: Subversion's C strings cut at the first, and it reads before its buffer for the
+  second.
+- **Bounds.** One, the caller's: a file's bytes, checked before anything is read. Nothing recurses: a rule path of
+  50,000 segments and a chain of 50,000 nested groups (and the same chain closed into a cycle) are tests.
+- **Tests** (`cargo test -p slates-svn --lib authz`, Mac Studio M3 Ultra, kiln, 2026-11-19):
+  - red first with the module stubbed: 50 of 55 failed, the five that passed asserting only that nothing panics or
+    that a file parses;
+  - then 57 of 57 in 2.1 s: every case of `authz-test.c` (its `authz.rules` and `authz.groups` byte for byte, and
+    `test_global_rights`, issues 4741 and 4762) and of `repos-test.c`'s authz tests (`authz`, `test_authz_wildcards`,
+    `test_authz_prefixes`, `test_authz_recursive_override`, `test_authz_pattern_tests`, `groups_authz`, the in-repo
+    tests, `issue_4060`, and `commit_editor_authz` as the questions item 10 has a commit ask); APR's `testfnmatch.c` at
+    flags 0; the `conf/authz` `svnadmin create` writes; the book's examples and the 1.10 and 1.14 notes with their
+    stated outcomes; every refusal kind with its line and Subversion error; the four departures; hostile input;
+  - the naive oracle (256 generated rule sets in assorted styles, every principal, four repositories, every path to
+    depth three), held non-vacuous by a rich hand-built set whose answers take every access, fall below beneath, and
+    are walked;
+  - the crate's lib suite, 110 of 110.
+- **Owed:** the server's questions (piece 7); the file read from the repository and compiled per file identity;
+  `svnserve`'s `force-username-case`; `mod_authz_svn`'s questions (piece 13). Main's: clippy and `xtask` over the
+  module, and the four departures confirmed against stock Subversion (run request).
+
+### A-595 — HTTP/1.1's request codec as a crate the version-control servers share, and git's smart HTTP routes over it (2026-11-19, g076b, UI goal 92; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's first part)
+Applied in the same change to:
+- §4.17.2's status and its "Transports" item 1; GAPS (the §4.17 entry);
+- `crates/http` (`slates-http`, new: `head`, `body`, `gzip`, `percent`, `reply`, `admission`, `grammar`, their tests);
+- `crates/git` (`http.rs` and its tests; `tests/http_golden.rs`; `fixtures/http` with `make-http-fixtures.sh` and
+  `cgi-host.py`; `Cargo.toml`: `slates-http`; the golden test gzips with flate2, a dependency since A-608);
+- the workspace manifest (`slates-http`) and lock (A-607's flate2 resolved: zlib-rs alone).
+- **Why a crate.** Mercurial's HTTP (A-569) already takes a request whose head and body are read, and Subversion's
+  WebDAV will; a module of `slates-git` would make both depend on git's crate and its hashes. `slates-http` holds no
+  tool's rule: it reads a request and frames a reply, and each tool routes.
+- **The head** (RFC 9112 §2 to §6). `HeadReader` scans each byte once across reads, keeping three offsets, and skips
+  empty lines before the request line. A line past 8000 octets (RFC 9112 §3's recommended minimum, the MCP edge's
+  bound) is refused, 414 for the request line and 431 after, whole or still open; a head that fills the admission's
+  room unended is refused the same way. A whole head is charged its bytes and its field index before the index is
+  built, and borrows the caller's bytes. The origin, absolute (`http` or `https`, no userinfo, its authority over
+  `Host`) and asterisk (`OPTIONS`) forms are read; a bare CR or LF, a fold, whitespace before a colon, a control byte
+  in a value, a target byte no URI holds, a second `Host` or none in HTTP/1.1 are refused 400 by kind. The framing is
+  RFC 9112 §6.3's with every case two readers could disagree on refused: `Content-Length` with `Transfer-Encoding`, a
+  transfer coding in HTTP/1.0, chunked not last or twice (400), another transfer coding (501), `Content-Length` values
+  that disagree or are not digits (400) or pass 64 bits (413). gzip once is the one content coding read (415 with
+  `Accept-Encoding: gzip` otherwise); `Expect: 100-continue` is honoured in HTTP/1.1 and ignored in HTTP/1.0, another
+  expectation 417. The refusals are judged in one order whatever the fields' order: the grammar, `Host`, the length,
+  the framing, the coding, the expectation.
+- **The body** (RFC 9112 §7.1). `BodyReader` keeps only the state of the line it is in; a step returns a run of data as
+  a slice of its input, or takes all its input and asks for more, or ends exactly at the body's last byte. Chunk sizes
+  are hexadecimal within 64 bits; extensions are skipped but hold no control byte; trailers are read to the field
+  grammar, dropped, and charged to the admission as a head is; every line is held to the same 8000 octets.
+- **gzip** (RFC 1952). `Gunzip` writes into flate2's `write::MultiGzDecoder` (A-607's zlib-rs; no backend named): every
+  inflated byte is charged as it is made, a write past the room is refused with the sink never grown past it, every
+  member's CRC-32 and length are checked, and the decoder is never written after its end (flate2 may panic there).
+- **git's routes**, as `http-backend.c` answers: `info/refs?service=` for `GET` and `HEAD`; `POST` to a service of its
+  request type (415) with a body (411); the dumb protocol's paths and `info/refs` with no service 403 (git with
+  `http.getanyfile` off), an unknown service 403, `git-upload-archive` 403; 405 naming `GET, HEAD` or `POST`, or 400 to
+  HTTP/1.0 (`bad_request`); 404 for a repository path with an empty, `.` or `..` segment (`daemon_avoid_alias`); paths
+  routed decoded and queries read as forms, the last `service` winning (`get_parameter`), an escaped slash or NUL 400.
+  `Git-Protocol`'s greatest `version=` is the version (`determine_protocol_version_server`; the codec before this
+  change took the last, which git does not). Replies carry `http-backend`'s `Expires`, `Pragma` and `Cache-Control`
+  in its order, then the content type; the `# service=` pkt-line and flush precede a v0 or v1 advertisement only.
+- **Golden vectors.** `make-http-fixtures.sh` (the MacBook, git 2.50.1 Apple Git-155, Python 3.9.6, 2026-11-19) serves
+  two repositories through `cgi-host.py`, a loopback CGI host running `git http-backend`, and records twelve exchanges:
+  `ls-remote` at v0 and v1, a v2 clone whose fetch is gzipped (git gzips a request past 1024 bytes), a push, and a v2
+  clone with a 64 KiB post buffer whose `ls-refs` and fetch go chunked after git's probe of a lone flush. As main ruled
+  with A-607 the fixtures hold inflated bytes alone: heads, plain pkt-line bodies, the gzip body inflated by Python and
+  gzipped again by the test, the chunked fetch's framing with the SHA-256 of its data, `http-backend`'s CGI heads and
+  its advertisements; no pack. git 2.50.1 refuses a post buffer of LARGE_PACKET_MAX or less over a stateless
+  connection (`BUG: ... rpc->buf should be larger than LARGE_PACKET_MAX`), hence 64 KiB.
+- **Not reused: the MCP edge's parser** (`crates/mcp/src/http.rs`). It reads MCP's fields alone, takes `POST` alone,
+  requires `Content-Length`, refuses every transfer coding, and lives in a crate on the runtime and the client. Its
+  line bound and its citations were taken; moving it onto `slates-http` is owed.
+- **Tests** (Mac Studio M3 Ultra, debug, 2026-11-19): red first, kiln r513 (load 6.5): 49 of 51 `slates-http` tests
+  and 11 of 11 git route tests failed on stubs; green `cargo test -p slates-http --lib` 51 of 51 and
+  `cargo test -p slates-git --lib` 87 of 87 at 7ece429be (load 7.6); with the golden vectors, 92 of 92 at 2dcc07210
+  (load 8.7; the first golden run's one failure was the test's own count, 1400 wants where git sent 1401, HEAD's
+  tip wanted twice); `cargo fmt --check` clean.
+- **Owed.** The edge that reads sockets (piece 8's next part): listeners on a shard, TLS, authentication (401 with its
+  challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
+  in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
+  DAV reading their requests through it.
 
 ### A-593 — Subversion's dump format: formats 2 and 3 read as the stream arrives within the caller's admission and written byte for byte as `svnadmin dump` writes them (2026-11-19, g264, UI goal 92; §4.17.4 "Pieces that follow" piece 6, its first part; A-500, A-553)
 Applied in the same change to:

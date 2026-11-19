@@ -17,6 +17,8 @@ sha1-checked = { workspace = true }
 flate2 = { workspace = true }
 # zlib's CRC32, which a pack index keeps of each object (A-591; the workspace manifest says why this crate).
 crc32fast = { workspace = true }
+# HTTP/1.1's request codec (A-595), which Mercurial's and Subversion's HTTP share: git's routes read its heads.
+slates-http = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }

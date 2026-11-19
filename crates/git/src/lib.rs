@@ -43,6 +43,7 @@
 mod admission;
 pub mod delta;
 pub mod entry;
+pub mod http;
 pub mod object_name;
 pub mod objects;
 pub mod out;
