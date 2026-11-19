@@ -4606,7 +4606,7 @@ async fn init_shard(
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     moves_out: std::collections::BTreeMap::new(),
-    move_carries: std::collections::BTreeMap::new(),
+    carries: std::collections::BTreeMap::new(),
     move_adoptions: std::collections::BTreeMap::new(),
     move_records: std::collections::BTreeMap::new(),
     moves_forgotten: std::collections::BTreeSet::new(),

@@ -201,6 +201,9 @@ bind is a record too, ending with its mount). The conformance suite in `crates/a
   engine it refused); just before the runtime binds, `ContainerBind::check_source()` (or
   `container::check_source(source, identity)`) checks the source is still the mount verified, by the
   kernel's table and the mount id it never reuses (`SourceFault`: `Missing`, `Replaced`, ...).
+  The engine profiles that hold evidence: Docker Desktop on macOS, a Docker Engine on its own Linux
+  host, and rootless podman on its own Linux host (`engine_profile("podman")`, whose container runs as
+  its root, the user who mounted the volume, over an unshared mount).
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`; on Windows that includes
   `MountManager`, the one-time setting that lets WinFsp's driver make the drive; on macOS and the BSDs,
@@ -335,5 +338,5 @@ the goal's clauses:
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
-3. The container engine profiles slates has run since its judge was written (rootless podman, and
-   podman's command line), which the judge still refuses.
+3. Rootless podman's profile (held since A-520's third piece) by use through the library: its live
+   check, which confirms the container's other ids are refused and every hard link's name is served.

@@ -12,7 +12,7 @@ use std::cell::Cell;
 
 use slates_mem::budget::MetadataBudget;
 use slates_vfs::ids::{Epoch, InodeNo};
-use slates_vfs::journal::{Op, OpLog};
+use slates_vfs::journal::{Op, OpLog, Patience};
 
 struct Counting;
 thread_local! {
@@ -57,14 +57,14 @@ const SHORT: usize = 256;
 const LONG: usize = 64 * SHORT;
 /// Shape: the reader that never reads, so every record stays owed and the ring grows with the history.
 const LAGGING_READER: u64 = 1;
-/// Shape: a lagging reader's patience, past any history here, so no record outlasts it.
-const PATIENCE_NS: u64 = u64::MAX;
+/// Shape: a lagging reader's patience: held while it is open (A-548), so no record outlasts it.
+const PATIENCE: Patience = Patience::WhileOpen;
 
 /// The largest single allocation any one append of a `records`-long history made, its path included.
 fn largest_append_allocation(records: usize) -> usize {
   let mut ledger = MetadataBudget::new(u64::MAX);
   let mut log = OpLog::new(JOURNAL_BYTES);
-  log.open_reader(LAGGING_READER, 0, PATIENCE_NS);
+  log.open_reader(LAGGING_READER, 0, PATIENCE);
   let mut largest = 0;
   for record in 0..records {
     let path = format!("dir/file-{record}");

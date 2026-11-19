@@ -270,13 +270,20 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`ContainerBind::check_source`] judge whether a bind's source is still the mount verified, by the kernel's table
 /// and the identity it never reuses, refusing [`SourceFault`]; `slates-bridge-oci` is linked on every platform, its
 /// types the contract's (kiln's container engine, kiln goal 01a1f124; 2026-11-19).
-/// 48: a host's refusal code carries its numbering (A-539): [`HostFault::Base`] names an [`OsCode`], an errno or a
+/// 48: rootless podman holds its tested profile on its own Linux host (A-520, third piece):
+/// [`container_engine::engine_profile`] speaks podman's own interface (`podman info`, one template: its host's
+/// operating system, version, rootless and SELinux flags, and whether its service is remote) beside the Docker CLI's,
+/// and the judge holds a local rootless podman on Linux to T-4.13's rootless run, with the appended
+/// [`container_engine::IdentityRule::ContainerRootAsMountingUser`] (the container's root is the user who mounted the
+/// volume); [`container_engine::Engine::Podman`] and [`container_engine::Endpoint::Local`] are appended, a remote
+/// podman is refused `RemoteEngine` and one run as root `ProfileUntested` (2026-11-19).
+/// 49: a host's refusal code carries its numbering (A-539): [`HostFault::Base`] names an [`OsCode`], an errno or a
 /// Win32 error code (none where the host named none), where it held a bare number; the wire's
 /// `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
 /// `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 48;
+pub const CONTRACT: u32 = 49;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

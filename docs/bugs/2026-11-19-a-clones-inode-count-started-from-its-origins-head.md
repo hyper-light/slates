@@ -42,7 +42,8 @@ changed since, and every clone of an older snapshot.
 
 ## Siblings (the sweep: every counter a clone, a restore or an adoption takes from the live origin instead of the frozen state)
 
-- **Open, the same quantity on the server's side:** the server's clone admission (`crates/server/src/verbs.rs`,
+- **Fixed since by A-549 (2026-11-19, `2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`), the
+  same quantity on the server's side:** the server's clone admission (`crates/server/src/verbs.rs`,
   `admit_clone`) reads the clone's inherited inodes from the origin volume's `inode_usage()`, its head's count now,
   before it clones. That count sizes a bounded clone's version reservation and the floor of its allowance, and a
   dynamic clone's version hold. It should read the snapshot's count, which this change records
@@ -55,9 +56,10 @@ changed since, and every clone of an older snapshot.
     clone runs with no inode cap. Before this change the same case admitted the clone under its allowance, its count
     low by the same difference.
   Reported, not changed here.
-- **Open, the same class:** `clone_inner`'s `live_entries`, the clone's namespace-entry count (§4.2, judged against its
-  `entry_allowance`), is also taken from the origin's head now. A restart recounts it (`rebuild_entries`, the shared
-  directories' entries added). Reported, not changed here.
+- **Fixed since by A-549 (2026-11-19), the same class:** `clone_inner`'s `live_entries`, the clone's namespace-entry
+  count (§4.2, judged against its `entry_allowance`), is also taken from the origin's head now. A restart recounts it
+  (`rebuild_entries`, the shared directories' entries added). Reported, not changed here. A snapshot now records its
+  entry count as it records its inodes, and a clone starts from it.
 - **Correct as they are:**
   - `next_counter` and `counter_ceiling` continue from the origin's current counter on purpose, so numbers stay unique
     across both volumes. A later counter is only safer.

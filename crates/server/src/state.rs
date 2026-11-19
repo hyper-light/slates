@@ -731,9 +731,9 @@ pub struct ShardState {
   /// back. Bounded by [`crate::verbs::ack_scatter_bound`]: past it the other shards' parts are not sent, and are
   /// counted refused and left to the next watermark.
   pub ack_scatters: BTreeMap<u64, usize>,
-  /// The listings, grants and status scatters a part of which could not be sent, by request word, and the first shard
-  /// it was for: the scatter answers `Overloaded { shard }` when its last part is settled. Bounded by those three
-  /// tables, whose entries it follows.
+  /// The listings, grants and status scatters a part of which could not be sent, or came home unserved (A-557), by
+  /// request word, and the first shard it was for: the scatter answers `Overloaded { shard }` when its last part is
+  /// settled. Bounded by those three tables, whose entries it follows.
   pub scatter_refusals: BTreeMap<u64, u16>,
   /// When this shard last did work for a client (served, forwarded, or ran a forwarded verb);
   /// the server loop polls for the idle window past it before parking (§4.7).
@@ -958,9 +958,9 @@ pub struct ShardState {
   /// target and the head its move waits to see placed. Bounded by the shard's volumes; an entry leaves when its volume
   /// is released to the target, or thaws.
   pub(crate) moves_out: crate::moves::MovesOut,
-  /// Where each of those moves stands in carrying its captured clone's capture (A-503, `crate::moves::begin_carry`).
-  /// Bounded by the moves; an entry leaves once its carry is recorded, or with its move.
-  pub(crate) move_carries: crate::moves::MoveCarries,
+  /// Where each captured clone of this shard stands in carrying its capture for its newest head (A-544,
+  /// `crate::carry`). Bounded by the shard's volumes; an entry leaves once its record is in.
+  pub(crate) carries: crate::carry::Carries,
   /// The adoptions of volumes the configuration moved to this node (A-291), driven on the control shard only: per
   /// volume, its round's epoch, the records its cohort reported and its seal. Bounded by the moved-object exceptions
   /// naming this node; an entry leaves once its move is adopted.

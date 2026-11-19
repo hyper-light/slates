@@ -2164,8 +2164,11 @@ drift check `fstat`s.
   redirect and drift records are journaled the same way; retention is bounded by a memory budget
   derived from the volume's measured mutation rate and the longest subscriber lag (A-157). The
   journal keeps what a live reader still owes. It starts at a one-page floor and grows from the
-  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader
-  silent past its transport's liveness pins nothing, and a refused growth is counted.
+  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader's
+  owner names its patience by what the reader's reads wait on (A-548): the NFS write-back tracker,
+  consumed at the change itself on the volume's own shard, holds its records while it is open; a
+  reader whose rounds wait on a mount's kernel is presumed gone past its transport's liveness, and
+  pins nothing then. A refused growth is counted.
 
 **Failure matrix.** Hash collision on equivalence (two names fold equal): Refused (`EEXIST`),
 which is APFS behaviour. Cut-over conversion mid-operation: Masked (conversion is a copy of a
@@ -3048,7 +3051,8 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
 the rest of the page as it fetched it. Apple's client does so for a page dirtied through a shared map while another path
 changed the file, and no recall makes it flush first. So the server keeps, per connection, A-140's byte states for each
 file the connection's READs and WRITEs touched. A READ makes bytes fresh, the connection's own changes refresh them,
-and every other change, fed by a per-volume keeper reading the journal (A-157), makes fetched bytes stale. A WRITE
+and every other change, fed by a per-volume keeper reading the journal (A-157; its reader held while the tracker is
+open, A-548), makes fetched bytes stale. A WRITE
 whose stale bytes differ from the file's bytes now is refused whole, `NFS3ERR_IO`, never merged (banned item 11). A
 write over bytes never fetched, or over stale bytes equal to the file's, is applied. The states go with their
 connection, on the shards its calls were served on, however it ends (`crates/server/src/nfs_writeback.rs`). Apple's
@@ -4456,6 +4460,9 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > the rest of the handoff is the library's too, and the command line calls it: the engine's profile, judged before a
 > host mounts for it (`container_engine::engine_profile`, under `slates oci-runtime`), and the check just before the
 > runtime binds that the source is still the mount verified (`container::check_source`, under `slates oci-check`).
+> Since its third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host too, the profile
+> `a_rootless_container_reads_and_writes_the_volume_through_its_mount` ran through (2026-10-19): the container's root
+> is the user who mounted the volume, so a host runs its container as the container's root over an unshared mount.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -7211,6 +7218,15 @@ failure.
 > of message as the release, sent by the client's own shard after it, so it queues behind the release. A request can
 > only find a release refused, which is counted.
 
+> **Status (2026-11-19, A-557: a read scatter is answered whole, or refused naming a shard whose part it lacks).** A
+> listing, the grants and `DaemonStatus` gather a part from every shard. A part whose shard's state refused the borrow
+> (the control shard fenced by a failed consensus publication, a retention refusal, a shard whose start failed) came
+> home as an empty part, so the answer left out that shard's volumes, grants or report and read as whole. A part now
+> comes home as what its shard served or as nothing, and nothing is settled as a part that could not be sent: the
+> answer is `Overloaded { shard }` for the first such shard, and `scatter.part_unserved` counts it apart from a full
+> control channel's refusal (`settle_unserved`; `a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard`,
+> red before; `docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`).
+
 **Flow control.** Credit-based, absolute offsets per stream; windows derived from the measured
 bandwidth-delay product and the class's latency budget; the sender never exceeds credit; a
 stalled receiver stalls only its own class.
@@ -8261,7 +8277,9 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > capture serves the agents started over an unchanged folder, and a base goes with its last clone. A moved captured
 > clone lands on its new owner against its capture (A-503): its move carries the captured state of every path it
 > changed in its catalog, and the new owner keeps the moved head as its mark (§4.15's status); the mark is no snapshot
-> that holds a later move back.
+> that holds a later move back. Since A-544 every head of its own carries that record, so a workspace taken over after
+> its runner's loss lands against its capture on the successor too; one whose runner died before its first snapshot
+> was placed reaches the successor as an empty tree, and its landing is refused by kind.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -9156,6 +9174,10 @@ it builds against the contract and adds to it rather than around it.
 > `AT_STATX_DONT_SYNC` and compared by device), with `HoldersUnread` saying why none were read (macOS: every libproc
 > answer stats the file). On Linux a plain `fusermount3 -u` refused while the table still lists the mount is
 > `MountFault::Busy`, where it was `MountFault::Unmount` with the helper's exit.
+> **`CONTRACT` = 46 (A-524):** an S3 base is named by the library: `S3Base`, the endpoint (`https`, or plain `http`
+> to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys' rules, and the addressing,
+> each refused by its kind (§4.15's S3 base). A base whose fetch is outstanding answers `Pending` through the host
+> seam, and the wire's `Unpublished` until the server parks it (A-555).
 > **`CONTRACT` = 47 (A-520, second piece):** the container handoff's other two steps are library calls, which the
 > command line now makes: `container_engine::engine_profile(runtime)` asks the runtime's engine for its profile,
 > bounded as the command line asked it, and judges it, answering an `EngineProfile` or an `EngineFault` (the judge's
@@ -9163,7 +9185,14 @@ it builds against the contract and adds to it rather than around it.
 > not in its shape, or a host that asks no engine); `container::check_source` and `ContainerBind::check_source`
 > judge whether a bind's source is still the mount verified, the table first and then the identity the kernel never
 > reuses, refusing `SourceFault`. `slates-bridge-oci` is linked on every platform, its judge's types the contract's.
-> **`CONTRACT` = 48 (A-539):** a host's refusal code carries its numbering. `HostFault::Base` names an `OsCode`, an
+> **`CONTRACT` = 48 (A-520, third piece):** rootless podman holds its tested profile on its own Linux host. The
+> handshake speaks podman's own interface beside the Docker CLI's (`podman info`, one template: its operating system,
+> version, rootless and SELinux flags, and whether its service is remote), and the judge holds a local rootless podman
+> on Linux to T-4.13's rootless run (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`), its rules
+> `IdentityRule::ContainerRootAsMountingUser` (appended) and every hard link's name served at once; `Engine::Podman`
+> and `Endpoint::Local` are appended. A remote podman is refused `RemoteEngine`, one run as root `ProfileUntested`, a
+> labelling one `SelinuxLabelsUntested`, and every other rootless profile still `UserNamespaceUntested`.
+> **`CONTRACT` = 49 (A-539):** a host's refusal code carries its numbering. `HostFault::Base` names an `OsCode`, an
 > errno or a Win32 error code (none where the host named none), where it held a bare number that on Windows was a Win32
 > code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
 > `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
@@ -9955,7 +9984,15 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > are where the source parts from the mark and every carried path, and what the capture held at a path is the carried
 > state, else the mark's, which is the stage-1 judgement exactly. A move from the new owner carries again from its mark
 > and its record. A carried record whose mark this node does not hold (a takeover that rebuilt a later head) is refused
-> typed, never landed as a scratch volume.
+> typed, never landed as a scratch volume. **Since A-544 (2026-11-18) every head carries, not a move's alone:** a
+> captured clone is born with its record (naming no head yet), each head of its own it seals is walked and recorded in
+> its catalog (`crate::carry`), and its head register ships only once the record for it is in, so a takeover after the
+> owner's loss adopts the newest placed head with its record and marks it as a move's new owner does, and its landing
+> is judged against the capture. A head whose carry could not be walked ships without its record (the head's content
+> is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind; a move waits
+> until the head it hands over carries its record, so a refused carry holds the move back until it is refused
+> `Unplaced`, as before. A clone never sealed before its owner's loss reaches its successor as an empty tree, the
+> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost).
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -10115,7 +10152,7 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > - `sim`: `SimS3`, the oracle: versioned and unversioned buckets, an outsider's puts and deletes, delimited listings
 >   paged with opaque tokens (a forged one refused `400`), reads bound by `If-Match` or a version answering `412`,
 >   `404 NoSuchKey` or `NoSuchVersion`, `416`, and a refused or expired credential, each as S3's reference states it.
-> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 43): the endpoint
+> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 46): the endpoint
 >   (`https`, or plain `http` to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys'
 >   rules, and the addressing (a dotted bucket refused virtual-hosted over HTTPS), each refused by its kind; its
 >   identity, a digest of the endpoint's host and port, the bucket and the prefix, is the device of every fingerprint.
@@ -10342,7 +10379,7 @@ entry either old or new, never torn).
    carries an errno alone and a Win32 variant appended beside it carries a Win32 code (`HostAnswer::Win32`,
    `LandingDegradation::CrashedWin32`, `TargetRefusal::HostWin32`, `Refusal::BaseUnavailableWin32`), pinned by golden
    vectors (`crates/ipc/src/os_code_vectors.rs`); the library contract's `HostFault::Base` names an `OsCode` (contract
-   48). An errno field so changed what it may hold, which no append-only change can say of what an older peer or record
+   49). An errno field so changed what it may hold, which no append-only change can say of what an older peer or record
    holds, so the change takes a new wire major (3: a major-2 peer is refused, never decoded; D-15, as A-237's took 2)
    and a new anchor layout (11: a segment whose completion records keep replies a layout-10 daemon wrote is refused,
    never misread); a ring body's schema hash moves with its appended variants on its own (§4.9 "Framing").
@@ -36291,7 +36328,7 @@ the bug record `docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origi
   at the first clone, `left: 9, right: 5`. Green with the change, the same machine: `cargo test --locked -p slates-vfs
   --lib` 79 passed, 1 ignored.
 - **The sweep for siblings** (every counter a clone, a restore or an adoption takes from the live origin rather than
-  the frozen state), reported and not changed, with their effects in the bug record:
+  the frozen state), reported and not changed, with their effects in the bug record (both fixed since by A-549):
   - the server's clone admission reads the clone's inherited inodes from the origin's head count
     (`verbs::admit_clone`'s `inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic
     clone's version hold), where it should read the snapshot's, now recorded;
@@ -36638,9 +36675,282 @@ and `crates/cli/Cargo.toml` with `Cargo.lock` (the command line no longer links 
   and podman's command line, both refused today), and Windows, which binds nothing (G-mount step 4) until a route into
   Docker Desktop's VM is measured (kiln's W9).
 
+### A-558 — A digest that finds another file at a clean entry's name leaves the inode on its file, as A-151 has it (2026-11-18, g230, UI goal 85, from g225's inventory; §4.15 "verified current", §4.5, A-151)
+Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-a-digest-pointed-an-open-base-inode-at-the-file-an-outsider-put-at-its-name.md`
+(new), and `crates/vfs/src/base.rs` (`verify_current`, `leave_name`, `Current`, `digest_begin`/`digest_begin_at`,
+`reopen_verified`, `DigestStats::replaced`, and its first unit test module).
+- **What was there.** `verify_current` opens a clean file's path afresh and compares its identity with the descriptor
+  the inode holds, the one check that sees a replacement racing the directory listing's validation. On a mismatch it
+  pointed the inode at the new file in place: it swapped in the new descriptor and adopted the new fingerprint. A handle
+  opened on the old file then read the outsider's bytes, and the name kept the old number. A-151 had made every relist
+  detach such an inode instead; this path was left as it was, with no test reaching it.
+- **The rule.** The inode leaves its name as a relist has it (`leave_name`): its descriptor is kept while a handle holds
+  it open (the opener reads the file it opened, POSIX), its directory's listing is reread, and the name leaves the node,
+  so the next lookup serves the disk's file as a new inode. `verify_current` answers `Current::Replaced`, counted
+  `DigestStats::replaced`, and so does an inode the validated listing itself took from its name, which was `NotFound`.
+  A digest by path looks the name up once more and digests the new entry; a second replacement is the disk changing it
+  now, refused `DigestUnverified`, as is a replacement between a digest's slices.
+- **Test.** `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one` (`base.rs`' unit tests):
+  a base file opened as a mount's `OPEN` does, then its path digested with an outsider's replacement landing at each
+  seam call of the digest in turn, a scene each, until one lands after the digest. Each landing must leave the handle
+  reading the file it opened, the digest naming the outsider's file (or the opened one where the replacement landed
+  after the digest's last check) or refused `DigestUnverified`, never torn bytes, the name a new inode, and at least one
+  landing must reach `verify_current`'s identity check (`replaced` moved). Green on the Mac Studio (kiln r33, debug);
+  red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
+  file and the name kept its number (`replaced` 1, so the path was reached).
+
+
+### A-520, third piece — Rootless podman holds its tested profile on its own Linux host, so a host runs containers under it (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9; AUD-29-67; `CONTRACT` = 48)
+Applied in the same change to: §4.6 (A-9's OCI record: the profiles held), §4.12's contract log (`CONTRACT` = 48), GAPS
+(the library's entry), `docs/library.md` (the profiles that hold evidence; what is owed), `docs/wip/oci-handoff.md`
+(§6's single profile superseded), `crates/bridge-oci/src/runtime.rs` (podman's interface and statement,
+`Interface`, `PodmanFacts`, `runtime_interface`, `podman_profile`; `Engine::Podman`, `Endpoint::Local` and
+`IdentityRule::ContainerRootAsMountingUser` appended; the judge's rootless-podman arm; the module's list of the profiles
+that hold evidence; and the tests), `crates/api/src/container_engine.rs` (podman's query and parser, the handshake
+routed by interface, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 48), and `crates/cli/src/oci_runtime.rs`
+(the new rule's words).
+- **Why.** kiln's container engine runs agents under the runtime a machine has, and on a Linux machine without
+  privilege that is rootless podman: R10's case. Slates had run a container workload through it by use
+  (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`, 2026-10-19; and G-mount step 3's map,
+  2026-10-25), yet its judge refused every rootless engine (`UserNamespaceUntested`) and podman's command line
+  (`RuntimeUnsupported`), so the library answered no profile for it.
+- **What podman is asked.** Podman's command line answers Docker's templates with its own fields and has no engine at
+  an endpoint, so the handshake speaks its own interface: one `podman info` template naming five fields of its
+  `libpod/define/info.go` (`Host.OS`, `Version.Version`, `Host.Security.Rootless`, `Host.Security.SELinuxEnabled`,
+  `Host.ServiceIsRemote`), small enough for the one page an answer may hold (its whole `info` is not), parsed as
+  hostile input. A podman whose service is remote (a `CONTAINER_HOST`, a podman machine's VM) is refused `RemoteEngine`,
+  as a Docker endpoint reached over a network is: a bind's source would resolve on the service's host. The Docker
+  endpoint's own admission still admits the Docker CLI's alone.
+- **The verdict.** A local rootless podman on Linux holds T-4.13's rootless leg: `IdentityRule::ContainerRootAsMountingUser`
+  (the container's root read, wrote, and was refused `EROFS` through a read-only bind as the user who mounted the volume,
+  over an unshared FUSE mount, which admits that user alone; so a host runs the container as its root) and
+  `HardLinkRule::EveryNameServedAtOnce` (the bind is the host's own FUSE mount with nothing shared between, as the Docker
+  Engine's measured). Podman run as root is `ProfileUntested` (no workload ran so); a labelling podman
+  `SelinuxLabelsUntested`; rootless podman on any other host, and every other rootless engine, `UserNamespaceUntested`.
+- **Tests.** `crates/bridge-oci/src/runtime.rs`: `podman_is_spoken_in_its_own_interface_and_never_at_a_docker_endpoint`,
+  `rootless_podman_on_its_own_linux_host_holds_its_tested_profile`,
+  `every_other_podman_and_every_other_rootless_profile_is_refused_typed`; `crates/api/src/container_engine.rs`:
+  `rootless_podman_on_linux_holds_its_tested_profile_asking_podman_alone` (podman asked its own statement alone) and
+  `every_other_podman_is_refused_typed` (with podman's hostile answers). `nothing_is_asked_past_a_refusal` names
+  nerdctl now, which the handshake still does not speak.
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug, load 15 to 22).** Red first, on a copy of this change made on
+  the Studio, never committed, whose interface left podman unspoken and whose judge refused every rootless profile,
+  as both were: `cargo test --locked -p slates-bridge-oci --lib runtime::` failed the three new tests, and `cargo
+  test --locked -p slates-api --lib -- container_engine:: contract_history` failed the two new podman tests and
+  passed the other six (run r47). Green with the change, the same copy restored from its commit: slates-bridge-oci's
+  whole `--lib` 8 passed; the same slates-api command 8 of 8, and its whole `--lib` 90 passed, 4 ignored. `cargo fmt
+  -p slates-api -p slates-cli -p slates-bridge-oci` laid the code out.
+- **Owed.** The profile's live check by use, filed for main: `slates oci-runtime podman` on a rootless Linux host
+  answering this evidence, the container's other ids refused through an unshared mount (the rule's second half, which
+  rests on FUSE's own rule today), and the hard-link probe through podman (the rule rests on the bind's mechanism, not
+  yet a podman run); podman's command line on macOS and Windows (a machine's VM), refused `RemoteEngine` until a run.
+
+### A-560 — A WinFsp receive worker learns its reply spin window from its own wakes, agreed before trusted and bounded by the shard's step quantum (2026-11-18, g230, UI goal 85's B4; §4.6 Windows, §4.3's 2-competitive rule; amends A-212's spin)
+Applied in the same change to: GAPS (the spin window's entry closed), `crates/bridge-winfsp/src/spin_window.rs` (new,
+pure), `reply.rs` (`Stamped`, `start`, `await_reply`; the start-up probe and its `SAMPLES` gone), `host.rs` (replies
+stamped at `Served::send`; `MountThread::start` reads the shard's step quantum), `dispatcher.rs` (`Worker::start` takes
+the ceiling), and `lib.rs`.
+- **What was there.** Each receive worker timed fifteen one-way channel wakes as it started and spun for their median for
+  its whole life, unbounded and unchecked: CI's arm64 runner, quiet, measured 143.9 and 108.1 µs on one daemon's two
+  workers where the other runs' measured 4.1 to 11.5 µs (diagnostics run 42178889880, run 3), and such a worker spun up
+  to 144 µs on every slow reply, a core taken from the shards of a 4-vCPU machine.
+- **The rule.** Every reply carries the instant the shard sent it (`reply::Stamped`), so each reply the worker parked
+  for, and that was sent after it parked, is one of its own wakes, and the window keeps learning from them for the
+  worker's life. The estimate is TCP's round-trip estimator as RFC 6298 §2 states it: a smoothed wake `S` and its
+  smoothed mean deviation `V`, gains `α = 1/8` and `β = 1/4`, seeded `S = R`, `V = R/2`, in Jacobson's fixed point. A
+  scheduling delay only lengthens a wake, so a sample past the RFC's band `S + 4V` is folded as the band's edge. The
+  wakes agree once `V < S/2`, below the RFC's seed; until then the window is zero and the worker parks. The window never
+  exceeds the step quantum of the shard that started the mount (`slates_rt::futures::step_budget_ns`, derived by the
+  daemon from the machine's measured wake): a longer spin takes more than a step of CPU from the shards. A worker
+  started off any shard has no quantum and never spins. No sample count is fixed; the constants are the RFC's.
+- **Tests.** `spin_window`'s, on every host: a start of delayed wakes (five of nine past 100 µs) never spins past the
+  ceiling, is zero while the wakes disagree, and settles within the settled wakes (4 to 11 µs); agreeing wakes are spun
+  for once a second confirms the first; agreeing wakes slower than the ceiling spin the ceiling, and a zero ceiling
+  never spins; one 10 ms delay moves the window by at most half a deviation. `reply`'s, on Windows (main's run): only a
+  reply the thread parked for teaches it, and a thread that started nothing never spins. Green on the Mac Studio (kiln
+  r51, 4 of 4); red once with the window unbounded and unchecked again (the old rule's essence): after the first wake a
+  window of 144,000 ns past the 50,000 ns ceiling, and the agreement and ceiling tests failing with it.
+
+### A-557 — A read scatter is answered whole, or refused naming a shard whose part it lacks (2026-11-19, goal 85 via g225; §4.8 "Lookup", §4.9, §4.14 `slates.status`; the 2026-11-05 scatter record's sibling, A-216, A-426)
+
+- **What was there.** A listing, the grants and `DaemonStatus` gather a part from every shard. A part whose shard's
+  state refused the borrow came home as an empty part (`unwrap_or_default`, or a status' `None` skipped by `extend`), so
+  the answer left out that shard's volumes, grants or report and read as whole. A shard refuses when it is fenced (a
+  failed consensus publication fences the control shard), when its retention check refuses, when its start failed and
+  installed no state (the daemon serves the rest), or when a borrow is nested.
+- **The rule.** A part comes home as what its shard served, or as nothing. Nothing is settled as a part that could not
+  be sent (`settle_unserved` over `settle_refused`), so the scatter answers `Overloaded { shard }` for the first such
+  shard once its last part is in: never a page or a report without that shard's part (§4.8 "Lookup": an enumeration is
+  a scatter-gather over owners). `scatter.part_unserved` counts it apart from a full control channel's refusal, which
+  answers the same. It is refused rather than marked partial, since the wire has no partial page or report to mark.
+- **Test.** `a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard` (`crates/server/src/verbs.rs`): a
+  two-shard daemon with its control shard fenced; a client seated on the other shard lists, asks for its grants and
+  asks for the status, and reads each answer from its own ring. Red with the old part tasks (the listing answered
+  `Listed { volumes: [], next: None }`, 0.75 s, Mac Studio); green with the fix, all three `Overloaded { shard: 0 }` and
+  three parts counted unserved.
+- **Reported, not changed.**
+  - A listing's or the grants' `Overloaded` is recorded as the request's completion. It is delivered as not yet
+    recorded, and `retry_deferred` records it, so a resend under its id meets the refusal and never runs the scatter
+    again. The protocol calls `Overloaded` not started, and `AnswerUnstarted` delivers its own unrecorded. This holds
+    for a part that could not be sent since 2026-11-05 as well, and A-557's unserved part takes the same path.
+  - A forwarded verb whose owner shard refuses the borrow is answered `NotFound`: `call_in_shard_time` returns the
+    refused borrow as `None`, and `named_if_unshared` turns that into `NotFound`.
+  - `settle_refused` can leave an orphaned refusal mark for a scatter already settled gone at a stop.
+
+Applied in the same change to: §4.9 (its status), GAPS (the 2026-11-05 entry's reported sibling, closed),
+`crates/server/src/{verbs,state}.rs`, `crates/ipc/src/protocol.rs` (the doc of `Refusal::Overloaded`; the wire is
+unchanged), the bug records `docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md` and
+`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
+
+### A-544 — A captured clone taken over after its owner's loss lands against its capture: every head it places carries its capture's record (2026-11-18, g267, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover"; A-291, A-424, A-503)
+
+- **What was there.** A-503 carried a captured clone's capture only with a move: the old owner walked it against the
+  head it handed over and recorded it in the catalog. A takeover after the owner's loss adopts the newest placed head
+  and its catalog, which carried nothing for it (no move had walked it), so the successor landed the clone as a volume
+  with no capture: every file a create, no removal, every change a conflict.
+- **The rule.** Every head of a captured clone is placed with its capture's record, so whatever head a successor adopts
+  comes with what it needs, and the move needs no walk of its own. A clone of a captured base is born with a record
+  naming no head (`carry::creation_record`, all-zero identity; `verbs::publish_clone_as`, in the clone's own atom). On
+  its owner, the seal walk steps each captured clone's carry (`carry::step`): when its head is a snapshot of its own
+  that its record is not for, a task of its shard walks the capture (its own here, or its mark and record on a node a
+  move or a takeover brought it to) against that snapshot a slice a turn (`CarryWalk`), and once the head's seal names
+  its archive identity records it (`Op::CaptureCarried`, its mark that snapshot, raising the catalog's sequence). The
+  head register waits for the record of its head (`carry::holds_head_back`, in `fleet::unplaced_heads`), and a head ships
+  only once its catalog's current version is placed, so a successor adopts the record with the head and marks the
+  snapshot it materializes (`verbs::finish_making`, A-503) when the identities agree. A move hands over a head placed
+  this way and waits until that head carries its record (`carry::carries_its_head`, first in
+  `moves::ready_to_hand_over`): a carry still walking or refused holds it back until it is refused `Unplaced`, as
+  A-503's own walk did, so a move never turns a clone that lands against its capture into one its new owner refuses.
+  A-503's move-time walk is gone, its `fleet.move.capture_uncarried` now `fleet.carry.refused`.
+- **A head of its own.** A clone's record starts as a copy of its origin's (`publish_clone_as`), so until its first
+  snapshot its head names its origin's snapshot, which its own tree cannot walk (a clone's volume core starts with no
+  snapshot). It carries nothing until then, and that head waits for no record (`carry::own_head`). As first written, a
+  carry was begun for it and refused, counted with a log line, for every captured clone made: on a kiln fleet runner,
+  every workspace.
+- **Bounded.** A shard's carries are bounded by the volumes it serves: an entry leaves once its record is in, when its
+  volume is no captured clone or has no head of its own, and at the end of each home seal walk when the shard no longer
+  serves its volume (`carry::forget_gone`; the walk visits only served volumes, so an entry refused or waiting for its
+  seal outlived a volume released, relinquished or destroyed). A carry's task ends with its entry.
+- **What is lost when the capture was never replicated.** The capture reaches the fleet only through the clone's own
+  sealed heads and their records; its origin (the captured base) is a volume of the node that made the clone, and the
+  clone's catalog names no lineage. Two cases:
+  - *The clone was sealed, but not the record for the head its successor adopts:* its carry could not be walked (the
+    capture or the head's tree unreadable, counted `fleet.carry.refused`; the head ships anyway, since placement is
+    never held back for a landing), the catalog carrying a newer head's record was placed and its owner died in the
+    round before that head was (the catalog ships first), or a live-shipped clone was rebuilt from its log past its
+    seal. The successor holds every byte of the head it adopted and lacks only what the capture held where the clone
+    changed it, so it holds no mark, and its landing is refused by kind (`Unsupported`, "a moved captured clone whose
+    moved head this node does not hold"), never landed as a volume with no capture. The agent's work stays in the
+    volume; what is lost is its landing against the capture.
+  - *The clone was never sealed before its owner's loss* (no snapshot of its own, or its first head not yet placed): its
+    successor holds its catalog and the record it was born with, and serves the creation head, an empty tree. What is
+    lost is the whole tree, the capture's bytes with every change since (the origin's own head, where it was sealed and
+    placed, is served by the origin's successor as a plain volume, which nothing links the clone to). Its landing is
+    refused by kind, so the empty tree is never landed as the clone.
+- **Tests.** `a544_a_clone_of_a_captured_base_is_born_with_its_capture_record` and
+  `a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind` (`crates/server/src/verbs.rs`: the
+  marked successor moves the clone on; the markless one refuses its landing and its carry, counted, and holds a move);
+  `a544_a_captured_clones_head_waits_for_its_capture_record_and_carries_it` (the head and a move held back before its
+  record and free after it; the record for the head, its mark the head, naming the rewritten file as captured and the
+  made one as absent), `a544_a_fresh_captured_clone_carries_nothing_until_its_first_snapshot` and
+  `a544_the_carry_of_a_clone_the_shard_no_longer_serves_is_forgotten_at_the_walks_end` (`crates/server/src/carry.rs`).
+  Red first on the Mac Studio (2026-11-18, `cargo test --locked -p slates-server --lib -- a544`): with the five rules
+  taken out and their calls kept (no creation record, no head held back, any sealed head taken as the clone's own, a
+  move never waiting, nothing forgotten), 0 of 5 passed, each failing at its own assertion; with them, 5 of 5, and 50
+  of 50 over the lib's `a544`, `carry::`, `moves::`, `catalog::`, `landing::` and `fleet::` tests; `slates-db`'s
+  carried-capture tests 3 of 3.
+- **Owed.** The fleet's own test of a takeover (three daemons: a captured clone's owner killed after a sealed head, its
+  successor landing it against its capture), filed for main. A live-shipped clone's record for the head its log rebuilt.
+  A captured clone sealed at its making (its content shares its origin's chunks, so its placement puts little), or its
+  catalog naming its capture, so a clone whose owner dies before its first snapshot is not lost whole. Seen, not
+  changed: until a clone's first snapshot its inherited head also refuses the home seal every period (`fleet.seal`
+  counted, `fleet::start_seal`), reported to main.
+
+Applied in the same change to: §4.15's status (A-503's paragraph), §4.10's status (the consumer's paragraph), GAPS
+(g267), `crates/db` (`catalog.rs`: `CarriedRecord::NO_HEAD`), `crates/server` (`carry.rs`, new; `moves.rs`: the
+move-time carry gone, the move waiting for its head's record; `fleet.rs`, `verbs.rs`, `state.rs`, `daemon.rs`,
+`lib.rs`).
+
+### A-549 — A clone is admitted by its snapshot's inodes and counts its snapshot's entries, whatever its origin did since (2026-11-19, goal 85, g234; A-541's sweep; §4.2's inode and namespace dimensions, §4.4 snapshots and clones, D-5)
+Applied in the same change to: A-541's entry and its bug record (both of its siblings marked fixed); GAPS, §8c (the fix
+and the siblings left open); the bug record `docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`;
+and:
+- `crates/vfs`: `snapshot.rs` (`Snapshot::live_entries`); `volume.rs` (`Volume::snapshot` records the head's entry
+  count, `clone_inner` starts the clone from it, `Volume::snapshot_inodes`, `clone_of`'s notes; two lib tests in
+  `clone_count_tests`); `recover.rs` (`rebuild_snapshot_tree` returns its tree's entries, `named_entries`,
+  `rebuild_snapshot` records them).
+- `crates/server`: `verbs.rs` (`admit_clone` reads the clone's inherited inodes from its snapshot; the lib test module
+  `clone_admission_tests`, new).
+
+- **What was there.** The server admitted a clone by its origin's inode count at the moment of the clone (`admit_clone`'s
+  `inherited`): a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold. Since
+  A-541 the clone counts its snapshot's inodes, so where the origin had removed files the allowance fell below the
+  clone's count, was refused, and left the clone with no inode cap, and a dynamic clone held fewer slots than it holds
+  inodes. A clone's entry count was its origin's head count at the clone, as its inode count had been.
+- **The rule.** A snapshot carries the counts a clone of it is admitted and counted by, as §4.2 has complete snapshot
+  roots carry their referenced counts for O(1) clone admission: its live inodes (A-541) and its live entries, each the
+  head's when the snapshot is taken. The owner admits a clone by the snapshot's inodes: a bounded clone reserves its fair
+  share but never fewer than them, and that is its allowance; a dynamic clone holds a slot for each. A clone's entry
+  count starts from the snapshot's. A recovered snapshot's entries are its tree's, by the rule the live count keeps (a
+  whiteout is no entry): the named entries of its own directories' images and the live entries of the head's
+  directories it shares (A-395), so the image's layout does not change. A stale snapshot is refused at admission, before
+  any slot is taken, with the refusal the clone would give.
+- **Tests.** In `crates/vfs/src/volume.rs`, `clone_count_tests`: the entry count of the origin, the clone and a clone of
+  the clone's snapshot against a walk of each namespace after every step, then an entry allowance of one past the tree
+  admitting exactly one file; and across a restart, the rebuilt clone and a clone of the recovered snapshot, whose tree
+  shares an untouched directory with its origin's head (the test first checks the image shares it, so the count's shared
+  arm is exercised). In `crates/server/src/verbs.rs`, `clone_admission_tests`: a bounded clone of an origin floored 8
+  past its fair share and left under it is admitted with its snapshot's inodes as its allowance, none refused; a dynamic
+  clone holds a slot for each inode its snapshot holds.
+- **Evidence.** All on the Mac Studio, 2026-11-19.
+  - Red first, with the tests alone on main `a613562eb`. The bounded clone's allowance was `u64::MAX` against its
+    snapshot's 36: the share, 28, was refused below 36. The dynamic clone held 2 slots for 13 inodes. The live entries
+    test counted 13 where the tree holds 9, and the restart test 14 where it holds 10.
+  - Green with the change: `cargo test --locked -p slates-vfs --lib` passed 81 with 1 ignored, and `cargo test --locked
+    -p slates-server --lib clone` passed 3 of 3.
+  - Each arm of the recovered count, removed on a copy, failed the restart test at the later clone: without the shared
+    directories it counted 7 of 9; recording zero, 0 of 9.
+- **Found by the sweep, left open** (GAPS, with the bug record):
+  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, the next piece).
+    This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
+  - A clone is admitted with no entry allowance.
+  - A resize leaves the entry allowance at the size the volume was made with.
+  - Recovery counts a whiteout as a live entry (found by reading).
+
+### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
+Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
+`crates/vfs/src/{journal,volume}.rs` (`Patience`), `crates/vfs/tests/journal_cost.rs`,
+`crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
+until part 2), `crates/bridge-core/tests/invalidation.rs`.
+- **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
+  the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
+  overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
+  and WinFsp readers' patience, the NFS write-back tracker's, and `verbs::await_materialization`.
+- **Part 1, the NFS write-back tracker** (`nfs_writeback::tracking`). The tracker's reader is consumed by its keeper, a
+  task on the volume's own shard woken by the change that journals the record, so only that shard's own turns stand
+  between a record and its consumer. A record waiting `W` on the wall therefore meant a shard kept off its CPU, never a
+  tracker gone, and dropping it was the costliest answer: the keeper's consume found its cursor behind the journal and
+  lost every connection's states, so each write-back of those connections was refused (`NFS3ERR_IO`) until the
+  connection ended. Now the reader holds its records while the tracker is open (`Patience::WhileOpen`); it closes with
+  the tracker when the tracker's last connection ends. Its records stay bounded by the shard's metadata ledger, whose
+  refusal drops the oldest, counted (`growth_refused`). A tracker whose keeper could not be spawned (a counted tripwire,
+  `nfs.writeback_keeper_refused`) is consumed at its connections' calls and holds its records until then, within the
+  same ledger.
+- **Tests (part 1).** `a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window` (`nfs_writeback.rs`:
+  a connection's fetch tracked, another path's change, the shard held a window and a tenth at a fifth of its CPU, the
+  journal filled past its budget, then the connection's write-back of a byte it fetched judged). On the Mac Studio
+  (debug, 2026-11-19, load 13 to 32): `slates-server --lib nfs_writeback` 2 of 2 and `slates-vfs --lib journal` 11 of 11;
+  red with the one-window patience put back: the write-back judged `Unknown`, the connection's states lost, where
+  `Apply` was expected.
+- **The journal's rule.** `Patience` names what a reader's reads wait on: `WhileOpen` for a reader consumed at the
+  change on the volume's own shard, `Bounded(ns)` for one whose rounds wait on another party, which may stall while the
+  reader stays open. The retention oracle (`retention_keeps_what_a_live_reader_needs_as_the_model_does`) generates
+  both, its model stating each rule, and checks directly that while no growth was refused no record a reader held
+  while open has not read has left.
+
 ### A-539 — A host's refusal code carries its numbering end to end, and the landing reads kinds, never numbers (2026-11-19, g085, UI goal 88; §4.15 step 6, §4.9, §4.12; A-527's owed half; A-185, A-227, A-237, A-519)
 Applied in the same change to: §4.15 step 6 (the rule), §4.9 (status: wire major 3), §4.12's contract log (`CONTRACT`
-= 48), GAPS (A-185's owed numbering: built, with what it leaves), `docs/library.md` (the host faults' row),
+= 49), GAPS (A-185's owed numbering: built, with what it leaves), `docs/library.md` (the host faults' row),
 `crates/vfs` (`src/host/mod.rs`: `OsCode`, the named kinds `HostError::Exists`, `NoSpace`, `Unsupported`,
 `Unavailable(OsCode)`, `OwnMount(OsCode)`, `HostError::code`; `src/host/sim.rs`: the simulated host gives the kinds and
 can refuse `rmdir` and a metadata open; `src/error.rs`: `VfsError::BaseUnavailable(Option<OsCode>)`; `src/base.rs` and
@@ -36654,7 +36964,7 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
 (`src/protocol.rs`: the four appended variants; `tests/wire_order.txt`; `src/os_code_vectors.rs` and its `.txt`, new),
 `crates/wire` (`src/header.rs`: `MAJOR` = 3), `crates/anchor` (`src/layout.rs`: `LAYOUT_VERSION` = 11;
 `tests/anchor.rs`), `crates/api` (`src/error.rs`: `OsCode`, `HostFault::Base { code }`; `src/lib.rs`: `CONTRACT` =
-48), `crates/mcp` and `crates/sdk-node` (a Win32 code as `win32` beside `errno`), and the bridges (`bridge-core`,
+49), `crates/mcp` and `crates/sdk-node` (a Win32 code as `win32` beside `errno`), and the bridges (`bridge-core`,
 `bridge-fuse`: the volume's refusal as its errno, where it is one).
 - **What was there.** A-527 typed the land seam's own refusal (`HostError::Win32` beside `Unavailable(errno)`), and
   past the seam one number field still held either numbering: the landing report's `Failed { errno }` and crash, the

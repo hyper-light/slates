@@ -3621,9 +3621,11 @@ pub enum Refusal {
   /// The shard's client or task capacity is reached.
   TooManyClients,
   /// A shard's cross-shard queue is at its bound; the request was not started and may be
-  /// retried (the client's credit bounds what it can have in flight).
+  /// retried (the client's credit bounds what it can have in flight). A listing, the grants or a status, gathered from
+  /// every shard, answers it too when a shard's part could not be sent there or came home unserved, that shard's state
+  /// refusing to serve it (fenced, or never started): the answer is never given without that shard's part (A-557).
   Overloaded {
-    /// The shard whose queue is full.
+    /// The shard whose queue is full, or whose part a gathered answer lacks.
     shard: u16,
   },
   /// A malformed request.
