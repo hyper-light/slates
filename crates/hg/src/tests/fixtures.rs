@@ -873,10 +873,6 @@ pub(crate) mod import {
       .map(|(_, bytes)| *bytes)
   }
 
-  /// The file named `name`.
-  pub(crate) fn file(name: &str) -> &'static [u8] {
-    find(name).unwrap_or_else(|| panic!("no import fixture {name}"))
-  }
 }
 
 /// The state's golden vectors (A-649 part 2): one history with phases, bookmarks and obsolescence markers stored by

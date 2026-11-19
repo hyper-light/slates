@@ -707,6 +707,18 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   revision is judged by are each history's next location, not the revision's own (`do_logs` builds `cur_paths` after
   `check_history` has advanced), which the recording shows: `tags/t1`'s log has r7's merge of `/branches/b1/dir`,
   seen through `/trunk`.
+- **`log`'s merged revisions** [C: `log.c` `get_paths_history_as_mergeinfo`, `fs_mergeinfo_changed`,
+  `get_combined_mergeinfo_changes`, `handle_merged_revisions`, `combine_mergeinfo_path_lists`, `reduce_search`,
+  `store_search`, `interesting_merge`, `send_log`; `mergeinfo.c` `svn_mergeinfo__mergeinfo_from_segments`; `tree.c`
+  `get_mergeinfo_for_path`; recorded]: a revision with children is followed by its merged revisions and an entry of
+  revision 0 with `invalid-revnum` true; a reverse merge's are `subtractive-merge` true; a revision whose merged
+  revisions were all sent before has its closing entry alone (recorded: `tags/t1`'s r5 after r11 sent r4). Two places
+  depend on the seeded hash order and so have no stable answer to match: `combine_mergeinfo_path_lists`' removal
+  (`array_pop_front` takes the array's first source where it means the one used up, wrong when two sources share a
+  first range and the first sorted has more), and `qsort`'s order of runs with equal ranges; slates takes the intent.
+  `interesting_merge` calls the client's changed-path receiver before it judges, and `send_log` checks
+  `nested_merges` after `fill_log_entry`, so a merged revision passed over has had its changed paths written, which
+  join the next entry's (not recorded: the recorded `-g -v` logs pass none over with changed paths).
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
