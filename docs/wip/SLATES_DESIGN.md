@@ -37205,6 +37205,8 @@ and `pending_changes` through them), and the bug record
   journal of the successor, so it is not marked. Carrying a FUSE mount's byte states in each publication, as A-231
   carries a held NFS connection's, would end it.
 - **Test.** `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`crates/bridge-fuse/src/coherence.rs`):
-  bytes 16..48 of a file written before a taken-over mount's start must be stale in the adopted file's states and the
+  the bytes of a file written before a taken-over mount's start must be stale in the adopted file's states and the
   rest fresh. Failing first on the Mac Studio (debug, r138, 2026-11-19): the rule moved unchanged into
-  `coherence::taken_over` left them fresh (`Some([])` for `Some([16..48])`).
+  `coherence::taken_over` left them fresh (`Some([])`, the write then at bytes 16..48). The fix's first run (r258) then
+  failed on the test's own premise: a write past the end of an empty file is recorded as an extension from its old end,
+  0..48, so the test now writes bytes 0..32 and expects exactly them stale.

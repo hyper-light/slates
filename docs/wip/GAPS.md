@@ -17930,7 +17930,7 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   they equal it, refused `EIO` where one differs, never applied whole. A journal that no longer reaches back to the
   successor's first record loses the file, whose write-backs are refused. Test, failing first:
   `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`crates/bridge-fuse/src/coherence.rs`; red
-  `Some([])` for `Some([16..48])`). **Its cost:** the write log names no writer, so a replayed write the mount's own
+  `Some([])` where the write's bytes were due stale). **Its cost:** the write log names no writer, so a replayed write the mount's own
   kernel made is taken as another path's, and a store through a shared map over those very bytes before a re-fetch is
   refused once (`EIO` at the next `msync`/`fsync`, its page invalidated and re-fetched after); logging each write's
   attachment and seeding the mount's own records from it would end that. **Still open:** a change before the last

@@ -1665,16 +1665,17 @@ mod tests {
     (store, volume, file)
   }
 
-  /// A-567 (B8; GAPS, "A dirty page from before a takeover is judged fresh"). Do: write bytes 16..48 of a file before a
+  /// A-567 (B8; GAPS, "A dirty page from before a takeover is judged fresh"). Do: write bytes 0..32 of a file before a
   /// mount taken over from a daemon that died begins to serve, as this daemon replays a write its predecessor
   /// acknowledged after its last publication (A-63); then adopt the file as the mount does when its kernel names a
   /// handle of it (A-147, A-152). Expect: those bytes stale in the file's states, so a cache write-back over them is
-  /// judged against the volume's bytes and never taken as fresh, and the bytes the write did not touch fresh.
+  /// judged against the volume's bytes and never taken as fresh, and the bytes past them fresh. (A write from byte 0:
+  /// one past the end of an empty file is recorded as an extension from its old end, so its change starts there.)
   #[test]
   fn a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states() {
     use slates_bridge_core::Bridge;
     let (mut store, mut volume, file) = volume_with_a_file();
-    volume.write(&mut store, file, 16, &[7; 32]).unwrap();
+    volume.write(&mut store, file, 0, &[7; 32]).unwrap();
     let volume_id = slates_db::catalog::VolumeId { bytes: [3; 16] };
     let mut attachments = slates_bridge_core::Attachments::new();
     let attachment = attachments
@@ -1700,7 +1701,7 @@ mod tests {
     states.adopted(file.0, adoption.from, adoption.changes.as_deref());
     assert_eq!(
       states.stale_after(file.0, 0..64, started_at, &[]),
-      Some(vec![16..48]),
+      Some(vec![0..32]),
       "the replayed write's bytes are stale, and only they"
     );
   }

@@ -34,9 +34,10 @@ takeover. A write the dead daemon acknowledged was undone by a write-back the su
   rule is cfg-free, so its test runs on every host.
 - `crates/bridge-fuse/src/channel.rs`: `adopt_restored` and `adopt_unseen_handle` adopt through `taken_over`, the room
   for each file's ranges made first (`TakenOver::most_ranges`); `pending_changes` reads through `changes_since`.
-- Test: `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`coherence.rs`): bytes 16..48 written
+- Test: `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`coherence.rs`): the bytes written
   before the mount's start must be stale in the adopted file's states, and the rest fresh. Red before the fix
-  (`Some([])` for `Some([16..48])`, Mac Studio r138, 2026-11-19).
+  (`Some([])`, Mac Studio r138, 2026-11-19). The fix's first run (r258) failed on the test's premise: its write at
+  16..48 into an empty file is recorded as an extension from byte 0, so the test now writes 0..32 and expects those.
 
 ## Left, stated
 
