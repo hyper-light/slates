@@ -104,13 +104,15 @@ struct FileAnswer<'repository> {
 }
 
 impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
-  /// `get-file ( path [ rev ] want-props want-contents ? want-iprops )` (`serve.c` `get_file`): the head, then, when
-  /// the text is wanted, a [`Stream`] of it.
+  /// `get-file ( path [ rev ] want-props want-contents ? want-iprops )` (`serve.c` `get_file`): refused first where the
+  /// session may not read the path (`must_have_access`); the head, then, when the text is wanted, a [`Stream`] of it.
   pub(super) fn file(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some(request) = FileRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if !self.must_read(&request.path)? {
+      return Ok(Outcome::Answered);
+    }
     let answer = match self.file_answer(&request) {
       Ok(answer) => answer,
       Err(failure) => return self.failure(&failure),

@@ -166,7 +166,7 @@ pub(super) struct FileRevsStream {
 
 impl FileRevsStream {
   /// Sends revisions until the bytes written and the revisions sent reach `room`, at least one step, or until the
-  /// answer is whole.
+  /// answer is whole; [`Progress::Close`] where `svnserve`'s process aborts (an empty mainline, `Stop::Aborted`).
   pub(super) fn resume<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
@@ -178,6 +178,10 @@ impl FileRevsStream {
       match self.step(reads) {
         Ok(()) => {}
         Err(Stop::Refused(failure)) => self.finish(reads, Some(&failure))?,
+        Err(Stop::Aborted) => {
+          self.ended = true;
+          return Ok(Progress::Close);
+        }
         Err(Stop::Unwritten(error)) => return Err(error),
       }
       steps = steps.saturating_add(1);
@@ -303,15 +307,16 @@ impl FileRevsStream {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `svn_repos_get_file_revs2`'s revisions, in the order they are sent.
-  fn file_revisions_to_send(&self, request: &FileRevsRequest) -> Result<VecDeque<PathRev>, Failure> {
+  /// `svn_repos_get_file_revs2`'s revisions, in the order they are sent; [`Stop::Aborted`] where its assertion that the
+  /// mainline holds a revision fails, the file's first location being one the session may not read.
+  fn file_revisions_to_send(&self, request: &FileRevsRequest) -> Result<VecDeque<PathRev>, Stop> {
     let youngest = i64::try_from(self.index.youngest()).map_err(|_| Failure::corrupt())?;
     let valid = |revision: Option<i64>| revision.filter(|&revision| revision >= 0).unwrap_or(youngest);
     let (start, end) = (valid(request.start), valid(request.end));
     if end < start {
       if request.merged {
         let message = String::from("Trying to use an unsupported feature");
-        return Err(Failure::new(SVN_ERR_UNSUPPORTED_FEATURE, message));
+        return Err(Failure::new(SVN_ERR_UNSUPPORTED_FEATURE, message).into());
       }
       let (older, newer) = (unsigned(end)?, unsigned(start)?);
       let mut found = BTreeSet::new();
@@ -325,6 +330,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       mark: false,
     };
     let mainline = self.interesting(&request.path, start, end, walk, &mut found)?;
+    if mainline.is_empty() {
+      return Err(Stop::Aborted);
+    }
     let merged = if request.merged {
       self.merged_revisions(start, &mainline, &mut found)?
     } else {
@@ -334,8 +342,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   }
 
   /// `find_interesting_revisions`: the file's history from `end` back across copies, each location kept until one at
-  /// or before `start`, or one already found when merged revisions are included; refused when the path is no file in
-  /// `end`.
+  /// or before `start`, or one already found when merged revisions are included, or one the session may not read;
+  /// refused when the path is no file in `end`.
   fn interesting(
     &self,
     path: &str,
@@ -353,7 +361,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     let mut revisions = Vec::new();
     while let Some(location) = self.history_prev(&history, true)? {
       let key = (location.path.clone(), location.revision);
-      if walk.merged && found.contains(&key) {
+      if (walk.merged && found.contains(&key)) || !self.readable(&location.path) {
         break;
       }
       let merged_mergeinfo = if walk.merged {
@@ -589,11 +597,15 @@ fn unsigned(revision: i64) -> Result<Revision, Failure> {
   Revision::try_from(revision).map_err(|_| Failure::corrupt())
 }
 
-/// Why a step stopped: a refusal the answer carries after `done`, or an item that could not be written.
+/// Why a step stopped: a refusal the answer carries after `done`, the connection's end where `svnserve` aborts, or an
+/// item that could not be written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stop {
   /// A refusal: the answer ends with `done` and it.
   Refused(Failure),
+  /// `SVN_ERR_ASSERT(mainline_path_revisions->nelts > 0)` failing: `svnserve` sets no malfunction handler, so
+  /// Subversion's default aborts its process and the connection ends without `done`; here it ends the same way.
+  Aborted,
   /// An item the writer refused.
   Unwritten(ItemError),
 }
