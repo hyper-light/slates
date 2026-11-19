@@ -1174,6 +1174,20 @@
 >   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
 >   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
 >   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
+> - **a host mount bound into a container, built 2026-11-18 (A-520, `CONTRACT` = 44; kiln's container engine, kiln goal
+>   01a1f124):** the OCI form (§4.6 A-9) was the wire's and the command line's alone (`slates attach --oci-source`), so
+>   a host that drives slates through the library alone (kiln) could not bind a volume into a container.
+>   `Instance::bind_into_container(volume, source, destination, intent)` and the seam's verb answer a `ContainerBind`
+>   (the binding's attachment and the `OciBinding` entry the runtime performs), refused typed as the daemon refuses the
+>   form; the source is spelled by its folder's real path, never by looking into the mount; the simulator binds the
+>   mounts it recorded in the daemon's order of checks and ends a bind with its mount. Unit tests: `container::tests`
+>   (a binding taken only from an answer that established one; the source's spelling) and `sim::tests` (the entry and
+>   its lifetime, every refusal with none holding room; Windows' refusal, on Windows' own build). By use, with a kernel
+>   mount: `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`,
+>   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. Owed (A-520's next pieces): the
+>   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
+>   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
+>   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
