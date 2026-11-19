@@ -1,0 +1,7 @@
+0012command=fetch
+0017object-format=sha1
+0001000eofs-delta
+0010no-progress
+001dwant-ref refs/heads/side
+0009done
+0000

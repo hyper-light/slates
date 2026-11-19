@@ -40,3 +40,7 @@ vendor/**       !text !eol
 *.bin           -text
 # Mercurial bundles stock `hg` 7.2 wrote: slates-hg's golden vectors (A-514).
 crates/hg/fixtures/**/*.hg -text
+# git's own wire and packs, captured from stock git 2.50.1: slates-git's golden vectors (A-582).
+crates/git/fixtures/*.bin -text
+crates/git/fixtures/*.pack -text
+crates/git/fixtures/*.idx -text
