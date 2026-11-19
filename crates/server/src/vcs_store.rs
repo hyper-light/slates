@@ -82,6 +82,8 @@ use slates_vfs::volume::Store;
 use crate::state::ShardState;
 
 pub(crate) mod hg_import;
+pub(crate) mod hg_view;
+pub(crate) mod paths;
 pub(crate) mod record;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
@@ -152,6 +154,14 @@ pub(crate) struct GitStore {
   pub(crate) derivations: Derivations,
   /// The reach sets' type, eager: each version's value kept as it commits, from the admission's own walks.
   pub(crate) reach: ReachSets,
+  /// The path map's type over the repository's greens (A-664 part 3, [`paths`]): what each green's map of its head in
+  /// `heads` is made and read by. Declared with the content store's window when the store is made ([`made`]); `None`
+  /// for a window too small for the map's branches, which no content plane's window is.
+  pub(crate) paths: Option<paths::GreenPaths>,
+  /// Each green's map of its head, by the green's key (A-664 part 3, [`paths`]): one a member green that committed a
+  /// version, its root held once by the store, replaced as each version commits, given back as the green leaves its
+  /// lineage and made again by a recovery.
+  pub(crate) heads: BTreeMap<u64, paths::Head>,
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
   versions: BTreeMap<u64, Vec<u64>>,
@@ -167,6 +177,8 @@ impl GitStore {
       repository: Repository::new(format),
       derivations: Derivations::new(),
       reach: ReachSets::declare(Mode::Eager),
+      paths: None,
+      heads: BTreeMap::new(),
       versions: BTreeMap::new(),
       charged: 0,
     }
@@ -367,6 +379,15 @@ impl VcsStores {
     }
   }
 
+  /// Repository `id`'s Mercurial store with the content store, read (A-680 part 2: the served view lends from it).
+  pub(crate) fn mercurial_ref(&self, id: RepositoryId) -> Option<(&ContentStore, &HgStore)> {
+    let content = self.content.as_ref()?;
+    match self.entries.get(&id)? {
+      RepositoryStore::Mercurial(store) => Some((content, store)),
+      _ => None,
+    }
+  }
+
   /// Repository `id`'s Subversion store, lent for one step.
   pub(crate) fn subversion(&mut self, id: RepositoryId) -> Option<&mut SvnStore> {
     match self.entries.get_mut(&id)? {
@@ -423,7 +444,15 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     stores.content = Some(content);
   }
   let store = match record.tool {
-    VcsTool::Git => RepositoryStore::Git(GitStore::new(git_format(record.format).ok_or(Unmade)?)),
+    VcsTool::Git => {
+      let mut git = GitStore::new(git_format(record.format).ok_or(Unmade)?);
+      // The map splits by the content store's own window, which its type's name carries (A-647).
+      git.paths = stores
+        .content
+        .as_ref()
+        .and_then(|content| paths::declare(content.window()));
+      RepositoryStore::Git(git)
+    }
     VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore::default()),
     VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
   };
@@ -465,7 +494,10 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
     RepositoryStore::Git(store) => {
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
-      store.repository.release(content).is_ok() && values && versions
+      let maps = store.heads.values().fold(true, |whole, head| {
+        content.release(&head.root).is_ok() && whole
+      });
+      store.repository.release(content).is_ok() && values && versions && maps
     }
     RepositoryStore::Mercurial(store) => {
       let values = store.derivations.release(content).is_ok();
@@ -1277,6 +1309,18 @@ pub(crate) async fn recover(
       index = index.saturating_add(1);
       slices.unit_done().await;
     }
+    // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
+    let greens: Vec<DbVolumeId> = state
+      .db
+      .partition()
+      .repositories()
+      .members_of(record.id)
+      .map(|member| member.green)
+      .collect();
+    for green in greens {
+      paths::remake_green(state, green);
+      slices.unit_done().await;
+    }
   }
 }
 
@@ -1288,5 +1332,7 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
     return;
   };
   make_from_log(state, &record);
+  // Each green's map of its head, made again as the live store holds it (A-664 part 3).
+  paths::remake(state, id);
   state.count(REBUILT, 1);
 }
