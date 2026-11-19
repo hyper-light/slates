@@ -5,8 +5,9 @@
 //! bytes' content in the store. The value is a tree of derived nodes ([`crate::content::Form::Derived`]): one trie a
 //! directory, whose entries name each file's content or the root of the directory beneath, so a version that changes
 //! one file shares every other directory with its parent by identity, as git's trees and Mercurial's manifests share
-//! them [C: git `Documentation/gitformat-index`'s trees; `research/edenfs-scale-distribution.md` §2.1, "a tree entry
-//! has the name of the child entry as well as the object ID"].
+//! them: "a tree entry has the name of the child entry as well as the object ID, which refers either to another tree
+//! object for a subdirectory or to a blob object for a regular file" [C: EdenFS `eden/fs/docs/Data_Model.md`, quoted in
+//! `research/edenfs-scale-distribution.md` §2.1].
 //!
 //! **A directory's trie.** A directory is one leaf, its entries in name order, while that leaf fits the window, the
 //! store's longest content (D-6). Past it, the directory is a branch over the digits of each name's place, a hash of the

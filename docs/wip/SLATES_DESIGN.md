@@ -12100,6 +12100,14 @@ is one more version, and the chain itself is never rewritten.
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
 
+> **Status (2026-11-19, A-647 part 1: derived data, one mechanism, A-645).** What a read computes for a version is a
+> type of derived data (`crates/vcs/src/derived.rs`): a pure function of the version's change and its parents' values
+> of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
+> any tier computes, keeps and serves it with no coordination; computed eagerly as each version is recorded or lazily
+> when first read, by the type's own declaration, a unit a step under the shard's slices. Its first type is a version's
+> map of paths to contents (`derived/paths.rs`). Owed: the tool stores as types (A-614's D(k) first), and the server's
+> use (A-647's entry).
+
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
 computes for it (a pack, a bundle, a slice of the index) is cached by its identity and shared across clients. The change
@@ -43395,6 +43403,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     bases and skip lists, copy detection, file search. Each type for a version is computed from its parents' values,
     eagerly or lazily, and stored immutable by identity, so any server or tier computes, caches and serves it without
     coordination. The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth.
+    (Part 1 built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type,
+    version) in an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down
+    a unit a step, and a version's map of paths to contents as its first type. Owed: A-614's D(k) as a type, part 2;
+    A-553's and A-588's stores after it.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -43777,3 +43789,94 @@ twenty lines), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§19).
 - **Owed.** `slates hg serve --stdio`'s loop over the SSH version 1 codec (`hello`, `between`, `protocaps`, `batch` and
   the commands built, a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas,
   `obsolete`'s `listkeys` dump, and the index's kept heads in place of the walks.
+
+### A-647 part 1 — Derived data, one mechanism: types derived from their parents' values, kept immutable under (type, version), eager or lazy, filled a unit a step; a version's map of paths to contents its first type (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.1 "Objects" item 2 and "Reads")
+
+- **Where, and why there.** `slates-vcs`, a module beside the object store (`crates/vcs/src/derived.rs`,
+  `derived/paths.rs`), not a crate of its own. A value is content in that store, under its window and its budget, and
+  the map from (type, version) to a value is one of its indexes; git's and Mercurial's crates depend on it already, so
+  each tool store can become a type with no new dependency, and no new crate rows (lints, unsafe budget, CI lanes).
+- **A type** (`DerivedType`) is a pure function of a version's change and its parents' values of the same type:
+  `derive(source, store, version, parents)` reads the change from the history (`Graph`: a version's parents in order,
+  the first the one its change is stated against, and the bytes that name it in keys) and returns the root of the new
+  value. No clock, randomness or state outside the store enters it.
+- **Kept immutable under (type, version)** (`Derivations`). A value is a tree of derived nodes in the store (below); a
+  row of a `slates-vcs` index names its root under the key of the type's name and the version's bytes (the name's
+  length first, so no two pairs share a key). The index keeps a key's row for ever and refuses another for it, so a
+  second computation, here or on another tier, is `Identical`, and a different one is refused `Diverged` naming both
+  roots, the recomputation mismatch §4.16 calls fatal and loud. A type's name carries every parameter its values depend
+  on, so tiers that chose different parameters never meet at a key. A fork shares every value kept by identity (the
+  index's fork), and keeps its own after. A value computed elsewhere is kept with `keep`.
+- **Eager or lazy, the type's own declaration** (`Mode`). `recorded(version)` answers the fill to run now for an eager
+  type and nothing for a lazy one; `read(version)` answers the value kept or the fill that computes it.
+- **A fill** (`Fill`) walks up from its version through the parents whose values are not kept, to the nearest kept
+  ancestors or the history's roots, then derives downward, every parent before its child, keeping each value as it
+  goes. One `step` is one unit (a version found kept, walked through, or derived), so the server runs a fill under its
+  shard's slices (`image::sliced`, as `run_releases` runs a lineage's releases). What it waits on is charged to the
+  store's budget as it grows and given back as it shrinks, so a fill over a history of any length is bounded and
+  refused past the budget, typed. A derivation is one unit as large as its change, which the change's admission
+  bounded. A version met again among its own ancestors is refused `Cycle`; a parent whose value is gone between the
+  walk and the derivation sends the version back to be walked (`rewalked`).
+- **Typed refusals** (`DerivedRefused`): `UnknownVersion` (the version or a parent), `Cycle`, `Type` (the type's own,
+  with the version), `Diverged`, `Corrupt` (a row naming other than one content), `NameTooLong`, and the store's and
+  the index's own.
+- **No tunable.** A value's identity must be the same on every tier, so the parameters of its shape are format, in the
+  type's name, never learned: the path map's window is the store's own (D-6's chunk), and its trie's sixteen children a
+  branch are the format's.
+- **A derived node** (`content.rs`, `Form::Derived`). The store's fourth form: the identities of the contents it names,
+  then its type's payload, at most a window, named under a key-derivation context of its own. It holds what it names
+  and freeing it gives that back, as a list's does, so a value lives exactly as long as something holds its root, and
+  two values that share a subtree share its nodes. No bytes a client sends can be taken for a node, whose freeing
+  would give back what it never held; and a node never names an index's table (`NotNameable`), whose rows only the
+  index that frees it gives back.
+- **The first type: a version's map of paths to contents** (`PathMap`). Every file of a version by path, its class
+  (its tool's, opaque) and its content. One trie a directory: a leaf of its entries in name order while that fits the
+  window, else a branch over the digits of each name's place (a BLAKE3 of the name read four bits a level), a node a
+  digit beneath it by the same rule, a hash array mapped trie [A: Bagwell, "Ideal Hash Trees", EPFL 2001]. The shape is
+  a function of the names alone, never of the order they came in, so the same map is the same root on every tier. A
+  branch records what its entries would take in one leaf, so a branch that comes to fit one becomes one with no read
+  beneath it. A change (each path set to a file, or removed, stated against the first parent's map) is derived by path
+  copying: the directories on its paths are looked up from the root down, each in one descent of its trie, and made
+  again from the deepest up, only the trie nodes on the changed names' places, every other node reused by identity
+  [A: Driscoll, Sarnak, Sleator and Tarjan, JCSS 1989]. `build` makes a map from its files alone, every directory
+  made. Refusals: a bad path, a removal of a path holding no file, a path both a file and a directory, an entry alone
+  past the window, a malformed node, a window under a full branch; a refused change leaves the store as it was.
+- **Tests** (`crates/vcs/src/derived/tests.rs`; `cargo test --locked -p slates-vcs --lib`, the Mac Studio d1323898,
+  2026-11-19, a fresh clone of the pushed branch, its own target directory).
+  - Red first (d6a600d69, 06:45 UTC): with `put_derived`, `Fill::step`, `PathMap::apply` and `PathMap::build` refusing
+    at once, 11 of the 12 new tests failed; the hostile-bytes reader, not stubbed, passed.
+  - The oracle (`t_a647_every_value_equals_a_naive_recomputation_from_the_root`, 96 cases a run): generated histories
+    of roots, first parents and merges' second parents, removals, sets and runs over nested and wide directories, one
+    hostile operation in some, an eager declaration (window 640) filled as each version is recorded and a lazy one
+    (window 1024) read. Every value reads as the model's map and is, identity for identity, the map built from scratch
+    from the model's files, the naive recomputation from the root; every derivation entered exactly the root and the
+    directories on its change's paths (the non-vacuity counter, `PathCounters::directories`); every fill derived and
+    walked exactly the versions it had to, one unit a step; every refusal is the model's; and once the values are
+    released the store holds the files' contents alone, once each. Its census, every run (28517b1ac, 06:57 UTC): 1,449
+    versions, 161 merges, 60 lazy fills of two versions or more, 133 splits and 24 collapses made by derivations, and
+    each of the four refusal kinds.
+  - Beside it: a lazy read walks to the nearest kept ancestor (21 walked and 21 derived in 42 steps, then 9 and 9 in
+    18); an eager type is filled as each version is recorded, two steps each, and one declared late fills its history
+    from the root; a value never changes (`Diverged`, `Identical`); a fork shares values and keeps its own; the fill's
+    refusals; a parent gone before the derivation is walked again; one file changed among 1,000 in a directory puts the
+    root's leaf and the nodes on its trie path alone (read by the format's own rule), where the build put every node;
+    a directory cut from 40 files to 10 becomes one leaf; the path map's refusals; a refused change leaves the store as
+    it was; the format's golden (a one-file map's bytes written by hand, its identity BLAKE3's key derivation over
+    them); a derived node's holds and its freeing; hostile node bytes.
+  - Green: 43 of 43 at f43c6e71d, then 45 of 45 at 28517b1ac in 2.12 s; `cargo fmt` clean.
+  - Red six ways, one mutation at a time in the Studio's clone: a derivation built from scratch (the non-vacuity
+    counter failed the oracle: one directory entered where the change named none); the second parent's value read for
+    the first's (the oracle); a derivation's own hold kept (the oracle's last holds, the fork test); no cycle check
+    (the refusals test); an eager type computed lazily (the oracle, the eager test); and no collapse, which passed all
+    42 tests at ec31c6408 because no generated history had shrunk a split directory under the window. The collapse test
+    and the runs of the wide directory came of that: since f43c6e71d no collapse fails two tests, the oracle among them.
+- **Owed.** Part 2: A-614's D(k) rows as a type, its outputs unchanged. Then A-553's node revisions and A-588's
+  manifests as types; the server's use (each repository's `Derivations` on its owner shard, eager types filled where a
+  version is recorded, lazy ones read by the queries A-645 names); dropping a value no version needs; a release and a
+  derivation larger than a slice cut into slices (one call today, as A-581's releases); a version's map of paths to
+  contents for a green's state (its eight maps, A-534) and a tool's trees from it; values offered between tiers by
+  identity.
+- **Applied in the same change to:** `crates/vcs/src/derived.rs`, `derived/paths.rs`, `derived/tests.rs` (new);
+  `crates/vcs/src/content.rs` (`Form::Derived`, `put_derived`, `derived`, `DerivedNode`, `encode_derived`, the release
+  cascade, `NotNameable`, `ContentCounters::derived`); `crates/vcs/src/lib.rs`; A-645's entry; §4.17.1 "Reads"; GAPS'
+  §4.17 entry.
