@@ -17,6 +17,25 @@
 //! seal refused) leaves the volume owing a whole record: its next publication ships the volume's whole image, and that
 //! entry is the checkpoint an install is made from ([`Shipper::mark_checkpoint`]).
 //!
+//! **Whose holders a log counts (A-240; A-601's question, answered 2026-11-19).** A takeover counts its `f + 1` reports
+//! only among the holders the volume's catalog records, and a successor going on with the log it adopted ships only to
+//! those, never to a member that joined since and holds none of the log. The configuration's candidates are taken
+//! instead only for a log that begins here, which no holder holds a durable entry of yet:
+//! - a shipper ships nothing until its epoch and holders are recorded in the catalog and that version is placed at
+//!   `f + 1` (`holders_placed`), so every log that ever shipped has a record that every takeover's catalog round meets;
+//! - a takeover runs phase one over a live log only when the catalog it adopts records holders (`fleet::materialize`).
+//!   A catalog that records none is served from its placed seal, and its successor's log begins new (`planned`: only a
+//!   live takeover's adopted head starts a log `Adopted`);
+//! - a successor that adopted a log keeps the holders its takeover counted in its record (`verbs::finish_making`), and
+//!   [`published`] ships to them.
+//!
+//! So a live-shipped volume can be taken over with no holders recorded: its owner lost before its first shipper's
+//! holders were placed, as for a volume just made live, or a new live clone, whose record `verbs::publish_clone_as`
+//! clears. Then no holder is counted at all, and refusing the takeover would leave unserved a volume its placed seal
+//! holds (A-577).
+//! The nemesis's model once gave the successor of an adopted log every host it knew, fresh members included, so a later
+//! phase one could count `f + 1` holders that held nothing (`crates/db/tests/live.rs`, A-601); the daemon never did.
+//!
 //! **The barrier (A-200).** A recorded verb on a live volume commits its effects but neither records its completion nor
 //! answers until the log is durable where its publication put it ([`durable_target`], [`defer`]); then both follow
 //! ([`resolve`]), and a retry meanwhile joins the wait ([`join`]), so no client reads a success that `f` candidates
@@ -2021,11 +2040,13 @@ pub(crate) fn published(
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
   // A new shipper starts from the holder set the volume's catalog records, less this node, when it records one: a
-  // successor's is the set its takeover counted (the dead owner's record, kept by `verbs::materialize_taken_over`), and
+  // successor's is the set its takeover counted (the dead owner's record, kept by `verbs::finish_making`), and
   // an owner restarted at its epoch finds its own. Those hosts hold the log; the configuration's candidates may be a set
   // the old owner was still moving to, holding none of it, and recorded at once they would leave the next takeover
   // counting them. The shipper moves to the configuration by a transition of its own ([`follow_candidates`]). With no
-  // record, nothing was ever shipped, and it starts from the configuration.
+  // record, nothing was ever shipped and no takeover adopted a log, so this log begins new and starts from the
+  // configuration, a newcomer among them included: none holds a durable entry of it yet (the module doc, "Whose holders
+  // a log counts").
   let recorded: Option<Vec<HostId>> = state
     .db
     .partition()

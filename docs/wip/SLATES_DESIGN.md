@@ -49912,3 +49912,36 @@ room test's query case), GAPS (§4.17.3: the open item closed, a Fixed line).
   admitting 256 bytes a request, by a path past them, by a query whose fields are past them, and with an `X-HgArg`
   header past them, then of a repository whose policy holds a rule only git reads: `414`, `414`, `431`, `500`.
 - **Owed.** The other platforms' runs (main's).
+
+### A-601, continued (1) — A takeover with no live holders recorded counts none, and the configuration names only a new log's holders (2026-11-19, g229, A-601's question to main; §4.10 "Live shipping"; A-240, A-577)
+Applied in the same change to: `crates/server/src/live_ship.rs` (its module doc, "Whose holders a log counts", and the
+comment where `published` chooses a new shipper's holders); GAPS (the register nemesis's entry: the question answered).
+
+- **The question.** A-601 found its model's successor naming fresh members as holders of a log it had adopted. The
+  daemon's successor takes the holders its volume's record names, and the configuration's candidates when it records
+  none (`live_ship::published`). Could a live-shipped volume be taken over with no holders recorded, and a fresh member
+  then be counted as a holder of a log it never held?
+- **The answer, by reading: it can be taken over so, and nothing is counted.** A shipper ships nothing until its
+  epoch and holders are recorded in the catalog and that version is placed at `f + 1` (`live_ship::holders_placed`), so
+  every log that ever shipped has a record every takeover's catalog round meets. A takeover runs phase one over a live
+  log only when the catalog it adopts records holders (`fleet::materialize`); one that records none had an owner lost
+  before its first shipper's holders were placed (a volume just made live, or a new live clone, whose record
+  `verbs::publish_clone_as` clears) and is served from its placed seal. Its successor's log then begins new
+  (`live_ship::planned`: only a live takeover's adopted head starts a log `Adopted`), and the configuration's
+  candidates it ships to hold no durable entry of that log until its own holders are recorded and placed. A successor
+  that adopted a log keeps the holders its takeover counted (`verbs::finish_making`) and ships to them.
+- **Not changed.** Refusing a takeover with none recorded would leave unserved a volume its placed seal holds (A-577's
+  window, `live_ship::holds_nothing_yet`). The hole was the model's alone; A-601 fixed it there.
+- **Also corrected:** the comment at the holder choice named `verbs::materialize_taken_over`, a test-only wrapper, as
+  where a successor's record keeps its holders; it is `verbs::finish_making`.
+- **Tests** macOS arm64, Mac Studio, 2026-11-19, kiln r215, on 5a92d4ec7 (main 22855c29e with this change merged: the
+  code this commit lands), `--test-threads=4`. The change is documentation alone; the runs show the behaviour it
+  describes stands.
+  - `cargo fmt -p slates-server -- --check`: clean.
+  - `cargo test --locked -p slates-server --lib`, filtered to `live_ship::`, `takeover::` and A-577's
+    `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`: 38 of 38.
+  - The fleet's live-shipping tests by name (`cargo test --locked -p slates-server --test fleet`): 17 of 17, among
+    them `a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`,
+    `a_successors_live_log_goes_on_past_every_position_durable_before_it` and
+    `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to`.
+  - The Linux and Windows runs are owed.
