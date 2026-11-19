@@ -12206,7 +12206,11 @@ is one more version, and the chain itself is never rewritten.
 > any tier computes, keeps and serves it with no coordination; computed eagerly as each version is recorded or lazily
 > when first read, by the type's own declaration, a unit a step under the shard's slices. Its first type is a version's
 > map of paths to contents (`derived/paths.rs`). A-614's D(k) and reached sets are one since A-647 part 2
-> (`crates/git/src/store/reach.rs`). Owed: A-553's and A-588's stores as types, and the server's use (A-647's entries).
+> (`crates/git/src/store/reach.rs`). Ancestry is one since A-666 part 1 (`derived/ancestry.rs`): each version's value
+> holds Mononoke's commit-graph fields (its generation, first-parent and skip-tree skew jumps, its run bottom and its
+> skip-tree parent, a dominator), so is-ancestor, the merge bases and bisect's midpoint are answered from the values,
+> logarithmic along runs and linear only in the merges a question must open. Owed: A-553's and A-588's stores as types,
+> and the server's use (A-647's and A-666's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -44111,7 +44115,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
-    client.
+    client. (Built, A-666 part 1: is-ancestor, the merge bases as `git merge-base --all` answers them, and bisect's
+    midpoint, from a type of derived data under A-647 holding Mononoke's commit-graph fields; no exact answer is
+    constant-time on histories of merges (Pǎtraşcu 2011), so each costs a search logarithmic along runs and a step for
+    each merge it must open. Owed: path history and blame; the server's verbs over the type.)
   - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
     request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
     above it (with goal 91's federation).

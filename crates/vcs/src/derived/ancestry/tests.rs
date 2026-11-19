@@ -79,7 +79,9 @@ fn number(index: usize) -> u64 {
 
 /// The version a found value names.
 fn version_of(found: &Found) -> usize {
-  index(u64::from_be_bytes(found.name.as_slice().try_into().unwrap()))
+  index(u64::from_be_bytes(
+    found.name.as_slice().try_into().unwrap(),
+  ))
 }
 
 /// The versions found values name.
@@ -160,7 +162,9 @@ impl Grower {
   fn octopus(&mut self, one: usize) {
     if self.tips.len() >= 3 && self.room() >= 1 {
       let first = one % self.tips.len();
-      let parents: Vec<u64> = (0..3).map(|at| self.tips[(first + at) % self.tips.len()]).collect();
+      let parents: Vec<u64> = (0..3)
+        .map(|at| self.tips[(first + at) % self.tips.len()])
+        .collect();
       if parents[0] != parents[1] && parents[1] != parents[2] && parents[0] != parents[2] {
         self.tips[first] = self.history.push(parents);
       }
@@ -277,7 +281,12 @@ impl Model {
   }
 
   fn record(&mut self, at: usize, parents: Vec<usize>, words: usize) {
-    let generation = 1 + parents.iter().map(|parent| self.generation[*parent]).max().unwrap_or(0);
+    let generation = 1
+      + parents
+        .iter()
+        .map(|parent| self.generation[*parent])
+        .max()
+        .unwrap_or(0);
     let depth = parents.first().map_or(0, |first| self.depth[*first] + 1);
     let bottom = match parents.as_slice() {
       [only] if self.parents[*only].len() == 1 => self.bottom[*only],
@@ -285,7 +294,9 @@ impl Model {
       _ => at,
     };
     let mut ancestors = vec![0; words];
-    let mut dominators = parents.first().map_or(vec![0; words], |first| self.dominators[*first].clone());
+    let mut dominators = parents
+      .first()
+      .map_or(vec![0; words], |first| self.dominators[*first].clone());
     for parent in &parents {
       ancestors = union(&ancestors, &self.ancestors[*parent]);
       for (word, more) in dominators.iter_mut().zip(&self.dominators[*parent]) {
@@ -342,20 +353,32 @@ impl Model {
 
   /// The versions `among` holds at or above generation `floor`: what a walk by generation visits at least.
   fn walked(&self, among: &Bits, floor: u64) -> u64 {
-    number(members(among).into_iter().filter(|at| self.generation[*at] >= floor).count())
+    number(
+      members(among)
+        .into_iter()
+        .filter(|at| self.generation[*at] >= floor)
+        .count(),
+    )
   }
 
   /// The merge bases by definition: the common ancestors that are no proper ancestor of another, the greatest
   /// generation first, then by version.
   fn bases(&self, one: usize, two: usize) -> Vec<usize> {
-    let common: Bits = self.ancestors[one].iter().zip(&self.ancestors[two]).map(|(a, b)| a & b).collect();
+    let common: Bits = self.ancestors[one]
+      .iter()
+      .zip(&self.ancestors[two])
+      .map(|(a, b)| a & b)
+      .collect();
     let mut below = vec![0; common.len()];
     for at in members(&common) {
       for parent in &self.parents[at] {
         below = union(&below, &self.ancestors[*parent]);
       }
     }
-    let mut bases: Vec<usize> = members(&common).into_iter().filter(|at| !has(&below, *at)).collect();
+    let mut bases: Vec<usize> = members(&common)
+      .into_iter()
+      .filter(|at| !has(&below, *at))
+      .collect();
     bases.sort_by_key(|at| (Reverse(self.generation[*at]), *at));
     bases
   }
@@ -373,9 +396,16 @@ impl Model {
     members(&candidates)
       .into_iter()
       .map(|at| {
-        let reached: Bits = self.ancestors[at].iter().zip(&candidates).map(|(a, c)| a & c).collect();
+        let reached: Bits = self.ancestors[at]
+          .iter()
+          .zip(&candidates)
+          .map(|(a, c)| a & c)
+          .collect();
         let weight = count(&reached);
-        ((weight.min(total - weight), self.generation[at], Reverse(at)), (at, weight, total))
+        (
+          (weight.min(total - weight), self.generation[at], Reverse(at)),
+          (at, weight, total),
+        )
       })
       .max_by_key(|(rank, _)| *rank)
       .map(|(_, answer)| answer)
@@ -386,7 +416,13 @@ impl Model {
 /// before (a 2 as the lowest non-zero digit becomes 0 and carries one up; else the lowest digit grows), its lowest
 /// non-zero digit less one, read back as a number, position i worth 2^(i + 1) - 1.
 fn digit_jumps(up_to: u64) -> Vec<u64> {
-  let worth = |digits: &[u64]| -> u64 { digits.iter().enumerate().map(|(at, digit)| digit * ((2 << at) - 1)).sum() };
+  let worth = |digits: &[u64]| -> u64 {
+    digits
+      .iter()
+      .enumerate()
+      .map(|(at, digit)| digit * ((2 << at) - 1))
+      .sum()
+  };
   let mut digits = vec![0_u64; DIGITS];
   let mut jumps = vec![0];
   for _ in 1..=up_to {
@@ -444,9 +480,17 @@ impl Fixture {
   fn eager(history: &History) -> Fixture {
     let mut fixture = Fixture::empty(Mode::Eager);
     for version in 0..number(history.len()) {
-      let recorded = fixture.derivations.recorded(&mut fixture.store, &fixture.ty, version);
+      let recorded = fixture
+        .derivations
+        .recorded(&mut fixture.store, &fixture.ty, version);
       let mut fill = recorded.unwrap().unwrap();
-      let root = drive(&mut fill, &mut fixture.derivations, &mut fixture.ty, history, &mut fixture.store);
+      let root = drive(
+        &mut fill,
+        &mut fixture.derivations,
+        &mut fixture.ty,
+        history,
+        &mut fixture.store,
+      );
       fill.release(&mut fixture.store).unwrap();
       fixture.roots.push(root);
     }
@@ -458,11 +502,19 @@ impl Fixture {
     let mut fixture = Fixture::empty(Mode::Lazy);
     let mut roots = vec![None; history.len()];
     for version in order {
-      let read = fixture.derivations.read(&mut fixture.store, &fixture.ty, history, *version);
+      let read = fixture
+        .derivations
+        .read(&mut fixture.store, &fixture.ty, history, *version);
       let root = match read.unwrap() {
         Read::Ready(root) => root,
         Read::Fill(mut fill) => {
-          let root = drive(&mut fill, &mut fixture.derivations, &mut fixture.ty, history, &mut fixture.store);
+          let root = drive(
+            &mut fill,
+            &mut fixture.derivations,
+            &mut fixture.ty,
+            history,
+            &mut fixture.store,
+          );
           fill.release(&mut fixture.store).unwrap();
           root
         }
@@ -588,47 +640,115 @@ fn bisect_bound(cost: &QueryCost, l: u64) -> u64 {
 
 /// Asks whether `one` is an ancestor of `two`: the model's answer, within its bound, never opening a merge the model
 /// does not put above the target.
-fn ask_ancestor(fixture: &mut Fixture, model: &Model, (one, two): (usize, usize), census: &mut Census) {
-  let (answer, cost) = is_ancestor(&mut fixture.store, fixture.root(one), fixture.root(two)).unwrap();
-  assert_eq!(answer, model.is_ancestor(one, two), "is {one} an ancestor of {two}");
+fn ask_ancestor(
+  fixture: &mut Fixture,
+  model: &Model,
+  (one, two): (usize, usize),
+  census: &mut Census,
+) {
+  let (answer, cost) =
+    is_ancestor(&mut fixture.store, fixture.root(one), fixture.root(two)).unwrap();
+  assert_eq!(
+    answer,
+    model.is_ancestor(one, two),
+    "is {one} an ancestor of {two}"
+  );
   let above = model.merge_parents(&model.ancestors[two], model.generation[one]);
-  let within = (cost.parents <= above, cost.reads <= cost.visits, cost.visits <= ancestor_bound(&cost, model.l()));
-  assert_eq!(within, (true, true, true), "{one} in {two}: {cost:?}, {above} parents above");
+  let within = (
+    cost.parents <= above,
+    cost.reads <= cost.visits,
+    cost.visits <= ancestor_bound(&cost, model.l()),
+  );
+  assert_eq!(
+    within,
+    (true, true, true),
+    "{one} in {two}: {cost:?}, {above} parents above"
+  );
   census.ancestors += u64::from(answer);
   census.not_ancestors += u64::from(!answer);
   census.fewer_opened += u64::from(cost.parents < above);
-  census.note_cost(&cost, model.walked(&model.ancestors[two], model.generation[one]));
+  census.note_cost(
+    &cost,
+    model.walked(&model.ancestors[two], model.generation[one]),
+  );
 }
 
 /// Asks for the merge bases of `one` and `two`: the model's, each with its root and generation, within the paint's
 /// bound, its entries at most the two asked of and what merges and jumps brought.
-fn ask_bases(fixture: &mut Fixture, model: &Model, (one, two): (usize, usize), census: &mut Census) {
-  let (found, cost) = merge_bases(&mut fixture.store, fixture.root(one), fixture.root(two)).unwrap();
+fn ask_bases(
+  fixture: &mut Fixture,
+  model: &Model,
+  (one, two): (usize, usize),
+  census: &mut Census,
+) {
+  let (found, cost) =
+    merge_bases(&mut fixture.store, fixture.root(one), fixture.root(two)).unwrap();
   let versions = versions_of(&found);
-  assert_eq!(versions, model.bases(one, two), "the merge bases of {one} and {two}");
-  let named: Vec<(ContentId, u64)> = found.iter().map(|base| (base.root, base.generation)).collect();
-  let expected: Vec<(ContentId, u64)> = versions.iter().map(|at| (fixture.root(*at), model.generation[*at])).collect();
+  assert_eq!(
+    versions,
+    model.bases(one, two),
+    "the merge bases of {one} and {two}"
+  );
+  let named: Vec<(ContentId, u64)> = found
+    .iter()
+    .map(|base| (base.root, base.generation))
+    .collect();
+  let expected: Vec<(ContentId, u64)> = versions
+    .iter()
+    .map(|at| (fixture.root(*at), model.generation[*at]))
+    .collect();
   assert_eq!(named, expected);
   let reach = union(&model.ancestors[one], &model.ancestors[two]);
   let parents = model.merge_parents(&reach, 0);
   let seeded = cost.entries <= 2 + cost.parents + cost.jumps;
-  let within = (cost.parents <= parents, seeded, cost.visits <= paint_bound(&cost, model.l()));
-  assert_eq!(within, (true, true, true), "bases of {one} and {two}: {cost:?}, {parents} parents");
+  let within = (
+    cost.parents <= parents,
+    seeded,
+    cost.visits <= paint_bound(&cost, model.l()),
+  );
+  assert_eq!(
+    within,
+    (true, true, true),
+    "bases of {one} and {two}: {cost:?}, {parents} parents"
+  );
   census.one_base += u64::from(versions.len() == 1);
   census.several_bases += u64::from(versions.len() > 1);
   census.no_base += u64::from(versions.is_empty());
-  let floor = versions.iter().map(|at| model.generation[*at]).min().unwrap_or(1);
+  let floor = versions
+    .iter()
+    .map(|at| model.generation[*at])
+    .min()
+    .unwrap_or(1);
   census.note_cost(&cost, model.walked(&reach, floor));
 }
 
 /// Asks bisect for its midpoint between `bad` and `goods`: the model's version, weight and count, within its bound.
-fn ask_bisect(fixture: &mut Fixture, model: &Model, bad: usize, goods: &[usize], census: &mut Census) {
+fn ask_bisect(
+  fixture: &mut Fixture,
+  model: &Model,
+  bad: usize,
+  goods: &[usize],
+  census: &mut Census,
+) {
   let good_roots: Vec<ContentId> = goods.iter().map(|good| fixture.root(*good)).collect();
   let (midpoint, cost) = bisect(&mut fixture.store, fixture.root(bad), &good_roots).unwrap();
-  let answer = midpoint.map(|midpoint| (version_of(&midpoint.found), midpoint.weight, midpoint.candidates));
-  assert_eq!(answer, model.bisect(bad, goods), "bisect {bad} against {goods:?}");
+  let answer = midpoint.map(|midpoint| {
+    (
+      version_of(&midpoint.found),
+      midpoint.weight,
+      midpoint.candidates,
+    )
+  });
+  assert_eq!(
+    answer,
+    model.bisect(bad, goods),
+    "bisect {bad} against {goods:?}"
+  );
   let bound = bisect_bound(&cost, model.l());
-  assert!(cost.visits <= bound, "bisect {bad} against {goods:?}: {cost:?} past {bound}");
+  assert!(
+    cost.visits <= bound,
+    "bisect {bad} against {goods:?}: {cost:?} past {bound}"
+  );
   census.bisects += 1;
   census.no_candidates += u64::from(answer.is_none());
   census.bisects_over_merges += u64::from(cost.segments >= 2);
@@ -642,13 +762,33 @@ fn check_values(fixture: &Fixture, model: &Model) {
   let jumps = digit_jumps(number(model.len()));
   for at in 0..model.len() {
     let node = read_node(&fixture.store, fixture.root(at)).unwrap().made;
-    let parents: Vec<ContentId> = model.parents[at].iter().map(|parent| fixture.root(*parent)).collect();
+    let parents: Vec<ContentId> = model.parents[at]
+      .iter()
+      .map(|parent| fixture.root(*parent))
+      .collect();
     let bottom = (model.parents[at].len() == 1).then(|| fixture.root(model.bottom[at]));
     let numbers = (model.generation[at], model.depth[at], model.skip_depth[at]);
-    assert_eq!(((node.generation, node.depth, node.skip_depth), &node.parents, node.bottom), (numbers, &parents, bottom));
-    let jump = (node.depth > 0).then(|| fixture.root(model.first_parent_at(at, jumps[index(node.depth)])));
-    let skip_jump = |idom| (fixture.root(idom), fixture.root(model.dominator_at(at, jumps[index(model.skip_depth[at])])));
-    assert_eq!((node.jump, node.skip), (jump, model.idom[at].map(skip_jump)), "version {at}'s links");
+    assert_eq!(
+      (
+        (node.generation, node.depth, node.skip_depth),
+        &node.parents,
+        node.bottom
+      ),
+      (numbers, &parents, bottom)
+    );
+    let jump =
+      (node.depth > 0).then(|| fixture.root(model.first_parent_at(at, jumps[index(node.depth)])));
+    let skip_jump = |idom| {
+      (
+        fixture.root(idom),
+        fixture.root(model.dominator_at(at, jumps[index(model.skip_depth[at])])),
+      )
+    };
+    assert_eq!(
+      (node.jump, node.skip),
+      (jump, model.idom[at].map(skip_jump)),
+      "version {at}'s links"
+    );
   }
 }
 
@@ -660,13 +800,21 @@ fn same_however_filled(history: &History, eager: &Fixture, stride: usize) {
   let mut order: Vec<u64> = (0..count).map(|at| number((at * step) % count)).collect();
   order.extend((0..number(count)).rev());
   let lazy = Fixture::lazy(history, &order);
-  assert_eq!(lazy.roots, eager.roots, "the same value whatever the filling's order");
+  assert_eq!(
+    lazy.roots, eager.roots,
+    "the same value whatever the filling's order"
+  );
   lazy.finish();
 }
 
 /// Asks every question of one pair: is-ancestor both ways, the merge bases, and a bisect of the second against the
 /// first, or against nothing, or against the first and a third.
-fn ask_all(fixture: &mut Fixture, model: &Model, (one, two, three): (usize, usize, usize), census: &mut Census) {
+fn ask_all(
+  fixture: &mut Fixture,
+  model: &Model,
+  (one, two, three): (usize, usize, usize),
+  census: &mut Census,
+) {
   ask_ancestor(fixture, model, (one, two), census);
   ask_ancestor(fixture, model, (two, one), census);
   ask_bases(fixture, model, (one, two), census);
@@ -690,10 +838,20 @@ fn case(ops: &[Op], queries: &[(usize, usize, usize)]) -> Census {
   check_values(&fixture, &model);
   same_however_filled(&history, &fixture, ops.len() * 7 + 1);
   for (x, y, z) in queries {
-    ask_all(&mut fixture, &model, (x % model.len(), y % model.len(), *z), &mut census);
+    ask_all(
+      &mut fixture,
+      &model,
+      (x % model.len(), y % model.len(), *z),
+      &mut census,
+    );
   }
   for pair in tips.windows(2) {
-    ask_all(&mut fixture, &model, (index(pair[0]), index(pair[1]), index(pair[0])), &mut census);
+    ask_all(
+      &mut fixture,
+      &model,
+      (index(pair[0]), index(pair[1]), index(pair[0])),
+      &mut census,
+    );
   }
   fixture.finish();
   census
@@ -754,8 +912,14 @@ impl Derived {
   /// Records a version of `parents` and derives its value.
   fn push(&mut self, parents: &[u64]) -> u64 {
     let version = self.history.push(parents.to_vec());
-    let values: Vec<ContentId> = parents.iter().map(|parent| self.roots[index(*parent)]).collect();
-    let root = self.ty.derive(&self.history, &mut self.store, version, &values).unwrap();
+    let values: Vec<ContentId> = parents
+      .iter()
+      .map(|parent| self.roots[index(*parent)])
+      .collect();
+    let root = self
+      .ty
+      .derive(&self.history, &mut self.store, version, &values)
+      .unwrap();
     self.roots.push(root);
     version
   }
@@ -791,8 +955,13 @@ fn long_history() -> (Derived, u64, u64) {
 /// The merge bases of `one` and `two` in a derived history, and whether the paint stayed within its bound and under a
 /// thousand visits.
 fn bases_within(derived: &mut Derived, (one, two): (u64, u64), l: u64) -> (Vec<usize>, bool, bool) {
-  let (bases, cost) = merge_bases(&mut derived.store, derived.root(one), derived.root(two)).unwrap();
-  (versions_of(&bases), cost.visits <= paint_bound(&cost, l), cost.visits < 1_000)
+  let (bases, cost) =
+    merge_bases(&mut derived.store, derived.root(one), derived.root(two)).unwrap();
+  (
+    versions_of(&bases),
+    cost.visits <= paint_bound(&cost, l),
+    cost.visits < 1_000,
+  )
 }
 
 /// A-666 (the bound's point). Do: derive a linear history of 2^17 versions and a side branch of 5,000 off version
@@ -805,17 +974,36 @@ fn bases_within(derived: &mut Derived, (one, two): (u64, u64), l: u64) -> (Vec<u
 fn t_a666_a_long_linear_history_is_answered_in_logarithmic_visits() {
   let (mut derived, tip, side) = long_history();
   let l = 3 * floor_lg(LONG_HISTORY + 1);
-  let (yes, cost) = is_ancestor(&mut derived.store, derived.root(1_000), derived.root(tip)).unwrap();
-  assert_eq!((yes, cost.visits <= ancestor_bound(&cost, l)), (true, true), "{cost:?}");
+  let (yes, cost) =
+    is_ancestor(&mut derived.store, derived.root(1_000), derived.root(tip)).unwrap();
+  assert_eq!(
+    (yes, cost.visits <= ancestor_bound(&cost, l)),
+    (true, true),
+    "{cost:?}"
+  );
   let (no, cost) = is_ancestor(&mut derived.store, derived.root(tip), derived.root(1_000)).unwrap();
   assert_eq!((no, cost.visits <= 2), (false, true), "{cost:?}");
-  assert_eq!(bases_within(&mut derived, (tip, 50_000), l), (vec![50_000], true, true));
-  assert_eq!(bases_within(&mut derived, (side, tip), l), (vec![60_000], true, true));
+  assert_eq!(
+    bases_within(&mut derived, (tip, 50_000), l),
+    (vec![50_000], true, true)
+  );
+  assert_eq!(
+    bases_within(&mut derived, (side, tip), l),
+    (vec![60_000], true, true)
+  );
   let (midpoint, cost) = bisect(&mut derived.store, derived.root(tip), &[derived.root(0)]).unwrap();
   let midpoint = midpoint.unwrap();
-  let answer = (version_of(&midpoint.found), midpoint.weight, midpoint.candidates);
+  let answer = (
+    version_of(&midpoint.found),
+    midpoint.weight,
+    midpoint.candidates,
+  );
   let within = (cost.visits <= bisect_bound(&cost, l), cost.visits < 1_000);
-  assert_eq!((answer, within), ((65_536, 65_536, 131_071), (true, true)), "{cost:?}");
+  assert_eq!(
+    (answer, within),
+    ((65_536, 65_536, 131_071), (true, true)),
+    "{cost:?}"
+  );
   derived.finish();
 }
 
@@ -851,12 +1039,18 @@ fn t_a666_a_merge_heavy_history_opens_only_the_branches_open_across_the_target()
   let (mut derived, main) = pull_request_history();
   let tip = *main.last().unwrap();
   let target = main[403];
-  let (yes, cost) = is_ancestor(&mut derived.store, derived.root(target), derived.root(tip)).unwrap();
+  let (yes, cost) =
+    is_ancestor(&mut derived.store, derived.root(target), derived.root(tip)).unwrap();
   let bounded = cost.opened <= 2 * number(FORK_BACK);
   assert_eq!((yes, bounded), (true, true), "{cost:?}");
   let feature = derived.run(target, 10);
-  let (bases, cost) = merge_bases(&mut derived.store, derived.root(tip), derived.root(feature)).unwrap();
-  assert_eq!((versions_of(&bases), cost.jumps > 0), (vec![index(target)], true), "{cost:?}");
+  let (bases, cost) =
+    merge_bases(&mut derived.store, derived.root(tip), derived.root(feature)).unwrap();
+  assert_eq!(
+    (versions_of(&bases), cost.jumps > 0),
+    (vec![index(target)], true),
+    "{cost:?}"
+  );
   derived.finish();
 }
 
@@ -884,13 +1078,24 @@ fn t_a666_a_skew_search_meets_myers_bound_exactly() {
   let jumps = digit_jumps(511);
   for depth in 1..=511_u64 {
     assert_eq!(skew_jump_depth(depth), jumps[index(depth)], "J({depth})");
-    let searches: Vec<(u64, bool)> = (0..depth).map(|target| search(&mut derived, depth, target)).collect();
-    let most = searches.iter().skip(1).map(|(visits, _)| *visits).max().unwrap_or(0);
+    let searches: Vec<(u64, bool)> = (0..depth)
+      .map(|target| search(&mut derived, depth, target))
+      .collect();
+    let most = searches
+      .iter()
+      .skip(1)
+      .map(|(visits, _)| *visits)
+      .max()
+      .unwrap_or(0);
     let bound = (3 * floor_lg(depth + 1)).saturating_sub(2);
     let attained = (2..10).any(|k| depth == (1 << k) - k);
     let to_root = searches[0].0 <= floor_lg(depth + 1) + 1;
     let landed = searches.iter().all(|(_, landed)| *landed);
-    assert_eq!((landed, most <= bound, !attained || most == bound, to_root), (true, true, true, true), "from {depth}");
+    assert_eq!(
+      (landed, most <= bound, !attained || most == bound, to_root),
+      (true, true, true, true),
+      "from {depth}"
+    );
   }
   derived.finish();
 }
@@ -928,7 +1133,8 @@ fn t_a666_a_value_is_the_formats_bytes() {
 
 /// A derived node's identity, by BLAKE3's key derivation under the store's context, computed here.
 fn derived_identity(bytes: &[u8]) -> ContentId {
-  let mut hasher = blake3::Hasher::new_derive_key("slates-vcs 2026-11-19 object store: a derived value's node");
+  let mut hasher =
+    blake3::Hasher::new_derive_key("slates-vcs 2026-11-19 object store: a derived value's node");
   hasher.update(bytes);
   ContentId(*hasher.finalize().as_bytes())
 }
@@ -978,7 +1184,11 @@ fn forged(length: u64, link: Option<u64>, numbers: [u64; 3]) -> (Derived, Conten
   };
   let mut bytes = payload(1, 1, numbers);
   bytes.extend(u64::MAX.to_be_bytes());
-  let forged = derived.store.put_derived(&[link; 5], &bytes).unwrap().identity;
+  let forged = derived
+    .store
+    .put_derived(&[link; 5], &bytes)
+    .unwrap()
+    .identity;
   (derived, forged)
 }
 
@@ -995,7 +1205,10 @@ fn refused(mut derived: Derived, forged: ContentId, ancestry: bool) {
     refusals.push(is_ancestor(&mut derived.store, root, forged).map(|_| ()));
   }
   for refusal in refusals {
-    assert!(matches!(refusal, Err(AncestryRefused::Malformed { .. })), "{refusal:?}");
+    assert!(
+      matches!(refusal, Err(AncestryRefused::Malformed { .. })),
+      "{refusal:?}"
+    );
   }
   assert_eq!(derived.store.charged(), charged, "every charge given back");
 }
@@ -1026,14 +1239,33 @@ fn t_a666_refusals_by_kind_leave_the_store_as_it_was() {
   let root = derived.push(&[]);
   let child = derived.history.push(vec![root]);
   let used = derived.store.used();
-  let parents = derived.ty.derive(&derived.history, &mut derived.store, child, &[]);
-  assert_eq!(parents, Err(AncestryRefused::Parents { expected: 1, given: 0 }));
-  let unknown = derived.ty.derive(&derived.history, &mut derived.store, 99, &[]);
-  assert_eq!((unknown, derived.store.used()), (Err(AncestryRefused::NoVersion), used));
+  let parents = derived
+    .ty
+    .derive(&derived.history, &mut derived.store, child, &[]);
+  assert_eq!(
+    parents,
+    Err(AncestryRefused::Parents {
+      expected: 1,
+      given: 0
+    })
+  );
+  let unknown = derived
+    .ty
+    .derive(&derived.history, &mut derived.store, 99, &[]);
+  assert_eq!(
+    (unknown, derived.store.used()),
+    (Err(AncestryRefused::NoVersion), used)
+  );
   derived.store.set_budget(used);
   let question = is_ancestor(&mut derived.store, derived.roots[0], derived.roots[0]);
-  let over = matches!(question, Err(AncestryRefused::Content(ContentRefused::OverBudget { .. })));
-  assert_eq!((over, derived.store.charged(), derived.store.used()), (true, 0, used));
+  let over = matches!(
+    question,
+    Err(AncestryRefused::Content(ContentRefused::OverBudget { .. }))
+  );
+  assert_eq!(
+    (over, derived.store.charged(), derived.store.used()),
+    (true, 0, used)
+  );
   derived.store.set_budget(BUDGET);
   derived.finish();
 }

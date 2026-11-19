@@ -21,9 +21,10 @@
 //! **Bounds**, in values visited (each read from the store at most once a question). A search along a skew-jumped chain
 //! from depth D to a depth past the root visits at most 3⌊lg(D + 1)⌋ - 2 values \[A: Myers 1983, Corollary 5, tight\],
 //! and to the root at most ⌊lg(D + 1)⌋ + 1 (a jump a unit of its skew-binary digits); with `L` = 3⌊lg(n + 1)⌋ for a
-//! history of greatest generation n, a search visits at most L and a lowest common ancestor at most 3L. No index of linear size answers
-//! is-ancestor in constant time on histories of two-parent merges \[A: Pǎtraşcu 2011, Theorem 2\], so each bound has a
-//! part logarithmic along chains and a part linear in the merges a question must open (P: the parents they take in).
+//! history of greatest generation n, a search visits at most L and a lowest common ancestor at most 3L. No index of
+//! linear size answers is-ancestor in constant time on histories of two-parent merges \[A: Pǎtraşcu 2011, Theorem 2\],
+//! so each bound has a part logarithmic along chains and a part linear in the merges a question must open (P: the
+//! parents they take in).
 //! - [`is_ancestor`]: Mononoke's lowering \[C: `lib.rs` 519-531, `frontier.rs` 120-160\]: the descendant's frontier
 //!   jumps along the skip tree to the lowest version still at the ancestor's generation, and opens a merge only when
 //!   its skip-tree parent lies below it. At most 2 + (1 + P)(2L + 3) visits; O(lg n) on a linear history.
@@ -327,7 +328,11 @@ impl Made {
     }
     let mut payload = Vec::with_capacity(HEAD_BYTES.saturating_add(self.name.len()));
     payload.extend_from_slice(&count.to_le_bytes());
-    payload.push(if self.skip.is_some() { HAS_SKIP } else { NO_SKIP });
+    payload.push(if self.skip.is_some() {
+      HAS_SKIP
+    } else {
+      NO_SKIP
+    });
     for number in [self.generation, self.depth, self.skip_depth] {
       payload.extend_from_slice(&number.to_le_bytes());
     }
@@ -368,8 +373,16 @@ fn decode(names: &[ContentId], payload: &[u8]) -> Option<Made> {
   };
   let mut names = names.iter().copied();
   let parents: Vec<ContentId> = names.by_ref().take(count).collect();
-  let jump = if count == 0 { None } else { Some(names.next()?) };
-  let bottom = if count == 1 { Some(names.next()?) } else { None };
+  let jump = if count == 0 {
+    None
+  } else {
+    Some(names.next()?)
+  };
+  let bottom = if count == 1 {
+    Some(names.next()?)
+  } else {
+    None
+  };
   let skip = if has_skip {
     Some((names.next()?, names.next()?))
   } else {
@@ -475,7 +488,10 @@ impl<'s> Walk<'s> {
   }
 
   /// Gives back what the walk charged, and its answer with its cost; past a refusal of either, the first.
-  fn finish<T>(self, answer: Result<T, AncestryRefused>) -> Result<(T, QueryCost), AncestryRefused> {
+  fn finish<T>(
+    self,
+    answer: Result<T, AncestryRefused>,
+  ) -> Result<(T, QueryCost), AncestryRefused> {
     let discharged = self.store.discharge(self.charged);
     let answer = answer?;
     discharged?;
@@ -626,7 +642,10 @@ enum Meet {
 /// Myers' rule, a jump while their jumps differ, else a step: a search toward the depth under their meeting point and one
 /// step more, two values each, at most 2L visits; at most 3L in all.
 fn meet(walk: &mut Walk<'_>, tree: Tree, one: usize, two: usize) -> Result<Meet, AncestryRefused> {
-  let (deep_one, deep_two) = (step_of(walk, tree, one)?.depth, step_of(walk, tree, two)?.depth);
+  let (deep_one, deep_two) = (
+    step_of(walk, tree, one)?.depth,
+    step_of(walk, tree, two)?.depth,
+  );
   let first = ancestor_at(walk, tree, one, deep_one.min(deep_two))?;
   let second = ancestor_at(walk, tree, two, deep_one.min(deep_two))?;
   if first == second {
@@ -696,7 +715,13 @@ fn skip_lowest(walk: &mut Walk<'_>, mut at: usize, floor: u64) -> Result<usize, 
     let (Some(parent), Some(jump)) = (step.parent, step.jump) else {
       return Ok(at);
     };
-    let jumped = follow(walk, SKIP_TREE, jump, skew_jump_depth(step.depth), step.generation)?;
+    let jumped = follow(
+      walk,
+      SKIP_TREE,
+      jump,
+      skew_jump_depth(step.depth),
+      step.generation,
+    )?;
     if walk.node(jumped)?.made.generation >= floor {
       at = jumped;
       continue;
@@ -715,7 +740,11 @@ fn skip_lowest(walk: &mut Walk<'_>, mut at: usize, floor: u64) -> Result<usize, 
 
 /// A version's value from its parents' values (module docs): its generation, its depths, its jumps by Myers' rule, its
 /// run bottom and its skip-tree parent.
-fn made(walk: &mut Walk<'_>, parents: &[ContentId], name: Vec<u8>) -> Result<Made, AncestryRefused> {
+fn made(
+  walk: &mut Walk<'_>,
+  parents: &[ContentId],
+  name: Vec<u8>,
+) -> Result<Made, AncestryRefused> {
   let mut handles = Vec::with_capacity(parents.len());
   for parent in parents {
     handles.push(walk.get(*parent)?);
@@ -766,13 +795,22 @@ fn bottom_link(walk: &Walk<'_>, parent: usize) -> Result<ContentId, AncestryRefu
 /// child's jump depth is the parent's depth, else (Lemma 3) the parent's jump's jump.
 fn pushed(walk: &mut Walk<'_>, tree: Tree, parent: usize) -> Result<ContentId, AncestryRefused> {
   let step = step_of(walk, tree, parent)?;
-  let depth = step.depth.checked_add(1).ok_or(AncestryRefused::Exhausted)?;
+  let depth = step
+    .depth
+    .checked_add(1)
+    .ok_or(AncestryRefused::Exhausted)?;
   let target = skew_jump_depth(depth);
   if target == step.depth {
     return Ok(step.root);
   }
   let jump = step.jump.ok_or(malformed(step.root))?;
-  let then = follow(walk, tree, jump, skew_jump_depth(step.depth), step.generation)?;
+  let then = follow(
+    walk,
+    tree,
+    jump,
+    skew_jump_depth(step.depth),
+    step.generation,
+  )?;
   let then = step_of(walk, tree, then)?;
   if skew_jump_depth(then.depth) != target {
     return Err(malformed(jump));
@@ -797,7 +835,10 @@ fn skip_of(walk: &mut Walk<'_>, parents: &[usize]) -> Result<(SkipLinks, u64), A
     }
   }
   let step = step_of(walk, SKIP_TREE, lowest)?;
-  let depth = step.depth.checked_add(1).ok_or(AncestryRefused::Exhausted)?;
+  let depth = step
+    .depth
+    .checked_add(1)
+    .ok_or(AncestryRefused::Exhausted)?;
   let jump = pushed(walk, SKIP_TREE, lowest)?;
   Ok((Some((step.root, jump)), depth))
 }
@@ -1187,7 +1228,11 @@ fn join_one(
 }
 
 /// Paints a joined run: each version its entry's paint, then each its children's, deepest first.
-fn paint_joined(walk: &Walk<'_>, joined: &mut Joined, entries: &Run) -> Result<(), AncestryRefused> {
+fn paint_joined(
+  walk: &Walk<'_>,
+  joined: &mut Joined,
+  entries: &Run,
+) -> Result<(), AncestryRefused> {
   let mut members: Vec<(u64, usize)> = Vec::with_capacity(joined.parents.len().saturating_add(1));
   members.push((walk.node(joined.bottom)?.made.depth, joined.bottom));
   for child in joined.parents.keys() {
@@ -1272,7 +1317,11 @@ pub fn merge_bases(
 }
 
 /// [`merge_bases`]'s paint.
-fn bases(walk: &mut Walk<'_>, one: ContentId, two: ContentId) -> Result<Vec<Found>, AncestryRefused> {
+fn bases(
+  walk: &mut Walk<'_>,
+  one: ContentId,
+  two: ContentId,
+) -> Result<Vec<Found>, AncestryRefused> {
   let mut pending = Pending::default();
   let first = walk.get(one)?;
   pending.add(walk, first, ONE)?;
@@ -1299,7 +1348,11 @@ fn bases(walk: &mut Walk<'_>, one: ContentId, two: ContentId) -> Result<Vec<Foun
 }
 
 /// The merge bases a joined run holds: its versions painted both sides and not stale, with no child painted both.
-fn bases_in(walk: &Walk<'_>, joined: &Joined, found: &mut Vec<Found>) -> Result<(), AncestryRefused> {
+fn bases_in(
+  walk: &Walk<'_>,
+  joined: &Joined,
+  found: &mut Vec<Found>,
+) -> Result<(), AncestryRefused> {
   let mut under_both = BTreeSet::new();
   for (child, parent) in &joined.parents {
     if joined.paint(*child) & BOTH == BOTH {
@@ -1464,7 +1517,12 @@ impl Segments {
 
   /// The version on segment `index` whose weight is `weight`: its top, or the top's first-parent ancestor that many
   /// versions under it.
-  fn version_at(&self, walk: &mut Walk<'_>, index: usize, weight: u64) -> Result<Found, AncestryRefused> {
+  fn version_at(
+    &self,
+    walk: &mut Walk<'_>,
+    index: usize,
+    weight: u64,
+  ) -> Result<Found, AncestryRefused> {
     let (_, highest) = self.range(index)?;
     let segment = self.segments.get(index).ok_or(AncestryRefused::Lost)?;
     let depth = walk
