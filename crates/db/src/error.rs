@@ -247,8 +247,12 @@ impl fmt::Display for DbError {
         f,
         "a repository policy set from a version it has moved past (version {current} now)"
       ),
-      Self::PolicyRuleMalformed { index } => write!(f, "a repository policy's rule {index} is malformed"),
-      Self::PolicyHookMalformed { index } => write!(f, "a repository policy's hook {index} is malformed"),
+      Self::PolicyRuleMalformed { index } => {
+        write!(f, "a repository policy's rule {index} is malformed")
+      }
+      Self::PolicyHookMalformed { index } => {
+        write!(f, "a repository policy's hook {index} is malformed")
+      }
     }
   }
 }

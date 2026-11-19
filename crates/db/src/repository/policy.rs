@@ -13,7 +13,9 @@ use std::collections::BTreeSet;
 
 use slates_wire::Wire;
 
-use crate::catalog::{HookConfig, HookPointName, PolicyNames, PolicyRule, RepositoryPolicy, VcsTool};
+use crate::catalog::{
+  HookConfig, HookPointName, PolicyNames, PolicyRule, RepositoryPolicy, VcsTool,
+};
 use crate::error::DbError;
 
 /// Format: the prefix of a Subversion glob rule's path (`[:glob:/path]`, the Subversion 1.10 release notes).
@@ -64,7 +66,11 @@ fn rule_holds(tool: VcsTool, rule: &PolicyRule) -> bool {
   rule.names.of(tool)
     && !pattern.is_empty()
     && !pattern.contains('\0')
-    && (rule.names != PolicyNames::Paths || pattern.strip_prefix(GLOB_FORM).unwrap_or(pattern).starts_with('/'))
+    && (rule.names != PolicyNames::Paths
+      || pattern
+        .strip_prefix(GLOB_FORM)
+        .unwrap_or(pattern)
+        .starts_with('/'))
 }
 
 /// Whether `hook` is one a repository serving `tool` may hold, its name aside from the others' (the module doc).
@@ -163,9 +169,16 @@ mod tests {
         "{names:?} in a {tool:?} repository"
       );
     }
-    for names in [PolicyNames::Branches, PolicyNames::Bookmarks, PolicyNames::Topics] {
+    for names in [
+      PolicyNames::Branches,
+      PolicyNames::Bookmarks,
+      PolicyNames::Topics,
+    ] {
       assert_eq!(
-        check(VcsTool::Mercurial, &policy(vec![rule(names, "*")], Vec::new())),
+        check(
+          VcsTool::Mercurial,
+          &policy(vec![rule(names, "*")], Vec::new())
+        ),
         Ok(())
       );
     }
@@ -173,14 +186,20 @@ mod tests {
       check(
         VcsTool::Subversion,
         &policy(
-          vec![rule(PolicyNames::Paths, "/trunk"), rule(PolicyNames::Paths, pattern)],
+          vec![
+            rule(PolicyNames::Paths, "/trunk"),
+            rule(PolicyNames::Paths, pattern),
+          ],
           Vec::new(),
         ),
       )
     };
     assert_eq!(svn(":glob:/tags/**"), Ok(()));
     assert_eq!(svn("trunk"), Err(DbError::PolicyRuleMalformed { index: 1 }));
-    assert_eq!(svn(":glob:tags"), Err(DbError::PolicyRuleMalformed { index: 1 }));
+    assert_eq!(
+      svn(":glob:tags"),
+      Err(DbError::PolicyRuleMalformed { index: 1 })
+    );
     assert_eq!(svn(""), Err(DbError::PolicyRuleMalformed { index: 1 }));
     assert_eq!(svn("/a\0b"), Err(DbError::PolicyRuleMalformed { index: 1 }));
   }
@@ -195,22 +214,42 @@ mod tests {
     let hg = |hooks: Vec<HookConfig>| check(VcsTool::Mercurial, &policy(Vec::new(), hooks));
     assert_eq!(
       hg(vec![
-        hook(HookPointName::HgPretxnchangegroup, "pretxnchangegroup", &program),
-        hook(HookPointName::HgPretxnchangegroup, "pretxnchangegroup.acl", &program),
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup",
+          &program
+        ),
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup.acl",
+          &program
+        ),
         hook(HookPointName::HgChangegroup, "changegroup.notify", &program),
       ]),
       Ok(())
     );
     assert_eq!(
       hg(vec![
-        hook(HookPointName::HgPretxnchangegroup, "pretxnchangegroup.acl", &program),
-        hook(HookPointName::HgPretxnchangegroup, "pretxnchangegroup.acl", &program),
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup.acl",
+          &program
+        ),
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup.acl",
+          &program
+        ),
       ]),
       Err(DbError::PolicyHookMalformed { index: 1 })
     );
     for name in ["changegroup", "pretxnchangegroup.", "pretxnchangegroupx"] {
       assert_eq!(
-        hg(vec![hook(HookPointName::HgPretxnchangegroup, name, &program)]),
+        hg(vec![hook(
+          HookPointName::HgPretxnchangegroup,
+          name,
+          &program
+        )]),
         Err(DbError::PolicyHookMalformed { index: 0 }),
         "{name}"
       );
@@ -224,11 +263,19 @@ mod tests {
       Err(DbError::PolicyHookMalformed { index: 1 })
     );
     assert_eq!(
-      git(vec![hook(HookPointName::GitUpdate, "update.check", &program)]),
+      git(vec![hook(
+        HookPointName::GitUpdate,
+        "update.check",
+        &program
+      )]),
       Err(DbError::PolicyHookMalformed { index: 0 })
     );
     assert_eq!(
-      git(vec![hook(HookPointName::SvnPreCommit, "pre-commit", &program)]),
+      git(vec![hook(
+        HookPointName::SvnPreCommit,
+        "pre-commit",
+        &program
+      )]),
       Err(DbError::PolicyHookMalformed { index: 0 })
     );
     for bad in ["hooks/pre-receive", "", "/bin/a\0b"] {
@@ -243,7 +290,11 @@ mod tests {
         VcsTool::Subversion,
         &policy(
           Vec::new(),
-          vec![hook(HookPointName::SvnPreRevpropChange, "pre-revprop-change", &program)]
+          vec![hook(
+            HookPointName::SvnPreRevpropChange,
+            "pre-revprop-change",
+            &program
+          )]
         )
       ),
       Ok(())
@@ -265,7 +316,10 @@ mod tests {
     );
     let one = rule(PolicyNames::Refs, "refs/heads/main");
     let hook = hook(HookPointName::GitUpdate, "update", "/srv/hooks/update");
-    assert_eq!(bytes(&policy(vec![one.clone()], Vec::new())), one.to_bytes().len());
+    assert_eq!(
+      bytes(&policy(vec![one.clone()], Vec::new())),
+      one.to_bytes().len()
+    );
     assert_eq!(
       bytes(&policy(vec![one.clone()], vec![hook.clone()])),
       one.to_bytes().len() + hook.to_bytes().len()

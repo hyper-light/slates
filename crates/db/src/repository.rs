@@ -521,7 +521,11 @@ impl Repositories {
 
   /// A policy set whole on a repository that exists, as the version after its current one, each rule naming what the
   /// repository's tool has and each hook at one of the tool's points (A-622, `policy`).
-  fn check_policy(&self, repository: RepositoryId, policy: &RepositoryPolicy) -> Result<(), DbError> {
+  fn check_policy(
+    &self,
+    repository: RepositoryId,
+    policy: &RepositoryPolicy,
+  ) -> Result<(), DbError> {
     let record = self.repository(repository).ok_or(DbError::NotFound)?;
     let current = record.policy.version;
     if current.checked_add(1) != Some(policy.version) {
@@ -1662,7 +1666,10 @@ mod tests {
     policy.hooks.push(crate::catalog::HookConfig {
       point: crate::catalog::HookPointName::GitPreReceive,
       name: "pre-receive".to_owned(),
-      program: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+      program: std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned(),
     });
     let set = Op::RepositoryPolicySet {
       repository: repo,
@@ -1670,7 +1677,10 @@ mod tests {
     };
     run(&mut partition, &set).unwrap();
     log.push(set);
-    assert_eq!(partition.repositories().repository(repo).unwrap().policy, policy);
+    assert_eq!(
+      partition.repositories().repository(repo).unwrap().policy,
+      policy
+    );
     assert_eq!(
       partition.repositories().position(repo),
       position.map(|position| position + 1)
@@ -1680,7 +1690,10 @@ mod tests {
       repository: repo,
       policy: rules_policy(1, Vec::new()),
     };
-    assert_eq!(run(&mut partition, &stale), Err(DbError::PolicyChanged { current: 1 }));
+    assert_eq!(
+      run(&mut partition, &stale),
+      Err(DbError::PolicyChanged { current: 1 })
+    );
     let mut branches = ref_rule("main");
     branches.names = crate::catalog::PolicyNames::Branches;
     let wrong_kind = Op::RepositoryPolicySet {
@@ -1713,10 +1726,17 @@ mod tests {
       run(&mut partition, &Op::RepositoryCreated { record: holding }),
       Err(DbError::PolicyChanged { current: 0 })
     );
-    assert_eq!(answers(&partition), before, "a refused setting changes nothing");
+    assert_eq!(
+      answers(&partition),
+      before,
+      "a refused setting changes nothing"
+    );
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(answers(&rebuilt), answers(&partition));
-    assert_eq!(rebuilt.repositories().position(repo), partition.repositories().position(repo));
+    assert_eq!(
+      rebuilt.repositories().position(repo),
+      partition.repositories().position(repo)
+    );
     let mut replayed = Partition::new(caps(), 0);
     for op in &log {
       replayed.apply(op).unwrap();
@@ -1747,22 +1767,47 @@ mod tests {
     let set = |repository, policy| Op::RepositoryPolicySet { repository, policy };
     run(
       &mut partition,
-      &set(first_id, rules_policy(1, rules(&["refs/heads/r0", "refs/heads/r1", "refs/heads/r2"]))),
+      &set(
+        first_id,
+        rules_policy(
+          1,
+          rules(&["refs/heads/r0", "refs/heads/r1", "refs/heads/r2"]),
+        ),
+      ),
     )
     .unwrap();
     run(
       &mut partition,
-      &set(first_id, rules_policy(2, rules(&["refs/heads/r3", "refs/heads/r4", "refs/heads/r5"]))),
+      &set(
+        first_id,
+        rules_policy(
+          2,
+          rules(&["refs/heads/r3", "refs/heads/r4", "refs/heads/r5"]),
+        ),
+      ),
     )
     .expect("a replacement gives back the policy it replaces");
-    let crowded = set(second_id, rules_policy(1, rules(&["refs/heads/r6", "refs/heads/r7"])));
+    let crowded = set(
+      second_id,
+      rules_policy(1, rules(&["refs/heads/r6", "refs/heads/r7"])),
+    );
     let full = Err(DbError::Capacity {
       table: "green_chains",
     });
     assert_eq!(run(&mut partition, &crowded), full);
     let mut rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), budget, 0).unwrap();
-    assert_eq!(run(&mut rebuilt, &crowded), full, "the rebuilt partition charges the first policy");
-    run(&mut rebuilt, &Op::RepositoryDestroyed { repository: first_id }).unwrap();
+    assert_eq!(
+      run(&mut rebuilt, &crowded),
+      full,
+      "the rebuilt partition charges the first policy"
+    );
+    run(
+      &mut rebuilt,
+      &Op::RepositoryDestroyed {
+        repository: first_id,
+      },
+    )
+    .unwrap();
     run(&mut rebuilt, &crowded).expect("a destroyed repository gives its policy's bytes back");
   }
 }
