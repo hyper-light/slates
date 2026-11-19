@@ -147,32 +147,39 @@ fn small_order_and_wrong_length_client_keys_are_refused() {
 }
 
 /// A-634 golden where the documents give one (the hybrid draft §2.1, §2.3.3, §2.4; RFC 7748 §6.1): do run the hybrid's
-/// server half with Alice's private key against a `C_INIT` of a fresh ML-KEM-768 encapsulation key and Bob's public
-/// key, decapsulate the reply's ciphertext with the client's key, and run it again on the same `C_INIT`. Expect
-/// `S_REPLY` as the 1088-byte ciphertext and then Alice's public key; `K` as the `string` of SHA-256 over the
-/// decapsulated secret and then RFC 7748's shared secret; and a new ciphertext and secret the second time, since the
-/// draft's §6 says implementations "MUST NOT reuse randomness in the generation of ML-KEM ciphertexts".
+/// server half 64 times with Alice's private key against one `C_INIT` of a fresh ML-KEM-768 encapsulation key and Bob's
+/// public key, and decapsulate each reply's ciphertext with the client's key. Expect each `S_REPLY` to be the 1088-byte
+/// ciphertext and then Alice's public key, and each `K` the `string` of SHA-256 over the decapsulated secret and then
+/// RFC 7748's shared secret, runs whose hash has its top bit set among them (there an `mpint` would add a zero byte, so
+/// only those runs tell the two encodings apart; this counter is the test's non-vacuity); and 64 different ciphertexts,
+/// since the draft's §6 says implementations "MUST NOT reuse randomness in the generation of ML-KEM ciphertexts".
 #[test]
 fn the_hybrid_server_half_agrees_with_a_decapsulating_client() {
   let alice_private = hex_array::<32>(ALICE_PRIVATE);
   let (client_key, encapsulation_key) = mlkem_key_pair();
   let init = [encapsulation_key, hex(BOB_PUBLIC)].concat();
-  let half = mlkem768x25519_server(&alice_private, &init).unwrap();
-  let (ciphertext, server_public) = half.public.split_at(MLKEM768_CIPHERTEXT_LEN);
-  let post_quantum = client_key
-    .decapsulate(Ciphertext::from(ciphertext))
-    .unwrap();
-  let both = [post_quantum.as_ref(), &hex(RFC7748_SHARED)[..]].concat();
-  let mut expected = Vec::new();
-  put_string(&mut expected, digest::digest(&SHA256, &both).as_ref());
-  let again = mlkem768x25519_server(&alice_private, &init).unwrap();
-  let observed = (
-    server_public.to_vec(),
-    half.shared_secret.bytes().to_vec(),
-    again.public.get(..MLKEM768_CIPHERTEXT_LEN) != Some(ciphertext),
-    again.shared_secret.bytes() != half.shared_secret.bytes(),
-  );
-  assert_eq!(observed, (hex(ALICE_PUBLIC), expected, true, true));
+  let mut ciphertexts = Vec::new();
+  let mut top_bit_set = 0usize;
+  for _ in 0..64 {
+    let half = mlkem768x25519_server(&alice_private, &init).unwrap();
+    let (ciphertext, server_public) = half.public.split_at(MLKEM768_CIPHERTEXT_LEN);
+    let post_quantum = client_key
+      .decapsulate(Ciphertext::from(ciphertext))
+      .unwrap();
+    let both = [post_quantum.as_ref(), &hex(RFC7748_SHARED)[..]].concat();
+    let hashed = digest::digest(&SHA256, &both);
+    let mut expected = Vec::new();
+    put_string(&mut expected, hashed.as_ref());
+    assert_eq!(
+      (server_public.to_vec(), half.shared_secret.bytes().to_vec()),
+      (hex(ALICE_PUBLIC), expected)
+    );
+    top_bit_set += usize::from(hashed.as_ref()[0] & 0x80 != 0);
+    ciphertexts.push(ciphertext.to_vec());
+  }
+  ciphertexts.sort();
+  ciphertexts.dedup();
+  assert_eq!((ciphertexts.len(), top_bit_set > 0), (64, true));
 }
 
 /// A-634 hostile (the hybrid draft §2.1: the server "MUST check that the length of the C_INIT is the sum of the expected
