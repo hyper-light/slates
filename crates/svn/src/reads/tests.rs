@@ -7,8 +7,10 @@
 //! transcripts do not reach, case by case, and hostile commands, which never panic.
 
 use super::*;
+use crate::handshake::ClientCapabilities;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
 use crate::ra_svn::{Bounds, Parsed, Parser};
+use crate::svndiff::decode_all;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use std::collections::BTreeMap;
@@ -374,6 +376,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
   let answers = items(server);
   let commands = items(client);
   let mut base = session_base(&commands[0]);
+  let capabilities = session_capabilities(&commands[0]);
   let mut at = 4;
   let mut answered = 0;
   for command in commands.iter().skip(2) {
@@ -381,6 +384,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
     let session = Session {
       base: &base,
       uuid: UUID,
+      capabilities,
     };
     let mut out = Vec::new();
     let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
@@ -446,6 +450,58 @@ fn reparented(command: &Value<'_>) -> String {
   }
 }
 
+/// The capabilities the client's greeting announces (its second item, a list of words).
+fn session_capabilities(greeting: &Value<'_>) -> ClientCapabilities {
+  let Value::List(parts) = greeting else {
+    panic!("a greeting that is no list");
+  };
+  let Some(Value::List(words)) = parts.get(1) else {
+    panic!("a greeting without its capabilities");
+  };
+  let words: Vec<&str> = words
+    .iter()
+    .filter_map(|word| match word {
+      Value::Word(word) => Some(*word),
+      _ => None,
+    })
+    .collect();
+  ClientCapabilities::of(&words)
+}
+
+/// A `get-file-revs` answer as the tests compare it: each item written out with its property lists as sets, and each
+/// delta, its strings up to the empty one, as [`delta_normalized`] writes it.
+fn file_revs_normalized(items: &[Value<'_>]) -> Vec<String> {
+  let mut normalized_items = Vec::new();
+  let mut delta: Vec<&[u8]> = Vec::new();
+  for item in items {
+    match item {
+      Value::String(bytes) if bytes.is_empty() => {
+        normalized_items.push(delta_normalized(&delta));
+        delta.clear();
+      }
+      Value::String(bytes) => delta.push(bytes),
+      other => normalized_items.push(normalized(other)),
+    }
+  }
+  normalized_items
+}
+
+/// One delta's strings as the tests compare them: none is no delta; svndiff 0's are compared byte for byte, each
+/// string a write `svndiff.c` makes; svndiff 2's by how many strings there are and the version and windows they decode
+/// to, since an LZ4 section is `lz4_flex`'s where `svnserve`'s is liblz4's and may differ in bytes while it makes the
+/// same window.
+fn delta_normalized(strings: &[&[u8]]) -> String {
+  match strings.first() {
+    None => String::from("no delta"),
+    Some(header) if header.starts_with(b"SVN\x02") => format!(
+      "{} strings of {:?}",
+      strings.len(),
+      decode_all(&strings.concat())
+    ),
+    Some(_) => format!("{strings:?}"),
+  }
+}
+
 /// A client command's word.
 fn command_word<'a>(name: &str, command: &'a Value<'_>) -> &'a str {
   match command {
@@ -458,7 +514,8 @@ fn command_word<'a>(name: &str, command: &'a Value<'_>) -> &'a str {
 }
 
 /// Holds one answer to `svnserve`'s items from `at`, property lists as sets for the commands that hold them; answers
-/// where the next answer starts.
+/// where the next answer starts, counted in items as written: a normalized answer may hold fewer entries than items
+/// (`get-file-revs` folds each delta's strings into one).
 fn same_answer(
   name: &str,
   word: &str,
@@ -466,8 +523,11 @@ fn same_answer(
   answers: &[Value<'_>],
   at: usize,
 ) -> usize {
-  let theirs = &answers[at..at + mine.len()];
-  let (mine, theirs): (Vec<String>, Vec<String>) = if PROPERTY_LISTS.contains(&word) {
+  let next = at + mine.len();
+  let theirs = &answers[at..next];
+  let (mine, theirs): (Vec<String>, Vec<String>) = if word == "get-file-revs" {
+    (file_revs_normalized(mine), file_revs_normalized(theirs))
+  } else if PROPERTY_LISTS.contains(&word) {
     (
       sorted(mine.iter().map(normalized).collect()),
       sorted(theirs.iter().map(normalized).collect()),
@@ -479,7 +539,7 @@ fn same_answer(
     )
   };
   assert_eq!(mine, theirs, "{name}: {word}");
-  at + mine.len()
+  next
 }
 
 /// Items in byte order of their written form: an answer `svnserve` writes in hash order, compared as a set.
@@ -581,6 +641,7 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("get-deleted-rev"), 15),
     (transcript!("log"), 16),
     (transcript!("log-merged"), 7),
+    (transcript!("get-file-revs"), 13),
     (transcript!("hostile-log-word"), 0),
     (transcript!("hostile-log-path"), 0),
     (transcript!("hostile-log-seven"), 0),
@@ -608,6 +669,8 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-ls"), 2),
     (transcript!("svn-log"), 4),
     (transcript!("svn-log-g"), 4),
+    (transcript!("svn-blame"), 5),
+    (transcript!("svn-blame-g"), 5),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
@@ -624,6 +687,9 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "get-file-revs",
+    "svn-blame",
+    "svn-blame-g",
     "svn-mergeinfo-eligible",
     "svn-mergeinfo-merged",
     "log-merged",
@@ -696,10 +762,7 @@ fn answered(command: &[u8]) -> (Outcome, Vec<u8>) {
   let outcome = answer(
     &fixture.index,
     &fixture.green,
-    &Session {
-      base: "/",
-      uuid: UUID,
-    },
+    &ROOT_SESSION,
     &value,
     &mut out,
   )
@@ -832,6 +895,18 @@ fn dates_are_read_and_written_as_subversion_reads_and_writes_them() {
 const ROOT_SESSION: Session<'static> = Session {
   base: "/",
   uuid: UUID,
+  capabilities: STOCK_CAPABILITIES,
+};
+
+/// What stock `svn` 1.15.0 announces (recorded: every session's greeting): `svndiff1`, `accepts-svndiff2`,
+/// `absent-entries`, `depth`, `mergeinfo` and `log-revprops` among them.
+const STOCK_CAPABILITIES: ClientCapabilities = ClientCapabilities {
+  svndiff1: true,
+  accepts_svndiff2: true,
+  absent_entries: true,
+  depth: true,
+  mergeinfo: true,
+  log_revprops: true,
 };
 
 /// One command's whole answer against `repository`, a streamed rest resumed in `room` until it is whole and once more;
@@ -1301,6 +1376,208 @@ fn a_history_opened_again_at_each_step_walks_as_one_kept_open() {
   );
 }
 
+/// A `get-file-revs` answer's revisions in order, each with the strings sent after it, its closing empty one last.
+fn file_revisions_sent(out: &[u8]) -> Vec<(u64, Vec<Vec<u8>>)> {
+  let mut sent: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
+  for item in items(out) {
+    match item {
+      Value::List(parts) => {
+        if let [Value::String(_), Value::Number(revision), ..] = parts.as_slice() {
+          sent.push((*revision, Vec::new()));
+        }
+      }
+      Value::String(bytes) => {
+        if let Some((_, strings)) = sent.last_mut() {
+          strings.push(bytes.to_vec());
+        }
+      }
+      _ => {}
+    }
+  }
+  sent
+}
+
+/// A-613 part 2 (`get-file-revs`, `send_path_revision`'s `svn_fs_contents_different`): a file added without a text and
+/// then given an empty one has the same text in both revisions (`svn_fs_fs__file_text_rep_equal` counts both empty), so
+/// the revision that gave it sends no delta, nor does a later change of its properties alone; the first revision sends
+/// its delta from no text, the header alone, since an empty target makes no window.
+#[test]
+fn a_text_made_empty_from_none_is_the_same_text() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/none.txt file add props "]);
+  fixture.commit(&[
+    "row 13 /trunk/none.txt file change text  md5 d41d8cd98f00b204e9800998ecf8427e sha1 \
+     da39a3ee5e6b4b0d3255bfef95601890afd80709",
+  ]);
+  fixture.commit(&["row 14 /trunk/none.txt file change props 6e=31"]);
+  let command = b"( get-file-revs ( 14:trunk/none.txt ( 12 ) ( 14 ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    file_revisions_sent(&out),
+    [
+      (12, vec![b"SVN\x02".to_vec(), Vec::new()]),
+      (13, vec![Vec::new()]),
+      (14, vec![Vec::new()]),
+    ]
+  );
+}
+
+/// A client that announces neither `svndiff1` nor `accepts-svndiff2`, at the repository's root: answered in svndiff 0.
+const SVNDIFF0_SESSION: Session<'static> = Session {
+  base: "/",
+  uuid: UUID,
+  capabilities: ClientCapabilities {
+    svndiff1: false,
+    accepts_svndiff2: false,
+    ..STOCK_CAPABILITIES
+  },
+};
+
+/// A-613 part 2 (`get-file-revs` in svndiff 0, `svndiff.c`): a window of new data alone, the first revision's, is
+/// written as `send_simple_insertion_window` writes it, the header, the window's integers and its instruction in one
+/// string, then the new data; a window with a source copy, the second revision's, as `window_handler` writes it, the
+/// header alone, then the integers, the instructions and the new data. The bytes are svndiff 0's, uncompressed:
+/// `/trunk/a.txt` is `alpha\n` in r1, and r2 copies those six bytes and adds `more\n`.
+#[test]
+fn svndiff_0_strings_are_the_writes_svndiff_c_makes() {
+  let fixture = Fixture::new();
+  let command = items(b"( get-file-revs ( 11:trunk/a.txt ( 1 ) ( 2 ) ) ) ").remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(
+    &fixture.index,
+    &fixture.green,
+    &SVNDIFF0_SESSION,
+    &command,
+    &mut out,
+  )
+  .unwrap();
+  assert!(matches!(
+    drained(outcome, &fixture, &SVNDIFF0_SESSION, &mut out),
+    Outcome::Answered
+  ));
+  assert_eq!(
+    file_revisions_sent(&out),
+    [
+      (
+        1,
+        vec![
+          b"SVN\0\x00\x00\x06\x01\x06\x86".to_vec(),
+          b"alpha\n".to_vec(),
+          Vec::new(),
+        ]
+      ),
+      (
+        2,
+        vec![
+          b"SVN\0".to_vec(),
+          b"\x00\x06\x0b\x03\x05".to_vec(),
+          b"\x06\x00\x85".to_vec(),
+          b"more\n".to_vec(),
+          Vec::new(),
+        ]
+      ),
+    ]
+  );
+}
+
+/// A `get-file-revs` answer's revisions in order, each its path, its number and whether it came in by a merge.
+fn file_revisions_listed(out: &[u8]) -> Vec<(String, u64, bool)> {
+  items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [
+          Value::String(path),
+          Value::Number(revision),
+          _,
+          _,
+          Value::Word(merged),
+        ] => Some((
+          String::from_utf8_lossy(path).into_owned(),
+          *revision,
+          *merged == "true",
+        )),
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect()
+}
+
+/// A `get-file-revs` answer's property changes, each revision's written as the tests compare them, as a set.
+fn property_changes_sent(out: &[u8]) -> Vec<(u64, String)> {
+  items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::String(_), Value::Number(revision), _, changes, _] => {
+          Some((*revision, normalized(changes)))
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-613 part 2 (`get-file-revs`, `svn_prop_diffs`): a revision that keeps one of a file's properties, changes one,
+/// takes one away and adds one sends those three changes, the one taken away with an empty value list, and nothing for
+/// the one kept; the first revision sends each of its properties as added.
+#[test]
+fn a_property_taken_away_is_sent_as_a_change_without_a_value() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/p.txt file add props 6d=32,6e=31,6f=33"]);
+  fixture.commit(&["row 13 /trunk/p.txt file change props 6d=39,6e=31,70=34"]);
+  let command = b"( get-file-revs ( 11:trunk/p.txt ( 12 ) ( 13 ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    property_changes_sent(&out),
+    [
+      (
+        12,
+        String::from("( ( 1:m ( 1:2 ) ) ( 1:n ( 1:1 ) ) ( 1:o ( 1:3 ) ) ) ")
+      ),
+      (
+        13,
+        String::from("( ( 1:m ( 1:9 ) ) ( 1:o ( ) ) ( 1:p ( 1:4 ) ) ) ")
+      ),
+    ]
+  );
+}
+
+/// A-613 part 2 (`get-file-revs` with merged revisions, `svn_repos_get_file_revs2`): a mainline revision and a merged
+/// one of the same number are sent mainline first (`main_pr->revnum <= merged_pr->revnum`). `/c.txt` records in r13
+/// that it merged `/d.txt`'s r13, a revision that changed both, so the merged range's walk, r13 back to its exclusive
+/// start r12, finds two revisions of `/d.txt` numbered as the two of `/c.txt`.
+#[test]
+fn a_mainline_revision_goes_before_a_merged_one_of_the_same_number() {
+  let mut fixture = Fixture::new();
+  let name = "svn:mergeinfo"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  let value = "/d.txt:13"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  fixture.commit(&["row 12 /c.txt file add", "row 12 /d.txt file add"]);
+  fixture.commit(&[
+    format!("row 13 /c.txt file change props {name}={value}").as_str(),
+    "row 13 /d.txt file change props 6e=31",
+  ]);
+  let command = b"( get-file-revs ( 5:c.txt ( 0 ) ( 13 ) true ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    file_revisions_listed(&out),
+    [
+      (String::from("/c.txt"), 12, false),
+      (String::from("/d.txt"), 12, true),
+      (String::from("/c.txt"), 13, false),
+      (String::from("/d.txt"), 13, true),
+    ]
+  );
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -1424,7 +1701,7 @@ proptest! {
     name in prop::sample::select(vec![
       "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
       "get-mergeinfo", "get-iprops", "get-file", "list", "get-location-segments", "get-deleted-rev",
-      "log", "no-such-command",
+      "log", "get-file-revs", "no-such-command",
     ]),
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {
