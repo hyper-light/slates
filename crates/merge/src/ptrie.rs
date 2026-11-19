@@ -472,10 +472,36 @@ fn graft_top<V: Clone>(
   shared: Shared,
   holders: &mut impl Holders<V>,
 ) -> Node<V> {
-  let copy = nodes.node(shared.slot).map(|node| Node {
+  let mut top = copy_of(nodes, shared.slot, shared.skip, holders);
+  nodes.release(shared.slot, holders);
+  // A map's root may be a bare edge (no value, one child); a grafted node may not, so the child takes its place, the
+  // edge's bytes before its own.
+  if top.value.is_none()
+    && let [(_, only)] = top.children.as_slice()
+  {
+    let only = *only;
+    let mut below = copy_of(nodes, only, 0, holders);
+    nodes.release(only, holders);
+    let mut label = std::mem::take(&mut top.label);
+    label.append(&mut below.label);
+    below.label = label;
+    top = below;
+  }
+  top
+}
+
+/// A new node like the one at `slot`, its label's first `skip` bytes dropped: its value told it has one more holder
+/// and each child held once more.
+fn copy_of<V: Clone>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  skip: usize,
+  holders: &mut impl Holders<V>,
+) -> Node<V> {
+  let copy = nodes.node(slot).map(|node| Node {
     label: node
       .label
-      .get(shared.skip..)
+      .get(skip..)
       .map(<[u8]>::to_vec)
       .unwrap_or_default(),
     value: node.value.clone(),
@@ -498,7 +524,6 @@ fn graft_top<V: Clone>(
   for (_, child) in &copy.children {
     nodes.hold(*child);
   }
-  nodes.release(shared.slot, holders);
   copy
 }
 
