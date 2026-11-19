@@ -537,7 +537,7 @@ fn last_at_or_before<T>(
 
 /// Whether `path` is in Subversion's canonical form for a repository path: `/` alone, or `/` followed by names joined
 /// by `/` (`svn_fspath__is_canonical`; `svn_fs__path_valid`).
-fn is_canonical(path: &str) -> bool {
+pub(crate) fn is_canonical(path: &str) -> bool {
   if path == ROOT {
     return true;
   }
