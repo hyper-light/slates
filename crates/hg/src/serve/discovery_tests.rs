@@ -126,9 +126,16 @@ fn interleaved_history() -> impl Strategy<Value = History> {
 /// The choices of revision `rev` of sample `sample`, taken from a node's bytes so they are fixed and spread.
 fn fixed_choices(sample: u64, rev: u64) -> (u32, u32, bool, bool, bool) {
   let bytes = node_for(sample.wrapping_mul(0x1_0000).wrapping_add(rev));
-  let word = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+  let word =
+    |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
   let (first, second, flags) = (word(0), word(4), word(8));
-  (first, second, flags.is_multiple_of(3), flags & 0x10 != 0, flags.is_multiple_of(10))
+  (
+    first,
+    second,
+    flags.is_multiple_of(3),
+    flags & 0x10 != 0,
+    flags.is_multiple_of(10),
+  )
 }
 
 /// A-667 (g304, against stock 7.2): do take each branch's heads of `default` 0, `stable` 1 on 0 and `default` 2 on 1,
@@ -142,7 +149,10 @@ fn a_descendant_reached_through_another_branch_ends_a_head() {
     ([Some(1), None], b"default"),
   ]);
   assert_eq!(heads(&history), [1, 2]);
-  let lines = [line(&history, b"default", &[2]), line(&history, b"stable", &[1])];
+  let lines = [
+    line(&history, b"default", &[2]),
+    line(&history, b"stable", &[1]),
+  ];
   assert_eq!(answer(&history), lines.join(&b'\n'));
 }
 
@@ -198,12 +208,17 @@ fn generated_histories_end_a_head_through_another_branch() {
   let differing = (0..SAMPLES)
     .filter(|sample| {
       let revisions = u64::try_from(REVISIONS).unwrap();
-      let choices: Vec<_> = (0..revisions).map(|rev| fixed_choices(*sample, rev)).collect();
+      let choices: Vec<_> = (0..revisions)
+        .map(|rev| fixed_choices(*sample, rev))
+        .collect();
       let history = interleaved(&choices, *sample);
       by_child(&history) != naive(&history)
     })
     .count();
-  assert!(differing > 0, "no sample of {SAMPLES} ends a head through another branch");
+  assert!(
+    differing > 0,
+    "no sample of {SAMPLES} ends a head through another branch"
+  );
 }
 
 proptest! {

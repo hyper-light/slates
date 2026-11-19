@@ -29,7 +29,9 @@ Read from Homebrew's Mercurial 7.2 (`mercurial/__version__.py`: `7.2`), on 2026-
 
 A-619 wrote the rule as "no child on its branch" and held it to an oracle that stated the same rule
 (`crates/hg/src/serve/tests.rs`, `oracle_branchmap`), so the generated test certified the implementation's rule rather
-than 7.2's: the CLAUDE.md gotcha about a model that states the implementation's rule.
+than 7.2's: the CLAUDE.md gotcha about a model that states the implementation's rule. A-641's push checks took their
+branch heads from the same function and stated the same rule in their own oracle (`crates/hg/src/push/tests.rs`,
+`oracle_updated`), found by the fix's first green run, where it alone failed.
 
 ## Impact
 
@@ -50,6 +52,8 @@ head where 7.2 refuses it as raced. What a client did with the extra head was no
 - `crates/hg/src/serve/mod.rs`: `RevSet::remove`, so the walk's set is left empty after each branch.
 - `crates/hg/src/serve/tests.rs`: `oracle_branchmap` states 7.2's rule: no later revision on the branch has the
   revision as an ancestor.
+- `crates/hg/src/push/tests.rs`: `oracle_updated` (`check:updated-heads`) states the same rule (`descends`, every path
+  walked).
 - `crates/hg/src/serve/discovery_tests.rs` (new): g304's history; the two histories below; a closed head kept and
   ending a head through it; a generated oracle over histories moving between two branches with merges of any earlier
   revisions; the oracle's non-vacuity, histories from fixed seeds where the old rule and 7.2's differ.
@@ -78,7 +82,7 @@ directory ancestor has no effect"); a pull, an import or `hg debugsetparents` ca
 | Where | What 7.2 judges there | Here |
 |---|---|---|
 | `branchmap` (`serve::discovery`) | branch heads, closed ones kept | this bug, fixed |
-| `check:updated-heads` (`push::check::updated_heads`) | the same heads (`all_nodes_are_heads`) | read `branch_head_revs`, fixed with it |
+| `check:updated-heads` (`push::check::updated_heads`) | the same heads (`all_nodes_are_heads`) | read `branch_head_revs`, fixed with it; its test oracle stated the old rule too, corrected |
 | `check:heads` (`push::check::all_heads`) | the repository's topological heads (`repo.heads()`) | `head_revs`, the same rule; not a sibling |
 | `reject_new_heads` (`push::reply::multiple_heads`'s caller) | `head() and not closed() and branch(B)`: the open topological heads on the branch (`hgext/hooklib/reject_new_heads.py`) | no caller yet: the landing that decides it is owed, and must count those, not branch heads |
 | the push's head count (`push::reply::heads_changed`'s caller) | topological heads added and removed, the added ones that close a branch apart (`changegroup.py` lines 879-886) | no caller yet: owed with the landing |

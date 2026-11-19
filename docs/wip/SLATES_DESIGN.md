@@ -46572,12 +46572,13 @@ Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`imp
 
 ### A-667 — Each branch's heads by 7.2's rule: no later revision on the branch descends from a head (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); found by g304 against stock 7.2; §4.17.3 "Pull and clone" item 1, "Push" step 4; A-619, A-641)
 Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::discovery::branch_head_revs`,
-`serve::RevSet::remove`, `serve::tests`' oracle, `serve/discovery_tests.rs`), GAPS (a fixed entry),
+`serve::RevSet::remove`, `serve::tests`' and `push::tests`' oracles, `serve/discovery_tests.rs`), GAPS (a fixed entry),
 `docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`.
 - **What was wrong.** A revision was its branch's head when no child of it was on its branch. 7.2's rule
   (`branchmap.py` lines 422-424) ends every revision a later revision on its branch descends from, through any
   branches: for `default` 0, `stable` 1 on 0, `default` 2 on 1, `hg heads default` answers 2, and `branchmap` and
-  `check:updated-heads` here answered 0 and 2. A-619's oracle stated the implementation's rule, so it certified it.
+  `check:updated-heads` here answered 0 and 2. A-619's oracle and A-641's push-check oracle stated the implementation's
+  rule, so both certified it.
 - **The decision.** The rule, computed as 7.2 computes it where 7.2 is exact: a revision continued on its branch is no
   head, one with no child at all is a head, and a branch whose other candidates have children is walked from its
   highest parent from another branch at or above its lowest such candidate down to that candidate (7.2's `uncertain`
