@@ -25,7 +25,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::catalog::{Principal, RepositoryId, ReviewApprovalRecord, ReviewCommentRecord, VolumeId};
+use crate::catalog::{
+  Principal, RepositoryId, ReviewApprovalRecord, ReviewCommentRecord, VolumeId,
+};
 use crate::error::{DbError, ReviewRefusal};
 use crate::op::Op;
 
@@ -321,9 +323,10 @@ impl Reviews {
     match op {
       Op::ReviewCommented { record } => {
         self.bytes = self.bytes.saturating_add(comment_bytes(record));
-        self
-          .comments
-          .insert((record.repository, record.request, record.id), record.clone());
+        self.comments.insert(
+          (record.repository, record.request, record.id),
+          record.clone(),
+        );
       }
       Op::ReviewCommentMoved {
         repository,
@@ -503,9 +506,7 @@ mod tests {
   }
 
   fn person(serial: u8) -> Principal {
-    Principal::Certificate {
-      hash: [serial; 32],
-    }
+    Principal::Certificate { hash: [serial; 32] }
   }
 
   fn caps() -> PartitionCaps {
@@ -534,7 +535,14 @@ mod tests {
     }
   }
 
-  fn comment(repo: u8, request: u8, id: u64, version: u64, start: u64, len: u64) -> ReviewCommentRecord {
+  fn comment(
+    repo: u8,
+    request: u8,
+    id: u64,
+    version: u64,
+    start: u64,
+    len: u64,
+  ) -> ReviewCommentRecord {
     ReviewCommentRecord {
       repository: repository_id(repo),
       request: request_id(request),
@@ -700,18 +708,33 @@ mod tests {
       version,
     };
     let review = |rule| Err(DbError::Review(rule));
-    assert_eq!(run(&mut partition, &moved(1, 9, 4)), review(ReviewRefusal::NotAfter));
+    assert_eq!(
+      run(&mut partition, &moved(1, 9, 4)),
+      review(ReviewRefusal::NotAfter)
+    );
     run(&mut partition, &moved(3, 9, 4)).unwrap();
-    assert_eq!(run(&mut partition, &moved(4, 9, 0)), review(ReviewRefusal::Empty));
-    assert_eq!(run(&mut partition, &outdated(3)), review(ReviewRefusal::NotAfter));
+    assert_eq!(
+      run(&mut partition, &moved(4, 9, 0)),
+      review(ReviewRefusal::Empty)
+    );
+    assert_eq!(
+      run(&mut partition, &outdated(3)),
+      review(ReviewRefusal::NotAfter)
+    );
     run(&mut partition, &outdated(4)).unwrap();
     let held = partition.reviews().comment(repo, request, 1).unwrap();
     assert_eq!(
       (held.start, held.len, held.version, held.outdated_at),
       (9, 4, 3, Some(4))
     );
-    assert_eq!(run(&mut partition, &moved(5, 13, 4)), review(ReviewRefusal::Outdated));
-    assert_eq!(run(&mut partition, &outdated(5)), review(ReviewRefusal::Outdated));
+    assert_eq!(
+      run(&mut partition, &moved(5, 13, 4)),
+      review(ReviewRefusal::Outdated)
+    );
+    assert_eq!(
+      run(&mut partition, &outdated(5)),
+      review(ReviewRefusal::Outdated)
+    );
     let mut ended = comment(0, 0, 2, 2, 5, 4);
     ended.outdated_at = Some(3);
     let mut unnamed = comment(0, 0, 2, 2, 5, 4);
@@ -723,7 +746,10 @@ mod tests {
       (unnamed, Err(DbError::InvalidName)),
       (nul, Err(DbError::InvalidName)),
       (comment(0, 0, 2, 2, 5, 0), review(ReviewRefusal::Empty)),
-      (comment(0, 0, 2, 2, u64::MAX, 2), review(ReviewRefusal::Empty)),
+      (
+        comment(0, 0, 2, 2, u64::MAX, 2),
+        review(ReviewRefusal::Empty),
+      ),
       (
         comment(0, 0, 1, 2, 5, 4),
         Err(DbError::AlreadyExists {
@@ -733,7 +759,12 @@ mod tests {
       (comment(1, 0, 2, 2, 5, 4), Err(DbError::NotFound)),
     ] {
       assert_eq!(
-        run(&mut partition, &Op::ReviewCommented { record: record.clone() }),
+        run(
+          &mut partition,
+          &Op::ReviewCommented {
+            record: record.clone()
+          }
+        ),
         answer,
         "{record:?}"
       );
@@ -779,7 +810,11 @@ mod tests {
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(records(&rebuilt), records(&partition));
     let mut rebuilt = rebuilt;
-    assert_eq!(fill(&mut rebuilt, 0), 0, "a rebuilt partition charges what it holds");
+    assert_eq!(
+      fill(&mut rebuilt, 0),
+      0,
+      "a rebuilt partition charges what it holds"
+    );
     let closed = Op::ReviewClosed {
       repository: repository_id(0),
       request: request_id(0),
@@ -913,7 +948,8 @@ mod tests {
 
     /// Removes every record of `repository` (and of `request` in it, when given), giving their bytes back.
     fn remove(&mut self, repository: u8, request: Option<u8>) {
-      let matches = |repo: u8, req: u8| repo == repository && request.is_none_or(|only| only == req);
+      let matches =
+        |repo: u8, req: u8| repo == repository && request.is_none_or(|only| only == req);
       let mut released = 0;
       self.comments.retain(|(repo, req, _), record| {
         let gone = matches(*repo, *req);
@@ -950,7 +986,13 @@ mod tests {
           self.remove(repo, None);
           Ok(())
         }
-        Step::Comment { at: (repo, request, id), path, span, ended, .. } => {
+        Step::Comment {
+          at: (repo, request, id),
+          path,
+          span,
+          ended,
+          ..
+        } => {
           let record = comment_of(step);
           if !self.repositories.contains(&repo) {
             return Err(DbError::NotFound);
@@ -976,9 +1018,16 @@ mod tests {
           self.comments.insert(key, record);
           Ok(())
         }
-        Step::Move { at: (repo, request, id), version, span } => {
+        Step::Move {
+          at: (repo, request, id),
+          version,
+          span,
+        } => {
           let (start, len) = span_of(span);
-          let held = self.comments.get_mut(&(repo, request, u64::from(id))).ok_or(DbError::NotFound)?;
+          let held = self
+            .comments
+            .get_mut(&(repo, request, u64::from(id)))
+            .ok_or(DbError::NotFound)?;
           if held.outdated_at.is_some() {
             return review(ReviewRefusal::Outdated);
           }
@@ -991,8 +1040,14 @@ mod tests {
           (held.start, held.len, held.version) = (start, len, u64::from(version));
           Ok(())
         }
-        Step::Outdate { at: (repo, request, id), version } => {
-          let held = self.comments.get_mut(&(repo, request, u64::from(id))).ok_or(DbError::NotFound)?;
+        Step::Outdate {
+          at: (repo, request, id),
+          version,
+        } => {
+          let held = self
+            .comments
+            .get_mut(&(repo, request, u64::from(id)))
+            .ok_or(DbError::NotFound)?;
           if held.outdated_at.is_some() {
             return review(ReviewRefusal::Outdated);
           }
@@ -1002,7 +1057,11 @@ mod tests {
           held.outdated_at = Some(u64::from(version));
           Ok(())
         }
-        Step::Approve { at: (repo, request, approver), version, ended } => {
+        Step::Approve {
+          at: (repo, request, approver),
+          version,
+          ended,
+        } => {
           if !self.repositories.contains(&repo) {
             return Err(DbError::NotFound);
           }
@@ -1012,7 +1071,9 @@ mod tests {
           let version = u64::from(version);
           let key = (repo, request, approver);
           let held = self.approvals.get(&key);
-          if held.is_some_and(|held| version < held.version || held.stale_at.is_some_and(|at| version < at)) {
+          if held.is_some_and(|held| {
+            version < held.version || held.stale_at.is_some_and(|at| version < at)
+          }) {
             return review(ReviewRefusal::Behind);
           }
           let record = approval(repo, request, approver, version);
@@ -1022,8 +1083,14 @@ mod tests {
           self.approvals.insert(key, record);
           Ok(())
         }
-        Step::Stale { at: (repo, request, approver), version } => {
-          let held = self.approvals.get_mut(&(repo, request, approver)).ok_or(DbError::NotFound)?;
+        Step::Stale {
+          at: (repo, request, approver),
+          version,
+        } => {
+          let held = self
+            .approvals
+            .get_mut(&(repo, request, approver))
+            .ok_or(DbError::NotFound)?;
           if held.stale_at.is_some() {
             return review(ReviewRefusal::Stale);
           }
@@ -1035,8 +1102,14 @@ mod tests {
         }
         Step::StaleBy { .. } => Ok(()),
         Step::Close(repo, request) => {
-          let any = self.comments.keys().any(|(r, q, _)| (*r, *q) == (repo, request))
-            || self.approvals.keys().any(|(r, q, _)| (*r, *q) == (repo, request));
+          let any = self
+            .comments
+            .keys()
+            .any(|(r, q, _)| (*r, *q) == (repo, request))
+            || self
+              .approvals
+              .keys()
+              .any(|(r, q, _)| (*r, *q) == (repo, request));
           if !any {
             return Err(DbError::NotFound);
           }
@@ -1079,7 +1152,15 @@ mod tests {
 
   /// The comment a generated step writes.
   fn comment_of(step: &Step) -> ReviewCommentRecord {
-    let Step::Comment { at: (repo, request, id), version, path, span, ended, body } = *step else {
+    let Step::Comment {
+      at: (repo, request, id),
+      version,
+      path,
+      span,
+      ended,
+      body,
+    } = *step
+    else {
       panic!("only a comment step writes a comment");
     };
     let (start, len) = span_of(span);
@@ -1107,7 +1188,11 @@ mod tests {
       Step::Comment { .. } => Op::ReviewCommented {
         record: comment_of(step),
       },
-      Step::Move { at: (repo, request, id), version, span } => {
+      Step::Move {
+        at: (repo, request, id),
+        version,
+        span,
+      } => {
         let (start, len) = span_of(span);
         Op::ReviewCommentMoved {
           repository: repository_id(repo),
@@ -1118,18 +1203,28 @@ mod tests {
           version: u64::from(version),
         }
       }
-      Step::Outdate { at: (repo, request, id), version } => Op::ReviewCommentOutdated {
+      Step::Outdate {
+        at: (repo, request, id),
+        version,
+      } => Op::ReviewCommentOutdated {
         repository: repository_id(repo),
         request: request_id(request),
         id: u64::from(id),
         version: u64::from(version),
       },
-      Step::Approve { at: (repo, request, approver), version, ended } => {
+      Step::Approve {
+        at: (repo, request, approver),
+        version,
+        ended,
+      } => {
         let mut record = approval(repo, request, approver, u64::from(version));
         record.stale_at = ended.then_some(u64::from(version) + 1);
         Op::ReviewApproved { record }
       }
-      Step::Stale { at: (repo, request, approver), version } => Op::ReviewApprovalStaled {
+      Step::Stale {
+        at: (repo, request, approver),
+        version,
+      } => Op::ReviewApprovalStaled {
         repository: repository_id(repo),
         request: request_id(request),
         approver: person(approver),

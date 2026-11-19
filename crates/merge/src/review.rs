@@ -74,7 +74,10 @@ pub fn line_range(text: &[u8], first: usize, last: usize) -> Option<Range> {
     if line == last {
       let from = start?;
       let len = end.checked_sub(from)?;
-      return Some(Range::new(u64::try_from(from).ok()?, u64::try_from(len).ok()?));
+      return Some(Range::new(
+        u64::try_from(from).ok()?,
+        u64::try_from(len).ok()?,
+      ));
     }
     line = line.saturating_add(1);
     at = end;
@@ -103,10 +106,7 @@ fn byte_at(text: &[u8], at: u64) -> Option<u8> {
 /// Whether `range` covers whole lines of `text` ([`covers_whole_lines`] over the whole text).
 pub fn whole_lines(text: &[u8], range: Range) -> bool {
   let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
-  let before = range
-    .start
-    .checked_sub(1)
-    .and_then(|at| byte_at(text, at));
+  let before = range.start.checked_sub(1).and_then(|at| byte_at(text, at));
   let last = range
     .start
     .checked_add(range.len)
@@ -244,7 +244,10 @@ mod tests {
       )
     };
     let above = moved_text(&text, 0, 0, b"new\n");
-    assert_eq!(step(&[op(OpKind::Insert, 0, 4)], &above), Ok(Range::new(9, 8)));
+    assert_eq!(
+      step(&[op(OpKind::Insert, 0, 4)], &above),
+      Ok(Range::new(9, 8))
+    );
     assert_eq!(lines_of(&above, Range::new(9, 8)), Some((2, 3)));
     let ending_a_line = moved_text(&text, 5, 0, b"new\n");
     assert_eq!(

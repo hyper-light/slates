@@ -10,7 +10,8 @@ use crate::catalog::{
   ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
   LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
   NfsOpenRecord, PlacementState, Principal, RepositoryId, RepositoryRecord, ReviewApprovalRecord,
-  ReviewCommentRecord, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
+  ReviewCommentRecord, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  VolumeState,
 };
 
 /// One mutation.
