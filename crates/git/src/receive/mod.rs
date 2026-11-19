@@ -25,9 +25,11 @@
 //! through A-608's reader, a thin pack's bases taken from the repository ([`Repository`]), then
 //! every object through A-590's checks under a push's strictness ([`fsck::first_refusal`]).
 //! [`connectivity`] holds every new tip to the objects the pack brought and the repository holds.
-//! [`receive`] does all of it for a push held whole; [`Session`] does it over one connection as the
-//! bytes arrive; [`write_report`] answers in report-status or report-status-v2, multiplexed on
-//! side-band-64k when the client asked, the lines git sends on band 2 first.
+//! [`check`] and [`decide`] are the push's two halves: read and checked, then its verdicts and
+//! appends, the caller free between them to admit the pushed objects to its store. [`receive`] does
+//! both for a push held whole; [`Session`] does them over one connection as the bytes arrive,
+//! waiting checked between them; [`write_report`] answers in report-status or report-status-v2,
+//! multiplexed on side-band-64k when the client asked, the lines git sends on band 2 first.
 //!
 //! **Each command's outcome**, in git's order and words. A pack the reader or the checks refused
 //! leaves every command `unpacker error`, the status git's own words for it: the header's, or
@@ -42,6 +44,11 @@
 //! does: the first one refused leaves every other `atomic push failure`, as git words it, and once
 //! every verdict has accepted, one append moves every ref or none ([`ATOMIC_TRANSACTION_FAILED`]
 //! when one moved since its verdict read it).
+//!
+//! **A protected branch's refusals** ([`protected`], A-644) are answered in git's own words:
+//! `non-fast-forward` and `deletion prohibited` as git refuses them itself, and `hook declined`
+//! after the words of what git leaves to a hook (a linear history, signed commits), relayed as git
+//! relays a hook's.
 //!
 //! **Stricter than git, by the documents' own words.** `atomic` is "Either all refs are updated or
 //! none" (gitprotocol-capabilities); git 2.50.1 still updates the other refs when one fails a check
@@ -59,9 +66,11 @@
 mod advertisement;
 mod connect;
 pub mod fsck;
+pub mod protected;
 mod report;
 mod request;
 mod session;
+pub mod works;
 
 pub use advertisement::{Advertised, write_advertisement};
 pub use connect::{Connected, connectivity};
@@ -156,6 +165,9 @@ pub trait Judge {
 pub struct Declined {
   /// Why, in git's words: the report's `ng <ref> <reason>`.
   pub reason: Vec<u8>,
+  /// What a hook wrote of it, relayed on band 2 before `message` as git relays a hook's words: in pieces of at most
+  /// [`protected::HOOK_PIECE`] bytes, as `copy_to_sideband` reads them (A-644). Empty when no hook spoke.
+  pub hook: Vec<u8>,
   /// The line git's `rp_error` sends on band 2 for it, made by [`message`], if any.
   pub message: Option<Vec<u8>>,
 }
@@ -372,11 +384,9 @@ pub const UNPACK_LIMIT: u32 = 100;
 static NO_INDEX: NoIndex = NoIndex;
 
 /// Receives a push held whole: reads its request from `bytes`, reads the pack that follows when one
-/// is due (its bases outside it from `repository`) and checks every object in it, checks every new
-/// tip's connectivity and every ref against `hidden`, then has `judge` judge each command the
-/// protocol's own checks passed and append those it accepted. Refused only for a request the
-/// protocol does not allow or past the admission; a pack refused is answered in the report, as git
-/// answers it.
+/// is due (its bases outside it from `repository`), checks it ([`check`]), then decides it with
+/// `judge` ([`decide`]). Refused only for a request the protocol does not allow or past the
+/// admission; a pack refused is answered in the report, as git answers it.
 pub fn receive<R, H, J>(
   bytes: &[u8],
   advertised: &Advertised<'_>,
@@ -398,19 +408,8 @@ where
     let read = pack.read(bytes.get(took..).unwrap_or_default(), admission);
     checked_pack(pack, read.map(|_| ()), repository, admission)
   });
-  let outcomes = outcomes(
-    &request,
-    unpacked.as_ref(),
-    repository,
-    hidden,
-    judge,
-    admission,
-  )?;
-  Ok(Received {
-    request,
-    unpacked,
-    outcomes,
-  })
+  let checked = check(request, unpacked, repository, hidden, admission)?;
+  decide(checked, judge, admission)
 }
 
 /// The pack's outcome once its bytes have ended or been refused (`read`): finished with its bases
@@ -434,36 +433,63 @@ fn checked_pack<R: Repository + ?Sized>(
   Ok(unpacked)
 }
 
-/// Each command's outcome: every command `unpacker error` after a refused pack; otherwise the
-/// connectivity check's refusals, then the hidden refs', then each remaining command's ref name,
-/// the judge's verdict and its append: each on its own without `atomic`, all or none under it. The
-/// outcomes, and the tables made on the way, are charged to `admission` before they are made.
-pub fn outcomes<R, H, J>(
-  request: &Request,
-  unpacked: Option<&Result<Unpacked, PackRefused>>,
+/// A push read and checked, before any verdict: its request, its pack's objects or why the pack was
+/// refused, and each command's refusal by the protocol's own checks. The caller may admit the
+/// pushed objects to its store's quarantine here ([`Checked::objects`]), holding nothing of
+/// receive-pack's, and then hand the push to [`decide`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checked {
+  /// The request.
+  pub request: Request,
+  /// The pack's objects, or why it was refused; `None` when no pack was due.
+  pub unpacked: Option<Result<Unpacked, PackRefused>>,
+  /// Each command's refusal by the checks, in the order sent; `None` for one they passed.
+  pub early: Vec<Option<Outcome>>,
+  /// The pushed objects' names and positions, sorted by name, charged once by [`check`].
+  by_id: Vec<(ObjectId, usize)>,
+}
+
+impl Checked {
+  /// The objects the push brought, in pack order: none when no pack was due or it was refused.
+  pub fn objects(&self) -> &[Object] {
+    match &self.unpacked {
+      Some(Ok(unpacked)) => unpacked.objects.as_slice(),
+      _ => &[],
+    }
+  }
+}
+
+/// Checks a read push: every command `unpacker error` after a refused pack; otherwise each new
+/// tip's connectivity against `repository`, then each ref against `hidden`. The tables made on the
+/// way are charged to `admission` before they are made.
+pub fn check<R, H>(
+  request: Request,
+  unpacked: Option<Result<Unpacked, PackRefused>>,
   repository: &R,
   hidden: &H,
-  judge: &mut J,
   admission: &mut Admission,
-) -> Result<Vec<Outcome>, Refusal>
+) -> Result<Checked, Refusal>
 where
   R: Repository + ?Sized,
   H: HiddenRefs + ?Sized,
-  J: Judge + ?Sized,
 {
   let count = request.commands.len();
-  let mut outcomes = charged_vec(count, admission)?;
-  if let Some(Err(_)) = unpacked {
-    outcomes.extend((0..count).map(|_| refused(UNPACKER_ERROR, None)));
-    return Ok(outcomes);
-  }
-  let objects = match unpacked {
+  let mut early = charged_vec(count, admission)?;
+  let objects = match &unpacked {
     Some(Ok(unpacked)) => unpacked.objects.as_slice(),
-    _ => &[],
+    Some(Err(_)) => {
+      early.extend((0..count).map(|_| Some(refused(UNPACKER_ERROR, None))));
+      return Ok(Checked {
+        request,
+        unpacked,
+        early,
+        by_id: Vec::new(),
+      });
+    }
+    None => &[],
   };
   let pushed = Pushed::new(objects, admission)?;
-  let connected = connectivity(request, &pushed, repository, admission)?;
-  let mut early = charged_vec(count, admission)?;
+  let connected = connectivity(&request, &pushed, repository, admission)?;
   early.extend(
     request
       .commands
@@ -471,12 +497,45 @@ where
       .zip(&connected)
       .map(|(command, connected)| early_refusal(command, *connected, hidden)),
   );
+  let by_id = pushed.by_id;
+  Ok(Checked {
+    request,
+    unpacked,
+    early,
+    by_id,
+  })
+}
+
+/// Decides a checked push: each command no check refused has `judge`'s verdict and then its append,
+/// each on its own without `atomic`, all or none under it; every outcome in the order sent. The
+/// outcomes are charged to `admission` before they are made.
+pub fn decide<J: Judge + ?Sized>(
+  checked: Checked,
+  judge: &mut J,
+  admission: &mut Admission,
+) -> Result<Received, Refusal> {
+  let Checked {
+    request,
+    unpacked,
+    early,
+    by_id,
+  } = checked;
+  let mut outcomes = charged_vec(request.commands.len(), admission)?;
+  let objects = match &unpacked {
+    Some(Ok(unpacked)) => unpacked.objects.as_slice(),
+    _ => &[],
+  };
+  let pushed = Pushed { objects, by_id };
   if request.requested.atomic {
-    atomic_outcomes(request, &pushed, judge, early, &mut outcomes, admission)?;
+    atomic_outcomes(&request, &pushed, judge, early, &mut outcomes, admission)?;
   } else {
-    each_outcome(request, &pushed, judge, early, &mut outcomes);
+    each_outcome(&request, &pushed, judge, early, &mut outcomes);
   }
-  Ok(outcomes)
+  Ok(Received {
+    request,
+    unpacked,
+    outcomes,
+  })
 }
 
 /// A command's refusal before any judging, in git's order: its connectivity, then a hidden ref.
@@ -591,6 +650,7 @@ fn verdict<J: Judge + ?Sized>(
   .concat();
   Err(Declined {
     reason: FUNNY_REFNAME.to_vec(),
+    hook: Vec::new(),
     message: Some(message(&line)),
   })
 }
@@ -599,6 +659,7 @@ fn verdict<J: Judge + ?Sized>(
 fn refused(reason: &[u8], message: Option<Vec<u8>>) -> Outcome {
   Outcome::Ng(Declined {
     reason: reason.to_vec(),
+    hook: Vec::new(),
     message,
   })
 }

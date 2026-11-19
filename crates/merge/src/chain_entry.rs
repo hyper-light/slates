@@ -25,7 +25,7 @@
 //! **The encoding** follows the origin's and the checkpoint's: magic and version, little-endian, every count checked
 //! against the bytes that remain before anything is allocated, any malformation refused typed ([`DocDecodeError`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::Increment;
 use crate::ops_doc::{DocDecodeError, Op, OpKind, Reader};
@@ -110,8 +110,9 @@ pub enum Applied {
   /// Remove an xattr: path, name.
   RemoveXattr(String, String),
   /// Copy `from`'s tree to `dst` by reference (A-586): what the head holds of it, which the verdict found unchanged
-  /// since `version`, the source's version the increment declared. Encoded as its two paths; `version` is read back
-  /// from the increment's own `Copy` operation, so the entry costs no more than its bound's two strings.
+  /// since `version`, the source's version the increment declared, replacing what `dst` holds when `replace` (A-626).
+  /// Encoded as its two paths; `version` and `replace` are read back from the increment's own `Copy` operation, so the
+  /// entry costs no more than its bound's two strings.
   CopyTree {
     /// The destination.
     dst: String,
@@ -119,7 +120,237 @@ pub enum Applied {
     from: String,
     /// The version of the source the increment copies.
     version: u64,
+    /// Whether the copy replaces what the destination holds ([`crate::ops_doc::REPLACE`]).
+    replace: bool,
+    /// What the copy changes in the head's tree it grafts, when its source changed after `version` (A-626 part 2):
+    /// recorded whole, so a replay reads no history.
+    fix: Option<Box<CopyFix>>,
   },
+}
+
+/// What a copy from a version its source changed after does to the head's tree it grafts, so the copy brings the
+/// source's tree as it stood at that version (A-626 part 2: FSFS copies from any committed revision). Recorded in the
+/// entry whole, so a replay reads no history, whatever its holder folded or restored. Paths are relative to the source,
+/// which is what they are relative to at the destination too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopyFix {
+  /// A copy made after the version at or above the source replaced its tree: nothing of the head's is grafted.
+  pub start_empty: bool,
+  /// The trees of copies made inside the source after the version, cut from what is grafted.
+  pub cuts: BTreeSet<String>,
+  /// Each file's bytes at the version, or none, where they differ from what is grafted.
+  pub files: BTreeMap<String, Option<Vec<u8>>>,
+  /// Each IPC node at the version, or none, where it differs from what is grafted.
+  pub specials: BTreeMap<String, Option<SpecialNode>>,
+  /// Whether each directory stood at the version, where that differs from what is grafted.
+  pub dirs: BTreeMap<String, bool>,
+  /// Each mode at the version, or none, where it differs from what is grafted.
+  pub modes: BTreeMap<String, Option<u32>>,
+  /// Each symbolic link's target at the version, or none, where it differs from what is grafted.
+  pub symlinks: BTreeMap<String, Option<String>>,
+  /// Each attribute's value at the version, or none, where it differs from what is grafted: by `(path, name)`.
+  pub xattrs: BTreeMap<(String, String), Option<Vec<u8>>>,
+}
+
+/// Format: the least bytes one record of a [`CopyFix`] table holds, a path's length word and a presence byte: what a
+/// decoder checks a table's count against before it allocates.
+const FIX_RECORD_MIN_BYTES: usize = size_of::<u32>() + size_of::<u8>();
+
+/// Format: the bytes a length or count word takes.
+const WORD_BYTES: usize = size_of::<u32>();
+
+/// The bytes [`put_fix`] writes for `fix`, without writing them: what a fixed copy's record adds to its entry, which the
+/// service secures before the verdict (`Green::copy_entry_room`).
+pub fn fix_bytes(fix: &CopyFix) -> usize {
+  let string = |text: &str| WORD_BYTES.saturating_add(text.len());
+  let maybe = |len: Option<usize>| len.map_or(1, |len| len.saturating_add(1));
+  let sum = |sizes: &mut dyn Iterator<Item = usize>| sizes.fold(0usize, usize::saturating_add);
+  let tables = [
+    sum(&mut fix.cuts.iter().map(|cut| string(cut))),
+    sum(&mut fix.files.iter().map(|(path, bytes)| {
+      string(path).saturating_add(maybe(bytes.as_ref().map(|bytes| string_len(bytes))))
+    })),
+    sum(&mut fix.specials.iter().map(|(path, node)| {
+      string(path).saturating_add(maybe(node.map(|node| string_len(&node.encode()))))
+    })),
+    sum(&mut fix.dirs.keys().map(|path| string(path).saturating_add(1))),
+    sum(
+      &mut fix
+        .modes
+        .iter()
+        .map(|(path, mode)| string(path).saturating_add(maybe(mode.map(|_| WORD_BYTES)))),
+    ),
+    sum(
+      &mut fix
+        .symlinks
+        .iter()
+        .map(|(path, target)| string(path).saturating_add(maybe(target.as_deref().map(string)))),
+    ),
+    sum(&mut fix.xattrs.iter().map(|((path, name), value)| {
+      string(path)
+        .saturating_add(string(name))
+        .saturating_add(maybe(value.as_ref().map(|value| string_len(value))))
+    })),
+  ];
+  let counts = WORD_BYTES.saturating_mul(tables.len());
+  sum(&mut tables.into_iter())
+    .saturating_add(counts)
+    .saturating_add(1)
+}
+
+/// The bytes a length word and `bytes` take.
+fn string_len(bytes: &[u8]) -> usize {
+  WORD_BYTES.saturating_add(bytes.len())
+}
+
+/// Writes `value`'s presence byte, then the value through `put` when present.
+fn put_maybe<T: ?Sized>(out: &mut Vec<u8>, value: Option<&T>, put: impl Fn(&mut Vec<u8>, &T)) {
+  out.push(u8::from(value.is_some()));
+  if let Some(value) = value {
+    put(out, value);
+  }
+}
+
+/// Writes a [`CopyFix`]: whether it starts empty, then its tables in key order, each a count and its records.
+fn put_fix(out: &mut Vec<u8>, fix: &CopyFix) {
+  out.push(u8::from(fix.start_empty));
+  put_count(out, fix.cuts.len());
+  for cut in &fix.cuts {
+    put_str(out, cut);
+  }
+  put_count(out, fix.files.len());
+  for (path, bytes) in &fix.files {
+    put_str(out, path);
+    put_maybe(out, bytes.as_deref(), put_bytes);
+  }
+  put_count(out, fix.specials.len());
+  for (path, node) in &fix.specials {
+    put_str(out, path);
+    put_maybe(out, node.as_ref(), |out, node| {
+      put_bytes(out, &node.encode())
+    });
+  }
+  put_count(out, fix.dirs.len());
+  for (path, stood) in &fix.dirs {
+    put_str(out, path);
+    out.push(u8::from(*stood));
+  }
+  put_fix_rest(out, fix);
+}
+
+/// [`put_fix`]'s modes, symbolic links and attributes.
+fn put_fix_rest(out: &mut Vec<u8>, fix: &CopyFix) {
+  put_count(out, fix.modes.len());
+  for (path, mode) in &fix.modes {
+    put_str(out, path);
+    put_maybe(out, mode.as_ref(), |out, mode| {
+      out.extend_from_slice(&mode.to_le_bytes());
+    });
+  }
+  put_count(out, fix.symlinks.len());
+  for (path, target) in &fix.symlinks {
+    put_str(out, path);
+    put_maybe(out, target.as_deref(), put_str);
+  }
+  put_count(out, fix.xattrs.len());
+  for ((path, name), value) in &fix.xattrs {
+    put_str(out, path);
+    put_str(out, name);
+    put_maybe(out, value.as_deref(), put_bytes);
+  }
+}
+
+/// A presence or truth byte: 0 or 1, anything else refused.
+fn take_flag(reader: &mut Reader<'_>) -> Result<bool, DocDecodeError> {
+  match reader.u8()? {
+    0 => Ok(false),
+    1 => Ok(true),
+    _ => Err(DocDecodeError::BadKind),
+  }
+}
+
+/// A [`CopyFix`] table's count, refused before anything is allocated when the bytes that remain could not hold that
+/// many records of `least` bytes each.
+fn take_table(reader: &mut Reader<'_>, least: usize) -> Result<usize, DocDecodeError> {
+  let count = reader.u32()? as usize;
+  if count > reader.remaining() / least.max(1) {
+    return Err(DocDecodeError::Truncated);
+  }
+  Ok(count)
+}
+
+/// A present value read by `take`, or none.
+fn take_maybe<T>(
+  reader: &mut Reader<'_>,
+  take: impl Fn(&mut Reader<'_>) -> Result<T, DocDecodeError>,
+) -> Result<Option<T>, DocDecodeError> {
+  if take_flag(reader)? {
+    take(reader).map(Some)
+  } else {
+    Ok(None)
+  }
+}
+
+/// Inserts one record of a [`CopyFix`] table; a key written twice is refused (an encoder writes each once, in order).
+fn insert_once<K: Ord, V>(
+  table: &mut BTreeMap<K, V>,
+  key: K,
+  value: V,
+) -> Result<(), DocDecodeError> {
+  if table.insert(key, value).is_some() {
+    return Err(DocDecodeError::DuplicatePath);
+  }
+  Ok(())
+}
+
+/// Reads a [`CopyFix`] as [`put_fix`] writes it.
+fn take_fix(reader: &mut Reader<'_>) -> Result<CopyFix, DocDecodeError> {
+  let mut fix = CopyFix {
+    start_empty: take_flag(reader)?,
+    ..CopyFix::default()
+  };
+  for _ in 0..take_table(reader, WORD_BYTES)? {
+    if !fix.cuts.insert(take_str(reader)?) {
+      return Err(DocDecodeError::DuplicatePath);
+    }
+  }
+  for _ in 0..take_table(reader, FIX_RECORD_MIN_BYTES)? {
+    let path = take_str(reader)?;
+    let bytes = take_maybe(reader, |reader| reader_bytes(reader).map(<[u8]>::to_vec))?;
+    insert_once(&mut fix.files, path, bytes)?;
+  }
+  for _ in 0..take_table(reader, FIX_RECORD_MIN_BYTES)? {
+    let path = take_str(reader)?;
+    let node = take_maybe(reader, |reader| SpecialNode::decode(reader_bytes(reader)?))?;
+    insert_once(&mut fix.specials, path, node)?;
+  }
+  for _ in 0..take_table(reader, FIX_RECORD_MIN_BYTES)? {
+    let path = take_str(reader)?;
+    let stood = take_flag(reader)?;
+    insert_once(&mut fix.dirs, path, stood)?;
+  }
+  take_fix_rest(reader, &mut fix)?;
+  Ok(fix)
+}
+
+/// [`take_fix`]'s modes, symbolic links and attributes.
+fn take_fix_rest(reader: &mut Reader<'_>, fix: &mut CopyFix) -> Result<(), DocDecodeError> {
+  for _ in 0..take_table(reader, FIX_RECORD_MIN_BYTES)? {
+    let path = take_str(reader)?;
+    let mode = take_maybe(reader, |reader| reader.u32())?;
+    insert_once(&mut fix.modes, path, mode)?;
+  }
+  for _ in 0..take_table(reader, FIX_RECORD_MIN_BYTES)? {
+    let path = take_str(reader)?;
+    let target = take_maybe(reader, take_str)?;
+    insert_once(&mut fix.symlinks, path, target)?;
+  }
+  for _ in 0..take_table(reader, FIX_RECORD_MIN_BYTES)? {
+    let key = (take_str(reader)?, take_str(reader)?);
+    let value = take_maybe(reader, |reader| reader_bytes(reader).map(<[u8]>::to_vec))?;
+    insert_once(&mut fix.xattrs, key, value)?;
+  }
+  Ok(())
 }
 
 /// A decoded chain entry.
@@ -207,6 +438,9 @@ mod tag {
   pub(super) const COPIED_SPLICED: u8 = 17;
   /// Format: the tag of a tree copied by reference (A-586), its source's version the increment's `Copy` operation's.
   pub(super) const COPY_TREE: u8 = 18;
+  /// Format: the tag of a tree copied from a version its source changed after (A-626 part 2): [`COPY_TREE`]'s record,
+  /// then its `CopyFix`.
+  pub(super) const COPY_TREE_FIXED: u8 = 19;
 }
 
 /// The largest an entry for `increment` can encode to, whatever its verdict resolves it to: what the service charges
@@ -453,15 +687,17 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
 }
 
 /// What an increment declares, indexed for its entry's effects (A-632): each path's content ops in
-/// order, and each copy's source version by its destination and source (A-586). Built in one pass
+/// order, and each copy's source version and whether it replaces, by its destination and source
+/// (A-586, A-626). Built in one pass
 /// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
 /// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
 /// files.
 struct Declared<'a> {
   /// Each path's content ops, in the increment's order.
   ops: BTreeMap<&'a str, Vec<Op>>,
-  /// Each copy's source version, by destination, then source; the first a pair declares.
-  copies: BTreeMap<&'a str, BTreeMap<&'a str, u64>>,
+  /// Each copy's source version and whether it replaces, by destination, then source; the first a
+  /// pair declares.
+  copies: BTreeMap<&'a str, BTreeMap<&'a str, (u64, bool)>>,
 }
 
 impl<'a> Declared<'a> {
@@ -488,7 +724,7 @@ impl<'a> Declared<'a> {
           .entry(path)
           .or_default()
           .entry(from)
-          .or_insert(op.at);
+          .or_insert((op.at, op.replaces()));
       }
     }
     declared
@@ -499,9 +735,9 @@ impl<'a> Declared<'a> {
     self.ops.get(path).map_or(&[][..], Vec::as_slice)
   }
 
-  /// The source version of the copy the increment declares from `from` to `dst`; `None` when it
-  /// declares none, which no entry the engine recorded holds.
-  fn copy(&self, dst: &str, from: &str) -> Option<u64> {
+  /// The source version of the copy the increment declares from `from` to `dst`, and whether it
+  /// replaces; `None` when it declares none, which no entry the engine recorded holds.
+  fn copy(&self, dst: &str, from: &str) -> Option<(u64, bool)> {
     self.copies.get(dst)?.get(from).copied()
   }
 }
@@ -547,7 +783,21 @@ fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
       put_bytes(out, value);
     }
     Applied::RemoveXattr(path, name) => put_tagged_paths(out, tag::REMOVE_XATTR, &[path, name]),
-    Applied::CopyTree { dst, from, .. } => put_tagged_paths(out, tag::COPY_TREE, &[dst, from]),
+    Applied::CopyTree {
+      dst,
+      from,
+      fix: None,
+      ..
+    } => put_tagged_paths(out, tag::COPY_TREE, &[dst, from]),
+    Applied::CopyTree {
+      dst,
+      from,
+      fix: Some(fix),
+      ..
+    } => {
+      put_tagged_paths(out, tag::COPY_TREE_FIXED, &[dst, from]);
+      put_fix(out, fix);
+    }
   }
 }
 
@@ -618,11 +868,22 @@ fn take_applied(
       let path = take_str(reader)?;
       Applied::RemoveXattr(path, take_str(reader)?)
     }
-    tag::COPY_TREE => {
+    kind @ (tag::COPY_TREE | tag::COPY_TREE_FIXED) => {
       let dst = take_str(reader)?;
       let from = take_str(reader)?;
-      let version = declared.copy(&dst, &from).ok_or(DocDecodeError::BadKind)?;
-      Applied::CopyTree { dst, from, version }
+      let (version, replace) = declared.copy(&dst, &from).ok_or(DocDecodeError::BadKind)?;
+      let fix = if kind == tag::COPY_TREE_FIXED {
+        Some(Box::new(take_fix(reader)?))
+      } else {
+        None
+      };
+      Applied::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+        fix,
+      }
     }
     _ => return Err(DocDecodeError::BadKind),
   })
@@ -634,6 +895,95 @@ mod tests {
 
   use super::*;
   use crate::ops_doc::OpsDoc;
+
+  /// A fix with a record of every kind it holds, present and absent.
+  fn every_kind_fix() -> CopyFix {
+    let mut fix = CopyFix::default();
+    fix.cuts.insert("t".to_owned());
+    fix.files.insert("a".to_owned(), Some(b"alpha".to_vec()));
+    fix.files.insert("c".to_owned(), None);
+    fix.specials.insert("p".to_owned(), None);
+    fix.dirs.insert("d".to_owned(), true);
+    fix.dirs.insert("e".to_owned(), false);
+    fix.modes.insert("a".to_owned(), Some(0o644));
+    fix.modes.insert("c".to_owned(), None);
+    fix.symlinks.insert("l".to_owned(), Some("a".to_owned()));
+    fix
+      .xattrs
+      .insert(("d".to_owned(), "n".to_owned()), Some(b"v".to_vec()));
+    fix.xattrs.insert(("d".to_owned(), "m".to_owned()), None);
+    fix
+  }
+
+  /// A-626 part 2. Do: encode a fix holding a record of every kind and decode it. Expect: the same fix, nothing left
+  /// over, and `fix_bytes` the encoding's length exactly: the room the service secures is the bytes the entry gains.
+  #[test]
+  fn a_copy_fix_round_trips_and_its_size_is_its_encoding() {
+    let fix = every_kind_fix();
+    let mut out = Vec::new();
+    put_fix(&mut out, &fix);
+    assert_eq!(fix_bytes(&fix), out.len());
+    let mut reader = Reader::new(&out);
+    assert_eq!(take_fix(&mut reader), Ok(fix));
+    assert_eq!(reader.remaining(), 0);
+  }
+
+  /// A-626 part 2 (golden vector). Do: encode a fix that starts empty with one cut and one file. Expect: these bytes, the
+  /// format's, byte for byte: the flag, then each table's count and records in order.
+  #[test]
+  fn a_copy_fix_encodes_to_its_golden_bytes() {
+    let mut fix = CopyFix {
+      start_empty: true,
+      ..CopyFix::default()
+    };
+    fix.cuts.insert("x".to_owned());
+    fix.files.insert("a".to_owned(), Some(b"z".to_vec()));
+    let mut out = Vec::new();
+    put_fix(&mut out, &fix);
+    let mut golden = [
+      // Starts empty; one cut, "x".
+      &b"\x01"[..],
+      b"\x01\x00\x00\x00\x01\x00\x00\x00x",
+      // One file, "a", present: "z".
+      b"\x01\x00\x00\x00\x01\x00\x00\x00a\x01\x01\x00\x00\x00z",
+    ]
+    .concat();
+    // No IPC node, directory, mode, symbolic link or attribute: five empty counts.
+    golden.extend_from_slice(&[0; 20]);
+    assert_eq!(out, golden);
+  }
+
+  /// A-626 part 2 (hostile bytes). Do: decode a fix whose file table claims `u32::MAX` records, one naming a file twice,
+  /// and one whose flag byte is 2. Expect: `Truncated` (before anything is allocated for the claim), `DuplicatePath` and
+  /// `BadKind`.
+  #[test]
+  fn a_hostile_copy_fix_is_refused_typed() {
+    let mut huge = vec![0u8];
+    put_count(&mut huge, 0);
+    huge.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      take_fix(&mut Reader::new(&huge)),
+      Err(DocDecodeError::Truncated)
+    );
+    let mut twice = vec![0u8];
+    put_count(&mut twice, 0);
+    put_count(&mut twice, 2);
+    for _ in 0..2 {
+      put_str(&mut twice, "a");
+      twice.push(0);
+    }
+    for _ in 0..5 {
+      put_count(&mut twice, 0);
+    }
+    assert_eq!(
+      take_fix(&mut Reader::new(&twice)),
+      Err(DocDecodeError::DuplicatePath)
+    );
+    assert_eq!(
+      take_fix(&mut Reader::new(&[2u8])),
+      Err(DocDecodeError::BadKind)
+    );
+  }
 
   thread_local! {
     /// The increment's ops an entry's index visited on this thread ([`Declared::of`]).

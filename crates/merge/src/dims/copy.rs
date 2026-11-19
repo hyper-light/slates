@@ -3,8 +3,8 @@
 //! `Copy` operation (A-586) calls these, records the copy by one entry for the destination's prefix, and a green made at
 //! a version before a copy takes the copy's tree away by [`Dim::cut_tree`].
 
-use super::{Dim, Files, PATH_END, Xattrs, escaped, path_key};
-use crate::ptrie::{GraftRefused, Holders, Plain, Ptrie, Shared};
+use super::{Block, Dim, Files, PATH_END, Xattrs, escaped, path_key};
+use crate::ptrie::{Holders, Plain, Ptrie, Shared};
 
 /// Format: the byte between a path's names, which every key beneath a path holds right after it.
 const SEPARATOR: u8 = b'/';
@@ -53,59 +53,129 @@ impl Copied {
   }
 }
 
+/// A path's tree held for a copy (A-626): the keys beneath it as one held subtree (every key, the root's own among them,
+/// for the root) and its own key's value, its holder told. Taken before a commit changes any map, so every copy of one
+/// version reads its source as the version before it, whatever an earlier copy of that version takes away; a graft
+/// takes it, or gives it back when it refuses.
+#[derive(Debug)]
+pub(crate) struct Held<V> {
+  /// The keys beneath the tree's own, as one held subtree.
+  below: Option<Shared>,
+  /// The tree's own key's value, one more holder of it told.
+  own: Option<V>,
+  /// Whether the tree is the root's, whose subtree holds its own key too.
+  root: bool,
+}
+
 impl<V: Clone> Dim<V> {
   /// Copies `from`'s tree to `to` (the parent module's "A tree is copied by reference"): O(the paths' lengths), no walk.
-  /// The root's tree is every key: they all come beneath `to`, and the root's own key to `to`'s.
+  /// The root's tree is every key: they all come beneath `to`, and the root's own key to `to`'s. A hold and its graft,
+  /// one after the other: the engine holds every source of a commit before it grafts any (A-626), so only the tests copy
+  /// this way.
+  #[cfg(test)]
   pub(crate) fn copy_tree(&mut self, from: &str, to: &str) -> Result<Copied, CopyRefused> {
-    self.copy_tree_held(from.as_bytes(), to.as_bytes(), &mut Plain)
+    let held = self.hold_tree_with(from.as_bytes(), &mut Plain);
+    self.graft_tree_with(held, to.as_bytes(), &mut Plain)
   }
 
-  /// [`Dim::copy_tree`], each value it copies told it has one more holder.
-  fn copy_tree_held(
+  /// `from`'s tree held for a later graft ([`Held`]): one descent and one count, no walk.
+  pub(crate) fn hold_tree(&mut self, from: &str) -> Held<V> {
+    self.hold_tree_with(from.as_bytes(), &mut Plain)
+  }
+
+  /// A held tree grafted at `to` (the parent module's "A tree is copied by reference"); refused, and the hold given back,
+  /// onto the root or a destination that holds a key.
+  pub(crate) fn graft_tree(&mut self, held: Held<V>, to: &str) -> Result<Copied, CopyRefused> {
+    self.graft_tree_with(held, to.as_bytes(), &mut Plain)
+  }
+
+  /// [`Dim::hold_tree`], the own value's holder told.
+  fn hold_tree_with(&mut self, from: &[u8], holders: &mut impl Holders<V>) -> Held<V> {
+    let below = self.root.subtree(&mut self.nodes, &below(from));
+    let own = self.root.get(&self.nodes, from).cloned();
+    if let Some(value) = &own {
+      holders.copied(value);
+    }
+    Held {
+      below,
+      own,
+      root: from.is_empty(),
+    }
+  }
+
+  /// [`Dim::graft_tree`], each value told as its nodes are copied and freed.
+  fn graft_tree_with(
     &mut self,
-    from: &[u8],
+    held: Held<V>,
     to: &[u8],
     holders: &mut impl Holders<V>,
   ) -> Result<Copied, CopyRefused> {
-    if to.is_empty() {
-      return Err(CopyRefused::Root);
+    if to.is_empty() || self.holds_tree_of(to) {
+      self.drop_held_with(held, holders);
+      return Err(if to.is_empty() {
+        CopyRefused::Root
+      } else {
+        CopyRefused::Occupied
+      });
     }
-    if self.holds_tree_of(to) {
-      return Err(CopyRefused::Occupied);
-    }
-    let into = beneath(to);
-    let held = self.root.subtree(&mut self.nodes, &below(from));
-    let own = self.root.get(&self.nodes, from).cloned();
-    let brought = held.as_ref().map_or(0, |shared| shared.len(&self.nodes));
+    let Held { below, own, root } = held;
+    let brought = below.as_ref().map_or(0, |shared| shared.len(&self.nodes));
     // The root's subtree holds its own key as well as every key beneath it.
-    let own_in_held = from.is_empty() && own.is_some();
+    let own_in_below = root && own.is_some();
     let copied = Copied {
       own: own.is_some(),
-      beneath: brought > usize::from(own_in_held),
+      beneath: brought > usize::from(own_in_below),
     };
-    if let Some(shared) = held {
-      self
+    let into = beneath(to);
+    if let Some(shared) = below {
+      if self
         .root
         .graft(&mut self.nodes, &into, shared, holders)
-        .map_err(|_: GraftRefused| CopyRefused::Occupied)?;
-      if own_in_held && let Some(misplaced) = self.root.remove(&mut self.nodes, &into, holders) {
+        .is_err()
+      {
+        // The check above leaves the graft nothing to refuse; were it to refuse, the own value is given back too.
+        if let Some(value) = own {
+          holders.freed(value);
+        }
+        return Err(CopyRefused::Occupied);
+      }
+      if own_in_below && let Some(misplaced) = self.root.remove(&mut self.nodes, &into, holders) {
         // The root's own key came with every key and stands at the destination's separator: it goes from there, and
         // is set at the destination's own key below.
         holders.freed(misplaced);
       }
     }
-    if let Some(value) = own {
-      holders.copied(&value);
-      if let Some(replaced) = self.root.insert(&mut self.nodes, to, value, holders) {
-        holders.freed(replaced);
-      }
+    if let Some(value) = own
+      && let Some(replaced) = self.root.insert(&mut self.nodes, to, value, holders)
+    {
+      holders.freed(replaced);
     }
     Ok(copied)
+  }
+
+  /// Gives a hold back without grafting it, each value whose last holder goes told.
+  fn drop_held_with(&mut self, held: Held<V>, holders: &mut impl Holders<V>) {
+    if let Some(shared) = held.below {
+      Ptrie::drop_subtree(&mut self.nodes, shared, holders);
+    }
+    if let Some(value) = held.own {
+      holders.freed(value);
+    }
   }
 
   /// Whether `path`'s tree holds a key: its own, or one beneath it (any key, for the root). Descents, no walk.
   pub(crate) fn holds_tree(&self, path: &str) -> bool {
     self.holds_tree_of(path.as_bytes())
+  }
+
+  /// How many keys `path`'s tree holds: its own and those beneath it (every key, for the root). Descents and the counts
+  /// their nodes keep, no walk (A-626: whether a copy's source held anything at the version it is copied at).
+  pub(crate) fn count_tree(&self, path: &str) -> usize {
+    if path.is_empty() {
+      return self.root.len(&self.nodes);
+    }
+    let own = usize::from(self.root.contains_key(&self.nodes, path.as_bytes()));
+    own.saturating_add(self.root.prefix_len(&self.nodes, &below(path.as_bytes())))
   }
 
   /// [`Dim::holds_tree`] over the path's bytes.
@@ -134,15 +204,33 @@ impl<V: Clone> Dim<V> {
 
 impl Files {
   /// [`Dim::copy_tree`]: each copied file one more holder of its block, never a copy of its bytes.
+  #[cfg(test)]
   pub(crate) fn copy_tree(&mut self, from: &str, to: &str) -> Result<Copied, CopyRefused> {
+    let held = self.hold_tree(from);
+    self.graft_tree(held, to)
+  }
+
+  /// [`Dim::hold_tree`]: the own file one more holder of its block, so a removal in the same commit frees no block a
+  /// held tree still names.
+  pub(crate) fn hold_tree(&mut self, from: &str) -> Held<Block> {
+    self.map.hold_tree_with(from.as_bytes(), &mut self.blocks)
+  }
+
+  /// [`Dim::graft_tree`].
+  pub(crate) fn graft_tree(&mut self, held: Held<Block>, to: &str) -> Result<Copied, CopyRefused> {
     self
       .map
-      .copy_tree_held(from.as_bytes(), to.as_bytes(), &mut self.blocks)
+      .graft_tree_with(held, to.as_bytes(), &mut self.blocks)
   }
 
   /// [`Dim::holds_tree`].
   pub(crate) fn holds_tree(&self, path: &str) -> bool {
     self.map.holds_tree(path)
+  }
+
+  /// [`Dim::count_tree`]: the files of `path`'s tree.
+  pub(crate) fn count_tree(&self, path: &str) -> usize {
+    self.map.count_tree(path)
   }
 
   /// [`Dim::cut_tree`]: a block is let go with its last holder.
@@ -151,36 +239,68 @@ impl Files {
   }
 }
 
+/// A path's attributes held for a copy (A-626, [`Held`]): its own attributes and its descendants', each one held subtree
+/// (every attribute, the root's own among them, for the root's descendants).
+#[derive(Debug)]
+pub(crate) struct HeldAttributes {
+  /// The path's own attributes.
+  own: Option<Shared>,
+  /// Its descendants' attributes.
+  below: Option<Shared>,
+  /// Whether the path is the root.
+  root: bool,
+}
+
 impl Xattrs {
   /// Copies the attributes of `from`'s tree to `to`'s: `from`'s own attributes, one prefix, and its descendants',
   /// another, both held before either is grafted. O(the paths' lengths), no walk. The root's descendants are every key,
   /// its own attributes among them: they come beneath `to` with the rest and are cut away from there, the root's own
-  /// having come to `to`'s own prefix.
+  /// having come to `to`'s own prefix. As [`Dim::copy_tree`], the tests' form.
+  #[cfg(test)]
   pub(crate) fn copy_tree(&mut self, from: &str, to: &str) -> Result<Copied, CopyRefused> {
-    if to.is_empty() {
-      return Err(CopyRefused::Root);
+    let held = self.hold_tree(from);
+    self.graft_tree(held, to)
+  }
+
+  /// `from`'s attributes held for a later graft ([`HeldAttributes`]): two descents and two counts, no walk.
+  pub(crate) fn hold_tree(&mut self, from: &str) -> HeldAttributes {
+    HeldAttributes {
+      own: self.map.root.subtree(&mut self.map.nodes, &path_key(from)),
+      below: self
+        .map
+        .root
+        .subtree(&mut self.map.nodes, &below(&escaped(from))),
+      root: from.is_empty(),
     }
-    if self.holds_tree(to) {
-      return Err(CopyRefused::Occupied);
+  }
+
+  /// Held attributes grafted at `to`'s tree; refused, and the holds given back, onto the root or a tree that carries an
+  /// attribute.
+  pub(crate) fn graft_tree(
+    &mut self,
+    held: HeldAttributes,
+    to: &str,
+  ) -> Result<Copied, CopyRefused> {
+    if to.is_empty() || self.holds_tree(to) {
+      self.drop_held(held);
+      return Err(if to.is_empty() {
+        CopyRefused::Root
+      } else {
+        CopyRefused::Occupied
+      });
     }
-    let own_to = path_key(to);
-    let beneath_to = beneath(&escaped(to));
-    let own = self.map.root.subtree(&mut self.map.nodes, &path_key(from));
-    let below_from = self
-      .map
-      .root
-      .subtree(&mut self.map.nodes, &below(&escaped(from)));
+    let HeldAttributes { own, below, root } = held;
     let own_len = own.as_ref().map_or(0, |shared| shared.len(&self.map.nodes));
-    let below_len = below_from
+    let below_len = below
       .as_ref()
       .map_or(0, |shared| shared.len(&self.map.nodes));
-    let root_own = if from.is_empty() { own_len } else { 0 };
+    let root_own = if root { own_len } else { 0 };
     let copied = Copied {
       own: own_len > 0,
       beneath: below_len > root_own,
     };
-    let refused = self.graft_each([(own, own_to), (below_from, beneath_to.clone())]);
-    if refused {
+    let beneath_to = beneath(&escaped(to));
+    if self.graft_each([(own, path_key(to)), (below, beneath_to.clone())]) {
       return Err(CopyRefused::Occupied);
     }
     if root_own > 0 {
@@ -195,6 +315,13 @@ impl Xattrs {
       }
     }
     Ok(copied)
+  }
+
+  /// Gives held attributes back without grafting them.
+  fn drop_held(&mut self, held: HeldAttributes) {
+    for shared in [held.own, held.below].into_iter().flatten() {
+      Ptrie::drop_subtree(&mut self.map.nodes, shared, &mut Plain);
+    }
   }
 
   /// Grafts each held subtree at its prefix, in order; true when one was refused. The copy's checks leave the grafts
@@ -214,6 +341,17 @@ impl Xattrs {
       }
     }
     refused
+  }
+
+  /// How many attributes `path` and the paths beneath it carry (every one, for the root): descents and counts, no walk.
+  pub(crate) fn count_tree(&self, path: &str) -> usize {
+    if path.is_empty() {
+      return self.map.root.len(&self.map.nodes);
+    }
+    [path_key(path), below(&escaped(path))]
+      .iter()
+      .map(|prefix| self.map.root.prefix_len(&self.map.nodes, prefix))
+      .fold(0, usize::saturating_add)
   }
 
   /// Whether `path` or a path beneath it carries an attribute (any path, for the root). Descents, no walk.

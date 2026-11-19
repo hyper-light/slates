@@ -621,3 +621,130 @@ server's directory are the ones its reviewed expected-failure list starts from.
   (`getfnode(computemissing=False)`); none was, so no session carried one.
 - **An abort on a bundle2 request is answered as a bundle2 stream** holding one `error:abort` part (the message
   mandatory, the hint advisory), not as an SSH error: owed to the stdio loop.
+
+## 20. Found while building piece 5's first part, a push's bundle, race checks and reply (A-641 part 1, 2026-11-19; 7.2's code [C] in the wheel uv installs on the Mac Studio, CPython 3.12; captures of stock `hg` 7.2 over SSH, `fixtures/push`)
+
+- **Files read**, with their SHA-256 there: `bundle2_part_handlers.py` (`7aabb77e10cd6160…`), `bundle2.py`
+  (`90ddd2bf3fbdb781…`), `exchange.py` (`ecf56e2d9f26d017…`), `wireprotov1server.py` (`b47340cf38d24c13…`); and from the
+  same wheel, not hashed: `changegroup.py`, `branchmap.py`, `error.py`, `hook.py`, `hgext/hooklib/reject_new_heads.py`.
+- **A part's handler** (`bundle2.py` `_gethandler`, its two raises at 539 and 546): routed by the type in lower case; a type no handler takes,
+  or a mandatory parameter outside the handler's declared names (`part.mandatorykeys - handler.params`, sorted), raises
+  `BundleUnknownFeatureError(parttype=part.type, params=...)` and is re-raised only for a mandatory part. The server
+  answers it with `error:unsupportedcontent` carrying `parttype` and the names joined by NUL, both mandatory
+  (`wireprotov1server.py` 808-814). Captured: an unknown `TEST:UNKNOWN` part answered `parttype: test:unknown`; an
+  unknown mandatory `slates-unknown` on `CHANGEGROUP` answered `parttype: changegroup, params: slates-unknown`.
+- **The race checks' words** (`bundle2_part_handlers.py` 244-352): `check:heads` and `check:updated-heads` "remote
+  repository changed while pushing - please try again"; `check:bookmarks` the same then ` (bookmark "%s" move from %s
+  to %s)` (the node the client saw, then the server's), `(bookmark "%s" is missing, expected %s)` or `(bookmark "%s" set
+  on %s, expected missing)`; `check:phases` ` (%s is %s expected %s)` (the node, its phase now, the phase expected),
+  every node as `short` (twelve hexadecimal digits). `check:heads` compares sorted lists (`sorted(heads) !=
+  sorted(op.repo.heads())`), and an empty repository's `heads()` is `[nullid]`; `check:updated-heads` asks
+  `branchmap().all_nodes_are_heads` (`branchmap.py` 888-894: every node among every branch's heads, closed ones too, and
+  `[nullid]` alone only when the repository is empty). `check:phases` reads the payload into a mapping keyed in
+  `allphases` order, so its nodes are judged public first whatever the payload's order. All four were captured: the
+  three races answered `error:pushraced` with exactly these words (`push-race`, `push-race-bookmark`,
+  `push-race-phase`).
+- **What a 7.2 client sends** (the captures' listings): `replycaps` first, then `check:bookmarks` (when it moves a
+  bookmark), `check:phases` (the remote's public heads and draft roots as the client saw them, `_pushb2checkphases`,
+  `exchange.py` 950-972), `check:updated-heads` (`checkheads=related`, 7.2's default) or `check:heads` (a strict
+  server), `changegroup` version `03`, then `bookmarks` or `phase-heads`. A forced push sends no check at all
+  (`_pushb2ctxcheckheads` 896-922 and the bookmark and phase checks skip under `force`).
+- **The reply** (`bundle2_part_handlers.py` 79-147, 424-452, 538-562; `exchange.py` `unbundle`, from 2818): parts are numbered from
+  0 as added; `reply:changegroup` is advisory with advisory `in-reply-to` (the changegroup part's id: 3, or 4 after a
+  bookmark check) and `return`; `reply:pushkey` and `reply:obsmarkers` are mandatory with advisory parameters; an
+  `output` part (advisory) follows a part whose handler printed, and one more comes last for the transaction's hooks,
+  but only where output is captured: always over HTTP (`url.startswith(b'remote:http')`), over SSH only under
+  `experimental.bundle2-output-capture`, so the captures over SSH hold none. A bookmark or a phase pushed alone is
+  answered by a stream with no part. A refused push is answered by a new stream (salvaged `output`, then one error
+  part), so a reply part made before the refusal is never sent.
+- **`reply:changegroup`'s `return`** (`changegroup.py` 879-890, 969-974): the heads added less those removed less the
+  added heads that close their branch, plus one, or minus one where negative: "never return 0".
+- **`unbundle`'s `heads` argument** (`exchange.py` 2799-2816): `force`, the list equal to `repo.heads()` in its order
+  (newest first), or `hashed` and the SHA-1 of the heads sorted and joined; judged before the payload is read ("while
+  preparing changes") and again as the bundle applies ("while uploading changes"). A bundle2 push sends `force`.
+- **A new head refused by 7.2's own hook** (`hgext/hooklib/reject_new_heads.py`, run as `pretxnclose`): `error:abort`
+  with "Changes on branch 'default' resulted in multiple heads" and no hint. Its `%r` is bytes formatting's `%a`, the
+  repr of a `pycompat.bytestr` (bytes' repr without its `b`); measured for ten names under CPython 3.12 (quotes, both
+  quotes, tab, NUL, bytes from 0x7f, a backslash, line ends, UTF-8), held by the test.
+- **The fixture script's first run** recorded none of the three races: the other clients pushed through the recording
+  stand-in without naming a capture, the stand-in failed on the missing name, and the script took their exit status
+  255 for a refused push, so each replay found the server unmoved and was accepted (`reply:changegroup` 1). The
+  stand-in now records only a named capture, and only a recorded push may be refused.
+- **Part 2's verification** (A-641 part 2): `revlog.py` 3831-3848 (`addgroup` passes over a node its log holds,
+  "this can happen if two branches make the same change", and raises "unknown parent" and "unknown delta base");
+  `changegroup.py` 2896 ("missing file data for %s:%s - run hg verify", under `server.validate`).
+- **The path audit** (`pathutil.py` 87-118, SHA-256 `57d845838cc47f2f…`; `encoding.py` 56-76, `47900298a9ce5928…`):
+  "path ends in directory separator" for a trailing separator; "path contains illegal component" for
+  `os.path.splitdrive(path)[0]`, a first component `.hg`, `.hg.` or empty, any `..`, or a Windows short name of `.hg`
+  (`first.upper() in [b"HG", b"HG8B6C"]` before `~` and digits); "path '%s' is inside nested repo %r" for `.hg` or
+  `.hg.` as any later component, the components before it joined. Each comparison is `_lowerclean`'s: Python's
+  ASCII-only `lower()`, then `hfsignoreclean`, which removes the UTF-8 of U+200C to U+200F, U+202A to U+202E, U+206A
+  to U+206F and U+FEFF. 7.2 applies it to a working copy's writes, not to a push.
+
+## 21. Found while building piece 3's import of an existing store and its file index (A-630 parts 2 and 3, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/import`)
+
+- **Which requirements 7.2 knows.** `repo/requirements.py`'s `BASE_SUPPORTED` (23), the `exp-compression-<engine>`
+  names of every engine with a revlog header (`zlib`, `zstd`, and `none`, whose chunks keep a NUL) with
+  `revlog-compression-zstd` (`gather_supported_requirements`), and the shipped extensions' `narrowhg-experimental`,
+  `lfs` and `largefiles`: 30 in all. A requirement it does not know refuses the repository ("repository requires
+  features unknown to this Mercurial"); an empty one, or one not beginning with a letter or a digit, is a corrupt file
+  (`ensurerequirementsrecognized`). `scmutil.readrequires` cuts the file with `splitlines`.
+- **Where a store's requirements are.** With `share-safe` in `.hg/requires` (7.2's default), the store's own are in
+  `store/requires`, which must be there (`readrequires(storevfs, False)`); without it every requirement is in
+  `.hg/requires` and there is no `store/requires`. Measured: the dotencode, hybrid, version 2 and file index
+  repositories' `.hg/requires` hold `share-safe` alone; a repository made with `format.use-share-safe=False` holds all
+  seven of its store's in `.hg/requires` and no `store/requires`, its store byte for byte the share-safe one's.
+- **A file index store is named by dotencode's encoding.** `localrepo.makestore` gives a `fileindex-v1` store
+  `Encoding.DOTENCODE` unless the plain encoding is required, though `dotencode` itself is refused beside
+  `fileindex-v1` (as `fncache` and `treemanifest` are). Measured: the version 1 file index store's data revlogs carry
+  exactly the dotencode store's names (`data/~2eleading.i`, `data/~20space.i`), and the version 2 store's dockets the
+  same with `-<id>.idx`, `.dat` and `.sda` beside them, a long one hashed with its extension kept
+  (`dh/upper_zzz….txt-18857273.idx<sha1>.idx`).
+- **The plain encoding** (`exp-very-fragile-and-unsafe-plain-store-encoding`, 7.2's `_plain_encode`) only gives each
+  directory under `data/` a trailing `_`; with `dotencode` it is refused. Its doctests are this crate's unit vectors; no
+  store of it was made, since on the Studio's case-insensitive volume the fixtures' history (`FOO` removed, then
+  `foo`) would fold two file logs into one file, which is the hazard its name gives.
+- **An absent revlog reads empty.** `revlog._get_data` answers an absent file with `b''`, so a store without a
+  changelog or manifest log is an empty repository (`hg init` writes neither), and a split revlog without its data file
+  reads until a chunk is needed. `verify` then calls a file log a changeset names but that is empty or missing an error
+  ("empty or missing"), a changeset whose manifest the manifest log lacks one too, and a listed log no manifest names
+  an orphan, a warning.
+- **The file index on disk** (`helptext/internals/file-index.txt`, `store_utils/file_index_util.py`): a 60-byte fixed
+  docket (`>12s3I8s8s8s3I`: the marker, three used sizes, three ids, the root's pointer, the unused bytes, flags 7.2
+  zeroes), then a garbage list (`>II` and `>HIIH` entries, a buffer of old files' paths). The list, meta and tree files
+  are `fileindex-list.<id>`, `-meta.` and `-tree.`, opened unencoded at the store's root; an id of eight `0`s names no
+  file. The paths are the meta records from token 1 (`items`); the tree serves `get_token`. 7.2 checks the root only
+  (token 0, an empty label, children when the tree file is not empty) and slices short garbage lists, children and
+  paths without a word. Measured (`hg debug::file-index --docket`): 22 paths, a list of 555 bytes, a meta of 184 (23
+  records with the root's), a tree of 198 with its root at 27 and 27 bytes no node reaches (a tree is appended to,
+  never rewritten in place, until it is vacuumed), no garbage entries.
+- **Deterministic dockets.** `utils/docket.py` makes every new id from the file `HGTEST_UUIDFILE` names when that is
+  set (7.2's own test suite's hook), and `devel.fileindex.garbage-timestamp` fixes a garbage entry's time, so the
+  fixtures' version 2 and file index stores are the same on every run; their ids come from one chain of seeds (the file
+  index store's list file and the version 2 store's changelog index are both `150e1cfc`).
+- **Revision flags.** 7.2 refuses a revision whose flags hold a bit outside `REVISION_FLAGS_KNOWN`, bits 6 to 15
+  (`flagutil.processflagsraw`: "incompatible revision flag"); of the known ones, censored, ellipsis and externally
+  stored change what the text is (`REVIDX_RAWTEXT_CHANGING_FLAGS` and the ellipsis processor), and the rest are
+  information (`hasmeta`, the copies' sidedata, the delta's quality). A file log with `hasmeta` keeps its texts as
+  without it (`filelog.add` sets the flag whenever it writes a block), so a text's block is split from its bytes the
+  same way.
+- **A first run of the import tests, red then green.** Against the stubs, 21 of the 224 lib tests failed, each by its
+  assertion; with the import, 224 of 224 at the first build.
+
+## 22. Found while building piece 4's read serving, part 3: the SSH version 1 session (A-619, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`; the three captured sessions, `fixtures/serve`)
+
+- **`_runsshserver`** reads a command line; an empty one ends the session; a name its table lacks
+  (`commandavailable`) is answered with an empty string and no argument read; any other has its arguments read by its
+  spec (`getargs`: `*` a count then that many `key length` lines) and answers bytes (`<length>\n<value>`), a stream
+  (raw), a push result (two strings) or an out-of-band error (`\n` on stdout, the message and `\n-\n` on stderr).
+- **The table** (21 commands): `batch` (`cmds *`), `between` (`pairs`), `branches` (`nodes`), `branchmap`,
+  `capabilities`, `changegroup` (`roots`), `changegroupsubset` (`bases heads`), `clonebundles`, `clonebundles_manifest`
+  (`*`), `debugwireargs` (`one two *`), `get_cached_bundle_inline` (`path`), `getbundle` (`*`), `heads`, `hello`,
+  `known` (`nodes *`), `listkeys` (`namespace`), `lookup` (`key`), `protocaps` (`caps`), `pushkey` (`namespace key old
+  new`, push), `stream_out`, `unbundle` (`heads`, push).
+- **`hello`** is `capabilities: ` and `capabilities`' answer, the sorted list, then a newline; `protocaps` answers `OK`.
+  Measured: 7.2's hello on the captured server, 537 bytes, `batch branchmap bundle2=… changegroupsubset getbundle known
+  lookup protocaps pushkey streamreqs=… unbundle=HG10GZ,HG10BZ,HG10UN unbundlehash`.
+- **`batch`** splits `cmds` at `;`, each call at its first space, its arguments at `,` and `=`, unescapes them, runs the
+  command (any in the table, its permission checked; a stream answer asserts) and joins the escaped answers with `;`.
+  Measured: `heads ;known nodes=` answered `124` bytes, the three heads, `;`, and an empty `known`.
