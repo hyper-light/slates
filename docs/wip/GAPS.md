@@ -597,9 +597,9 @@
 > `commit`: the drive's out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's
 > transaction as the index's own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()`
 > and `verify_locks` transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real
-> check on 4,096 generated histories a run; `cargo test -p slates-svn --lib` on the Mac Studio (see A-592). Owed from
-> it: the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each command
-> arrives, over a transaction built a command at a time (piece 7). Found by it and fixed by A-617 (2026-11-19, g268):
+> check on 4,096 generated histories a run; `cargo test -p slates-svn --lib` on the Mac Studio (see A-592). Built since
+> (A-617 part 2b): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as
+> each command arrives. Found by it and fixed by A-617 (2026-11-19, g268):
 > `LockTable::verdict` verified the locks a commit meets in the byte order of their paths, where FSFS checks the changed
 > paths in `svn_path_compare_paths` order and returns at the first that fails (`transaction.c` 3537-3539, 3578), so a
 > commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at `/t/a-b` where `svnserve` answers `/t/a/b`; it
@@ -609,9 +609,15 @@
 > (`E210001`) refused as it refuses them; held to seventeen commits of stock `svn` 1.15.0 against stock `svnserve`
 > 1.15.0 recorded through a relay (`crates/svn/fixtures/commit`, SHA-256 checked), each command read and written back
 > byte for byte and each text delta applied, and to `vparse_tuple` transcribed over generated items; `cargo test
-> --locked -p slates-svn --lib` on the Mac Studio, red first (see A-617 part 2a). Owed from it (part 2b): the drive,
-> each command checked as it arrives and declared on a trial built a command at a time, `close-edit`'s verdict and the
-> answers `svnserve` writes. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
+> --locked -p slates-svn --lib` on the Mac Studio, red first (see A-617 part 2a). A-617 part 2b (2026-11-19, g268, UI
+> goal 93): the drive (`commit::drive`), each command checked as it arrives in `svnserve`'s order and words, FSFS's lock
+> check at each call, text deltas applied a window at a time with their MD5 checked, `close-edit`'s verdict and the
+> early-error rule, its rows read over the index at its base with nothing borrowed between commands; held to the
+> seventeen recorded commits replayed in their order, every answer byte for byte (revisions 1 to 13, the out-of-date,
+> lock and conflict refusals among them), and to hostile drives, each guard red-checked; `cargo test --locked -p
+> slates-svn --lib` on the Mac Studio (see A-617 part 2b). Owed from it: `svn_repos__validate_prop`'s checks,
+> authorization (A-606), `svn_repos__validate_new_path`, authenticating for write, the owner's commit step and the
+> connection task. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
 > (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
 > applied unconditionally; its oracle FSFS's lock rules transcribed, equal on generated histories; `cargo test -p
@@ -623,8 +629,15 @@
 > the Mac Studio (see A-609). Owed from it: the update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK,
 > `list-report` and `file-revs-report`, and main's live capture against `mod_dav_svn`. A-627 (2026-11-19, g250):
 > `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token`
-> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued); owed: the
-> replay drive, LOCK's answer, and LOCK and UNLOCK onto the A-602 guards. A-531 (2026-11-19): the ra_svn item codec, its
+> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued). A-627's rest
+> (2026-11-19, g298): one `dav::Drive` writes the update-report's answer (send-all mode and outside it) and the replay
+> report's from A-616's `Call`s, byte for byte against `update.c`'s and `replay.c`'s format strings; LOCK and UNLOCK read
+> into A-602's guards in `mod_dav`'s and `mod_dav_svn`'s order and answered as they answer, with the PROPFIND's
+> `DAV:lockdiscovery`, held to stock svn 1.15.0's recorded LOCK and UNLOCK heads; `cargo test -p slates-svn --lib` on
+> the Mac Studio, red on a mutated copy (see A-627, completed). Owed from it: (1) the update-report's resource walk, a
+> pre-1.2 client's; (2) the drive's facts carrying `dav_svn__get_safe_cr`'s revision, not `svn_fs_node_created_rev`'s,
+> for a node beneath a copy not changed since (A-616's drive over the index); (3) main's live capture against Apache
+> with `mod_dav_svn`. A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
