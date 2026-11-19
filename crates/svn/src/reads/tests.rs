@@ -9,8 +9,8 @@
 use super::*;
 use crate::handshake::ClientCapabilities;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
-use crate::svndiff::decode_all;
 use crate::ra_svn::{Bounds, Parsed, Parser};
+use crate::svndiff::decode_all;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use std::collections::BTreeMap;
@@ -469,31 +469,37 @@ fn session_capabilities(greeting: &Value<'_>) -> ClientCapabilities {
 }
 
 /// A `get-file-revs` answer as the tests compare it: each item written out with its property lists as sets, and each
-/// delta, its strings up to the empty one, decoded to its version and windows (an LZ4 section is `lz4_flex`'s where
-/// `svnserve`'s is liblz4's, so it may differ in bytes while it makes the same window).
+/// delta, its strings up to the empty one, as [`delta_normalized`] writes it.
 fn file_revs_normalized(items: &[Value<'_>]) -> Vec<String> {
   let mut normalized_items = Vec::new();
-  let mut delta = Vec::new();
-  let mut in_delta = false;
+  let mut delta: Vec<&[u8]> = Vec::new();
   for item in items {
     match item {
       Value::String(bytes) if bytes.is_empty() => {
-        normalized_items.push(if in_delta {
-          format!("{:?}", decode_all(&delta))
-        } else {
-          String::from("no delta")
-        });
+        normalized_items.push(delta_normalized(&delta));
         delta.clear();
-        in_delta = false;
       }
-      Value::String(bytes) => {
-        delta.extend_from_slice(bytes);
-        in_delta = true;
-      }
+      Value::String(bytes) => delta.push(bytes),
       other => normalized_items.push(normalized(other)),
     }
   }
   normalized_items
+}
+
+/// One delta's strings as the tests compare them: none is no delta; svndiff 0's are compared byte for byte, each
+/// string a write `svndiff.c` makes; svndiff 2's by how many strings there are and the version and windows they decode
+/// to, since an LZ4 section is `lz4_flex`'s where `svnserve`'s is liblz4's and may differ in bytes while it makes the
+/// same window.
+fn delta_normalized(strings: &[&[u8]]) -> String {
+  match strings.first() {
+    None => String::from("no delta"),
+    Some(header) if header.starts_with(b"SVN\x02") => format!(
+      "{} strings of {:?}",
+      strings.len(),
+      decode_all(&strings.concat())
+    ),
+    Some(_) => format!("{strings:?}"),
+  }
 }
 
 /// A client command's word.
@@ -1365,6 +1371,110 @@ fn a_history_opened_again_at_each_step_walks_as_one_kept_open() {
   assert_eq!(
     String::from_utf8(reopened).unwrap(),
     String::from_utf8(kept).unwrap()
+  );
+}
+
+/// A `get-file-revs` answer's revisions in order, each with the strings sent after it, its closing empty one last.
+fn file_revisions_sent(out: &[u8]) -> Vec<(u64, Vec<Vec<u8>>)> {
+  let mut sent: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
+  for item in items(out) {
+    match item {
+      Value::List(parts) => {
+        if let [Value::String(_), Value::Number(revision), ..] = parts.as_slice() {
+          sent.push((*revision, Vec::new()));
+        }
+      }
+      Value::String(bytes) => {
+        if let Some((_, strings)) = sent.last_mut() {
+          strings.push(bytes.to_vec());
+        }
+      }
+      _ => {}
+    }
+  }
+  sent
+}
+
+/// A-613 part 2 (`get-file-revs`, `send_path_revision`'s `svn_fs_contents_different`): a file added without a text and
+/// then given an empty one has the same text in both revisions (`svn_fs_fs__file_text_rep_equal` counts both empty), so
+/// the revision that gave it sends no delta, nor does a later change of its properties alone; the first revision sends
+/// its delta from no text, the header alone, since an empty target makes no window.
+#[test]
+fn a_text_made_empty_from_none_is_the_same_text() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/none.txt file add props "]);
+  fixture.commit(&[
+    "row 13 /trunk/none.txt file change text  md5 d41d8cd98f00b204e9800998ecf8427e sha1 \
+     da39a3ee5e6b4b0d3255bfef95601890afd80709",
+  ]);
+  fixture.commit(&["row 14 /trunk/none.txt file change props 6e=31"]);
+  let command = b"( get-file-revs ( 14:trunk/none.txt ( 12 ) ( 14 ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    file_revisions_sent(&out),
+    [
+      (12, vec![b"SVN\x02".to_vec(), Vec::new()]),
+      (13, vec![Vec::new()]),
+      (14, vec![Vec::new()]),
+    ]
+  );
+}
+
+/// A client that announces neither `svndiff1` nor `accepts-svndiff2`, at the repository's root: answered in svndiff 0.
+const SVNDIFF0_SESSION: Session<'static> = Session {
+  base: "/",
+  uuid: UUID,
+  capabilities: ClientCapabilities {
+    svndiff1: false,
+    accepts_svndiff2: false,
+    ..STOCK_CAPABILITIES
+  },
+};
+
+/// A-613 part 2 (`get-file-revs` in svndiff 0, `svndiff.c`): a window of new data alone, the first revision's, is
+/// written as `send_simple_insertion_window` writes it, the header, the window's integers and its instruction in one
+/// string, then the new data; a window with a source copy, the second revision's, as `window_handler` writes it, the
+/// header alone, then the integers, the instructions and the new data. The bytes are svndiff 0's, uncompressed:
+/// `/trunk/a.txt` is `alpha\n` in r1, and r2 copies those six bytes and adds `more\n`.
+#[test]
+fn svndiff_0_strings_are_the_writes_svndiff_c_makes() {
+  let fixture = Fixture::new();
+  let command = items(b"( get-file-revs ( 11:trunk/a.txt ( 1 ) ( 2 ) ) ) ").remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(
+    &fixture.index,
+    &fixture.green,
+    &SVNDIFF0_SESSION,
+    &command,
+    &mut out,
+  )
+  .unwrap();
+  assert!(matches!(
+    drained(outcome, &fixture, &SVNDIFF0_SESSION, &mut out),
+    Outcome::Answered
+  ));
+  assert_eq!(
+    file_revisions_sent(&out),
+    [
+      (
+        1,
+        vec![
+          b"SVN\0\x00\x00\x06\x01\x06\x86".to_vec(),
+          b"alpha\n".to_vec(),
+          Vec::new(),
+        ]
+      ),
+      (
+        2,
+        vec![
+          b"SVN\0".to_vec(),
+          b"\x00\x06\x0b\x03\x05".to_vec(),
+          b"\x06\x00\x85".to_vec(),
+          b"more\n".to_vec(),
+          Vec::new(),
+        ]
+      ),
+    ]
   );
 }
 
