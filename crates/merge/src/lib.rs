@@ -51,7 +51,8 @@ pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
 pub use engine::{
-  ConflictWindow, Green, HeadMoved, Increment, Judged, Judgment, Outcome, ReanchorRefused, Reanchored,
+  ConflictWindow, Green, HeadMoved, Increment, Judged, Judgment, Outcome, ReanchorRefused,
+  Reanchored,
 };
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};

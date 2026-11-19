@@ -186,9 +186,9 @@ fn assert_a_held_verdict_commits_as_a_submit_would(green: &mut Green, mut submit
   assert_eq!(seen(green), before, "a judgment applied something");
   let answered = submitted.submit_resolved(&accepting);
   assert_eq!(answered.1.as_deref(), Some(held.applied()));
-  let committed = green.commit_judged(held).map(|(version, applied)| {
-    (Outcome::Accepted { version }, Some(applied))
-  });
+  let committed = green
+    .commit_judged(held)
+    .map(|(version, applied)| (Outcome::Accepted { version }, Some(applied)));
   assert_eq!(committed, Ok(answered));
   assert_eq!(seen(green), seen(&mut submitted));
 }
@@ -269,12 +269,16 @@ fn edit() -> impl Strategy<Value = Edit> {
 }
 
 fn step() -> impl Strategy<Value = Step> {
-  (0..8u8, 0..3u8, proptest::collection::vec(edit(), 1..4), any::<u8>()).prop_map(
-    |(kind, back, edits, step)| match kind {
+  (
+    0..8u8,
+    0..3u8,
+    proptest::collection::vec(edit(), 1..4),
+    any::<u8>(),
+  )
+    .prop_map(|(kind, back, edits, step)| match kind {
       0 => Step::Again { step },
       _ => Step::Work { back, edits },
-    },
-  )
+    })
 }
 
 /// What the generated histories met: the oracle's non-vacuity counters.
