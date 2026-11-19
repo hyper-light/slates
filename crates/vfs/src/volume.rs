@@ -792,7 +792,8 @@ impl Volume {
 
   /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) in the snapshot's size (D-5). The clone's
   /// policy is the origin's; its inode counter continues from the origin's so numbers stay
-  /// unique across both, and its live-inode count is the snapshot's, whatever the origin made or removed since (A-541).
+  /// unique across both, and its live-inode and live-entry counts are the snapshot's, whatever the origin made or removed
+  /// since (A-541, A-549).
   /// An overlay's clone reads the origin's base directories as the origin does. A file the
   /// snapshot froze held with no name left is carried with an orphan record (A-532), so the clone reclaims it as it
   /// reclaims any orphan: at its last reference's release (a restored guest's), or at a restart's settle when nothing
@@ -843,12 +844,13 @@ impl Volume {
       .map_err(|_| VfsError::StaleHandle)?
       .inode;
     snap.clone_refs = snap.clone_refs.saturating_add(1);
-    let (root, inode_root, epoch, referenced, live_inodes) = (
+    let (root, inode_root, epoch, referenced, live_inodes, live_entries) = (
       snap.root,
       snap.inode_root,
       snap.epoch,
       snap.referenced_bytes,
       snap.live_inodes,
+      snap.live_entries,
     );
     let carried: BTreeMap<InodeNo, u64> = snap.orphans.iter().map(|no| (*no, 0)).collect();
     let _ = config.clock.monotonic_ns();
@@ -902,7 +904,8 @@ impl Volume {
       inode_allowance: u64::MAX,
       holds_versions: false,
       version_hold: 0,
-      live_entries: origin.live_entries,
+      // The snapshot's tree's entries too, not the origin's head's now (A-549).
+      live_entries,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
       attribute_writes_in_place: 0,
@@ -2919,6 +2922,7 @@ impl Volume {
       next: None,
       referenced_bytes: self.bytes.total(),
       live_inodes: self.live_inodes,
+      live_entries: self.live_entries,
       seq: self.journal.head_seq(),
       identity: None,
       orphans: self.orphans.keys().copied().collect(),
@@ -2946,6 +2950,17 @@ impl Volume {
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
     Ok((s.epoch, s.root))
+  }
+
+  /// The live inodes a snapshot's tree holds (§4.2's inode dimension): the head's count when it was taken, or a
+  /// recovered snapshot's tree's. A clone of it starts its own count there (A-541), and its owner admits the clone by
+  /// it: the version slots a bounded clone reserves and its allowance's floor, or a dynamic clone's version hold (A-549).
+  pub fn snapshot_inodes(&self, id: SnapshotId) -> Result<u64, VfsError> {
+    self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map(|snap| snap.live_inodes)
+      .map_err(|_| VfsError::StaleHandle)
   }
 
   /// Looks a name up in a directory of a snapshot's tree (the same walk over frozen nodes).

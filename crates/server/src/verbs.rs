@@ -10005,19 +10005,31 @@ pub(crate) fn admit_clone(
   };
   // Take the clone's version slots *before* cloning (§4.2: reserve all credits or none before publishing), so a refusal
   // allocates nothing and does not leave the origin's `clone_refs` bumped. A clone shares its origin's versions until
-  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the count it
-  // inherits from the origin (equal to the origin's live count at clone time) — as the sacred claim that backs full
-  // divergence of the inherited inodes. A dynamic clone holds slots for the inodes it inherits only, from the
-  // unpromised capacity, and grows its hold as it makes more (A-342). If the slab cannot back them, the clone is refused.
-  let inherited = match state.volumes.get(handle) {
-    Ok(slot) => slot.volume.inode_usage().0,
-    Err(_) => {
+  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the inodes it
+  // inherits — as the sacred claim that backs full divergence of the inherited inodes. A dynamic clone holds slots for
+  // the inodes it inherits only, from the unpromised capacity, and grows its hold as it makes more (A-342). If the slab
+  // cannot back them, the clone is refused. The inodes it inherits are its snapshot's tree's, the count the clone starts
+  // from (A-541), never the origin's head's now, which has made and removed files since (A-549); a stale snapshot is
+  // refused here, before any slot is taken, as the clone would refuse it.
+  let inherited = state
+    .volumes
+    .get(handle)
+    .map_err(|_| Refusal::NotFound)
+    .and_then(|slot| {
+      slot
+        .volume
+        .snapshot_inodes(core_snapshot(snapshot))
+        .map_err(|error| refusal_of_vfs(&error))
+    });
+  let inherited = match inherited {
+    Ok(inodes) => inodes,
+    Err(refusal) => {
       return Err(Box::new(give_back(
         state,
         reservation,
         None,
         None,
-        Refusal::NotFound,
+        refusal,
       )));
     }
   };
