@@ -2,9 +2,11 @@
 //! part by part as 7.2's part handlers read it ([`read`]); the race checks it carries, judged against the served view
 //! the push read ([`check`]); and the reply 7.2's server writes for each outcome ([`reply`]). Part 2: its changegroup
 //! verified against what the repository holds ([`verify`]), and the work each line's or bookmark's move makes, its
-//! trees laid out from flat manifests and compared by A-618's builder ([`tree`]). Their landing on each green's own log
-//! at the positions the push read (A-642), which lines and bookmarks a push moves, and the policy and the hooks at
-//! their points are the piece's next parts.
+//! trees laid out from flat manifests and compared by A-618's builder ([`tree`]). Part 3 (A-657): what the repository
+//! holds read from its index ([`held`]), which lines, bookmarks and phases a verified push moves and what its reply
+//! counts ([`classify`]), and its revisions kept in a fork of the index that replaces it once the push commits
+//! ([`commit`]); the landing on each green's own log at the positions the push read (A-642, A-635's append) is
+//! slates-server's (`hg_push`), where the policy and the hooks run at their points.
 //!
 //! **Sources** (read 2026-11-19 in the wheel of Mercurial 7.2 that uv installs, CPython 3.12, on the Mac Studio; each
 //! file's SHA-256 in `docs/wip/research/mercurial-server.md` §20) \[C\]: `bundle2.py` (`_gethandler`, `_processpart`,
@@ -41,6 +43,9 @@
 //! it.
 
 pub mod check;
+pub mod classify;
+pub mod commit;
+pub mod held;
 pub mod reply;
 pub mod tree;
 pub mod verify;

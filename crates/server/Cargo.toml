@@ -38,9 +38,13 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
-# The version-control servers' shared crate (§4.17.1 shared piece 3): git's wildmatch glob, which the policy
-# (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); and, in tests, the content store an
-# upload-pack test's empty repository is kept in (A-625 part 3; `crate::vcs_http::git::upload`).
+# Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
+# and places a push; its index and content store are slates-vcs's.
+slates-hg = { workspace = true }
+# The version-control servers' shared crate (§4.17.1 shared piece 3): Mercurial's index and content store (A-657);
+# git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); and,
+# in tests, the content store an upload-pack test's empty repository is kept in (A-625 part 3;
+# `crate::vcs_http::git::upload`).
 slates-vcs = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }

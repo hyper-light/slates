@@ -12818,6 +12818,15 @@ engine: the verdict, rebase, position mapping, the register).
 > thin one with the client's objects, as exactly the wanted closure less the client's. Owed: a part only partly wanted
 > read entry by entry; a delta search for an object past a window; the fragments' encoding sliced.
 >
+> **Status (2026-11-19, A-653: a part partly wanted read entry by entry; one pack source).** A kept part only partly
+> wanted is now read entry by entry, its wanted entries alone judged: each kept part keeps its entries' indexes in
+> their objects' position order, so the entries of the objects a stream wants are found by halving and marked, a
+> window's worth of handles a unit, and the part's reading costs what it sends, never the whole part. A `blob:limit`
+> clone takes its small blobs from the parts of blobs as they were kept. After the greens whose heads are wanted, each
+> object still wanted is offered the parts of the version its row says brought it, so a partial clone's later fetch of
+> blobs by their ids, which wants no head, is answered from the fragments too. upload-pack's service writes the stream
+> through one pack source, A-640 part 3's `upload::Fragments`.
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -13141,8 +13150,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
 7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise (built,
-   A-615); packs from fragments (built, A-639: runs from their fragments, the walk's objects covered by whole kept parts
-   and the rest encoded, `thin-pack` and `ofs-delta` as the client says, streamed in turns); shallow; filters;
+   A-615); packs from fragments (built, A-639 and A-653: runs from their fragments, the walk's objects covered by kept
+   parts and the rest encoded, `thin-pack` and `ofs-delta` as the client says, streamed in turns); shallow; filters;
    `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
@@ -13431,6 +13440,30 @@ signature verification).
 > checked, the repository's state read; no borrow held between turns; abandoned, it gives back everything. `import`
 > is its thin facade. Proven by three stores imported a unit a turn equal row for row to one call, and an import
 > abandoned or refused midway holding nothing (Windows x86_64, jupiter: 278 of 278, red 2 failed; macOS owed).
+
+> **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
+> `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
+> are its heads before and its new changesets less every one a new changeset of the branch descends from, through any
+> branch (checked with stock 7.2); each new head is matched to a line it descends from by a maximum matching (an empty
+> line's head being the null node), so only a made line (a new head, or a new branch) or a retired one (merged into a
+> head another line took) touches the names log; its phase roots move as 7.2's `apply`, `advanceboundary`,
+> `updatephases` and `pushphase` move them; the `bookmarks` part applies as it is and a `bookmarks` pushkey is a
+> compare and swap on the hex the client saw; `reply:changegroup`'s `return` is `apply`'s. `push::held` reads what the
+> repository holds from its index, and `push::commit` keeps a push's revisions in a fork of the index. slates-server's
+> `repository::hg_push` lands it: the namespace holds `branch:<label>:<number>` for a line and `bookmark:<label>:` for a
+> bookmark, the label escaping `:`, `%`, controls and bytes not UTF-8, so the kinds and each branch's lines are
+> prefix-free ranges and a bookmark's name is checked exactly; each move, made line, retirement and bookmark change is
+> one of A-635's `BranchChange`s, its work built through A-618's builder against the version read; the client's race
+> checks are handed to the append as positions (lines' greens, names, the markers and phases logs), so they hold where
+> the entry commits, and the phase roots move in the same entry; a refusal for anything moved is `error:pushraced` in
+> 7.2's words; the fork replaces the index once the entry commits. Proven against stock 7.2's pushes
+> (`crates/hg/fixtures/push`): the fixtures' repository rebuilt from its texts in a new Mercurial repository, every node
+> 7.2's, then `push-plain`, `push-phase` and `push-bookmark` landed and answered byte for byte as 7.2 answered them,
+> `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
+> branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
+> histories (macOS arm64, Mac Studio: slates-hg's push tests 36 of 36, the server's 7 of 7; other platforms owed).
+> Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index and the
+> served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13845,8 +13878,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
    (A-641 part 2, `push::verify`, `push::tree`): the changegroup verified against the repository, and a move's work
-   through A-618's builder over laid-out flat manifests; owed: which lines and bookmarks a push moves, the landing on
-   each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
+   through A-618's builder over laid-out flat manifests. Built (A-657, part 3; `push::classify`, `push::held`,
+   `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
+   (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
+   each green's log with the phase roots in the same entry, the index kept; owed: the policy and the hooks (part 4).
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -47894,6 +47929,101 @@ with the fixed history first), GAPS (A-668's entry, where the census's failure w
   histories meeting the rare case in 3 of 34 nested pairs; `cargo fmt -p slates-merge -- --check` clean. The change is
   in the lib's test module alone, which no integration target compiles; its red is the luck recorded above (r81, r84),
   and a red of the new guard (a fixed history that stops meeting a case) is a mutation run, main's.
+
+### A-653 — A part only partly wanted read entry by entry, its wanted entries alone judged; the holders of objects still wanted found by their rows; one pack source (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch" item 3 and "Filters", piece 7; after A-639; A-640 part 3)
+
+Applied in the same change to: §4.17.2 (a status block; piece 7's line), GAPS (the §4.17 entry), `crates/git`
+(`store::upload`: `Chosen`, marking, the holders stage, `entries_judged`; `store::repository`: `Kept::order`, charged;
+the store's module docs; three tests in `tests::store::upload`; and A-665's test helper `git_part` in
+`tests::store::hook_view`, which builds a `Kept` and so now gives it its entries' order).
+
+- **A part partly wanted.** A-639 left a kept part whose objects were not all wanted to the encoder. Now any part a
+  stream offers sends the objects of it still wanted: copied whole when they are all of it, read entry by entry
+  otherwise. A reading of a part partly wanted marks its wanted entries first, a bit an entry, a window's worth of
+  handles a unit; each entry is found by halving the part's entries in their objects' position order, an index each
+  part keeps (`Kept::order`, four bytes an entry, charged with its entries). Then the marked entries alone are judged,
+  in their order in the part, so offset deltas' bases come first. A part's reading costs what it sends: a fetch of two
+  files from a part of forty judges two (`entries_judged`).
+- **`blob:limit`.** A clone under `blob:limit` takes the small blobs from the parts of blobs entry by entry, as kept,
+  deltas and all, where A-639 encoded them afresh. A blob whose delta base the filter left out is sent whole, as any
+  delta whose base the client cannot read.
+- **The holders.** After the greens a head of whose versions is wanted, each object still wanted is offered the parts
+  of the version its row says brought it, each part once: a partial clone's later fetch of blobs by their ids wants no
+  head, and its blobs are found so, one row read an object. What no part holds is encoded, as before.
+- **One pack source.** The piece began an adapter of its own, A-640's `PackSource` over the stream. g296's
+  `upload::Fragments` (A-640 part 3, landed at f607f424c) is the same join, so this piece's was dropped before
+  landing; the stream needs no change for it, and A-640 part 3's rule (a step may work and write nothing while the
+  stream counts its pack) is the stream's own.
+- **Tests**, failing first against the stream as A-639 left it:
+  `a_blob_limit_clone_reads_a_partly_wanted_part_entry_by_entry` (a clone under `blob:limit`: the base pack's part
+  without blobs and the newest version's copied whole, the base pack's blobs read entry by entry for the one small
+  file, nothing encoded afresh) and `only_the_wanted_entries_of_a_part_are_judged` (two files of forty, wanted by id:
+  one part read, two entries judged); then `a_parts_wanted_entries_are_marked_over_units_and_read_over_words` (two
+  of every three of 384 files, three marking units' worth at the tests' 1 KiB window, so the 256 wanted take two
+  units and their marks lie in all six words: exactly those read back, one part read entry by entry, each entry
+  judged once). A-639's oracle, whose filters include `blob:limit`, holds every answered pack to the wanted closure
+  less the client's, each object once.
+- **Runs.** Over the tree landed, on macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1): `cargo test --locked
+  -p slates-git --lib -- store:: upload:: v2::tests::fetch tests::v0`, slates-git compiled afresh: 116 passed, 0
+  failed, 4 ignored, 375 filtered out, the three tests above among the passes; `cargo fmt -p slates-git -- --check`
+  clean. No integration target reaches the stream or `upload::Fragments` (the server's upload-pack tests lend a stub
+  pack source), so these filters are the focused set. Earlier, the whole lib: at c6a9b6c35 on the Mac Studio, 447 of
+  447 and 3 ignored, with the adapter since dropped; at a86f1d9a3 on Windows x86_64 (jupiter), 443 of 443 and 3
+  ignored.
+- **Owed.** The real clone's requests answered through `upload::Fragments` with every version encoded and a base pack
+  made (A-640's small.git clone and A-582's five fetches), each object once, and a plan past its admission refused:
+  the next piece, with `Streamed::counters()`; the red-checks of the marking and the other platforms' runs (main's); a
+  delta search for an object past a window; the fragments' encoding sliced.
+
+### A-657 part 3 (A-641 part 3) — a Mercurial push landed on each green's own log: its new heads placed on lines and bookmarks by a maximum matching, its race checks made positions, its phase roots moved in the same entry, its names prefix-free (2026-11-19, g304, UI goal 93 (kiln 51cef9f7); §4.17.3 decisions 1 to 3 and 6, "Push" steps 3 to 7 and piece 5; A-635, A-642, A-645; after A-641 parts 1 and 2)
+
+- **What.** `crates/hg/src/push/classify.rs`: `classify(unbundle, (brought, held), view, (lines, marks), publishing,
+  admission) -> Result<Plan, Unclassified>`, the lines' moves and retirements, the lines made, the bookmarks' moves,
+  the draft roots' changes, the reply's parts and the changesets the hooks name; `Unclassified::refused` answers in
+  7.2's words. `push/held.rs`: `IndexHeld`, verification's `Held` over `HgIndex` and its `ContentStore`.
+  `push/commit.rs`: `fork_with`, a push's revisions appended to a fork of the index, all or none.
+  `verify::Verified::held_changesets` (7.2's `duprevs`). `crates/server/src/repository/hg_push.rs`: the namespace's
+  names (`line_name`, `branch_prefix`, `bookmark_name`, `line_of`), `prepare` (the checks judged, the changegroup
+  verified, the push placed, each `BranchChange` and its work built, the entry's checks and state) and `land` (the
+  fork, A-635's `RepositoryLogs::append`, the fork in the index's place or released, the reply).
+- **Read from 7.2's code and a run** (`research/mercurial-server.md` §24): `apply`'s phases and `return`,
+  `advanceboundary`, `updatephases`, `pushphase`, `pushbookmark`, `handlebookmark`, `headrevsdiff` from an empty
+  changelog, the external hook's environment and words; and with stock 7.2, a branch head dropped by a descendant on its
+  branch through another branch.
+- **Decided.** (1) The namespace: `branch:<label>:<number>` a line, `bookmark:<label>:` a bookmark, the label the
+  name's valid UTF-8 with `:`, `%`, control characters and bytes not UTF-8 written `%XX`; prefix-free by construction
+  (the tags differ and end in `:`, a label holds no `:`), so `branch:<B>:` is exactly B's lines and `bookmark:<M>:`
+  exactly one name; every name a stock client makes reads as itself (7.2 refuses `:` in a label); a line made takes its
+  branch's lowest free number; a Mercurial repository's first line is `branch:default:0`. (2) New heads matched to
+  lines by a maximum matching, so a push makes and retires as few names as it can and a line's move never touches the
+  names log. (3) The race checks as positions: `check:heads` the lines' names, every line's green and the markers log;
+  `check:updated-heads` each named head's line and its branch's names; `check:bookmarks` the bookmark's green and name
+  or its absence; `check:phases` the phases log; with every touched branch's names, every changed bookmark's name, and
+  the phases log for a push that moves roots. Stricter than 7.2: a phase moved anywhere since the read races, paid only
+  where a hook's run separates the read from the append. (4) A refusal for anything moved (a line's verdict meeting
+  another head, `Moved`, a name taken or retired, a check or state change that no longer holds) is `error:pushraced`
+  in 7.2's words; any other is `error:abort` in slates' words. (5) Stricter than 7.2: a node the `bookmarks` or
+  `phase-heads` part names that the repository does not hold is refused by kind; an `obsmarkers` part is refused until
+  piece 7. (6) A new line is made from a line its head descends from, else one holding its first parents' first held
+  changeset, else a line of that changeset's branch: the work replaces exactly what differs, so the base costs only the
+  work's size.
+- **Evidence** (macOS arm64, Mac Studio, kiln r47, 2026-11-19, debug, on the merged tree that lands, 5aa274153):
+  `cargo test --locked -p slates-hg --lib -- push::` 36 of 36 (the classifier's 11, the index fork's 2, parts 1 and
+  2's 23); `cargo test --locked -p slates-server --lib hg_push -- --test-threads=4` 7 of 7, its build warning-free;
+  `cargo fmt -p slates-hg -p slates-server -- --check` clean. The first build (r5) refused the server test's use of
+  slates-hg's crate-private hex helpers (now the server's `hex_of` and slates-hg's public `pushkey::hex_node`), and the
+  test build warned that `Prepared`'s admission and hook inputs were never read (removed: part 4 brings them with the
+  tests that observe them). No integration target reaches the landing until A-650's site serves `unbundle`. The reds
+  by mutation, clippy and the other platforms are main's.
+- **Owed.** Part 4: `vcs_policy::admit` before the append, with the right each change needs, and the hook driver at
+  `pretxnchangegroup` and `changegroup`. The server's home for each Mercurial repository's index and content store and
+  the served view over them (with A-650's site); the bundle read in slices; the pushkey compatibility hooks; markers
+  (piece 7); the fleet half of the append (A-636).
+- **Applied in the same change to:** §4.17.3's status (A-657) and piece 5's line; GAPS' §4.17.3 entry;
+  `research/mercurial-server.md` §24; `crates/hg/src/push/{mod,verify}.rs`, `crates/hg/src/import.rs` (`branch_of`
+  crate-visible); `crates/hg/src/push/{classify,classify_tests,held,commit,commit_tests}.rs` (new);
+  `crates/server/src/repository.rs`, `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs` (new);
+  `crates/server/Cargo.toml`, `Cargo.toml` and `Cargo.lock` (slates-server on slates-hg and slates-vcs).
 
 ### A-671 — git's `wildmatch` moved to slates-vcs, the crate every version-control server's crate builds on (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.1 "Policy" and shared piece 3; A-597, A-640 part 4)
 Applied in the same change to:
