@@ -522,6 +522,7 @@ mod tests {
         read_ahead: None,
         read_ahead_pending: 0,
         remote_volumes: Vec::new(),
+        maps_sent: std::collections::BTreeSet::new(),
       })
       .unwrap();
     assert!(super::start_watch(state, seat, WATCHED, hangup));
