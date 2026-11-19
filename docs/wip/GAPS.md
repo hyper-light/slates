@@ -149,8 +149,13 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
-> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs and its index built (2026-11-18,
-> A-500, A-531 and A-553, D-28; UI goal 91; g292).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
+> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index and its lock table built
+> (2026-11-18, A-500, A-531, A-553 and A-602, D-28; UI goals 91 and 92; g292, g250).** A-602 (2026-11-19, g250): the
+> lock table, the guards of `lock` (with stealing) and `unlock` (with breaking), and the verdict's lock check (with
+> release or keep), each returning the register entries it decided, applied unconditionally; its oracle FSFS's lock
+> rules transcribed, equal on generated histories; `cargo test -p slates-svn --lib` 74 of 74 on the Mac Studio (see
+> A-602). Owed from it: the verbs on the wire, the lock hooks, DAV's LOCK and UNLOCK, the entries' encoding, the head
+> view over the index, the room from the shard's. A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
 > golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531). A-553
 > (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities, predecessors,
 > history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem
@@ -169,11 +174,11 @@
 > (2026-11-19): Copy's maps, every map of a green's state copying a path's tree by reference on A-534's radix tree,
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
-> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
-> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
-> mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
-> suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
-> No speed is claimed until measured.
+> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the commit
+> rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server (with the
+> lock verbs); mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's:
+> the Python suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4
+> item 13. No speed is claimed until measured.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

@@ -138,6 +138,12 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
+# The deflate engine for git packs, smart HTTP's gzip bodies and Mercurial's GZ streams and revlog chunks (A-607,
+# §4.17.2 piece 3 "chosen by measurement"): flate2's API over zlib-rs, pure Rust. Measured against miniz_oxide on the
+# Mac Studio M3 Ultra, 2026-11-19, over slates' own 4,742 files at e85c17f9f: at git's level 6, deflate 135.0 against
+# 79.4 MB/s and inflate 956.4 against 497.5 MB/s, best of 5 interleaved, output 0.255 against 0.257 of the input
+# (docs/wip/BENCHMARKS.md, "The deflate engine"). Crates name it `flate2.workspace = true`; no crate picks a backend.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 # The derive macro's parser and emitter (the standard trio); build-time only.
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

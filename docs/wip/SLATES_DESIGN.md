@@ -12209,7 +12209,7 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 2. The object codecs: the object header and identity (collision-detecting SHA-1 and SHA-256), a pack entry's header,
    and delta instructions with an applier; golden vectors from packs stock git wrote, recorded with the commands.
 3. The pack reader: streaming, bounded, inflating, resolving deltas against the pack and the index, checking the
-   trailer; hostile input. (A deflate implementation enters the workspace here, chosen by measurement.)
+   trailer; hostile input. (The deflate implementation, chosen by measurement: zlib-rs through flate2's API, A-607.)
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack.
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
@@ -12690,6 +12690,14 @@ and export by landing).
 > FSFS's operations to whole trees, equals it on generated histories, and equals itself replayed in random drive
 > orders. Owed with the object store (§4.17.1 shared piece 3): the rows held as content tables with a mutable tail, and
 > the learned fold (item 12); with the server (piece 7): one large revision applied in slices under the shard's budget.
+>
+> **Status (2026-11-19, A-602).** Built: locks (`slates-svn`'s `lock`, piece 8; items 7 and 3.4). The lock table has
+> three guards: `lock` (with stealing), `unlock` (with breaking) and the verdict's check (with release or keep). Each
+> returns the register entries it decided and its answers, and `apply` applies an entry unconditionally, so a holder's
+> replay never reads a clock or draws a token. Its oracle transcribes FSFS's lock rules (`lock.c`, `fs-loader.c`,
+> `fs-wrap.c`, `transaction.c`, `serve.c`) and equals it on generated histories. Owed: the verbs on the wire with the
+> ra_svn server (piece 7), the lock hooks (piece 11), DAV's LOCK and UNLOCK (piece 13), the entries' encoding in the
+> repository's register, the head view over the index, and the room derived from the shard's (item 12).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12820,10 +12828,13 @@ for Subversion.)
    identical change and which knows neither rule 3 nor rule 4 nor a directory's subtree-wide last change; this section
    states the exact rule, and §4.17.1 needs only to point here.
 4. **Locks at the verdict.** Before it accepts, the merge task reads the lock table for every node the work changes,
-   deletes or moves away, and every file beneath a deleted or replaced directory: a lock held by another principal is
-   `E160039`, a lock whose token the commit did not present is `E160037`. An accept releases the presented locks unless
-   the client asked to keep them. The check and the release are in the verdict's one step on the owner, so no lock
-   changes between them.
+   deletes or moves away. A modified path meets its own lock. A path the work adds, deletes or replaces meets every
+   lock at or beneath it, as FSFS's `verify_locks` checks: a lock kept through its file's deletion can stand beneath a
+   path added later. A lock held by another principal is `E160039`, checked first. A lock whose token the commit did
+   not present is `E160037`, wherever in the commit the token was presented. A commit with no principal that meets a
+   lock is `E160034`. An accept releases every presented lock whose token and owner match, paths it did not change
+   among them, unless the client asked to keep them. The check and the release are in the verdict's one step on the
+   owner, so no lock changes between them (A-602).
 5. **What the version records.** The revision's changed-path rows as the drive declared them (add; delete; replace, a
    delete and an add of one path in one drive; modify; text changed when `apply-textdelta` came; properties changed;
    mergeinfo changed; the copy source), the transaction's name, and the initial revision properties: `svn:author` the
@@ -12916,6 +12927,21 @@ follow the locking specification (notes §7): only a file is locked; a current r
 be out of date (`E160042`); pre-lock, post-lock, pre-unlock and post-unlock run around each. A lock is data the verdict
 reads, not a lock in the sense of §2 bans 1 and 10: nothing ever waits on it and no coordination call is made; a commit
 that meets another principal's lock is refused at once. `svn:needs-lock` is a property whose meaning is the client's.
+
+Stated with A-602, beyond Subversion's own rules:
+- **An expiry, once judged, is recorded.** FSFS removes an expired lock it meets under its write lock. Here the guard
+  that meets one records its removal: a lock request replaces it, an unlock answers `E160041` and removes it, and an
+  accepted commit removes every expired lock its check met. So the judgment stands on every holder whatever its
+  clock says.
+- **A refused commit records nothing.** FSFS removes the expired locks its walk met before the refusing one, in a hash
+  table's order, which leaves which it removed unspecified. Here none is removed, and the next use judges each again.
+- **The table's room is the owner's**, derived from its shard's room (item 12). A lock request whose paths could take
+  the table past it first lets go of every expired lock. A new lock past the room is then refused `E160000`, which is
+  the closest error Subversion has.
+- **A comment or a token is the whole string the client sent.** C stops at a NUL; here a comment holding one is
+  `E130004` and a token `E160037`.
+- **Release in the verdict's step.** `svnserve` releases a commit's locks after the commit; here release is in the
+  verdict's step (item 3.4).
 
 *8. Mergeinfo and merges.* `svn:mergeinfo` is a property whose value must parse (notes §7). `get-mergeinfo` answers it
 explicit (the node's own), inherited (the nearest ancestor's, each source path extended by the relative path, its
@@ -13037,13 +13063,15 @@ base checksum that differs: `E200014`, the work released. A malformed item or sv
 refused, naming the hook. A lock in the way: refused as item 3.4 says. A holder whose recomputed index differs: as
 §4.16, fatal and loud.
 
-*Refusals*, each in Subversion's words and number (derived from `svn_error_codes.h`, notes §6): out of date at the
-drive `E160028`; conflict at the verdict `E160024`; no such revision `E160006`; no such transaction `E160007`; a lock
-held by another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a
-lock `E160042`; a revision property's old value differs `E160049`; hook refused `E165001`; revision properties not
-enabled `E165006`; post-commit failed `E165007`; not authorized `E170001`; unreadable `E220001`, unwritable `E220004`;
-checksum `E200014`; property value `E125005`; mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`;
-request too large `E210009`; svndiff `E185000` to `E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
+*Refusals*, each in Subversion's words and number (derived from `svn_error_codes.h`, notes §6): out of date at the drive
+`E160028`; conflict at the verdict `E160024`; no such revision `E160006`; no such transaction `E160007`; a lock held by
+another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a lock
+`E160042`, an expired lock `E160041`, no principal `E160034`, a directory to lock `E160017`, a path to lock the head
+lacks `E160013`, a lock comment XML cannot carry `E130004`, a negative expiry `E200004`; a revision property's old value
+differs `E160049`; hook refused `E165001`; revision properties not enabled `E165006`; post-commit failed `E165007`; not
+authorized `E170001`; unreadable `E220001`, unwritable `E220004`; checksum `E200014`; property value `E125005`;
+mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`; request too large `E210009`; svndiff `E185000` to
+`E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
 
 *Worked example.* Repository `kernel` is at revision 1,200. Carol's working copy mixes revisions: `/trunk` at 1,190 and
 `/trunk/kernel/sched/core.c` at 1,195. She commits an edit of `core.c`: the work's base B is 1,200, and `core.c`'s
@@ -13088,7 +13116,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
    checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
-8. Locks. 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
+   oracle). 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
@@ -39383,6 +39412,101 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-602 — Subversion's locks: the lock table, its verbs' guards and the verdict's check, guarded then applied and held to FSFS's lock rules (2026-11-19, g250, UI goal 92 (kiln 51cef9f7); §4.17.4 item 7, item 3.4 and piece 8; A-500)
+Applied in the same change to:
+- §4.17.4's status, item 3.4, item 7, its refusals and its pieces, and GAPS (the §4.17.4 entry);
+- `crates/svn` (`lock.rs` and `lock/tests.rs`, new; `lib.rs`; `index.rs`, whose canonical-path check the lock table
+  shares);
+- `research/vcs-servers-subversion.md` (§1: six more files with their hashes; §7: "Locks, the code").
+
+- **What is built.** `slates-svn`'s `lock` holds a repository's lock table and three guards:
+  - `lock` makes locks: `lock` and `lock-many` over `svn://`, or a LOCK over HTTP, with stealing;
+  - `unlock` removes them, with breaking;
+  - `verdict` is the check a commit meets (item 3.4).
+
+  Each guard reads the table, the head and the instant the owner's clock gave. The head is a `HeadView`, which the
+  server answers from the index. Each guard returns the register entries it decided with its answers. `apply` applies
+  an entry unconditionally, as `crates/db/src/partition.rs` applies its records. So a holder's replay never reads a
+  clock or draws a token. The owner reads its clock through the codebase's seam (`Clock::wall_ns`, made an `AprTime`
+  by `AprTime::from_wall_ns`). It draws a token's sixteen bytes from its random source, and `LockToken::drawn` makes
+  them `opaquelocktoken:` and a version 4 UUID.
+- **The rules, from FSFS's code** (Subversion 1.14.x at `d434dc14`; notes §7, "Locks, the code"):
+  - A lock request needs a principal (`E160034`), a comment XML can carry (`E130004`) and an expiry that is not
+    negative (`E200004`). Zero is none.
+  - Then each path on its own:
+    - A supplied token must be `opaquelocktoken:` and printable ASCII (`E160037`). A supplied token comes from a DAV
+      refresh or a pre-lock hook.
+    - Only a file is locked (`E160017`).
+    - A path the head lacks is `E160013`, or `E160042` when the client named its revision.
+    - That revision past the head is `E160006`, and before the file's last change is `E160042`.
+    - A path locked already is `E160035`, whoever asks, unless the request steals the lock.
+  - A token is drawn only for a lock made, in path order.
+  - An unlock needs a principal, even to break a lock (`E160034`). No lock is `E160040`. Unless the request breaks it,
+    the wrong token is `E160040` and another principal's lock is `E160039`.
+  - An expired lock is no lock to every rule. A read does not show it.
+  - At the verdict:
+    - Each lock met must be the committer's, checked first (`E160039`).
+    - Its token must be among those presented, under any path (`E160037`).
+    - An accepted commit releases every presented lock whose token and owner match, unless it keeps them.
+- **What slates states on top** (item 7):
+  - An expiry the owner judges is recorded, so it stands on every holder.
+  - A refused commit records nothing.
+  - The table holds at most its room. Past it, a lock request first lets go of every expired lock, then refuses
+    `E160000`.
+  - A NUL in a comment or a token is refused.
+  - Release is in the verdict's step.
+- **The oracle.** `the_lock_table_equals_fsfs_lock_rules_on_generated_histories` transcribes FSFS's functions
+  (`check_lock`, `lock_body`, `check_unlock`, `unlock_body`, `get_lock`, `walk_locks`, `verify_lock`,
+  `verify_locks`, `svn_fs_lock_many`, `unlock_paths`, `get_locks_filter_func`) into a model. The model changes its map
+  of locks in place, as FSFS changes its digest files. The table, guarded then applied, must equal it after every step
+  of 256 generated histories in five ways:
+  - the same answers;
+  - the same tokens, drawn in the same order;
+  - every lock held, expired ones too;
+  - every `get-lock` and `get-locks`;
+  - a commit refused for a lock the model could have refused it for, or accepted by both. FSFS meets a directory's
+    locks in a hash table's order, so it reports whichever it meets first.
+
+  The census of the first run (Mac Studio, 2026-11-19) met all of these:
+  - all 15 refusals a guard makes;
+  - 469 tokens drawn and 80 supplied;
+  - 45 steals and 8 breaks;
+  - 17 releases and 20 commits that kept their locks;
+  - 60 expired locks met by commits and 35 requests that let go of expired locks;
+  - 460 commits refused.
+- **Tests and the run.** Twenty case tests, each citing the function it holds the table to.
+  `cargo test --locked -p slates-svn --lib` passed 74 of 74 on the Mac Studio (debug, 2026-11-19), and
+  `cargo fmt -p slates-svn -- --check` was clean. Red once, on a copy with the verdict's owner check skipped: three case
+  tests and the oracle failed, `E160037` where `E160039` was due.
+- **The commit rule (A-592, g268)** calls `verdict` with the work's changed paths and their actions as arguments.
+  Nothing here reads its module.
+- **Owed.** The verbs on the wire with the ra_svn server (piece 7): `lock`, `lock-many`, `unlock`, `unlock-many`,
+  `get-lock`, `get-locks`, and `commit`'s `lock-tokens` and `keep-locks`. Also owed:
+  - the four lock hooks, a pre-lock hook's token among them (piece 11);
+  - DAV's LOCK and UNLOCK with `Timeout` (piece 13);
+  - the entries' encoding in the repository's register;
+  - the `HeadView` over the index;
+  - the room derived from the shard's (item 12).
+
+  Main's: clippy and `cargo xtask check` on `slates-svn`.
+
+### A-607 — the deflate engine for the version-control servers: zlib-rs through flate2, chosen by measurement (2026-11-19, main, UI goal 93 (kiln 51cef9f7); §4.17.2 piece 3; §4.17.3 piece 1's GZ streams and piece 3's zlib revlog chunks)
+
+- **What.** One deflate engine for every zlib stream the servers read or write: git's pack entries and loose objects,
+  smart HTTP's gzip request bodies, Mercurial's GZ bundles and zlib revlog chunks. It is flate2's API over zlib-rs (pure
+  Rust), named once in the workspace's `[workspace.dependencies]`; a crate takes it as `flate2.workspace = true` and
+  never picks a backend.
+- **Why, measured.** Against miniz_oxide (also pure Rust) on the Mac Studio M3 Ultra, 2026-11-19, over slates' own
+  4,742 files at e85c17f9f, each its own zlib stream as git stores objects, five interleaved pairs: at git's level 6,
+  deflate 135.0 against 79.4 MB/s and inflate 956.4 against 497.5 MB/s (best of five), output 0.255 against 0.257 of
+  the input; at level 1 both directions faster too. The table, every run and the command are in docs/wip/BENCHMARKS.md
+  ("The deflate engine for the version-control servers"). Measured and rejected: miniz_oxide. Not measured: zlib-ng (C;
+  its build needs cmake).
+- **Consequence for tests.** Two deflate engines need not write the same compressed bytes for one input, so a golden
+  test holds an inflated stream's meaning (its bytes, its object id), never a stock tool's compressed bytes.
+- **Applied in the same change to:** Cargo.toml (`flate2` in `[workspace.dependencies]`, with the measurement),
+  docs/wip/BENCHMARKS.md, §4.17.2 piece 3.
 
 ### A-591 — git's pack index, version 2, and a pack's header and trailer, read and written as git 2.50.1 does (2026-11-19, g293, UI goal 92; §4.17.2 "Pieces (git)" pieces 2 and 3, "The repository in git's terms" item 4; after A-600)
 Applied in the same change to:
