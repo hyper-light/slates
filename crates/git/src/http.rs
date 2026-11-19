@@ -289,7 +289,12 @@ pub fn route(head: &Head<'_>, admission: &mut Admission) -> Result<Route, RouteR
   check_method(endpoint, method)?;
   let repo = repository(decoded, span)?;
   match endpoint {
-    Endpoint::InfoRefs => advertise(head, query.unwrap_or_default(), repo, method == Method::Head),
+    Endpoint::InfoRefs => advertise(
+      head,
+      query.unwrap_or_default(),
+      repo,
+      method == Method::Head,
+    ),
     Endpoint::Service(service) => serve(head, service, repo),
     Endpoint::Archive => Err(RouteRefused::ServiceNotServed),
     Endpoint::Dumb => Err(RouteRefused::DumbProtocol),
@@ -358,9 +363,11 @@ fn is_loose_object(directory: &[u8], file: &[u8]) -> bool {
 
 /// Whether `file` is `pack-<name>.pack` or `pack-<name>.idx`.
 fn is_pack_file(file: &[u8]) -> bool {
-  let name = file
-    .strip_prefix(b"pack-")
-    .and_then(|rest| rest.strip_suffix(b".pack").or_else(|| rest.strip_suffix(b".idx")));
+  let name = file.strip_prefix(b"pack-").and_then(|rest| {
+    rest
+      .strip_suffix(b".pack")
+      .or_else(|| rest.strip_suffix(b".idx"))
+  });
   name.is_some_and(|name| is_lower_hex(name) && NAME_DIGITS.contains(&name.len()))
 }
 
@@ -379,7 +386,9 @@ fn check_method(endpoint: Endpoint, method: Method) -> Result<(), RouteRefused> 
     (Endpoint::Service(_) | Endpoint::Archive, _) => {
       Err(RouteRefused::MethodNotAllowed(Allowed::Post))
     }
-    (Endpoint::InfoRefs | Endpoint::Dumb, _) => Err(RouteRefused::MethodNotAllowed(Allowed::GetHead)),
+    (Endpoint::InfoRefs | Endpoint::Dumb, _) => {
+      Err(RouteRefused::MethodNotAllowed(Allowed::GetHead))
+    }
   }
 }
 
@@ -444,7 +453,9 @@ fn serve(head: &Head<'_>, service: Service, repo: String) -> Result<Route, Route
   let content_type = head
     .field(REQUEST_CONTENT_TYPE)
     .map_err(RouteRefused::Head)?;
-  if !content_type.is_some_and(|value| media_type(value).eq_ignore_ascii_case(service.request_type())) {
+  if !content_type
+    .is_some_and(|value| media_type(value).eq_ignore_ascii_case(service.request_type()))
+  {
     return Err(RouteRefused::UnsupportedMediaType);
   }
   if head.framing == Framing::None {
@@ -527,7 +538,11 @@ pub fn refusal_reply(
         Allowed::GetHead => ALLOW_GET_HEAD,
         Allowed::Post => ALLOW_POST,
       };
-      reply::refusal(status, &[(ALLOW, methods), expires, pragma, cache_control], out)
+      reply::refusal(
+        status,
+        &[(ALLOW, methods), expires, pragma, cache_control],
+        out,
+      )
     }
     _ => reply::refusal(status, &NO_CACHE, out),
   }

@@ -127,12 +127,7 @@ impl<'a> Head<'a> {
 /// type "/" subtype parameters`), to be compared without regard to case ("The type and subtype tokens are
 /// case-insensitive").
 pub fn media_type(value: &[u8]) -> &[u8] {
-  trim_ows(
-    value
-      .split(|byte| *byte == b';')
-      .next()
-      .unwrap_or_default(),
-  )
+  trim_ows(value.split(|byte| *byte == b';').next().unwrap_or_default())
 }
 
 /// What a read of the bytes so far found.
@@ -441,11 +436,9 @@ fn parse<'a>(
     .next()
     .unwrap_or(Err(HeadRefused::BadRequest(Malformed::RequestLine)))?;
   let line = request_line(first)?;
-  let count = lines(text)
-    .skip(1)
-    .try_fold(0usize, |count, line| {
-      field_line(line?).map(|_| count.saturating_add(1))
-    })?;
+  let count = lines(text).skip(1).try_fold(0usize, |count, line| {
+    field_line(line?).map(|_| count.saturating_add(1))
+  })?;
   charge(admission, consumed, count)?;
   let mut fields = Vec::with_capacity(count);
   for line in all {
@@ -552,7 +545,10 @@ fn request_target<'a>(
 /// Reads the origin form: a path of URI characters from its `/`, and a query after the first `?`.
 fn origin_form(raw: &[u8]) -> Result<Target<'_>, HeadRefused> {
   let (path, query) = match raw.iter().position(|byte| *byte == b'?') {
-    Some(at) => (raw.get(..at).unwrap_or_default(), raw.get(at.saturating_add(1)..)),
+    Some(at) => (
+      raw.get(..at).unwrap_or_default(),
+      raw.get(at.saturating_add(1)..),
+    ),
     None => (raw, None),
   };
   if is_path(path) && query.is_none_or(is_query) {

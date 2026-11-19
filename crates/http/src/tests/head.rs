@@ -86,11 +86,35 @@ fn a_get_reads_its_line_its_fields_and_its_defaults() {
 fn a_post_reads_its_framing_and_its_coding() {
   let line = "POST /r.git/git-upload-pack HTTP/1.1";
   let cases: [(&[&str], Framing, Coding); 5] = [
-    (&["Host: h", "Content-Length: 1234"], Framing::Length(1234), Coding::Identity),
-    (&["Host: h", "Transfer-Encoding: chunked"], Framing::Chunked, Coding::Identity),
-    (&["Host: h", "Content-Length: 9", "Content-Encoding: gzip"], Framing::Length(9), Coding::Gzip),
-    (&["Host: h", "Transfer-Encoding: CHUNKED", "Content-Encoding: x-gzip"], Framing::Chunked, Coding::Gzip),
-    (&["Host: h", "Content-Length: 0", "Content-Encoding: identity"], Framing::Length(0), Coding::Identity),
+    (
+      &["Host: h", "Content-Length: 1234"],
+      Framing::Length(1234),
+      Coding::Identity,
+    ),
+    (
+      &["Host: h", "Transfer-Encoding: chunked"],
+      Framing::Chunked,
+      Coding::Identity,
+    ),
+    (
+      &["Host: h", "Content-Length: 9", "Content-Encoding: gzip"],
+      Framing::Length(9),
+      Coding::Gzip,
+    ),
+    (
+      &[
+        "Host: h",
+        "Transfer-Encoding: CHUNKED",
+        "Content-Encoding: x-gzip",
+      ],
+      Framing::Chunked,
+      Coding::Gzip,
+    ),
+    (
+      &["Host: h", "Content-Length: 0", "Content-Encoding: identity"],
+      Framing::Length(0),
+      Coding::Identity,
+    ),
   ];
   for (fields, framing, coding) in cases {
     let input = request(line, fields);
@@ -109,7 +133,11 @@ fn the_connection_is_kept_as_each_version_and_its_connection_field_say() {
     ("GET / HTTP/1.0", &["Connection: Keep-Alive, close"], false),
     ("GET / HTTP/1.1", &["Host: h"], true),
     ("GET / HTTP/1.1", &["Host: h", "Connection: close"], false),
-    ("GET / HTTP/1.1", &["Host: h", "connection: keep-alive", "Connection: CLOSE"], false),
+    (
+      "GET / HTTP/1.1",
+      &["Host: h", "connection: keep-alive", "Connection: CLOSE"],
+      false,
+    ),
   ];
   for (line, fields, kept) in cases {
     let input = request(line, fields);
@@ -142,7 +170,10 @@ fn a_later_minor_version_reads_as_1_1_and_another_major_is_refused() {
 #[test]
 fn a_head_skips_empty_lines_before_it_and_ends_at_its_own() {
   let mut input = b"\r\n\r\n".to_vec();
-  let head_bytes = request("POST /r/git-receive-pack HTTP/1.1", &["Host: h", "Content-Length: 5"]);
+  let head_bytes = request(
+    "POST /r/git-receive-pack HTTP/1.1",
+    &["Host: h", "Content-Length: 5"],
+  );
   input.extend_from_slice(&head_bytes);
   input.extend_from_slice(b"hello");
   let (head, consumed) = whole(&input);
@@ -240,7 +271,11 @@ fn expect_100_continue_is_honoured_for_1_1_ignored_for_1_0_and_another_is_417() 
 fn every_cut_of_a_head_is_partial_and_charges_nothing() {
   let input = request(
     "POST /r.git/git-receive-pack HTTP/1.1",
-    &["Host: h", "Content-Type: application/x-git-receive-pack-request", "Content-Length: 10"],
+    &[
+      "Host: h",
+      "Content-Type: application/x-git-receive-pack-request",
+      "Content-Length: 10",
+    ],
   );
   for cut in 0..input.len() {
     let mut admission = Admission::new(ROOM);
@@ -266,7 +301,11 @@ fn a_head_fed_a_byte_at_a_time_reads_as_one_read_does() {
   let mut reader = HeadReader::new();
   let mut admission = Admission::new(ROOM);
   for cut in 0..input.len() {
-    assert_eq!(reader.read(&input[..cut], &mut admission), Ok(Progress::Partial), "cut at {cut}");
+    assert_eq!(
+      reader.read(&input[..cut], &mut admission),
+      Ok(Progress::Partial),
+      "cut at {cut}"
+    );
   }
   let Ok(Progress::Complete { value, consumed }) = reader.read(&input, &mut admission) else {
     panic!("not complete");
@@ -301,7 +340,10 @@ fn a_head_is_charged_its_bytes_and_its_field_index_exactly() {
 /// partial while the input is shorter than the room.
 #[test]
 fn a_head_past_its_room_is_refused_414_or_431() {
-  let input = request("GET /a-long-enough-path HTTP/1.1", &["Host: h", "X-Long: 0123456789"]);
+  let input = request(
+    "GET /a-long-enough-path HTTP/1.1",
+    &["Host: h", "X-Long: 0123456789"],
+  );
   let line_end = input.windows(2).position(|pair| pair == b"\r\n").unwrap();
   let mut admission = Admission::new(to_u64(line_end));
   assert_eq!(
@@ -327,13 +369,22 @@ fn a_head_past_its_room_is_refused_414_or_431() {
 fn lines_past_max_line_are_refused_whole_or_still_open() {
   let at_bound = format!("GET /{} HTTP/1.1", "a".repeat(MAX_LINE - 14));
   assert_eq!(at_bound.len(), MAX_LINE);
-  assert!(matches!(read(&request(&at_bound, &["Host: h"])), Ok(Progress::Complete { .. })));
+  assert!(matches!(
+    read(&request(&at_bound, &["Host: h"])),
+    Ok(Progress::Complete { .. })
+  ));
   let past = format!("GET /{} HTTP/1.1", "a".repeat(MAX_LINE - 13));
-  assert_eq!(refused(&request(&past, &["Host: h"])), HeadRefused::UriTooLong);
+  assert_eq!(
+    refused(&request(&past, &["Host: h"])),
+    HeadRefused::UriTooLong
+  );
   let open = format!("GET /{}", "a".repeat(MAX_LINE + 2));
   assert_eq!(refused(open.as_bytes()), HeadRefused::UriTooLong);
   let field = format!("X: {}", "b".repeat(MAX_LINE - 3));
-  assert!(matches!(read(&request("GET / HTTP/1.1", &["Host: h", &field])), Ok(Progress::Complete { .. })));
+  assert!(matches!(
+    read(&request("GET / HTTP/1.1", &["Host: h", &field])),
+    Ok(Progress::Complete { .. })
+  ));
   let field = format!("X: {}", "b".repeat(MAX_LINE - 2));
   assert_eq!(
     refused(&request("GET / HTTP/1.1", &["Host: h", &field])),
@@ -348,27 +399,63 @@ fn lines_past_max_line_are_refused_whole_or_still_open() {
 #[test]
 fn the_grammar_is_held_and_each_break_is_named() {
   let cases: [(&[u8], Malformed); 22] = [
-    (b"GET  / HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::RequestLine),
+    (
+      b"GET  / HTTP/1.1\r\nHost: h\r\n\r\n",
+      Malformed::RequestLine,
+    ),
     (b"GET /\r\nHost: h\r\n\r\n", Malformed::RequestLine),
-    (b"GET / HTTP/1.1 x\r\nHost: h\r\n\r\n", Malformed::RequestLine),
+    (
+      b"GET / HTTP/1.1 x\r\nHost: h\r\n\r\n",
+      Malformed::RequestLine,
+    ),
     (b"G(T / HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Method),
     (b"GET / http/1.1\r\nHost: h\r\n\r\n", Malformed::Version),
     (b"GET / HTTP/1.10\r\nHost: h\r\n\r\n", Malformed::Version),
-    (b"GET relative HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Target),
+    (
+      b"GET relative HTTP/1.1\r\nHost: h\r\n\r\n",
+      Malformed::Target,
+    ),
     (b"GET /a#b HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Target),
     (b"GET /%zz HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Target),
     (b"GET /%4 HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Target),
-    (b"GET /\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Target),
+    (
+      b"GET /\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n",
+      Malformed::Target,
+    ),
     (b"GET /a\"b HTTP/1.1\r\nHost: h\r\n\r\n", Malformed::Target),
     (b"GET / HTTP/1.1\r\nHost : h\r\n\r\n", Malformed::FieldName),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nBad Name: x\r\n\r\n", Malformed::FieldName),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nNoColon\r\n\r\n", Malformed::FieldName),
-    (b"GET / HTTP/1.1\r\nHost: h\r\n: empty\r\n\r\n", Malformed::FieldName),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nX: a\r\n folded\r\n\r\n", Malformed::Folded),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nX: a\x00b\r\n\r\n", Malformed::FieldValue),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nX: a\x7fb\r\n\r\n", Malformed::FieldValue),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nX: a\rb\r\n\r\n", Malformed::LineBreak),
-    (b"GET / HTTP/1.1\r\nHost: h\r\nX: a\nb\r\n\r\n", Malformed::LineBreak),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nBad Name: x\r\n\r\n",
+      Malformed::FieldName,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nNoColon\r\n\r\n",
+      Malformed::FieldName,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\n: empty\r\n\r\n",
+      Malformed::FieldName,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nX: a\r\n folded\r\n\r\n",
+      Malformed::Folded,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nX: a\x00b\r\n\r\n",
+      Malformed::FieldValue,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nX: a\x7fb\r\n\r\n",
+      Malformed::FieldValue,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nX: a\rb\r\n\r\n",
+      Malformed::LineBreak,
+    ),
+    (
+      b"GET / HTTP/1.1\r\nHost: h\r\nX: a\nb\r\n\r\n",
+      Malformed::LineBreak,
+    ),
     (b"GET / HTTP/1.1\nHost: h\r\n\r\n", Malformed::LineBreak),
   ];
   for (input, fault) in cases {
@@ -387,7 +474,10 @@ fn the_grammar_is_held_and_each_break_is_named() {
 /// required once in HTTP/1.1, at most once in HTTP/1.0, and an authority with no userinfo.
 #[test]
 fn host_is_required_once_in_1_1_and_is_an_authority() {
-  assert_eq!(refused(b"GET / HTTP/1.1\r\n\r\n"), HeadRefused::BadRequest(Malformed::NoHost));
+  assert_eq!(
+    refused(b"GET / HTTP/1.1\r\n\r\n"),
+    HeadRefused::BadRequest(Malformed::NoHost)
+  );
   assert_eq!(
     refused(b"GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n"),
     HeadRefused::BadRequest(Malformed::RepeatedHost)
@@ -398,7 +488,11 @@ fn host_is_required_once_in_1_1_and_is_an_authority() {
   );
   for host in ["a b", "user@h", "h/x", "h?x"] {
     let input = request("GET / HTTP/1.1", &[&format!("Host: {host}")]);
-    assert_eq!(refused(&input), HeadRefused::BadRequest(Malformed::Host), "{host}");
+    assert_eq!(
+      refused(&input),
+      HeadRefused::BadRequest(Malformed::Host),
+      "{host}"
+    );
   }
   for host in ["[::1]:8080", "127.0.0.1", "xn--bcher-kva.example", ""] {
     let input = request("GET / HTTP/1.1", &[&format!("Host: {host}")]);
@@ -445,7 +539,10 @@ fn content_length_is_digits_and_its_values_agree() {
     );
   }
   assert_eq!(
-    refused(&request(line, &["Host: h", "Content-Length: 18446744073709551616"])),
+    refused(&request(
+      line,
+      &["Host: h", "Content-Length: 18446744073709551616"]
+    )),
     HeadRefused::ContentTooLarge
   );
 }
@@ -459,12 +556,30 @@ fn framing_two_readers_could_disagree_on_is_refused() {
       &["Content-Length: 5", "Transfer-Encoding: chunked"],
       HeadRefused::BadRequest(Malformed::LengthAndTransferCoding),
     ),
-    (&["Transfer-Encoding: gzip, chunked"], HeadRefused::NotImplemented),
-    (&["Transfer-Encoding: chunked, gzip"], HeadRefused::BadRequest(Malformed::ChunkedNotLast)),
-    (&["Transfer-Encoding: chunked, chunked"], HeadRefused::BadRequest(Malformed::ChunkedTwice)),
-    (&["Transfer-Encoding: chunked", "Transfer-Encoding: chunked"], HeadRefused::BadRequest(Malformed::ChunkedTwice)),
-    (&["Transfer-Encoding:"], HeadRefused::BadRequest(Malformed::ChunkedNotLast)),
-    (&["Transfer-Encoding: gzip", "Transfer-Encoding: chunked"], HeadRefused::NotImplemented),
+    (
+      &["Transfer-Encoding: gzip, chunked"],
+      HeadRefused::NotImplemented,
+    ),
+    (
+      &["Transfer-Encoding: chunked, gzip"],
+      HeadRefused::BadRequest(Malformed::ChunkedNotLast),
+    ),
+    (
+      &["Transfer-Encoding: chunked, chunked"],
+      HeadRefused::BadRequest(Malformed::ChunkedTwice),
+    ),
+    (
+      &["Transfer-Encoding: chunked", "Transfer-Encoding: chunked"],
+      HeadRefused::BadRequest(Malformed::ChunkedTwice),
+    ),
+    (
+      &["Transfer-Encoding:"],
+      HeadRefused::BadRequest(Malformed::ChunkedNotLast),
+    ),
+    (
+      &["Transfer-Encoding: gzip", "Transfer-Encoding: chunked"],
+      HeadRefused::NotImplemented,
+    ),
   ];
   for (fields, refusal) in cases {
     let mut all = vec!["Host: h"];
@@ -485,12 +600,23 @@ fn framing_two_readers_could_disagree_on_is_refused() {
 fn content_codings_other_than_one_gzip_are_refused_415() {
   let line = "POST /r/git-upload-pack HTTP/1.1";
   for coding in ["br", "deflate", "gzip, gzip", "gzip;q=1"] {
-    let input = request(line, &["Host: h", "Content-Length: 1", &format!("Content-Encoding: {coding}")]);
+    let input = request(
+      line,
+      &[
+        "Host: h",
+        "Content-Length: 1",
+        &format!("Content-Encoding: {coding}"),
+      ],
+    );
     assert_eq!(refused(&input), HeadRefused::UnsupportedCoding, "{coding}");
   }
   let input = request(
     line,
-    &["Host: h", "Content-Length: 1", "Content-Encoding: gzip, identity"],
+    &[
+      "Host: h",
+      "Content-Length: 1",
+      "Content-Encoding: gzip, identity",
+    ],
   );
   let (head, _) = whole(&input);
   assert_eq!(head.coding, Coding::Gzip);
@@ -537,7 +663,12 @@ fn refusals_are_judged_in_one_order_whatever_the_fields_order() {
 fn a_field_asked_for_once_but_sent_twice_is_refused() {
   let input = request(
     "POST / HTTP/1.1",
-    &["Host: h", "Content-Type: a/b", "content-type: c/d", "Content-Length: 0"],
+    &[
+      "Host: h",
+      "Content-Type: a/b",
+      "content-type: c/d",
+      "Content-Length: 0",
+    ],
   );
   let (head, _) = whole(&input);
   assert_eq!(
@@ -590,5 +721,8 @@ fn each_refusal_has_its_status_and_a_closing_reply() {
     out,
     b"HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
   );
-  assert_eq!(HeadRefused::FieldsTooLarge.status(), Status::FIELDS_TOO_LARGE);
+  assert_eq!(
+    HeadRefused::FieldsTooLarge.status(),
+    Status::FIELDS_TOO_LARGE
+  );
 }

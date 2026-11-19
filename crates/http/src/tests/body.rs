@@ -9,14 +9,21 @@ use crate::{Admission, MAX_LINE, PastAdmission, to_u64};
 const ROOM: u64 = 1 << 20;
 
 /// What a body read in `pieces` gave: its data and the bytes it took in all, or its refusal.
-fn read_in(framing: Framing, pieces: &[&[u8]], admission: &mut Admission) -> Result<(Vec<u8>, usize), BodyRefused> {
+fn read_in(
+  framing: Framing,
+  pieces: &[&[u8]],
+  admission: &mut Admission,
+) -> Result<(Vec<u8>, usize), BodyRefused> {
   let mut reader = BodyReader::new(framing);
   let (mut data, mut taken) = (Vec::new(), 0usize);
   for piece in pieces {
     let mut at = 0;
     loop {
       match reader.step(&piece[at..], admission)? {
-        Step::Data { data: run, consumed } => {
+        Step::Data {
+          data: run,
+          consumed,
+        } => {
           assert!(!run.is_empty(), "an empty run of data");
           data.extend_from_slice(run);
           at += consumed;
@@ -69,14 +76,18 @@ fn chunked(data: &[u8], sizes: &[usize]) -> Vec<u8> {
 }
 
 /// The chunked body of RFC 9112's era's own illustration, with a next request after it.
-const WIKI: &[u8] = b"4\r\nWiki\r\n6\r\npedia \r\nE\r\nin \r\n\r\nchunks.\r\n0\r\n\r\nGET / HTTP/1.1\r\n";
+const WIKI: &[u8] =
+  b"4\r\nWiki\r\n6\r\npedia \r\nE\r\nin \r\n\r\nchunks.\r\n0\r\n\r\nGET / HTTP/1.1\r\n";
 
 /// A-595: do read a `Content-Length` body whole and at every cut, a next request after it. Expect its bytes, and the
 /// end exactly after them.
 #[test]
 fn a_length_body_is_its_bytes_and_ends_there() {
   let input = b"helloGET";
-  assert_eq!(read_whole(Framing::Length(5), input), Ok((b"hello".to_vec(), 5)));
+  assert_eq!(
+    read_whole(Framing::Length(5), input),
+    Ok((b"hello".to_vec(), 5))
+  );
   for cut in 0..=input.len() {
     let pieces: [&[u8]; 2] = [&input[..cut], &input[cut..]];
     assert_eq!(
@@ -93,8 +104,14 @@ fn no_body_and_an_empty_body_end_at_once() {
   for framing in [Framing::None, Framing::Length(0)] {
     let mut reader = BodyReader::new(framing);
     let mut admission = Admission::new(ROOM);
-    assert_eq!(reader.step(b"GET", &mut admission), Ok(Step::End { consumed: 0 }));
-    assert_eq!(reader.step(b"", &mut admission), Ok(Step::End { consumed: 0 }));
+    assert_eq!(
+      reader.step(b"GET", &mut admission),
+      Ok(Step::End { consumed: 0 })
+    );
+    assert_eq!(
+      reader.step(b"", &mut admission),
+      Ok(Step::End { consumed: 0 })
+    );
   }
 }
 
@@ -114,7 +131,10 @@ fn every_cut_of_a_chunked_body_reads_its_data() {
     );
   }
   let bytes: Vec<&[u8]> = WIKI.chunks(1).collect();
-  assert_eq!(read_in(Framing::Chunked, &bytes, &mut Admission::new(ROOM)), Ok(expected));
+  assert_eq!(
+    read_in(Framing::Chunked, &bytes, &mut Admission::new(ROOM)),
+    Ok(expected)
+  );
 }
 
 /// A-595: do read chunks with extensions (tokens, quoted strings holding `;` and an escaped quote, whitespace before the
@@ -122,7 +142,8 @@ fn every_cut_of_a_chunked_body_reads_its_data() {
 #[test]
 fn chunk_extensions_are_skipped_and_trailers_dropped_and_charged() {
   let trailers = b"Expires: never\r\nX-Checksum: \tabc\r\n";
-  let mut input = b"5;name=value;q=\"a;\\\"b\"\r\nhello\r\n000006 ;x\r\n world\r\n0;last\r\n".to_vec();
+  let mut input =
+    b"5;name=value;q=\"a;\\\"b\"\r\nhello\r\n000006 ;x\r\n world\r\n0;last\r\n".to_vec();
   input.extend_from_slice(trailers);
   input.extend_from_slice(b"\r\n");
   let mut admission = Admission::new(ROOM);
@@ -157,7 +178,12 @@ fn hostile_chunk_lines_are_refused_by_kind() {
     (long_extension.as_bytes(), LineTooLong),
   ];
   for (input, refusal) in cases {
-    assert_eq!(refused(input), refusal, "{:?}", String::from_utf8_lossy(input));
+    assert_eq!(
+      refused(input),
+      refusal,
+      "{:?}",
+      String::from_utf8_lossy(input)
+    );
   }
   assert_eq!(
     read_whole(Framing::Chunked, b"0000000005\r\nhello\r\n00\r\n\r\n"),
@@ -186,7 +212,12 @@ fn trailers_are_held_to_the_grammar_and_the_room() {
     (long.as_bytes(), LineTooLong),
   ];
   for (input, refusal) in cases {
-    assert_eq!(refused(input), refusal, "{:?}", String::from_utf8_lossy(input));
+    assert_eq!(
+      refused(input),
+      refusal,
+      "{:?}",
+      String::from_utf8_lossy(input)
+    );
   }
   let mut reader = BodyReader::new(Framing::Chunked);
   let mut admission = Admission::new(5);
@@ -215,7 +246,10 @@ fn a_body_is_streamed_never_held() {
     }
   }
   assert_eq!(seen, body.len());
-  assert_eq!(reader.step(b"", &mut admission), Ok(Step::End { consumed: 0 }));
+  assert_eq!(
+    reader.step(b"", &mut admission),
+    Ok(Step::End { consumed: 0 })
+  );
   assert_eq!(admission.left(), ROOM);
 }
 

@@ -43,7 +43,10 @@ fn inflate(pieces: &[&[u8]], admission: &mut Admission) -> Result<Vec<u8>, GzipR
 fn a_gzip_body_inflates_to_its_bytes_charged_exactly() {
   let text = text();
   let mut admission = Admission::new(ROOM);
-  assert_eq!(inflate(&[&gzipped(&text)], &mut admission), Ok(text.clone()));
+  assert_eq!(
+    inflate(&[&gzipped(&text)], &mut admission),
+    Ok(text.clone())
+  );
   assert_eq!(admission.left(), ROOM - to_u64(text.len()));
 }
 
@@ -73,7 +76,11 @@ fn every_body_cut_short_is_refused_at_its_finish() {
     let mut gunzip = Gunzip::new();
     let mut admission = Admission::new(ROOM);
     gunzip.feed(&body[..cut], &mut admission).unwrap();
-    assert_eq!(gunzip.finish(&mut admission), Err(GzipRefused::Malformed), "cut at {cut}");
+    assert_eq!(
+      gunzip.finish(&mut admission),
+      Err(GzipRefused::Malformed),
+      "cut at {cut}"
+    );
   }
 }
 
@@ -170,14 +177,20 @@ fn an_inflater_fed_after_its_end_or_a_refusal_is_refused() {
   gunzip.feed(&gzipped(b"x"), &mut admission).unwrap();
   gunzip.finish(&mut admission).unwrap();
   assert_eq!(gunzip.take(), b"x");
-  assert_eq!(gunzip.feed(b"more", &mut admission), Err(GzipRefused::Ended));
+  assert_eq!(
+    gunzip.feed(b"more", &mut admission),
+    Err(GzipRefused::Ended)
+  );
   assert_eq!(gunzip.finish(&mut admission), Err(GzipRefused::Ended));
   let mut gunzip = Gunzip::new();
   assert_eq!(
     gunzip.feed(b"not gzip, not at all", &mut admission),
     Err(GzipRefused::Malformed)
   );
-  assert_eq!(gunzip.feed(&gzipped(b"x"), &mut admission), Err(GzipRefused::Ended));
+  assert_eq!(
+    gunzip.feed(&gzipped(b"x"), &mut admission),
+    Err(GzipRefused::Ended)
+  );
 }
 
 /// A-595: do ask each refusal's status. Expect 413 past the room and 400 for the rest.

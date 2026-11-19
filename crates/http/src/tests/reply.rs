@@ -33,7 +33,12 @@ fn each_framing_is_written_and_a_refusal_closes() {
   head(Status::OK, &[], Body::UntilClose, false, &mut out).unwrap();
   assert_eq!(out, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
   let mut out = Vec::new();
-  refusal(Status::METHOD_NOT_ALLOWED, &[(b"Allow", b"GET, HEAD")], &mut out).unwrap();
+  refusal(
+    Status::METHOD_NOT_ALLOWED,
+    &[(b"Allow", b"GET, HEAD")],
+    &mut out,
+  )
+  .unwrap();
   assert_eq!(
     out,
     b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -62,8 +67,18 @@ fn a_field_that_could_split_the_reply_is_refused_with_nothing_written() {
     assert_eq!(out, b"kept");
   }
   let mut out = Vec::new();
-  head(Status::OK, &[(b"X", b"a\tb")], Body::Length(0), false, &mut out).unwrap();
-  assert_eq!(out, b"HTTP/1.1 200 OK\r\nX: a\tb\r\nContent-Length: 0\r\n\r\n");
+  head(
+    Status::OK,
+    &[(b"X", b"a\tb")],
+    Body::Length(0),
+    false,
+    &mut out,
+  )
+  .unwrap();
+  assert_eq!(
+    out,
+    b"HTTP/1.1 200 OK\r\nX: a\tb\r\nContent-Length: 0\r\n\r\n"
+  );
 }
 
 /// A-595: do write chunks of several sizes, an empty one, the last chunk and the interim `100 Continue`. Expect each
@@ -96,11 +111,23 @@ fn each_status_is_rfc_9110s() {
     (Status::LENGTH_REQUIRED, 411, "Length Required"),
     (Status::CONTENT_TOO_LARGE, 413, "Content Too Large"),
     (Status::URI_TOO_LONG, 414, "URI Too Long"),
-    (Status::UNSUPPORTED_MEDIA_TYPE, 415, "Unsupported Media Type"),
+    (
+      Status::UNSUPPORTED_MEDIA_TYPE,
+      415,
+      "Unsupported Media Type",
+    ),
     (Status::EXPECTATION_FAILED, 417, "Expectation Failed"),
-    (Status::FIELDS_TOO_LARGE, 431, "Request Header Fields Too Large"),
+    (
+      Status::FIELDS_TOO_LARGE,
+      431,
+      "Request Header Fields Too Large",
+    ),
     (Status::NOT_IMPLEMENTED, 501, "Not Implemented"),
-    (Status::VERSION_NOT_SUPPORTED, 505, "HTTP Version Not Supported"),
+    (
+      Status::VERSION_NOT_SUPPORTED,
+      505,
+      "HTTP Version Not Supported",
+    ),
   ];
   for (status, code, reason) in cases {
     assert_eq!((status.code, status.reason), (code, reason));

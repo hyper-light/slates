@@ -20,35 +20,80 @@ pub struct Status {
 
 impl Status {
   /// Format: `100 Continue` (RFC 9110 §15.2.1), sent before a body a client waits to send (§10.1.1).
-  pub const CONTINUE: Status = Status { code: 100, reason: "Continue" };
+  pub const CONTINUE: Status = Status {
+    code: 100,
+    reason: "Continue",
+  };
   /// Format: `200 OK` (RFC 9110 §15.3.1).
-  pub const OK: Status = Status { code: 200, reason: "OK" };
+  pub const OK: Status = Status {
+    code: 200,
+    reason: "OK",
+  };
   /// Format: `400 Bad Request` (RFC 9110 §15.5.1).
-  pub const BAD_REQUEST: Status = Status { code: 400, reason: "Bad Request" };
+  pub const BAD_REQUEST: Status = Status {
+    code: 400,
+    reason: "Bad Request",
+  };
   /// Format: `401 Unauthorized` (RFC 9110 §15.5.2).
-  pub const UNAUTHORIZED: Status = Status { code: 401, reason: "Unauthorized" };
+  pub const UNAUTHORIZED: Status = Status {
+    code: 401,
+    reason: "Unauthorized",
+  };
   /// Format: `403 Forbidden` (RFC 9110 §15.5.4).
-  pub const FORBIDDEN: Status = Status { code: 403, reason: "Forbidden" };
+  pub const FORBIDDEN: Status = Status {
+    code: 403,
+    reason: "Forbidden",
+  };
   /// Format: `404 Not Found` (RFC 9110 §15.5.5).
-  pub const NOT_FOUND: Status = Status { code: 404, reason: "Not Found" };
+  pub const NOT_FOUND: Status = Status {
+    code: 404,
+    reason: "Not Found",
+  };
   /// Format: `405 Method Not Allowed` (RFC 9110 §15.5.6), which carries `Allow`.
-  pub const METHOD_NOT_ALLOWED: Status = Status { code: 405, reason: "Method Not Allowed" };
+  pub const METHOD_NOT_ALLOWED: Status = Status {
+    code: 405,
+    reason: "Method Not Allowed",
+  };
   /// Format: `411 Length Required` (RFC 9110 §15.5.12).
-  pub const LENGTH_REQUIRED: Status = Status { code: 411, reason: "Length Required" };
+  pub const LENGTH_REQUIRED: Status = Status {
+    code: 411,
+    reason: "Length Required",
+  };
   /// Format: `413 Content Too Large` (RFC 9110 §15.5.14).
-  pub const CONTENT_TOO_LARGE: Status = Status { code: 413, reason: "Content Too Large" };
+  pub const CONTENT_TOO_LARGE: Status = Status {
+    code: 413,
+    reason: "Content Too Large",
+  };
   /// Format: `414 URI Too Long` (RFC 9110 §15.5.15).
-  pub const URI_TOO_LONG: Status = Status { code: 414, reason: "URI Too Long" };
+  pub const URI_TOO_LONG: Status = Status {
+    code: 414,
+    reason: "URI Too Long",
+  };
   /// Format: `415 Unsupported Media Type` (RFC 9110 §15.5.16).
-  pub const UNSUPPORTED_MEDIA_TYPE: Status = Status { code: 415, reason: "Unsupported Media Type" };
+  pub const UNSUPPORTED_MEDIA_TYPE: Status = Status {
+    code: 415,
+    reason: "Unsupported Media Type",
+  };
   /// Format: `417 Expectation Failed` (RFC 9110 §15.5.18).
-  pub const EXPECTATION_FAILED: Status = Status { code: 417, reason: "Expectation Failed" };
+  pub const EXPECTATION_FAILED: Status = Status {
+    code: 417,
+    reason: "Expectation Failed",
+  };
   /// Format: `431 Request Header Fields Too Large` (RFC 6585 §5).
-  pub const FIELDS_TOO_LARGE: Status = Status { code: 431, reason: "Request Header Fields Too Large" };
+  pub const FIELDS_TOO_LARGE: Status = Status {
+    code: 431,
+    reason: "Request Header Fields Too Large",
+  };
   /// Format: `501 Not Implemented` (RFC 9110 §15.6.2).
-  pub const NOT_IMPLEMENTED: Status = Status { code: 501, reason: "Not Implemented" };
+  pub const NOT_IMPLEMENTED: Status = Status {
+    code: 501,
+    reason: "Not Implemented",
+  };
   /// Format: `505 HTTP Version Not Supported` (RFC 9110 §15.6.6).
-  pub const VERSION_NOT_SUPPORTED: Status = Status { code: 505, reason: "HTTP Version Not Supported" };
+  pub const VERSION_NOT_SUPPORTED: Status = Status {
+    code: 505,
+    reason: "HTTP Version Not Supported",
+  };
 }
 
 /// How a reply's body is framed (RFC 9112 §6).
@@ -146,7 +191,11 @@ fn field(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
 
 /// Writes the reply to a refused request: `status`, `fields`, no body, and `Connection: close`, since a refused
 /// request's body is not read and the connection cannot carry another.
-pub fn refusal(status: Status, fields: &[(&[u8], &[u8])], out: &mut Vec<u8>) -> Result<(), BadField> {
+pub fn refusal(
+  status: Status,
+  fields: &[(&[u8], &[u8])],
+  out: &mut Vec<u8>,
+) -> Result<(), BadField> {
   head(status, fields, Body::Length(0), true, out)
 }
 
