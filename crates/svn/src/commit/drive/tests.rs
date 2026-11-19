@@ -295,7 +295,7 @@ fn recorded_date(server: &[Read<'_>]) -> String {
 }
 
 /// Commits an accepted work as the owner would and writes `svnserve`'s answer.
-fn commit(replay: &mut Replay, work: Work, user: &str, date: &str, out: &mut Vec<u8>) {
+fn commit_work(replay: &mut Replay, work: Work, user: &str, date: &str, out: &mut Vec<u8>) {
   let revision = replay.index.append(work.record, ROOM).unwrap();
   replay.green.texts.extend(work.texts);
   replay.green.lists.extend(work.property_lists);

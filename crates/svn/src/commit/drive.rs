@@ -358,7 +358,6 @@ pub struct Start {
 }
 
 /// How a `commit` began ([`commit`]).
-#[derive(Debug)]
 pub enum Begun {
   /// Its answer is written: hand the drive every item that follows ([`Drive::command`]).
   Driving(Box<Drive>),
@@ -369,6 +368,17 @@ pub enum Begun {
   Answered,
   /// Parameters `svnserve` cannot read: the connection ends, nothing written.
   Close,
+}
+
+impl std::fmt::Debug for Begun {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(match self {
+      Self::Driving(_) => "Driving",
+      Self::Authenticate => "Authenticate",
+      Self::Answered => "Answered",
+      Self::Close => "Close",
+    })
+  }
 }
 
 /// The one entry point for `commit` (A-655; the svn:// connection task, A-656, calls it with the command's
