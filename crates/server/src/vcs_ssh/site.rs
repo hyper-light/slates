@@ -32,13 +32,15 @@
 //!    --stdio` runs (`super::hg`, A-679: `slates_hg::serve::stdio::Stdio`, A-650 part 2) when the lender the HTTP site
 //!    reads Mercurial's stores from holds the repository's ([`HgStores`]): the daemon's lends each repository's served
 //!    view from its store on its owner shard (`crate::vcs_store::hg_view::ServedViews`, A-680 part 2a). The daemon
-//!    hands this site both lenders once it starts the SSH edge (A-684). Receive-pack (A-654) and Subversion's tunnel
-//!    (A-656) wait for their entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the
-//!    not-served answer goes with the last of them.
+//!    hands this site both lenders once it starts the SSH edge (A-684). Receive-pack (A-654) waits for its entry point.
+//!    Each becomes a [`Command`] behind [`Services`] as it can run, and the not-served answer goes with the last of
+//!    them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
-//! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]).
+//! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]). The tunnel runs as a service of its own
+//! beside the others (`super::svn`'s `SvnServices`, A-688): A-656's connection over the channel, the repository found
+//! and judged when its URL comes, its store lent as git's is, and refused as not served where it is not held here.
 
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal, RepositoryRecord, VcsTool};
 use slates_ssh::command::Command as Asked;
@@ -507,7 +509,8 @@ fn repository_name(path: &[u8]) -> Option<&str> {
 }
 
 /// The words a service the server cannot start ends with, in its tool's words (the module doc, step 3); a session whose
-/// store goes away mid-way ends in them too.
+/// store goes away mid-way ends in them too, and so does a Subversion tunnel whose client names a repository not served
+/// here (`super::svn`).
 pub(crate) fn not_served(service: Service) -> Refused {
   Tool::of(service).refused(&format!("{} is not served yet", service.name()))
 }
