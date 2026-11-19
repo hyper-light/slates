@@ -479,6 +479,21 @@ impl Owner {
     reachable: &Reach,
   ) -> Result<Owner, TakeoverError> {
     let (reachable_candidates, new_epoch) = cohort.phase_one(reachable)?;
+    // RED STUB: the in-memory read before A-636 part 2a.
+    if true {
+      let mut logs: Vec<Vec<Record>> = Vec::new();
+      for candidate in &reachable_candidates {
+        if let Some(holder) = cohort.holders.get_mut(candidate) {
+          let _ = holder.fence.accept(new_epoch);
+          logs.push(holder.log.clone());
+        }
+      }
+      return Ok(Owner {
+        id: new_id,
+        epoch: new_epoch,
+        log: adopt(&logs),
+      });
+    }
     let prepare = Prepare {
       owner: new_id,
       object: cohort.object,
@@ -558,6 +573,10 @@ impl PhaseOne {
   /// Hears `from`'s reply `bytes`: counts it when it decodes to a promise naming `from` that binds the prepare and
   /// comes from a candidate not counted before; otherwise says why not and counts nothing.
   pub fn hear(&mut self, from: HostId, bytes: &[u8]) -> Heard {
+    // RED STUB: a round that counts nothing.
+    if true {
+      return Heard::Malformed;
+    }
     let Ok(promise) = LedgerPromise::decode(bytes) else {
       return Heard::Malformed;
     };

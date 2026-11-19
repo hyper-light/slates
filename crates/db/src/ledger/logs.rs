@@ -425,6 +425,16 @@ impl LogsOwner {
     new_id: HostId,
     reachable: &Reach,
   ) -> Result<TakenOver, LogsTakeoverRefused> {
+    // RED STUB: part 1's rule, every log's round asked first, nothing fenced on a refusal.
+    for (name, log) in &cohort.logs {
+      log
+        .phase_one(reachable)
+        .map_err(|error| LogsTakeoverRefused {
+          log: *name,
+          error,
+          fenced: Vec::new(),
+        })?;
+    }
     let mut owners = BTreeMap::new();
     for (name, log) in &mut cohort.logs {
       let owner =

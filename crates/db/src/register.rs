@@ -103,18 +103,29 @@ impl ObjectId {
   /// exactly as its object is ([`ObjectId::placement_key`]), so a volume's catalog and its head always share
   /// their holders and their successor.
   pub const fn catalog(self) -> ObjectId {
-    self.in_class(RegisterClass::Catalog)
+    // RED STUB: the encoding before A-636 part 2a.
+    let mut bytes = self.0;
+    bytes[CLASS_BYTE] |= CATALOG_CLASS;
+    ObjectId(bytes)
   }
 
   /// Whether this id names a catalog register ([`ObjectId::catalog`]).
   pub const fn is_catalog(&self) -> bool {
-    matches!(self.class(), RegisterClass::Catalog)
+    // RED STUB: the encoding before A-636 part 2a.
+    self.0[CLASS_BYTE] & CATALOG_CLASS != 0
   }
 
   /// Which register of its object this id names (§4.8 "Data model"; AUD-29-17; A-636 part 2a), read from the
   /// class bits of its counter's top byte: none for the object's own register; the top bit alone for its
   /// catalog; the second bit for one of a repository's state logs, which the top and third bits then name.
   pub const fn class(&self) -> RegisterClass {
+    // RED STUB: before A-636 part 2a no id names a state log.
+    if self.is_catalog() {
+      return RegisterClass::Catalog;
+    }
+    if true {
+      return RegisterClass::Own;
+    }
     let byte = self.0[CLASS_BYTE];
     if byte & STATE_CLASS == 0 {
       return if byte & CATALOG_CLASS == 0 {
@@ -135,10 +146,18 @@ impl ObjectId {
   /// Every register of one object is placed, owned and taken over as the object is, so a repository's state
   /// logs share the repository's holders and successor, as a volume's catalog shares its volume's. An id
   /// minted at or below [`MAX_OBJECT_COUNTER`] carries no class bit, so each of its registers leads back to it.
-  pub const fn in_class(self, class: RegisterClass) -> ObjectId {
-    let mut bytes = self.placement_key().0;
-    bytes[CLASS_BYTE] |= class_bits(class);
-    ObjectId(bytes)
+  pub fn in_class(self, class: RegisterClass) -> ObjectId {
+    // RED STUB: before A-636 part 2a a state log took a fresh id of its own, as part 1's tests named them.
+    let fresh = match class {
+      RegisterClass::Own => return self,
+      RegisterClass::Catalog => return self.catalog(),
+      RegisterClass::State(StateLog::Names) => 1,
+      RegisterClass::State(StateLog::Phases) => 2,
+      RegisterClass::State(StateLog::Markers) => 3,
+      RegisterClass::State(StateLog::Locks) => 4,
+    };
+    let _unused = class_bits(class);
+    ObjectId::new(self.creator(), self.local().wrapping_add(fresh))
   }
 
   /// The object whose placement and takeover this id follows: the id with its register class's bits cleared,
@@ -147,7 +166,8 @@ impl ObjectId {
   /// an id is placed exactly as before the state logs' class.
   pub const fn placement_key(&self) -> ObjectId {
     let mut bytes = self.0;
-    let class = if bytes[CLASS_BYTE] & STATE_CLASS == 0 {
+    // RED STUB: the encoding before A-636 part 2a.
+    let class = if true || bytes[CLASS_BYTE] & STATE_CLASS == 0 {
       CATALOG_CLASS
     } else {
       CLASS_BITS
@@ -202,7 +222,7 @@ const CLASS_BITS: u8 = CATALOG_CLASS | STATE_CLASS | STATE_LOW;
 /// class sets ([`CLASS_BITS`]: the catalog's top bit, AUD-29-17, and the state logs' two below it, A-636
 /// part 2a), so no object's own id reads as another register. An id minter refuses past it.
 /// Format: the counter is the id's last six bytes, 48 bits; the classes take its top three.
-pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 45) - 1;
+pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 47) - 1;
 
 /// The width of an encoded object id (16 bytes) — its place in every register wire layout.
 pub const OBJECT_BYTES: usize = size_of::<ObjectId>();
