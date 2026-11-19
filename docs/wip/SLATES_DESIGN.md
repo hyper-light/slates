@@ -11431,6 +11431,24 @@ absent at the head and unchanged after the base, and its source's tree unchanged
 > link, a hard link or an IPC node is refused `TypeChanged` with no concurrent change, though POSIX replaces it; and a
 > hard link names its target by path, so the target's removal leaves the link naming whatever is made there next.
 
+> **Status (2026-11-19, A-646 part 1: a rename replaces an unchanged link or IPC node, and an IPC node's removal is two
+> lookups).**
+> - *A rename's destination is replaced as POSIX `rename` replaces it.* Any node but a directory the work's base held
+>   unchanged is removed by its own effect, pushed before the source's set: a symbolic link, a hard link, an IPC node,
+>   and (A-643) a file a link is renamed over. A directory, and a link or IPC node changed after the base, are still a
+>   type change; a file changed after it is still rename against rename; an IPC node a hard link names is delete
+>   against modify, as its unlink is. Before, any node but a file at the destination was refused `TypeChanged`, though
+>   nothing had changed after the base.
+> - *Two names of one file renamed one over the other change nothing*, as POSIX `rename` does: a file over its own hard
+>   link, or one link over another link to the same file (A-643 settled a link over the file it names).
+> - *An IPC node's removal reads its last change in any dimension (`changed_after`) and the links naming it
+>   (`links_to`)*, two lookups, where it had scanned every attribute change and every hard link of the green.
+>
+> Tests: `crates/merge/src/engine/replaced_node_tests.rs` and `scan_tests.rs` (a counter of the entries the verdict
+> examines: 2 for one removal in a green of a thousand hard links and attribute changes, 2,000 before). The whole-state
+> oracle renames a file or a link over a file or a link. Owed, as A-646 part 2: a hard link names its target's node,
+> never a path.
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -43491,3 +43509,39 @@ Applied in the same change to:
   - a hard link names its target by path, so the head's removal of a file that links name is accepted and the links
     then name whatever is made there next;
   - the IPC node's unlink scans every attribute change and every hard link once per unlink.
+
+### A-646 part 1 — a rename replaces an unchanged link or IPC node at its destination, and an IPC node's removal is two lookups (2026-11-19, g267, UI goal 93; §4.16 "The verdict"; A-643's first and third siblings)
+Applied in the same change to:
+- §4.16's verdict status; GAPS (A-643's siblings: the first and third fixed, the second owed as part 2);
+- `crates/merge/src/engine.rs`: `merge_rename` (`replaced_by_rename`, `same_file`), `merge_unlink`'s IPC branch,
+  `named_by_links`, and a counter of the entries examined in test builds;
+- `crates/merge/src/engine/replaced_node_tests.rs` and `crates/merge/src/engine/scan_tests.rs`: the failing-first
+  tests, and the whole-state oracle widened to renames over links;
+- `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
+- **The defects.**
+  - A rename over a symbolic link, a hard link or an IPC node was refused `TypeChanged`, even with nothing changed
+    after the work's base. POSIX `rename` replaces any destination but a directory, and does nothing for two names of
+    one file, so `mv file link`, `mv link link`, `mv file fifo` and a file renamed over its own link could never land.
+  - An IPC node's unlink scanned every attribute change and every hard link of the green: O(changes) per removal.
+- **The rule, from §4.16 and POSIX `rename`.** A type change is a conflict for a concurrent change, not for an
+  operation the work saw and made. The destination is replaced when it is the node the base held:
+  - A directory is still refused, since a non-directory never replaces one.
+  - A link or IPC node changed after the base is a type change.
+  - A file changed after it is rename against rename.
+  - An IPC node a hard link names is delete against modify until links name nodes (part 2).
+  - Otherwise the node is removed by its own effect before the source's set, so the history's last entry at the version
+    is the new node.
+
+  Two names of one file are one name.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 7 to 9), green on kiln r960: `cargo test -p slates-merge --lib`, 104
+  of 104; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests:
+  - the file and the symlink, each renamed over a symlink, a hard link and a FIFO, accepted and replacing it;
+  - the guard: a link changed after the base, and a directory, still `TypeChanged`;
+  - a file over its own link, and a link over another link to the same file, accepted with nothing changed;
+  - the whole-state oracle renaming the file or a link over a file or a link, with a census count of a link replaced;
+  - the counter: one IPC node's removal examines two entries in a green of a thousand hard links and attribute
+    changes.
+
+  Red on r960, with the old rename rule and the old scans restored (the scans counting): 4 of the 7 tests the run
+  selected failed, and the guards passed either way. The file over the symlink, and the file over its own link, were
+  each `TypeChanged`; the oracle shrank to the hard link renamed over the symlink; the removal examined 2,000 entries.
