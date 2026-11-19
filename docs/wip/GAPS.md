@@ -410,6 +410,12 @@
 > their text; `LocksRefused` tells `507` from `500`. `cargo test -p slates-git --lib` on the Mac Studio: 387 passed, 2
 > ignored, red first. Owed: part 2b-ii (the server's `Access`, `Locks` through `RepositoryLogs::append`, the edge's
 > call).
+> **A-629 part 2b-ii (2026-11-19, g293; LFS on the daemon):** `slates-server` (`lfs`): the edge's call `answer`,
+> `LfsAccess` (vcs_policy's `admit` per need and ref) and `LogLocks` (A-635's locks log through
+> `RepositoryLogs::append`). `cargo test -p slates-server --lib` on the Mac Studio: 632 passed, the 4 new red first,
+> main's `deadlines` test failing as on main. Owed: the edge's answer whose status follows the body; the durable
+> object store on the owner shard (A-581); locks by others than the owner once the push's policy check lands;
+> principals' names for people (§4.13).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
