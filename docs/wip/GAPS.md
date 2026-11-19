@@ -11665,6 +11665,17 @@ dead daemon left: 72 pipelined writes across six kills answered on one connectio
 Open:
 - Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
   against a ledger of the send in flight (A-113) before it may resume one.
+  - **Built, part 1 (2026-11-18, A-550, goal 85, g079): the adoption's judgment.** `crate::held_send::resume` judges a
+    held connection from the bytes the kernel says its writer handed it against the ledger of the send in flight:
+    exactly the bytes before that send (`Untouched`) or those and the whole send (`Whole`) serve on, any other count is
+    `Torn` and ends the connection. Held by `a_held_connection_is_served_on_only_on_a_records_boundary` (the server's
+    unit tests, every host), red with today's rule on the Mac Studio.
+  - **Owed, part 2 (Linux-only, main's to write and compile; run-requests.md):** the ledger in anchor-owned RAM (per
+    held connection, `committed` and `in_flight` written before each send and `committed` advanced after it, each
+    record checksummed so a torn write reads as torn); the kernel's count at adoption (`TCP_INFO`'s
+    `tcpi_bytes_acked`, measured for whether it counts the SYN, plus `SIOCOUTQ`); `make_sends_whole` answering held on
+    Linux once both are there, and `nfs::adopt_held` ending a `Torn` connection before it reads; then the Linux kill
+    run of `crates/cli/tests/nfs_held.rs`.
 - The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
   so it waits for Ada.
   - **2026-11-18 (g079), Ada's go.** On Adas-Mac-Studio-2 (b24c5c95: M4 Max, macOS 26.2, no memory tagging),

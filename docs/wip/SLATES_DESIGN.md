@@ -36275,3 +36275,26 @@ Applied in the same change to: GAPS (the folding-drive entry: part 1 built, part
 - **Tests.** `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (`crates/bridge-core/src/
   lib.rs`): three spellings on a folding volume name `\Src\Main.RS`, an exact volume finds only its own spelling. Red
   with the open named as asked on the Mac Studio; green with the walk.
+
+### A-550 — A held NFS connection is served on after its daemon only on a record's boundary: the judgment, part 1 of A-113's Linux half (2026-11-18, goal 85, g079; §4.6 the loopback listener; A-113, A-128)
+Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part 2 owed), `crates/server/src/held_send.rs`
+(new: `SendLedger`, `Resume`, `resume` and the unit test), `crates/server/src/lib.rs`, and the bug record
+`docs/bugs/2026-11-18-linux-nfs-loopback-connections-were-dropped-at-every-daemon-restart.md`.
+- **What was there.** A-113 holds each loopback NFS connection in the anchor across a restart, so a restart is a slow
+  reply and never a dropped connection, on macOS only: its sends are all or nothing (`SO_SNDLOWAT`). Linux copies what
+  fits, so a send can end mid-record, and a successor resuming such a stream would hand the client the next reply's
+  bytes as the rest of the torn one. So every Linux daemon restart dropped every NFS client's connection, and each
+  client reconnected.
+- **The rule (judgment).** At adoption the successor compares the bytes the kernel says the connection's writer handed
+  it with the ledger the dead daemon wrote before its last send: the bytes of whole replies before it (`committed`) and
+  that send's length (`in_flight`). Exactly `committed` (nothing of the send) or exactly `committed + in_flight` (all of
+  it) leaves the stream on a record's boundary, and the connection is served on: a request still queued is answered
+  afresh, a whole reply sent twice is dropped by its client (RFC 5531). Any other count, the sum's overflow included,
+  is a torn stream: the connection ends and its client reconnects, as every one did before.
+- **Owed (part 2, Linux-only).** The ledger in anchor-owned RAM, written before each send and advanced after it, each
+  record checksummed; the kernel's count (`tcpi_bytes_acked` plus `SIOCOUTQ`); Linux connections held once both are
+  there; and the kill run.
+- **Tests.** `a_held_connection_is_served_on_only_on_a_records_boundary` (`crates/server/src/held_send.rs`, every
+  host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
+  in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
+  judgment.
