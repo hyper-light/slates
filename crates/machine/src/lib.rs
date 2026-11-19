@@ -21,6 +21,8 @@
 //! - [`stats`] — medians, percentiles by integer rationals, bootstrap intervals with a seeded
 //!   generator, and the stopping rule.
 //! - [`mod@bench`] — the measurement harness with batching for sub-timer-resolution operations.
+//! - [`attribution`] — what a harness's measurement of a request owes the server and what it owes the harness, by the
+//!   stamps the request's and the reply's producers write as each lands in its ring (A-559).
 //! - [`build_cost`] — what this build costs against the machine: one chain of work compiled by this build and in
 //!   machine code, so a judgment in CPU time is held to the build it runs in (A-318).
 //! - [`facts`] — the fixed facts queried from the OS (pages, cache line, the cores this process may run
@@ -46,6 +48,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod attribution;
 pub mod bench;
 pub mod build_cost;
 pub mod clock;

@@ -5040,7 +5040,8 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 **Data model.**
 ```rust
-#[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
+#[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, request: u64, payload: [u8; 40],
+                                   stamp: u32 /* the producer's clock, low 32 bits, as it wrote the slot (A-559) */ }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
 struct ClientRegion { magic, version /* 3 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
                      spin_ns: u32, spin_shift: u32,
@@ -5139,7 +5140,11 @@ well-known name.
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
 after a lost reply returns the original result; deadlines are remaining budgets; cancellation is
-a slot kind.
+a slot kind. Each slot carries its producer's stamp (A-559): the low 32 bits of the host's monotonic clock as the slot
+was written, the lowest bit set so zero reads as unstamped, which whoever takes it widens back to the full reading
+(`slates_ipc::slot::landed_ns`, from any reading within 2³² ns, about 4.3 s, after it). So a client knows when its
+request landed in the command ring and when its reply landed in its own, not only when it took it, and a caller's
+latency splits into the daemon's part and its own (`slates_machine::attribution`).
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
@@ -37056,6 +37061,56 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
   suites and the xwin check (the Windows writer's rule, the deadlock and over-long codes), the anchor's cross-process
   test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
   `Outcome::Failed { code: Option<OsCode> }`, and clippy.
+
+### A-559 — Every slot carries its producer's stamp, so a harness splits each latency into the daemon's part and its own, measures its own noise, and charges the server only for the server's part (2026-11-19, goal 87 via g083; §4.7 "Data model", "Protocol"; A-297, A-416, A-528)
+
+Applied in the same change to: §4.7 ("Data model", the slot; "Protocol", the stamp); GAPS (the 1,000-client bound's
+entry); `crates/ipc/src/slot.rs` (`Slot::stamp`, `stamp_now`, `landed_ns`, the format), `crates/ipc/src/endpoint.rs`
+(each push stamped, `Reply::stamp`, `ClientEnd::request_stamp`), `crates/ipc/src/protocol.rs` (a bulk slot keeps its
+stamp through `owned`), `crates/client/src/client.rs` (`Client::poll_reply_stamped`, `request_stamp`; the pending
+replies keep their stamps), `crates/machine/src/attribution.rs` (new: `Exchange`, `harness_part`, `Verdict`, `judge`),
+`crates/machine/src/bench.rs` (`longest_gap_ns`), and `crates/client/examples/load_bench.rs` (the split, the `noise`
+row, the bound's verdict).
+
+- **What was measured.** Main's reading of r100's harness lines (the Mac Studio, 2026-11-19, 1,000 clients, without
+  the replicas): the rounds with a bad p99 were the rounds where `load_bench` itself stalled. Accepted submits' p99 was
+  29.2 ms beside a longest sweep of 33.8 ms and a longest window of 44.0 ms in which a reply's arrival could not be
+  placed (a 20 ms think, round 1), 22.9 ms beside 37.5 and 37.6 ms (round 3), and 2.7 and 0.42 ms beside 11.0 and
+  3.8 ms and 7.6 and 5.1 ms. The harness stamped a reply when its sweep took it, so its own stalls were in every
+  latency, and the bound charged them to the server.
+- **The stamp.** The slot's last four bytes were padding. Each producer now writes there the low 32 bits of the host's
+  monotonic clock (`slates_machine::clock::monotonic_ns`, the clock the daemon stamps its spans in) as it writes the
+  slot, with the lowest bit set, so a slot no producer stamped reads zero (`slates_ipc::slot::stamp_now`). The client
+  stamps its requests and the daemon its replies alike, one rule at the one push each end makes. Whoever takes a slot
+  widens the stamp back to the clock's full reading from any reading taken within 2³² ns (about 4.3 s) after it, to
+  within the nanosecond the set bit may add (`landed_ns`). A producer of the layout before writes zero there, which
+  reads as no stamp, so a client and a daemon of the two layouts still talk.
+- **The split.** An answered attempt's harness part is the time from its sending to its request's landing and from its
+  reply's landing to its taking (`slates_machine::attribution::harness_part`); its server part is the rest. With a stamp
+  missing or the instants out of order there is no harness part, and the whole latency is the server's. The bench sums
+  each client's attempts' harness parts and its held sends, so an operation, a cycle and a round each have theirs over
+  their own span; its rows `latency_server`, `latency_harness`, `operation_server` and `operation_harness` replace the
+  `floor` rows, which held only a lower bound on what the daemon took.
+- **The noise floor.** Before each level the bench runs as many threads as the level has workers, each watching the
+  clock for 100 ms with nothing between its reads (`slates_machine::bench::longest_gap_ns`, the probe `destroy_rows`
+  in `crates/vfs/examples/vfs_bench.rs` uses), and reports the longest gap any saw (the `noise` row, and in the
+  `harness` and `bound` rows).
+- **The verdict.** A judged kind is charged only for its server part (`slates_machine::attribution::judge`): its server
+  part's p99 at or over the bound misses it; its latency's p99 over the bound with its server part's under it is
+  harness-bound; both under, it is met. A level is `met\tyes` when every judged kind is met at the stated rate with no
+  failure, `met\tharness` when none missed and some kind was harness-bound (counted in `harness_bound`), never charged to
+  the server, and `met\tno` otherwise.
+- **Tests.** Failing first on the Mac Studio (debug, r52, 2026-11-19): `slates-machine`'s three attribution tests
+  against stub functions (`None` for every harness part, `Met` for every verdict) failed, the stalled-sweep reply read
+  as no harness part where 29.005 ms was, and a server part past the bound read as met. Green with the rule (r80):
+  `cargo test --locked -p slates-machine --lib attribution` 3 of 3 and `bench::` 4 of 4 (the noise probe's own test),
+  `-p slates-ipc --lib` 69 passed and 1 ignored (the slot's four stamp tests among them: widened back within a wrap,
+  zero and a pre-clock landing none, carried through a write and a read, a stamp taken now between the readings around
+  it), `-p slates-client --lib` 8 of 8, and `-p slates-server --lib` 485 passed and 3 ignored, every daemon in them
+  replying through stamped slots; rustfmt's layout taken. The bench is an example, compiled and run by main: its new
+  unit test is `a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`.
+- **Owed (main's).** The example and the suites built and run, the lint matrix, and the A/B again on a quiet machine
+  reading the split rows.
 
 ### A-545 — Mercurial's part payloads decoded and encoded and held to what stock Mercurial 7.2 sent and wrote: phases, bookmarks, the check parts, obsolescence markers in both formats, pushkey (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-514, A-16)
 Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (`phases`, `bookmarks`, `heads`,
