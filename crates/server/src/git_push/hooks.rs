@@ -1,38 +1,47 @@
-//! git's hooks as a push runs them on its repository's owner shard (A-665 part 3; §4.17.2 "Hooks, in git's terms";
-//! §4.17.1 "Policy"; A-597's inputs, A-622's policy and driver, A-665 part 2's view; git's `execute_commands`,
-//! `update`, `run_receive_hook`, `run_update_hook`, `copy_to_sideband` and the end of `cmd_receive_pack`, v2.50.1).
+//! git's hooks as a push runs them on its repository's owner shard (A-665 part 3; §4.17.2 "Hooks,
+//! in git's terms"; §4.17.1 "Policy"; A-597's inputs, A-622's policy and driver, A-665 part 2's
+//! view; git's `execute_commands`, `update`, `run_receive_hook`, `run_update_hook`,
+//! `copy_to_sideband` and the end of `cmd_receive_pack`, v2.50.1).
 //!
-//! **The points, in git's order.** `pre-receive` runs once, its standard input every command no earlier check
-//! refused, in a view showing the push in git's quarantine (a push of deletes alone brings no pack, so no quarantine).
-//! Its refusal answers each of those commands `pre-receive hook declined`, after the hook's words, and no later hook
-//! runs. `update` runs for each such command the repository's policy admits (A-622 part 2's check point first, as git's
-//! `update()` refuses before it runs its hook), the ref, its old and its new value its arguments, in a view showing the
-//! push among the repository's packs; its refusal answers that command `hook declined`, after the hook's words and
-//! git's line `error: hook declined to update <ref>`. Then the verdicts and the appends, and the report but its last
-//! flush. Then `post-receive`, its standard input every applied command, in a view of the refs as the push left them:
-//! it only observes, and its words follow the report, before the last flush, as git writes them.
+//! **The points, in git's order.** `pre-receive` runs once, its standard input every command no
+//! earlier check refused, in a view showing the push in git's quarantine (a push of deletes alone
+//! brings no pack, so no quarantine). Its refusal answers each of those commands `pre-receive hook
+//! declined`, after the hook's words, and no later hook runs. `update` runs for each such command
+//! the repository's policy admits (A-622 part 2's check point first, as git's `update()` refuses
+//! before it runs its hook), the ref, its old and its new value its arguments, in a view showing
+//! the push among the repository's packs; its refusal answers that command `hook declined`, after
+//! the hook's words and git's line `error: hook declined to update <ref>`. Then the verdicts and
+//! the appends, and the report but its last flush. Then `post-receive`, its standard input every
+//! applied command, in a view of the refs as the push left them: it only observes, and its words
+//! follow the report, before the last flush, as git writes them.
 //!
-//! **A step at a time.** At each point the view is opened over the repository's store on the owner shard, sealed a turn
-//! at a time (`GitHookView::seal_turn`, the edge yielding between turns), shown at a path by the push's presenter, and
-//! the hook handed to the edge to run off the shard's step ([`HookCall`]). Its answer comes back through `hook_ran`,
-//! which withdraws the view's showing and closes it. An accepted hook's words go to band 2 at once, as git's
-//! `copy_to_sideband` relays them while the hook runs; a refusing one's are its refusal's (`receive::protected`). A
-//! hook's words are kept up to what the push may still hold (its admission) and charged to it.
+//! **A step at a time.** At each point the view is opened over the repository's store on the owner
+//! shard, sealed a turn at a time (`GitHookView::seal_turn`, the edge yielding between turns),
+//! shown at a path by the push's presenter, and the hook handed to the edge to run off the shard's
+//! step ([`HookCall`]). Its answer comes back through `hook_ran`, which withdraws the view's
+//! showing and closes it. An accepted hook's words go to band 2 at once, as git's
+//! `copy_to_sideband` relays them while the hook runs; a refusing one's are its refusal's
+//! (`receive::protected`). A hook's words are kept up to what the push may still hold (its
+//! admission) and charged to it.
 //!
-//! **A hook that cannot run** (its view not opened or sealed, the presenter not showing it, its program not started,
-//! past its bound or its client gone) refuses what it would have judged: `pre-receive` every command, `update` its own,
-//! so no command goes through unjudged. At `post-receive`, which only observes, it is counted
-//! ([`POST_RECEIVE_UNACCEPTED`]), as is a `post-receive` that exits non-zero, whose status git ignores.
+//! **A hook that cannot run** (its view not opened or sealed, the presenter not showing it, its
+//! program not started, past its bound or its client gone) refuses what it would have judged:
+//! `pre-receive` every command, `update` its own, so no command goes through unjudged. At
+//! `post-receive`, which only observes, it is counted ([`POST_RECEIVE_UNACCEPTED`]), as is a
+//! `post-receive` that exits non-zero, whose status git ignores.
 //!
-//! **Where it differs from git.** Every `update` hook runs before any append, each view showing the refs as they stood
-//! before the push, where git moves each ref right after its hook (without `atomic`), so a later command's hook there
-//! sees an earlier ref moved. The band-2 lines of commands refused otherwise (the policy's, the verdicts') follow every
-//! hook's words, where git interleaves them command by command. The hooks' learned times are owed (A-622's list): a run
-//! is bounded by its client alone.
+//! **Where it differs from git.** Every `update` hook runs before any append, each view showing the
+//! refs as they stood before the push, where git moves each ref right after its hook (without
+//! `atomic`), so a later command's hook there sees an earlier ref moved. The band-2 lines of
+//! commands refused otherwise (the policy's, the verdicts') follow every hook's words, where git
+//! interleaves them command by command. The hooks' learned times are owed (A-622's list): a run is
+//! bounded by its client alone.
 
 use std::path::PathBuf;
 
-use slates_db::catalog::{RepositoryId, RepositoryPolicy, RepositoryRecord, VolumeId as DbVolumeId};
+use slates_db::catalog::{
+  RepositoryId, RepositoryPolicy, RepositoryRecord, VolumeId as DbVolumeId,
+};
 use slates_git::Admission;
 use slates_git::out::Out;
 use slates_git::receive::{
@@ -41,8 +50,8 @@ use slates_git::receive::{
 };
 
 use super::{
-  AnswerState, Answering, Every, HookVerdicts, PushFailed, ReceivePack, ServerJudge, git_head, ref_of,
-  words,
+  AnswerState, Answering, Every, HookVerdicts, PushFailed, ReceivePack, ServerJudge, git_head,
+  ref_of, words,
 };
 use crate::git_hooks::{
   GitHookRan, GitHookRefused, GitHookSite, GitHookView, PresentView, Presented, ReadRef, ShownPush,
@@ -55,8 +64,9 @@ use crate::vcs_hooks::{
 };
 use crate::vcs_store::{SealedPush, green_key};
 
-/// Counter: a `post-receive` that did not run (its view not shown, its program not started, its client gone) or did
-/// not exit 0, which git ignores and slates counts (the module docs). Format: a counter name in the status report.
+/// Counter: a `post-receive` that did not run (its view not shown, its program not started, its
+/// client gone) or did not exit 0, which git ignores and slates counts (the module docs). Format: a
+/// counter name in the status report.
 pub(crate) const POST_RECEIVE_UNACCEPTED: &str = "git_push.post_receive_unaccepted";
 
 /// The point a push's hooks are at.
@@ -82,9 +92,11 @@ struct Open {
 pub(super) struct PushHooks {
   /// The repository's policy as the answer read it: its hook at each point.
   policy: RepositoryPolicy,
-  /// `HEAD`'s target: the default branch's ref; empty where the repository names none, whose views refuse it.
+  /// `HEAD`'s target: the default branch's ref; empty where the repository names none, whose views
+  /// refuse it.
   head: Vec<u8>,
-  /// The commands no earlier check refused, in the order sent: what `pre-receive` and the `update` hooks judge.
+  /// The commands no earlier check refused, in the order sent: what `pre-receive` and the `update`
+  /// hooks judge.
   judged: Vec<Command>,
   /// The push's options, as git hands its hooks them.
   options: Vec<Vec<u8>>,
@@ -122,7 +134,8 @@ pub(super) struct Observing {
   hooks: PushHooks,
 }
 
-/// A hook's run handed to the edge (the module docs, "A step at a time"): its point's input and its view as shown.
+/// A hook's run handed to the edge (the module docs, "A step at a time"): its point's input and its
+/// view as shown.
 #[derive(Debug)]
 pub(crate) struct HookCall {
   /// The repository's policy: the hook configured at the input's point.
@@ -136,8 +149,8 @@ pub(crate) struct HookCall {
 }
 
 impl HookCall {
-  /// Runs the hook until it ends or `client_gone` resolves (A-622 part 3's driver, with no learned bound: the module
-  /// docs).
+  /// Runs the hook until it ends or `client_gone` resolves (A-622 part 3's driver, with no learned
+  /// bound: the module docs).
   pub(crate) async fn run(self, client_gone: impl core::future::Future<Output = ()>) -> HookAnswer {
     let site = GitHookSite {
       policy: &self.policy,
@@ -163,7 +176,8 @@ enum Turn {
 }
 
 impl Hooking {
-  /// The answer of `record`'s push `sealed`, named `name`, checked as `checked`, its hooks before the verdicts due.
+  /// The answer of `record`'s push `sealed`, named `name`, checked as `checked`, its hooks before
+  /// the verdicts due.
   pub(super) fn new(
     record: RepositoryRecord,
     (sealed, name): (SealedPush, [u8; 32]),
@@ -204,9 +218,9 @@ impl Hooking {
 }
 
 impl PushHooks {
-  /// One turn of the hook due at the point under way (the module docs): its view opened over `repository`'s store
-  /// showing `pushed`, then sealed a turn at a time, then shown by `presenter`; or why the hook cannot run, the view
-  /// closed.
+  /// One turn of the hook due at the point under way (the module docs): its view opened over
+  /// `repository`'s store showing `pushed`, then sealed a turn at a time, then shown by
+  /// `presenter`; or why the hook cannot run, the view closed.
   fn turn<P: PresentView>(
     &mut self,
     state: &mut ShardState,
@@ -253,7 +267,8 @@ impl PushHooks {
     Turn::Shown(presented)
   }
 
-  /// Withdraws the showing of the view under way and closes it, giving back what it holds of the shard.
+  /// Withdraws the showing of the view under way and closes it, giving back what it holds of the
+  /// shard.
   fn close<P: PresentView>(&mut self, state: &mut ShardState, presenter: &mut P) {
     if let Some(open) = self.open.take() {
       if let Some(root) = &open.root {
@@ -279,8 +294,9 @@ impl PushHooks {
   }
 }
 
-/// One step of the hooks before the verdicts (the module docs): a turn of the point's view sealed, its hook handed to
-/// the edge, or, past the last, the verdicts, the report but its last flush, then `post-receive`'s first step.
+/// One step of the hooks before the verdicts (the module docs): a turn of the point's view sealed,
+/// its hook handed to the edge, or, past the last, the verdicts, the report but its last flush,
+/// then `post-receive`'s first step.
 pub(super) fn before<P: PresentView>(
   push: &mut ReceivePack<P>,
   state: &mut ShardState,
@@ -310,7 +326,11 @@ pub(super) fn before<P: PresentView>(
           return Ok(Answering::Hook(call));
         }
         hooking.hooks.close(state, &mut push.presenter);
-        not_run(&mut hooking, point, b"its command is not the push's".to_vec());
+        not_run(
+          &mut hooking,
+          point,
+          b"its command is not the push's".to_vec(),
+        );
       }
       Turn::NotRun(why) => not_run(&mut hooking, point, why),
     }
@@ -328,9 +348,10 @@ pub(super) fn before<P: PresentView>(
   observe(push, state, Observing { received, hooks }, out)
 }
 
-/// The point whose hook is due next before the verdicts, the point under way moved past those with no hook or nothing
-/// to judge; `None` once the verdicts are due. An `update` hook is due for a command the policy admits alone, as git's
-/// `update()` refuses before it runs its hook; one it refuses is refused again by the verdicts' judge.
+/// The point whose hook is due next before the verdicts, the point under way moved past those with
+/// no hook or nothing to judge; `None` once the verdicts are due. An `update` hook is due for a
+/// command the policy admits alone, as git's `update()` refuses before it runs its hook; one it
+/// refuses is refused again by the verdicts' judge.
 fn due<P>(
   push: &ReceivePack<P>,
   state: &mut ShardState,
@@ -362,7 +383,8 @@ fn due<P>(
   }
 }
 
-/// Whether the repository's policy admits `command` (A-622 part 2's check point, as the verdicts' judge asks it).
+/// Whether the repository's policy admits `command` (A-622 part 2's check point, as the verdicts'
+/// judge asks it).
 fn admitted<P>(
   push: &ReceivePack<P>,
   state: &mut ShardState,
@@ -380,8 +402,8 @@ fn admitted<P>(
   judge.admitted(command).is_ok()
 }
 
-/// The input of the hook due before the verdicts at the point under way: `pre-receive` every command it judges,
-/// `update` the one under way.
+/// The input of the hook due before the verdicts at the point under way: `pre-receive` every
+/// command it judges, `update` the one under way.
 fn input_before(hooks: &PushHooks) -> Option<HookInput> {
   let view = PendingView(hooks.views);
   match hooks.at {
@@ -397,8 +419,8 @@ fn input_before(hooks: &PushHooks) -> Option<HookInput> {
   }
 }
 
-/// A hook before the verdicts that cannot run at `point`, for `why` (the module docs): `pre-receive` refuses every
-/// command, `update` its own; the point under way moves on.
+/// A hook before the verdicts that cannot run at `point`, for `why` (the module docs):
+/// `pre-receive` refuses every command, `update` its own; the point under way moves on.
 fn not_run(hooking: &mut Hooking, point: HookPoint, why: Vec<u8>) {
   let line = [
     b"the repository's ".as_slice(),
@@ -432,9 +454,9 @@ fn not_run(hooking: &mut Hooking, point: HookPoint, why: Vec<u8>) {
   }
 }
 
-/// One step of `post-receive` (the module docs): its view opened at the refs the push left, sealed, shown and its hook
-/// handed over; or, with no hook configured or nothing applied, or a view that cannot be shown (counted), the report's
-/// last flush and the answer.
+/// One step of `post-receive` (the module docs): its view opened at the refs the push left, sealed,
+/// shown and its hook handed over; or, with no hook configured or nothing applied, or a view that
+/// cannot be shown (counted), the report's last flush and the answer.
 pub(super) fn observe<P: PresentView>(
   push: &mut ReceivePack<P>,
   state: &mut ShardState,
@@ -475,9 +497,10 @@ fn finish(received: Received, out: &mut impl Out) -> Result<Answering, PushFaile
   Ok(Answering::Answered(received))
 }
 
-/// Takes what the hook the last step handed the edge answered (the module docs): its view's showing withdrawn and the
-/// view closed; before the verdicts, its decision kept and the point under way moved on; at `post-receive`, its words
-/// relayed and the report's last flush written. Refused for a push no hook of which runs.
+/// Takes what the hook the last step handed the edge answered (the module docs): its view's showing
+/// withdrawn and the view closed; before the verdicts, its decision kept and the point under way
+/// moved on; at `post-receive`, its words relayed and the report's last flush written. Refused for
+/// a push no hook of which runs.
 pub(super) fn ran<P: PresentView>(
   push: &mut ReceivePack<P>,
   state: &mut ShardState,
@@ -511,8 +534,9 @@ pub(super) fn ran<P: PresentView>(
   }
 }
 
-/// Keeps what the hook before the verdicts at the point under way decided (the module docs): through, its words relayed
-/// at once; refused, every command `pre-receive hook declined` or its own `hook declined`, the words its refusal's.
+/// Keeps what the hook before the verdicts at the point under way decided (the module docs):
+/// through, its words relayed at once; refused, every command `pre-receive hook declined` or its
+/// own `hook declined`, the words its refusal's.
 fn decided(
   hooking: &mut Hooking,
   admission: &mut Admission,
@@ -557,7 +581,8 @@ fn decided(
 struct Said {
   /// Its own words.
   hook_words: Vec<u8>,
-  /// slates' line for an end git does not have (past its bound, its client gone, not started, its view refused).
+  /// slates' line for an end git does not have (past its bound, its client gone, not started, its
+  /// view refused).
   ours: Vec<u8>,
 }
 
@@ -568,8 +593,8 @@ impl Said {
   }
 }
 
-/// Whether the hook at `point` let its commands through, and what it said (the module docs): no hook configured lets
-/// them through (A-597), exit 0 does, anything else does not.
+/// Whether the hook at `point` let its commands through, and what it said (the module docs): no
+/// hook configured lets them through (A-597), exit 0 does, anything else does not.
 fn judged(answer: HookAnswer, point: HookPoint) -> (bool, Said) {
   let said = |hook_words: Vec<u8>, ours: Option<String>| Said {
     hook_words,
@@ -580,7 +605,12 @@ fn judged(answer: HookAnswer, point: HookPoint) -> (bool, Said) {
   };
   let ran = match answer.0 {
     Ok(ran) => ran,
-    Err(refused) => return (false, said(Vec::new(), Some(format!("could not run: {refused:?}")))),
+    Err(refused) => {
+      return (
+        false,
+        said(Vec::new(), Some(format!("could not run: {refused:?}"))),
+      );
+    }
   };
   match ran.outcome {
     None => (true, said(Vec::new(), None)),
@@ -590,17 +620,27 @@ fn judged(answer: HookAnswer, point: HookPoint) -> (bool, Said) {
       bound_ns, words, ..
     }) => (
       false,
-      said(words.kept, Some(format!("ran past its bound of {bound_ns} ns"))),
+      said(
+        words.kept,
+        Some(format!("ran past its bound of {bound_ns} ns")),
+      ),
     ),
-    Some(Outcome::Abandoned) => (false, said(Vec::new(), Some("was ended: its client left".to_owned()))),
+    Some(Outcome::Abandoned) => (
+      false,
+      said(Vec::new(), Some("was ended: its client left".to_owned())),
+    ),
     Some(Outcome::Unstartable { cause }) => (
       false,
-      said(Vec::new(), Some(format!("could not be started ({cause:?})"))),
+      said(
+        Vec::new(),
+        Some(format!("could not be started ({cause:?})")),
+      ),
     ),
   }
 }
 
-/// `words` relayed on band 2 as git's `copy_to_sideband` relays them, once charged to the push's room; past it, not.
+/// `words` relayed on band 2 as git's `copy_to_sideband` relays them, once charged to the push's
+/// room; past it, not.
 fn relay((requested, admission): (&Requested, &mut Admission), words: &[u8], out: &mut impl Out) {
   let words = kept(admission, words.to_vec());
   write_hook_words(requested, &words, out);
@@ -653,9 +693,9 @@ fn point_name(point: HookPoint) -> &'static str {
   }
 }
 
-/// The refs a hook's view shows (the module docs): each of `repository`'s refs as it stands now, in git's order, by
-/// its green and the green's version the newest of the store's versions of it is; a green no push gave a git head shows
-/// none, as the advertisement shows none.
+/// The refs a hook's view shows (the module docs): each of `repository`'s refs as it stands now, in
+/// git's order, by its green and the green's version the newest of the store's versions of it is; a
+/// green no push gave a git head shows none, as the advertisement shows none.
 fn shown_refs(state: &ShardState, repository: RepositoryId) -> Vec<(Vec<u8>, DbVolumeId, u64)> {
   let Some(store) = state.vcs_stores.git_ref(repository) else {
     return Vec::new();
@@ -676,8 +716,9 @@ fn shown_refs(state: &ShardState, repository: RepositoryId) -> Vec<(Vec<u8>, DbV
   refs
 }
 
-/// Gives back what a dropped push's answer held (the module docs, "A step at a time"): its sealed push and a hook's
-/// open view, through the shard's state; logged where the state is not lent to the drop.
+/// Gives back what a dropped push's answer held (the module docs, "A step at a time"): its sealed
+/// push and a hook's open view, through the shard's state; logged where the state is not lent to
+/// the drop.
 pub(super) fn dropped(answer: AnswerState) {
   let (view, sealed) = match answer {
     AnswerState::Hooking(hooking) => {
@@ -700,8 +741,8 @@ pub(super) fn dropped(answer: AnswerState) {
   });
   if given.is_none() {
     slates_machine::log_line!(
-      "slates-server: a git push dropped mid-answer could not give back its quarantine or its hook's view: the shard's \
-       state was not lent to its drop"
+      "slates-server: a git push dropped mid-answer could not give back its quarantine or its \
+       hook's view: the shard's state was not lent to its drop"
     );
   }
 }

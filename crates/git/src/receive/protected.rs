@@ -32,8 +32,9 @@ pub const DELETION_PROHIBITED: &[u8] = b"deletion prohibited";
 /// Format: the report's reason for a command a hook refused (`update()`, after `run_update_hook()`).
 pub const HOOK_DECLINED: &[u8] = b"hook declined";
 
-/// Format: the report's reason for each command a `pre-receive` hook refused (`execute_commands`, after
-/// `run_receive_hook(commands, "pre-receive", ...)` failed, for every command no earlier check refused).
+/// Format: the report's reason for each command a `pre-receive` hook refused (`execute_commands`,
+/// after `run_receive_hook(commands, "pre-receive", ...)` failed, for every command no earlier
+/// check refused).
 pub const PRE_RECEIVE_HOOK_DECLINED: &[u8] = b"pre-receive hook declined";
 
 /// Format: the most bytes of a hook's words one band-2 packet carries: `copy_to_sideband`'s buffer (`char data[128]`,
@@ -66,9 +67,10 @@ pub fn hook_declined(name: &[u8], words: Vec<u8>) -> Declined {
   }
 }
 
-/// What git answers a command when the `pre-receive` hook refused the push with `words` (A-665 part 3): `pre-receive
-/// hook declined`, with no `rp_error` line of git's own. git relays the words once, as the hook writes them, so they are
-/// the first refused command's and every other's are empty.
+/// What git answers a command when the `pre-receive` hook refused the push with `words` (A-665 part
+/// 3): `pre-receive hook declined`, with no `rp_error` line of git's own. git relays the words
+/// once, as the hook writes them, so they are the first refused command's and every other's are
+/// empty.
 pub fn pre_receive_declined(words: Vec<u8>) -> Declined {
   Declined {
     reason: PRE_RECEIVE_HOOK_DECLINED.to_vec(),

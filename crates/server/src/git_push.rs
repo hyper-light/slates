@@ -144,9 +144,9 @@ const HEADS: &str = "refs/heads/";
 /// Format: every other ref a namespace name can be begins with this (git's `check_refname_format` for a pushed ref).
 const REFS: &str = "refs/";
 
-/// Slates' words: the reason every command of a push is given while a git hook is configured for its repository and
-/// nothing here shows a hook's view (A-665 part 3), and the reason of the commands a hook could not judge, its view not
-/// opened, sealed or shown.
+/// Slates' words: the reason every command of a push is given while a git hook is configured for
+/// its repository and nothing here shows a hook's view (A-665 part 3), and the reason of the
+/// commands a hook could not judge, its view not opened, sealed or shown.
 pub(crate) const HOOK_NOT_RUN: &[u8] = b"hook not run";
 
 /// Slates' words: the reason every command of a push is given whose objects its repository's store did not admit (the
@@ -179,8 +179,8 @@ pub(crate) enum PushFailed {
   Unchecked,
 }
 
-/// One git push over one connection, on its repository's owner shard (module docs), its hooks' views shown by its
-/// presenter `P` (A-665 part 3).
+/// One git push over one connection, on its repository's owner shard (module docs), its hooks'
+/// views shown by its presenter `P` (A-665 part 3).
 pub(crate) struct ReceivePack<P = Unpresented> {
   /// The repository.
   repository: RepositoryId,
@@ -203,12 +203,14 @@ pub(crate) enum Answering {
   Answered(Received),
   /// A hook's view is being sealed a turn at a time: yield the shard, then step again.
   Sealing,
-  /// A hook is to run in its view: run it off the shard's step, then hand what it answered to `hook_ran`.
+  /// A hook is to run in its view: run it off the shard's step, then hand what it answered to
+  /// `hook_ran`.
   Hook(HookCall),
 }
 
-/// The daemon's presenter until a hook's view is served as a read-only attachment (A-665 part 3, owed): it shows none,
-/// so a push whose repository configures a git hook is refused `hook not run` (module docs, "Answering", item 1).
+/// The daemon's presenter until a hook's view is served as a read-only attachment (A-665 part 3,
+/// owed): it shows none, so a push whose repository configures a git hook is refused `hook not run`
+/// (module docs, "Answering", item 1).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Unpresented;
 
@@ -255,7 +257,8 @@ enum AnswerState {
   Done,
 }
 
-/// A hook's run handed to the edge: none where no hook driver runs, whose configured hooks answer `hook not run`.
+/// A hook's run handed to the edge: none where no hook driver runs, whose configured hooks answer
+/// `hook not run`.
 #[cfg(not(unix))]
 #[derive(Debug)]
 pub(crate) enum HookCall {}
@@ -263,7 +266,10 @@ pub(crate) enum HookCall {}
 #[cfg(not(unix))]
 impl HookCall {
   /// Runs the hook until it ends or `client_gone` resolves.
-  pub(crate) async fn run(self, _client_gone: impl core::future::Future<Output = ()>) -> HookAnswer {
+  pub(crate) async fn run(
+    self,
+    _client_gone: impl core::future::Future<Output = ()>,
+  ) -> HookAnswer {
     match self {}
   }
 }
@@ -274,10 +280,10 @@ impl HookCall {
 pub(crate) enum HookAnswer {}
 
 impl<P> ReceivePack<P> {
-  /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what reading them builds
-  /// admitted `room` bytes, the edge's request room, its hooks' views shown by `presenter`; writes the advertisement to
-  /// `out` when `advertise`. Refused for a repository not here or not git's, a store not held, or a policy git's
-  /// matcher cannot read.
+  /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
+  /// reading them builds admitted `room` bytes, the edge's request room, its hooks' views shown by
+  /// `presenter`; writes the advertisement to `out` when `advertise`. Refused for a repository not
+  /// here or not git's, a store not held, or a policy git's matcher cannot read.
   pub(crate) fn start(
     state: &mut ShardState,
     (principal, repository): (&Principal, RepositoryId),
@@ -366,9 +372,10 @@ impl<P> ReceivePack<P> {
     })
   }
 
-  /// The answer's first step (module docs, "Answering"): every command refused while a git hook is configured that
-  /// cannot run here (`can_present` false); else the push's objects admitted and sealed, then its hooks before the
-  /// verdicts due, or the verdicts at once where no git hook is configured.
+  /// The answer's first step (module docs, "Answering"): every command refused while a git hook is
+  /// configured that cannot run here (`can_present` false); else the push's objects admitted and
+  /// sealed, then its hooks before the verdicts due, or the verdicts at once where no git hook is
+  /// configured.
   fn begin(
     &mut self,
     state: &mut ShardState,
@@ -384,7 +391,9 @@ impl<P> ReceivePack<P> {
       return Ok(Begun::Answering(answering));
     }
     match prepare(state, &record, checked)? {
-      Prepared::Declined(mut declining) => Ok(Begun::Answering(self.declined(&mut declining, out)?)),
+      Prepared::Declined(mut declining) => {
+        Ok(Begun::Answering(self.declined(&mut declining, out)?))
+      }
       Prepared::Sealed { sealed, name } => {
         #[cfg(unix)]
         if hooked {
@@ -414,9 +423,10 @@ impl<P> ReceivePack<P> {
     Ok(Answering::Answered(received))
   }
 
-  /// The verdicts and the appends of the sealed push (module docs, "Answering", items 3 to 6), each command first
-  /// answered as the hooks before the verdicts decided it (`verdicts`); the sealed push given back after, holding only
-  /// what no append committed: what was received. Nothing is written: the caller writes the report.
+  /// The verdicts and the appends of the sealed push (module docs, "Answering", items 3 to 6), each
+  /// command first answered as the hooks before the verdicts decided it (`verdicts`); the sealed
+  /// push given back after, holding only what no append committed: what was received. Nothing is
+  /// written: the caller writes the report.
   fn decide(
     &mut self,
     state: &mut ShardState,
@@ -447,9 +457,10 @@ impl<P> ReceivePack<P> {
 
 #[cfg(unix)]
 impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
-  /// One step of the checked push's answer (module docs, "A step at a time"), writing what git writes of it to `out`:
-  /// answered, a turn of a hook's view sealed, or a hook to run. Refused for a push not yet checked or answered already,
-  /// a repository gone, a store not held, or a report git's protocol cannot carry.
+  /// One step of the checked push's answer (module docs, "A step at a time"), writing what git
+  /// writes of it to `out`: answered, a turn of a hook's view sealed, or a hook to run. Refused for
+  /// a push not yet checked or answered already, a repository gone, a store not held, or a report
+  /// git's protocol cannot carry.
   pub(crate) fn answer_step(
     &mut self,
     state: &mut ShardState,
@@ -470,8 +481,8 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     }
   }
 
-  /// Hands the push what the hook its last step handed the edge answered, writing what git writes of it to `out`; the
-  /// next step goes on. Refused for a push no hook of which runs.
+  /// Hands the push what the hook its last step handed the edge answered, writing what git writes
+  /// of it to `out`; the next step goes on. Refused for a push no hook of which runs.
   pub(crate) fn hook_ran(
     &mut self,
     state: &mut ShardState,
@@ -494,9 +505,10 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
 
 #[cfg(not(unix))]
 impl<P> ReceivePack<P> {
-  /// One step of the checked push's answer (module docs, "A step at a time"): with no hook driver here, the whole
-  /// answer, every command refused `hook not run` while a git hook is configured. Refused for a push not yet checked or
-  /// answered already, a repository gone, a store not held, or a report git's protocol cannot carry.
+  /// One step of the checked push's answer (module docs, "A step at a time"): with no hook driver
+  /// here, the whole answer, every command refused `hook not run` while a git hook is configured.
+  /// Refused for a push not yet checked or answered already, a repository gone, a store not held,
+  /// or a report git's protocol cannot carry.
   pub(crate) fn answer_step(
     &mut self,
     state: &mut ShardState,
@@ -524,9 +536,10 @@ impl<P> ReceivePack<P> {
 
 #[cfg(unix)]
 impl<P> Drop for ReceivePack<P> {
-  /// A push dropped between its steps (its edge's task ended, its client gone) gives back what its answer holds of the
-  /// shard: the sealed push and a hook's open view (module docs, "A step at a time"). A view's showing is its
-  /// presenter's, which ends what it still shows when it is dropped.
+  /// A push dropped between its steps (its edge's task ended, its client gone) gives back what its
+  /// answer holds of the shard: the sealed push and a hook's open view (module docs, "A step at a
+  /// time"). A view's showing is its presenter's, which ends what it still shows when it is
+  /// dropped.
   fn drop(&mut self) {
     hooks::dropped(core::mem::replace(&mut self.answer, AnswerState::Done));
   }
@@ -671,9 +684,9 @@ enum Prepared {
   },
 }
 
-/// Prepares `checked`, a push to `record`'s repository (module docs, "Answering", item 2): its objects admitted to the
-/// quarantine and sealed (none when the checks refused every command), or every command refused when the store does
-/// not admit them.
+/// Prepares `checked`, a push to `record`'s repository (module docs, "Answering", item 2): its
+/// objects admitted to the quarantine and sealed (none when the checks refused every command), or
+/// every command refused when the store does not admit them.
 fn prepare(
   state: &mut ShardState,
   record: &RepositoryRecord,
@@ -741,8 +754,8 @@ struct Declining {
 }
 
 impl Declining {
-  /// Every command refused while `hook` is configured and nothing here shows its view (module docs, "Answering", item
-  /// 1).
+  /// Every command refused while `hook` is configured and nothing here shows its view (module docs,
+  /// "Answering", item 1).
   fn hook(hook: &HookConfig) -> Declining {
     let why = format!(
       "the repository's {} hook cannot run here yet: its view of the push is not served",
@@ -799,9 +812,10 @@ impl Judge for Declining {
   }
 }
 
-/// What a push's hooks before the verdicts decided of its commands (module docs, "Answering", item 1; A-665 part 3): a
-/// refusal every command takes, where `pre-receive` refused the push or could not run, and each `update` hook's
-/// refusal of its own command, or its not running. Empty where no hook ran.
+/// What a push's hooks before the verdicts decided of its commands (module docs, "Answering", item
+/// 1; A-665 part 3): a refusal every command takes, where `pre-receive` refused the push or could
+/// not run, and each `update` hook's refusal of its own command, or its not running. Empty where no
+/// hook ran.
 #[derive(Debug, Default)]
 struct HookVerdicts {
   /// The refusal every command takes.
@@ -819,7 +833,8 @@ struct Every {
   reason: &'static [u8],
   /// The hook's words, relayed once, with the first command refused.
   words: Vec<u8>,
-  /// Why, in slates' words, the band-2 line after each command's ref; none where git writes no line of its own.
+  /// Why, in slates' words, the band-2 line after each command's ref; none where git writes no line
+  /// of its own.
   why: Option<Vec<u8>>,
 }
 

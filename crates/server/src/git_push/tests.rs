@@ -298,8 +298,8 @@ fn pre_receive() -> HookConfig {
   }
 }
 
-/// A push by the owner to `repository` started on the shard, advertising, under the daemon's presenter, which shows no
-/// hook's view: the advertisement, and the driver.
+/// A push by the owner to `repository` started on the shard, advertising, under the daemon's
+/// presenter, which shows no hook's view: the advertisement, and the driver.
 fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, ReceivePack) {
   let mut advertised = Vec::new();
   let push = ReceivePack::start(
@@ -313,8 +313,9 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
   (advertised, push)
 }
 
-/// `request` handed to `push` a piece at a time as an edge hands it in, then its end, then its answer, in one step
-/// under a presenter that shows no view: what the driver wrote, and what it received.
+/// `request` handed to `push` a piece at a time as an edge hands it in, then its end, then its
+/// answer, in one step under a presenter that shows no view: what the driver wrote, and what it
+/// received.
 fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (Vec<u8>, Received) {
   for piece in request.chunks(PIECE) {
     push.input(state, piece).expect("taken");
@@ -619,8 +620,8 @@ fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The hooks (A-665 part 3; Unix, where the hook driver runs).
 
-/// A hook program: a shell script running `body`, in a scratch directory of its own removed with it, and its
-/// configuration at `point` under `name`.
+/// A hook program: a shell script running `body`, in a scratch directory of its own removed with
+/// it, and its configuration at `point` under `name`.
 #[cfg(unix)]
 struct Script {
   /// Its directory.
@@ -646,25 +647,27 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
   Script { _dir: dir, config }
 }
 
-/// Shape: how long a test waits for a push whose hooks run: a test's bound for each of its three hooks and one for the
-/// push itself.
+/// Shape: how long a test waits for a push whose hooks run: a test's bound for each of its three
+/// hooks and one for the push itself.
 #[cfg(unix)]
 const PUSH_WAIT_NS: u64 = 4 * crate::git_hooks::tests::TEST_BOUND_NS;
 
-/// What a push driven with its hooks answered: what the driver wrote, what it received, and how many views the
-/// presenter showed and withdrew; or why the drive stopped.
+/// What a push driven with its hooks answered: what the driver wrote, what it received, and how
+/// many views the presenter showed and withdrew; or why the drive stopped.
 #[cfg(unix)]
 type Driven = Result<(Vec<u8>, Received, (u32, u32)), String>;
 
-/// `request` pushed to `repository` by its owner as the HTTP edge pushes one (`vcs_http::git::receive`): a task on the
-/// daemon's shard drives the push a step at a time, the shard's state lent for each step, yielding while a view is
-/// sealed and running each hook off the shard's step in a view the scratch presenter shows. What it answered.
+/// `request` pushed to `repository` by its owner as the HTTP edge pushes one
+/// (`vcs_http::git::receive`): a task on the daemon's shard drives the push a step at a time, the
+/// shard's state lent for each step, yielding while a view is sealed and running each hook off the
+/// shard's step in a view the scratch presenter shows. What it answered.
 #[cfg(unix)]
 fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: &[u8]) -> Driven {
   let (sent, got) = std::sync::mpsc::channel();
   let request = request.to_vec();
   crate::daemon::observe_first(daemon, move |_| {
-    let task = slates_rt::futures::spawn(drive(repository, request, sent)).expect("the push's task");
+    let task =
+      slates_rt::futures::spawn(drive(repository, request, sent)).expect("the push's task");
     slates_rt::futures::detach(task).expect("the task detached");
   });
   got
@@ -684,7 +687,13 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
   use crate::state::with_state;
   let presenter = crate::git_hooks::tests::ScratchPresenter::default();
   let mut push = with_state(|state| {
-    ReceivePack::start(state, (&owner(), repository), (ROOM, false), &mut Vec::new(), presenter)
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      (ROOM, false),
+      &mut Vec::new(),
+      presenter,
+    )
   })
   .ok_or("no state to start")?
   .map_err(|failed| format!("not started: {failed:?}"))?;
@@ -716,7 +725,8 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
   Ok((answer, received, shown))
 }
 
-/// Each packet of `answer` in order, as its band and payload: band 0 for a packet not multiplexed, none for a flush.
+/// Each packet of `answer` in order, as its band and payload: band 0 for a packet not multiplexed,
+/// none for a flush.
 #[cfg(unix)]
 fn bands(answer: &[u8]) -> Vec<(u8, Vec<u8>)> {
   let mut packets = Vec::new();
@@ -748,13 +758,21 @@ fn band_two(answer: &[u8]) -> String {
 /// The pack of a request stock git made: its bytes from the pack's magic on.
 #[cfg(unix)]
 fn pack_of(request: &[u8]) -> &[u8] {
-  let at = request.windows(4).position(|magic| magic == b"PACK").unwrap();
+  let at = request
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
   &request[at..]
 }
 
-/// The files the green `name` of `repository` holds on `daemon`'s shard, and the records its register holds.
+/// The files the green `name` of `repository` holds on `daemon`'s shard, and the records its
+/// register holds.
 #[cfg(unix)]
-fn held(daemon: &crate::Daemon, repository: RepositoryId, name: &'static str) -> (Vec<(String, Vec<u8>)>, usize, bool) {
+fn held(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  name: &'static str,
+) -> (Vec<(String, Vec<u8>)>, usize, bool) {
   crate::daemon::observe_first(daemon, move |state| {
     let is_bound = bound(state, repository, name);
     let held_files = if is_bound {
@@ -768,7 +786,11 @@ fn held(daemon: &crate::Daemon, repository: RepositoryId, name: &'static str) ->
 
 /// Makes git repository `name` on `daemon`'s shard with `hooks` configured: its id.
 #[cfg(unix)]
-fn hooked_repository(daemon: &crate::Daemon, name: &'static str, hooks: &[&Script]) -> RepositoryId {
+fn hooked_repository(
+  daemon: &crate::Daemon,
+  name: &'static str,
+  hooks: &[&Script],
+) -> RepositoryId {
   let configs: Vec<HookConfig> = hooks.iter().map(|hook| hook.config.clone()).collect();
   crate::daemon::observe_first(daemon, move |state| {
     let repository = git_repository(state, name);
@@ -777,10 +799,11 @@ fn hooked_repository(daemon: &crate::Daemon, name: &'static str, hooks: &[&Scrip
   })
 }
 
-/// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `copy_to_sideband`). Do: configure a
-/// `pre-receive` hook that writes a line and exits 1; push stock git's `create` as the HTTP edge pushes, each hook's view
-/// shown in a scratch directory. Expect: `main` refused `pre-receive hook declined`; the hook's line on band 2, once;
-/// nothing appended and `main` holding no file; one view shown and withdrawn.
+/// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `copy_to_sideband`).
+/// Do: configure a `pre-receive` hook that writes a line and exits 1; push stock git's `create` as
+/// the HTTP edge pushes, each hook's view shown in a scratch directory. Expect: `main` refused
+/// `pre-receive hook declined`; the hook's line on band 2, once; nothing appended and `main`
+/// holding no file; one view shown and withdrawn.
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothing() {
@@ -801,13 +824,14 @@ fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothin
   assert_eq!(shown, (1, 1));
 }
 
-/// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `update()` and the end of
-/// `cmd_receive_pack`). Do: configure `pre-receive` and `update` hooks that write what they were handed and exit 0, and
-/// a `post-receive` hook that writes its standard input and the `packed-refs` of the repository it runs in; push stock
-/// git's `create` as the HTTP edge pushes. Expect: `main` applied and holding the first text, one record appended; on
-/// band 2, `pre-receive`'s line naming the create, then `update`'s naming the ref and its two ids, before the report on
-/// band 1, then `post-receive`'s lines after it, its view's `packed-refs` naming `main` at the pushed commit: it ran
-/// after the update; three views shown and withdrawn.
+/// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `update()` and the end
+/// of `cmd_receive_pack`). Do: configure `pre-receive` and `update` hooks that write what they were
+/// handed and exit 0, and a `post-receive` hook that writes its standard input and the
+/// `packed-refs` of the repository it runs in; push stock git's `create` as the HTTP edge pushes.
+/// Expect: `main` applied and holding the first text, one record appended; on band 2,
+/// `pre-receive`'s line naming the create, then `update`'s naming the ref and its two ids, before
+/// the report on band 1, then `post-receive`'s lines after it, its view's `packed-refs` naming
+/// `main` at the pushed commit: it ran after the update; three views shown and withdrawn.
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update() {
@@ -817,7 +841,11 @@ fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update
     "pre-receive",
     "echo \"pre-receive $(cat)\"",
   );
-  let update = script(HookPointName::GitUpdate, "update", "echo \"update $1 $2 $3\"");
+  let update = script(
+    HookPointName::GitUpdate,
+    "update",
+    "echo \"update $1 $2 $3\"",
+  );
   let post = script(
     HookPointName::GitPostReceive,
     "post-receive",
@@ -837,13 +865,16 @@ fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update
      post-receive {zero} {FIRST} refs/heads/main\n"
   );
   assert!(said.starts_with(&lines), "{said}");
-  assert!(said.contains(&format!("\n{FIRST} refs/heads/main\n")), "{said}");
+  assert!(
+    said.contains(&format!("\n{FIRST} refs/heads/main\n")),
+    "{said}"
+  );
   assert_report_between_the_hooks(&answer);
   assert_eq!(shown, (3, 3));
 }
 
-/// Asserts that `answer`'s report, on band 1, comes after two band-2 packets (`pre-receive`'s and `update`'s words) and
-/// before at least one (`post-receive`'s), every other packet being band 2's.
+/// Asserts that `answer`'s report, on band 1, comes after two band-2 packets (`pre-receive`'s and
+/// `update`'s words) and before at least one (`post-receive`'s), every other packet being band 2's.
 #[cfg(unix)]
 fn assert_report_between_the_hooks(answer: &[u8]) {
   let order: Vec<u8> = bands(answer).iter().map(|(band, _)| *band).collect();
@@ -858,12 +889,13 @@ fn assert_report_between_the_hooks(answer: &[u8]) {
   assert!(report >= 2 && report + 1 < order.len(), "{order:?}");
 }
 
-/// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `update()`, `run_update_hook()`). Do: configure an `update`
-/// hook that refuses `refs/heads/other` with a line and lets every other ref through; push one pack creating `main` and
-/// `other` at the fixtures' first commit, as the HTTP edge pushes. Expect: `main` applied and holding the first text;
-/// `other` refused `hook declined`, the hook's line then git's `error: hook declined to update refs/heads/other` on
-/// band 2, and left unbound; one record appended; two views shown and withdrawn, the second command's hook having run
-/// too.
+/// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `update()`, `run_update_hook()`). Do:
+/// configure an `update` hook that refuses `refs/heads/other` with a line and lets every other ref
+/// through; push one pack creating `main` and `other` at the fixtures' first commit, as the HTTP
+/// edge pushes. Expect: `main` applied and holding the first text; `other` refused `hook declined`,
+/// the hook's line then git's `error: hook declined to update refs/heads/other` on band 2, and left
+/// unbound; one record appended; two views shown and withdrawn, the second command's hook having
+/// run too.
 #[cfg(unix)]
 #[test]
 fn t_a665_an_update_hook_refuses_its_own_command_alone() {
@@ -883,7 +915,10 @@ fn t_a665_an_update_hook_refuses_its_own_command_alone() {
   let other_held = held(&daemon, repository, "other");
   daemon.stop();
   let (answer, received, shown) = driven.unwrap();
-  assert_eq!(reasons(&received), [b"ok".as_slice(), protected::HOOK_DECLINED]);
+  assert_eq!(
+    reasons(&received),
+    [b"ok".as_slice(), protected::HOOK_DECLINED]
+  );
   assert_eq!(main_held, (vec![("text".to_owned(), text(false))], 1, true));
   assert!(!other_held.2);
   let words = "no refs/heads/other\nerror: hook declined to update refs/heads/other\n";

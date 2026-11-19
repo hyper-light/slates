@@ -160,8 +160,8 @@ impl<L: ShardLender> Exchange for Receive<L> {
         Answering::Answered(_) => return Ok(()),
         Answering::Sealing => slates_rt::futures::yield_now().await,
         Answering::Hook(call) => {
-          // This edge's signal of its client gone is owed with the presenter that shows a view (the module doc): until
-          // then no hook runs here.
+          // This edge's signal of its client gone is owed with the presenter that shows a view (the
+          // module doc): until then no hook runs here.
           let answer = call.run(core::future::pending()).await;
           lender
             .lend(|state| push.hook_ran(state, answer, given))

@@ -313,7 +313,9 @@ fn a_held_report_and_its_end_are_the_answer_written_whole() {
 /// its own standard error.
 #[test]
 fn a_hooks_words_go_to_band_two_in_gits_pieces_only_when_multiplexed() {
-  let words: Vec<u8> = (0..300_u32).map(|at| b'a' + u8::try_from(at % 26).unwrap()).collect();
+  let words: Vec<u8> = (0..300_u32)
+    .map(|at| b'a' + u8::try_from(at % 26).unwrap())
+    .collect();
   let multiplexed = Requested {
     side_band_64k: true,
     ..Requested::default()
