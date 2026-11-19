@@ -294,8 +294,7 @@ impl Repositories {
       {
         return Err(DbError::Corrupt {
           seq: 0,
-          reason: "a snapshot's repository binding names no repository, or binds a green twice"
-            .to_owned(),
+          reason: "a snapshot's repository binding names no repository, or binds a green twice",
         });
       }
       repositories.bind(binding);
