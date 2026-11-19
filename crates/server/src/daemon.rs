@@ -150,7 +150,7 @@ pub enum SegmentSource {
 /// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns`: one beat times half a liveness
 /// window over the span, at most the whole beat, so the hold's whole CPU is at most half a window and the watchdog never
 /// finds it spinning, while each beat's share shows CPU progress, so it is never wedged either (A-228's rule).
-pub fn starved_share_ns(span_ns: u64) -> u64 {
+pub fn starved_share_ns(span_ns: u64, _window_ns: u64) -> u64 {
   HEARTBEAT_NS
     .saturating_mul(LIVENESS_BUDGET_NS / 2)
     .checked_div(span_ns)
@@ -165,7 +165,7 @@ pub fn starved_share_ns(span_ns: u64) -> u64 {
 /// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
 /// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
 pub fn starve_this_thread(span_ns: u64) -> u64 {
-  let share_ns = starved_share_ns(span_ns);
+  let share_ns = starved_share_ns(span_ns, LIVENESS_BUDGET_NS);
   let begin = slates_rt::futures::now_ns();
   let end = begin.saturating_add(span_ns);
   let mut beat_began = begin;
@@ -6601,6 +6601,48 @@ mod late_beat_tests {
       "under the ceiling's half"
     );
     assert!(beat_is_late(5 * window, runaway), "at the ceiling's half");
+  }
+}
+
+#[cfg(test)]
+mod starved_share_tests {
+  use super::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, starved_share_ns};
+  use crate::watchdog::watch_window_ns;
+
+  /// Shape: a hold's span: ten liveness windows, a whole number of beats, past every window judged here.
+  const SPAN_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+
+  /// A hold's whole CPU over `span_ns` on a shard judged by `window_ns`, as `starve_this_thread` spends it: its share
+  /// each beat, over the span's beats.
+  fn whole_cpu_ns(span_ns: u64, window_ns: u64) -> u64 {
+    span_ns.div_ceil(HEARTBEAT_NS) * starved_share_ns(span_ns, window_ns)
+  }
+
+  /// A-552 (R3's class D, `starved_share_ns`; A-232, A-455). Do: take a starved hold's share over ten liveness windows on
+  /// a quiet shard and on one whose host held it off its CPU two and a half windows, each judged by the window the
+  /// watchdog gives its measured overrun; then over a span shorter than a beat. Expect the hold's whole CPU to be half
+  /// the shard's own window in both, so the watchdog judging the shard by that window finds it neither spinning nor
+  /// still, and no beat's share past a beat. Before, the hold's whole CPU was half the liveness window whatever window
+  /// the watchdog judged its shard by.
+  #[test]
+  fn a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by() {
+    let quiet = watch_window_ns(0);
+    assert_eq!(
+      whole_cpu_ns(SPAN_NS, quiet),
+      quiet / 2,
+      "a quiet shard's hold"
+    );
+    let held = watch_window_ns(5 * LIVENESS_BUDGET_NS / 2);
+    assert_eq!(
+      whole_cpu_ns(SPAN_NS, held),
+      held / 2,
+      "a held shard's hold spins half the window the watchdog judges it by"
+    );
+    assert_eq!(
+      starved_share_ns(HEARTBEAT_NS / 2, held),
+      HEARTBEAT_NS,
+      "a span under a beat spins a beat at most"
+    );
   }
 }
 

@@ -114,6 +114,8 @@ mod delegation;
 mod learned_wait;
 // The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
 mod helper_runs;
+// The anchor's answers on the Windows hold channel, each exchange's wait learned as `learned_wait` learns one (A-552).
+mod anchor_answers;
 mod listing;
 mod lock_ledger;
 pub mod nfs;

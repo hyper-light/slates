@@ -890,4 +890,66 @@ mod tests {
     record_into(&set, 6).unwrap();
     record_into(&set, 8).unwrap();
   }
+
+  /// Shape: the window the gate test's gates judge a still learning by. A std timed wait under a launchd job's timer
+  /// policy (kiln's agents, CI's macOS runner) comes back about eight times late, at most about 150 ms late (measured
+  /// 2026-10-26), so the window is long enough for a learning that ends that late to end inside it.
+  #[cfg(unix)]
+  const GATE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+  /// Shape: the gate test's shards still learning when its check begins: each finishes a quarter window after the last,
+  /// so the six take a window and a half.
+  #[cfg(unix)]
+  const LEARNING_SHARDS: usize = 6;
+
+  /// A-552 (R3's class D: `start_with_fleet`'s learning gate). Do: make a gate with six shards learning, check a crossing
+  /// on a thread that entered it, and let the shards finish one every quarter window; then make a second gate whose one
+  /// shard never finishes and check it the same way. Expect the first check to wait while the shards go on finishing, a
+  /// window and a half in all, and answer once the last has; the second to give up `EAGAIN` once a window passes with
+  /// none finishing. Before, a check waited one window in all, so a daemon whose shards were still learning, each in its
+  /// turn, had its crossings refused while every shard was alive.
+  #[cfg(unix)]
+  #[test]
+  fn a_crossing_waits_while_its_daemons_shards_go_on_learning_and_gives_up_on_a_still_window() {
+    let gate = Gate::new(u64::try_from(GATE_WINDOW.as_nanos()).unwrap());
+    let mut learning: Vec<Learning> = (0..LEARNING_SHARDS).map(|_| gate.learning()).collect();
+    let check = std::thread::spawn(move || {
+      gate.enter();
+      let began = std::time::Instant::now();
+      (await_learned(), began.elapsed())
+    });
+    while let Some(shard) = learning.pop() {
+      // The point of the fixture: a shard finishing its learning a quarter window after the last.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(GATE_WINDOW / 4);
+      drop(shard);
+    }
+    let (answer, took) = check.join().unwrap();
+    assert_eq!(
+      answer,
+      Ok(()),
+      "the check waited while the shards went on learning: {took:?}"
+    );
+    assert!(
+      took > GATE_WINDOW,
+      "the learning took more than a window: {took:?}"
+    );
+    let stuck = Gate::new(u64::try_from(GATE_WINDOW.as_nanos()).unwrap());
+    let never = stuck.learning();
+    let (answer, took) = std::thread::spawn(move || {
+      stuck.enter();
+      let began = std::time::Instant::now();
+      (await_learned(), began.elapsed())
+    })
+    .join()
+    .unwrap();
+    drop(never);
+    assert_eq!(
+      answer,
+      Err(HostError::Unavailable(
+        rustix::io::Errno::AGAIN.raw_os_error()
+      )),
+      "a still window gives the check up"
+    );
+    assert!(took >= GATE_WINDOW, "after a window: {took:?}");
+  }
 }

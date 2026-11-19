@@ -848,6 +848,15 @@ pub(crate) struct DirectMapState {
   pub(crate) unclaimed: BTreeMap<u64, (u32, u64)>,
 }
 
+/// Whether a map this shard took back from its anchor at `taken_back_ns` is past its holder's claim at `now_ns`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn claim_overdue(taken_back_ns: u64, now_ns: u64, _failover_ns: u64) -> bool {
+  now_ns
+    >= taken_back_ns.saturating_add(
+      slates_db::replay::RECOVERY_BUDGET_NS.saturating_add(crate::daemon::LIVENESS_BUDGET_NS),
+    )
+}
+
 /// A retry of a map still being filled joins it: the verb does not run again, and the reply goes where this attempt
 /// came from. Whether the request was running.
 pub(crate) fn join_in_flight(state: &mut ShardState, origin: u64, id: RequestId) -> bool {
@@ -1779,6 +1788,31 @@ fn recorded_form(reply: &ReplyBody) -> ReplyBody {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-552 (R3's class D: `held_copy`'s reconnect budget; A-197, A-414, A-468). Do: judge a map taken back at a shard's
+  /// start while its shard holds the failover delay at three liveness windows, two and a half windows on and three and a
+  /// half; then once the delay is fanned down to two windows, two and a half windows on. Expect: still owed its claim at
+  /// two and a half windows and overdue at three and a half; overdue at two and a half once the delay is two. Before, a
+  /// map was overdue at the client's old reconnect budget (the recovery budget and a window) whatever term its holder's
+  /// write lease runs for, though its client reconnects by no clock since A-468.
+  #[test]
+  fn a_taken_back_maps_claim_is_owed_for_the_failover_delay_its_shard_holds_now() {
+    let window = crate::daemon::LIVENESS_BUDGET_NS;
+    let taken_back = window;
+    let (owed_at, past_at) = (taken_back + 5 * window / 2, taken_back + 7 * window / 2);
+    assert!(
+      !claim_overdue(taken_back, owed_at, 3 * window),
+      "owed within the failover delay"
+    );
+    assert!(
+      claim_overdue(taken_back, past_at, 3 * window),
+      "overdue past it"
+    );
+    assert!(
+      claim_overdue(taken_back, owed_at, 2 * window),
+      "judged by the delay the shard holds now"
+    );
+  }
 
   /// A-505 (A-488's sibling, goal 85). Do: on a client's record of the maps sent to it, ask to send map 7 whose send
   /// succeeds and whose answer is then lost, as a client's shard that stopped for a window answers it; ask again, as the
