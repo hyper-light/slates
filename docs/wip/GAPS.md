@@ -506,9 +506,13 @@
 > of blobs by id is answered from the fragments. One pack source, g296's `upload::Fragments` (A-640 part 3); this
 > piece's own adapter was dropped for it. Closes A-639's "a part only partly wanted read entry by entry". A-653
 > continued (1): stock git's clone of small.git and A-582's five fetches answered through `Fragments` from the
-> store's parts, every version encoded and a base pack made, each object once; `Streamed::counters`. Owed: the live
-> clone over the HTTP edge (A-625 part 3's store per repository); a delta search past a window; the fragments'
-> encoding sliced; the red-checks and the other platforms' runs (main's).
+> store's parts, every version encoded and a base pack made, each object once; `Streamed::counters`. A-653
+> continued (2): a version's fragments and a base pack encoded a unit at a time under the owner's quantum
+> (`store::Encoding`: a pair of trees walked, a window's worth of rows read, or one object encoded, a unit), the same
+> bytes over any turns; closes A-639's "the fragments' encoding sliced". Owed: the live clone over the HTTP edge
+> (A-625 part 3's store per repository), and with it the owner driving encodings by turns; a delta search past a
+> window; within an encoding, one object, a pair of trees and a part's put each still a unit whole; the red-checks
+> and the other platforms' runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
