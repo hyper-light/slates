@@ -613,9 +613,25 @@
 > vcs_ssh:: vcs_store::` 95 of 95, among them stock git's `create` push posted to the daemon's edge and its objects
 > fetched back whole over the same edge, `slates-cli --test cli vcs_http` 2 of 2, fmt clean. Owed: the objects a
 > hidden ref alone reaches stay fetchable by id (slates-git's negotiation answers a want of any object the store holds;
-> its hidden refs are owed there); the daemon starting the SSH edge (A-684); the live stock `git clone` over the
-> daemon's edge (the interop piece after this one) and other platforms' runs (main's); the exchange moved by the live
-> memory-pressure and load signals, as the codec policy's.
+> its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
+> exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
+> the daemon's edge is built since (stock git's interop tests, next).
+> **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
+> (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
+> first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first
+> copy) run as a control against stock git's own server (a bare repository over `file://`), so every step expects
+> what git's own server answers; git with no credential refused in its own words (`could not read Username for
+> 'http://127.0.0.1:PORT': terminal prompts disabled`, exit 128); and the round trip over the HTTP edge, the token a
+> bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository
+> create` made, pushes to it and fetches from it over the daemon's edge. Ignored naming their waits: the round trip
+> with the token as Basic's password in the URL (A-686, g258: the cleartext edge's `401` offers Bearer alone, so git
+> answers `Authentication failed`), and over the SSH edge (A-684, g299: `--vcs-ssh`; A-683, g302: git-receive-pack on
+> the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where that surface is a
+> descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln r426 over main
+> 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2 ignored; with
+> `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication failed for
+> 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the control and
+> the refusal run there, the HTTP leg skips), main's.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

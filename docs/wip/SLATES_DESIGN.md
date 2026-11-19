@@ -12837,7 +12837,13 @@ engine: the verdict, rebase, position mapping, the register).
 > keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
 > take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
 > hidden ref alone reaches, fetchable by id until slates-git hides them; the daemon starting the SSH edge (A-684); the
-> live stock `git clone` over the daemon's edge (the next piece) and the other platforms (main's).
+> other platforms (main's).
+>
+> **Status (2026-11-19, stock git's interop tests).** Stock git 2.50.1 clones a repository from a real anchor's
+> daemon, pushes to it and fetches from it over the HTTP edge, the token a bearer credential
+> (`crates/cli/tests/git_interop.rs`), each step held to what git's own server answers the same round trip over
+> `file://`, and git with no credential is refused in its own words. The round trip with the token as Basic's password
+> waits on A-686, and over the SSH edge on A-684 and A-683; each is ignored naming them.
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
