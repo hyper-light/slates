@@ -23558,7 +23558,11 @@ mod clone_admission_tests {
   }
 
   /// Makes a volume named `name` of `size` for [`owner`]; its id.
-  pub(super) fn made(state: &mut ShardState, name: &str, size: SizeClass) -> slates_ipc::protocol::VolumeId {
+  pub(super) fn made(
+    state: &mut ShardState,
+    name: &str,
+    size: SizeClass,
+  ) -> slates_ipc::protocol::VolumeId {
     let reply = dispatch(
       state,
       1,
@@ -23895,7 +23899,8 @@ mod materialization_wait_tests {
 mod resize_admission_tests {
   use super::clone_admission_tests::{entries_of, link_names, made, on_core, owner};
   use super::{
-    ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch, entry_allowance,
+    ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch,
+    entry_allowance,
   };
 
   /// Shape: the policies the volume is made with, resized up to and resized down to: their entry shares grow with their
@@ -23933,7 +23938,12 @@ mod resize_admission_tests {
       let smaller = SizeClass::Bounded {
         limit: SMALLER_BYTES,
       };
-      link_names(state, volume, file, ("l", entry_allowance(smaller) + PAST_SMALLER));
+      link_names(
+        state,
+        volume,
+        file,
+        ("l", entry_allowance(smaller) + PAST_SMALLER),
+      );
       let larger = SizeClass::Bounded {
         limit: LARGER_BYTES,
       };
@@ -23949,13 +23959,19 @@ mod resize_admission_tests {
       (up, down, refused)
     });
     let (share, (walked, count, allowance)) = up;
-    assert_eq!(count, walked, "the count is the entries the namespace holds");
+    assert_eq!(
+      count, walked,
+      "the count is the entries the namespace holds"
+    );
     assert_eq!(
       allowance, share,
       "a resize up moves the entry allowance to the larger policy's share"
     );
     let (share, (walked, count, allowance)) = down;
-    assert_eq!(count, walked, "the count is still the entries the namespace holds");
+    assert_eq!(
+      count, walked,
+      "the count is still the entries the namespace holds"
+    );
     assert!(
       walked > share,
       "the volume holds more names than the smaller policy's share: {walked} against {share}"

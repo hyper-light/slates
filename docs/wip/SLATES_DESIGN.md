@@ -37211,7 +37211,7 @@ and:
   - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, fixed since).
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance (fixed since by A-572).
-  - A resize leaves the entry allowance at the size the volume was made with.
+  - A resize leaves the entry allowance at the size the volume was made with (fixed since by A-572).
   - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
@@ -37976,6 +37976,20 @@ commit a part, in order of harm.
     none refused.
   - **Evidence.** On the Mac Studio, 2026-11-19: red first with the rule's lines taken out (`u64::MAX` against 4,104),
     green with them; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test).
+- **Part 3, a resize left the entry allowance at the size the volume was made with.**
+  - **What was there.** `resize` re-derived the inode allowance from the new policy, floored at the live count, but
+    never the entry allowance, which only a create and a restart set. A volume grown from 64 KiB to 1 MiB kept the
+    smaller share; one shrunk kept the larger.
+  - **The rule.** A resize moves the entry allowance with the new policy as it moves the inode allowance: the new
+    policy's share, never below the entries the volume holds. It reserves nothing, so it is set once the core has
+    accepted the new limit.
+  - **Tests.** `a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held`
+    (`crates/server/src/verbs.rs`, the new `resize_admission_tests`). Resized up, a volume holding names past the smallest
+    policy's share gets the larger share. Resized down, it gets the smallest share floored at its entries, which a walk
+    of its namespace counts. None is refused.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (4,096 against 65,536 after the
+    resize up); green with the rule; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored, and
+    `resize_admission_tests` 1 of 1.
 
 ### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
 Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's
