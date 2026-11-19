@@ -222,8 +222,9 @@ mod tests {
   /// Shape: see [`KEPT`].
   const ENDED: u32 = 22;
 
-  /// A-522. Do: on a one-shard daemon, seat two clients and begin a status capture for each, its deadline a tenth of a
-  /// liveness window away, entered as the status verb enters it; end the second seat at once, as the session gate does.
+  /// A-522. Do: on a one-shard daemon, seat two clients and make a status capture for each, its deadline a tenth of a
+  /// liveness window away, entered as `send_reply` enters it (A-525); end the second seat at once, as the session gate
+  /// does.
   /// Expect: the ended seat takes its entry out of the index at once; the kept seat's capture released within half a
   /// window, its entry gone, by the keeper at its deadline, where the reap loop's tick asked every client each window.
   #[test]
@@ -235,9 +236,13 @@ mod tests {
       for client_id in [KEPT, ENDED] {
         let seat = seat(state, client_id);
         if let Ok(client) = state.clients.get_mut(seat) {
+          let reply = slates_ipc::protocol::ReplyBody::Acknowledged;
+          let capacity = slates_ipc::protocol::encode_body(&reply).len();
+          client.status_pages.begin(1, &mut state.store.metadata);
           client
             .status_pages
-            .begin(1, expires, &mut state.store.metadata);
+            .capture(1, &reply, (capacity, expires), &mut state.store.metadata)
+            .unwrap();
         }
         super::capture_set(state, seat, expires);
         if client_id == ENDED {

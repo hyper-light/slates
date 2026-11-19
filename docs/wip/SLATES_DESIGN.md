@@ -1939,10 +1939,12 @@ landing constants are in §4.15.
 > meanwhile). **Since A-425 the NFSv4 lease is derived** from what the clients it serves need, not the failover delay:
 > an idle Linux client's renewal floor (five seconds) and a liveness window, in whole seconds (6 s); the delegation
 > recall's wait, the quiet period, the NFSv3 gate's wait and a landing's recall wait all read it (`nfs::v4_lease_ns`).
-> **Since A-525 a move's overdue bound and the telemetry horizon read the failover delay, and the anchor's crash-loop
-> cap is the NFSv4 lease its daemon grants.** Two bounds that are not leases (the FUSE helpers' and the status
-> capture's) still read the operator's 10 s placeholder above until each takes a term of its own (A-414's owed list;
-> GAPS, the `LIVENESS_BUDGET_NS` entry).
+> **Since A-525 the operator's 10 s placeholder is gone** (`FAILOVER_SLO_NS`, `with_failover_slo`,
+> `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry horizon read the failover delay, the
+> anchor's crash-loop cap is the NFSv4 lease its daemon grants, a FUSE helper is waited for as long as its shard's
+> helpers have taken (learned, backed off to the failover delay), and a status capture is held the failover delay from
+> its capture. The operator's failover SLO above is now a check against the published delay
+> (`FleetReport::failover`), not an input.
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -35581,12 +35583,33 @@ Applied in the same change to: §4.4's status (A-363's paragraph), GAPS (the fai
   idle Linux client's renewal floor and a liveness window, A-425; `restart_policy` in `crates/api/src/role/anchor.rs`):
   once the cause clears the daemon is back before a client renewing at its floor sees its lease run out. The backoff is
   still never shorter than the failed start's own life (A-311).
-- **Left on the placeholder, each owed a term of its own:** the FUSE mount and unmount helpers' bounds (Linux, a helper
-  process's wait: unit-tested on Linux) and the status capture's deadline (released at it on the shard's timing wheel
-  since A-522, but the deadline is still the request's time plus the placeholder; it should count from the capture).
-  Then `FAILOVER_SLO_NS`, `with_failover_slo` and
-  `DaemonConfig::failover_slo_ns` go (L-h), with the integration tests that still size outages by them
-  (`crates/server/tests/fleet.rs`, `crates/cli/tests/fs_server.rs`, `crates/cli/tests/live_chaos.rs`).
+- **Part 2 (the same day): the last readers, then the placeholder gone (L-h).**
+  - *The FUSE helpers.* A mount's and an unmount's `fusermount3` (`crate::fuse`, Linux) are one exec of a small setuid
+    program and one system call each, so how long they take is the machine's to measure: each shard learns its helpers'
+    runs as `learned_wait` learns a wait (`crate::helper_runs`, cfg-free so every host's tests run the rule: RFC 6298's
+    estimator over the runs that finished, the bound their tail plus a liveness window; a run given up at its bound is no
+    sample and doubles the next bound, backed off no further than the failover delay). A helper past its bound is
+    killed and reaped and its mount refused, typed, as before.
+  - *The status capture.* Its deadline is set at the capture, the failover delay from it, never at the request
+    (`send_reply`; `StatusPages::capture` takes it, `begin` sets none), so a scatter that a starved daemon took long to
+    gather takes nothing from its client's time to page it; the failover delay is the term the daemon holds every
+    other thing a client leaves waiting for its next request to (a staging buffer, A-414). A capture still awaiting
+    its scatter holds no bytes or credit and has no deadline; it ends with the next capture or its seat (A-475). A
+    capture its first page leaves held is entered in A-522's index, whose keeper lets it go at the deadline.
+  - *L-h.* `config::FAILOVER_SLO_NS`, `DaemonConfig::failover_slo_ns` and `with_failover_slo` are deleted: nothing
+    read them any more, and nothing replaces them. The integration tests that sized outages by the placeholder read
+    the fleet's own delay: the link-cut flow (`crates/cli/tests/fs_server.rs`) and the partition flows
+    (`crates/cli/tests/live_chaos.rs`, `live_failover`) from each node's status (`fleet_failover: total_ns=`), and the
+    burst backstop (`crates/server/tests/fleet.rs`) from `Daemon::failover_ns`. The chaos flows now require the
+    takeover within the delay the fleet measured before the partition, where they allowed ten seconds.
+  - *Tests (red first).* `a_helpers_wait_follows_the_runs_this_shard_measured_and_backs_off_to_the_failover_delay`
+    (`helper_runs`: a window before any run, a little past it after quick runs, doubled for a run given up and held at
+    the delay, back once a run finishes; the placeholder's ten seconds failed it) and
+    `a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` (`deadlines`: the report captured
+    two delays after the request, made several pages long; the first page served at the capture, the capture let go a
+    delay after it; counted from the request by the placeholder it was held ten seconds), with
+    `a_captures_deadline_counts_from_its_capture` (`status_pages`) and A-522's capture test made through the capture.
+    The NFSv4 lease test now holds the failover delay short, not the placeholder.
 - **Tests.** `an_unreported_move_is_overdue_past_the_live_failover_delay_and_not_before` (`moves`: with the delay at two
   windows, a move begun three windows ago is overdue and one begun a window ago is not),
   `a_chokepoint_silent_past_the_live_failover_delay_is_reported_absent` (`telemetry`: a span three windows old is not

@@ -4551,6 +4551,8 @@ async fn init_shard(
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     learned_fuse: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    fuse_helpers: crate::helper_runs::HelperRuns::default(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]

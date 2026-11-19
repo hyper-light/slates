@@ -1,6 +1,13 @@
 //! The helper processes a shard starts and waits on, and how long it waits for each (A-525; R3, A-414's owed list): the
-//! FUSE mount's and unmount's `fusermount3` (`crate::fuse`, Linux). Cfg-free, so the rule is tested on every host; its
-//! only caller is Linux's.
+//! FUSE mount's and unmount's `fusermount3` (`crate::fuse`, Linux), each one exec of a small setuid program and one
+//! mount or unmount system call. How long that takes is this machine's to measure, not a setting, so a shard learns its
+//! helpers' runs as `crate::learned_wait` learns a wait: RFC 6298's estimator over the runs that finished, the bound
+//! their tail plus a liveness window (the lateness a live party may show before it is judged, A-228); a run given up at
+//! its bound is no sample (Karn's rule) and doubles the next bound (RFC 6298 §5.5), backed off no further than the
+//! failover delay the fleet measures (`F = D + E + R`, A-363), the bound it holds a dead owner's volumes to. A helper
+//! that has not finished by then is given up, killed and reaped, and its mount refused, typed; the next is waited for
+//! longer. Until A-525 every helper was given the operator's ten-second failover placeholder, whatever its machine's
+//! helpers took. Cfg-free, so the rule is tested on every host; its only caller is Linux's.
 
 /// The helper runs one shard waited on.
 #[derive(Debug, Default)]
@@ -21,10 +28,11 @@ impl HelperRuns {
     self.runs.ran_out();
   }
 
-  /// How long the next helper is waited for before it is given up, under the failover delay `_failover_ns`.
+  /// Derived: how long the next helper is waited for before it is given up: the learned bound of the runs this shard
+  /// waited on, backed off for those given up no further than the failover delay `failover_ns` (the module doc).
   #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-  pub(crate) fn bound_ns(&self, _failover_ns: u64) -> u64 {
-    crate::config::FAILOVER_SLO_NS
+  pub(crate) fn bound_ns(&self, failover_ns: u64) -> u64 {
+    self.runs.bound_ns(failover_ns)
   }
 }
 

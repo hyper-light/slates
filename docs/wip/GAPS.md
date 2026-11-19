@@ -3895,14 +3895,13 @@
 > `fs/nfs/nfs4renewd.c`) and a liveness window, in whole seconds (6 s), one number for the lease advertised, the
 > delegation recall's and quiet period's waits, the NFSv3 gate's and a landing's recall wait (`nfs::v4_lease_ns`).
 > Owed beside it: the client table's lapse judged per client, from each client's own renewal gaps (A-384's accrual), so
-> a client slower than Linux's floor keeps its state too. **Since A-525** a move's overdue bound and the telemetry
-> freshness horizon read the failover delay, and the anchor's crash-loop cap is the NFSv4 lease. Still on the
-> placeholder, each owed a term of its own: the FUSE helpers' bounds and the status capture's deadline (it should
-> count from the capture, not the request). Owed, each in its own
-> change: each other lease takes its term from a φ-accrual
-> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
-> pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets
-> `F`. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
+> a client slower than Linux's floor keeps its state too. **Since A-525 the operator's placeholder is gone**
+> (`FAILOVER_SLO_NS`, `with_failover_slo`, `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry
+> freshness horizon read the failover delay, the anchor's crash-loop cap is the NFSv4 lease, a FUSE helper's wait is
+> learned from its shard's helper runs (backed off to the failover delay), and a status capture is held the failover
+> delay from its capture. Owed, each in its own change: each other lease takes its term from a φ-accrual detector of its
+> own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the pulses' running
+> overrun for the rest of class D. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
 > recovery's cross-shard passes and the image's alias steps** (A-359's class A list on the wall) wait in their target's
 > own time (`xshard::call_in_shard_time`), so W's floor for them is the target's measured progress, not a boot snapshot.
 > **Since A-455 (2026-11-18, goal g255, D-a) the watchdog judges each shard by its own window**
