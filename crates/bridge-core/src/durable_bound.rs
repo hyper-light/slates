@@ -38,8 +38,8 @@
 //! **The total bound.** Progress that trickles in, other writes' acknowledgements moving the count while this reply's
 //! own position is never acknowledged, would start window after window without end, and a receiver that never idles
 //! would hold the verdict for ever (banned item 8; the supervisor's landing condition, 2026-11-11). So a wait ends at its
-//! total bound whatever it hears: the failover SLO from the hold, the operator's bound on how long an object may go
-//! unserved before a takeover serves it (§4.8). A write the fleet has not made durable within it is past what the fleet
+//! total bound whatever it hears: the failover delay from the hold, the fleet's measured bound on how long an object may
+//! go unserved before a takeover serves it (§4.8, A-363). A write the fleet has not made durable within it is past what the fleet
 //! promises to keep. The bound is kept on the clock rather than as a count of windows, since a window whose silence
 //! awaited its receiver lasts longer than a window.
 
@@ -81,7 +81,7 @@ impl GaveUp {
       GaveUp::Silent => {
         "nothing heard in its last window, an ask unanswered for a window, its receiver drained"
       }
-      GaveUp::AtTheBound => "its total bound reached, the failover SLO from its hold",
+      GaveUp::AtTheBound => "its total bound reached, the failover delay from its hold",
     }
   }
 }
@@ -100,7 +100,7 @@ enum Confirming {
 pub struct Spans {
   /// One window: the daemon's liveness budget, past which a holder that has not answered is not a live one to wait for.
   pub window_ns: u64,
-  /// The whole wait at most, from the hold: the failover SLO. At least one window ([`DurableBound::begin`]).
+  /// The whole wait at most, from the hold: the failover delay (A-363). At least one window ([`DurableBound::begin`]).
   pub total_ns: u64,
   /// How far apart the looks are that confirm a silence: a span within which a receiver that runs idles at least once.
   pub look_ns: u64,
@@ -215,8 +215,8 @@ mod tests {
 
   /// Shape: a window's length in these tests: the daemon's liveness budget.
   const WINDOW_NS: u64 = 1_000_000_000;
-  /// Shape: the default failover SLO, ten windows.
-  const SLO_NS: u64 = 10_000_000_000;
+  /// Shape: a failover delay of ten windows.
+  const FAILOVER_NS: u64 = 10_000_000_000;
   /// Shape: the looks that confirm a silence: the daemon's heartbeat, a tenth of a window.
   const LOOK_NS: u64 = 100_000_000;
   /// Shape: the hold's instant.
@@ -226,7 +226,7 @@ mod tests {
   fn spans() -> Spans {
     Spans {
       window_ns: WINDOW_NS,
-      total_ns: SLO_NS,
+      total_ns: FAILOVER_NS,
       look_ns: LOOK_NS,
     }
   }
@@ -267,15 +267,15 @@ mod tests {
     None
   }
 
-  /// The total bound is the failover SLO from the hold, and never shorter than a window. Do: begin a wait at the default
-  /// spans and at an SLO shorter than a window, and judge each at the instant before its bound and at it with
-  /// acknowledgements still arriving. Expect it to go on before and end `AtTheBound` at the SLO, or at one window.
+  /// The total bound is the failover delay from the hold, and never shorter than a window. Do: begin a wait at the
+  /// default spans and at a delay shorter than a window, and judge each at the instant before its bound and at it with
+  /// acknowledgements still arriving. Expect it to go on before and end `AtTheBound` at the delay, or at one window.
   #[test]
-  fn a_held_replys_wait_ends_at_the_failover_slo_from_its_hold() {
+  fn a_held_replys_wait_ends_at_the_failover_delay_from_its_hold() {
     let mut bound = DurableBound::begin(heard(0, 0), HELD_AT_NS, spans());
-    assert_eq!(bound.judge(heard(1, 0), HELD_AT_NS + SLO_NS - 1), None);
+    assert_eq!(bound.judge(heard(1, 0), HELD_AT_NS + FAILOVER_NS - 1), None);
     assert_eq!(
-      bound.judge(heard(2, 0), HELD_AT_NS + SLO_NS),
+      bound.judge(heard(2, 0), HELD_AT_NS + FAILOVER_NS),
       Some(GaveUp::AtTheBound)
     );
     let short = Spans {
@@ -333,7 +333,7 @@ mod tests {
 
   /// A receiver that has not idled twice holds the verdict. Do: end a window with nothing heard, then look again and
   /// again with the receiver idling once in all. Expect no verdict at any of those looks before the total bound, and
-  /// `AtTheBound` at it: a receiver that never drains cannot hold a wait past the failover SLO (banned item 8).
+  /// `AtTheBound` at it: a receiver that never drains cannot hold a wait past the failover delay (banned item 8).
   #[test]
   fn a_receiver_that_never_drains_holds_the_verdict_only_to_the_total_bound() {
     let mut bound = DurableBound::begin(heard(0, 5), HELD_AT_NS, spans());
@@ -346,13 +346,13 @@ mod tests {
         break;
       }
     }
-    assert_eq!(ended, Some((GaveUp::AtTheBound, HELD_AT_NS + SLO_NS)));
+    assert_eq!(ended, Some((GaveUp::AtTheBound, HELD_AT_NS + FAILOVER_NS)));
   }
 
   /// The total bound with trickling acknowledgements (banned item 8). Do: begin a wait and, at every window's end, hear
   /// one more acknowledgement (other writes' placements moving while this reply's own position is never acknowledged),
-  /// until the wait ends or a thousand looks pass. Expect it to end `AtTheBound` at the failover SLO from the hold, after
-  /// the SLO's worth of windows. Red with the bound removed: a thousand windows and no end.
+  /// until the wait ends or a thousand looks pass. Expect it to end `AtTheBound` at the failover delay from the hold,
+  /// after the delay's worth of windows. Red with the bound removed: a thousand windows and no end.
   #[test]
   fn acknowledgements_that_trickle_without_the_target_end_the_wait_at_its_bound() {
     let mut bound = DurableBound::begin(heard(0, 0), HELD_AT_NS, spans());
@@ -368,10 +368,10 @@ mod tests {
     }
     assert_eq!(
       ended,
-      Some((GaveUp::AtTheBound, HELD_AT_NS + SLO_NS)),
+      Some((GaveUp::AtTheBound, HELD_AT_NS + FAILOVER_NS)),
       "the wait ends at its bound"
     );
-    assert_eq!(bound.windows(), 10, "after the SLO's worth of windows");
+    assert_eq!(bound.windows(), 10, "after the delay's worth of windows");
   }
 
   /// A window that heard something starts the next from the moment it was judged. Do: hear once at the first window's
@@ -417,7 +417,7 @@ mod tests {
 
   /// An owner that never asks holds the verdict only to the total bound (banned item 8). Do: begin a wait with nothing of
   /// the owner's unanswered, and look at every look with nothing heard, the receiver idling once a look and the owner
-  /// asking nothing, until it ends or a thousand looks pass. Expect `AtTheBound` at the failover SLO from the hold. Red
+  /// asking nothing, until it ends or a thousand looks pass. Expect `AtTheBound` at the failover delay from the hold. Red
   /// under A-292's rule alone, which gave up `Silent` three looks after the first window's end.
   #[test]
   fn an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound() {
@@ -430,6 +430,6 @@ mod tests {
         break;
       }
     }
-    assert_eq!(ended, Some((GaveUp::AtTheBound, HELD_AT_NS + SLO_NS)));
+    assert_eq!(ended, Some((GaveUp::AtTheBound, HELD_AT_NS + FAILOVER_NS)));
   }
 }

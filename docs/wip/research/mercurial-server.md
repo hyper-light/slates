@@ -375,3 +375,42 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **Stream parameters are matched without case.** `_processparam` looks a name up as `name.lower()`, so a lower-case
   `compression=GZ` is processed as `Compression` is; an unknown name is ignored when its first letter is lower-case
   and refused otherwise.
+
+## 13. Found while building piece 1's part payloads (A-545, 2026-11-19; 7.2's code [C] in the wheel `uvx` installs, and runs of stock `hg` 7.2 on the Mac Studio)
+
+- **7.2's two format 1 marker readers disagree, measured.** 7.2 reads an obsstore or an `obsmarkers` payload with the C
+  reader when it is built (`_fm1readmarkers`, `obsolete.py:459`: `parsers.fm1readmarkers`, the wheel's
+  `cext/parsers.cpython-312-darwin.so`) and the pure one otherwise (`_fm1purereadmarkers`, `obsolete.py:347`). Three
+  markers, each fed to both by a probe run with `uvx --python 3.12 --from mercurial==7.2 python -I`: a size field of 41
+  over a 39-byte marker and two more bytes reads as one marker in C (the two bytes skipped as the marker's) and fails
+  the pure reader (`unpack requires a buffer of 19 bytes`); a parent count of 0 is no parent data (`None`) in C and
+  parents recorded and none (`()`) in the pure reader; a parent count of 4 with no parent bytes is no parent data in C
+  and fails the pure reader (`unpack requires a buffer of 80 bytes`). The pure reader's branches are
+  `obsolete.py:386-395` (`numpar == noneflag` → `None`, `numpar == 1`, else `numpar` nodes). slates-hg refuses a size
+  that is not exactly the marker's fields and a count past 3, so both readers read alike whatever it accepts, and keeps
+  a count of 0 as written (7.2's writer writes it for `parents == ()`), read as the pure reader reads it.
+- **Format 0's metadata.** `_fm0decodemeta` (`obsolete.py:291-298`) splits at NUL, skips empty entries and splits each
+  at its first `:`, so an entry without one fails it; `_fm0encodeonemarker` refuses a SHA-256 marker ("cannot handle
+  sha256 with old obsstore format", `obsolete.py:261`) while `_fm0readmarkers` reads 20-byte nodes whatever the flag.
+- **A push sends `phase-heads` only for what it publishes.** `_pushb2phaseheads` (`exchange.py:1046-1053`) adds the part
+  only when `pushop.outdatedphases` is not empty, and then only public heads (`updates[0]`); a getbundle sends every
+  phase's heads. The captured pushes have none: the modern push left its draft a draft, and the legacy one published
+  through a pushkey part.
+- **The client asks `listkeys phases` after every push** (`_pushsyncphase`, `exchange.py:1346-1350`: "even when we don't
+  push, exchanging phase data is useful"). Over SSH version 1 a bundle2 reply is written unframed
+  (`_sshv1respondstream`, `wireprotoserver.py:378-382`) and the next response, `<length>\n<payload>`, follows it at
+  once, so a reply cut at the end of the server's output carries that response after its stream's end. 7.2's reader
+  stops at the stream's end marker and never sees it; slates-hg refuses it as trailing bytes, which is how the first
+  fixture run's cut was found (3 of 78 tests). The fixture script now walks each reply's frames to its end and keeps the
+  listkeys payload apart: the amended draft as the one draft root after the modern push, nothing after the legacy push
+  published it, the strict push's commit after that.
+- **The server's reply parts.** `handlepushkey` (`bundle2_part_handlers.py:438-444`) writes `reply:pushkey` with the
+  default mandatory type (`REPLY:PUSHKEY` on the wire) and both parameters advisory, `in-reply-to` as the part id's
+  decimal and `return` as `'%i'`; `handlepushkeyreply` (`:530-535`) reads both with `int()`. The captured replies hold
+  exactly that, and slates-hg's `reply_part` writes parts equal to them.
+- **The legacy exchange.** With `devel.legacy.exchange=bookmarks,phases` 7.2's client moves a phase and a bookmark by
+  `pushkey` parts (four mandatory parameters, in the order `namespace`, `key`, `old`, `new`) instead of `phase-heads`
+  and `bookmarks`, and still sends `check:bookmarks` and `check:phases`.
+- **The fixtures are deterministic.** The payload fixture script, run a second time on 2026-11-19 from a clean clone,
+  made every file the first run made byte for byte (the pushes, the obsstores, every listing and log) but the three
+  replies, whose cut it had changed.

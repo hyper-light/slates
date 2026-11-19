@@ -41,8 +41,9 @@
 //!
 //! **The file system is deleted only after the anchor released its hold.** The anchor's copies keep the volume and the
 //! drive whoever else closes theirs, so a file system deleted first leaves a drive nobody serves. A `detach` therefore
-//! asks the anchor while the mount goes on serving, repeating the request for [`crate::anchor_hold::RELEASE_BOUND_NS`],
-//! and only an answer ends the attachment and removes the drive. Past the bound the detach is answered a typed refusal:
+//! asks the anchor while the mount goes on serving, repeating the request within the bound the anchor's answers are
+//! waited for ([`crate::anchor_hold::release_bound_ns`], learned from them, A-552), and only an answer ends the
+//! attachment and removes the drive. Past the bound the detach is answered a typed refusal:
 //! the drive stays served and held. The request stands, since it may already be waiting in the pipe for the anchor's
 //! next turn, so it goes on being repeated, and the anchor's answer ends the mount then. Every other end (a destroy, a
 //! revocation, a mount refused or lost) has already ended the attachment, so it stops serving and waits for the same
@@ -201,6 +202,9 @@ pub(crate) struct WinFspMount {
   /// Flush replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
   /// first ([`settle_held`]); bounded by `live_ship::reply_hold_bound`. WinFsp's dispatcher waits on each meanwhile.
   held: VecDeque<HeldFlush>,
+  /// What this mount's journal reader's rounds have shown of Windows' pace (A-548): the reader's patience is learned
+  /// from them after every turn (`crate::reader_patience`).
+  patience: crate::learned_wait::LearnedWait,
 }
 
 /// A WinFsp volume's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227): its kernel name's,
@@ -393,7 +397,7 @@ pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) ->
   let shard = state.shard;
   let record = record.clone();
   let task = async move {
-    let answered = release_within(attachment, crate::anchor_hold::RELEASE_BOUND_NS).await;
+    let answered = release_within(attachment, crate::anchor_hold::release_bound_ns()).await;
     let refused = answered.is_err();
     let _ = state::with_state_counted(|s| {
       let reply = complete(s, request, cause, attachment, |s| match &answered {
@@ -674,6 +678,7 @@ fn keep(
       released: false,
       _own: own,
       held: VecDeque::new(),
+      patience: crate::learned_wait::LearnedWait::default(),
     },
   );
   open_journal_reader(s, record.volume, registry);
@@ -1123,6 +1128,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     return Turned::Ended;
   };
   s.count(JOURNAL_OVERRUNS, delivered.overruns);
+  // What the journal reader's rounds found this turn teaches its patience (A-548).
+  crate::reader_patience::learn(s, mount.volume, mount.registry.key(), &mut mount.patience);
   s.count(RECORDS_TOLD, std::mem::take(&mut mount.told));
   s.count(NAMES_TOO_LONG, delivered.too_long);
   // What this turn delivered is behind it, so the task waits past the generation as it now stands; another path's
@@ -1663,15 +1670,10 @@ pub(crate) fn drop_all(s: &mut ShardState) {
 }
 
 /// Opens the journal reader of a mount that now serves `volume` under registry attachment `registry` (§4.5): from here
-/// the volume keeps the records after the head for it, and each of its rounds moves its point.
+/// the volume keeps the records after the head for it, and each of its rounds moves its point. Its patience is learned
+/// from its rounds after every turn, from the learned wait's prior (`crate::reader_patience`, A-548).
 fn open_journal_reader(s: &mut ShardState, volume: VolumeId, registry: AttachmentId) {
-  if let Some(&handle) = s.by_id.get(&volume)
-    && let Ok(slot) = s.volumes.get_mut(handle)
-  {
-    slot
-      .volume
-      .open_journal_reader(registry.key(), crate::daemon::LIVENESS_BUDGET_NS);
-  }
+  crate::reader_patience::open(s, volume, registry.key());
 }
 
 /// Closes the journal reader of `mount`, removed for good. A volume already gone took its readers with it.

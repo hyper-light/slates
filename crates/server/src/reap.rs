@@ -4,15 +4,17 @@
 //! new attachment. Work is bounded by the client table and sliced by the runtime batch. Evidence: the two-owner SIGKILL
 //! history in `client/tests/reap.rs`, which failed with the former local-partition sweep.
 //!
-//! **A death is an event (A-475).** Each seated client has a watch, a task of its shard that awaits the client's hang-up
-//! through the shard's driver (`crate::hangup`) and reports it once ([`watch`]): a slot that never proved its id is ended
-//! there, any other is marked retiring, which closes admission from its ring, and queued for the shard's reaper
-//! ([`reaper`]), which retires the dead a batch at a time and idles while none is owed. Until A-475 a sweep each liveness
-//! budget asked every client silent for a budget whether its peer was gone (`peer_gone`), so a client killed with
-//! `SIGKILL` kept its seat, its attachments and its id for one to two budgets, and every shard woke each second to ask.
-//! The jobs that sweep also did went elsewhere: the forwards a dead client left waiting for room go at its report, an
-//! unproven slot ends there, and the expiry of abandoned staging buffers and status pages stays on the reap loop's tick
-//! until the deadline wheel takes it (the reaper series' next piece, GAPS).
+//! **A death is an event (A-475).** Each seated client has a watch, a task of its shard that awaits the client's
+//! hang-up through the shard's driver (`crate::hangup`) and reports it once ([`watch`]): a slot that never proved its
+//! id is ended there, any other is marked retiring, which closes admission from its ring, and queued for the shard's
+//! reaper ([`reaper`]), which retires the dead a batch at a time and idles while none is owed. Until A-475 a sweep each
+//! liveness budget asked every client silent for a budget whether its peer was gone (`peer_gone`), so a client killed
+//! with `SIGKILL` kept its seat, its attachments and its id for one to two budgets, and every shard woke each second to
+//! ask. The jobs that sweep also did went elsewhere: the forwards a dead client left waiting for room go at its report,
+//! an unproven slot ends there, and the expiry of abandoned staging buffers and status pages went to the shard's
+//! deadline keeper (A-522, `crate::deadlines`). Since A-554 the reaper also ends, on the control shard, the attachments
+//! of hosts the fleet let go (A-222), looked at when the fleet's members or their anchors change, where the reap loop's
+//! tick looked once a window.
 
 use std::collections::VecDeque;
 
@@ -31,7 +33,8 @@ use crate::state::{self, ClientSlot, ShardState};
 /// moved for an unproven slot ended at its report and for a retirement finished by the reaper.
 pub(crate) const REAPED_BY_HANGUP: &str = "client.reaped_by_hangup";
 /// Format: the counter of clients that wrote on their control socket, which no client does after its opening, ended as
-/// a hang-up is (Linux, [`Ended`]).
+/// a hang-up is (Linux, [`Ended`]). Linux's alone, as `Ended::Broke` is.
+#[cfg(target_os = "linux")]
 pub(crate) const CONTROL_BROKEN: &str = "client.control_broken";
 /// Format: the counter of watches whose wait the shard refused, each client ended as a hang-up is, since nothing could
 /// see its death afterwards.
@@ -169,13 +172,29 @@ fn take_round(state: &mut ShardState) -> Option<Round> {
 /// The shard's reaper (A-475): retires the clients whose watches reported them gone, a batch at a time with its turn given
 /// back between batches, so a mass death is reaped in slices; idles while none is owed, woken by the next report. A
 /// retirement an owner deferred is tried again a window later (the shard's own, A-455), or at the next report if that
-/// comes first. One task a shard, made at its start; it ends with the shard's state.
+/// comes first. On the control shard it also ends the attachments of hosts the fleet let go, when a look is asked for
+/// (A-222, A-554: `remote_attach::look_for_departures`), since a departed host's clients are dead clients no watch here
+/// can see. One task a shard, made at its start; it ends with the shard's state.
 pub(crate) async fn reaper() {
   if state::with_state(|state| state.reaper_task = slates_rt::futures::current_task()).is_none() {
     return;
   }
   let mut deferred: VecDeque<(Handle<ClientSlot>, u32)> = VecDeque::new();
   loop {
+    // A host the fleet no longer counts a member has its clients' attachments ended on every shard (A-222), looked at
+    // when the members or their anchors changed, or again a retry window after a look some shard did not answer
+    // (A-554).
+    let Some(departures) = state::with_state(|state| std::mem::take(&mut state.departures_owed))
+    else {
+      return;
+    };
+    if departures {
+      crate::remote_attach::sweep_departed().await;
+    }
+    // A taken-back map no holder claimed within the reconnect budget is reclaimed as a dead client's maps are (A-197),
+    // owed by the keeper at its claim's deadline (A-554). Linux alone takes such maps back.
+    #[cfg(target_os = "linux")]
+    let _reclaimed = crate::held_copy::reclaim_owed().await;
     let Some(round) = state::with_state(take_round) else {
       return;
     };

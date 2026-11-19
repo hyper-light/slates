@@ -439,40 +439,60 @@ fn bytes_after_the_end_are_refused() {
   );
 }
 
-/// A-514: do encode streams that are not well formed: an empty chunk, a chunk outside any part, a part opened inside
-/// another without an interruption, a part left open, an event naming no part, a type with a space. Expect each
-/// refused by kind, at the event that broke it.
+/// The encoding of a stream of `parts` and `events`, or its refusal.
+fn try_encode(parts: Vec<Part<'static>>, events: Vec<Event<'static>>) -> Result<(), EncodeRefusal> {
+  Bundle2 {
+    params: Vec::new(),
+    parts,
+    events,
+  }
+  .encode(&mut Vec::new())
+}
+
+/// One part with no parameters, for the malformed streams below.
+fn one_part() -> Vec<Part<'static>> {
+  vec![part(b"x", Vec::new(), 0, 0)]
+}
+
+/// A-514: do encode an empty chunk, and a chunk outside any part. Expect `EmptyChunk` at the chunk (its length, 0,
+/// would read as the part's end) and `Malformed` at the stray chunk.
 #[test]
-fn malformed_streams_are_not_encoded() {
-  let try_encode = |parts: Vec<Part<'static>>, events: Vec<Event<'static>>| {
-    Bundle2 {
-      params: Vec::new(),
-      parts,
-      events,
-    }
-    .encode(&mut Vec::new())
-  };
-  let one = || vec![part(b"x", Vec::new(), 0, 0)];
+fn empty_and_stray_chunks_are_not_encoded() {
   assert_eq!(
-    try_encode(one(), vec![Event::Open(0), Event::Chunk(b""), Event::Close]),
+    try_encode(
+      one_part(),
+      vec![Event::Open(0), Event::Chunk(b""), Event::Close]
+    ),
     Err(EncodeRefusal::EmptyChunk { at: 1 })
   );
   assert!(matches!(
-    try_encode(one(), vec![Event::Chunk(b"a")]),
+    try_encode(one_part(), vec![Event::Chunk(b"a")]),
     Err(EncodeRefusal::Malformed { at: 0, .. })
   ));
+}
+
+/// A-514: do encode a part opened inside another without an interruption, a part left open, and an event naming no
+/// part. Expect each refused `Malformed` at the event that broke it.
+#[test]
+fn parts_opened_out_of_place_left_open_or_missing_are_not_encoded() {
   assert!(matches!(
-    try_encode(one(), vec![Event::Open(0), Event::Open(0)]),
+    try_encode(one_part(), vec![Event::Open(0), Event::Open(0)]),
     Err(EncodeRefusal::Malformed { at: 1, .. })
   ));
   assert!(matches!(
-    try_encode(one(), vec![Event::Open(0)]),
+    try_encode(one_part(), vec![Event::Open(0)]),
     Err(EncodeRefusal::Malformed { at: 1, .. })
   ));
   assert!(matches!(
-    try_encode(one(), vec![Event::Open(1)]),
+    try_encode(one_part(), vec![Event::Open(1)]),
     Err(EncodeRefusal::Malformed { at: 0, .. })
   ));
+}
+
+/// A-514: do encode a part whose type holds a space. Expect `PartType` naming it, as 7.2's `validateparttype` refuses
+/// one.
+#[test]
+fn a_part_type_with_a_space_is_not_encoded() {
   assert_eq!(
     try_encode(
       vec![part(b"a b", Vec::new(), 0, 0)],
@@ -484,9 +504,12 @@ fn malformed_streams_are_not_encoded() {
   );
 }
 
+/// A generated part's fields: its type, its parameters (key and value), how many are mandatory, its payload chunks,
+/// and whether an interruption follows them.
+type GeneratedPart = (String, Vec<(String, Vec<u8>)>, usize, Vec<Vec<u8>>, bool);
+
 /// A generated part: a valid type, distinct keys, a mandatory count, payload chunks, and maybe an interruption.
-fn arbitrary_part()
--> impl Strategy<Value = (String, Vec<(String, Vec<u8>)>, usize, Vec<Vec<u8>>, bool)> {
+fn arbitrary_part() -> impl Strategy<Value = GeneratedPart> {
   (
     "[a-zA-Z0-9_:-]{1,12}",
     proptest::collection::btree_map(

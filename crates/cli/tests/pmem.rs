@@ -535,7 +535,7 @@ fn a_pmem_vmms_copy_survives_a_daemon_takeover_with_its_unsynced_store() {
 /// Step 6.2 (A-197): a taken-back copy no holder claims is written back and let go. Do: run `slates pmem` with the
 /// stand-in VMM and have it store a page, unsynced; kill the daemon with SIGKILL and, before its successor answers, the
 /// launcher too (its VMM ends with it); wait for the anchor's successor. Expect: the successor took the copy back and,
-/// its holder never claiming it within the client's reconnect budget, writes it back through the kept attachment and
+/// its holder never claiming it within the failover delay (A-552), writes it back through the kept attachment and
 /// lets it go, so the file comes to hold the page, counted (`dax.local_map_unclaimed_reclaimed`).
 #[test]
 fn a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go() {

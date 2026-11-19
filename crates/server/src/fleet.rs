@@ -556,6 +556,7 @@ pub(crate) fn learn_member(
     }
     LearnedOutcome::Current => {
       state.authenticated_members.insert(announced);
+      let learned = !state.learned_members.contains_key(&anchor);
       state
         .learned_members
         .entry(anchor)
@@ -564,6 +565,10 @@ pub(crate) fn learn_member(
           host: announced,
           previous: None,
         });
+      // A member's anchor learned: the departures the control shard judges are counted by anchor (A-222, A-554).
+      if learned {
+        crate::remote_attach::look_for_departures(state);
+      }
     }
     LearnedOutcome::Restarted { old } => {
       state.authenticated_members.remove(&old);
@@ -576,6 +581,8 @@ pub(crate) fn learn_member(
           previous: Some(old),
         },
       );
+      // The anchor's member id changed: the departures the control shard judges are counted by anchor (A-222, A-554).
+      crate::remote_attach::look_for_departures(state);
       // A discovery exchange pending on this anchor's link addresses the old incarnation: woken now, it
       // ends invalidated and releases its endpoint, so the link re-dials the new one this period.
       wake_link_waiter(state, anchor);
@@ -1242,7 +1249,12 @@ impl PeerDriver {
       stale: false,
       seed_retired: false,
     };
-    let _ = state::with_state_counted(|s| s.plane.peers.insert(peer.anchor, plane_peer));
+    let _ = state::with_state_counted(|s| {
+      s.plane.peers.insert(peer.anchor, plane_peer);
+      // A member's seed id now maps to its anchor: the departures the control shard judges are counted by anchor
+      // (A-222, A-554).
+      crate::remote_attach::look_for_departures(s);
+    });
     let record = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
@@ -2449,6 +2461,9 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some((sequence, value)) = head_value_of(state, record, object, config.quorum) else {
       continue; // The newest seal's content is not yet placed: the head waits for it.
     };
+    if crate::carry::holds_head_back(state, record.id, record.head, &value) {
+      continue; // A captured clone's head waits for its capture's record (A-544), so a successor adopts both.
+    }
     if !sealing_covers_candidates(state, config, object, &value, local) {
       continue; // A candidate could not open the sealed content as a successor: the head waits for its pair.
     }
@@ -3189,6 +3204,9 @@ fn advance_home_seal(
   round: CommitBudget,
 ) -> Option<ContentWork> {
   let object = ObjectId(id.bytes);
+  // A captured clone's head carries its capture's record (A-544): its carry is stepped whether or not its seal is done,
+  // since the head register waits for the record after its content is placed.
+  crate::carry::step(state, id);
   let (head, sequence) = sealable_head(state, id, object)?;
   // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the head
   // naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
@@ -3293,6 +3311,8 @@ fn seal_walk_slice(
   };
   if remaining.is_none() && track == Track::Home {
     heal_one_placed_snapshot(state, local, slicing.created_unix);
+    // The walk visits only the volumes this shard serves, so the carry of one it let go is forgotten here (A-544).
+    crate::carry::forget_gone(state);
   }
   (work, remaining)
 }

@@ -550,6 +550,8 @@ mod tests {
       if now >= times || Instant::now() >= deadline {
         return now;
       }
+      // The harness paces its looks; the watch under test waits on its kernel event (as reap.rs's harness does).
+      #[allow(clippy::disallowed_methods)]
       std::thread::sleep(LOOK_PAUSE);
     }
   }
@@ -634,6 +636,9 @@ mod tests {
     let _ = judged(&daemon, 1);
     post(&events);
     let _ = judged(&daemon, 2);
+    // The late event comes a whole liveness budget after the second judgment: the stand-in kernel is slow, not the
+    // watch, which waits on the event alone.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS));
     let kept = held(&daemon, attachment);
     MOUNTED.store(false, Ordering::SeqCst);

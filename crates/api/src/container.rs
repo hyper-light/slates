@@ -24,11 +24,25 @@
 //! own name kept ([`real_source`]). Never the mount point resolved whole, which looks into the mount: a request to the
 //! very daemon asked, and on a hard NFS mount one that waits on its server. A source with no folder to resolve (relative,
 //! the root, or in a folder that does not exist) goes as given, and the daemon's verdict on it is the answer.
+//!
+//! **Checked again just before the runtime binds** ([`check_source`], [`ContainerBind::check_source`]; AUD-29-66): the
+//! kernel's table read now, then the identity of the mount at the source read now (Linux's `STATX_MNT_ID_UNIQUE`, an id
+//! the kernel never reuses; macOS's filesystem id) and compared with the one the binding's evidence recorded, never by
+//! touching the mount. A mount gone or replaced between the bind and the runtime's use refuses typed ([`SourceFault`]),
+//! so the runtime is never handed a replacement, or a bare folder where the mount was, which it would bind, or make.
+//! The judgment is pure over the table and the identity it is given, and held on every host by its tests; a host with
+//! no table to read (Windows) is told so by the table itself. Moved here from the CLI's `slates oci-check` on
+//! 2026-11-19 (A-520), which now calls it.
 
+use std::fmt;
 use std::path::Path;
 
+use slates_bridge_oci::mount_table::MountEntry;
+use slates_bridge_oci::verify::SourceChange;
 use slates_client::Attachment;
 use slates_ipc::protocol::{AttachRequest, Established, Intent, OciBinding, VolumeId};
+
+pub use slates_bridge_oci::mount_table::{MountIdentity, MountTableError};
 
 use crate::error::{Error, Missing, ProtocolFault};
 use crate::instance::Instance;
@@ -67,6 +81,118 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     bound(attachment)
   }
+}
+
+/// Why a bind's source is no longer the mount its binding verified ([`check_source`]; AUD-29-66), typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceFault {
+  /// No mount is at the source any more: a runtime handed it would bind whatever folder is left there, or make one.
+  Missing {
+    /// The source.
+    source: String,
+  },
+  /// Another mount is at the source: the mount was unmounted and mounted again, or something was mounted over it.
+  Replaced {
+    /// The source.
+    source: String,
+    /// The mount the binding verified.
+    verified: MountIdentity,
+    /// The mount at the source now.
+    found: MountIdentity,
+  },
+  /// This kernel names no mount by an id it never reuses, so a replacement at the source cannot be told from the mount
+  /// verified (Linux added `STATX_MNT_ID_UNIQUE` in 6.8).
+  Uncheckable {
+    /// The source.
+    source: String,
+  },
+  /// The kernel's mount table could not be read (on a host with none to read, `Unsupported`).
+  MountTable(MountTableError),
+  /// The identity of the mount at the source could not be read.
+  Identity(MountTableError),
+}
+
+impl fmt::Display for SourceFault {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Missing { source } => write!(f, "SourceMissing: no mount is at {source} any more"),
+      Self::Replaced { source, found, .. } => write!(
+        f,
+        "SourceReplaced: {source} is now mount {} on device {}, not the mount verified",
+        found.mount, found.device
+      ),
+      Self::Uncheckable { source } => write!(
+        f,
+        "SourceUncheckable: this kernel does not report a mount id it never reuses, so a replacement at {source} cannot \
+         be told from the mount verified (Linux 6.8 added it)"
+      ),
+      Self::MountTable(e) => write!(f, "reading the mount table: {e}"),
+      Self::Identity(e) => write!(f, "reading the mount identity: {e}"),
+    }
+  }
+}
+
+impl ContainerBind {
+  /// Whether this binding's source is still the mount it verified, by the identity its evidence recorded
+  /// ([`check_source`]): the check a host runs immediately before its runtime binds the source.
+  pub fn check_source(&self) -> Result<(), SourceFault> {
+    check_source(
+      &self.binding.source,
+      MountIdentity {
+        mount: self.binding.evidence.mount_id,
+        device: self.binding.evidence.mount_device,
+      },
+    )
+  }
+}
+
+/// Whether `source` is still the mount instance verified as `verified` (AUD-29-66; see the module's notes): the kernel's
+/// table read now, and the identity of the mount at `source` read now and compared, never by touching the mount. The
+/// table first: a source whose mount is gone has nothing to identify, and is `Missing`, never a failed identity read.
+pub fn check_source(source: &str, verified: MountIdentity) -> Result<(), SourceFault> {
+  judged(
+    source,
+    verified,
+    slates_bridge_oci::mount_table::mount_table(),
+    || slates_bridge_oci::mount_table::mount_identity_at(source),
+  )
+}
+
+/// The check's judgment of `source` over the kernel's `table`, read already, and the identity at `source`, read by `live`
+/// only once the table shows a mount there ([`check_source`]): pure, so its order and each answer are tested on every
+/// host.
+fn judged(
+  source: &str,
+  verified: MountIdentity,
+  table: Result<Vec<MountEntry>, MountTableError>,
+  live: impl FnOnce() -> Result<MountIdentity, MountTableError>,
+) -> Result<(), SourceFault> {
+  let table = table.map_err(SourceFault::MountTable)?;
+  let missing = || SourceFault::Missing {
+    source: source.to_owned(),
+  };
+  if !slates_bridge_oci::verify::mounted_at(&table, source) {
+    return Err(missing());
+  }
+  let live = match live() {
+    Ok(live) => live,
+    Err(MountTableError::NoUniqueMountId) => {
+      return Err(SourceFault::Uncheckable {
+        source: source.to_owned(),
+      });
+    }
+    Err(e) => return Err(SourceFault::Identity(e)),
+  };
+  slates_bridge_oci::verify::source_unchanged(&table, source, verified, live).map_err(|change| {
+    match change {
+      SourceChange::Missing => missing(),
+      SourceChange::Replaced { verified, found } => SourceFault::Replaced {
+        source: source.to_owned(),
+        verified,
+        found,
+      },
+    }
+  })
 }
 
 /// The binding a daemon's answer to a container bind established, or the protocol fault of an answer that established
@@ -210,5 +336,153 @@ mod tests {
     let unresolvable = folder.join("folder-never-made").join("mount");
     let unresolvable = unresolvable.to_string_lossy();
     assert_eq!(real_source(&unresolvable), unresolvable);
+  }
+
+  /// Shape: the source the judgment's tables mount at, and two identities, the one verified and another.
+  const SOURCE: &str = "/mnt/work";
+  /// Shape: the identity a binding's evidence recorded.
+  const VERIFIED: MountIdentity = MountIdentity {
+    mount: 7,
+    device: 9,
+  };
+  /// Shape: the identity of a mount that replaced it.
+  const REPLACEMENT: MountIdentity = MountIdentity {
+    mount: 8,
+    device: 9,
+  };
+
+  /// A kernel table holding one slates mount at `at`, of `identity`.
+  fn table_with(at: &str, identity: MountIdentity) -> Vec<MountEntry> {
+    vec![MountEntry {
+      identity,
+      mount_point: at.to_owned(),
+      fstype: "fuse.slates".to_owned(),
+      source: "slates:00000000000000ab".to_owned(),
+    }]
+  }
+
+  /// AUD-29-66, A-520 (moved from the CLI's `oci-check`). Do: judge a source over a table that could not be read, a
+  /// table with no mount at the source, a mount whose identity this kernel cannot read uniquely, one whose identity read
+  /// is refused otherwise, a mount replaced at the source, and the mount verified (named with a trailing separator),
+  /// counting the identity reads. Expect `MountTable` and `Missing` with no identity read, then `Uncheckable`,
+  /// `Identity`, `Replaced` naming both mounts, and the mount verified passed: never a replacement or a bare folder
+  /// judged unchanged.
+  #[test]
+  fn a_source_is_judged_by_the_table_first_then_by_the_identity_the_kernel_never_reuses() {
+    let reads = std::cell::Cell::new(0_u32);
+    let identity = |found: MountIdentity| {
+      let reads = &reads;
+      move || -> Result<MountIdentity, MountTableError> {
+        reads.set(reads.get() + 1);
+        Ok(found)
+      }
+    };
+    let refused = MountTableError::Query { errno: 13 };
+    assert_eq!(
+      judged(SOURCE, VERIFIED, Err(refused.clone()), identity(VERIFIED)),
+      Err(SourceFault::MountTable(refused))
+    );
+    assert_eq!(
+      judged(
+        SOURCE,
+        VERIFIED,
+        Ok(table_with("/mnt/other", VERIFIED)),
+        identity(VERIFIED)
+      ),
+      Err(SourceFault::Missing {
+        source: SOURCE.to_owned()
+      })
+    );
+    assert_eq!(
+      reads.get(),
+      0,
+      "no identity is read until the table shows a mount"
+    );
+    assert_eq!(
+      judged(SOURCE, VERIFIED, Ok(table_with(SOURCE, VERIFIED)), || Err(
+        MountTableError::NoUniqueMountId
+      )),
+      Err(SourceFault::Uncheckable {
+        source: SOURCE.to_owned()
+      })
+    );
+    let unreadable = MountTableError::Query { errno: 2 };
+    assert_eq!(
+      judged(SOURCE, VERIFIED, Ok(table_with(SOURCE, VERIFIED)), || Err(
+        unreadable.clone()
+      )),
+      Err(SourceFault::Identity(unreadable))
+    );
+    assert_eq!(
+      judged(
+        SOURCE,
+        VERIFIED,
+        Ok(table_with(SOURCE, REPLACEMENT)),
+        identity(REPLACEMENT)
+      ),
+      Err(SourceFault::Replaced {
+        source: SOURCE.to_owned(),
+        verified: VERIFIED,
+        found: REPLACEMENT
+      })
+    );
+    assert_eq!(
+      judged(
+        &format!("{SOURCE}/"),
+        VERIFIED,
+        Ok(table_with(SOURCE, VERIFIED)),
+        identity(VERIFIED)
+      ),
+      Ok(())
+    );
+    assert_eq!(reads.get(), 2, "the identity is read once a mount is there");
+  }
+
+  /// AUD-29-66, A-520 (the host's own table, read and nothing touched). Do: check the root, which every Unix host mounts,
+  /// against its identity read now and against another; check a path no mount is at; on a host with no table, check its
+  /// drive. Expect the root unchanged, the other identity `Replaced` naming both, the path `Missing` (on a Linux kernel
+  /// that names no mount uniquely, the root `Uncheckable`), and a host with no table refused by the table,
+  /// `MountTable(Unsupported)`: never a source judged unchanged where nothing was checked.
+  #[test]
+  fn a_source_is_checked_against_the_hosts_own_table() {
+    #[cfg(unix)]
+    {
+      let nowhere = format!("/{NOTHING_MADE}");
+      assert_eq!(
+        check_source(&nowhere, MountIdentity::default()),
+        Err(SourceFault::Missing {
+          source: nowhere.clone()
+        })
+      );
+      match slates_bridge_oci::mount_table::mount_identity_at("/") {
+        Err(MountTableError::NoUniqueMountId) => assert_eq!(
+          check_source("/", MountIdentity::default()),
+          Err(SourceFault::Uncheckable {
+            source: "/".to_owned()
+          })
+        ),
+        Ok(root) => {
+          assert_eq!(check_source("/", root), Ok(()));
+          let other = MountIdentity {
+            mount: root.mount ^ 1,
+            ..root
+          };
+          assert_eq!(
+            check_source("/", other),
+            Err(SourceFault::Replaced {
+              source: "/".to_owned(),
+              verified: other,
+              found: root
+            })
+          );
+        }
+        Err(e) => panic!("the root's identity: {e}"),
+      }
+    }
+    #[cfg(not(unix))]
+    assert!(matches!(
+      check_source("C:\\", MountIdentity::default()),
+      Err(SourceFault::MountTable(MountTableError::Unsupported { .. }))
+    ));
   }
 }

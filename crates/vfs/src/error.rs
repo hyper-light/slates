@@ -61,8 +61,9 @@ pub enum VfsError {
   /// mapping ends (Shards part 3, step 4): a guest's writable map over the file's backing holds stores not yet written
   /// back, which a `rewitness` would have to discard.
   DaxMapped,
-  /// The base beneath an overlay entry cannot be served: the host's errno.
-  BaseUnavailable(i32),
+  /// The base beneath an overlay entry cannot be served: the code the host named, typed by its numbering (A-539); none
+  /// where the volume met no host to ask (none lent, or one away).
+  BaseUnavailable(Option<crate::host::OsCode>),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
   /// than return torn bytes; `status` lists the drift.
   BaseDrift,

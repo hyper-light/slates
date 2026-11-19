@@ -792,7 +792,8 @@ impl Volume {
 
   /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) in the snapshot's size (D-5). The clone's
   /// policy is the origin's; its inode counter continues from the origin's so numbers stay
-  /// unique across both, and its live-inode count is the snapshot's, whatever the origin made or removed since (A-541).
+  /// unique across both, and its live-inode and live-entry counts are the snapshot's, whatever the origin made or removed
+  /// since (A-541, A-549).
   /// An overlay's clone reads the origin's base directories as the origin does. A file the
   /// snapshot froze held with no name left is carried with an orphan record (A-532), so the clone reclaims it as it
   /// reclaims any orphan: at its last reference's release (a restored guest's), or at a restart's settle when nothing
@@ -843,12 +844,13 @@ impl Volume {
       .map_err(|_| VfsError::StaleHandle)?
       .inode;
     snap.clone_refs = snap.clone_refs.saturating_add(1);
-    let (root, inode_root, epoch, referenced, live_inodes) = (
+    let (root, inode_root, epoch, referenced, live_inodes, live_entries) = (
       snap.root,
       snap.inode_root,
       snap.epoch,
       snap.referenced_bytes,
       snap.live_inodes,
+      snap.live_entries,
     );
     let carried: BTreeMap<InodeNo, u64> = snap.orphans.iter().map(|no| (*no, 0)).collect();
     let _ = config.clock.monotonic_ns();
@@ -902,7 +904,8 @@ impl Volume {
       inode_allowance: u64::MAX,
       holds_versions: false,
       version_hold: 0,
-      live_entries: origin.live_entries,
+      // The snapshot's tree's entries too, not the origin's head's now (A-549).
+      live_entries,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
       attribute_writes_in_place: 0,
@@ -1109,13 +1112,14 @@ impl Volume {
     self.journal.note_round(reader, cursor, now)
   }
 
-  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount that consumes the journal from the
-  /// moment it serves, so the records after the head now are the first it may read. A record it has not read holds the
-  /// journal's budget until it has waited `patience_ns`, the transport's liveness (A-157). Its owner closes it when the
-  /// mount ends ([`Volume::close_journal_reader`]).
-  pub fn open_journal_reader(&mut self, key: u64, patience_ns: u64) {
+  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount, or another consumer of the journal,
+  /// from the moment it serves, so the records after the head now are the first it may read. A record it has not read
+  /// holds the journal's budget while it is within `patience`, which the owner names by what the reader's reads wait on
+  /// (A-157, A-548: [`crate::journal::Patience`]). Its owner closes it when its attachment ends
+  /// ([`Volume::close_journal_reader`]).
+  pub fn open_journal_reader(&mut self, key: u64, patience: crate::journal::Patience) {
     let head = self.journal.head_seq();
-    self.journal.open_reader(key, head, patience_ns);
+    self.journal.open_reader(key, head, patience);
   }
 
   /// The bytes the shard's metadata ledger granted the journal beyond its floor (A-157): what the volume's owner
@@ -1127,6 +1131,18 @@ impl Volume {
   /// Closes the journal reader of transport attachment `key`; a key with no reader open is left alone.
   pub fn close_journal_reader(&mut self, key: u64) {
     self.journal.close_reader(key);
+  }
+
+  /// What the rounds of the journal reader of transport attachment `key` found since this was last asked, `None` when
+  /// none is open (A-548, [`crate::journal::OpLog::take_rounds`]): what its owner learns the reader's patience from.
+  pub fn take_journal_rounds(&mut self, key: u64) -> Option<crate::journal::ReaderRounds> {
+    self.journal.take_rounds(key)
+  }
+
+  /// Names the patience of the journal reader of transport attachment `key` again (A-548): its owner's learned bound. A
+  /// key with no reader open is left alone.
+  pub fn set_journal_patience(&mut self, key: u64, patience: crate::journal::Patience) {
+    self.journal.set_patience(key, patience);
   }
 
   /// The number of live snapshots.
@@ -1704,7 +1720,7 @@ impl Volume {
         // Unpinned disk bytes need the host: `Overlay::read` serves them.
         let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
-          return Err(VfsError::BaseUnavailable(0));
+          return Err(VfsError::BaseUnavailable(None));
         }
         for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
@@ -2919,6 +2935,7 @@ impl Volume {
       next: None,
       referenced_bytes: self.bytes.total(),
       live_inodes: self.live_inodes,
+      live_entries: self.live_entries,
       seq: self.journal.head_seq(),
       identity: None,
       orphans: self.orphans.keys().copied().collect(),
@@ -2946,6 +2963,17 @@ impl Volume {
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
     Ok((s.epoch, s.root))
+  }
+
+  /// The live inodes a snapshot's tree holds (§4.2's inode dimension): the head's count when it was taken, or a
+  /// recovered snapshot's tree's. A clone of it starts its own count there (A-541), and its owner admits the clone by
+  /// it: the version slots a bounded clone reserves and its allowance's floor, or a dynamic clone's version hold (A-549).
+  pub fn snapshot_inodes(&self, id: SnapshotId) -> Result<u64, VfsError> {
+    self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map(|snap| snap.live_inodes)
+      .map_err(|_| VfsError::StaleHandle)
   }
 
   /// Looks a name up in a directory of a snapshot's tree (the same walk over frozen nodes).
@@ -7198,7 +7226,7 @@ pub(crate) fn read_frozen_body(
       }
       let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
       if unpinned {
-        return Err(VfsError::BaseUnavailable(0));
+        return Err(VfsError::BaseUnavailable(None));
       }
       for e in overlapping(&b.pinned, off, read_end) {
         store.content.read_extent_into(e, off, out)?;
@@ -7863,14 +7891,16 @@ mod clone_orphan_tests {
 
 /// A-541: a clone's live-inode count (§4.2's inode dimension) is its snapshot's tree's, whatever its origin did since.
 /// After every step each volume's count is compared with the recount a restart makes of its tree (`rebuild`: the
-/// image's own inodes and the numbers it shares with its origin), as the oracle tests compare both counters.
+/// image's own inodes and the numbers it shares with its origin), as the oracle tests compare both counters. A-549 does
+/// the same for its live-entry count (the namespace dimension) against a walk of its namespace, and A-561 restarts a
+/// clone holding a snapshot of its own across a matrix of what it and its origin did, comparing what each reads.
 #[cfg(test)]
 mod clone_count_tests {
   use slates_mem::region::Region;
 
   use super::*;
   use crate::clock::StepClock;
-  use crate::recover::Claims;
+  use crate::recover::{Claims, SharedSource};
 
   /// Shape: the test store's page, the machine's usual one.
   const PAGE: usize = 4096;
@@ -7890,6 +7920,8 @@ mod clone_count_tests {
   /// Shape: the files the origin holds at its snapshot, and the ones it makes after it.
   const BEFORE: usize = 3;
   const AFTER: usize = 5;
+  /// Shape: the files the entries tests' origin holds in each of its subdirectories at its snapshot.
+  const INNER: usize = 2;
   /// Format: a file's and a directory's mode.
   const FILE_MODE: u32 = 0o644;
   const DIR_MODE: u32 = 0o755;
@@ -8075,5 +8107,471 @@ mod clone_count_tests {
     counted_as_its_tree(&recovered, &fresh, "the clone's restart");
     let later = Volume::clone_of(&fresh, &mut recovered_origin, cut, config(LATER_PREFIX)).unwrap();
     counted_as_its_tree(&later, &fresh, "a clone of the recovered snapshot");
+  }
+
+  /// The entries a walk of `volume`'s namespace from its root reaches: every directory's children as a transport lists
+  /// them, which §4.2's namespace dimension counts.
+  fn entries_reachable(volume: &Volume, store: &Store) -> u64 {
+    let mut entries = 0;
+    let mut directories = vec![volume.root_inode(store).unwrap()];
+    while let Some(directory) = directories.pop() {
+      for row in volume.readdir_no(store, directory).unwrap() {
+        entries += 1;
+        if row.kind == Kind::Dir {
+          directories.push(row.inode);
+        }
+      }
+    }
+    entries
+  }
+
+  /// Checks `volume`'s entry count against the entries its namespace reaches after `step`.
+  fn entries_counted_as_its_tree(volume: &Volume, store: &Store, step: &str) {
+    assert_eq!(
+      volume.entry_usage().0,
+      entries_reachable(volume, store),
+      "the live-entry count after {step}"
+    );
+  }
+
+  /// An origin holding two directories with [`INNER`] files in each and [`BEFORE`] files beside them at its snapshot,
+  /// which then makes [`AFTER`] more files and one more in the first directory, and removes one of each, leaving the
+  /// second directory as it was: the origin, the snapshot, and that untouched directory, which the snapshot shares with
+  /// the origin's head (A-395).
+  fn origin_whose_entries_changed_since_its_cut(
+    store: &mut Store,
+  ) -> (Volume, SnapshotId, InodeNo) {
+    let mut origin = Volume::create(store, config(ORIGIN_PREFIX)).unwrap();
+    let root = origin.root_inode(store).unwrap();
+    let inner = origin.mkdir_no(store, root, "d", DIR_MODE).unwrap();
+    let kept = origin.mkdir_no(store, root, "kept", DIR_MODE).unwrap();
+    for n in 0..INNER {
+      origin
+        .create_file_no(store, inner, &format!("inner-{n}"), FILE_MODE)
+        .unwrap();
+      origin
+        .create_file_no(store, kept, &format!("kept-{n}"), FILE_MODE)
+        .unwrap();
+    }
+    for n in 0..BEFORE {
+      origin
+        .create_file_no(store, root, &format!("before-{n}"), FILE_MODE)
+        .unwrap();
+    }
+    entries_counted_as_its_tree(&origin, store, "the origin's first entries");
+    let cut = origin.snapshot(store).unwrap();
+    for n in 0..AFTER {
+      origin
+        .create_file_no(store, root, &format!("after-{n}"), FILE_MODE)
+        .unwrap();
+    }
+    origin
+      .create_file_no(store, inner, "inner-after", FILE_MODE)
+      .unwrap();
+    origin.unlink_no(store, root, "before-0").unwrap();
+    origin.unlink_no(store, inner, "inner-0").unwrap();
+    entries_counted_as_its_tree(&origin, store, "the origin's changes since its snapshot");
+    (origin, cut, kept)
+  }
+
+  /// Makes a file and a directory in `clone`'s root and removes an inherited file from its directory `d`.
+  fn make_and_remove_entries(clone: &mut Volume, store: &mut Store) {
+    let root = clone.root_inode(store).unwrap();
+    let inner = clone.lookup_no(store, root, "d").unwrap().inode;
+    clone
+      .create_file_no(store, root, "clone-made", FILE_MODE)
+      .unwrap();
+    clone.unlink_no(store, inner, "inner-1").unwrap();
+    clone.mkdir_no(store, root, "e", DIR_MODE).unwrap();
+  }
+
+  /// A-549 (A-541's sibling). Do: clone a snapshot whose origin has since made and removed entries, in its root and in a
+  /// subdirectory; make and remove entries in the clone; snapshot the clone, make a file and clone the clone's snapshot;
+  /// then give the clone an entry allowance of one more than its namespace holds and make files until refused. After
+  /// every step compare each entry count with the entries a walk of its namespace reaches. Expect them equal at every
+  /// step, and exactly one file admitted under the allowance before `NoSpace`. Before A-549 a clone started from its
+  /// origin's count at the clone, so every step was off by the origin's net change since the snapshot (10 counted where
+  /// the tree holds 6), and the allowance was refused below the entries the clone held.
+  #[test]
+  fn a_clone_counts_its_snapshots_entries_whatever_its_origin_did_since() {
+    let mut store = store();
+    let (mut origin, cut, _) = origin_whose_entries_changed_since_its_cut(&mut store);
+    let mut clone = Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)).unwrap();
+    entries_counted_as_its_tree(
+      &clone,
+      &store,
+      "the clone of a snapshot its origin changed since",
+    );
+    make_and_remove_entries(&mut clone, &mut store);
+    entries_counted_as_its_tree(&clone, &store, "entries made and removed in the clone");
+    let root = clone.root_inode(&store).unwrap();
+    let clone_cut = clone.snapshot(&mut store).unwrap();
+    clone
+      .create_file_no(&mut store, root, "after-the-clones-snapshot", FILE_MODE)
+      .unwrap();
+    entries_counted_as_its_tree(&clone, &store, "a file made after the clone's snapshot");
+    let clone_of_clone =
+      Volume::clone_of(&store, &mut clone, clone_cut, config(CLONE_OF_CLONE_PREFIX)).unwrap();
+    entries_counted_as_its_tree(&clone_of_clone, &store, "a clone of the clone's snapshot");
+    let reachable = entries_reachable(&clone, &store);
+    clone.set_entry_allowance(reachable + 1).unwrap();
+    clone
+      .create_file_no(&mut store, root, "within-the-allowance", FILE_MODE)
+      .unwrap();
+    assert!(
+      matches!(
+        clone.create_file_no(&mut store, root, "past-the-allowance", FILE_MODE),
+        Err(VfsError::NoSpace)
+      ),
+      "the allowance admits one entry past the namespace the clone holds, then refuses"
+    );
+  }
+
+  /// A-549. Do: clone a snapshot whose origin has made and removed entries since, make and remove entries in the clone,
+  /// then restart (rebuild the origin and the clone from their images into a store over the same RAM) and clone the
+  /// recovered origin's snapshot again. The snapshot holds a directory its origin never changed after it, which its
+  /// image shares with the origin's head (A-395), so the rebuilt snapshot reads that directory's entries from the head's
+  /// node; the test first checks the image shares it, or the count's shared arm would go untested. Expect the rebuilt
+  /// clone's entry count and the later clone's to equal the entries a walk of each namespace reaches. Before A-549 the
+  /// later clone started from the recovered origin's head count. The clone takes no snapshot of its own here: a restart
+  /// refused a clone holding one while it shared a file with its origin until A-561, whose matrix test restarts those.
+  #[test]
+  fn a_clone_of_a_recovered_snapshot_counts_its_snapshots_entries() {
+    let mut store = store();
+    let (mut origin, cut, kept) = origin_whose_entries_changed_since_its_cut(&mut store);
+    let mut clone = Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)).unwrap();
+    make_and_remove_entries(&mut clone, &mut store);
+    entries_counted_as_its_tree(&clone, &store, "entries made and removed in the clone");
+    let origin_image = origin.to_image(&store, None).unwrap();
+    let clone_image = clone.to_image(&store, None).unwrap();
+    assert!(
+      origin_image.snapshots.iter().any(|snapshot| snapshot
+        .shared
+        .iter()
+        .any(|entry| entry.number == kept.0 && matches!(entry.source, SharedSource::Head))),
+      "the snapshot's untouched directory is shared with the head, whose node its entries are read from"
+    );
+    let mut fresh = surviving(&store);
+    let claims = Claims::prepare(&mut fresh, [&origin_image, &clone_image]).unwrap();
+    let mut recovered_origin = Volume::from_image(
+      &mut fresh,
+      &origin_image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      None,
+    )
+    .unwrap();
+    let recovered = Volume::clone_from_image(
+      &mut fresh,
+      &clone_image,
+      &claims,
+      &recovered_origin,
+      cut,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      None,
+    )
+    .unwrap();
+    entries_counted_as_its_tree(&recovered, &fresh, "the clone's restart");
+    let later = Volume::clone_of(&fresh, &mut recovered_origin, cut, config(LATER_PREFIX)).unwrap();
+    entries_counted_as_its_tree(&later, &fresh, "a clone of the recovered snapshot");
+  }
+
+  /// A-561's matrix: one bit of a case each. The origin makes a file in `d` and removes one there after its snapshot.
+  const ORIGIN_CHANGES_D: u32 = 1;
+  /// The clone removes an inherited file from `d`, so it holds its own copy of `d`.
+  const CLONE_REMOVES_INHERITED: u32 = 1 << 1;
+  /// The clone makes a directory of its own.
+  const CLONE_MAKES_DIRECTORY: u32 = 1 << 2;
+  /// The clone takes a snapshot of its own, then makes a file.
+  const CLONE_SNAPSHOT: u32 = 1 << 3;
+  /// The clone's snapshot is cloned in turn; a case only with [`CLONE_SNAPSHOT`].
+  const CLONE_OF_CLONE: u32 = 1 << 4;
+  /// The clone rewrites an inherited file, after its snapshot where it took one, so the snapshot keeps the origin's
+  /// record of it while the head holds its own.
+  const CLONE_REWRITES_INHERITED: u32 = 1 << 5;
+  /// Shape: every combination of the bits above.
+  const CASES: u32 = 1 << 6;
+  /// Shape: the bytes the clone writes into an inherited file.
+  const REWRITTEN: &[u8] = b"rewritten by the clone";
+  /// Shape: the most bytes a file of the matrix holds, read whole by [`tree`].
+  const MOST_BYTES: usize = 64;
+
+  /// `result`, its error named by the step that met it.
+  fn step<T, E: std::fmt::Debug>(label: &str, result: Result<T, E>) -> Result<T, String> {
+    result.map_err(|error| format!("{label}: {error:?}"))
+  }
+
+  /// `Ok` when `after` equals `before`, else what differs.
+  fn same<T: PartialEq + std::fmt::Debug>(what: &str, before: &T, after: &T) -> Result<(), String> {
+    if before == after {
+      Ok(())
+    } else {
+      Err(format!(
+        "{what} differs after the restart: before {before:?}, after {after:?}"
+      ))
+    }
+  }
+
+  /// One name a walk reaches: its path, kind, number, size and bytes.
+  type Reached = (String, Kind, InodeNo, u64, Vec<u8>);
+
+  /// Everything a walk of `volume`'s namespace from its root reaches, in path order: what a reader of it sees.
+  fn tree(volume: &Volume, store: &Store) -> Result<Vec<Reached>, String> {
+    let mut reached = Vec::new();
+    let mut directories = vec![(String::new(), step("the root", volume.root_inode(store))?)];
+    while let Some((path, directory)) = directories.pop() {
+      for row in step("a listing", volume.readdir_no(store, directory))? {
+        let named = format!("{path}/{}", row.name);
+        let size = step("a stat", volume.stat(store, row.inode))?.size;
+        let mut bytes = vec![0; MOST_BYTES];
+        let read = if row.kind == Kind::File {
+          step("a read", volume.read(store, row.inode, 0, &mut bytes))?
+        } else {
+          0
+        };
+        bytes.truncate(read);
+        if row.kind == Kind::Dir {
+          directories.push((named.clone(), row.inode));
+        }
+        reached.push((named, row.kind, row.inode, size, bytes));
+      }
+    }
+    reached.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(reached)
+  }
+
+  /// A volume's live-inode and live-entry counts.
+  fn counts(volume: &Volume) -> (u64, u64) {
+    (volume.inode_usage().0, volume.entry_usage().0)
+  }
+
+  /// Makes `case`'s origin, clone and clone of the clone, images them, restarts, and compares: `Ok` when the restart
+  /// rebuilt each and every volume made of them reads and counts as before it, else the step that refused or the
+  /// first difference.
+  fn rebuilt_as_it_was(case: u32) -> Result<(), String> {
+    let mut store = store();
+    let mut origin = step(
+      "make the origin",
+      Volume::create(&mut store, config(ORIGIN_PREFIX)),
+    )?;
+    let root = step("the origin's root", origin.root_inode(&store))?;
+    let inner = step("make d", origin.mkdir_no(&mut store, root, "d", DIR_MODE))?;
+    for n in 0..INNER {
+      let name = format!("inner-{n}");
+      step(
+        "make d's files",
+        origin.create_file_no(&mut store, inner, &name, FILE_MODE),
+      )?;
+    }
+    for n in 0..BEFORE {
+      let name = format!("before-{n}");
+      step(
+        "make the root's files",
+        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+      )?;
+    }
+    let cut = step("snapshot the origin", origin.snapshot(&mut store))?;
+    for n in 0..AFTER {
+      let name = format!("after-{n}");
+      step(
+        "make files after the snapshot",
+        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+      )?;
+    }
+    step(
+      "remove before-0",
+      origin.unlink_no(&mut store, root, "before-0"),
+    )?;
+    if case & ORIGIN_CHANGES_D != 0 {
+      step(
+        "make inner-after",
+        origin.create_file_no(&mut store, inner, "inner-after", FILE_MODE),
+      )?;
+      step(
+        "remove inner-0",
+        origin.unlink_no(&mut store, inner, "inner-0"),
+      )?;
+    }
+    let mut clone = step(
+      "clone the origin's snapshot",
+      Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)),
+    )?;
+    let clone_root = step("the clone's root", clone.root_inode(&store))?;
+    let clone_inner = step("the clone's d", clone.lookup_no(&store, clone_root, "d"))?.inode;
+    let inherited = step(
+      "the clone's before-1",
+      clone.lookup_no(&store, clone_root, "before-1"),
+    )?
+    .inode;
+    step(
+      "make clone-made",
+      clone.create_file_no(&mut store, clone_root, "clone-made", FILE_MODE),
+    )?;
+    if case & CLONE_REMOVES_INHERITED != 0 {
+      step(
+        "remove inner-1 in the clone",
+        clone.unlink_no(&mut store, clone_inner, "inner-1"),
+      )?;
+    }
+    if case & CLONE_MAKES_DIRECTORY != 0 {
+      step(
+        "make e in the clone",
+        clone.mkdir_no(&mut store, clone_root, "e", DIR_MODE),
+      )?;
+    }
+    let clone_cut = if case & CLONE_SNAPSHOT != 0 {
+      let clone_cut = step("snapshot the clone", clone.snapshot(&mut store))?;
+      let after = "after-the-clones-snapshot";
+      step(
+        "make a file after the clone's snapshot",
+        clone.create_file_no(&mut store, clone_root, after, FILE_MODE),
+      )?;
+      Some(clone_cut)
+    } else {
+      None
+    };
+    if case & CLONE_REWRITES_INHERITED != 0 {
+      step(
+        "rewrite before-1 in the clone",
+        clone.write(&mut store, inherited, 0, REWRITTEN),
+      )?;
+    }
+    let clone_of_clone = match clone_cut {
+      Some(clone_cut) if case & CLONE_OF_CLONE != 0 => Some(step(
+        "clone the clone's snapshot",
+        Volume::clone_of(&store, &mut clone, clone_cut, config(CLONE_OF_CLONE_PREFIX)),
+      )?),
+      _ => None,
+    };
+    // What each volume shows before the restart. The clone's snapshot is read through a clone of it.
+    let clone_shown = (tree(&clone, &store)?, counts(&clone));
+    let clone_of_clone_shown = match &clone_of_clone {
+      Some(volume) => Some((tree(volume, &store)?, counts(volume))),
+      None => None,
+    };
+    let snapshot_shown = match clone_cut {
+      Some(clone_cut) => {
+        let view = step(
+          "clone the clone's snapshot to read it",
+          Volume::clone_of(&store, &mut clone, clone_cut, config(LATER_PREFIX)),
+        )?;
+        Some((tree(&view, &store)?, counts(&view)))
+      }
+      None => None,
+    };
+    let origin_image = step("image the origin", origin.to_image(&store, None))?;
+    let clone_image = step("image the clone", clone.to_image(&store, None))?;
+    let clone_of_clone_image = match &clone_of_clone {
+      Some(volume) => Some(step(
+        "image the clone of the clone",
+        volume.to_image(&store, None),
+      )?),
+      None => None,
+    };
+    // The restart: each volume rebuilt from its image into a store over the same RAM.
+    let mut fresh = surviving(&store);
+    let images: Vec<_> = [
+      Some(&origin_image),
+      Some(&clone_image),
+      clone_of_clone_image.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let claims = step(
+      "claim the images' blocks",
+      Claims::prepare(&mut fresh, images),
+    )?;
+    let recovered_origin = step(
+      "rebuild the origin",
+      Volume::from_image(
+        &mut fresh,
+        &origin_image,
+        &claims,
+        Box::new(StepClock::new(0, 1)),
+        JOURNAL,
+        None,
+      ),
+    )?;
+    let mut recovered = step(
+      "rebuild the clone",
+      Volume::clone_from_image(
+        &mut fresh,
+        &clone_image,
+        &claims,
+        &recovered_origin,
+        cut,
+        Box::new(StepClock::new(0, 1)),
+        JOURNAL,
+        None,
+      ),
+    )?;
+    same(
+      "the clone",
+      &clone_shown,
+      &(tree(&recovered, &fresh)?, counts(&recovered)),
+    )?;
+    if let (Some(clone_cut), Some(shown)) = (clone_cut, &snapshot_shown) {
+      let view = step(
+        "clone the rebuilt clone's snapshot",
+        Volume::clone_of(&fresh, &mut recovered, clone_cut, config(LATER_PREFIX)),
+      )?;
+      same(
+        "a clone of the clone's snapshot",
+        shown,
+        &(tree(&view, &fresh)?, counts(&view)),
+      )?;
+    }
+    if let (Some(clone_cut), Some(image), Some(shown)) =
+      (clone_cut, &clone_of_clone_image, &clone_of_clone_shown)
+    {
+      let rebuilt = step(
+        "rebuild the clone of the clone",
+        Volume::clone_from_image(
+          &mut fresh,
+          image,
+          &claims,
+          &recovered,
+          clone_cut,
+          Box::new(StepClock::new(0, 1)),
+          JOURNAL,
+          None,
+        ),
+      )?;
+      same(
+        "the clone of the clone",
+        shown,
+        &(tree(&rebuilt, &fresh)?, counts(&rebuilt)),
+      )?;
+    }
+    Ok(())
+  }
+
+  /// A-561. Do: for every case of the matrix (the origin changes `d` after its snapshot or not; the clone removes an
+  /// inherited file, makes a directory, takes a snapshot of its own and makes a file after it, has that snapshot cloned,
+  /// and rewrites an inherited file, each or not), restart: rebuild the origin, the clone and the clone of the clone
+  /// from their images over the same RAM. Expect every case rebuilt; the clone and the clone of the clone reading as they
+  /// did (every path's kind, number, size and bytes) with their counts; and a clone of the clone's snapshot made after
+  /// the restart reading and counting as one made before it. Before A-561 every case whose clone held a snapshot was
+  /// refused `RecoveryIncomplete`: the snapshot shares the files the clone still shares with its origin with the head,
+  /// and recovery looked a file shared with the head up only among the head's own inodes.
+  #[test]
+  fn a_clone_holding_its_own_snapshot_is_rebuilt_at_a_restart_whatever_it_shares_with_its_origin() {
+    let failures: Vec<String> = (0..CASES)
+      .filter(|case| case & CLONE_OF_CLONE == 0 || case & CLONE_SNAPSHOT != 0)
+      .filter_map(|case| {
+        rebuilt_as_it_was(case)
+          .err()
+          .map(|why| format!("case {case:06b}: {why}"))
+      })
+      .collect();
+    assert!(
+      failures.is_empty(),
+      "{} cases were not rebuilt as they were:\n{}",
+      failures.len(),
+      failures.join("\n")
+    );
   }
 }
