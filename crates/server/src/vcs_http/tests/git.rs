@@ -896,7 +896,10 @@ fn an_lfs_request_without_credentials_is_401_naming_its_challenges_for_git_lfs_t
   let mut expected = with_cache(&[(www, BASIC_CHALLENGE), (www, BEARER_CHALLENGE)]);
   expected.extend([
     (lfs.as_bytes().to_vec(), BASIC_CHALLENGE.as_bytes().to_vec()),
-    (lfs.as_bytes().to_vec(), BEARER_CHALLENGE.as_bytes().to_vec()),
+    (
+      lfs.as_bytes().to_vec(),
+      BEARER_CHALLENGE.as_bytes().to_vec(),
+    ),
   ]);
   assert_eq!(
     refusal(&ready(site.answer(&head(&asked), true))),
@@ -912,14 +915,28 @@ fn an_lfs_request_without_credentials_is_401_naming_its_challenges_for_git_lfs_t
 #[test]
 fn an_lfs_request_meets_its_shard_then_404_403_and_503_for_an_endpoint_not_served() {
   let mut lfs = lfs_site(Carried);
-  let elsewhere = request("POST", "/elsewhere.git/info/lfs/locks", &[LFS_BODY, OWNER_BEARER]);
+  let elsewhere = request(
+    "POST",
+    "/elsewhere.git/info/lfs/locks",
+    &[LFS_BODY, OWNER_BEARER],
+  );
   let moved = ready(lfs.answer(&head(&elsewhere), true));
   assert!(
     matches!(moved.answer, Answer::Move { shard } if shard == ELSEWHERE_SHARD) && moved.proven
   );
   let cases = [
-    ("POST", "/missing.git/info/lfs/locks", OWNER_BEARER, Status::NOT_FOUND),
-    ("POST", "/hg/info/lfs/locks", OWNER_BEARER, Status::NOT_FOUND),
+    (
+      "POST",
+      "/missing.git/info/lfs/locks",
+      OWNER_BEARER,
+      Status::NOT_FOUND,
+    ),
+    (
+      "POST",
+      "/hg/info/lfs/locks",
+      OWNER_BEARER,
+      Status::NOT_FOUND,
+    ),
     ("POST", LFS_LOCKS, STRANGER_BEARER, Status::FORBIDDEN),
     ("GET", LFS_OBJECT, OWNER_BEARER, Status::SERVICE_UNAVAILABLE),
   ];
@@ -1015,6 +1032,10 @@ fn the_daemons_lfs_serves_the_locks_api_and_refuses_objects_at_their_head() {
   for (method, target) in locks {
     let asked = request(method, &target, &[LFS_BODY, OWNER_BEARER]);
     let (_, _, status, _, proven) = served_lfs(ready(site.answer(&head(&asked), true)));
-    assert_eq!((status, proven), (StatusMode::AfterBody, true), "{method} {target}");
+    assert_eq!(
+      (status, proven),
+      (StatusMode::AfterBody, true),
+      "{method} {target}"
+    );
   }
 }

@@ -12847,6 +12847,22 @@ engine: the verdict, rebase, position mapping, the register).
 > shard (A-581); principals' names for people (§4.13); locks by others than the owner once the push's policy
 > check lands.
 >
+> **Status (2026-11-19, A-629 part 2c: Git LFS on the shared HTTP edge).** git's HTTP site (`crates/server`,
+> `vcs_http::git`) routes a request under `<repo>/info/lfs` through `slates_git::lfs::serve::route` before git's own
+> routes, in A-625 part 3's order: a route's refusal whoever asks (`405` with `Allow`, `400`, `414`, `415`, `406`); the
+> credentials, a `401` naming each challenge in `LFS-Authenticate` too; the repository, the connection moved to its
+> owner shard, or `404`; the policy's gate for LFS's rights (`403`); and `503` at the head for an endpoint the site's
+> service does not serve. A served request decides its status after its body (main's ruling: a route's status is
+> decided at its head or after its body; `slates-http-edge`'s `StatusMode` and `Connection::reply_status`): its body is
+> kept whole within the request's room and answered with the status, fields and body `lfs::answer` decided, its hrefs
+> under the authority the request named, its actions expiring in the second the bearer token that asked expires in. A
+> status no reply's content may follow (`1xx`, `204`, `205`, `304`), or one named on a streamed route, fails the
+> request `500` in stages. The daemon (`daemon_edge::ShardLfs`) serves the locks API over the repository's locks log;
+> the batch API and the transfers answer `503` at their head until the owner shard keeps LFS objects durably (A-581),
+> so no upload is acknowledged that a restart would forget. Owed: A-581's durable objects and the batch API and the
+> transfers served over them; locks by others than the owner once the push's policy check lands; principals' names for
+> people (§4.13); the stock git-lfs client end to end against the daemon (main's).
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -50153,3 +50169,58 @@ Applied in the same change to:
   rules; other forms refused by kind), its blob read within the request's admission and its patterns given to the
   negotiation, git's two refusals' words ("unable to access sparse blob in '%s'", "unable to parse sparse filter data
   in %s"), and a stock git `sparse:oid` exchange recorded as a golden.
+
+### A-629 part 2c — Git LFS on the shared HTTP edge: its routes on git's site through the edge's authentication, its status decided after its body, the locks API served by the daemon (2026-11-19, g230, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Transports" item 1; after A-629 part 2b-ii, A-625 part 3 and A-650 part 1)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/http-edge` (`connection.rs`:
+`StatusMode`, `Decision::Serve`'s `status`, `Connection::reply_status`, `carries_content`; its tests); `crates/server`
+(`vcs_http.rs`: `Exchange::reply_status`, `Answer::Serve`'s `status`, the reply step; `vcs_http/git.rs`: `LfsService`,
+`NoLfs`, `LfsExchange`, `SiteExchange`, the LFS route, gate and refusals, `expiry_of`; `vcs_http/daemon_edge.rs`:
+`ShardLfs`, `DaemonSite`; `vcs_http/hg.rs`; `lfs.rs`: `NoObjects`, `bare`; the tests of `vcs_http`'s git site, hg site
+and serving loop); `crates/git` (`lfs::serve::Answer::fields`); `crates/cli` (`tests/cli.rs`).
+- **A status per route** (main's ruling, 2026-11-19). A served reply's status is its route's to decide: at its head,
+  `200`, as git's services and Mercurial's commands stream theirs (`StatusMode::Streamed`); or after its body, named by
+  the service as its reply begins (`StatusMode::AfterBody`), as Git LFS answers `201`, `409`, `422`, `413` and `507`
+  only once it has read the request. The engine asks the exchange once, before its fields (`Exchange::reply_status`,
+  none for `200`). A status no reply's content may follow (RFC 9110 §6.4.1's `1xx`, `204` and `304`; §15.3.6's
+  `205`), a code outside §15's classes, or a status named for a streamed route fails the request `500` in stages,
+  nothing of a reply sent; one named after the reply began is never written.
+- **The routes on git's site.** An LFS path (`<repo>/info/lfs/...`, the server URL git-lfs derives from a remote) is
+  routed by `slates_git::lfs::serve::route` before git's own routes; a path it does not know falls through to them,
+  and both decode a path alike. The order is A-625 part 3's: the route's refusal whoever asks (`405` naming the
+  endpoint's methods, `400`, `414`, `415`, `406`); a request naming no authority `400`; the credentials (`401` with the
+  connection's challenges, each named again in `LFS-Authenticate`, batch.md, so git-lfs asks for credentials); the
+  repository (the connection moved to its owner shard, or `404` for none or another tool's); the policy's gate, the
+  principal reaching the repository for some LFS right (read, submit or rewrite; `403`); then the service (`503` for an
+  endpoint it does not serve). Every refusal carries `http-backend`'s cache fields, as git's own do. Each endpoint's
+  own right on the ref it names stays `lfs::answer`'s (`LfsAccess`, A-629 part 2b-ii).
+- **The call.** A served LFS request's body is kept whole within the request's room, which the engine's admission
+  bounds, and answered once it ends. `LfsCall` carries the route, the query, the body, the proven principal, the
+  credential's expiry (the second a bearer token's `expires_ns` falls in, so no action outlives the token; none for
+  Basic, whose transfers authenticate as their batch did, A-625 part 3), the scheme and the authority the request named
+  (an absolute-form target's, else `Host`'s, as slates-http checked it) and the room. The answer's status, its fields
+  (`Answer::fields`: the media type, and a `401`'s `LFS-Authenticate`) and its body are the reply's.
+- **What the daemon serves** (`ShardLfs`): the locks API, on the repository's owner shard over its locks log (A-635),
+  durable as the partition's log is, the objects seam handed in holding nothing (`lfs::NoObjects`). The batch API and
+  the transfers answer `503` at their head, their bodies never read: the owner shard keeps no durable LFS object store
+  yet (A-581), and an acknowledged upload that a restart forgot would leave a pushed pointer naming nothing, against
+  §4.17.1's rule that a repository's acknowledged state is durable as greens are (A-662). Rejected on that rule: the
+  objects held in memory beside the git store (`GitStore::lfs`), as the unfinished draft this piece took over had them.
+- **Tests.** `slates-http-edge`
+  (`connection::tests::a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names`: `201`, none,
+  `204`, `205`, a streamed route's, one named after the reply began). `slates-server` `vcs_http::git::tests`: route
+  refusals whoever asks; `401` with `LFS-Authenticate`; the owner shard, `404`, `403` and `503`; a served call's status,
+  fields, body and what it carried (the route, query, whole body, principal, expiry, origin and room); the daemon's
+  `ShardLfs` refusing the four object endpoints at their head and serving the locks API's four. `vcs_http::tests::serve`
+  over a loopback connection: `201` heading a reply, and `204` or a status on a streamed route failing it in stages.
+  `slates-cli` `an_anchors_vcs_http_flag_starts_its_daemons_edge`: a real anchor's daemon answers its git refs and its
+  LFS locks `401`, Bearer's challenge in `WWW-Authenticate` and in `LFS-Authenticate`, no Basic in cleartext.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, `CARGO_BUILD_JOBS=2`; kiln r109 over this piece on main
+  cb9d7f5a5, 21:41 to 21:53 UTC, load 8 to 16). Failing first, the edge never taking the status its service names:
+  the edge test failed, 0 of 1. Restored: `cargo test --locked -p slates-http-edge --lib -- connection::` 18 of 18;
+  `-p slates-git --lib -- lfs::` 73 of 73; `-p slates-server --lib -- vcs_http:: lfs:: credentials:: --test-threads=4`
+  55 of 55, the six new among them and main's four `lfs::tests` passing on the seam as it was; `-p slates-cli --test cli
+  -- an_anchors_vcs_http_flag_starts_its_daemons_edge` 1 of 1, in 3.86 s. rustfmt asked for six layout changes, made
+  as it wrote them. The Linux and Windows runs are owed (main's).
+- **Owed.** The objects' durable store on the owner shard (A-581), and with it the batch API and the transfers served;
+  locks by others than the owner once the push's policy check lands (A-635); principals' names for people (§4.13); a
+  request id named in LFS's error bodies; the stock git-lfs client end to end against the daemon (main's).

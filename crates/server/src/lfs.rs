@@ -40,8 +40,8 @@ use slates_git::lfs::serve::{
 };
 use slates_git::lfs::{Oid, Timestamp};
 use slates_http::reply::Status;
-use slates_vcs::ContentRefused;
 use slates_ipc::protocol::Refusal;
+use slates_vcs::ContentRefused;
 use slates_vfs::clock::Clock;
 use slates_wire::Wire;
 

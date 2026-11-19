@@ -68,9 +68,7 @@ use std::task::{Poll, Waker};
 
 use slates_http::head::Head;
 use slates_http::reply::Status;
-use slates_http_edge::connection::{
-  Connection, Decision, Ended, Fields, Next, Phase, StatusMode,
-};
+use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
