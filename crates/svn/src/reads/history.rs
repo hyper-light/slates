@@ -9,20 +9,22 @@
 //!   crossed: then the history ends.
 //! - The node at the place: when the place's revision is the node's created revision, the node itself is reported if it
 //!   was not yet; if it was, the walk moves to its predecessor (none: the history ends).
-//! - Then the youngest copy root on the place's path (`find_youngest_copyroot`): when it is younger than the node's
-//!   created revision and the place is at or beneath that copy's destination, the next location is the place in the copy's
-//!   revision, carrying the copy's source joined with the rest of the path; reported unless it is the location just
-//!   reported, which is then passed over ("retry").
+//! - Then the youngest copy root on the place's path (`find_youngest_copyroot`, the crate's one walk of copy roots in
+//!   `crate::report::drive::history`): when it is younger than the node's created revision and the place is at or
+//!   beneath that copy's destination, the next location is the place in the copy's revision, carrying the copy's
+//!   source joined with the rest of the path; reported unless it is the location just reported, which is then passed
+//!   over ("retry").
 //! - Otherwise the next location is the node's created path in its created revision, reported.
 //!
 //! The root changes in every revision and is never copied, so its history is every revision down to 0
 //! (`fs_history_prev`'s special case). `fs_history_prev` steps until a location is reported, which takes at most two
 //! steps ([`PREVIOUS_STEPS`]): a passed-over location is a copy's, and the step after it starts at the copy's source,
-//! where every case reports. `tree.c`'s shortcut through linear history (`next_copy`, `current_id`) answers as the steps
-//! do, so it is not kept.
+//! where every case reports. `tree.c`'s shortcut through linear history (`next_copy`, `current_id`) answers as the
+//! steps do, so it is not kept.
 
 use super::{Failure, ROOT, Reads, Repository, SEPARATOR};
 use crate::index::Revision;
+use crate::report::drive::history as copies;
 
 /// The most steps one `fs_history_prev` takes before a location is reported.
 /// Derived: a location passed over is a copy's retry, and the step after it starts at the copy's source, where every
@@ -123,7 +125,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     revision: Revision,
     commit_revision: Revision,
   ) -> Result<Option<(Revision, (String, Revision))>, Failure> {
-    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
+    let youngest = copies::youngest_copy_root(self.index, path, revision)
+      .map_err(|refusal| Failure::of_index(&refusal))?;
+    let Some((copied_in, copy_path)) = youngest else {
       return Ok(None);
     };
     if copied_in <= commit_revision {

@@ -1102,6 +1102,33 @@ fn a_log_streams_a_revision_a_step_and_refuses_merged_revisions_until_built() {
   assert!(out.ends_with(b"done ( failure ( ( 200007 36:Trying to use an unsupported feature 0: 0 ) ) ) "));
 }
 
+/// A-613 part 2 (`log`): `fill_log_entry` hands over every revision property when the names asked are as many as the
+/// revision's and each is among them (`log.c`: `revprops->nelts == apr_hash_count(r_props)`, then each name looked up),
+/// so a request naming `svn:log` twice and `svn:author` once gets `svn:date` too; naming one of them alone, the others
+/// are left out.
+#[test]
+fn revision_properties_are_gathered_as_fill_log_entry_gathers_them() {
+  let fixture = Fixture::new();
+  let twice = b"( log ( ( 0: ) ( 1 ) ( 1 ) false false 0 false revprops ( 7:svn:log 7:svn:log 10:svn:author ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, twice, usize::MAX);
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    concat!(
+      "( success ( ( ) 0: ) ) ( ( ) 1 ( 5:alice ) ( 27:2026-01-01T01:00:00.000000Z ) ",
+      "( 15:the first trees ) false false 0 ( ) false ) done ( success ( ) ) "
+    )
+  );
+  let once = b"( log ( ( 0: ) ( 1 ) ( 1 ) false false 0 false revprops ( 7:svn:log ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, once, usize::MAX);
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    concat!(
+      "( success ( ( ) 0: ) ) ( ( ) 1 ( ) ( ) ( 15:the first trees ) false false 0 ( ) false ) ",
+      "done ( success ( ) ) "
+    )
+  );
+}
+
 /// A-613 part 2 (`log`): a path past `MAX_OPEN_HISTORIES` has its history opened again at each step
 /// (`get_history`), one step past the last location and two after the first time; its log is the same as the same
 /// path's with its history kept open, across a copy.
@@ -1155,11 +1182,82 @@ fn hostile_param() -> impl Strategy<Value = String> {
   })
 }
 
-proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+/// Whether an item is a command response, `( success ... )` or `( failure ... )`.
+fn is_response(item: &Value<'_>) -> bool {
+  matches!(item, Value::List(parts) if matches!(parts.first(), Some(Value::Word("success" | "failure"))))
+}
 
-  /// A-613: hostile commands, a known command's name with parameters of any shape: never a panic, and an answer is
-  /// the authentication request then a success or a refusal, or a refusal alone, or nothing at all.
+/// Holds one hostile command's answer to what `svnserve` can answer: nothing for a command that ends the connection or
+/// is another piece's; the authentication request then a response, or a refusal alone; and for a streamed answer, a
+/// stream that ends, whose answer is the authentication request first and a response last, three items at the least
+/// (the request, `done`, the refusal: `list`'s refusal of a depth word it does not know, recorded).
+fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
+  let mut parser = Parser::new(hostile_bounds());
+  let Ok(Parsed::Item { value, .. }) = parser.parse(command.as_bytes()) else {
+    return Ok(());
+  };
+  let fixture = Fixture::new();
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, &fixture.green, &ROOT_SESSION, &value, &mut out)
+    .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
+  let mut stream = match outcome {
+    Outcome::Close | Outcome::Elsewhere => {
+      prop_assert!(out.is_empty());
+      return Ok(());
+    }
+    Outcome::Answered => {
+      let answers = items(&out);
+      prop_assert!(!answers.is_empty() && answers.len() <= 2);
+      return Ok(());
+    }
+    Outcome::Streaming(stream) => stream,
+  };
+  let mut slices = 0_usize;
+  while stream
+    .resume(&fixture.index, &fixture.green, &ROOT_SESSION, &mut out, 1)
+    .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?
+    == Progress::More
+  {
+    slices += 1;
+    prop_assert!(slices < 1_024, "a stream that does not end");
+  }
+  let answers = items(&out);
+  let request = items(b"( success ( ( ) 0: ) ) ");
+  prop_assert!(answers.len() >= 3, "{}", String::from_utf8_lossy(&out));
+  prop_assert_eq!(answers.first(), request.first());
+  prop_assert!(answers.last().is_some_and(is_response));
+  Ok(())
+}
+
+/// A-613 part 2: the hostile input g264 found on main (a5dffc913, seed `cc 8c15aaa6...` in this test's seed file): a
+/// `list` whose depth is the word `true`, which `svn_depth_from_word` reads as unknown, is answered with the
+/// authentication request, `done` and "Invalid depth '-2' in svn_repos_list", three items, as `svnserve` answers a
+/// depth word it does not know (recorded, session `list`); the test had required four of every stream.
+#[test]
+fn a_list_with_a_word_for_its_depth_is_three_items_as_svnserve_answers_it() {
+  if let Err(error) = hostile_command_holds("( list ( 5:trunk ( ) true ) ) ") {
+    panic!("{error}");
+  }
+  let (_, out, _) = answered_streamed(b"( list ( 5:trunk ( ) true ) ) ");
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    "( success ( ( ) 0: ) ) done ( failure ( ( 165002 36:Invalid depth '-2' in svn_repos_list 0: 0 ) ) ) "
+  );
+}
+
+/// One command's whole answer against the fixture, its stream resumed in a room past it.
+fn answered_streamed(command: &[u8]) -> (Outcome, Vec<u8>, usize) {
+  let fixture = Fixture::new();
+  streamed(&fixture, &fixture.green, command, usize::MAX)
+}
+
+proptest! {
+  #![proptest_config(
+    slates_test_seeds::seeded(ProptestConfig::default(), include_str!("tests.proptest-regressions")).unwrap()
+  )]
+
+  /// A-613: hostile commands, a known command's name with parameters of any shape: never a panic, and an answer as
+  /// [`hostile_command_holds`] holds it.
   #[test]
   fn hostile_commands_are_answered_or_end_the_connection(
     name in prop::sample::select(vec![
@@ -1170,30 +1268,6 @@ proptest! {
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {
     let command = format!("( {name} ( {}) ) ", params.concat());
-    let mut parser = Parser::new(hostile_bounds());
-    let Ok(Parsed::Item { value, .. }) = parser.parse(command.as_bytes()) else {
-      return Ok(());
-    };
-    let fixture = Fixture::new();
-    let mut out = Vec::new();
-    let outcome = answer(&fixture.index, &fixture.green, &Session { base: "/", uuid: UUID }, &value, &mut out)
-      .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
-    match outcome {
-      Outcome::Close | Outcome::Elsewhere => prop_assert!(out.is_empty()),
-      Outcome::Answered => {
-        let answers = items(&out);
-        prop_assert!(!answers.is_empty() && answers.len() <= 2);
-      }
-      Outcome::Streaming(mut stream) => {
-        let session = Session { base: "/", uuid: UUID };
-        let mut slices = 0_usize;
-        while stream.resume(&fixture.index, &fixture.green, &session, &mut out, 1)
-          .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))? == Progress::More {
-          slices += 1;
-          prop_assert!(slices < 1_024, "a stream that does not end");
-        }
-        prop_assert!(items(&out).len() >= 4);
-      }
-    }
+    hostile_command_holds(&command)?;
   }
 }

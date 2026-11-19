@@ -48,6 +48,7 @@
 
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
+use crate::report::drive::history as copies;
 use crate::ra_svn::{ItemError, Value, write};
 
 /// `SVN_ERR_BAD_DATE`, "Bogus date".
@@ -1049,60 +1050,18 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     )))
   }
 
-  /// `svn_fs_closest_copy` (`tree.c` `fs_closest_copy`): the revision and path of the copy that made the node at `path`
-  /// in `revision` what it is: the youngest copy root on the path, unless the node there in that revision is another
-  /// line, or was made fresh in it beneath the copy; `None` without one. Refused when the path is absent.
+  /// `svn_fs_closest_copy` (`tree.c` `fs_closest_copy`), asked of the crate's one walk of copy roots
+  /// (`crate::report::drive::history`): the revision and path of the copy that made the node at `path` in `revision`
+  /// what it is; `None` without one. Refused when the path is absent, as FSFS's `open_path` refuses it.
   fn closest_copy(
     &self,
     path: &str,
     revision: Revision,
   ) -> Result<Option<(Revision, String)>, Failure> {
-    let node = self
-      .node(path, revision)?
-      .ok_or_else(|| Failure::not_found(path, revision))?;
-    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
-      return Ok(None);
-    };
-    let Some(copied) = self.node(path, copied_in)? else {
-      return Ok(None);
-    };
-    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
-    if copied.node_id() != node.node_id() || fresh {
-      return Ok(None);
+    if self.node(path, revision)?.is_none() {
+      return Err(Failure::not_found(path, revision));
     }
-    Ok(Some((copied_in, copy_path)))
-  }
-
-  /// FSFS's `find_youngest_copyroot`: the youngest copy root of the path's node and its directories in `revision`, a
-  /// child's preferred over its parent's of the same revision; `None` when it is revision 0's root.
-  fn youngest_copy_root(
-    &self,
-    path: &str,
-    revision: Revision,
-  ) -> Result<Option<(Revision, String)>, Failure> {
-    let mut youngest: Option<(Revision, String)> = None;
-    let mut chain: Vec<&str> = Vec::new();
-    let mut place = Some(path);
-    while let Some(at) = place {
-      chain.push(at);
-      place = parent(at);
-    }
-    for at in chain.into_iter().rev() {
-      let Some(node) = self.node(at, revision)? else {
-        continue;
-      };
-      let root = self
-        .index
-        .node_revision(node.copy_root())
-        .map_err(|refusal| Failure::of_index(&refusal))?;
-      if youngest
-        .as_ref()
-        .is_none_or(|(kept, _)| root.created_revision() >= *kept)
-      {
-        youngest = Some((root.created_revision(), root.created_path().to_owned()));
-      }
-    }
-    Ok(youngest.filter(|(copied_in, _)| *copied_in != 0))
+    copies::closest_copy(self.index, path, revision).map_err(|refusal| Failure::of_index(&refusal))
   }
 
   /// An unknown command: "Unknown editor command", with no authentication request first.
