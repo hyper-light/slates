@@ -90,3 +90,11 @@ macOS arm64, Mac Studio, debug, 2026-11-19; each run a fresh clone of the pushed
 - The repository test asserts a fold the doubling rule takes by bytes: it holds while the second write's increment
   outweighs the checkpoint at 1 (194 against 155 bytes now, 39 to spare; 41 before part 3, by the layout). A test that
   needs a version folded could ask for the fold rather than lean on the sizes; reported to main, not changed.
+  Changed since (2026-11-19, g307, UI goal 93, on main's ruling): the test writes its root until the rule takes a
+  checkpoint past version 1 (`repository::tests::write_until_folded`), reading the rule's own inputs after each write
+  through `merge_service::fold_inputs`, which `checkpoint_green_when` now reads them through too: while no checkpoint
+  is taken the rule must be waiting on them (the bytes to fold under the held checkpoint's size) and each write must
+  add bytes to fold, so the writes end within that size. A checkpoint or an increment that grows or shrinks now moves
+  how many writes the fold takes, never the test's verdict. A sweep of slates-server's unit and integration tests and
+  slates-client's for any other fold awaited past a held checkpoint found none: the rest hold a reader below the head,
+  wait only for a green's first checkpoint (taken at once, nothing held), or fold over hundreds of 8 KiB versions.

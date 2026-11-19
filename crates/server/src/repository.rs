@@ -1013,8 +1013,9 @@ mod tests {
   }
 
   /// A-603, A-642 (§4.17.1 shared piece 2: each green keeps its own log; the namespace is a log of its own). Do: create a
-  /// repository, write its root twice, branch it at a version it folded and then at its head, retire the branch's name
-  /// and bind it again, write the branch; then write a green no repository holds, and send a bind the guard refuses.
+  /// repository, write its root until the service folds its first version (`write_until_folded`: as many writes as the
+  /// doubling rule's own inputs ask), branch it at that version and then at its head, retire the branch's name and bind
+  /// it again, write the branch; then write a green no repository holds, and send a bind the guard refuses.
   /// Expect: each verb moves the names log alone, by each change it makes; each member's version moves its own green's
   /// log alone; the refused branch, the lone green's version and the refused bind move no log of the repository; and no
   /// verb or lone version is an atomic record.
@@ -1034,8 +1035,9 @@ mod tests {
         |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
       assert_eq!(names(state), Some(2), "the root joined and its name bound");
       write(state, root, b"v1", 1);
-      write(state, root, b"v2", 2);
-      assert_eq!((names(state), head_of(state, root)), (Some(2), 2));
+      let mut serial = 1;
+      let root_head = write_until_folded(state, root, &mut serial);
+      assert_eq!((names(state), head_of(state, root)), (Some(2), root_head));
       // No reader held version 1, so the root folded it: a branch there is refused before any record.
       assert!(matches!(
         refusal(branch(state, ("tree", "early", "main"), Some(1))),
@@ -1045,18 +1047,49 @@ mod tests {
       assert_eq!(names(state), Some(4));
       retire_and_bind_again(state, topic);
       assert_eq!(names(state), Some(6));
-      write(state, topic, b"t1", 3);
+      write(state, topic, b"t1", serial + 1);
       assert_eq!(
         (names(state), head_of(state, topic), head_of(state, root)),
-        (Some(6), 1, 2)
+        (Some(6), 1, root_head)
       );
-      assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic);
+      assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic, serial + 2);
       assert_eq!(names(state), Some(6));
       assert_eq!(
         state.db.partition().repositories().atomic_records().count(),
         0
       );
     });
+  }
+
+  /// Writes `green` a version at a time, each through a work destroyed after (`write`), so no reader holds a version,
+  /// until the service's doubling rule takes a checkpoint past the one `green` holds
+  /// (`merge_service::checkpoint_green_when`: a checkpoint is taken once the increments it would fold reach the size of
+  /// the one held). How many writes that takes follows the checkpoint's and the increments' encodings, so it is read
+  /// from the rule's own inputs after each write (`merge_service::fold_inputs`), never fixed here: while no checkpoint
+  /// is taken the rule must be waiting on them, and each write must have added bytes to fold, so the writes end within
+  /// the held checkpoint's size in bytes. Returns the head reached, `serial` left at the last serial used.
+  fn write_until_folded(state: &mut ShardState, green: VolumeId, serial: &mut u32) -> u64 {
+    let id = to_db_volume(green);
+    let held = state.db.partition().green_floor(id);
+    let mut waited_on = 0;
+    loop {
+      *serial += 1;
+      let head = write(state, green, format!("v{serial}").as_bytes(), *serial);
+      if state.db.partition().green_floor(id) > held {
+        return head;
+      }
+      let inputs =
+        crate::merge_service::fold_inputs(state, id).expect("versions past the checkpoint");
+      assert!(
+        inputs.waits(),
+        "the doubling rule's inputs say fold, yet no checkpoint was taken: {inputs:?}"
+      );
+      assert!(
+        inputs.to_fold > waited_on,
+        "a version added no bytes to fold: {inputs:?}"
+      );
+      waited_on = inputs.to_fold;
+    }
   }
 
   /// Retires `topic`'s name and binds it again.
@@ -1082,8 +1115,13 @@ mod tests {
     assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
   }
 
-  /// Writes a green no repository holds, and binds a taken name: the one moves its own log, the other nothing.
-  fn assert_a_lone_green_and_a_refused_bind_move_nothing(state: &mut ShardState, topic: VolumeId) {
+  /// Writes a green no repository holds (its work named by `serial`), and binds a taken name: the one moves its own
+  /// log, the other nothing.
+  fn assert_a_lone_green_and_a_refused_bind_move_nothing(
+    state: &mut ShardState,
+    topic: VolumeId,
+    serial: u32,
+  ) {
     let lone = green_of(ask(
       state,
       &owner(),
@@ -1093,7 +1131,7 @@ mod tests {
         base: None,
       },
     ));
-    write(state, lone, b"l1", 4);
+    write(state, lone, b"l1", serial);
     assert_eq!(state.db.partition().green_head(to_db_volume(lone)), 1);
     let taken = ask(
       state,
