@@ -11,10 +11,9 @@ use super::replaced_node_tests::{
   FILE, HARDLINK, Kind, NAME, SPECIAL, TARGET, Work, accept, classes_on, green, kinds_at,
   removal_of,
 };
-use super::{Green, Increment, Outcome, Rebased};
-use crate::increment::compose_volume_planned;
+use super::{ConflictWindow, Green, Increment, Outcome, Rebased};
+use crate::increment::{DeriveError, VolumeOp, compose_volume_planned};
 use crate::ops_doc::OpKind;
-use crate::special::SpecialNode;
 use crate::verdict::MergeConflictClass;
 
 /// Shape: a second hard link to `TARGET` the tests make.
@@ -424,16 +423,14 @@ fn a_rebase_restates_the_node_a_removed_home_hands_to_its_link() -> Result<(), S
   Ok(())
 }
 
-/// What a green holds at a path of a node's own metadata: its mode, `NAME`'s value and its IPC
-/// node.
-type Metadata = (Option<u32>, Option<Vec<u8>>, Option<SpecialNode>);
+/// What a green holds at a path of a node's own metadata: its mode and `NAME`'s value.
+type Metadata = (Option<u32>, Option<Vec<u8>>);
 
 /// What `green` holds at `path` of a node's own metadata.
 fn metadata_at(green: &Green, path: &str) -> Metadata {
   (
     green.mode(path),
     green.xattr(path, NAME).map(<[u8]>::to_vec),
-    green.special(path),
   )
 }
 
@@ -545,21 +542,57 @@ fn a_rebased_works_next_submit_leaves_its_link_the_nodes_attributes() -> Result<
   Ok(())
 }
 
-/// A-677's sibling (A-646's hand-over: the least surviving link takes an IPC node). Do: rebase at
-/// the head a work that removes the FIFO `SPECIAL`, which `SECOND` names, and one that renames
-/// `FILE` over it; submit the rebased work's next submit beside a twin that submits the work
-/// itself. Expect `SECOND` to hold the FIFO after both: a rebased work's view lists no IPC node, so
-/// its next submit is where the node it holds lands.
+/// The classes of `windows` at `SPECIAL`.
+fn classes_at_the_fifo(windows: &[ConflictWindow]) -> Vec<MergeConflictClass> {
+  windows
+    .iter()
+    .filter(|window| window.path == SPECIAL)
+    .map(|window| window.class)
+    .collect()
+}
+
+/// A-677's sibling (A-646's hand-over of an IPC node; GAPS, the inode-aware namespace journal
+/// owed). Do: rebase at the head a work that removes the FIFO `SPECIAL`, which `SECOND` names, and
+/// compose its restated journal again, as the rebased work's next submit, beside the work's own
+/// declared journal, as the server composes its submit; and rebase a work that renames `FILE` over
+/// the FIFO beside a twin that submits it. Expect the removal restated as the work declared it and
+/// both journals refused alike, `Unsupported` at `SPECIAL` (the deriver does not unlink a name
+/// while a link names its IPC node), and the rename refused alike, a conflict at `SPECIAL`: a work
+/// in the server never seals, submits or rebases either, so a rebased work holds no FIFO its next
+/// submit could lose.
 #[test]
-fn a_rebased_works_next_submit_leaves_its_link_the_ipc_node() -> Result<(), String> {
-  let works: [fn() -> Work; 2] = [removed_fifo, replaced_fifo];
-  for work in works {
-    let (resubmitted, submitted) = resubmitted_beside_submitted(linked_fifo, work, SECOND)?;
-    if resubmitted.2 != submitted.2 || submitted.2.is_none() {
-      return Err(format!(
-        "the next submit left {resubmitted:?}, the work {submitted:?}"
-      ));
-    }
+fn a_rebased_work_is_refused_as_its_own_submit_at_a_linked_fifo() -> Result<(), String> {
+  let rebasing = linked_fifo()?;
+  let head = rebasing.head();
+  let declared = vec![VolumeOp::Unlink {
+    path: SPECIAL.to_owned(),
+  }];
+  let Rebased::Rebased {
+    version, journal, ..
+  } = rebasing.rebase(&removed_fifo().at(head, 4))
+  else {
+    return Err("the removal did not rebase cleanly".to_owned());
+  };
+  let refusal =
+    |ops: &[VolumeOp]| compose_volume_planned(&rebasing.base_for(version, ops), ops).err();
+  let refused = Some(DeriveError::Unsupported(SPECIAL.to_owned()));
+  if journal != declared || refusal(&journal) != refused || refusal(&declared) != refused {
+    return Err(format!(
+      "the removal restated {journal:?}, composed {:?}",
+      refusal(&journal)
+    ));
+  }
+  let renamed = replaced_fifo().at(head, 5);
+  let mut submitting = linked_fifo()?;
+  let (Rebased::Conflict { windows: rebased }, Outcome::Conflict { windows: submitted }) =
+    (rebasing.rebase(&renamed), submitting.submit(&renamed))
+  else {
+    return Err("the rename over the FIFO was not refused by both".to_owned());
+  };
+  if rebased.is_empty() || classes_at_the_fifo(&rebased) != classes_at_the_fifo(&submitted) {
+    return Err(format!(
+      "the rebase's windows {rebased:?}, the submit's {submitted:?}"
+    ));
   }
   Ok(())
 }
