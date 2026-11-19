@@ -715,7 +715,11 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 5 since A-484, which gave each completion record the settled
+/// Format: the regional configuration's layout version: 7 since A-546, which added the members whose settled
+/// neighbourhood certifies their content (a host set, after the settled neighbourhoods). Layout 6 (A-538) gave each
+/// retirement and each completion record a byte saying whether its confirmations certify their content (after its
+/// version). Layout 5 (A-484) gave each
+/// completion record the settled
 /// neighbourhoods its takeover recovered through (a count, then each owner and its settled form) and the hosts that
 /// stayed members through it, after its version and before its confirmed hosts. Layout 4 (A-291's planned move) gave
 /// each moved-object exception the member a move took it from and the cohort its records sit in (a flag, then, when it
@@ -729,7 +733,15 @@ const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
 /// (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was dropped and no retirement is
 /// kept, and A-291's when no object is moved, which only the version tells apart.
 /// Format: the regional layout's version, raised with each change of its fields' meaning (4 since A-291).
-const REGIONAL_LAYOUT: u32 = 5;
+const REGIONAL_LAYOUT: u32 = 7;
+/// Format: the older regional layout a decoder still reads whose takeovers carry their certification byte but whose
+/// settles carry none, 6 (A-538's): its settles are read as uncertified (A-546), so a holder keeps the content of a live
+/// owner's copy judged on them.
+const REGIONAL_LAYOUT_SETTLES_UNCERTIFIED: u32 = 6;
+/// Format: the oldest regional layout a decoder still reads, 5 (A-484's): its retirements and completion records carry
+/// no certification byte, and are read as uncertified (A-538), as its settles are (A-546), so a holder keeps the content
+/// of a stale copy judged on them. Every other layout is refused by name.
+const REGIONAL_LAYOUT_UNCERTIFIED: u32 = 5;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
@@ -751,15 +763,52 @@ fn take_layout(bytes: &[u8], (magic, layout): (u32, u32)) -> Result<&[u8], RaftW
   Ok(rest)
 }
 
+/// Reads a regional configuration's magic and layout version, with whether its takeovers carry their certification byte
+/// (A-538) and whether it lists its certified settles (A-546): both in the current layout, the first alone in layout 6,
+/// neither in layout 5, whose marks are read as uncertified. Any other layout is refused by name, as [`take_layout`]
+/// refuses it.
+fn take_regional_layout(bytes: &[u8]) -> Result<((bool, bool), &[u8]), RaftWireError> {
+  let (arrived, rest) = take_u32(bytes)?;
+  if arrived != REGIONAL_MAGIC {
+    return Err(RaftWireError::ForeignLayout { magic: arrived });
+  }
+  let (layout, rest) = take_u32(rest)?;
+  match layout {
+    REGIONAL_LAYOUT => Ok(((true, true), rest)),
+    REGIONAL_LAYOUT_SETTLES_UNCERTIFIED => Ok(((true, false), rest)),
+    REGIONAL_LAYOUT_UNCERTIFIED => Ok(((false, false), rest)),
+    other => Err(RaftWireError::LayoutVersion { layout: other }),
+  }
+}
+
+/// A takeover's certification (A-538): its flag where the layout carries one (`certifies`), and `false` where it
+/// does not: an older build's confirmations may have come before the content was placed again.
+fn take_certified(bytes: &[u8], certifies: bool) -> Result<(bool, &[u8]), RaftWireError> {
+  if certifies {
+    take_bool(bytes)
+  } else {
+    Ok((false, bytes))
+  }
+}
+
 /// Encodes a [`RegionalConfiguration`] for the wire — a **learner** fetches it from a council voter to catch
 /// up on the committed configuration (§4.8, D-14: the council is a small elected set but the region is large,
 /// so a non-voter member *learns* the configuration rather than voting on it). Little-endian throughout: its magic
 /// and layout version ([`REGIONAL_MAGIC`], [`REGIONAL_LAYOUT`]), then each map as a count then its entries, so two
 /// nodes encode it identically.
 pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> {
+  encode_regional_at(config, REGIONAL_LAYOUT)
+}
+
+/// A regional configuration in the layout `layout`: [`REGIONAL_LAYOUT`] always, but for a test writing an older layout a
+/// decoder still reads ([`REGIONAL_LAYOUT_SETTLES_UNCERTIFIED`], [`REGIONAL_LAYOUT_UNCERTIFIED`]), which carry fewer
+/// certification marks.
+fn encode_regional_at(config: &RegionalConfiguration, layout: u32) -> Vec<u8> {
+  let certifies = layout != REGIONAL_LAYOUT_UNCERTIFIED;
+  let settles_certified = layout == REGIONAL_LAYOUT;
   let mut out = Vec::new();
   put_u32(&mut out, REGIONAL_MAGIC);
-  put_u32(&mut out, REGIONAL_LAYOUT);
+  put_u32(&mut out, layout);
   put_u64(&mut out, config.version);
   put_u32(&mut out, config.quorum.f);
   out.push(u8::from(config.has_mirror));
@@ -790,6 +839,17 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_u64(&mut out, owner.0);
     encode_settled(&mut out, settled);
   }
+  // The members whose settle certifies their content (A-546), in the current layout only.
+  if settles_certified {
+    encode_hosts(
+      &mut out,
+      &config
+        .settle_certified
+        .iter()
+        .copied()
+        .collect::<Vec<HostId>>(),
+    );
+  }
   put_u32(
     &mut out,
     u32::try_from(config.retired.len()).unwrap_or(u32::MAX),
@@ -797,6 +857,10 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
   for (host, retirement) in &config.retired {
     put_u64(&mut out, host.0);
     put_u64(&mut out, retirement.version);
+    // Whether its confirmations certify their content (A-538): a byte, in the current layout only.
+    if certifies {
+      out.push(u8::from(retirement.certified));
+    }
     encode_settled(&mut out, &retirement.settled);
     encode_hosts(&mut out, &retirement.survivors);
     encode_hosts(&mut out, &retirement.confirmed);
@@ -820,7 +884,7 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_bytes(&mut out, &adoption.head);
     put_bytes(&mut out, &adoption.catalog);
   }
-  encode_completed(&mut out, &config.completed);
+  encode_completed(&mut out, &config.completed, certifies);
   put_u32(
     &mut out,
     u32::try_from(config.moved.len()).unwrap_or(u32::MAX),
@@ -841,16 +905,22 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
   out
 }
 
-/// Encodes the completion records: their count, then each host, its version, its recovery neighbourhoods (a count, then
-/// each owner and its settled form), its held hosts and its confirmed hosts (A-309, A-484).
+/// Encodes the completion records: their count, then each host, its version, its certification byte where `certifies`
+/// (the current layout, A-538), its recovery neighbourhoods (a count, then each owner and its settled form), its held
+/// hosts and its confirmed hosts (A-309, A-484).
 fn encode_completed(
   out: &mut Vec<u8>,
   completed: &std::collections::BTreeMap<HostId, CompletedTakeover>,
+  certifies: bool,
 ) {
   put_u32(out, u32::try_from(completed.len()).unwrap_or(u32::MAX));
   for (host, record) in completed {
     put_u64(out, host.0);
     put_u64(out, record.version);
+    // Whether its confirmations certify their content (A-538): a byte, in the current layout only.
+    if certifies {
+      out.push(u8::from(record.certified));
+    }
     // The neighbourhoods the takeover recovered through and the hosts that stayed members through it (A-484), before
     // the confirmed hosts.
     put_u32(
@@ -899,16 +969,19 @@ fn decode_moved(
   Ok((moved, rest))
 }
 
-/// Decodes the completion records (count, then each `(host, version, recovery, held hosts, confirmed hosts)`, the
-/// recovery a count of `(owner, settled)`), bounding every count (A-309, A-484).
+/// Decodes the completion records (count, then each `(host, version, certified, recovery, held hosts, confirmed
+/// hosts)`, the recovery a count of `(owner, settled)`, `certified` a flag where `certifies` and read as false in the
+/// older layout), bounding every count (A-309, A-484, A-538).
 fn decode_completed(
   bytes: &[u8],
+  certifies: bool,
 ) -> Result<(std::collections::BTreeMap<HostId, CompletedTakeover>, &[u8]), RaftWireError> {
   let (count, mut rest) = take_count(bytes)?;
   let mut completed = std::collections::BTreeMap::new();
   for _ in 0..count {
     let (host, tail) = take_u64(rest)?;
     let (version, tail) = take_u64(tail)?;
+    let (certified, tail) = take_certified(tail, certifies)?;
     let (recovery, tail) = decode_settled_map(tail)?;
     let (held, tail) = decode_hosts(tail)?;
     let (confirmed, tail) = decode_hosts(tail)?;
@@ -919,6 +992,7 @@ fn decode_completed(
         confirmed,
         recovery,
         held,
+        certified,
       },
     );
     rest = tail;
@@ -1000,12 +1074,14 @@ fn decode_settled_map(
 /// current)`, the current neighbourhood a presence byte and then its settled form), bounding every count.
 fn decode_retired(
   bytes: &[u8],
+  certifies: bool,
 ) -> Result<(std::collections::BTreeMap<HostId, Retirement>, &[u8]), RaftWireError> {
   let (count, mut rest) = take_count(bytes)?;
   let mut retired = std::collections::BTreeMap::new();
   for _ in 0..count {
     let (host, tail) = take_u64(rest)?;
     let (version, tail) = take_u64(tail)?;
+    let (certified, tail) = take_certified(tail, certifies)?;
     let (settled, tail) = decode_settled(tail)?;
     let (survivors, tail) = decode_hosts(tail)?;
     let (confirmed, tail) = decode_hosts(tail)?;
@@ -1026,6 +1102,7 @@ fn decode_retired(
         survivors,
         confirmed,
         unconfirmed,
+        certified,
       },
     );
     rest = tail;
@@ -1039,7 +1116,7 @@ fn decode_retired(
 /// bytes of another layout are refused by name before any field is read ([`RaftWireError::ForeignLayout`],
 /// [`RaftWireError::LayoutVersion`]).
 pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfiguration, RaftWireError> {
-  let rest = take_layout(bytes, (REGIONAL_MAGIC, REGIONAL_LAYOUT))?;
+  let ((certifies, settles_certified), rest) = take_regional_layout(bytes)?;
   let (version, rest) = take_u64(rest)?;
   let (f, rest) = take_u32(rest)?;
   let (has_mirror, rest) = take_bool(rest)?;
@@ -1048,9 +1125,15 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (epochs, rest) = decode_epochs(rest)?;
   let (domains, rest) = decode_domains(rest)?;
   let (settled, rest) = decode_settled_map(rest)?;
-  let (retired, rest) = decode_retired(rest)?;
+  let (settle_certified, rest) = if settles_certified {
+    let (hosts, rest) = decode_hosts(rest)?;
+    (hosts.into_iter().collect(), rest)
+  } else {
+    (std::collections::BTreeSet::new(), rest)
+  };
+  let (retired, rest) = decode_retired(rest, certifies)?;
   let (adoptions, rest) = decode_adoptions(rest)?;
-  let (completed, rest) = decode_completed(rest)?;
+  let (completed, rest) = decode_completed(rest, certifies)?;
   let (moved, rest) = decode_moved(rest)?;
   let (voters, rest) = decode_hosts(rest)?;
   expect_end(rest)?;
@@ -1068,6 +1151,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     completed,
     moved,
     voters,
+    settle_certified,
   })
 }
 
@@ -2109,6 +2193,67 @@ mod tests {
     );
   }
 
+  /// A-538: a configuration an older build wrote (layout 5) is still read, its takeovers uncertified, and the current
+  /// layout carries each takeover's mark. Do: keep a completion record and a retirement in a configuration, encode it in
+  /// the current layout and in layout 5, and decode each. Expect the current one back whole with both certified, and the
+  /// older one back with every retirement and record uncertified and nothing else changed.
+  #[test]
+  fn a_layout_five_configuration_reads_its_takeovers_as_uncertified() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3), HostId(4)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    config.take_over(A, 3);
+    for survivor in config.survivors_of(A) {
+      config.confirm(A, survivor);
+    }
+    config.take_over(B, 3);
+    assert!(
+      config.completed.contains_key(&A) && config.retired.contains_key(&B),
+      "a completion record and a kept retirement"
+    );
+    assert!(
+      config.certifies_content(A) && config.certifies_content(B),
+      "this build certifies both"
+    );
+    expect_round_trip(&config, "the current layout carries the marks");
+    let older =
+      decode_regional_configuration(&encode_regional_at(&config, REGIONAL_LAYOUT_UNCERTIFIED));
+    let mut expected = config.clone();
+    for retirement in expected.retired.values_mut() {
+      retirement.certified = false;
+    }
+    for record in expected.completed.values_mut() {
+      record.certified = false;
+    }
+    expected.settle_certified.clear();
+    assert_eq!(
+      older,
+      Ok(expected),
+      "layout 5 is read with every takeover and settle uncertified and nothing else changed"
+    );
+    // Layout 6 (A-538's) carries the takeovers' marks but no settle's (A-546).
+    let six = decode_regional_configuration(&encode_regional_at(
+      &config,
+      REGIONAL_LAYOUT_SETTLES_UNCERTIFIED,
+    ));
+    let mut expected_six = config.clone();
+    expected_six.settle_certified.clear();
+    assert_eq!(
+      six,
+      Ok(expected_six),
+      "layout 6 is read with its takeovers' marks and every settle uncertified"
+    );
+    assert!(
+      !config.settle_certified.is_empty(),
+      "the current layout carries the settles' marks"
+    );
+  }
+
   /// A configuration whose moved-object count lies — more exceptions than the bytes back — is refused before
   /// allocating, and one cut short inside an exception is refused as truncated.
   #[test]
@@ -2261,10 +2406,10 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x05\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x07\x00\x00\x00".as_slice()),
         Some(b"RTCF\x02\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 5 since A-484, which gave each completion record its recovery neighbourhoods and the hosts held through it (4 since A-291, 3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 7 since A-546, which lists the members whose settle certifies their content (6 since A-538, 5 since A-484, 4 since A-291, 3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));

@@ -3629,6 +3629,7 @@ impl Daemon {
           principal: record.owner.clone(),
           rights: verbs::rights_of(&record, &record.owner),
           token,
+          mount: None,
         },
       };
       // One durable transaction, as the verb path writes it (`Db::begin` … `commit`, AC-2.3): the
@@ -4505,6 +4506,8 @@ async fn init_shard(
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     learned_fuse: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    fuse_helpers: crate::helper_runs::HelperRuns::default(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
@@ -5771,7 +5774,7 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
   let owed = rebuild_remote_works(origin, shards).await;
   if owed > 0 {
     slates_machine::log_line!(
-      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept"
+      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept, answering Unpublished, and asked for again as clients are let in"
     );
   }
   drop_pending_creations(origin, shards).await;
@@ -5789,8 +5792,8 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
 /// (`verbs::unbuilt_works`), and the install ends the work's record there (`verbs::install_replayed_work`), so a
 /// second ask behind a first that ran finds what the first left. Taken, one lost answer left every work of that shard
 /// unbuilt for the daemon's life: unserved, every change it acknowledged out of reach, and its floor holding its green's
-/// checkpoint at its base. A work whose asks went unanswered twice keeps its record and stays unbuilt until the daemon's
-/// next start replays it from its log (a retry after admission is owed, GAPS). Returns how many works were left so.
+/// checkpoint at its base. A work whose asks went unanswered twice keeps its record, answers `Unpublished`, and is asked
+/// for again as clients are let in ([`ask_again_for_unbuilt_works`], A-533). Returns how many works were left so.
 async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) -> usize {
   let mut owed = 0usize;
   for shard in shards.iter().copied() {
@@ -5844,6 +5847,26 @@ async fn rebuild_remote_work(
   })
   .await
   .is_some()
+}
+
+/// Format: the refusal-ledger name of a shard the retry of unbuilt works could not reach ([`ask_again_for_unbuilt_works`]):
+/// the shard gone, or the carrier refusing the message.
+const UNBUILT_ASK_REFUSED: &str = "merge.work_unbuilt_ask_refused";
+
+/// As clients are let in (A-533): tells every shard to ask its works still recorded unbuilt of their greens' owners
+/// again (`verbs::ask_owners_to_replay`), by a message each runs when it next runs. A work whose rebuild asks went
+/// unanswered twice at recovery is so rebuilt when its shard and its green's owner run again, each run the event, and
+/// answers `Unpublished` meanwhile; nothing waits, so the admission is not held, and no timer runs. A shard with no such
+/// work does nothing.
+fn ask_again_for_unbuilt_works(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    crate::xshard::run_on_waiting(
+      origin,
+      shard.0,
+      crate::verbs::ask_owners_to_replay,
+      UNBUILT_ASK_REFUSED,
+    );
+  }
 }
 
 /// Asks `shard` to run `work` in its own time, and once more when no answer came back (A-513, as A-505 asks a map's
@@ -6146,6 +6169,7 @@ async fn control_loop(
   // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
   // green's owner, and only then is every floor compared with the work it holds for (A-247).
   recover_works_across_partitions(control, &shards).await;
+  ask_again_for_unbuilt_works(control, &shards);
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the
@@ -6739,7 +6763,7 @@ mod limits {
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_first, test_profile,
+  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -6985,6 +7009,17 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
+      .expect("the observation completed")
+  }
+
+  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  pub(crate) fn observe_at<T: Send + 'static>(
+    daemon: &super::Daemon,
+    partition: usize,
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    daemon
+      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 
@@ -9437,12 +9472,14 @@ mod tests {
     (departed, volume, manifest)
   }
 
-  /// A-335, red before it (the bug record named in [`hold_a_head_naming_this_holder`]): a holder outside the
-  /// successor's placement keeps the copy whose content its head names it for, when the successor confirms and when the
-  /// takeover completes. Do: hold such a head and its content (the fixture); take the departed member over and install;
-  /// have the volume's successor alone confirm its share and install; then every other survivor, so the takeover
-  /// completes, and install again. Expect the head and the content held after both installs, each counted
-  /// `fleet.takeover.kept_holding_content`, and nothing reclaimed. A successor confirms once it adopted the head
+  /// A-335, red before it (the bug record named in [`hold_a_head_naming_this_holder`]), and A-538's uncertified case: a
+  /// holder outside the successor's placement keeps the copy whose content its head names it for, when the successor
+  /// confirms and when the takeover completes, where the takeover is uncertified (read from a configuration an older
+  /// build wrote, layout 5, whose successors confirmed before placing the content again). Do: hold such a head and its
+  /// content (the fixture); take the departed member over and install; have the volume's successor alone confirm its
+  /// share, read the takeover as uncertified, and install; then every other survivor, so the takeover completes, read
+  /// it as uncertified again, and install again. Expect the head and the content held after both installs, each counted
+  /// `fleet.takeover.kept_holding_content`, and nothing reclaimed. Red with an uncertified takeover's content let go. A successor confirms once it adopted the head
   /// register, before its materialization has fetched the content, and it fetches from the head's holders alone
   /// (`fleet::fetch_into_hold`): before, this holder let the head and the content go at the confirmation, so with the
   /// dead owner the head's only other holder the successor could fetch from nobody, and one failure lost the volume.
@@ -9473,6 +9510,7 @@ mod tests {
         departed,
         successor,
       }));
+      adopt_uncertified(state, departed);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let after_one = holds(state);
@@ -9490,6 +9528,7 @@ mod tests {
           .contains_key(&departed),
         "the takeover completed"
       );
+      adopt_uncertified(state, departed);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
@@ -9502,11 +9541,79 @@ mod tests {
     });
     assert!(
       after_one,
-      "the successor's confirmation leaves the content its head names, which the successor may still fetch"
+      "an uncertified confirmation leaves the content its head names, which the successor may still fetch"
     );
     assert!(after_all, "and so does the completed takeover");
     assert_eq!(kept, 2, "each install counts the copy kept for its content");
     assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
+  /// Gives the audit shard's council a learned view of its configuration in which `departed`'s takeover is
+  /// uncertified, as a configuration an older build wrote (regional layout 5) is read (A-538). The next proposal's fold
+  /// discards it, so a test adopts it again after each.
+  fn adopt_uncertified(
+    state: &mut crate::state::ShardState,
+    departed: slates_db::register::HostId,
+  ) {
+    let mut view = state.council.configuration().clone();
+    if let Some(retirement) = view.retired.get_mut(&departed) {
+      retirement.certified = false;
+    }
+    if let Some(record) = view.completed.get_mut(&departed) {
+      record.certified = false;
+    }
+    view.version = view.version.checked_add(1).unwrap();
+    assert!(state.council.adopt(view), "the uncertified view is newer");
+  }
+
+  /// A-538, red before it: a holder outside the successor's placement lets a stale copy's content go once the
+  /// successor's confirmation certifies its content (it confirms only once it serves the volume from its own placement,
+  /// A-529). Do: hold a head naming this holder and its content (the fixture of
+  /// [`a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`]); take the departed member over and
+  /// install; have the volume's successor confirm its share and install. Expect the head and the content gone at that
+  /// install, counted `fleet.takeover.released_certified` once and `fleet.takeover.reclaimed` once, and nothing kept
+  /// for its content. Before, the holder kept both for good (A-335), since a confirmation said nothing of content.
+  #[test]
+  fn a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation() {
+    let (held, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state
+        .council
+        .configuration()
+        .successor(departed, volume)
+        .expect("the volume ranks a survivor");
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor,
+      }));
+      assert!(
+        state.council.configuration().certifies_content(departed),
+        "this build's takeover certifies its content"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&volume)
+          || state.held_content.holds_manifest(volume, &manifest),
+        [
+          count("fleet.takeover.released_certified"),
+          count("fleet.takeover.reclaimed"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert!(!held, "the stale copy and its content are gone");
+    assert_eq!(
+      counts,
+      [1, 1, 0],
+      "released once, reclaimed once, never kept for its content"
+    );
   }
 
   /// A-335, red before it: a holder that installs a takeover only once it completed keeps the copy whose content its head
@@ -9557,10 +9664,11 @@ mod tests {
   /// each successor placing them away from the audit node. Take the member over and install; have the first successor
   /// alone confirm and install; then every other survivor, so the takeover completes, give the audit node a fourth copy
   /// of the member's (a lagging holder's, still routed to the member) and install again. Expect all three moved to their
-  /// successors at the first install; at the first confirmation the first register let go and the head kept for its
-  /// content; on the completed takeover's record the head kept for its content again, and the second register and the
-  /// fourth copy let go. Counted `fleet.takeover.unasked_covered` five times, `fleet.takeover.reclaimed` three times,
-  /// `fleet.takeover.kept_holding_content` twice and `fleet.takeover.kept_unasked` never. Before A-341 every such copy
+  /// successors at the first install; at the first confirmation the first register let go, and the head too, its content
+  /// released since this build's confirmation certifies the successor's content (A-538); on the completed takeover's
+  /// record the second register and the fourth copy let go. Counted `fleet.takeover.unasked_covered` four times,
+  /// `fleet.takeover.reclaimed` four times, `fleet.takeover.kept_holding_content` never and `fleet.takeover.kept_unasked`
+  /// never. Before A-341 every such copy
   /// was kept for good (A-309), and before A-484 every copy first judged on the record, which kept no neighbourhood to
   /// judge by; the lineage model (`crates/db/tests/lineage_model.rs`) found the history where one let go past tolerance
   /// was the last copy of a record placed at `f + 1`.
@@ -9728,18 +9836,18 @@ mod tests {
     assert!(moved, "every copy moves to its successor at the takeover");
     assert_eq!(
       after_one,
-      (false, true, true),
-      "at the first confirmation the plain register goes, the named head stays for its content, the other waits"
+      (false, false, true),
+      "at the first confirmation the plain register and the named head go, its content released (A-538); the other waits"
     );
     assert_eq!(
       after_all,
-      ((false, true, false), false),
-      "on the completed takeover's record the head stays for its content, the other register and the late copy go"
+      ((false, false, false), false),
+      "on the completed takeover's record the other register and the late copy go"
     );
     assert_eq!(
       counts,
-      [5, 3, 2, 0],
-      "covered five times, reclaimed three times, kept for content twice, never kept unasked"
+      [4, 4, 0, 0],
+      "covered four times, reclaimed four times, never kept for content, never kept unasked"
     );
   }
 
@@ -9952,9 +10060,11 @@ mod tests {
     assert_eq!(counts, [2, 0], "kept unasked twice, never covered");
   }
 
-  /// A-508, red before it: a holder a live owner's neighbourhood settled away from lets the owner's copies go once the
-  /// owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever content a head still names it
-  /// for. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
+  /// A-508, red before it, and A-546's uncertified case: a holder a live owner's neighbourhood settled away from lets the
+  /// owner's copies go once the owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever
+  /// content a head still names it for where the owner's settle is uncertified (read from a configuration an older build
+  /// wrote, layout 6 or before, whose owners settled before their content was placed within the neighbourhood). Each
+  /// install below reads the owner's settle as uncertified. Red with an uncertified settle's content let go. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
   /// and a head naming this holder for content it holds, both of a member's own writing, though it is in none of that
   /// member's neighbourhoods, and install; then take over one of the member's neighbours, give the audit node a third
   /// copy of the member's and install; then have the member settle its new neighbourhood and install. Expect the plain
@@ -10041,6 +10151,7 @@ mod tests {
           archive,
         )
         .expect("the audit shard holds the named head's content");
+      adopt_settle_uncertified(state, owner);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let held = |state: &crate::state::ShardState, object: ObjectId| {
@@ -10050,6 +10161,7 @@ mod tests {
       assert!(state.council.propose(Reconfiguration::TakeOver(neighbour)));
       let generation = state.fleet.configuration().version;
       hold_written_copy(state, (owner, generation), third, b"head".to_vec());
+      adopt_settle_uncertified(state, owner);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let second = held(state, third);
@@ -10064,6 +10176,7 @@ mod tests {
         owner,
         generation: settled_generation,
       }));
+      adopt_settle_uncertified(state, owner);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let third_held = (
@@ -10100,6 +10213,114 @@ mod tests {
       counts,
       [2, 2, 2],
       "released twice, kept outside twice, kept for content twice"
+    );
+  }
+
+  /// Gives the audit shard's council a learned view of its configuration in which `owner`'s settle is uncertified, as a
+  /// configuration an older build wrote (regional layout 6 or before) is read (A-546). The next proposal's fold discards
+  /// it, so a test adopts it again after each.
+  fn adopt_settle_uncertified(
+    state: &mut crate::state::ShardState,
+    owner: slates_db::register::HostId,
+  ) {
+    let mut view = state.council.configuration().clone();
+    view.settle_certified.remove(&owner);
+    view.version = view.version.checked_add(1).unwrap();
+    assert!(state.council.adopt(view), "the uncertified view is newer");
+  }
+
+  /// A-546, red before it: a holder a live owner's neighbourhood settled away from lets go the content a head of the
+  /// owner's named it for, once the owner's settle certifies its content (an owner reports its neighbourhood placed only
+  /// once every volume it owns is served from within it). Do: in a six-member `f = 1` region make the audit node hold,
+  /// though it is in none of a member's neighbourhoods, a head of that member's naming this holder for content it holds,
+  /// and install. Expect the head and its content gone at that install, counted `fleet.settle.released_content` once and
+  /// `fleet.settle.released` once, and nothing kept for its content. Before, the holder kept both for good (A-508).
+  #[test]
+  fn a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go() {
+    let (held, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::RegionalCouncil;
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the owner's and its four others', apart from the next one's.
+      let stride = 8;
+      let (members, owner) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..6).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let owner = *members.get(1)?;
+          let formed = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          (!formed.holds_for(owner, local)).then_some((members, owner))
+        })
+        .expect("a member whose neighbourhoods leave the audit node out");
+      let named = ObjectId::new(owner, 1);
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      assert!(
+        state
+          .council
+          .configuration()
+          .settle_certifies_content(owner),
+        "this build's settle certifies the owner's content"
+      );
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![owner.0, local.0],
+        sealing: None,
+      };
+      hold_written_copy(state, (owner, generation), named, head.to_record_bytes());
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the head's content");
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&named)
+          || state.held_content.holds_manifest(named, &manifest),
+        [
+          count("fleet.settle.released_content"),
+          count("fleet.settle.released"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert!(!held, "the head and its content are gone");
+    assert_eq!(
+      counts,
+      [1, 1, 0],
+      "its content released once, the copy released once, never kept for its content"
     );
   }
 

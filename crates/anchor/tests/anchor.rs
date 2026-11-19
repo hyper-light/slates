@@ -226,13 +226,13 @@ fn oversize_payloads_foreign_identities_and_wrong_lengths_are_refused() {
   ));
 }
 
-/// Shape: the failover SLO the tests' supervisors derive their backoff cap from: a minute, past every backoff a test here
-/// reaches, so each test's backoffs are its failed starts' own lives and their doublings.
-const FAILOVER_SLO_NS: u64 = 60_000_000_000;
+/// Shape: the lease the tests' supervisors derive their backoff cap from (A-525): a minute, past every backoff a test
+/// here reaches, so each test's backoffs are its failed starts' own lives and their doublings.
+const LEASE_NS: u64 = 60_000_000_000;
 
-/// The restart policy every supervisor here runs under: the anchor's derivation over [`FAILOVER_SLO_NS`].
+/// The restart policy every supervisor here runs under: the anchor's derivation over [`LEASE_NS`].
 fn policy() -> RestartPolicy {
-  RestartPolicy::derive(FAILOVER_SLO_NS).get()
+  RestartPolicy::derive(LEASE_NS).get()
 }
 
 /// The child: attaches from the environment, beats `CHILD_BEATS` times, exits with

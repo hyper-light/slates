@@ -2173,8 +2173,8 @@ impl Client {
   }
 
   /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
-  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step bounded by the client's
-  /// reply deadline.
+  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step waiting while the route's
+  /// connection lives (`slates_ipc::route::claim`, A-523).
   #[cfg(target_os = "macos")]
   fn claim_offer(
     &self,
@@ -2185,8 +2185,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Stream, attachment),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| (claimed.descriptor, claimed.resync))
     .map_err(ClientError::Ipc)
@@ -2206,7 +2204,8 @@ impl Client {
   }
 
   /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its descriptor, each step of
-  /// the claim waited for in reply deadlines while the daemon lives, as the map's own reply is (A-186).
+  /// the claim waiting while the route's connection lives, as the map's own reply waits while the daemon does (A-186,
+  /// A-523).
   #[cfg(target_os = "macos")]
   fn claim_map(
     &self,
@@ -2217,8 +2216,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Map, mapping_id),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| claimed.descriptor)
     .map_err(ClientError::Ipc)
@@ -2237,16 +2234,17 @@ impl Client {
 
   /// Receives the descriptor the daemon sent over the control socket for the reply just read (§4.6: a content map,
   /// A-135; a stream end, A-161), the one `ours` recognises by what the reply named. The daemon sends it before the
-  /// ring reply, so it is already waiting; the loop only covers a kernel that makes the socket readable a scheduling
-  /// tick after the ring slot, bounded by the client's existing reply deadline (no new timeout). A delivery for an
-  /// earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never answers a later
-  /// call.
+  /// ring reply, and answers a typed refusal where the send failed, so it is waiting, or the socket turns readable a
+  /// scheduling tick after the ring slot: the loop waits on the socket itself, readable or hung up, with no clock
+  /// (`ClientEnd::wait_delivery`, A-523), and ends `ChannelLost` once the daemon is gone with nothing delivered. Until
+  /// A-523 it yielded until the client's reply deadline (a fixed second) and gave up `DeadlineExceeded` there. A
+  /// delivery for an earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never
+  /// answers a later call.
   #[cfg(unix)]
   fn recv_delivery(
     &self,
     ours: impl Fn(&ControlDelivery) -> bool,
   ) -> Result<ControlDelivery, ClientError> {
-    let start = Instant::now();
     loop {
       if let Some(delivery) = self.end.recv_delivery().map_err(ClientError::Ipc)? {
         if ours(&delivery) {
@@ -2254,10 +2252,10 @@ impl Client {
         }
         continue;
       }
-      if elapsed_ns(start) > self.deadlines.reply_ns {
-        return Err(ClientError::Ipc(IpcError::DeadlineExceeded));
+      if self.end.daemon_gone() {
+        return Err(ClientError::ChannelLost);
       }
-      std::thread::yield_now();
+      self.end.wait_delivery().map_err(ClientError::Ipc)?;
     }
   }
 

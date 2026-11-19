@@ -5358,22 +5358,34 @@ fn slow_candidate_waited(outcomes: &[Outcome], slowed: (Duration, Duration)) -> 
   }
 }
 
-/// Derived: the longest a volume may go unserved before a takeover serves it, the operator's failover SLO (§4.8, "the
-/// operator's bound on how long an object may go unserved"; the daemons' default, `slates_server::config::FAILOVER_SLO_NS`),
-/// counted from the partition's start, detection and the takeover's round included. Before A-351 a deafened owner, which
-/// still probes, kept its holders' promotion gate shut and was taken over after 22.7 and 34.8 s (CI diag run
-/// 44315314779), or not at all.
-const FAILOVER_BOUND: Duration = Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS);
-
-/// Derived: the longest a write sent to a partitioned owner may wait for its answer: the failover SLO from its hold, at
-/// which a verb's reply held for durability is refused `DurabilityPending` (A-354, the total bound of the rule every
-/// transport's held reply is judged by, A-292), plus one liveness budget for the record period that judges it and the
-/// reply's way back to its client. A write held longer was held past what the fleet promises to keep: before A-354 the
-/// deafened owner's write waited 41 to 85 s and the cut-off and muted owners' about 20.5 s, each until the relay healed
-/// (CI diag runs 44302631709 and 44315314779, 2026-11-18).
-const HELD_WRITE_BOUND: Duration = Duration::from_nanos(
-  slates_server::config::FAILOVER_SLO_NS.saturating_add(slates_server::daemon::LIVENESS_BUDGET_NS),
-);
+/// The failover delay the fleet measures now (A-363), the largest any of `instances` reports in its status
+/// (`fleet_failover: total_ns=`): the longest a volume may go unserved before a takeover serves it (§4.8, "the
+/// operator's bound on how long an object may go unserved"), counted from the partition's start, detection and the
+/// takeover's round included; and from a write's hold, the total a reply held for durability waits before it is refused
+/// `DurabilityPending` (A-354, A-375). Read before a flow partitions anyone, so it is what the fleet promised for the
+/// partition to come. Until A-525 both bounds were the operator's ten-second placeholder. Before A-351 a deafened owner,
+/// which still probes, kept its holders' promotion gate shut and was taken over after 22.7 and 34.8 s (CI diag run
+/// 44315314779), or not at all; before A-354 the deafened owner's write waited 41 to 85 s and the cut-off and muted
+/// owners' about 20.5 s, each until the relay healed (CI diag runs 44302631709 and 44315314779, 2026-11-18).
+fn live_failover(instances: &[String]) -> Duration {
+  Duration::from_nanos(
+    instances
+      .iter()
+      .filter_map(|instance| {
+        let (_, status, _) = run(instance, &["status"]);
+        status
+          .lines()
+          .find_map(|line| line.strip_prefix("fleet_failover: "))
+          .and_then(|line| {
+            line
+              .split_whitespace()
+              .find_map(|part| part.strip_prefix("total_ns=")?.parse::<u64>().ok())
+          })
+      })
+      .max()
+      .expect("a node of the fleet reports its failover delay"),
+  )
+}
 
 /// How a flow partitions one node mid-stream (goal g229).
 #[derive(Clone, Copy, Debug)]
@@ -5438,6 +5450,10 @@ struct PartitionRun {
   successor_outcomes: Vec<Outcome>,
   /// The reads of the successor's last acknowledged writes, through every survivor and through the old owner.
   probes: Vec<ReadProbe>,
+  /// The failover delay the fleet measured before the partition ([`live_failover`]): the bound on the takeover, and,
+  /// with a liveness budget for the record period that judges it and the reply's way back, on a write held at the old
+  /// owner ([`judge_stale_writes`]).
+  failover: Duration,
 }
 
 /// Sets its flag when dropped, so a stream told to stop by it stops however the code holding it ends: a failed wait that
@@ -5457,8 +5473,9 @@ impl Drop for StopOnDrop<'_> {
 /// survivor, then through the old owner: while the partition lasts when its process runs on (its lease lapsed unrenewed
 /// while it still serves its clients, its peers silent from its side), and the moment it resumes when it was stopped
 /// (its lease lapsed by the clock meanwhile); heal; let the old owner's stream go on. Expect: the volume taken over within
-/// [`FAILOVER_BOUND`]; no write sent to the old owner while it was partitioned acknowledged, and every write to it
-/// answered within [`HELD_WRITE_BOUND`] ([`judge_stale_writes`]); every read refused or answered with the write,
+/// the failover delay the fleet measured before ([`live_failover`]); no write sent to the old owner while it was
+/// partitioned acknowledged, and every write to it answered within that delay and a liveness budget
+/// ([`judge_stale_writes`]); every read refused or answered with the write,
 /// never other bytes and never missing (ReadSafety); every write either owner acknowledged served by the successor
 /// (NoLoss), those made through the old node after the heal included; the successor's first head past every position
 /// durable under the old epoch (Continuity); every copy fenced at or above the successor's epoch; one identity at every
@@ -5513,6 +5530,7 @@ fn partition_owner_mid_stream(
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
   let mut run = PartitionRun::default();
   after_writes(owner, volume, BETWEEN_EVENTS);
+  run.failover = live_failover(&fleet.instances);
   partition.begin(fleet, owner_index);
   run.partitioned_at = began.elapsed();
   let taken = wait_taken_over(&survivors, volume);
@@ -5520,11 +5538,12 @@ fn partition_owner_mid_stream(
     "owner {partition:?} at {:?}; taken over: {taken:?}",
     run.partitioned_at
   ));
+  let failover = run.failover;
   verdict.check(
-    "the volume taken over within the failover SLO",
+    "the volume taken over within the failover delay",
     match taken {
-      Some((_, took)) if took > FAILOVER_BOUND => vec![format!(
-        "taken over {took:?} after the owner was {partition:?}, past {FAILOVER_BOUND:?}"
+      Some((_, took)) if took > failover => vec![format!(
+        "taken over {took:?} after the owner was {partition:?}, past the failover delay {failover:?}"
       )],
       _ => Vec::new(),
     },
@@ -5629,6 +5648,7 @@ fn judge_stale_writes(
   verdict: &mut Verdict,
   outcomes: &[Outcome],
   (partitioned_at, healed_at): (Duration, Duration),
+  held_bound: Duration,
 ) {
   let during: Vec<&Outcome> = outcomes
     .iter()
@@ -5660,8 +5680,8 @@ fn judge_stale_writes(
     "every write to the old owner answered within the held-write bound",
     outcomes
       .iter()
-      .filter(|outcome| outcome.took > HELD_WRITE_BOUND)
-      .map(|outcome| format!("{outcome:?} past {HELD_WRITE_BOUND:?}"))
+      .filter(|outcome| outcome.took > held_bound)
+      .map(|outcome| format!("{outcome:?} past {held_bound:?}"))
       .collect(),
   );
 }
@@ -5682,13 +5702,19 @@ fn judge_partition(
     first_head,
     successor_outcomes,
     probes,
+    failover,
   } = run;
   verdict.note(format!(
     "old owner: {}; successor: {}",
     latency_line(outcomes),
     latency_line(&successor_outcomes)
   ));
-  judge_stale_writes(verdict, outcomes, (partitioned_at, healed_at));
+  // A held reply's total is the failover delay from its hold (A-354, A-375), and a liveness budget more brings the
+  // record period that judges it and the reply's way back to its client.
+  let held_bound = failover.saturating_add(Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+  ));
+  judge_stale_writes(verdict, outcomes, (partitioned_at, healed_at), held_bound);
   verdict.note(format!(
     "reads: {}",
     probes
