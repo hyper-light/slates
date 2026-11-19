@@ -281,12 +281,12 @@ fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) 
   let Child::Dir(src) = src.child else {
     panic!("/src is a directory");
   };
+  // `OsCode::native` builds the code in this platform's numbering (A-539), so it is compared, not matched.
+  let gone = slates_vfs::host::OsCode::native(GONE_ERRNO);
   assert!(
     matches!(
       vol.with_host(host).readdir(store, src),
-      Err(VfsError::BaseUnavailable(Some(
-        slates_vfs::host::OsCode::native(GONE_ERRNO)
-      )))
+      Err(VfsError::BaseUnavailable(Some(code))) if code == gone
     ),
     "listing the gone directory refuses rather than show part of it"
   );

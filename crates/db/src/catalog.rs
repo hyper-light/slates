@@ -221,6 +221,46 @@ pub struct IdentityRecord {
   pub version: u64,
 }
 
+/// What a version-control credential is (§4.13, §4.17.2 "Access"; A-625 part 3): an SSH user key or an HTTP token.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum CredentialKind {
+  /// An SSH user key (RFC 4252 §7): its public key blob as a client sends it, and its algorithm's name, the blob's
+  /// first string (`ssh-ed25519`, `ssh-rsa`, ...), so a later algorithm joins with no change of record.
+  SshKey {
+    /// The key's algorithm, as its blob names it.
+    algorithm: String,
+    /// The public key blob (RFC 4253 §6.6).
+    blob: Vec<u8>,
+  },
+  /// An HTTP token, Basic's password or a bearer token (RFC 7617, RFC 6750): held as its SHA-256 alone, the record's
+  /// id, so the token itself is never kept.
+  HttpToken,
+}
+
+/// A version-control credential a human enrolled for a principal (§4.13: through the CLI's control verbs, never MCP or
+/// an SDK; A-625 part 3). Named by the SHA-256 of what a client presents (an SSH key's blob, OpenSSH's fingerprint; an
+/// HTTP token's bytes), so an edge finds it by one lookup on the partition its id routes to, and a token's bytes are
+/// never held. A record never changes once made: enrolled whole, revoked whole.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CredentialRecord {
+  /// The SHA-256 of what a client presents.
+  pub id: [u8; 32],
+  /// The principal it proves.
+  pub principal: Principal,
+  /// What it is.
+  pub kind: CredentialKind,
+  /// When it stops proving its principal, on the wall clock in nanoseconds since the Unix epoch; none when it never
+  /// does.
+  pub expires_ns: Option<u64>,
+}
+
+impl CredentialRecord {
+  /// Whether it still proves its principal at wall-clock instant `now_ns`: it has no expiry, or its expiry is later.
+  pub fn live_at(&self, now_ns: u64) -> bool {
+    self.expires_ns.is_none_or(|expires_ns| now_ns < expires_ns)
+  }
+}
+
 /// Rights on a volume (§4.13).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rights {
@@ -2039,6 +2079,13 @@ pub struct RepositoryEntry {
   pub names: Vec<NameChange>,
   /// The repository's own state's changes, in order.
   pub state: Vec<StateChange>,
+  /// The objects the push brought to the repository's tool store (§4.17.1 "Durability and residency"; A-662): the
+  /// content identities of the objects its quarantine sealed and the repository did not hold, in the order they were
+  /// admitted, with their bytes and the moves the store committed them with, encoded by the repository's tool and
+  /// opaque here. The register holds them as a version's chain entry holds its work's post-state, for as long as the
+  /// repository lives, so a recovery replays them through the store's own admission and commit. Empty when the entry
+  /// brought none.
+  pub objects: Vec<u8>,
 }
 
 /// A phase root of a repository (§4.17.3 decision 3, A-603): `node` is a root of phase `phase`.
@@ -2068,4 +2115,6 @@ pub struct RegisterRecord {
   pub markers: Vec<Vec<u8>>,
   /// The locks, in path order.
   pub locks: Vec<LockRecord>,
+  /// Each entry's objects (`RepositoryEntry::objects`, A-662), in the order the register received them.
+  pub objects: Vec<Vec<u8>>,
 }

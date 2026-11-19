@@ -52,6 +52,8 @@ Conformance 3 VerifiedSourceExport
 Conformance 4 SimulatedGuestDriver
 Conformance 5 LiveGuestWorkloads
 Conformance 6 SimulatedShardsDevice
+CredentialMaterial 0 SshKey
+CredentialMaterial 1 HttpToken
 DatabaseRefusal 0 Corrupt
 DatabaseRefusal 1 NfsInstanceRegressed
 DatabaseRefusal 2 CheckpointOutOfRange
@@ -351,7 +353,9 @@ ReplyBody 70 Moved
 ReplyBody 71 BaseCaptured
 ReplyBody 72 ArchiveExported
 ReplyBody 73 ArchiveImported
-ReplyBody 74 IdentitiesSet
+ReplyBody 74 CredentialEnrolled
+ReplyBody 75 CredentialRevoked
+ReplyBody 76 IdentitiesSet
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -439,7 +443,9 @@ RequestBody 83 CreateBranch
 RequestBody 84 BindBranch
 RequestBody 85 RetireBranch
 RequestBody 86 SetRepositoryPolicy
-RequestBody 87 SetIdentities
+RequestBody 87 EnrollCredential
+RequestBody 88 RevokeCredential
+RequestBody 89 SetIdentities
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

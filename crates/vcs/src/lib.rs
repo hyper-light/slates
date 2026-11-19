@@ -43,6 +43,10 @@
 //! whole store to a model of plain maps over generated histories of arrivals, commits, seals, merges, forks and
 //! releases, and requires the store empty once everything is released.
 //!
+//! **One matcher besides.** [`wildmatch`] is git's glob, `wildmatch` with `WM_PATHNAME` (A-597), kept here because
+//! this is the crate every version-control server's crate builds on: each one that matches a pattern holds the one
+//! matcher, never a copy (A-671): slates-server's policy now, git's sparse filter next (A-640 part 4).
+//!
 //! **Every bound is the caller's.** The content budget and the window are derived by the owner from its shard's memory
 //! and pages (§4.2, D-6, D-11), and the budget may be derived again as the shard's pressure moves; an index's tail and
 //! its runs' fences are charged against the same budget. Nothing in this crate is a tuning constant: the formats'
@@ -68,6 +72,7 @@ pub mod derived;
 pub mod index;
 pub mod rule;
 pub mod table;
+pub mod wildmatch;
 
 pub use arrival::{
   AdmitRefused, Admitted, Arriving, CommitRefused, Naming, Quarantine, object_payload, object_row,

@@ -82,6 +82,22 @@ pub enum Principal {
   },
 }
 
+/// A version-control credential, as `EnrollCredential` gives it (§4.13, §4.17.2 "Access"; A-625 part 3).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum CredentialMaterial {
+  /// An SSH user key: its public key blob (RFC 4253 §6.6), the bytes a `.pub` line carries base64-encoded.
+  SshKey {
+    /// The blob.
+    blob: Vec<u8>,
+  },
+  /// An HTTP token, Basic's password or a bearer token, by its SHA-256 alone: the token stays with the human the issuer
+  /// showed it to, so it never crosses a channel.
+  HttpToken {
+    /// The token's SHA-256.
+    id: [u8; 32],
+  },
+}
+
 /// Rights on a volume (§4.13 "Access lists"), as a `share` grants them.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rights {
@@ -1227,6 +1243,34 @@ pub enum RequestBody {
     /// else the `default` one, else nothing. Empty for git and Mercurial. Appended.
     hooks_env: Vec<HooksEnvSection>,
   },
+  /// Enroll a version-control credential for `principal` (§4.13: the human surface, proving issuer authority as an
+  /// enrollment does; §4.17.2 "Access"; A-625 part 3): an SSH user key by its blob, or an HTTP token by its SHA-256, so
+  /// the token itself never crosses a channel. It proves `principal` to the HTTP and SSH edges until `expires_ns` on the
+  /// wall clock (nanoseconds since the Unix epoch) when one is given. Served on the partition the credential's id routes
+  /// to. Answered `CredentialEnrolled` with the id; refused `Forbidden` on a consumer's channel, `GrantIssuerUnverified`
+  /// when the proof does not verify, `AlreadyExists` for an id held, `BadRequest` for a key blob that names no
+  /// algorithm, and `TableAtCapacity` past the partition's table bytes. Appended.
+  EnrollCredential {
+    /// The principal it proves.
+    principal: Principal,
+    /// The credential.
+    material: CredentialMaterial,
+    /// When it stops proving `principal` (wall clock, nanoseconds since the Unix epoch); none for never.
+    expires_ns: Option<u64>,
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential-enroll" ‖ the wire encodings
+    /// of principal, material and expires_ns, in that order)`.
+    proof: [u8; 32],
+  },
+  /// Revoke the version-control credential named `id` (§4.13; A-625 part 3): the human surface, proving issuer
+  /// authority. Served on the partition the id routes to. Answered `CredentialRevoked`; refused `Forbidden` on a
+  /// consumer's channel, `GrantIssuerUnverified` when the proof does not verify, and `NotFound` for an id not held.
+  /// Appended.
+  RevokeCredential {
+    /// The credential's id: the SHA-256 of a key's blob or of a token.
+    id: [u8; 32],
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential-revoke" ‖ id)`.
+    proof: [u8; 32],
+  },
   /// Sets a principal's tool identities whole (§4.13; §4.17.1 "A push is a work" item 4; A-664): git's author and
   /// committer and Mercurial's user, which the commits the server makes for the principal carry. Its owner's act on
   /// the control channel, proven by the keyed hash under the launcher's secret (`slates_server::landing::
@@ -2256,6 +2300,8 @@ impl RequestBody {
       | RequestBody::Revoke { .. }
       | RequestBody::SetIdentities { .. }
       | RequestBody::Renew { .. } => None,
+      // A credential is served on the partition its id routes to, never a volume's (A-625 part 3).
+      RequestBody::EnrollCredential { .. } | RequestBody::RevokeCredential { .. } => None,
       // Retired (A-267): refused where it arrives, so routed nowhere.
       RequestBody::Read { .. } => None,
       RequestBody::Share { volume, .. }
@@ -5273,6 +5319,13 @@ pub enum ReplyBody {
     /// The manifest identity of the archive it was made from, verified against the tree: the exported snapshot's.
     manifest: [u8; 32],
   },
+  /// A version-control credential was enrolled (`EnrollCredential`, A-625 part 3). Appended.
+  CredentialEnrolled {
+    /// Its id: the SHA-256 of a key's blob or of a token.
+    id: [u8; 32],
+  },
+  /// A version-control credential was revoked (`RevokeCredential`, A-625 part 3). Appended.
+  CredentialRevoked,
   /// A principal's tool identities were set (`SetIdentities`, A-664): their version now. Appended.
   IdentitiesSet {
     /// The version now.
