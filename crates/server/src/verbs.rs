@@ -11604,14 +11604,13 @@ pub(crate) fn use_attachment(
 /// The attachments ended.
 pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
+  // The lapsed alone, from the partition's index of terms (A-536), never a walk of every attachment.
   let lapsed: Vec<AttachmentRecord> = state
     .db
     .partition()
-    .attachments()
-    .filter(
-      |record| matches!(record.consumer, Consumer::Termed { expires_ns } if expires_ns <= now),
-    )
-    .cloned()
+    .lapsed_terms(now)
+    .into_iter()
+    .filter_map(|id| state.db.partition().attachment(id).cloned())
     .collect();
   let mut ended = 0usize;
   for record in lapsed {

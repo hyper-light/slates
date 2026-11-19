@@ -1,16 +1,16 @@
 //! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536; the
 //! event-driven reaper's pieces 2 and 3): a staging buffer expires a lease after its last use (`crate::staging`), a
-//! status capture at its absolute deadline (`crate::status_pages`), and a volume's write lease at its term (D-16, the
-//! partition's lease wheel). One task a shard, the keeper, sleeps on the wheel until the earliest of them, releases what
+//! status capture at its absolute deadline (`crate::status_pages`), a volume's write lease at its term (D-16, the
+//! partition's lease wheel), and a CLI attachment at its term's lapse (A-230, the partition's index of terms). One task a shard, the keeper, sleeps on the wheel until the earliest of them, releases what
 //! is due then, and sleeps until the next; a deadline set earlier than the one it sleeps for wakes it at once, so it
 //! re-arms. Nothing is scanned on a tick: each pass reads only the due entries of ordered indexes (the staging buffers by
 //! expiry, the seats by their capture's deadline, the lease wheel). Until A-522 and A-536 the reap loop's tick released
 //! each once a liveness window, every client's status capture asked at every tick, and a shard with none woke anyway.
 //!
 //! **Woken by whatever sets an earlier deadline.** The staging verbs and the status verb tell the keeper themselves
-//! ([`noted`], [`capture_set`]). A lease is recorded by many paths (a take, a renewal, a replay), so the partition notes
-//! the earliest lease it entered and every state borrow closes by handing that to the keeper ([`after_borrow`]): one
-//! read of an `Option` a borrow.
+//! ([`noted`], [`capture_set`]). A lease or a term is recorded by many paths (a take, a renewal, a replay), so the
+//! partition notes the earliest it entered and every state borrow closes by handing that to the keeper
+//! ([`after_borrow`]): two reads of an `Option` a borrow.
 //!
 //! **Bounds.** A seat is entered in the capture index once at most: a new capture replaces its entry
 //! (`StatusPages::index`), and a seat that ends takes its entry with it ([`forget_seat`]). Staging buffers are bounded by
@@ -58,6 +58,8 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   // The leases first, at their own clock read: a lease whose holder keeps a live write attachment is renewed rather than
   // released (`verbs::expire_leases`).
   let _acted = crate::verbs::expire_leases(state);
+  // A CLI attachment whose term lapsed ends, within its term of its last use (A-230).
+  let _ended = crate::verbs::expire_lapsed_attachments(state);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
   while let Some(&(at, index, generation)) = state.capture_deadlines.first() {
@@ -74,6 +76,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.staging.next_expiry(),
     state.capture_deadlines.first().map(|(at, ..)| *at),
     state.db.partition_mut().next_lease_expiry(),
+    state.db.partition().next_term_lapse(),
   ]
   .into_iter()
   .flatten()
@@ -86,7 +89,12 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
 /// keeper sleeps for wakes it, so it re-arms (A-536). The keeper's own pass notes the leases it renews, after it armed
 /// for them, so they wake nothing.
 pub(crate) fn after_borrow(state: &mut ShardState) {
-  if let Some(at) = state.db.partition_mut().take_noted_lease() {
+  let partition = state.db.partition_mut();
+  let earliest = [partition.take_noted_lease(), partition.take_noted_term()]
+    .into_iter()
+    .flatten()
+    .min();
+  if let Some(at) = earliest {
     noted(state, at);
   }
 }
@@ -209,22 +217,7 @@ mod tests {
     let daemon = crate::daemon::audit_daemon_of(1);
     let begun = Instant::now();
     let volume = crate::daemon::observe_first(&daemon, |state| {
-      let reply = crate::verbs::dispatch(
-        state,
-        1,
-        &principal(),
-        slates_ipc::protocol::RequestBody::Create {
-          name: "lapsing".to_owned(),
-          size: slates_ipc::protocol::SizeClass::Bounded { limit: 1 << 20 },
-          names: slates_ipc::protocol::NamePolicy::Exact,
-          require_locked: false,
-          base: None,
-        },
-      );
-      let slates_ipc::protocol::ReplyBody::Created { id } = reply else {
-        panic!("the volume was not created: {reply:?}")
-      };
-      let volume = crate::verbs::to_db_volume(id);
+      let volume = crate::verbs::to_db_volume(created(state, "lapsing"));
       let now = state.clock.monotonic_ns();
       state
         .db
@@ -253,6 +246,61 @@ mod tests {
     daemon.stop();
     let released = released.expect("the lease was released within half a liveness window");
     println!("a write lease due in {SOON_NS} ns released {released:?} after it was recorded");
+  }
+
+  /// A volume named `name` that [`principal`] creates on `state`'s shard, through the verb: its id.
+  fn created(state: &mut ShardState, name: &str) -> slates_ipc::protocol::VolumeId {
+    let reply = crate::verbs::dispatch(
+      state,
+      1,
+      &principal(),
+      slates_ipc::protocol::RequestBody::Create {
+        name: name.to_owned(),
+        size: slates_ipc::protocol::SizeClass::Bounded { limit: 1 << 20 },
+        names: slates_ipc::protocol::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::Created { id } = reply else {
+      panic!("the volume was not created: {reply:?}")
+    };
+    id
+  }
+
+  /// A-536 (CLI attachments off the tick). Do: on a one-shard daemon whose failover delay, a CLI attachment's term, is a
+  /// tenth of a liveness window, create a volume and attach it for reading in the CLI's form; look until the attachment
+  /// is gone. Expect: ended within half a window, by the keeper at its term's lapse, found in the partition's index of
+  /// terms. The reap loop's tick, which walked every attachment for a lapsed term once a window, no longer does.
+  #[test]
+  fn a_lapsed_cli_attachment_ends_at_its_term_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = Instant::now();
+    let attachment = crate::daemon::observe_first(&daemon, |state| {
+      state.failover_ns = SOON_NS;
+      let volume = created(state, "termed");
+      let reply = crate::verbs::dispatch(
+        state,
+        1,
+        &principal(),
+        slates_ipc::protocol::RequestBody::Attach {
+          volume,
+          snapshot: None,
+          intent: slates_ipc::protocol::Intent::Read,
+          form: slates_ipc::protocol::AttachRequest::Termed,
+        },
+      );
+      let slates_ipc::protocol::ReplyBody::Attached { attachment, .. } = reply else {
+        panic!("the volume was not attached: {reply:?}")
+      };
+      attachment
+    });
+    let ended = look_until(&daemon, begun, move |state| {
+      state.db.partition().attachment(attachment).is_none()
+    });
+    daemon.stop();
+    let ended = ended.expect("the attachment ended within half a liveness window");
+    println!("a CLI attachment with a {SOON_NS} ns term ended {ended:?} after it was made");
   }
 
   /// Seats a client that never proved its id on `state`'s shard, as an admission does (its watch left out): its seat.

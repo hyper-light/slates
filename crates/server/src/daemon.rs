@@ -4870,11 +4870,11 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the deadlines and the cold work it still owns, at the liveness cadence: lapsed CLI attachments,
-/// destroys and grants, the audit owed, departed hosts' attachments, the pressure hold, base hints and
-/// the idle seal. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's
-/// reaper retires it then (`crate::reap`); nor, since A-522 and A-536, are abandoned staging buffers, status captures
-/// and lapsed write leases, which the shard's keeper releases at their own deadlines (`crate::deadlines`). The jobs left
+/// The shard's tick for the cold work it still owns, at the liveness cadence: destroys and grants, the audit owed,
+/// departed hosts' attachments, held copies, the pressure hold, NFS purges, base hints and the idle seal. Dead clients are
+/// no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper retires it then
+/// (`crate::reap`); nor, since A-522 and A-536, are abandoned staging buffers, status captures, lapsed write leases and
+/// lapsed CLI attachments, which the shard's keeper releases at their own deadlines (`crate::deadlines`). The jobs left
 /// here leave a piece at a time for the events or deadlines that own them, and then the loop and its tick go (the reaper
 /// series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
@@ -4887,8 +4887,6 @@ async fn reap_loop() {
   loop {
     pace(cadence).await;
     state::with_state(|s| {
-      // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
-      let _ = verbs::expire_lapsed_attachments(s);
       // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
