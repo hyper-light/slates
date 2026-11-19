@@ -8,7 +8,11 @@
 //! head identity to `v` by the same keys (the identity is a set hash, `crate::identity`: an entry out, an entry in). The
 //! new green's histories, last-change indexes and change index start empty: by the engine's one history rule every key
 //! has held its value since version 0. It answers every read as a green seeded from a copy of the other's state at `v`
-//! does ([`Green::with_origin`], the copying reference its tests hold it to).
+//! does ([`Green::with_origin`], the copying reference its tests hold it to). A copy the other made after `v` (A-586) is
+//! taken away first, its tree cut from the new green's maps in O(its destination's length) and its entry out of the
+//! identity, with the entry it gave each key that changed after it back in. A copy made at or before `v` is part of the
+//! state the new green starts from: its keys hold their values since version 0 there, and its entry stays in the
+//! identity's sum, which a recount of the new green's own state does not reproduce (its records stay with the other).
 //!
 //! **What it costs.** Let `E` be the change index's entries in `(v, head]`, `c` the paths they name, `L` the longest
 //! such path in bytes, `n` the keys a history map holds and `B` the bytes of the changed files at `v` and at the head.
@@ -37,8 +41,9 @@ use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 use super::{
-  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, dir_entry, file_entry, history_at,
-  link_entry, mode_entry, present_at, relink, special_entry, xattr_entry,
+  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry,
+  history_at, last_version, link_entry, mode_entry, present_at, relink, special_entry,
+  xattr_entry,
 };
 use crate::dims::{Arenas, GreenRelease};
 use crate::identity::{Entry, SetHash};
@@ -54,6 +59,9 @@ enum Revert {
   Symlink(String, Option<String>),
   Hardlink(String, Option<String>),
   Xattr(String, String, Option<Vec<u8>>),
+  /// A copy's tree taken away, made after the version (A-586): applied before every other revert, so the keys set back
+  /// beneath it land where it stood.
+  Cut(String),
 }
 
 /// Why a lineage refused a call.
@@ -185,14 +193,76 @@ impl Green {
   /// histories of the paths the change index names in `(version, head]`; `identity` (this green's at its head) is moved
   /// to `version` by the same keys.
   fn reverts(&self, version: u64, identity: &mut SetHash) -> Vec<Revert> {
-    let mut reverts = Vec::new();
-    for path in self.changed_between(version, self.head()) {
-      self.file_reverts(&path, version, identity, &mut reverts);
-      self.node_reverts(&path, version, identity, &mut reverts);
-      self.link_reverts(&path, version, identity, &mut reverts);
-      self.xattr_reverts(&path, version, identity, &mut reverts);
+    let changed = self.changed_between(version, self.head());
+    let mut reverts = self.copy_reverts(&changed, version, identity);
+    for path in &changed {
+      self.file_reverts(path, version, identity, &mut reverts);
+      self.node_reverts(path, version, identity, &mut reverts);
+      self.link_reverts(path, version, identity, &mut reverts);
+      self.xattr_reverts(path, version, identity, &mut reverts);
+      self.copied_reverts(path, version, identity);
     }
     reverts
+  }
+
+  /// [`Green::reverts`] of the copies made after `version` (A-586), first: each one's tree cut and its entry taken out
+  /// of `identity`, which then no longer stands for the tree's entries. The change index names each copy's destination at
+  /// its version, so this costs the paths it names.
+  fn copy_reverts(&self, changed: &[String], version: u64, identity: &mut SetHash) -> Vec<Revert> {
+    let mut reverts = Vec::new();
+    for dst in changed {
+      let entries = self.copy_entries_after(dst, version);
+      if entries.is_empty() {
+        continue;
+      }
+      for entry in &entries {
+        identity.remove(entry);
+      }
+      reverts.push(Revert::Cut(dst.clone()));
+    }
+    reverts
+  }
+
+  /// [`Green::reverts`] of the entries copies made after `version` gave `path`'s keys that changed after it (A-586): put
+  /// back into `identity`, since each key's own exchange takes out only its head entry, and the copy's entry, taken out,
+  /// stood for the one it gave.
+  fn copied_reverts(&self, path: &str, version: u64, identity: &mut SetHash) {
+    if self.copies_above_after(path, version).is_empty() {
+      return;
+    }
+    for key in self.keys_changed_after(path, version) {
+      for entry in self.copied_entries(&key, version) {
+        identity.add(&entry);
+      }
+    }
+  }
+
+  /// `path`'s keys, in every dimension, with a change of their own after `version`.
+  fn keys_changed_after(&self, path: &str, version: u64) -> Vec<IdentityKey> {
+    let after = |last: Option<u64>| last.is_some_and(|last| last > version);
+    let lasts: [(Option<u64>, fn(String) -> IdentityKey); 6] = [
+      (last_version(self.content_history.get(path)), IdentityKey::File),
+      (last_version(self.special_history.get(path)), IdentityKey::Special),
+      (last_version(self.dir_history.get(path)), IdentityKey::Dir),
+      (last_version(self.mode_history.get(path)), IdentityKey::Mode),
+      (last_version(self.symlink_history.get(path)), IdentityKey::Symlink),
+      (last_version(self.hardlink_history.get(path)), IdentityKey::Hardlink),
+    ];
+    let mut keys: Vec<IdentityKey> = lasts
+      .into_iter()
+      .filter(|(last, _)| after(*last))
+      .map(|(_, key)| key(path.to_owned()))
+      .collect();
+    let from = (path.to_owned(), String::new());
+    keys.extend(
+      self
+        .xattr_history
+        .range(from..)
+        .take_while(|((at, _), _)| at == path)
+        .filter(|(_, history)| after(history.last().map(|(recorded, _)| *recorded)))
+        .map(|((_, name), _)| IdentityKey::Xattr(path.to_owned(), name.clone())),
+    );
+    keys
   }
 
   /// [`Green::reverts`] of `path`'s bytes.
@@ -361,6 +431,16 @@ impl Green {
       }
       Revert::Xattr(path, name, None) => {
         self.xattrs.remove(&path, &name);
+      }
+      Revert::Cut(dst) => {
+        // The reverse map of hard links holds nothing a copy brought: a copy's source holds no link (A-586).
+        self.content.cut_tree(&dst);
+        self.specials.cut_tree(&dst);
+        self.dirs.cut_tree(&dst);
+        self.modes.cut_tree(&dst);
+        self.symlinks.cut_tree(&dst);
+        self.hardlinks.cut_tree(&dst);
+        self.xattrs.cut_tree(&dst);
       }
     }
   }

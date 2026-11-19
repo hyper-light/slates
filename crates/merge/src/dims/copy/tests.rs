@@ -17,9 +17,10 @@ const DESTINATION: &str = "dst";
 /// The source of the cost test's copies.
 const SOURCE: &str = "src";
 
-/// Whether `key` is in `path`'s tree: `path` itself or beneath it.
+/// Whether `key` is in `path`'s tree: `path` itself or beneath it; every key is in the root's.
 fn in_tree(key: &str, path: &str) -> bool {
-  key == path
+  path.is_empty()
+    || key == path
     || key
       .strip_prefix(path)
       .is_some_and(|rest| rest.starts_with('/'))
@@ -27,7 +28,11 @@ fn in_tree(key: &str, path: &str) -> bool {
 
 /// `key`, in `from`'s tree, at the same place in `to`'s.
 fn moved(key: &str, from: &str, to: &str) -> String {
-  format!("{to}{}", key.strip_prefix(from).unwrap())
+  match (from.is_empty(), key.is_empty()) {
+    (true, true) => to.to_owned(),
+    (true, false) => format!("{to}/{key}"),
+    (false, _) => format!("{to}{}", key.strip_prefix(from).unwrap()),
+  }
 }
 
 /// The reference: `from`'s tree copied to `to` key by key, as a map that shares nothing must.
@@ -36,7 +41,7 @@ fn copied_by_hand<V: Clone>(
   from: &str,
   to: &str,
 ) -> Result<Copied, CopyRefused> {
-  if from.is_empty() || to.is_empty() {
+  if to.is_empty() {
     return Err(CopyRefused::Root);
   }
   if model.keys().any(|key| in_tree(key, to)) {
@@ -61,7 +66,7 @@ fn attributes_copied_by_hand(
   from: &str,
   to: &str,
 ) -> Result<Copied, CopyRefused> {
-  if from.is_empty() || to.is_empty() {
+  if to.is_empty() {
     return Err(CopyRefused::Root);
   }
   if model.keys().any(|(path, _)| in_tree(path, to)) {
@@ -127,8 +132,8 @@ fn a_copy_costs_its_paths_never_its_tree() {
   }
 }
 
-/// A-542 (part 1). Do: copy onto a destination that is present, onto one with a key beneath it, from and onto the root,
-/// in each kind of map. Expect: each refused with its reason, and every map exactly as it was.
+/// A-542 (part 1), A-586. Do: copy onto a destination that is present, onto one with a key beneath it, and onto the
+/// root, in each kind of map. Expect: each refused with its reason, and every map exactly as it was.
 #[test]
 fn a_copy_onto_what_is_there_or_the_root_is_refused_and_changes_nothing() {
   let mut modes: Dim<u32> = Dim::default();
@@ -145,8 +150,9 @@ fn a_copy_onto_what_is_there_or_the_root_is_refused_and_changes_nothing() {
   for (from, to, refusal) in [
     ("a", "b", CopyRefused::Occupied),
     ("a", "c", CopyRefused::Occupied),
-    ("", "d", CopyRefused::Root),
+    ("", "a/x", CopyRefused::Occupied),
     ("a", "", CopyRefused::Root),
+    ("", "", CopyRefused::Root),
   ] {
     assert_eq!(modes.copy_tree(from, to), Err(refusal), "{from} to {to}");
     assert_eq!(
@@ -199,6 +205,111 @@ fn a_copy_into_its_own_subtree_copies_the_source_as_it_was() {
   assert_eq!(walked, attribute_model);
 }
 
+/// A-586 (the root's copy: `svn copy ^/ ^/snap`, which a stock client sends, `libsvn_client/copy.c` refusing a copy
+/// into its own child only between working copies). Do: give the root, `a`, `a/b` and `c/d` modes, files and attributes,
+/// then copy the root to `snap` in each map. Expect: every map equal to the reference that copies key by key: every key
+/// beneath `snap`, the root's own mode and attributes at `snap`'s own key and never at a key ending in the separator;
+/// no walk ran and no file's bytes were copied.
+#[test]
+fn a_copy_of_the_root_brings_every_key_and_gives_the_roots_own_to_the_destination() {
+  let mut modes: Dim<u32> = Dim::default();
+  let mut mode_model = BTreeMap::new();
+  let mut files = Files::default();
+  let mut file_model = BTreeMap::new();
+  let mut attributes = Xattrs::default();
+  let mut attribute_model = BTreeMap::new();
+  for (path, value) in [("", 1u8), ("a", 2), ("a/b", 3), ("c/d", 4)] {
+    modes.insert(path, u32::from(value));
+    mode_model.insert(path.to_owned(), u32::from(value));
+    files.insert(path, vec![value]);
+    file_model.insert(path.to_owned(), vec![value]);
+    attributes.insert(path, "p", vec![value]);
+    attribute_model.insert((path.to_owned(), "p".to_owned()), vec![value]);
+  }
+  let visited = (modes.visited(), files.visited(), attributes.visited());
+  let blocks = files.blocks.live();
+  assert_eq!(
+    modes.copy_tree("", "snap"),
+    copied_by_hand(&mut mode_model, "", "snap")
+  );
+  assert_eq!(
+    files.copy_tree("", "snap"),
+    copied_by_hand(&mut file_model, "", "snap")
+  );
+  assert_eq!(
+    attributes.copy_tree("", "snap"),
+    attributes_copied_by_hand(&mut attribute_model, "", "snap")
+  );
+  assert_eq!(
+    (modes.visited(), files.visited(), attributes.visited()),
+    visited,
+    "the root's copy walked a map"
+  );
+  assert_eq!(files.blocks.live(), blocks, "a file's bytes were copied");
+  let walked: BTreeMap<String, u32> = modes.iter().map(|(key, value)| (key, *value)).collect();
+  assert_eq!(walked, mode_model);
+  assert_eq!(walked.get("snap"), Some(&1));
+  assert!(!walked.contains_key("snap/"));
+  let walked: BTreeMap<String, Vec<u8>> = files
+    .iter()
+    .map(|(key, bytes)| (key, bytes.to_vec()))
+    .collect();
+  assert_eq!(walked, file_model);
+  let walked: BTreeMap<(String, String), Vec<u8>> = attributes
+    .iter()
+    .map(|(key, value)| (key, value.clone()))
+    .collect();
+  assert_eq!(walked, attribute_model);
+  assert_eq!(attributes.get("snap", "p"), Some(&vec![1]));
+  assert_eq!(attributes.get("snap/a/b", "p"), Some(&vec![3]));
+  assert!(attributes.of("snap/").next().is_none());
+}
+
+/// A-586 (a green made at a version before a copy takes the copy's tree away). Do: put modes, files and attributes at
+/// `a`, `a/b`, `a/c/d`, `ab` and `b`, then cut `a`'s tree from each map. Expect: `a` and everything beneath it gone,
+/// `ab` and `b` left as they were, no walk ran, and the cut files' blocks let go; then cut the root's tree, and every
+/// map is empty.
+#[test]
+fn a_cut_takes_a_paths_tree_away_and_leaves_its_neighbours() {
+  let mut modes: Dim<u32> = Dim::default();
+  let mut files = Files::default();
+  let mut attributes = Xattrs::default();
+  for (path, value) in [("a", 1u8), ("a/b", 2), ("a/c/d", 3), ("ab", 4), ("b", 5)] {
+    modes.insert(path, u32::from(value));
+    files.insert(path, vec![value]);
+    attributes.insert(path, "p", vec![value]);
+  }
+  let visited = (modes.visited(), files.visited(), attributes.visited());
+  modes.cut_tree("a");
+  files.cut_tree("a");
+  attributes.cut_tree("a");
+  assert_eq!(
+    (modes.visited(), files.visited(), attributes.visited()),
+    visited,
+    "a cut walked a map"
+  );
+  let left: Vec<String> = modes.keys().collect();
+  assert_eq!(left, ["ab", "b"]);
+  let left: Vec<String> = files.keys().collect();
+  assert_eq!(left, ["ab", "b"]);
+  assert_eq!(files.blocks.live(), 2, "the cut files' blocks were kept");
+  let left: Vec<(String, String)> = attributes.iter().map(|(key, _)| key).collect();
+  assert_eq!(
+    left,
+    [
+      ("ab".to_owned(), "p".to_owned()),
+      ("b".to_owned(), "p".to_owned())
+    ]
+  );
+  assert!(!modes.holds_tree("a") && !files.holds_tree("a") && !attributes.holds_tree("a"));
+  assert!(modes.holds_tree("ab") && files.holds_tree("") && attributes.holds_tree("b"));
+  modes.cut_tree("");
+  files.cut_tree("");
+  attributes.cut_tree("");
+  assert_eq!((modes.len(), files.map.len(), attributes.map.len()), (0, 0, 0));
+  assert_eq!(files.blocks.live(), 0);
+}
+
 /// Every path the generated histories name: up to three names deep over three names, one holding a NUL, so a copy
 /// meets prefixes of one another, escaped bytes and paths beneath themselves; the root first, for copies only.
 fn paths() -> Vec<String> {
@@ -247,6 +358,8 @@ struct Census {
   grafted: usize,
   /// Copies into their own source's tree that grafted keys.
   into_themselves: usize,
+  /// Copies of the root's tree that grafted keys (A-586).
+  from_root: usize,
   /// Copies refused as occupied, and as the root.
   occupied: usize,
   root: usize,
@@ -281,8 +394,8 @@ impl Maps {
     let at = |index: usize| paths[index % paths.len()].clone();
     match *step {
       Step::Put { path, value } => {
-        // Puts name a path other than the root, the first of `paths`.
-        let path = paths[1 + path % (paths.len() - 1)].clone();
+        // Puts name any path, the root among them, so a copy of the root carries the root's own key (A-586).
+        let path = at(path);
         self.files.insert(&path, vec![value]);
         self.file_model.insert(path.clone(), vec![value]);
         self.modes.insert(&path, u32::from(value));
@@ -329,6 +442,7 @@ impl Maps {
       Ok(copied) if copied.beneath => {
         census.grafted += 1;
         census.into_themselves += usize::from(in_tree(to, from));
+        census.from_root += usize::from(from.is_empty());
       }
       Err(CopyRefused::Occupied) => census.occupied += 1,
       Err(CopyRefused::Root) => census.root += 1,
@@ -463,6 +577,7 @@ fn every_map_copies_a_tree_as_a_reference_that_copies_each_key() {
   let met = [
     census.grafted,
     census.into_themselves,
+    census.from_root,
     census.occupied,
     census.root,
     census.forked,

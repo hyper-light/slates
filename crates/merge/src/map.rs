@@ -56,7 +56,8 @@ fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
     | OpKind::SetMode
     | OpKind::SetXattr
     | OpKind::RemoveXattr
-    | OpKind::Mknod => None,
+    | OpKind::Mknod
+    | OpKind::Copy => None,
   }
 }
 
