@@ -163,6 +163,12 @@ mod vcs_policy;
 // tests until the servers' push paths start hooks (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_hooks;
+// A hook run as a process of its own over a read-only view of the work, held to `vcs_hooks`' runner (A-622 part 3):
+// Unix alone until its Windows part (a job object, `slates_ipc::win_spawn`). No caller outside tests until the servers'
+// push paths start hooks (their pieces).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod hook_driver;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

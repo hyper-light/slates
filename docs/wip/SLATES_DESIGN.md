@@ -12037,6 +12037,17 @@ is one more version, and the chain itself is never rewritten.
 > rewrites, a removal deletes) judged in order; the first refused is the push's typed refusal (`PushRefusal`: denied by
 > rule n, not listed, not permitted, another tool's name, or a policy its matcher cannot read), naming the change by
 > index. A change no rule speaks to is the owner's alone (A-575), and a rule binds the owner as it binds anyone.
+>
+> **Status (2026-11-19, A-622 part 3: the hook driver, Unix).** `hook_driver::run` runs one configured hook as a process
+> of its own process group over the read-only view the tool's server makes (its working directory, and Mercurial's
+> `HG_PENDING`), with its point's arguments, environment and standard input (A-597), its words one pipe (both streams
+> for git and Mercurial, standard error alone for Subversion). One task drives A-597's runner on events alone: the
+> words readable, standard input writable, the exit through `slates_ipc`'s exit watch, the learned deadline on the
+> shard's wheel, and its client leaving. The hook's exit status is read without reaping it, so its group id stays
+> reserved until the run ends and the group's kill can never reach a group formed under a reused id; the child is
+> always reaped (a run whose task is dropped kills the group and hands the child to a reaper task). The run's lesson
+> goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
+> handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12145,7 +12156,7 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
    learned deadlines and the runner; A-622 part 1 the policy in the repository record and its verb, part 2 the push's
-   check point; the hook driver is owed, A-622's part 3).
+   check point, part 3 the hook driver on Unix; its Windows driver and the push pieces' calls owed).
 
 Each server's pieces follow these, in its own section.
 
@@ -42726,6 +42737,54 @@ Applied in the same change to: §4.17.2 (a status block; piece 5's line), GAPS (
   bounded today by the versions a pack spans and reset by each rebuild. The encoding and the rebuild sliced under the
   shard's budget. One base pack shared by greens that reach alike. Main's runs are filed: `git verify-pack` over the
   sample pack, the double hashing, clippy, `xtask` and the docs.
+
+### A-622 part 3 — The hook driver: a hook run as an owned process of its own group, held to A-597's runner (2026-11-19, g255, UI goal 93; §4.17.1 "Policy" and shared piece 7's rest; after A-622 part 2)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7); GAPS (the §4.17 entry);
+- `crates/server` (`hook_driver.rs`, new, Unix; `vcs_hooks.rs`: the `Learns` trait, `Lesson`, `HookRun::with_bound`;
+  `lib.rs`).
+
+- **Where.** The lint wall keeps host-path symbols (`std::fs`, `std::net` and their platform extensions) to its allowed
+  crates and leaves `std::process` open; the hook driver names none of them (its paths are the policy's program and the
+  view's root, handed to `std::process::Command`), so it lives beside the runner in `slates-server`, its exit watch and
+  its descriptors' waits taken from `slates-ipc` and `slates-rt`.
+- **The launch.** `Command` with the program, the point's arguments, the environment's changes (`EnvValue::ViewRoot`
+  names the view's root), the view's root as the working directory, `process_group(0)`, standard input piped, and the
+  words one pipe (`std::io::pipe`): standard output and standard error both for git and Mercurial, standard error alone
+  for Subversion with standard output to the null device. The command's copies of the pipe's write end are dropped at
+  the spawn, so the words end when the hook and what it started close theirs. Each refusal to start is typed (not found,
+  not permitted, no room, another errno).
+- **The run.** One task: it writes standard input as the non-blocking pipe takes it (a write error ends the input, as
+  git stops feeding a hook that closed its end), reads the words as they arrive (a page a read, the machine's), and
+  otherwise waits on the first of the words readable, the input writable, the exit (`ExitWatch`: `NOTE_EXIT` on macOS,
+  a pidfd on Linux), the runner's deadline on the shard's wheel and the client's future, doing what the runner answers.
+  The client's future is never polled again once it has answered.
+- **No orphan, no stray kill.** The exit's status is read with `waitid(WEXITED | WNOWAIT | WNOHANG)`, leaving the
+  hook's leader unreaped until the run ends: its process-group id stays reserved, so ending what the hook left behind
+  (the runner's `end_leftovers`) kills the hook's own group and never one another process formed under a reused id.
+  The child is reaped before the run returns; a run whose task is dropped first kills the group and hands the child to
+  a reaper task of the shard that waits on its exit watch (counted `hook.reap_handed`), or waits for it at once when no
+  task can start (`hook.reap_waited`). A process the hook moves out of its group escapes the kill; the launcher's
+  namespace (§4.6) is what holds those.
+- **The lesson.** The runner reports a finished run and a cut to a `Learns`: the hook's times themselves (A-597's
+  tests) or a `Lesson` the driver carries across its awaits, since a task cannot hold the shard's times there; the
+  caller teaches the hook's times with it afterwards. The driver takes the bound its caller read before the first
+  await (`HookRun::with_bound`).
+- **Tests** (`cargo test --locked -p slates-server --lib -- hook_driver:: vcs_hooks:: vcs_policy:: wildmatch::
+  repository::`, Mac Studio M3 Ultra, kiln, debug, 2026-11-19: 42 of 42, `cargo fmt --all` applied from the Studio's
+  run). The hook is this test binary re-invoked (`hook_driver::tests::a_hook_role`, its role named by
+  `SLATES_HOOK_ROLE`, its lines tagged since libtest's banner shares its standard output), as `crates/anchor`'s tests
+  re-invoke theirs: a hook that reads its input and reports its arguments, environment and working directory; one
+  refusing with exit 3 at a git point and at a Subversion point (whose words keep standard error alone); one sleeping
+  past a learned bound (timed out at the bound, within a liveness window, the run cut); a first run ended by its client
+  leaving (abandoned, nothing learned); one leaving a sleeping child holding its words (accepted by its own exit, the
+  child gone with its group); one exiting without reading a mebibyte of input; a program that does not exist
+  (unstartable, not found). Red on a mutated copy, each caught by its test: no kill at the runner's kill (the deadline
+  test ran to the test's own bound), no kill of leftovers (the child outlived the run), the client's leaving never seen
+  (the first run never ended).
+- **Owed:** the Windows driver (a job object for the hook's descendants and `slates_ipc::win_spawn`'s handle-list
+  spawn); the launcher's namespace for a hook on Linux (§4.6); the push pieces' calls, each with its view and its tool's
+  words for the outcomes; the hook times' table on the owner shard, one a configured hook.
 
 ### A-616 — ra_svn's reporter, part 1: the commands that begin a report and the report, kept and refused as `svnserve` keeps and refuses them (2026-11-19, g234, UI goal 93; §4.17.4 "4. Reads", the reporter, and piece 7's third part; after A-599)
 Applied in the same change to:

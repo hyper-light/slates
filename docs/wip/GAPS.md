@@ -215,6 +215,11 @@
 > first refused the push's typed `PushRefusal` (denied by rule n, not listed, not permitted, another tool's name, an
 > unreadable rule); unruled changes are the owner's alone. Server lib `vcs_policy::` on the Mac Studio, red first.
 > Owed: the git, Mercurial and Subversion push pieces calling it, each with its tool's words; the hook driver (part 3).
+> **A-622 part 3 (2026-11-19, g255; the hook driver, Unix):** `hook_driver::run` runs a configured hook as a process of
+> its own group over the tool's read-only view, held to A-597's runner on events alone (words, input, exit watch, learned
+> deadline, client), its exit read without reaping so the group's kill stays its own, its child always reaped. Server
+> lib tests 42 of 42 on the Mac Studio with the test binary re-invoked as the hook, red three ways. Owed: the Windows
+> driver (a job object), the Linux launcher's namespace (§4.6), the push pieces' calls, the hook times' table.
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the
