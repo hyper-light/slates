@@ -35229,3 +35229,30 @@ Applied in the same change to: §4.17.4 (new), `research/vcs-servers-subversion.
   the new crate are main's (the run-request queue, 2026-11-18).
 - **Owed.** §4.17.4's pieces 2 to 14, after §4.17.1's shared pieces they need; then main's runs: Subversion's Python
   suite over both URLs, the differential run, and the order-of-magnitude measurements.
+
+### A-529 — A takeover's share is done only once the successor serves each volume it adopted from its own placement (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover", §4.10 "the healer"; the content release signal's first half; A-335, A-276, A-345)
+Applied in the same change to: GAPS (A-335's release entry), `crates/server/src/takeover.rs` (`share_done`,
+`adopted_served`, `served_from_placement`, `adopted_here`) and `crates/server/src/fleet.rs` (`heal_decision`'s adopted
+case, `fleet.heal.adopted_replaced`).
+- **What was there.** A successor confirmed its share once each object it learned was adopted and materialized here
+  (A-345). An adopted volume stays placed where the departed owner's head said (`verbs::materialize_taken_over`), and
+  the head the successor serves names those holders until the healer replaces the placement. So the confirmation said
+  nothing about content: a holder outside the successor's placement had to keep a stale copy's content for good, since
+  a head might still name it (A-335). The healer also left a named member outside the candidates named (A-276).
+- **The rule.** A share is done only when every volume its round adopted is served from this node's own placement:
+  its head snapshot's placement names only this node and the volume's current content candidates. The healer replaces
+  an adopted volume's placement that names a member outside them, where it would otherwise restore it, so the share
+  can finish. A confirmation now certifies that no head the successor serves names a holder outside its placement.
+  An object with no volume here (a catalog, a tombstone, a green), or a volume whose head names no content yet, has
+  nothing to serve.
+- **The cost.** A takeover completes later by the healer's replace of each adopted volume's content, so its retirement
+  stays kept that much longer. Main measures it: time to confirm, before and after.
+- **Tests.** `a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement` (a placement naming the
+  departed owner, one naming a member outside the candidates, and one naming this node and its candidates alone; the
+  share done only with the last) and the healer's decision test with its adopted case. Kiln on the Mac Studio,
+  2026-11-19, debug: `slates-server --lib` `takeover::`, the healer and the holder tests 29 of 29; red once on a
+  mutated copy with the share ignoring the adopted volumes' placement (`[true, true, true]`, every placement done).
+- **Owed.** Holders let a stale copy's content go on such a confirmation or its completion record, under a regional
+  layout bump so a mixed fleet never reads an older build's confirmation as certified. An owner's settle certifies
+  content the same way, and A-508's holders then drop content too. The replace could also run at once for an adopted
+  volume rather than at the healer's cadence.
