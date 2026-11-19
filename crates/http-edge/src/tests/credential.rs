@@ -140,41 +140,45 @@ fn a_repeated_authorization_is_refused_400() {
   assert_eq!(CredentialRefused::Repeated.status(), Status::BAD_REQUEST);
 }
 
-/// A-625: do send Basic over a cleartext connection. Expect it refused, `401`, whatever it names (RFC 7617 §4).
+/// A-686 (main's ruling, 2026-11-19: Basic with the token as the password is taken on the loopback cleartext edge as
+/// over TLS). Do: read RFC 7617 §2's own example on a TLS connection and on a cleartext one, which the server serves on
+/// loopback alone. Expect: the same Basic credential on both.
 #[test]
-fn basic_in_cleartext_is_refused_401() {
-  assert_eq!(
-    read(
-      &["Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="],
-      false
-    ),
-    Err(CredentialRefused::BasicInCleartext)
-  );
-  assert_eq!(
-    CredentialRefused::BasicInCleartext.status(),
-    Status::UNAUTHORIZED
-  );
+fn basic_reads_alike_over_tls_and_on_a_loopback_cleartext_connection() {
+  for secure in [true, false] {
+    assert_eq!(
+      read(
+        &["Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="],
+        secure
+      ),
+      Ok(Some(basic(b"Aladdin", b"open sesame"))),
+      "secure: {secure}"
+    );
+  }
 }
 
-/// A-625: do ask for the challenges over TLS and in cleartext, and with a realm holding a quote and a backslash, and one
-/// holding a control byte. Expect Basic with its charset and Bearer over TLS, Bearer alone in cleartext, the realm a
+/// A-686 (main's ruling, 2026-11-19: Basic's challenge first on every connection, TLS included). Do: ask for the
+/// challenges on a TLS connection and on a cleartext one, then with a realm holding a quote and a backslash, and with
+/// one holding a control byte. Expect: Basic with its charset first and Bearer second on both connections, the realm a
 /// quoted string with its quote and backslash escaped, and the control byte refused.
 #[test]
-fn challenges_name_the_realm_and_offer_basic_over_tls_alone() {
-  assert_eq!(
-    challenges("slates", true),
-    Ok(vec![
-      b"Basic realm=\"slates\", charset=\"UTF-8\"".to_vec(),
-      b"Bearer realm=\"slates\"".to_vec(),
-    ])
-  );
-  assert_eq!(
-    challenges("slates", false),
-    Ok(vec![b"Bearer realm=\"slates\"".to_vec()])
-  );
+fn challenges_offer_basic_first_then_bearer_on_either_connection() {
+  for secure in [true, false] {
+    assert_eq!(
+      challenges("slates", secure),
+      Ok(vec![
+        b"Basic realm=\"slates\", charset=\"UTF-8\"".to_vec(),
+        b"Bearer realm=\"slates\"".to_vec(),
+      ]),
+      "secure: {secure}"
+    );
+  }
   assert_eq!(
     challenges("a\"b\\c", false),
-    Ok(vec![b"Bearer realm=\"a\\\"b\\\\c\"".to_vec()])
+    Ok(vec![
+      b"Basic realm=\"a\\\"b\\\\c\", charset=\"UTF-8\"".to_vec(),
+      b"Bearer realm=\"a\\\"b\\\\c\"".to_vec(),
+    ])
   );
   assert_eq!(challenges("a\nb", true), Err(BadRealm));
 }

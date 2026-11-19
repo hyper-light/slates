@@ -73,6 +73,12 @@ fn identity() -> (EdgeIdentity, CertificateDer<'static>) {
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`.
 fn daemon(identity: EdgeIdentity) -> Daemon {
+  daemon_named(Some(identity)).0
+}
+
+/// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
+/// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
+fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -83,14 +89,20 @@ fn daemon(identity: EdgeIdentity) -> Daemon {
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
   config.vcs_http = Some(VcsHttpConfig {
     address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
-    identity: Some(identity),
+    identity,
   });
-  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance })
-    .expect("the daemon starts");
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: instance.clone(),
+    },
+  )
+  .expect("the daemon starts");
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");
-  daemon
+  (daemon, instance)
 }
 
 /// A git repository's name that routes to [`REPOSITORY`]'s partition, not the listener's.
@@ -531,4 +543,127 @@ fn a_stock_git_push_over_the_daemons_edge_lands_through_the_push_driver() {
   assert_eq!(after, (200, served_advertisement(&main)));
   assert_deletion_prohibited(&deleted);
   assert_eq!(last, after);
+}
+
+/// A plain connection to the edge on loopback `port`, its reads waiting [`PATIENCE_NS`].
+fn cleartext_client(port: u16) -> ClientStream {
+  let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    .expect("the edge's listener takes the connection");
+  socket
+    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .expect("a read timeout");
+  socket
+}
+
+/// The head and the body of the answer to `request`, sent whole on `stream`.
+fn head_and_body(stream: &mut (impl Read + Write), request: &[u8]) -> (String, Vec<u8>) {
+  stream.write_all(request).expect("the request is sent");
+  let mut head = Vec::new();
+  while !head.ends_with(b"\r\n\r\n") {
+    head.extend(line_of(stream));
+  }
+  let head = String::from_utf8_lossy(&head).into_owned();
+  let body = body_of(stream, &head);
+  (head, body)
+}
+
+/// The values of `head`'s `WWW-Authenticate` fields, in the order its answer gives them.
+fn challenges_in(head: &str) -> Vec<String> {
+  head
+    .lines()
+    .filter_map(|line| {
+      let (name, value) = line.split_once(':')?;
+      name
+        .eq_ignore_ascii_case("WWW-Authenticate")
+        .then(|| value.trim().to_owned())
+    })
+    .collect()
+}
+
+/// The status the answer `head` heads names, if its status line names one.
+fn status_in(head: &str) -> Option<u16> {
+  head.split(' ').nth(1)?.parse().ok()
+}
+
+/// The status and the challenges of the answer `head` heads.
+fn status_and_challenges(head: &str) -> (Option<u16>, Vec<String>) {
+  (status_in(head), challenges_in(head))
+}
+
+/// The status and the challenges an edge whose realm names `instance` answers a request with no credentials: `401`,
+/// Basic's challenge with its charset first and Bearer's second (A-686).
+fn challenged(instance: &str) -> (Option<u16>, Vec<String>) {
+  (
+    Some(401),
+    vec![
+      format!("Basic realm=\"slates {instance}\", charset=\"UTF-8\""),
+      format!("Bearer realm=\"slates {instance}\""),
+    ],
+  )
+}
+
+/// Format: a request for a git repository's refs that carries no credentials.
+const BARE_REQUEST: &[u8] =
+  b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+/// A-686 (main's ruling, 2026-11-19: Basic's challenge first on every connection, TLS included). Do: start a daemon
+/// whose edge serves loopback TLS and ask it for a repository's refs with no credentials; then one whose edge serves
+/// loopback cleartext (no identity) and ask it the same. Expect: both answer `401` with two challenges, Basic's with
+/// its charset first and Bearer's second, each naming its daemon's realm (`slates <instance>`), so stock Mercurial 7.2,
+/// whose urllib reads the first challenge alone, reads Basic from either edge.
+#[test]
+fn a_daemons_edge_challenges_basic_first_then_bearer_over_tls_and_in_cleartext() {
+  let (identity, certificate) = identity();
+  let (daemon, over_tls) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let (tls_head, _) = head_and_body(&mut tls_client(port, &certificate), BARE_REQUEST);
+  daemon.stop();
+  let (daemon, in_cleartext) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let (cleartext_head, _) = head_and_body(&mut cleartext_client(port), BARE_REQUEST);
+  daemon.stop();
+  assert_eq!(
+    (
+      status_and_challenges(&tls_head),
+      status_and_challenges(&cleartext_head)
+    ),
+    (challenged(&over_tls), challenged(&in_cleartext))
+  );
+}
+
+/// A-686 (main's ruling, 2026-11-19: Basic with the token as the password is taken on the loopback cleartext edge as
+/// over TLS). Do: start a two-shard daemon whose edge serves loopback cleartext (no identity); create a git repository
+/// on the second shard's partition and enroll its owner's token; then, each on a new plain connection, ask for
+/// receive-pack's advertisement with the owner's token as Basic's password (`git:<token>`, the only credential stock
+/// git sends), and with no credentials. Expect: the Basic request proven, moved to the repository's shard and answered
+/// `200` with the push driver's advertisement (the prelude, then no ref), the bare one `401`, and the listener's shard
+/// counting the one move.
+#[test]
+fn basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge() {
+  let (daemon, _) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let advertise = |credentials: &str| {
+    format!(
+      "GET /{name}/info/refs?service=git-receive-pack HTTP/1.1\r\nHost: localhost\r\n\
+       {credentials}\r\n"
+    )
+  };
+  let basic = advertise(&format!("{OWNER_BASIC}\r\n"));
+  let (basic_head, basic_body) = head_and_body(&mut cleartext_client(port), basic.as_bytes());
+  let (bare_head, _) = head_and_body(&mut cleartext_client(port), advertise("").as_bytes());
+  let moved = counts_on(&daemon, LISTENER).moved;
+  daemon.stop();
+  assert_eq!(
+    (
+      status_in(&basic_head),
+      basic_body,
+      status_in(&bare_head),
+      moved
+    ),
+    (Some(200), served_advertisement(&[]), Some(401), 1),
+    "{basic_head}"
+  );
 }

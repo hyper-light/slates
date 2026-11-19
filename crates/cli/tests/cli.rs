@@ -13475,11 +13475,12 @@ fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
 const VCS_HTTP_CLEARTEXT_LINE: &str =
   "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
 
-/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor whose daemon is asked for the version-control HTTP
-/// edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon names; ask that
-/// port for a repository's refs with no credentials. Expect: the daemon names the edge's port before it says it serves,
-/// and the edge answers `401` with a Bearer challenge and no Basic one (Basic's password is taken over TLS alone): the
-/// flag went from the anchor to its daemon, which started the shared edge.
+/// A-625 part 3 (§4.17.2 "Transports" item 1) and A-686. Do: start an anchor whose daemon is asked for the
+/// version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the
+/// daemon names; ask that port for a repository's refs with no credentials. Expect: the daemon names the edge's port
+/// before it says it serves, and the edge answers `401` with Basic's challenge first and Bearer's after it (main's
+/// ruling, 2026-11-19: Basic's password is taken on the loopback edge as over TLS, and stock Mercurial reads the first
+/// challenge alone): the flag went from the anchor to its daemon, which started the shared edge.
 #[test]
 fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   use std::io::{BufRead, Write};
@@ -13527,8 +13528,12 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   let port = port.expect("the daemon named its edge's port before it served");
   let head = bare_request(port, WAIT_FOR).expect("the edge answered");
   assert!(head.starts_with("http/1.1 401 "), "{head}");
-  assert!(head.contains("www-authenticate: bearer realm="), "{head}");
-  assert!(!head.contains("basic"), "{head}");
+  let basic = head.find("www-authenticate: basic realm=");
+  let bearer = head.find("www-authenticate: bearer realm=");
+  assert!(
+    matches!((basic, bearer), (Some(basic), Some(bearer)) if basic < bearer),
+    "{head}"
+  );
 }
 
 /// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
