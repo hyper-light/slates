@@ -474,6 +474,16 @@
 > 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
 > only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
 > the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
+> **A-653 (2026-11-19, g083; partly wanted parts):** A-639's stream reads a kept part only partly wanted entry by entry,
+> its wanted entries alone judged: each kept part keeps its entries' indexes in position order (four bytes an entry,
+> charged), so a stream marks the entries it wants by halving, a window's worth of handles a unit, and a fetch of two
+> files of forty judges two. A `blob:limit` clone takes its small blobs from the kept parts; each object still wanted
+> after the head cover is offered the parts of the version its row says brought it, so a partial clone's later fetch
+> of blobs by id is answered from the fragments. One pack source, g296's `upload::Fragments` (A-640 part 3); this
+> piece's own adapter was dropped for it. Closes A-639's "a part only partly wanted read entry by entry". Owed: the
+> real clone's requests (small.git, A-582's five) answered through `Fragments` with every version encoded and a base
+> pack made, each object once (the next piece; A-640 part 3 landed at f607f424c); a delta search past a window; the
+> fragments' encoding sliced; the marking's red-checks and the other platforms' runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
@@ -753,18 +763,25 @@
 > on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
 > nothing); red first (2 failed), then 278 of 278 on Windows x86_64 (jupiter) against three stores imported a unit a
 > turn equal to one call; the macOS run owed.
+> **Built (A-657 = A-641 part 3):** a push landed on each green's own log: its new heads
+> placed on lines by a maximum matching (only a made or retired line touches the names log), its bookmarks applied as
+> 7.2 applies them and its pushkeys compared and swapped, its phase roots moved in the same entry as 7.2's
+> `advanceboundary`, its race checks handed to A-635's append as positions, a refusal for anything moved answered as
+> 7.2's race; the names `branch:<label>:<number>` and `bookmark:<label>:`, prefix-free; what the repository holds read
+> from its index, and its revisions kept in a fork of the index; held to stock 7.2's pushes on the fixtures' repository
+> rebuilt from its texts (every node 7.2's; replies byte for byte): slates-hg's push tests 36 of 36 and the server's 7
+> of 7 on macOS arm64 (Mac Studio, kiln r47, 2026-11-19); the other platforms owed to main.
 > Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
-> (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
-> refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens the
-> checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
-> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
-> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
-> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
-> it whole);
+> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
+> `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
+> content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
+> 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
+> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
+> the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one
+> position for every phase) measured under concurrent pushes before it is kept;
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -902,7 +919,12 @@
 > Its sixth slice, in part (g297): `log` without merged revisions (a log asking for them refused until built),
 > red-checked ten ways; reads asks A-616's one walk of copy roots; the sixth slice whole, `log`'s merged revisions
 > (nested walks of each merge's runs; `svn log -g` and `svn mergeinfo --show-revs` replayed whole), red-checked
-> thirteen ways. Owed from it: `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
+> replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
+> `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
+> among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
+> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0. Owed
+> from it: `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
@@ -1007,6 +1029,12 @@
 > replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
 > them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
 > A-652's generator.
+> A-616 continued (6) (2026-11-19, g234, a bug g297 found): a version-0 delta's chunks as `svnserve` writes them, a
+> window of new data alone `send_simple_insertion_window`'s two with the stream's header in the first (the writer had
+> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64).
+> Owed: two hand-made sessions from a client announcing neither svndiff version, recorded against `svnserve` 1.15.0
+> (the Mac Studio), and their drives held to its chunks byte for byte; the macOS run. Swept: only the reporter's
+> editor writes `textdelta-chunk`s.
 > A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
 > command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
 > land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
@@ -2661,7 +2689,10 @@
 > passing), fmt clean; the one failure, A-626's copy oracle census meeting no nested copy whose inner copy replaced a
 > tree (0 of 30 nested pairs), is not A-668's, since that oracle bases every work at the head and so never reaches the
 > walk A-668 changed, and it passed alone again (r131, 3 of 37); its owner's, filed. Bug record:
-> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
+> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`. That census failure is fixed
+> (2026-11-19, A-672, g307): one fixed history, run first, meets every case the copy oracle's census counts, whatever
+> the seed, and the generated histories add to the counts (macOS arm64, Mac Studio, kiln r4: `cargo test --locked -p
+> slates-merge --lib copy` 34 passed, the fixed history meeting all eleven cases; the other platforms' runs owed).
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name

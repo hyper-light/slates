@@ -38,6 +38,10 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+# Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
+# and places a push; its index and content store are slates-vcs's.
+slates-hg = { workspace = true }
+slates-vcs = { workspace = true }
 # The version-control credentials (`crate::credentials`, A-625 part 3): an SSH key is enrolled only when SSH's user
 # authentication takes it (A-633's parser), and its id is OpenSSH's fingerprint.
 slates-ssh = { workspace = true }

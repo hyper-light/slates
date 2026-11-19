@@ -13,6 +13,7 @@ relay between the two before it forwards it:
 - Stock sessions run `svn` with an empty configuration directory, non-interactive, no authentication cache.
 - Scripted sessions send the stock client's own greeting and ANONYMOUS answer (taken from the first stock session), then
   exact commands, the server's refusals among them, and close their sending half; the server answers each in turn.
+  `get-file-revs-svndiff0` sends the greeting without `svndiff1` and `accepts-svndiff2`, so its deltas are svndiff 0.
 - A-613 part 2 added revisions 8 to 11 (a 10,000-byte text and its change, an empty text, a name in capitals, a path
   added again after its deletion, a file replaced by a copy, a revision without an author, mergeinfo taken away) and
   the sessions of get-file, list, get-location-segments, get-deleted-rev, log (with merged revisions) and
@@ -501,6 +502,19 @@ SCRIPTED = {
     ],
 }
 
+# Scripted sessions of a client that takes svndiff 0 alone: the stock greeting without `svndiff1` and
+# `accepts-svndiff2`, so `svnserve` writes every delta uncompressed (`svn_ra_svn__svndiff_version`) and the tests hold
+# its strings byte for byte, `send_simple_insertion_window`'s among them.
+SCRIPTED_SVNDIFF0 = {
+    "get-file-revs-svndiff0": [
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,), "true"),
+        command("get-file-revs", b"trunk/big.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/empty.txt", (), ()),
+        command("get-file-revs", b"trunk/a.txt", (11,), (0,)),
+    ],
+}
+
 # Stock sessions: each a list of `svn` argument lists, run one after another.
 STOCK = {
     "svn-info": [["info", URL]],
@@ -550,9 +564,12 @@ def main():
                 greeting = bytes(record["client"])
             written += write_pair(outdir, "%s.%d" % (name, number), record)
     opening = opening_items(greeting)
-    for name, commands in SCRIPTED.items():
+    scripted = [(opening, name, commands) for name, commands in SCRIPTED.items()]
+    plain = svndiff0_opening(opening)
+    scripted += [(plain, name, commands) for name, commands in SCRIPTED_SVNDIFF0.items()]
+    for first, name, commands in scripted:
         peer = socket.create_connection(("127.0.0.1", PORT), timeout=STEP_SECONDS)
-        peer.sendall(opening + b"".join(commands))
+        peer.sendall(first + b"".join(commands))
         peer.shutdown(socket.SHUT_WR)
         while peer.recv(CHUNK):
             pass
@@ -612,6 +629,17 @@ def opening_items(greeting):
     if b"ANONYMOUS" not in opening[first:]:
         sys.exit("the stock client's second item is not ANONYMOUS: %r" % opening)
     return opening
+
+
+def svndiff0_opening(opening):
+    """The stock client's opening with `svndiff1` and `accepts-svndiff2` taken from its greeting's capability words."""
+    first = item_end(opening, 0)
+    greeting = opening[:first]
+    for word in (b" svndiff1 ", b" accepts-svndiff2 "):
+        if greeting.count(word) != 1:
+            sys.exit("the stock greeting does not announce %r once: %r" % (word, greeting))
+        greeting = greeting.replace(word, b" ")
+    return greeting + opening[first:]
 
 
 def write_pair(outdir, stem, record):
