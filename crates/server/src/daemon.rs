@@ -9802,6 +9802,157 @@ mod tests {
     assert_eq!(counts, [2, 0], "kept unasked twice, never covered");
   }
 
+  /// A-508, red before it: a holder a live owner's neighbourhood settled away from lets the owner's copies go once the
+  /// owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever content a head still names it
+  /// for. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
+  /// and a head naming this holder for content it holds, both of a member's own writing, though it is in none of that
+  /// member's neighbourhoods, and install; then take over one of the member's neighbours, give the audit node a third
+  /// copy of the member's and install; then have the member settle its new neighbourhood and install. Expect the plain
+  /// register let go at the first install and the head kept for its content; the third copy kept while the member's
+  /// settled cohort lacks a member, and let go once the member settled; counted `fleet.settle.released` twice,
+  /// `fleet.settle.kept_outside` twice (the head and the third copy at the second install) and
+  /// `fleet.takeover.kept_holding_content` twice. Before, every such copy was kept for good.
+  #[test]
+  fn a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go() {
+    let (first, second, third, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the owner's and its four others', apart from the next one's.
+      let stride = 8;
+      // A member whose neighbourhoods leave the audit node out, before and after one of its neighbours is taken over:
+      // rendezvous decides them from the random ids alone, so search a few regions.
+      let (members, owner, neighbour) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..6).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let owner = *members.get(1)?;
+          let mut dry = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          if dry.holds_for(owner, local) {
+            return None;
+          }
+          let neighbour = dry
+            .neighbourhoods
+            .get(&owner)?
+            .hosts
+            .iter()
+            .copied()
+            .find(|host| *host != owner)?;
+          dry.take_over(neighbour, scatter)?;
+          (!dry.holds_for(owner, local)).then_some((members, owner, neighbour))
+        })
+        .expect("a member whose neighbourhoods leave the audit node out");
+      let (plain, named, third) = (
+        ObjectId::new(owner, 0),
+        ObjectId::new(owner, 1),
+        ObjectId::new(owner, 2),
+      );
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![owner.0, local.0],
+        sealing: None,
+      };
+      hold_written_copy(state, (owner, generation), plain, b"head".to_vec());
+      hold_written_copy(state, (owner, generation), named, head.to_record_bytes());
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the named head's content");
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let held = |state: &crate::state::ShardState, object: ObjectId| {
+        state.holder_records.contains_key(&object)
+      };
+      let first = (held(state, plain), held(state, named));
+      assert!(state.council.propose(Reconfiguration::TakeOver(neighbour)));
+      let generation = state.fleet.configuration().version;
+      hold_written_copy(state, (owner, generation), third, b"head".to_vec());
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let second = held(state, third);
+      let settled_generation = state
+        .council
+        .configuration()
+        .neighbourhoods
+        .get(&owner)
+        .map(|neighbourhood| neighbourhood.generation)
+        .expect("the owner is a member");
+      assert!(state.council.propose(Reconfiguration::Settle {
+        owner,
+        generation: settled_generation,
+      }));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let third_held = (
+        held(state, named) && state.held_content.holds_manifest(named, &manifest),
+        held(state, third),
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        first,
+        second,
+        third_held,
+        [
+          count("fleet.settle.released"),
+          count("fleet.settle.kept_outside"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert_eq!(
+      first,
+      (false, true),
+      "the plain register goes at once, the head stays for its content"
+    );
+    assert!(
+      second,
+      "the third copy stays while the owner's settled cohort lacks a member"
+    );
+    assert_eq!(
+      third,
+      (true, false),
+      "once the owner settled, the head still stays for its content and the third copy goes"
+    );
+    assert_eq!(
+      counts,
+      [2, 2, 2],
+      "released twice, kept outside twice, kept for content twice"
+    );
+  }
+
   /// Measurement (not a gate): the condemnation cost — slates' own takeover work per retired-host object —
   /// for the detection-budget F decision (`docs/wip/fleet-under-load.md` Part 6). The takeover is one batched,
   /// paged phase-one round per retired host (§4.8 "Promotion and takeover", `crate::takeover`), so its work is

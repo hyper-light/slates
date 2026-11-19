@@ -26669,7 +26669,10 @@ model below; each red before its fix):
   (`RegionalConfiguration::within_tolerance`), and is kept past tolerance. Since A-484 the takeover judged is the first
   since the copy was written, its writer's (`Acceptor::written_by`, `RegionalConfiguration::copy_stale`), never the
   last in the line, and it is judged on its completion record too, which keeps the neighbourhoods it recovered through
-  and the hosts that stayed members through it; a settled line's unasked copy is judged the same way.
+  and the hosts that stayed members through it; a settled line's unasked copy is judged the same way. Since A-508 a
+  live owner's copy that the owner wrote, held outside all of its neighbourhoods, goes the same way where the owner's
+  settled cohort for the object is whole and at least `f + 1` wide (`RegionalConfiguration::settled_away`), its content
+  kept while a head still names it.
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -33235,3 +33238,29 @@ Unix sibling built); and:
   a turn that owes a refill sends nothing, and a later turn tells it. `held_turn.rs`'s `1_u64`,
   which the literal check reads as `1_`, main fixed meanwhile with its `Derived:` line (`cf61d54e4`), so this landing
   leaves it.
+
+### A-508 — A live owner's copy held outside all of its neighbourhoods goes once the owner's settled cohort holds it whole (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Neighbourhood changes", "Promotion and takeover"; A-309's owed settle rule, A-335, A-484)
+Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::settled_away`) and `crates/server/src/takeover.rs` (`settle_away`, `let_go_settled_away`,
+`fleet.settle.released`, `fleet.settle.kept_outside`).
+- **What was there.** A holder an owner's neighbourhood moved away from kept that owner's copies for good: no takeover
+  touches a live owner's object, and nothing else let them go (A-309's open item).
+- **The rule.** A copy of a live owner's object that the owner itself wrote (`Acceptor::written_by`, A-484), held by a
+  host in none of the owner's neighbourhoods, goes as a stale copy goes (its content kept while its retention rule keeps
+  any, A-335) where the owner's settled cohort for the object is whole and at least `f + 1` wide. Every record the owner
+  committed is on `f + 1` of its settled cohort (its settle report placed the newest there, and each joint write since
+  placed it there too), so with that cohort whole the copy's record, or a newer one, is on `f + 1` live hosts without
+  it, and no takeover of the owner would ask this holder (a round asks the members of the settled and current
+  neighbourhoods). Kept, counted `fleet.settle.kept_outside`: while a member has left the settled cohort (until the owner
+  settles a whole neighbourhood again), where the settled cohort is narrower than `f + 1` (a bootstrap's, the owner
+  alone: its joint writes' `f + 1` came from a current cohort that may have moved off this holder), and for a moved
+  object. A copy another owner wrote is a takeover's to judge (A-341, A-484); one whose writer this process cannot know
+  is kept.
+- **Tests.** `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` (`crates/server/src/daemon.rs`,
+  red before: every copy kept) and `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`
+  (`crates/db/src/register.rs`). Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `register::` 85 of 85,
+  `slates-server` `takeover::` and the holder tests 25 of 25; red once on a mutated copy with the live-owner branch
+  keeping every copy, as before: the plain register stayed (`(true, true)`).
+- **Owed.** The lineage model's mirror of the rule and its own oracle (a live owner's copy let go only while a record at
+  least as new is on `f + 1` members), main's to compile and run beyond its default cases; the content release signal
+  (a successor confirms once its adopted content is re-placed, a settle certifies content too); the Lineage.tla text.

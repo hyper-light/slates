@@ -201,6 +201,19 @@ const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 /// is judged at. Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_HOLDING_CONTENT: &str = "fleet.takeover.kept_holding_content";
 
+/// The status count under which a holder records a copy of a live owner's object it let go because it is in none of
+/// that owner's neighbourhoods and the owner's settled cohort for the object is whole and at least `f + 1` wide
+/// (`RegionalConfiguration::settled_away`, A-508): the copy's record, or a newer one, is on `f + 1` live hosts without it,
+/// and no takeover of the owner would ask this holder. A neighbourhood the owner settled away from kept such copies for
+/// good before. Format: a refusal name in the daemon's status report.
+const SETTLE_RELEASED: &str = "fleet.settle.released";
+
+/// The status count under which a holder records a copy of a live owner's object it keeps though it is in none of that
+/// owner's neighbourhoods, because the owner's settled cohort for the object is not whole (a member left it and the
+/// owner has not settled a new neighbourhood), is narrower than `f + 1` (a bootstrap's), or the object moved (A-508).
+/// Counted at each install that judges it. Format: a refusal name in the daemon's status report.
+const SETTLE_KEPT_OUTSIDE: &str = "fleet.settle.kept_outside";
+
 /// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
 /// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
 /// current, answered first, and the newest record any of them held was adopted. Before A-309 such an object was counted
@@ -478,6 +491,8 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309), unless the
 ///   first takeover since the copy was written, its writer's, recovered the object within tolerance, judged on that
 ///   takeover's kept retirement or its completion record, when it goes the same way (A-341, A-484);
+/// - a copy of a live owner's object that the owner wrote, held outside all of the owner's neighbourhoods, goes the same
+///   way where the owner's settled cohort for it is whole and at least `f + 1` wide ([`settle_away`], A-508);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
 #[cfg(test)]
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
@@ -523,7 +538,7 @@ fn resolve_by_route(
         let_go_stale(state, object);
       }
       Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
-      Confirmation::None => {}
+      Confirmation::None => settle_away(state, regional, object, owner, local),
     }
     return;
   }
@@ -667,6 +682,47 @@ fn unasked_copy_stale(
     .get(&object)
     .and_then(|acceptor| acceptor.written_by())
     .is_some_and(|writer| regional.copy_stale(writer, object))
+}
+
+/// Judges this holder's copy of `object`, routed to its live owner `owner`, when the owner wrote it
+/// (`Acceptor::written_by`) and this holder is in none of the owner's neighbourhoods (A-508): an owner whose
+/// neighbourhood settled away from this holder left the copy here, and nothing else would ever let it go. It goes as a
+/// stale copy goes ([`let_go_settled_away`]) where the owner's settled cohort for the object is whole and at least
+/// `f + 1` wide (`RegionalConfiguration::settled_away`), and is kept, counted [`SETTLE_KEPT_OUTSIDE`], where it is not. A
+/// copy another owner wrote is a takeover's to judge, and one whose writer this process cannot know is kept, as before.
+fn settle_away(
+  state: &mut ShardState,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+  owner: HostId,
+  local: HostId,
+) {
+  let written_by_owner = state
+    .holder_records
+    .get(&object)
+    .is_some_and(|acceptor| acceptor.written_by() == Some(owner));
+  if !written_by_owner || regional.holds_for(owner, local) {
+    return;
+  }
+  if regional.settled_away(owner, local, object) {
+    let_go_settled_away(state, object);
+  } else {
+    state.count(SETTLE_KEPT_OUTSIDE, 1);
+  }
+}
+
+/// Lets go a copy a live owner's neighbourhood settled away from (A-508) as a stale one goes ([`let_go_stale`]): kept
+/// whole, counted [`TAKEOVER_KEPT_HOLDING_CONTENT`], while its retention rule keeps content for it, since the owner's
+/// head may still name this holder for its content and the healer leaves such a named holder be (A-335, A-276's open
+/// item); dropped otherwise, counted [`SETTLE_RELEASED`].
+fn let_go_settled_away(state: &mut ShardState, object: ObjectId) {
+  crate::content_retention::retain_object(state, object);
+  if state.held_content.newest_placed(object).is_some() {
+    state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
+    return;
+  }
+  drop_copy(state, object);
+  state.count(SETTLE_RELEASED, 1);
 }
 
 /// Forgets `object`'s owner in this shard's routing and in every other shard's: the end [`track_owner_on_every_shard`]

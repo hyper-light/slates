@@ -2226,6 +2226,13 @@
 >   (`crates/server/src/verbs.rs`); the AC-8.3 fleet test holds it `None` within tolerance, and the store-destroyed flow
 >   holds the report to the successor's own counts (the supervisor's run). Still Ada's (Decisions): whether a volume
 >   recovered past tolerance also refuses writes until an operator acknowledges it.
+> - **Fixed for registers (A-508, g250, 2026-11-19): a neighbourhood an owner settled away from let go of nothing.** A
+>   live owner's copy that the owner wrote, held outside all of its neighbourhoods, goes where the owner's settled
+>   cohort for the object is whole and at least `f + 1` wide (`RegionalConfiguration::settled_away`,
+>   `fleet.settle.released`; kept and counted `fleet.settle.kept_outside` otherwise), its content kept while a head
+>   names it. Tests: `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` (red before) and
+>   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. Owed: the lineage model's mirror and its
+>   oracle; the content release below.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
