@@ -1303,6 +1303,29 @@ impl Effect {
     }
   }
 
+  /// The homes this effect moves a node away from or removes one at (A-646's node model; A-663): a rename's source, the
+  /// file its destination held, and a removed file or IPC node.
+  fn unhomes(&self) -> [Option<&str>; 2] {
+    match self {
+      Effect::SetContent(dst, _, _, ContentSource::Copied(from, _)) => {
+        [Some(from.as_str()), Some(dst.as_str())]
+      }
+      Effect::RemoveContent(path) | Effect::RemoveSpecial(path) => [Some(path.as_str()), None],
+      _ => [None, None],
+    }
+  }
+
+  /// The name this effect frees for another node: a removal of what stands there.
+  fn frees(&self) -> Option<&str> {
+    match self {
+      Effect::RemoveContent(path)
+      | Effect::RemoveSpecial(path)
+      | Effect::RemoveSymlink(path)
+      | Effect::RemoveHardlink(path) => Some(path),
+      _ => None,
+    }
+  }
+
   fn identity_key(&self) -> IdentityKey {
     match self {
       Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
@@ -4749,14 +4772,20 @@ impl Green {
   /// Restates the accepted effects of a clean rebase as the work's changes over the head and its
   /// journal: each content effect's file, kept only where it ends different from the head's; the
   /// journal is the effects as declared operations in head coordinates (a content op keeps its mapped
-  /// range, a file new to the head is created first). The green is not touched.
+  /// range, a file new to the head is created first), in the order a volume with real inodes replays
+  /// them ([`in_replay_order`], A-663): each hard link where the node it names still stands at the name
+  /// it names it by, and one made where the head holds another after that one's removal. The green is
+  /// not touched.
   fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
     use crate::increment::VolumeOp;
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     // The sources of the renames restated: each one's removal is the rename's, not an unlink of its own.
     let mut moved_from: BTreeSet<String> = BTreeSet::new();
-    for effect in effects {
+    // The head's links the effects remove themselves (a link's rename over one): a link made at such a name follows
+    // that removal and needs none of its own.
+    let removed_links = removed_links(&effects);
+    for effect in in_replay_order(effects) {
       match effect {
         Effect::Special(path, node) => {
           if self.specials.contains_key(&path) {
@@ -4804,7 +4833,14 @@ impl Green {
         Effect::RemoveSymlink(path) | Effect::RemoveHardlink(path) => {
           journal.push(VolumeOp::Unlink { path });
         }
-        Effect::Hardlink(path, target) => journal.push(VolumeOp::Link { path, target }),
+        Effect::Hardlink(path, target) => {
+          // A link made where the head holds another replaces it: the old link goes first, since a volume refuses a
+          // name already held, and so does the deriver composing the journal again (`LinkOverExisting`; A-663).
+          if self.hardlinks.contains_key(&path) && !removed_links.contains(&path) {
+            journal.push(VolumeOp::Unlink { path: path.clone() });
+          }
+          journal.push(VolumeOp::Link { path, target });
+        }
         Effect::SetXattr(path, name, value) => {
           journal.push(VolumeOp::SetXattr { path, name, value });
         }
@@ -4822,6 +4858,74 @@ impl Green {
       journal,
     }
   }
+}
+
+/// A version's effects in the order a volume with real inodes replays them (A-663; §4.16 "Rebase, the only corrective
+/// path"). A hard link names the node at its target when it is made (A-646), so a restated link must meet that node at
+/// the name it names it by: each link moves to just before the first effect that moves its node away from that name or
+/// removes it there (a rename from it or over it, a removal), when one comes before it ([`link_places`]). Every other
+/// effect keeps the verdict's order, and so does a link nothing moves, which comes after the effect that made its node.
+/// The verdict's order put every link after the renames and removals, so `ln g l; mv f g` restated put `l` on `f`'s
+/// file, and a link to a node the work renamed or removed named an emptied name.
+fn in_replay_order(effects: Vec<Effect>) -> Vec<Effect> {
+  let places = link_places(&effects);
+  let mut before: BTreeMap<usize, Vec<Effect>> = BTreeMap::new();
+  let mut kept = Vec::with_capacity(effects.len());
+  for (index, effect) in effects.into_iter().enumerate() {
+    match places.get(&index) {
+      Some(&place) => before.entry(place).or_default().push(effect),
+      None => kept.push((index, effect)),
+    }
+  }
+  let mut ordered = Vec::with_capacity(kept.len());
+  for (index, effect) in kept {
+    ordered.extend(before.remove(&index).into_iter().flatten());
+    ordered.push(effect);
+  }
+  // A link's place is a kept effect's, since a link never moves a node, so nothing is left here; were anything, it
+  // would keep its order rather than be lost.
+  ordered.extend(before.into_values().flatten());
+  ordered
+}
+
+/// Where [`in_replay_order`] restates each hard link, by the link's index among `effects`: the index of the first effect
+/// that moves the node it names away from its home or removes it there ([`Effect::unhomes`]), when that comes before
+/// the link and after the last effect before the link that frees the link's own name ([`Effect::frees`]). A link with no
+/// such place keeps its own; both bounds cross only in a document the deriver never composes (a link's own rename over
+/// a held name, whose node another rename moves first), where the link keeps the verdict's order as before.
+fn link_places(effects: &[Effect]) -> BTreeMap<usize, usize> {
+  let mut unhomed: BTreeMap<&str, usize> = BTreeMap::new();
+  for (index, effect) in effects.iter().enumerate() {
+    for home in effect.unhomes().into_iter().flatten() {
+      unhomed.entry(home).or_insert(index);
+    }
+  }
+  let mut freed: BTreeMap<&str, usize> = BTreeMap::new();
+  let mut places = BTreeMap::new();
+  for (index, effect) in effects.iter().enumerate() {
+    if let Effect::Hardlink(path, home) = effect
+      && let Some(&place) = unhomed.get(home.as_str())
+      && place < index
+      && freed.get(path.as_str()).is_none_or(|&at| at < place)
+    {
+      places.insert(index, place);
+    }
+    if let Some(path) = effect.frees() {
+      freed.insert(path, index);
+    }
+  }
+  places
+}
+
+/// The names whose hard links a version's effects remove ([`Effect::RemoveHardlink`]).
+fn removed_links(effects: &[Effect]) -> BTreeSet<String> {
+  effects
+    .iter()
+    .filter_map(|effect| match effect {
+      Effect::RemoveHardlink(path) => Some(path.clone()),
+      _ => None,
+    })
+    .collect()
 }
 
 /// Restates a file's mapped content ops as declared operations, in head coordinates. The ops are one pass over the
@@ -4977,6 +5081,9 @@ mod scan_tests;
 
 #[cfg(test)]
 mod node_tests;
+
+#[cfg(test)]
+mod restate_tests;
 
 #[cfg(test)]
 mod tests {
