@@ -34115,3 +34115,45 @@ unsynced until a barrier; `tests/base.rs`, the directory witness's test) and `cr
   directory has no home for `path_of_inode` to read; fixed (`witnessed_path`), and that integration test's rerun is
   filed for main with the other checks main runs (clippy, `cargo xtask check`, the cross-target checks, the oracle and
   crash oracle, the Windows `--test os` suite).
+
+### A-519 — A read-only file's metadata entry lands on Windows: opened to write its attributes alone, write-through, each set stored as it returns (2026-11-19, g085, UI goal 88; §4.15 step 8; A-458, A-472)
+Applied in the same change to: §4.15 step 8 (the read-only file's rule and its sources), GAPS (A-472's owed read-only
+file: built, with what it leaves), `crates/land` (`src/windows_bits.rs`: `MetaOpen`, `meta_open`, `read_only`, the
+access rights and create options at Windows' values, and the tests; `src/os_windows.rs`: `open_to_chmod`'s second open,
+the writer's write-through files kept across a lend, `begin_barrier` leaving them out, `CHMOD_ACCESS` a directory's;
+`tests/os.rs`: the Windows test).
+- **What was there.** A file's metadata entry opened the file with `FILE_WRITE_DATA` beside its attributes, which its
+  batch's `FlushFileBuffers` needs; NTFS refuses that right to a read-only file, so the entry failed alone (A-472's
+  owed item).
+- **The sources (read 2026-11-19).**
+  - Microsoft's File Caching (learn.microsoft.com, updated 2025-03-12): "File system metadata is always cached.
+    Therefore, to store any metadata changes to disk, the file must either be flushed or be opened with
+    FILE_FLAG_WRITE_THROUGH."
+  - FlushFileBuffers (learn.microsoft.com): "The file handle must have the GENERIC_WRITE access right"; flushing every
+    file of a volume asks administrative privileges (R10 rules that out).
+  - MS-FSA 2.1.5.1.2.1, Algorithm to Check Access to an Existing File: "If Open.File.FileType is DataFile and
+    (File.FileAttributes.FILE_ATTRIBUTE_READONLY && (DesiredAccess.FILE_WRITE_DATA || DesiredAccess.FILE_APPEND_DATA)),
+    then return STATUS_ACCESS_DENIED", and with `MAXIMUM_ALLOWED` it clears the same rights; `FILE_WRITE_ATTRIBUTES`
+    is never among them.
+  - NtCreateFile (learn.microsoft.com): `FILE_WRITE_THROUGH` (0x2), "System services, file-system drivers, and drivers
+    that write data to the file must actually transfer the data to the file before any requested write operation is
+    considered complete"; `FILE_WRITE_ATTRIBUTES`, "Write the attributes of the file".
+  - So a read-only file can be neither flushed by a handle the landing may hold nor written: the documented way left is
+    the write-through open, and a set of `FILE_BASIC_INFO` needs only `FILE_WRITE_ATTRIBUTES`.
+- **The rule.** The writer opens a metadata entry's file to write its attributes and data first (the flushable open,
+  A-472). Refused, it opens the file again with `FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE` and
+  `FILE_WRITE_THROUGH`; a file that reads `READONLY` through it is kept so, and any other refusal stands. Each set
+  through it (time, bits, mode, as A-501 orders them) is stored as it returns, and the batch's barrier leaves it out.
+  The write-through files are the writer's own state, kept across a lend. A directory needs none of this: MS-FSA
+  refuses those rights to a data file alone.
+- **What it leaves.** The write-through sets wait on the device on the shard, up to three a file, beside the directory
+  syncs A-132 left there. One write-through set of the fields the entry changes, run by the barrier off the shard, would
+  end that; it is owed, to measure (GAPS).
+- **Tests.** Failing first on the Mac Studio (2026-11-19, kiln, load 14.2 to 20.6, debug): `cargo test --locked -p
+  slates-land --lib windows_bits` 1 of 6 failed, the new
+  `a_read_only_files_metadata_is_opened_write_through_to_its_attributes_alone` (the read-only open asked
+  `FILE_WRITE_DATA`). With the change (load 17.0 to 18.5): `slates-land --lib` 42 passed, the writer ignored; `cargo
+  fmt` laid the lines out. Windows only, filed for main: `the_metadata_opens_values_are_windows_own` (the values
+  against windows-sys) and `tests/os.rs`'s `a_read_only_files_metadata_entry_lands` (a file `attrib +R` made
+  read-only, marked hidden through an overlay, lands `HIDDEN` and still `READONLY`, its entry written), with the xwin
+  check and clippy.

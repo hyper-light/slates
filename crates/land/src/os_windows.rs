@@ -1289,8 +1289,14 @@ impl LandFs for OsLand {
       Ok(opened) => (opened, false),
       Err(refused) => {
         let stored = crate::windows_bits::meta_open(true);
-        let Ok(opened) = nt_create(parent, name, stored.access, nt::FILE_OPEN, stored.options, 0)
-        else {
+        let Ok(opened) = nt_create(
+          parent,
+          name,
+          stored.access,
+          nt::FILE_OPEN,
+          stored.options,
+          0,
+        ) else {
           return Err(refused);
         };
         match attributes(opened.as_handle()) {
