@@ -121,7 +121,7 @@ const KIND_DIRECTORY: &[u8] = b"dir";
 
 /// The value of a delta flag that is set.
 /// Format: `dump.c` 1439 and 1462 write `true`; `load.c` 711 and 732 read nothing else as set.
-const FLAG_SET: &[u8] = b"true";
+pub(super) const FLAG_SET: &[u8] = b"true";
 
 /// The value of a delta flag that is not set.
 /// Format: `notes/dump-load-format.txt`: "[Text-delta: true|false]", "The default value for the boolean headers is
@@ -276,7 +276,7 @@ impl Block {
       .position(|&byte| byte == b':')
       .filter(|&colon| colon > 0)
       .ok_or(DumpError::MalformedHeader)?;
-    let (name, after) = line.split_at(colon);
+    let (name, after) = line.split_at_checked(colon).ok_or(DumpError::MalformedHeader)?;
     let value = after
       .strip_prefix(HEADER_SEPARATOR)
       .ok_or(DumpError::MalformedHeader)?;
