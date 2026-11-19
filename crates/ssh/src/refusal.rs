@@ -29,15 +29,28 @@ impl DisconnectReason {
   /// The reason's number on the wire (RFC 4250 §4.2.2).
   pub fn code(self) -> u32 {
     match self {
-      DisconnectReason::ProtocolError => 2,
-      DisconnectReason::KeyExchangeFailed => 3,
-      DisconnectReason::MacError => 5,
-      DisconnectReason::ServiceNotAvailable => 7,
-      DisconnectReason::ProtocolVersionNotSupported => 8,
-      DisconnectReason::ByApplication => 11,
+      DisconnectReason::ProtocolError => PROTOCOL_ERROR,
+      DisconnectReason::KeyExchangeFailed => KEY_EXCHANGE_FAILED,
+      DisconnectReason::MacError => MAC_ERROR,
+      DisconnectReason::ServiceNotAvailable => SERVICE_NOT_AVAILABLE,
+      DisconnectReason::ProtocolVersionNotSupported => PROTOCOL_VERSION_NOT_SUPPORTED,
+      DisconnectReason::ByApplication => BY_APPLICATION,
     }
   }
 }
+
+/// Format: `SSH_DISCONNECT_PROTOCOL_ERROR` (RFC 4250 §4.2.2).
+const PROTOCOL_ERROR: u32 = 2;
+/// Format: `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`.
+const KEY_EXCHANGE_FAILED: u32 = 3;
+/// Format: `SSH_DISCONNECT_MAC_ERROR`.
+const MAC_ERROR: u32 = 5;
+/// Format: `SSH_DISCONNECT_SERVICE_NOT_AVAILABLE`.
+const SERVICE_NOT_AVAILABLE: u32 = 7;
+/// Format: `SSH_DISCONNECT_PROTOCOL_VERSION_NOT_SUPPORTED`.
+const PROTOCOL_VERSION_NOT_SUPPORTED: u32 = 8;
+/// Format: `SSH_DISCONNECT_BY_APPLICATION`.
+const BY_APPLICATION: u32 = 11;
 
 /// A direction of the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
