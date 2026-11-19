@@ -390,6 +390,19 @@
 > refused. Tests on the Mac Studio: merge 94/94, db 138/138 (model test with crashes: Agreement, StaleNeverCommits,
 > NoLoss), ipc 74, server 577 with main's known failure; red sixteen ways. Owed: the fleet half (A-636), the policy's
 > check (A-622's next part), stacks of works on one green (piece 5).
+> **Fixed (A-694, 2026-11-19, g300; found by A-687's import landing): an append's new branches were minted one volume
+> id.** `verbs::fresh_volume_id` minted from the database's next sequence, which moves only when a record commits, so
+> every `Create` of one entry got one id and the second was refused `ContentUnavailable` (`Lineage::branch` met it
+> already): a git push under `atomic` creating two refs, a Mercurial push making two lines or bookmarks, an import of
+> two bookmarks. Now the partition keeps a volume counter, one past the highest counter of every volume created,
+> advanced by each `VolumeCreated` in `apply` and carried by the snapshot; `Db::volume_counter_at` mints
+> `max(next_seq, counter) + offset`, and the append's plan mints each `Create` at its own offset, so no id repeats and a
+> recovery mints what the live partition would (the bug record
+> `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.md`). Proven on macOS arm64 (Mac Studio, kiln
+> r398, over main b288b412e): red first, the two server tests failing with every new branch minted at offset 0; then the
+> db model test's minting histories with crashes and its recovery histories 3 of 3, the server's 55 of 55 filtered to the
+> append, the Mercurial push, the repository verbs, git's push and the stores, `green_checkpoint` 6 of 6, fmt clean; the
+> other platforms owed.
 > **A-636 part 1 (2026-11-19, g261; the fleet half's protocol):** `crates/db/src/ledger/logs.rs`, the fenced ledger over
 > a repository's logs. Each log is a register of its own, placed by its own object id and committing at `f + 1` of its
 > own holders, so a push to one green waits on that green's holders alone. A record is committed once every log it
