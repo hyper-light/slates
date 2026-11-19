@@ -210,7 +210,7 @@
 > and `ERR` from either side. A capability git does not define is kept by name; a malformed id or line is refused by
 > kind and place. Golden vectors are fifteen exchanges and six advertisements stock git wrote under protocol.version 0
 > and 1 (`fixtures/v0`, `make-v0-fixtures.sh`, SHA-256 checked). `cargo test -p slates-git --lib` over main with it:
-> 187 of 187 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
+> 203 of 203 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
 > Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
 > the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
 

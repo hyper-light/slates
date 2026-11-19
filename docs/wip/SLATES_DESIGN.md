@@ -41199,7 +41199,7 @@ Applied in the same change to:
   and that fetch runs with `--no-tags`, so the vector holds `deepen-relative`, `deepen 1` and a shallow-update with
   `unshallow`. Two further runs wrote the same 39 files. gitprotocol-pack's own examples are vectors too, each long
   line as its length counts it.
-- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 187 of 187 over main
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 203 of 203 over main
   with this change, 25 new; `cargo fmt -p slates-git -- --check` clean; each test and helper read against the lint
   wall's cognitive-complexity threshold of 10 by count, every `assert_eq!` counting one). Every advertisement decodes to the refs `refs.txt` recorded and writes back; every line of every exchange
   reads and writes back; each depth request is answered by its shallow-update; the document's examples read and write
