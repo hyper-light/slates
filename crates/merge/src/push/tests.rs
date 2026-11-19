@@ -738,6 +738,110 @@ fn an_attribute_and_a_mode_on_the_root_compose_and_land() {
   assert_eq!(green.mode(ROOT), Some(0o700));
 }
 
+/// A-618 (a file's mode and attributes are the file's: the engine drops a special node's with it, `remove_special`, and
+/// a regular file's and a directory's must go too, or a path made again takes the removed one's; found by the
+/// client-fidelity test). Do: land an executable file with an attribute, and a directory with a mode; remove both in a
+/// later version; make a plain file and the directory again in a third. Expect: after the removal no mode or attribute
+/// stands at either path; the file made again is not executable and has no attribute; the directory has no mode.
+#[test]
+fn a_removed_file_and_directory_take_their_mode_and_attributes_with_them() {
+  let mut green = Green::new();
+  let submit = |green: &mut Green, journal: &[VolumeOp], bytes: &[u8], id: u8| {
+    let base = green.base_for(green.head(), journal);
+    let (doc, plan) = compose_volume_planned(&base, journal).unwrap();
+    let mut post = Vec::new();
+    for op in doc.ops.iter().filter(|op| op.src != u64::MAX) {
+      let at = usize::try_from(op.src).unwrap();
+      let run: &[u8] = match op.kind {
+        OpKind::SetXattr => b"note",
+        _ => {
+          let from = usize::try_from(plan[&op.src]).unwrap();
+          &bytes[from..from + usize::try_from(op.len).unwrap()]
+        }
+      };
+      post.resize(post.len().max(at + run.len()), 0);
+      post[at..at + run.len()].copy_from_slice(run);
+    }
+    let version = green.head() + 1;
+    let increment = Increment {
+      id: [id; 32],
+      base: green.head(),
+      doc,
+      post_state: post,
+      evidence: Vec::new(),
+    };
+    assert_eq!(green.submit(&increment), Outcome::Accepted { version });
+  };
+  let made = [
+    VolumeOp::Create {
+      path: "tool".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "tool".to_owned(),
+      at: 0,
+      len: 3,
+    },
+    VolumeOp::SetMode {
+      path: "tool".to_owned(),
+      mode: 0o755,
+    },
+    VolumeOp::SetXattr {
+      path: "tool".to_owned(),
+      name: "user.note".to_owned(),
+      value: b"note".to_vec(),
+    },
+    VolumeOp::Mkdir {
+      path: "dir".to_owned(),
+    },
+    VolumeOp::SetMode {
+      path: "dir".to_owned(),
+      mode: 0o700,
+    },
+  ];
+  submit(&mut green, &made, b"old", 1);
+  assert_eq!(green.mode("tool"), Some(0o755));
+  let removed = [
+    VolumeOp::Unlink {
+      path: "tool".to_owned(),
+    },
+    VolumeOp::Rmdir {
+      path: "dir".to_owned(),
+    },
+  ];
+  submit(&mut green, &removed, b"", 2);
+  assert_eq!(
+    (
+      green.mode("tool"),
+      green.xattr("tool", "user.note"),
+      green.mode("dir")
+    ),
+    (None, None, None)
+  );
+  let again = [
+    VolumeOp::Create {
+      path: "tool".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "tool".to_owned(),
+      at: 0,
+      len: 3,
+    },
+    VolumeOp::Mkdir {
+      path: "dir".to_owned(),
+    },
+  ];
+  submit(&mut green, &again, b"new", 3);
+  assert_eq!(green.content("tool"), Some(&b"new"[..]));
+  assert_eq!(
+    (
+      green.mode("tool"),
+      green.xattr("tool", "user.note"),
+      green.mode("dir")
+    ),
+    (None, None, None)
+  );
+}
+
 /// A store of one root tree with `entries`, beside the objects they name.
 fn tree_with(store: &mut Store, entries: Vec<TreeEntry>) -> ObjectKey {
   store.put_tree(entries)
