@@ -8,9 +8,10 @@
 //! the deltas inside them ([`delta`]), and the part payloads a push and a pull carry ([`phases`], [`bookmarks`],
 //! [`heads`], [`obsmarkers`], [`pushkey`]; A-545), and the wire protocol's version 1 framings both transports use
 //! ([`ssh`], [`http`], their arguments [`wire`], the [`capabilities`] and [`batch`]; A-569), byte for byte as Mercurial
-//! 7.2 writes them, and nothing more: it hashes no node (piece 3), runs no compression engine (a stream compressed with
-//! `GZ`, `BZ` or `ZS` is refused by kind until the engines are wired, D-17), handles no part (piece 5), and serves no
-//! command (piece 4).
+//! 7.2 writes them, and nothing more: it hashes no node (piece 3), handles no part (piece 5), and serves no command
+//! (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by [`compression`] (A-598): its zlib, bzip2
+//! or zstd stream inflated within the caller's admission, a compression bomb refused by kind; and a plain bundle is
+//! compressed as 7.2 compresses one.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
 //! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
@@ -38,7 +39,10 @@
 //! from the deltas, and encode each bundle back to its own bytes. `fixtures/payloads/` (A-545) holds what 7.2's client
 //! sent and its server answered in three pushes over SSH, captured on the wire, and two obsstores 7.2 wrote, made by
 //! `fixtures/payloads/make-payload-fixtures.sh` the same way; every part payload in them is decoded to what 7.2's
-//! listings and logs say and encoded back to its bytes.
+//! listings and logs say and encoded back to its bytes. `fixtures/compressed/` (A-598) holds the bundles 7.2 wrote of
+//! the same repository compressed (bundle1 with gzip and bzip2, bundle2 with gzip, bzip2 and zstd), made by
+//! `fixtures/compressed/make-compressed-fixtures.sh` and checked by its `SHA256SUMS`; each is made plain to exactly the
+//! uncompressed bundle 7.2 wrote.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt;
 // out-of-bounds indexing and slicing are denied workspace-wide.
@@ -53,6 +57,7 @@ pub mod bundle1;
 pub mod bundle2;
 pub mod capabilities;
 pub mod changegroup;
+pub mod compression;
 mod decimal;
 pub mod delta;
 pub mod heads;
