@@ -12790,8 +12790,9 @@ engine: the verdict, rebase, position mapping, the register).
 > the deployment plan hands them over (`FleetPlan::edge_identity`) from the DER the command read from the manifest's
 > files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
 > no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
-> the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
-> anything starts, rather than by a daemon that would start without its edge.
+> the flag is read (`slates_api::role::vcs_address`, by both roles and the `slates` command; named `vcs_http_address`
+> until A-689 made it the one reader of `--vcs-http` and `--vcs-svn`), as usage before anything starts, rather than by
+> a daemon that would start without its edge.
 >
 > **Status (2026-11-19, A-625 part 3 continued (2): the anchor holds the edge's port, built).** On Unix the anchor binds
 > the edge's listener once, at the address `--vcs-http` names, with the backlog the edge derives
@@ -13969,6 +13970,18 @@ signature verification).
 > the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
 > the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
 >
+> **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
+> `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
+> a divergent name, one with an `@` before its end, as 7.2's `listbinbookmarks` leaves it out (`bookmarks.py` 475-484:
+> `hasnode(v) and not isdivergent(k)`); the rule is `crate::bookmarks::divergent`, which the push's refusal of a
+> divergent name now shares. Before, every bookmark naming a held changeset was listed, and A-619's oracle stated the
+> same over names that never held an `@`. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19):
+> `fixtures/state`'s `divergent`, where `feature` moved apart in a clone and the clone was pulled back so 7.2 kept the
+> clone's as `feature@1`, answers `@` and `feature` to `hg debugpushkey` over `hg serve`, and a clone over it holds
+> those two, where slates' view of it answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and
+> r356 green, 2026-11-19; the other platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0
+> failed, fmt clean (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
+>
 > **Status (2026-11-19, A-679: `serve --stdio` behind the daemon's SSH edge).** `crates/server`'s `vcs_ssh::hg` runs
 > A-650 part 2's `serve::stdio` over an SSH session's standard input and output (A-651's edge, "Transports" above:
 > served in the daemon with no process): `ToolServices` starts it for `hg -R <path> serve --stdio` over the store the
@@ -14837,6 +14850,31 @@ and export by landing).
 > authentication for `lock-many` (the reporter's `lock-a` session), byte for byte; red seven ways. Owed: the lock
 > verbs; the read commands' authentication for one command with their authorization (A-606); the daemon's commit
 > once A-655 part 2b lands.
+>
+> **Status (2026-11-19, A-689: the svn:// listener, A-656 part 2's first slice).** Built: `slates anchor|daemon
+> --vcs-svn ADDRESS` (read by the roles' one version-control address reader, `slates_api::role::vcs_address`, beside
+> `--vcs-http`: loopback alone for a daemon that is no fleet node, since ra_svn has no TLS) starts the daemon's
+> svn:// listener on the control shard (`crates/server/src/vcs_svn.rs`), its port logged before the daemon's serving
+> line. On Unix the anchor binds the listener once, at that address (`slates_server::daemon::bind_vcs_svn_listener`),
+> and hands it to every daemon it starts (`slates_anchor::ENV_VCS_SVN`), as it holds the HTTP edge's: the daemon adopts
+> it only where its configuration would have bound (`crate::daemon::held_or_bound_listener`, now the HTTP edge's too),
+> so a restart never drops the port and a client that connects meanwhile is answered by the next daemon; a library
+> starter asks for it with `StartSpec::vcs_svn`. Each accepted connection is a seated child task running A-656's
+> connection over its socket: `svnserve`'s greeting byte for byte but for `svndiff1` ("5. The wire"), the client's
+> answer judged by A-599's handshake, and its URL answered "No repository found" (210005), as `svnserve` answers under
+> a root holding no repository, then the connection's end. Its seats and its overdue rule are the HTTP edge's: as many
+> connections as the shard seats clients, a wait past the connection's first RTO (its own handshake round trip)
+> marking it overdue, and the most overdue reaped only when a seat is needed. Proven against stock `svnserve` 1.15.0's
+> recorded `no-repository` session, the URL naming the listener's port: in-process
+> (`vcs_svn::tests::a_connection_is_greeted_as_svnserve_greets_and_its_url_refused_in_svnserves_words`), through a
+> real anchor (`an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener`), and across a `kill -9` of the daemon, a
+> connection made while it was down answered by its successor on the same port
+> (`a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again`); red first, the flag unknown. Owed: the
+> repositories' lookup (the rest of `find_repos`: the scheme, the URL's canonical form, a path that climbs with `..`;
+> a name located on its partition's shard, the connection moved there as the HTTP edge moves one), the repository's
+> sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
+> HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
+> (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -51813,6 +51851,96 @@ A-686), GAPS (the §4.17.3 entry).
 - **Owed.** The site's pushes (`unbundle` through `hg_push`: the push capabilities, the exchange driving prepare,
   admission, hooks and the landing, the reply framed as 7.2's `streamreslegacy`; A-680 part 2b); the stock `hg` round
   trip over the edge (g083's tests, once A-685 and A-686 land); the other platforms' runs (main's).
+
+### A-690 — Divergent bookmarks left out where bookmarks are served, as 7.2's `listbinbookmarks` leaves them out (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" items 1 and 3; A-619, A-680 part 1)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::divergent`, `push::classify`,
+`serve::pull::bookmark_entries`, `serve::Repository::bookmarks`' doc, `serve::tests`' generator and oracle,
+`serve/indexed_tests.rs`, `tests/fixtures.rs`), `crates/hg/fixtures/state` (both scripts by repository name;
+`divergent`), GAPS (a fixed entry), `docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`.
+- **What was wrong.** `bookmark_entries` listed every bookmark naming a changeset the served view holds; 7.2 lists those
+  whose name is not divergent (`bookmarks.py` 471-472, `isdivergent`: an `@` in the name and not as its last byte;
+  475-484, `listbinbookmarks`), for `listkeys bookmarks` (`pushkey.py` 27-32, through `listbookmarks`, 487-491) and
+  the `bookmarks` part (`exchange.py` 2638-2649). A-619's oracle stated the implementation's rule over generated names
+  that never held an `@`, so it certified it.
+- **The decision.** One rule, 7.2's, in `crate::bookmarks::divergent`: the pull's listing leaves a divergent name out
+  and the push's classification refuses one (`push/classify.rs`, unchanged in behaviour, now sharing it). `@` alone and
+  any name ending with `@` stay listed.
+- **Reproduced by use first** (Mac Studio, macOS arm64, stock Mercurial 7.2 from PyPI through uv, 2026-11-19).
+  `make-state-fixtures.sh . divergent` makes the repository as a divergent bookmark is made (a root bookmarked
+  `feature`, a changeset on it in a clone and another here, the clone pulled back: "divergent bookmark feature stored
+  as feature@1"; `@` on the root), and `make-served-fixtures.sh . divergent` records 7.2's served answers. The
+  repository rebuilt from those files: `hg bookmarks` lists `@`, `feature` and `feature@1`; under `hg serve`,
+  `hg debugpushkey http://127.0.0.1:54846/ bookmarks` answers `@` and `feature`, and a clone over it holds `@` and
+  `feature`. Before the fix slates' view of the same repository answered `feature@1` too (r340, below).
+- **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r340 over ab23dd3e0 (the fixture and the golden alone):
+  `cargo test --locked -p slates-hg --lib serve::` 52 passed and 1 failed, the golden, at `listkeys bookmarks`
+  (`feature@1` answered). Green: kiln r356 over 15342a05f: `cargo test --locked -p slates-hg --lib -- serve:: push::
+  bookmarks::` 93 passed and 0 failed; `cargo fmt -p slates-hg -- --check` clean. Again over the landing merged with
+  main 0462bd922 (8afa1583c; A-664 part 3 adds to slates-merge, which slates-hg links): 93 passed and 0 failed,
+  slates-merge and slates-hg compiled afresh, fmt clean. The golden holds `divergent`'s three changesets, none left
+  out, `heads` (two), `branchmap` (`default`'s two heads), `listkeys` of `bookmarks` and `phases`, and the `bookmarks`
+  part's entries to stock 7.2's, the view holding all three bookmarks. The serve oracle now generates names with an
+  `@` inside them and at their end, and states `isdivergent` as 7.2's source states it.
+- **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
+  draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
+- **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
+
+### A-689 — The svn:// listener: `slates anchor|daemon --vcs-svn ADDRESS`, held by the anchor across daemon restarts (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's first slice; after A-625 part 3 continued (2))
+Applied in the same change to: §4.17.4's status; §4.17.2's status (A-625 part 3 continued's reader, renamed); GAPS
+(the A-656 entry); `crates/api/src/role/mod.rs` (`ProcessOptions::vcs_svn`, `vcs_address` replacing
+`vcs_http_address` as the one reader of both flags, `Role::args`), `role/daemon.rs` (`DaemonConfig::vcs_svn`, the port
+line), `role/anchor.rs` (`hold_vcs_svn_listener`), `start.rs` (`StartSpec::vcs_svn` and its test), `lib.rs`
+(`CONTRACT` 54); `crates/anchor/src/supervise.rs` (`ENV_VCS_SVN`, `Supervisor::hold_vcs_svn_listener`) and `lib.rs`;
+`crates/cli/src/args.rs` (the roles' grammar and usage); `crates/server/src/vcs_svn.rs` and `vcs_svn/tests.rs` (new),
+`config.rs` (`DaemonConfig::vcs_svn`), `daemon.rs` (`Daemon::vcs_svn_port`, `bind_vcs_svn_listener`, and
+`held_or_bound_listener` with `listens_at`, moved from `vcs_http::daemon_edge`'s `listener_for` and `listens_at` so
+both servers adopt an anchor's listener one way), `vcs_http/daemon_edge.rs` and its test, `vcs_http.rs` (`awaited`
+visible to the crate); `crates/cli/tests/cli.rs` (`edge_port_before_serving` takes the line naming the port);
+`docs/cli.md`; the README's command table.
+
+- **Why.** The daemon had no svn:// listener: A-656 part 1 built the connection with no I/O, and nothing served it, so
+  a stock `svn` could not connect at all.
+- **The listener.** `--vcs-svn ADDRESS` is read as `--vcs-http` is, by one reader (`vcs_address`): an IPv4 address and
+  port, port 0 the system's pick, which the daemon logs (`slates daemon: the svn:// listener serves on IP:PORT`) before
+  it says it serves; an address off loopback is refused as usage for a daemon that is no fleet node, since ra_svn is
+  cleartext (CRAM-MD5 sends no password, every other byte crosses as written), and the daemon's start checks it again.
+  The listener runs on the control shard; each connection is a child task (spawned, detached, cancelled and joined with
+  the listener). Its bounds are the HTTP edge's (`Bounds::of_shard`: a seat for each client the shard seats, an item at
+  most a client region's bytes) and one read is `svnserve`'s own read buffer, `SVN_RA_SVN__READBUF_SIZE` (four 4,096-byte
+  pages, `libsvn_ra_svn/ra_svn.h` 65-67). A wait on a client past RFC 6298's first RTO of the connection's own handshake
+  round trip marks the connection overdue and goes on; with every seat taken the most overdue is reaped for a new one,
+  and none is cut while seats are free (the HTTP edge's rule, main's ruling of 2026-11-19).
+- **The anchor holds its port.** As A-625 part 3 continued (2) holds the HTTP edge's: on Unix the anchor binds the
+  listener once at the operator's address, with the backlog the daemon derives (`bind_vcs_svn_listener`), and every
+  daemon it starts inherits it (`ENV_VCS_SVN`) and adopts it where it listens at the configured address (the same
+  port unless port 0), else refuses it and starts no listener, logged; with no anchor the daemon binds its own. A
+  restart never drops the port: a connection made while the daemon is down waits in the listener's queue for its
+  successor. An address the anchor cannot bind ends its start by name. Windows keeps no listener across a restart
+  (`docs/wip/platforms.md`, gap 2).
+- **What a connection does.** A-656's `Connection`: the greeting (`svnserve`'s without `svndiff1`, "5. The wire"),
+  the client's answer judged by A-599's handshake, and the URL answered "No repository found in '…'" (210005),
+  `svnserve`'s answer under a root that holds no repository (`serve.c` `find_repos`), then its end. Until the lookup's
+  piece, the repository type the handshake's calls name is an uninhabited one (`Unresolved`), so no sources can be
+  handed to a connection.
+- **Tests.** Red first (macOS arm64, Mac Studio, 2026-11-19 21:55Z, at 825715a27 over main 2410011da): the CLI
+  test `an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener` failed, the anchor ending before any daemon served,
+  `--vcs-svn` unknown. The first build of the listener failed the same test by the test's own expectation: it read
+  `svnserve`'s 207-byte greeting whole where the daemon writes 198, `svndiff1` aside as "5. The wire" decides, and
+  waited out its timeout; the tests now take `svndiff1` out of the recording, as `slates_svn::handshake`'s tests do.
+  Green (macOS arm64, Mac Studio, 2026-11-19 22:45-22:51Z, kiln r310, at 39478a4a8 over main b94ae6e90):
+  `cargo test --locked -p slates-server --lib -- vcs_svn:: vcs_http::daemon_edge:: deploy::` 19 of 19 (the listener
+  in-process, the HTTP edge's adoption through the shared function, the deploy plan's configuration);
+  `-p slates-api --lib -- role:: start::tests contract_history` 39 passed, 4 ignored (child roles);
+  `-p slates-cli --bin slates -- the_grammar` 12 of 12; `-p slates-cli --test cli -- vcs_svn svn_listeners vcs_http`
+  4 of 4 (the svn start and restart tests, and the HTTP edge's two over the shared port reader);
+  `-p slates-anchor --test anchor -- held_vcs_http` 1 of 1; `cargo fmt -p slates-anchor -p slates-api -p
+  slates-server -p slates-cli -- --check` clean. The same commands again over main 693bc8feb, whose A-681, A-651 part
+  3 and A-655 part 2b had changed slates-server and slates-svn, and whose hg interop tests' helpers the start test now
+  shares (kiln r344, 22:55-23:03Z): 19 of 19, 39 and 4 ignored, 12 of 12, 4 of 4 (main's ignored hg test aside), 1 of
+  1, fmt clean.
+- **Owed.** The repositories' lookup (the rest of `find_repos`, a name located on its partition's shard, the
+  connection moved there), the repository's sources with every call, CRAM-MD5 keys over §4.13's principals, learned
+  waits (one mechanism for the three edges), the SSH tunnel's entry point; the Windows and Linux runs (main's).
 
 ### A-679 — Mercurial's `serve --stdio` behind the daemon's SSH edge: slates-hg's `serve::stdio` over the store the HTTP site's lender holds, its refusals in 7.2's words (2026-11-19, g304 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Transports" and piece 4; §4.17.2 "Transports" item 2; after A-650 part 2, A-651 and A-662)
 Applied in the same change to: `crates/server` (`vcs_ssh/hg.rs`, new; `vcs_ssh/site.rs`: `ToolServices<L, H>`,
