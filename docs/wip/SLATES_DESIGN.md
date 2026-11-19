@@ -50911,7 +50911,14 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   `slates credential token` and sent as a bearer token finds the repository by its name (receive-pack's advertisement,
   `200`) where a name no repository has answers `404`. Where no issuer surface is published (Linux) the token's leg
   skips loudly.
-- **Runs.** EVIDENCE PENDING.
+- **Runs.** macOS arm64, Mac Studio (kiln r294, 2026-11-19 22:35-22:45Z, debug, rustc 1.98.1, `CARGO_BUILD_JOBS=2`, a
+  fresh clone of the branch at dbe8ba1ef, load 7.7). Red first, on the same tree with the verb's dispatch taken out of
+  the grammar, so `repository` is unknown to it: `cargo test --locked -p slates-cli --bin slates the_grammar` 11
+  passed, 2 failed (the two above, each at its first parse); `--test cli a_repository_the_cli_creates` 1 failed, its
+  first create answered exit 2 (usage). Green: `--bin slates the_grammar` 13 of 13; `--test cli vcs_http` 3 of 3 in
+  5.2 s (this test and the two A-625 edge tests, whose request helper it now shares). `cargo fmt -p slates-cli -p
+  slates-client -p slates-server -- --check` asked for layout alone; rustfmt's own patch from that clone is applied.
+  Main's: clippy, `xtask check`, the doc gates, the Linux and Windows runs.
 - **Owed.** The other repository verbs on the command line (`CreateBranch`, `BindBranch`, `RetireBranch`,
   `SetRepositoryPolicy`, `ImportRepository`); the SDKs' and MCP's words for them; the server's own refusal of a format
   its tool does not name (today it records the repository, and a git one in revision numbers gets no store,

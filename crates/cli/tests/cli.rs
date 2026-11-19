@@ -13780,10 +13780,7 @@ fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
   )
   .expect("the edge answered for the unknown name");
   drop(anchor);
-  assert!(
-    found.starts_with("http/1.1 200 "),
-    "found by name: {found}"
-  );
+  assert!(found.starts_with("http/1.1 200 "), "found by name: {found}");
   assert!(
     unknown.starts_with("http/1.1 404 "),
     "no repository of that name: {unknown}"

@@ -3243,11 +3243,21 @@ mod tests {
     );
     assert_eq!(
       repository_spec("repository create shared --tool hg"),
-      spec("shared", (Mercurial, ObjectFormat::Sha1), "branch:default:0", None)
+      spec(
+        "shared",
+        (Mercurial, ObjectFormat::Sha1),
+        "branch:default:0",
+        None
+      )
     );
     assert_eq!(
       repository_spec("repository create shared --tool svn"),
-      spec("shared", (Subversion, ObjectFormat::Revisions), "root", None)
+      spec(
+        "shared",
+        (Subversion, ObjectFormat::Revisions),
+        "root",
+        None
+      )
     );
     assert_eq!(
       repository_spec(&format!(
@@ -3257,11 +3267,21 @@ mod tests {
     );
     assert_eq!(
       repository_spec("repository create shared --tool hg --default-branch stable --format sha1"),
-      spec("shared", (Mercurial, ObjectFormat::Sha1), "branch:stable:0", None)
+      spec(
+        "shared",
+        (Mercurial, ObjectFormat::Sha1),
+        "branch:stable:0",
+        None
+      )
     );
     assert_eq!(
       repository_spec("repository create shared --tool svn --format revisions"),
-      spec("shared", (Subversion, ObjectFormat::Revisions), "root", None)
+      spec(
+        "shared",
+        (Subversion, ObjectFormat::Revisions),
+        "root",
+        None
+      )
     );
   }
 
@@ -3279,13 +3299,25 @@ mod tests {
     );
     for (text, refused) in [
       ("repository create r --tool cvs", "--tool"),
-      ("repository create r --tool git --format revisions", "--format"),
+      (
+        "repository create r --tool git --format revisions",
+        "--format",
+      ),
       ("repository create r --tool hg --format sha256", "--format"),
       ("repository create r --tool svn --format sha1", "--format"),
       ("repository create r --tool git --format md5", "--format"),
-      ("repository create r --tool git --default-branch refs/heads/main", "--default-branch"),
-      ("repository create r --tool git --default-branch a..b", "--default-branch"),
-      ("repository create r --tool svn --default-branch trunk", "--default-branch"),
+      (
+        "repository create r --tool git --default-branch refs/heads/main",
+        "--default-branch",
+      ),
+      (
+        "repository create r --tool git --default-branch a..b",
+        "--default-branch",
+      ),
+      (
+        "repository create r --tool svn --default-branch trunk",
+        "--default-branch",
+      ),
       ("repository create r --tool git --root nothex", "volume ID"),
     ] {
       assert!(
