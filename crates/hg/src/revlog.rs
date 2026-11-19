@@ -804,7 +804,12 @@ impl Outline {
 }
 
 /// A delta applied by slates-hg's applier, its refusal in the reader's terms.
-fn apply(base: &[u8], piece: &[u8], rev: u32, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
+fn apply(
+  base: &[u8],
+  piece: &[u8],
+  rev: u32,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refused> {
   delta::apply(base, piece, admission).map_err(|refusal| match refusal {
     delta::Refusal::PastAdmission(past) => Refused::PastAdmission(past),
     refusal => Refused::Delta { rev, refusal },

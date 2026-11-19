@@ -16,7 +16,7 @@ use crate::import::{FileRefused, ImportRefused, Imported, RepositoryFiles, impor
 use crate::index::{Log, NONE, RevisionRow};
 use crate::lines::lines;
 use crate::obsmarkers;
-use crate::phases::{Phase, PhaseHead};
+use crate::phases::Phase;
 use crate::revlog;
 use crate::store::RequiresRefused;
 use crate::{Admission, NULL_NODE, changeset, filerev, node};
@@ -80,7 +80,11 @@ impl RepositoryFiles for Repository {
     let Some(bytes) = self.files.get(&joined) else {
       return Ok(None);
     };
-    let at = |value: u64| usize::try_from(value).unwrap_or(usize::MAX).min(bytes.len());
+    let at = |value: u64| {
+      usize::try_from(value)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len())
+    };
     let range = bytes
       .get(at(offset)..at(offset.saturating_add(len)))
       .unwrap_or_default();
@@ -321,7 +325,12 @@ fn named(path: &str) -> Box<[u8]> {
 /// The reads of the file at `path`, each its length.
 fn read_lengths(repository: &Repository, path: &[u8]) -> Vec<u64> {
   let of_path = |(read, _, _): &&Range| read.as_slice() == path;
-  repository.reads.iter().filter(of_path).map(|(_, _, len)| *len).collect()
+  repository
+    .reads
+    .iter()
+    .filter(of_path)
+    .map(|(_, _, len)| *len)
+    .collect()
 }
 
 /// A-649 part 3 (non-vacuity): do import the dotencode store, whose changelog keeps a data file, and the version 2 store,
@@ -343,7 +352,11 @@ fn revlogs_are_read_by_ranges_never_whole() {
     let whole = u64::try_from(repository.files[path].len()).unwrap();
     let lengths = read_lengths(repository, path);
     let pieces = lengths.len() > 1 && lengths.iter().all(|len| *len < whole);
-    assert!(pieces, "{}: {lengths:?} of {whole}", String::from_utf8_lossy(path));
+    assert!(
+      pieces,
+      "{}: {lengths:?} of {whole}",
+      String::from_utf8_lossy(path)
+    );
   }
   let inline = read_lengths(&dot, b"store/data/plain.txt.i");
   let whole = u64::try_from(dot.files[b"store/data/plain.txt.i".as_slice()].len()).unwrap();

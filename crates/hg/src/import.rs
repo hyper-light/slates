@@ -514,11 +514,10 @@ fn read_shape<F: RepositoryFiles>(
   let mut layout = Layout::default();
   layout.read(&read_whole(files, &[REQUIRES], room)?.unwrap_or_default())?;
   if layout.share_safe {
-    let in_store = read_whole(files, &[STORE, REQUIRES], room)?.ok_or_else(|| {
-      ImportRefused::Missing {
+    let in_store =
+      read_whole(files, &[STORE, REQUIRES], room)?.ok_or_else(|| ImportRefused::Missing {
         path: in_store(REQUIRES),
-      }
-    })?;
+      })?;
     layout.read(&in_store)?;
   }
   Ok(layout.shape()?)
@@ -936,7 +935,8 @@ impl<F: RepositoryFiles> Walk<'_, F> {
           path: index.shown(),
         });
       }
-      let outline = Outline::of_index(&[], room).map_err(|refused| revlog_refused(radix, refused))?;
+      let outline =
+        Outline::of_index(&[], room).map_err(|refused| revlog_refused(radix, refused))?;
       return Ok((outline, Bytes::Whole(Vec::new())));
     };
     let head_len = len.min(to_u64(HEADER_BYTES));
@@ -953,8 +953,12 @@ impl<F: RepositoryFiles> Walk<'_, F> {
         self.split(radix, index, header, len)
       }
       _ => {
-        let whole = self.files.read(&index.names(), 0, len, room)?.unwrap_or_default();
-        let outline = Outline::of_index(&whole, room).map_err(|refused| revlog_refused(radix, refused))?;
+        let whole = self
+          .files
+          .read(&index.names(), 0, len, room)?
+          .unwrap_or_default();
+        let outline =
+          Outline::of_index(&whole, room).map_err(|refused| revlog_refused(radix, refused))?;
         Ok((outline, Bytes::Whole(whole)))
       }
     }
@@ -968,7 +972,8 @@ impl<F: RepositoryFiles> Walk<'_, F> {
     header: u32,
     len: u64,
   ) -> Result<(Outline, Bytes), ImportRefused<F::Refused>> {
-    let outline = Outline::of_split(header, len).map_err(|refused| revlog_refused(radix, refused))?;
+    let outline =
+      Outline::of_split(header, len).map_err(|refused| revlog_refused(radix, refused))?;
     let data = self.store_path(&[radix, DATA_EXTENSION].concat())?;
     let data_len = self.files.len(&data.names())?.unwrap_or_default();
     let bytes = Bytes::Ranged {
@@ -987,7 +992,10 @@ impl<F: RepositoryFiles> Walk<'_, F> {
     len: u64,
     room: &mut Admission,
   ) -> Result<(Outline, Bytes), ImportRefused<F::Refused>> {
-    let docket = self.files.read(&path.names(), 0, len, room)?.unwrap_or_default();
+    let docket = self
+      .files
+      .read(&path.names(), 0, len, room)?
+      .unwrap_or_default();
     let read = revlog::read_docket(&docket).map_err(|refused| revlog_refused(radix, refused))?;
     let outline = Outline::of_docket(&read).map_err(|refused| revlog_refused(radix, refused))?;
     let index = self.store_path(&[radix, &[ID_SEPARATOR], read.index_id, DOCKET_INDEX].concat())?;
@@ -1448,7 +1456,9 @@ impl<F: RepositoryFiles> Source for Reader<'_, F> {
   ) -> Result<Cow<'_, [u8]>, Self::Error> {
     match self {
       Self::Whole(slices) => Ok(slices.index(at, len, admission)?),
-      Self::Ranged { files, index, .. } => ranged(&mut **files, *index, at, len, admission, "an entry"),
+      Self::Ranged { files, index, .. } => {
+        ranged(&mut **files, *index, at, len, admission, "an entry")
+      }
     }
   }
 
@@ -1460,7 +1470,9 @@ impl<F: RepositoryFiles> Source for Reader<'_, F> {
   ) -> Result<Cow<'_, [u8]>, Self::Error> {
     match self {
       Self::Whole(slices) => Ok(slices.data(at, len, admission)?),
-      Self::Ranged { files, data, .. } => ranged(&mut **files, *data, at, len, admission, "a chunk"),
+      Self::Ranged { files, data, .. } => {
+        ranged(&mut **files, *data, at, len, admission, "a chunk")
+      }
     }
   }
 }
