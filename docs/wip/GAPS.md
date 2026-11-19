@@ -241,6 +241,19 @@
 > deadline, client), its exit read without reaping so the group's kill stays its own, its child always reaped. Server
 > lib tests 42 of 42 on the Mac Studio with the test binary re-invoked as the hook, red three ways. Owed: the Windows
 > driver (a job object), the Linux launcher's namespace (§4.6), the push pieces' calls, the hook times' table.
+> **A-623 (2026-11-19, g229; §4.17.4 item 9, Subversion's hook points):** `vcs_hooks` holds Subversion's nine points
+> with each hook's arguments, standard input and environment as stock `svnserve` 1.15 hands them, and `svn_told`,
+> `svnserve`'s own words for every outcome; slates ships no `svnlook` (Ada's scope: a hook runs the stock one). Held to
+> 33 cases recorded from stock `svnserve` 1.15.0 on the Mac Studio (`crates/svn/fixtures/hooks`, 325 files, SHA-256
+> checked): `cargo test -p slates-server --lib -- vcs_hooks hook_driver` 37 of 37, red eleven ways. Found by the
+> recording: lock-token lines carry the client's relative path; no token, no input (A-597's builder and its test had
+> `LOCK-TOKENS:` and a blank line); an empty hooks-env section is none; a program that cannot be executed is exit 255
+> with no output. Owed: the record's six new points (`HookPointName`, A-622's wire tags); a hooks-env the owner can set;
+> from A-622 part 3's driver, which now clears a Subversion hook's environment (this change): the directory `/` and what
+> REPOS names for a stock `svnlook`, pre-lock's output read as the token (the driver sends it to the null device) and a
+> bad one refused as `svn_fs_lock_many` refuses it (recorded), a dangling link told apart (recorded), no core dumps; the
+> server's calls; Windows' `svnserve` words for a program `CreateProcess` refuses. Main's: clippy, `xtask` and the lint
+> matrix over the two modules.
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the
@@ -575,9 +588,10 @@
 > `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac
 > Studio, red-checked six ways (see A-613); its second part's first slice, `get-dir` and `get-locations`, the two stock
 > sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
-> the caller's room, red-checked six ways, the fixtures recorded again for every command still owed. Owed from it:
-> `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by
-> A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
+> the caller's room, red-checked six ways, the fixtures recorded again for every command still owed; its third slice
+> (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways. Owed from it: `log` with merged revisions,
+> `get-location-segments`, `get-file-revs`, `get-deleted-rev`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
 > greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's
@@ -623,9 +637,17 @@
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
 > kept whole), a rebase restating a copy (the deriver's `VolumeOp::Copy`), a copy from a version its source changed
-> after (refused today), Subversion's replace with history, moves and second copies into a copied tree in one increment,
-> the server's change-index consumers treating a copy's destination as its tree (a Merkle identity over the radix trees
-> was weighed and declined, A-586). Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
+> after (refused today), the server's change-index consumers treating a copy's destination as its tree (a Merkle
+> identity over the radix trees was weighed and declined, A-586). A-626 part 1 (2026-11-19, g295): Subversion's replace
+> with history (`REPLACE`, the destination's tree taken away key by key at the copy's version) and copies nested in one
+> increment (a second copy into a copied tree, a move inside one as a copy and a removal) built, with three defects of
+> A-586's branch made before a copy fixed; held to a per-version model with a replay and a branch at every version
+> (`cargo test -p slates-merge --lib` 99 of 99 on the Mac Studio, red seven ways, see A-626). Owed from A-626: a copy
+> from a version its source changed after (part 2: the changes since set back at the destination, recorded in the
+> chain entry and reserved before the verdict, with room in the server's entry bound), a checkpoint of a green holding
+> a copy (part 3), a rebase restating a copy (part 4); the replaced tree held by reference rather than removed key by
+> key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
+> Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
 > ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616
 > part 1, and its drive's calls with their ra_svn writer, A-616 part 2's first slice), with the lock verbs; hooks and
 > `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`,

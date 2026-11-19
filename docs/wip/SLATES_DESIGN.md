@@ -11368,7 +11368,10 @@ it). Fast path: if `last_changed[path] <= base` for every path in the increment,
 node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
 Subversion client's commit needs. A `Copy` (A-586) is always judged so, as an addition: its destination's tree must be
-absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies.
+absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies. One that
+replaces (A-626, `REPLACE`) is judged as its destination tree's removal with that addition: the tree unchanged after the
+base and holding no hard link nor any link's target. A copy into another copy's tree in the same increment is judged
+against what that copy brings there.
 
 > **Status (2026-11-19, A-612: a work never changes bytes it did not see).** Two rules the verdict now keeps, each a
 > defect A-596's oracle found:
@@ -11556,6 +11559,12 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > recorded once at its destination (`crates/merge/src/engine/copy.rs`; the "Copies" bullet below). Owed: a checkpoint
 > of a green holding a copy, a rebase that restates one, a copy from a version its source changed after, and a copy
 > onto a path its own increment removes (the A-586 entry).
+>
+> **Status (2026-11-19, A-626 part 1).** Built in the engine: a copy that replaces what its destination holds
+> (Subversion's replace with history) and copies nested in one increment, a move inside a copied tree among them (the
+> "Copies" bullet below); with them, three defects of A-586's branch made before a copy, which A-626's oracle found.
+> Owed (the A-626 entry): a copy from a version its source changed after, a checkpoint of a green holding a copy, and a
+> rebase that restates one.
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -11585,7 +11594,14 @@ which of its pending paths green has moved under (awareness, never load-bearing)
   conflict. The set hash adds one entry a copy (its destination, source and source version), which stands for every
   entry the copy brought: the sum is the state's entries plus each copy's entry less the entries of the tree it copied,
   O(1) a copy and recomputed alike by every holder that applies the same versions. A branch made before a copy cuts the
-  copy's tree from its maps (`Ptrie::cut`, a graft's inverse) and takes the copy's entry out of its identity.
+  copy's tree from its maps (`Ptrie::cut`, a graft's inverse) and takes the copy's entry out of its identity; every key
+  the change index names after it is read through the copies above it and set back wherever it differs from what the
+  branch then holds (A-626). A copy may replace what its destination holds (A-626, `REPLACE`, Subversion's replace with
+  history): the tree is taken away key by key at the copy's version, each removal recorded as removals are, before the
+  source is grafted there, and a key's own removal at a copy's version reads as before the copy, so a key the replace
+  took away and the copy gave back reads as the copy's. Copies nest in one increment: every source is held before any
+  lands (FSFS copies from a revision), they land in their destinations' order, and one inside another's tree is judged
+  against what that one brings there.
 - **A lineage.** Greens made from one another's versions share their maps' arenas through a `Lineage`, which owns the
   arenas and lends them to one green for the length of one call, so every node has one owner and nothing is shared by
   pointer (R2). `branch(from, v)` forks `from`'s eight roots (one count each), sets back in the new green every key whose
@@ -13462,6 +13478,12 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
+> destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
+> nested in one increment, a second copy into a new branch and a move inside one (a copy and a removal) among them, so
+> a stock client's commit holding either is no longer refused. Owed (the A-626 entry): a copy from a version its source
+> changed after, a checkpoint of a green holding a copy, and a rebase restating one.
+>
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
 > writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
@@ -13486,8 +13508,11 @@ and export by landing).
 > whole. Its second slice (2026-11-19, g297): `get-file` (the checksum from the node row, the properties and inherited
 > properties, then the text in `svnserve`'s 4,096-byte strings, the empty string and a second response), the text read
 > from the green a piece at a time and written a slice at a time in the room the caller gives (a `Stream` the server
-> resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Owed: `list`, `log` with merged
-> revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`; read access by the authorization rules
+> resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Its third slice (2026-11-19, g297):
+> `list`, `svn_repos_list`'s walk streamed a slice at a time (each slice bounded by the bytes it writes and the entries
+> it visits), its patterns matched by APR's `apr_fnmatch` after Subversion's fold, exact over ASCII names; `svn ls -v
+> -R` replayed whole. Owed: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
 > (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
@@ -13806,16 +13831,44 @@ copy and commits the result as any commit. The server never merges file contents
   review; approving it submits the work under item 3 and makes the revision, and the author's next `svn update` meets
   its own edits as the incoming change. A held commit built on another is a work over a work (§4.17.1).
 
-*9. Hooks* (§4.17.1's hook rule). start-commit (the repository's path, the user, the client's capabilities joined by
-`:`, the transaction), pre-commit (path, transaction; on standard input `LOCK-TOKENS:` and a `path|token` line per
-presented token), post-commit (path, revision, transaction), pre- and post-revprop-change (path, revision, author,
-property, action `A`, `M` or `D`; the new value, or the old one, on standard input) and the four lock hooks, each with
-`hooks.c`'s arguments (notes §7). A hook's standard input is a pipe, never Subversion's temporary file (R1). A stock
-hook reads the transaction with `svnlook -t TXN REPOS`, so slates installs its own `svnlook` (the subcommands hooks use:
-`author`, `cat`, `changed`, `date`, `diff`, `dirs-changed`, `filesize`, `history`, `info`, `lock`, `log`, `propget`,
-`proplist`, `tree`, `uuid`, `youngest`) first on the hook's `PATH`, answering from the work or the revision through the
-client channel and never from a disk, and REPOS is the repository's configured directory. A refusing pre-hook's
-standard error is the client's message (`E165001`); post-commit's becomes `commit-info`'s `post-commit-err`.
+*9. Hooks* (§4.17.1's hook rule; A-623). The server's nine hook points as stock `svnserve` 1.15 runs them, and nothing
+of Subversion's client side: slates offers the server alone, and a hook that reads its transaction runs the stock
+`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). Each hook runs through §4.17.1's
+driver over a read-only attachment of the work or the revision, and gets `hooks.c`'s arguments, standard input and
+environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
+- start-commit: the repository's directory (REPOS, its configured directory), the user, the client's capabilities
+  joined by `:`, the transaction.
+- pre-commit: REPOS and the transaction. On standard input, when the commit presented lock tokens, `LOCK-TOKENS:`, a
+  `path|token` line a token and a blank line; the path is the client's own, relative to its commit's base (`b.txt` for
+  `/trunk/with space/b.txt`), escaped as `svn_path_uri_autoescape` escapes (ten bytes: `%20` for a space, `%7C` for
+  `|`; `%` and every byte past ASCII kept). Otherwise nothing.
+- post-commit: REPOS, the revision, the transaction.
+- pre- and post-revprop-change: REPOS, the revision, the author, the property, the action `A`, `M` or `D`; the new
+  value, or the old one, on standard input.
+- pre-lock: REPOS, the path, the user, the comment, `1` for a stolen lock; its standard output, when it writes one, is
+  the lock's token. pre-unlock: REPOS, the path, the user, the token, `1` for a broken lock. post-lock and post-unlock:
+  REPOS and the user, the paths on standard input a line each. A commit that releases its locks runs pre-unlock for each
+  with its token, not broken, then post-unlock.
+
+Every argument is a C string that ends at its first NUL. A hook's environment is its own hooks-env section, else the
+default section, else nothing, and never the server's; a section named twice is one, and a section with no variables is
+none. Its directory is `/` and a hook with no input of its own reads the null device, as under `svnserve -d`; standard
+input is a pipe, never Subversion's temporary file (R1).
+
+What the client is told is `svnserve`'s own words, byte for byte (`check_hook_result`, `fs-wrap.c`, `serve.c`). A
+refusing pre-hook is `E165001` "Commit blocked by pre-commit hook (exit code 2)" (start-commit and pre-commit "Commit",
+pre-revprop-change "Revprop change", pre-lock "Lock", pre-unlock "Unlock"), then " with output:" and its standard error
+up to its first NUL when that is UTF-8, `[Error output could not be translated from the native locale to UTF-8.]` when
+it is not, or " with no output.". A hook a signal ended, or one slates killed past its learned bound, is "'pre-commit'
+hook failed (did not exit cleanly: apr_exit_why_e was 2, exitcode was 9). " and the same tail: `svnserve` has no
+deadline, so its words have no place for the bound. A program that cannot be executed is told as exit code 255 with no
+output, since `svnserve` learns of a failed `exec` only from its child's exit; one with no room to start is `E165002`
+"Failed to start '<program>' hook" over "Can't start process". Start-commit's refusal answers `open-root`, pre-commit's
+`close-edit`, and pre-lock's and pre-unlock's their own path among `lock-many`'s or `unlock-many`'s. A failed
+post-revprop-change is the command's `E165001`, the change standing; post-lock's and post-unlock's are `E165008`
+"Locking succeeded, but post-lock hook failed" and `E165009` "Unlock succeeded, but post-unlock hook failed" over
+`E165001`, after the `done`; post-commit's is `commit-info`'s `post-commit-err`, the commit standing. The unlock hooks a
+commit's release runs are logged and never told, as `svnserve` drops them.
 
 *10. Who may do what.* The transport proves the principal (§4.13): over `svn://` the SASL mechanisms `ANONYMOUS`,
 `CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
@@ -13852,6 +13905,26 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the server's questions (piece 7: every path sent, every path a commit changes); the file read from the
 > repository (`authz-db` as a `^/` URL) and compiled per file identity; `svnserve`'s `force-username-case`; and
 > `mod_authz_svn`'s questions with HTTP (piece 13).
+>
+> **Status (2026-11-19, A-623: the hook points, item 9).** Built in `crates/server`'s `vcs_hooks`, pure and not yet
+> called: Subversion's nine points, each hook's input (`svn_start_commit` to `svn_post_unlock`, `SvnHooksEnv`), and what
+> the client is told of each outcome (`svn_told`, `svn_told_unconfigured`). Held to stock `svnserve` 1.15.0's own runs
+> on the Mac Studio, recorded by `crates/svn/fixtures/hooks/make-fixtures.py`: 33 cases, 64 hook runs and every byte
+> `svnserve` sent, SHA-256 checked. Every recorded input is rebuilt byte for byte, and every refusal's words are found
+> in the bytes `svnserve` sent. `cargo test -p slates-server --lib -- vcs_hooks hook_driver`: 37 of 37 on the tree
+> merged with A-622 part 3; red eleven ways, each guard broken in a copy failing the tests that hold it. slates ships no
+> `svnlook`; the rebuilt one was stopped by Ada's scope, and its recordings stay on the unmerged branch
+> `agents/g229-a623-svnlook`.
+> Owed: the record's six new points (`HookPointName` names pre-commit, pre-revprop-change and post-commit alone; the
+> others need wire tags, A-622); a hooks-env the owner can set (until then every hook runs with an empty environment,
+> as `svnserve` with no hooks-env file); from A-622 part 3's driver, which now starts a hook whose input asks for a
+> clean environment with none of the server's (this change): a Subversion hook's directory (`svnserve -d` runs hooks in
+> `/`, the driver in its view's root) and what REPOS names, which a stock `svnlook -t TXN REPOS` must be able to read;
+> pre-lock's standard output, which the driver sends to the null device, read as the token, and a bad one refused as
+> `svn_fs_lock_many` refuses it (`E160037`, "Lock token '…' is not ASCII or is a control character at byte 31" for a
+> trailing newline, recorded); a dangling link told apart (`svnserve`'s "Failed to run '…' hook; broken symlink",
+> recorded); no core dumps (`apr_exit_why_e` 6); the server's calls at commit, lock, unlock and revision-property
+> change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -13929,7 +14002,9 @@ refused, naming the hook. A lock in the way: refused as item 3.4 says. A holder 
 another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a lock
 `E160042`, an expired lock `E160041`, no principal `E160034`, a directory to lock `E160017`, a path to lock the head
 lacks `E160013`, a lock comment XML cannot carry `E130004`, a negative expiry `E200004`; a revision property's old value
-differs `E160049`; hook refused `E165001`; revision properties not enabled `E165006`; post-commit failed `E165007`; not
+differs `E160049`; hook refused `E165001`; a hook that could not start `E165002`; revision properties not enabled
+`E165006`; post-lock or post-unlock failed `E165008`, `E165009` (a failed post-commit is `commit-info`'s
+`post-commit-err`, never a failure: item 9); not
 authorized `E170001`; unreadable `E220001`, unwritable `E220004`; checksum `E200014`; property value `E125005`;
 mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`; request too large `E210009`; svndiff `E185000` to
 `E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
@@ -13967,8 +14042,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    cut anywhere).
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
    A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation built,
-   A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; owed from it: the
-   checkpoint, the rebase, a copy from a changed source's older version, and the replace with history).
+   A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; the replace with history
+   and copies nested in one increment built, A-626 part 1; owed: the checkpoint, the rebase, and a copy from a changed
+   source's older version).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -41871,9 +41947,10 @@ unknown).
     destination.
   - a copy from a version its source changed after: the source's changes since set back at the destination, as a
     branch sets back, and recorded in the chain entry so replay reads no folded history.
-  - Subversion's replace with history: a copy onto a path its own increment removes, which needs the removed tree held
-    by reference.
-  - moves, links and second copies into a copied tree in one increment.
+  - Subversion's replace with history: a copy onto a path its own increment removes. Built as A-626 part 1, key by key
+    rather than by reference (the A-626 entry weighs both).
+  - moves, links and second copies into a copied tree in one increment. Moves and second copies built as A-626 part 1;
+    links stay refused (Subversion has none).
   - the server's consumers of the change index (attachments' invalidation) treating a copy's destination as its tree.
   - the appearance records live as long as the green: a key they cover reads by them whatever the fold. Their bytes are
     charged with the change index's, and the chain bounds them while no checkpoint folds it.
@@ -42405,9 +42482,30 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
 - **Scope** (Ada, 2026-11-18, through main): slates offers the server's portion; `svn mergeinfo --show-revs`'s eligible
   and merged revisions are the stock client's work over `get-mergeinfo`, `log` and the location segments, so no
   server piece computes them.
-- **Owed** (the next slices): `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
-  `get-deleted-rev`, each replayed against the transcripts already recorded; read access by A-606's rules, and the
-  authentication request a denied anonymous read makes when the session could authenticate.
+- **Part 2, its third slice** (2026-11-19, g297): `list` (`reads/list.rs`). The parameters `c(?r)w?l?l` (the
+  fields, each a word, any word but the six ignored; the patterns, each a string read to its NUL); the authentication
+  request; a revision past the youngest refused before `done`; then `svn_repos_list`'s walk, its `done` and its answer:
+  a depth below `empty` refused "Invalid depth 'N' in svn_repos_list" (165002; `exclude` -1, `unknown` and every word
+  `svn_depth_from_word` does not know -2), an absent path "Path 'P' not found" (160013), a file listed alone, an empty
+  pattern list answered at once, the path's own dirent when its name matches, then its entries depth-first, each
+  directory's in byte order, directories left out at `files`, a file matching no pattern left out, a directory
+  matching none walked unreported. A dirent is `( path kind ( size ) ( has-props ) ( created-rev ) ( date ) ( author ) )`
+  with absolute paths, each list empty when its field is not asked and the kind `unknown`, or `( path kind )` when
+  only the kind is asked; filled, every field is read whichever are asked, so a date that does not parse refuses the
+  listing after the dirents before it. Names match after Subversion's fold (`svn_utf__fuzzy_glob_match`: utf8proc's
+  decomposition, case folding and mark stripping, composed again; over ASCII the letters lowered), through A-606's
+  `apr_fnmatch` port, now re-exported to the crate. The walk is a `Stream`: it keeps one level of sorted names per
+  directory on its path, and a slice ends when the bytes it wrote and the entries it visited reach the caller's room.
+  Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 323 of 323, `cargo fmt --check` clean; the `list` session (16 commands), its hostile one and `svn ls -v -R` replayed whole;
+  slicing; a date that does not parse; the parameters; a pattern read to its NUL. Red-checked eight ways (entries in
+  reverse, names not folded, the kind `none` when not asked, `exclude` walked, dates never read, directories kept at
+  `files`, recursion at every depth: each failed named tests; the eighth, an empty pattern list walked, answers the
+  same bytes and failed once the test of its one slice was added).
+- **Owed** (the next slices): `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+  `get-deleted-rev`, each replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
+  (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
+  general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
+  when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
@@ -43798,6 +43896,187 @@ twenty lines), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§19).
 - **Owed.** `slates hg serve --stdio`'s loop over the SSH version 1 codec (`hello`, `between`, `protocaps`, `batch` and
   the commands built, a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas,
   `obsolete`'s `listkeys` dump, and the index's kept heads in place of the walks.
+
+### A-626 part 1 — `Copy` replaces what its destination holds and nests in one increment: Subversion's replace with history, a second copy into a new branch and a move inside one, never refused (2026-11-19, g295 for UI goal 93; §4.16 "The state's maps" and "The verdict", §4.17.4 items 3 and 3.5 and piece 3; A-586, A-618, A-621, A-631, A-632)
+Applied in the same change to: §4.16 (a status block, the verdict's sentence on `Copy`, the "Copies" bullet), §4.17.4
+(a status block, piece 3), the A-586 entry (its owed list), GAPS (the §4.17.4 entry), `crates/merge/src/ops_doc.rs`
+(`REPLACE`, `Op::replaces`), `crates/merge/src/engine.rs` (each copy's `CopySpec` in the resolved increment,
+`Effect::CopyTree`'s flag, the commit as `apply_effect` over a `Staged` set with `remove_file_now` and A-618's
+`drop_metadata`, the readers' `last_entry`, `head_identity_from_scratch` split, the replace's reservations),
+`crates/merge/src/engine/copy.rs` (nesting, the replace's verdict and removal, every source held before any copy lands,
+the readers' ties, the reservations), `crates/merge/src/engine/branch.rs` (the reverts), `crates/merge/src/dims.rs` and
+`dims/copy.rs` (`hold_tree` and `graft_tree`, `Xattrs::iter_tree`), `crates/merge/src/chain_entry.rs`
+(`Applied::CopyTree`'s flag, read from A-632's index), `crates/merge/src/engine/reanchor.rs`, and the tests
+(`engine/copy_tests.rs`).
+- **What was there.** A-586's `Copy` refused a destination that held anything (`CreateCreate`) and any second copy,
+  move or link into a copied tree in the same increment (`TypeChanged`). A stock client sends both, and FSFS commits
+  both: a replace with history is a changed path `R` with a copy source (`svn rm` and `svn cp` of one path in one
+  commit: re-tagging a release, restoring a file from an older revision), and a branch made and edited in one commit
+  carries copies beneath it (`svn cp ^/trunk ^/branches/b` with `svn mv` or `svn cp` inside it, which the editor drives
+  as `add-file` with a copy source and `delete-entry`).
+- **The flag.** `REPLACE`, the low bit of a `Copy`'s flags (`0x01`; no other kind sets it, so a document that never
+  sets it means what it meant): the destination's tree is taken away first, then the source's tree is copied there.
+  The removal is the flag's; the document's other operations on paths in the destination's tree land after the copy,
+  on what it brought. The chain entry records nothing more: replay reads the flag back from the increment's own
+  operation through A-632's one-pass index, as it reads the source's version.
+- **The verdict.** A replace is judged as the removal of its destination's tree, as an unlink is judged, and as A-586's
+  addition: refused when the tree changed after the base (`DeleteModify`, a delete against a change) or holds a hard
+  link or another link's target (`TypeChanged`: Subversion has neither, and the reverse map of links would carry them
+  through the removal). A copy whose destination lies in another copy's tree of the same increment (the innermost one
+  holding it) is judged against what that copy brings there, its source's tree at the same place, which the outer
+  copy's verdict holds unchanged since its version: a tree there takes it only as a replace (`CreateCreate`
+  otherwise). Subversion's move inside a copied tree is such a copy and a removal of the moved name, which A-586's
+  same-increment rule already judges against the copied tree. A rename or a hard link with an end in a copied tree stays
+  refused, typed: Subversion has neither.
+- **The commit.** Every source is held first, before any copy of the version changes a map, since FSFS copies from a
+  revision root and never from the transaction (`libsvn_fs_fs/tree.c` `copy_helper` refuses a mutable source: "Copy
+  from mutable tree not currently supported"). The copies then land in their destinations' order, an outer one before
+  those inside its tree: for a replace its destination's tree is taken away key by key, then the held source is
+  grafted. The removal walks each map beneath the destination once and records each key as its own removal records it:
+  a file as an unlink (its value seeded where its history does not hold it, and `file_removed` for A-612's rule), an
+  IPC node with its metadata, a directory, a symbolic link, then every mode and attribute left, through A-618's
+  `drop_metadata`; each path joins the version's change index.
+- **The readers.** A key's own last entry at a copy's version that records a removal reads as before the copy
+  (`covered_since`), so a key the replace took away and the copy gave back reads as the copy's from that version, and by
+  its own history before it. Of the copies one version made above a key, the nearest is the latest (`copy_above`).
+- **The identity (A-202).** Unchanged: the state's entries plus, for each copy, its entry less its tree's. A replace's
+  removals move the sum as removals do. A key an outer copy brought and an inner replace of the same version took away
+  gives back the outer copy's entry for it, read from the copies above it (`copied_entries`).
+- **Cost, and the shape weighed.** A replace costs O(the replaced tree): one walk of each map beneath the destination
+  and one removal a key. That is what removing the tree key by key costs, and what Subversion's delete of the same tree
+  costs a slates increment, which has no tree removal. A file whose value its history does not hold (unchanged since
+  version 0, or since the copy that gave it) is recorded whole (W2's `Value::whole` copies its bytes), as any removal
+  records it. Both are secured before the verdict: `history_reservation` adds each replaced file's latest bytes and
+  each IPC node, and `changes_reservation` each path taken away, named at its destination, twice (at the version and
+  as its last change), a replace inside another copy's tree counted where that copy's source holds it; a test holds
+  each at least what the commit grew by. The other shape, the replaced tree held by reference in the copy's record,
+  costs O(the paths) and copies no byte, but needs a second reader rule (a key with no history of its own, read before
+  the replace, from the held tree, recursively through the copies before it), an identity term for each held tree, its
+  retention counted without a walk, a branch that grafts it back and a checkpoint that lists it. It is owed if a
+  measured re-tag's removal outweighs its copy (GAPS).
+- **Three defects of A-586's branch, found by this oracle** (`Lineage::branch` at a version before a copy).
+  1. A key of the cut tree that held, at the branch's version, the value the head holds was left cut: a replace that
+     gives a tree back unchanged meets it, and so did a copy bringing a removed key's bytes back.
+  2. A key's value at the version was read from its own history alone for IPC nodes, directories, modes, links and
+     attributes, so a key an older copy (at or before the version) gave its value read as before that copy whenever its
+     path was visited for another change.
+  3. A copy's entry was given back only for keys changed after the version, so a key whose history ended before the
+     copy over it (a copy's own destination, removed and then copied over) had its head entry exchanged out with
+     nothing standing for it.
+
+  Now every key the change index names is read through the copies above it, set back wherever its value differs from
+  what the branch holds once its cuts are made, and given back each copy's entry when it has a history of its own. The
+  algebra: the branch's sum is the head's less each later copy's entry, plus each later copy's tree entries, less each
+  key's head entry, plus its entry at the version; a key the change index does not name holds at both ends what the
+  copies over it stand for, so only the named keys move it.
+- **Main's clippy findings, with it.** `head_identity_from_scratch` split (`add_state_entries`); branch.rs's array of
+  last changes, whose type and length clippy flagged, went with the third defect's fix (a slice of `HasHistory`).
+- **Tests** (`crates/merge/src/engine/copy_tests.rs`).
+  - A replace takes its destination's tree away and copies the source there; the version before reads byte for byte;
+    the change index names what it took; it replays from its encoded chain entry.
+  - A key a replace took away and gave back, changed later, and a directory it took away, made again later, read at
+    every version.
+  - Copies nest in one increment: a second copy where the outer leaves nothing, a replace where it brings a tree, and a
+    move inside it; replayed.
+  - A replace's reservations cover what its commit adds and exceed a plain copy's.
+  - Branches before and after a replace and nested copies; before a copy that brings a removed key back unchanged;
+    through the copy that gave a key its value.
+  - Every refusal, the green unchanged; among them a second copy onto a filled place, and replaces of a tree changed
+    after the base, of one holding a hard link and of a link's target.
+  - The oracle, rewritten: a model that states every version's tree by the design's rules (a reference green cannot,
+    since plain operations state no replace), over generated histories of puts, takes, directories, single copies
+    (replacing or not, from the head or an older version), nested pairs and moves. The green decides every step as the
+    model does and reads as it at every version (bases, bytes, the paths the change index names since); its identity
+    equals its recount and its change index's bytes theirs; no map refuses a copy; a copy that replaces nothing walks
+    no map; its chain replays; a branch at every version reads as the model and hashes as the replay, and making it
+    walks no map. Its steps are chosen by a weighted selector over plain tuples (`prop_oneof!`'s strategy is
+    shared-ownership backed, R2).
+- **Evidence** (the Mac Studio M3 Ultra, kiln, debug, fresh clones of the branch; r868 at 05:51 UTC, load 8.9; r893
+  from 05:59 to 06:03 UTC, load 5.0 to 6.2; 2026-11-19).
+  - `cargo test --locked -p slates-merge --lib`: 99 of 99 at `eddac8c74` (24.48 s), `cargo fmt --check` clean. The
+    census over 128 histories: 85 copies accepted, 362 refused, 8 from the root, 33 from an older version, 25 into
+    their own source's tree, 71 refused for a source changed since, 33 keys changed beneath a copy, 31 replaces over a
+    tree that held something, 31 nested pairs (7 with an inner replace), 20 moves.
+  - Red first: the new tests over main's implementation (the engine files of `0020d61`, the tests and `REPLACE` kept):
+    7 failed, every A-626 test, and A-586's 10 passed; the same over the branch's first base (`6ce9e687d`, r851).
+  - The first green run, before merging main (`fcffd15c4`, r851): 61 of 63, both failures the tests' own (the branch
+    test's expected identity at version 1 was version 2's; the oracle counted the walk of a branch's base read, which
+    walks by design). After merging main (`682479e9f`, r868): 95 of 97, the branch defects above.
+  - Red seven ways at `eddac8c74` (r893), each on a copy of the tree with one guard taken out, the whole `--lib` suite
+    run: the readers' tie rule, 2 failed; the nested verdict, 2; the replace's refusal of a tree changed after the
+    base, 1; the replaced tree's modes and attributes, 4; the replace's reservation, 1; every source held before any
+    copy lands, 1 (the oracle); branch.rs before its fix, 4.
+  - Merged with main again (A-637's submodule links and A-643's verdict siblings in slates-merge, both clean): 111 of
+    111 at `2d453fca3` (06:08 UTC, load 10.0, 24.48 s), `cargo fmt --check` clean; that run's census: 80 accepted, 397
+    refused, 4 from the root, 30 from an older version, 14 into their own source's tree, 63 refused for a changed
+    source, 34 keys changed beneath a copy, 31 replaces, 34 nested pairs (4 with an inner replace), 29 moves.
+  - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
+- **Owed** (A-626's later parts):
+  - a copy from a version its source changed after (part 2): the source's changes since set back at the destination,
+    recorded in the chain entry so replay reads no folded history, reserved before the verdict, with room in the
+    server's entry bound (`crates/server/src/verbs.rs`, computed from the increment alone);
+  - a checkpoint of a green holding a copy (part 3): its copies and the identity's sum carried;
+  - a rebase restating a copy (part 4): the deriver's `VolumeOp::Copy`.
+
+### A-623 — Subversion's hook points as stock svnserve runs them: each hook's input and what the client is told, byte for byte (2026-11-19, g229, UI goal 93; §4.17.4 item 9 and piece 11; after A-597 and A-622)
+Applied in the same change to:
+- §4.17.4 item 9 (rewritten), its refusals list (`E165002`, `E165008`, `E165009`; post-commit's failure no failure)
+  and a status;
+- GAPS (the §4.17 entry); the Subversion research notes §7 (the recorded facts);
+- `crates/server` (`vcs_hooks.rs`: start-commit, post-revprop-change and the four lock hooks added to the points;
+  `SvnHooksEnv`; every argument a C string and a lock token's path escaped; `svn_told` and `svn_told_unconfigured`;
+  `Outcome::TimedOut` keeps the status its process was reaped with; `hook_driver.rs`, A-622 part 3's driver, which
+  landed while this piece ran: a hook whose input asks for a clean environment starts with none of the server's, and
+  its test helper's input names the new field);
+- `crates/svn/fixtures/hooks` (new: `make-fixtures.py` and the 325 files it wrote).
+
+- **Scope.** Ada's correction (2026-11-19, relayed by main): slates offers the server portion only, and stock clients
+  and tools stay stock. The piece first rebuilt `svnlook`'s commands; that stopped, and its recordings stay on the
+  unmerged branch `agents/g229-a623-svnlook`. Item 9's "slates installs its own `svnlook`" is gone: a hook that reads
+  its transaction runs the stock `svnlook` itself. The piece is now the server's nine hook points: their arguments,
+  standard input and environment as `svnserve` passes them, run through A-597's runner and A-622's driver over a
+  read-only attachment, and each hook's refusal returned to the client as `svnserve` returns it.
+- **The evidence.** `make-fixtures.py` runs stock `svnserve` 1.15.0 on the Mac Studio in `/` with the null device as
+  its input, as a daemon starts its hooks, with nine generated hooks that record their arguments, standard input,
+  environment and directory, and a relay that logs each connection. 33 cases: commits by two users, locks taken,
+  stolen, broken, taken from a working copy with a token the pre-lock hook chose and given back with their tokens, a
+  commit that releases its lock and one that keeps two, three revision-property changes; then each pre-hook refusing
+  with output and without, killed by a signal, writing bytes UTF-8 refuses or a NUL; pre-revprop-change missing; each
+  post-hook failing; a hook not executable, a broken link, and a pre-lock token with a newline. Before any Rust ran,
+  each refusal's predicted bytes were looked for in what `svnserve` sent: 17 of 17 found.
+- **Found by the recording.** (1) A `LOCK-TOKENS:` line names the client's own path, relative to its commit's base
+  (`b.txt` for `/trunk/with space/b.txt`), escaped by `svn_path_uri_autoescape`, whose table escapes ten bytes and none
+  past ASCII; `LockToken` took a pre-escaped path, and now the builder escapes. (2) With no token presented,
+  pre-commit reads the null device: A-597's builder wrote `LOCK-TOKENS:` and a blank line, and its test asserted it.
+  (3) A hooks-env section with no variables is no section, so its hook takes the default one; a section named twice
+  is one. (4) `svn_io_start_cmd3` leaves APR's error check off, so a program `exec` refuses is told as exit code 255
+  with no output, never "Failed to start", which only a failed `fork` gives. (5) `svnserve` releases a commit's locks
+  through pre-unlock and post-unlock and drops their failures. (6) post-lock's and post-unlock's failures come wrapped
+  in `E165008` and `E165009` after the `done`; post-commit's is `commit-info`'s `post-commit-err`.
+- **Decided.** A hook slates kills past its learned bound is told as `svnserve` tells of a hook a signal ended, from
+  the status it was reaped with (`Outcome::TimedOut` now keeps it): `svnserve` has no deadline, so its words have no
+  place for the bound. The server speaks UTF-8, so a hook's standard error is told as it is when it is UTF-8 and as
+  `check_hook_result`'s notice otherwise, as `svnserve` does under a UTF-8 locale; a character the runner's cap cut in
+  two is left out, so a cut does not turn the whole into the notice. Every argument ends at its first NUL, as
+  `svnserve`'s C strings do, so none holds a NUL no `execve` could pass. The driver applied a hook's variables over
+  the server's environment; a Subversion hook's input asks for a clean one (`HookInput::clean_environment`), and the
+  driver now clears it first, shown by a re-invoked test binary that writes its environment's names.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19): `cargo test --locked -p slates-server --lib vcs_hooks` 28 of
+  28 and `cargo fmt -p slates-server -- --check` clean, on a fresh clone of the branch. Red ten ways, each on a copy of
+  the module in the Studio's clone, each failing the tests that guard it and nothing else: an argument kept past its NUL
+  (1 test), nothing escaped (2), an empty section kept (2), sections not merged (6), a cut character kept (1),
+  `apr_exit_why_e` 1 for a signal (2), exit 1 for a failed `exec` (2), post-lock's failure unwrapped (1), standard error
+  read past its NUL (2), and A-597's `LOCK-TOKENS:` with no token (2: the token test and the recorded commits); the file
+  put back, 28 of 28 again. On the tree merged with A-622 part 3 (06aa369e6): `-- vcs_hooks hook_driver` 37 of 37, fmt
+  clean; red once more, the driver's clearing taken out: its new test fails and nothing else (8 of 9).
+- **Owed.** The record's six new points (`HookPointName` names three; the rest need wire tags, A-622); a hooks-env the
+  owner can set, until which every hook runs with an empty environment, as `svnserve` with no hooks-env file; from
+  A-622 part 3's driver: the directory `/` and what REPOS names, which a stock `svnlook -t TXN REPOS` must be able to
+  read; pre-lock's standard output, sent to the null device now, read as the token, and a bad one refused as
+  `svn_fs_lock_many` refuses it (recorded: `E160037` for a trailing newline); a dangling link told apart as
+  `svnserve`'s "broken symlink" (recorded); no core dumps; the server's calls at commit, lock, unlock and
+  revision-property change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ. Main's:
+  clippy, `xtask` and the lint matrix over the two modules.
 
 ### A-625 part 2 — the HTTP edge on the daemon's runtime: the listener and its connection tasks, each phase's wait learned, the bounds derived from the shard's budget, and git's site (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1, "Access" and "Pieces (git)" piece 8; after A-625 part 1, A-595, A-597, A-622)
 Applied in the same change to:

@@ -1,0 +1,4 @@
+LOCK-TOKENS:
+a.txt|opaquelocktoken:fixture-a
+café.txt|opaquelocktoken:fixture-c
+
