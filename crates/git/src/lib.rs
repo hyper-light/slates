@@ -7,8 +7,10 @@
 //! ([`sideband`]): each data packet's first byte names its band, 1 the pack, 2 progress, 3 a fatal error. Under
 //! protocol v2's `sideband-all` every data packet of a response is multiplexed so. This crate reads and writes both,
 //! byte for byte as stock git 2.50 writes them. It also names objects ([`object_name`], A-600): the object header, and an
-//! object's name in either `object-format`, SHA-1 with git's collision detection or SHA-256. Protocol v2's messages,
-//! deltas, pack indexes and packs are A-582's next parts (GAPS, the §4.17 entry).
+//! object's name in either `object-format`, SHA-1 with git's collision detection or SHA-256. And it speaks protocols v0
+//! and v1 for clients older than v2 ([`v0`], A-604): the ref advertisement with its capabilities, a fetch's request and
+//! negotiation lines, and the shallow-update. Protocol v2's messages, deltas, pack indexes and packs are A-582's next
+//! parts (GAPS, the §4.17 entry).
 //!
 //! **Sources** (read 2026-11-19). git's `Documentation/gitprotocol-common.txt` ("pkt-line Format"),
 //! `gitprotocol-v2.txt` ("Packet-Line Framing", "packfile section", `sideband-all`) and `gitprotocol-capabilities.txt`
@@ -45,6 +47,7 @@ pub mod object_name;
 pub mod out;
 pub mod pktline;
 pub mod sideband;
+pub mod v0;
 
 pub use admission::{Admission, PastAdmission};
 
