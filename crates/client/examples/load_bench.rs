@@ -674,13 +674,7 @@ impl Agent {
           Kind::Edit,
         )
       }
-      Step::Submit => (
-        RequestBody::Submit {
-          work: work?,
-          evidence: Vec::new(),
-        },
-        Kind::SubmitAccepted,
-      ),
+      Step::Submit => (RequestBody::submit(work?, Vec::new()), Kind::SubmitAccepted),
       Step::ResolveVersion => (RequestBody::Versions { green: self.green }, Kind::ReadHead),
       Step::ResolveRead(n) => {
         let window = &self.windows[n];

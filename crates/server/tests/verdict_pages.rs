@@ -148,10 +148,7 @@ fn a_submits_verdict_past_one_reply_is_read_whole() {
   let (daemon, instance) = daemon("submit");
   let mut client = connect(&instance);
   let (_, work) = conflicting(&mut client);
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   let Ok(ReplyBody::Submitted {
     version: None,
     conflicts,
@@ -216,10 +213,7 @@ fn a_replaced_verdict_is_refused_typed() {
   let mut client = connect(&instance);
   let (_, work) = conflicting(&mut client);
   let verdict_of = |client: &mut Client| {
-    let reply = client.call(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    });
+    let reply = client.call(&RequestBody::submit(work, Vec::new()));
     let Ok(ReplyBody::Submitted {
       conflicts, verdict, ..
     }) = reply
@@ -296,10 +290,7 @@ fn a_verdict_judged_on_the_greens_shard_is_kept_with_its_work_on_another() {
     |green| off_owner_name(green, "second"),
   );
   let asked_before = asked_of_the_owner(&daemon);
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   assert!(
     asked_of_the_owner(&daemon) > asked_before,
     "the verdict was asked of the green's owner"
@@ -342,6 +333,7 @@ fn a_signed_verdict_past_one_reply_is_read_whole() {
     work,
     evidence: Vec::new(),
     signature: signature.clone(),
+    authorship: Default::default(),
   });
   let Ok(ReplyBody::SubmittedSigned {
     version: None,
