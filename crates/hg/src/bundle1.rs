@@ -1,9 +1,11 @@
-//! Bundle1 (`HG10`): one changegroup of version `01` after a six-byte header (A-514; `internals.bundles` [B]).
+//! Bundle1 (`HG10`): one changegroup of version `01` after a six-byte header (A-514; `internals.bundles` \[B\]).
 //!
 //! The header is `HG10` and two bytes naming the compression of everything after it: `UN` (none), `GZ` (zlib) or `BZ`
-//! (bzip2, whose own leading `BZ` the header doubles as). This module reads and writes `UN` bundles and refuses the
-//! compressed ones by kind until the engines are wired (D-17). Bundle1 is what clients without bundle2 push and pull,
-//! where a server's policy still allows them (7.2's `server.bundle1`).
+//! (bzip2, whose own leading `BZ` the header doubles as). This module reads and writes `UN` bundles. A compressed one
+//! is made plain first by [`crate::compression::plain`] (A-598), its stream inflated behind `HG10UN`; given one still
+//! compressed, [`changegroup`] refuses it by kind. Bundle1 is what clients without bundle2 push and pull, where a
+//! server's policy still allows them (7.2's `server.bundle1`), and a legacy client's push over HTTP arrives as
+//! `HG10GZ`, the first type the server's `unbundle` capability lists.
 
 use crate::Truncated;
 use crate::read::Cursor;
@@ -14,7 +16,7 @@ pub const MAGIC: [u8; 4] = *b"HG10";
 /// Format: the compression marker of an uncompressed bundle1.
 pub const UNCOMPRESSED: [u8; 2] = *b"UN";
 
-/// Format: the compression markers Mercurial defines for bundle1 besides `UN`: zlib and bzip2.
+/// Format: the compression markers 7.2 writes for bundle1 besides `UN`: zlib and bzip2 (`bundletypes`).
 pub const COMPRESSED: [[u8; 2]; 2] = [*b"GZ", *b"BZ"];
 
 /// Why a bundle1 was refused.
@@ -25,12 +27,13 @@ pub enum Refusal {
     /// The bytes found.
     found: [u8; 4],
   },
-  /// A compressed bundle1, refused until the compression engines are wired (D-17).
+  /// A bundle1 still compressed: [`crate::compression::plain`] inflates it first (A-598).
   Compressed {
     /// The compression marker.
     engine: [u8; 2],
   },
-  /// A compression marker Mercurial does not define.
+  /// A compression marker this crate does not read: one Mercurial does not define, or `ZS`, which 7.2's reader takes
+  /// since `ZS` is among its bundle types but no 7.2 writer makes (`zstd-v1` is refused as a bundle spec; A-598).
   UnknownCompression {
     /// The marker found.
     engine: [u8; 2],

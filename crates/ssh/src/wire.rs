@@ -2,7 +2,7 @@
 //!
 //! A [`Reader`] walks one message's payload. Every length is checked against the bytes left before anything past it is
 //! read, and nothing is copied: strings and name-lists borrow the payload. [`Reader::finish`] refuses bytes left after
-//! a message's last field, as OpenSSH's `sshpkt_get_end` does [C]. The writers append to a buffer and refuse only a
+//! a message's last field, as OpenSSH's `sshpkt_get_end` does \[C\]. The writers append to a buffer and refuse only a
 //! string whose length does not fit the format's `uint32`.
 //!
 //! A name-list is checked as RFC 4251 §5 and §6 define a name: at least one byte, at most 64, printable US-ASCII with no
@@ -10,10 +10,10 @@
 //! big-endian magnitude, the only form the key exchange needs (RFC 8731 §3.1): its leading zero bytes dropped, and a zero
 //! byte put first when the top bit is set, so the value reads as positive.
 
-/// The longest name RFC 4251 §6 allows: names "MUST NOT be longer than 64 characters".
+/// Format: the longest name RFC 4251 §6 allows: names "MUST NOT be longer than 64 characters".
 pub const MAX_NAME: usize = 64;
 
-/// The bytes of a `uint32`, and of the length that leads a `string` (RFC 4251 §5).
+/// Format: the bytes of a `uint32`, and of the length that leads a `string` (RFC 4251 §5).
 pub const UINT32_LEN: usize = 4;
 
 /// Why bytes did not read, or a value did not write, as SSH's types.
@@ -211,6 +211,7 @@ pub fn put_mpint_unsigned(out: &mut Vec<u8>, magnitude: &[u8]) -> Result<(), Wir
     .iter()
     .position(|byte| *byte != 0)
     .map_or(&[][..], |first| magnitude.get(first..).unwrap_or(&[]));
+  // Format: an mpint is two's complement, so a first byte with its top bit (0x80) set reads as negative.
   let sign_byte = significant.first().is_some_and(|byte| byte & 0x80 != 0);
   let length = significant
     .len()

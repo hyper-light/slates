@@ -8,7 +8,7 @@
 //! **The client's line.** [`IdentificationReader`] reads it a byte at a time, within RFC 4253 §4.2's bound: "The maximum
 //! length of the string is 255 characters, including the Carriage Return and Line Feed". It is refused on its 255th byte
 //! if that byte does not end it, so the bound holds whatever the client sends. Three choices follow OpenSSH's own reader
-//! (`kex_exchange_identification` in `kex.c` at `fa4b2a82`) [C] where the document leaves room:
+//! (`kex_exchange_identification` in `kex.c` at `fa4b2a82`) \[C\] where the document leaves room:
 //! - a line before the identification is refused, since only a server may send one ("Do not accept lines before the SSH
 //!   ident from a client");
 //! - a bare LF ends the line, which RFC 4253 §4.2 itself allows for older clients ("may want to process the
@@ -27,7 +27,7 @@ pub const PROTOCOL_VERSION: &str = "2.0";
 /// The older servers' version RFC 4253 §5.1 makes identical to 2.0.
 pub const COMPATIBLE_VERSION: &str = "1.99";
 
-/// The longest identification line, CR and LF included (RFC 4253 §4.2).
+/// Format: the longest identification line, CR and LF included (RFC 4253 §4.2).
 pub const MAX_LINE: usize = 255;
 
 /// What every identification line starts with.

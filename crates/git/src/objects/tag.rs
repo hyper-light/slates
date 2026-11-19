@@ -8,10 +8,11 @@
 
 use super::fsck::{FsckId, Report, Strictness};
 use super::headers::{self, Header};
-use super::{ObjectRefused, hex, ident, refname};
+use super::{ObjectRefused, hex, ident};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::out::Out;
+use crate::refname;
 
 /// Format: the first lines of the signature blocks git recognizes (gpg-interface.c's formats: OpenPGP's two, X.509's
 /// and SSH's).
@@ -161,7 +162,7 @@ fn check(bytes: &[u8], format: ObjectFormat, report: &mut Report) -> Result<(), 
   Kind::from_name(kind).map_err(|_| FsckId::BadType)?;
   let after = rest.strip_prefix(b"tag ").ok_or(FsckId::MissingTagEntry)?;
   let (name, rest) = line(after).ok_or(FsckId::MissingTag)?;
-  if !refname::tag_name_ok(name) && report.report(FsckId::BadTagName) {
+  if !refname::tag_name_is_valid(name) && report.report(FsckId::BadTagName) {
     return Ok(());
   }
   let rest = match rest.strip_prefix(b"tagger ") {

@@ -1,7 +1,7 @@
 //! A pack entry's header (A-582 part 3; §4.17.2 "Pieces (git)", piece 2, "a pack entry's header"): what an entry
 //! holds, how many bytes its data inflates to, and for a delta which base it applies to.
 //!
-//! **Sources** (read 2026-11-19, git v2.50.1). The document [B], `Documentation/gitformat-pack.adoc`:
+//! **Sources** (read 2026-11-19, git v2.50.1). The document \[B\], `Documentation/gitformat-pack.adoc`:
 //! - an entry is "n-byte type and length (3-bit type, (n-1)*7+4-bit length)", then a REF_DELTA's "base object name" or
 //!   an OFS_DELTA's "negative relative offset from the delta object's position in the pack", then the compressed data
 //!   (lines 51-66), whose size "is the size before compression" for an object and "the size of the delta data that
@@ -11,14 +11,14 @@
 //! - the offset encoding: "n bytes with MSB set in all but the last one", and "for n >= 2 adding 2^7 + 2^14 + ... +
 //!   2^(7*(n-1)) to the result" (257-262).
 //!
-//! The code [C], which clients and git's own receive-pack run, followed where the document leaves room: `packfile.c`'s
+//! The code \[C\], which clients and git's own receive-pack run, followed where the document leaves room: `packfile.c`'s
 //! `unpack_object_header_buffer` (1116-1139) and `get_delta_base` (1238-1277); `builtin/index-pack.c`'s
 //! `unpack_raw_entry` (520-582); `pack-write.c`'s `encode_in_pack_object_header` (505-526); and
 //! `builtin/pack-objects.c`'s offset writer (548-559). The four object types and their numbers are A-600's
 //! ([`Kind::pack_number`]), and a REF_DELTA's base is an [`ObjectId`] in the pack's [`ObjectFormat`].
 //!
 //! [`read`] reads one header from the bytes a pack stream has delivered so far, `None` until its last byte arrives, so
-//! the pack reader (§4.17.2 piece 3) reads each entry as it comes; [`write`] writes one as `pack-objects` does, each
+//! the pack reader (§4.17.2 piece 3) reads each entry as it comes; [`write`](fn@write) writes one as `pack-objects` does, each
 //! number in the fewest bytes, and [`written_len`] says how long that is beforehand.
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted, and every refusal is a typed variant naming where its entry
@@ -26,10 +26,10 @@
 //! - Type 0 (invalid) and 5 (reserved) are refused as soon as the first byte arrives (`Type`), as index-pack refuses
 //!   them ("unknown object type").
 //! - A size is read as `unpack_object_header_buffer` reads it on a 64-bit word: it refuses a further byte once the
-//!   shift passes the word less seven bits ("bad object header"), so a size has at most 60 bits (`SizeTooLong`), refused
-//!   before the byte that would pass it arrives. index-pack's own loop has no such check and shifts past the word; this
-//!   reader holds every entry to the stricter rule, which no pack git writes can break: a size past 60 bits is an object
-//!   of an exbibyte.
+//!   shift passes the word less seven bits ("bad object header"), so a size has at most 60 bits (`SizeTooLong`),
+//!   refused before the byte that would pass it arrives. index-pack's own loop has no such check and shifts past the
+//!   word; this reader holds every entry to the stricter rule, which no pack git writes can break: a size past 60 bits
+//!   is an object of an exbibyte.
 //! - An offset whose next byte would lose bits is refused as git refuses it ("offset value overflow for delta base
 //!   object", `OffsetTooLong`).
 //! - An OFS_DELTA's base must begin before its own entry and after the pack's header: an offset of zero names the entry
@@ -350,6 +350,19 @@ fn write_offset(offset: u64, out: &mut impl Out) {
     rest = rest.checked_shr(GROUP_BITS).unwrap_or(0);
   }
   out.put(bytes.get(first..).unwrap_or_default());
+}
+
+/// The most bytes an entry's header takes in a pack whose objects are named in `format`: its type and size (one byte,
+/// then one for each shift git reads a group at), then the longer of the two bases, an offset's ten bytes or a name.
+/// A reader that holds this many bytes of a header has it whole or refused.
+pub fn longest_header(format: ObjectFormat) -> usize {
+  let size_groups = SIZE_BITS
+    .saturating_sub(FIRST_SIZE_BITS)
+    .div_ceil(GROUP_BITS);
+  usize::try_from(size_groups)
+    .unwrap_or(usize::MAX)
+    .saturating_add(1)
+    .saturating_add(OFFSET_BYTES_MAX.max(format.raw_len()))
 }
 
 /// The bytes `header` takes when written for the entry at `at`, or why it cannot be written.

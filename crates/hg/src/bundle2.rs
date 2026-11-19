@@ -1,4 +1,4 @@
-//! Bundle2 (`HG20`), decoded and encoded (A-514; `internals.bundle2` [B]; `mercurial/bundle2.py` [C]).
+//! Bundle2 (`HG20`), decoded and encoded (A-514; `internals.bundle2` \[B\]; `mercurial/bundle2.py` \[C\]).
 //!
 //! A stream is the magic `HG20`; a signed 32-bit length and that many bytes of stream parameters, space-separated,
 //! each `name` or `name=value`, URL-quoted, mandatory when its first letter is upper-case; then parts. A part is a
@@ -9,10 +9,12 @@
 //! one more part (or none, 7.2's "no part found during interruption") follows whole and the interrupted part resumes.
 //!
 //! The only stream parameter Mercurial defines is `Compression` (`UN`, `GZ`, `BZ`, `ZS`), matched without regard to
-//! case as 7.2 matches it (`b2streamparamsmap[name.lower()]`). This module reads `UN` streams and refuses the
-//! compressed ones by kind until the engines are wired (D-17). Any other mandatory stream parameter is refused, as
-//! bundle2 requires, and an advisory one is kept. Parts are returned for their handlers: a mandatory part no handler
-//! takes is the handler table's to refuse (piece 5), not the codec's.
+//! case as 7.2 matches it (`b2streamparamsmap[name.lower()]`). A compressed stream is made plain first by
+//! [`crate::compression::plain`] (A-598), as 7.2's own relay makes one (`_forwardchunks`): its parts inflated and its
+//! `Compression` dropped. This module reads the plain stream, and refuses one still compressed by kind
+//! ([`Refusal::CompressedStream`]). Any other mandatory stream parameter is refused, as bundle2 requires, and an
+//! advisory one is kept. Parts are returned for their handlers: a mandatory part no handler takes is the handler
+//! table's to refuse (piece 5), not the codec's.
 //!
 //! A decoded stream is its stream parameters, its parts in the order their headers appear (nested ones included, each
 //! with its depth), and its payload as [`Event`]s in stream order, which is exactly what an encode writes back, so a
@@ -20,7 +22,9 @@
 //!
 //! Stricter than 7.2, each on purpose: a part header with bytes left after its parameters is refused (7.2 ignores
 //! them), and one whose parameters run past its end (7.2 slices them short); a part that repeats a parameter key is
-//! refused (the document says keys "MUST be unique"; 7.2 keeps the last); bytes after the stream's end are refused.
+//! refused (the document says keys "MUST be unique"; 7.2 keeps the last); bytes after the stream's end are refused;
+//! and a stream that names `Compression` twice, in any case, is refused (7.2 takes the last, so two readers could
+//! inflate one stream two ways; A-598).
 
 use crate::out::{Measure, Out};
 use crate::quote::{self, PATH_SAFE};
@@ -39,10 +43,11 @@ pub const END: i32 = 0;
 /// Format: the one stream parameter Mercurial defines (`b2streamparamsmap`), matched without regard to case.
 pub const COMPRESSION: &[u8] = b"compression";
 
-/// Format: the `Compression` value this module reads: `UN`, the bundle type of Mercurial's `none` engine.
+/// Format: the `Compression` value of a plain stream: `UN`, the bundle type of Mercurial's `none` engine.
 pub const UNCOMPRESSED: &[u8] = b"UN";
 
-/// Format: the `Compression` values Mercurial defines besides `UN`: zlib, bzip2 and zstd (`supportedbundletypes`).
+/// Format: the `Compression` values Mercurial defines besides `UN`: zlib, bzip2 and zstd (`supportedbundletypes`),
+/// which [`crate::compression::plain`] inflates (A-598).
 pub const COMPRESSED: [&[u8]; 3] = [b"GZ", b"BZ", b"ZS"];
 
 /// Format: the bytes a part type may hold besides letters and digits (`_parttypeforbidden`, `bundle2.py`).
@@ -175,16 +180,19 @@ pub enum Refusal {
     /// The name.
     name: Vec<u8>,
   },
-  /// A compressed stream, refused until the compression engines are wired (D-17).
+  /// A stream still compressed: [`crate::compression::plain`] inflates it first (A-598).
   CompressedStream {
     /// The compression named.
     engine: Vec<u8>,
   },
-  /// A `Compression` parameter with no value or one Mercurial does not define.
+  /// A `Compression` parameter with no value, or one this crate does not read: one Mercurial does not define, or 7.2's
+  /// internal `_truncatedBZ`, which its reader takes but no 7.2 writer makes (A-598).
   UnknownCompression {
     /// The value, if any.
     engine: Option<Vec<u8>>,
   },
+  /// A stream that names `Compression` twice, in any case (7.2 takes the last; A-598).
+  RepeatedCompression,
   /// A part type that is empty or holds a byte outside `[a-zA-Z0-9_:-]`.
   PartType {
     /// The type.
@@ -365,6 +373,9 @@ impl<'a> Bundle2<'a> {
     }
     let block = sized(&mut cursor, "stream parameters length", "stream parameters")?;
     let params = stream_params(block, admission)?;
+    if let Some(engine) = still_compressed(&params) {
+      return Err(Refusal::CompressedStream { engine });
+    }
     let mut count = Count::default();
     walk(&mut cursor.clone(), &mut count)?;
     admission.charge_items::<Part<'_>>(count.parts)?;
@@ -496,7 +507,7 @@ impl<'a> Iterator for Payload<'_, 'a> {
 }
 
 /// A length-prefixed block: a signed 32-bit length, refused if negative, then that many bytes.
-fn sized<'a>(
+pub(crate) fn sized<'a>(
   cursor: &mut Cursor<'a>,
   what: &'static str,
   block: &'static str,
@@ -506,8 +517,12 @@ fn sized<'a>(
   Ok(cursor.take(len, block)?)
 }
 
-/// The stream parameters of `block`: counted, charged, then unquoted and checked one by one.
-fn stream_params(block: &[u8], admission: &mut Admission) -> Result<Vec<StreamParam>, Refusal> {
+/// The stream parameters of `block`: counted, charged, then unquoted and checked one by one, and a second
+/// `Compression` refused.
+pub(crate) fn stream_params(
+  block: &[u8],
+  admission: &mut Admission,
+) -> Result<Vec<StreamParam>, Refusal> {
   if block.is_empty() {
     return Ok(Vec::new());
   }
@@ -524,7 +539,24 @@ fn stream_params(block: &[u8], admission: &mut Admission) -> Result<Vec<StreamPa
     check_stream_param(&param)?;
     params.push(param);
   }
+  if params
+    .iter()
+    .filter(|param| param.name.eq_ignore_ascii_case(COMPRESSION))
+    .nth(1)
+    .is_some()
+  {
+    return Err(Refusal::RepeatedCompression);
+  }
   Ok(params)
+}
+
+/// The engine a stream's `Compression` names, when it names one other than `UN`.
+fn still_compressed(params: &[StreamParam]) -> Option<Vec<u8>> {
+  params
+    .iter()
+    .find(|param| param.name.eq_ignore_ascii_case(COMPRESSION))
+    .and_then(|param| param.value.clone())
+    .filter(|engine| engine.as_slice() != UNCOMPRESSED)
 }
 
 /// 7.2's `_processparam`: a name that begins with a letter; `Compression` read; any other mandatory name refused.
@@ -546,13 +578,11 @@ fn check_stream_param(param: &StreamParam) -> Result<(), Refusal> {
   Ok(())
 }
 
-/// 7.2's `processcompression`: `UN` read; the other engines refused by kind; anything else unknown.
+/// 7.2's `processcompression`: `UN` and the engines [`crate::compression`] inflates read (exactly, case and all, as
+/// 7.2's set of bundle types matches them); anything else unknown.
 fn check_compression(value: Option<&[u8]>) -> Result<(), Refusal> {
   match value {
-    Some(engine) if engine == UNCOMPRESSED => Ok(()),
-    Some(engine) if COMPRESSED.contains(&engine) => Err(Refusal::CompressedStream {
-      engine: engine.to_vec(),
-    }),
+    Some(engine) if engine == UNCOMPRESSED || COMPRESSED.contains(&engine) => Ok(()),
     other => Err(Refusal::UnknownCompression {
       engine: other.map(<[u8]>::to_vec),
     }),

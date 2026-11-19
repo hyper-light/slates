@@ -13,12 +13,21 @@ description = "git's wire formats (§4.17.2, A-582): pkt-lines and side-band-64k
 aws-lc-rs = { workspace = true }
 # SHA-1 object names with collision detection, as git's sha1dc (A-600; the workspace manifest says why this crate).
 sha1-checked = { workspace = true }
+# The pack reader's inflation (A-608), through the workspace's one deflate engine, zlib-rs (A-607), no backend picked.
+flate2 = { workspace = true }
 # zlib's CRC32, which a pack index keeps of each object (A-591; the workspace manifest says why this crate).
 crc32fast = { workspace = true }
+# HTTP/1.1's request codec (A-595), which Mercurial's and Subversion's HTTP share: git's routes read its heads.
+slates-http = { workspace = true }
+# The object store git's rides on (§4.17.1 shared piece 3; git piece 5, A-614): content by identity, index tables.
+slates-vcs = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
+# The LFS tests' oracle (A-610): JSON compared by meaning with what the stock git-lfs client accepted, and the other leg
+# of the JSON validator's differential test. Tests only; the codecs read and write JSON themselves.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

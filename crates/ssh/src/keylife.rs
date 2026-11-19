@@ -11,7 +11,7 @@
 //!   bound of that kind; its own limit, 2^70 bytes under one nonce (the chacha draft §8), cannot be reached by one packet.
 //! - When to rekey: before the limit, at its half, the point RFC 4344 §3.1 itself prefers for packets ("rekey after
 //!   receiving more than 2**31 packets"), applied the same way to blocks and to both directions, as OpenSSH applies its
-//!   own (`MAX_PACKETS (1U<<31)` in `packet.c` at `fa4b2a82`) [C]. The other half covers what is in flight while the new
+//!   own (`MAX_PACKETS (1U<<31)` in `packet.c` at `fa4b2a82`) \[C\]. The other half covers what is in flight while the new
 //!   exchange runs; a key that reaches its whole limit anyway ends the connection.
 //! - An operator may cap a key's use lower ([`UsageCap`], as the session plane's `cap_key_usage` does), never higher.
 //!
@@ -24,17 +24,17 @@
 
 use crate::packet::{AES_BLOCK_LEN, Cipher, Usage};
 
-/// Nanoseconds in a second.
+/// Format: nanoseconds in a second.
 pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// RFC 4253 §9's recommended key time, an hour ("after each hour of connection time"): the ceiling on the learned key
 /// time and its value before a lifetime is measured.
 pub const RECOMMENDED_KEY_TIME_NS: u64 = NANOS_PER_SECOND.saturating_mul(SECONDS_PER_HOUR);
 
-/// Seconds in an hour.
+/// Format: seconds in an hour.
 const SECONDS_PER_HOUR: u64 = 3_600;
 
-/// Bits in a byte.
+/// Format: bits in a byte.
 const BITS_PER_BYTE: usize = 8;
 
 /// The bits of a sequence number (RFC 4253 §6.4, `uint32 sequence_number`).
@@ -60,6 +60,7 @@ pub struct UsageCap {
 
 /// RFC 4344 §3.2's bound for a block cipher of `block_bits` bits: 2^(L/4) blocks.
 pub fn block_cipher_bound(block_bits: u32) -> u64 {
+  // Derived: RFC 4344 §3.2's exponent is a quarter of the block's bits, L/4.
   let exponent = block_bits.checked_div(4).unwrap_or(0);
   1u64.checked_shl(exponent).unwrap_or(u64::MAX)
 }

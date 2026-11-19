@@ -15,7 +15,7 @@
 //! padding byte, four bytes of padding and a payload byte; a length not aligned to the cipher's block, which RFC 4253 §6
 //! says "MUST be enforced, even when using stream ciphers"; and a packet past the caller's cap, refused before a byte of
 //! its body is read. Then, whole ([`Opener::open`]): the tag, and the padding, "at least four bytes" and leaving a payload.
-//! The alignment is the rule OpenSSH applies (`packet.c` at `fa4b2a82`) [C]: in the clear, the whole packet is a multiple
+//! The alignment is the rule OpenSSH applies (`packet.c` at `fa4b2a82`) \[C\]: in the clear, the whole packet is a multiple
 //! of 8; under an AEAD, the part after the length is a multiple of the cipher's block, 16 for AES and 8 for ChaCha20,
 //! whose length field is not part of what is padded.
 //!
@@ -38,38 +38,38 @@ use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKe
 use crate::entropy::Entropy;
 use crate::to_u64;
 
-/// The largest packet every implementation must accept, in bytes on the wire, tag included: RFC 4253 §6.1, "All
+/// Format: the largest packet every implementation must accept, in bytes on the wire, tag included: RFC 4253 §6.1, "All
 /// implementations MUST be able to process packets with ... a total packet size of 35000 bytes or less". The server sends
 /// nothing larger, and accepts no cap below it.
 pub const MAX_PACKET_EVERY_PEER_ACCEPTS: usize = 35_000;
 
-/// The bytes of the length field.
+/// Format: the bytes of the length field.
 pub const LENGTH_LEN: usize = 4;
 
-/// The fewest padding bytes a packet carries: RFC 4253 §6, "There MUST be at least four bytes of padding".
+/// Format: the fewest padding bytes a packet carries: RFC 4253 §6, "There MUST be at least four bytes of padding".
 pub const MIN_PADDING: usize = 4;
 
-/// The alignment in the clear: RFC 4253 §6, "a multiple of the cipher block size or 8, whichever is larger".
+/// Format: the alignment in the clear: RFC 4253 §6, "a multiple of the cipher block size or 8, whichever is larger".
 pub const CLEAR_ALIGNMENT: usize = 8;
 
 /// The tag of both ciphers: GCM's full 16 bytes (RFC 5647 §6.3, "MUST use the full 16-octet Authentication Tag") and
 /// Poly1305's (the chacha draft §4).
 pub const TAG_LEN: usize = CHACHA_TAG_LEN;
 
-/// AES's block, 128 bits (FIPS 197), to which AES-GCM's plaintext is padded (RFC 5647 §7.1).
+/// Format: AES's block, 128 bits (FIPS 197), to which AES-GCM's plaintext is padded (RFC 5647 §7.1).
 pub const AES_BLOCK_LEN: usize = 16;
 
 /// The padding block of `chacha20-poly1305@openssh.com`: as a stream cipher it has none of its own, so RFC 4253 §6's
-/// floor of 8 applies, as OpenSSH's cipher table gives it (`cipher.c`) [C].
+/// floor of 8 applies, as OpenSSH's cipher table gives it (`cipher.c`) \[C\].
 pub const CHACHA_ALIGNMENT: usize = CLEAR_ALIGNMENT;
 
-/// The bytes of AES-256's key (RFC 5647 §6.2, `K_LEN` 32).
+/// Format: the bytes of AES-256's key (RFC 5647 §6.2, `K_LEN` 32).
 pub const GCM_KEY_LEN: usize = 32;
 
 /// The bytes of AES-GCM's IV (RFC 5647 §6.2, `N_MIN` = `N_MAX` = 12).
 pub const GCM_IV_LEN: usize = NONCE_LEN;
 
-/// The bytes of the IV's fixed field; the rest is the invocation counter (RFC 5647 §7.1).
+/// Format: the bytes of the IV's fixed field; the rest is the invocation counter (RFC 5647 §7.1).
 const GCM_FIXED_LEN: usize = 4;
 
 /// The most padding a packet can carry: its `padding_length` is one byte.
@@ -239,6 +239,7 @@ impl GcmKey {
     let iv: [u8; GCM_IV_LEN] = iv.try_into().map_err(|_| KeyMaterialRefusal::IvLength)?;
     let (fixed, invocation) = iv.split_at(GCM_FIXED_LEN);
     let fixed: [u8; GCM_FIXED_LEN] = fixed.try_into().map_err(|_| KeyMaterialRefusal::IvLength)?;
+    // Format: the invocation counter's eight bytes, the IV's rest after its fixed field (RFC 5647 §7.1).
     let invocation: [u8; 8] = invocation
       .try_into()
       .map_err(|_| KeyMaterialRefusal::IvLength)?;

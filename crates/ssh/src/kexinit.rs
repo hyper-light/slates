@@ -25,7 +25,7 @@
 //! **A guess.** A client may send its first exchange packet before seeing the server's KEXINIT. The guess "is considered
 //! wrong if ... the kex algorithm and/or the host key algorithm is guessed wrong (server and client have different
 //! preferred algorithm)" [B: RFC 4253 §7], judged as OpenSSH judges it, by the first names of the two lists
-//! (`proposals_match` in `kex.c` at `fa4b2a82`) [C]; a wrong guess's packet is ignored.
+//! (`proposals_match` in `kex.c` at `fa4b2a82`) \[C\]; a wrong guess's packet is ignored.
 
 use crate::hostkey::ED25519;
 use crate::packet::Cipher;
@@ -33,10 +33,10 @@ use crate::wire::{
   NameList, Reader, WireRefusal, put_boolean, put_byte, put_name_list, put_uint32,
 };
 
-/// `SSH_MSG_KEXINIT` (RFC 4250 §4.1.2).
+/// Format: `SSH_MSG_KEXINIT` (RFC 4250 §4.1.2).
 pub const KEXINIT: u8 = 20;
 
-/// The bytes of a KEXINIT's cookie (RFC 4253 §7.1, `byte[16] cookie`).
+/// Format: the bytes of a KEXINIT's cookie (RFC 4253 §7.1, `byte[16] cookie`).
 pub const COOKIE_LEN: usize = 16;
 
 /// The key exchange method the server runs (RFC 8731 §3).
