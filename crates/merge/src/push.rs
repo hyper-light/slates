@@ -19,7 +19,11 @@
 //! file it removes, `Unlink`. A directory it adds is `Mkdir` before what it holds; one it removes, `Rmdir` after what
 //! it held is removed. An executable file is `SetMode` 0755, and a file that stops being executable `SetMode` 0644 (a
 //! file a green records no mode for checks out 0644, the server's `DEFAULT_FILE_MODE`). A symbolic link is `Symlink` to
-//! its target; a changed target is `Unlink` then `Symlink`, which the deriver composes into one `Symlink`.
+//! its target; a changed target is `Unlink` then `Symlink`, which the deriver composes into one `Symlink`. A submodule's
+//! link (git's `160000`) is `Mknod` of a special node holding the commit's id, with no owner, time or permission bit,
+//! since git records none (A-637); a link moved to another commit is `Unlink` then `Mknod`, and a removed one `Unlink`.
+//! The deriver lays a node's encoding in the post-state after the files' and attributes' bytes, and the build lays it
+//! there.
 //!
 //! **The head (item 3).** A push that moves the branch sets the green's head: one `SetXattr` of [`HEAD_ATTRIBUTE`] on
 //! the green's root ([`ROOT`], the empty path, which the deriver and the engine hold always present) to the new head.
@@ -28,7 +32,8 @@
 //! tool's own form of its head, which its server reads back (git: the commit id's raw bytes).
 //!
 //! **The client's bytes (item 4).** Once accepted, every path of the pushed tree holds exactly the bytes the client
-//! sent, with its mode or its target, nothing else stands in the tree, and the root's head is the client's: the
+//! sent, with its mode, its target or its commit, nothing else stands in the tree, and the root's head is the client's:
+//! the
 //! client-fidelity test in this module's tests checks it after every push of generated histories.
 //!
 //! **What is refused, typed ([`PushRefused`]).** A base version the green does not hold; an object the push names that
@@ -50,6 +55,7 @@ use std::collections::BTreeMap;
 use crate::engine::{Green, Increment};
 use crate::increment::{DeriveError, PostStatePlan, VolumeOp, compose_volume_planned};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::special::{SpecialKind, SpecialNode};
 
 /// Format: the reserved attribute a green's root holds the branch's head in (§4.17.1 "A push is a work", item 3).
 pub const HEAD_ATTRIBUTE: &str = "slates.vcs.head";
@@ -66,6 +72,8 @@ const EXECUTABLE_MODE: u32 = 0o755;
 /// Format: the permission bits git checks out any other file with (`100644`), which a file a green records no mode for
 /// checks out with too (the server's `DEFAULT_FILE_MODE`).
 const FILE_MODE: u32 = 0o644;
+/// Format: the permission bits of a submodule's link: none, as git records it (`160000`; A-637).
+const GITLINK_MODE: u32 = 0;
 
 /// Format: the BLAKE3 key-derivation context a push's work identity is hashed under, so it is never a work volume's.
 const IDENTITY_CONTEXT: &str = "slates 2026-11-19 a client's push as a work";
@@ -238,8 +246,8 @@ pub enum PushRefused {
     /// The link's path.
     path: String,
   },
-  /// A path that is a file, a directory or a symbolic link on one side and another on the other, whose composition the
-  /// deriver owes (GAPS §8f).
+  /// A path that is a file, a directory, a symbolic link or a submodule's link on one side and another on the other,
+  /// whose composition the deriver owes (GAPS §8f).
   KindChanged {
     /// The path.
     path: String,
@@ -287,6 +295,7 @@ pub fn build<O: PushObjects>(
     objects,
     journal: Vec::new(),
     contents: BTreeMap::new(),
+    nodes: BTreeMap::new(),
     reads: Reads::default(),
     held: 0,
     room,
@@ -359,6 +368,8 @@ struct Walk<'o, O> {
   journal: Vec<VolumeOp>,
   /// Each added or changed file's blob and its length, by path: the bytes the post-state takes.
   contents: BTreeMap<String, (ObjectKey, u64)>,
+  /// Each submodule link made, by path: its node, whose encoding the post-state takes (A-637).
+  nodes: BTreeMap<String, SpecialNode>,
   /// What the walk read.
   reads: Reads,
   /// The bytes charged.
@@ -510,6 +521,11 @@ impl<O: PushObjects> Walk<'_, O> {
         }
         Ok(())
       }
+      (EntryKind::Submodule, EntryKind::Submodule) if was_id == now_id => Ok(()),
+      (EntryKind::Submodule, EntryKind::Submodule) => {
+        self.emit(VolumeOp::Unlink { path: path.clone() })?;
+        self.link(path, now_id)
+      }
       _ => Err(PushRefused::KindChanged { path }),
     }
   }
@@ -526,10 +542,9 @@ impl<O: PushObjects> Walk<'_, O> {
           pushed: None,
         })
       }
-      EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
+      EntryKind::File | EntryKind::Executable | EntryKind::Symlink | EntryKind::Submodule => {
         self.emit(VolumeOp::Unlink { path })
       }
-      EntryKind::Submodule => Err(PushRefused::KindChanged { path }),
     }
   }
 
@@ -559,8 +574,32 @@ impl<O: PushObjects> Walk<'_, O> {
         let target = self.target(&path, id)?;
         self.emit(VolumeOp::Symlink { path, target })
       }
-      EntryKind::Submodule => Err(PushRefused::KindChanged { path }),
+      EntryKind::Submodule => self.link(path, id),
     }
+  }
+
+  /// Makes `path` a submodule's link to `commit` (A-637; §4.17.2 "Trees as a volume" item 5): a special node holding the
+  /// commit's id, with no owner or time, since git records none, its encoding charged now and laid at the seal.
+  fn link(&mut self, path: String, commit: ObjectKey) -> Result<(), PushRefused> {
+    let node = SpecialNode {
+      kind: SpecialKind::Gitlink { commit },
+      uid: 0,
+      gid: 0,
+      atime: 0,
+      mtime: 0,
+      ctime: 0,
+      btime: 0,
+    };
+    let entry = size_of::<(String, SpecialNode)>()
+      .saturating_add(path.len())
+      .saturating_add(node.encoded_len());
+    self.charge(to_u64(entry))?;
+    self.nodes.insert(path.clone(), node);
+    self.emit(VolumeOp::Mknod {
+      path,
+      node,
+      mode: GITLINK_MODE,
+    })
   }
 
   /// Gives the empty file at `path` the blob `id`'s bytes: its length charged now, its bytes taken at the seal.
@@ -657,6 +696,12 @@ impl<O: PushObjects> Walk<'_, O> {
           (self.file_bytes(path)?, plan.get(&op.src).copied())
         }
         OpKind::SetXattr => (Cow::Borrowed(head), Some(0)),
+        OpKind::Mknod => {
+          let node = self.nodes.get(path).ok_or_else(|| PushRefused::Unplaced {
+            path: path.to_owned(),
+          })?;
+          (Cow::Owned(node.encode()), Some(0))
+        }
         _ => continue,
       };
       lay(&mut post, op, &source, from).ok_or_else(|| PushRefused::Unplaced {
@@ -694,7 +739,7 @@ impl<O: PushObjects> Walk<'_, O> {
 fn adds_bytes(kind: OpKind) -> bool {
   matches!(
     kind,
-    OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr
+    OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr | OpKind::Mknod
   )
 }
 

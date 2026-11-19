@@ -91,7 +91,9 @@ impl SpecialNode {
     match self.kind {
       SpecialKind::Fifo | SpecialKind::Socket => ENCODED_BYTES,
       SpecialKind::BlockDevice { .. } | SpecialKind::CharDevice { .. } => DEVICE_ENCODED_BYTES,
-      SpecialKind::Gitlink { .. } => ENCODED_BYTES,
+      SpecialKind::Gitlink { commit } => ENCODED_BYTES
+        .saturating_add(size_of::<u8>())
+        .saturating_add(commit.as_bytes().len()),
     }
   }
 
@@ -115,6 +117,11 @@ impl SpecialNode {
       bytes.extend_from_slice(&major.to_le_bytes());
       bytes.extend_from_slice(&minor.to_le_bytes());
     }
+    if let SpecialKind::Gitlink { commit } = self.kind {
+      let id = commit.as_bytes();
+      bytes.push(u8::try_from(id.len()).unwrap_or(u8::MAX));
+      bytes.extend_from_slice(id);
+    }
     bytes
   }
 
@@ -134,7 +141,7 @@ impl SpecialNode {
     let tag = reader.u8()?;
     if !matches!(
       tag,
-      KIND_FIFO | KIND_SOCKET | KIND_BLOCK_DEVICE | KIND_CHAR_DEVICE
+      KIND_FIFO | KIND_SOCKET | KIND_BLOCK_DEVICE | KIND_CHAR_DEVICE | KIND_GITLINK
     ) {
       return Err(DocDecodeError::BadKind);
     }
@@ -153,10 +160,14 @@ impl SpecialNode {
         major: reader.u32()?,
         minor: reader.u32()?,
       },
-      _ => SpecialKind::CharDevice {
+      KIND_CHAR_DEVICE => SpecialKind::CharDevice {
         major: reader.u32()?,
         minor: reader.u32()?,
       },
+      KIND_GITLINK => SpecialKind::Gitlink {
+        commit: read_commit(reader)?,
+      },
+      _ => return Err(DocDecodeError::BadKind),
     };
     Ok(Self {
       kind,
@@ -168,6 +179,16 @@ impl SpecialNode {
       btime,
     })
   }
+}
+
+/// A submodule link's commit id, after its node's fields: its length in one byte, then its bytes, refused by kind when
+/// the length is none or past [`LONGEST_ID`] (module docs).
+fn read_commit(reader: &mut Reader<'_>) -> Result<ObjectKey, DocDecodeError> {
+  let len = usize::from(reader.u8()?);
+  if len == 0 || len > LONGEST_ID {
+    return Err(DocDecodeError::BadKind);
+  }
+  ObjectKey::new(reader.bytes(len)?).ok_or(DocDecodeError::BadKind)
 }
 
 /// The IPC portion of a composed journal. Its size is bounded by the base and declared names.
