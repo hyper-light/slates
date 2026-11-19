@@ -484,17 +484,61 @@ impl HookTimes {
   pub(crate) fn cut_runs(&self) -> u64 {
     self.cuts
   }
+}
 
-  /// A run that finished `ran_ns` after it started: a sample, and the end of any back-off.
+/// What a run teaches its hook's times (A-622 part 3): the runner reports a run that finished and a run cut at its bound
+/// to whatever holds them, the hook's times themselves or a [`Lesson`] a driver carries across its awaits (it cannot hold
+/// the shard's times there) and teaches them after.
+pub(crate) trait Learns {
+  /// A run that finished `ran_ns` after it started.
+  fn finished(&mut self, ran_ns: u64);
+  /// A run cut at its bound.
+  fn ran_out(&mut self);
+}
+
+impl Learns for HookTimes {
+  /// A sample, and the end of any back-off.
   fn finished(&mut self, ran_ns: u64) {
     self.runs.completed(ran_ns);
     self.samples = self.samples.saturating_add(1);
   }
 
-  /// A run cut at its bound: no sample, and the bound backed off.
+  /// No sample, and the bound backed off.
   fn ran_out(&mut self) {
     self.runs.ran_out();
     self.cuts = self.cuts.saturating_add(1);
+  }
+}
+
+/// One run's lesson for its hook's times, carried by a driver (A-622 part 3): the finished run's length, or that it was
+/// cut at its bound; a run teaches at most one of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Lesson {
+  /// The run's length, when it finished on its own.
+  ran_ns: Option<u64>,
+  /// Whether it was cut at its bound.
+  cut: bool,
+}
+
+impl Learns for Lesson {
+  fn finished(&mut self, ran_ns: u64) {
+    self.ran_ns = Some(ran_ns);
+  }
+
+  fn ran_out(&mut self) {
+    self.cut = true;
+  }
+}
+
+impl Lesson {
+  /// Teaches `times` what the run showed: its length as a sample, or its cut as a back-off.
+  pub(crate) fn teach(self, times: &mut HookTimes) {
+    if let Some(ran_ns) = self.ran_ns {
+      times.finished(ran_ns);
+    }
+    if self.cut {
+      times.ran_out();
+    }
   }
 }
 
@@ -672,12 +716,22 @@ impl HookRun {
   /// A run whose process its driver started at `started_ns`, held to the bound `times` has learned, its words kept to
   /// `words_cap` bytes; and what the driver does first: wait, with the timer at the deadline when there is one.
   pub(crate) fn started(started_ns: u64, times: &HookTimes, words_cap: usize) -> (Self, Step) {
+    Self::with_bound(started_ns, times.bound_ns(), words_cap)
+  }
+
+  /// A run whose process its driver started at `started_ns`, held to `bound_ns` (its hook's learned bound, read by the
+  /// driver before its first await), its words kept to `words_cap` bytes; and what the driver does first.
+  pub(crate) fn with_bound(
+    started_ns: u64,
+    bound_ns: Option<u64>,
+    words_cap: usize,
+  ) -> (Self, Step) {
     let run = Self {
       state: RunState::Running,
       words: Words::default(),
       words_cap,
       started_ns,
-      bound_ns: times.bound_ns(),
+      bound_ns,
       output_open: true,
     };
     let step = run.wait();
@@ -691,7 +745,7 @@ impl HookRun {
 
   /// What `event` changes, `times` taught what the run shows of its hook, and what the driver does next. A run that is
   /// over answers every later event with nothing to do.
-  pub(crate) fn on(&mut self, event: Event<'_>, times: &mut HookTimes) -> Step {
+  pub(crate) fn on(&mut self, event: Event<'_>, times: &mut impl Learns) -> Step {
     match self.state {
       RunState::Running => self.running(event, times),
       RunState::Draining(status) => self.draining(status, event),
@@ -715,7 +769,7 @@ impl HookRun {
   }
 
   /// An event while the hook's process runs.
-  fn running(&mut self, event: Event<'_>, times: &mut HookTimes) -> Step {
+  fn running(&mut self, event: Event<'_>, times: &mut impl Learns) -> Step {
     match event {
       Event::Output(bytes) => {
         self.words.append(bytes, self.words_cap);
@@ -733,7 +787,7 @@ impl HookRun {
 
   /// The hook's process exited on its own at `at_ns`: a sample of its hook's runs, and its outcome once its words
   /// stream has ended.
-  fn exited(&mut self, status: ExitStatus, at_ns: u64, times: &mut HookTimes) -> Step {
+  fn exited(&mut self, status: ExitStatus, at_ns: u64, times: &mut impl Learns) -> Step {
     times.finished(at_ns.saturating_sub(self.started_ns));
     if self.output_open {
       self.state = RunState::Draining(status);
@@ -744,7 +798,7 @@ impl HookRun {
 
   /// The timer fired at `now_ns`: at or past the deadline, the run is cut at its bound (no sample, the bound backed
   /// off) and its hook killed; before it, a wait for the deadline still.
-  fn timer(&mut self, now_ns: u64, times: &mut HookTimes) -> Step {
+  fn timer(&mut self, now_ns: u64, times: &mut impl Learns) -> Step {
     match (self.bound_ns, self.deadline_ns()) {
       (Some(bound_ns), Some(deadline_ns)) if now_ns >= deadline_ns => {
         times.ran_out();

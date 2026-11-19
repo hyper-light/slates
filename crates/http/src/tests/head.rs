@@ -54,30 +54,33 @@ fn a_get_reads_its_line_its_fields_and_its_defaults() {
     ],
   );
   let (head, consumed) = whole(&input);
-  assert_eq!(head.method, b"GET");
-  assert_eq!(
-    head.target,
-    Target::Path {
+  let expected = Head {
+    method: b"GET",
+    target: Target::Path {
       path: b"/team/repo.git/info/refs",
-      query: Some(b"service=git-upload-pack")
-    }
-  );
-  assert_eq!(head.version, Version::Http11);
-  assert_eq!(head.authority, Some(&b"example.com:8443"[..]));
-  let expected: Vec<Field<'_>> = vec![
-    (b"Host", b"example.com:8443"),
-    (b"User-Agent", b"git/2.50.1"),
-    (b"Git-Protocol", b"version=2"),
-  ];
-  assert_eq!(head.fields, expected);
+      query: Some(b"service=git-upload-pack"),
+    },
+    version: Version::Http11,
+    authority: Some(b"example.com:8443"),
+    fields: vec![
+      (b"Host", b"example.com:8443"),
+      (b"User-Agent", b"git/2.50.1"),
+      (b"Git-Protocol", b"version=2"),
+    ],
+    framing: Framing::None,
+    coding: Coding::Identity,
+    keep_alive: true,
+    expect_continue: false,
+  };
+  assert_eq!((&head, consumed), (&expected, input.len()));
+  assert_one_field_found_in_any_case(&head);
+}
+
+/// The advertisement's head's one-value lookups: `Git-Protocol` by either case, `Content-Type` absent.
+fn assert_one_field_found_in_any_case(head: &Head<'_>) {
   assert_eq!(head.field(b"git-protocol"), Ok(Some(&b"version=2"[..])));
   assert_eq!(head.field(b"GIT-PROTOCOL"), Ok(Some(&b"version=2"[..])));
   assert_eq!(head.field(b"content-type"), Ok(None));
-  assert_eq!(head.framing, Framing::None);
-  assert_eq!(head.coding, Coding::Identity);
-  assert!(head.keep_alive);
-  assert!(!head.expect_continue);
-  assert_eq!(consumed, input.len());
 }
 
 /// A-595: do read POSTs framed each way and coded each way. Expect `Content-Length`'s value, chunked, gzip under either

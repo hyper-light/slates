@@ -43,6 +43,7 @@ pub mod map;
 pub mod ops_doc;
 pub mod origin;
 pub mod ptrie;
+pub mod push;
 pub mod range;
 pub mod review;
 pub mod splice;

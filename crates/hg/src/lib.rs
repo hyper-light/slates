@@ -13,7 +13,8 @@
 //! for byte as Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), handles no part
 //! (piece 5), and serves no command (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by
 //! [`compression`] (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb
-//! refused by kind; and a plain bundle is compressed as 7.2 compresses one.
+//! refused by kind; and a plain bundle is compressed as 7.2 compresses one. [`serve`] holds read serving's logic
+//! (A-619): discovery's answers, `listkeys`, and which changesets a `getbundle` sends, over the served view's graph.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
 //! `internals.bundle2`, `internals.bundles` and `internals.changegroups` \[B\], and its code \[C\], which is what clients
@@ -89,7 +90,9 @@ pub mod pushkey;
 mod quote;
 mod read;
 pub mod revlog;
+pub mod serve;
 pub mod ssh;
+pub mod store;
 pub mod wire;
 
 pub use admission::{Admission, PastAdmission};
@@ -140,3 +143,7 @@ mod revlog_tests;
 #[cfg(test)]
 #[path = "tests/index.rs"]
 mod index_tests;
+
+#[cfg(test)]
+#[path = "tests/store.rs"]
+mod store_tests;

@@ -1,4 +1,4 @@
-use super::{BadField, Body, CONTINUE, LAST_CHUNK, Status, chunk, head, refusal};
+use super::{BadField, Body, CONTINUE, LAST_CHUNK, Status, bare, chunk, head, refusal};
 
 /// A-595: do write a chunked reply's head kept open, and one closed. Expect the status line, the fields in order, the
 /// framing, `Connection: close` only when asked, and the empty line, byte for byte.
@@ -100,7 +100,7 @@ fn chunks_are_framed_by_their_hexadecimal_size() {
 /// A-595: do read every status's code and reason. Expect RFC 9110's, and RFC 6585's for 431.
 #[test]
 fn each_status_is_rfc_9110s() {
-  let cases: [(Status, u16, &str); 15] = [
+  let cases: [(Status, u16, &str); 17] = [
     (Status::CONTINUE, 100, "Continue"),
     (Status::OK, 200, "OK"),
     (Status::BAD_REQUEST, 400, "Bad Request"),
@@ -122,7 +122,9 @@ fn each_status_is_rfc_9110s() {
       431,
       "Request Header Fields Too Large",
     ),
+    (Status::INTERNAL_SERVER_ERROR, 500, "Internal Server Error"),
     (Status::NOT_IMPLEMENTED, 501, "Not Implemented"),
+    (Status::SERVICE_UNAVAILABLE, 503, "Service Unavailable"),
     (
       Status::VERSION_NOT_SUPPORTED,
       505,
@@ -131,5 +133,29 @@ fn each_status_is_rfc_9110s() {
   ];
   for (status, code, reason) in cases {
     assert_eq!((status.code, status.reason), (code, reason));
+  }
+}
+
+/// A-625: do write a bare head for each framing, kept and closed. Expect the status line and the framing alone, the
+/// same bytes `head` writes with no fields.
+#[test]
+fn a_bare_head_is_a_head_with_no_fields() {
+  for (body, close) in [
+    (Body::Length(0), true),
+    (Body::Length(7), false),
+    (Body::Chunked, false),
+    (Body::UntilClose, false),
+  ] {
+    let (mut bare_out, mut head_out) = (Vec::new(), Vec::new());
+    bare(Status::INTERNAL_SERVER_ERROR, body, close, &mut bare_out);
+    head(
+      Status::INTERNAL_SERVER_ERROR,
+      &[],
+      body,
+      close,
+      &mut head_out,
+    )
+    .unwrap();
+    assert_eq!(bare_out, head_out, "{body:?} {close}");
   }
 }

@@ -7,11 +7,14 @@ use std::mem::size_of;
 
 use slates_vcs::{ContentId, ContentRefused, ContentStore, Index, IndexRefused, NewRow};
 
-use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tag::Tag;
 use crate::objects::tree::Tree;
+use crate::out::Out;
+use crate::{Admission, pack, to_u64};
 
+use super::fragment::{self, FragmentRefused, Learning, Placed, Stored, ToEncode};
+use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
 use super::positions::Positions;
 use super::push::Push;
@@ -62,6 +65,26 @@ pub enum StoreRefused {
   PositionsExhausted,
   /// A push made for a repository of another object format.
   ForeignPush,
+  /// A green has no such version.
+  NoVersion {
+    /// The green.
+    green: u64,
+    /// The version asked for.
+    version: u64,
+  },
+  /// A pack asked for a version whose fragments are not encoded yet.
+  NotEncoded {
+    /// The version.
+    version: u64,
+  },
+  /// A fragment or a base pack could not be encoded.
+  Encoding(FragmentRefused),
+  /// A pack of more entries than its header can count.
+  PackTooLarge,
+  /// A kept fragment's bytes are not in the store.
+  FragmentUnreadable,
+  /// The pack's trailer could not be made (SHA-1's collision detection refused it).
+  TrailerRefused,
   /// The index refused the rows.
   Index(IndexRefused),
   /// The store refused (the budget).
@@ -97,6 +120,16 @@ pub struct StoreCounters {
   pub remade: u64,
   /// Of those, the ones that started from another green's set.
   pub bases_found: u64,
+  /// Fragments encoded.
+  pub fragments: u64,
+  /// Entries written whole.
+  pub whole: u64,
+  /// Entries written as a delta against an earlier entry.
+  pub offset_deltas: u64,
+  /// Entries written as a delta against a named object.
+  pub reference_deltas: u64,
+  /// Base packs made.
+  pub rebuilds: u64,
 }
 
 /// The entry a path names in a version's tree.
@@ -113,6 +146,33 @@ pub struct Found {
 struct Version {
   head: Option<u64>,
   brought: Positions,
+  /// Its D(k) encoded, once the owner asked (A-614 part 2).
+  fragments: Option<Fragments>,
+}
+
+/// Shape: what one fragment entry's record costs the budget. Derived from the type.
+const PLACED_BYTES: usize = size_of::<Placed>();
+
+/// One fragment, or a base pack, kept: its bytes as content, its length, its entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Kept {
+  content: ContentId,
+  len: u64,
+  placed: Vec<Placed>,
+}
+
+/// A version's two fragments: its commits, trees and tags, then its blobs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fragments {
+  objects: Kept,
+  blobs: Kept,
+}
+
+/// A green's base pack: every object its head reached at `version`, self-contained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BasePack {
+  version: usize,
+  kept: Kept,
 }
 
 /// A ref's chain of versions and the set its current head reaches.
@@ -120,6 +180,8 @@ struct Version {
 struct Chain {
   versions: Vec<Version>,
   reached: Positions,
+  base: Option<BasePack>,
+  rebuild: Rebuild,
 }
 
 impl Chain {
@@ -135,7 +197,25 @@ impl Chain {
       .fold(self.reached.runs(), |runs, version| {
         runs.saturating_add(version.brought.runs())
       });
-    bytes(self.versions.len(), VERSION_BYTES).saturating_add(bytes(runs, RUN_BYTES))
+    let records = bytes(self.versions.len(), VERSION_BYTES).saturating_add(bytes(runs, RUN_BYTES));
+    records.saturating_add(bytes(self.placed(), PLACED_BYTES))
+  }
+
+  /// Every kept fragment's and the base pack's entries.
+  fn placed(&self) -> usize {
+    self.kept().fold(0_usize, |total, kept| {
+      total.saturating_add(kept.placed.len())
+    })
+  }
+
+  /// Every fragment kept and the base pack.
+  fn kept(&self) -> impl Iterator<Item = &Kept> + '_ {
+    self
+      .versions
+      .iter()
+      .filter_map(|version| version.fragments.as_ref())
+      .flat_map(|fragments| [&fragments.objects, &fragments.blobs])
+      .chain(self.base.as_ref().map(|base| &base.kept))
   }
 }
 
@@ -234,6 +314,9 @@ pub struct Repository {
   /// What the chains and the head map charge the store.
   charged: u64,
   counters: Cell<StoreCounters>,
+  window: Window,
+  levels: Levels,
+  depth: Depth,
 }
 
 impl Repository {
@@ -247,6 +330,9 @@ impl Repository {
       heads: BTreeMap::new(),
       charged: 0,
       counters: Cell::new(StoreCounters::default()),
+      window: Window::default(),
+      levels: Levels::default(),
+      depth: Depth::default(),
     }
   }
 
@@ -792,6 +878,7 @@ impl Repository {
     self.next_position = next;
     let given = u64::try_from(fresh.len()).unwrap_or(u64::MAX);
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
+    self.depth.seen(push.deepest());
     push.release_holds(store)?;
     Ok(versions)
   }
@@ -989,7 +1076,11 @@ impl Repository {
         .map(|to| self.position_of(store, positions, &to))
         .transpose()?;
       move_head(&mut heads, movement.green, movement.from, head);
-      chain.versions.push(Version { head, brought });
+      chain.versions.push(Version {
+        head,
+        brought,
+        fragments: None,
+      });
       chains.insert(movement.green, chain);
     }
     Ok((chains, heads))
@@ -1103,8 +1194,16 @@ impl Repository {
   /// Gives back everything the repository holds: its rows' holds, their tables, and its versions' charge. It goes on
   /// past a refusal and answers the first.
   pub fn release(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
-    let index = self.index.release(store).map_err(StoreRefused::from);
-    index.and(store.discharge(self.charged).map_err(StoreRefused::from))
+    let mut first = self.index.release(store).map_err(StoreRefused::from);
+    for kept in self.chains.values().flat_map(Chain::kept) {
+      first = first.and(
+        store
+          .release(&kept.content)
+          .map(drop)
+          .map_err(StoreRefused::from),
+      );
+    }
+    first.and(store.discharge(self.charged).map_err(StoreRefused::from))
   }
 }
 
@@ -1146,4 +1245,421 @@ fn footprint(
     .values()
     .fold(0_usize, |total, greens| total.saturating_add(greens.len()));
   chains.saturating_add(bytes(entries, HEAD_BYTES))
+}
+
+/// A tree's entries that are objects of this repository: name, whether a subtree, id.
+type TreeEntries = BTreeMap<Vec<u8>, (bool, ObjectId)>;
+
+/// The objects to encode, split: commits, trees and tags, then blobs.
+type Split = (Vec<ToEncode>, Vec<ToEncode>);
+
+/// The slot of `green`'s version `version`'s fragments.
+fn fragments_slot(
+  chains: &mut BTreeMap<u64, Chain>,
+  green: u64,
+  version: usize,
+) -> Option<&mut Option<Fragments>> {
+  chains
+    .get_mut(&green)
+    .and_then(|chain| chain.versions.get_mut(version))
+    .map(|record| &mut record.fragments)
+}
+
+/// A fragment's bytes kept as content.
+fn keep(
+  store: &mut ContentStore,
+  (bytes, placed): fragment::Encoded,
+) -> Result<Kept, StoreRefused> {
+  let content = store.put_object(&bytes)?;
+  Ok(Kept {
+    content,
+    len: to_u64(bytes.len()),
+    placed,
+  })
+}
+
+/// The order a fragment's objects are encoded in: by type, the largest first (a delta is tried
+/// against the larger objects before it), then by id.
+fn order(objects: &mut [ToEncode]) {
+  objects.sort_by(|a, b| {
+    a.kind
+      .cmp(&b.kind)
+      .then(b.bytes.len().cmp(&a.bytes.len()))
+      .then(a.id.cmp(&b.id))
+  });
+}
+
+/// The fragments' part (A-614 part 2; module docs and `fragment`'s).
+impl Repository {
+  /// A version's record, or why there is none.
+  fn version_record(&self, green: u64, version: usize) -> Result<&Version, StoreRefused> {
+    self
+      .chains
+      .get(&green)
+      .and_then(|chain| chain.versions.get(version))
+      .ok_or(StoreRefused::NoVersion {
+        green,
+        version: to_u64(version),
+      })
+  }
+
+  /// An indexed object's type and bytes.
+  fn read(&self, store: &ContentStore, id: &ObjectId) -> Result<(Kind, Vec<u8>), StoreRefused> {
+    let (row, content) = self
+      .indexed(store, id)
+      .ok_or(StoreRefused::Missing { id: *id })?;
+    let bytes = store
+      .object_bytes(&content, row.len)
+      .ok_or(StoreRefused::Unreadable { id: *id })?;
+    Ok((row.kind, bytes))
+  }
+
+  /// A tree's entries that are objects of this repository.
+  fn tree_entries(
+    &self,
+    store: &ContentStore,
+    tree: &ObjectId,
+  ) -> Result<TreeEntries, StoreRefused> {
+    let (_, bytes) = self.read(store, tree)?;
+    let malformed = StoreRefused::Malformed { id: *tree };
+    let parsed =
+      Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
+    let mut entries = TreeEntries::new();
+    for entry in parsed
+      .entries()
+      .iter()
+      .filter(|entry| entry.kind() != Kind::Commit)
+    {
+      let id = entry.object_id(self.format).ok_or(malformed)?;
+      entries.insert(entry.name.to_vec(), (entry.is_dir(), id));
+    }
+    Ok(entries)
+  }
+
+  /// For each tree or blob version `version` of `green` holds at a path where version
+  /// `version - 1` held another of its kind, that other: the bases REF deltas may name. The two
+  /// root trees are walked together, into the subtrees that differ only.
+  fn named_bases(
+    &self,
+    store: &ContentStore,
+    green: u64,
+    version: usize,
+  ) -> Result<BTreeMap<ObjectId, ObjectId>, StoreRefused> {
+    let mut named = BTreeMap::new();
+    let old = version
+      .checked_sub(1)
+      .and_then(|previous| self.tree(store, green, previous));
+    let (Some(new), Some(old)) = (self.tree(store, green, version), old) else {
+      return Ok(named);
+    };
+    let mut pending = vec![(new, old)];
+    while let Some((new, old)) = pending.pop() {
+      if new == old || named.insert(new, old).is_some() {
+        continue;
+      }
+      let olds = self.tree_entries(store, &old)?;
+      for (name, (is_dir, id)) in self.tree_entries(store, &new)? {
+        match olds.get(&name) {
+          Some((was_dir, was)) if *was_dir == is_dir && *was != id && is_dir => {
+            pending.push((id, *was));
+          }
+          Some((was_dir, was)) if *was_dir == is_dir && *was != id => {
+            named.insert(id, *was);
+          }
+          _ => {}
+        }
+      }
+    }
+    Ok(named)
+  }
+
+  /// The objects at `positions` to encode, split and each in its order, each with the object
+  /// `named` gives it and that object's bytes.
+  fn to_encode(
+    &self,
+    store: &ContentStore,
+    positions: &Positions,
+    named: &BTreeMap<ObjectId, ObjectId>,
+  ) -> Result<Split, StoreRefused> {
+    let (mut others, mut blobs) = (Vec::new(), Vec::new());
+    for position in positions.iter() {
+      let id = self
+        .id_at(store, position)
+        .ok_or(StoreRefused::FragmentUnreadable)?;
+      let (kind, bytes) = self.read(store, &id)?;
+      let named = match named.get(&id) {
+        Some(old) => Some((*old, self.read(store, old)?.1)),
+        None => None,
+      };
+      let object = ToEncode {
+        id,
+        kind,
+        bytes,
+        named,
+      };
+      if kind == Kind::Blob {
+        blobs.push(object);
+      } else {
+        others.push(object);
+      }
+    }
+    order(&mut others);
+    order(&mut blobs);
+    Ok((others, blobs))
+  }
+
+  /// Counts a kept fragment's entries by how each holds its object.
+  fn count_entries(&self, placed: &[Placed]) {
+    for entry in placed {
+      self.count(|counters| match entry.stored {
+        Stored::Whole => counters.whole = counters.whole.saturating_add(1),
+        Stored::Offset => counters.offset_deltas = counters.offset_deltas.saturating_add(1),
+        Stored::Reference => {
+          counters.reference_deltas = counters.reference_deltas.saturating_add(1);
+        }
+      });
+    }
+  }
+
+  /// Charges what the chains and the head map take now against what was charged.
+  fn recharge(&mut self, store: &mut ContentStore) -> Result<(), StoreRefused> {
+    let total = footprint(&self.chains, &BTreeMap::new(), &self.heads);
+    if total > self.charged {
+      store.charge(total.saturating_sub(self.charged))?;
+    } else {
+      store.discharge(self.charged.saturating_sub(total))?;
+    }
+    self.charged = total;
+    Ok(())
+  }
+
+  /// Encodes `green`'s version `version` as its two fragments (`fragment`'s docs), kept as
+  /// content: the owner calls it after the commit's answer, off the answer's path. A version is
+  /// encoded once. Refused, nothing is kept.
+  pub fn encode_fragments(
+    &mut self,
+    store: &mut ContentStore,
+    (green, version): (u64, usize),
+    clock: &mut dyn Clock,
+    exchange: Exchange,
+  ) -> Result<(), StoreRefused> {
+    let record = self.version_record(green, version)?;
+    if record.fragments.is_some() {
+      return Ok(());
+    }
+    let brought = record.brought.clone();
+    let named = self.named_bases(store, green, version)?;
+    let (others, blobs) = self.to_encode(store, &brought, &named)?;
+    let mut learning = Learning {
+      window: &mut self.window,
+      levels: &mut self.levels,
+      depth: self.depth.limit(),
+      exchange,
+      clock,
+    };
+    let objects = fragment::encode(&others, &mut learning).map_err(StoreRefused::Encoding)?;
+    let blobs = fragment::encode(&blobs, &mut learning).map_err(StoreRefused::Encoding)?;
+    let objects = keep(store, objects)?;
+    let blobs = match keep(store, blobs) {
+      Ok(kept) => kept,
+      Err(refused) => {
+        store.release(&objects.content)?;
+        return Err(refused);
+      }
+    };
+    self.install(store, (green, version), Fragments { objects, blobs })
+  }
+
+  /// Records a version's fragments and charges their entries; refused, the fragments' content is
+  /// let go and nothing changed.
+  fn install(
+    &mut self,
+    store: &mut ContentStore,
+    (green, version): (u64, usize),
+    fragments: Fragments,
+  ) -> Result<(), StoreRefused> {
+    let contents = [fragments.objects.content, fragments.blobs.content];
+    self.count_entries(&fragments.objects.placed);
+    self.count_entries(&fragments.blobs.placed);
+    if let Some(kept) = fragments_slot(&mut self.chains, green, version) {
+      *kept = Some(fragments);
+    }
+    if let Err(refused) = self.recharge(store) {
+      if let Some(kept) = fragments_slot(&mut self.chains, green, version) {
+        *kept = None;
+      }
+      for content in contents {
+        store.release(&content)?;
+      }
+      return Err(refused);
+    }
+    self.count(|counters| counters.fragments = counters.fragments.saturating_add(2));
+    Ok(())
+  }
+
+  /// Makes `green`'s base pack again from every object its current head reaches, self-contained
+  /// (offset deltas only), and teaches the rebuild rule its measured time. Refused, the old base
+  /// pack stays.
+  pub fn rebuild_base(
+    &mut self,
+    store: &mut ContentStore,
+    green: u64,
+    clock: &mut dyn Clock,
+    exchange: Exchange,
+  ) -> Result<(), StoreRefused> {
+    let chain = self
+      .chains
+      .get(&green)
+      .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
+    let version = chain
+      .versions
+      .len()
+      .checked_sub(1)
+      .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
+    let reached = chain.reached.clone();
+    let start = clock.now_ns();
+    let (mut objects, blobs) = self.to_encode(store, &reached, &BTreeMap::new())?;
+    objects.extend(blobs);
+    let mut learning = Learning {
+      window: &mut self.window,
+      levels: &mut self.levels,
+      depth: self.depth.limit(),
+      exchange,
+      clock,
+    };
+    let encoded = fragment::encode(&objects, &mut learning).map_err(StoreRefused::Encoding)?;
+    let ns = learning.clock.now_ns().saturating_sub(start);
+    let kept = keep(store, encoded)?;
+    self.install_base(store, green, BasePack { version, kept }, ns)
+  }
+
+  /// Records a base pack in place of the old one, charges it, and teaches the rule its time.
+  fn install_base(
+    &mut self,
+    store: &mut ContentStore,
+    green: u64,
+    base: BasePack,
+    ns: u64,
+  ) -> Result<(), StoreRefused> {
+    let content = base.kept.content;
+    let placed = base.kept.placed.clone();
+    let old = self
+      .chains
+      .get_mut(&green)
+      .and_then(|chain| chain.base.replace(base));
+    if let Err(refused) = self.recharge(store) {
+      if let Some(chain) = self.chains.get_mut(&green) {
+        chain.base = old;
+      }
+      store.release(&content)?;
+      return Err(refused);
+    }
+    if let Some(old) = old {
+      store.release(&old.kept.content)?;
+    }
+    if let Some(chain) = self.chains.get_mut(&green) {
+      chain.rebuild.rebuilt(ns);
+    }
+    self.count_entries(&placed);
+    self.count(|counters| counters.rebuilds = counters.rebuilds.saturating_add(1));
+    Ok(())
+  }
+
+  /// A clone of `green` spent `ns` serving the fragments after its base pack: the rebuild rule's
+  /// rent.
+  pub fn clone_took(&mut self, green: u64, ns: u64) {
+    if let Some(chain) = self.chains.get_mut(&green) {
+      chain.rebuild.cloned(ns);
+    }
+  }
+
+  /// Whether `green`'s base pack is due to be made again (`learn`'s rebuild rule).
+  pub fn rebuild_due(&self, green: u64) -> bool {
+    self
+      .chains
+      .get(&green)
+      .is_some_and(|chain| chain.rebuild.due())
+  }
+
+  /// The entries of `green`'s version `version`'s fragments: commits, trees and tags, then blobs.
+  pub fn fragments(&self, green: u64, version: usize) -> Option<(&[Placed], &[Placed])> {
+    let fragments = self
+      .version_record(green, version)
+      .ok()?
+      .fragments
+      .as_ref()?;
+    Some((&fragments.objects.placed, &fragments.blobs.placed))
+  }
+
+  /// A pack of `green`'s versions `from` to `to`, each version's fragments in order (§4.17.2 "A
+  /// fetch", item 3): a header counting their entries, the entries as kept, and the trailer.
+  /// Refused `NotEncoded` for a version not yet encoded.
+  pub fn pack(
+    &self,
+    store: &ContentStore,
+    green: u64,
+    (from, to): (usize, usize),
+  ) -> Result<Vec<u8>, StoreRefused> {
+    let mut parts: Vec<&Kept> = Vec::new();
+    for version in from..=to {
+      let fragments = self
+        .version_record(green, version)?
+        .fragments
+        .as_ref()
+        .ok_or(StoreRefused::NotEncoded {
+          version: to_u64(version),
+        })?;
+      parts.push(&fragments.objects);
+      parts.push(&fragments.blobs);
+    }
+    self.assemble(store, &parts)
+  }
+
+  /// A clone's pack of `green`: its base pack, then the fragments of the versions after it; every
+  /// version's fragments while it has none.
+  pub fn clone_pack(&self, store: &ContentStore, green: u64) -> Result<Vec<u8>, StoreRefused> {
+    let chain = self
+      .chains
+      .get(&green)
+      .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
+    let last = chain
+      .versions
+      .len()
+      .checked_sub(1)
+      .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
+    let Some(base) = &chain.base else {
+      return self.pack(store, green, (0, last));
+    };
+    let mut parts: Vec<&Kept> = vec![&base.kept];
+    for version in base.version.saturating_add(1)..=last {
+      let fragments = self
+        .version_record(green, version)?
+        .fragments
+        .as_ref()
+        .ok_or(StoreRefused::NotEncoded {
+          version: to_u64(version),
+        })?;
+      parts.push(&fragments.objects);
+      parts.push(&fragments.blobs);
+    }
+    self.assemble(store, &parts)
+  }
+
+  /// A pack of `parts`: header, entries, trailer, through A-591's writer.
+  fn assemble(&self, store: &ContentStore, parts: &[&Kept]) -> Result<Vec<u8>, StoreRefused> {
+    let entries = parts.iter().fold(0_usize, |total, part| {
+      total.saturating_add(part.placed.len())
+    });
+    let count = u32::try_from(entries).map_err(|_| StoreRefused::PackTooLarge)?;
+    let mut out = Vec::new();
+    let mut writer = pack::Writer::new(self.format, count, &mut out);
+    for part in parts {
+      let bytes = store
+        .object_bytes(&part.content, part.len)
+        .ok_or(StoreRefused::FragmentUnreadable)?;
+      writer.put(&bytes);
+    }
+    writer.finish().map_err(|_| StoreRefused::TrailerRefused)?;
+    Ok(out)
+  }
 }
