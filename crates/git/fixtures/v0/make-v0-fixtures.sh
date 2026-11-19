@@ -8,7 +8,8 @@
 #   deepened, clones by `--shallow-since` and `--shallow-exclude`, and a partial clone by `--filter=blob:none`;
 # - requests written here byte for byte (stateless, as an HTTP server answers them) with upload-pack's answers: the
 #   negotiation under multi_ack, under multi_ack_detailed ending `done` and reaching `ready`, and with neither; a client
-#   shallow at the tip deepened to two (`unshallow`); and a want never advertised (`ERR`).
+#   shallow at the tip deepened to two (`unshallow`); a want never advertised (`ERR`); and a `sparse:oid` filter's
+#   clone, and its refusal of a blob that names nothing, on side-band-64k and on no band (A-640 part 4).
 # Then SHA256SUMS: every file's SHA-256, which the tests check before they read a byte.
 # Deterministic: no configuration but this script's (system, global and the environment's `GIT_CONFIG_*` cleared), a
 # fixed identity, every date 2005-04-07T22:13:13Z, packs made on one thread, and no progress.
@@ -111,5 +112,17 @@ up < "$OUT/unshallow.request.bin" > "$OUT/unshallow.response.bin"
 # A want the server never advertised: refused with `ERR`.
 { pkt "want $UNKNOWN side-band-64k ofs-delta"$'\n'; printf 0000; pkt $'done\n'; } > "$OUT/unknown-want.request.bin"
 up < "$OUT/unknown-want.request.bin" > "$OUT/unknown-want.response.bin" 2> /dev/null || true
+# A sparse filter (A-640 part 4): `main:a` names a blob whose one pattern, `one`, matches no path, so the pack holds the
+# commits and trees alone; `main:missing` names nothing, which `pack-objects` dies of as it begins: its words on band 2
+# and git's band-3 words after the `NAK` on side-band-64k, and with no band to say them on, the `NAK` alone.
+{ pkt "want $TIP side-band-64k ofs-delta no-progress filter"$'\n'; pkt $'filter sparse:oid=main:a\n'; printf 0000
+  pkt $'done\n'; } > "$OUT/sparse-v0.request.bin"
+up < "$OUT/sparse-v0.request.bin" > "$OUT/sparse-v0.response.bin"
+{ pkt "want $TIP side-band-64k ofs-delta no-progress filter"$'\n'; pkt $'filter sparse:oid=main:missing\n'
+  printf 0000; pkt $'done\n'; } > "$OUT/sparse-missing-v0.request.bin"
+up < "$OUT/sparse-missing-v0.request.bin" > "$OUT/sparse-missing-v0.response.bin" 2> /dev/null || true
+{ pkt "want $TIP ofs-delta no-progress filter"$'\n'; pkt $'filter sparse:oid=main:missing\n'; printf 0000
+  pkt $'done\n'; } > "$OUT/sparse-bare-v0.request.bin"
+up < "$OUT/sparse-bare-v0.request.bin" > "$OUT/sparse-bare-v0.response.bin" 2> /dev/null || true
 cd "$OUT"
 find . -type f ! -name SHA256SUMS ! -name make-v0-fixtures.sh | LC_ALL=C sort | sed 's|^\./||' | xargs shasum -a 256 > SHA256SUMS
