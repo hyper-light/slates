@@ -17,9 +17,10 @@
 > Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
 > the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
 > by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
-> macOS run owed). Part 1's server half BUILT (`crates/server/src/identities/tests.rs`; A-664's entry has the runs):
+> macOS run owed). Part 1's server half BUILT, its runs OWED (`crates/server/src/identities/tests.rs`; A-664's entry):
 > `SetIdentities` on the control channel (the launcher's proof, `Forbidden` on a consumer's channel, git's identity held
-> to `slates_git::derived::Identity`, a one-line Mercurial user), recorded on the principal's partition; a session's
+> to `slates_git::derived::Identity`, a Mercurial user as Mercurial 7.2's `changelog.add` writes it: not empty, one
+> line, no byte it strips from either end), recorded on the principal's partition; a session's
 > identities read once, at its first submit, kept with the session and written into each submit over the client's
 > claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
 > submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one

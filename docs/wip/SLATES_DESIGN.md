@@ -47334,7 +47334,11 @@ Applied in the same change to:
 - **Set by the owner** (`SetIdentities`, `slates-server`'s `identities`): the launcher's act on the control channel,
   proven by the keyed hash under its secret (`landing::identities_proof`, its own domain), refused `Forbidden` on a
   consumer's channel whatever its proof and `GrantIssuerUnverified` without it; git's identity held to git's own rules
-  (`slates_git::derived::Identity`) and Mercurial's user to one line, else `BadRequest` naming the part; recorded on the
+  (`slates_git::derived::Identity`) and Mercurial's user to what Mercurial writes as it is: not empty, one line, and no
+  byte Mercurial strips from its ends (`identities::MERCURIAL_STRIPS`: Mercurial 7.2's `changelog.add` strips the user
+  with Python's `bytes.strip()`, then refuses an empty one or one holding a newline [C: `mercurial/changelog.py`, read
+  2026-11-19], so " Ada <a@example.com>" would be recorded as bytes no changeset of Mercurial's carries), else
+  `BadRequest` naming the part; recorded on the
   principal's partition (a consumer's, the one its id names; any other's, the one its key's bytes hash to,
   `verbs::owner_of_key`, the hash `owner_of_name` places a name by) as the version after the one read
   (`PolicyChanged` from a stale read), answered `IdentitiesSet`.
@@ -47359,16 +47363,22 @@ Applied in the same change to:
   owed with its revisions.
 - **Wire** (`slates-ipc`, published): `RequestBody::SetIdentities` tag 87, `Refusal::MessageRequired` 76 and
   `IdentityRequired` 77, `ReplyBody::IdentitiesSet` 74.
-- **Tests** (`crates/server/src/identities/tests.rs`, 12, each guard its own; `repository.rs`'s writes now submit with
+- **Tests** (`crates/server/src/identities/tests.rs`, 13, each guard its own; `repository.rs`'s writes now submit with
   a message and identities, `identities::authored`): a repository's green refuses a submit without a message, or with
   an empty one, `MessageRequired` in git, Mercurial and Subversion, then accepts it at version 1; with no identity in
   its tool `IdentityRequired` naming git, and Mercurial, then accepts it; a Subversion repository's takes one with none;
   a plain green takes either; an agent's channel is refused `Forbidden`, a proof not the launcher's
-  `GrantIssuerUnverified`, a git name git would change and a Mercurial user of two lines `BadRequest`, a stale setting
-  `PolicyChanged`. On audit daemons with seated clients: a session's claim of git's identity is written over with its
-  own none and refused, a setting made mid-session reaches the next session and not this one, two reads counted for two
-  sessions; a revocation while the read is away refuses the submit, which built nothing; a later read never replaces
-  what a session keeps; a read the fenced partition never answers refuses `Overloaded`, nothing recorded.
+  `GrantIssuerUnverified`, a git name git would change `BadRequest`, and so is each Mercurial user Mercurial would
+  refuse or change (two lines, empty, a leading space, a trailing vertical tab), a stale setting `PolicyChanged`. On
+  audit daemons with seated clients: a session's claim of git's identity is written over with its own none and
+  refused, a setting made mid-session reaches the next session and not this one, two reads counted for two sessions; a
+  revocation while the read is away refuses the submit, which built nothing; a later read never replaces what a
+  session keeps; a read that returns to a seat another session (an agent's) now holds, or to one retiring, is refused
+  `NotFound`, kept by neither seat, counted by none, and builds nothing; a read the fenced partition never answers
+  refuses `Overloaded`, nothing recorded. Runs owed: the first build on Windows x86_64 (jupiter) ended at 18:40Z on
+  2026-11-19 with the machine's disk full (os error 112), before any test ran; the green run of `slates-server --lib`
+  against main's 23 failures there, the Mercurial user's test red over the one-line rule first, the lib tests of
+  `slates-ipc`, `slates-api` and `slates-client`, and the macOS run.
 - **Owed.** A session's first submit on a fleet node (f ≥ 1), answered on its own route once its commit lands (main's
   fleet lane: `crates/server/tests/fleet.rs` and `works_off_owner.rs` submit through sessions); the clients' surfaces
   (the typed client's submits carrying a message, the SDKs, the MCP and the CLI, setting identities); Subversion's
