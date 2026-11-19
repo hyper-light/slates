@@ -839,8 +839,9 @@ fn rule(
 /// principal a submit to branch `default`, prepare stock `push-plain` and ask the policy; with the rule gone, ask again;
 /// on another repository whose one rule lets only a stranger submit to bookmarks, prepare stock `push-bookmark`'s move
 /// of `main` and ask. Expect: the first refused in `acl`'s words naming the principal, `default` and the first changeset
-/// the push brings on it; the second admitted (no rule speaks, and the owner holds what none speaks to); the third
-/// refused as not allowed on bookmark `main`, naming the bookmark's new node.
+/// the push brings on it in `short`'s twelve digits; the second admitted (no rule speaks, and the owner holds what none
+/// speaks to); the third refused as not allowed on bookmark `main`, naming every digit of the bookmark's new node, the
+/// `new` 7.2 hands `prepushkey` for a bookmark (`bundle2_part_handlers.handlebookmark`) and `acl` names.
 #[test]
 fn the_policy_refuses_before_the_verdict_in_acls_words() {
   use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyNames, PolicyWho};
@@ -902,14 +903,107 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
     let prepared = marks
       .prepare(state, &stock(fixture!("push-bookmark.hg")), &view)
       .unwrap();
+    let second = "59d5dc23f8786c06d0fae53e625be1cdd640a783";
     let listed = format!(
-      "acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"59d5dc23f878\")",
+      "acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"{second}\")",
       owner()
     );
     assert_eq!(
       super::admitted(state, (&owner(), marks.repository), &prepared),
       Err(Refused::Abort {
         message: listed.into_bytes(),
+        hint: None
+      })
+    );
+  });
+}
+
+/// A-657 part 4 (`acl`'s words for a bookmark deleted: 7.2's `bundle2_part_handlers.handlebookmark` hands `prepushkey`
+/// the pushkey's `new`, empty for a deletion, and `acl`'s `_pkhook` names it as the changeset). Do: with a rule denying
+/// every principal the deletion of any bookmark, prepare a push deleting `main` and ask the policy. Expect: refused in
+/// `acl`'s words naming bookmark `main` and an empty changeset, never the node `main` leaves.
+#[test]
+fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
+  crate::daemon::audit_on_shard(|state| {
+    let mut marks = Hg::new(state, "acl-delete");
+    rebuild(state, &mut marks, (&[1], 1));
+    set_policy(
+      state,
+      ("acl-delete", 0),
+      vec![PolicyRule {
+        names: PolicyNames::Bookmarks,
+        pattern: "*".to_owned(),
+        right: PolicyRight::Delete,
+        effect: PolicyEffect::Deny,
+        who: PolicyWho::Anyone,
+      }],
+    );
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let deleting = Unbundle {
+      parts: vec![taken(
+        0,
+        Asks::Bookmarks(vec![BookmarkAt {
+          name: b"main".to_vec(),
+          node: None,
+        }]),
+      )],
+    };
+    let prepared = marks.prepare(state, &deleting, &view).unwrap();
+    let denied = format!(
+      "acl: user \"{:?}\" denied on bookmark \"main\" (changeset \"\")",
+      owner()
+    );
+    assert_eq!(
+      super::admitted(state, (&owner(), marks.repository), &prepared),
+      Err(Refused::Abort {
+        message: denied.into_bytes(),
+        hint: None
+      })
+    );
+  });
+}
+
+/// A-657 part 4 (`acl`'s order: 7.2's `_txnhook` walks the pushed changesets in revision order and names the first it
+/// refuses). Do: with a rule denying every principal a submit to any branch, prepare a push whose first changeset opens
+/// branch `stable` and whose second moves `default`'s line, and ask the policy. Expect: refused naming `stable` and its
+/// changeset, the branch `acl` meets first, though the line the push moves is `default`'s.
+#[test]
+fn the_policy_names_the_branch_acl_meets_first() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyWho};
+  crate::daemon::audit_on_shard(|state| {
+    let mut two = Hg::new(state, "acl-order");
+    let made = rebuild(state, &mut two, (&[1], 1));
+    set_policy(
+      state,
+      ("acl-order", 0),
+      vec![rule(
+        PolicyNames::Branches,
+        "*",
+        (PolicyEffect::Deny, PolicyWho::Anyone),
+      )],
+    );
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let pushed = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[4, 3])))],
+    };
+    let prepared = two.prepare(state, &pushed, &view).unwrap();
+    let stable = hex(&made[4].node);
+    let denied = format!(
+      "acl: user \"{:?}\" denied on branch \"stable\" (changeset \"{}\")",
+      owner(),
+      stable.get(..12).unwrap()
+    );
+    assert_eq!(
+      super::admitted(state, (&owner(), two.repository), &prepared),
+      Err(Refused::Abort {
+        message: denied.into_bytes(),
         hint: None
       })
     );
