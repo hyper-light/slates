@@ -173,7 +173,10 @@ fn appended() -> Appended {
 /// Holds the changelog's rows to 7.2's listing: numbers, parents, nodes, branches and closed heads.
 fn check_changelog(index: &HgIndex, store: &ContentStore, numbers: &[u32]) {
   let changelog = listed("index-changelog.txt");
-  assert_eq!(numbers, changelog.iter().map(|row| row.rev).collect::<Vec<_>>());
+  assert_eq!(
+    numbers,
+    changelog.iter().map(|row| row.rev).collect::<Vec<_>>()
+  );
   assert_eq!(index.len(store, Log::Changelog), 11);
   for row in &changelog {
     let read = index.changeset(store, row.rev).unwrap();
@@ -191,8 +194,16 @@ fn check_changelog(index: &HgIndex, store: &ContentStore, numbers: &[u32]) {
 /// Holds one manifest or file log's rows to 7.2's listing: numbers, parents, links and nodes both ways.
 fn check_log(index: &HgIndex, store: &ContentStore, log: Log<'_>, numbers: &[u32], listing: &str) {
   let rows = listed(listing);
-  assert_eq!(numbers, rows.iter().map(|row| row.rev).collect::<Vec<_>>(), "{listing}");
-  assert_eq!(usize::try_from(index.len(store, log)).unwrap(), rows.len(), "{listing}");
+  assert_eq!(
+    numbers,
+    rows.iter().map(|row| row.rev).collect::<Vec<_>>(),
+    "{listing}"
+  );
+  assert_eq!(
+    usize::try_from(index.len(store, log)).unwrap(),
+    rows.len(),
+    "{listing}"
+  );
   for row in rows {
     let read = index.revision(store, log, row.rev).unwrap();
     assert_eq!(
@@ -213,16 +224,31 @@ fn check_log(index: &HgIndex, store: &ContentStore, log: Log<'_>, numbers: &[u32
 fn the_history_7_2_stored_is_numbered_as_7_2_numbered_it() {
   let (index, store, numbers) = appended();
   check_changelog(&index, &store, &numbers["changelog"]);
-  check_log(&index, &store, Log::Manifest, &numbers["manifest"], "index-manifest.txt");
+  check_log(
+    &index,
+    &store,
+    Log::Manifest,
+    &numbers["manifest"],
+    "index-manifest.txt",
+  );
   for path in paths() {
     let listing = format!("index-file-{path}.txt");
-    check_log(&index, &store, Log::File(path.as_bytes()), &numbers[&path], &listing);
+    check_log(
+      &index,
+      &store,
+      Log::File(path.as_bytes()),
+      &numbers[&path],
+      &listing,
+    );
   }
   assert!((0..11).any(|rev| index.changeset(&store, rev).unwrap().closed));
   let copy = index.revision(&store, Log::File(b"c"), 0).unwrap();
   assert!(copy.block.is_some());
   let meta = index.revision(&store, Log::File(b"meta"), 0).unwrap();
-  assert_eq!(meta.block.map(|block| store.get(&block).map(<[u8]>::len)), Some(Some(0)));
+  assert_eq!(
+    meta.block.map(|block| store.get(&block).map(<[u8]>::len)),
+    Some(Some(0))
+  );
 }
 
 /// A-588 part 2 (golden): do name every revision 7.2 stored by Mercurial's naming, a file revision's block given as
@@ -484,7 +510,11 @@ type Parents = Vec<(Node, Node)>;
 
 /// What 7.2's `addgroup` does with `group` (positions of the history, in order) brought onto a log holding `held`, in a
 /// model: each revision's number and the log after the group, or the first missing parent's refusal.
-fn model_group(held: &[usize], group: &[usize], parents: &Parents) -> Result<(Vec<u32>, Vec<usize>), Refused> {
+fn model_group(
+  held: &[usize],
+  group: &[usize],
+  parents: &Parents,
+) -> Result<(Vec<u32>, Vec<usize>), Refused> {
   let mut expected = held.to_vec();
   let mut numbers = Vec::new();
   for at in group {
@@ -493,7 +523,9 @@ fn model_group(held: &[usize], group: &[usize], parents: &Parents) -> Result<(Ve
       continue;
     }
     let (p1, p2) = parents.get(*at).copied().unwrap_or((NULL_NODE, NULL_NODE));
-    let known = |parent: &Node| *parent == NULL_NODE || expected.iter().any(|kept| model_node(*kept) == *parent);
+    let known = |parent: &Node| {
+      *parent == NULL_NODE || expected.iter().any(|kept| model_node(*kept) == *parent)
+    };
     if let Some(missing) = [p1, p2].into_iter().find(|parent| !known(parent)) {
       return Err(Refused::MissingParent { node: missing });
     }
@@ -504,18 +536,32 @@ fn model_group(held: &[usize], group: &[usize], parents: &Parents) -> Result<(Ve
 }
 
 /// Holds every revision the model's log holds to the index: its node and its parents' numbers.
-fn check_model(index: &HgIndex, store: &ContentStore, log: Log<'_>, model: &[usize], parents: &Parents) {
+fn check_model(
+  index: &HgIndex,
+  store: &ContentStore,
+  log: Log<'_>,
+  model: &[usize],
+  parents: &Parents,
+) {
   let number = |parent: Node| {
     if parent == NULL_NODE {
       return NONE;
     }
-    let held = model.iter().position(|kept| model_node(*kept) == parent).unwrap();
+    let held = model
+      .iter()
+      .position(|kept| model_node(*kept) == parent)
+      .unwrap();
     u32::try_from(held).unwrap()
   };
   for (rev, at) in model.iter().enumerate() {
-    let read = index.revision(store, log, u32::try_from(rev).unwrap()).unwrap();
+    let read = index
+      .revision(store, log, u32::try_from(rev).unwrap())
+      .unwrap();
     let (p1, p2) = parents[*at];
-    assert_eq!((read.node, read.p1, read.p2), (model_node(*at), number(p1), number(p2)));
+    assert_eq!(
+      (read.node, read.p1, read.p2),
+      (model_node(*at), number(p1), number(p2))
+    );
   }
 }
 

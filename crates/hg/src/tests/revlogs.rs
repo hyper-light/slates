@@ -149,17 +149,29 @@ fn read(entry: &Entry) -> Listed {
 fn check_log(repository: &str, stem: &str, name: &str, seen: &mut Seen) {
   let log = open(repository, stem);
   let rows = listing(&format!("{repository}-{name}.index"));
-  assert_eq!(usize::try_from(log.len()).unwrap(), rows.len(), "{repository} {name}");
+  assert_eq!(
+    usize::try_from(log.len()).unwrap(),
+    rows.len(),
+    "{repository} {name}"
+  );
   for row in &rows {
     let rev: u32 = column(row, "rev").parse().unwrap();
     let entry = log.entry(rev).unwrap();
     assert_eq!(read(&entry), listed(row), "{repository} {name} {rev}");
     let text = log.text(rev, &mut room()).unwrap();
-    assert_eq!(text, file(&format!("{name}-{rev}.txt")), "{repository} {name} {rev}");
-    seen.longest_chain = seen.longest_chain.max(log.chain(rev, &mut room()).unwrap().len());
+    assert_eq!(
+      text,
+      file(&format!("{name}-{rev}.txt")),
+      "{repository} {name} {rev}"
+    );
+    seen.longest_chain = seen
+      .longest_chain
+      .max(log.chain(rev, &mut room()).unwrap().len());
     seen.generaldelta |= entry.base != rev && entry.base.checked_add(1) != Some(rev);
     if V1_REPOSITORIES.contains(&repository) && entry.compressed > 0 {
-      seen.headers.push(first_stored_byte(repository, stem, &log, rev));
+      seen
+        .headers
+        .push(first_stored_byte(repository, stem, &log, rev));
     }
   }
 }
@@ -177,7 +189,9 @@ fn every_revision_reads_as_7_2_stored_it() {
       check_log(repository, stem, name, &mut seen);
     }
   }
-  assert!(seen.headers.contains(&b'x') && seen.headers.contains(&b'(') && seen.headers.contains(&b'u'));
+  assert!(
+    seen.headers.contains(&b'x') && seen.headers.contains(&b'(') && seen.headers.contains(&b'u')
+  );
   assert!(seen.longest_chain > 1 && seen.generaldelta);
   let snapshots = core::str::from_utf8(file("zstd-grow.chain"))
     .unwrap()
@@ -301,7 +315,10 @@ fn damaged_entries_are_refused_by_kind() {
       bytes[second + field..second + field + 4].copy_from_slice(&5_i32.to_be_bytes());
     });
     let read = Revlog::open(&later, &[], &mut room()).unwrap();
-    assert!(matches!(read.entry(1), Err(Refused::Corrupt { rev: 1, .. })));
+    assert!(matches!(
+      read.entry(1),
+      Err(Refused::Corrupt { rev: 1, .. })
+    ));
   }
 }
 
@@ -312,13 +329,28 @@ fn damaged_entries_are_refused_by_kind() {
 fn damaged_texts_are_refused_by_kind() {
   let wrong_node = damaged(|bytes, _| bytes[32] ^= 1);
   let read = Revlog::open(&wrong_node, &[], &mut room()).unwrap();
-  assert!(matches!(read.text(0, &mut room()), Err(Refused::Node { rev: 0, .. })));
+  assert!(matches!(
+    read.text(0, &mut room()),
+    Err(Refused::Node { rev: 0, .. })
+  ));
   let unknown = damaged(|bytes, _| bytes[64] = b'?');
   let read = Revlog::open(&unknown, &[], &mut room()).unwrap();
-  assert_eq!(read.text(0, &mut room()), Err(Refused::Compression { rev: 0, header: b'?' }));
+  assert_eq!(
+    read.text(0, &mut room()),
+    Err(Refused::Compression {
+      rev: 0,
+      header: b'?'
+    })
+  );
   let censored = damaged(|bytes, _| bytes[6] |= 0x80);
   let read = Revlog::open(&censored, &[], &mut room()).unwrap();
-  assert_eq!(read.text(0, &mut room()), Err(Refused::Flags { rev: 0, flags: 0x8000 }));
+  assert_eq!(
+    read.text(0, &mut room()),
+    Err(Refused::Flags {
+      rev: 0,
+      flags: 0x8000
+    })
+  );
 }
 
 /// An inline revlog of one revision whose chunk is `chunk` (a full text of `len` bytes, no parents).
