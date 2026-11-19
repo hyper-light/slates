@@ -40987,5 +40987,10 @@ unknown).
     - same-increment operations judged against the head: 2 failed.
   - The first green run failed one test, the cost test's own ordering: it read the retained figures, which walk the
     files for their sizes, after the walk counter. The ordering was fixed; the copy walked nothing.
+  - Merged with main (A-596's comments among its changes), at `5998d368a`, 04:46 UTC: 52 of 52 run, 2 ignored (main's),
+    7.66 s, `cargo fmt --check` clean. The census that run (generated cases differ run to run): 69 accepted, 619
+    refused, 9 from the root, 29 from an older version, 16 into their own source's tree, 84 refused for a changed
+    source, 12 keys changed beneath a copy. Red first for the reanchor fix: with `reanchor.rs` as it was before it, the
+    new test alone failed, `Err(NotLines)` where `Ok(Moved(0..4))` was due.
   - Main's: the integration suites (`crates/merge/tests/`, `ops_doc.rs` among them), clippy and `cargo xtask check`
     (the run-request queue).
