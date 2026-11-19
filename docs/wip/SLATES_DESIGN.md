@@ -2851,16 +2851,23 @@ kernel, and its successor's journal starts empty. The successor knows where such
   write in the write log (A-63);
 - a kernel holds state older than a change only for an inode it looked up before the change, and the change's
   publication recorded that reference (A-61);
-- a logged write is in no publication, so the write-log replay notes the inodes it wrote.
+- a logged write is in no publication, so the write-log replay notes the inodes it wrote;
+- but a lookup made after the last publication is in no image, and such a kernel can hold what the successor never had
+  or holds otherwise: bytes a mutation showed before the publication the death lost, and the pages of a base file an
+  outsider wrote while no daemon ran (A-573). The successor cannot tell which inodes those are.
 
 So a restored mount's rounds open with a takeover round. First comes `FUSE_NOTIFY_INC_EPOCH`, to a kernel that offered
 FUSE 7.44 or later: every cached name is looked up again at its next use, which reaches the names no inode set can.
-Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode its owner's restored references and
-the replay name. A directory's invalidation also drops its cached listing, which kernels before Linux 7.2 keep past an
-epoch bump. The set is as large as what the kernel had looked up, so the round is sent in slices of half the shard's
-live step quantum, walked in inode order from where the last slice ended. The mount turns at once while a slice is owed
-and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44 cannot drop a
-renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
+Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode of the head, each costing the kernel
+nothing for an inode it never cached; a mount of a pinned view, whose version takes no head change, is sent its owner's
+restored references and the replay's inodes. A directory's invalidation also drops its cached listing, which kernels
+before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so the round is sent in slices of half the
+shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
+while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
+cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
+after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
+opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
+(GAPS).
 
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
@@ -37655,3 +37662,42 @@ paths), `crates/merge/src/engine/branch.rs` and `branch/tests.rs` (new: `Lineage
   a green at a commit that is no version's head (piece 3's trees); and §4.17.4's `Copy` (g292, A-542's second half),
   which grafts with `subtree` and `graft` on these maps and needs a per-prefix appearance record under the one history
   rule (a grafted key has no history, and must not read as present before the copy).
+
+### A-573 — A takeover names every inode of the head to a mount of the head: what a kernel looked up after the last publication never outlives a death (2026-11-19, g232; UI goal 85, B10; §4.6 "A mount taken over by a restarted daemon"; A-61, A-63, A-151, A-158)
+Applied in the same change to: §4.6 (the takeover paragraph), GAPS (A-158's siblings "an effect served before its
+publication" and "an outsider's change beneath a base during a takeover's gap"), the bug record
+`docs/bugs/2026-11-19-a-takeover-left-cached-what-a-kernel-looked-up-after-the-last-publication.md`,
+`crates/vfs/src/{trie,volume,base}.rs`, `crates/bridge-core/src/{volume_bridge,lib}.rs`.
+- **What was there.** A-158's takeover round invalidated the root and every inode the mount's owner's restored
+  references and the write-log replay named, on the premise that a kernel holds state older than a change only for an
+  inode it looked up before the change, which the change's publication recorded (A-61). A lookup made after the last
+  publication is in no image, and two kinds of kernel state fell outside the premise: bytes a mutation showed before
+  the publication the death lost (a dirty read), and the pages of a base file an outsider wrote in place while no daemon
+  ran, whose names and attributes revalidate but whose pages a FUSE mount, which asks no `FUSE_AUTO_INVAL_DATA`, keeps.
+  Both stayed cached for as long as the kernel kept them.
+- **The rule, by kind.** The successor cannot tell which inodes a kernel looked up after the last publication, so a
+  mount of the head is sent every inode of the head (`Volume::visit_head_inodes`), each `FUSE_NOTIFY_INVAL_INODE`
+  costing the kernel nothing for an inode it never cached; every reference a current view takes and every inode the
+  replay writes is one of them. A mount of a pinned view keeps A-158's set: its version takes no head change, so no
+  mutation the death lost ever showed through it. A number the dead daemon issued after its last publication (another
+  path's unpublished create a listing showed, a base directory first loaded after the publication) is in no image and
+  no head: the successor refuses it (`NotFound`) and never serves it.
+- **The walk.** The inode table is a radix trie over the number's counter; `trie::visit_after` walks it in that order
+  from past any number, entering only the nodes on that number's path and the subtrees past it, so the round's slices
+  each cost what they send. The table's order is the counter's, which keeps a clone's own and its origin's inodes in one
+  order, where the numbers' full values would interleave two prefixes.
+- **Tests.** `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover` (a: a file published,
+  looked up and written after the publication, the daemon dead; the successor holds the published bytes, no restored
+  reference names the file, and the head's walk does) and
+  `a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit` (b: a base file
+  loaded and published, looked up after, written in place by an outsider while no daemon ran; the successor reads the
+  edit, and the head's walk names the file), both in `crates/vfs/src/base.rs`;
+  `a_walk_after_any_number_gives_the_inodes_past_it_in_order_and_slices_join_whole` (`trie.rs`). On the Mac Studio
+  (debug, 2026-11-19, load 2 to 11): `slates-vfs --lib` the two 2 of 2 and `trie::` 6 of 6, `slates-bridge-core --lib`
+  40 of 40; red with the old rule put back (the mount's restored references and the replay): both failed at the walk's
+  assertion, their premises holding under both rules.
+- **Owed.** The numbers issued after the last publication: a descriptor opened before the death keeps their cached
+  pages, since no walk can name them until each publication records the volume's live counter beside its reserved
+  ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
+  between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
+  kill-in-window tests) are Linux's, main's to run.
