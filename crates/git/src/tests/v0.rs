@@ -1150,7 +1150,12 @@ fn advertisement_lines_that_break_the_grammar_are_refused_by_kind() {
 fn an_advertised_ref_name_is_held_to_gits_ref_name_rule() {
   let (tip, two) = (recorded("refs/heads/main"), commit("two"));
   let first = format!("{tip} HEAD\0multi_ack\n");
-  for name in ["refs/heads/a..b", "main", "refs/heads/x.lock", "refs/heads/a@{1}"] {
+  for name in [
+    "refs/heads/a..b",
+    "main",
+    "refs/heads/x.lock",
+    "refs/heads/a@{1}",
+  ] {
     let second = format!("{tip} {name}\n");
     let lines: [&[u8]; 2] = [first.as_bytes(), second.as_bytes()];
     refused_advertisement(
@@ -1180,7 +1185,11 @@ fn an_advertised_ref_name_is_held_to_gits_ref_name_rule() {
   let alternate = format!("{two} .have\n");
   let bytes = stream(&[first.as_bytes(), alternate.as_bytes()]);
   let (advertisement, _) = decoded(&bytes);
-  let names: Vec<&[u8]> = advertisement.refs.iter().map(|reference| reference.name).collect();
+  let names: Vec<&[u8]> = advertisement
+    .refs
+    .iter()
+    .map(|reference| reference.name)
+    .collect();
   assert_eq!(names, [b"HEAD".as_slice(), b".have"]);
 }
 

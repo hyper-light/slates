@@ -57,7 +57,8 @@ use crate::pktline::{self, Packet};
 use crate::sideband::MAX_BAND_DATA;
 use crate::store::StoreGraph;
 use crate::v0::{
-  self as codec, AckStatus, AdvertisedRef, Capabilities, Capability, ClientLine, ServerLine, ShallowUpdate,
+  self as codec, AckStatus, AdvertisedRef, Capabilities, Capability, ClientLine, ServerLine,
+  ShallowUpdate,
 };
 use crate::{Admission, to_u64};
 
@@ -292,10 +293,7 @@ fn capability_list<'a>(
     .charge_items::<Capability<'a>>(count)
     .map_err(Refusal::PastAdmission)?;
   let mut list = Vec::with_capacity(count);
-  list.extend(FLAGS.iter().map(|name| Capability {
-    name,
-    value: None,
-  }));
+  list.extend(FLAGS.iter().map(|name| Capability { name, value: None }));
   list.extend(symref.map(|value| Capability {
     name: SYMREF,
     value: Some(value),
@@ -509,7 +507,9 @@ pub(super) fn answer<P: PackSource>(
   }
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
   if let Some(id) = asked.wants.iter().find(|id| graph.node(id).is_none()) {
-    return Err(Refusal::Negotiation(negotiation::Refusal::NotOurs { id: *id }));
+    return Err(Refusal::Negotiation(negotiation::Refusal::NotOurs {
+      id: *id,
+    }));
   }
   let not = asked
     .not

@@ -12615,6 +12615,15 @@ engine: the verdict, rebase, position mapping, the register).
 > Refusals are answered in git's words. The answer is written a slice at a time within the caller's room, the
 > repository lent afresh each step. Proven against stock git 2.50.1's own answers, and against a stock clone's own
 > requests served from the repository it cloned, rebuilt in the store. Protocol v0 and v1 are A-640's next part.
+>
+> **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
+> answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
+> capabilities and this server's agent. Each request is answered whole and statelessly: the shallow-update first,
+> then the acknowledgments have by have, as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed`
+> (with `no-done`) and neither, then the pack on side-band-64k, side-band or bare. Proven against stock git 2.50.1's
+> stateless answers and its one-round sessions. Those goldens found A-615's object choice missing git's rule for a
+> thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
+> session, an SSH client's, is owed.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -44057,6 +44066,87 @@ items 1 to 4, "Pieces (git)" piece 7). Sources, read 2026-11-19 at git v2.50.1: 
 Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload`, new:
 `mod.rs`, `advertise.rs`, `refs.rs`, `fetch.rs`, `answer.rs` and `tests/`; `store/graph.rs`, `StoreGraph::new` made
 infallible through `ObjectId::null` and `head` added, with `tests/store_graph.rs`; the `mod` line in `lib.rs`).
+
+**Part 3: protocol v0 and v1 behind the same entry point** (`crates/git/src/upload/v0.rs`; §4.17.2 "Pieces (git)"
+piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack.c` (`send_ref`,
+`format_symref_info`, `upload_pack`, `receive_needs`, `get_common_commits`, `got_oid`, `do_got_oid`, `ok_to_give_up`,
+`send_unshallow`, `create_pack_file`, `send_client_data`), `sideband.c` (`send_sideband`), `pkt-line.h`
+(`DEFAULT_PACKET_MAX`), `builtin/pack-objects.c` (`--objects-edge-aggressive` under `--thin` and `--shallow`) and
+`revision.c` (`mark_edges_uninteresting`) [C]; `gitprotocol-pack` and `gitprotocol-capabilities` [B].
+
+- **The advertisement**, as `send_ref` writes it. Under v1, `version 1` comes first. Then `HEAD` where its branch has
+  a commit, then each ref in name order, an annotated tag's peeled line after it; a repository with no ref sends
+  `capabilities^{}`. The capabilities, in git's order: `multi_ack thin-pack side-band side-band-64k ofs-delta shallow
+  deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want
+  allow-reachable-sha1-in-want no-done`, then `symref=HEAD:<branch>` where the branch has a commit, `filter`,
+  `object-format` and `agent`. The two `allow-*` say that a want need not be a tip, which holds: as under v2, any held
+  object may be wanted.
+- **A request**, read whole and answered statelessly, as each `POST` of git's smart HTTP is:
+  - the wants, any of them carrying capabilities, as git reads them on any;
+  - `shallow`, `deepen`, `deepen-since`, `deepen-not`, `filter`, then a flush;
+  - the haves, ended by `done` or a flush, the request's end read as a flush.
+  A capability the server did not advertise is refused, by the document's words, where git 2.50.1 passes it. So is a
+  line out of its place, or bytes after the request's end.
+- **The answer** follows `upload_pack`. A request that deepens gets the shallow-update first (`receive_needs`), from
+  the negotiation's cut alone (`negotiation::shallow_update`). Then the acknowledgments, have by have, as
+  `get_common_commits` writes them:
+  - `ACK <id> common`, `continue` or plain;
+  - `ready` or `continue` for a lacked have once ready;
+  - at `done`, `ACK <last>` or `NAK`; at a flush, `ACK <last> ready`, `NAK`, and under `no-done` the closing `ACK`.
+  Ready is A-615's, asked of the held haves so far (`negotiation::ready`) only when one was added since it was last
+  asked, each asking kept within the request's room. git's `have_obj` count is kept as `do_got_oid` keeps it: a commit
+  counts unless an earlier held commit named it as a parent or it was named already, which decides git's plain
+  `ACK`s. The pack is A-615's for the wants and every have. It is framed on side-band-64k, on side-band (1000-byte
+  packets, so 995 bytes of the pack each) or bare, with a flush after it on either band, through the answer's framing
+  shared with v2.
+- **A-615's object rule, corrected** (`negotiation/objects.rs`, its oracle with it). Serving git's own `--deepen` fetch
+  (a thin pack; the client shallow at the tip, which it sent as a have) sent that tip's blobs again; git had left them
+  out. git's stateless `deepen 2` without `thin-pack` had sent them. The rule that holds both is `pack-objects`':
+  under `--thin` with `--shallow` it walks with `--objects-edge-aggressive`, and `mark_edges_uninteresting` leaves out
+  the tree of every uninteresting commit on its command line. That means each have `do_got_oid` lists, and each commit
+  `send_unshallow` adds to `extra_edge_obj`. Without a thin pack only the edges are left out. The negotiation's request
+  now carries `thin`, and the oracle states the same rule and draws `thin` as well.
+- **v0's ref names** (main's ask, after A-615's finding): an advertised ref is `HEAD`, `receive-pack`'s `.have`, or a
+  name `refname::is_valid` takes, read and written. It was any word. The word check stays first, so a bad byte is
+  still placed exactly.
+- **Stateless only.** Over SSH a v0 client speaks in rounds on one stream and the server keeps what each round taught
+  it; that is owed. git's client speaks v2 over SSH since 2.26, and v2 is stateless by design.
+- **Tests** (`src/upload/tests/v0.rs`, 8; the v0 repository rebuilt from the pack git sent its clone):
+  - the advertisement at v0 and v1 against git's;
+  - git's six stateless answers (`multi_ack`, `multi_ack_detailed` ending `done` and reaching `ready`, neither, an
+    `unshallow`, a want never advertised), packet for packet, packs as object sets;
+  - git's nine one-round sessions (clone and fetch at v0 and v1; depth, a deepening, `deepen-since`, `deepen-not`,
+    `filter blob:none`), every packet after the advertisement;
+  - side-band's 1000-byte packets (a 3,000-byte pack in packets of 995, 995, 995 and 15 bytes), and a bare pack;
+  - `no-done`;
+  - a lacked have keeping a flush from `ready`;
+  - refusals: a capability not advertised, SHA-256, a have before the flush, bytes after `done`, no flush;
+  - every cut and every bit flip of git's `detailed-done` request.
+  In A-604's tests, a test of the ref-name rule; its generator now draws valid names.
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 424 of 424 (2 of main's ignored),
+  `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first, the first run failed 3:
+  - A-604's property test, drawing ref names as words;
+  - A-604's writer test, which placed a bad byte exactly;
+  - git's deepen-v0 session, which found the object rule above.
+  An edge kept always then failed git's `unshallow`, which held the rule to thin packs. Red nine ways, one guard at a
+  time:
+  - v0's answer stubbed: 7 tests failed;
+  - parents never marked: git's stateless golden;
+  - `NAK` always: git's stateless golden;
+  - `ready` despite a lacked have: its test;
+  - side-band sized as side-band-64k: its test;
+  - any capability taken: its test;
+  - the aggressive rule never applied: A-615's oracle and git's `deepen-v0`;
+  - the aggressive rule always applied: A-615's oracle and git's `unshallow`;
+  - any ref name taken: both of A-604's tests.
+- **Next** (A-640's parts): `sparse:oid` (part 4); a stateful v0 session over SSH; `packfile-uris` and `bundle-uri`
+  from the store's URI packs and bundle list; progress on band 2; the walk in cooperative slices.
+
+Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload/v0.rs`,
+new, with `upload/tests/v0.rs`; `upload/mod.rs`, v0 and v1 dispatched and their refusals; `upload/answer.rs`, the
+pack's framing; `upload/advertise.rs`, `upload/refs.rs` and `upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`,
+`ready`, `shallow_update` and `Request::thin`; `negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`,
+the ref-name rule, with its tests; `tests/store_graph.rs`; `upload/tests/refused.rs` and `upload/tests/steps.rs`).
 
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and

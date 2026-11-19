@@ -345,7 +345,11 @@ fn side_band_packets_hold_a_thousand_bytes_and_no_side_band_sends_the_pack_bare(
     Version::V0,
     Asked::Request(&clone_request("side-band ofs-delta")),
   );
-  assert!(packets_from(&bytes, 0).iter().all(|packet| packet.len() <= 1000));
+  assert!(
+    packets_from(&bytes, 0)
+      .iter()
+      .all(|packet| packet.len() <= 1000)
+  );
   let (others, pack) = split(&bytes, 0);
   assert_eq!(others, [pkt(b"NAK\n").as_slice(), b"0000"]);
   assert_eq!(names(&pack, &fixture), expected);
@@ -404,7 +408,10 @@ fn no_done_sends_the_pack_after_ready_without_done() {
     pkt(format!("ACK {TWO}\n").as_bytes()),
     b"0000".to_vec(),
   ];
-  assert_eq!(others, expected.iter().map(Vec::as_slice).collect::<Vec<_>>());
+  assert_eq!(
+    others,
+    expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+  );
   let names = names(&pack, &fixture);
   assert!(names.contains(&id(TIP)) && !names.contains(&id(TWO)) && !names.contains(&id(ONE)));
 }
@@ -426,11 +433,7 @@ fn a_lacked_have_keeps_a_flush_from_ready() {
   .concat();
   let (bytes, answer) = answered(&fixture, Version::V0, Asked::Request(&request));
   assert_eq!(answer.refusal(), None);
-  let expected = [
-    pkt(format!("ACK {TWO} common\n").as_bytes()),
-    pkt(b"NAK\n"),
-  ]
-  .concat();
+  let expected = [pkt(format!("ACK {TWO} common\n").as_bytes()), pkt(b"NAK\n")].concat();
   assert_eq!(bytes, expected);
 }
 
@@ -456,9 +459,15 @@ fn a_request_past_the_advertisement_or_its_grammar_is_refused() {
       clone_request("side-band-64k object-format=sha256"),
       |refusal| matches!(refusal, Refusal::ObjectFormat { .. }),
     ),
-    (have_first, |refusal| matches!(refusal, Refusal::Request { .. })),
-    (after_done, |refusal| matches!(refusal, Refusal::Request { .. })),
-    (unfinished, |refusal| matches!(refusal, Refusal::Request { .. })),
+    (have_first, |refusal| {
+      matches!(refusal, Refusal::Request { .. })
+    }),
+    (after_done, |refusal| {
+      matches!(refusal, Refusal::Request { .. })
+    }),
+    (unfinished, |refusal| {
+      matches!(refusal, Refusal::Request { .. })
+    }),
   ];
   for (request, expected) in cases {
     let (bytes, answer) = answered(&fixture, Version::V0, Asked::Request(&request));
@@ -474,7 +483,9 @@ fn a_request_past_the_advertisement_or_its_grammar_is_refused() {
 fn every_cut_and_flip_of_a_v0_request_is_refused_or_answered_whole() {
   let fixture = repository();
   let request = fixture!("detailed-done.request.bin");
-  let mut requests: Vec<Vec<u8>> = (0..request.len()).map(|cut| request[..cut].to_vec()).collect();
+  let mut requests: Vec<Vec<u8>> = (0..request.len())
+    .map(|cut| request[..cut].to_vec())
+    .collect();
   for bit in 0..request.len() * 8 {
     let mut flipped = request.to_vec();
     flipped[bit / 8] ^= 1 << (bit % 8);
@@ -488,5 +499,8 @@ fn every_cut_and_flip_of_a_v0_request_is_refused_or_answered_whole() {
       None => answered_whole += 1,
     }
   }
-  assert!(refused > 0 && answered_whole > 0, "{refused} {answered_whole}");
+  assert!(
+    refused > 0 && answered_whole > 0,
+    "{refused} {answered_whole}"
+  );
 }
