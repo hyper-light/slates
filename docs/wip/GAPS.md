@@ -268,7 +268,7 @@
 > kind changes, removed directories, modes, links and whole-file replacements; the client-fidelity test after every
 > accepted push found, and the engine now fixes, a removed file's or directory's mode and attributes outliving it (bug
 > record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
-> --lib` on the Mac Studio, 70 of 70 merged with main, red first (a stub walk, and the root absent), red four ways by
+> --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
 > mutation. Owed: git's store
 > implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6); submodule links (§4.17.2
 > item 5's special node kind); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one

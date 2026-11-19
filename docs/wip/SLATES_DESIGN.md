@@ -42161,8 +42161,8 @@ Applied in the same change to:
   deleted one's mode 0755: removing a file, a directory or a link left the path's mode and attributes in the green, as
   removing a special node did not. `commit` now drops them (`drop_metadata`, `remove_special`'s code shared) for each
   path a version removed at which nothing then stands; the history, the identity and the verdict's change index see it.
-- **Tests** (`cargo test --locked -p slates-merge --lib`, Mac Studio, debug: 70 of 70 on the tree merged with main,
-  5.64 s, its own target directory). Failing first: with the walk a stub that
+- **Tests** (`cargo test --locked -p slates-merge --lib`, Mac Studio, debug: 88 of 88 on the tree merged with main
+  and A-621, 23.82 s, its own target directory). Failing first: with the walk a stub that
   refused every push and the root absent, 11 of 11 push tests failed; the removed-metadata test failed against the
   engine before its fix (mode 0755, the attribute, mode 0700 at the removed paths). An oracle compares the two whole
   trees key by key, makes the journal the design states, composes it, lays its own post-state from the trees' bytes,
