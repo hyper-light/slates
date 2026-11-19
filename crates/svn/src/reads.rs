@@ -32,10 +32,10 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments`, `get-deleted-rev` and `log` (each
-//! its own module, `file`, `list`, `segments`, `deleted` and `log`, over FSFS's node history in `history`). Owed with
-//! this piece: `log`'s merged revisions, `get-file-revs`, and read access by the authorization rules (A-606): today
-//! every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments`, `get-deleted-rev`, `log` with its
+//! merged revisions and `get-file-revs` (each its own module, `file`, `list`, `segments`, `deleted`, `log` and
+//! `file_revs`, over FSFS's node history in `history`). Owed with this piece: read access by the authorization rules
+//! (A-606): today every path is readable, as in an `anon-access = read` repository with no rules.
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
@@ -46,6 +46,7 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+use crate::handshake::ClientCapabilities;
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
 use crate::ra_svn::{ItemError, Value, write};
@@ -170,7 +171,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 17] = [
+const ELSEWHERE: [&str; 16] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -179,7 +180,6 @@ const ELSEWHERE: [&str; 17] = [
   "switch",
   "status",
   "diff",
-  "get-file-revs",
   "lock",
   "lock-many",
   "unlock",
@@ -303,6 +303,9 @@ pub struct Session<'session> {
   pub base: &'session str,
   /// The repository's UUID, which a node's properties carry as `svn:entry:uuid`.
   pub uuid: &'session str,
+  /// What the client announced it takes (the handshake's, A-599): `get-file-revs` sends svndiff 2 to a client that
+  /// accepts it, 0 to any other.
+  pub capabilities: ClientCapabilities,
 }
 
 /// What the read commands read from the green beyond the index and the mergeinfo queries' [`Contents`]: revision
@@ -376,6 +379,7 @@ pub fn answer<R: Repository + ?Sized>(
     "get-location-segments" => reads.location_segments(params),
     "get-deleted-rev" => reads.deleted_revision(params),
     "log" => reads.log(params),
+    "get-file-revs" => reads.file_revisions(params, session.capabilities),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -1683,6 +1687,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 mod deleted;
 mod file;
+mod file_revs;
 mod history;
 mod list;
 mod log;
