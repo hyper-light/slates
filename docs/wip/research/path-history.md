@@ -1,7 +1,8 @@
-# Path history by API: `log <path>` and `--follow` from derived data (A-666 part 2)
+# Path history by API: `log <path>` and `--follow` from derived data (A-666 part 2), and blame (part 3, §6)
 
 Status: read 2026-11-19 by g302 for A-666 part 2 (UI goal 93; A-645 "Queries by API"), the evidence behind the
-`history` type of derived data (`crates/vcs/src/derived/history.rs`). Tiers as in the design: A a paper, B a standard
+`history` type of derived data (`crates/vcs/src/derived/history.rs`), and for part 3 (§6) behind the `blame` type
+(`crates/vcs/src/derived/blame.rs`). Tiers as in the design: A a paper, B a standard
 or the vendor's own documentation, C deployed code, D a blog (flagged). Every quotation was read on 2026-11-19 from
 the revision named, at the lines given; each copy was fetched on jupiter with `curl` from `raw.githubusercontent.com`
 and its sha256 (first 16 hex) is in §1.
@@ -14,6 +15,11 @@ and its sha256 (first 16 hex) is in §1.
 | Mononoke's unodes: `eden/mononoke/mononoke_types/src/unode.rs`, `eden/mononoke/derived_data/unodes/derive.rs` | facebook/sapling `main` at `573994010efaffe5a2b4a9fd2a87499ed7caaaf3` (part 1's pin) | 13f62b04189a84a6, b155572df1f5409d |
 | Mononoke's fastlog: `eden/mononoke/mononoke_types/src/fastlog_batch.rs`, `eden/mononoke/derived_data/fastlog/fastlog_impl.rs` | the same revision | b97473ab575a1bec, 6d5366649dfaf346 |
 | Mononoke's deleted manifest: `eden/mononoke/derived_data/deleted_manifest/derive.rs`, `.../ops.rs` | the same revision | b0bedede3875acd6, ac0d78eba3cfc810 |
+| git `Documentation/git-blame.adoc` (part 3) | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 1a4609ad39fc2398 |
+| Mercurial's linelog and fastannotate: `mercurial/linelog.py`, `hgext/fastannotate/__init__.py` (part 3) | Mercurial 7.2.4, the source release on PyPI (`mercurial-7.2.4.tar.gz`, sha256 `85839e0f…cb71a2`, `vcs-servers.md`'s pin, checked again) | be30501d062729c8, 2a728c621545ba24 |
+| Mononoke's blame: `eden/mononoke/mononoke_types/src/blame_v2.rs` (part 3) | facebook/sapling `main` at `573994010efaffe5a2b4a9fd2a87499ed7caaaf3` | 306009d36819fdf0 |
+| diff-match-patch's bisection: `python3/diff_match_patch.py` (part 3) | google/diff-match-patch `master` at `62f2e689f498f9c92dbc588c58750addec9b1654` | 4068fac1f44214ca |
+| E. W. Myers, "An O(ND) Difference Algorithm and Its Variations", Algorithmica 1(2):251-266, 1986 (part 3) | the copy at `www.xmailserver.org/diff2.pdf` (15 pages) | 74233752c748a108 |
 
 ## 2. What the server must answer, in git's words
 
@@ -112,3 +118,80 @@ and its sha256 (first 16 hex) is in §1.
 - **Mononoke's tree-unode reuse by subentries**: compares history, not content, and lists merges git does not (§4).
 - **A deleted manifest beside the unodes**: two structures and two merge rules for one question (§4).
 - **Copy-from outside the node**: makes a value mutable, which A-647 refuses (§4).
+
+## 6. Blame (A-666 part 3)
+
+Part 3's copies (§1's last five rows) were fetched with `curl` on the MacBook on 2026-11-19 and read there.
+
+- **What the server must answer** [C: git `git-blame.adoc` 20-21]: "Annotates each line in the given file with
+  information from the revision which last modified the line." It can show "the filename in the original commit" and
+  "the line number in the original commit" (67-73), and it follows "whole-file renames" (26-27), which git finds by
+  "rename detection" (69), an inference slates never makes (§2, `--follow`). Mercurial's linelog states the same
+  answer [C: `mercurial/linelog.py` 14-19]: "Executing the program emits information about lines, including the
+  revision that introduced them and the line number in the file at the introducing revision." The type answers it as
+  runs of lines (`Span`): the introducing version, the file's path there, and the run's first line's number there,
+  counted from zero (git's output counts from one, `git-blame.adoc` 220).
+- **What Mercurial deploys.** "linelog is an efficient cache for annotate data inspired by SCCS Weaves" [C:
+  `linelog.py` 7]: one program a file, "a jump instruction is used to patch in a new body of annotate information"
+  at each insertion or deletion (18-19). fastannotate keeps one a file along a main branch [C:
+  `hgext/fastannotate/__init__.py` 23-26]: "the internal linelog will only contain the linear (ignoring p2)
+  "mainbranch". since linelog cannot move backwards without a rebuild, this should be something that always moves
+  forward". A merge's second parent is outside the weave, and the weave changes with every revision.
+- **What Mononoke deploys** [C: `mononoke_types/src/blame_v2.rs`]: a blame a file version, its lines kept as ranges
+  (1224-1235, `BlameRangeIndex`: an offset and a length, indexes into the blame's tables of changesets and paths, the
+  `origin_offset`, and the range's parent). A blame is made from its parent's and the diff of the two contents
+  (514-565): "Hunks coming from `diff_hunks` have two associated ranges: `add` and `remove`. ... For each hunk, add a
+  new range corresponding to `add` after removing the range from `remove`." A merge takes each line from one parent
+  (1609-1612): "we take the first one that does *not* match the merge changeset. This give us the first parent which
+  blames the line on itself or one of its ancestors"; a line no parent blames on an ancestor is the merge's
+  (1635-1637).
+- **The design** (`crates/vcs/src/derived/blame.rs`, the type `slates-vcs blame 1 <window>`):
+  - **The value.** A version's blame tree, a path map whose files are each file's blame: a derived node naming the
+    file's content and an object of its spans, and holding its count of lines. A file keeps the blame of the first
+    parent whose file at its path has the same content, as path history keeps a node (§4), so a file no change reaches
+    keeps its first parent's blame by path copying.
+  - **The rule.** A file the change sets otherwise is diffed once against each parent's file at its path, in parent
+    order, then against its recorded source (a rename's or a copy's, §4); each line takes the attribution of the first
+    candidate whose diff keeps it, and a line none keeps is the version's own. With one candidate this is Mononoke's
+    hunks; at a merge, Mononoke's first parent that does not blame the line on the merge.
+  - **A merge (D-27).** A line both parents changed is attributed by the merge's own recorded content: it takes the
+    first parent whose text the merge recorded there, else it is the merge's. No merge of the parents is computed or
+    inferred; the diff only says which recorded lines are shared.
+  - **The diff.** Myers' O(ND) algorithm in linear space [A: Myers 1986, §4b "A Linear Space Refinement"]: the common
+    prefix and suffix taken, then the middle snake of an optimal path found by searching from both ends at once (each
+    diagonal's path started as Fig. 2's greedy algorithm starts it), and each side solved again. The search follows
+    diff-match-patch's `diff_bisect` [C: `diff_match_patch.py` 254-354] (its `v1`, `v2`, `k1start`, `k1end`), with no
+    deadline: no clock, and the search ends within half the lines by parity. The lines kept are a longest common
+    subsequence, and the tests hold their count to the dynamic program's.
+  - **What a derivation reads.** Each file its change sets, and its candidates' versions of that file: never an
+    ancestor's, never another file's, never the history (the counter `lines_read`, held to the replay's).
+  - **The question's cost.** `blame` reads the trie nodes on the path, the file's blame node and its spans' bytes, by
+    its code no more: never the file's content, never the history. It reports both (`BlameCost`); no test holds the
+    report yet (owed).
+- **What differs, and why.**
+  - One immutable value a version, not a weave patched in place along one branch: A-647's values never change, and a
+    weave ignoring second parents (fastannotate) cannot answer histories made of merges, A-645's.
+  - A span names its version and its path itself; Mononoke's ranges index tables kept in each blame (1225-1227). A
+    blame's spans shared between versions by identity is owed.
+  - Renames and copies are the works' declared sources (§4), never rename detection (git) nor copy-from information
+    kept outside the node (Mononoke, §3).
+- **Measured** (Windows x86_64, jupiter, 2026-11-19, kiln run r87; the macOS run owed): the green at ee6868011, 75 of
+  75 (`cargo test -p slates-vcs --lib`, 213.05 s). The oracle's 32 cases: 818 versions, 215 merges, 861 files judged,
+  153 keeping a parent's blame whole and 708 blames made (74 over two candidates or more), 2,299 blames asked holding
+  6,963 lines, 103 lines a merge resolved itself, 175 kept through a later parent and 259 through a recorded source;
+  every derivation read exactly the lines the replay read. A file of 2,000 lines edited a line a version 300 times:
+  its derivations read 1,202,000 lines, 4,000 for each edit (the file and its parent's version), never the history.
+- **Rejected.**
+  - **Replaying the history at the question**, git's own way: a question pays a diff for each version since its lines
+    were introduced. The oracle's model is that replay. The type pays one diff a candidate when a version is recorded,
+    and a question reads the file's spans alone.
+  - **One weave a file** (Mercurial's linelog, fastannotate): a weave patched in place along one branch "ignoring p2",
+    which "cannot move backwards without a rebuild" (`hgext/fastannotate/__init__.py` 23-26). A-647's values are
+    immutable, and A-645's histories are merges.
+  - **Inferring a merge's lines** (a three-way merge of the parents' texts or blames): banned (D-27). The merge's
+    recorded content decides; each line goes to the first parent whose diff keeps it.
+  - **Rename and copy detection** (git's `-M` and `-C`): an inference by content, banned (§4.16; D-27). The works'
+    declared sources are followed instead.
+  - **Tables of changesets and paths in each blame** (Mononoke's `BlameRangeIndex`, 1224-1235, whose derivation clones
+    its parent's tables, 523 and 532): smaller ranges, but a blame reads only with its tables, and every derivation
+    copies them. A span here names its version and its path itself.

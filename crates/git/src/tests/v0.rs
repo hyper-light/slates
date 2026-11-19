@@ -1143,6 +1143,56 @@ fn advertisement_lines_that_break_the_grammar_are_refused_by_kind() {
   );
 }
 
+/// A-640 (A-615's finding: this module read a ref's name as a word): do decode advertisements naming a ref git's
+/// `check_refname_format` refuses (`..`, a name outside `refs/`, `.lock` at the end, `@{`), and write each. Expect:
+/// each refused at its name, read or written; `HEAD` and `receive-pack`'s `.have` taken.
+#[test]
+fn an_advertised_ref_name_is_held_to_gits_ref_name_rule() {
+  let (tip, two) = (recorded("refs/heads/main"), commit("two"));
+  let first = format!("{tip} HEAD\0multi_ack\n");
+  for name in [
+    "refs/heads/a..b",
+    "main",
+    "refs/heads/x.lock",
+    "refs/heads/a@{1}",
+  ] {
+    let second = format!("{tip} {name}\n");
+    let lines: [&[u8]; 2] = [first.as_bytes(), second.as_bytes()];
+    refused_advertisement(
+      &lines,
+      Refusal::Line {
+        at: packet_at(&lines, 1),
+        refusal: LineRefusal::Name { at: 41 },
+      },
+    );
+    let written = Advertisement {
+      version: Version::V0,
+      capabilities: Capabilities::listed(&[]),
+      refs: vec![AdvertisedRef {
+        id: tip,
+        name: name.as_bytes(),
+        peeled: None,
+      }],
+      shallows: Vec::new(),
+    }
+    .write(&mut Vec::new());
+    assert_eq!(
+      written,
+      Err(WriteRefusal::Line(LineRefusal::Name { at: 41 })),
+      "{name}"
+    );
+  }
+  let alternate = format!("{two} .have\n");
+  let bytes = stream(&[first.as_bytes(), alternate.as_bytes()]);
+  let (advertisement, _) = decoded(&bytes);
+  let names: Vec<&[u8]> = advertisement
+    .refs
+    .iter()
+    .map(|reference| reference.name)
+    .collect();
+  assert_eq!(names, [b"HEAD".as_slice(), b".have"]);
+}
+
 /// A-604, refused by kind: do decode advertisements whose order breaks the grammar one way each. Expect: each refused as
 /// unexpected where its packet begins: a peeled line after no ref or after another ref, a ref after the shallow lines,
 /// `capabilities^{}` with a name not null, a ref after it, it again on a later line, a peeled first line.
@@ -1818,14 +1868,31 @@ fn line_format(line: &ClientLine<'_>) -> ObjectFormat {
   }
 }
 
-/// A ref a generated advertisement may hold: its name not a peeled line's, maybe a peeled object.
+/// A ref a generated advertisement may hold: a name its ref-name rule takes, maybe a peeled object.
 fn any_ref(format: ObjectFormat) -> impl Strategy<Value = OwnedRef> {
   (
     any_id(format),
-    proptest::collection::vec(any_word_byte(), 1..24)
-      .prop_filter("not a peeled line's name", |name| !name.ends_with(b"^{}")),
+    any_ref_name(),
     proptest::option::of(any_id(format)),
   )
+}
+
+/// A name an advertised ref may have (A-640: held to git's ref-name rule): `HEAD`, or one to three components under
+/// `refs/`, each of letters, digits, `-` and `_`.
+fn any_ref_name() -> impl Strategy<Value = Vec<u8>> {
+  let byte = prop_oneof![b'a'..=b'z', b'0'..=b'9', Just(b'-'), Just(b'_')];
+  let component = proptest::collection::vec(byte, 1..8);
+  prop_oneof![
+    1 => Just(b"HEAD".to_vec()),
+    8 => proptest::collection::vec(component, 1..4).prop_map(|components| {
+      let mut name = b"refs".to_vec();
+      for component in components {
+        name.push(b'/');
+        name.extend(component);
+      }
+      name
+    }),
+  ]
 }
 
 /// An advertisement's parts: its version, its capabilities with an `object-format` naming its format added last, its
