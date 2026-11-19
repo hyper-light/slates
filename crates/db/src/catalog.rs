@@ -191,6 +191,36 @@ pub struct ConsumerRecord {
   pub write_version: u64,
 }
 
+/// git's author and committer of the commits the server makes for a principal (§4.17.1 "A push is a work" item 4;
+/// A-664): the name and the email exactly as git writes them. The server holds them to git's own rules before it records
+/// them (`slates_git::derived::Identity`: no byte git would strip from either end or drop from inside, a name not
+/// empty), so every commit made of them carries these bytes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GitIdentity {
+  /// The name.
+  pub name: String,
+  /// The email: may be empty, which git writes `<>`.
+  pub email: String,
+}
+
+/// A principal's identities in the tools whose objects the server makes for it (§4.13 "a principal's record"; §4.17.1
+/// "A push is a work" item 4; §4.17.3 decision 7; A-664): git's author and committer, and Mercurial's user. Set whole by
+/// the principal's owner on the control channel, never on the principal's own channel, as the version after the one
+/// its setter read, so a setting made from a stale read changes nothing (`Op::IdentitiesSet`). Kept on the partition
+/// that holds the principal's record, keyed by the principal's key.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRecord {
+  /// The principal.
+  pub principal: Principal,
+  /// git's author and committer; `None` when the principal has none, so a submit of its to a git repository's green is
+  /// refused `IdentityRequired`.
+  pub git: Option<GitIdentity>,
+  /// Mercurial's user, `Name <address>` (§4.17.3 decision 7); `None` when it has none.
+  pub mercurial: Option<String>,
+  /// How many times they were set: the first setting's is 1.
+  pub version: u64,
+}
+
 /// Rights on a volume (§4.13).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rights {
