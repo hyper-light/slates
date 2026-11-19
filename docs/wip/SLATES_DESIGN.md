@@ -8604,6 +8604,12 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 > - **Greens (2026-11-07).** A green ships its catalog register too, and no merge record of it ships before the
 >   register's current version is committed. Its successor waits for the adopted register and rebuilds the green with
 >   its access list (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
+> - **A repository's state logs (2026-11-19, A-636 part 2a).** A repository's four state logs (its names, Mercurial's
+>   phase roots and markers, Git LFS's locks) are registers of the repository, as a volume's catalog is of the volume
+>   (`RegisterClass`, `ObjectId::in_class`): the counter's second bit marks one and its top and third bits name which,
+>   so the catalog's bit and every id with the second bit clear are as they were. They are placed and taken over as the
+>   repository is, so its state moves as one. Three class bits in place of one: a partition mints at most 2^45 − 1 ids
+>   (`MAX_OBJECT_COUNTER`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -11926,15 +11932,20 @@ decides the details.
 > in memory, secures retention, holds every work's verdict (`Green::judge`), judges the whole entry with its new greens
 > counted held (`Partition::check_creating`), and only then commits the verdicts (`Green::commit_judged`) and records
 > the new greens and the entry as one log record; a refusal names every change refused and why, or the entry's
-> refusal, and gives back what it held. The fleet half's protocol is built (A-636 part 1, `crates/db/src/ledger/logs.rs`,
-> the fenced ledger over a repository's logs): each log is a register of its own, placed by its own object id and
-> committing at `f + 1` of its own holders; a record is committed once every log it moves holds it on `f + 1` and every
-> record before it is committed, so the repository's committed state is the greatest cut at or below each log's
-> committed length that holds every record whole; holders apply that cut at their joins; a replica answers a read at a
-> vector of positions and refuses one past what it applied or one that splits a record; a takeover fences every log's
-> quorum or none, adopts each log, and keeps a record only where every log's read holds it whole, dropping it and what
-> follows it otherwise. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs' register
-> class, the server's takeover by this rule); and the repository policy's check before the verdict (A-622's next part).
+> refusal, and gives back what it held. The fleet half's protocol is built (A-636 part 1,
+> `crates/db/src/ledger/logs.rs`, the fenced ledger over a repository's logs): each log is a register of its own,
+> committing at `f + 1` of its own holders and placed by its register's id, a green's log by the green's and the state
+> logs by their repository's, whose register class they are (A-636 part 2a), so a repository's state moves as one; a
+> record is committed once every log it moves holds it on `f + 1` and every record before it is committed, so the
+> repository's committed state is the greatest cut at or below each log's committed length that holds every record
+> whole; holders apply that cut at their joins; a replica answers a read at a vector of positions and refuses one past
+> what it applied or one that splits a record; a takeover runs a log at a time, as a live round does (A-636 part 2a):
+> each log's holders answer on the wire with that log's promise alone, which only that log's round counts, and the
+> repository is adopted only once every log's round has read its quorum, a refusal leaving the logs read before it
+> fenced; it keeps a record only where every log's read holds it whole, dropping it and what follows it otherwise. Owed:
+> the live plane's rest (A-636 part 2b, the partition's records shipped to each log's holders; 2c, the server's takeover
+> by this rule, every log of a repository, its greens' included, following one successor); and the repository policy's
+> check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12433,8 +12444,10 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
    (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); the fleet
    half's protocol built as the fenced ledger over a repository's logs (A-636 part 1: each log replicated on its own,
-   holders applying records at their joins, replicas refusing split cuts, takeovers fencing every log or none and
-   keeping each record whole); owed: its live plane (A-636 part 2).
+   holders applying records at their joins, replicas refusing split cuts, takeovers keeping each record whole), and its
+   live plane's first piece (A-636 part 2a: the state logs a register class of the repository, placed and taken over as
+   it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
+   every log or none); owed: the rest of the live plane (A-636 parts 2b and 2c).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and

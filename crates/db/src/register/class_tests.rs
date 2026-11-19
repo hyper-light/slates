@@ -216,5 +216,5 @@ fn the_catalog_class_is_as_it_was_for_every_id_it_named_before() {
   let changed: Vec<u8> = (u8::MIN..=u8::MAX)
     .filter(|byte| byte & STATE_BIT == 0 && !catalog_as_before(*byte))
     .collect();
-  assert_eq!(changed, Vec::new(), "class bytes whose catalog changed");
+  assert_eq!(changed, Vec::<u8>::new(), "class bytes whose catalog changed");
 }
