@@ -2893,6 +2893,8 @@ fn status_on_channel(
     slot
       .status_pages
       .begin(request, expires, &mut state.store.metadata);
+    // The capture's deadline is the shard's keeper's to keep (A-522).
+    crate::deadlines::capture_set(state, client, expires);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -6812,6 +6814,11 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       errno: code,
     },
+    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
+    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
     _ => Refusal::BaseUnavailable {
       path: path.to_owned(),
       errno: 0,
@@ -7847,7 +7854,11 @@ fn stage_begin(
     (state.partition, expires),
     &mut state.store.metadata,
   ) {
-    Ok(token) => ReplyBody::Staged { token },
+    Ok(token) => {
+      // Its expiry is a deadline the shard's keeper sleeps for (A-522).
+      crate::deadlines::noted(state, expires);
+      ReplyBody::Staged { token }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -7871,7 +7882,10 @@ fn stage_put(
     .staging
     .put((work_id, principal, token), offset, bytes, expires)
   {
-    Ok(filled) => ReplyBody::StagePutDone { filled },
+    Ok(filled) => {
+      crate::deadlines::noted(state, expires);
+      ReplyBody::StagePutDone { filled }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -10965,9 +10979,10 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// The consumer an attachment in `form` belongs to (§4.6, §4.13; AUD-01), which is its lifetime: a
 /// host kernel mount's attachment is the OS filesystem bridge's (`Consumer::Bridge`) — it outlives the
 /// ring client that requested it (`slates mount` exits after `mount_nfs`) and the daemon (the anchor
-/// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
-/// destroy. A root record is the ring client's. OCI requires a verified source dependency,
-/// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
+/// keeps the listener across a restart), ending when the kernel unmounts it (seen through the kernel's own unmount
+/// event, A-511), with a `detach`, or with the volume's destroy. A root record is the ring client's. OCI requires a
+/// verified source dependency, constructed separately by `oci::Binding::consumer`; a guest requires its owned device
+/// seam.
 pub(crate) fn consumer_of(
   form: &AttachRequest,
   client_id: u32,
@@ -11406,9 +11421,11 @@ fn bind_mount(
     now,
   ) {
     Ok(_) => {
+      // The mount is watched from here: the kernel's unmount of it ends this attachment whenever it comes (A-511).
       #[cfg(target_os = "macos")]
       if let Some(own) = own {
         state.own_nfs_mounts.insert(attachment, own);
+        crate::own_nfs::watch(state);
       }
       ReplyBody::MountBound
     }
@@ -11554,11 +11571,12 @@ pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   ended
 }
 
-/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
-/// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
+/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's unmount of a host
+/// mount's (§4.6, §4.13; AUD-01; A-511): the record removed as a recorded operation, a green pin dropped, and,
 /// when it was the holder's last attachment of the volume and the holder holds the write lease, the
-/// lease released (D-16). The caller has authorized the end — the verb by the principal, the `UMNT` by
-/// the mount capability. The typed database refusal when the removal could not be recorded.
+/// lease released (D-16). The caller has authorized the end — the verb by the principal, an unmount by the
+/// kernel's own table no longer naming the mount (`own_nfs`). The typed database refusal when the removal could not
+/// be recorded.
 pub(crate) fn end_attachment(
   state: &mut ShardState,
   record: &AttachmentRecord,

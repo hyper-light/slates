@@ -73,8 +73,7 @@ use slates_vfs::inode::Fingerprint;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem as nt;
 use windows_sys::Win32::Foundation::{
-  ERROR_ALREADY_EXISTS, ERROR_DISK_FULL, ERROR_FILE_EXISTS, ERROR_FILENAME_EXCED_RANGE,
-  ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE,
+  ERROR_FILENAME_EXCED_RANGE, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE,
   NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
   STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY,
   STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -89,12 +88,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::engine::LandingTarget;
+// The errnos of the kinds the engine tells apart that a Win32 code is given (A-527), from the writer's one rule.
+use crate::windows_codes::{ERRNO_EXIST, ERRNO_NOSPC};
 
-/// Format: the errno numbers the engine tells refusals apart by (it was written over POSIX; `engine.rs`).
-const ERRNO_EXIST: i32 = 17;
-/// Format: `ENOSPC`: no room.
-const ERRNO_NOSPC: i32 = 28;
-/// Format: `EOPNOTSUPP`: the verb does not exist here.
+/// Format: `EOPNOTSUPP`: the verb does not exist here, an errno whose kind the engine tells apart (`engine.rs`).
 const ERRNO_NOTSUP: i32 = 95;
 /// Format: `EPERM`: the verb would need a privilege slates never asks for (R10).
 const ERRNO_PERM: i32 = 1;
@@ -189,13 +186,20 @@ impl std::fmt::Debug for OsLand {
   }
 }
 
-/// A Win32 error code as the seam's refusal, in the engine's errno numbers where it tells them apart.
+/// A Win32 error code as the seam's refusal (A-527, `crate::windows_codes::refusal_of`): the errno of a kind the engine
+/// tells apart, else the Win32 code it is.
 fn code_refusal(code: u32) -> HostError {
-  match code {
-    ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => HostError::Unavailable(ERRNO_EXIST),
-    ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL => HostError::Unavailable(ERRNO_NOSPC),
-    other => HostError::Unavailable(i32::try_from(other).unwrap_or(i32::MAX)),
-  }
+  crate::windows_codes::refusal_of(code)
+}
+
+/// An I/O error of the standard library's as the seam's refusal: its OS code is a Win32 code here.
+fn io_refusal(error: &std::io::Error) -> HostError {
+  code_refusal(
+    error
+      .raw_os_error()
+      .and_then(|code| u32::try_from(code).ok())
+      .unwrap_or(0),
+  )
 }
 
 /// The calling thread's last Win32 error as the seam's refusal; read before any other call.
@@ -1233,7 +1237,7 @@ impl LandFs for OsLand {
       let at = off.saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
       let n = writer
         .seek_write(bytes.get(written..).unwrap_or_default(), at)
-        .map_err(|e| code_refusal(u32::try_from(e.raw_os_error().unwrap_or(0)).unwrap_or(0)))?;
+        .map_err(|error| io_refusal(&error))?;
       if n == 0 {
         return Err(HostError::Unavailable(ERRNO_NOSPC));
       }
@@ -1256,7 +1260,7 @@ impl LandFs for OsLand {
         self
           .file(*file)?
           .try_clone_to_owned()
-          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+          .map_err(|error| io_refusal(&error))
       })
       .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(OsBarrier { files }))

@@ -63,7 +63,7 @@ pub(crate) fn run(role: &str, name: &str, shards: u16) {
     .collect();
   // The role runs once: its first exit is the test's verdict, and the watch ends at the step that reports it, whatever
   // the supervisor does next (A-311 restarts a first failed start at once; the restarted role is stopped on return).
-  let policy = RestartPolicy::derive(config.failover_slo_ns).get();
+  let policy = RestartPolicy::derive(config.nfs_v4.lease_ns).get();
   let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   supervisor.hold_environment(ROLE_ENV, role.to_owned());
   supervisor.hold_environment(INSTANCE_ENV, instance);

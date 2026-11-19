@@ -129,6 +129,9 @@ pub mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
+// The deadlines of what a shard's clients leave behind (staging buffers, status captures), kept on the shard's timing
+// wheel by one keeper task (A-522).
+mod deadlines;
 // A client's hang-up, the event its death is seen at (A-475): its control socket's end of stream (Linux) or its
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;

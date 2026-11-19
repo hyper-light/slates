@@ -2456,12 +2456,68 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
     take.learned.is_empty(),
     take.given_up.is_empty(),
     !materializing(state, departed),
+    adopted_served(state, departed, local),
     regional
       .recovery_hosts(departed)
       .into_iter()
       .filter(|host| *host != local && regional.members.contains(host))
       .all(|host| take.pages.get(&host).is_some_and(|page| page.complete)),
   )
+}
+
+/// Whether every volume `departed`'s round adopted here is served from this node's own placement (A-529): its head
+/// snapshot's recorded placement names only this node and hosts among the volume's current content candidates
+/// ([`served_from_placement`]). An adopted volume starts placed where the departed owner's head said
+/// (`verbs::materialize_taken_over`), and the healer replaces that placement on this node's current cohort and
+/// republishes the head naming it (`fleet::heal_decision`, its adopted case). Until it has, the head this node serves
+/// still names holders outside its placement, which a confirmation would leave keeping content no head of the takeover's
+/// line will drop: the confirmation is what certifies that no head the successor serves names a holder outside its
+/// placement, the content release's first half. An object with no volume here (a catalog, a tombstone, a green), or a
+/// volume whose head names no content yet, has nothing to serve.
+fn adopted_served(state: &ShardState, departed: HostId, local: HostId) -> bool {
+  let Some(take) = state.host_takeovers.get(&departed) else {
+    return true;
+  };
+  let configuration = state.fleet.configuration();
+  take.adopted.iter().all(|object| {
+    let id = slates_db::catalog::VolumeId { bytes: object.0 };
+    let Some(record) = state.db.partition().volume(id) else {
+      return true;
+    };
+    if record.epoch == 0 {
+      return true;
+    }
+    state
+      .db
+      .partition()
+      .snapshot(id, record.head)
+      .is_some_and(|snapshot| match &snapshot.placed {
+        slates_db::catalog::PlacementState::Placed { region, .. } => served_from_placement(
+          region,
+          local,
+          &configuration.place_content(*object).candidates,
+        ),
+        slates_db::catalog::PlacementState::Local => true,
+      })
+  })
+}
+
+/// Whether a placement naming `region` is served from `local`'s own placement (A-529): every host it names is `local`
+/// or among the object's current content `candidates`, so the head that records it names no holder outside them.
+pub(crate) fn served_from_placement(region: &[u64], local: HostId, candidates: &[HostId]) -> bool {
+  region
+    .iter()
+    .map(|host| HostId(*host))
+    .all(|host| host == local || candidates.contains(&host))
+}
+
+/// Whether `object` is a volume a takeover round on this node adopted and has not yet confirmed (A-529): the healer
+/// replaces its placement wherever it names a host outside its current candidates, so its round can confirm.
+pub(crate) fn adopted_here(state: &ShardState, object: ObjectId) -> bool {
+  state
+    .host_takeovers
+    .values()
+    .any(|take| take.adopted.contains(&object))
 }
 
 /// Whether an object `departed`'s round adopted is still being materialized on this node (A-345): its volume's content,
@@ -2484,7 +2540,8 @@ fn materializing(state: &ShardState, departed: HostId) -> bool {
 }
 
 /// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
-/// complete, and every object it learned adopted and held here, none given up (A-272, A-304, A-345). A confirmation is what lets the takeover
+/// complete, every object it learned adopted and held here, none given up, and every volume it adopted served from this
+/// node's own placement (A-272, A-304, A-345, A-529). A confirmation is what lets the takeover
 /// complete, and a completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an
 /// object still learned or given up must not confirm: its retirement stays kept, and its holders keep their copies.
 /// Before A-272 an object declared lost was dropped from those learned and the round confirmed as though it had been
@@ -2496,9 +2553,16 @@ fn share_done(
   nothing_learned: bool,
   nothing_given_up: bool,
   nothing_materializing: bool,
+  every_adopted_served: bool,
   every_page: bool,
 ) -> bool {
-  current && unfenced && nothing_learned && nothing_given_up && nothing_materializing && every_page
+  current
+    && unfenced
+    && nothing_learned
+    && nothing_given_up
+    && nothing_materializing
+    && every_adopted_served
+    && every_page
 }
 
 #[cfg(test)]
@@ -2745,24 +2809,55 @@ mod tests {
   #[test]
   fn a_round_confirms_only_once_every_object_it_learned_is_adopted() {
     assert!(
-      !share_done(true, true, false, true, true, true),
+      !share_done(true, true, false, true, true, true, true),
       "an object still learned: not done, the takeover stays kept"
     );
     assert!(
-      !share_done(true, true, true, false, true, true),
+      !share_done(true, true, true, false, true, true, true),
       "an object given up: not done, the takeover stays kept"
     );
     assert!(
-      !share_done(true, true, true, true, false, true),
+      !share_done(true, true, true, true, false, true, true),
       "an object adopted but still materializing here: not done, the takeover stays kept (A-345)"
     );
     assert!(
-      share_done(true, true, true, true, true, true),
+      share_done(true, true, true, true, true, true, true),
       "every object adopted and held: done"
     );
     assert!(
-      !share_done(true, true, true, true, true, false),
+      !share_done(true, true, true, true, true, true, false),
       "a member's pages incomplete: not done"
+    );
+  }
+
+  /// A-529, red before it: a share is not done while a volume its round adopted is still placed where the departed
+  /// owner's head said, outside this node's own placement. Do: judge a placement naming the departed owner beside two
+  /// candidates, one naming a member outside the candidates, one naming this node and the candidates alone, and a share
+  /// whose every other fact holds with each verdict. Expect only the last served, and the share done only then. Before,
+  /// the share confirmed once the volume was adopted and held, and the head the successor served still named the
+  /// departed owner's holders, which kept the content for good.
+  #[test]
+  fn a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement() {
+    let (local, departed, a, b, outside) = (HostId(1), HostId(2), HostId(3), HostId(4), HostId(5));
+    let candidates = [local, a, b];
+    let verdicts = [
+      served_from_placement(&[departed.0, a.0, b.0], local, &candidates),
+      served_from_placement(&[a.0, b.0, outside.0], local, &candidates),
+      served_from_placement(&[local.0, a.0, b.0], local, &candidates),
+    ];
+    assert_eq!(
+      verdicts,
+      [false, false, true],
+      "served only once the placement names this node and its candidates alone"
+    );
+    let done: Vec<bool> = verdicts
+      .iter()
+      .map(|served| share_done(true, true, true, true, true, *served, true))
+      .collect();
+    assert_eq!(
+      done,
+      vec![false, false, true],
+      "the share waits for the adopted volume's placement"
     );
   }
   use crate::head::{HeadKey, HeadSealing};
