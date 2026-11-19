@@ -79,6 +79,17 @@ pub(crate) enum WordsFrom {
   ErrorStream,
 }
 
+/// Where a hook runs (A-648).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookDirectory {
+  /// The root of its read-only view: git's bare repository (git runs a hook in `$GIT_DIR`, `githooks.adoc`) and
+  /// Mercurial's repository root.
+  ViewRoot,
+  /// The filesystem's root, where `svnserve -d` runs its hooks: `apr_proc_detach` changes the daemon to `/`, and
+  /// `run_hook_cmd` starts a hook in its server's own directory, `.` (`hooks.c`; every recorded run's directory).
+  FilesystemRoot,
+}
+
 /// What a point with no hook configured answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unconfigured {
@@ -203,6 +214,37 @@ impl HookPoint {
         | Self::SvnPreUnlock
         | Self::SvnPostUnlock
     )
+  }
+
+  /// Where its hook runs (A-648): Subversion's in the filesystem's root, as `svnserve -d` runs them; git's and
+  /// Mercurial's in the root of their view.
+  pub(crate) fn directory(self) -> HookDirectory {
+    if self.is_subversions() {
+      HookDirectory::FilesystemRoot
+    } else {
+      HookDirectory::ViewRoot
+    }
+  }
+
+  /// The point a repository's record names (`slates_db`'s `HookPointName`, A-622 and A-648).
+  pub(crate) fn of(named: slates_db::catalog::HookPointName) -> Self {
+    use slates_db::catalog::HookPointName as Named;
+    match named {
+      Named::GitPreReceive => Self::GitPreReceive,
+      Named::GitUpdate => Self::GitUpdate,
+      Named::GitPostReceive => Self::GitPostReceive,
+      Named::HgPretxnchangegroup => Self::HgPretxnchangegroup,
+      Named::HgChangegroup => Self::HgChangegroup,
+      Named::SvnStartCommit => Self::SvnStartCommit,
+      Named::SvnPreCommit => Self::SvnPreCommit,
+      Named::SvnPreRevpropChange => Self::SvnPreRevpropChange,
+      Named::SvnPostCommit => Self::SvnPostCommit,
+      Named::SvnPostRevpropChange => Self::SvnPostRevpropChange,
+      Named::SvnPreLock => Self::SvnPreLock,
+      Named::SvnPostLock => Self::SvnPostLock,
+      Named::SvnPreUnlock => Self::SvnPreUnlock,
+      Named::SvnPostUnlock => Self::SvnPostUnlock,
+    }
   }
 
   /// What it answers with no hook configured.
@@ -477,6 +519,25 @@ impl SvnHooksEnv {
     }
     merged.retain(|(_, variables)| !variables.is_empty());
     Self { sections: merged }
+  }
+
+  /// The environment a Subversion repository's record gives its hooks (A-648): its policy's hooks-env, its sections read
+  /// as [`SvnHooksEnv::new`] reads a file's.
+  pub(crate) fn of(policy: &slates_db::catalog::RepositoryPolicy) -> Self {
+    Self::new(
+      policy
+        .hooks_env
+        .iter()
+        .map(|section| {
+          let variables = section
+            .variables
+            .iter()
+            .map(|variable| (variable.name.clone(), variable.value.clone()))
+            .collect();
+          (section.name.clone(), variables)
+        })
+        .collect(),
+    )
   }
 
   /// The whole environment `point`'s hook runs with: its own section if the file has one, else the default section,
@@ -1034,6 +1095,37 @@ pub(crate) fn svn_told(point: HookPoint, program: &str, outcome: &Outcome) -> Op
   Some(svn_reported(point, chain))
 }
 
+/// What a pre-lock hook's standard output asks its lock to be made with (`svn_repos__hooks_pre_lock`, `hooks.c`, and
+/// `svn_repos_fs_lock_many`, `fs-wrap.c`; A-648).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SvnLockToken {
+  /// The hook wrote nothing before a NUL: the filesystem makes the token, as for a lock with none supplied
+  /// (`svn_repos_fs_lock_many` sets the hook's token only when it is not empty).
+  Made,
+  /// This token, the hook's output up to its first NUL, as `svnserve` reads it, a C string. The lock judges it as it
+  /// judges one a client supplied (`slates_svn`'s `lock::Token::supplied`: `E160037` unless `opaquelocktoken:` and
+  /// printable ASCII, so a token ending in a newline is refused, as the recorded `svnserve` refused one).
+  Given(Vec<u8>),
+  /// The hook wrote more than the server keeps of its output before any NUL: the token is not all here, so no lock
+  /// may be made with it.
+  PastCap,
+}
+
+/// What `output`, a pre-lock hook's standard output kept to the run's cap, asks its lock to be made with
+/// ([`SvnLockToken`]).
+pub(crate) fn svn_lock_token(output: &Words) -> SvnLockToken {
+  let mut fields = output.kept.split(|byte| *byte == 0);
+  let token = fields.next().unwrap_or_default();
+  if fields.next().is_none() && output.dropped > 0 {
+    return SvnLockToken::PastCap;
+  }
+  if token.is_empty() {
+    SvnLockToken::Made
+  } else {
+    SvnLockToken::Given(token.to_vec())
+  }
+}
+
 /// What `svnserve` tells its client when `point` has no hook: `pre-revprop-change`'s refusal of every change
 /// (`SVN_ERR_REPOS_DISABLED_FEATURE`), else nothing; `None` at another tool's point.
 pub(crate) fn svn_told_unconfigured(point: HookPoint) -> Option<SvnTold> {
@@ -1173,7 +1265,7 @@ pub(crate) struct Words {
 
 impl Words {
   /// `bytes` written: kept while there is room under `cap`, counted past it.
-  fn append(&mut self, bytes: &[u8], cap: usize) {
+  pub(crate) fn append(&mut self, bytes: &[u8], cap: usize) {
     let room = cap.saturating_sub(self.kept.len()).min(bytes.len());
     let Some((kept, past)) = bytes.split_at_checked(room) else {
       return;
@@ -1489,13 +1581,13 @@ mod tests {
   use proptest::prelude::*;
 
   use super::{
-    Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookInput, HookPoint, HookRun,
-    HookTimes, LockToken, Outcome, PendingView, Phase, RefUpdate, RevpropAction, RevpropChange,
-    StartRefused, Step, SvnError, SvnHooksEnv, SvnTold, Unconfigured, View, Words, WordsFrom,
-    git_post_receive, git_pre_receive, git_update, hg_changegroup, hg_pretxnchangegroup,
-    svn_post_commit, svn_post_lock, svn_post_revprop_change, svn_post_unlock, svn_pre_commit,
-    svn_pre_lock, svn_pre_revprop_change, svn_pre_unlock, svn_start_commit, svn_told,
-    svn_told_unconfigured,
+    Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookDirectory, HookInput, HookPoint,
+    HookRun, HookTimes, LockToken, Outcome, PendingView, Phase, RefUpdate, RevpropAction,
+    RevpropChange, StartRefused, Step, SvnError, SvnHooksEnv, SvnLockToken, SvnTold, Unconfigured,
+    View, Words, WordsFrom, git_post_receive, git_pre_receive, git_update, hg_changegroup,
+    hg_pretxnchangegroup, svn_lock_token, svn_post_commit, svn_post_lock, svn_post_revprop_change,
+    svn_post_unlock, svn_pre_commit, svn_pre_lock, svn_pre_revprop_change, svn_pre_unlock,
+    svn_start_commit, svn_told, svn_told_unconfigured,
   };
   use crate::daemon::LIVENESS_BUDGET_NS;
 
@@ -3031,5 +3123,117 @@ mod tests {
         prop_assert_eq!(words.kept.len() as u64 + words.dropped, driven.written as u64);
       }
     }
+  }
+
+  /// A-648 (the record's points). Do: map every point a repository's record can name to the runner's, and ask where its
+  /// hook runs. Expect: each the point of the same name; Subversion's run in the filesystem's root, as `svnserve -d` ran
+  /// the recorded ones (their directory was `/`), git's and Mercurial's in their view's root.
+  #[test]
+  fn every_recorded_point_maps_to_its_own_and_runs_where_its_tool_runs_it() {
+    use slates_db::catalog::{HookPointName as Named, VcsTool};
+    let named = [
+      Named::GitPreReceive,
+      Named::GitUpdate,
+      Named::GitPostReceive,
+      Named::HgPretxnchangegroup,
+      Named::HgChangegroup,
+      Named::SvnPreCommit,
+      Named::SvnPreRevpropChange,
+      Named::SvnPostCommit,
+      Named::SvnStartCommit,
+      Named::SvnPostRevpropChange,
+      Named::SvnPreLock,
+      Named::SvnPostLock,
+      Named::SvnPreUnlock,
+      Named::SvnPostUnlock,
+    ];
+    for name in named {
+      let point = HookPoint::of(name);
+      assert_eq!(point.name(), name.name());
+      let expected = if name.tool() == VcsTool::Subversion {
+        HookDirectory::FilesystemRoot
+      } else {
+        HookDirectory::ViewRoot
+      };
+      assert_eq!(point.directory(), expected, "{}", name.name());
+    }
+    let recorded =
+      include_bytes!("../../svn/fixtures/hooks/runs/commit-by-jrandom.1-start-commit.cwd");
+    assert_eq!(recorded.as_slice(), b"/");
+  }
+
+  /// A-648 (the hooks-env read from the record). Do: build the environment of a Subversion repository's record whose
+  /// hooks-env is the recording's file (a default section named twice, pre-commit's own, an empty post-commit one), and
+  /// from it pre-commit's and post-commit's inputs. Expect: the file's own environment, and each input the recorded
+  /// run's, byte for byte.
+  #[test]
+  fn a_records_hooks_env_gives_the_recorded_hooks_their_environment() {
+    let section = |name: &str, variables: &[(&str, &str)]| slates_db::catalog::HooksEnvSection {
+      name: name.to_owned(),
+      variables: variables
+        .iter()
+        .map(|(name, value)| slates_db::catalog::HooksEnvVariable {
+          name: (*name).to_owned(),
+          value: value.as_bytes().to_vec(),
+        })
+        .collect(),
+    };
+    let policy = slates_db::catalog::RepositoryPolicy {
+      hooks_env: vec![
+        section("default", &[("LANG", "en_US.UTF-8")]),
+        section("pre-commit", &[("SLATES_FIXTURE", "pre-commit section")]),
+        section("post-commit", &[]),
+        section("default", &[("SLATES_FIXTURE", "default section")]),
+      ],
+      ..slates_db::catalog::RepositoryPolicy::default()
+    };
+    let env = SvnHooksEnv::of(&policy);
+    assert_eq!(env, recorded_hooks_env());
+    let pre = svn_pre_commit(PendingView(1), &env, RECORDED_REPOSITORY, "0-0", &[]);
+    assert_recorded(&pre, &recorded!("commit-by-jrandom.2-pre-commit"));
+    let post = svn_post_commit(CommittedView(1), &env, RECORDED_REPOSITORY, 1, "0-0");
+    assert_recorded(&post, &recorded!("commit-by-jrandom.3-post-commit"));
+  }
+
+  /// A-648 (`svn_repos__hooks_pre_lock`: the hook's output is the token, a C string). Do: read the token of a pre-lock
+  /// hook that wrote nothing; a token; a token, a NUL and more; a NUL first; a token cut at the cap before any NUL; and
+  /// one cut at the cap after a NUL. Expect: the filesystem's own token; the token; the token before the NUL; the
+  /// filesystem's own; none, past the cap; and the token before the NUL.
+  #[test]
+  fn a_pre_lock_hooks_output_is_its_locks_token_up_to_a_nul() {
+    let token = |kept: &[u8], dropped: u64| {
+      svn_lock_token(&Words {
+        kept: kept.to_vec(),
+        dropped,
+      })
+    };
+    let given = |token: &[u8]| SvnLockToken::Given(token.to_vec());
+    assert_eq!(token(b"", 0), SvnLockToken::Made);
+    assert_eq!(token(b"opaquelocktoken:t", 0), given(b"opaquelocktoken:t"));
+    assert_eq!(
+      token(b"opaquelocktoken:t\0more", 0),
+      given(b"opaquelocktoken:t")
+    );
+    assert_eq!(token(b"\0opaquelocktoken:t", 0), SvnLockToken::Made);
+    assert_eq!(token(b"opaquelocktoken:", 9), SvnLockToken::PastCap);
+    assert_eq!(
+      token(b"opaquelocktoken:t\0", 9),
+      given(b"opaquelocktoken:t")
+    );
+  }
+
+  /// A-623, A-648 (golden). Do: read the token of the recorded pre-lock hook that wrote `opaquelocktoken:fixture-b` and
+  /// nothing else. Expect: that token, which the recorded `svnserve` made the lock with: its lock answer names it.
+  #[test]
+  fn the_recorded_pre_lock_token_is_the_one_svnserve_locked_with() {
+    let token = svn_lock_token(&words(b"opaquelocktoken:fixture-b"));
+    assert_eq!(
+      token,
+      SvnLockToken::Given(b"opaquelocktoken:fixture-b".to_vec())
+    );
+    assert!(holds(
+      told!("lock-token-from-the-hook"),
+      b"25:opaquelocktoken:fixture-b "
+    ));
   }
 }

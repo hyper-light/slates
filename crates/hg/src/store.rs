@@ -427,10 +427,12 @@ enum Asks {
   FileIndex,
   /// `share-safe`: the store's own requirements in `store/requires`.
   ShareSafe,
+  /// `bookmarksinstore`: the bookmarks in the store's `bookmarks` rather than `.hg/bookmarks`.
+  BookmarksInStore,
   /// Nothing of the walk: what each revlog's own header says (the revlog versions, generaldelta, sparse-revlog, delta
   /// information, the compression engines the reader inflates), a cache 7.2 rebuilds (the persistent nodemap), the
-  /// working directory's (dirstate-v2 and its tracked hint, sparse checkouts), or what the import does not take yet
-  /// (bookmarks kept in the store, the internal and archived phases: §4.17.3 pieces 5 and 7).
+  /// working directory's (dirstate-v2 and its tracked hint, sparse checkouts), or the internal and archived phases,
+  /// which `phaseroots` names as it names the others (A-649).
   Neutral,
   /// A store the import cannot take whole: a manifest log per directory (`treemanifest`), file logs missing outside a
   /// narrow clone's patterns, file contents outside the store (`lfs`, `largefiles`), another repository's store
@@ -466,7 +468,7 @@ const KNOWN: [(&[u8], Asks); 30] = [
   (b"dirstate-v2", Asks::Neutral),
   (b"dirstate-tracked-key-v1", Asks::Neutral),
   (b"exp-sparse", Asks::Neutral),
-  (b"bookmarksinstore", Asks::Neutral),
+  (b"bookmarksinstore", Asks::BookmarksInStore),
   (b"internal-phase-2", Asks::Neutral),
   (b"exp-archived-phase", Asks::Neutral),
   (b"treemanifest", Asks::Refused),
@@ -494,6 +496,8 @@ pub struct Layout {
   pub file_index: bool,
   /// `share-safe`: the store's requirements are in its own `requires`, `store/requires`.
   pub share_safe: bool,
+  /// `bookmarksinstore`: the bookmarks are the store's `bookmarks`, not `.hg/bookmarks`.
+  pub bookmarks_in_store: bool,
 }
 
 /// How a store lists its file logs.
@@ -512,6 +516,8 @@ pub struct Shape {
   pub listing: Listing,
   /// How every store path is named.
   pub encoding: Encoding,
+  /// Whether the bookmarks are the store's (`bookmarksinstore`) rather than the repository's `.hg/bookmarks`.
+  pub bookmarks_in_store: bool,
 }
 
 /// Why a repository's requirements were refused.
@@ -575,6 +581,7 @@ impl Layout {
       Asks::Plain => self.plain = true,
       Asks::FileIndex => self.file_index = true,
       Asks::ShareSafe => self.share_safe = true,
+      Asks::BookmarksInStore => self.bookmarks_in_store = true,
       Asks::Neutral => {}
       Asks::Refused => {
         return Err(RequiresRefused::Unsupported {
@@ -605,10 +612,12 @@ impl Layout {
       (true, _) => Ok(Shape {
         listing: Listing::Fncache,
         encoding: encoding(Encoding::Hybrid),
+        bookmarks_in_store: self.bookmarks_in_store,
       }),
       (false, true) => Ok(Shape {
         listing: Listing::FileIndex,
         encoding: encoding(Encoding::Dot),
+        bookmarks_in_store: self.bookmarks_in_store,
       }),
       (false, false) => Err(RequiresRefused::Unlisted),
     }
@@ -695,10 +704,12 @@ mod tests {
     let fncache = |encoding| Shape {
       listing: Listing::Fncache,
       encoding,
+      bookmarks_in_store: false,
     };
     let file_index = |encoding| Shape {
       listing: Listing::FileIndex,
       encoding,
+      bookmarks_in_store: false,
     };
     let plain = "exp-very-fragile-and-unsafe-plain-store-encoding";
     for (lines, expected) in [

@@ -3,7 +3,7 @@
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
-> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** OWED: derived data as one mechanism (the tool stores as types under it); merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). OWED: part 2, A-614's D(k) rows as a type (A-647); A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** OWED: A-603's repository-wide register position replaced by each green's own log; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own (g261, with A-635/A-636).
 >
@@ -270,6 +270,16 @@
 > deadline, client), its exit read without reaping so the group's kill stays its own, its child always reaped. Server
 > lib tests 42 of 42 on the Mac Studio with the test binary re-invoked as the hook, red three ways. Owed: the Windows
 > driver (a job object), the Linux launcher's namespace (§4.6), the push pieces' calls, the hook times' table.
+> **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
+> (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
+> hooks-env in its policy (refused by section, `DatabaseRefusal` 11, when no hook's environment can carry it or the
+> repository is not Subversion's; charged as rules and hooks are); the driver runs a Subversion hook in `/`, hands
+> pre-lock's standard output back as the lock's token (`svn_lock_token`), and builds the environment from the record.
+> On the Mac Studio: db lib 140 of 140, ipc lib 74 of 74, both `wire_order` tests, server lib 597 of 598 (the
+> failure a `deadlines` test that fails alike on main 3239c88: run request); red eleven ways. Owed: the read-only
+> FSFS-layout view at REPOS for stock `svnlook` (after A-647, queued by main); the
+> server's calls; a dangling link told apart; no core dumps; the Windows driver. Main's: clippy, `xtask` and the lint
+> matrix over the change.
 > **A-623 (2026-11-19, g229; §4.17.4 item 9, Subversion's hook points):** `vcs_hooks` holds Subversion's nine points
 > with each hook's arguments, standard input and environment as stock `svnserve` 1.15 hands them, and `svn_told`,
 > `svnserve`'s own words for every outcome; slates ships no `svnlook` (Ada's scope: a hook runs the stock one). Held to
@@ -577,8 +587,7 @@
 > Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
 > history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
-> import, with later pieces: the phase roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an
-> import holds every changeset, secret ones too, and must not be served); the import sliced under the shard's step
+> import, with later pieces: the import sliced under the shard's step
 > budget and resumed after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a
 > text rebuilt from the one before it where its chain passes through it (7.2's revision cache), rather than from its
 > chain's base; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's
@@ -593,7 +602,12 @@
 > audits them (transcribed: the first audit, written from the design's summary, took `a/.hg/b`, which 7.2 refuses), and
 > a line's move made A-618's work over its flat manifests laid out as directories named by their content; held to stock
 > 7.2's bundles (each branch head landed holding exactly what `hg cat` recorded) and hand-made changegroups breaking
-> each rule; red nine ways. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
+> each rule; red nine ways. **Built (A-649 part 2):** the phase roots, bookmarks and markers imported as 7.2 reads them
+> (`phaseroots` strict as `_readroots`, bookmarks lenient as `bmstore`, the obsstore checked whole); the phase roots and
+> bookmarks returned typed for the register, the repository's mutable state (an import is not served before the
+> register's entry holds them); the markers kept as the index's `M` rows in the obsstore's order; red first (5 failed),
+> 261 of 261, against a history 7.2 kept with drafts, an amend, a secret changeset, bookmarks and markers
+> (`crates/hg/fixtures/state`). Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
 > `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move

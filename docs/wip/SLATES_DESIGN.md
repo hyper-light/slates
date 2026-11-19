@@ -12200,6 +12200,14 @@ is one more version, and the chain itself is never rewritten.
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
 
+> **Status (2026-11-19, A-647 part 1: derived data, one mechanism, A-645).** What a read computes for a version is a
+> type of derived data (`crates/vcs/src/derived.rs`): a pure function of the version's change and its parents' values
+> of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
+> any tier computes, keeps and serves it with no coordination; computed eagerly as each version is recorded or lazily
+> when first read, by the type's own declaration, a unit a step under the shard's slices. Its first type is a version's
+> map of paths to contents (`derived/paths.rs`). Owed: the tool stores as types (A-614's D(k) first), and the server's
+> use (A-647's entry).
+
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
 computes for it (a pack, a bundle, a slice of the index) is cached by its identity and shared across clients. The change
@@ -13201,6 +13209,19 @@ signature verification).
 > version through a merge and a new directory; the same bundle again bringing nothing; version 01's deltas resolved
 > against what the repository held), and against hand-made changegroups breaking each rule. Owed: which lines and
 > bookmarks a push moves (decisions 1 and 2), and the landing (part 3).
+>
+> **Status (2026-11-19, A-649 parts 1 and 2: the index's keys tagged by kind; a store's state imported with its
+> history).** Every key of the index begins with its kind's tag (`L`, `N`, `O` for a push's object rows written by
+> `HgIndex::commit_objects`, `M` for markers), so no row of one kind meets another's whatever a path's length. The
+> import reads the state beside the history as 7.2 reads it: `phaseroots` (`phases._readroots`: a line it cannot read
+> refused, a root it does not hold dropped and counted), the bookmarks from `.hg/bookmarks` or, under
+> `bookmarksinstore`, the store (`bookmarks.bmstore`: a malformed line passed over and counted, an unheld node dropped,
+> a name given twice its later node), both returned typed for the register, which records the repository's mutable
+> state (a row of the index is never rewritten); and the obsstore, checked whole and kept as the index's marker rows in
+> its order, each alone in its format. Proven against one history 7.2 kept with a public root, drafts, an amended draft,
+> a secret changeset, three bookmarks and two markers, in `.hg` and in the store (`crates/hg/fixtures/state`, the
+> command in `make-state-fixtures.sh`): every changeset's phase computed from the imported roots as 7.2 lists it, every
+> bookmark and marker as 7.2 lists them, the markers written back to the obsstore's bytes.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13318,10 +13339,12 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
   that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
   and bytes as two contents of its row.
-- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, and an object row's `O` and the node
-  (`HgIndex::commit_objects`, a push's quarantine committed tagged), so no key of one kind equals one of another
-  whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long, as a node
-  is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on these rows.
+- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, an object row's `O` and the node
+  (`HgIndex::commit_objects`, a push's quarantine committed tagged), and a marker row's `M` and the marker's number
+  (the obsolescence markers in the order they arrived, each alone in its format), so no key of one kind equals one of
+  another whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long,
+  as a node is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on
+  these rows.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -13600,8 +13623,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
    encodings, the hashed long names) and its fncache. Built (A-630 parts 2 and 3, `crates/hg`: `import`,
    `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
-   read-only seam, its file index read. Owed with later pieces: the phase roots, bookmarks and markers (pieces 5 and
-   7), the import sliced and by ranges, and the server's adapter from §4.15's host seam.
+   read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
+   phase roots, bookmarks and markers imported with the history. Owed: the import sliced and by ranges, and the
+   server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -14166,9 +14190,12 @@ copy and commits the result as any commit. The server never merges file contents
 
 *9. Hooks* (§4.17.1's hook rule; A-623). The server's nine hook points as stock `svnserve` 1.15 runs them, and nothing
 of Subversion's client side: slates offers the server alone, and a hook that reads its transaction runs the stock
-`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). Each hook runs through §4.17.1's
-driver over a read-only attachment of the work or the revision, and gets `hooks.c`'s arguments, standard input and
-environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
+`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). REPOS names a read-only
+FSFS-layout view of the repository, derived from the index (A-645's derived data), so that stock `svnlook` reads the
+transaction and the revisions there, as git's hooks get a read-only bare repository (git piece 10; main's decision,
+2026-11-19; owed after A-647's derived-data mechanism). Each hook runs through §4.17.1's driver, configured in the
+repository's policy at one of the nine points the record names (A-648), and gets `hooks.c`'s arguments, standard input
+and environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
 - start-commit: the repository's directory (REPOS, its configured directory), the user, the client's capabilities
   joined by `:`, the transaction.
 - pre-commit: REPOS and the transaction. On standard input, when the commit presented lock tokens, `LOCK-TOKENS:`, a
@@ -14185,8 +14212,11 @@ environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates
 
 Every argument is a C string that ends at its first NUL. A hook's environment is its own hooks-env section, else the
 default section, else nothing, and never the server's; a section named twice is one, and a section with no variables is
-none. Its directory is `/` and a hook with no input of its own reads the null device, as under `svnserve -d`; standard
-input is a pipe, never Subversion's temporary file (R1).
+none. The sections are the repository policy's (A-648), set by its owner with the rules and the hooks: in place of the
+file `svnserve.conf`'s `hooks-env` names, which a repository with no disk has not. Its directory is `/` and a hook with
+no input of its own reads the null device, as under `svnserve -d`; standard input is a pipe, never Subversion's
+temporary file (R1). pre-lock's standard output, read up to its first NUL, is the token the lock is made with, judged as
+a client's token is; empty, the server makes the token.
 
 What the client is told is `svnserve`'s own words, byte for byte (`check_hook_result`, `fs-wrap.c`, `serve.c`). A
 refusing pre-hook is `E165001` "Commit blocked by pre-commit hook (exit code 2)" (start-commit and pre-commit "Commit",
@@ -14258,6 +14288,22 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > trailing newline, recorded); a dangling link told apart (`svnserve`'s "Failed to run '…' hook; broken symlink",
 > recorded); no core dumps (`apr_exit_why_e` 6); the server's calls at commit, lock, unlock and revision-property
 > change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ.
+>
+> **Status (2026-11-19, A-648: the record's points, the hooks-env and the driver's gaps).** The repository record names
+> Subversion's nine points (`slates_db`'s and the protocol's `HookPointName`, tags 8 to 13 appended, both wire orders
+> published) and holds a Subversion repository's hooks-env in its policy (`RepositoryPolicy::hooks_env` and
+> `SetRepositoryPolicy`'s, appended): the guard refuses a section no hook's environment can carry (unnamed, a NUL, a
+> variable named by nothing or holding `=` or a NUL, a value holding a NUL) and any section in a git or Mercurial
+> repository (`PolicyHooksEnvMalformed`, `DatabaseRefusal` 11, by index), and charges its sections' bytes as it charges
+> rules and hooks. The driver runs a Subversion hook in `/` (`HookPoint::directory`), hands pre-lock's standard output
+> back (`Ended::standard_output`: a second pipe, read as the words are, to the run's cap) as the lock's token
+> (`svn_lock_token`: up to the first NUL, the server's own when empty, none past the cap), and a Subversion hook's
+> environment is the record's (`SvnHooksEnv::of`; the record's point is the runner's by `HookPoint::of`). On the Mac
+> Studio: `slates-db` and `slates-ipc` lib whole, both wire orders, and `slates-server` lib 597 of 598, the one failure
+> (a `deadlines` test) failing alike on main; red eleven ways.
+> Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
+> revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
+> a dangling link told apart; no core dumps; the Windows driver.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -43954,6 +44000,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     bases and skip lists, copy detection, file search. Each type for a version is computed from its parents' values,
     eagerly or lazily, and stored immutable by identity, so any server or tier computes, caches and serves it without
     coordination. The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth.
+    (Part 1 built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type,
+    version) in an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down
+    a unit a step, and a version's map of paths to contents as its first type. Owed: A-614's D(k) as a type, part 2;
+    A-553's and A-588's stores after it.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -45702,6 +45752,182 @@ entry); `crates/rt` (`tcp::RoundTrip`, `TcpStream::round_trip`; `netsys`'s reade
   added. Pure: the first RTO's three cases, the TLS handshake's work then duration, a reap's back-off and its doubling
   of a first RTO, a stranger's reap backing nothing off, reaps together backing off once.
 - **Owed.** As part 2, plus the Linux and Windows round-trip readers compiled and run (main's lint matrix).
+
+### A-648 — Subversion's hook points in the record and the driver's gaps: the six other points, a repository's hooks-env, hooks run in /, pre-lock's output as the token (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-623 and A-622)
+Applied in the same change to:
+- §4.17.4 item 9 (REPOS a read-only FSFS-layout view, main's decision; the hooks-env the policy's; pre-lock's output
+  the token) and a status;
+- GAPS (the §4.17 entry);
+- `crates/db` (`catalog.rs`: `HookPointName`'s six appended points, `HooksEnvSection` and `HooksEnvVariable`, new, and
+  `RepositoryPolicy::hooks_env`, appended; `error.rs`: `PolicyHooksEnvMalformed`; `repository/policy.rs`: the guard and
+  the charge; `repository.rs`'s tests; `tests/wire_order.txt`, the six tags published);
+- `crates/ipc` (`protocol.rs`: the same points, types and field, `SetRepositoryPolicy::hooks_env` appended,
+  `DatabaseRefusal::PolicyHooksEnvMalformed`, tag 11 (after A-642's `Moved`, 10); `tests/wire_order.txt`);
+- `crates/server` (`repository.rs`: the verb's hooks-env and points; `verbs.rs`; `error.rs`; `vcs_policy.rs`'s test
+  record; `vcs_hooks.rs`: `HookPoint::directory` and `HookPoint::of`, `SvnHooksEnv::of`, `svn_lock_token`;
+  `hook_driver.rs`: the directory, pre-lock's output, `Ended`).
+
+- **The record.** `HookPointName` names Subversion's nine points, the six A-623 added appended as tags 8 to 13 in the
+  database's enum and the protocol's, each published by its wire order's file. A Subversion repository's policy holds
+  its hooks-env, set with its rules and hooks by `SetRepositoryPolicy`: sections, each named for a hook or `default`,
+  of variables, each a name and bytes, in place of the file `svnserve.conf`'s `hooks-env` names, which a repository
+  with no disk has not. A section is held as the file's would be read (A-623's `SvnHooksEnv`: one named twice is one,
+  one with no variables is none), and its bytes are charged to the partition's merge budget as rules and hooks are.
+- **The guard.** It refuses, by section index, a section in a git or Mercurial repository (their hooks inherit the
+  server's environment), one named by nothing or holding a NUL, and one with a variable no hook's environment can carry:
+  a name empty or holding `=` or a NUL, a value holding a NUL. Typed on the wire as `PolicyHooksEnvMalformed`.
+- **The driver.** A Subversion hook runs in `/`, as `svnserve -d` runs it (`HookPoint::directory`; git's and
+  Mercurial's still run in their view's root). pre-lock's standard output is a second pipe, read as the words are, to
+  the run's cap, and handed back with the outcome (`Ended::standard_output`); `svn_lock_token` reads it as `svnserve`
+  does, a C string up to its first NUL, the server's own token when that is empty, and none when the cap cut it before
+  any NUL. A Subversion hook's environment is built from the record (`SvnHooksEnv::of`), and a record's point is the
+  runner's by `HookPoint::of`.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19, a fresh clone of 135d358c0; `cargo fmt` clean over the
+  three crates): `cargo test --locked -p slates-db --lib` 140 of 140; `-p slates-ipc --lib` 74 of 74, two ignored;
+  `-p slates-db --test wire_order` and `-p slates-ipc --test wire_order` 2 of 2 each, the appended tags published by
+  hand and held by them; `-p slates-server --lib` 597 of 598. The failure,
+  `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` (`deadlines.rs`
+  830, the capture never let go within its window), is not this change's: it fails 5 of 5 alone here and 3 of 3 on a
+  clean clone of main at 3239c88. Red eleven ways, each guard broken in a copy failing the tests that hold it and
+  nothing else: the hooks-env unchecked, `=` allowed in a name, a section held by any tool (each the guard's test and
+  the verb's), the sections uncharged (the charge's test), pre-lock taken for git's (the nine points' test and the
+  snapshot's), two appended tags swapped (`wire_order`), a Subversion hook run in its view's root, pre-lock's output
+  sent to the null device, its token read past a NUL, the record's sections dropped, and pre-lock's point read as
+  post-lock's (each its own test); the files put back, 49 of 49 again. On the tree merged with main (de9dc5cbf, A-642's
+  `Moved` taking `DatabaseRefusal` 10 first): db lib 142 of 142, ipc lib 74 of 74, both wire orders 2 of 2, server lib
+  621 of 622, the same `deadlines` test failing.
+- **Owed.** The read-only FSFS-layout view at REPOS for stock `svnlook` (A-645's derived data, after A-647, queued by
+  main); the server's calls at commit, lock, unlock and revision-property change, refusing in Subversion's words a lock
+  whose token the hook wrote past the cap; a dangling link told apart; no core dumps; the Windows driver. Main's:
+  clippy, `xtask` and the lint matrix over the change.
+
+### A-649 part 2 — A Mercurial store's phases, bookmarks and obsolescence markers imported with its history, read as 7.2 reads them (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 decisions 2 to 4 and piece 3; A-630, A-545)
+Applied in the same change to: §4.17.3 (its status, the index's rows, piece 3), `crates/hg` (`import`: the state's
+three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/state/` and its
+`make-state-fixtures.sh`), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (its newest section).
+- **What it does.** After the logs the import reads the repository's state as 7.2 reads it. `store/phaseroots`
+  (`phases._readroots`): each line two fields between Python's whitespace, a phase 7.2 defines in decimal and a node's
+  forty hexadecimal digits, any other line refused (`PhaseRoots`, its number), as 7.2 aborts on it; a root whose node
+  the changelog does not hold dropped and counted, as 7.2 drops it; a public root passed over. The bookmarks,
+  `.hg/bookmarks` or, under `bookmarksinstore`, the store's (`bookmarks.bmstore`): each line stripped, an empty one passed
+  over, a node in hexadecimal, a space and the name; a line without the space or with digits that are not an even run
+  of hexadecimal passed over and counted, as 7.2 warns and passes over it; a node the changelog does not hold dropped
+  and counted; a name given twice its later node. `store/obsstore` (`obsolete.obsstore`): empty is none, anything else
+  checked whole by A-545's reader, every marker kept alone in the obsstore's format as a content, appended in its order
+  as the index's marker rows (`M` and the number, big-endian), numbered as a log is.
+- **Decision: where each is kept.** Markers are facts never changed once made, so they are rows of the index. The phase
+  roots and the bookmarks move with every push, and the shared index never rewrites a row, so they are the repository's
+  mutable state, which the register records (A-642's logs; bookmarks are greens, §4.17.3 decision 2): the import
+  returns them typed (`Imported::phase_roots`, sorted by phase and node; `Imported::bookmarks`, sorted by name) with
+  what it dropped and passed over, for the register's first entry. Until that entry exists an import is not served.
+- **Golden vectors.** `crates/hg/fixtures/state`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 06:49:34 to
+  06:49:44 UTC (load 8.8 to 9.9), by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the
+  branch at fdc52e9f1, exactly: `bash crates/hg/fixtures/state/make-state-fixtures.sh "$D/out"`. One history with
+  evolution on and publishing off (a root made public, a draft, a draft amended, a secret changeset, three bookmarks, a
+  prune of a node never held) in two repositories, bookmarks in `.hg` and in the store; each store whole, its
+  requirements, `.hg/bookmarks`, and 7.2's own listings (`hg log --hidden -T '{node} {phase}\n'`, `hg bookmarks`, `hg
+  debugobsolete`). 36 files and their `SHA256SUMS`, each checked equal after the copy.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-states-red` (18f0ba467, not for main:
+  the three readers and `HgIndex::marker` stubbed to read nothing), `cargo test --locked -p slates-hg --lib` 256 passed
+  and 5 failed, each new test by its assertion. Green: 261 of 261 at 8b395716b, the first build, in a target directory of
+  its own; rustfmt's layout from that run. Golden: every changeset's phase computed from the imported roots equal to
+  7.2's (public, draft, the amended one's hidden predecessor draft, secret), every bookmark and every marker as 7.2
+  lists them, the markers read back alone and written into one payload equal to the obsstore's bytes, the two
+  repositories' indexes equal row for row and each one's bookmarks read from where it keeps them alone. Hostile: six
+  `phaseroots` lines 7.2 cannot read, each refused by its line with nothing left held; an unheld root, a public root,
+  tabs and a carriage return, a root twice; nine bookmark lines of every kind; an obsstore cut by a byte, and an empty
+  one.
+
+### A-647 part 1 — Derived data, one mechanism: types derived from their parents' values, kept immutable under (type, version), eager or lazy, filled a unit a step; a version's map of paths to contents its first type (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.1 "Objects" item 2 and "Reads")
+
+- **Where, and why there.** `slates-vcs`, a module beside the object store (`crates/vcs/src/derived.rs`,
+  `derived/paths.rs`), not a crate of its own. A value is content in that store, under its window and its budget, and
+  the map from (type, version) to a value is one of its indexes; git's and Mercurial's crates depend on it already, so
+  each tool store can become a type with no new dependency, and no new crate rows (lints, unsafe budget, CI lanes).
+- **A type** (`DerivedType`) is a pure function of a version's change and its parents' values of the same type:
+  `derive(source, store, version, parents)` reads the change from the history (`Graph`: a version's parents in order,
+  the first the one its change is stated against, and the bytes that name it in keys) and returns the root of the new
+  value. No clock, randomness or state outside the store enters it.
+- **Kept immutable under (type, version)** (`Derivations`). A value is a tree of derived nodes in the store (below); a
+  row of a `slates-vcs` index names its root under the key of the type's name and the version's bytes (the name's
+  length first, so no two pairs share a key). The index keeps a key's row for ever and refuses another for it, so a
+  second computation, here or on another tier, is `Identical`, and a different one is refused `Diverged` naming both
+  roots, the recomputation mismatch §4.16 calls fatal and loud. A type's name carries every parameter its values depend
+  on, so tiers that chose different parameters never meet at a key. A fork shares every value kept by identity (the
+  index's fork), and keeps its own after. A value computed elsewhere is kept with `keep`.
+- **Eager or lazy, the type's own declaration** (`Mode`). `recorded(version)` answers the fill to run now for an eager
+  type and nothing for a lazy one; `read(version)` answers the value kept or the fill that computes it.
+- **A fill** (`Fill`) walks up from its version through the parents whose values are not kept, to the nearest kept
+  ancestors or the history's roots, then derives downward, every parent before its child, keeping each value as it
+  goes. One `step` is one unit (a version found kept, walked through, or derived), so the server runs a fill under its
+  shard's slices (`image::sliced`, as `run_releases` runs a lineage's releases). What it waits on is charged to the
+  store's budget as it grows and given back as it shrinks, so a fill over a history of any length is bounded and
+  refused past the budget, typed. A derivation is one unit as large as its change, which the change's admission
+  bounded. A version met again among its own ancestors is refused `Cycle`; a parent whose value is gone between the
+  walk and the derivation sends the version back to be walked (`rewalked`).
+- **Typed refusals** (`DerivedRefused`): `UnknownVersion` (the version or a parent), `Cycle`, `Type` (the type's own,
+  with the version), `Diverged`, `Corrupt` (a row naming other than one content), `NameTooLong`, and the store's and
+  the index's own.
+- **No tunable.** A value's identity must be the same on every tier, so the parameters of its shape are format, in the
+  type's name, never learned: the path map's window is the store's own (D-6's chunk), and its trie's sixteen children a
+  branch are the format's.
+- **A derived node** (`content.rs`, `Form::Derived`). The store's fourth form: the identities of the contents it names,
+  then its type's payload, at most a window, named under a key-derivation context of its own. It holds what it names
+  and freeing it gives that back, as a list's does, so a value lives exactly as long as something holds its root, and
+  two values that share a subtree share its nodes. No bytes a client sends can be taken for a node, whose freeing
+  would give back what it never held; and a node never names an index's table (`NotNameable`), whose rows only the
+  index that frees it gives back.
+- **The first type: a version's map of paths to contents** (`PathMap`). Every file of a version by path, its class
+  (its tool's, opaque) and its content. One trie a directory: a leaf of its entries in name order while that fits the
+  window, else a branch over the digits of each name's place (a BLAKE3 of the name read four bits a level), a node a
+  digit beneath it by the same rule, a hash array mapped trie [A: Bagwell, "Ideal Hash Trees", EPFL 2001]. The shape is
+  a function of the names alone, never of the order they came in, so the same map is the same root on every tier. A
+  branch records what its entries would take in one leaf, so a branch that comes to fit one becomes one with no read
+  beneath it. A change (each path set to a file, or removed, stated against the first parent's map) is derived by path
+  copying: the directories on its paths are looked up from the root down, each in one descent of its trie, and made
+  again from the deepest up, only the trie nodes on the changed names' places, every other node reused by identity
+  [A: Driscoll, Sarnak, Sleator and Tarjan, JCSS 1989]. `build` makes a map from its files alone, every directory
+  made. Refusals: a bad path, a removal of a path holding no file, a path both a file and a directory, an entry alone
+  past the window, a malformed node, a window under a full branch; a refused change leaves the store as it was.
+- **Tests** (`crates/vcs/src/derived/tests.rs`; `cargo test --locked -p slates-vcs --lib`, the Mac Studio d1323898,
+  2026-11-19, a fresh clone of the pushed branch, its own target directory).
+  - Red first (d6a600d69, 06:45 UTC): with `put_derived`, `Fill::step`, `PathMap::apply` and `PathMap::build` refusing
+    at once, 11 of the 12 new tests failed; the hostile-bytes reader, not stubbed, passed.
+  - The oracle (`t_a647_every_value_equals_a_naive_recomputation_from_the_root`, 96 cases a run): generated histories
+    of roots, first parents and merges' second parents, removals, sets and runs over nested and wide directories, one
+    hostile operation in some, an eager declaration (window 640) filled as each version is recorded and a lazy one
+    (window 1024) read. Every value reads as the model's map and is, identity for identity, the map built from scratch
+    from the model's files, the naive recomputation from the root; every derivation entered exactly the root and the
+    directories on its change's paths (the non-vacuity counter, `PathCounters::directories`); every fill derived and
+    walked exactly the versions it had to, one unit a step; every refusal is the model's; and once the values are
+    released the store holds the files' contents alone, once each. Its census, every run (28517b1ac, 06:57 UTC): 1,449
+    versions, 161 merges, 60 lazy fills of two versions or more, 133 splits and 24 collapses made by derivations, and
+    each of the four refusal kinds.
+  - Beside it: a lazy read walks to the nearest kept ancestor (21 walked and 21 derived in 42 steps, then 9 and 9 in
+    18); an eager type is filled as each version is recorded, two steps each, and one declared late fills its history
+    from the root; a value never changes (`Diverged`, `Identical`); a fork shares values and keeps its own; the fill's
+    refusals; a parent gone before the derivation is walked again; one file changed among 1,000 in a directory puts the
+    root's leaf and the nodes on its trie path alone (read by the format's own rule), where the build put every node;
+    a directory cut from 40 files to 10 becomes one leaf; the path map's refusals; a refused change leaves the store as
+    it was; the format's golden (a one-file map's bytes written by hand, its identity BLAKE3's key derivation over
+    them); a derived node's holds and its freeing; hostile node bytes.
+  - Green: 43 of 43 at f43c6e71d, then 45 of 45 at 28517b1ac in 2.12 s; `cargo fmt` clean.
+  - Red six ways, one mutation at a time in the Studio's clone: a derivation built from scratch (the non-vacuity
+    counter failed the oracle: one directory entered where the change named none); the second parent's value read for
+    the first's (the oracle); a derivation's own hold kept (the oracle's last holds, the fork test); no cycle check
+    (the refusals test); an eager type computed lazily (the oracle, the eager test); and no collapse, which passed all
+    42 tests at ec31c6408 because no generated history had shrunk a split directory under the window. The collapse test
+    and the runs of the wide directory came of that: since f43c6e71d no collapse fails two tests, the oracle among them.
+- **Owed.** Part 2: A-614's D(k) rows as a type, its outputs unchanged. Then A-553's node revisions and A-588's
+  manifests as types; the server's use (each repository's `Derivations` on its owner shard, eager types filled where a
+  version is recorded, lazy ones read by the queries A-645 names); dropping a value no version needs; a release and a
+  derivation larger than a slice cut into slices (one call today, as A-581's releases); a version's map of paths to
+  contents for a green's state (its eight maps, A-534) and a tool's trees from it; values offered between tiers by
+  identity.
+- **Applied in the same change to:** `crates/vcs/src/derived.rs`, `derived/paths.rs`, `derived/tests.rs` (new);
+  `crates/vcs/src/content.rs` (`Form::Derived`, `put_derived`, `derived`, `DerivedNode`, `encode_derived`, the release
+  cascade, `NotNameable`, `ContentCounters::derived`); `crates/vcs/src/lib.rs`; A-645's entry; §4.17.1 "Reads"; GAPS'
+  §4.17 entry.
 
 ### A-646 part 2b — the ops document names a hard link's node, never its path: version 3 (2026-11-19, g267, UI goal 93; §4.16 "Data model"; A-646's decision)
 Applied in the same change to:
