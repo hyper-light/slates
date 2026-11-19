@@ -10,7 +10,9 @@
 
 use super::super::discovery::head_revs;
 use super::super::pull::{self, Outgoing};
-use super::super::tests::{History, ancestors, at, captured, hex, history, joined, room};
+use super::super::tests::{
+  Changeset, History, ancestors, at, captured, hex, history, joined, node_for, room,
+};
 use super::super::{Refusal, Repository, Rev};
 use super::{Asked, Logged, Store, changegroup, getbundle};
 use crate::bundle2::{Bundle2, Param, Part};
@@ -834,6 +836,74 @@ fn both_packings(
     lacking(ours, &served, &held),
     lacking(oracle, &served, &held),
   )
+}
+
+/// A history of public changesets on `default` whose parents are `parents`.
+fn shaped(parents: &[[Option<Rev>; 2]]) -> History {
+  let mut history = History::default();
+  for (seed, parents) in (1..).zip(parents) {
+    history.push(Changeset {
+      node: node_for(seed),
+      parents: *parents,
+      branch: b"default".to_vec(),
+      closes: false,
+      phase: Phase::Public,
+    });
+  }
+  history
+}
+
+/// Each group's path and how many revisions it carries.
+fn counted(picked: &Picked) -> Vec<(&[u8], usize)> {
+  picked
+    .files
+    .iter()
+    .map(|(path, revisions)| (path.as_slice(), revisions.len()))
+    .collect()
+}
+
+/// A-619 (the model's non-vacuity): do pack, for a client holding changesets 0 and 2, changesets 3 and 4 of a history
+/// where 1 and 2 both make `b/c`'s first revision (one file revision, its log linked to 1, on a branch neither held
+/// nor sent), 3 edits `a` with its manifest stored whole, and 4 edits `b/c` again. Expect 7.2's packer to send `b/c`'s
+/// first revision once more (its log's link is not common, and 3's whole manifest yields it), this module to leave it
+/// out, both to send `a`'s and `b/c`'s new revisions and both manifests, and the two equal once what the client holds
+/// is set aside: the divergence the model's comparison is built to allow, reached.
+#[test]
+fn mercurials_packer_resends_a_held_revision_this_module_leaves_out() {
+  let history = shaped(&[
+    [None, None],
+    [Some(0), None],
+    [Some(0), None],
+    [Some(2), None],
+    [Some(3), None],
+  ]);
+  let edits: Vec<Edit> = vec![
+    (vec![(0, 0)], 0),
+    (vec![(1, 0)], 0),
+    (vec![(1, 0)], 0),
+    (vec![(0, 1)], 2),
+    (vec![(1, 1)], 0),
+  ];
+  let (served, stored) = filled(history, &edits);
+  let held = ancestors(&served.history, &[2]);
+  let missing: Vec<Rev> = vec![3, 4];
+  let oracle = packed(&served, &stored, &missing, &held);
+  let outgoing = Outgoing {
+    heads: vec![4],
+    common: vec![2],
+    missing: missing.clone(),
+  };
+  let ours = changegroup(&served, &outgoing, Version::V03, &mut room()).unwrap();
+  let ours = picked(&Changegroup::decode(&ours, Version::V03, &mut room()).unwrap());
+  assert_eq!(counted(&oracle), [(&b"a"[..], 1), (&b"b/c"[..], 2)]);
+  assert_eq!(
+    (counted(&ours), ours.manifests.len()),
+    (vec![(&b"a"[..], 1), (&b"b/c"[..], 1)], 2)
+  );
+  assert_eq!(
+    lacking(ours, &served, &held),
+    lacking(oracle, &served, &held)
+  );
 }
 
 /// The refusal `getbundle` gives `asked`, if any.
