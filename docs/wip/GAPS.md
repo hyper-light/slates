@@ -909,8 +909,9 @@
 > `cargo test --locked -p slates-server --lib vcs_http::hg` 6 passed and 1 failed, the room test reading `400` for the
 > query where `414` was expected and its other three statuses as expected; then `slates-server --lib vcs_http::hg` 7 of
 > 7, `slates-hg --lib http` 22 of 22 and fmt clean on macOS arm64 (Mac Studio, kiln r212); the other platforms owed.
-> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
-> g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
+> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site (g303, running) and that loop
+> (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -3083,8 +3084,9 @@
 > **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
 > sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
 > 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
->    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
->    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
+>    it, as POSIX `rename` does. A directory, or a link or IPC node changed after the base, is still refused. A rename
+>    over an IPC node a hard link names is accepted by the verdict since A-646 part 2 (the node goes to the link) and is
+>    refused only by the deriver (`PathKindConflict`) until the inode-aware journal (g305, A-677's siblings, 2026-11-19). Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
 > 2. Fixed (A-646 parts 2a and 2b; §4.16's decision): a hard link names its node, never a path. In the engine (2a), a
 >    removed or replaced home hands the node to its least surviving link, with its content or IPC node, mode and

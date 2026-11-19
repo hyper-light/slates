@@ -49495,7 +49495,7 @@ docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison be
   lib 77 of 77 filtered, the checkpoint tests 4 of 4 and 3 of 3, slates-anchor 2 of 2 and 6 of 6, fmt clean. Main's
   commits after b13a6e05f change only manifest comments, the server's Mercurial site over HTTP and slates-svn's report
   editor, none of which slates-merge or slates-anchor builds from or the repository test reaches.
-- **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
+- **For A-626 part 4** (landed 3612d1ef9): its logged copy takes the anchor's layout 14.
 
 ### A-651 part 2 — git's upload-pack behind the SSH edge: A-640's entry point over an SSH session, the store lent a step at a time, git's server's exit status at each end, and protocols v0 and v1 refused over SSH (2026-11-19, g294, UI goal 93; §4.17.2 "A fetch", "Transports" item 2 and "Pieces (git)" piece 9; after A-651 part 1, A-640 parts 2 and 3, A-625 part 3 and A-662)
 Applied in the same change to:
