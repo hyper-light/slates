@@ -22405,7 +22405,10 @@ mod tests {
         seen.at_once.get(&sequence),
         seen.again.get(&sequence),
       );
-      assert!(refused_for_the_fence(first), "{verb}'s first answer: {first:?}");
+      assert!(
+        refused_for_the_fence(first),
+        "{verb}'s first answer: {first:?}"
+      );
       assert_eq!(at_once, None, "{verb}'s resend was answered from a record");
       assert!(refused_for_the_fence(again), "{verb}'s resend: {again:?}");
     }
