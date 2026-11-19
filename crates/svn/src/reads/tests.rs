@@ -11,6 +11,8 @@ use crate::authz::{Authz, Principal};
 use crate::handshake::ClientCapabilities;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
 use crate::ra_svn::{Bounds, Parsed, Parser};
+use crate::report::drive::{Call, Facts};
+use crate::report::editor::EditorWriter;
 use crate::svndiff::decode_all;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -402,6 +404,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
       uuid: UUID,
       capabilities,
       authz,
+      authentication: Authentication::Settled,
     };
     let mut out = Vec::new();
     let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
@@ -425,6 +428,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
         at = same_answer(name, word, &items(&out), &answers, at);
         return closed(name, word, at, answers.len(), answered);
       }
+      Outcome::Authenticate => panic!("{name}: {word} asked for an authentication"),
     }
   }
   assert_eq!(
@@ -755,6 +759,7 @@ fn every_fixture_has_its_recorded_sum() {
     "locked-svn-cat-denied",
     "locked-svn-proplist",
     "get-file-revs",
+    "get-file-revs-svndiff0",
     "svn-blame",
     "svn-blame-g",
     "svn-mergeinfo-eligible",
@@ -965,6 +970,7 @@ const ROOT_SESSION: Session<'static> = Session {
   uuid: UUID,
   capabilities: STOCK_CAPABILITIES,
   authz: None,
+  authentication: Authentication::Settled,
 };
 
 /// What stock `svn` 1.15.0 announces (recorded: every session's greeting): `svndiff1`, `accepts-svndiff2`,
@@ -1501,6 +1507,7 @@ const SVNDIFF0_SESSION: Session<'static> = Session {
     ..STOCK_CAPABILITIES
   },
   authz: None,
+  authentication: Authentication::Settled,
 };
 
 /// A-613 part 2 (`get-file-revs` in svndiff 0, `svndiff.c`): a window of new data alone, the first revision's, is
@@ -1548,6 +1555,119 @@ fn svndiff_0_strings_are_the_writes_svndiff_c_makes() {
       ),
     ]
   );
+}
+
+/// The nodes the report editor holds open while it writes one added file's delta.
+/// Shape: the root directory and the file.
+const DELTA_NODES_OPEN: usize = 2;
+
+/// A-616 continued (7) (one writer of an svndiff stream's writes, `svndiff.c`, which `svnserve` sends a string each, a
+/// delta string of `get-file-revs` and a `textdelta-chunk` of an edit alike): replay `svnserve`'s
+/// `get-file-revs-svndiff0` session, whose client takes svndiff 0 alone, through `get-file-revs`; then write each delta
+/// `svnserve` sent there, its windows decoded from its strings, through the report editor for the same client. Expect
+/// both callers of the one writer to send `svnserve`'s strings byte for byte, the editor's as its `textdelta-chunk`s,
+/// over the session's 14 deltas: 4 that open with a window of new data alone (the header, its integers and its
+/// instruction one string), 9 that open with the header alone, and an empty text's header with nothing after it.
+#[test]
+fn both_callers_of_the_one_delta_writer_send_svnserves_svndiff_0_writes() {
+  let (name, client, server) = transcript!("get-file-revs-svndiff0");
+  assert_eq!(replay(name, client, server, &[]), 5, "{name}");
+  let deltas = recorded_deltas(server);
+  assert_eq!(delta_shapes(&deltas), (14, 4, 9, 1), "{name}");
+  for strings in &deltas {
+    assert_eq!(&editor_chunks(strings), strings, "{name}");
+  }
+}
+
+/// Each delta a `get-file-revs` answer sends, its strings before the closing empty one; a revision that sends none is
+/// left out.
+fn recorded_deltas(server: &[u8]) -> Vec<Vec<Vec<u8>>> {
+  file_revisions_sent(server)
+    .into_iter()
+    .filter_map(|(_, mut strings)| {
+      strings.pop();
+      (!strings.is_empty()).then_some(strings)
+    })
+    .collect()
+}
+
+/// How many deltas there are, and how many open with the header joined to a window of new data alone, with the header
+/// alone and more after it, and with the header alone and nothing else.
+fn delta_shapes(deltas: &[Vec<Vec<u8>>]) -> (usize, usize, usize, usize) {
+  let header = b"SVN\0".as_slice();
+  let joined = deltas
+    .iter()
+    .filter(|strings| {
+      first_string(strings)
+        .is_some_and(|bytes| bytes.len() > header.len() && bytes.starts_with(header))
+    })
+    .count();
+  let alone_then_more = deltas
+    .iter()
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() > 1)
+    .count();
+  let alone = deltas
+    .iter()
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() == 1)
+    .count();
+  (deltas.len(), joined, alone_then_more, alone)
+}
+
+/// A delta's first string, if it has one.
+fn first_string(strings: &[Vec<u8>]) -> Option<&[u8]> {
+  strings.first().map(Vec::as_slice)
+}
+
+/// The `textdelta-chunk`s the report editor writes, to a client that takes svndiff 0 alone, for an added file whose
+/// delta is the windows `strings` hold.
+fn editor_chunks(strings: &[Vec<u8>]) -> Vec<Vec<u8>> {
+  let (_, windows) = decode_all(&strings.concat()).unwrap();
+  let node = Facts {
+    repository_path: "/trunk/a.txt",
+    created_revision: 1,
+    sha1: None,
+  };
+  let mut drive = vec![
+    Call::TargetRevision(1),
+    Call::OpenRoot {
+      base: Some(1),
+      node,
+    },
+    Call::Add {
+      kind: NodeKind::File,
+      path: "a.txt",
+      copy_from: None,
+      node,
+    },
+    Call::ApplyTextDelta { base_md5: None },
+  ];
+  drive.extend(windows.iter().map(Call::Window));
+  drive.extend([
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5: [0; 16] },
+    Call::CloseDirectory,
+    Call::CloseEdit,
+  ]);
+  let mut writer = EditorWriter::new(&SVNDIFF0_SESSION.capabilities, DELTA_NODES_OPEN);
+  let mut out = Vec::new();
+  for call in &drive {
+    writer.write(call, &mut out).unwrap();
+  }
+  items(&out).iter().filter_map(textdelta_chunk).collect()
+}
+
+/// A `textdelta-chunk` command's chunk.
+fn textdelta_chunk(item: &Value<'_>) -> Option<Vec<u8>> {
+  let Value::List(parts) = item else {
+    return None;
+  };
+  let [Value::Word("textdelta-chunk"), Value::List(params)] = parts.as_slice() else {
+    return None;
+  };
+  let [_, Value::String(chunk)] = params.as_slice() else {
+    return None;
+  };
+  Some(chunk.to_vec())
 }
 
 /// A `get-file-revs` answer's revisions in order, each its path, its number and whether it came in by a merge.
@@ -1721,6 +1841,133 @@ fn a_copy_from_a_hidden_source_shows_no_source_and_the_author_and_date_alone() {
   );
 }
 
+/// The paths a listing's answer names, in byte order.
+fn listed_paths(out: &[u8]) -> Vec<String> {
+  let mut paths: Vec<String> = items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::String(path), Value::Word(_), ..] => {
+          Some(String::from_utf8_lossy(path).into_owned())
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect();
+  paths.sort();
+  paths
+}
+
+/// A-613 part 2, step 7 (`svn_repos_list` with patterns, `svn_utf__fuzzy_glob_match`): commit `Ärger.txt` and
+/// `Straße` beneath `/trunk`, then list `/trunk`'s entries with the patterns `arger*` and `strasse`, then with `Ärger*`
+/// alone; expect both entries named by the first listing, each name folded as utf8proc folds it before it is matched,
+/// and none by the second, a pattern the client did not fold, since the server folds the names alone.
+#[test]
+fn a_listing_matches_names_beyond_ascii_folded_as_utf8proc_folds_them() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&[
+    "row 12 /trunk/Ärger.txt file add",
+    "row 12 /trunk/Straße file add",
+  ]);
+  let folded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 6:arger* 7:strasse ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, folded.as_bytes(), usize::MAX);
+  assert_eq!(
+    listed_paths(&out),
+    [
+      String::from("/trunk/Straße"),
+      String::from("/trunk/Ärger.txt")
+    ]
+  );
+  let unfolded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 7:Ärger* ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, unfolded.as_bytes(), usize::MAX);
+  assert_eq!(listed_paths(&out), Vec::<String>::new());
+}
+
+/// The anonymous principal's rules over a root it reads whole but `/branches` (A-606).
+fn branches_hidden() -> PrincipalRules {
+  let rules_text = b"[/]\n* = r\n\n[/branches]\n* =\n";
+  Authz::parse(rules_text, None, crate::authz::Bounds::of(rules_text, None))
+    .unwrap()
+    .rules(b"repo", Principal::Anonymous)
+}
+
+/// One command answered at the root under `rules` with `authentication`: its outcome, a streamed answer drained, and
+/// what was written.
+fn answered_with(
+  rules: &PrincipalRules,
+  authentication: Authentication,
+  command: &[u8],
+) -> (Outcome, String) {
+  let fixture = Fixture::new();
+  let session = Session {
+    authz: Some(rules),
+    authentication,
+    ..ROOT_SESSION
+  };
+  let value = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+  let outcome = drained(outcome, &fixture, &session, &mut out);
+  (outcome, String::from_utf8(out).unwrap())
+}
+
+/// A-613 part 2, step 7 (`must_have_access` 829-834, where the client could authenticate): ask for each of the six
+/// reads that check their path first, of a path the anonymous rules hide, in a session whose client could
+/// authenticate; expect each to answer that an authentication is to be asked for, with nothing written, so the
+/// connection can ask before any word of the command's answer.
+#[test]
+fn a_hidden_path_asks_for_an_authentication_where_the_client_could_give_one() {
+  let rules = branches_hidden();
+  for command in [
+    b"( check-path ( 8:branches ( ) ) ) ".as_slice(),
+    b"( stat ( 8:branches ( ) ) ) ",
+    b"( get-dir ( 8:branches ( ) true true ) ) ",
+    b"( get-file ( 17:branches/b1/a.txt ( ) true false ) ) ",
+    b"( get-iprops ( 8:branches ( ) ) ) ",
+    b"( list ( 8:branches ( ) infinity ( kind ) ) ) ",
+  ] {
+    let answered = answered_with(&rules, Authentication::Available, command);
+    assert_eq!(
+      answered,
+      (Outcome::Authenticate, String::new()),
+      "{}",
+      String::from_utf8_lossy(command)
+    );
+  }
+}
+
+/// A-613 part 2, step 7 (`must_have_access` after its `auth_request`): run `check-path` again once the client has
+/// authenticated for it, of a path the new principal may read and of one it may not; expect the first answered with no
+/// trivial authentication request before it, and the second refused "Authorization failed" (170001) with nothing
+/// before it; and a readable path asked where the client could authenticate answered as ever, the trivial request
+/// first.
+#[test]
+fn a_read_run_again_after_its_authentication_has_no_trivial_request() {
+  let rules = branches_hidden();
+  let refusal = "( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) ";
+  let trunk = b"( check-path ( 5:trunk ( ) ) ) ";
+  assert_eq!(
+    answered_with(&rules, Authentication::Done, trunk),
+    (Outcome::Answered, String::from("( success ( dir ) ) "))
+  );
+  assert_eq!(
+    answered_with(
+      &rules,
+      Authentication::Done,
+      b"( check-path ( 8:branches ( ) ) ) "
+    ),
+    (Outcome::Answered, String::from(refusal))
+  );
+  assert_eq!(
+    answered_with(&rules, Authentication::Available, trunk),
+    (
+      Outcome::Answered,
+      String::from("( success ( ( ) 0: ) ) ( success ( dir ) ) ")
+    )
+  );
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -1782,7 +2029,7 @@ fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
   )
   .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
   let mut stream = match outcome {
-    Outcome::Close | Outcome::Elsewhere => {
+    Outcome::Close | Outcome::Elsewhere | Outcome::Authenticate => {
       prop_assert!(out.is_empty());
       return Ok(());
     }

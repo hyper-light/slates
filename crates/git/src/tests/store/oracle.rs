@@ -334,7 +334,7 @@ pub(super) fn apply(real: &mut Real, model: &mut Model, op: &Op) {
 /// bytes the model made.
 fn check_packs(real: &Real, model: &Model) {
   for (green, heads) in &model.heads {
-    let all = brought_by(&real.repository, *green, 0..heads.len());
+    let all = brought_by(&real.repository, &real.store, *green, 0..heads.len());
     let pack = pack_of(&real.repository, &real.store, &all);
     let unpacked =
       read_whole(&pack, model.format, &NoIndex, &mut Admission::new(u64::MAX)).unwrap();
@@ -356,22 +356,25 @@ fn check_packs(real: &Real, model: &Model) {
   }
 }
 
-/// A ref's versions read as the model's: each head and D(k), and the reached set its head's closure.
+/// A ref's versions read as the model's, every one of them (A-647 part 3: each version serves its sets from its own
+/// value): its head, its D(k), and its reached set, its head's closure.
 fn check_green(real: &Real, model: &Model, green: u64) {
   let heads = model.heads.get(&green).cloned().unwrap_or_default();
   assert_eq!(real.repository.versions(green), heads.len());
   for (version, head) in heads.iter().enumerate() {
     assert_eq!(real.repository.head(&real.store, green, version), *head);
-    let brought = real.repository.brought(green, version).unwrap();
+    let brought = real.repository.brought(&real.store, green, version);
     assert_eq!(
-      ids(&real.repository, &real.store, brought),
+      ids(&real.repository, &real.store, &brought.unwrap()),
       model.brought(green, version)
     );
-  }
-  if let Some(last) = heads.last() {
-    let reached = real.repository.reached(green).unwrap();
-    let expected: Vec<ObjectId> = model.reach(*last).into_iter().collect();
-    assert_eq!(ids(&real.repository, &real.store, reached), expected);
+    let reached = real.repository.reached(&real.store, green, version);
+    let expected: Vec<ObjectId> = model.reach(*head).into_iter().collect();
+    assert_eq!(
+      reached.map(|reached| ids(&real.repository, &real.store, &reached)),
+      Ok(expected),
+      "green {green} version {version}"
+    );
   }
 }
 

@@ -409,7 +409,8 @@ pub enum Rebased {
     /// The head the work is now based on.
     version: u64,
     /// Per path the work changed: its bytes after the rebase where they differ from the head's, or
-    /// `None` where the work removes a file the head holds.
+    /// `None` where the work removes a file the head holds; and each link the work's removal or
+    /// replacement of a file's home hands its node to, holding the node's bytes (A-669, A-677).
     changed: BTreeMap<String, Option<Vec<u8>>>,
     /// The work's declared operations restated relative to the new base.
     journal: Vec<crate::increment::VolumeOp>,
@@ -1512,8 +1513,9 @@ impl Green {
 
   /// The green's checkpoint at version `at` (§4.16; [`crate::checkpoint`]): every key whose value in effect at `at` was
   /// set after the origin by its own change, with that version and value, and every increment accepted at or before
-  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and the identity's
-  /// sum at `at` (A-626 part 3, `copy_checkpoint`). `None` when `at` is past the head or below the folded floor (its
+  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and, beside a copy's
+  /// record alone, the identity's sum at `at` (A-626 part 3 and its continuation (1), `copy_checkpoint`). `None` when
+  /// `at` is past the head or below the folded floor (its
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
@@ -1521,6 +1523,10 @@ impl Green {
       return None;
     }
     let (copied, listed) = self.copied_at(at);
+    let copies = self.copy_records_at(at);
+    // The sum stands for what the copies' entries hold beyond the restored state's own, so it travels beside a copy's
+    // record alone: without one, a restore's own entries are the identity (A-626 part 3, continued (1)).
+    let sum = (!copies.is_empty()).then(|| self.sum_at(at));
     let mut checkpoint = crate::checkpoint::Checkpoint {
       version: at,
       accepted: self
@@ -1552,9 +1558,9 @@ impl Green {
       hardlinks: changed_at(&self.hardlink_history, at),
       specials: changed_at(&self.special_history, at),
       xattrs: changed_at(&self.xattr_history, at),
-      copies: self.copy_records_at(at),
+      copies,
       copied,
-      sum: self.sum_at(at),
+      sum,
       head_check: None,
     };
     Green::leave_out_copied(&mut checkpoint, &listed);
@@ -1608,9 +1614,12 @@ impl Green {
     green.special_history_bytes = green.special_history_recounted();
     green.index_restored_changes();
     // The copied trees' keys and the copies' records after the change index, which counts the restored histories alone,
-    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3).
+    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3). A checkpoint
+    // with no copy's record carries none: the entries placed above are the identity (A-626 part 3, continued (1)).
     green.restore_copied(&checkpoint.copied, &checkpoint.copies);
-    green.take_sum(&checkpoint.sum);
+    if let Some(sum) = &checkpoint.sum {
+      green.take_sum(sum);
+    }
     self
   }
 
@@ -3348,9 +3357,11 @@ impl Green {
   /// The home now of the node at `path` at version `base`: the file or IPC node a hard link there
   /// names, or the one there, while it has not changed since the base (A-646). A node changed or
   /// removed since, or moved away (its link changed, its file removed), is gone for a work based
-  /// before: delete against modify. A path holding a directory or a symlink is a type change, and
-  /// a path holding nothing is delete against modify, whether its node was removed since or none
-  /// stood there at the base (a link no work can make: `link(2)` answers `ENOENT`).
+  /// before: delete against modify. So is a file or IPC node made at `path` after the base where
+  /// none stood (A-676): it is no node the work saw, and only a forged link names it. A path
+  /// holding a directory or a symlink is a type change, and a path holding nothing is delete
+  /// against modify, whether its node was removed since or none stood there at the base (a link no
+  /// work can make: `link(2)` answers `ENOENT`).
   fn node_home(&self, path: &str, base: u64) -> Result<String, MergeConflictClass> {
     if let Some(home) = self.hardlinks.get(path) {
       if self.changed_after(path, base) {
@@ -3359,7 +3370,7 @@ impl Green {
       return Ok(home.clone());
     }
     if self.content.contains_key(path) || self.specials.contains_key(path) {
-      if self.file_removed_since(path, base) {
+      if self.file_removed_since(path, base) || !self.node_stood_at(path, base) {
         return Err(MergeConflictClass::DeleteModify);
       }
       return Ok(path.to_owned());
@@ -3368,6 +3379,15 @@ impl Green {
       return Err(MergeConflictClass::TypeChanged);
     }
     Err(MergeConflictClass::DeleteModify)
+  }
+
+  /// Whether a file or an IPC node stood at `path` at version `base` ([`Green::node_home`],
+  /// A-676), read off the histories by the one history rule and the copies, and never by copying
+  /// the file: a file a copy brought after the base stood nowhere then. Exact at and above the fold
+  /// floor, as [`Green::special_kind_changed`]'s read of the base is; the service folds only below
+  /// the oldest base a live reader names.
+  fn node_stood_at(&self, path: &str, base: u64) -> bool {
+    self.content_len_at(path, base).is_some() || self.special_at(path, base).is_some()
   }
 
   /// Merges an xattr set; a differing intervening value for the same `(path, name)` conflicts.
@@ -3968,7 +3988,8 @@ impl Green {
   /// attributes, and every other surviving link names it there. When the version renames a home,
   /// its links name the new home. Derived from the head and the version's own effects, so a replay
   /// derives the same; never recorded, since they are the node model's consequence, not a work's
-  /// operation, and a rebase restates only the work's (`Green::rebased_from`).
+  /// operation, and a rebase's journal restates only the work's (`Green::rebased_from`), while its
+  /// changes show the files the moves leave ([`Green::heirs_of`], A-677).
   fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
     let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     let mut removed: BTreeSet<&str> = BTreeSet::new();
@@ -4009,6 +4030,22 @@ impl Green {
       self.hand_over(home, self.surviving_links(home, &links), &mut moves);
     }
     moves
+  }
+
+  /// The files a version's node moves leave at the links its removed or replaced homes hand their
+  /// nodes to ([`Green::node_moves`], [`Green::hand_over`]): each heir with the node's bytes, as the
+  /// commit makes them (A-669's rule: the link takes the node as the version leaves it). A rebase's
+  /// changes hold them so the work reads the link the submit would keep, while its journal holds
+  /// none, since a volume's link names the node already (A-677).
+  fn heirs_of(&self, effects: &[Effect]) -> Vec<(String, Option<Vec<u8>>)> {
+    self
+      .node_moves(effects)
+      .into_iter()
+      .filter_map(|moved| match moved {
+        Effect::SetContent(heir, bytes, ..) => Some((heir, Some(bytes.unwrap_or_default()))),
+        _ => None,
+      })
+      .collect()
   }
 
   /// The links naming the node at `home` once the version's link effects (`links`: each link's last
@@ -5150,10 +5187,14 @@ impl Green {
   /// them ([`in_replay_order`], A-663): each hard link where the node it names still stands at the name
   /// it names it by, and one made where the head holds another after that one's removal. A node handed
   /// on to a link with the work's writes is restated as the work made it, the writes on its home and
-  /// then the home's removal ([`Green::handed_in`], A-669). The green is not touched.
+  /// then the home's removal ([`Green::handed_in`], A-669). A node the work's removal or replacement
+  /// of its home hands on to a link is in the changes at that link, holding the node's bytes, and in
+  /// no operation of the journal ([`Green::heirs_of`], A-677). The green is not touched.
   fn rebased_from(&self, mut effects: Vec<Effect>, to: u64, post_state: &[u8]) -> Rebased {
     use crate::increment::VolumeOp;
     self.make_mapped(&mut effects, post_state);
+    // The links the version's removals and replacements hand a node to, as the commit hands it on (A-669's rule).
+    let heirs = self.heirs_of(&effects);
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     // The sources of the renames restated: each one's removal is the rename's, not an unlink of its own.
@@ -5239,6 +5280,8 @@ impl Green {
         Effect::CopyTree { .. } => {}
       }
     }
+    // After the work's own changes, as the commit applies its node moves after the version's effects.
+    changed.extend(heirs);
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
     // removal of a file the head does not hold, are no change.
     changed.retain(|path, after| after.as_deref() != self.content.get(path));

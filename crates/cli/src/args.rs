@@ -12,6 +12,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
 
   anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
   daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
+           [--vcs-http ADDRESS]                                either role: serve git over HTTP(S) at ADDRESS; loopback
+                                                               alone unless --fleet gives the node's HTTPS identity
   profile  [--quick] [--json]                      measure and print the machine profile
   version                                          print this binary's version (`slates VERSION`)
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
@@ -741,6 +743,7 @@ const VALUES: &[&str] = &[
   "--shards",
   "--fleet",
   "--node",
+  "--vcs-http",
   "--bounded",
   "--dynamic",
   "--base",
@@ -1292,6 +1295,24 @@ fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
   }
 }
 
+/// `--vcs-http ADDRESS`, the version-control servers' shared HTTP edge (A-625 part 3), read as the roles read it
+/// (`slates_api::role::vcs_http_address`): an address off loopback on a daemon that is no fleet node (`fleet_node`
+/// false) would serve cleartext there, so it is refused as usage before anything starts.
+fn vcs_http_of(
+  taken: &Taken,
+  fleet_node: bool,
+) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
+  taken
+    .value("--vcs-http")
+    .map(|text| {
+      slates_api::role::vcs_http_address(text, fleet_node).map_err(|reason| ParseError::BadValue {
+        what: "--vcs-http",
+        reason,
+      })
+    })
+    .transpose()
+}
+
 fn size_of(taken: &Taken) -> Result<SizeClass, ParseError> {
   match (taken.value("--bounded"), taken.value("--dynamic")) {
     (Some(limit), None) => Ok(SizeClass::Bounded {
@@ -1745,14 +1766,16 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node"],
+        values: &["--shards", "--fleet", "--node", "--vcs-http"],
         switches: &["--quick"],
       })?;
+      let fleet = fleet_of(&taken)?;
       let options = ProcessOptions {
         instance: taken.instance(),
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
-        fleet: fleet_of(&taken)?,
+        vcs_http: vcs_http_of(&taken, fleet.is_some())?,
+        fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
         Command::Anchor(options)
@@ -2609,6 +2632,7 @@ mod tests {
         quick: true,
         shards: Some(2),
         fleet: None,
+        vcs_http: None,
       }))
     );
     assert_eq!(
@@ -2716,6 +2740,7 @@ mod tests {
           manifest: "/etc/slates/fleet.json".into(),
           node: "a".into(),
         }),
+        vcs_http: None,
       }))
     );
     assert!(matches!(
@@ -2725,6 +2750,46 @@ mod tests {
     assert!(matches!(
       parse(&args("anchor --node a")),
       Err(ParseError::Missing(_))
+    ));
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: parse `daemon --vcs-http` on a loopback address, a fleet node's
+  /// `anchor --vcs-http` on an address every interface reaches, a daemon that is no fleet node asking for an edge off
+  /// loopback, and an address that is a name. Expect: the edge's address read on the daemon and on the fleet node's
+  /// anchor (which hands it to its daemon); the edge off loopback without a fleet refused as a bad `--vcs-http` naming
+  /// loopback, since it would serve cleartext there; the name refused as a bad `--vcs-http`.
+  #[test]
+  fn the_grammar_parses_the_daemons_vcs_http_edge() {
+    let loopback = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 8080);
+    assert_eq!(
+      parse(&args("daemon --instance a --vcs-http 127.0.0.1:8080")),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: Some(loopback),
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --fleet /etc/slates/fleet.json --node b --vcs-http 0.0.0.0:443",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_http
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 443))),
+      "{anchor:?}"
+    );
+    let cleartext = parse(&args("daemon --vcs-http 10.0.0.7:8080"));
+    assert!(
+      matches!(&cleartext, Err(ParseError::BadValue { what: "--vcs-http", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
+    assert!(matches!(
+      parse(&args("daemon --vcs-http localhost:8080")),
+      Err(ParseError::BadValue {
+        what: "--vcs-http",
+        ..
+      })
     ));
   }
 

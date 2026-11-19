@@ -160,7 +160,7 @@ fn a_base_pack_is_made_an_object_a_unit_as_one_pass_makes_it() {
   whole
     .rebuild_base(&mut store_whole, 1, &mut Ticks(0), EXCHANGE)
     .unwrap();
-  let mut encoding = Encoding::base(&turned, 1).unwrap();
+  let mut encoding = Encoding::base(&turned, &store_turned, 1).unwrap();
   let turns = one_unit_a_turn(&mut encoding, &mut turned, &mut store_turned);
   assert!(
     turns > encoding.counters().objects,

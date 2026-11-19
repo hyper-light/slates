@@ -42,6 +42,8 @@ vendor/**       !text !eol
 crates/hg/fixtures/**/*.hg -text
 # What stock `hg` 7.2 sent and answered on the wire (A-569): HTTP's CRLF heads and binary bundles, kept as captured.
 crates/hg/fixtures/wire/** -text
+# A stock 7.2 client's clone, pull and incoming over HTTP against stock `hg serve` (A-650): CRLF heads, kept as captured.
+crates/hg/fixtures/serve-http/** -text
 # Revisions stock `hg` 7.2 stored (A-588): NUL-separated extras and manifests, metadata blocks, kept as stored.
 crates/hg/fixtures/objects/** -text
 # Revlogs stock `hg` 7.2 stored (A-611): index, data and docket files, and every revision's text, kept as stored.

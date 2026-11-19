@@ -20,16 +20,20 @@
 //! the session is anonymous and the client could authenticate, `svnserve` asks for authentication
 //! in the middle of the command, decides again with the principal the client proves, and keeps that
 //! principal for the rest of the connection (`must_have_access`, `serve.c` 807-850). So does the
-//! connection, for `commit`, which needs write access (A-655's [`Begun::Authenticate`]), and for
-//! `update`, which needs to read its target: the request lists `EXTERNAL` and `CRAM-MD5` alone
+//! connection, for `commit`, which needs write access (A-655's [`Begun::Authenticate`]), for
+//! `update`, which needs to read its target, and for the reads that check their path first
+//! (`get-file`, `get-dir`, `check-path`, `stat`, `get-iprops`, `list`: A-613's
+//! [`reads::Outcome::Authenticate`]): the request lists `EXTERNAL` and `CRAM-MD5` alone
 //! ([`handshake::Server::for_command`]), the caller answers what it asks as in the handshake, and
 //! once the client is established ([`Turn::Established`]) the command runs again at the next call,
-//! with the new principal's guards and no trivial auth request before its answer, or is refused
-//! "Authorization failed" (170001) where the new principal lacks the access too. The read commands
-//! judge every path by the rules the repository's authorization file gives the session's principal
-//! (A-606, A-613's eighth slice), compiled at the first read and again once an authentication has
-//! changed the principal (`Established::reads_session`); they ask for no authentication yet, so a
-//! read an anonymous session could authenticate for is refused where `svnserve` asks (owed).
+//! judged by the new principal's rules with no trivial auth request before its answer, or is
+//! refused "Authorization failed" (170001) where the new principal lacks the access too. A session
+//! has one read rule: the rules the repository's authorization file gives its principal (A-606,
+//! A-613's eighth slice), compiled at the first command that reads and again once an authentication
+//! has changed the principal (`Established::compiled_read_rules`), and asked through
+//! [`authz::may_read`] by the read commands, an update's target and the update's drive alike
+//! (A-656 continued (2)), so a read run again after its authentication is judged by the principal
+//! the client proved.
 //!
 //! **A commit.** The client's `commit` is handed to the caller ([`Turn::CommitAsked`]), which gives
 //! the transaction's name, its instant and its room ([`Connection::commit`]). A-655's entry point
@@ -60,8 +64,8 @@
 //! [`Connection::refuse`]), gives a CRAM-MD5 challenge's parts ([`Connection::challenge`]) and a
 //! user's key ([`Connection::key`]), begins a commit and makes or refuses its work, and from the
 //! session's establishment on hands over the repository's [`Sources`] with every call, the guards
-//! the principal's. What the connection waits on its client for, which the caller's waits are
-//! learned by, is [`Connection::waiting`].
+//! (the locks) the principal's. What the connection waits on its client for, which the caller's
+//! waits are learned by, is [`Connection::waiting`].
 //!
 //! **Bounds.** Every bound is the caller's: one item's bytes, the report's room and the nodes a
 //! drive holds open at once ([`Limits`], each derived from its shard's budget), and a commit's room
@@ -157,7 +161,8 @@ pub struct Sources<'s, R: ?Sized, G: ?Sized> {
   /// The repository's green: entries, texts, property lists and revision properties, and the names
   /// it gives new content.
   pub repository: &'s R,
-  /// The session's principal's guards: what it may read and the locks it holds.
+  /// The session's principal's guards: the locks it holds. What it may read is `policy`'s
+  /// authorization file's rules, which the connection compiles for the principal.
   pub guards: &'s G,
   /// The repository's lock table (A-602).
   pub locks: &'s LockTable,
@@ -262,8 +267,8 @@ pub enum Turn<'a> {
     consumed: usize,
   },
   /// The client authenticated as `principal`, at the handshake's end or for one command: from here
-  /// on every call hands over the repository's sources, the guards the principal's. After an
-  /// authentication for one command, the next call runs the command again.
+  /// on every call hands over the repository's sources, the guards (the locks) the principal's.
+  /// After an authentication for one command, the next call runs the command again.
   Established {
     /// Who.
     principal: Principal,
@@ -405,33 +410,89 @@ struct ReadRules {
   rules: Option<authz::PrincipalRules>,
 }
 
-impl Established {
-  /// The session the read commands run in: the path the session's URL names, the repository's
-  /// UUID, what the client takes, and the rules `policy`'s authorization file gives the principal,
-  /// compiled again where an authentication has changed the principal since they were compiled.
-  fn reads_session(&mut self, policy: &Policy<'_>) -> reads::Session<'_> {
-    let principal = &self.session.principal;
-    if self
-      .read_rules
+impl ReadRules {
+  /// The rules `policy`'s authorization file gives `principal`, compiled into `held` at the first
+  /// call and again only where `held` was compiled for another principal, an authentication having
+  /// changed it since; none where the repository names no authorization file.
+  fn for_principal<'held>(
+    held: &'held mut Option<Self>,
+    principal: &Principal,
+    policy: &Policy<'_>,
+  ) -> Option<&'held authz::PrincipalRules> {
+    if held
       .as_ref()
       .is_some_and(|compiled| compiled.principal != *principal)
     {
-      self.read_rules = None;
+      *held = None;
     }
-    let compiled = self.read_rules.get_or_insert_with(|| {
+    let compiled = held.get_or_insert_with(|| {
       let user = authz::Principal::named(user_of(principal));
-      ReadRules {
+      Self {
         principal: principal.clone(),
         rules: policy
           .authz
           .map(|(rules_file, name)| rules_file.rules(name, user)),
       }
     });
+    compiled.rules.as_ref()
+  }
+}
+
+impl Established {
+  /// The session's one read rule ([`ReadRules::for_principal`]), which the read commands, an
+  /// update's target and the update's drive all judge paths by ([`authz::may_read`]).
+  fn compiled_read_rules(&mut self, policy: &Policy<'_>) -> Option<&authz::PrincipalRules> {
+    ReadRules::for_principal(&mut self.read_rules, &self.session.principal, policy)
+  }
+
+  /// How the client may authenticate for one command needing `level`, as `must_have_access` finds
+  /// it (`serve.c` 829-834, `send_mechs` with a username needed): `None` where the session already
+  /// has a user, where authenticated users lack `level`, or where the session kept no way in;
+  /// else `EXTERNAL` for the tunnel's user and `CRAM-MD5` where the repository holds keys, never
+  /// `ANONYMOUS`.
+  fn mechanisms_for(
+    &self,
+    policy: &Policy<'_>,
+    level: authz::Access,
+  ) -> Option<CommandMechanisms<'_>> {
+    if self.session.principal != Principal::Anonymous {
+      return None;
+    }
+    let allowed = policy.authenticated >= level;
+    let kept = &self.mechanisms;
+    let mechanisms = CommandMechanisms {
+      realm: &kept.realm,
+      tunnel_user: kept.tunnel_user.as_deref().filter(|_| allowed),
+      cram_md5: kept.cram_md5 && allowed,
+    };
+    (mechanisms.tunnel_user.is_some() || mechanisms.cram_md5).then_some(mechanisms)
+  }
+
+  /// Where the session's authentication stands for a read's path check: the client could
+  /// authenticate for read access ([`Established::mechanisms_for`]), or nothing can be asked.
+  fn reads_authentication(&self, policy: &Policy<'_>) -> reads::Authentication {
+    if self.mechanisms_for(policy, authz::Access::Read).is_some() {
+      reads::Authentication::Available
+    } else {
+      reads::Authentication::Settled
+    }
+  }
+
+  /// The session the read commands run in: the path the session's URL names, the repository's
+  /// UUID, what the client takes, the session's one read rule, and where its `authentication`
+  /// stands.
+  fn reads_session(
+    &mut self,
+    policy: &Policy<'_>,
+    authentication: reads::Authentication,
+  ) -> reads::Session<'_> {
+    let authz = ReadRules::for_principal(&mut self.read_rules, &self.session.principal, policy);
     reads::Session {
       base: &self.base,
       uuid: &self.uuid,
       capabilities: self.session.capabilities,
-      authz: compiled.rules.as_ref(),
+      authz,
+      authentication,
     }
   }
 }
@@ -457,6 +518,12 @@ enum Interrupted {
   },
   /// `update`: its item.
   Update {
+    /// The item.
+    command: Vec<u8>,
+  },
+  /// A read that checks its path first (`get-file`, `get-dir`, `check-path`, `stat`, `get-iprops`,
+  /// `list`): its item.
+  Read {
     /// The item.
     command: Vec<u8>,
   },
@@ -1005,12 +1072,18 @@ impl Connection {
       }
       Parsed::Item { value, consumed } => (value, consumed),
     };
-    let session = established.reads_session(&sources.policy);
+    let authentication = established.reads_authentication(&sources.policy);
+    let session = established.reads_session(&sources.policy, authentication);
     let outcome = reads::answer(sources.index, sources.repository, &session, &value, out)
       .map_err(Refused::Item)?;
     match outcome {
       Outcome::Answered => {
         self.phase = Phase::Commands(established);
+        Ok(Turn::Took { consumed })
+      }
+      Outcome::Authenticate => {
+        let item = input.get(..consumed).ok_or(Refused::Malformed)?;
+        self.ask_for_read(established, item.to_vec(), &sources.policy, out)?;
         Ok(Turn::Took { consumed })
       }
       Outcome::Streaming(stream) => {
@@ -1082,9 +1155,8 @@ impl Connection {
       return Ok(Answered::Unserved);
     };
     let request = Request::read(kind, params).map_err(Refused::Report)?;
-    let readable = sources
-      .guards
-      .may_read(&join_fspath(&established.base, &request.target));
+    let target = join_fspath(&established.base, &request.target);
+    let readable = authz::may_read(established.compiled_read_rules(&sources.policy), &target);
     if kind == RequestKind::Update
       && !readable
       && let Some(server) = self.ask(established, &sources.policy, authz::Access::Read, out)?
@@ -1112,19 +1184,9 @@ impl Connection {
     level: authz::Access,
     out: &mut Vec<u8>,
   ) -> Result<Option<Box<handshake::Server>>, Refused> {
-    if established.session.principal != Principal::Anonymous {
+    let Some(mechanisms) = established.mechanisms_for(policy, level) else {
       return Ok(None);
-    }
-    let allowed = policy.authenticated >= level;
-    let kept = &established.mechanisms;
-    let mechanisms = CommandMechanisms {
-      realm: &kept.realm,
-      tunnel_user: kept.tunnel_user.as_deref().filter(|_| allowed),
-      cram_md5: kept.cram_md5 && allowed,
     };
-    if mechanisms.tunnel_user.is_none() && !mechanisms.cram_md5 {
-      return Ok(None);
-    }
     let server = handshake::Server::for_command(
       established.session.clone(),
       &mechanisms,
@@ -1133,6 +1195,64 @@ impl Connection {
     )
     .map_err(Refused::Handshake)?;
     Ok(Some(Box::new(server)))
+  }
+
+  /// A read the anonymous session may not make where the client could authenticate
+  /// (`must_have_access` 829-834): the request for an authentication for it, the read kept to run
+  /// again once the client is established. Where no way in is offered after all, the read is
+  /// refused as one no authentication can help, "Authorization failed" (170001) with nothing
+  /// before it.
+  fn ask_for_read(
+    &mut self,
+    established: Box<Established>,
+    command: Vec<u8>,
+    policy: &Policy<'_>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused> {
+    match self.ask(&established, policy, authz::Access::Read, out)? {
+      Some(server) => {
+        let interrupted = Interrupted::Read { command };
+        self.phase = Phase::Authenticating(established, server, Box::new(interrupted));
+      }
+      None => {
+        ReportFailure::NotAuthorized
+          .write(out)
+          .map_err(Refused::Report)?;
+        self.phase = Phase::Commands(established);
+      }
+    }
+    Ok(())
+  }
+
+  /// A read an authentication interrupted, run again with the principal the client proved and no
+  /// trivial auth request before its answer (`must_have_access` after its `auth_request`): between
+  /// commands after it, or streaming its answer.
+  fn read_again<R, G>(
+    &mut self,
+    mut established: Box<Established>,
+    command: &[u8],
+    sources: &Sources<'_, R, G>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused>
+  where
+    R: reads::Repository + ?Sized,
+    G: ?Sized,
+  {
+    let value = self.whole_item(command)?;
+    let session = established.reads_session(&sources.policy, reads::Authentication::Done);
+    let outcome = reads::answer(sources.index, sources.repository, &session, &value, out)
+      .map_err(Refused::Item)?;
+    self.phase = match outcome {
+      Outcome::Answered => Phase::Commands(established),
+      Outcome::Streaming(stream) => Phase::Streaming(established, Box::new(stream)),
+      // The read answered `Authenticate` once and is read whole again: with `Done` it asks for
+      // nothing and is the same read, so none of these comes back; were one to, the connection
+      // ends rather than leave the command unanswered.
+      Outcome::Close | Outcome::Elsewhere | Outcome::Authenticate => {
+        return Err(Refused::Malformed);
+      }
+    };
+    Ok(())
   }
 
   /// A report command's exchange begun (`Reporter::begin`): its exchange, or `None` where it was
@@ -1168,16 +1288,17 @@ impl Connection {
   /// proved and no trivial auth request before its answer.
   fn resume<'a, R, G>(
     &mut self,
-    established: Box<Established>,
+    mut established: Box<Established>,
     interrupted: Interrupted,
     sources: &Sources<'_, R, G>,
     out: &mut Vec<u8>,
   ) -> Result<Turn<'a>, Refused>
   where
-    R: ?Sized,
+    R: reads::Repository + ?Sized,
     G: Guards + ?Sized,
   {
     match interrupted {
+      Interrupted::Read { command } => self.read_again(established, &command, sources, out)?,
       Interrupted::Commit { command, start } => {
         self.begin_commit(established, command, start, true, &sources.policy, out)?;
       }
@@ -1187,9 +1308,8 @@ impl Connection {
           let (_, params) = command_of(&value).ok_or(Refused::Malformed)?;
           Request::read(RequestKind::Update, params).map_err(Refused::Report)?
         };
-        let readable = sources
-          .guards
-          .may_read(&join_fspath(&established.base, &request.target));
+        let target = join_fspath(&established.base, &request.target);
+        let readable = authz::may_read(established.compiled_read_rules(&sources.policy), &target);
         let begun = self.begin_report(&established, sources.index, request, readable, true, out)?;
         self.phase = match begun {
           Some(exchange) => Phase::Reporting(established, exchange),
@@ -1386,7 +1506,8 @@ impl Connection {
     R: reads::Repository + ?Sized,
     G: ?Sized,
   {
-    let session = established.reads_session(&sources.policy);
+    let authentication = established.reads_authentication(&sources.policy);
+    let session = established.reads_session(&sources.policy, authentication);
     let progress = stream
       .resume(
         sources.index,
@@ -1407,7 +1528,7 @@ impl Connection {
   /// A report command's exchange, on.
   fn exchange<'a, R, G>(
     &mut self,
-    established: Box<Established>,
+    mut established: Box<Established>,
     mut exchange: Box<Exchange>,
     sources: &Sources<'_, R, G>,
     input: &'a [u8],
@@ -1422,6 +1543,7 @@ impl Connection {
       index: sources.index,
       repository: sources.repository,
       guards: sources.guards,
+      rules: established.compiled_read_rules(&sources.policy),
     };
     let turn = exchange
       .receive(&drive_sources, input, out, budget)

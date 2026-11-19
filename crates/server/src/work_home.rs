@@ -348,11 +348,12 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         return None;
       }
       let (evidence, approval, signature) = submitted(body)?;
+      let authorship = body.authorship().cloned().unwrap_or_default();
       Some(verdict_need(
         state,
         work,
         seal(state, work),
-        (evidence, approval, signature),
+        (evidence, approval, signature, authorship),
       ))
     }
     RequestBody::Rebase { .. } => {
@@ -393,8 +394,10 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       } else {
         crate::verbs::Approval::None
       };
-      sealed_with_edit(state, work, (path, *at, *delete_len, insert))
-        .map(|sealed| verdict_need(state, work, sealed, (evidence, approval, None)))
+      sealed_with_edit(state, work, (path, *at, *delete_len, insert)).map(|sealed| {
+        let authorship = body.authorship().cloned().unwrap_or_default();
+        verdict_need(state, work, sealed, (evidence, approval, None, authorship))
+      })
     }
     _ => None,
   }
@@ -436,7 +439,12 @@ fn verdict_need(
   state: &ShardState,
   work: DbVolumeId,
   sealed: SealedWork,
-  (evidence, approval, signature): (&[[u8; 32]], crate::verbs::Approval, Option<Vec<u8>>),
+  (evidence, approval, signature, authorship): (
+    &[[u8; 32]],
+    crate::verbs::Approval,
+    Option<Vec<u8>>,
+    slates_ipc::protocol::Authorship,
+  ),
 ) -> Need {
   if !route_committed(state, work) {
     return Need::Route;
@@ -444,7 +452,7 @@ fn verdict_need(
   base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
     evidence: evidence.to_vec(),
     sealed: composed(state, sealed, evidence.to_vec()),
-    policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature)),
+    policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
   })
 }
 

@@ -15,22 +15,26 @@
 //! and its generation number), and its position row, which names the id back. The rows are written once, in time
 //! proportional to the push's new objects, and nothing rewrites them; a refused push writes none.
 //!
-//! **What each version brought.** Version `k` of a ref's green records D(k), the objects reachable from its head and not
-//! from version `k - 1`'s, as a set of positions ([`Positions`]), and the green keeps the set its current head reaches.
-//! Both are computed when the push is admitted ([`Repository::admit`]), before its verdict, by walks that read the push
-//! and the index alike: from the new head, stopping at every object the green had already reached, so a tree the green
-//! reached is skipped whole and the walk costs the objects new to the branch and the entries of its new trees. A
+//! **What each version brought.** Version `k` of a ref's green has D(k), the objects reachable from its head and not
+//! from version `k - 1`'s, as a set of positions ([`Positions`]), and the set its head reaches, both kept as the
+//! version's value (below). Both are computed when the push is admitted ([`Repository::admit`]), before its verdict,
+//! by walks that read the push and the index alike: from the new head, stopping at every object the green had already
+//! reached, so a tree the green reached is skipped whole and the walk costs the objects new to the branch and the
+//! entries of its new trees. A
 //! fast-forward (found by a walk back through generation numbers that stops at the old head's) grows the reached set by
 //! D(k), so a client holding version `M`'s head needs the union of D(M+1) to D(N) and no walk at all. A rewrite, a
 //! create and a ref made at another ref's commit make the set again from the newest commit that is some green's
 //! current head, found back through the commit rows by generation, walking only what lies beyond it: a branch made at
 //! another's head costs no walk.
 //!
-//! **D(k) as derived data** (A-647 part 2, [`ReachSets`]). A version's two sets are a type of `slates-vcs`'s derived
-//! data: a pure function of the version's record and its parents' values (version `k - 1`'s, and that of the version a
-//! remade set came from, which each version records), so any tier derives them with the admission's own walks over the
-//! committed index, and the owner keeps the admission's sets under (type, version) with no second walk
-//! ([`Repository::reach_value`]). The sets above are unchanged; the type reads them back, identity for identity.
+//! **D(k) as derived data** (A-647 parts 2 and 3, [`ReachSets`]). A version's two sets are a type of `slates-vcs`'s
+//! derived data: a pure function of the version's record and its parents' values (version `k - 1`'s, and that of the
+//! version a remade set came from, which each version records), so any tier derives them with the admission's own walks
+//! over the committed index. The store keeps a version's sets as its value alone: its commit puts the sets its
+//! admission walked as the version's value, held by the version's record, and it serves every version's D(k) and
+//! reached set from it ([`Repository::brought`], [`Repository::reached`]), an older version's as well as the newest's;
+//! the owner keeps the same value under (type, version) with no second walk ([`Repository::reach_value`]). A value
+//! names its sets' bytes as an object of any length, so no set is too large to keep.
 //!
 //! **A version read as a tree.** A version's head and its root tree are read from its commit row, and a path is
 //! resolved one tree a component down ([`Repository::entry`]): no walk of history and none of the tree. Making a
@@ -42,10 +46,10 @@
 //! ([`Repository::merge_commit`]) and the first no trusted key signed ([`Repository::unsigned_commit`], through a
 //! [`CommitSigners`]).
 //!
-//! **Bounds.** Every byte the store keeps is in the shared store's derived budget: the objects and the index as
-//! `slates-vcs` charges them, and the versions' sets and the head map as this store charges them ([`Repository`]); a
-//! commit past the budget is refused with nothing changed. Nothing here is a tuning constant: positions are counted,
-//! generation numbers computed, and the walks bounded by the repository they read.
+//! **Bounds.** Every byte the store keeps is in the shared store's derived budget: the objects, the index and the
+//! versions' values as `slates-vcs` charges them, and the versions' records and the head map as this store charges them
+//! ([`Repository`]); a commit past the budget is refused with nothing changed. Nothing here is a tuning constant:
+//! positions are counted, generation numbers computed, and the walks bounded by the repository they read.
 //!
 //! **upload-pack's pack (A-639, A-653).** A fetch's pack is streamed from what the store keeps ([`Upload`]): the
 //! negotiation's runs of versions (A-615, taken through [`Answered`]) from their fragments, then the objects still
@@ -66,10 +70,11 @@
 //! and packs from the base packs and fragments, each whole by itself, with the push's objects in
 //! git's quarantine; every file's bytes made when a read reaches them.
 //!
-//! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks
-//! and a commit sliced under the shard's budget, and their transient sets charged; within an encoding, one object, a
-//! pair of trees and a part's put each still a unit whole (`encoding`'s docs); a delta search for an object past a
-//! window; the versions' records kept as content, replicated as the index's tables are.
+//! **Owed (later pieces):** the walks and a commit sliced under the shard's budget, and their transient sets charged;
+//! within an encoding, one object, a pair of trees and a part's put each still a unit whole (`encoding`'s docs); a
+//! delta search for an object past a window; the versions' records kept as content, replicated as the index's tables
+//! are. A-614 part 3, the commit rows' changed-path Bloom filters, is superseded: a path's history and blame are
+//! A-666's derived types, and no walk here reads paths.
 
 mod deltas;
 mod encoding;
@@ -84,7 +89,7 @@ pub mod rows;
 mod upload;
 pub mod views;
 
-pub use deltas::delta_of;
+pub use deltas::{Search, SearchCounters, SearchStep, delta_of};
 pub use encoding::{Encoding, EncodingCounters};
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
