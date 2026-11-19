@@ -30,6 +30,7 @@ pub mod handshake;
 pub mod index;
 pub mod lock;
 pub mod mergeinfo;
+pub mod migration;
 pub mod ra_svn;
 pub mod reads;
 pub mod svndiff;
