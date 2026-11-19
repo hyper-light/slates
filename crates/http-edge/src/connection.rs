@@ -10,7 +10,9 @@
 //!
 //! **The reply's head** is written when the service's first bytes are passed in, or at its end, from the decision's
 //! fields and then any the service names as its reply begins ([`Connection::reply_fields`]: a reply whose fields follow
-//! from its outcome, as Mercurial's media type follows from its command's): `200`, those fields, chunked to HTTP/1.1
+//! from its outcome, as Mercurial's media type follows from its command's): `200`, or the status the service names as
+//! its reply begins ([`Connection::reply_status`]: a WebDAV `PROPFIND`'s `207`, or a refusal its body explains, as
+//! Subversion's site answers one, A-681), those fields, chunked to HTTP/1.1
 //! and framed by the close to HTTP/1.0, `Connection: close` when the connection ends after it. A field a reply cannot
 //! carry fails the request `500` before any of it is sent: the decision's at the decision, the service's as it names
 //! them. `100 Continue` is sent when a decision admits a request whose client waits for it: it sent
@@ -66,7 +68,8 @@ pub enum Next<'a> {
 /// A site's answer to a request's head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-  /// Serve it: the reply is `200` with `fields`; `head_only` for a `HEAD` request, whose reply has no body.
+  /// Serve it: the reply is `200`, or the status its service names as its reply begins ([`Connection::reply_status`]),
+  /// with `fields`; `head_only` for a `HEAD` request, whose reply has no body.
   Serve {
     /// The reply's fields (its content type, cache fields and the like), in order.
     fields: Fields,
@@ -168,6 +171,8 @@ struct Reply {
   head_only: bool,
   /// Whether any of the reply has been sent: the head goes with its first bytes, and a failure after this aborts.
   started: bool,
+  /// The head's status: `200` unless the service names another before any of the reply is sent.
+  status: Status,
 }
 
 /// Where the loop is.
@@ -560,7 +565,7 @@ impl Connection {
   /// Serves a request: its reply's fields judged now (a decision whose fields a reply cannot carry is refused 500),
   /// `100 Continue` sent to a client waiting for it, and its body read, if it has one.
   fn serve(&mut self, request: Request, fields: Fields, head_only: bool) {
-    if rendered(request, &fields, &mut Vec::new()).is_err() {
+    if rendered(request, Status::OK, &fields, &mut Vec::new()).is_err() {
       self.refuse_staged(Status::INTERNAL_SERVER_ERROR);
       return;
     }
@@ -568,6 +573,7 @@ impl Connection {
       fields,
       head_only,
       started: false,
+      status: Status::OK,
     };
     if !request.has_body() {
       self.state = State::BodyEnded { request, reply };
@@ -706,9 +712,20 @@ impl Connection {
       return;
     }
     reply.fields.extend(fields);
-    let carried = rendered(*request, &reply.fields, &mut Vec::new()).is_ok();
+    let carried = rendered(*request, reply.status, &reply.fields, &mut Vec::new()).is_ok();
     if !carried {
       self.fail(Status::INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  /// The status the service names for its reply's head as its reply begins (the module doc), in place of `200`. Taken
+  /// only before any of the reply is sent, and only while a reply is under way.
+  pub fn reply_status(&mut self, status: Status) {
+    let State::Reply { reply, .. } = &mut self.state else {
+      return;
+    };
+    if !reply.started {
+      reply.status = status;
     }
   }
 
@@ -720,7 +737,7 @@ impl Connection {
     };
     let mut head = Vec::new();
     if !reply.started {
-      if let Err(bad) = rendered(*request, &reply.fields, &mut head) {
+      if let Err(bad) = rendered(*request, reply.status, &reply.fields, &mut head) {
         return Some(Err(bad));
       }
       reply.started = true;
@@ -811,15 +828,20 @@ impl Connection {
   }
 }
 
-/// Renders a served reply's head for `request` into `out`: `200`, `fields`, chunked to HTTP/1.1 and framed by the
+/// Renders a served reply's head for `request` into `out`: `status`, `fields`, chunked to HTTP/1.1 and framed by the
 /// close to HTTP/1.0, `Connection: close` when the connection ends after it. Refused, writing nothing, where a field
 /// cannot be carried.
-fn rendered(request: Request, fields: &Fields, out: &mut Vec<u8>) -> Result<(), BadField> {
+fn rendered(
+  request: Request,
+  status: Status,
+  fields: &Fields,
+  out: &mut Vec<u8>,
+) -> Result<(), BadField> {
   let body = match request.version {
     Version::Http11 => Body::Chunked,
     Version::Http10 => Body::UntilClose,
   };
-  reply::head(Status::OK, &borrowed(fields), body, !request.kept(), out)
+  reply::head(status, &borrowed(fields), body, !request.kept(), out)
 }
 
 /// `fields` as `slates-http`'s reply writer takes them.

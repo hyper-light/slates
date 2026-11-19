@@ -1,0 +1,496 @@
+//! A-681 part 1: the site's read side answered from the report fixtures' repository (`report::drive::green`, the history
+//! stock `svnserve` was recorded against: six revisions, `trunk/secret` hidden from all but alice) to the bodies stock
+//! svn 1.15.0 sent (A-609's `dav/fixtures`), each answer held to the bytes `mod_dav`'s and `mod_dav_svn`'s format
+//! strings write.
+
+use super::*;
+use crate::lock::{Lock, LockEntry, LockToken};
+use crate::report::drive::green::{Green, repository, rules_of};
+
+/// Shape: the repository root's URL path the tests' URLs name.
+const ROOT: &str = "/repo";
+/// Shape: the UUID the tests' repository carries.
+const UUID: &str = "6b4a5e2c-1d3f-4a7b-9c8e-0f1a2b3c4d5e";
+/// Shape: room enough for every answer these tests ask for.
+const ROOM: usize = 1 << 20;
+/// Shape: bounds wide enough for every recorded body.
+const BOUNDS: Bounds = Bounds {
+  body_bytes: 1 << 16,
+  depth: 16,
+  name_bytes: 256,
+  attributes: 32,
+  elements: 1024,
+};
+/// Shape: the instant locks are judged at, after every fixture revision (2027-01-15).
+const NOW: AprTime = AprTime(1_800_000_000_000_000);
+/// Shape: the OPTIONS body stock svn opens a session with, asking for the activity collection.
+const OPTIONS_BODY: &[u8] = include_bytes!("../fixtures/options.xml");
+/// Shape: the PROPFIND `svn info` sends: six properties of a node.
+const PROPFIND_INFO: &[u8] = include_bytes!("../fixtures/propfind-props.xml");
+/// Shape: the PROPFIND `svn cat` sends for a file's properties.
+const PROPFIND_ALL: &[u8] = include_bytes!("../fixtures/propfind-allprop.xml");
+/// Shape: the PROPFIND `svn ls` sends at depth 1 where no `list` capability is listed.
+const PROPFIND_KIND: &[u8] = include_bytes!("../fixtures/propfind-resourcetype.xml");
+/// Shape: the PROPFIND `svn info` sends for a URL's lock.
+const PROPFIND_LOCKS: &[u8] = include_bytes!("../fixtures/propfind-lockdiscovery.xml");
+/// Shape: a PROPFIND of the two properties a checked-in version is read by.
+const PROPFIND_VERSION: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop>\
+<checked-in/><version-name/></prop></propfind>";
+
+/// The fixtures' repository, with a lock table.
+struct Fixture {
+  /// The index.
+  index: Index,
+  /// The green.
+  green: Green,
+  /// The locks.
+  locks: LockTable,
+}
+
+impl Fixture {
+  /// The repository with no lock.
+  fn new() -> Self {
+    let (index, green) = repository();
+    Self {
+      index,
+      green,
+      locks: LockTable::new(),
+    }
+  }
+
+  /// The answer to `method` on `path` below the root, as the principal `rules` compile for asks it.
+  fn ask(
+    &self,
+    rules: Option<&PrincipalRules>,
+    method: &str,
+    (path, depth): (&str, Option<&str>),
+    body: &[u8],
+  ) -> Answer {
+    let served = Served {
+      index: &self.index,
+      repository: &self.green,
+      root: ROOT,
+      uuid: UUID,
+      locks: &self.locks,
+      rules,
+      now: NOW,
+    };
+    let request = Request {
+      method,
+      path,
+      depth,
+      body,
+    };
+    answer(&served, &request, &BOUNDS, ROOM)
+  }
+
+  /// The whole answer anonymous gets to `method` on `path`.
+  fn anonymous(&self, method: &str, path: &str, depth: Option<&str>, body: &[u8]) -> HttpAnswer {
+    whole(self.ask(Some(&rules_of(None)), method, (path, depth), body))
+  }
+}
+
+/// The answer, which must be whole.
+fn whole(answer: Answer) -> HttpAnswer {
+  match answer {
+    Answer::Whole(whole) => whole,
+    Answer::Text { .. } => panic!("a text where a whole answer was due"),
+  }
+}
+
+/// The answer's body as text.
+fn text_of(answer: &HttpAnswer) -> String {
+  String::from_utf8(answer.body.clone()).unwrap()
+}
+
+/// Every value of the header `name`, in order.
+fn header<'h>(headers: &'h Headers, name: &str) -> Vec<&'h str> {
+  headers
+    .iter()
+    .filter(|(found, _)| *found == name)
+    .map(|(_, value)| value.as_str())
+    .collect()
+}
+
+/// Every href a multistatus names, in order.
+fn hrefs(body: &str) -> Vec<String> {
+  body
+    .split("<D:href>")
+    .skip(1)
+    .filter_map(|rest| rest.split("</D:href>").next())
+    .filter(|href| !href.contains("!svn/ver/") && !href.contains("!svn/vcc/"))
+    .map(str::to_owned)
+    .collect()
+}
+
+/// A-681 (`version.c` `get_option`): do send the OPTIONS stock svn opens a session with, asking for the activity
+/// collection; expect `200`, the HTTPv2 stubs built from the root, the youngest revision 6, no capability line (each
+/// names a report or a commit this part does not serve), mergeinfo answered `no`, and the activity collection's href.
+#[test]
+fn an_options_answer_lists_the_httpv2_facts_and_no_capability_unserved() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous("OPTIONS", "/trunk", None, OPTIONS_BODY);
+  let headers = &answer.headers;
+  assert_eq!(
+    (
+      answer.status,
+      header(headers, "DAV"),
+      header(headers, "SVN-Youngest-Rev"),
+      header(headers, "SVN-Repository-Root"),
+      header(headers, "SVN-Rev-Root-Stub"),
+      header(headers, "SVN-Repository-MergeInfo"),
+      header(headers, "SVN-Repository-UUID"),
+    ),
+    (
+      200,
+      vec![
+        "1,2",
+        "version-control,checkout,working-resource",
+        "merge,baseline,activity,version-controlled-collection"
+      ],
+      vec!["6"],
+      vec!["/repo"],
+      vec!["/repo/!svn/rvr"],
+      vec!["no"],
+      vec![UUID],
+    )
+  );
+  assert!(text_of(&answer).contains("<D:href>/repo/!svn/act/</D:href>"));
+}
+
+/// A-681 (`dav_get_props`, `liveprops.c`): do PROPFIND a file's revision-root resource at depth 0 with the six
+/// properties `svn info` asks for; expect `207` and the bytes `mod_dav` writes: one response naming the request's URL,
+/// `lp1` and `lp2` declared as first used, each value as `liveprops.c` writes it.
+#[test]
+fn svn_infos_propfind_of_a_file_is_answered_byte_for_byte() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous(
+    "PROPFIND",
+    "/!svn/rvr/6/trunk/script.sh",
+    Some("0"),
+    PROPFIND_INFO,
+  );
+  let expected = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n\
+<D:response xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://subversion.tigris.org/xmlns/dav/\">\n\
+<D:href>/repo/!svn/rvr/6/trunk/script.sh</D:href>\n<D:propstat>\n<D:prop>\n<lp1:resourcetype/>\n\
+<lp1:getcontentlength>18</lp1:getcontentlength>\n<lp2:deadprop-count>1</lp2:deadprop-count>\n\
+<lp1:version-name>1</lp1:version-name>\n<lp1:creationdate>2026-01-01T00:00:01.000000Z</lp1:creationdate>\n\
+<lp1:creator-displayname>alice</lp1:creator-displayname>\n</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n\
+</D:propstat>\n</D:response>\n</D:multistatus>\n";
+  assert_eq!(
+    (
+      answer.status,
+      header(&answer.headers, "Content-Type"),
+      text_of(&answer)
+    ),
+    (207, vec!["text/xml; charset=\"utf-8\""], expected.to_owned())
+  );
+}
+
+/// A-681 (`dav_get_props`): do PROPFIND a directory with `svn info`'s six properties; expect its href to end in a slash,
+/// the length it does not define listed under `404 Not Found` with a generated `g0` prefix declared after the live
+/// properties' prefixes, and the rest found.
+#[test]
+fn a_property_a_directory_does_not_define_is_listed_not_found() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous("PROPFIND", "/!svn/rvr/6/trunk", Some("0"), PROPFIND_INFO);
+  let expected = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n\
+<D:response xmlns:lp1=\"DAV:\" xmlns:lp2=\"http://subversion.tigris.org/xmlns/dav/\" xmlns:g0=\"DAV:\">\n\
+<D:href>/repo/!svn/rvr/6/trunk/</D:href>\n<D:propstat>\n<D:prop>\n\
+<lp1:resourcetype><D:collection/></lp1:resourcetype>\n<lp2:deadprop-count>1</lp2:deadprop-count>\n\
+<lp1:version-name>6</lp1:version-name>\n<lp1:creationdate>2026-01-06T00:00:06.000000Z</lp1:creationdate>\n\
+<lp1:creator-displayname>bob</lp1:creator-displayname>\n</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n\
+</D:propstat>\n<D:propstat>\n<D:prop>\n<g0:getcontentlength/>\n</D:prop>\n\
+<D:status>HTTP/1.1 404 Not Found</D:status>\n</D:propstat>\n</D:response>\n</D:multistatus>\n";
+  assert_eq!((answer.status, text_of(&answer)), (207, expected.to_owned()));
+}
+
+/// A-681 (`dav_get_allprops`, `deadprops.c`, `liveprops.c`): do PROPFIND `allprop` of a file with a property, as
+/// `svn cat` does; expect its own property first in `S:`, then `resourcetype`, `mod_dav_svn`'s live properties in their
+/// table's order (the digests the index holds, its safe created revision in `checked-in`), then `supportedlock` and an
+/// empty `lockdiscovery`, the dead properties' prefixes declared before the live ones'.
+#[test]
+fn svn_cats_allprop_of_a_file_is_answered_byte_for_byte() {
+  let fixture = Fixture::new();
+  let text = fixture
+    .index
+    .node("/trunk/dir/c.bin", 1)
+    .unwrap()
+    .unwrap()
+    .text()
+    .unwrap();
+  let answer = fixture.anonymous(
+    "PROPFIND",
+    "/!svn/rvr/1/trunk/dir/c.bin",
+    Some("0"),
+    PROPFIND_ALL,
+  );
+  let expected = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n\
+<D:response xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\" xmlns:C=\"http://subversion.tigris.org/xmlns/custom/\" \
+xmlns:V=\"http://subversion.tigris.org/xmlns/dav/\" xmlns:lp1=\"DAV:\" \
+xmlns:lp2=\"http://subversion.tigris.org/xmlns/dav/\">\n<D:href>/repo/!svn/rvr/1/trunk/dir/c.bin</D:href>\n\
+<D:propstat>\n<D:prop>\n<S:mime-type>application/octet-stream</S:mime-type>\n<lp1:resourcetype/>\n\
+<lp1:getcontentlength>256</lp1:getcontentlength>\n<lp1:getcontenttype>application/octet-stream</lp1:getcontenttype>\n\
+<lp1:getetag>\"1//trunk/dir/c.bin\"</lp1:getetag>\n<lp1:creationdate>2026-01-01T00:00:01.000000Z</lp1:creationdate>\n\
+<lp1:getlastmodified>Thu, 01 Jan 2026 00:00:01 GMT</lp1:getlastmodified>\n\
+<lp1:checked-in><D:href>/repo/!svn/ver/1/trunk/dir/c.bin</D:href></lp1:checked-in>\n\
+<lp1:version-controlled-configuration><D:href>/repo/!svn/vcc/default</D:href></lp1:version-controlled-configuration>\n\
+<lp1:version-name>1</lp1:version-name>\n<lp1:creator-displayname>alice</lp1:creator-displayname>\n\
+<lp2:baseline-relative-path>trunk/dir/c.bin</lp2:baseline-relative-path>\n<lp2:md5-checksum>{}</lp2:md5-checksum>\n\
+<lp2:repository-uuid>{UUID}</lp2:repository-uuid>\n<lp2:deadprop-count>1</lp2:deadprop-count>\n\
+<lp2:sha1-checksum>{}</lp2:sha1-checksum>\n<D:supportedlock>\n<D:lockentry>\n\
+<D:lockscope><D:exclusive/></D:lockscope>\n<D:locktype><D:write/></D:locktype>\n</D:lockentry>\n</D:supportedlock>\n\
+<D:lockdiscovery/>\n</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n</D:response>\n\
+</D:multistatus>\n",
+    hex(&text.md5),
+    hex(&text.sha1)
+  );
+  assert_eq!((answer.status, text_of(&answer)), (207, expected));
+}
+
+/// A-681 (`dav_svn__get_safe_cr`): do PROPFIND `checked-in` and `version-name` of a file a copy brought into a branch
+/// and left unchanged, then of the trunk's file it came from, changed since; expect the branch's file checked in at the
+/// copy's revision 3 with its created revision 1, and the trunk's at its own change, revision 6.
+#[test]
+fn checked_in_names_the_safe_created_revision() {
+  let fixture = Fixture::new();
+  let version = |path: &str| {
+    let answer = fixture.anonymous("PROPFIND", path, Some("0"), PROPFIND_VERSION);
+    let body = text_of(&answer);
+    let checked_in = body
+      .split("<lp1:checked-in><D:href>")
+      .nth(1)
+      .and_then(|rest| rest.split("</D:href>").next())
+      .map(str::to_owned);
+    let name = body
+      .split("<lp1:version-name>")
+      .nth(1)
+      .and_then(|rest| rest.split("</lp1:version-name>").next())
+      .map(str::to_owned);
+    (checked_in, name)
+  };
+  assert_eq!(
+    (
+      version("/!svn/rvr/6/branches/b1/dir/b.txt"),
+      version("/!svn/rvr/6/trunk/dir/b.txt")
+    ),
+    (
+      (
+        Some("/repo/!svn/ver/3/branches/b1/dir/b.txt".to_owned()),
+        Some("1".to_owned())
+      ),
+      (
+        Some("/repo/!svn/ver/6/trunk/dir/b.txt".to_owned()),
+        Some("6".to_owned())
+      )
+    )
+  );
+}
+
+/// A-681 (`mod_dav_svn`'s walker; `mod_authz_svn`): do PROPFIND a directory at depth 1 with `resourcetype`, as `svn ls`
+/// does with no `list` capability listed, as anonymous and as alice; expect the directory then each child in name
+/// order, collections ending in a slash, and `secret` (alice's alone) left out of anonymous's answer.
+#[test]
+fn a_depth_one_propfind_lists_the_children_the_principal_may_read() {
+  let fixture = Fixture::new();
+  let alice = rules_of(Some(b"alice"));
+  let listed = |rules: &PrincipalRules| {
+    let answer = whole(fixture.ask(
+      Some(rules),
+      "PROPFIND",
+      ("/!svn/rvr/6/trunk", Some("1")),
+      PROPFIND_KIND,
+    ));
+    (answer.status, hrefs(&text_of(&answer)))
+  };
+  let prefix = "/repo/!svn/rvr/6/trunk/";
+  let children = ["", "a.txt", "big.txt", "dir/", "renamed.txt", "script.sh"];
+  let mut alices: Vec<String> = children
+    .iter()
+    .map(|child| format!("{prefix}{child}"))
+    .collect();
+  let anonymous = alices.clone();
+  alices.push(format!("{prefix}secret/"));
+  assert_eq!(
+    (listed(&rules_of(None)), listed(&alice)),
+    ((207, anonymous), (207, alices))
+  );
+}
+
+/// The text a [`Answer::Text`] streams, read from the green a piece at a time as the edge reads it, and its headers.
+fn streamed(fixture: &Fixture, answer: Answer) -> (Headers, Vec<u8>) {
+  let Answer::Text { headers, text } = answer else {
+    panic!("a whole answer where a text was due");
+  };
+  let mut bytes = Vec::new();
+  if let Some(text) = text {
+    while let Some(piece) = fixture
+      .green
+      .text(&text.identity, u64::try_from(bytes.len()).unwrap())
+      .filter(|piece| !piece.is_empty())
+    {
+      bytes.extend_from_slice(piece);
+    }
+  }
+  (headers, bytes)
+}
+
+/// A-681 (`repos.c` `set_headers`): do GET a file at its revision root's URL, as `svn cat` does, then at its public
+/// URL, then a file with a MIME type; expect its text with a week's cache, no `Last-Modified` and its ETag for the
+/// first; no cache and `Last-Modified` for the public URL; and the file's own valid type for the third.
+#[test]
+fn a_get_streams_a_files_text_with_set_headers_fields() {
+  let fixture = Fixture::new();
+  let rules = rules_of(None);
+  let get = |path: &str| streamed(&fixture, fixture.ask(Some(&rules), "GET", (path, None), b""));
+  let (revision_root, text) = get("/!svn/rvr/6/trunk/script.sh");
+  let (public, public_text) = get("/trunk/script.sh");
+  let (typed, _) = get("/!svn/rvr/1/trunk/dir/c.bin");
+  let script_headers = vec![
+    ("Cache-Control", String::from("max-age=604800")),
+    ("ETag", String::from("\"1//trunk/script.sh\"")),
+    ("Content-Type", String::from("text/plain")),
+  ];
+  let public_headers = vec![
+    ("Cache-Control", String::from("max-age=0")),
+    ("Last-Modified", String::from("Thu, 01 Jan 2026 00:00:01 GMT")),
+    ("ETag", String::from("\"1//trunk/script.sh\"")),
+    ("Content-Type", String::from("text/plain")),
+  ];
+  assert_eq!(
+    (
+      revision_root,
+      text.clone(),
+      public,
+      public_text,
+      header(&typed, "Content-Type")
+    ),
+    (
+      script_headers,
+      b"#!/bin/sh\necho hi\n".to_vec(),
+      public_headers,
+      text,
+      vec!["application/octet-stream"]
+    )
+  );
+}
+
+/// A-681 (`mod_authz_svn`; `repos.c` `parse_uri`, `prep_regular`; `mod_dav.c` `dav_method_propfind`): do ask for what
+/// this part refuses; expect each refused with its status: a hidden file `403`, a missing one `404`, a revision past
+/// the youngest `404`, a malformed special URI `500`, an unserved special resource or method `501`, an infinite or
+/// unknown depth on a directory `403` and `400`, a `..` name `400`, a directory's GET `501`.
+#[test]
+fn every_refusal_has_its_status() {
+  let fixture = Fixture::new();
+  let status = |method: &str, path: &str, depth: Option<&str>| {
+    fixture.anonymous(method, path, depth, PROPFIND_KIND).status
+  };
+  let asked = [
+    ("GET", "/trunk/secret/s.txt", None),
+    ("GET", "/trunk/missing.txt", None),
+    ("PROPFIND", "/!svn/rvr/9/trunk", Some("0")),
+    ("PROPFIND", "/!svn/rvr/x/trunk", Some("0")),
+    ("PROPFIND", "/!svn/zzz", Some("0")),
+    ("PROPFIND", "/!svn/me", Some("0")),
+    ("REPORT", "/!svn/me", None),
+    ("PROPFIND", "/trunk", None),
+    ("PROPFIND", "/trunk", Some("infinity")),
+    ("PROPFIND", "/trunk", Some("2")),
+    ("GET", "/trunk/../trunk/a.txt", None),
+    ("GET", "/trunk", None),
+    ("MKCOL", "/trunk/new", None),
+  ];
+  let statuses: Vec<u16> = asked
+    .iter()
+    .map(|(method, path, depth)| status(method, path, *depth))
+    .collect();
+  assert_eq!(
+    statuses,
+    [403, 404, 404, 500, 500, 501, 501, 403, 403, 400, 400, 501, 501]
+  );
+}
+
+/// A-681 (`dav_svn__convert_err`, `dav_error_response_tag`): do PROPFIND a revision past the youngest and send a
+/// REPORT; expect each refusal's `D:error` body with Subversion's error tag, its code and its words.
+#[test]
+fn a_refusal_that_carries_a_subversion_error_explains_itself() {
+  let fixture = Fixture::new();
+  let past = fixture.anonymous("PROPFIND", "/!svn/rvr/9/trunk", Some("0"), PROPFIND_KIND);
+  let report = fixture.anonymous("REPORT", "/!svn/me", None, b"");
+  let error = |code: u32, words: &str| {
+    format!(
+      "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:error xmlns:D=\"DAV:\" xmlns:m=\"http://apache.org/dav/xmlns\" \
+xmlns:C=\"svn:\">\n<C:error/>\n<m:human-readable errcode=\"{code}\">\n{words}\n</m:human-readable>\n</D:error>\n"
+    )
+  };
+  assert_eq!(
+    (text_of(&past), text_of(&report)),
+    (
+      error(160_006, "No such revision 9"),
+      error(200_007, "The requested report is unknown")
+    )
+  );
+}
+
+/// A-681 (`props.c` `dav_insert_coreprop`; A-627's `lockdiscovery`): do lock a file, then PROPFIND its public URL's
+/// `lockdiscovery` as `svn info` does; expect its active lock in the property and the lock's owner and creation date in
+/// `X-SVN-Lock-Owner` and `X-SVN-Creation-Date`, and an unlocked file's property empty with neither header.
+#[test]
+fn svn_infos_lockdiscovery_shows_the_lock_and_its_headers() {
+  let mut fixture = Fixture::new();
+  let lock = Lock {
+    path: "/trunk/script.sh".to_owned(),
+    token: LockToken::drawn([7; 16]),
+    owner: "alice".to_owned(),
+    comment: None,
+    is_dav_comment: false,
+    created: AprTime(1_767_225_600_000_000),
+    expires: None,
+  };
+  let token = lock.token.as_str().to_owned();
+  fixture.locks.apply(&LockEntry::Set(lock)).unwrap();
+  let locked = fixture.anonymous("PROPFIND", "/trunk/script.sh", Some("0"), PROPFIND_LOCKS);
+  let unlocked = fixture.anonymous("PROPFIND", "/trunk/a.txt", Some("0"), PROPFIND_LOCKS);
+  let body = text_of(&locked);
+  assert_eq!(
+    (
+      body.contains(&format!("<D:href>{token}</D:href>")),
+      header(&locked.headers, "X-SVN-Lock-Owner"),
+      header(&locked.headers, "X-SVN-Creation-Date"),
+      text_of(&unlocked).contains("<D:lockdiscovery/>\n"),
+      header(&unlocked.headers, "X-SVN-Lock-Owner"),
+    ),
+    (
+      true,
+      vec!["alice"],
+      vec!["2026-01-01T00:00:00.000000Z"],
+      true,
+      Vec::<&str>::new()
+    )
+  );
+}
+
+/// A-681 (`svn_mime_type_validate`): do judge media types; expect a type and subtype taken, with parameters and a tab
+/// among them, and one beginning with its slash (Subversion checks only that the slash is in the media type); and one
+/// with no slash, a special character in its media type, or a control character but a tab anywhere refused.
+#[test]
+fn a_mime_type_is_judged_as_subversion_judges_it() {
+  let judged: Vec<bool> = [
+    "text/plain",
+    "text/html; charset=UTF-8",
+    "text/plain;\tcharset=x",
+    "text",
+    "/plain",
+    "te(xt/plain",
+    "text/pl:ain",
+    "text/plain; \u{1}",
+  ]
+  .iter()
+  .map(|value| valid_mime_type(value))
+  .collect();
+  assert_eq!(
+    judged,
+    [true, true, true, false, true, false, false, false]
+  );
+}
