@@ -244,7 +244,11 @@ impl Search {
       out: core::mem::take(&mut self.out),
       inserts_from: self.inserts_from,
     };
-    let scanned = scan.run(&self.blocks, (at, rolling), at.saturating_add(budget.max(1)));
+    let scanned = scan.run(
+      &self.blocks,
+      (at, rolling),
+      at.saturating_add(budget.max(1)),
+    );
     if scanned == Some(Scanned::End) {
       scan.flush(target.len());
     }

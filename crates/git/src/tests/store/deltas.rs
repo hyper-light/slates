@@ -184,10 +184,7 @@ fn first_unbounded_step(
     .unwrap_or(0)
     .max(1)
     .saturating_mul(BLOCK);
-  let scan_most = budget
-    .max(1)
-    .saturating_add(COPY_MAX)
-    .saturating_add(BLOCK);
+  let scan_most = budget.max(1).saturating_add(COPY_MAX).saturating_add(BLOCK);
   seen.windows(2).find_map(|pair| match pair {
     [before, after]
       if after.indexed.saturating_sub(before.indexed) > blocks
@@ -211,7 +208,10 @@ fn a_delta_is_searched_a_budget_a_step_as_one_pass_searches_it() {
   assert_eq!(first_unbounded_step(&seen, BUDGET), None);
   let steps = seen.last().map_or(0, |last| last.steps);
   let least = u64::try_from(source.len().checked_div(BUDGET).unwrap()).unwrap();
-  assert!(steps >= least, "{steps} steps for {least} budgets of the source");
+  assert!(
+    steps >= least,
+    "{steps} steps for {least} budgets of the source"
+  );
   assert_eq!(delta, reference::delta_of(&source, &target));
   let delta = delta.unwrap();
   assert_eq!(
