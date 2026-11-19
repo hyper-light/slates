@@ -24,10 +24,11 @@
 //!    push).
 //! 5. The service. One whose server half has not landed, or whose repository's store is not held here, is `503` (RFC
 //!    9110 §15.6.4: "the server is currently unable to handle the request"). upload-pack is served from a repository's
-//!    store by [`upload`] (A-640 part 2, A-625 part 3), once the server lends stores (owed); receive-pack by [`receive`]
-//!    through the push driver on the repository's owner shard (A-654 parts 2 and 3). [`Halves`] serves each from its
-//!    own half, and `Unserved` answers `503` to both. A service that cannot start its push is refused as its driver
-//!    says: the repository gone `404`, its policy unreadable `500`, its advertisement unwritable `500`.
+//!    store by [`upload`] (A-640 part 2, A-625 part 3), the store lent from the owner shard's map a step at a time and
+//!    the refs lent those the principal may read (A-682); receive-pack by [`receive`] through the push driver on the
+//!    repository's owner shard (A-654 parts 2 and 3). [`Halves`] serves each from its own half. A service that cannot
+//!    start its push is refused as its driver says: the repository gone `404`, its policy unreadable `500`, its
+//!    advertisement unwritable `500`.
 //!
 //! Every refusal of steps 2 to 5 is typed ([`Refused`]) and counted under its kind in the shard's status counters.
 //!
@@ -243,36 +244,6 @@ pub(crate) trait GitServices {
   type Exchange: Exchange;
   /// Starts the service `start` names, or refuses it.
   fn start(&mut self, start: &Start<'_>) -> Result<Self::Exchange, ServiceRefused>;
-}
-
-/// Services with no server half: each answers [`ServiceRefused::Unavailable`], as upload-pack's half does in the daemon
-/// until the server lends its stores.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Unserved;
-
-/// The exchange an unserved service never starts: no value has this type.
-pub(crate) enum NoExchange {}
-
-impl Exchange for NoExchange {
-  async fn body(&mut self, _run: &[u8]) -> Result<(), Failed> {
-    match *self {}
-  }
-
-  async fn body_end(&mut self) -> Result<(), Failed> {
-    match *self {}
-  }
-
-  async fn reply(&mut self, _out: &mut Vec<u8>) -> Result<bool, Failed> {
-    match *self {}
-  }
-}
-
-impl GitServices for Unserved {
-  type Exchange = NoExchange;
-
-  fn start(&mut self, _start: &Start<'_>) -> Result<NoExchange, ServiceRefused> {
-    Err(ServiceRefused::Unavailable)
-  }
 }
 
 /// git's two services, each from its own half: upload-pack's from `upload`, receive-pack's from `receive` (A-654 part

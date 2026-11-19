@@ -110,7 +110,27 @@ impl StoreLender for Lends {
 
   fn lend<R>(
     &mut self,
+    (id, _reader): (RepositoryId, &Principal),
+    step: impl FnOnce(&Served<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    self.lent(id, UNBORN_HEAD, step)
+  }
+
+  fn lend_objects<R>(
+    &mut self,
     id: RepositoryId,
+    step: impl FnOnce(&Served<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    self.lent(id, &[], step)
+  }
+}
+
+impl Lends {
+  /// Runs `step` over the empty store with `head` as `HEAD`'s branch, when `id` is the one held.
+  fn lent<R>(
+    &mut self,
+    id: RepositoryId,
+    head: &[u8],
     step: impl FnOnce(&Served<'_>, &mut NoPacks) -> R,
   ) -> Option<R> {
     let held = self.held;
@@ -118,9 +138,17 @@ impl StoreLender for Lends {
       repository: &held.repository,
       store: &held.store,
       refs: &[],
-      head: UNBORN_HEAD,
+      head,
     };
     self.holds(id).then(|| step(&served, &mut self.packs))
+  }
+}
+
+/// The session's principal: the repository's owner.
+fn reader() -> Principal {
+  Principal::Uid {
+    host: HostId(0),
+    uid: 1,
   }
 }
 
@@ -169,7 +197,7 @@ fn holds(haystack: &[u8], needle: &[u8]) -> bool {
 /// session, exit 0.
 #[test]
 fn an_ssh_session_advertises_answers_each_request_and_ends_at_a_flush() {
-  let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V2, ROOM);
+  let mut command = UploadCommand::new(Lends::empty(), (HELD, reader()), Version::V2, ROOM);
   let (advertisement, _, waiting) = run(&mut command);
   command.input(LS_REFS).expect("taken");
   let ls_refs = run(&mut command);
@@ -194,7 +222,7 @@ fn an_ssh_session_advertises_answers_each_request_and_ends_at_a_flush() {
 /// no pkt-line. Expect: git's `ERR` answer, every byte consumed, and the session ended with git's `die` status.
 #[test]
 fn a_refused_request_is_answered_in_gits_words_and_ends_the_session() {
-  let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V2, ROOM);
+  let mut command = UploadCommand::new(Lends::empty(), (HELD, reader()), Version::V2, ROOM);
   let _ = run(&mut command);
   command.input(b"zzzz").expect("taken");
   let (answer, consumed, next) = run(&mut command);
@@ -209,7 +237,7 @@ fn a_refused_request_is_answered_in_gits_words_and_ends_the_session() {
 #[test]
 fn a_v0_or_v1_session_is_refused_until_its_stateful_session_is_served() {
   let refused = |version| {
-    let mut command = UploadCommand::new(Lends::empty(), HELD, version, ROOM);
+    let mut command = UploadCommand::new(Lends::empty(), (HELD, reader()), version, ROOM);
     let (answer, consumed, next) = run(&mut command);
     let packet = match pktline::read(&answer, 0) {
       Ok(Some((Packet::Data(data), length))) if length == answer.len() => data.to_vec(),
@@ -230,7 +258,7 @@ fn a_v0_or_v1_session_is_refused_until_its_stateful_session_is_served() {
 /// session ended, exit 0, as git's server ends when its input ends before a request's first packet is whole.
 #[test]
 fn the_end_of_input_before_a_whole_request_ends_the_session() {
-  let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V2, ROOM);
+  let mut command = UploadCommand::new(Lends::empty(), (HELD, reader()), Version::V2, ROOM);
   let _ = run(&mut command);
   command.input(b"0014comm").expect("taken");
   let waiting = run(&mut command);
@@ -252,7 +280,7 @@ fn the_end_of_input_before_a_whole_request_ends_the_session() {
 /// session refused in git's words, "the remote end hung up unexpectedly", with git's `die` status.
 #[test]
 fn the_end_of_input_inside_a_request_dies_as_gits_reader_does() {
-  let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V2, ROOM);
+  let mut command = UploadCommand::new(Lends::empty(), (HELD, reader()), Version::V2, ROOM);
   let _ = run(&mut command);
   command.input(LS_REFS_FIRST_PACKET).expect("taken");
   let waiting = run(&mut command);
@@ -278,10 +306,7 @@ fn record(id: RepositoryId) -> RepositoryRecord {
     tool: VcsTool::Git,
     format: ObjectFormat::Sha1,
     default_branch: None,
-    owner: Principal::Uid {
-      host: HostId(0),
-      uid: 1,
-    },
+    owner: reader(),
     policy: RepositoryPolicy {
       version: 1,
       rules: Vec::new(),
