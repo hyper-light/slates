@@ -105,7 +105,7 @@ impl<'a> Pair<'a> {
   }
 }
 
-/// How a client uses a list's bundles [`config/bundle.adoc`: `bundle.mode`].
+/// How a client uses a list's bundles (`config/bundle.adoc`, `bundle.mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
   /// `all`: the bundles together are what the list offers.
@@ -114,7 +114,7 @@ pub enum Mode {
   Any,
 }
 
-/// How a client chooses among a list's bundles [`config/bundle.adoc`: `bundle.heuristic`].
+/// How a client chooses among a list's bundles (`config/bundle.adoc`, `bundle.heuristic`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Heuristic {
   /// `creationToken`: by each bundle's creation token, newest first, as far back as the client needs.
