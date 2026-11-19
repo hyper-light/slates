@@ -1050,9 +1050,12 @@
 > (7) recorded the `get-file-revs-svndiff0` session; its eighth slice
 > (g297), read access by A-606's rules (the `locked` repository's four scripted and seven stock sessions replayed
 > whole, the connection judging each read by its principal's rules; macOS arm64, Mac Studio, 54 of 54), not yet
-> red-checked. Owed
-> from it: `list`'s fold of a name beyond ASCII (utf8proc's case
-> folding and mark stripping need Unicode's tables; over ASCII it is exact); and a denied read's mid-command authentication request. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
+> red-checked; its step 7 (g297), a denied read's authentication request mid-command (stock `svn cat` and `svn ls` as
+> alice and `svn cat` as bob recorded and replayed whole through the connection) and `list`'s fold beyond ASCII (every
+> scalar value Unicode 17 assigns, 1,112,006, folded as utf8proc 2.12.0 folds it; macOS arm64, Mac Studio, 64 of 64),
+> not yet red-checked. Owed from it: the 58 code points Unicode 18 assigned that `svnserve`'s utf8proc 2.12.0 folds
+> and the fold here keeps (its tables, `unicode-normalization` 0.1.25's and CaseFolding.txt's, are Unicode 17.0.0),
+> until the crate's tables move to 18. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
 > greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's
