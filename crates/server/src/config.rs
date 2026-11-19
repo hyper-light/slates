@@ -44,6 +44,14 @@ const SEAL_KEY_BYTES: usize = 32;
 const FLEET_RECEIVE_SHARE_PERMILLE: u64 = 250;
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
+/// Derived: the NFS send ledgers an anchor may hold for a daemon at once (A-550, Linux): the one in force, and at a
+/// start the fresh one, held before the newest inherited one is let go (every older one is let go first,
+/// `crate::held_send::Handover`). None elsewhere, where no ledger is kept.
+#[cfg(target_os = "linux")]
+const LEDGER_COPIES: usize = 2;
+/// See the Linux arm.
+#[cfg(not(target_os = "linux"))]
+const LEDGER_COPIES: usize = 0;
 /// Shape: the archive walk's slice as a share of the shard's step budget, parts per thousand: half,
 /// so a seal in progress never takes the whole step from the clients (the share a cooperative destroy
 /// takes, `verbs::DESTROY_SLICE_PERMILLE`).
@@ -644,12 +652,13 @@ impl DaemonConfig {
   }
 
   /// Derived: the copies an anchor may hold for this daemon across a restart: every writable direct map's copy its shards
-  /// may hold at once (A-197), `shards × direct_maps_per_shard`, of which the writable ones are some; and every Shards
-  /// stream's DAX object ([`DaemonConfig::held_dax_bound`]).
+  /// may hold at once (A-197), `shards × direct_maps_per_shard`, of which the writable ones are some; every Shards
+  /// stream's DAX object ([`DaemonConfig::held_dax_bound`]); and the NFS send ledgers ([`LEDGER_COPIES`]).
   pub fn held_copy_bound(&self) -> usize {
     usize::from(self.runtime.shards)
       .saturating_mul(self.direct_maps_per_shard)
       .saturating_add(self.held_dax_bound())
+      .saturating_add(LEDGER_COPIES)
   }
 
   /// Derived: the Shards streams' DAX objects an anchor may hold for this daemon across a restart (A-365; Windows' DAX

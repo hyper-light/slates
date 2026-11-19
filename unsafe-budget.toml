@@ -400,7 +400,11 @@ slates-mem = 63
 #   handle asked with a zero timeout for the register-then-test and each wake's attribution (`WaitForSingleObject`, 1),
 #   and the callback's read of the context its registration boxed (1). The callback's post shares the kick's one
 #   `PostQueuedCompletionStatus` block (`iocp::post`, 0). None has a safe wrapper.
-slates-rt = 106
+# 2026-11-19 (+1, A-550, `netsys.rs` `send_queue`, compiled only for Linux): `ioctl(SIOCOUTQ)`, the bytes a held NFS
+#   connection queued and the peer has not acknowledged, which with `tcpi_bytes_acked` (read through the existing
+#   `getsockopt` helper) tells a successor whether the stream a dead daemon left stands on a record's boundary. rustix
+#   wraps `FIONREAD` but not `SIOCOUTQ`, and no other call reads it.
+slates-rt = 107
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
