@@ -44,6 +44,15 @@ const SVNDIFF1: &[u8] = b"svndiff1 ";
 /// The sessions the golden replay must meet: every recorded one.
 const REPLAYED: usize = 40;
 
+/// The entry `svnserve` hides from the anonymous principal in a listing (`make-fixtures.py`'s
+/// `AUTHZ`), which A-613's `get-dir` lists: the read commands apply no authorization yet (A-606,
+/// owed in `reads`).
+const HIDDEN: &[u8] = b"secret";
+
+/// The answers the replay meets where slates lists [`HIDDEN`] and `svnserve` does not: one, the
+/// listing of `/trunk` in `update-depth-files`.
+const HIDDEN_LISTINGS: usize = 1;
+
 /// The repository `svnserve` named for every recorded session's URL: anonymous reads, users with
 /// keys, mergeinfo announced, its UUID its realm (`make-fixtures.py`).
 fn fixtures_repository() -> Repository<'static> {
@@ -154,7 +163,8 @@ fn session_guards(recorded: Recorded) -> FixtureGuards {
   }
 }
 
-/// An item as a tree, every list of pairs led by a string sorted, so property lists compare as sets.
+/// An item as a tree, every list of records led by a name sorted, so property lists and a
+/// directory's entries compare as sets.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Tree {
   /// A word.
@@ -175,10 +185,10 @@ fn tree(value: &Value<'_>) -> Tree {
     Value::String(bytes) => Tree::Bytes(bytes.to_vec()),
     Value::List(items) => {
       let mut trees: Vec<Tree> = items.iter().map(tree).collect();
-      let pairs = trees.iter().all(|tree| {
-        matches!(tree, Tree::List(pair) if pair.len() == 2 && matches!(pair[0], Tree::Bytes(_)))
-      });
-      if pairs {
+      let named = |tree: &Tree| {
+        matches!(tree, Tree::List(record) if record.len() >= 2 && matches!(record[0], Tree::Bytes(_)))
+      };
+      if !trees.is_empty() && trees.iter().all(named) {
         trees.sort();
       }
       Tree::List(trees)
@@ -198,18 +208,43 @@ fn drive_span(items: &[&[u8]]) -> (usize, usize) {
   (start, start + drive.len())
 }
 
-/// Asserts that items match one for one as trees.
-fn assert_items(name: &str, ours: &[&[u8]], theirs: &[&[u8]]) {
+/// A tree without the directory entry named [`HIDDEN`].
+fn without_hidden(tree: Tree) -> Tree {
+  match tree {
+    Tree::List(items) => Tree::List(
+      items
+        .into_iter()
+        .filter(|item| !matches!(item, Tree::List(record) if record.first() == Some(&Tree::Bytes(HIDDEN.to_vec())) && matches!(record.get(1), Some(Tree::Word(_)))))
+        .map(without_hidden)
+        .collect(),
+    ),
+    other => other,
+  }
+}
+
+/// Asserts that items match one for one as trees, ours allowed to list [`HIDDEN`] where theirs
+/// does not; the answers that did so are counted into `hidden`.
+fn assert_items(name: &str, ours: &[&[u8]], theirs: &[&[u8]], hidden: &mut usize) {
   assert_eq!(ours.len(), theirs.len(), "{name}: the items");
   for (index, (ours, theirs)) in ours.iter().zip(theirs).enumerate() {
-    assert_eq!(tree(&value_of(ours)), tree(&value_of(theirs)), "{name}: item {index}");
+    let (ours, theirs) = (tree(&value_of(ours)), tree(&value_of(theirs)));
+    if ours != theirs {
+      assert_eq!(without_hidden(ours), theirs, "{name}: item {index}");
+      *hidden += 1;
+    }
   }
 }
 
 /// Asserts that a connection wrote what `svnserve` wrote in its session, up to `end` of our items:
 /// the greeting less `svndiff1`, the items before the drive and after it as trees, the drive call
 /// for call in the shared form.
-fn assert_as_svnserve(name: &str, ours: &[&[u8]], server: &[u8], texts: &BTreeMap<[u8; 16], Vec<u8>>) {
+fn assert_as_svnserve(
+  name: &str,
+  ours: &[&[u8]],
+  server: &[u8],
+  texts: &BTreeMap<[u8; 16], Vec<u8>>,
+  hidden: &mut usize,
+) {
   let theirs = items(server);
   let greeting: Vec<u8> = {
     let greeting = theirs[0];
@@ -220,27 +255,28 @@ fn assert_as_svnserve(name: &str, ours: &[&[u8]], server: &[u8], texts: &BTreeMa
   let (our_start, our_end) = drive_span(ours);
   let (their_start, their_end) = drive_span(&theirs);
   if our_start == ours.len() {
-    assert_items(name, &ours[1..], &theirs[1..ours.len()]);
+    assert_items(name, &ours[1..], &theirs[1..ours.len()], hidden);
     return;
   }
-  assert_items(name, &ours[1..our_start], &theirs[1..their_start]);
+  assert_items(name, &ours[1..our_start], &theirs[1..their_start], hidden);
   let our_drive = read_drive(&ours[our_start..our_end]).calls;
   let their_drive = read_drive(&theirs[their_start..their_end]).calls;
   assert_eq!(normalize(our_drive, texts), normalize(their_drive, texts), "{name}: the drive");
   let after = ours.len() - our_end;
-  assert_items(name, &ours[our_end..], &theirs[their_end..their_end + after]);
+  assert_items(name, &ours[our_end..], &theirs[their_end..their_end + after], hidden);
 }
 
 /// A-656 (`serve.c`'s command loop against stock `svnserve` 1.15.0): replay every recorded session
 /// from its first byte through a connection over the fixtures' repository, the client's items
 /// handed over as a stock client sends them; expect `svnserve`'s greeting less `svndiff1`, every
 /// item as a tree, the drive call for call, up to a command not served yet, answered "Unknown editor
-/// command"; and every recorded session met.
+/// command"; and every recorded session met, the listing that shows an entry `svnserve` hides the
+/// one place they differ.
 #[test]
 fn every_recorded_session_is_answered_as_svnserve_answered_it() {
   let fixture = fixture();
   let texts = texts_by_md5(&fixture.green);
-  let mut replayed = 0;
+  let (mut replayed, mut hidden) = (0, 0);
   for recorded in SESSIONS.iter().copied() {
     let (out, ending) = replay(&fixture, recorded, PLENTY);
     replayed += 1;
@@ -257,9 +293,10 @@ fn every_recorded_session_is_answered_as_svnserve_answered_it() {
       }
       Ending::Waiting => ours.len(),
     };
-    assert_as_svnserve(recorded.name, &ours[..compared], recorded.server, &texts);
+    assert_as_svnserve(recorded.name, &ours[..compared], recorded.server, &texts, &mut hidden);
   }
   assert_eq!(replayed, REPLAYED);
+  assert_eq!(hidden, HIDDEN_LISTINGS);
 }
 
 /// A-656 (bounded turns): replay the recorded checkout and an update with one byte and one step a
@@ -452,7 +489,7 @@ fn a_tunnels_user_is_taken_and_a_closed_repository_ends_the_connection() {
   };
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();
-  let answer = b"( 2 ( edit-pipeline ) 25:svn://127.0.0.1/repo/trunk ) ";
+  let answer = b"( 2 ( edit-pipeline ) 26:svn://127.0.0.1/repo/trunk ) ";
   let none = None::<&Sources<'_, Green, FixtureGuards>>;
   let opened = connection.receive(none, answer, &mut out, PLENTY).unwrap();
   assert!(matches!(opened, Turn::Opened { .. }));
