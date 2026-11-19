@@ -994,4 +994,88 @@ mod tests {
     let db = recover(segment, 0, caps(), 0).unwrap().0;
     assert_eq!(db.partition().carried(id), None);
   }
+
+  /// A-540. Do: record a host mount's attachment and bind it; keep its mount's id with `AttachmentMountSeen`; ask the
+  /// same for an attachment the partition does not hold; then recover the database from its log, and from a snapshot.
+  /// Expect: no id before the mount was seen; the id kept once seen; the unheld attachment refused `NotFound` with
+  /// nothing recorded; and both recoveries keeping the id, so a restarted daemon can judge the mount by it.
+  #[test]
+  fn an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot() {
+    use crate::catalog::{AttachForm, AttachmentRecord, Consumer, Rights};
+    /// Shape: the kernel's id of the attachment's mount.
+    const MOUNT: u64 = (7 << 32) | 42;
+    /// Shape: the attachment.
+    const ATTACHMENT: u64 = 3;
+    let mut segment = segment_named("slates-db-replay-mount-seen");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    let record = volume();
+    let (id, owner) = (record.id, record.owner.clone());
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    let attachment = AttachmentRecord {
+      id: ATTACHMENT,
+      volume: id,
+      consumer: Consumer::Bridge,
+      snapshot: None,
+      form: AttachForm::Root,
+      principal: owner,
+      rights: Rights {
+        read: true,
+        write: true,
+        admin: false,
+      },
+      token: [1; 16],
+      mount: None,
+    };
+    db.mutate(&mut segment, &Op::AttachmentAdded { record: attachment }, 0)
+      .unwrap();
+    db.mutate(
+      &mut segment,
+      &Op::AttachmentBound {
+        id: ATTACHMENT,
+        path: "/Volumes/seen".to_owned(),
+      },
+      0,
+    )
+    .unwrap();
+    let seen = |db: &Db| {
+      db.partition()
+        .attachment(ATTACHMENT)
+        .and_then(|record| record.mount)
+    };
+    assert_eq!(seen(&db), None, "a mount never seen leaves no id");
+    db.mutate(
+      &mut segment,
+      &Op::AttachmentMountSeen {
+        id: ATTACHMENT,
+        mount: MOUNT,
+      },
+      0,
+    )
+    .unwrap();
+    assert_eq!(
+      seen(&db),
+      Some(MOUNT),
+      "the record keeps the seen mount's id"
+    );
+    assert_eq!(
+      db.mutate(
+        &mut segment,
+        &Op::AttachmentMountSeen {
+          id: ATTACHMENT + 1,
+          mount: MOUNT,
+        },
+        0,
+      ),
+      Err(DbError::NotFound),
+      "an attachment the partition does not hold keeps nothing"
+    );
+    drop(db);
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(seen(&db), Some(MOUNT), "replayed from the log");
+    db.snapshot(&mut segment).unwrap();
+    drop(db);
+    let db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(seen(&db), Some(MOUNT), "restored from a snapshot");
+  }
 }

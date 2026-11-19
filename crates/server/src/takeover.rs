@@ -201,6 +201,11 @@ const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 /// is judged at. Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_HOLDING_CONTENT: &str = "fleet.takeover.kept_holding_content";
 
+/// The status count of manifests a holder released from a stale copy judged on a takeover whose confirmations certify
+/// their content (A-538): the successor serves the volume from its own placement, so no head it serves names this
+/// holder for what its stale records name. Format: a refusal name in the daemon's status report.
+const TAKEOVER_RELEASED_CERTIFIED: &str = "fleet.takeover.released_certified";
+
 /// The status count under which a holder records a copy of a live owner's object it let go because it is in none of
 /// that owner's neighbourhoods and the owner's settled cohort for the object is whole and at least `f + 1` wide
 /// (`RegionalConfiguration::settled_away`, A-508): the copy's record, or a newer one, is on `f + 1` live hosts without it,
@@ -213,6 +218,11 @@ const SETTLE_RELEASED: &str = "fleet.settle.released";
 /// owner has not settled a new neighbourhood), is narrower than `f + 1` (a bootstrap's), or the object moved (A-508).
 /// Counted at each install that judges it. Format: a refusal name in the daemon's status report.
 const SETTLE_KEPT_OUTSIDE: &str = "fleet.settle.kept_outside";
+
+/// The status count of manifests a holder released from a live owner's copy it let go on a settle that certifies the
+/// owner's content (A-546): no head the owner serves names this holder for what its own records name. Format: a refusal
+/// name in the daemon's status report.
+const SETTLE_RELEASED_CONTENT: &str = "fleet.settle.released_content";
 
 /// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
 /// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
@@ -531,11 +541,16 @@ fn resolve_by_route(
     return;
   };
   if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
+    // The confirmation judged is the copy's takeover's, so is its certification (A-538).
+    let certified = state
+      .departed_owners
+      .get(&object)
+      .is_some_and(|departed| regional.certifies_content(departed.owner));
     match stale_after_confirmation(state, regional, object, owner, local) {
-      Confirmation::Stale => let_go_stale(state, object),
+      Confirmation::Stale => let_go_stale(state, object, certified),
       Confirmation::Covered => {
         state.count(TAKEOVER_UNASKED_COVERED, 1);
-        let_go_stale(state, object);
+        let_go_stale(state, object, certified);
       }
       Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
       Confirmation::None => settle_away(state, regional, object, owner, local),
@@ -564,12 +579,14 @@ fn resolve_by_route(
     // it shows what it keeps that no takeover will recover (A-340).
     Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
     Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
+    // A settled line's holder lagged: it judges no successor's placement, so its content goes only as its retention rule
+    // lets it, certified or not (A-538 releases content only where the holder is outside the successor's placement).
     Lineage::Settled { takeover } => {
       if regional.settled_for(takeover, local) {
-        let_go_stale(state, object);
+        let_go_stale(state, object, false);
       } else if unasked_copy_stale(state, regional, object) {
         state.count(TAKEOVER_UNASKED_COVERED, 1);
-        let_go_stale(state, object);
+        let_go_stale(state, object, false);
       } else {
         state.count(TAKEOVER_KEPT_UNASKED, 1);
       }
@@ -585,8 +602,25 @@ fn resolve_by_route(
 /// dead owner the only other holder this copy is the one it fetches. AUD-29-43's rule is the same one: a holder keeps
 /// content for a head it still backs, and the adopted head still names it. Before, the reclaim dropped the content with
 /// the record (the bug record of 2026-11-18).
-fn let_go_stale(state: &mut ShardState, object: ObjectId) {
-  crate::content_retention::retain_object(state, object);
+///
+/// `certified` when the confirmation the copy was judged on certifies its content (A-538,
+/// `RegionalConfiguration::certifies_content`): the successor confirmed only once it served the volume from its own
+/// placement (A-529), which this holder is outside, so no head it serves names this holder for the content its own
+/// stale records name, and that goes ([`crate::content_retention::release_certified`], counted
+/// [`TAKEOVER_RELEASED_CERTIFIED`]); content placed ahead of those records stays. A takeover read from an older layout is
+/// uncertified, and its holders keep the content as before.
+fn let_go_stale(state: &mut ShardState, object: ObjectId, certified: bool) {
+  if certified {
+    let released = crate::content_retention::release_certified(state, object);
+    if released > 0 {
+      state.count(
+        TAKEOVER_RELEASED_CERTIFIED,
+        u64::try_from(released).unwrap_or(u64::MAX),
+      );
+    }
+  } else {
+    crate::content_retention::retain_object(state, object);
+  }
   if state.held_content.newest_placed(object).is_some() {
     state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
     return;
@@ -705,7 +739,7 @@ fn settle_away(
     return;
   }
   if regional.settled_away(owner, local, object) {
-    let_go_settled_away(state, object);
+    let_go_settled_away(state, object, regional.settle_certifies_content(owner));
   } else {
     state.count(SETTLE_KEPT_OUTSIDE, 1);
   }
@@ -714,9 +748,23 @@ fn settle_away(
 /// Lets go a copy a live owner's neighbourhood settled away from (A-508) as a stale one goes ([`let_go_stale`]): kept
 /// whole, counted [`TAKEOVER_KEPT_HOLDING_CONTENT`], while its retention rule keeps content for it, since the owner's
 /// head may still name this holder for its content and the healer leaves such a named holder be (A-335, A-276's open
-/// item); dropped otherwise, counted [`SETTLE_RELEASED`].
-fn let_go_settled_away(state: &mut ShardState, object: ObjectId) {
-  crate::content_retention::retain_object(state, object);
+/// item); dropped otherwise, counted [`SETTLE_RELEASED`]. Where the owner's settle certifies its content (`certified`,
+/// A-546: it reported its neighbourhood placed only once every volume it owns was served from within it), no head it
+/// serves names this holder, which is outside its neighbourhoods, so the content this holder's own records name goes
+/// first ([`crate::content_retention::release_certified`], counted [`SETTLE_RELEASED_CONTENT`]); content placed ahead
+/// of those records stays.
+fn let_go_settled_away(state: &mut ShardState, object: ObjectId, certified: bool) {
+  if certified {
+    let released = crate::content_retention::release_certified(state, object);
+    if released > 0 {
+      state.count(
+        SETTLE_RELEASED_CONTENT,
+        u64::try_from(released).unwrap_or(u64::MAX),
+      );
+    }
+  } else {
+    crate::content_retention::retain_object(state, object);
+  }
   if state.held_content.newest_placed(object).is_some() {
     state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
     return;

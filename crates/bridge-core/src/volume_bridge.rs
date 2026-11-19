@@ -952,6 +952,25 @@ impl Bridge for VolumeBridge<'_> {
     Ok(attr)
   }
 
+  fn stored_entry(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+  ) -> Result<(String, NodeAttr), VfsError> {
+    // Looked up first, through the base plane on an overlay, so an untouched base entry is in the directory with the
+    // name its host gave it (`lookup` materializes a hit). `.` and `..` are no entries a directory stores: they are named
+    // as asked.
+    let attr = self.lookup(parent, cx, name)?;
+    if name == "." || name == ".." {
+      return Ok((name.to_owned(), attr));
+    }
+    let stored = self
+      .volume
+      .stored_name_no(self.store, InodeNo(parent.inode), name)?;
+    Ok((stored, attr))
+  }
+
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError> {
     self.authorize_read(cx)?;
     if let Some(owner) = InodeNo(object.inode).derived_from() {

@@ -12,13 +12,14 @@
 //! **What it is not.** A second API. Every method is the [`Instance`] verb of the same name, taking and returning the
 //! contract's own types: no outcome or error type is added for it, and a contract change reaches it as it reaches the
 //! instance. The trait carries what a scheduler does with volumes: provision from every source, snapshot, destroy,
-//! list, serve one to a Shards microVM, mount one on the host, and end an attachment. Landings, merges and write
-//! policy stay on the instance, which a host that schedules work does not drive.
+//! list, serve one to a Shards microVM, mount one on the host, bind a mount into a container (A-520), and end an
+//! attachment. Landings, merges and write policy stay on the instance, which a host that schedules work does not drive.
 //!
 //! **What the simulator answers.** The same typed outcome or [`Error`] the instance answers for the same request, for
 //! every case the conformance suite exercises; it serves no file system, so a stream it hands out is answered by
 //! nothing and a mount it makes is a record of one ([`crate::sim`]).
 
+use crate::container::ContainerBind;
 use crate::error::Error;
 use crate::instance::Instance;
 use crate::mount::{MountOptions, Mounted, Unmounted};
@@ -62,6 +63,16 @@ pub trait Volumes {
 
   /// [`Instance::unmount`]: the mount at `path` removed, with each volume a Windows scan could not ask.
   fn unmount(&mut self, path: &str) -> Result<Unmounted, Error>;
+
+  /// [`Instance::bind_into_container`]: `volume`'s mount at `source` bound at `destination` inside a container, the
+  /// entry the host's OCI runtime performs.
+  fn bind_into_container(
+    &mut self,
+    volume: VolumeId,
+    source: &str,
+    destination: &str,
+    intent: Intent,
+  ) -> Result<ContainerBind, Error>;
 
   /// [`Instance::detach`]: an attachment (a mount's, a stream's) ended.
   fn detach(&mut self, attachment: u64) -> Result<(), Error>;
@@ -108,6 +119,16 @@ impl Volumes for Instance {
 
   fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
     Instance::unmount(self, path)
+  }
+
+  fn bind_into_container(
+    &mut self,
+    volume: VolumeId,
+    source: &str,
+    destination: &str,
+    intent: Intent,
+  ) -> Result<ContainerBind, Error> {
+    Instance::bind_into_container(self, volume, source, destination, intent)
   }
 
   fn detach(&mut self, attachment: u64) -> Result<(), Error> {
