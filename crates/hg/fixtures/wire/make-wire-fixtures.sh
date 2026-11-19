@@ -172,7 +172,7 @@ REMOTE="ssh://user@dummy/$WORK/server"
 CAPTURE="$WORK/ssh-clone" hg clone -q "${SSH[@]}" "$REMOTE" sshclient
 (cd server && printf 'b\n' > b && hg add -q b && hg commit -m second)
 (cd sshclient && CAPTURE="$WORK/ssh-pull" hg pull -q "${SSH[@]}" "$REMOTE")
-(cd sshclient && printf 'c\n' > c && hg add -q c && hg commit -m third)
+(cd sshclient && hg update -q tip && printf 'c\n' > c && hg add -q c && hg commit -m third)
 (cd sshclient && CAPTURE="$WORK/ssh-push" hg push -q "${SSH[@]}" "$REMOTE")
 CAPTURE="$WORK/ssh-wireargs" hg debugwireargs "${SSH[@]}" "$REMOTE" un deux --three "$THREE" --four "$FOUR" \
   > "$OUT/ssh-wireargs.answer"
