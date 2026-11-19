@@ -192,7 +192,10 @@ fn waits_and_host(s: &mut ShardState, volume: VolumeId) -> (&mut BaseWaits, Opti
 /// every request parked on the fetch it settled woken to run again (A-555). How many were woken: none when it settled
 /// no fetch (a listing's page that asks for the next), when nothing waited on it, or when the volume or its S3 base is
 /// gone. The shard's driver of the host's fetches calls it as each answer arrives.
-#[cfg_attr(not(test), allow(dead_code))] // Its caller is the fetch driver, the S3 volume's next piece (GAPS A-464).
+#[expect(
+  dead_code,
+  reason = "its caller is the fetch driver, the S3 volume's next piece (GAPS A-464); the tests drive `land_on`"
+)]
 pub(crate) fn land(
   s: &mut ShardState,
   volume: VolumeId,

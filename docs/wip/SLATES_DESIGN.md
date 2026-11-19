@@ -37727,6 +37727,12 @@ oracle's tree a type alias.
   and dispatched again when its fetch lands); the other transports' answers and waits (WinFsp, the Shards streams,
   slates' virtio-fs device, the typed channel's verbs); and the volume over an S3 base itself (the wire's create, the
   credential's hand-off, the fetch driver that calls `base_wait::land`), with A-524's other owed items.
-- **Evidence.** Mac Studio (debug, 2026-11-19, kiln r128): see the commit for the unit runs, red first with today's
-  behaviour put back (no wake, no hold release, no bound, the bridges' catch-alls; the cache shedding a held item) and
-  then green.
+- **Evidence.** Mac Studio (debug, 2026-11-19). Red first, today's behaviour put back on a scratch copy: before the
+  merge (kiln r128) the FUSE lookup answered `EIO` and the NFS call `NFS3ERR_SERVERFAULT`, and with held items shed the
+  host's hold test kept `b.bin` beside nothing; on the merged tree (r241) with no wake a landing woke none of its
+  requests (`(0, 0, 0)` where `(0, 0, 1)` was due), with no bound a second request parked (`Parked(1)` where `Full`
+  was due), with no release `b.bin`'s chunk was still not kept (2 unkept where 1 was due), and with held items shed both
+  hold tests kept it at once (0 where 1 was due). Green on the merged tree (r241): `cargo test --locked -p
+  slates-server --lib -- base_wait error::` 6 of 6, `-p slates-base --lib -- s3` 55 of 55, `-p slates-vfs --lib --
+  base::` 4 of 4, `-p slates-land --lib -- engine` 2 of 2, `-p slates-bridge-fuse --lib -- bridge::tests` 1 of 1,
+  `-p slates-bridge-nfs --lib -- procedures::tests` 1 of 1, `cargo fmt --check` clean.
