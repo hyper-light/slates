@@ -34395,7 +34395,7 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   takeover: the window in which a request refused for now is held for its resend under its id, the pause between
   such resends (a tenth of it) and `call_through_transient`; their own bound, the failover delay the daemon reports, is
   owed (GAPS, class C). The server's reclaim of a taken-back map no holder claims (`held_copy::reconnect_budget_ns`)
-  mirrors the old budget, owed beside them. `CLAIM_WAIT_NS` keeps its users less the two A-468 removes (a Windows
+  mirrored the old budget; since A-552 its claim is owed for the failover delay its shard holds. `CLAIM_WAIT_NS` keeps its users less the two A-468 removes (a Windows
   claim's wait under a live anchor, and the further one for a claim the daemon took to answer).
 - **Tests (each written red first).** `rendezvous::platform::tests`, on every platform:
   `a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget` (a daemon end stops before
@@ -36537,7 +36537,11 @@ D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`
 `crates/base/src/own_mounts.rs` (`Gate`, `Learning`'s drop, `await_learned`, the test), `crates/server/src/anchor_answers.rs`
 (new, cfg-free: `AnchorAnswers` and its test), `crates/server/src/lib.rs`, `crates/server/src/anchor_hold_windows.rs`
 (`ANSWERS`, `ANSWER_BOUND_NS`, `answer_bound_ns`, `learn`, `exchange`, `release_bound_ns`; `HOLD_BUDGET_NS`,
-`RELEASE_ATTEMPT_NS` and `RELEASE_BOUND_NS` deleted; its test's first deadline) and `crates/server/src/winfsp.rs`.
+`RELEASE_ATTEMPT_NS` and `RELEASE_BOUND_NS` deleted; its test's first deadline), `crates/server/src/winfsp.rs`,
+`crates/server/src/direct_map.rs` (`claim_overdue`, `unclaimed`'s doc, the test), `crates/server/src/held_copy.rs`
+(`taken_back_ns`, `adopt_or_release`, `reclaim_unclaimed`; `reconnect_budget_ns` and `claim_deadline` deleted),
+`crates/server/src/shards/dax_hold.rs`, `crates/cli/tests/pmem.rs`'s doc, and A-468's note on the reclaim (below and
+GAPS).
 - **What was there.** A-359's sweep left the daemon's own supervision waits on the liveness window `W` (class D, D-c),
   each owed its own change: a starved hold's CPU (`starved_share_ns`), the log writer's drain wait at a stop
   (`stop_parts`), the learning gate's crossing wait (`start_with_fleet`), the Windows hold channel's two bounds
@@ -36579,6 +36583,16 @@ D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`
   exchange reads it once as it begins, so the asking shard waits for the owner shard (in its own time, A-440) by the
   same span the owner waits for the anchor. A detach answers its client a refusal once a release is late past that
   bound (`release_bound_ns`), and goes on asking as before.
+- **A taken-back writable copy's claim (`held_copy`, A-197; Linux).** A copy the successor took back from its anchor
+  waits for its holder to name it in a sync or a release; one no holder claimed within the client's reconnect budget
+  (the recovery budget and a window, mirrored from `slates_client::Deadlines`), counted from the shard's start, was
+  written back and let go with its attachment. No client keeps that budget any more: since A-468 a client reconnects
+  while its anchor lives, by no clock. The map keeps its holder's write attachment, and with it the holder's write lease
+  (D-16), which a silent holder keeps for the failover delay since A-414. So a claim is now owed for the failover delay
+  the shard holds (`direct_map::claim_overdue`, cfg-free): the shard records when it took the map back, and each reclaim
+  judges that instant by the delay the shard holds then (A-363's estimate, fanned to every shard), so a dead holder's
+  lease keeps no other writer out longer than a silent one's would, and a fleet that measures a longer delay gives a
+  holder as long.
 - **Tests.** `a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by` (`crates/server/src/daemon.rs`: a quiet
   shard's hold half the liveness window, a shard held two and a half windows half of those, a span under a beat a beat
   at most); red with today's rule (the held shard's hold half the liveness window) on the Mac Studio.
@@ -36594,3 +36608,7 @@ D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`
   failover delay, back under the doubled bound once one is answered); red with today's rule (two seconds before any
   answer). The Windows wiring and its pipe test (`a_missed_deadline_keeps_the_hold_channel_and_a_late_answer_answers_nothing`,
   its first deadline now the estimator's first bound) are Windows-only and filed for main's build.
+  `a_taken_back_maps_claim_is_owed_for_the_failover_delay_its_shard_holds_now` (`crates/server/src/direct_map.rs`:
+  with the delay at three windows a map is owed at two and a half and overdue at three and a half, and overdue at two
+  and a half once the delay is two); red with today's rule (overdue at two and a half, past the old two seconds). The
+  Linux wiring is filed for main's build, with the pmem flows that reclaim a copy (`crates/cli/tests/pmem.rs`).

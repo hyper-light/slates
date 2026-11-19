@@ -4044,9 +4044,11 @@
 > where it spun one `W` in all; the Windows hold channel's exchanges wait for the anchor by a bound learned from its
 > answers (RFC 6298's tail plus a window, Karn's rule, backed off to the failover delay; `crate::anchor_answers`),
 > where a hold waited the recovery budget and a window and a release a window (the wiring is Windows-only, built by
-> main).
-> Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
-> `held_copy`; D-c), and a laptop's
+> main); and a taken-back writable copy's claim (`held_copy`, Linux) is owed for the failover delay its shard holds,
+> the term its holder's write lease runs for (A-414), where it mirrored the client's old two-second reconnect budget
+> (the wiring is Linux-only, built by main). D-c is closed by these.
+> Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
+> in the event-driven reaper series), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
@@ -4206,9 +4208,10 @@
 >   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
 >   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
 >   owner's takeover (a request refused for now held for its resend, the pause between resends,
->   `Client::call_through_transient`), owed to the failover delay the daemon reports; and the server's reclaim of a
->   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") still mirrors the old
->   reconnect budget, a fixed two seconds R3 forbids, owed. macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
+>   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old
+>   reconnect budget, a fixed two seconds R3 forbids; since A-552 its claim is owed for the failover delay its shard
+>   holds (`direct_map::claim_overdue`), the term a silent holder keeps its write lease for (A-414). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
