@@ -14,7 +14,8 @@
 //! **Names a `fetch` gives.** A `want-ref` is a ref's full name, `HEAD` read through to the default branch
 //! (`refs_read_ref`). A `deepen-not` is tried, as `expand_ref` tries it, as each of git's patterns (the name itself, then
 //! under `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, and `refs/remotes/<name>/HEAD`), and must name exactly
-//! one ref. A ref whose green has no version names nothing, as no git ref does.
+//! one ref. A `sparse:oid` filter's revision is the first ref those patterns find, as `repo_dwim_ref` takes it (A-640
+//! part 4). A ref whose green has no version names nothing, as no git ref does.
 
 use core::cmp::Ordering;
 
@@ -89,6 +90,15 @@ pub(super) fn deepen_not(
     (None, _) => Err(Refusal::DeepenNotRef { rev: rev.to_vec() }),
     (Some(_), Some(_)) => Err(Refusal::DeepenNotAmbiguous { rev: rev.to_vec() }),
   }
+}
+
+/// What the ref a short name names, by position (A-640 part 4, a `sparse:oid` filter's revision): the ref the first of
+/// git's patterns finds (`repo_dwim_ref`, which takes the first and warns of the rest), `HEAD` read through to the
+/// default branch; `None` when no pattern finds one.
+pub(super) fn dwim(graph: &StoreGraph<'_>, served: &Served<'_>, rev: &[u8]) -> Option<u64> {
+  REV_PARSE_RULES
+    .iter()
+    .find_map(|&(before, after)| resolved(graph, served, [before, rev, after]))
 }
 
 /// What the ref whose name `parts` make up, in order, names: `HEAD` read through to the default branch.
@@ -245,10 +255,16 @@ fn ref_line<'n>(graph: &StoreGraph<'_>, name: &'n [u8], node: u64, peel: bool) -
 }
 
 /// What the annotated tag at `node` names, peeled through every tag it names in turn (`peel_iterated_oid`): `None` for an
-/// object that is no tag, and for a chain of tags that comes back on itself, which a store whose names are hashes
-/// cannot hold. Floyd's check (a second walker at twice the pace meets the first inside a loop) keeps the walk finite
-/// without a list of what it passed.
+/// object that is no tag, and for a chain of tags that comes back on itself ([`peeled_node`]).
 pub(super) fn peeled(graph: &StoreGraph<'_>, node: u64) -> Option<ObjectId> {
+  peeled_node(graph, node).map(|peeled| graph.id(peeled))
+}
+
+/// What the annotated tag at `node` names, by position, peeled through every tag it names in turn: `None` for an object
+/// that is no tag, and for a chain of tags that comes back on itself, which a store whose names are hashes cannot hold.
+/// Floyd's check (a second walker at twice the pace meets the first inside a loop) keeps the walk finite without a list
+/// of what it passed.
+pub(super) fn peeled_node(graph: &StoreGraph<'_>, node: u64) -> Option<u64> {
   let mut slow = node;
   let mut fast = node;
   while graph.kind(fast) == Kind::Tag {
@@ -262,5 +278,5 @@ pub(super) fn peeled(graph: &StoreGraph<'_>, node: u64) -> Option<ObjectId> {
       return None;
     }
   }
-  (fast != node).then(|| graph.id(fast))
+  (fast != node).then_some(fast)
 }
