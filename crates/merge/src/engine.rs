@@ -2973,24 +2973,42 @@ impl Green {
         .saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
-    seed(&mut self.mode_history, &path, held(self.modes.get(&path)));
-    if self.modes.remove(&path).is_some() {
-      self.identity_dirty.insert(IdentityKey::Mode(path.clone()));
-      self.mode_changed.insert(path.clone(), version);
+    self.drop_metadata(&path, version);
+    self
+      .special_history
+      .entry(path)
+      .or_default()
+      .push((version, None));
+  }
+
+  /// Removes `path`'s mode and attributes, keeping their values in the history and marking what the identity and the
+  /// verdict read: what a removed special node's metadata does (`remove_special`), and since A-618 a removed file's and
+  /// directory's, once nothing stands at the path.
+  fn drop_metadata(&mut self, path: &str, version: u64) {
+    seed(
+      &mut self.mode_history,
+      &path.to_owned(),
+      held(self.modes.get(path)),
+    );
+    if self.modes.remove(path).is_some() {
+      self
+        .identity_dirty
+        .insert(IdentityKey::Mode(path.to_owned()));
+      self.mode_changed.insert(path.to_owned(), version);
       self
         .mode_history
-        .entry(path.clone())
+        .entry(path.to_owned())
         .or_default()
         .push((version, None));
     }
     let attributes: Vec<(String, Vec<u8>)> = self
       .xattrs
-      .of(&path)
+      .of(path)
       .map(|(name, value)| (name, value.clone()))
       .collect();
     for (name, value) in attributes {
-      self.xattrs.remove(&path, &name);
-      let key = (path.clone(), name);
+      self.xattrs.remove(path, &name);
+      let key = (path.to_owned(), name);
       seed(&mut self.xattr_history, &key, Some(Some(value)));
       self
         .identity_dirty
@@ -3002,11 +3020,6 @@ impl Green {
         .or_default()
         .push((version, None));
     }
-    self
-      .special_history
-      .entry(path)
-      .or_default()
-      .push((version, None));
   }
 
   /// Applies the accepted effects, committing version `version`.
@@ -3015,6 +3028,8 @@ impl Green {
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut removed_content: Vec<String> = Vec::new();
     let mut set_content: Vec<(String, Vec<u8>, Vec<Op>)> = Vec::new();
+    // The paths whose file or directory this version removes: their mode and attributes go with them (A-618).
+    let mut emptied: Vec<String> = Vec::new();
     // Content removes are staged before sets so a rename's source removal never deletes a file the
     // same increment recreates or renames into at that path.
     for effect in effects {
@@ -3024,7 +3039,10 @@ impl Green {
         Effect::Special(path, node) => self.commit_special(path, node, version),
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
         Effect::SetContent(path, bytes, ops, _) => set_content.push((path, bytes, ops)),
-        Effect::RemoveContent(path) => removed_content.push(path),
+        Effect::RemoveContent(path) => {
+          emptied.push(path.clone());
+          removed_content.push(path);
+        }
         // Each key's history first records what it held since version 0 when it has none yet (`seed`, the one
         // history rule, A-534), then its change.
         Effect::MakeDir(path) => {
@@ -3038,6 +3056,7 @@ impl Green {
             .push((version, true));
         }
         Effect::RemoveDir(path) => {
+          emptied.push(path.clone());
           let stood = self.dirs.contains_key(&path).then_some(true);
           seed(&mut self.dir_history, &path, stood);
           self.dirs.remove(&path);
@@ -3159,8 +3178,26 @@ impl Green {
       self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
     }
+    // A file or a directory this version removed takes its mode and attributes with it once nothing stands at its path
+    // (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's, so a
+    // path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
+    // one's mode 0755).
+    for path in emptied {
+      if !self.holds(&path) {
+        self.drop_metadata(&path, version);
+      }
+    }
     self.deltas.push(delta);
     self.record_changes(version, changed);
+  }
+
+  /// Whether anything stands at `path`: a file, a directory, a special node, a symbolic link or a hard link.
+  fn holds(&self, path: &str) -> bool {
+    self.content.contains_key(path)
+      || self.dirs.contains_key(path)
+      || self.specials.contains_key(path)
+      || self.symlinks.contains_key(path)
+      || self.hardlinks.contains_key(path)
   }
 
   /// Records what version `version` changed in the change index (`changes`): every path an effect changed, and every
