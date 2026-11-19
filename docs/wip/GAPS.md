@@ -87,6 +87,15 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
+> create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
+> `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
+> on `main`, Mercurial SHA-1 on `default`'s first line, Subversion's revisions bound to `root`); a format or branch the
+> tool cannot have is usage (exit 2), a name taken `AlreadyExists` (exit 1). Tests: the grammar's two and a real
+> anchor's CLI test (the A-685 entry has the runs). OWED: the other repository verbs on the command line (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`), the SDKs' and MCP's words, and the
+> server's own refusal of a format its tool does not name (it records the repository today and makes no git store for
+> `--tool git` in revisions; the CLI refuses it before asking).
 > **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
 > header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
 > `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
@@ -332,7 +341,18 @@
 > after the tests' client race its runs met was fixed on its own (4a74c118), 34 of 34 and 38 of 38, fmt clean).
 > Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
-> connection there (main's finding, its own piece).
+> connection there (main's finding, closed by A-651 part 4).
+> **A-651 part 4 (2026-11-19, g294; the SSH edge serves a repository from its owner shard):** an `exec` that names a
+> repository another shard's partition holds (`SshSite::locate`, by its name's route, D-14) moves its connection there
+> whole, as the HTTP edge moves one: the socket's handle, the session with its keys, sequence numbers and channel, the
+> client's unread bytes, the waits, the phase and the proven principal, one spawn on that shard's control channel;
+> there it takes a seat as a new connection would (a free one, the most overdue's, or a wait bounded by the seats) and
+> the `exec` is dispatched where the repository's record, policy and store live; each shard keeps its own edge state
+> (`vcs_ssh::keep_here`), only the listener's holding the host key (macOS arm64, Mac Studio: red at aa16b067,
+> `--lib -- vcs_ssh` 28 of 30, the two new tests failing; green 30 of 30, and 30 of 30 as it landed over main
+> 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684);
+> Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival waiting
+> for a full shard's seat and of one refused past the bound; main's runs.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

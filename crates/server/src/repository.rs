@@ -39,6 +39,11 @@
 //! (`crate::vcs_store`, A-662). A Subversion repository's first entry also holds its creation's record (A-655 part 2b:
 //! its UUID and revision 0's date, `slates_svn::commit::record`), from which its store's records are made, as a
 //! recovery makes them again.
+//!
+//! **A creator's defaults (A-685).** What a client names when it creates a repository is decided here, beside the verb,
+//! so every surface creates alike (`slates repository create`): the formats each tool names its objects in
+//! ([`object_formats`]) and the namespace name its root is bound to ([`root_binding`]): git's branch by its ref under
+//! `refs/heads/`, Mercurial's branch by its first line, Subversion's one name.
 
 use slates_db::catalog::{
   BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
@@ -121,6 +126,83 @@ fn db_format(format: ObjectFormat) -> slates_db::catalog::ObjectFormat {
     ObjectFormat::Sha1 => slates_db::catalog::ObjectFormat::Sha1,
     ObjectFormat::Sha256 => slates_db::catalog::ObjectFormat::Sha256,
     ObjectFormat::Revisions => slates_db::catalog::ObjectFormat::Revisions,
+  }
+}
+
+/// The formats `tool` names its objects in, its own default first (§4.17.1 item 1: "its object format (git's SHA-1 or
+/// SHA-256, Mercurial's node format, Subversion's revision numbers)"; A-685): git's SHA-1, the format git takes when
+/// none is named (A-600), or SHA-256; Mercurial's SHA-1 node ids alone; Subversion's revision numbers alone. What a
+/// repository of the tool may be created with (`slates repository create --format`).
+pub fn object_formats(tool: VcsTool) -> &'static [ObjectFormat] {
+  match tool {
+    VcsTool::Git => &[ObjectFormat::Sha1, ObjectFormat::Sha256],
+    VcsTool::Mercurial => &[ObjectFormat::Sha1],
+    VcsTool::Subversion => &[ObjectFormat::Revisions],
+  }
+}
+
+/// Format: the git branch a repository's root is bound to when its creator names none (A-685): `main`, the branch this
+/// server's push tests and its captures of stock git 2.50.1 bind (`git_push/tests.rs`, `crates/git/fixtures/v0`). A
+/// stock clone of the empty repository takes it from the unborn `HEAD` the site advertises (`ls-refs=unborn`, §4.17.2
+/// "The wire").
+const GIT_DEFAULT_BRANCH: &str = "main";
+
+/// Format: the Mercurial branch whose first line a repository's root is when its creator names none (A-685): `default`,
+/// the branch Mercurial puts a changeset on when none is named, whose first line a new repository's first push takes
+/// (`hg_push`'s module docs: "a Mercurial repository's first line, the green its verb makes, is `branch:default:0`").
+const HG_DEFAULT_BRANCH: &str = "default";
+
+/// Format: the number of a Mercurial branch's first line (`hg_push`'s namespace: a line a push makes takes the lowest
+/// number its branch does not use, so the first is this).
+const HG_FIRST_LINE: u32 = 0;
+
+/// Format: the one name a Subversion repository's namespace binds (A-685): its one green holds the repository from its
+/// root, its branches directories in it (§4.17.4), so the name says that.
+const SVN_ROOT: &str = "root";
+
+/// Why a branch cannot be a new repository's default branch ([`root_binding`]; A-685).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootRefused {
+  /// git's: no branch's name. Branch `N` is the ref `refs/heads/N`, which git's rules must take (`git
+  /// check-ref-format`), and a name beginning `refs/` is a ref of its own in slates' namespace, never a branch
+  /// (`git_push`'s module docs).
+  NotAGitBranch,
+  /// Subversion's: its repository is one green, its branches directories in it (§4.17.4), so it binds no branch.
+  NoSubversionBranch,
+}
+
+impl core::fmt::Display for RootRefused {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::NotAGitBranch => "not a git branch's name (as `git init --initial-branch` takes one)",
+      Self::NoSubversionBranch => "Subversion's branches are directories in its one green",
+    })
+  }
+}
+
+/// The namespace name a new repository's root is bound to, `CreateRepository`'s `default_branch` (§4.17.1 item 1;
+/// A-685), from the branch its creator names in the tool's own terms, else the tool's default: git's branch `N` is the
+/// name `N` (the ref `refs/heads/N`), `GIT_DEFAULT_BRANCH` when none is named; Mercurial's branch `B` is its first
+/// line, the green the verb makes (`hg_push`'s namespace), `HG_DEFAULT_BRANCH`'s when none is named; Subversion's is
+/// `SVN_ROOT`, and a branch named for it is refused.
+pub fn root_binding(tool: VcsTool, branch: Option<&str>) -> Result<String, RootRefused> {
+  match (tool, branch) {
+    (VcsTool::Git, _) => git_branch(branch.unwrap_or(GIT_DEFAULT_BRANCH)),
+    (VcsTool::Mercurial, _) => Ok(hg_push::line_name(
+      branch.unwrap_or(HG_DEFAULT_BRANCH).as_bytes(),
+      HG_FIRST_LINE,
+    )),
+    (VcsTool::Subversion, None) => Ok(SVN_ROOT.to_owned()),
+    (VcsTool::Subversion, Some(_)) => Err(RootRefused::NoSubversionBranch),
+  }
+}
+
+/// git's branch `name` as its namespace name: refused unless slates' namespace maps `name` to the ref `refs/heads/name`
+/// and git's rules take that ref (`git_push::ref_of`).
+fn git_branch(name: &str) -> Result<String, RootRefused> {
+  match crate::git_push::ref_of(name) {
+    Some(full) if full.starts_with(crate::git_push::HEADS.as_bytes()) => Ok(name.to_owned()),
+    _ => Err(RootRefused::NotAGitBranch),
   }
 }
 

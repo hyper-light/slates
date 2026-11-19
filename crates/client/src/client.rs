@@ -33,8 +33,8 @@ use slates_ipc::protocol::{
   VolumeSummary, WorkOp, unpack,
 };
 use slates_ipc::protocol::{
-  ChangedCursor, CredentialMaterial, EntriesCursor, PlannedEntry, PolicySubject, Verification,
-  WritePolicy,
+  ChangedCursor, CredentialMaterial, EntriesCursor, ObjectFormat, PlannedEntry, PolicySubject,
+  VcsTool, Verification, WritePolicy,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -260,6 +260,23 @@ pub struct CreateSpec {
   pub require_locked: bool,
   /// A host directory to overlay, or nothing for a scratch volume.
   pub base: Option<String>,
+}
+
+/// What [`Client::create_repository`] takes: `CreateRepository`'s fields (§4.17.1 "The repository and its greens";
+/// A-575, A-685). A creator's defaults for each tool are the server crate's (`slates_server::object_formats`,
+/// `slates_server::root_binding`), which `slates repository create` asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositorySpec {
+  /// The repository's name, unique everywhere.
+  pub name: String,
+  /// The tool it serves.
+  pub tool: VcsTool,
+  /// How it names its objects, fixed at creation.
+  pub format: ObjectFormat,
+  /// The namespace name its root is bound to: its default branch as its tool's server names it.
+  pub default_branch: String,
+  /// The green that becomes its root, an unbound green of the repository's partition; a new empty one when none.
+  pub green: Option<VolumeId>,
 }
 
 /// One page of a presented landing's entry list ([`Client::landing_entries_page`]; §4.15 step 2): the bytes of the
@@ -3820,6 +3837,26 @@ impl Client {
       ReplyBody::GreenCreated { id } => Ok(id),
       _ => Err(ClientError::UnexpectedReply {
         verb: "create_green",
+      }),
+    }
+  }
+
+  /// Creates a version-control repository (§4.17.1 "The repository and its greens"; A-575, A-685) on the partition its
+  /// name hashes to: its record and its root, `spec.green` (an unbound green of that partition, which joins as it
+  /// stands) or a new empty green, bound to `spec.default_branch`; the root's id. Refused typed, nothing made:
+  /// `AlreadyExists` for a name any repository holds, `InvalidName` for an empty name or one holding a NUL, `NotGreen`,
+  /// `Forbidden` or `NotFound` for a root that cannot join, `TableAtCapacity` past the partition's tables.
+  pub fn create_repository(&mut self, spec: &RepositorySpec) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateRepository {
+      name: spec.name.clone(),
+      tool: spec.tool,
+      format: spec.format,
+      default_branch: spec.default_branch.clone(),
+      green: spec.green,
+    })? {
+      ReplyBody::GreenCreated { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_repository",
       }),
     }
   }

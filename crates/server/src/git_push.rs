@@ -119,7 +119,7 @@ const AGENT: &[u8] = slates_git::upload::AGENT.as_bytes();
 const PUSH_NAME_CONTEXT: &str = "slates 2026-11-19 git push name (A-654)";
 
 /// Format: a branch's ref is this and its namespace name (module docs).
-const HEADS: &str = "refs/heads/";
+pub(crate) const HEADS: &str = "refs/heads/";
 
 /// Format: every other ref a namespace name can be begins with this (git's `check_refname_format` for a pushed ref).
 const REFS: &str = "refs/";
@@ -324,8 +324,9 @@ fn advertised_refs(state: &ShardState, repository: RepositoryId) -> Vec<(ObjectI
   refs
 }
 
-/// The ref the namespace name `name` is (module docs): none for a name that is no git ref.
-fn ref_of(name: &str) -> Option<Vec<u8>> {
+/// The ref the namespace name `name` is (module docs): none for a name that is no git ref. A new repository's default
+/// branch is held to it too (`repository::root_binding`, A-685).
+pub(crate) fn ref_of(name: &str) -> Option<Vec<u8>> {
   if name.starts_with(HEADS) {
     return None;
   }
