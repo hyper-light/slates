@@ -15768,10 +15768,63 @@ async fn rebuild_records(
       rebuilt.orphans_reclaimed = rebuilt
         .orphans_reclaimed
         .saturating_add(settle_references(state, record));
+    } else {
+      rebuilt.attachments_dropped = rebuilt
+        .attachments_dropped
+        .saturating_add(keep_unrecovered_mounts(state, record));
     }
     slices.unit_done().await;
   }
   max_prefix
+}
+
+/// The FUSE mounts of a volume recovery could not rebuild (§4.8 `NotRecovered`; A-102; A-509): one whose device the
+/// anchor held, on a kernel that can resend what the dead daemon read, is kept and served again, every request refused
+/// `EIO` (`fuse::refuse_unrecovered`), so its user is told why and releases it, and a later restart whose recovery
+/// rebuilds the volume serves it as any kept mount; any other died with the process and is left in place as any dead
+/// mount is (`fuse::leave_stale`), its record ended. The volume's other attachments stay, as its record does. Returns
+/// the records ended. Before, recovery passed such a volume's attachments by: a held device was let go with its mount
+/// still in the kernel's table, which answered `ENOTCONN` until someone unmounted it by hand.
+fn keep_unrecovered_mounts(state: &mut ShardState, record: &VolumeRecord) -> usize {
+  let now = state.clock.monotonic_ns();
+  let mounts: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .iter()
+    .filter(|a| a.form.fuse_mount_point().is_some())
+    .map(|a| (**a).clone())
+    .collect();
+  let mut ended: usize = 0;
+  for attachment in mounts {
+    #[cfg(target_os = "linux")]
+    if let Some(at) = state
+      .inherited_fuse
+      .iter()
+      .position(|held| held.attachment == attachment.id && held.adoptable())
+    {
+      let held = state.inherited_fuse.swap_remove(at);
+      state.adopt_fuse.push((attachment, held));
+      continue;
+    }
+    if let Some(point) = attachment.form.fuse_mount_point() {
+      state
+        .stale_fuse_mounts
+        .push((attachment.id, point.to_owned()));
+    }
+    if state
+      .db
+      .mutate(
+        &mut state.segment,
+        &Op::AttachmentRemoved { id: attachment.id },
+        now,
+      )
+      .is_ok()
+    {
+      ended = ended.saturating_add(1);
+    }
+  }
+  ended
 }
 
 /// Rebuilds one recorded volume by its role; false when a plain volume could not be (refused and logged, never
@@ -16672,12 +16725,32 @@ pub(crate) fn owner_replay(
   crate::work_log::replay(Some(engine), created_at, entries).ok()
 }
 
-/// A work the green's owner replayed, installed on its own shard; a log that did not replay is counted (A-207).
+/// The works this shard recovered whose green lives on another partition and whose replay's outcome is not installed
+/// yet (A-247): what the recovery's pass asks this shard for (`daemon::rebuild_remote_works`). A copy, never taken: the
+/// records stay here until each outcome is installed ([`install_replayed_work`]), so an ask whose answer was lost after
+/// it ran is asked again and finds every one (A-513). Until then a work stays unserved, and its floor holds its green's
+/// checkpoint at its base.
+pub(crate) fn unbuilt_works(state: &ShardState) -> Vec<crate::work_home::Unbuilt> {
+  state.work_home.unbuilt.clone()
+}
+
+/// A work the green's owner replayed, installed on its own shard; a log that did not replay is counted (A-207). Once
+/// for each recorded work (A-513): the outcome ends the work's record, and an ask that finds no record, a second one
+/// after an answer lost behind the first, changes nothing, where it once installed the work again and charged the
+/// budget for it twice.
 pub(crate) fn install_replayed_work(
   state: &mut ShardState,
   unbuilt: &crate::work_home::Unbuilt,
   replayed: Option<(u64, crate::work_files::WorkFiles, Vec<VolumeOp>)>,
 ) {
+  let owed = state.work_home.unbuilt.len();
+  state
+    .work_home
+    .unbuilt
+    .retain(|recorded| recorded.work != unbuilt.work);
+  if state.work_home.unbuilt.len() == owed {
+    return;
+  }
   match replayed {
     Some(replayed) => install_rebuilt_work(state, unbuilt.work, unbuilt.green, replayed),
     None => state.count(WORK_REBUILD_REFUSED, 1),
@@ -19837,6 +19910,98 @@ mod tests {
     });
     assert!(refused, "a nested borrow is refused");
     assert_eq!(after, before + 1, "and counted");
+  }
+
+  /// What [`a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`] saw.
+  #[derive(Debug)]
+  struct RebuiltOnce {
+    /// The works the second listing named, after the first listing's answer was lost.
+    listed_again: Vec<crate::work_home::Unbuilt>,
+    /// Whether the work is installed after the first install.
+    installed: bool,
+    /// The budget the first install charged, and the one the second, its answer lost behind the first, charged.
+    first_charge: u64,
+    second_charge: u64,
+    /// Whether the work the first install made was kept by the second.
+    kept: bool,
+    /// The works still owed once the outcome is installed.
+    owed_after: usize,
+  }
+
+  /// A-513 (A-488's and A-505's sibling; §4.16, A-207, A-247): a recovered work whose green lives on another partition
+  /// is replayed through the green's owner, and every ask of its shard may lose its answer after it ran. Do: on a shard,
+  /// record such a work; list the works to rebuild twice, the first answer lost; install the replay's outcome twice,
+  /// the first answer lost, marking the work between. Expect the second listing to name the work, the first install to
+  /// make it and charge the budget for it, the second to charge nothing and keep the work the first made, and no work
+  /// owed after. Before, the listing took the shard's list, so one lost answer left every work of the shard unbuilt for
+  /// the daemon's life (unserved, its acknowledged changes out of reach, its floor holding its green's checkpoint), and
+  /// an install asked again made the work afresh and charged it twice.
+  #[test]
+  fn a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let work = super::DbVolumeId { bytes: [0x51; 16] };
+      let green = super::DbVolumeId { bytes: [0x52; 16] };
+      state.work_home.unbuilt.push(crate::work_home::Unbuilt {
+        work,
+        green,
+        created_at: 1,
+      });
+      let _lost = super::unbuilt_works(state);
+      let listed_again = super::unbuilt_works(state);
+      let replayed = Some((
+        1,
+        crate::work_files::WorkFiles::default(),
+        vec![slates_merge::increment::VolumeOp::Overwrite {
+          path: "/rebuilt".to_owned(),
+          at: 0,
+          len: 1,
+        }],
+      ));
+      let owed = crate::work_home::Unbuilt {
+        work,
+        green,
+        created_at: 1,
+      };
+      let before = state.store.budget.committed();
+      super::install_replayed_work(state, &owed, replayed.clone());
+      let after_first = state.store.budget.committed();
+      let installed = state.works.contains_key(&work);
+      // A mark on the work the first install made: a second install that made it afresh would drop it.
+      let marked = 7;
+      if let Some(made) = state.works.get_mut(&work) {
+        made.revision = marked;
+      }
+      super::install_replayed_work(state, &owed, replayed);
+      let after_second = state.store.budget.committed();
+      RebuiltOnce {
+        listed_again,
+        installed,
+        first_charge: after_first.saturating_sub(before),
+        second_charge: after_second.saturating_sub(after_first),
+        kept: state
+          .works
+          .get(&work)
+          .is_some_and(|kept| kept.revision == marked),
+        owed_after: super::unbuilt_works(state).len(),
+      }
+    });
+    assert_eq!(
+      seen.listed_again.len(),
+      1,
+      "the work is listed again after the first listing's answer was lost: {seen:?}"
+    );
+    assert!(
+      seen.installed && seen.first_charge > 0,
+      "the first install makes the work and charges it: {seen:?}"
+    );
+    assert!(
+      seen.second_charge == 0 && seen.kept,
+      "a second install, its answer lost behind the first, changes nothing: {seen:?}"
+    );
+    assert_eq!(
+      seen.owed_after, 0,
+      "no work is owed once its outcome is installed: {seen:?}"
+    );
   }
 
   /// AUD-29-43, the laptop degenerate (R8): a destroy's tombstone is owed only to remote candidate holders, and

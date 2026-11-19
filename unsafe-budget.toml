@@ -224,6 +224,9 @@
 #   has no safe wrapper for reading them: the `GetAdaptersAddresses` call (1), and the walk over what it writes, each
 #   read made only once the link or address is checked to lie wholly inside the call's buffer, aligned: an adapter
 #   entry (1), a DNS server entry (1), and a server's socket address with its address word read through the union (1).
+#   Raised 9 → 10 on 2026-11-19 (A-507, `mount.rs` `ask_unmount`, compiled for macOS and the BSDs): an unmount calls
+#   `unmount(2)` itself rather than running `umount` from the `PATH`, and neither rustix nor std wraps it there: the
+#   call on the mount point's C string (1).
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
@@ -512,7 +515,7 @@ slates-ipc = 147
 #   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
 slates-server = 5
 slates-client = 0
-slates-api = 9
+slates-api = 10
 slates-cli = 2
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
 #   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one
@@ -673,3 +676,6 @@ slates-image = 0
 # 2026-10-29, when `cargo xtask unsafe` found the crate unbudgeted since A-187 added it (CI runs the structural and
 # literal checks, not the budget).
 slates-seal = 0
+# slates-svn (0): the Subversion server's pure pieces (A-500, §4.17.4): svndiff's integers, windows and sections read
+# and written by checked offsets and `get`, LZ4 through lz4_flex's safe codec; no casts, no maps, no FFI.
+slates-svn = 0

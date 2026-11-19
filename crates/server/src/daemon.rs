@@ -5744,7 +5744,12 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
       "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
     );
   }
-  rebuild_remote_works(origin, shards).await;
+  let owed = rebuild_remote_works(origin, shards).await;
+  if owed > 0 {
+    slates_machine::log_line!(
+      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept"
+    );
+  }
   drop_pending_creations(origin, shards).await;
   let floors = reconcile_work_floors(origin, shards).await;
   if floors > 0 {
@@ -5755,55 +5760,79 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
 }
 
 /// Replays each work whose green lives on another partition through that green's owner (A-247), its log being read
-/// from the work's partition. A shard that does not answer leaves its works unbuilt, and a retry of their verbs answers
-/// `NotFound`, as a work whose log would not replay does.
-async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
+/// from the work's partition, and installs the outcome on the work's shard. Every ask is made once more when its answer
+/// was lost ([`ask_once_more`], A-513): the list is read from the work's shard, never taken
+/// (`verbs::unbuilt_works`), and the install ends the work's record there (`verbs::install_replayed_work`), so a
+/// second ask behind a first that ran finds what the first left. Taken, one lost answer left every work of that shard
+/// unbuilt for the daemon's life: unserved, every change it acknowledged out of reach, and its floor holding its green's
+/// checkpoint at its base. A work whose asks went unanswered twice keeps its record and stays unbuilt until the daemon's
+/// next start replays it from its log (a retry after admission is owed, GAPS). Returns how many works were left so.
+async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) -> usize {
+  let mut owed = 0usize;
   for shard in shards.iter().copied() {
-    let Some(unbuilt) = crate::xshard::call_in_shard_time(
-      origin,
-      shard.0,
-      |s| std::mem::take(&mut s.work_home.unbuilt),
-      LIVENESS_BUDGET_NS,
-    )
-    .await
+    let Some(unbuilt) = ask_once_more(origin, shard.0, |s| crate::verbs::unbuilt_works(s)).await
     else {
+      slates_machine::log_line!(
+        "slates-server: shard {} did not list its works to rebuild at recovery",
+        shard.0
+      );
       continue;
     };
     for work in unbuilt {
-      let id = work.work;
-      let Some(entries) = crate::xshard::call_in_shard_time(
-        origin,
-        shard.0,
-        move |s| s.db.partition().work_log(id).to_vec(),
-        LIVENESS_BUDGET_NS,
-      )
-      .await
-      else {
-        continue;
-      };
-      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
-      let Some(owner) = shards.get(usize::from(partition)) else {
-        continue;
-      };
-      let (green, created_at) = (work.green, work.created_at);
-      let Some(replayed) = crate::xshard::call_in_shard_time(
-        origin,
-        owner.0,
-        move |s| crate::verbs::owner_replay(s, green, created_at, &entries),
-        LIVENESS_BUDGET_NS,
-      )
-      .await
-      else {
-        continue;
-      };
-      let _ = crate::xshard::call_in_shard_time(
-        origin,
-        shard.0,
-        move |s| crate::verbs::install_replayed_work(s, &work, replayed),
-        LIVENESS_BUDGET_NS,
-      )
-      .await;
+      if !rebuild_remote_work(origin, shards, shard, work).await {
+        owed = owed.saturating_add(1);
+      }
     }
+  }
+  owed
+}
+
+/// One work of [`rebuild_remote_works`]: its log read on its shard, replayed through its green's owner, the outcome
+/// installed on its shard. Whether every ask was answered.
+async fn rebuild_remote_work(
+  origin: u16,
+  shards: &[ShardId],
+  shard: ShardId,
+  work: crate::work_home::Unbuilt,
+) -> bool {
+  let id = work.work;
+  let Some(entries) = ask_once_more(origin, shard.0, move |s| {
+    s.db.partition().work_log(id).to_vec()
+  })
+  .await
+  else {
+    return false;
+  };
+  let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
+  let Some(owner) = shards.get(usize::from(partition)) else {
+    return false;
+  };
+  let (green, created_at) = (work.green, work.created_at);
+  let Some(replayed) = ask_once_more(origin, owner.0, move |s| {
+    crate::verbs::owner_replay(s, green, created_at, &entries)
+  })
+  .await
+  else {
+    return false;
+  };
+  ask_once_more(origin, shard.0, move |s| {
+    crate::verbs::install_replayed_work(s, &work, replayed);
+  })
+  .await
+  .is_some()
+}
+
+/// Asks `shard` to run `work` in its own time, and once more when no answer came back (A-513, as A-505 asks a map's
+/// send): the second ask runs behind the first on the shard's channel, so a first ask that ran is answered from what it
+/// left there. Only for work that reads, or whose second run finds the record its first left.
+async fn ask_once_more<T: Send + 'static>(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+) -> Option<T> {
+  match crate::xshard::call_in_shard_time(origin, shard, work.clone(), LIVENESS_BUDGET_NS).await {
+    Some(answer) => Some(answer),
+    None => crate::xshard::call_in_shard_time(origin, shard, work, LIVENESS_BUDGET_NS).await,
   }
 }
 

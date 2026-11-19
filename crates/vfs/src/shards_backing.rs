@@ -275,6 +275,11 @@ pub struct ShardsBacking {
   uncleared: BTreeSet<u64>,
   writable: BTreeSet<u64>,
   stale: bool,
+  /// Whether its object was taken back from a dead daemon (A-365, [`ShardsBackings::adopt_vmm`]): that daemon's range
+  /// table names a range only once its ask was answered, so a range it was filling when it died, or one whose fill it
+  /// had refused, is named by nothing and may hold that fill's bytes. Every range not filled is cleared before a fill of
+  /// it begins (A-526).
+  inherited: bool,
 }
 
 impl std::fmt::Debug for ShardsBacking {
@@ -286,6 +291,7 @@ impl std::fmt::Debug for ShardsBacking {
       .field("uncleared", &self.uncleared.len())
       .field("writable", &self.writable.len())
       .field("stale", &self.stale)
+      .field("inherited", &self.inherited)
       .finish()
   }
 }
@@ -321,6 +327,7 @@ impl ShardsBacking {
       uncleared: BTreeSet::new(),
       writable: BTreeSet::new(),
       stale: false,
+      inherited: false,
     }
   }
 
@@ -381,6 +388,14 @@ impl ShardsBacking {
   /// Range `range` was cleared: the object reads zero there again, as over a range never filled.
   pub fn cleared(&mut self, range: u64) {
     self.uncleared.remove(&range);
+  }
+
+  /// Whether range `range` must be cleared before a fill of it begins: a fill here began it and did not finish (A-419),
+  /// or the object came from a dead daemon and the range is not filled, so that daemon's fill may have left bytes there
+  /// (A-526). A fill copies only the volume's data and pages that are not zeros, so bytes left there would outlive it.
+  #[must_use]
+  pub fn owes_clear(&self, range: u64) -> bool {
+    self.uncleared.contains(&range) || (self.inherited && !self.filled.contains(&range))
   }
 
   /// The ranges a mapping asked to write, by index: what an ingest compares.
@@ -636,6 +651,10 @@ impl ShardsBackings {
   /// Measured: kept awake through the replay, a guest's unsynced store was written over by the replay of the write it
   /// followed and never reached the file (`a_streams_dax_map_outlives_its_daemon_with_its_unsynced_stores`, 2026-11-18).
   ///
+  /// **Inherited** ([`ShardsBacking::owes_clear`]): a range the table does not name may hold bytes of a fill the dead
+  /// daemon began and never answered, so each such range is cleared before its first fill here (A-526). Those bytes are
+  /// counted by nothing until then: at most the ranges the dead daemon's fills had begun and not finished.
+  ///
   /// [`Slab::insert_at`]: slates_mem::Slab::insert_at
   pub fn adopt_vmm(
     &mut self,
@@ -655,6 +674,7 @@ impl ShardsBackings {
     let mut backing = ShardsBacking::new(object, volume, inode);
     backing.filled = filled;
     backing.writable = writable;
+    backing.inherited = true;
     match self.slab.insert_at(index, generation, backing) {
       Ok(handle) => Ok(handle),
       Err(full) => {

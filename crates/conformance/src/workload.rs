@@ -13,10 +13,13 @@
 //! On Windows (A-300) the lane runs the version-control workloads ([`Workload::runs_on_windows`]) with Git for
 //! Windows' POSIX shell, in an NTFS folder and on the WinFsp drive. Windows tools print a directory in several
 //! spellings (`D:\a`, `D:/a`, the shell's `/d/a`), each of which becomes the root token ([`normalize_output`]). And a
-//! route may state a difference from its host that is a property of the route, never a defect: the drive makes no hard
-//! link, since WinFsp's driver refuses one, so a local clone copies there where NTFS links. Those lines are named per
-//! route ([`stated_differences`]) and recorded with both sides ([`WorkloadStatus::Stated`]); every other byte is
-//! compared as on every other leg, and a stated line that no longer differs fails, so the list only shrinks.
+//! route may state a difference from its host that is a property of the route, never a defect: a drive under WinFsp's
+//! driver as released makes no hard link, since that driver refuses one, so a local clone copies there where NTFS
+//! links. Those lines are named per route ([`stated_differences`]) and recorded with both sides
+//! ([`WorkloadStatus::Stated`]); every other byte is compared as on every other leg, and a stated line that no longer
+//! differs fails, so the list only shrinks. Whether the drive makes a link is learned from the drive the run uses, never
+//! assumed of the route ([`HardLinks`], A-498): a driver carrying `docs/wip/winfsp-patches` links (A-360), and there a
+//! clone's link counts are held to NTFS's like every other line.
 
 use serde::{Deserialize, Serialize};
 
@@ -908,17 +911,29 @@ pub struct StatedDifference {
   pub reason: &'static str,
 }
 
-/// Why the WinFsp drive's link counts are not NTFS's (A-300).
+/// Why the WinFsp drive's link counts are not NTFS's when its driver refuses a link (A-300).
 const NO_HARD_LINK_ON_THE_DRIVE: &str = concat!(
-  "the WinFsp drive makes no hard link: WinFsp's driver answers ",
+  "the WinFsp drive made no hard link: WinFsp's driver as released answers ",
   "FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS ",
   "compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes ",
   "are the same (A-300)",
 );
 
-/// The WinFsp drive's stated differences: how many files of a local clone have two names (A-300). git and Mercurial
-/// link a local clone's files where the file system can and copy them where it cannot, so these lines count links on
-/// NTFS and none on the drive; every other line, and every byte of the trees, is compared.
+/// Whether the mount a run uses makes a hard link (A-498), learned by the harness from that mount before the workloads
+/// run: one file in the mount's workload root given a second name. It is the route's own data, never assumed of it: a
+/// WinFsp drive makes one under a driver carrying `docs/wip/winfsp-patches` (A-360) and refuses one under WinFsp's
+/// driver as released, and the two drives are one transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardLinks {
+  /// The mount gave the file its second name.
+  Made,
+  /// The mount refused the second name.
+  Refused,
+}
+
+/// The WinFsp drive's stated differences where it refuses a link: how many files of a local clone have two names
+/// (A-300). git and Mercurial link a local clone's files where the file system can and copy them where it cannot, so
+/// these lines count links on NTFS and none on such a drive; every other line, and every byte of the trees, is compared.
 const WINFSP_STATED: &[StatedDifference] = &[
   StatedDifference {
     workload: "git-history",
@@ -937,11 +952,13 @@ const WINFSP_STATED: &[StatedDifference] = &[
   },
 ];
 
-/// The lines a route's workloads may print otherwise than its host (A-300): the WinFsp drive's link counts, and none
-/// on any other route.
-pub fn stated_differences(transport: Transport) -> &'static [StatedDifference] {
-  match transport {
-    Transport::NativeWindowsWinfsp => WINFSP_STATED,
+/// The lines a route's workloads may print otherwise than its host (A-300): the WinFsp drive's link counts where the
+/// drive refused the harness's link ([`HardLinks::Refused`]), and none anywhere else. A drive that made the link is
+/// held to its host's counts like every other line (A-498): a clone that copied there is a difference, not a property
+/// of the route.
+pub fn stated_differences(transport: Transport, links: HardLinks) -> &'static [StatedDifference] {
+  match (transport, links) {
+    (Transport::NativeWindowsWinfsp, HardLinks::Refused) => WINFSP_STATED,
     _ => &[],
   }
 }
@@ -1301,7 +1318,7 @@ mod tests {
       &workload,
       &host,
       &mount,
-      stated_differences(Transport::NativeWindowsWinfsp),
+      stated_differences(Transport::NativeWindowsWinfsp, HardLinks::Refused),
     );
     match &on_the_drive {
       WorkloadStatus::Stated { lines } => {
@@ -1323,7 +1340,7 @@ mod tests {
       &workload,
       &host,
       &mount,
-      stated_differences(Transport::NativeLinuxFuse),
+      stated_differences(Transport::NativeLinuxFuse, HardLinks::Made),
     ));
     assert!(elsewhere.contains("output line 1"), "{elsewhere}");
   }
@@ -1334,7 +1351,7 @@ mod tests {
   #[test]
   fn a_stated_line_excuses_nothing_else() {
     let workload = named("git-history");
-    let stated = stated_differences(Transport::NativeWindowsWinfsp);
+    let stated = stated_differences(Transport::NativeWindowsWinfsp, HardLinks::Refused);
     let (host, mut mount) = clone_runs("0");
     mount.output = mount.output.replace("merged", "MERGED");
     assert!(difference(compare_with(&workload, &host, &mount, stated)).contains("output line 2"));
@@ -1353,9 +1370,9 @@ mod tests {
     assert!(difference(compare_with(&workload, &host, &mount, stated)).contains("output line 1"));
   }
 
-  /// A-300 ("the list only shrinks"). Do: on the drive's route, compare runs whose stated line did not differ, as when
-  /// a drive makes links. Expect a difference saying the stated difference no longer differs, so it is struck from
-  /// the list rather than left to excuse a later regression.
+  /// A-300 ("the list only shrinks"). Do: on the drive's route, with the harness's link refused there, compare runs
+  /// whose stated line did not differ. Expect a difference saying the stated difference no longer differs, so it is
+  /// struck from the list rather than left to excuse a later regression.
   #[test]
   fn a_stated_difference_that_no_longer_differs_fails() {
     let workload = named("git-history");
@@ -1364,13 +1381,56 @@ mod tests {
       &workload,
       &host,
       &mount,
-      stated_differences(Transport::NativeWindowsWinfsp),
+      stated_differences(Transport::NativeWindowsWinfsp, HardLinks::Refused),
     ));
     assert!(
       detail.starts_with("a stated difference no longer differs"),
       "{detail}"
     );
     assert_eq!(compare(&workload, &host, &mount), WorkloadStatus::Identical);
+  }
+
+  /// A Mercurial run in `directory` whose clone left `clone` of its 9 store files with two names, and `commit` after
+  /// the clone's commit, as the workload prints them.
+  fn mercurial_run(directory: &str, clone: &str, commit: &str) -> Run {
+    run(
+      directory,
+      &format!(
+        "store files with two names after the clone: {clone} of 9\nstore files with two names after the clone's \
+         commit: {commit}\n"
+      ),
+      vec![file("clone/c.txt", "cc")],
+    )
+  }
+
+  /// A-498 (the drive's link counts held to NTFS's where it links). Do: on the WinFsp drive's route, judge the Mercurial
+  /// workload's NTFS run (`7 of 9`, then `4`) against a drive run that printed the same counts, as a driver carrying
+  /// `docs/wip/winfsp-patches` makes, with the harness's link made on that drive; then against a drive run that copied
+  /// (`0 of 9`, `0`) on that same drive; then the copying run on a drive that refused the harness's link. Expect the
+  /// first identical, every line compared; the second a difference naming the clone's line, since a drive that links
+  /// and a clone that copied is a defect, never the route's property; and the third the two stated lines, as WinFsp's
+  /// driver as released prints them.
+  #[test]
+  fn a_drive_that_makes_links_is_held_to_its_hosts_link_counts() {
+    let workload = named("mercurial");
+    let host = mercurial_run(r"D:\h\mercurial", "7", "4");
+    let linked = mercurial_run(r"E:\m\mercurial", "7", "4");
+    let copied = mercurial_run(r"E:\m\mercurial", "0", "0");
+    let links_made = stated_differences(Transport::NativeWindowsWinfsp, HardLinks::Made);
+    assert_eq!(
+      compare_with(&workload, &host, &linked, links_made),
+      WorkloadStatus::Identical
+    );
+    let detail = difference(compare_with(&workload, &host, &copied, links_made));
+    assert!(
+      detail.contains("output line 1") && detail.contains("0 of 9"),
+      "{detail}"
+    );
+    let links_refused = stated_differences(Transport::NativeWindowsWinfsp, HardLinks::Refused);
+    match compare_with(&workload, &host, &copied, links_refused) {
+      WorkloadStatus::Stated { lines } => assert_eq!(lines.len(), 2, "{lines:?}"),
+      other => panic!("expected the two stated lines, got {other:?}"),
+    }
   }
 
   /// AC-3.2 / AC-4.2: every visible name participates in the comparison, including `._` names.
