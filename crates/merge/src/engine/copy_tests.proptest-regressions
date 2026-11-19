@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ef9d35575a219623b880d96c51fec0a6ac94e4709ecc554605bd973d73c68dc5 # found by g307 on A-626 part 3 over main 4644dcec3 (Windows x86_64, jupiter, 2026-11-19): shrinks to [Put { path: 311949923791648001, byte: 0 }, Mkdir { path: 1070795753467658482, mode: 237 }, Put { path: 14243497414038293861, byte: 190 }, Copy { from: 16108507355730507258, to: 4479050946912245920, back: 215, replace: true }]; a copy at 4 from 1 replayed on a green restored at 2 or 3, whose recount read the source's history at 1 (pinned by a_replica_restored_after_a_copys_source_version_hashes_as_its_owner)

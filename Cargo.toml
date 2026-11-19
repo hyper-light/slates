@@ -60,6 +60,8 @@ slates-git = { path = "crates/git", version = "0.1.0" }
 # SSH's transport, authentication and session channel as a sans-io core (§4.17.2 "Transports" 2; A-594, A-633, A-634),
 # which the daemon's SSH edge drives (A-651).
 slates-ssh = { path = "crates/ssh", version = "0.1.0" }
+# Mercurial's exchange formats, objects, index and push (§4.17.3), whose pushes the daemon lands (A-657).
+slates-hg = { path = "crates/hg", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
