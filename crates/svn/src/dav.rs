@@ -43,6 +43,13 @@
 //! client's; a LOCK's refresh, which a stock client never sends; and a generic DAV client's owner element, since every
 //! client is read as an svn client.
 //!
+//! The third part (A-681), its first: [`site`], the read side's resources a request names below a repository's root
+//! (a public URL, a revision root's `!svn/rvr`, a baseline collection's `!svn/bc`) answered to OPTIONS, PROPFIND, GET
+//! and HEAD from the index, the green and the lock table, each path judged by the principal's compiled read rules; and
+//! its second, the `log-report` streamed from A-613's log walk with `mod_dav_svn`'s receivers
+//! (`crate::reads::DavLog`). The edge's site in `slates-server` (`vcs_http::svn`) routes and authenticates the
+//! requests it answers.
+//!
 //! No I/O, no clock, no randomness, no panic.
 
 pub mod drive;
@@ -50,6 +57,7 @@ pub mod listing;
 pub mod locking;
 pub mod request;
 pub mod response;
+pub mod site;
 mod time;
 pub mod xml;
 

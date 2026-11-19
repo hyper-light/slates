@@ -45,10 +45,14 @@
 //! framed through, each charged before it is made. A step writes at most the room its caller gives it and asks the
 //! pack's source for at most one packet's data at a time, so a step's work is bounded by its room and one packet.
 //!
-//! **Owed** (GAPS): a stateful protocol v0 session, an SSH client's (git speaks v2 over SSH since 2.26); `sparse:oid`
-//! (part 4); `packfile-uris` answered from the store's URI packs and `bundle-uri` from its bundle list, whose choice
-//! A-624 built and which the store keeps neither of yet; progress on band 2; hidden refs, which §4.17.2's "Access"
-//! makes policy.
+//! **`sparse:oid`** (A-640 part 4, every protocol version): the filter's blob is resolved and read ([`sparse`]) and the
+//! negotiation walks by its patterns. A blob that cannot be resolved or read is answered as git answers it when the
+//! answer carries a pack: its `pack-objects` dies as it begins, so the client meets git's words on band 2 and git's
+//! band-3 words, or, under protocol v0 with no band, the pack missing.
+//!
+//! **Owed** (GAPS): a stateful protocol v0 session, an SSH client's (git speaks v2 over SSH since 2.26);
+//! `packfile-uris` answered from the store's URI packs and `bundle-uri` from its bundle list, whose choice A-624 built
+//! and which the store keeps neither of yet; progress on band 2; hidden refs, which §4.17.2's "Access" makes policy.
 
 use slates_vcs::ContentStore;
 
@@ -66,6 +70,7 @@ mod answer;
 mod fetch;
 mod fragments;
 mod refs;
+mod sparse;
 mod v0;
 
 pub use answer::{Answer, Written};
@@ -217,6 +222,35 @@ pub enum Refusal {
   },
   /// A `filter` spec that is not one git reads.
   Filter(negotiation::filter::Refusal),
+  /// A `sparse:oid` filter's `<blob-ish>` that names nothing: a ref or a path the repository does not hold, an object
+  /// it holds no tree of, or an index path, which a served repository holds none of (A-640 part 4; git's
+  /// `filter_sparse_oid__init`: "unable to access sparse blob in '%s'").
+  SparseBlob {
+    /// The `<blob-ish>`, as the client sent it.
+    name: Vec<u8>,
+  },
+  /// A `sparse:oid` filter's `<blob-ish>` in a form of git's revision syntax this server does not resolve: a parent or
+  /// an ancestor (`~`, `^`), a peel or a reflog (`^{...}`, `@{...}`), an abbreviated name or `git describe`'s, or a
+  /// search of commit messages (`:/`). Answered with git's words for a name that names nothing, and why.
+  SparseForm {
+    /// The `<blob-ish>`, as the client sent it.
+    name: Vec<u8>,
+  },
+  /// A `sparse:oid` filter's `<blob-ish>` whose path is relative (`./`, `../`), which needs a work tree a served
+  /// repository has none of (`resolve_relative_path`: "relative path syntax can't be used outside working tree").
+  SparseRelative,
+  /// A `sparse:oid` filter's `<blob-ish>` naming an object that is no blob the store holds ("unable to parse sparse
+  /// filter data in %s").
+  SparseData {
+    /// What it names.
+    id: ObjectId,
+  },
+  /// A `sparse:oid` filter's blob past git's limit, its final newline counted (`add_patterns_from_blob_to_list`: git
+  /// warns "ignoring excessively large pattern blob: %s", then refuses as for [`Refusal::SparseData`]).
+  SparseTooLarge {
+    /// The blob.
+    id: ObjectId,
+  },
   /// The negotiation refused (A-615).
   Negotiation(negotiation::Refusal),
   /// A read the store could not make while the answer was made (A-640 part 1).
@@ -259,13 +293,42 @@ impl Refusal {
         said(&[b"git upload-pack: ambiguous deepen-not: deepen-not ", rev])
       }
       Refusal::Filter(_) => said(&[b"upload-pack: invalid filter-spec"]),
+      Refusal::SparseBlob { name } => said(&[SPARSE_BLOB, name, b"'"]),
+      Refusal::SparseForm { name } => said(&[SPARSE_BLOB, name, b"': ", SPARSE_FORMS]),
+      Refusal::SparseRelative => {
+        said(&[b"relative path syntax can't be used outside working tree"])
+      }
+      Refusal::SparseData { id } | Refusal::SparseTooLarge { id } => {
+        said(&[b"unable to parse sparse filter data in ", &hex(id)])
+      }
       Refusal::Negotiation(refusal) => negotiation_words(refusal),
       Refusal::Store(_) | Refusal::Pack(_) => said(&[ABORT]),
       Refusal::PastAdmission(_) => said(&[PAST_ADMISSION]),
       Refusal::Refs { .. } => said(&[b"upload-pack: the server's refs are out of order"]),
     }
   }
+
+  /// What git's `pack-objects` warns of before it dies of this refusal, in git's words: a `sparse:oid` filter's blob
+  /// past git's limit (`add_patterns_from_blob_to_list`); `None` for every other refusal.
+  pub(super) fn warning(&self) -> Option<Vec<u8>> {
+    if let Refusal::SparseTooLarge { id } = self {
+      Some(said(&[
+        b"ignoring excessively large pattern blob: ",
+        &hex(id),
+      ]))
+    } else {
+      None
+    }
+  }
 }
+
+/// Format: git's words for a `sparse:oid` filter's `<blob-ish>` that names nothing, before the name and its closing
+/// quote (`list-objects-filter.c` `filter_sparse_oid__init`).
+const SPARSE_BLOB: &[u8] = b"unable to access sparse blob in '";
+
+/// Format: why a `<blob-ish>` of a form this server does not resolve is answered as naming nothing: what it resolves.
+const SPARSE_FORMS: &[u8] =
+  b"this server resolves an object's full name or a ref, alone or with :<path>";
 
 /// Format: the words for a request past its admission.
 const PAST_ADMISSION: &[u8] = b"upload-pack: the request needs more room than the server admits";

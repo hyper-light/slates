@@ -1035,6 +1035,40 @@ fn write_failure(refusal: &DriveRefusal, out: &mut Vec<u8>) -> Result<(), ItemEr
   write_failure_words(refusal.subversion_code(), &default_message(refusal), out)
 }
 
+/// The words of the commit rule's refusals for a commit by `user` (`commit.c` 164-198; `tree.c` `conflict_err`;
+/// `lock.c` `verify_lock` 605-630): what the drive writes at `close-edit`, and what the owner's step writes for a work
+/// it judged again where its verdict's facts moved (A-655 part 2b; [`super::revision::StepRefusal::Verdict`]).
+pub fn commit_words(refusal: &CommitRefusal, user: Option<&str>) -> String {
+  match refusal {
+    CommitRefusal::OutOfDate { path, kind } => match kind {
+      Some(NodeKind::Directory) => format!("Directory '{path}' is out of date"),
+      Some(NodeKind::File) => format!("File '{path}' is out of date"),
+      None => format!("'{path}' is out of date"),
+    },
+    CommitRefusal::RevisionPastBase { revision } => format!("No such revision {revision}"),
+    CommitRefusal::Conflict { path, .. } => format!("{CONFLICT_AT} '{path}'"),
+    CommitRefusal::Locked(refusal) => lock_words(refusal, user),
+    CommitRefusal::Index(refusal) => format!("{refusal:?}"),
+  }
+}
+
+/// FSFS's words for a lock in the way of a commit by `user` (`lock.c` `verify_lock` 605-630).
+fn lock_words(refusal: &LockRefusal, user: Option<&str>) -> String {
+  match refusal {
+    LockRefusal::NoUser { path: Some(path) } => {
+      format!("Cannot verify lock on path '{path}'; no username available")
+    }
+    LockRefusal::OwnerMismatch { path, owner } => format!(
+      "User '{}' does not own lock on path '{path}' (currently locked by '{owner}')",
+      user.unwrap_or_default()
+    ),
+    LockRefusal::TokenNotPresented { path } => {
+      format!("Cannot verify lock on path '{path}'; no matching lock-token available")
+    }
+    other => format!("{other:?}"),
+  }
+}
+
 /// The words of a refusal that needs nothing of the drive's (`serve.c` `add_lock_tokens` 1374-1395).
 fn default_message(refusal: &DriveRefusal) -> String {
   match refusal {
@@ -1368,7 +1402,7 @@ impl Drive {
   /// The words `svnserve` writes for `refusal` in this drive.
   pub fn message(&self, refusal: &DriveRefusal) -> String {
     match refusal {
-      DriveRefusal::Commit(refusal) => self.commit_message(refusal),
+      DriveRefusal::Commit(refusal) => commit_words(refusal, self.setup.locks.user.as_deref()),
       DriveRefusal::PastHead { revision, youngest } => {
         format!("No such revision {revision} (HEAD is {youngest})")
       }
@@ -1436,39 +1470,6 @@ impl Drive {
         "The client request size exceeds the configured limit".to_owned()
       }
       other => default_message(other),
-    }
-  }
-
-  /// The words of the commit rule's refusals (`commit.c` 164-198; `tree.c` `conflict_err`; `lock.c` `verify_lock`
-  /// 605-630).
-  fn commit_message(&self, refusal: &CommitRefusal) -> String {
-    match refusal {
-      CommitRefusal::OutOfDate { path, kind } => match kind {
-        Some(NodeKind::Directory) => format!("Directory '{path}' is out of date"),
-        Some(NodeKind::File) => format!("File '{path}' is out of date"),
-        None => format!("'{path}' is out of date"),
-      },
-      CommitRefusal::RevisionPastBase { revision } => format!("No such revision {revision}"),
-      CommitRefusal::Conflict { path, .. } => format!("{CONFLICT_AT} '{path}'"),
-      CommitRefusal::Locked(refusal) => self.lock_message(refusal),
-      CommitRefusal::Index(refusal) => format!("{refusal:?}"),
-    }
-  }
-
-  /// FSFS's words for a lock in a commit's way (`lock.c` `verify_lock` 605-630).
-  fn lock_message(&self, refusal: &LockRefusal) -> String {
-    match refusal {
-      LockRefusal::NoUser { path: Some(path) } => {
-        format!("Cannot verify lock on path '{path}'; no username available")
-      }
-      LockRefusal::OwnerMismatch { path, owner } => format!(
-        "User '{}' does not own lock on path '{path}' (currently locked by '{owner}')",
-        self.setup.locks.user.as_deref().unwrap_or_default()
-      ),
-      LockRefusal::TokenNotPresented { path } => {
-        format!("Cannot verify lock on path '{path}'; no matching lock-token available")
-      }
-      other => format!("{other:?}"),
     }
   }
 

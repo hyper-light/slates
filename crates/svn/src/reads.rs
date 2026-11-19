@@ -1923,6 +1923,7 @@ mod log;
 mod segments;
 mod stream;
 
+pub use log::dav::{DavLog, DavLogProgress};
 pub use stream::{Progress, Stream};
 
 #[cfg(test)]

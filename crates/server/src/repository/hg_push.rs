@@ -215,6 +215,16 @@ pub(crate) fn line_of(name: &str) -> Option<(Vec<u8>, u32)> {
   (line_name(&branch, number) == name).then_some((branch, number))
 }
 
+/// The bookmark a bookmark's name names (A-680 part 2: the served view lists the register's bookmarks); none for a name
+/// [`bookmark_name`] does not write exactly so, as [`line_of`] reads a line's.
+pub(crate) fn bookmark_of(name: &str) -> Option<Vec<u8>> {
+  let label = name
+    .strip_prefix(BOOKMARK_TAG)?
+    .strip_suffix(char::from(END))?;
+  let bookmark = unlabel(label)?;
+  (bookmark_name(&bookmark) == name).then_some(bookmark)
+}
+
 /// A line or a bookmark as a push read it: its name, its green, the version the green was at and its head there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Named {
@@ -777,6 +787,7 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
     checks,
     names: Vec::new(),
     state,
+    objects: Vec::new(),
   }
 }
 

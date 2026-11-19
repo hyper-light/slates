@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
@@ -20,7 +21,7 @@ use slates_http_edge::connection::Fields;
 use slates_http_edge::credential::Credential;
 
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
-use super::{Fastest, HgSite, HgStores, NoStores};
+use super::{Fastest, HgSite, HgStores};
 use crate::vcs_http::{Answer, Decided, Exchange, Failed};
 
 /// Shape: room enough for every request these tests send.
@@ -173,20 +174,29 @@ impl Repository for Empty {
 }
 
 impl Store for Empty {
-  fn changeset_text(&self, _rev: Rev) -> Option<&[u8]> {
-    None
+  fn changeset_text(
+    &self,
+    _rev: Rev,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, slates_hg::PastAdmission> {
+    Ok(None)
   }
 
-  fn manifest(&self, _node: &Node) -> Option<Logged<'_>> {
-    None
+  fn manifest(
+    &self,
+    _node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    Ok(None)
   }
 
-  fn file(&self, _path: &[u8], _node: &Node) -> Option<Logged<'_>> {
-    None
-  }
-
-  fn file_node(&self, _manifest: &Node, _path: &[u8]) -> Option<Node> {
-    None
+  fn file(
+    &self,
+    _path: &[u8],
+    _node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    Ok(None)
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -199,14 +209,19 @@ impl Store for Empty {
 struct OneStore;
 
 impl HgStores for OneStore {
-  type Store = Empty;
+  type Store<'s> = Empty;
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HG
   }
 
-  fn lend<R>(&mut self, id: RepositoryId, step: impl FnOnce(&Empty) -> R) -> Option<R> {
-    (id == HG).then(|| step(&Empty))
+  fn lend<R>(
+    &mut self,
+    id: RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    (id == HG).then(|| step(&Empty, room))
   }
 }
 
@@ -614,26 +629,27 @@ fn an_exchange_holds_nothing_past_its_room_or_its_store() {
 struct Vanishing;
 
 impl HgStores for Vanishing {
-  type Store = Empty;
+  type Store<'s> = Empty;
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HG
   }
 
-  fn lend<R>(&mut self, _id: RepositoryId, _step: impl FnOnce(&Empty) -> R) -> Option<R> {
+  fn lend<R>(
+    &mut self,
+    _id: RepositoryId,
+    _room: &mut slates_hg::Admission,
+    _step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
     None
   }
 }
 
-/// AC-HG.9, A-650 part 1: do ask the server's stores today for a repository, and ask the first value's compressor for a
-/// `0.2` client listing `none`, one listing zstd and zlib, and a `0.1` client. Expect no store (every Mercurial request
-/// `503` until the site is handed A-662's stores), and `none`, zstd at libzstd's fastest level, and zlib at level 0
-/// (stored), the fastest form each client reads.
+/// A-650 part 1: do ask the first value's compressor for a `0.2` client listing `none`, one listing zstd and zlib, and a
+/// `0.1` client. Expect `none`, zstd at libzstd's fastest level, and zlib at level 0 (stored), the fastest form each
+/// client reads.
 #[test]
-fn until_the_stores_land_nothing_is_served_and_streams_take_the_fastest_form() {
-  let record = Held { rules: Vec::new() }.find("hg").unwrap();
-  let mut stores = NoStores;
-  let held = (stores.holds(record.id), stores.lend(record.id, |_| ()));
+fn streams_take_the_fastest_form_the_client_reads() {
   let mut fastest = Fastest;
   let chosen = [
     fastest.choose(Media::V2, &[Engine::Zstd, Engine::Uncompressed], 1),
@@ -642,23 +658,20 @@ fn until_the_stores_land_nothing_is_served_and_streams_take_the_fastest_form() {
   ];
   let fastest_zstd = *Engine::Zstd.levels().start();
   assert_eq!(
-    (held, chosen),
-    (
-      (false, None),
-      [
-        Compression {
-          engine: Engine::Uncompressed,
-          level: 0
-        },
-        Compression {
-          engine: Engine::Zstd,
-          level: fastest_zstd
-        },
-        Compression {
-          engine: Engine::Zlib,
-          level: 0
-        },
-      ]
-    )
+    chosen,
+    [
+      Compression {
+        engine: Engine::Uncompressed,
+        level: 0
+      },
+      Compression {
+        engine: Engine::Zstd,
+        level: fastest_zstd
+      },
+      Compression {
+        engine: Engine::Zlib,
+        level: 0
+      },
+    ]
   );
 }

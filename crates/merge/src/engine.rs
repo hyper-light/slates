@@ -2122,9 +2122,58 @@ impl Green {
     self.content.iter()
   }
 
+  /// Every symbolic link the green currently holds, with its target. With [`Green::files`], [`Green::hardlinks`] and
+  /// [`Green::specials`] it is every name the green holds that is not a directory: what a whole reading of the head
+  /// takes (A-664 part 3: a git repository's green read as git's files where no earlier map is kept).
+  pub fn symlinks(&self) -> impl Iterator<Item = (String, &str)> {
+    self
+      .symlinks
+      .iter()
+      .map(|(path, target)| (path, target.as_str()))
+  }
+
+  /// Every hard link the green currently holds, with the path of the name it aliases ([`Green::symlinks`]).
+  pub fn hardlinks(&self) -> impl Iterator<Item = (String, &str)> {
+    self
+      .hardlinks
+      .iter()
+      .map(|(path, target)| (path, target.as_str()))
+  }
+
+  /// Every special node the green currently holds under its primary name, with its metadata ([`Green::symlinks`]).
+  pub fn specials(&self) -> impl Iterator<Item = (String, SpecialNode)> {
+    self.specials.iter().map(|(path, node)| (path, *node))
+  }
+
   /// Whether a directory exists at the path.
   pub fn is_dir(&self, path: &str) -> bool {
     self.dirs.contains_key(path)
+  }
+
+  /// The files and directories beneath `path` at the head, each with whether it is a directory, deepest first, `path`
+  /// itself not among them (A-655 part 2b): what a Subversion deletion names, since a node-exclusive removal of a
+  /// directory needs the same increment to empty it (`merge_rmdir`), and a tree a copy grafted is listed as the head
+  /// holds it. It walks the keys beneath `path` alone; the root's tree is every key.
+  pub fn beneath(&self, path: &str) -> Vec<(String, bool)> {
+    let prefix = if path.is_empty() {
+      String::new()
+    } else {
+      format!("{path}/")
+    };
+    let mut found: Vec<(String, bool)> = self
+      .content
+      .prefix(&prefix)
+      .map(|(file, _)| (file, false))
+      .chain(
+        self
+          .dirs
+          .prefix(&prefix)
+          .map(|(directory, _)| (directory, true)),
+      )
+      .filter(|(found, _)| !found.is_empty())
+      .collect();
+    found.sort_by(|left, right| right.0.cmp(&left.0));
+    found
   }
 
   /// IPC aliases share the primary inode's metadata; no independent value is stored at an alias.
@@ -2149,6 +2198,27 @@ impl Green {
   /// A hard link's target file at the path, or `None` when it is not a hard link.
   pub fn hardlink(&self, path: &str) -> Option<&str> {
     self.hardlinks.get(path).map(String::as_str)
+  }
+
+  /// The hard links naming the file at `path`, each a name read through it: what a change to the file changes with it.
+  /// The change index names such a change at the file alone (a special node's links are named with it,
+  /// `record_changes`), so a reader that keeps what each name reads, a version's map of paths to git's files (A-664
+  /// part 3), takes the links from here. One lookup.
+  pub fn links_naming<'a>(&'a self, path: &str) -> impl Iterator<Item = &'a str> + use<'a> {
+    self
+      .links_to
+      .get(path)
+      .into_iter()
+      .flatten()
+      .map(String::as_str)
+  }
+
+  /// Whether a copy whose tree holds `path` (its destination is `path` or an ancestor) was made after `version`
+  /// (A-586): the change index names a copy at its destination alone, which stands for the tree it brought, so a reader
+  /// of the index (a version's map of paths, A-664 part 3) takes that tree from the head. One lookup a level of the
+  /// path's depth, none on a green that never copied.
+  pub fn copied_after(&self, path: &str, version: u64) -> bool {
+    self.replaced_after(path, version)
   }
 
   /// An xattr value at `(path, name)`, or `None` when unset.
@@ -5770,11 +5840,17 @@ pub use reanchor::{ReanchorRefused, Reanchored};
 mod position;
 pub use position::PositionRefused;
 
+// A computed verdict's wire form (A-658 part 3a): what a green's holder sends its owner, read back against the increment
+// it judged (`Computed::encode`, `Green::computed_from`).
+mod computed_wire;
+
 mod stack;
 pub use stack::{Landed, RestateRefused, Restated, TreeBase, TreeNode, Upper};
 
 #[cfg(test)]
 mod compute_tests;
+#[cfg(test)]
+mod computed_wire_tests;
 #[cfg(test)]
 mod judge_tests;
 #[cfg(test)]

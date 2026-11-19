@@ -875,3 +875,48 @@ server's directory are the ones its reviewed expected-failure list starts from.
   incoming: the same three (its `getbundle` 338 bytes) and `listkeys` of the phases. The client sent
   `X-HgProto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull` with every command after `capabilities`, and its
   arguments in `X-HgArg-1` alone, each request by `GET`.
+
+## 26. Found while building the served view (A-680 part 1, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`, CPython 3.12; stock 7.2's `served` filter over `fixtures/state`'s two repositories, `fixtures/state/make-served-fixtures.sh`)
+
+- **`served` is two filters joined** (`repoview.computeunserved`): the revisions `visible` hides and those
+  `served.hidden` hides (`computesecret`: the `remotehiddenphases`, secret 2, archived 32 and internal 96). `hg serve`
+  answers every peer from it (`wireprotov1server.getdispatchrepo`, `server.view` at its default).
+- **`visible`** (`computehidden`): `hideablerevs` (the obsolete revisions and those of the `localhiddenphases`, internal
+  and archived) less `pinnedrevs` (the working directory's parents, every bookmark's changeset, the local tags' and,
+  while files are unresolved, an active merge's two sides); then `_revealancestors` from every revision of a
+  `mutablephases` phase (draft, secret, archived, internal) that is not hidden: each hidden parent leaves the hidden set
+  and is walked in turn, on a stack, so a chain of hidden ancestors is revealed through hidden ones. A public revision
+  reveals nothing (it is not mutable) and needs nothing revealed (its ancestors are public, never hideable).
+- **Obsolete** (`obsolete._computeobsoleteset`): a revision of the `relevant_mutable_phases`, draft and secret, whose
+  node is a key of `obsstore.successors`, which keys every marker by its predecessor, a prune's too. An archived or
+  internal revision is hideable by its phase alone.
+- **Phase roots** (`phases._readroots`): a root whose node the changelog lacks is dropped (`removing unknown node %s
+  from %i-phase boundary`) and the roots marked dirty, never refused.
+- **The captures.** Each repository made again from its committed store, `.hg/requires` and `.hg/bookmarks` (its nodes
+  the fixtures' own) and opened with evolution on and publishing off: `served` keeps `c3daaa7` (public), `baa2576` and
+  `b252f2a` (draft), and leaves out `a1286ad` (hidden: amended into `b252f2a`, no bookmark on it, no visible descendant)
+  and `4ed9423` (secret); `heads` and `branchmap` answer `b252f2a` alone; `listkeys bookmarks` answers `one` and `two`,
+  never `secret-one`, whose changeset is secret; `listkeys phases` answers the one draft root, `baa2576`. Both
+  repositories (bookmarks in `.hg/bookmarks`, and in the store) answer alike.
+
+## 27. Found while serving `hg serve --stdio` behind the daemon's SSH edge (A-679, 2026-11-19; 7.2's code [C] read in Homebrew's 7.2: `dispatch.py` lines 329 to 353, `utils/stringutil.py` `escapestr` and `pprintgen`, `commands.py` `serve` lines 6215 to 6230; and runs of that stock `hg` 7.2, CPython 3.14, on macOS arm64 under `HGPLAIN=1 HGRCPATH=` in an empty directory)
+
+- **A repository argument starting `--` is refused before anything is opened** (`dispatch.py` `_runcatchfunc`). For
+  `serve` with `--stdio`, 7.2 accepts exactly `-R <repo> serve --stdio`, with `--hidden` as a fifth word when asked,
+  and refuses a `<repo>` starting `--` (its comment: a repository named `--debugger` or `--config=ui.debugger=1` "used
+  to actually run the debugger"): `abort: potentially unsafe serve --stdio invocation: <arguments>` on standard error,
+  nothing on standard output, status 255. A `<repo>` starting with one `-` passes and is looked up like any other.
+- **The arguments are listed by `stringutil.pprint`**: `[`, each argument in single quotes joined by `, `, `]`, each
+  argument's bytes through `escapestr`, which is `codecs.escape_encode`: a quote and a backslash each after a
+  backslash; tab, line feed and carriage return as `\t`, `\n` and `\r`; any other byte below a space or from DEL up
+  as `\x` and two lowercase hexadecimal digits; everything else, a double quote among it, as itself.
+- **Measured, every case refused 255 with standard output empty:** `--` gave `['-R', '--', 'serve', '--stdio']`;
+  `--x` gave `['-R', '--x', 'serve', '--stdio']`, and with `--hidden` `['-R', '--x', 'serve', '--stdio', '--hidden']`;
+  `--y'` and the byte 0xFF, with `--hidden`, gave `'--y\'\xff'`; `--a`, tab, `b`, line feed, `c`, carriage return,
+  `d`, a backslash, `e`, DEL, `h`, the byte 0x01, a double quote and `g` gave `'--a\tb\nc\rd\\e\x7fh\x01"g'`; `--`
+  and `é` in UTF-8 gave `'--\xc3\xa9'`; `-x`, with `--hidden` or not, gave `abort: repository -x not found`.
+- **`--hidden` without access** (`commands.py` `serve`). A user `experimental.server.allow-hidden-access` does not name
+  (the list is empty by default) is warned on standard error, `ignoring request to access hidden changeset by
+  unauthorized user: <user>` with the account `procutil.getuser()` names, and the session is then served with the
+  served view, as without the flag: run on a new repository with `hello` and the null `between`, it answered both and
+  exited 0. slates names the principal's record where 7.2 names the account, as A-657 part 4's `acl` words do.

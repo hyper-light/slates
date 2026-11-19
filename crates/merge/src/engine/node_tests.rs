@@ -145,6 +145,37 @@ fn a_file_replaced_by_a_rename_leaves_its_node_to_its_links() -> Result<(), Stri
   Ok(())
 }
 
+/// A-664 part 3 (a reader of the change index takes a file's links from the engine: the index names a change to a
+/// file at the file alone, though every link reads it). Do: in `linked`, read what the index names for version 2, which
+/// set `TARGET`'s mode, and which links name `TARGET`; then rename `TARGET` to a free path and ask both paths again.
+/// Expect: the index names `TARGET` alone; `HARDLINK` and `SECOND` name it, and after the rename name the new path,
+/// none left at `TARGET`.
+#[test]
+fn the_links_naming_a_file_follow_it_and_the_index_names_the_file_alone() -> Result<(), String> {
+  let mut green = linked()?;
+  let naming = |green: &Green, path: &str| -> Vec<String> {
+    green.links_naming(path).map(str::to_owned).collect()
+  };
+  let indexed = green.changed_between(1, 2);
+  let before = naming(&green, TARGET);
+  accept(
+    &mut green,
+    Work::default().naming(OpKind::Rename, "moved", TARGET),
+    4,
+  )?;
+  let found = (
+    indexed,
+    before,
+    naming(&green, "moved"),
+    naming(&green, TARGET),
+  );
+  let both = vec![HARDLINK.to_owned(), SECOND.to_owned()];
+  if found != (vec![TARGET.to_owned()], both.clone(), both, Vec::new()) {
+    return Err(format!("{found:?}"));
+  }
+  Ok(())
+}
+
 /// A-646. Do: link `pipe` to the FIFO `SPECIAL`, then remove `SPECIAL` by a work based at the
 /// head. Expect it accepted and the FIFO kept at `pipe`, nothing at `SPECIAL`. Before, the removal
 /// was refused `DeleteModify`, since the link would have named nothing.

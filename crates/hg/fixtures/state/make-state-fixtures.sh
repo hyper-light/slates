@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Makes slates-hg's golden vectors for a repository's state beside its history (A-649 part 2): its phases, bookmarks
 # and obsolescence markers, with stock Mercurial 7.2 from PyPI through uv (nothing installed system-wide). Fixed users,
-# dates and docket ids (7.2's HGTEST_UUIDFILE). Usage: make-state-fixtures.sh OUT
+# dates and docket ids (7.2's HGTEST_UUIDFILE). Usage: make-state-fixtures.sh OUT [REPO...], every repository below
+# when none is named.
 # One history in two repositories: `states` (bookmarks in `.hg/bookmarks`, 7.2's default) and `states-store`
 # (`format.bookmarks-in-store`: the store's own `bookmarks`, required as `bookmarksinstore`). The history, made with
 # evolution on and publishing off: a root made public, a draft line, a draft amended (a marker from the old changeset to
 # the new, the old one hidden), a secret changeset, a bookmark on each of three changesets (the secret one's among them)
 # and a prune marker for a node the repository never held.
+# And `divergent` (A-690), made as a divergent bookmark is made: a root bookmarked `feature`; the repository cloned, a
+# changeset made on `feature` in the clone and another here, and the clone pulled back, so 7.2 keeps the clone's
+# `feature` as `feature@1` (`bookmarks._diverge`: the pulled path has no alias, so the first free number); then `@` on
+# the root, whose `@` is its last byte, so it is no divergent name.
 # For each repository R:
 #   R/<path>            every file of .hg/store as stored (but `undo*` and `*.bck`): `phaseroots`, `obsstore` and, in
 #                       states-store, `bookmarks` among them
@@ -37,15 +42,29 @@ history() {
   hg bookmark -q -r . secret-one
   hg debugobsolete -q 1111111111111111111111111111111111111111
 }
+divergence() {
+  printf 'a\n' > a; hg add -q a; hg commit -q -m 'root'
+  hg bookmark -q feature
+  hg clone -q . "$WORK/$repo-clone"
+  (cd "$WORK/$repo-clone" && hg update -q feature && printf 'b\n' > b && hg add -q b && hg commit -q -m 'in the clone')
+  printf 'c\n' > c; hg add -q c; hg commit -q -m 'here'
+  hg pull -q "$WORK/$repo-clone"
+  hg bookmark -q -r 0 @
+}
 hg version -q
-for repo in states states-store; do
+REPOS=(states states-store divergent)
+if [ $# -gt 1 ]; then shift; REPOS=("$@"); fi
+for repo in "${REPOS[@]}"; do
+  MAKE=history
   case $repo in
     states) EXTRA=() ;;
     states-store) EXTRA=(--config format.bookmarks-in-store=yes) ;;
+    divergent) EXTRA=(); MAKE=divergence ;;
+    *) echo "make-state-fixtures.sh: no repository named $repo" >&2; exit 2 ;;
   esac
   export HGTEST_UUIDFILE="$WORK/uuid-$repo"
   hg init "$WORK/$repo"
-  (cd "$WORK/$repo" && history)
+  (cd "$WORK/$repo" && "$MAKE")
   EXTRA=()
   (cd "$WORK/$repo/.hg/store" && find . -type f ! -name 'undo*' ! -name '*.bck' | sed 's|^\./||' | LC_ALL=C sort) \
     > "$OUT/$repo-files.txt"

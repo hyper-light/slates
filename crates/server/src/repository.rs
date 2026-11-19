@@ -6,8 +6,9 @@
 //! green of the partition that joins as it stands, bound to the default branch. `CreateBranch` makes a member at a
 //! version of a branch (its head when none) through `Lineage::branch` and binds the new name to it. `BindBranch` binds a
 //! name to a member no name binds, which restores a retired branch; `RetireBranch` lets a name go and keeps its green
-//! (item 5). Destroying a member is the green's own destroy verb: it retires the member from its lineage at once and
-//! queues what only it held, which [`run_releases`] gives back a node a unit under the shard's slice.
+//! (item 5). Destroying a member is the green's own destroy verb: it retires the member from its lineage at once, gives
+//! back its map of paths to git's files (A-664 part 3, `crate::vcs_store::paths`), and queues what only it held, which
+//! [`run_releases`] gives back a node a unit under the shard's slice.
 //!
 //! **Rights.** A repository's owner holds every right on it (§4.13) until §4.17.1's policy (shared piece 7) says
 //! otherwise, so the branch verbs are its owner's, refused `Forbidden` to another principal; a green that becomes a root
@@ -36,7 +37,14 @@
 //! its id.
 //!
 //! **The store.** `CreateRepository` makes the repository's tool store beside its record, on this owner shard
-//! (`crate::vcs_store`, A-662).
+//! (`crate::vcs_store`, A-662). A Subversion repository's first entry also holds its creation's record (A-655 part 2b:
+//! its UUID and revision 0's date, `slates_svn::commit::record`), from which its store's records are made, as a
+//! recovery makes them again.
+//!
+//! **A creator's defaults (A-685).** What a client names when it creates a repository is decided here, beside the verb,
+//! so every surface creates alike (`slates repository create`): the formats each tool names its objects in
+//! ([`object_formats`]) and the namespace name its root is bound to ([`root_binding`]): git's branch by its ref under
+//! `refs/heads/`, Mercurial's branch by its first line, Subversion's one name.
 
 use slates_db::catalog::{
   BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
@@ -60,9 +68,49 @@ pub(crate) mod push;
 // calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hg_push;
+// Subversion's commit landed through the push (A-655 part 2b): until the svn:// connection task (A-656 part 2) and the
+// import (A-652 part 3) call it, a daemon build calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod svn_commit;
 // The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
 // `vcs_store::hg_import`, the request answered when the import ends.
 pub(crate) mod import;
+
+/// Format: where RFC 4122's form puts a `-` among a UUID's sixteen bytes, written as two hexadecimal digits each:
+/// before bytes 4, 6, 8 and 10 (8-4-4-4-12 digits).
+const UUID_DASHES_BEFORE: [usize; 4] = [4, 6, 8, 10];
+
+/// The UUID a Subversion repository is made with (A-655 part 2b): its id's sixteen bytes in RFC 4122's form, in
+/// lower-case hexadecimal, so every holder and every recovery names it alike and no two repositories share one, their
+/// ids differing (`verbs::fresh_volume_id`).
+fn svn_uuid(repository: RepositoryId) -> Option<slates_svn::dump::Uuid> {
+  let mut text = String::new();
+  for (at, byte) in repository.bytes.iter().enumerate() {
+    if UUID_DASHES_BEFORE.contains(&at) {
+      text.push('-');
+    }
+    text.push_str(&format!("{byte:02x}"));
+  }
+  slates_svn::dump::Uuid::parse(text.as_bytes())
+}
+
+/// The record a Subversion repository is made with (A-655 part 2b; `slates_svn::commit::record`): its UUID
+/// ([`svn_uuid`]) and revision 0's `svn:date`, the owner's instant as `svn_time_to_cstring` writes it, as `svnadmin
+/// create` dates revision 0. Refused `Unsupported` for an instant that writer cannot write (before 1970 or past the
+/// year 9999), which no owner's clock reads.
+fn svn_created(state: &mut ShardState, repository: RepositoryId) -> Result<Vec<u8>, Refusal> {
+  let unwritable = || Refusal::Unsupported {
+    feature: "a Subversion repository dated before 1970 or past the year 9999".to_owned(),
+  };
+  let uuid = svn_uuid(repository).ok_or_else(unwritable)?;
+  let now = slates_svn::lock::AprTime::from_wall_ns(state.clock.wall_ns());
+  let date = slates_svn::dav::response::svn_time(now).map_err(|_| unwritable())?;
+  let record = slates_svn::commit::record::Record::Created {
+    uuid,
+    date: date.into_bytes(),
+  };
+  Ok(record.encode())
+}
 
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
@@ -79,6 +127,83 @@ fn db_format(format: ObjectFormat) -> slates_db::catalog::ObjectFormat {
     ObjectFormat::Sha1 => slates_db::catalog::ObjectFormat::Sha1,
     ObjectFormat::Sha256 => slates_db::catalog::ObjectFormat::Sha256,
     ObjectFormat::Revisions => slates_db::catalog::ObjectFormat::Revisions,
+  }
+}
+
+/// The formats `tool` names its objects in, its own default first (§4.17.1 item 1: "its object format (git's SHA-1 or
+/// SHA-256, Mercurial's node format, Subversion's revision numbers)"; A-685): git's SHA-1, the format git takes when
+/// none is named (A-600), or SHA-256; Mercurial's SHA-1 node ids alone; Subversion's revision numbers alone. What a
+/// repository of the tool may be created with (`slates repository create --format`).
+pub fn object_formats(tool: VcsTool) -> &'static [ObjectFormat] {
+  match tool {
+    VcsTool::Git => &[ObjectFormat::Sha1, ObjectFormat::Sha256],
+    VcsTool::Mercurial => &[ObjectFormat::Sha1],
+    VcsTool::Subversion => &[ObjectFormat::Revisions],
+  }
+}
+
+/// Format: the git branch a repository's root is bound to when its creator names none (A-685): `main`, the branch this
+/// server's push tests and its captures of stock git 2.50.1 bind (`git_push/tests.rs`, `crates/git/fixtures/v0`). A
+/// stock clone of the empty repository takes it from the unborn `HEAD` the site advertises (`ls-refs=unborn`, §4.17.2
+/// "The wire").
+const GIT_DEFAULT_BRANCH: &str = "main";
+
+/// Format: the Mercurial branch whose first line a repository's root is when its creator names none (A-685): `default`,
+/// the branch Mercurial puts a changeset on when none is named, whose first line a new repository's first push takes
+/// (`hg_push`'s module docs: "a Mercurial repository's first line, the green its verb makes, is `branch:default:0`").
+const HG_DEFAULT_BRANCH: &str = "default";
+
+/// Format: the number of a Mercurial branch's first line (`hg_push`'s namespace: a line a push makes takes the lowest
+/// number its branch does not use, so the first is this).
+const HG_FIRST_LINE: u32 = 0;
+
+/// Format: the one name a Subversion repository's namespace binds (A-685): its one green holds the repository from its
+/// root, its branches directories in it (§4.17.4), so the name says that.
+const SVN_ROOT: &str = "root";
+
+/// Why a branch cannot be a new repository's default branch ([`root_binding`]; A-685).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootRefused {
+  /// git's: no branch's name. Branch `N` is the ref `refs/heads/N`, which git's rules must take (`git
+  /// check-ref-format`), and a name beginning `refs/` is a ref of its own in slates' namespace, never a branch
+  /// (`git_push`'s module docs).
+  NotAGitBranch,
+  /// Subversion's: its repository is one green, its branches directories in it (§4.17.4), so it binds no branch.
+  NoSubversionBranch,
+}
+
+impl core::fmt::Display for RootRefused {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::NotAGitBranch => "not a git branch's name (as `git init --initial-branch` takes one)",
+      Self::NoSubversionBranch => "Subversion's branches are directories in its one green",
+    })
+  }
+}
+
+/// The namespace name a new repository's root is bound to, `CreateRepository`'s `default_branch` (§4.17.1 item 1;
+/// A-685), from the branch its creator names in the tool's own terms, else the tool's default: git's branch `N` is the
+/// name `N` (the ref `refs/heads/N`), `GIT_DEFAULT_BRANCH` when none is named; Mercurial's branch `B` is its first
+/// line, the green the verb makes (`hg_push`'s namespace), `HG_DEFAULT_BRANCH`'s when none is named; Subversion's is
+/// `SVN_ROOT`, and a branch named for it is refused.
+pub fn root_binding(tool: VcsTool, branch: Option<&str>) -> Result<String, RootRefused> {
+  match (tool, branch) {
+    (VcsTool::Git, _) => git_branch(branch.unwrap_or(GIT_DEFAULT_BRANCH)),
+    (VcsTool::Mercurial, _) => Ok(hg_push::line_name(
+      branch.unwrap_or(HG_DEFAULT_BRANCH).as_bytes(),
+      HG_FIRST_LINE,
+    )),
+    (VcsTool::Subversion, None) => Ok(SVN_ROOT.to_owned()),
+    (VcsTool::Subversion, Some(_)) => Err(RootRefused::NoSubversionBranch),
+  }
+}
+
+/// git's branch `name` as its namespace name: refused unless slates' namespace maps `name` to the ref `refs/heads/name`
+/// and git's rules take that ref (`git_push::ref_of`).
+fn git_branch(name: &str) -> Result<String, RootRefused> {
+  match crate::git_push::ref_of(name) {
+    Some(full) if full.starts_with(crate::git_push::HEADS.as_bytes()) => Ok(name.to_owned()),
+    _ => Err(RootRefused::NotAGitBranch),
   }
 }
 
@@ -109,6 +234,11 @@ fn free_name(state: &ShardState, repository: RepositoryId, name: &str) -> Result
 
 /// Records `op` in the verb's transaction; its refusal typed.
 fn record(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
+  // A change of the repository's own state logs is admitted only while the parts this shard owes their holders are
+  // within their bound (A-636 part 2b).
+  if crate::state_log::moves_state_logs(op) {
+    crate::state_log::admit(state)?;
+  }
   let now = state.clock.monotonic_ns();
   state
     .db
@@ -287,8 +417,13 @@ fn record_repository(
   ),
   adopted: Option<DbVolumeId>,
 ) -> Result<DbVolumeId, Refusal> {
+  // A Subversion repository's creation's record is made first, for the same reason (A-655 part 2b).
+  let created = match tool {
+    VcsTool::Subversion => svn_created(state, repository)?,
+    VcsTool::Git | VcsTool::Mercurial => Vec::new(),
+  };
   // A new root's record is judged first: once the repository's is recorded, a refusal would leave it rootless.
-  let created = match adopted {
+  let root_created = match adopted {
     Some(_) => None,
     None => {
       let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
@@ -314,15 +449,16 @@ fn record_repository(
       },
     },
   )?;
-  let root = match (adopted, created) {
+  let root = match (adopted, root_created) {
     (Some(id), _) => id,
-    (None, Some((id, created))) => {
-      record(state, &created)?;
+    (None, Some((id, root_created))) => {
+      record(state, &root_created)?;
       id
     }
     (None, None) => return Err(Refusal::NotFound),
   };
-  // The root joins and the default branch binds it in one entry of the new register (A-603).
+  // The root joins and the default branch binds it in one entry of the new register (A-603), which holds a Subversion
+  // repository's creation's record too (A-655 part 2b).
   let mut entry = next_entry(state, repository)?;
   entry.joined.push(MemberRecord {
     repository,
@@ -333,6 +469,7 @@ fn record_repository(
     name: default_branch.to_owned(),
     green: root,
   });
+  entry.objects = created;
   record(state, &Op::RepositoryAdvanced { entry })?;
   Ok(root)
 }
@@ -354,7 +491,8 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
   if !adopted {
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
   }
-  // The repository's tool store, beside its record, on its owner shard (A-662).
+  // The repository's tool store, beside its record, on its owner shard (A-662), made from the records its entries hold
+  // (a Subversion repository's creation's, A-655 part 2b), as a recovery makes it.
   if let Some(record) = state
     .db
     .partition()
@@ -362,7 +500,7 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
     .repository(repository)
     .cloned()
   {
-    crate::vcs_store::make(state, &record);
+    crate::vcs_store::make_from_log(state, &record);
   }
 }
 
@@ -720,12 +858,18 @@ fn db_hooks_env_section(
   }
 }
 
-/// Retires member `id` from its lineage at its destroy (module docs): its engine is gone at once, and what only it held
-/// is queued for [`run_releases`], which starts when none runs. False when `id` is no member.
+/// Retires member `id` from its lineage at its destroy (module docs): its engine is gone at once, and so is its map of
+/// paths to git's files (A-664 part 3, `vcs_store::paths::forget`), and what only it held in the lineage is queued for
+/// [`run_releases`], which starts when none runs. False when `id` is no member.
 pub(crate) fn retire_member(state: &mut ShardState, id: DbVolumeId) -> bool {
+  // Read before the retire, which ends the membership the lineage answers by.
+  let lineage = state.greens.lineage_of(&id);
   match state.greens.retire_queued(&id) {
     None => false,
     Some(Ok(start)) => {
+      if let Some(repository) = lineage {
+        crate::vcs_store::paths::forget(state, repository, id);
+      }
       if start {
         let spawned =
           slates_rt::futures::spawn(run_releases()).and_then(slates_rt::futures::detach);

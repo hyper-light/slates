@@ -13534,12 +13534,30 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
 /// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
 /// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
 fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
+  answer_head(
+    port,
+    "GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    patience,
+  )
+}
+
+/// Asks the version-control edge at loopback `port` for `target` with `token` as a bearer token, waiting [`WAIT_FOR`]
+/// for each read: the answer's head, lowercased, or why there was none.
+fn bearer_request(port: u16, target: &str, token: &str) -> std::io::Result<String> {
+  answer_head(
+    port,
+    &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"),
+    WAIT_FOR,
+  )
+}
+
+/// Sends `request` to the version-control edge at loopback `port`, waiting `patience` for each read: the answer's head,
+/// lowercased, or why there was none (a refused connection among them).
+fn answer_head(port: u16, request: &str, patience: Duration) -> std::io::Result<String> {
   use std::io::{Read, Write};
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
   stream.set_read_timeout(Some(patience))?;
-  stream.write_all(
-    b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
-  )?;
+  stream.write_all(request.as_bytes())?;
   let mut head = Vec::new();
   let mut chunk = [0u8; 1024];
   while !head.windows(4).any(|end| end == b"\r\n\r\n") {
@@ -13558,10 +13576,11 @@ fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
   Ok(String::from_utf8_lossy(&head).to_ascii_lowercase())
 }
 
-/// The port the next daemon of an anchor names for its version-control edge, from the anchor's forwarded `lines`, read
-/// until that daemon says it serves (`serving_line`); none if it named none first.
+/// The port the next daemon of an anchor names for a version-control edge on the line that starts `port_line`, from
+/// the anchor's forwarded `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
 fn edge_port_before_serving(
   lines: &std::sync::mpsc::Receiver<String>,
+  port_line: &str,
   serving_line: &str,
 ) -> Option<u16> {
   let mut port = None;
@@ -13573,7 +13592,7 @@ fn edge_port_before_serving(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
     );
-    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+    if let Some(rest) = line.strip_prefix(port_line) {
       port = rest.trim().parse::<u16>().ok();
     }
     if line.starts_with(serving_line) {
@@ -13610,7 +13629,7 @@ fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
   let (lines, forwarding) = forward_lines(stderr);
   anchor.drain = Some(forwarding);
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let port = edge_port_before_serving(&lines, &serving_line)
+  let port = edge_port_before_serving(&lines, VCS_HTTP_CLEARTEXT_LINE, &serving_line)
     .expect("the daemon named its edge's port before it served");
   let first = bare_request(port, WAIT_FOR).expect("the edge answered");
   assert!(first.starts_with("http/1.1 401 "), "{first}");
@@ -13661,5 +13680,686 @@ fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
     again,
     Some(port),
     "the restarted daemon serves the edge on the port its anchor holds"
+  );
+}
+
+/// Shape: the variable naming the command that runs stock Mercurial 7.2, its words split at spaces: on the Mac Studio
+/// `uvx --quiet --python 3.12 --from mercurial==7.2 hg`, as `crates/hg/fixtures/make-fixtures.sh` runs it. Unset, `hg`
+/// on the path.
+const STOCK_HG: &str = "SLATES_TEST_HG";
+
+/// Format: the start of the daemon's line naming its SSH edge's address, in the words of the HTTP edge's line (main's
+/// ruling, 2026-11-19); the port follows, and the line names the host key's SHA256 fingerprint too, so [`port_on`]
+/// reads the port's digits alone. A-684 (g299) makes the line with `--vcs-ssh <addr>`; until it lands no daemon starts
+/// the SSH edge (`crates/server/src/vcs_ssh.rs`, its Owed).
+const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
+
+/// Format: the user name stock hg gives, over SSH and as Basic's user name. It proves nothing: the key the test
+/// enrolled proves the principal over SSH, and the token, Basic's password, over HTTP.
+const HG_USER: &str = "slates";
+
+/// Stock Mercurial 7.2's command, or `None` when this host runs none, which the caller skips loudly: the words
+/// [`STOCK_HG`] names, answering `--version` with 7.2's line.
+fn stock_hg() -> Option<Vec<String>> {
+  let line = std::env::var(STOCK_HG).unwrap_or_else(|_| "hg".to_owned());
+  let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+  let (program, leading) = words.split_first()?;
+  let version = Command::new(program)
+    .args(leading)
+    .arg("--version")
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .output()
+    .ok()?;
+  let text = String::from_utf8_lossy(&version.stdout);
+  (version.status.success() && text.contains("(version 7.2")).then_some(words)
+}
+
+/// Runs stock hg with `args` in `dir`, outside any user's configuration (`HGRCPATH` empty), in its plain words
+/// (`HGPLAIN`), committing as one test user, with no terminal to prompt on: its exit code and both outputs.
+fn hg_in(hg: &[String], dir: &str, args: &[&str]) -> (i32, String, String) {
+  let output = Command::new(&hg[0])
+    .args(&hg[1..])
+    .args(args)
+    .current_dir(dir)
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .env("HGUSER", "Test <test@example.com>")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// Runs stock hg as [`hg_in`] does, failing the test unless it succeeds: its standard output.
+fn hg_ok(hg: &[String], dir: &str, args: &[&str]) -> String {
+  let (code, out, err) = hg_in(hg, dir, args);
+  assert_eq!(code, 0, "hg {args:?} in {dir}: {out}{err}");
+  out
+}
+
+/// `args`, then the `--config` words `config` holds.
+fn with_config<'a>(args: &[&'a str], config: &'a [String]) -> Vec<&'a str> {
+  args
+    .iter()
+    .copied()
+    .chain(config.iter().map(String::as_str))
+    .collect()
+}
+
+/// The changesets of the working copy at `dir`, newest first.
+fn hg_nodes(hg: &[String], dir: &str) -> Vec<String> {
+  hg_ok(hg, dir, &["log", "--template", "{node}\\n"])
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Starts an anchor whose daemon is asked for `edges` (`--vcs-http`, `--vcs-ssh`) and waits until it serves: the
+/// anchor, and the daemon's lines before it served, which name the edges' ports.
+fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<String>) {
+  use std::io::{BufRead, Write};
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .args(edges)
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let mut lines = Vec::new();
+  loop {
+    let mut line = String::new();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    if line.starts_with(&serving_line) {
+      break;
+    }
+    lines.push(line);
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  (anchor, lines)
+}
+
+/// The port named on the line of `lines` that begins with `prefix`: the digits right after it, so what the line names
+/// after the port (the SSH edge's host key, A-684) is never read as part of it.
+fn port_on(lines: &[String], prefix: &str) -> Option<u16> {
+  lines.iter().find_map(|line| {
+    line
+      .strip_prefix(prefix)?
+      .split(|character: char| !character.is_ascii_digit())
+      .next()?
+      .parse()
+      .ok()
+  })
+}
+
+/// Makes a Mercurial repository `name` through the CLI: `slates repository create <name> --tool hg`, A-685 (g305),
+/// `CreateRepository`'s fields as its flags (main's ruling, 2026-11-19). Until it lands no client verb sends
+/// `CreateRepository`: the server's tests and the Subversion migration alone do.
+fn create_hg_repository(instance: &str, name: &str) {
+  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
+  assert_eq!(code, 0, "repository create: {out}{err}");
+}
+
+/// Stock hg's round trip through slates at `url`, `config` its `--config` words (credentials, the SSH command): a
+/// history made in a fresh working copy and pushed, the repository's first; cloned into a second copy; a changeset made
+/// there and pushed; pulled back into the first. Fails the test unless every step succeeds and both copies end with the
+/// same two changesets.
+#[allow(clippy::disallowed_methods)]
+fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
+  let (local, clone) = (format!("{scratch}/local"), format!("{scratch}/clone"));
+  hg_ok(hg, scratch, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--addremove", "--message", "first"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  hg_ok(hg, scratch, &with_config(&["clone", url, &clone], config));
+  assert_eq!(
+    hg_nodes(hg, &clone),
+    hg_nodes(hg, &local),
+    "the clone holds what was pushed"
+  );
+  std::fs::write(format!("{clone}/file"), "first\nsecond\n").unwrap();
+  hg_ok(hg, &clone, &["commit", "--message", "second"]);
+  hg_ok(hg, &clone, &with_config(&["push"], config));
+  hg_ok(hg, &local, &with_config(&["pull", url], config));
+  let nodes = hg_nodes(hg, &local);
+  assert_eq!(
+    (nodes.len(), &nodes),
+    (2, &hg_nodes(hg, &clone)),
+    "the pull brought the clone's push back"
+  );
+}
+
+/// A-650 part 1 and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a Basic challenge,
+/// which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial 7.2, given no
+/// credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort: http
+/// authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 the daemon's edge serves git's site
+/// alone (`DaemonSite`), so hg's request is answered `404` (hg: `abort: HTTP Error 404: Not Found`; Mac Studio, kiln
+/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offers Bearer alone, which crashes 7.2
+/// ("** unknown exception encountered", `ValueError: AbstractDigestAuthHandler does not support the following scheme:
+/// 'Bearer'`, raised at Python 3.12's `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1; measured on
+/// the Mac Studio on 2026-11-19 against a stub answering that `401`), since urllib's digest handler reads the first
+/// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
+/// (g258).
+#[test]
+#[ignore = "waits on A-686 (g258: Basic's challenge first; stock hg 7.2 crashes on a first Bearer challenge); \
+            the hg site and its lender are on the daemon's edge (A-680 part 2a)"]
+fn stock_hg_without_credentials_is_refused_in_its_own_words() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's refusal: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("cli-hg-refused-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port =
+    port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-refused"),
+  };
+  let url = format!("http://127.0.0.1:{port}/r");
+  let (code, out, err) = hg_in(&hg, &scratch.path, &["clone", &url, "clone"]);
+  assert!(
+    !err.contains("unknown exception"),
+    "stock hg crashed on the edge's refusal: {err}"
+  );
+  assert_eq!(code, 255, "{out}{err}");
+  assert!(
+    err.contains("abort: http authorization required for"),
+    "{err}"
+  );
+}
+
+/// A-650 part 1 and A-686 (§4.17.3 "Access": Basic with a token as the password, over TLS or the loopback edge, main's
+/// ruling of 2026-11-19). Do: start an anchor with its HTTP edge on loopback (`--vcs-http 127.0.0.1:0`); make a
+/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`); with the token as
+/// Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and
+/// pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: as of main 34d10acb5 the CLI has no
+/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), the daemon's edge serves git's site alone and
+/// the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them), and the
+/// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
+/// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
+#[test]
+#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push) and A-686 (g258: Basic \
+            with the token as password on the loopback edge, Basic's challenge first)"]
+fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg over the HTTP edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("cli-hg-http-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port =
+    port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = run(&instance, &["credential", "token"]);
+  assert_eq!(code, 0, "credential token: {out}{err}");
+  let token = out
+    .lines()
+    .find_map(|line| line.strip_prefix("token: "))
+    .expect("credential token names its token")
+    .trim()
+    .to_owned();
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-http"),
+  };
+  hg_round_trip(&hg, &scratch.path, &format!("{prefix}r"), &config);
+}
+
+/// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
+/// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a
+/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
+/// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
+/// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
+/// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
+/// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
+/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
+/// HTTP site's pushes wait on A-680 part 2b.
+#[test]
+#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (unbundle in the stdio \
+            session, through hg_push as A-680 part 2b lands the HTTP site's)"]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg over the SSH edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-ssh"),
+  };
+  let key = format!("{}/key", scratch.path);
+  let Ok(made) = Command::new("ssh-keygen")
+    .args([
+      "-q",
+      "-t",
+      "ed25519",
+      "-N",
+      "",
+      "-C",
+      "slates-hg-test",
+      "-f",
+      &key,
+    ])
+    .output()
+  else {
+    eprintln!("skipping stock hg over the SSH edge: no ssh-keygen here");
+    return;
+  };
+  assert!(made.status.success(), "ssh-keygen: {made:?}");
+  let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
+  let instance = format!("cli-hg-ssh-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let port = port_on(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = run(&instance, &["credential", "key", public.trim()]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let ssh = format!(
+    "ui.ssh=ssh -i {key} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no \
+     -o UserKnownHostsFile=/dev/null"
+  );
+  let config = vec!["--config".to_owned(), ssh];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  hg_round_trip(&hg, &scratch.path, &url, &config);
+}
+
+/// Starts an anchor whose daemon serves the version-control HTTP edge on loopback, on a port the system picks
+/// (`--vcs-http 127.0.0.1:0`), and waits for it as [`start_anchor_with_issuer_surface`] does, its consensus group
+/// bootstrapped: the anchor, the issuer surface's exports where this platform prints them ([`PRINTS_ISSUER_SURFACE`]),
+/// and the edge's port, which the daemon names before it says it serves.
+fn start_anchor_with_vcs_http(
+  instance: &str,
+) -> (AnchorProcess, Option<Vec<(String, String)>>, u16) {
+  use std::io::{BufRead, Write};
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-http",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let (mut port, mut exports, mut serving) = (None, None, false);
+  let mut line = String::new();
+  while !serving || (PRINTS_ISSUER_SURFACE && exports.is_none()) {
+    line.clear();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    port = port.or_else(|| {
+      line
+        .strip_prefix(VCS_HTTP_CLEARTEXT_LINE)
+        .and_then(|rest| rest.trim().parse::<u16>().ok())
+    });
+    serving |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  await_stable_daemon(instance, true);
+  let port = port.expect("the daemon named its edge's port before it served");
+  (anchor, exports, port)
+}
+
+/// A-685 (§4.17.1 "The repository and its greens"; §4.17.2 "Transports" item 1): `slates repository create` against
+/// a real anchor. Do: start an anchor whose daemon serves the version-control HTTP edge on loopback; create git
+/// repository `NAME` from the command line; create `NAME` again, for Mercurial; create one repository of each other
+/// tool with its defaults, and one with `--json`; enroll an HTTP token for this account (`slates credential token`, the
+/// issuer's verb) and ask the edge, with it as a bearer token, for `NAME`'s receive-pack advertisement and for a name
+/// no repository has. Expect: the create answers the repository and its root green's id; the second create is refused
+/// `AlreadyExists` (exit 1), a name being taken whatever the tool; each tool's create answers with its defaults; the
+/// edge answers `200` for the repository by its name and `404` for the unknown name. Where this platform publishes no
+/// issuer surface (Linux: a descriptor only the anchor's children hold) the token's leg is skipped, loudly; the creates
+/// run everywhere.
+#[test]
+fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
+  let instance = format!("cli-repository-{}", std::process::id());
+  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance);
+  let name = "made-by-the-cli";
+  let (code, out, err) = run(&instance, &["repository", "create", name, "--tool", "git"]);
+  assert_eq!(code, 0, "the create answers: {err}");
+  assert_eq!(value_of(&out, "repository"), name, "{out}");
+  assert_eq!(value_of(&out, "id").len(), 32, "the root green's id: {out}");
+  the_name_is_taken_whatever_the_tool(&instance, name);
+  each_tool_creates_with_its_defaults(&instance);
+  let Some(issuer) = issuer else {
+    println!(
+      "SKIP the edge's leg: this platform publishes no issuer surface through the environment, so a separate process \
+       cannot enroll a token (on Linux the anchor's segment is a descriptor its children hold). The creates ran."
+    );
+    return;
+  };
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "token"]);
+  assert_eq!(code, 0, "a token for this account: {err}");
+  let token = value_of(&out, "token");
+  let found = bearer_request(
+    port,
+    &format!("/{name}/info/refs?service=git-receive-pack"),
+    &token,
+  )
+  .expect("the edge answered for the repository");
+  let unknown = bearer_request(
+    port,
+    "/no-such-repository/info/refs?service=git-receive-pack",
+    &token,
+  )
+  .expect("the edge answered for the unknown name");
+  drop(anchor);
+  assert!(found.starts_with("http/1.1 200 "), "found by name: {found}");
+  assert!(
+    unknown.starts_with("http/1.1 404 "),
+    "no repository of that name: {unknown}"
+  );
+}
+
+/// `repository create NAME` again, for another tool than the first: refused `AlreadyExists`, exit 1 (a repository's
+/// name is unique whatever its tool, §4.17.1 item 1).
+fn the_name_is_taken_whatever_the_tool(instance: &str, name: &str) {
+  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
+  assert_eq!(code, 1, "the name is taken: {out}{err}");
+  assert!(err.contains("AlreadyExists"), "{err}");
+}
+
+/// A repository of each tool, with its defaults, and one created with `--json`: each answers (exit 0), the JSON one with
+/// its name and its root green's id.
+fn each_tool_creates_with_its_defaults(instance: &str) {
+  for (name, tool) in [("an-hg-one", "hg"), ("an-svn-one", "svn")] {
+    let (code, out, err) = run(instance, &["repository", "create", name, "--tool", tool]);
+    assert_eq!(code, 0, "{tool}'s create answers: {err}");
+    assert_eq!(value_of(&out, "repository"), name, "{out}");
+  }
+  let (code, out, err) = run(
+    instance,
+    &[
+      "repository",
+      "create",
+      "a-sha256-one",
+      "--tool",
+      "git",
+      "--format",
+      "sha256",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"repository\":\"a-sha256-one\"") && out.contains("\"id\":\""),
+    "{out}"
+  );
+}
+
+/// Format: the start of the daemon's line naming where its svn:// listener serves (`crates/api/src/role/daemon.rs`),
+/// here on the loopback address the tests ask for; the port follows.
+const VCS_SVN_LINE: &str = "slates daemon: the svn:// listener serves on 127.0.0.1:";
+/// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`SVN_RECORDED_URL`] under a root
+/// holding no repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
+const SVNSERVE_NO_REPOSITORY: &[u8] =
+  include_bytes!("../../svn/fixtures/handshake/no-repository.server.bin");
+/// Format: what that client wrote: its answer to the greeting, naming [`SVN_RECORDED_URL`].
+const SVN_NO_REPOSITORY: &[u8] =
+  include_bytes!("../../svn/fixtures/handshake/no-repository.client.bin");
+/// Format: the URL the recorded client named, at `svnserve`'s default port; a client of the listener names its port.
+const SVN_RECORDED_URL: &str = "svn://127.0.0.1/missing";
+/// Format: where the recorded server's refusal starts, after its greeting.
+const SVN_REFUSAL_START: &[u8] = b"( failure ";
+/// Format: the capability `svnserve`'s greeting announces and slates' does not, its word and the space after it: a
+/// sender uses zlib only with a peer that announced `svndiff1` (`marshal.c`), so slates never receives zlib (§4.17.4
+/// "5. The wire"; `slates_svn::handshake`).
+const SVN_SVNDIFF1: &str = "svndiff1 ";
+
+/// The URL a client of the svn:// listener at loopback `port` names for the repository `missing`, as
+/// [`SVN_RECORDED_URL`] did.
+fn svn_url_at(port: u16) -> String {
+  format!("svn://127.0.0.1:{port}/missing")
+}
+
+/// ra_svn's string item holding `text`: its length, a colon, its bytes (`marshal.c`).
+fn svn_string(text: &str) -> String {
+  format!("{}:{text}", text.len())
+}
+
+/// `svnserve`'s words refusing `url` under a root that holds no repository (`serve.c` `find_repos`).
+fn svn_no_repository(url: &str) -> String {
+  format!("No repository found in '{url}'")
+}
+
+/// `recorded` with its one item `item` written as `replacement`: the recording must hold `item` exactly once, so the
+/// replacement keeps every other byte as stock Subversion wrote it.
+fn svn_replaced(recorded: &[u8], item: &str, replacement: &str) -> Vec<u8> {
+  let item = item.as_bytes();
+  let places: Vec<usize> = recorded
+    .windows(item.len())
+    .enumerate()
+    .filter(|(_, window)| *window == item)
+    .map(|(place, _)| place)
+    .collect();
+  assert_eq!(places.len(), 1, "the recording holds the item once");
+  let place = places[0];
+  let mut bytes = recorded[..place].to_vec();
+  bytes.extend_from_slice(replacement.as_bytes());
+  bytes.extend_from_slice(&recorded[place + item.len()..]);
+  bytes
+}
+
+/// What the svn:// listener at loopback `port` must send, as `svnserve` sent it: the greeting, its `svndiff1` taken out
+/// ([`SVN_SVNDIFF1`]), then the refusal of the recorded client's URL naming that port.
+fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
+  let refusal = SVNSERVE_NO_REPOSITORY
+    .windows(SVN_REFUSAL_START.len())
+    .position(|window| window == SVN_REFUSAL_START)
+    .expect("the recorded server refused");
+  (
+    svn_replaced(&SVNSERVE_NO_REPOSITORY[..refusal], SVN_SVNDIFF1, ""),
+    svn_replaced(
+      &SVNSERVE_NO_REPOSITORY[refusal..],
+      &svn_string(&svn_no_repository(SVN_RECORDED_URL)),
+      &svn_string(&svn_no_repository(&svn_url_at(port))),
+    ),
+  )
+}
+
+/// Speaks to the svn:// listener at loopback `port` as stock `svn` 1.15.0 spoke to `svnserve`, waiting `patience` for
+/// each read: reads as many bytes as the greeting holds, answers with the recorded client's answer naming that port,
+/// and reads until the listener closes. What it read before answering and after, or why there was none (a refused
+/// connection among them, or a silence past `patience`, which names the bytes read before it).
+fn svn_exchange(port: u16, patience: Duration) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+  use std::io::{Read, Write};
+  let (greeting, _) = svnserves_answers(port);
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  let mut greeted = Vec::new();
+  let mut chunk = [0u8; 4096];
+  while greeted.len() < greeting.len() {
+    let read = stream.read(&mut chunk).map_err(|error| {
+      std::io::Error::new(
+        error.kind(),
+        format!(
+          "{error}, the greeting read so far {:?}",
+          String::from_utf8_lossy(&greeted)
+        ),
+      )
+    })?;
+    if read == 0 {
+      break;
+    }
+    greeted.extend_from_slice(&chunk[..read]);
+  }
+  stream.write_all(&svn_replaced(
+    SVN_NO_REPOSITORY,
+    &svn_string(SVN_RECORDED_URL),
+    &svn_string(&svn_url_at(port)),
+  ))?;
+  let mut rest = Vec::new();
+  stream.read_to_end(&mut rest)?;
+  Ok((greeted, rest))
+}
+
+/// Asserts that `exchanged`, what [`svn_exchange`] read from the listener at `port`, is what `svnserve` sent: its
+/// greeting byte for byte but for `svndiff1`, then its refusal of the URL, "No repository found" (210005), and the
+/// connection's end.
+fn assert_svnserves_answers(exchanged: &(Vec<u8>, Vec<u8>), port: u16) {
+  let (greeting, refusal) = svnserves_answers(port);
+  assert_eq!(
+    String::from_utf8_lossy(&exchanged.0),
+    String::from_utf8_lossy(&greeting),
+    "the listener greets as svnserve does, svndiff1 aside"
+  );
+  assert_eq!(
+    String::from_utf8_lossy(&exchanged.1),
+    String::from_utf8_lossy(&refusal),
+    "the URL is refused as svnserve refuses it"
+  );
+}
+
+/// A-689 (§4.17.4 piece 7). Do: start an anchor whose daemon is asked for the svn:// listener on loopback, on a port
+/// the system picks (`--vcs-svn 127.0.0.1:0`); read the port the daemon names; connect, read the greeting, answer it as
+/// stock `svn` 1.15.0 answered `svnserve`, naming the repository `missing` at that port
+/// (`crates/svn/fixtures/handshake/no-repository.client.bin`), and read until the connection ends. Expect: the daemon
+/// names the listener's port before it says it serves; the greeting is `svnserve`'s byte for byte but for `svndiff1`
+/// (§4.17.4 "5. The wire"); the answer is refused as `svnserve` refuses a URL no repository holds, "No repository
+/// found" (210005), and the connection ends: the flag went from the anchor to its daemon, which runs A-656's
+/// connection on each connection it accepts.
+#[test]
+fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
+  let instance = format!("cli-vcs-svn-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = port_on(&lines, VCS_SVN_LINE)
+    .expect("the daemon named its svn:// listener's port before it served");
+  let exchanged = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  assert_svnserves_answers(&exchanged, port);
+}
+
+/// A-689 (§4.17.4 piece 7). Do: start an anchor with the svn:// listener on loopback (`--vcs-svn 127.0.0.1:0`); read
+/// the port its daemon names and speak to it as stock `svn` does; kill the daemon; once the anchor says it restarted
+/// it, connect to the same port again, before its successor serves; read the port the successor names. Expect: the
+/// connection made while the daemon was gone is greeted and answered by the successor as `svnserve` answers, and the
+/// successor names the same port: the anchor holds the listener, so a restart never drops its port.
+#[test]
+fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
+  let instance = format!("cli-vcs-svn-held-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-svn",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let port = edge_port_before_serving(&lines, VCS_SVN_LINE, &serving_line)
+    .expect("the daemon named its svn:// listener's port before it served");
+  let first = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  assert_svnserves_answers(&first, port);
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
+  let mut successor = None;
+  let mut while_restarting = None;
+  let mut again = None;
+  let mut served = false;
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(svn_exchange(port, START_CEILING));
+    }
+    if let Some(rest) = line.strip_prefix(VCS_SVN_LINE) {
+      again = rest.trim().parse::<u16>().ok();
+    }
+    served |= line.starts_with(&serving_line);
+  }
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let exchanged = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the svn:// listener's port was dropped while its daemon restarted: {error}")
+    });
+  assert_svnserves_answers(&exchanged, port);
+  assert_eq!(
+    again,
+    Some(port),
+    "the restarted daemon serves the svn:// listener on the port its anchor holds"
   );
 }

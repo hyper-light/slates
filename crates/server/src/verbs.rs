@@ -148,11 +148,18 @@ pub(crate) fn unpin_origin(
 /// `None` once the counter would reach the register-class bit (`slates_db::register::MAX_OBJECT_COUNTER`): an id
 /// past it would read as another register class of an older volume, so the partition mints no more ids
 /// ([`ids_exhausted`]). Until 2026-09-30 the counter was truncated silently to its low 48 bits.
+///
+/// The counter is the database's (`Db::volume_counter_at`, A-694): the next record's sequence, or one past the highest
+/// counter of any volume created here when that is later, so a volume a verb records moves the next mint past it even
+/// within the verb's own transaction.
 pub(crate) fn fresh_volume_id(state: &mut ShardState) -> Option<DbVolumeId> {
-  let count = state.db.next_seq();
-  if count > slates_db::register::MAX_OBJECT_COUNTER {
-    return None;
-  }
+  fresh_volume_id_at(state, 0)
+}
+
+/// The `offset`-th of several fresh volume ids minted before any of their volumes is recorded (A-694): an append's new
+/// branches, each its own, where [`fresh_volume_id`] would name the same id for each.
+pub(crate) fn fresh_volume_id_at(state: &mut ShardState, offset: u64) -> Option<DbVolumeId> {
+  let count = state.db.volume_counter_at(offset)?;
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
   bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());
@@ -9545,6 +9552,8 @@ fn judge_submission(
       // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
       // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
       let _ = crate::merge_service::settle_green_retention(state, green_id);
+      // A git repository's green keeps the version's map of paths to git's files (A-664 part 3, `vcs_store::paths`).
+      crate::vcs_store::paths::advance(state, green_id, version);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply

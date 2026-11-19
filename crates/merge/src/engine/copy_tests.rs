@@ -172,6 +172,34 @@ fn accept(green: &mut Green, work: &Work, id: u64) -> u64 {
   }
 }
 
+/// A-655 part 2b (`Green::beneath`: what a Subversion deletion names). Do: over `trunk`, list what stands beneath
+/// `trunk`, beneath `trunk/d`, beneath a file and beneath nothing; copy `trunk` to `branch` and list beneath `branch`.
+/// Expect: every file and directory beneath each, deepest first, the path itself left out; none beneath a file or an
+/// absent path; the copy's graft listed as the source's tree at its new place.
+#[test]
+fn t_a655_beneath_lists_a_tree_deepest_first_a_copys_graft_among_them() {
+  let mut green = trunk();
+  let tree = |at: &str| -> Vec<(String, bool)> {
+    [("d/b", false), ("d", true), ("c", false), ("a", false)]
+      .iter()
+      .map(|(path, directory)| (format!("{at}/{path}"), *directory))
+      .collect()
+  };
+  assert_eq!(green.beneath("trunk"), tree("trunk"));
+  assert_eq!(
+    green.beneath("trunk/d"),
+    vec![("trunk/d/b".to_owned(), false)]
+  );
+  assert_eq!(
+    (green.beneath("trunk/a"), green.beneath("gone")),
+    (Vec::new(), Vec::new())
+  );
+  let mut copy = Work::exclusive();
+  copy.copy("trunk", "branch", 1);
+  accept(&mut green, &copy, 2);
+  assert_eq!(green.beneath("branch"), tree("branch"));
+}
+
 /// The paths and classes of a conflict, or none for any other outcome.
 fn windows(outcome: &Outcome) -> Option<Vec<(String, MergeConflictClass)>> {
   match outcome {
@@ -386,6 +414,29 @@ fn a_copy_of_the_root_brings_every_path_beneath_its_destination() {
   );
   assert_eq!(green.changed_between(1, 2), ["snap"]);
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+}
+
+/// A-664 part 3 (a reader of the change index takes a copy's tree from the head: the index names the copy at its
+/// destination alone). Do: copy `trunk` at version 1 to `branches/x`, then ask `copied_after` of the destination, a
+/// path beneath it, the source and a path beside it. Expect: the destination and the path beneath it copied after
+/// version 1 and not after version 2, the copy's own; the source and the path beside it never.
+#[test]
+fn a_copy_is_named_for_every_path_of_its_tree_after_the_version_before_it() {
+  let mut green = trunk();
+  accept(
+    &mut green,
+    Work::exclusive().copy("trunk", "branches/x", 1),
+    2,
+  );
+  let asked = [
+    green.copied_after("branches/x", 1),
+    green.copied_after("branches/x/d/b", 1),
+    green.copied_after("branches/x", 2),
+    green.copied_after("branches/x/d/b", 2),
+    green.copied_after("trunk/a", 1),
+    green.copied_after("branches/y", 1),
+  ];
+  assert_eq!(asked, [true, true, false, false, false, false]);
 }
 
 /// A-586 and A-626 (the verdict's refusals, each naming the destination by kind). Do: against a green holding a trunk,

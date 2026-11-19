@@ -274,6 +274,9 @@ pub trait KeyHolders {
 pub enum Holding<P> {
   /// No principal holds it for this user.
   Nobody,
+  /// The holders cannot say yet: their record is somewhere a lookup must wait for (A-651). The request is answered
+  /// once its caller is told ([`Answer::wanted`]); nothing about it is decided or counted until then.
+  Unknown,
   /// `principal` holds it, and its policy wants `keys_required` distinct keys of its to sign (one at least).
   Holds {
     /// The principal.
@@ -313,6 +316,20 @@ pub struct Answer<P> {
   pub replies: Vec<Vec<u8>>,
   /// The authentication, when this request completed it.
   pub authenticated: Option<Authenticated<P>>,
+  /// The key the holders could not answer for yet ([`Holding::Unknown`]): the request is unanswered, and is asked again
+  /// once the caller knows who holds the key.
+  pub wanted: Option<Wanted>,
+}
+
+/// A key the holders could not answer for yet, and for whom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wanted {
+  /// The user name the client gave.
+  pub user: Vec<u8>,
+  /// The key.
+  pub key: UserKey,
+  /// Its blob, as the client sent it.
+  pub blob: Vec<u8>,
 }
 
 /// Keys proven so far for one user's principal.
@@ -435,6 +452,7 @@ impl<P: Clone + PartialEq> Authenticator<P> {
     let mut answer = Answer {
       replies: Vec::new(),
       authenticated: None,
+      wanted: None,
     };
     if self.done {
       return Ok(answer);
@@ -461,11 +479,7 @@ impl<P: Clone + PartialEq> Authenticator<P> {
         algorithm,
         blob,
         signature: None,
-      } => {
-        answer
-          .replies
-          .push(self.query(request.user, algorithm, blob, holders)?);
-      }
+      } => self.query(request.user, algorithm, blob, holders, &mut answer)?,
       Method::PublicKey {
         algorithm,
         blob,
@@ -485,22 +499,28 @@ impl<P: Clone + PartialEq> Authenticator<P> {
     Ok(answer)
   }
 
-  /// A query: `SSH_MSG_USERAUTH_PK_OK` for a key a principal holds, a counted failure otherwise.
+  /// A query: `SSH_MSG_USERAUTH_PK_OK` for a key a principal holds, a counted failure otherwise, and nothing yet for a
+  /// key the holders cannot answer for.
   fn query<H: KeyHolders<Principal = P>>(
     &mut self,
     user: &[u8],
     algorithm: &[u8],
     blob: &[u8],
     holders: &mut H,
-  ) -> Result<Vec<u8>, AuthRefusal> {
-    if held(user, algorithm, blob, holders).is_none() {
-      return self.fail();
+    answer: &mut Answer<P>,
+  ) -> Result<(), AuthRefusal> {
+    match held(user, algorithm, blob, holders) {
+      Held::Nobody => answer.replies.push(self.fail()?),
+      Held::Wanted(wanted) => answer.wanted = Some(wanted),
+      Held::Holds(..) => {
+        let mut reply = Vec::new();
+        put_byte(&mut reply, USERAUTH_PK_OK);
+        put_string(&mut reply, algorithm).map_err(AuthRefusal::Malformed)?;
+        put_string(&mut reply, blob).map_err(AuthRefusal::Malformed)?;
+        answer.replies.push(reply);
+      }
     }
-    let mut reply = Vec::new();
-    put_byte(&mut reply, USERAUTH_PK_OK);
-    put_string(&mut reply, algorithm).map_err(AuthRefusal::Malformed)?;
-    put_string(&mut reply, blob).map_err(AuthRefusal::Malformed)?;
-    Ok(reply)
+    Ok(())
   }
 
   /// A signed request: success, a partial success, or a counted failure.
@@ -510,10 +530,16 @@ impl<P: Clone + PartialEq> Authenticator<P> {
     holders: &mut H,
     answer: &mut Answer<P>,
   ) -> Result<(), AuthRefusal> {
-    let Some((kind, key, holding)) = held(request.user, request.algorithm, request.blob, holders)
-    else {
-      answer.replies.push(self.fail()?);
-      return Ok(());
+    let (kind, key, holding) = match held(request.user, request.algorithm, request.blob, holders) {
+      Held::Holds(kind, key, holding) => (kind, key, holding),
+      Held::Wanted(wanted) => {
+        answer.wanted = Some(wanted);
+        return Ok(());
+      }
+      Held::Nobody => {
+        answer.replies.push(self.fail()?);
+        return Ok(());
+      }
     };
     let data = signed_data(&self.session_id, request).map_err(AuthRefusal::Malformed)?;
     if !verify(kind, &key, &data, request.signature) {
@@ -591,20 +617,38 @@ struct Signed<'a> {
   signature: &'a [u8],
 }
 
-/// The key `blob` for `algorithm` and who holds it for `user`, if it reads and someone does.
+/// What the holders say of a request's key.
+enum Held<P> {
+  /// The key does not read, or nobody holds it for the user.
+  Nobody,
+  /// They cannot say yet.
+  Wanted(Wanted),
+  /// Someone holds it: the signature's algorithm, the key, and who.
+  Holds(SignatureAlgorithm, UserKey, Holding<P>),
+}
+
+/// The key `blob` for `algorithm` and who holds it for `user`.
 fn held<H: KeyHolders>(
   user: &[u8],
   algorithm: &[u8],
   blob: &[u8],
   holders: &mut H,
-) -> Option<(SignatureAlgorithm, UserKey, Holding<H::Principal>)> {
-  let kind = SignatureAlgorithm::from_name(algorithm)?;
-  let key = UserKey::parse(kind, blob).ok()?;
-  let holding = holders.holding(user, &key, blob);
-  if holding == Holding::Nobody {
-    return None;
+) -> Held<H::Principal> {
+  let Some(kind) = SignatureAlgorithm::from_name(algorithm) else {
+    return Held::Nobody;
+  };
+  let Ok(key) = UserKey::parse(kind, blob) else {
+    return Held::Nobody;
+  };
+  match holders.holding(user, &key, blob) {
+    Holding::Nobody => Held::Nobody,
+    Holding::Unknown => Held::Wanted(Wanted {
+      user: user.to_vec(),
+      key,
+      blob: blob.to_vec(),
+    }),
+    holding => Held::Holds(kind, key, holding),
   }
-  Some((kind, key, holding))
 }
 
 /// What the signature of `request` covers (RFC 4252 §7).

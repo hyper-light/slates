@@ -6,7 +6,8 @@ use slates_api::{Instance, Issuer};
 use slates_client::{
   AttachRequest, AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport,
   Digest, Established, GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal, Rebased,
-  Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId, VolumeSummary,
+  RepositorySpec, Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId,
+  VolumeSummary,
 };
 use slates_ipc::delivery::{Delivery, Output};
 use slates_ipc::rendezvous::ENV_ENDPOINT;
@@ -903,6 +904,27 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
   Ok(())
 }
 
+/// `repository create` (§4.17.1; A-685): the repository's name and its root green's id (the green its default branch
+/// is bound to), as text lines or a JSON `{ "repository", "id" }`. A refusal (a name taken: `AlreadyExists`) is the
+/// client's error, exit 1, as every verb's is.
+fn emit_repository_created(
+  client: &mut Client,
+  spec: &RepositorySpec,
+  json: bool,
+) -> Result<(), ClientError> {
+  let root = client.create_repository(spec)?;
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "repository": spec.name, "id": volume_id_text(root) })
+    );
+  } else {
+    slates_machine::out_line!("repository: {}", spec.name);
+    slates_machine::out_line!("id: {}", volume_id_text(root));
+  }
+  Ok(())
+}
+
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
 fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
@@ -1567,6 +1589,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       );
     }
     Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
+    Verb::RepositoryCreate { spec } => emit_repository_created(client, spec, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }

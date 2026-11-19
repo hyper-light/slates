@@ -7,7 +7,9 @@
 //! - git: A-614's store (`slates_git::store::Repository`) with its derived values (`slates_vcs::Derivations`), the first
 //!   of them A-647 part 2's reach sets, kept as each version commits;
 //! - Mercurial: A-588's index (`slates_hg::index::HgIndex`) with its derived values;
-//! - Subversion: A-553's index (`slates_svn::index::Index`) beside the repository's one green.
+//! - Subversion: the repository's records (`slates_svn::migration::Repository`: A-553's index, every revision's
+//!   properties, every text and property list by content identity, the lock table and the UUID) beside its one green
+//!   (A-655 part 2b), made from the record its creation's entry holds.
 //!
 //! The entry is made with the repository's record by `CreateRepository` on its owner shard ([`make`]), freed with the
 //! repository ([`free`]), and made again by a recovery ([`recover`]). The servers reach a store only through this map,
@@ -43,13 +45,23 @@
 //! and counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
 //! as before.
 //!
+//! **Subversion** (A-655 part 2b). A Subversion repository's entries hold its records (`slates_svn::commit::record`):
+//! the entry that joins its root holds its creation (its UUID and revision 0's date), and each entry that moves its
+//! green holds the revision the commit step committed. A recovery replays them through the step's own check and apply
+//! (`replay_svn`), so the records after it equal the records before; the creation's own entry is replayed the same way
+//! when the repository is made ([`make_from_log`]). The records are charged to the shard's budget by the bytes they hold
+//! (their texts, property lists and revision properties) as retention: a step is lent the room the shard could admit
+//! ([`lend_svn`]), the growth it checked is charged before its append ([`reserve_svn`]), and the charge is trued up after
+//! it ([`settle_svn`]); their index's entries are bounded by the room's bytes over the fewest an entry takes
+//! (`Index::ENTRY_BYTES`).
+//!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
 //! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
-//! today, as a commit is one step); a Mercurial push's record and its replay (its entry holds none yet, so a recovery
-//! keeps an import's history and not a push's), and Subversion's (g268's commit step), whose arm is placed here and whose
-//! records a recovery refuses typed until then; the Subversion index charged
-//! by the bytes it holds, once slates-svn measures them; a version's pack fragments encoded again after a recovery, off
-//! the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same records (A-636).
+//! today, as a commit is one step); a Mercurial push's record and its replay (an import's
+//! replays since A-687, [`replay_hg`]; a push's entry holds none yet); the Subversion index charged by the bytes it holds, once
+//! slates-svn measures them (its entries are bounded meanwhile); a version's pack fragments encoded again after a
+//! recovery, off the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same
+//! records (A-636).
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -62,15 +74,23 @@ use slates_git::store::views::PushedObjects;
 use slates_git::store::{Incoming, Move, Push, PushRefused, ReachSets, Repository, StoreRefused};
 use slates_hg::index::HgIndex;
 use slates_ipc::protocol::Refusal;
+use slates_svn::commit::record::{Record as SvnRecord, RecordRefused as SvnRecordRefused};
+use slates_svn::commit::revision::StepRefusal;
+use slates_svn::index::Index as SvnIndex;
+use slates_svn::migration::{Repository as SvnRecords, Room as SvnRoom};
 use slates_vcs::{Admitted, ContentRefused, ContentStore, Derivations, Mode};
 use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
 
 pub(crate) mod hg_import;
+pub(crate) mod hg_view;
+pub(crate) mod paths;
 pub(crate) mod record;
+// Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
+pub(crate) mod upload;
 
 use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 
@@ -136,6 +156,14 @@ pub(crate) struct GitStore {
   pub(crate) derivations: Derivations,
   /// The reach sets' type, eager: each version's value kept as it commits, from the admission's own walks.
   pub(crate) reach: ReachSets,
+  /// The path map's type over the repository's greens (A-664 part 3, [`paths`]): what each green's map of its head in
+  /// `heads` is made and read by. Declared with the content store's window when the store is made ([`made`]); `None`
+  /// for a window too small for the map's branches, which no content plane's window is.
+  pub(crate) paths: Option<paths::GreenPaths>,
+  /// Each green's map of its head, by the green's key (A-664 part 3, [`paths`]): one a member green that committed a
+  /// version, its root held once by the store, replaced as each version commits, given back as the green leaves its
+  /// lineage and made again by a recovery.
+  pub(crate) heads: BTreeMap<u64, paths::Head>,
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
   versions: BTreeMap<u64, Vec<u64>>,
@@ -151,6 +179,8 @@ impl GitStore {
       repository: Repository::new(format),
       derivations: Derivations::new(),
       reach: ReachSets::declare(Mode::Eager),
+      paths: None,
+      heads: BTreeMap::new(),
       versions: BTreeMap::new(),
       charged: 0,
     }
@@ -202,11 +232,13 @@ pub(crate) struct HgStore {
   pub(crate) derivations: Derivations,
 }
 
-/// A Subversion repository's store: A-553's index, beside its one green.
+/// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
 #[derive(Debug, Default)]
 pub(crate) struct SvnStore {
-  /// The index.
-  pub(crate) index: slates_svn::index::Index,
+  /// The records: none until the creation's record is replayed.
+  pub(crate) records: Option<SvnRecords>,
+  /// What the records hold of the shard's budget, charged as retention.
+  pub(crate) charged: u64,
 }
 
 /// Why a recovery could not make a store again from its records. Each leaves the store unserved.
@@ -220,13 +252,19 @@ pub(crate) enum ReplayRefused {
   Diverged,
   /// The store refused what it took before.
   Git(GitRefused),
+  /// A Subversion record's bytes (A-655 part 2b).
+  SvnRecord(SvnRecordRefused),
+  /// A Subversion repository's records not made from its creation's record: past the room (A-655 part 2b).
+  SvnCreated(slates_svn::migration::MigrationRefusal),
+  /// A Subversion revision the commit step refused again (A-655 part 2b).
+  SvnStep(StepRefusal),
+  /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
+  SvnOrder,
   /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
   /// step.
   Mercurial(slates_hg::import::record::Refused),
   /// Giving back the empty index a replayed one took the place of was refused: the content store's count of holds is off.
   Released,
-  /// A record of a tool whose replay is owed: Subversion's (g268's commit step).
-  Owed,
 }
 
 /// Why a git push's step was refused. Each leaves the store as it was, and the push holding what it held.
@@ -299,6 +337,13 @@ impl VcsStores {
     self.content.as_ref()
   }
 
+  /// The content store, lent for one step that gives back what something beside a repository's
+  /// store holds in it: a hook's view, whose holds outlive no repository entry
+  /// (`crate::git_hooks`, A-665 part 2).
+  pub(crate) fn content_mut(&mut self) -> Option<&mut ContentStore> {
+    self.content.as_mut()
+  }
+
   /// What the stores hold of the shard's budget.
   pub(crate) fn charged(&self) -> u64 {
     self.charged
@@ -339,10 +384,27 @@ impl VcsStores {
     }
   }
 
+  /// Repository `id`'s Mercurial store with the content store, read (A-680 part 2: the served view lends from it).
+  pub(crate) fn mercurial_ref(&self, id: RepositoryId) -> Option<(&ContentStore, &HgStore)> {
+    let content = self.content.as_ref()?;
+    match self.entries.get(&id)? {
+      RepositoryStore::Mercurial(store) => Some((content, store)),
+      _ => None,
+    }
+  }
+
   /// Repository `id`'s Subversion store, lent for one step.
   pub(crate) fn subversion(&mut self, id: RepositoryId) -> Option<&mut SvnStore> {
     match self.entries.get_mut(&id)? {
       RepositoryStore::Subversion(store) => Some(store),
+      _ => None,
+    }
+  }
+
+  /// Repository `id`'s Subversion records, read; none before its creation's record is replayed.
+  pub(crate) fn subversion_records(&self, id: RepositoryId) -> Option<&SvnRecords> {
+    match self.entries.get(&id)? {
+      RepositoryStore::Subversion(store) => store.records.as_ref(),
       _ => None,
     }
   }
@@ -387,7 +449,15 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     stores.content = Some(content);
   }
   let store = match record.tool {
-    VcsTool::Git => RepositoryStore::Git(GitStore::new(git_format(record.format).ok_or(Unmade)?)),
+    VcsTool::Git => {
+      let mut git = GitStore::new(git_format(record.format).ok_or(Unmade)?);
+      // The map splits by the content store's own window, which its type's name carries (A-647).
+      git.paths = stores
+        .content
+        .as_ref()
+        .and_then(|content| paths::declare(content.window()));
+      RepositoryStore::Git(git)
+    }
     VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore::default()),
     VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
   };
@@ -405,10 +475,19 @@ struct Unmade;
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   hg_import::abandon(state, id);
   state.vcs_stores.unrecovered.remove(&id);
-  if !release(&mut state.vcs_stores, id) {
+  if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
   }
   settle(state);
+}
+
+/// [`release`], the Subversion records' charge given back to the shard's budget first (A-655 part 2b).
+fn release_charged(state: &mut ShardState, id: RepositoryId) -> bool {
+  if let Some(store) = state.vcs_stores.subversion(id) {
+    let charged = core::mem::take(&mut store.charged);
+    state.store.budget.credit_retention(charged);
+  }
+  release(&mut state.vcs_stores, id)
 }
 
 /// Gives back everything repository `id`'s store holds; whether every hold went back.
@@ -420,7 +499,10 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
     RepositoryStore::Git(store) => {
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
-      store.repository.release(content).is_ok() && values && versions
+      let maps = store.heads.values().fold(true, |whole, head| {
+        content.release(&head.root).is_ok() && whole
+      });
+      store.repository.release(content).is_ok() && values && versions && maps
     }
     RepositoryStore::Mercurial(store) => {
       let values = store.derivations.release(content).is_ok();
@@ -473,8 +555,116 @@ pub(crate) fn settle(state: &mut ShardState) {
   }
 }
 
-/// Runs `step` over the stores with the room [`lend`] gives for `bytes`, then settles.
-fn within_budget<T>(
+/// The room a Subversion repository's records may grow into now: what they hold, charged, and every byte the shard's
+/// budget could admit; their index's entries those it holds and as many more as those bytes could hold at the fewest
+/// an entry takes (`Index::ENTRY_BYTES`, module docs).
+fn svn_room(store: &Store, charged: u64, entries: usize) -> SvnRoom {
+  let room = store.admittable();
+  let more = usize::try_from(room)
+    .unwrap_or(usize::MAX)
+    .checked_div(SvnIndex::ENTRY_BYTES)
+    .unwrap_or(0);
+  SvnRoom {
+    entries: entries.saturating_add(more),
+    bytes: charged.saturating_add(room),
+  }
+}
+
+/// Lends repository `id`'s Subversion records room for one step that brings `bytes` (A-655 part 2b; module docs,
+/// "Subversion"): the arena grown by them from its pool where it can be, then the room [`svn_room`] derives. Whether
+/// its records are held here.
+pub(crate) fn lend_svn(state: &mut ShardState, id: RepositoryId, bytes: u64) -> bool {
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  let Some(svn) = vcs_stores.subversion(id) else {
+    return false;
+  };
+  let Some(records) = svn.records.as_mut() else {
+    return false;
+  };
+  store.make_room(bytes);
+  records.set_room(svn_room(store, svn.charged, records.index().entries()));
+  true
+}
+
+/// Charges `bytes` repository `id`'s Subversion records are about to hold to the shard's budget, before the step that
+/// grows them appends (A-655 part 2b), so its append is lent only what remains; refused with the bytes the budget could
+/// admit, nothing charged.
+pub(crate) fn reserve_svn(state: &mut ShardState, id: RepositoryId, bytes: u64) -> Result<(), u64> {
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  let Some(svn) = vcs_stores.subversion(id) else {
+    return Err(0);
+  };
+  if store.budget.charge_retention(bytes).is_err() {
+    return Err(store.admittable());
+  }
+  svn.charged = svn.charged.saturating_add(bytes);
+  Ok(())
+}
+
+/// Gives back a reservation ([`reserve_svn`]) whose step was refused before its records grew.
+pub(crate) fn unreserve_svn(state: &mut ShardState, id: RepositoryId, bytes: u64) {
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  if let Some(svn) = vcs_stores.subversion(id) {
+    let given = bytes.min(svn.charged);
+    svn.charged = svn.charged.saturating_sub(given);
+    store.budget.credit_retention(given);
+  }
+}
+
+/// Trues the shard's charge up to what repository `id`'s Subversion records hold after a step, and sets their room back
+/// to what they hold (A-655 part 2b), counting a charge the budget would not take ([`CHARGE_SHORT`]).
+pub(crate) fn settle_svn(state: &mut ShardState, id: RepositoryId) {
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  let whole = vcs_stores
+    .subversion(id)
+    .is_none_or(|svn| settle_records(store, svn));
+  if !whole {
+    state.count(CHARGE_SHORT, 1);
+  }
+}
+
+/// [`settle_svn`]'s step over one store: whether the shard took every byte the records hold.
+fn settle_records(store: &mut Store, svn: &mut SvnStore) -> bool {
+  let Some(records) = svn.records.as_mut() else {
+    return true;
+  };
+  let held = records.held();
+  let mut whole = true;
+  if held > svn.charged {
+    if store
+      .budget
+      .charge_retention(held.saturating_sub(svn.charged))
+      .is_ok()
+    {
+      svn.charged = held;
+    } else {
+      whole = false;
+    }
+  } else {
+    store
+      .budget
+      .credit_retention(svn.charged.saturating_sub(held));
+    svn.charged = held;
+  }
+  records.set_room(SvnRoom {
+    entries: records.index().entries(),
+    bytes: svn.charged,
+  });
+  whole
+}
+
+/// Runs `step` over the stores with the room [`lend`] gives for `bytes`, then settles: a push's
+/// steps here, and a hook's view opened and sealed over the store (`crate::git_hooks`, A-665
+/// part 2).
+pub(crate) fn within_budget<T>(
   state: &mut ShardState,
   bytes: u64,
   step: impl FnOnce(&mut VcsStores) -> T,
@@ -555,7 +745,8 @@ impl SealedPush {
 
   /// The objects it holds in quarantine, read only: what a ref's work is read from beside the repository's index
   /// (A-638's `PushedObjects`), and how a move changes its ref (A-644's `Repository::change`), as git's push judges
-  /// each command (A-654).
+  /// each command (A-654). Also what a hook's view shows of the push (`crate::git_hooks`, A-665
+  /// part 2): in git's quarantine for `pre-receive`, among the repository's packs for `update`.
   pub(crate) fn quarantine(&self) -> &Push {
     &self.push
   }
@@ -992,31 +1183,42 @@ fn replay_record(
     ..
   } = &mut *state;
   let bytes = db.partition().repositories().object_record(id, index)?;
-  lend(
-    store,
-    vcs_stores,
-    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-  );
-  let replayed = replay_into(vcs_stores, id, bytes);
-  let whole = settle_in(store, vcs_stores);
+  let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  lend(store, vcs_stores, brought);
+  let room = vcs_stores.subversion(id).map(|svn| {
+    let entries = svn
+      .records
+      .as_ref()
+      .map_or(0, |records| records.index().entries());
+    svn_room(store, svn.charged, entries)
+  });
+  let replayed = replay_into(vcs_stores, id, bytes, room);
+  let mut whole = settle_in(store, vcs_stores);
+  if let Some(svn) = vcs_stores.subversion(id) {
+    whole &= settle_records(store, svn);
+  }
   if !whole {
     state.count(CHARGE_SHORT, 1);
   }
   Some(replayed.map(|unkept| state.count(VALUE_UNKEPT, unkept)))
 }
 
-/// Replays `bytes` into repository `id`'s store, by its tool: the derived values not kept.
+/// Replays `bytes` into repository `id`'s store, by its tool, a Subversion record within `svn_room`: the derived values
+/// not kept.
 fn replay_into(
   stores: &mut VcsStores,
   id: RepositoryId,
   bytes: &[u8],
+  svn_room: Option<SvnRoom>,
 ) -> Result<u64, ReplayRefused> {
   let unheld = ReplayRefused::Git(GitRefused::NoStore);
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
   match stores.entries.get_mut(&id) {
     Some(RepositoryStore::Git(store)) => replay_git(content, store, bytes),
+    Some(RepositoryStore::Subversion(store)) => {
+      replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
+    }
     Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
-    Some(RepositoryStore::Subversion(_)) => Err(ReplayRefused::Owed),
     None => Err(unheld),
   }
 }
@@ -1043,6 +1245,31 @@ fn replay_hg(
     .map_err(|_| ReplayRefused::Released)
 }
 
+/// Replays one Subversion record (A-655 part 2b; module docs, "Subversion") within `room`: a creation makes the
+/// records, revision 0 dated as recorded; a revision is checked and applied by the commit step, as its live step was,
+/// its lock entries as recorded. A record out of its order is refused, and so is one the step refuses; either leaves
+/// the records as they were.
+fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), ReplayRefused> {
+  match SvnRecord::decode(bytes).map_err(ReplayRefused::SvnRecord)? {
+    SvnRecord::Created { uuid, date } => {
+      if store.records.is_some() {
+        return Err(ReplayRefused::SvnOrder);
+      }
+      let records = SvnRecords::new(uuid, &date, room).map_err(ReplayRefused::SvnCreated)?;
+      store.records = Some(records);
+      Ok(())
+    }
+    SvnRecord::Revision(revision) => {
+      let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
+      records.set_room(room);
+      records
+        .commit(revision)
+        .map(drop)
+        .map_err(ReplayRefused::SvnStep)
+    }
+  }
+}
+
 /// The outcome of one record's replay, counted; a refused one leaves repository `id`'s store unserved, given back, with
 /// why. Whether to go on.
 fn replayed(state: &mut ShardState, id: RepositoryId, outcome: Result<(), ReplayRefused>) -> bool {
@@ -1057,13 +1284,32 @@ fn replayed(state: &mut ShardState, id: RepositoryId, outcome: Result<(), Replay
         state.partition
       );
       state.count(REPLAY_REFUSED, 1);
-      if !release(&mut state.vcs_stores, id) {
+      if !release_charged(state, id) {
         state.count(RELEASE_REFUSED, 1);
       }
       settle(state);
       state.vcs_stores.unrecovered.insert(id, why);
       false
     }
+  }
+}
+
+/// Makes `record`'s store and replays the records its register holds, in log order (module docs), in one step: what
+/// `CreateRepository` does on its owner shard, where a Subversion repository's creation's entry holds its first record
+/// (A-655 part 2b), and what a rebuild does.
+pub(crate) fn make_from_log(state: &mut ShardState, record: &RepositoryRecord) {
+  make(state, record);
+  replay_all(state, record.id);
+}
+
+/// Replays every record repository `id`'s register holds into its store, in log order, stopping at a refused one.
+fn replay_all(state: &mut ShardState, id: RepositoryId) {
+  let mut index = 0usize;
+  while let Some(outcome) = replay_record(state, id, index) {
+    if !replayed(state, id, outcome) {
+      break;
+    }
+    index = index.saturating_add(1);
   }
 }
 
@@ -1090,6 +1336,18 @@ pub(crate) async fn recover(
       index = index.saturating_add(1);
       slices.unit_done().await;
     }
+    // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
+    let greens: Vec<DbVolumeId> = state
+      .db
+      .partition()
+      .repositories()
+      .members_of(record.id)
+      .map(|member| member.green)
+      .collect();
+    for green in greens {
+      paths::remake_green(state, green);
+      slices.unit_done().await;
+    }
   }
 }
 
@@ -1100,13 +1358,8 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
     return;
   };
-  make(state, &record);
-  let mut index = 0usize;
-  while let Some(outcome) = replay_record(state, id, index) {
-    if !replayed(state, id, outcome) {
-      break;
-    }
-    index = index.saturating_add(1);
-  }
+  make_from_log(state, &record);
+  // Each green's map of its head, made again as the live store holds it (A-664 part 3).
+  paths::remake(state, id);
   state.count(REBUILT, 1);
 }

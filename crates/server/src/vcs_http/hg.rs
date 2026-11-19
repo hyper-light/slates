@@ -19,8 +19,8 @@
 //!    `checkauthz` reads `deny_read` and `allow_read` first. A push (`unbundle`, `pushkey`) also needs `POST` (`405`
 //!    with `Allow: POST`, hgweb's "push requires POST request") and a right to submit, rewrite or delete (`403`).
 //! 6. The service. hgweb's pages (a request naming no command of 7.2's table: the repository's browsing URLs,
-//!    §4.17.3 piece 12) are `503`, and so is a repository whose store this shard does not hold (A-662 keeps each
-//!    repository's on its owner shard; until the site is handed them no repository has one here, [`NoStores`]).
+//!    §4.17.3 piece 12) are `503`, and so is a repository whose served view this shard does not lend ([`HgStores`]: A-662
+//!    keeps each repository's store on its owner shard, and the daemon's lender makes the view over it, A-680 part 2).
 //!
 //! A served request is `200`: its body is the command's answer and its media type the one the answer names
 //! (`application/mercurial-0.1`, `-0.2` or `application/hg-error`), given as the reply begins.
@@ -42,12 +42,9 @@
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_hg::compression::Engine;
-use slates_hg::obsmarkers::Marker;
-use slates_hg::phases::Phase;
-use slates_hg::serve::getbundle::{Logged, Store};
+use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::http::{self as hg_http, Compression, Compressor, Media, Permission};
-use slates_hg::serve::{Repository, Rev};
-use slates_hg::{Admission, Node, http as hg_wire};
+use slates_hg::{Admission, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
@@ -96,96 +93,23 @@ fn to_u64(count: usize) -> u64 {
   u64::try_from(count).unwrap_or(u64::MAX)
 }
 
-/// Where Mercurial repositories' stores are lent on this shard (A-662: each repository's tool store, kept on its owner
-/// shard with its record), afresh for each step, as git's site's `StoreLender` lends its (A-640 part 2: "so a shard's
-/// state is never held across a wait").
+/// Where Mercurial repositories' served views are lent on this shard (A-662: each repository's store, kept on its owner
+/// shard with its record; A-680: the view over it), afresh for each step, as git's site's `StoreLender` lends its stores
+/// (A-640 part 2: "so a shard's state is never held across a wait"). The daemon's is
+/// `crate::vcs_store::hg_view::ServedViews`.
 pub(crate) trait HgStores {
-  /// The store a repository's commands are answered from.
-  type Store: Store;
-  /// Whether the store of repository `id` is held here.
+  /// The served view a repository's commands are answered from, lent for one step.
+  type Store<'s>: Store;
+  /// Whether the store of repository `id` is held here, to be lent.
   fn holds(&self, id: RepositoryId) -> bool;
-  /// Runs `step` over repository `id`'s store; none when it is not held here.
-  fn lend<R>(&mut self, id: RepositoryId, step: impl FnOnce(&Self::Store) -> R) -> Option<R>;
-}
-
-/// The stores as the site has them until it is handed A-662's (each repository's kept beside its record on its owner
-/// shard): none, so every Mercurial request a principal may make is `503`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct NoStores;
-
-/// The store no repository has yet: no value has this type.
-pub(crate) enum NoStore {}
-
-impl Repository for NoStore {
-  fn count(&self) -> Rev {
-    match *self {}
-  }
-
-  fn node(&self, _rev: Rev) -> Option<Node> {
-    match *self {}
-  }
-
-  fn rev(&self, _node: &Node) -> Option<Rev> {
-    match *self {}
-  }
-
-  fn parents(&self, _rev: Rev) -> [Option<Rev>; 2] {
-    match *self {}
-  }
-
-  fn branch(&self, _rev: Rev) -> &[u8] {
-    match *self {}
-  }
-
-  fn closes(&self, _rev: Rev) -> bool {
-    match *self {}
-  }
-
-  fn phase(&self, _rev: Rev) -> Phase {
-    match *self {}
-  }
-
-  fn publishing(&self) -> bool {
-    match *self {}
-  }
-
-  fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
-    std::iter::empty()
-  }
-}
-
-impl Store for NoStore {
-  fn changeset_text(&self, _rev: Rev) -> Option<&[u8]> {
-    match *self {}
-  }
-
-  fn manifest(&self, _node: &Node) -> Option<Logged<'_>> {
-    match *self {}
-  }
-
-  fn file(&self, _path: &[u8], _node: &Node) -> Option<Logged<'_>> {
-    match *self {}
-  }
-
-  fn file_node(&self, _manifest: &Node, _path: &[u8]) -> Option<Node> {
-    match *self {}
-  }
-
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    std::iter::empty()
-  }
-}
-
-impl HgStores for NoStores {
-  type Store = NoStore;
-
-  fn holds(&self, _id: RepositoryId) -> bool {
-    false
-  }
-
-  fn lend<R>(&mut self, _id: RepositoryId, _step: impl FnOnce(&NoStore) -> R) -> Option<R> {
-    None
-  }
+  /// Runs `step` over repository `id`'s served view, the view made within `room` and `step` handed what is left of it;
+  /// none when its store is not held here or no view could be made of it.
+  fn lend<R>(
+    &mut self,
+    id: RepositoryId,
+    room: &mut Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
+  ) -> Option<R>;
 }
 
 /// The design's first value for a stream's compression (§4.17.3 "Learned tunables": "each named engine at its fastest
@@ -379,6 +303,20 @@ fn judged<E>(
   }
 }
 
+/// Whether `head` is a Mercurial wire request, read within `room`: its query names a command (`cmd`), as hgweb tells a
+/// wire request from its pages (`wireprotoserver.handlewsgirequest` \[C\]: "if b'cmd' not in req.qsparams: return
+/// False"). git's requests name none, so the daemon's edge hands Mercurial's site these alone ([`super::ToolSites`]); a
+/// query that cannot be read within `room` names none.
+pub(crate) fn wire_request(head: &Head<'_>, room: u64) -> bool {
+  let Target::Path {
+    query: Some(query), ..
+  } = head.target
+  else {
+    return false;
+  };
+  hg_http::command(query, &mut Admission::new(room)).is_ok_and(|command| command.is_some())
+}
+
 /// Routes `head` (the module doc's names): its repository's name and its command's permission, each read within
 /// `room`; refused `400` where the path's escapes cannot be read, `414` where the path or the query's fields are past
 /// `room`, and `404` where no repository could be named.
@@ -526,8 +464,8 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     let mut admission = self.room;
     let answered = self
       .stores
-      .lend(self.repository.id, |store| {
-        hg_http::answer(store, &request, header_line(), &mut Fastest, &mut admission)
+      .lend(self.repository.id, &mut admission, |store, room| {
+        hg_http::answer(store, &request, header_line(), &mut Fastest, room)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     self.answered = Some((answered.media_type, answered.body));
