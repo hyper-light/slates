@@ -10,11 +10,14 @@
 //! - **Absent entries** are written only to a client that announced `absent-entries`; to any other
 //!   nothing is written, as `ra_svn_absent_dir` and `ra_svn_absent_file` skip them.
 //! - **A text delta** is `apply-textdelta`, then the svndiff stream as `textdelta-chunk`s, then
-//!   `textdelta-end`. The stream's four-byte header is one chunk, written at its first window or,
-//!   with none, at its end (`svndiff.c` `window_handler` writes it on its first call, the last
-//!   one's empty window included). Each window is up to three chunks, as `window_handler`'s three
-//!   stream writes make them: its integers, then its instruction section and its new-data section,
-//!   each when it is not empty.
+//!   `textdelta-end`, the chunks as `svndiff.c`'s stream writes make them (`d434dc14` and 1.15.0
+//!   alike). A version-0 window of new data alone, no source copy and one instruction, is
+//!   `send_simple_insertion_window`'s (89-151, chosen at 259-261): the stream's four-byte header,
+//!   when it is not out yet, its integers and its instruction as one chunk, then its new data.
+//!   Every other window is `window_handler`'s (250-303): the header as a chunk of its own when it
+//!   is not out yet, then up to three chunks, its integers, its instruction section and its
+//!   new-data section, each when it is not empty. A delta with no window has the header alone at
+//!   its end (the last call's empty window writes it).
 //! - **The svndiff version** is 2, each section LZ4 when that is shorter, to a client that accepts
 //!   it; 0 to any other (`svn_ra_svn__svndiff_version`). Never 1, which is zlib: slates sends no
 //!   zlib, and every client takes 0 (A-500).
@@ -34,7 +37,9 @@ use super::drive::Call;
 use crate::handshake::ClientCapabilities;
 use crate::index::{NodeKind, Revision};
 use crate::ra_svn::{self, ItemError, Value};
-use crate::svndiff::{Compression, Encoder, INTEGER_LIMIT, SvndiffError, Version, Window};
+use crate::svndiff::{
+  Compression, Encoder, INTEGER_LIMIT, Instruction, SvndiffError, Version, Window,
+};
 
 /// The first letter of a directory's token.
 /// Format: `editorp.c`'s `make_token('d', ...)` in `ra_svn_open_root`, `ra_svn_add_dir` and
@@ -453,8 +458,10 @@ impl EditorWriter {
     Ok(())
   }
 
-  /// One window of the open delta: the stream's header first if it is not out, then the window's
-  /// sections as `window_handler` writes them.
+  /// One window of the open delta, its chunks as `svndiff.c` writes them (module documentation): a
+  /// version-0 window of new data alone as `send_simple_insertion_window` writes it, the stream's
+  /// header leading its first chunk when it is not out yet; any other as `window_handler` writes
+  /// it, the header first as a chunk of its own when it is not out yet.
   fn window(&mut self, window: &Window, out: &mut Vec<u8>) -> Result<(), EditorRefused> {
     let (Phase::Rooted, Some(file), Some(delta)) =
       (self.phase, self.open.last(), self.delta.as_mut())
@@ -465,16 +472,43 @@ impl EditorWriter {
       return Err(EditorRefused::OutOfOrder);
     }
     let mut encoder = delta.encoder.clone();
+    let header = encoder.header();
+    let insertion = simple_insertion(self.version, window);
     self.window_bytes.clear();
+    if insertion && !delta.header_written {
+      self.window_bytes.extend_from_slice(&header);
+    }
+    let lead = self.window_bytes.len();
     encoder
       .window(window, self.compression, &mut self.window_bytes)
       .map_err(EditorRefused::Window)?;
-    let sections = window_sections(&self.window_bytes)?;
-    if !delta.header_written {
-      chunk(&file.token, &encoder.header(), out)?;
-    }
-    for section in sections.into_iter().filter(|section| !section.is_empty()) {
-      chunk(&file.token, section, out)?;
+    let encoded = self
+      .window_bytes
+      .get(lead..)
+      .ok_or(EditorRefused::Window(SvndiffError::CorruptWindowHeader))?;
+    let [integers, instructions, new_data] = window_sections(encoded)?;
+    if insertion {
+      let first_end = lead
+        .saturating_add(integers.len())
+        .saturating_add(instructions.len());
+      let first = self
+        .window_bytes
+        .get(..first_end)
+        .ok_or(EditorRefused::Window(SvndiffError::CorruptWindowHeader))?;
+      chunk(&file.token, first, out)?;
+      // Never empty, so `send_simple_insertion_window`'s `if (len)` always writes it: the encoder
+      // took the one instruction only with a length (`Progress::take` refuses zero) and with all
+      // the new data used (`Progress::finish`).
+      chunk(&file.token, new_data, out)?;
+    } else {
+      if !delta.header_written {
+        chunk(&file.token, &header, out)?;
+      }
+      for section in [integers, instructions, new_data] {
+        if !section.is_empty() {
+          chunk(&file.token, section, out)?;
+        }
+      }
     }
     delta.encoder = encoder;
     delta.header_written = true;
@@ -639,6 +673,13 @@ fn hex(digest: &[u8; 16]) -> [u8; 32] {
 /// One hexadecimal digit of a nibble.
 fn hex_digit(nibble: u8) -> u8 {
   HEX_DIGITS.get(usize::from(nibble)).copied().unwrap_or(b'0')
+}
+
+/// Whether `svndiff.c` writes `window` through `send_simple_insertion_window` (`window_handler`
+/// 259-261: version 0, no source copy and one instruction, which is then the new data making the
+/// whole target, 101-104).
+fn simple_insertion(version: Version, window: &Window) -> bool {
+  version == Version::Zero && matches!(window.instructions.as_slice(), [Instruction::New { .. }])
 }
 
 /// An encoded window split as `window_handler` writes it: its integers, its instruction section and
