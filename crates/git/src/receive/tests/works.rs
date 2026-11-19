@@ -11,7 +11,8 @@ use slates_vcs::ContentStore;
 use super::{ADVERTISED, commit_text, pack_of, request, unbounded, zero};
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::receive::works::{
-  Appends, Entry, GreenRead, Greens, KIND_CHANGED, Unappended, Version, Works,
+  Appends, Entry, GreenRead, Greens, KIND_CHANGED, Unappended, Version, Works, append_declined,
+  atomic_declined,
 };
 use crate::receive::{
   ATOMIC_TRANSACTION_FAILED, Declined, FAILED_TO_UPDATE, NoneHidden, Outcome, Received, Session,
@@ -426,15 +427,24 @@ fn an_orphan_create_states_the_whole_difference_from_the_default_head() {
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
   let made_at = matches!(
     logs.appended.as_slice(),
-    [Entry::Create { from: Some((GREEN, 1)), .. }]
+    [Entry::Create {
+      from: Some((GREEN, 1)),
+      ..
+    }]
   );
   assert!(made_at, "{:?}", logs.appended);
   let increment = only_increment(&logs).unwrap().clone();
   let verdict = served.green.submit(&increment);
-  assert!(matches!(verdict, Verdict::Accepted { version: 2 }), "{verdict:?}");
+  assert!(
+    matches!(verdict, Verdict::Accepted { version: 2 }),
+    "{verdict:?}"
+  );
   assert_eq!(served.green.content("file"), None);
   assert_eq!(served.green.content("other"), Some(&b"other\n"[..]));
-  assert_eq!(served.green.xattr(ROOT, HEAD_ATTRIBUTE), Some(orphan.as_bytes()));
+  assert_eq!(
+    served.green.xattr(ROOT, HEAD_ATTRIBUTE),
+    Some(orphan.as_bytes())
+  );
 }
 
 /// A-620 part 2 (§4.17.1 item 6: a tag is a green). Do: create `refs/tags/v1` at an annotated tag
@@ -550,4 +560,32 @@ fn a_work_a_store_cannot_build_is_refused_in_slates_words_naming_its_path() {
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [refused(KIND_CHANGED, MAIN, b"file")]);
   assert!(logs.appended.is_empty());
+}
+
+/// A-654 (an entry the append refused for a reason of its own: git's words for a ref not updated,
+/// slates' on band 2). Do: decline one ref's entry the append refused for the shard's budget, and an
+/// atomic push whose second entry it refused so. Expect: `failed to update ref` for the one and
+/// `atomic transaction failed` for the push, each band-2 line naming the refused ref and why.
+#[test]
+fn an_entry_the_append_refused_for_its_own_reason_is_answered_in_git_words_with_slates_why() {
+  let why = b"past the shard's budget".to_vec();
+  let one = append_declined(
+    MAIN,
+    &Unappended::Refused {
+      at: 0,
+      why: why.clone(),
+    },
+  );
+  assert_eq!(one.reason, FAILED_TO_UPDATE);
+  assert_eq!(
+    one.message,
+    Some(message(b"refs/heads/main: past the shard's budget"))
+  );
+  let names: [&[u8]; 2] = [MAIN, b"refs/heads/topic"];
+  let atomic = atomic_declined(&names, &Unappended::Refused { at: 1, why });
+  assert_eq!(atomic.reason, ATOMIC_TRANSACTION_FAILED);
+  assert_eq!(
+    atomic.message,
+    Some(message(b"refs/heads/topic: past the shard's budget"))
+  );
 }

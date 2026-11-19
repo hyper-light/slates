@@ -3,20 +3,22 @@
 //! through A-618's [`build`], read through the store's view of the push (A-638's `PushedObjects`),
 //! and appended to its green's own log through [`Appends`].
 //!
-//! **The verdict reads, and moves nothing** ([`Works`], receive-pack's [`Judge`]). Each green is
-//! read as the push found it ([`Greens`]), its state immutable at that position, so its work can be
-//! computed anywhere (A-645: merges computed anywhere, committed by position):
+//! **The verdict reads, and moves nothing** ([`Verdicts`]; [`Works`] pairs them with the appends
+//! as receive-pack's [`Judge`], and a server whose greens and appends are one shard's state judges
+//! through them between its own appends, A-654). Each green is read as the push found it
+//! ([`Greens`]), its state immutable at that position, so its work can be computed anywhere (A-645:
+//! merges computed anywhere, committed by position):
 //! - an update's base is the version whose head is the command's old value (§4.17.1 item 1); a
 //!   value no version of the green held is answered as git answers a ref that moved, before any
 //!   work is built;
 //! - its work is A-618's: the whole-file operations between that version's tree and the tree the
 //!   new value names, and the head operation (items 2 and 3);
 //! - a create is made at the version of a green its new value's first parent heads, where one can
-//!   still be branched from, else at the default branch's head ([`Greens::base_of_create`]), and its
-//!   work states the whole difference against that version's tree, so the new green holds exactly
-//!   the client's tree; in a repository whose default branch is unborn, over an empty green. A
-//!   create of a ref that names a green is a ref that moved, as git's lock refuses a ref that exists
-//!   (A-654, main's ruling of 2026-11-19);
+//!   still be branched from, else at the default branch's head ([`Greens::base_of_create`]), and
+//!   its work states the whole difference against that version's tree, so the new green holds
+//!   exactly the client's tree; in a repository whose default branch is unborn, over an empty
+//!   green. A create of a ref that names a green is a ref that moved, as git's lock refuses a ref
+//!   that exists (A-654, main's ruling of 2026-11-19);
 //! - a delete retires the green, its old value the green's head, or the ref moved.
 //!
 //! A ref's tree is its commit's, or the tree it names; a tag (a green too, §4.17.1 item 6) may name
@@ -97,16 +99,17 @@ pub struct Version {
 /// green). A green is lent for one call at a time, as the server lends one member of a lineage at a
 /// time (A-575), so each read runs its caller's step over the green and answers what it made.
 pub trait Greens {
-  /// Runs `with` over the green the ref `name` names, read for this push: what it made, or none for a
-  /// ref that names none.
+  /// Runs `with` over the green the ref `name` names, read for this push: what it made, or none
+  /// for a ref that names none.
   fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T>;
 
   /// The version of `green` whose head is `head`, if one held it (§4.17.1 item 1: a push's base).
   fn version_of(&self, green: u64, head: &ObjectId) -> Option<Version>;
 
   /// Runs `with` over the green and version a create whose new value's first parent is `parent` is
-  /// made at (module docs): the version whose head is `parent` where one can still be branched from;
-  /// else the default branch's head. What it made, or none while the default branch is unborn.
+  /// made at (module docs): the version whose head is `parent` where one can still be branched
+  /// from; else the default branch's head. What it made, or none while the default branch is
+  /// unborn.
   fn base_of_create<T>(
     &self,
     parent: Option<&ObjectId>,
@@ -160,6 +163,15 @@ pub enum Unappended {
     /// The conflict's windows.
     windows: Vec<ConflictWindow>,
   },
+  /// The append refused it for a reason of its own, given in slates' words (the shard's budget, the
+  /// register's capacity, an approval the branch requires): git's words for a ref not updated, with
+  /// `why` on band 2 (A-654).
+  Refused {
+    /// The entry's place.
+    at: usize,
+    /// Why, in slates' words.
+    why: Vec<u8>,
+  },
 }
 
 /// The appends that move refs (A-642: each green its own log; module docs).
@@ -171,20 +183,29 @@ pub trait Appends {
   fn append_atomic(&mut self, entries: Vec<Entry>) -> Result<(), Unappended>;
 }
 
-/// receive-pack's part 2 judge (module docs).
-pub struct Works<'w, G: ?Sized, R: ?Sized, O, A: ?Sized> {
+/// receive-pack's part 2 verdicts, read only (module docs): each command's entry, judged over the
+/// greens as the push read them, moving nothing. [`Works`] pairs them with an [`Appends`]; a server
+/// whose greens and appends are one shard's state judges through them between its own appends
+/// (A-654), each borrow of the state ending with its call.
+pub struct Verdicts<'w, G: ?Sized, R: ?Sized, O> {
   /// The greens as the push reads them.
   greens: &'w G,
   /// The repository's indexed objects, for a commit or tag the push did not bring.
   repository: &'w R,
   /// The push's trees and blobs, the index first and then the push's quarantine.
   objects: &'w O,
-  /// Where the works are appended.
-  appends: &'w mut A,
   /// The push's name, which every work's identity begins with (A-618).
   name: [u8; 32],
   /// The room each work is built within.
   room: u64,
+}
+
+/// receive-pack's part 2 judge (module docs): the verdicts, appended through `appends`.
+pub struct Works<'w, G: ?Sized, R: ?Sized, O, A: ?Sized> {
+  /// The verdicts.
+  verdicts: Verdicts<'w, G, R, O>,
+  /// Where the works are appended.
+  appends: &'w mut A,
 }
 
 impl<'w, G, R, O, A> Works<'w, G, R, O, A>
@@ -206,12 +227,46 @@ where
     room: u64,
   ) -> Self {
     Self {
+      verdicts: Verdicts::new(greens, repository, objects, name, room),
+      appends,
+    }
+  }
+}
+
+impl<'w, G, R, O> Verdicts<'w, G, R, O>
+where
+  G: Greens + ?Sized,
+  R: Repository + ?Sized,
+  O: PushObjects,
+{
+  /// The verdicts of the push named `name` (two submits of one push carry one name): its greens
+  /// read from `greens`, a commit it did not bring from `repository`, its trees and blobs from
+  /// `objects` (A-638's `PushedObjects`), each work built within `room` bytes.
+  pub fn new(greens: &'w G, repository: &'w R, objects: &'w O, name: [u8; 32], room: u64) -> Self {
+    Self {
       greens,
       repository,
       objects,
-      appends,
       name,
       room,
+    }
+  }
+
+  /// `command`'s entry (module docs): an update's work, a create's new green, a delete's
+  /// retirement, or why not, in git's words where git has them.
+  pub fn judge(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
+    let (create, delete) = (command.is_create(), command.is_delete());
+    let judged = self
+      .greens
+      .read(&command.name, |read| match (create, delete) {
+        (false, true) => self.retire(command, read),
+        (false, false) => self.update(command, pushed, read),
+        _ => Err(moved(&command.name)),
+      });
+    match (judged, create, delete) {
+      (Some(judged), ..) => judged,
+      (None, true, false) => self.create(command, pushed),
+      _ => Err(moved(&command.name)),
     }
   }
 
@@ -237,11 +292,13 @@ where
   /// A create's work, against the version it is made at, or over an empty green (module docs).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
     let parent = self.first_parent(&command.new, pushed);
-    let made = self.greens.base_of_create(parent.as_ref(), |read, version| {
-      self
-        .work(command, pushed, read.green, Some(version))
-        .map(|increment| (Some((read.id, version.number)), increment))
-    });
+    let made = self
+      .greens
+      .base_of_create(parent.as_ref(), |read, version| {
+        self
+          .work(command, pushed, read.green, Some(version))
+          .map(|increment| (Some((read.id, version.number)), increment))
+      });
     let (from, increment) = match made {
       Some(made) => made?,
       None => (None, self.work(command, pushed, &Green::new(), None)?),
@@ -367,19 +424,7 @@ where
   type Accepted = Entry;
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
-    let (create, delete) = (command.is_create(), command.is_delete());
-    let judged = self
-      .greens
-      .read(&command.name, |read| match (create, delete) {
-        (false, true) => self.retire(command, read),
-        (false, false) => self.update(command, pushed, read),
-        _ => Err(moved(&command.name)),
-      });
-    match (judged, create, delete) {
-      (Some(judged), ..) => judged,
-      (None, true, false) => self.create(command, pushed),
-      _ => Err(moved(&command.name)),
-    }
+    self.verdicts.judge(command, pushed)
   }
 
   fn append(&mut self, command: &Command, entry: Entry) -> Result<Vec<Reported>, Declined> {
@@ -387,7 +432,7 @@ where
       .appends
       .append(entry)
       .map(|()| Vec::new())
-      .map_err(|unappended| not_appended(FAILED_TO_UPDATE, &[command.name.as_slice()], &unappended))
+      .map_err(|unappended| append_declined(&command.name, &unappended))
   }
 
   fn append_atomic(
@@ -403,8 +448,20 @@ where
       .appends
       .append_atomic(entries)
       .map(|()| Vec::new())
-      .map_err(|unappended| not_appended(ATOMIC_TRANSACTION_FAILED, &names, &unappended))
+      .map_err(|unappended| atomic_declined(&names, &unappended))
   }
+}
+
+/// The refusal of the ref `name`'s entry the append did not take, in git's words for a ref not
+/// updated (`failed to update ref`), why on band 2.
+pub fn append_declined(name: &[u8], unappended: &Unappended) -> Declined {
+  not_appended(FAILED_TO_UPDATE, &[name], unappended)
+}
+
+/// The refusal of an atomic push's entries the append did not take, in git's words (`atomic
+/// transaction failed`) for every command, the band-2 line naming the ref refused among `names`.
+pub fn atomic_declined(names: &[&[u8]], unappended: &Unappended) -> Declined {
+  not_appended(ATOMIC_TRANSACTION_FAILED, names, unappended)
 }
 
 /// `id` as A-618 keys objects.
@@ -441,6 +498,7 @@ fn not_appended(reason: &[u8], names: &[&[u8]], unappended: &Unappended) -> Decl
   let (at, detail): (usize, &[u8]) = match unappended {
     Unappended::Moved { at } => (*at, b"cannot lock ref: it moved since the push read it"),
     Unappended::Conflict { at, .. } => (*at, b"cannot lock ref: another push came first"),
+    Unappended::Refused { at, why } => (*at, why.as_slice()),
   };
   let name = names.get(at).copied().unwrap_or_default();
   declined(reason, name, detail)
