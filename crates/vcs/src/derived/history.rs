@@ -908,7 +908,7 @@ impl<'s> Walk<'s> {
       self.push(start, path.to_vec(), value.generation.saturating_add(1))?;
     }
     let mut answer = Vec::new();
-    while self.cost.listed < limit {
+    loop {
       let Some((_, _, at_path, id)) = self.frontier.pop_first() else {
         break;
       };
@@ -926,6 +926,8 @@ impl<'s> Walk<'s> {
       });
       self.cost.listed = self.cost.listed.saturating_add(1);
     }
+    answer.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    self.cost.listed = u64::try_from(answer.len()).unwrap_or(u64::MAX);
     Ok(answer)
   }
 
