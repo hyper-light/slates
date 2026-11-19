@@ -621,22 +621,29 @@ fn assert_counted(counters: ViewCounters, built: &Built) {
   assert_eq!(counters, expected);
 }
 
-/// A-665 (lazy, a window a read). Do: before any seal, read each pack's trailer and its index, and
-/// a base pack up to its trailer; seal; read every file in windows of 1, 13, a content window and
-/// the whole, and from its end. Expect: unsealed, the trailers and indexes refused naming their
-/// packs and the base pack's bytes before its trailer read; sealed, every file the same bytes in
-/// every window, and nothing from an end.
+/// A-665 (lazy, a window a read). Do: before any seal, read each of the five packs' trailers and
+/// indexes, and the base pack up to its trailer; seal; read `HEAD`, `config`, `packed-refs` and
+/// every pack file in windows of 1, 13, a content window and the whole, and from its end. Expect:
+/// unsealed, the trailers and indexes refused naming their packs and the base pack's bytes before
+/// its trailer read; sealed, every file the same bytes in every window, and nothing from an end.
 #[test]
 fn every_window_reads_the_same_bytes_and_only_what_the_seal_knows_waits_for_it() {
   let mut built = built(ObjectFormat::Sha1);
   let refs = shown(&built.refs);
   let pushed = Some(Pushed::Quarantined(&built.push));
   let view = open(&built.repository, &mut built.store, &refs, pushed);
-  for path in pack_paths(&view) {
-    refused_before_the_seal(&view, &built.store, &path);
+  let packs = pack_paths(&view);
+  assert_eq!((packs.len(), view.packs().count()), (5, 5));
+  for path in &packs {
+    refused_before_the_seal(&view, &built.store, path);
   }
   let seals = seal_all(&view, &built.repository, &mut built.store);
-  for line in walk(&view).iter().filter(|line| line.starts_with("f ")) {
+  let files: Vec<String> = walk(&view)
+    .into_iter()
+    .filter(|line| line.starts_with("f "))
+    .collect();
+  assert_eq!(files.len(), 3 + 2 * packs.len());
+  for line in &files {
     same_in_every_window(&view, &built.store, &seals, path_of(line).as_bytes());
   }
   close(view, seals, &mut built.store);

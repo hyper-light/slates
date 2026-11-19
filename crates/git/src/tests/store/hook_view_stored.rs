@@ -97,6 +97,7 @@ fn any_window_of_a_stream_is_the_same_bytes_as_the_whole() {
   let len = 2 * BLOCK_MAX + 7;
   let bytes = object(len);
   let whole = stream_of(&bytes);
+  assert_eq!(u64::try_from(whole.len()).unwrap(), stream_len(len));
   for window in [1, 2, 4, 5, 6, 7, 4096, BLOCK_MAX, BLOCK_MAX + 5, stream_len(len)] {
     let mut pieces = Vec::new();
     let mut at = 0;
