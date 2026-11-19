@@ -462,6 +462,14 @@ pub struct Green {
   /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
   deltas_from: u64,
   last_changed: BTreeMap<String, u64>,
+  /// The last version that removed the file at each path: an unlink, a rename away, or a rename onto it, which removes
+  /// the file it replaces (A-612). A work based before it names a file that is gone, whatever stands at the path now
+  /// (made again, renamed onto it), so the verdict answers delete against modify, and rename against rename for a
+  /// rename of it, never an edit or a move of the file that took its place. Unlike the content history it is never
+  /// folded, so a base below the fold floor meets it too. One entry a path the green ever removed a file at, as
+  /// `last_changed` holds one a path it ever changed; empty in a green restored from a checkpoint or made as a branch,
+  /// whose bases are never before its first version.
+  file_removed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
   symlink_changed: BTreeMap<String, u64>,
   hardlink_changed: BTreeMap<String, u64>,
@@ -2134,6 +2142,15 @@ impl Green {
   /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
   /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
   /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
+  /// Whether the file at `path` was removed after version `base` (`file_removed`): unlinked, renamed away or renamed
+  /// onto after the base, whatever stands at the path now (A-612).
+  fn file_removed_since(&self, path: &str, base: u64) -> bool {
+    self
+      .file_removed
+      .get(path)
+      .is_some_and(|version| *version > base)
+  }
+
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     if base < self.folded_below {
       return self.intervening_walk(path, base);
@@ -2307,6 +2324,11 @@ impl Green {
     if !source_exists {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
     }
+    // A source whose file was removed after the work's base is gone too, whatever stands at its path now (made again,
+    // renamed onto): the rename names a file that no longer exists, never the one that took its place (A-612).
+    if self.file_removed_since(from, base) {
+      return Err(Green::window(dst, MergeConflictClass::RenameRename));
+    }
     // The destination must be free: a non-file already there is a type change; a file the base did
     // not still hold (changed since base) is a rename/rename. An unchanged base file at the
     // destination is replaced (the design's rename-over-a-base-file case).
@@ -2354,6 +2376,7 @@ impl Green {
     } else {
       self.intervening(from, base)
     };
+    let source_len = self.content.get(from).map_or(0, len_of);
     ops
       .iter()
       .map(
@@ -2361,7 +2384,7 @@ impl Green {
           crate::map::Mapped::Shifted(shifted) => {
             let mut moved = *op;
             moved.at = shifted.start;
-            Ok(moved)
+            Ok(at_head(moved, source_len))
           }
           crate::map::Mapped::Overlaps => Err(ConflictWindow {
             path: dst.to_owned(),
@@ -2460,6 +2483,12 @@ impl Green {
       }
       return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
     }
+    // The file the work edited is gone when the path's file was removed after its base, whatever stands at the path
+    // now: delete against modify (§4.16 "The verdict"), never an edit mapped into the file that took its place, whose
+    // delta (one insert of its whole length) every op of the work would shift past (A-612).
+    if self.file_removed_since(path, inc.base) {
+      return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
+    }
     let base_changed = self.last_changed.get(path).copied().unwrap_or(0);
     let unchanged = base_changed <= inc.base;
     if unchanged {
@@ -2476,12 +2505,13 @@ impl Green {
     let mut mapped = Vec::with_capacity(ops.len());
     let mut candidates: Vec<&Op> = Vec::new();
     let mut shifting_overlap: Option<Range> = None;
+    let head_len = self.content.get(path).map_or(0, len_of);
     for op in ops {
       match crate::map::map_range(&intervening, touched_range(op)) {
         crate::map::Mapped::Shifted(shifted) => {
           let mut moved = *op;
           moved.at = shifted.start;
-          mapped.push(moved);
+          mapped.push(at_head(moved, head_len));
         }
         crate::map::Mapped::Overlaps => {
           if op.kind == OpKind::Overwrite {
@@ -3010,7 +3040,8 @@ impl Green {
     let changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut removed_content: Vec<String> = Vec::new();
-    let mut set_content: Vec<(String, Vec<u8>, Vec<Op>)> = Vec::new();
+    // Each set carries whether it is a rename's, which removes the file it replaces (`file_removed`, A-612).
+    let mut set_content: Vec<(String, Vec<u8>, Vec<Op>, bool)> = Vec::new();
     // Content removes are staged before sets so a rename's source removal never deletes a file the
     // same increment recreates or renames into at that path.
     for effect in effects {
@@ -3019,7 +3050,10 @@ impl Green {
       match effect {
         Effect::Special(path, node) => self.commit_special(path, node, version),
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
-        Effect::SetContent(path, bytes, ops, _) => set_content.push((path, bytes, ops)),
+        Effect::SetContent(path, bytes, ops, source) => {
+          let renamed = matches!(source, ContentSource::Copied(..));
+          set_content.push((path, bytes, ops, renamed));
+        }
         Effect::RemoveContent(path) => removed_content.push(path),
         // Each key's history first records what it held since version 0 when it has none yet (`seed`, the one
         // history rule, A-534), then its change.
@@ -3142,9 +3176,14 @@ impl Green {
       self.seed_content(&path);
       self.content.remove(&path);
       self.last_changed.insert(path.clone(), version);
+      self.file_removed.insert(path.clone(), version);
       self.push_content(path, version, None);
     }
-    for (path, bytes, ops) in set_content {
+    for (path, bytes, ops, renamed) in set_content {
+      // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already.
+      if renamed && self.content.contains_key(&path) {
+        self.file_removed.insert(path.clone(), version);
+      }
       // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the
       // history gains is the bytes the new value added, its piece list, and whatever the old one held that the new
       // one does not, the retention charged to the running totals.
@@ -4001,6 +4040,27 @@ fn record(
     Ok(None) => {}
     Err(window) => windows.push(window),
   }
+}
+
+/// A file's length, as an op's coordinates count it.
+fn len_of(bytes: &[u8]) -> u64 {
+  u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+}
+
+/// An op mapped to the head (`head_len` bytes), in the head's canonical form. A truncate removes the bytes it saw, its
+/// span `[at, at + len)`, a run of its base's bytes as the interval algebra composes a removal (`slates_vfs::algebra`),
+/// and is judged by its span with the edge rule as every removal is. Where the head grew past that span after the base
+/// (an append at the end the work never saw) it no longer runs to the file's end, so it is the delete of its span,
+/// which `apply`, the version's delta and every reader of the delta take as exactly those bytes: cut to the head's end,
+/// it removed the append (A-612). Any other op, and a truncate that still runs to the end, is unchanged.
+fn at_head(op: Op, head_len: u64) -> Op {
+  if op.kind == OpKind::Truncate && op.at.saturating_add(op.len) < head_len {
+    return Op {
+      kind: OpKind::Delete,
+      ..op
+    };
+  }
+  op
 }
 
 /// An `Insert` op that adds a whole file's bytes at offset zero from post-state offset zero (used
