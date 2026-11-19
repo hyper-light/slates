@@ -1869,6 +1869,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-vcs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-vfs"
 version = "0.1.0"
 dependencies = [
