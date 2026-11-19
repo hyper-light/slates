@@ -195,6 +195,7 @@ pub(super) fn choose(
       continue;
     }
     covered = covered.union(&positions);
+    admission.charge_items::<Source>(1)?;
     cover.sources.push(Source::Base { green });
   }
   let mut uncovered = Positions::span(0, repository.next_position()).difference(&covered);

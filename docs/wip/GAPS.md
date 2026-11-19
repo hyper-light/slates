@@ -382,6 +382,19 @@
 > 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
 > only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
 > the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
+> **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
+> (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
+> `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
+> fragments with the bases their reference deltas name held whole, as `index-pack --fix-thin` completes a thin pack;
+> the rest and the push whole, as zlib stored blocks so every offset follows from lengths), chosen as few as cover every
+> object; the push in git's quarantine for `pre-receive` with receive-pack's environment, among the packs for
+> `update`. A pack's trailer, Adler-32s and index are its seal, derived in slices and kept by the caller; every other
+> byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
+> of the store and the push back through the view's packs, counted. Found: stock receive-pack sets
+> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unsets it (reported to main). Owed: part 2, the view presented to the hook
+> driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
+> from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a
+> mounted view.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;

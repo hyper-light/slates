@@ -12716,6 +12716,25 @@ engine: the verdict, rebase, position mapping, the register).
 > run. Proven against an oracle over generated histories that reads every answered pack back through A-608's reader, a
 > thin one with the client's objects, as exactly the wanted closure less the client's. Owed: a part only partly wanted
 > read entry by entry; a delta search for an object past a window; the fragments' encoding sliced.
+>
+> **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
+> `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
+> volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
+> `packed-refs` are as stock git 2.50.1 writes them. `objects/pack` holds packs each whole by itself, since git finds a
+> reference delta's base in the delta's own pack alone ("The base entry _must_ be in the same pack", `packfile.c`): a
+> green's base pack; a version's fragments, then each base their reference deltas name held whole, as
+> `index-pack --fix-thin` completes a thin pack; and the objects no kept part holds, whole. An object held whole is a
+> zlib stream of stored blocks, so every offset follows from lengths. For `pre-receive` the push lies in git's
+> quarantine, `objects/tmp_objdir-incoming-<six>/pack`, with the environment receive-pack sets to it; for `update`
+> among the repository's packs. The packs cover every object with as few kept parts as hold it: base packs largest
+> first, then the version that brought each object still uncovered. Only a pack's trailer, the Adler-32 ending each
+> object held whole and its index need every byte of the pack: they are its seal, derived once in the owner's slices
+> and kept by the caller; a pack's name hashes what it is made from, so a listing names every pack before any is
+> sealed. Proven against what stock git made (`fixtures/view`): the layout, `HEAD`, both formats' `config`,
+> `packed-refs` and the hooks' environment; git's own packs laid out and indexed byte for byte as `index-pack` indexes
+> them; and an oracle reading every object of the store and of the push back through the view's packs, each checked
+> as `git verify-pack` checks one, counted. Owed: part 2, the view presented to the hook driver on the owner shard
+> (after A-662); main's run of stock git over a mounted view.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12908,7 +12927,12 @@ commit in the pushed range); require signed commits, checking SSH-format commit 
 **Hooks, in git's terms.** `pre-receive`, `update` and `post-receive` run with git's inputs (the `old new ref` lines on
 standard input, the `GIT_PUSH_OPTION_*` variables) per §4.17.1. A hook expects a repository it can run `git` in, so it
 runs over a read-only view of the green's version as a bare repository, with the work's objects visible as git's
-quarantine shows them to a hook. Building that view (packs and refs generated from the index on demand) is a piece.
+quarantine shows them to a hook. Building that view (packs and refs generated from the index on demand) is a piece:
+part 1, the view itself, is built (A-665: `HEAD`, `config` and `packed-refs` as git writes them; packs each whole by
+itself from the base packs and fragments, the objects no kept part holds and the push's held whole; the push in
+`objects/tmp_objdir-incoming-<six>` for `pre-receive` with receive-pack's environment, among the repository's packs for
+`update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2
+presents it to the hook driver on the owner shard.
 
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
@@ -13011,7 +13035,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
    `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
-10. Hooks over a read-only bare-repository view; push options; push to review with report-status-v2.
+10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, presenting it to the hook
+    driver on the owner shard, after A-662); push options; push to review with report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API.
@@ -46281,3 +46306,89 @@ the `Revlog` facade over them; `import`: the ranged seam and reader, the rebuild
   that run, and the two warnings part 2 had left in the tests removed. The golden imports of every store unchanged;
   new: every split or docketed file of the dotencode and version 2 stores read in more than one range and none as long
   as the file, an inline revlog read whole, and texts rebuilt from the cache.
+
+### A-665 — The read-only bare repository a git hook runs in, part 1: the view made from the store when it is read, its packs each whole by itself, the push in git's quarantine (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-591, A-614, A-622, A-638, A-645)
+Applied in the same change to:
+- §4.17.2 (a status block, "Hooks, in git's terms", piece 10's line) and GAPS (the §4.17 entry);
+- `crates/git`: `store::hook_view` with `units`, `seal`, `stored`, `text` and `environment` (new); `store/mod.rs` (its
+  module line and a paragraph); `Repository::next_position` and `Repository::greens`; `Positions::span`;
+  `pack::idx::len_of` and `is_large`; the tests `src/tests/store/hook_view.rs` and `hook_view_stored.rs`; the golden
+  vectors `fixtures/view/` and `make-view-fixtures.sh`.
+
+- **What.** `HookView::open(repository, store, snapshot, pushed, admission)` answers the tree a volume serves as the bare
+  repository a hook runs in: `node`, `list` and `read` of the paths under it, and `environment(root)`, what
+  receive-pack hands a hook beside its own input. Nothing is materialized. Opening reads records: the store's kept
+  parts, the rows of the refs' heads and of the objects held whole, and the tags a ref names. A listing and a file's
+  length need nothing more, and a read makes the bytes it reaches.
+- **The layout** (`fixtures/view`, made by stock git 2.50.1, Apple Git-155, with `make-view-fixtures.sh` on
+  2026-11-19). `HEAD`, `ref: ` and the default branch. `config` as `git init --bare` writes it: for SHA-256
+  `[extensions] objectformat` first, since `initialize_repository_version` sets it before
+  `core.repositoryformatversion`, and version 1; less `ignorecase` and `precomposeunicode`, which macOS's probes of its
+  own filesystem add and the view's filesystem, case-sensitive and keeping names' bytes, does not call for.
+  `objects/info`, `objects/pack`, `refs/heads` and `refs/tags`. `packed-refs` with git 2.50.1's header and traits,
+  sorted, a peeled line after each ref naming an annotated tag (`write_packed_entry` writes one exactly when
+  `peel_object` peels). Left out: `description`, the hook samples, `info/exclude`, and the `.rev` `index-pack` writes by
+  default, which git builds in memory when a command needs one (`pack-revindex.c` `load_pack_revindex`).
+- **The packs, each whole by itself.** git reads a reference delta's base from the delta's own pack alone
+  (`packfile.c` `get_delta_base`: "The base entry _must_ be in the same pack"), so a pack of one kept fragment would not
+  read; and one pack of everything a green reaches has a trailer over every byte and a count in its header, made again
+  at every version. So each pack is a kept unit: a green's base pack, its two parts holding offset deltas alone; a
+  version's two fragments, then each base their reference deltas name, which lies outside them in the version before,
+  held whole, as `index-pack --fix-thin` completes a thin pack ("adding the excluded objects the deltified objects are
+  based on to the pack", `git-index-pack.adoc`); the rest; the push. A fragment's bytes are never rewritten: its offset
+  deltas keep distances, valid wherever it lands (A-614 part 2).
+- **Objects held whole** are zlib streams of stored blocks (RFC 1951 §3.2.4: at most 65535 bytes a block; zlib's
+  level-0 header `78 01`; the Adler-32 last, RFC 1950 §2.2). Their length is a function of the object's, so every
+  offset of a pack follows from lengths with nothing compressed, and a window of one is the object's bytes from the
+  store with the framing between. A compressed entry's place would wait on compressing every object before it.
+- **The cover.** At A-645's scale many greens' base packs and first fragments repeat one history (a create's D(0) is
+  everything its head reaches, A-614). The view takes the base packs, largest first, each holding a position no earlier
+  one holds (one passed over is counted, `skipped`); then, walking the positions still uncovered, the fragments of the
+  version that brought each (its row's green and version), when they hold it; what is left is the rest. The walk costs
+  the packs taken and the rest, never the versions no object needs.
+- **The seal** (`seal`). git reads a pack's trailer when it opens the pack and holds it to the copy the index keeps
+  (`open_packed_git_1`: "packfile %s does not match index"); `verify-pack` and `fsck` hold the trailer to the checksum
+  of every byte before it; and an index ends with its own checksum, which git maps with the copy beside it. So a pack's
+  trailer, the Adler-32 ending each object held whole, and its index follow from every byte of the pack. A `Sealing`
+  reads the pack a content window a unit of work, in the owner's slices (`Quantum`, §4.3), hashing every byte, taking
+  each whole object's Adler-32 from its own bytes before its entry and that entry's CRC32 as it passes; then writes the
+  index with A-591's writer, the kept parts' entries from the records the store keeps of them, each offset moved to
+  where its part lies, and keeps it as content. Every other byte reads without it; a read that reaches what only the
+  seal knows is refused `Unsealed`, naming the pack. A pack's name hashes what it is made from (each part's content and
+  length, each whole object's name), never its bytes, so a listing names every pack at once and a seal serves every
+  view that shows its pack. git takes a pack's hash from its name and never holds it to the trailer
+  (`add_packed_git`), where `index-pack` names a pack by its trailer.
+- **The quarantine** (`environment`; `tmp-objdir.c`, `builtin/receive-pack.c`). For `pre-receive`
+  (`Pushed::Quarantined`) the push's objects are one pack in `objects/tmp_objdir-incoming-<six>/pack`, the six the
+  first digits of its pack's name in place of `mkdtemp`'s random letters, and the environment is receive-pack's:
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES` `<root>/./objects` (quoted as `env_append` quotes a value holding `PATH_SEP` or
+  beginning with a double quote), `GIT_OBJECT_DIRECTORY` and `GIT_QUARANTINE_PATH` the quarantine, and `GIT_DIR=.`.
+  receive-pack moves the objects into the repository before `update` and `post-receive` (`tmp_objdir_migrate` in
+  `execute_commands`), so for `update` the push's pack lies in `objects/pack` (`Pushed::Migrated`), and both hooks see
+  `GIT_DIR=.` alone. Stock receive-pack unpacks a push of fewer than 100 objects loose and keeps a larger one as a pack
+  with a `.keep`; the view always shows one pack, and no `.keep`. Left to the hook driver: `GIT_PUSH_OPTION_*`; to the
+  hook's own `git`: `GIT_EXEC_PATH`.
+- **Holds.** The view holds every content it reads until `close`, so a base pack made again, or a push let go, while a
+  hook runs leaves the view's bytes as they were. A seal begun after a base pack was made again is refused `Changed`,
+  and the view is opened again.
+- **Found: stock receive-pack sets `GIT_PUSH_OPTION_COUNT=0` on a push that negotiated no push options.**
+  `cmd_receive_pack` always hands `run_receive_hook` its option list, so `run_and_feed_hook`'s branch that unsets the
+  variable is never taken (the fixtures' `loose` and `pack` pushes, `receive.advertisePushOptions` off). `githooks.adoc`
+  says the variables "will not be set", and `slates-server`'s `vcs_hooks::push_option_env` follows the document.
+  Reported to main; not changed here.
+- **Tests** (`src/tests/store/hook_view.rs`, `hook_view_stored.rs`; run results below). The layout, `HEAD` and both
+  formats' `config` against `git init --bare`, `index-pack` and `pack-refs`; `packed-refs` read in every window size;
+  git's own SHA-1 and SHA-256 packs laid out as a kept part and sealed, read back as git's pack and `index-pack`'s index
+  byte for byte; the oracle, a repository of every case in both formats (two base packs, one passed over; two
+  versions' fragments, one completed with its text's base; a version not encoded and a blob nothing reaches, held
+  whole; an annotated tag; a push quarantined), every pack read back in windows and checked as `git verify-pack`
+  checks it, every object of the store and of the push found, each counter exact; every window the same bytes, and
+  reads before a seal refused only where the seal is needed; the hooks' environment against receive-pack's for
+  `pre-receive` (loose and packed), `update` and `post-receive`, and the quarantine's listing; `env_append`'s quoting;
+  the refusals by kind with nothing held; a base pack made again under an open view; the stored-block streams against
+  zlib (flate2), in every window, and Adler-32 against RFC 1950's vectors.
+- **Owed.** Part 2, the view presented to the hook driver on the owner shard (after A-662), its seals kept as derived
+  data; a seal made where a version's fragments are encoded, when the bytes pass anyway; `packed-refs` read from the
+  register's sorted namespace by ranges for a repository of very many refs; the cover kept as derived data, grown as
+  versions are encoded, and the fragments after a base pack merged into larger packs so a hook's `git` searches few
+  indexes; the open sliced where the rest or the refs are large; main's run of stock git over a mounted view (filed).
