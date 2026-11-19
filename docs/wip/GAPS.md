@@ -621,10 +621,9 @@
 > byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
 > of the store and the push back through the view's packs, counted (Windows x86_64, jupiter: red 13 of 15, then the
 > two vacuous ones made to read and red 2 of 2; green 15 of 15, the crate 462 of 462 with 4 ignored; macOS owed). Found: stock receive-pack sets
-> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: part 2, the view presented to the hook
-> driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
-> from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a
-> mounted view.
+> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: seals kept as derived data (part 2 handed
+> the view to the driver, below); a seal made at encoding; `packed-refs` by ranges from the register; the cover as
+> derived data and fragments merged into fewer packs; main's run of stock git over a mounted view.
 > **Fixed (2026-11-19, g293; found by A-665): a git hook given no push options is handed `GIT_PUSH_OPTION_COUNT=0`,**
 > as stock receive-pack 2.50.1 hands it (`cmd_receive_pack` always passes its option list, so `run_and_feed_hook` sets
 > the count; `githooks.adoc` says unset), where `vcs_hooks::push_option_env` had unset it; `EnvValue::Unset`, its one
@@ -632,13 +631,31 @@
 > three pushes; Windows x86_64, jupiter: red 2 of 2 new failing, green vcs_hooks 33 of 33; the Unix driver's test
 > filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
 > hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
-> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
+> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2
+> (built, below);
 > Subversion's environment is its hooks-env section alone (A-623). Mercurial 7.2's, closed by A-657 part 4 (g304,
 > 2026-11-19): `_exthook` always sets `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`)
 > and `shellenviron` sets `HG`, and the transaction adds `HG_BUNDLE2`, `HG_TXNID` and `HG_TXNNAME`
 > (`research/mercurial-server.md` §6); recorded from stock 7.2's own `pretxnchangegroup` and `changegroup`
 > (`crates/hg/fixtures/hooks`), slates' changegroup hooks now carry all five, held to the recording by `vcs_hooks`'
 > test (red without them in kiln r192, green on macOS arm64, Mac Studio, kiln r202).
+> **A-665 part 2 (2026-11-19, g293; piece 10's view handed to the hook driver on the owner shard):** `slates-server`
+> (`git_hooks`) opens part 1's view over the repository's store in the shard's `vcs_stores` (A-662), the push
+> quarantined for `pre-receive`, among the packs for `update`, none for `post-receive`, each ref named by its green and
+> the version of it the push read (a version no push made refused, `NotInStore`); charges the view's tables to the
+> shard's budget while it lives; seals its packs in the shard's slices, each lent the room `HookView::seal_len` names;
+> and runs the configured hook in the view's root with `GIT_DIR=.` and, for `pre-receive`, the quarantine's three
+> variables beside its point's own, refusing a view the point would not see. Held by running the test binary as each
+> point's hook in a view the tests write into a scratch directory, stock `git` reading the pushed commit there
+> (macOS arm64, Mac Studio: red first, the 4 new tests failing against stubs,
+> kiln r204; green on the merged tree, kiln r111 over main 0577ab0bd: `git_hooks`, `vcs_hooks`, `hook_driver`,
+> `vcs_store::` and `git_push` 70 of 70, `hook_view` 16 passed with 1 ignored, fmt clean, and again over main's newer
+> commits as it landed, the landing merge's message says; the other platforms owed).
+> Owed: part 3, the view presented at a path (a read-only attachment the mount edges serve a read at a
+> time; on Linux in the launcher's namespace, §4.6); seals kept as derived data across views; the calls of git's push
+> driver (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until
+> they land); git's words for each outcome. Found, reported to main: a git hook inherits the daemon's `GIT_*` repository
+> variables, which `update` and `post-receive` would read in place of the view's objects.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -776,14 +793,14 @@
 > history at once. Found beside it: `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`
 > fails on main (8b3297fe0) on the Mac Studio, 3 of 3 alone.
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
-> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
-> objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
-> 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619), the session over a byte channel (A-650 part 2) and HTTP version 1 (A-650 part 1); piece 5's first part,
-> a push's bundle read, its race
-> checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
-> for A-598 and A-619, g301 for A-641, g303 for A-650).**
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads (A-545)
+> and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its objects and
+> nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part 1) and an
+> existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1 (A-619), the
+> session over a byte channel (A-650 part 2), HTTP version 1 (A-650 part 1) and the served view over a repository's
+> index (A-680 part 1); piece 5's first part, a push's bundle read, its race checks and its reply (A-641 part 1)
+> (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079 for A-598 and A-619, g301 for A-641,
+> g303 for A-650 and A-680).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -941,6 +958,16 @@
 > recorded first; a resend takes the held route over; every refusal by kind (`ImportFault`, the API's
 > `Invalid::Import`); proven on macOS arm64 (Mac Studio, kiln r110): the verb's 4 tests (red first), `vcs_store::` 18 of
 > 18, `wire_order` 2 of 2, `slates-api`'s `error` tests 12 of 12 with the refusal's typing.
+> **Built (A-680 part 1):** the served view over a repository's index (`serve::indexed`): its changelog rows, the
+> content store and its register's state (phase roots, bookmarks, publishing) served as 7.2's `served` filter serves
+> them (hidden: obsolete, archived or internal, pinned by no bookmark, and revealed by no visible descendant that is not
+> public; then secret, archived and internal left out), numbered densely, walked from the first changeset that is not
+> public, each list charged to the request's room; texts lent in place where the store holds one window, else copied
+> within the room (`getbundle::Store` lends that way, its `file_node` gone: a path's file node found in its manifest's
+> text by halving, `manifest::find`); a root the changelog lacks dropped and counted. `slates-hg --lib serve::
+> manifest::` 61 of 61 (red first, 6 of the view's 9 failing against a stub), `slates-server --lib vcs_http::hg` 7 of 7
+> and fmt clean on macOS arm64 (Mac Studio, kiln r256, 2026-11-19), the two `fixtures/state` repositories held to stock
+> 7.2's `served` answers; the other platforms owed.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -969,15 +996,16 @@
 > **Built (A-679, 2026-11-19, g304): `serve --stdio` behind the daemon's SSH edge.** `vcs_ssh::hg` runs A-650 part 2's
 > `serve::stdio` over an SSH session, started by `ToolServices` (beside upload-pack, `ToolCommand`) over the store the
 > HTTP site's lender holds (`HgStores`); the site refuses a repository argument starting `--` before any lookup in 7.2's
-> recorded words (research §26); `--hidden` answered with 7.2's warning to an unauthorized user, then the view; a
+> recorded words (research §27); `--hidden` answered with 7.2's warning to an unauthorized user, then the view; a
 > store gone mid-session ends in the not-served words; input arriving after the session ended given back to the window.
 > Red first (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed against stubs), then
 > `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128; over main
 > 9f349d66b as it landed, kiln r292, 42 of 42 with A-651 part 3's key tests): the probe stock `hg serve --stdio` 7.2
 > answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a scripted SSH client. The
-> other platforms, and main's live `hg clone` over SSH once A-680 lends the stores, owed.
+> other platforms, and main's live `hg clone` over SSH once A-680 part 2 lends the stores, owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: A-662's stores handed to the lender the HTTP
-> site and the SSH edge read (A-680, g303, running; their home on each owner shard is built); the learned
+> site and the SSH edge read, with the served view over them (A-680 part 2, g303, running; their home on each owner
+> shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -986,7 +1014,8 @@
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the served view over them (with A-650's site);
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the site's use of the served view over them
+> (A-680 part 2; the view is built, A-680 part 1);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2

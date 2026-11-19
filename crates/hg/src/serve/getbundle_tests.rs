@@ -24,8 +24,9 @@ use crate::obsmarkers::{self, Marker};
 use crate::phases::Phase;
 use crate::ssh::{self, Read};
 use crate::wire::{Arguments, Spec};
-use crate::{Admission, NULL_NODE, Node, changeset, delta, node};
+use crate::{Admission, NULL_NODE, Node, PastAdmission, changeset, delta, node};
 use proptest::prelude::*;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A revision of a manifest or file log the test's store keeps.
@@ -45,7 +46,7 @@ impl Kept {
       parents: self.parents,
       link: self.link,
       flags: self.flags,
-      text: &self.text,
+      text: Cow::Borrowed(&self.text),
     }
   }
 }
@@ -95,20 +96,37 @@ impl Repository for Served {
 }
 
 impl Store for Served {
-  fn changeset_text(&self, rev: Rev) -> Option<&[u8]> {
-    self
-      .changesets
-      .get(&self.history.node(rev)?)
-      .map(Vec::as_slice)
+  fn changeset_text(
+    &self,
+    rev: Rev,
+    _room: &mut Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, PastAdmission> {
+    let text = self
+      .history
+      .node(rev)
+      .and_then(|node| self.changesets.get(&node));
+    Ok(text.map(|text| Cow::Borrowed(text.as_slice())))
   }
-  fn manifest(&self, node: &Node) -> Option<Logged<'_>> {
-    self.manifests.get(node).map(Kept::logged)
+  fn manifest(
+    &self,
+    node: &Node,
+    _room: &mut Admission,
+  ) -> Result<Option<Logged<'_>>, PastAdmission> {
+    Ok(self.manifests.get(node).map(Kept::logged))
   }
-  fn file(&self, path: &[u8], node: &Node) -> Option<Logged<'_>> {
-    self.files.get(path)?.get(node).map(Kept::logged)
-  }
-  fn file_node(&self, manifest_node: &Node, path: &[u8]) -> Option<Node> {
-    self.entries(manifest_node).remove(path)
+  fn file(
+    &self,
+    path: &[u8],
+    node: &Node,
+    _room: &mut Admission,
+  ) -> Result<Option<Logged<'_>>, PastAdmission> {
+    Ok(
+      self
+        .files
+        .get(path)
+        .and_then(|log| log.get(node))
+        .map(Kept::logged),
+    )
   }
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
     self.markers.iter().flat_map(|payload| {
