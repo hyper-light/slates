@@ -14415,16 +14415,16 @@ and export by landing).
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
-> (`reads::Repository`: entries, property lists, revision properties, texts in runs) and the session's `Guards` (its
-> locks and what its principal may read): an explicit stack of frames, never recursion, a step at a time under the
-> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
-> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
-> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
-> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from
-> each session's own report over `history.txt` rebuilt into an index and a green and checked against
-> `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
-> delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
-> sent today as new data; and the handler.
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs), the session's `Guards` (its locks)
+> and its one compiled read rule, which its read commands ask too (A-656 continued (2)): an explicit stack of frames,
+> never recursion, a step at a time under the caller's budget, the report read one path ahead as `reporter.c` reads it;
+> entry properties, lock tokens removed, property differences, absent entries, deletions with `svn_repos_deleted_rev`'s
+> revision, depth upgrades and exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve`
+> makes in its words. Held to every drive `svnserve` made in the recorded sessions (27, the early answer's being the
+> handler's), replayed from each session's own report over `history.txt` rebuilt into an index and a green and checked
+> against `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by
+> what its delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base
+> (`xdelta.c`), sent today as new data; and the handler.
 >
 > **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
 > (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
@@ -49711,3 +49711,34 @@ Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the mac
   Mercurial hook variables (owed, now closed); `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`;
   `crates/server/src/vcs_hooks.rs`; `crates/hg/src/push/classify.rs` and `classify_tests.rs`;
   `crates/hg/fixtures/hooks/` (new).
+
+### A-656, continued (2) — One read rule for a session: an update, its drive and the reads judge paths alike (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-616 part 2's second slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/authz.rs` (`may_read`); `crates/svn/src/reads.rs`; `crates/svn/src/report/drive.rs` (`Guards`,
+`Sources::rules`, `Drive::next`), `report/drive/green.rs` (`FixtureGuards`, `AUTHZ`, `rules_of`) and the drive's
+tests; `crates/svn/src/report/exchange.rs` and its tests; `crates/svn/src/serve.rs` (`ReadRules::for_principal`,
+`Established::compiled_read_rules`) and its tests;
+`docs/bugs/2026-11-19-an-update-read-by-the-callers-guards-where-the-reads-used-the-sessions-rules.md`.
+
+- **Found** by g297 (A-613's eighth slice, step 6): `update` judged its target, and its drive every path, by the
+  caller's `Guards::may_read`, while the read commands judged by the rules `Policy::authz` gives the session's
+  principal, compiled by the connection (A-606): two sources for one principal's read rule, which could disagree. With
+  guards that hid less than the rules, an anonymous `update` of `/trunk/secret` began its report and an update of
+  `/trunk` added `secret`, while `check-path secret` was refused "Authorization failed".
+- **One rule.** `authz::may_read(rules, path)` is a session's one read rule, `authz_check_access` for
+  `svn_authz_read`: every path where the repository names no authorization file; with rules, a path they give read or
+  write access; a path that is no repository path, never. The connection compiles the principal's rules once
+  (`ReadRules::for_principal`, again only after an authentication changes the principal) and hands the same set to the
+  read commands (`reads::Session::authz`), to `update`'s target check and to the report drive
+  (`drive::Sources::rules`), which judges the edit's root, each entry and each copy source by it. `Guards` keeps the
+  locks alone.
+- **Tests.** `an_update_and_the_reads_judge_one_path_by_the_one_rule_set` (`serve/tests.rs`): an anonymous session
+  whose guards carry no read rule, on the fixtures' repository whose rules keep `/trunk/secret` from all but alice:
+  `check-path secret` and `update secret` both refused "Authorization failed" where users hold no keys, and an update
+  of `/trunk` from nothing sends `secret` absent and never adds it. Red before the change (macOS arm64, Mac Studio,
+  2026-11-19, over main at `733e6de6b`): the check refused, the update answered `( success ( ( ) 0: ) )` and awaited
+  its report. The drive's and the exchange's tests judge reads by the recorder's own rules compiled for the anonymous
+  principal (`green::rules_of`), where they had guards hiding `/trunk/secret` by hand. Run (macOS arm64, Mac Studio,
+  2026-11-19): `cargo test --locked -p slates-svn --lib -- report:: reads:: serve:: authz::` 158 of 158, `cargo fmt -p
+  slates-svn -- --check` clean; the crate has no integration target.
+- **Owed.** The Windows run and red-checks (main's).
