@@ -1449,6 +1449,16 @@
 > no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
 > differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
 > the file is Unix-only, as `tests/cli.rs` is).
+> Part 2, first slice, 2026-11-19 (A-689): the svn:// listener. `slates anchor|daemon --vcs-svn ADDRESS` (loopback alone
+> without `--fleet`; one address reader with `--vcs-http`) starts it on the control shard, its port logged; on Unix the
+> anchor binds it once and hands it to every daemon (`ENV_VCS_SVN`), so a restart never drops its port. Each connection,
+> seated as the HTTP edge seats one, runs A-656's connection: `svnserve`'s greeting (`svndiff1` aside), the client's
+> answer, "No repository found" (210005), its end. macOS arm64 (Mac Studio, kiln r310, and r344 over main 693bc8feb):
+> the listener in-process, a real anchor's, and its port across a `kill -9` of the daemon answered as stock `svnserve`
+> 1.15.0's recorded session; server 19 of 19, api 39, grammar 12, cli 4 of 4, anchor 1, fmt clean. Owed: the
+> repositories' lookup (the rest of `find_repos`, the owner shard), the sources with every call, CRAM-MD5 keys, learned
+> waits (one mechanism for the three edges), the SSH tunnel's entry point; Windows and Linux runs (main's); Windows
+> holds no listener across a restart (`docs/wip/platforms.md`, gap 2).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
