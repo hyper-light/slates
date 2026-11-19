@@ -924,8 +924,9 @@ pub(crate) fn admit(
   Ok(())
 }
 
-/// Whether `principal` holds `change`'s own right on its name (A-622 part 2).
-fn admit_right(
+/// Whether `principal` holds `change`'s own right on its name (A-622 part 2): over a policy compiled once, as git's
+/// receive-pack hides each ref its pusher may not read (A-654).
+pub(crate) fn admit_right(
   compiled: &Compiled,
   record: &RepositoryRecord,
   principal: &Principal,

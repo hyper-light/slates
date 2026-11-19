@@ -11708,6 +11708,15 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > every checkpoint, 2,048 bytes, had held the service's doubling rule from folding a small green's early versions.
 > Owed: a rebase that restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since
 > its version, where the checkpoint lists it key by key (the A-626 part 3 entry).
+>
+> **Status (2026-11-19, A-626 part 4).** Built: a rebase restates a copy (`crates/merge/src/engine/copy_restate.rs`), as
+> the deriver's `VolumeOp::Copy` and, after it, every operation its work made in the copied tree as the work made it:
+> a file edited there as edits over what the copy brings, never a rename. The deriver composes a journal holding a copy
+> against a base holding the copied tree at its destination (`Green::base_for`: the source's tree at the copy's version,
+> re-rooted), refusing an operation in a destination's tree before its copy (`Unsupported`). A work's logged journal
+> holds a copy (`LoggedOp::Copy`, the anchor's layout 14); a work's own shard leaves such a journal to the green's owner
+> to compose. Owed: the work model resolving copies, so a rebased work sees the copied files it left alone (the A-626
+> part 4 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -13031,11 +13040,12 @@ engine: the verdict, rebase, position mapping, the register).
 > sets them, in the view's root, and refuses a view the point would not see. Proven by running the test binary as each
 > point's hook in its view, written into a scratch directory by the tests' own presenter: each hook sees what
 > receive-pack's hooks see, and stock `git` there reads the pushed commit and its history (macOS arm64, Mac Studio,
-> kiln r39: `git_hooks` and `vcs_store::` 22 of 22, `hook_view` 16 passed and 1 ignored; red first against stubs,
-> kiln r204). Owed: part 3, the
+> kiln r111 over main 0577ab0bd: `git_hooks`, `vcs_hooks`, `hook_driver`, `vcs_store::` and `git_push` 70 of 70,
+> `hook_view` 16 passed and 1 ignored; red first against stubs, kiln r204). Owed: part 3, the
 > view presented at a path (a read-only attachment the mount edges serve a read at a time; on Linux in the launcher's
-> namespace, §4.6); its seals kept as derived data across views; receive-pack's calls (A-654); git's words for each
-> outcome.
+> namespace, §4.6); its seals kept as derived data across views; the calls of git's push driver (`git_push`, A-654
+> part 2, which answers every command `hook not run` while a git hook is configured until they land); git's words for
+> each outcome.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -13055,6 +13065,22 @@ engine: the verdict, rebase, position mapping, the register).
 > would). Proven by the twelve pushes of A-644's golden vectors answered through the policy with every byte stock git
 > wrote, and by the commit signatures stock git made verifying under git's namespace alone. Owed: receive-pack's server
 > half asking it for each command (A-620 part 2's judge composed with the server's greens and appends).
+>
+> **Status (2026-11-19, A-654 part 2: git's push driver on the owner shard).** `crates/server` (`git_push`) is
+> receive-pack's one entry point for both edges, each call one step on the repository's owner shard.
+> `ReceivePack::start` advertises each branch whose green holds a git head (a namespace name `N` is the ref
+> `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under the repository's policy
+> hidden as `receive.hideRefs` hides one; `input` and `end` run A-620's session over A-638's index view, lent the
+> shard's room; `answer` refuses every command `hook not run` while a git hook is configured and its view is not served
+> (A-665 part 2), else admits the checked objects to A-662's quarantine and seals them, asks each command of A-622's
+> policy through A-644 part 2's check point before its work is built (the right its change needs, then a protected
+> name's linear history and signed commits on what it brings), refused in git's words, judges with A-654 part 1's
+> verdicts over the shard's greens, appends each entry through A-635's append with A-662's store moves (one entry each,
+> all in one under `atomic`), and writes git's report. A ref's base is its green's head alone, held at the append by
+> compare and swap, until A-664's server-made commits; a create is made at its first parent's version, or from the
+> default branch's empty green while that branch is unborn. Six pushes stock git 2.50.1 made are answered with git's
+> bytes. Owed: the edges' calls, the hooks' runs, older bases (A-664), the policy's principals other than the owner at
+> A-635's append, push options, review requests, the new versions' fragments off the answer's path.
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -14314,6 +14340,9 @@ and export by landing).
 > layout 12; version 5 and layout 13 since its continuation (1), the sum carried beside a copy's record alone), so a
 > repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a rebase restating a
 > copy (part 4).
+>
+> **Status (2026-11-19, A-626 part 4).** Built: a work holding a copy rebases, its copy and its edits in the copied tree
+> restated, and composes again over the head. Owed: the work model resolving copies.
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -49504,7 +49533,7 @@ docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison be
   lib 77 of 77 filtered, the checkpoint tests 4 of 4 and 3 of 3, slates-anchor 2 of 2 and 6 of 6, fmt clean. Main's
   commits after b13a6e05f change only manifest comments, the server's Mercurial site over HTTP and slates-svn's report
   editor, none of which slates-merge or slates-anchor builds from or the repository test reaches.
-- **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
+- **For A-626 part 4** (landed 3612d1ef9): its logged copy takes the anchor's layout 14.
 
 ### A-651 part 2 — git's upload-pack behind the SSH edge: A-640's entry point over an SSH session, the store lent a step at a time, git's server's exit status at each end, and protocols v0 and v1 refused over SSH (2026-11-19, g294, UI goal 93; §4.17.2 "A fetch", "Transports" item 2 and "Pieces (git)" piece 9; after A-651 part 1, A-640 parts 2 and 3, A-625 part 3 and A-662)
 Applied in the same change to:
@@ -50222,13 +50251,143 @@ Applied in the same change to: §4.10's live-log status (the lease's half cited)
     `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`: 3 of 3.
   - The Linux and Windows runs are owed.
 
+### A-626 part 4 — A rebase restates a copy: the deriver's `VolumeOp::Copy`, composed against the copied tree, and a work's logged journal holding one, the anchor's layout 14 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path" and "Composition at seal", §4.17.4 item 3 and piece 3; A-586, A-626 parts 1 to 3, A-663, A-247)
+Applied in the same change to: §4.16 and §4.17.4 (status blocks), GAPS (the §4.17.4 entry), `crates/merge/src/increment.rs`
+(`VolumeOp::Copy`, `check_copies`, `emit_copies`), `crates/merge/src/engine/copy_restate.rs` (new: `copied_base`,
+`restate_sourced`, `copy_roots`, `copied_edit`), `crates/merge/src/engine.rs` (`base_for` laying in each copied tree,
+`Green::rebase` restating a copy where it refused one, `rebased_from`'s copy arm, `link_places` moving no link for a
+copied tree's edit), `crates/server/src/work_log.rs` (`LoggedOp::Copy`, appended last), `crates/server/src/work_home.rs`
+(`holds_copy`, `COPY_COMPOSED_BY_OWNER`), `crates/server/src/verbs.rs` (the count, where the owner composes),
+`crates/server/src/listing.rs` (a replacing copy's arm), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 14), and the
+tests (`src/increment/tests.rs`, `src/engine/copy_restate_tests.rs`, new; `copy_tests.rs` without the refusal's test;
+`crates/server/src/work_home.rs`'s, the owner's count; `crates/anchor/tests/anchor.rs`, a segment of layout 13 refused
+at start).
+- **What was there.** `Green::rebase` refused a work holding a copy (`TypeChanged` on its destination): a journal had no
+  operation to restate one as, and the deriver composed none.
+- **The deriver.** `VolumeOp::Copy { from, to, version, replace }` composes to one `Copy` (`REPLACE` where it replaces),
+  laid out by destination. What the journal does in the copied tree after it composes against the copied tree, which
+  `Green::base_for` puts at the destination for each copy the journal declares, in its order: the source's tree at the
+  copy's version, re-rooted, in place of whatever the destination's tree held. An operation in a destination's tree
+  before its copy is refused `Unsupported`: it would be composed against what the copy brings.
+- **The restatement.** A copy is restated as `VolumeOp::Copy`, before every operation in its tree; a file set beneath it
+  from its source (`ContentSource::Copied`, which a rename's edited destination names too) is the work's edit there,
+  restated over the bytes the copy brings, never a rename, and moves no node for A-663's link placement.
+- **The server.** A work's logged journal carries a copy (`LoggedOp::Copy`, appended so every tag before it stands;
+  the layout 14, one bump a landing by main's ruling, after A-626 part 3, continued (1) took 13). A work's own shard composes no journal holding a copy, since the
+  entries it fetches are a path's each and never a tree (A-247): it fetches nothing for one, and the green's owner
+  composes it against `Green::base_for`, counted `merge.work.copy_composed_by_owner`. A replacing copy takes the
+  journal's declared directories and symbolic links in its destination's tree out of the work's listing.
+- **The owner's extra cost** (main's ruling: the owner composing beats a refusal, which would answer nothing). A work
+  whose journal holds a copy is composed on its green's owner, as every work was before A-247: its sealed journal and
+  files go to the owner's shard, and the composition reads each copied tree once, every key at the copy's version
+  (`copied_base`, O(the copied trees' keys)), beside the deriver's own pass over the journal. A work with no copy is
+  composed where it was. `merge.work.copy_composed_by_owner` counts each such composition, and a test holds it moved.
+- **Owed.** The work model resolving copies: `Rebased::changed` names the files a rebased work changed, so its reads
+  and its listing do not yet show the copied files it left alone.
+- **Tests.** The deriver: a copy and an edit beneath it composed, the replace flag, an operation before its copy
+  refused, copies laid out by destination. The restatement: a copy of `trunk` at version 1 with an edit beneath it
+  rebased past a change to its source, restated as the copy and the edit. The oracle: generated works over the fixture
+  (copies of `trunk`, `trunk/d` or the root at version 1 or the head to `b` or `tags/t`, edits and files made in the
+  copied tree, a rename out of it, a link into it), each rebased as it submits: refused alike, a type change among the
+  windows, where it renames out or links in (A-586), else its restated journal composed again over the head and
+  submitted giving the green the original submit gives; a census of copies, edits and made files restated, renames out
+  and links in refused. Its first run (kiln r193) met a work that edits a copied file and renames one out: refused
+  alike, two type changes and a delete against modify on the rename's destination, whose source the base never held;
+  the oracle had asked type changes alone, and that work is now a fixed test. The owner's count
+  (`crates/server/src/work_home.rs`): a sealed work whose journal copies the root, handed to the owner's rebase step
+  composed nowhere, counts once whatever the owner answers it; one making a directory rebases clean and counts nothing.
+  A segment of layout 13 refused at start.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). The oracle's first
+  run (kiln r193, over main 7d020df47) failed on the work above, now a fixed test, and the owner's count had asked a
+  clean rebase of a copy the work model does not yet carry; after both, over main bb535bd4d with A-677 (kiln r15, at
+  3c5ad384f): `cargo test --locked -p slates-merge --lib -- increment copy restate rebase base_for` 67 passed, none
+  failed, the copy oracle's fixed history meeting all 13 census cases; `--test increment` 42 of 42, `--test rebase` 3
+  of 3, `--test base_for` 3 of 3; `cargo test --locked -p slates-server --lib -- work_log work_home listing` 7 of 7,
+  the owner's count moving once for the copy and not for the directory (the owner answered the root copy, handed with
+  no files, `TypeChanged` on `b`: the owed work model); `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and
+  `--test anchor a_segment_` 7 of 7, the layout 13 refusal among them; the three crates' fmt checks clean. The same
+  runs over main ee5cbed4c, after A-644 part 2's server, db and ipc changes (kiln r40, at 15ba6b078): 67 of 67, 42 of
+  42, 3 of 3, 3 of 3, 7 of 7, 2 of 2 and 7 of 7, fmt clean.
+
+### A-654 part 2 — git's push driver on the owner shard (2026-11-19, g258, UI goal 93; §4.17.1 "A push is a work" items 1 to 5 and "Policy"; §4.17.2 "A push" items 1 to 7, "Access", "Protected branches, in git's terms" and "Hooks, in git's terms"; A-620, A-622, A-635, A-638, A-642, A-644, A-662)
+
+- **What was there.** A-654 part 1 made slates-git's receive-pack session keepable between an edge's calls and its
+  verdicts read-only beside the appends; A-662 put each repository's store on its owner shard and appended a git push
+  through `push_sealed`; A-644 part 2 built the policy's check point for a protected name (`git_protect`). Nothing in
+  the server drove a push: the HTTP site answered receive-pack `503`, and the SSH edge answered it as not served.
+- **The decision.** (1) One sans-io driver, `git_push::ReceivePack`, which both edges call a step at a time: `start`
+  (writing the advertisement when the transport opens with it), `input`, `end`, `answer`. No call holds anything of the
+  shard after it returns, and every read of the store is lent the room the shard can admit now (`vcs_store::with_room`),
+  since A-614's store parses within its content store's room. The request, the pack and what reading and answering them
+  builds are charged to the room the edge gives the push, as A-625's request room. (2) A namespace name `N` is the ref
+  `refs/heads/N`, a name beginning `refs/` is itself, and a name beginning `refs/heads/` is no ref, so names and refs
+  map one to one (`namespace_of` checks the round trip). A branch is advertised once its green holds a git head in the
+  store, so git sees a new repository's default branch unborn. (3) A ref's base is its green's head alone: a command's
+  old value names a version only when it is the head of the newest of the store's versions of its green and that version
+  is the green's head now, and the append holds the green to the position its verdict read (compare and swap). A push
+  based on an older version, or made after a submit moved the green without git, is a ref that moved until A-664's
+  server-made commits let a work based on an older version be composed and its result named. An annotated tag's tree is
+  read through the tag's bytes, since A-614's rows hold no tag's target. (4) A-622's policy is asked per command before
+  its work is built, through A-644 part 2's check point: A-644's `Repository::change` gives the right the change needs
+  (`git_protect::right_of`: Submit for a create or a fast-forward, Rewrite for a rewrite, Delete for a delete), and
+  `vcs_policy::admit` judges it and, where a rule imposes them, the requirements on what the change brings
+  (`StoreBrings`: a linear history, commits a trusted key signed). A refusal is in git's words
+  (`git_protect::declined`): `non-fast-forward` and `deletion prohibited` as git refuses them itself, every other as git
+  answers an update hook refusing it. A change whose ref names no born green is judged against a key no green has (the
+  repository's own id's, minted by the counter its greens' ids are), so a create brings every commit its head reaches,
+  as A-644 judges one. §4.17.2's item 6 lists the work first; the policy goes first here as git's `update()` refuses
+  before it runs a hook, the cheaper refusal first. A ref the pusher may not read is hidden as `receive.hideRefs` hides
+  one, by the policy the push started under, compiled once (`vcs_policy::admit_right`, now visible to the crate). (5) A
+  configured git hook refuses every command `hook not run`, a line naming it, until A-665 part 2 serves its view: no ref
+  moves that a configured hook was not asked about. (6) A create is made from the member whose store head is its first
+  parent, where a branch can still be made at that version (the default branch's first), else at the default branch's
+  newest version; while the default branch is unborn, from its green, which must be empty at its version 0: the default
+  branch itself is moved by the work, any other ref is a new branch made at that empty version, and a default branch
+  holding files no commit names refuses it, typed (A-664's to commit). (7) A push's name is a BLAKE3 key derivation over
+  its repository and commands, so a push sent again makes the same works and A-635 answers each the version it made. (8)
+  A-635's refusals are git's: a conflict, a green moved and a name taken or gone since the push read it are a ref that
+  moved; anything else is the append's own reason in slates' words, its typed refusal named as Mercurial's push names
+  its own. (9) receive-pack advertises upload-pack's agent, `slates_git::upload::AGENT`, now public, so both name the
+  server alike.
+- **Tests** (`crates/server/src/git_push/tests.rs`): six pushes stock git 2.50.1 made, captured by
+  `crates/git/fixtures/push/make-push-fixtures.sh` (create, a thin-pack update, an annotated tag, a branch at a held
+  commit with an empty pack, a branch at a new commit, its delete), fed through the driver a few bytes at a time in the
+  script's order, each advertisement equal to the refs git's server held then and each answer the very bytes `git
+  receive-pack` wrote, each ref's green holding the text its commit names, one register record a push; the policy hiding
+  a ref and refusing its delete as git refuses a hidden ref's, `deletion prohibited`, a submission refused through the
+  check point as an update hook refuses it naming the rule, and a configured `pre-receive` hook refusing typed, each
+  refused push recording nothing; `atomic` all or none at the verdict and at the append (a branch the CLI made, which
+  git sees unborn, refusing a create of its name), and a push without it applying a ref at a time. A protected name's
+  linear history and signed commits are A-644 part 2's own tests.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). Red first, the
+  three tests over a stub driver refusing every call (a56e7a725, kiln r223): `cargo test --locked -p slates-server --lib
+  -- git_push:: repository::push:: vcs_policy:: vcs_store:: --test-threads=4` 32 passed and the 3 new failed at `start`.
+  Green at e6d2b1405 (r234): 35 of 35, fmt clean, no warning. Over main bb535bd4d (62db35348, r16): 40 of 40. Over main
+  ee5cbed4c, the policy step moved onto A-644 part 2's check point and `git_protect::` added to the filters (0850516b3):
+  46 of 46, the merge's first build having stopped at the tests' `SetRepositoryPolicy`, to which A-644 part 2 gave
+  `signers`. Over main 3612d1ef9 as it lands (8af0bd751; main's b5231f0ff after it changes comments and documents
+  alone): the same filters 46 of 46 (`git_push` 3, `git_protect` 3, `repository::push` 4, `vcs_policy` 18, `vcs_store`
+  18), `cargo fmt --all -- --check` clean, no warning. No integration target pushes through git yet: no edge calls the
+  driver.
+- **Owed.** The edges' calls: g299's `GitServices` for the HTTP site and g294's channel for SSH. The hooks run over
+  A-665 part 2's view (`pre-receive` with every command, `update` per ref, `post-receive` after). A push based on an
+  older version (A-664). A principal the policy allows who is not the repository's owner, whom A-635's append refuses
+  `Forbidden` until its owner check gives way to the policy. Push options. Review requests (`refs/for/`). The new
+  versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8). A tag of a tag.
+- **Applied in the same change to:** `crates/server/src/git_push.rs` (new) and `git_push/tests.rs`, `lib.rs` (the
+  module, and `git_protect`'s note), `vcs_store.rs` (`with_room`, `SealedPush::quarantine`), `vcs_policy.rs`
+  (`admit_right` visible to the crate), `repository.rs` (`branch_version` visible to the crate),
+  `crates/git/src/upload/mod.rs` (`AGENT` public); §4.17.2's status; GAPS (the A-654 entry, and A-644 part 2's owed
+  line).
+
 ### A-665 part 2 — The hook's view on the owner shard: opened over the repository's store, sealed in the shard's slices, and handed to the hook driver with receive-pack's variables (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-662, A-665)
 Applied in the same change to:
 - §4.17.2 (a status block, "Hooks, in git's terms", piece 10's line) and GAPS (the §4.17 entry: A-665's owed list, the
   hooks' variable sweep, and this part's paragraph);
 - `crates/server`: `git_hooks` and its tests (new); `lib.rs` (the module, Unix alone with the hook driver);
-  `vcs_store.rs` (`SealedPush::push`, `VcsStores::content_mut`, `within_budget` made crate-visible) and its tests'
-  push helpers made crate-visible for the hooks' tests;
+  `vcs_store.rs` (`VcsStores::content_mut`, `within_budget` made crate-visible, and the docs of A-654 part 2's
+  `SealedPush::quarantine`, which the view reads a push through) and its tests' push helpers made crate-visible for
+  the hooks' tests;
 - `crates/git`: `HookView::seal_len`, its module's docs, and a test in `src/tests/store/hook_view.rs`.
 
 - **What.** `git_hooks::GitHookView::open(state, repository, (refs, head), pushed)` opens part 1's view over the
@@ -50310,13 +50469,23 @@ Applied in the same change to:
     these files; the end-to-end test again with `--nocapture`, printing no skip, so stock git 2.50.1 (Apple Git-155)
     read every view; `cargo fmt -p slates-git -p slates-server -- --check` clean. r12's build had warned that
     `GitHookView::node` was never used; the tests' presenter now holds each path's node to its listing.
-  - No integration test reaches `git_hooks`: it is the crate's own until receive-pack calls it (A-654).
+  - On the merged trees, main having landed A-626 part 4 (3612d1ef9: slates-server's listing, verbs, work_home and
+    work_log) and A-654 part 2 (0577ab0bd: git's push driver, whose `SealedPush::quarantine` the view now reads a push
+    through, in place of this part's own accessor of the same field), each run with `--nocapture` and printing no
+    skip, no warning from a slates crate, both crates' fmt checks clean: r82 over 3612d1ef9, `cargo test --locked -p
+    slates-server --lib -- git_hooks vcs_hooks hook_driver vcs_store::` 67 of 67 (`git_hooks` 4, `vcs_hooks` 34,
+    `hook_driver` 11, `vcs_store` 18) and `-p slates-git --lib hook_view` 16 passed and 1 ignored; r111 over
+    0577ab0bd, the tree that lands but for these lines, the same with `git_push` added: 70 of 70, and 16 passed and 1
+    ignored.
+  - No integration test reaches `git_hooks`: it is the crate's own until git's push driver calls it (`git_push`,
+    A-654 part 2).
 - **Found, not changed (reported to main).** A git hook inherits the daemon's environment (A-597: git's and Mercurial's
   hooks inherit the server's), so a repository variable the daemon was started with (`GIT_OBJECT_DIRECTORY`,
   `GIT_COMMON_DIR`, git's `local_repo_env` list) would reach `update` and `post-receive`, which the view sets none of,
   and point their `git` away from the view. Stock git's own transports clear that list for receive-pack (`connect.c`,
   from memory, to verify); whether the hook driver clears it for git's points is main's to decide.
 - **Owed.** Part 3, the view presented at a path (above); its seals kept as derived data across views, since a pack's
-  name hashes what it is made from and a seal serves every view showing its pack; receive-pack's calls (A-654), which
-  open, seal, present, run and close the views at each point; git's words for each outcome (`pre-receive hook
-  declined`, `hook declined`); main's runs (the other platforms, clippy, `xtask`, the doc gates).
+  name hashes what it is made from and a seal serves every view showing its pack; the calls of git's push driver
+  (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until they
+  land), which open, seal, present, run and close the views at each point; git's words for each outcome (`pre-receive
+  hook declined`, `hook declined`); main's runs (the other platforms, clippy, `xtask`, the doc gates).
