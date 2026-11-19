@@ -3781,8 +3781,7 @@ impl Green {
       let footprint = position::Footprint::pair(dst, from).and_links_naming(&replaced);
       units.unit(footprint, |_| {
         let mut unit = position::Unit::default();
-        let unseen =
-          !cleared.contains(dst) && self.leaves_to_an_unseen_link(dst, base, (r, homes));
+        let unseen = !cleared.contains(dst) && self.leaves_to_an_unseen_link(dst, base, (r, homes));
         let merged = if unseen {
           Err(Green::window(dst, MergeConflictClass::RenameRename))
         } else {
@@ -4807,7 +4806,12 @@ impl Green {
       .collect();
     let relinked = changed
       .iter()
-      .flat_map(|path| [self.hardlink_at(path, at), self.hardlinks.get(path).cloned()])
+      .flat_map(|path| {
+        [
+          self.hardlink_at(path, at),
+          self.hardlinks.get(path).cloned(),
+        ]
+      })
       .flatten()
       .collect();
     let copies = at != head || floor != self.floor();

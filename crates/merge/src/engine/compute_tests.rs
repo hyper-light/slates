@@ -17,7 +17,7 @@ use super::{
 };
 use crate::chain_entry::Applied;
 use crate::increment::Base;
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 use crate::origin::Origin;
 use crate::push::{HEAD_ATTRIBUTE, ROOT};
 use crate::verdict::MergeConflictClass;
@@ -134,10 +134,20 @@ impl Draft {
     self.op(kind, path, (at, bytes.len() as u64, src));
   }
 
-  /// A namespace op on `path` naming `other` (a rename's source, a link's target).
+  /// A namespace op on `path` naming `other`: a rename's source, or a link's target, the node there at the work's base
+  /// in the document's node table (A-646), which is where the verdict reads a link's node; a link naming a path table
+  /// entry names no node and is refused as invalid.
   fn naming(&mut self, kind: OpKind, path: &str, other: &str) {
     let other = self.doc.paths.intern(other);
-    self.op(kind, path, (0, 0, other));
+    let src = if kind == OpKind::Link {
+      self.doc.nodes.intern(NodeRef {
+        path: other,
+        origin: NodeOrigin::Base,
+      })
+    } else {
+      other
+    };
+    self.op(kind, path, (0, 0, src));
   }
 
   /// A namespace op on `path` alone.
