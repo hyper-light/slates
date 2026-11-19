@@ -14,10 +14,10 @@ use std::fmt::Debug;
 use std::ops::Bound;
 
 /// All the room there is, for the tests that are not about the bound.
-const ALL_ROOM: usize = usize::MAX;
+pub(crate) const ALL_ROOM: usize = usize::MAX;
 
 /// A transaction name of the form §4.17.4 item 3.1 gives: the base revision, `-`, and a work's id in base 36.
-const TRANSACTION: &str = "0-1z";
+pub(crate) const TRANSACTION: &str = "0-1z";
 
 /// A text named by one byte.
 fn text(mark: u8) -> Text {
@@ -1002,10 +1002,10 @@ const COPY_CAP: usize = 24;
 /// A node-revision of the naive filesystem, held as FSFS holds one (`structure` 551-588): identities as revision and
 /// number, the copy root as a revision and a path.
 #[derive(Clone, Debug)]
-struct NaiveNode {
-  kind: NodeKind,
-  node_id: (Revision, u64),
-  copy_id: (Revision, u64),
+pub(crate) struct NaiveNode {
+  pub(crate) kind: NodeKind,
+  pub(crate) node_id: (Revision, u64),
+  pub(crate) copy_id: (Revision, u64),
   created_path: String,
   created_revision: Revision,
   predecessor: Option<usize>,
@@ -1013,7 +1013,7 @@ struct NaiveNode {
   copy_from: Option<(String, Revision)>,
   copy_root: (Revision, String),
   text: Option<Text>,
-  properties: PropertyList,
+  pub(crate) properties: PropertyList,
 }
 
 /// How a naive clone took its copy identity (`tree.c` `copy_id_inherit_t`).
@@ -1026,7 +1026,7 @@ enum Way {
 
 /// What a history met, so the oracle can show each rule it compared was exercised.
 #[derive(Clone, Copy, Debug, Default)]
-struct Census {
+pub(crate) struct Census {
   /// Clones that kept their copy identity.
   kept: usize,
   /// Clones that took their parent's copy identity where it differed from their own: lazy copies.
@@ -1116,15 +1116,15 @@ fn moved(path: &str, from: &str, to: &str) -> String {
 /// The naive filesystem: every node-revision ever made and every revision's whole tree, path by path; FSFS's operations
 /// applied to them literally (`tree.c`, `dag.c`); and what each revision's deletions removed.
 #[derive(Clone, Debug)]
-struct NaiveFs {
-  nodes: Vec<NaiveNode>,
-  trees: Vec<BTreeMap<String, usize>>,
+pub(crate) struct NaiveFs {
+  pub(crate) nodes: Vec<NaiveNode>,
+  pub(crate) trees: Vec<BTreeMap<String, usize>>,
   deleted: Vec<BTreeMap<String, usize>>,
 }
 
 impl NaiveFs {
   /// Revision 0: the root alone.
-  fn new() -> Self {
+  pub(crate) fn new() -> Self {
     let root = NaiveNode {
       kind: NodeKind::Directory,
       node_id: (0, 0),
@@ -1151,9 +1151,16 @@ impl NaiveFs {
   }
 
   /// A transaction on the youngest revision, its root already a new node-revision (`create_new_txn_noderev_from_rev`).
-  fn begin(&mut self) -> Txn<'_> {
+  pub(crate) fn begin(&mut self) -> Txn<'_> {
+    let youngest = u64::try_from(self.trees.len() - 1).unwrap();
+    self.begin_on(youngest)
+  }
+
+  /// A transaction on revision `base`, its root already a new node-revision of `base`'s root, numbered as the next
+  /// revision so that no identity it makes equals one a revision holds: a work's transaction on its base (A-592).
+  pub(crate) fn begin_on(&mut self, base: Revision) -> Txn<'_> {
     let revision = u64::try_from(self.trees.len()).unwrap();
-    let mut tree = self.trees.last().unwrap().clone();
+    let mut tree = self.trees[usize::try_from(base).unwrap()].clone();
     let old_root = tree["/"];
     let mut root = self.nodes[old_root].clone();
     root.predecessor = Some(old_root);
@@ -1204,7 +1211,7 @@ type Opened = (String, Option<usize>, Way);
 
 /// A transaction of the naive filesystem: its tree as it stands, the node-revisions it made, and what its deletions
 /// removed.
-struct Txn<'fs> {
+pub(crate) struct Txn<'fs> {
   fs: &'fs mut NaiveFs,
   revision: Revision,
   tree: BTreeMap<String, usize>,
@@ -1217,10 +1224,15 @@ struct Txn<'fs> {
 
 impl Txn<'_> {
   /// Makes the transaction the next revision; answers what it met.
-  fn commit(self) -> Census {
+  pub(crate) fn commit(self) -> Census {
     self.fs.trees.push(self.tree);
     self.fs.deleted.push(self.deleted);
     self.census
+  }
+
+  /// The transaction's tree as it stands, never committed: what A-592's oracle merges.
+  pub(crate) fn into_tree(self) -> BTreeMap<String, usize> {
+    self.tree
   }
 
   /// Keeps a node-revision this transaction made.
@@ -1448,7 +1460,7 @@ impl Txn<'_> {
 
 /// One generated wish for a revision; a transaction turns it into a row when its tree allows one, else drops it.
 #[derive(Clone, Copy, Debug)]
-struct Wish {
+pub(crate) struct Wish {
   op: u8,
   place: u16,
   source: u16,
@@ -1459,7 +1471,7 @@ struct Wish {
 }
 
 /// Any wish.
-fn wish() -> impl Strategy<Value = Wish> {
+pub(crate) fn wish() -> impl Strategy<Value = Wish> {
   (
     any::<u8>(),
     any::<u16>(),
@@ -1482,7 +1494,7 @@ fn wish() -> impl Strategy<Value = Wish> {
 
 /// Histories of up to nine revisions of up to six wishes each, and the priorities that rank a revision's rows in a
 /// drive order.
-fn histories() -> impl Strategy<Value = (Vec<Vec<Wish>>, Vec<u32>)> {
+pub(crate) fn histories() -> impl Strategy<Value = (Vec<Vec<Wish>>, Vec<u32>)> {
   (
     prop::collection::vec(prop::collection::vec(wish(), 0..7), 1..10),
     prop::collection::vec(any::<u32>(), 1..24),
@@ -1500,7 +1512,7 @@ fn pick<T: Clone>(choices: &[T], pick: u16) -> Option<T> {
 
 impl Txn<'_> {
   /// The rows a revision's wishes make, each applied as it is made: generation is itself one drive order.
-  fn rows_from(&mut self, wishes: &[Wish]) -> Vec<ChangedPath> {
+  pub(crate) fn rows_from(&mut self, wishes: &[Wish]) -> Vec<ChangedPath> {
     let mut rows: Vec<ChangedPath> = Vec::new();
     for wish in wishes {
       if let Some(row) = self.row_for(wish, &rows) {
