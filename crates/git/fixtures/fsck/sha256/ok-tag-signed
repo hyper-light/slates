@@ -1,0 +1,10 @@
+object cfbf8937fbc9add24669c437554783a120a0ed5c4f50068ecd751d83e7920243
+type commit
+tag v1
+tagger C O Mitter <committer@example.com> 1112911993 +0000
+
+version one
+-----BEGIN PGP SIGNATURE-----
+
+bm90IGEgc2lnbmF0dXJl
+-----END PGP SIGNATURE-----

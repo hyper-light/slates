@@ -126,6 +126,12 @@ sha1-checked = { version = "0.10.0", default-features = false }
 # ARMv8's CRC instructions or x86-64's carry-less multiply at run time, with a table for the rest, and slates-git keeps
 # no `unsafe` of its own.
 crc32fast = "1"
+# HMAC-MD5 for ra_svn's CRAM-MD5 (RFC 2195; §4.17.4 items 5 and 10, A-599): RustCrypto's pure-Rust `hmac` over its
+# `md-5`, approved by main (2026-11-19) for this mechanism alone. The vendored aws-lc-rs has MD5 (a local change, for S3)
+# but HMAC over the SHA family alone (`vendor/aws-lc-rs/src/hmac.rs`: `Algorithm`'s field is private, and its constants
+# are HMAC with SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512). No default features: neither needs `std`.
+hmac = { version = "0.12.1", default-features = false }
+md-5 = { version = "0.10.6", default-features = false }
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }
