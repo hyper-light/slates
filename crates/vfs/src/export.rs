@@ -81,6 +81,8 @@ pub const MODE_CHAR_DEVICE: u32 = 0o020_000;
 const POLICY_EXACT: u32 = 0;
 /// Format: the archive header's name-policy id for normalization- and case-insensitive names.
 const POLICY_FOLD: u32 = 1;
+/// Format: the archive header's name-policy id for names folded by Windows' upcase table (A-576).
+const POLICY_UPCASE: u32 = 2;
 /// Format: the archive header's Unicode version field when the exporter carries none — the volume
 /// core's names module fixes its own table and does not yet surface a version number (owed).
 const UNICODE_VERSION_UNSPECIFIED: u32 = 0;
@@ -91,6 +93,7 @@ pub fn name_equivalence_of_id(id: u32) -> Option<NameEquivalence> {
   match id {
     POLICY_EXACT => Some(NameEquivalence::Exact),
     POLICY_FOLD => Some(NameEquivalence::Fold),
+    POLICY_UPCASE => Some(NameEquivalence::Upcase),
     _ => None,
   }
 }
@@ -379,6 +382,7 @@ impl SnapshotArchiver {
     let name_policy_id = match volume.policy {
       NameEquivalence::Exact => POLICY_EXACT,
       NameEquivalence::Fold => POLICY_FOLD,
+      NameEquivalence::Upcase => POLICY_UPCASE,
     };
     let mut archiver = SnapshotArchiver {
       snapshot: id,
@@ -1292,12 +1296,16 @@ mod tests {
     );
   }
 
-  /// A-453: do export a snapshot of a byte-exact volume and of a folding one. Expect each archive's name-policy id to
-  /// name its volume's policy back (`name_equivalence_of_id`), so a volume made from the archive takes the policy its
-  /// source had; and an id the exporter never writes to name none.
+  /// A-453, A-576: do export a snapshot of a byte-exact volume, of a folding one and of one that folds by Windows'
+  /// upcase table. Expect each archive's name-policy id to name its volume's policy back (`name_equivalence_of_id`), so
+  /// a volume made from the archive takes the policy its source had; and an id the exporter never writes to name none.
   #[test]
   fn an_archives_name_policy_names_its_volumes_back() {
-    for names in [NameEquivalence::Exact, NameEquivalence::Fold] {
+    for names in [
+      NameEquivalence::Exact,
+      NameEquivalence::Fold,
+      NameEquivalence::Upcase,
+    ] {
       let mut store = store();
       let mut volume = Volume::create(
         &mut store,
