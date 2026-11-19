@@ -37,6 +37,7 @@ use slates_git::lfs::serve::{
 };
 use slates_http::reply::Status;
 use slates_ipc::protocol::Refusal;
+use slates_vfs::clock::Clock;
 use slates_wire::Wire;
 
 use crate::repository::push::{AppendRefused, EntryParts, RepositoryLogs};

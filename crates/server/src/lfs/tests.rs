@@ -248,7 +248,7 @@ fn stranger_submits_to_main() -> RepositoryPolicy {
         }],
       },
     }],
-    hooks: Vec::new(),
+    ..RepositoryPolicy::default()
   }
 }
 
