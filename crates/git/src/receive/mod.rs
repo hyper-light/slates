@@ -135,8 +135,11 @@ pub trait Judge {
   /// Appends one accepted command's entry to its ref's own log, on its own (a push without
   /// `atomic`): what report-status-v2 reports of it (nothing for a plain update), or why not
   /// ([`FAILED_TO_UPDATE`] when the ref moved since its verdict read it).
-  fn append(&mut self, command: &Command, accepted: Self::Accepted)
-  -> Result<Vec<Reported>, Declined>;
+  fn append(
+    &mut self,
+    command: &Command,
+    accepted: Self::Accepted,
+  ) -> Result<Vec<Reported>, Declined>;
 
   /// Appends an atomic push's commands, every one accepted, one entry on each ref, each only while
   /// its ref is still at the position its verdict read: all or none. What report-status-v2 reports
@@ -233,7 +236,12 @@ impl<'a> Pushed<'a> {
       .map_err(Refusal::PastAdmission)?;
     let mut by_id = Vec::new();
     reserve(&mut by_id, objects.len())?;
-    by_id.extend(objects.iter().enumerate().map(|(at, object)| (object.id, at)));
+    by_id.extend(
+      objects
+        .iter()
+        .enumerate()
+        .map(|(at, object)| (object.id, at)),
+    );
     by_id.sort_unstable();
     Ok(Self { objects, by_id })
   }
@@ -390,7 +398,14 @@ where
     let read = pack.read(bytes.get(took..).unwrap_or_default(), admission);
     checked_pack(pack, read.map(|_| ()), repository, admission)
   });
-  let outcomes = outcomes(&request, unpacked.as_ref(), repository, hidden, judge, admission)?;
+  let outcomes = outcomes(
+    &request,
+    unpacked.as_ref(),
+    repository,
+    hidden,
+    judge,
+    admission,
+  )?;
   Ok(Received {
     request,
     unpacked,
@@ -524,7 +539,8 @@ fn atomic_outcomes<J: Judge + ?Sized>(
 ) -> Result<(), Refusal> {
   let count = request.commands.len();
   if early.iter().any(Option::is_some) {
-    let others = |outcome: Option<Outcome>| outcome.unwrap_or_else(|| refused(ATOMIC_FAILURE, None));
+    let others =
+      |outcome: Option<Outcome>| outcome.unwrap_or_else(|| refused(ATOMIC_FAILURE, None));
     outcomes.extend(early.into_iter().map(others));
     return Ok(());
   }

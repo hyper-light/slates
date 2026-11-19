@@ -345,9 +345,15 @@ fn receive_pack_resolves_a_thin_pack_against_the_store() {
   let bytes = request(parent, commit_id, b"refs/heads/main", &pack);
   let view = IndexedObjects::new(&repository, &store, ROOM);
   let mut admission = Admission::new(ROOM);
-  let received =
-    receive::receive(&bytes, &ADVERTISED, &view, &receive::NoneHidden, &mut Applies, &mut admission)
-      .unwrap();
+  let received = receive::receive(
+    &bytes,
+    &ADVERTISED,
+    &view,
+    &receive::NoneHidden,
+    &mut Applies,
+    &mut admission,
+  )
+  .unwrap();
   assert_eq!(received.outcomes, [receive::Outcome::Ok(Vec::new())]);
   let unpacked = received.unpacked.unwrap().unwrap();
   for (id, edit) in ids.iter().zip(&edits) {

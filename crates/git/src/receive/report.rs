@@ -97,7 +97,13 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
 fn pack_lines(refused: &PackRefused) -> Vec<Vec<u8>> {
   match refused.why {
     PackRefusal::Fsck { id, finding } => {
-      let text = [FSCK_OBJECT, hex(&id).as_slice(), b": ", finding.name().as_bytes()].concat();
+      let text = [
+        FSCK_OBJECT,
+        hex(&id).as_slice(),
+        b": ",
+        finding.name().as_bytes(),
+      ]
+      .concat();
       vec![message(&text), FSCK_FATAL.to_vec()]
     }
     PackRefusal::Unpack(_) => Vec::new(),

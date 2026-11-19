@@ -60,9 +60,15 @@ fn assert_refused_by_fsck(objects: &[(Kind, &[u8])], id: ObjectId, finding: Fsck
   let capabilities = b" report-status side-band-64k";
   let bytes = request(&[], &command, capabilities, &[], &pack_of(objects));
   let mut judge = Applies::default();
-  let received =
-    receive(&bytes, &ADVERTISED, &Repo::default(), &NoneHidden, &mut judge, &mut unbounded())
-      .unwrap();
+  let received = receive(
+    &bytes,
+    &ADVERTISED,
+    &Repo::default(),
+    &NoneHidden,
+    &mut judge,
+    &mut unbounded(),
+  )
+  .unwrap();
   let refused = PackRefused {
     objects: Some(u32::try_from(objects.len()).unwrap()),
     why: PackRefusal::Fsck { id, finding },
@@ -112,10 +118,12 @@ fn a_push_refuses_what_a_default_fsck_only_warns_of() {
   let warnings: Vec<FsckId> = default.report.warnings().collect();
   assert_eq!(warnings, [FsckId::HasDotgit]);
   let pack = pack_of(&[(Kind::Tree, &dotgit)]);
-  let unpacked =
-    unpack::read_whole(&pack, ObjectFormat::Sha1, &NoIndex, &mut unbounded()).unwrap();
+  let unpacked = unpack::read_whole(&pack, ObjectFormat::Sha1, &NoIndex, &mut unbounded()).unwrap();
   let refused = fsck::first_refusal(&unpacked.objects, ObjectFormat::Sha1);
-  assert_eq!(refused, Some((id_of(Kind::Tree, &dotgit), FsckId::HasDotgit)));
+  assert_eq!(
+    refused,
+    Some((id_of(Kind::Tree, &dotgit), FsckId::HasDotgit))
+  );
 }
 
 /// A-620 (the object named is the first refused in pack order). Do: push a pack holding a tag of

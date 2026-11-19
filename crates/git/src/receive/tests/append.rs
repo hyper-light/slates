@@ -121,7 +121,14 @@ fn three_creates(atomic: bool, logs: &mut Logs) -> Vec<Outcome> {
   };
   let pack = pack_of(&[(Kind::Commit, &commit)]);
   let bytes = request(&[], &commands, capabilities, &[], &pack);
-  let received = receive(&bytes, &ADVERTISED, &repository, &NoneHidden, logs, &mut unbounded());
+  let received = receive(
+    &bytes,
+    &ADVERTISED,
+    &repository,
+    &NoneHidden,
+    logs,
+    &mut unbounded(),
+  );
   received.unwrap().outcomes
 }
 

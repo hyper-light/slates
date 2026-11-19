@@ -54,7 +54,10 @@ fn assert_answers_as_the_last_piece_arrives(scenario: &Scenario, piece: usize, w
     assert_eq!(answered, Ok(None), "{label}");
   }
   let answered = session.input(last, &mut written, &mut unbounded());
-  assert!(matches!(answered, Ok(Some(_))) && session.is_done(), "{label}");
+  assert!(
+    matches!(answered, Ok(Some(_))) && session.is_done(),
+    "{label}"
+  );
   assert_eq!(written, whole, "{label}");
 }
 
@@ -84,7 +87,14 @@ fn assert_as_held_whole(bytes: &[u8], repository: &Repo, label: &str) {
   let piece = 1 + bytes.len() % 7;
   let answered = fed_in_pieces(bytes, piece, repository);
   let mut policy = git_policy(repository);
-  let whole = receive(bytes, &ADVERTISED, repository, &HIDDEN, &mut policy, &mut unbounded());
+  let whole = receive(
+    bytes,
+    &ADVERTISED,
+    repository,
+    &HIDDEN,
+    &mut policy,
+    &mut unbounded(),
+  );
   let written = match &whole {
     Ok(received) => answer_to(received),
     Err(_) => Vec::new(),

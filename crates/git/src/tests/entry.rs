@@ -361,7 +361,11 @@ const KINDS: [Kind; 4] = [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag];
 /// plain tuples and selectors, each choice as likely as the others, so the strategy needs no
 /// `Arc`-backed `prop_oneof!` (R2; `crates/vcs/src/tests.rs` `step` is the pattern).
 fn any_entry() -> impl Strategy<Value = (Header, u64, ObjectFormat)> {
-  let at = (any::<bool>(), PACK_HEADER_LEN + 1..300, PACK_HEADER_LEN + 1..=u64::MAX);
+  let at = (
+    any::<bool>(),
+    PACK_HEADER_LEN + 1..300,
+    PACK_HEADER_LEN + 1..=u64::MAX,
+  );
   let size = (any::<bool>(), 0..300u64, 0..1u64 << 60);
   (at, size, any::<bool>()).prop_flat_map(|((near, near_at, far_at), sizes, sha256)| {
     let at = if near { near_at } else { far_at };

@@ -503,7 +503,14 @@ fn every_cut_of_a_push_is_refused_or_answered_as_a_short_pack() {
       let label = format!("{} cut at {cut}", scenario.name);
       let mut policy = git_policy(&repository);
       let bytes = &scenario.request[..cut];
-      let result = receive(bytes, &ADVERTISED, &repository, &HIDDEN, &mut policy, &mut unbounded());
+      let result = receive(
+        bytes,
+        &ADVERTISED,
+        &repository,
+        &HIDDEN,
+        &mut policy,
+        &mut unbounded(),
+      );
       match cut.checked_sub(request_len) {
         None => assert_eq!(result, Err(Refusal::Truncated { at: wide(cut) }), "{label}"),
         Some(into) => {
@@ -547,7 +554,14 @@ fn every_bit_flip_of_a_command_list_is_refused_by_kind_or_answered() {
     let mut flipped = atomic.request.to_vec();
     flipped[bit / 8] ^= 1 << (bit % 8);
     let mut policy = git_policy(&repository);
-    match receive(&flipped, &ADVERTISED, &repository, &HIDDEN, &mut policy, &mut unbounded()) {
+    match receive(
+      &flipped,
+      &ADVERTISED,
+      &repository,
+      &HIDDEN,
+      &mut policy,
+      &mut unbounded(),
+    ) {
       Ok(received) => {
         answer_to(&received);
         seen.push("answered");
@@ -674,7 +688,14 @@ fn outcomes_hiding(
   hidden: &dyn HiddenRefs,
 ) -> (Vec<Outcome>, Vec<Vec<u8>>) {
   let mut judge = Applies::default();
-  let received = receive(bytes, &ADVERTISED, repository, hidden, &mut judge, &mut unbounded());
+  let received = receive(
+    bytes,
+    &ADVERTISED,
+    repository,
+    hidden,
+    &mut judge,
+    &mut unbounded(),
+  );
   (received.unwrap().outcomes, judge.0)
 }
 
@@ -771,8 +792,14 @@ fn an_atomic_push_with_one_refusal_applies_no_ref() {
   ];
   let atomic = request(&[], &commands, b" report-status atomic", &[], &pack);
   let (outcomes, judged) = outcomes_of(&atomic, &repository);
-  assert!(refused_for(&outcomes[0], b"atomic push failure"), "{outcomes:?}");
-  assert!(refused_for(&outcomes[1], b"missing necessary objects"), "{outcomes:?}");
+  assert!(
+    refused_for(&outcomes[0], b"atomic push failure"),
+    "{outcomes:?}"
+  );
+  assert!(
+    refused_for(&outcomes[1], b"missing necessary objects"),
+    "{outcomes:?}"
+  );
   assert!(judged.is_empty());
   let plain = request(&[], &commands, b" report-status", &[], &pack);
   let (outcomes, judged) = outcomes_of(&plain, &repository);
@@ -821,7 +848,11 @@ fn a_ref_name_git_refuses_is_a_funny_refname() {
       Outcome::Ok(Vec::new())
     };
     let label = String::from_utf8_lossy(name);
-    assert_eq!(one_command_outcome(name, delete), (expected, !funny), "{label}");
+    assert_eq!(
+      one_command_outcome(name, delete),
+      (expected, !funny),
+      "{label}"
+    );
   }
 }
 
@@ -841,7 +872,11 @@ fn each_request_the_protocol_does_not_allow_is_refused_by_kind() {
   let command = format!("{} {id} refs/heads/x", zero());
   let first = line(&format!("{command}\0 report-status"));
   let second_at = wide(first.len());
-  let not_hex = format!("{} {}x refs/heads/x", zero(), id.to_string().get(1..).unwrap());
+  let not_hex = format!(
+    "{} {}x refs/heads/x",
+    zero(),
+    id.to_string().get(1..).unwrap()
+  );
   let cases: Vec<(Vec<u8>, Refusal)> = vec![
     (
       line(&format!("{command}\0 object-format=sha256")),
@@ -916,8 +951,15 @@ fn three_reported(id: ObjectId) -> Received {
   let bytes = request(&[], &commands, b" report-status", &[], &[]);
   let repository = Repo::default();
   let mut judge = Applies::default();
-  let mut received = receive(&bytes, &ADVERTISED, &repository, &NoneHidden, &mut judge, &mut unbounded())
-    .unwrap();
+  let mut received = receive(
+    &bytes,
+    &ADVERTISED,
+    &repository,
+    &NoneHidden,
+    &mut judge,
+    &mut unbounded(),
+  )
+  .unwrap();
   let first = Reported {
     refname: Some(b"refs/pull/1/head".to_vec()),
     old: Some(zero()),
@@ -1011,13 +1053,29 @@ fn assert_pack_answered(pack: &[u8], words: &[u8]) {
   let bytes = request(&[], &command, b" report-status", &[], pack);
   let repository = Repo::default();
   let mut judge = Applies::default();
-  let received =
-    receive(&bytes, &ADVERTISED, &repository, &NoneHidden, &mut judge, &mut unbounded()).unwrap();
+  let received = receive(
+    &bytes,
+    &ADVERTISED,
+    &repository,
+    &NoneHidden,
+    &mut judge,
+    &mut unbounded(),
+  )
+  .unwrap();
   let mut expected = Vec::new();
   pktline::write(Packet::Data(&[words, b"\n"].concat()), &mut expected).unwrap();
-  pktline::write(Packet::Data(b"ng refs/heads/x unpacker error\n"), &mut expected).unwrap();
+  pktline::write(
+    Packet::Data(b"ng refs/heads/x unpacker error\n"),
+    &mut expected,
+  )
+  .unwrap();
   pktline::write(Packet::Flush, &mut expected).unwrap();
-  assert_eq!(answer_to(&received), expected, "{}", String::from_utf8_lossy(words));
+  assert_eq!(
+    answer_to(&received),
+    expected,
+    "{}",
+    String::from_utf8_lossy(words)
+  );
   assert!(judge.0.is_empty());
 }
 
@@ -1048,7 +1106,10 @@ fn a_refused_pack_is_answered_in_gits_words() {
     ),
     (thin_pack(), b"unpack unpack-objects abnormal exit"),
     (pack_header(below), b"unpack unpack-objects abnormal exit"),
-    (pack_header(UNPACK_LIMIT), b"unpack index-pack abnormal exit"),
+    (
+      pack_header(UNPACK_LIMIT),
+      b"unpack index-pack abnormal exit",
+    ),
   ];
   for (pack, words) in cases {
     assert_pack_answered(&pack, words);
@@ -1059,7 +1120,14 @@ fn a_refused_pack_is_answered_in_gits_words() {
 fn options_received(options: &Scenario, admission: &mut Admission) -> Result<Received, Refusal> {
   let repository = Repo::from_pack(options.before_pack);
   let mut policy = git_policy(&repository);
-  receive(options.request, &ADVERTISED, &repository, &HIDDEN, &mut policy, admission)
+  receive(
+    options.request,
+    &ADVERTISED,
+    &repository,
+    &HIDDEN,
+    &mut policy,
+    admission,
+  )
 }
 
 /// A-620 (every size charged to the admission before it is built). Do: receive the options push

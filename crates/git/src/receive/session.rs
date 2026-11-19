@@ -165,7 +165,9 @@ where
       return Ok(None);
     };
     let unpacked = checked_pack(reader, read, self.repository, admission);
-    self.answer(request, Some(unpacked), out, admission).map(Some)
+    self
+      .answer(request, Some(unpacked), out, admission)
+      .map(Some)
   }
 
   /// Each command's outcome, written to `out` as receive-pack answers it.
