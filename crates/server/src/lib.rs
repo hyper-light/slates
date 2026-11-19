@@ -151,10 +151,12 @@ mod deadlines;
 mod hangup;
 mod reap;
 mod repository;
-// git's `wildmatch` with `WM_PATHNAME`: the glob of a git repository's ref patterns and of a Subversion glob rule's
-// segments (A-597). No caller outside tests until the version-control servers' policy reads it (their pieces).
-#[cfg_attr(not(test), allow(dead_code))]
-mod wildmatch;
+// git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
+// that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both
+// crates' tests hold one transcription and no product build links it (A-671). The matcher is `slates_vcs::wildmatch`.
+#[cfg(test)]
+#[path = "../../vcs/src/wildmatch/reference.rs"]
+mod wildmatch_reference;
 // §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
 // policy the repository's record holds (`admit`, A-622). No caller outside tests until the servers' push paths ask it
 // (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).
@@ -187,6 +189,15 @@ mod vcs_http;
 // key's keeping, the key store and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_ssh;
+// The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
+// tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
+// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_store;
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). No caller
+// outside tests until the daemon imports a repository's directory (its piece).
+#[cfg_attr(not(test), allow(dead_code))]
+mod hg_base;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;
