@@ -3537,12 +3537,14 @@ its copies and the one asking, and a map past it is refused `MapShareExhausted` 
 shard (A-188).** Every map verb names its volume and runs on the volume's shard, and the copy is held there, in that
 shard's table under its client, whichever shard serves the client. The hand-off reaches the client where it is: on Linux
 the copy's shard asks the client's own shard, by a cross-shard call, to send the descriptor on the client's control
-socket, whose deliveries are sealed under the client's channel (A-187); on Windows it asks that shard for the client's
-process and duplicates the handle into it; macOS's offer is made on the copy's shard and claimed by the mapping id,
-which names it. The reply is delivered to the client's ring on its own shard. The client's own shard runs its reap and
-reaches every shard: there the client's writable maps are written back before its attachments go, and its copies let
-go after. A consumer in a separate network namespace (a container on a bridge network, a pod of its own) reaches the
-daemon through the rendezvous's socket file (A-187).
+socket, whose deliveries are sealed under the client's channel (A-187), and sent once: that shard records each map it
+sent until its reply reaches the client, an ask after a lost answer is answered from the record, and a hand-off whose
+every answer was lost keeps its copy as handed, the client's to let go (A-505); on Windows it asks that shard for the
+client's process and duplicates the handle into it; macOS's offer is made on the copy's shard and claimed by the
+mapping id, which names it. The reply is delivered to the client's ring on its own shard. The client's own shard runs
+its reap and reaches every shard: there the client's writable maps are written back before its attachments go, and its
+copies let go after. A consumer in a separate network namespace (a container on a bridge network, a pod of its own)
+reaches the daemon through the rendezvous's socket file (A-187).
 
 > **Status (local zero-copy read / A-135, 2026-10-15).** **Built and proven end to end on x86_64 Linux.** A same-uid
 > client requests `MapRead` over the command ring; the daemon mints a read mapping (`Volume::dax_map_read`) and sends
@@ -33964,6 +33966,49 @@ Unix sibling built); and:
   `slates-client --lib` 5 of 5; clippy clean on macOS (ipc and client, all targets), Linux x86_64 and aarch64 and Windows
   x86_64 and arm64 (ipc, all targets), `cargo xwin check` of the client clean; `cargo xtask check` structural ok and no
   literal of this change's; rustfmt clean.
+
+### A-487 — Goal 85's bug 2, the move back to the creator, had A-485's cause; its regression test (2026-11-18, g230; §4.8 "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398, A-485)
+Applied in the same change to: GAPS (the move's entry), A-485's bug record (a section of its own), and
+`crates/server/src/fleet.rs`'s unit tests.
+- **What happened.** `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the
+  quiet Mac Studio at main 3022c6894: the move back answered `Moving` and `MoveRefused { Unplaced }` in turn until its
+  deadline. The third node refused every head and catalog record and 2,663 content puts of the volume's new owner
+  `Unauthorized`, and no node counted `fleet.move.followed`: A-485's cause. No rule changes here.
+- **Tests.** `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests):
+  the move installed through the walk as the coordinator drives it; the copy routed to the new owner, its authority
+  naming it, the new owner's next record accepted and the creator's refused `Unauthorized`. Green on the Mac Studio
+  (kiln r26, debug); red with A-485's follow call removed (the copy routed to the creator, the new owner refused
+  `Unauthorized`, none followed). The fleet test is main's.
+
+### A-505 — A direct map's send to its client is taken once: the client's shard records it until its reply arrives, and a hand-off whose answers were lost keeps its copy as handed (2026-11-19, goal 85 via g225; A-488's sibling; §4.6; A-174, A-187, A-188)
+
+- **What was there.** On Linux the copy's shard asks the client's shard to send the copy's descriptor on the client's
+  control socket (A-188), waiting in that shard's own time (A-435's class A). A client's shard that stopped for a
+  window, or ran one of CPU without answering, had its ask forgotten by the caller and still ran the ask once it
+  resumed. The descriptor was sent, but the copy's shard, with no answer, replied `MapUnavailable` and gave the copy
+  back: the client read by copy, and the descriptor it was sent sat in its control socket, holding the copy's pages
+  outside every budget, until a later receive happened to drain it. Asked again, the same send would have sent the
+  copy twice.
+- **The rule.** The client's shard records each map it sends the client (`ClientSlot::maps_sent`) and answers a map it
+  holds as sent `Sent` without sending it again (`direct_map::send_once`). An ask whose answer was lost is made once
+  more; it runs behind the first on that shard's channel, so it is answered from the first's record. When no answer
+  comes back at all, the copy is kept as handed and the reply is `Mapped` (`kept_as_handed`, counted
+  `dax.local_map_handed_unanswered`): a client that received the descriptor maps it, and one that received none gives
+  the copy back when its receive gives up at its reply deadline (A-174). A map's record ends when its reply is
+  delivered on the client's shard (`forget_replied`, from `deliver_to`), after every ask about it, since one channel
+  carries the asks and the reply in order: the record holds at most the client's maps in flight, and ends with its
+  slot.
+- **Why this and not another.** The send is the client's shard's effect, so its record is kept there, as A-488 keeps a
+  seal's on its owner shard. After a lost answer `MapUnavailable` cannot be made safe, since the descriptor may already
+  be the client's; `Mapped` is safe either way, by the client's own give-back. The second ask only spares a client
+  whose send was refused that wait: the copy is kept as handed after any number of lost answers.
+- **Test.** `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`
+  (`crates/server/src/direct_map.rs`, on every host): the record, the verdict and the record's end. The Linux glue
+  (`send_to_client`, `hand_off`, `handed`) builds on Linux alone; its build and the client's direct-map suites there
+  are filed for main's Linux lane.
+
+Applied in the same change to: §4.6 (the hand-off's sentence), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, its
+siblings), A-488's bug record (its `direct_map` sibling closed), `crates/server/src/{direct_map,state,daemon}.rs`.
 
 ### A-499 — The Mercurial server over greens and works (2026-11-18, g291 for UI goal 91; new §4.17.3; D-28, §4.17.1, §4.16)
 - **What it adds.** §4.17.3, built on §4.17.1 without redefining it: the decisions that are Mercurial's alone (a named

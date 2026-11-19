@@ -11584,6 +11584,163 @@ mod discovery_wait_tests {
 #[cfg(test)]
 mod tests {
 
+  /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
+  /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
+  /// ([`super::install_slice`]), as the coordinator's period drives it ([`super::drive_install_walk`]).
+  fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
+    let regional = state.council.configuration().clone();
+    let Some(configuration) = regional.configuration_for(local) else {
+      return;
+    };
+    let version = configuration.version;
+    crate::readmission::install_placement(state, configuration, &regional.members);
+    state.install_walk = Some(super::InstallWalk {
+      version,
+      after: None,
+      walking: false,
+    });
+    // Every turn reaches at least one copy, so the walk ends within one turn a copy and one more.
+    let turns = state.holder_records.len().saturating_add(1);
+    for _ in 0..turns {
+      if !super::install_slice(state, local, version) {
+        return;
+      }
+    }
+  }
+
+  /// What a holder's copy of a moved object answers once its install's walk has reached it
+  /// ([`a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it`]).
+  #[derive(Debug)]
+  struct Followed {
+    /// The member the object moved from (its creator) and the member it moved to.
+    from: super::HostId,
+    to: super::HostId,
+    /// The owner this node's routing names for the object.
+    routed: Option<super::HostId>,
+    /// The owner the copy's authority names.
+    authority: Option<super::HostId>,
+    /// How the copy judges the next record from the move's new owner, and from the owner it left.
+    from_new: Option<Result<(), slates_db::register::RegisterError>>,
+    from_old: Option<Result<(), slates_db::register::RegisterError>>,
+    /// The copies counted followed (`fleet.move.followed`).
+    followed: u64,
+  }
+
+  /// A-487, goal 85's bug 2, closed by A-485's rule (§4.8 "Authority scope", A-291's switch through A-398's walk). Do: on
+  /// a holder in a region of three members at `f = 1`, hold a copy of an object its creator owns, then commit the
+  /// creator's move of it to the third member and install that configuration through the walk as the coordinator drives
+  /// it ([`walk_the_install`]). Expect the copy routed to the new owner, its authority naming the new owner, its next
+  /// record from the new owner accepted and one from the creator refused `Unauthorized`, and the copy counted followed.
+  /// Before A-485 the walk's per-copy step followed a move only for a copy routed to a retired host, so the copy kept the
+  /// creator's authority and refused every record and content put of the new owner: a volume moved back to its creator
+  /// could never place its head off its owner, and the move test's answers alternated `Moving` and
+  /// `MoveRefused { Unplaced }` until its deadline (the third node refusing 8,006 records and 2,663 content puts
+  /// `Unauthorized`, quiet Mac Studio, main 3022c6894).
+  #[test]
+  fn a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, ObjectId, Quorum, Record};
+      let local = state.fleet.host();
+      let (from, to) = (super::HostId(local.0 ^ 1), super::HostId(local.0 ^ 2));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      for host in [from, to] {
+        assert!(
+          state
+            .council
+            .propose(Reconfiguration::Admit { host, domain: None })
+        );
+      }
+      walk_the_install(state, local);
+      let object = ObjectId::new(from, 7);
+      let generation = state.fleet.configuration().version;
+      let mut copy = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: from,
+        },
+      );
+      copy
+        .accept(&Record {
+          owner: from,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"the head before the move".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, copy);
+      state.fleet.track_object_owner(object, from);
+      assert!(state.council.propose(Reconfiguration::Move {
+        object,
+        from,
+        to,
+        cohort: vec![from, local, to],
+      }));
+      walk_the_install(state, local);
+      let generation = state.council.configuration().version;
+      let fence = state
+        .holder_records
+        .get(&object)
+        .map(|copy| copy.persisted().0);
+      let next = |owner| {
+        fence.map(|epoch| Record {
+          owner,
+          object,
+          sequence: 1,
+          epoch,
+          generation,
+          value: b"the next head".to_vec(),
+        })
+      };
+      Followed {
+        from,
+        to,
+        routed: state.fleet.object_owner(object),
+        authority: state.holder_records.get(&object).map(Acceptor::owner),
+        from_new: next(to).map(|record| super::check_held_record(state, local, to, &record)),
+        from_old: next(from).map(|record| super::check_held_record(state, local, from, &record)),
+        followed: state
+          .refusals
+          .get("fleet.move.followed")
+          .copied()
+          .unwrap_or(0),
+      }
+    });
+    assert_eq!(
+      seen.routed,
+      Some(seen.to),
+      "the copy is routed to the move's new owner: {seen:?}"
+    );
+    assert_eq!(
+      seen.authority,
+      Some(seen.to),
+      "the copy's authority names the new owner: {seen:?}"
+    );
+    assert_eq!(
+      seen.from_new,
+      Some(Ok(())),
+      "the new owner's next record is accepted: {seen:?}"
+    );
+    assert_eq!(
+      seen.from_old,
+      Some(Err(slates_db::register::RegisterError::Unauthorized)),
+      "the old owner's ({:?}) is refused: {seen:?}",
+      seen.from
+    );
+    assert_eq!(seen.followed, 1, "the copy is counted followed: {seen:?}");
+  }
+
   /// CLAUDE.md §2 item 8 with §4.8's paged takeover: a taken-over object's wait for a register the still-paging round
   /// of its departed owner may yet bring reads that round's page advances, which the bound takes as its progress; every
   /// other wait, and every wait once the round stops paging, reads none and counts. Do: ask for the round of a catalog
