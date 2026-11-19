@@ -227,16 +227,12 @@ fn a_relative_path_and_a_form_not_resolved_are_answered_in_their_words() {
 fn died(fixture: &served::Served, refusal: Refusal, banded: bool) -> (Vec<u8>, Option<Refusal>) {
   let served = serving(fixture, &REFS, MAIN_REF);
   let mut source = WholeObjects::new(&fixture.objects);
-  let mut answer: Answer<WholePack> = Answer::died(
-    b"head".to_vec(),
-    refusal,
-    banded,
-    &mut Admission::new(u64::MAX),
-  )
-  .unwrap();
+  let mut admission = Admission::new(u64::MAX);
+  let mut answer: Answer<WholePack> =
+    Answer::died(b"head".to_vec(), refusal, banded, &mut admission).unwrap();
   let mut bytes = Vec::new();
   assert_eq!(
-    answer.write(&served, &mut source, &mut bytes, usize::MAX),
+    answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),
     Written::End
   );
   (bytes, answer.refusal().cloned())
