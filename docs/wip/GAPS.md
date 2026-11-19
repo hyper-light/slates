@@ -38,6 +38,21 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
+> **§4.17.4 the Subversion server: designed, its svndiff codec built (2026-11-18, A-500, D-28; UI goal 91; g292).**
+> Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
+> head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
+> property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
+> properties and locks as register entries, reads by history lists, the change index and extent-list deltas, ra_svn
+> without zlib, `svn+ssh` through slates' `svnserve -t`, HTTPv2 then DeltaV, hooks with slates' `svnlook`, Subversion's
+> authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
+> 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
+> `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
+> Owed, in order: the ra_svn item codec; node-exclusive operations and `Copy` in the engine; the Subversion index; the
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
+> suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
+> No speed is claimed until measured.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
