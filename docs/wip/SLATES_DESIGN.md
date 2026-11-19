@@ -47827,3 +47827,19 @@ Applied in the same change to: §4.17.4's status (part 2's first slice); GAPS (t
 - **Swept**: only the reporter's editor writes `textdelta-chunk`s. The dump's, the HTTP listing's and drive's and the
   migration's svndiff writers write one continuous stream, where write boundaries never show; the commit's drive
   reads a client's chunks whatever their boundaries.
+
+### A-672 — The copy oracle's census is met by a fixed history whatever the seed (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); A-626's copy oracle; found by g306 in A-668's merged-tree run; A-670's rule)
+Applied in the same change to: `crates/merge/src/engine/copy_tests.rs` (`fixed_history`, `Census::met`, the oracle run
+with the fixed history first), GAPS (A-668's entry, where the census's failure was filed for its owner).
+- **What was there.** `every_copy_reads_as_its_model_over_every_history` required every count of its census past zero
+  over 128 histories generated from a new seed each run, and an increment of two nested copies whose inner copy replaces
+  what the outer one brought there is rare: in about one nested pair in thirty (2 of 31 and 2 of 46 in A-626 part 2's
+  runs, none of 30 in A-668's merged-tree run r81, 3 of 37 in r131; none in A-626 part 3's green run r84, 3 in the run
+  after it). A run met none of them about one time in three to five and failed by the seed's luck, though every history
+  agreed with its model, and passed by luck as often.
+- **The fix** (A-670's rule for the restatement oracle's census). One fixed history, run first through the whole oracle,
+  meets every case the census counts on every run, and the test fails at once, naming the counts, if it ever stops
+  meeting one; the generated histories add to the counts. Its nine steps: a file put twice; its directory copied as the
+  version before the head held it, its tree changed since; a put beneath that copy; the root copied into its own tree;
+  a copy replacing its destination, then the same copy without replacing, refused; a copy with a file moved inside it
+  as a stock client moves one; and two copies nested in one increment, the inner replacing the file the outer brought.
