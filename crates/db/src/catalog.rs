@@ -520,6 +520,12 @@ pub struct CarriedRecord {
   pub entries: Vec<u8>,
 }
 
+impl CarriedRecord {
+  /// Format: the head a captured clone's record names before any head of it was carried (A-544): all zeros, which no
+  /// archive's BLAKE3 identity is in practice, so no head a successor adopts matches it and its landing is refused by kind.
+  pub const NO_HEAD: [u8; 32] = [0; 32];
+}
+
 /// A volume's carried capture as a partition keeps it (A-503): what its catalog ships ([`CarriedRecord`]) and, when this
 /// node holds that head's tree as one of the volume's snapshots, that snapshot, the **mark** its landings are judged from.
 /// The mark is this node's own snapshot id, so it is never shipped.

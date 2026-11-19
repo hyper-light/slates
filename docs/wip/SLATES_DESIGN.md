@@ -9888,7 +9888,12 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > are where the source parts from the mark and every carried path, and what the capture held at a path is the carried
 > state, else the mark's, which is the stage-1 judgement exactly. A move from the new owner carries again from its mark
 > and its record. A carried record whose mark this node does not hold (a takeover that rebuilt a later head) is refused
-> typed, never landed as a scratch volume.
+> typed, never landed as a scratch volume. **Since A-544 (2026-11-18) every head carries, not a move's alone:** a
+> captured clone is born with its record (naming no head yet), each head it seals is walked and recorded in its
+> catalog (`crate::carry`), and its head register ships only once the record for it is in, so a takeover after the
+> owner's loss adopts the newest placed head with its record and marks it as a move's new owner does, and its landing
+> is judged against the capture. A head whose carry could not be walked ships without its record (the head's content
+> is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind.
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -35974,3 +35979,40 @@ layout 6; layout 5 still read, uncertified), `crates/server/src/content_retentio
 
 Applied in the same change to: §4.16 (A-513's status: its owed item done), GAPS (A-513's remainder closed), A-513's bug
 record, `crates/server/src/{work_home,verbs,daemon}.rs`.
+
+### A-544 — A captured clone taken over after its owner's loss lands against its capture: every head it places carries its capture's record (2026-11-18, g267, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover"; A-291, A-424, A-503)
+
+- **What was there.** A-503 carried a captured clone's capture only with a move: the old owner walked it against the
+  head it handed over and recorded it in the catalog. A takeover after the owner's loss adopts the newest placed head
+  and its catalog, which carried nothing for it (no move had walked it), so the successor landed the clone as a volume
+  with no capture: every file a create, no removal, every change a conflict.
+- **The rule.** Every head of a captured clone is placed with its capture's record, so whatever head a successor adopts
+  comes with what it needs, and the move needs no walk of its own. A clone of a captured base is born with a record
+  naming no head (`carry::creation_record`, all-zero identity; `verbs::publish_clone_as`, in the clone's own atom). On
+  its owner, the seal walk steps each captured clone's carry (`carry::step`): when its head is a snapshot its record is
+  not for, a task of its shard walks the capture (its own here, or its mark and record on a node a move or a takeover
+  brought it to) against that snapshot a slice a turn (`CarryWalk`), and once the head's seal names its archive identity
+  records it (`Op::CaptureCarried`, its mark that snapshot, raising the catalog's sequence). The head register at that
+  sequence waits for the record (`carry::holds_head_back`, in `fleet::unplaced_heads`), and a head ships only once its
+  catalog's current version is placed, so a successor adopts the record with the head and marks the snapshot it
+  materializes (`verbs::finish_making`, A-503) when the identities agree. A move hands over a head placed this way, so
+  its report already waits for the record; A-503's move-time walk is gone.
+- **What is lost when the record is not replicated.** The successor holds the clone's newest placed head and every
+  byte in it; what it can lack is the record for that head: a clone whose owner died before any head of it was placed
+  (the successor serves the creation head, which names no content), a head whose carry could not be walked (its
+  capture or its tree unreadable: the head ships without its record, counted `fleet.carry.refused`, since placement is
+  never held back for a landing), or a live-shipped clone rebuilt from its log past its seal. Such a successor has no
+  mark, and its landing is refused by kind (`Unsupported`, "a moved captured clone whose moved head this node does not
+  hold"), never landed as a volume with no capture; the agent's work stays in the volume, and is committed through its
+  change request as any is. What is lost is only that landing.
+- **Tests.** `a544_a_clone_of_a_captured_base_is_born_with_its_capture_record` and
+  `a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind` (`crates/server/src/verbs.rs`), and
+  `a544_a_captured_clones_head_waits_for_its_capture_record_and_carries_it` (`crates/server/src/carry.rs`: the head held
+  back before its record and shipped after; the record for the head, its mark the head, naming the rewritten file as
+  captured and the made one as absent).
+- **Owed.** The fleet's own test of a takeover (three daemons: a captured clone's owner killed after a sealed head, its
+  successor landing it against its capture), filed for main. A live-shipped clone's record for the head its log rebuilt.
+
+Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267), `crates/db` (`catalog.rs`:
+`CarriedRecord::NO_HEAD`), `crates/server` (`carry.rs`, new; `moves.rs`: the move-time carry gone; `fleet.rs`,
+`verbs.rs`, `state.rs`, `daemon.rs`, `lib.rs`).

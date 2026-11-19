@@ -10225,25 +10225,32 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
-  // A clone of a captured base holds its whole tree and reads no base directory (A-291).
-  if state
+  // A clone of a captured base holds its whole tree and reads no base directory (A-291), and is born with its capture's
+  // record, naming no head yet (A-544): a successor that adopts a head no record is for refuses its landing by kind.
+  let captured = state
     .db
     .partition()
-    .is_captured(record.id, to_db_snapshot(snapshot))
-  {
+    .is_captured(record.id, to_db_snapshot(snapshot));
+  if captured {
     new_record.base = BaseRecord::Scratch;
   }
+  let born_with = captured.then(|| Op::CaptureCarried {
+    volume: id,
+    carried: crate::carry::creation_record(),
+    mark: None,
+  });
   let ops = [
-    Op::VolumeCreated { record: new_record },
-    Op::LineageAdded {
+    Some(Op::VolumeCreated { record: new_record }),
+    Some(Op::LineageAdded {
       edge: LineageEdge {
         child: id,
         origin_volume: record.id,
         origin_snapshot: to_db_snapshot(snapshot),
       },
-    },
+    }),
+    born_with,
   ];
-  for op in &ops {
+  for op in ops.iter().flatten() {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       discard_clone(state, origin, snapshot, admitted);
       return Err(refusal_of_db(&e));
@@ -20764,6 +20771,166 @@ mod tests {
           assert!(!state.by_id.contains_key(&locked), "nothing was published");
         }
       }
+    });
+  }
+
+  /// A-544. Do: capture a volume's snapshot as a base and clone it, after cloning it once before the capture. Expect the
+  /// clone of the captured base born with its capture's record, naming no head (so a successor that adopts a head no
+  /// record is for refuses its landing by kind), shipped in its catalog; and the clone of the snapshot no capture named
+  /// born with none.
+  #[test]
+  fn a544_a_clone_of_a_captured_base_is_born_with_its_capture_record() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "a544-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let clone = |state: &mut crate::state::ShardState, name: &str| {
+        let reply = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Clone {
+            volume: origin,
+            snapshot,
+            name: name.to_owned(),
+          },
+        );
+        let super::ReplyBody::Cloned { id } = reply else {
+          panic!("the clone was made: {reply:?}")
+        };
+        super::to_db_volume(id)
+      };
+      let plain = clone(state, "a544-plain");
+      let captured_op = super::Op::BaseCaptured {
+        volume: super::to_db_volume(origin),
+        snapshot: super::to_db_snapshot(snapshot),
+      };
+      state
+        .db
+        .mutate(&mut state.segment, &captured_op, 0)
+        .unwrap();
+      let captured = clone(state, "a544-captured");
+      let born = crate::carry::creation_record();
+      assert_eq!(state.db.partition().carried(captured), Some((&born, None)));
+      let record = state.db.partition().volume(captured).cloned().unwrap();
+      let carried = state
+        .db
+        .partition()
+        .carried(captured)
+        .map(|(carried, _)| carried);
+      assert_eq!(
+        crate::catalog::CatalogValue::of(&record, carried).carried,
+        Some(born),
+        "the catalog ships the record"
+      );
+      assert_eq!(state.db.partition().carried(plain), None);
+    });
+  }
+
+  /// [`take_over_at`] with the adopted head naming `manifest`, as a sealed head names its archive's identity.
+  fn take_over_named(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    manifest: [u8; 32],
+  ) -> Result<(), Box<super::ReplyBody>> {
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: Vec::new(),
+      sealing: None,
+    };
+    let taken = super::TakenOver {
+      head: &head,
+      catalog,
+      catalog_sequence: 0,
+      sequence: 1,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+        past_tolerance: None,
+      },
+    };
+    super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
+  /// adopts; and another whose catalog carries only the record it was born with (no head of it was ever placed with its
+  /// record). Expect: the first judged against its capture on the successor, the carried paths as its owner recorded
+  /// them; the second refused by kind, never landed as a volume with no capture.
+  #[test]
+  fn a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"CAPT".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x3c; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/gone.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let record = slates_db::catalog::CarriedRecord {
+        head,
+        entries: slates_wire::Wire::to_bytes(&carried),
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x91; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(record),
+        ..takeover_catalog("a544-carried", 1 << 20)
+      };
+      take_over_named(state, id, &catalog, &archive, head).unwrap();
+      match crate::landing::capture_of(state, id) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried)
+        }
+        other => panic!("the successor holds no capture to land against: {other:?}"),
+      }
+      let born = slates_db::catalog::VolumeId { bytes: [0x92; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(crate::carry::creation_record()),
+        ..takeover_catalog("a544-born", 1 << 20)
+      };
+      take_over_named(state, born, &catalog, &archive, head).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, born),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a captured clone with no record for its head is refused by kind, never landed as a volume with no capture"
+      );
     });
   }
 
