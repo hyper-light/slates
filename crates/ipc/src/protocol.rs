@@ -2955,8 +2955,9 @@ pub enum AttachRequest {
   /// A host kernel mount the daemon's OS filesystem bridge serves (§4.6, §4.13; the `slates mount`
   /// flow): the attachment is the **mount's**, recorded under the bridge consumer, so it outlives the
   /// process that requested it (the CLI exits after `mount_nfs`) and the daemon (the anchor keeps the
-  /// listener across a restart), and ends only with the kernel's `UMNT` of the mount, an explicit
-  /// `detach`, or the volume's destroy. The reply's `token` is the capability the mount presents.
+  /// listener across a restart), and ends only when the kernel unmounts the mount (seen through the kernel's own
+  /// unmount event, A-511; a `UMNT` ends nothing), with an explicit `detach`, or with the volume's destroy. The
+  /// reply's `token` is the capability the mount presents.
   HostMount,
   /// A Linux FUSE mount of the volume at `mount_point` — an existing directory the caller owns — that the
   /// daemon establishes through the OS's `fusermount3` and serves on the volume's owner shard (§4.6

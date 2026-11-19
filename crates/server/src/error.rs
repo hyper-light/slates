@@ -282,6 +282,10 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     H::NotFile => TargetRefusal::NotFile,
     H::StaleHandle => TargetRefusal::Stale,
     H::Unavailable(errno) | H::OwnMount(errno) => TargetRefusal::Host { errno: *errno },
+    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
+    H::Win32(code) => TargetRefusal::Host {
+      errno: i32::try_from(*code).unwrap_or(i32::MAX),
+    },
   }
 }
 

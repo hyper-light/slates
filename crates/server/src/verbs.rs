@@ -2893,6 +2893,8 @@ fn status_on_channel(
     slot
       .status_pages
       .begin(request, expires, &mut state.store.metadata);
+    // The capture's deadline is the shard's keeper's to keep (A-522).
+    crate::deadlines::capture_set(state, client, expires);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -6818,6 +6820,11 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       errno: code,
     },
+    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
+    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
     _ => Refusal::BaseUnavailable {
       path: path.to_owned(),
       errno: 0,
@@ -7853,7 +7860,11 @@ fn stage_begin(
     (state.partition, expires),
     &mut state.store.metadata,
   ) {
-    Ok(token) => ReplyBody::Staged { token },
+    Ok(token) => {
+      // Its expiry is a deadline the shard's keeper sleeps for (A-522).
+      crate::deadlines::noted(state, expires);
+      ReplyBody::Staged { token }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -7877,7 +7888,10 @@ fn stage_put(
     .staging
     .put((work_id, principal, token), offset, bytes, expires)
   {
-    Ok(filled) => ReplyBody::StagePutDone { filled },
+    Ok(filled) => {
+      crate::deadlines::noted(state, expires);
+      ReplyBody::StagePutDone { filled }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -8404,21 +8418,13 @@ fn build_increment(
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
-  build_increment_on(state.greens.get(&sealed.green), sealed, evidence)
-}
-
-/// [`build_increment`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
-/// work's shard (A-465), which composes the same increment from the same state.
-fn build_increment_on(
-  engine: Option<&slates_merge::engine::Green>,
-  sealed: &crate::work_home::SealedWork,
-  evidence: Vec<[u8; 32]>,
-) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
   let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
-  let engine = engine
+  let engine = state
+    .greens
+    .get(&green_id)
     .filter(|engine| base_version <= engine.head())
     .ok_or(Refusal::UnknownBase {
       green: to_wire_volume(green_id),
@@ -9199,9 +9205,6 @@ fn judge_submission(
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
   // reader's version).
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
-  // The green's replicas on the node's other shards are made before its first change (A-457, A-273 step 5a), so the
-  // settle's fold and the verdict's version below are fed to them.
-  crate::green_replicas::ensure(state, green_id);
   if let Err(available) =
     crate::merge_service::settle_green_retention_leaving(state, green_id, room)
   {
@@ -9257,15 +9260,6 @@ fn judge_submission(
       ) {
         return refused(refusal);
       }
-      // The version goes to the green's replicas (A-457, A-273 step 5a) before anything else changes the green: a change
-      // left unfed would evict them all at the next.
-      crate::green_replicas::feed_version(
-        state,
-        green_id,
-        (version, &inc),
-        applied,
-        crate::signed_work::to_entry(&signed.verification),
-      );
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
       let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
@@ -9456,21 +9450,12 @@ fn map_rebase(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
-  rebase_on(state.greens.get_mut(&sealed.green), sealed)
-}
-
-/// [`map_rebase`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
-/// shard (A-465), whose answer is the owner's for the same state, since it is computed by this same function.
-pub(crate) fn rebase_on(
-  engine: Option<&mut slates_merge::engine::Green>,
-  sealed: &crate::work_home::SealedWork,
-) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  let (green_id, inc) = match build_increment_on(engine.as_deref(), sealed, Vec::new()) {
+  let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get_mut(&green_id) else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
@@ -9626,18 +9611,8 @@ pub(crate) fn owner_files(
   version: u64,
   paths: &[String],
 ) -> crate::work_files::FetchedBase {
-  base_files(state.greens.get(&green), version, paths)
-}
-
-/// [`owner_files`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
-/// work's shard (A-465).
-pub(crate) fn base_files(
-  engine: Option<&slates_merge::engine::Green>,
-  version: u64,
-  paths: &[String],
-) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get(&green) else {
     fetched.gone = true;
     return fetched;
   };
@@ -9660,21 +9635,10 @@ pub(crate) fn owner_page(
   green: DbVolumeId,
   version: u64,
   path: String,
-  range: (u64, u64),
-) -> crate::work_files::FetchedBase {
-  base_page(state.greens.get(&green), version, path, range)
-}
-
-/// [`owner_page`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
-/// shard (A-465).
-pub(crate) fn base_page(
-  engine: Option<&slates_merge::engine::Green>,
-  version: u64,
-  path: String,
   (offset, want): (u64, u64),
 ) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get(&green) else {
     fetched.gone = true;
     return fetched;
   };
@@ -9693,17 +9657,8 @@ pub(crate) fn owner_sizes(
   green: DbVolumeId,
   version: u64,
 ) -> crate::work_files::FetchedBase {
-  base_sizes(state.greens.get(&green), version)
-}
-
-/// [`owner_sizes`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
-/// shard (A-465).
-pub(crate) fn base_sizes(
-  engine: Option<&slates_merge::engine::Green>,
-  version: u64,
-) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = engine else {
+  let Some(engine) = state.greens.get(&green) else {
     fetched.gone = true;
     return fetched;
   };
@@ -11030,9 +10985,10 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// The consumer an attachment in `form` belongs to (§4.6, §4.13; AUD-01), which is its lifetime: a
 /// host kernel mount's attachment is the OS filesystem bridge's (`Consumer::Bridge`) — it outlives the
 /// ring client that requested it (`slates mount` exits after `mount_nfs`) and the daemon (the anchor
-/// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
-/// destroy. A root record is the ring client's. OCI requires a verified source dependency,
-/// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
+/// keeps the listener across a restart), ending when the kernel unmounts it (seen through the kernel's own unmount
+/// event, A-511), with a `detach`, or with the volume's destroy. A root record is the ring client's. OCI requires a
+/// verified source dependency, constructed separately by `oci::Binding::consumer`; a guest requires its owned device
+/// seam.
 pub(crate) fn consumer_of(
   form: &AttachRequest,
   client_id: u32,
@@ -11471,9 +11427,11 @@ fn bind_mount(
     now,
   ) {
     Ok(_) => {
+      // The mount is watched from here: the kernel's unmount of it ends this attachment whenever it comes (A-511).
       #[cfg(target_os = "macos")]
       if let Some(own) = own {
         state.own_nfs_mounts.insert(attachment, own);
+        crate::own_nfs::watch(state);
       }
       ReplyBody::MountBound
     }
@@ -11619,11 +11577,12 @@ pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   ended
 }
 
-/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
-/// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
+/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's unmount of a host
+/// mount's (§4.6, §4.13; AUD-01; A-511): the record removed as a recorded operation, a green pin dropped, and,
 /// when it was the holder's last attachment of the volume and the holder holds the write lease, the
-/// lease released (D-16). The caller has authorized the end — the verb by the principal, the `UMNT` by
-/// the mount capability. The typed database refusal when the removal could not be recorded.
+/// lease released (D-16). The caller has authorized the end — the verb by the principal, an unmount by the
+/// kernel's own table no longer naming the mount (`own_nfs`). The typed database refusal when the removal could not
+/// be recorded.
 pub(crate) fn end_attachment(
   state: &mut ShardState,
   record: &AttachmentRecord,
@@ -11986,17 +11945,8 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     state.by_id.remove(id);
     crate::live_ship::forget(state, *id);
   }
-  // A green whose record went with the rollback is given up once every replica of it has left (A-457, A-273 step 5a).
-  let gone: Vec<DbVolumeId> = state
-    .greens
-    .keys()
-    .copied()
-    .filter(|id| state.db.partition().volume(*id).is_none())
-    .collect();
-  for id in gone {
-    crate::green_replicas::give_up(state, id);
-  }
   let partition = state.db.partition();
+  state.greens.retain(|id, _| partition.volume(*id).is_some());
   let mut released = 0u64;
   state.works.retain(|id, work| {
     let keep = partition.volume(*id).is_some();
@@ -13032,8 +12982,6 @@ pub(crate) fn adopt_taken_over_green(
     ..
   } = adopted;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
-  crate::green_replicas::give_up(state, id);
   state.greens.insert(id, engine);
   // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
   // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
@@ -16124,8 +16072,6 @@ fn install_green(
       return Vec::new();
     }
   };
-  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
-  crate::green_replicas::give_up(state, record.id);
   state.greens.insert(record.id, green);
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
   // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
@@ -16484,8 +16430,7 @@ fn fence_green(
   record: &VolumeRecord,
   fence: crate::merge_service::GreenFence,
 ) {
-  // Its engine is given up once every replica of it has left (A-457, A-273 step 5a).
-  crate::green_replicas::give_up(state, record.id);
+  state.greens.remove(&record.id);
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
   state.count(GREEN_FENCED, 1);

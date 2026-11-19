@@ -74,9 +74,14 @@ pub(crate) struct Hangup {
 }
 
 impl Hangup {
-  /// The watch on a client the rendezvous admitted with `control` and process `pid`.
-  pub(crate) fn of_client(control: Option<&Control>, pid: u32) -> Result<Hangup, Unwatchable> {
-    platform::of_client(control, pid).map(|inner| Hangup { inner })
+  /// The watch on a client the rendezvous admitted with `control` and process `pid`, which started at `started` (macOS,
+  /// Windows; A-522: the claim names its process by both, so a pid reused before the watch is not taken for it).
+  pub(crate) fn of_client(
+    control: Option<&Control>,
+    pid: u32,
+    started: u64,
+  ) -> Result<Hangup, Unwatchable> {
+    platform::of_client(control, pid, started).map(|inner| Hangup { inner })
   }
 
   /// The watch on the client whose control socket's daemon end is `socket` (Linux): a test's seat, which keeps no
@@ -86,10 +91,10 @@ impl Hangup {
     platform::of_socket(socket).map(|inner| Hangup { inner })
   }
 
-  /// The watch on the client whose process is `pid` (macOS, Windows): a test's seat.
+  /// The watch on the client whose process is `pid`, started at `started` (macOS, Windows): a test's seat.
   #[cfg(all(test, any(target_os = "macos", windows)))]
-  pub(crate) fn of_process(pid: u32) -> Result<Hangup, Unwatchable> {
-    platform::of_process(pid).map(|inner| Hangup { inner })
+  pub(crate) fn of_process(pid: u32, started: u64) -> Result<Hangup, Unwatchable> {
+    platform::of_process(pid, started).map(|inner| Hangup { inner })
   }
 
   /// Waits through the shard until the client hangs up: registers, then tests once. Refused when the shard refuses the
@@ -126,7 +131,11 @@ mod platform {
     socket: OwnedFd,
   }
 
-  pub(super) fn of_client(control: Option<&Control>, _pid: u32) -> Result<Hangup, Unwatchable> {
+  pub(super) fn of_client(
+    control: Option<&Control>,
+    _pid: u32,
+    _started: u64,
+  ) -> Result<Hangup, Unwatchable> {
     let control = control.ok_or(Unwatchable::NoControl)?;
     of_socket(control.socket.as_fd())
   }
@@ -192,12 +201,17 @@ mod platform {
     exit: ExitWatch,
   }
 
-  pub(super) fn of_client(_control: Option<&Control>, pid: u32) -> Result<Hangup, Unwatchable> {
-    of_process(pid)
+  pub(super) fn of_client(
+    _control: Option<&Control>,
+    pid: u32,
+    started: u64,
+  ) -> Result<Hangup, Unwatchable> {
+    of_process(pid, started)
   }
 
-  pub(super) fn of_process(pid: u32) -> Result<Hangup, Unwatchable> {
-    ExitWatch::on(pid)
+  /// The watch on process `pid` alone if it started at `started`: a pid reused by another process reads exited at once.
+  pub(super) fn of_process(pid: u32, started: u64) -> Result<Hangup, Unwatchable> {
+    ExitWatch::on_started(pid, started)
       .map(|exit| Hangup { exit })
       .map_err(Unwatchable::Refused)
   }
@@ -239,12 +253,17 @@ mod platform {
     exit: ExitWatch,
   }
 
-  pub(super) fn of_client(_control: Option<&Control>, pid: u32) -> Result<Hangup, Unwatchable> {
-    of_process(pid)
+  pub(super) fn of_client(
+    _control: Option<&Control>,
+    pid: u32,
+    started: u64,
+  ) -> Result<Hangup, Unwatchable> {
+    of_process(pid, started)
   }
 
-  pub(super) fn of_process(pid: u32) -> Result<Hangup, Unwatchable> {
-    ExitWatch::on(pid)
+  /// The watch on process `pid` alone if it started at `started`: a pid reused by another process reads exited at once.
+  pub(super) fn of_process(pid: u32, started: u64) -> Result<Hangup, Unwatchable> {
+    ExitWatch::on_started(pid, started)
       .map(|exit| Hangup { exit })
       .map_err(Unwatchable::Refused)
   }
@@ -272,7 +291,11 @@ mod platform {
   /// No hang-up is watched on a platform slates does not ship.
   pub(super) struct Hangup;
 
-  pub(super) fn of_client(_control: Option<&Control>, _pid: u32) -> Result<Hangup, Unwatchable> {
+  pub(super) fn of_client(
+    _control: Option<&Control>,
+    _pid: u32,
+    _started: u64,
+  ) -> Result<Hangup, Unwatchable> {
     Err(Unwatchable::Refused(slates_ipc::IpcError::Unsupported {
       feature: "a client's hang-up on this platform",
     }))
@@ -396,7 +419,10 @@ mod tests {
       .arg("30")
       .spawn()
       .expect("a client process");
-    let hangup = Hangup::of_process(child.id()).expect("a watch on the process");
+    let started = slates_ipc::exit_watch::ExitWatch::start_of(child.id())
+      .expect("the client's start is read")
+      .expect("a live client has a start");
+    let hangup = Hangup::of_process(child.id(), started).expect("a watch on the process");
     Client { child, hangup }
   }
 
@@ -407,8 +433,44 @@ mod tests {
       .args(["/C", "ping", "-n", "30", "127.0.0.1"])
       .spawn()
       .expect("a client process");
-    let hangup = Hangup::of_process(child.id()).expect("a watch on the process");
+    let started = slates_ipc::exit_watch::ExitWatch::start_of(child.id())
+      .expect("the client's start is read")
+      .expect("a live client has a start");
+    let hangup = Hangup::of_process(child.id(), started).expect("a watch on the process");
     Client { child, hangup }
+  }
+
+  /// A-522 (a claim's pid bound to its process). Do: watch a live child process by its pid and a start not its own, as
+  /// the watch on a claimant that died before its watch, its pid taken meanwhile by another process, would be made; run
+  /// the watch's first poll. Expect: the watch answers `HungUp` there, though a process holds the pid. A watch by the pid
+  /// alone waited on the other process for as long as it lived, and the dead client's seat with it.
+  #[cfg(any(target_os = "macos", windows))]
+  #[test]
+  fn a_client_whose_pid_another_process_took_is_ended_at_its_watchs_first_poll() {
+    let runtime = runtime();
+    #[cfg(target_os = "macos")]
+    let mut child = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .expect("a process holding the pid");
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+      .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+      .spawn()
+      .expect("a process holding the pid");
+    let started = slates_ipc::exit_watch::ExitWatch::start_of(child.id())
+      .expect("the process's start is read")
+      .expect("a live process has a start");
+    let hangup =
+      Hangup::of_process(child.id(), started.wrapping_add(1)).expect("a watch on the pid");
+    let (_task, answer) = start(&runtime, hangup);
+    let answer = answer.try_recv();
+    child.kill().expect("the process is killed");
+    child.wait().expect("the process is reaped");
+    assert!(
+      matches!(answer, Ok(Ok(Some(Ok(Ended::HungUp))))),
+      "the watch on another process answered {answer:?} at its first poll"
+    );
   }
 
   /// A-475 ("a client killed with SIGKILL is retired within one event turn, not a liveness budget"). Do: watch a client

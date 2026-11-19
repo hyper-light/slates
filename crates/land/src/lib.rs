@@ -48,6 +48,9 @@ pub mod verdict;
 // The Windows attribute word a landed object takes from the volume's bits (A-451): the Windows writer's, and pure.
 #[cfg(any(windows, test))]
 mod windows_bits;
+// The refusal a Win32 error code is at the write seam (A-527): the Windows writer's, and pure.
+#[cfg(any(windows, test))]
+mod windows_codes;
 
 #[cfg(unix)]
 pub mod os;
