@@ -485,7 +485,7 @@ fn a_request_for_a_repository_another_shard_holds_moves_there_once_proven() {
   let mut site = site(Vec::new());
   let mut decide = |fields: &[&str]| {
     let bytes = request("GET", "/away?cmd=capabilities", fields);
-    let decided = ready(site.answer(&head(&bytes), false));
+    let decided = ready(site.answer(&head(&bytes)));
     let refused = refusal(&decided).map(|(status, _)| status);
     let moved = match &decided.answer {
       Answer::Move { shard } => Some(*shard),
@@ -538,7 +538,7 @@ fn served<S: HgStores + Clone>(
   let mut all = vec![OWNER_BEARER];
   all.extend_from_slice(fields);
   let bytes = request(method, target, &all);
-  match ready(site.answer(&head(&bytes), false)).answer {
+  match ready(site.answer(&head(&bytes))).answer {
     Answer::Serve {
       fields,
       head_only,

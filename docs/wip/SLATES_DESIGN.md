@@ -13142,6 +13142,15 @@ engine: the verdict, rebase, position mapping, the register).
 > `sparse:oid` without its patterns, which the service does not read yet (the next slice), and one within a
 > `combine:`, where git's answer turns on its order of walk.
 
+> **Status (2026-11-19, A-686: Basic on the loopback edge, and Basic's challenge first).** The shared edge takes Basic
+> with the token as the password on its loopback cleartext edge as over TLS (`slates_http_edge::credential::credential`
+> reads either scheme on every connection; `--vcs-http` serves cleartext on loopback alone, where Bearer was already
+> taken, so a token crosses no network either way), and every `401` offers Basic's challenge first and Bearer's after
+> it, on both kinds of connection (`challenges`). Stock Mercurial 7.2 reads the first challenge alone and crashed on a
+> Bearer first; stock git and Subversion send Basic alone, so a lone anchor's edge, which is cleartext, took none of
+> their credentials. Proven with stock hg 7.2 against the edge serving the hg site, and over a daemon's loopback
+> cleartext edge, where the owner's token as Basic's password is answered with receive-pack's advertisement.
+
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
 commands are `ls-refs`, `fetch`, `object-info` and `bundle-uri` [B: gitprotocol-v2]; it defines no push, so a push
@@ -13324,9 +13333,10 @@ other byte, with its SHA-256 name an index row and the bytes checked against it 
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
 is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
 
-**Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS; SSH: the user's public key. Each
-proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and `git-receive-pack`
-(write) per repository and per ref. Hidden refs are policy, as git's `receive.hideRefs` is.
+**Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS or on a loopback edge in cleartext,
+where the two carry the same token, and a `401` offers Basic's challenge first, then Bearer's (A-686); SSH: the user's
+public key. Each proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and
+`git-receive-pack` (write) per repository and per ref. Hidden refs are policy, as git's `receive.hideRefs` is.
 
 **Protected branches, in git's terms.** Refuse a non-fast-forward; refuse a delete; require linear history (no merge
 commit in the pushed range); require signed commits, checking SSH-format commit signatures with A-321's verifier
@@ -44465,9 +44475,11 @@ Applied in the same change to:
   configuration (TLS 1.3 and 1.2, ALPN `http/1.1` alone, no client certificate, no tickets, no session cache), its `Arc`
   owned by that connection (D-8 exception 2). `HttpsSession` hands rustls plaintext in the pieces it takes and moves the
   sealed records out between them, the network export's lesson.
-- **Credentials.** Basic (RFC 7617) decoded strictly and refused in cleartext; Bearer (RFC 6750) a `b64token`; a
-  repeated or malformed line 400, another scheme 401; the challenges offer Basic over TLS alone, each naming a quoted
-  realm; secrets compared to their end. A credential's debug form never shows its secret.
+- **Credentials.** Basic (RFC 7617) decoded strictly; Bearer (RFC 6750) a `b64token`; a repeated or malformed line 400,
+  another scheme 401; the challenges each name a quoted realm; secrets compared to their end. A credential's debug form
+  never shows its secret. Basic was refused in cleartext and offered over TLS alone until A-686 (2026-11-19): since,
+  both schemes are read on every connection (the server serves cleartext on loopback alone) and Basic's challenge comes
+  first, then Bearer's.
 - **Refusals.** The head's, the body's framing and coding (400, 413, 501 and the rest), the credentials', the site's and
   a failing service's, each with its status. A refusal whose request leaves no body unread keeps the connection (a 401
   to a client's first request is the common case); any other ends in stages: the reply with `Connection: close`,
@@ -45780,8 +45792,9 @@ Applied in the same change to:
   yields after each body run, each reply run and each drained read, so a large push or clone never holds the shard.
   A staged refusal is counted as it is decided, before the client can read the connection's end.
 - **git's site** (`vcs_http::git`). The route first, as `http-backend` refuses it whoever asks; then the credentials
-  (none, another scheme, Basic in cleartext or one that proves no principal: `401` with the connection's challenges; a
-  repeated or malformed `Authorization`: `400`); then the repository by its exact name (`404` for none, or another
+  (none, another scheme or one that proves no principal: `401` with the challenges, Basic's first and Bearer's after it
+  on every connection since A-686, where Basic in cleartext was refused and offered Bearer alone; a repeated or
+  malformed `Authorization`: `400`); then the repository by its exact name (`404` for none, or another
   tool's); then the policy's gate (`403`: no rule lets the principal reach it for the service's rights, read for
   upload-pack, submit, rewrite or delete for receive-pack, its advertisement too); then the service (`503` while its
   server half has not landed: `Unserved` today). A served advertisement's body is the `# service=` prelude for v0 and v1,
@@ -49072,8 +49085,11 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   NFS export moves a mount's connection. Credentials are enrolled, never minted per start: a human enrolls them through
   the CLI's control channel (§4.13), kept in the metadata database, tokens as their hash with an expiry and SSH keys by
   fingerprint, one record both edges read (g294 kept none, so this is the one). HTTP takes Basic with the token as the
-  password, never in cleartext, or Bearer, and the authenticator hands a bearer token's expiry with its principal. The
-  edge's certificate and key come from where the RPC-with-TLS export's do, handed in by the operator.
+  password, or Bearer, over TLS or on the loopback cleartext edge (revised 2026-11-19, A-686, from "Basic never in
+  cleartext": `--vcs-http` allows cleartext on loopback alone, where Bearer was already taken, so the exposure is the
+  same; Basic's challenge first on every connection, TLS included, then Bearer's), and the authenticator hands a bearer
+  token's expiry with its principal. The edge's certificate and key come from where the RPC-with-TLS export's do,
+  handed in by the operator.
 - **The record** (`slates_db::credentials`). Keyed by the SHA-256 of what a client presents, so a lookup is one map read
   on the partition the id routes to (its first eight bytes over the partitions; D-14, no global index). Guard then
   apply: an id held is `AlreadyExists`, a revocation of one not held `NotFound`; each record's bytes (the record, a
@@ -51143,3 +51159,60 @@ lent with the request's room and `file_node` gone, the changegroup lending each 
   panics on arbitrary bytes.
 - **Owed.** The view handed to the daemon's HTTP site over A-662's stores, and the site's pushes through `hg_push`
   (A-680 part 2); the other platforms' runs (main's).
+
+### A-686 — Basic with the token as the password on the loopback cleartext edge as over TLS, and Basic's challenge first on every connection, so stock Mercurial 7.2 reads a `401` (2026-11-19, g258 for UI goal 93; §4.17.2 "Access" and "Transports" item 1; §4.17.3 "Access"; main's ruling of 2026-11-19, revising A-625 part 3's "never in cleartext"; A-625 parts 1 to 3, A-650 part 1)
+
+- **What was there.** `slates_http_edge::credential::challenges(realm, secure)` offered Basic over TLS alone and Bearer
+  after it, and `credential(head, secure)` refused Basic on a cleartext connection (`BasicInCleartext`, the git site's
+  `Refused::CleartextBasic`, counted `vcs_http.git.cleartext_basic`). A daemon that is no fleet node serves its edge in
+  cleartext, on loopback alone (`slates_api::role::vcs_http_address`), so a lone anchor's `401` offered Bearer alone.
+  Stock Mercurial 7.2 crashed on it: its opener hands a `401` to urllib's digest handler before its Basic one
+  (`handler_order` 490 against `BaseHandler`'s 500, Python 3.12.16's `urllib/request.py` lines 1243 and 602), and that
+  handler reads the first `WWW-Authenticate` field alone (`headers.get`, line 1113) and raises `ValueError` on any
+  scheme but Digest and Basic (line 1129), through hg's `url.py` line 418: "** unknown exception", with or without
+  `auth.*` credentials (g083's probe against a stub; this piece's red run against the edge itself). And the cleartext
+  edge took no credential stock git or Subversion sends: both send a token as Basic's password (serf sends no Bearer
+  at all, main's brief).
+- **The decision** (main's ruling, 2026-11-19). (1) Basic with the token as the password is taken on the loopback
+  cleartext edge as over TLS. `--vcs-http` allows cleartext on loopback alone (the grammar above; the daemon's start
+  and the edge's `serve` refuse it elsewhere, `CleartextOffLoopback`), where Bearer was already taken, so the same
+  token crosses the same loopback either way: the exposure RFC 7617 §4 and RFC 6750 §5.3 warn of is a network's, and
+  none is crossed. So the reading takes no connection: `credential(head)` reads Basic or Bearer, and
+  `BasicInCleartext`, `Refused::CleartextBasic` and its counter are gone, replaced rather than kept beside the new rule.
+  (2) Every `401` offers Basic's challenge first, with its charset, then Bearer's, on both kinds of connection
+  (`challenges(realm)`): a client that reads the first challenge alone reads Basic, and urllib's Basic handler reads
+  every field (`get_all`, line 998), so it takes Basic in either place. (3) The sites (`vcs_http::git`, `vcs_http::hg`)
+  decide without the connection's kind; `Site::decide` keeps it, the scheme a site writing absolute URLs needs (LFS's
+  call takes it for its hrefs, A-629 part 2b-ii).
+- **Tests.** `slates-http-edge`: `challenges_offer_basic_first_then_bearer_each_naming_the_realm` (red as
+  `challenges_offer_basic_first_then_bearer_on_either_connection` and
+  `basic_reads_alike_over_tls_and_on_a_loopback_cleartext_connection`, both failing on cleartext; once the reading takes
+  no connection the second is `basic_reads_rfc_7617s_own_example`). git's site:
+  `a_request_without_credentials_is_401_with_basics_challenge_first_on_either_connection`,
+  `basic_proves_its_principal_on_a_loopback_cleartext_connection_as_over_tls`, and
+  `credentials_that_prove_no_principal_are_401_and_a_repeated_line_400` (a Basic token that proves no one on cleartext,
+  the challenges whole and in order). Mercurial's site: `each_step_of_hgwebs_order_refuses_with_its_status` (the
+  owner's `heads` by Basic on cleartext served) and `refusals_name_what_the_client_may_do_instead` (Basic's challenge
+  first). The daemon's edge: `a_daemons_edge_challenges_basic_first_then_bearer_over_tls_and_in_cleartext` (a daemon
+  whose edge serves TLS and one whose edge serves cleartext, each realm its instance's) and
+  `basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge` (the owner's token as Basic's password over plain
+  TCP, moved to the repository's shard and answered with receive-pack's advertisement through the push driver). The
+  edge with stock hg: `vcs_http::tests::stock_hg_meets_basic_first_on_a_loopback_edge_and_reaches_the_hg_site`
+  (Mercurial's site on a loopback cleartext edge, no store held; stock hg 7.2's `hg identify` with the owner's token as
+  Basic's password in the URL ends `abort: HTTP Error 503: Service Unavailable`, the site reached; it skips loudly
+  without stock hg 7.2, `SLATES_TEST_HG`). `slates-cli`: `an_anchors_vcs_http_flag_starts_its_daemons_edge` (a real
+  anchor's cleartext edge answers Basic's challenge, then Bearer's).
+- **Evidence** EVIDENCE_PENDING
+- **Not changed, on purpose.** The daemon's site is git's alone (`DaemonSite`), so stock hg against a running anchor
+  still meets git's route (`404`) until the sites are composed; g083's two stock-hg tests over the anchor's HTTP edge
+  stay ignored on A-680 (and A-685), A-686 dropped from their reasons.
+- **Owed.** Stock hg's clone over a running anchor, once the daemon serves the hg site (A-680 part 2 and the sites'
+  composition); stock svn over the loopback edge (A-681); the Windows and Linux runs (main's).
+- **Applied in the same change to:** `crates/http-edge/src/credential.rs` (`credential`, `challenges`,
+  `CredentialRefused`, the module doc) and its tests; `crates/server/src/vcs_http.rs` (`Site::decide`'s doc);
+  `vcs_http/git.rs` (the module doc's step 2, `Refused`, the site's steps without the connection's kind);
+  `vcs_http/hg.rs` (the module doc's step 2, the site's steps); `vcs_http/tests/git.rs`, `tests/hg.rs`,
+  `tests/daemon_edge.rs` (`daemon_named`, the cleartext client and the two tests) and `tests/serve.rs` (`served_by`,
+  the stock-hg test and its site); `crates/cli/tests/cli.rs` (the anchor's edge test; g083's two stock-hg tests' waits);
+  §4.17.2 "Access" and its status; A-625 part 1's "Credentials", part 2's "git's site" and part 3's "Main's rulings";
+  GAPS (A-625 part 1's line, the A-686 entry).

@@ -476,7 +476,8 @@
 > Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 > **A-625 part 1 (2026-11-19, g076b; the edge's engine):** `crates/http-edge` (`slates-http-edge`) holds one
 > connection's request loop as a state machine over bytes: HTTPS through rustls (TLS 1.3 and 1.2, ALPN `http/1.1`, no
-> client certificate, no resumption), Basic over TLS alone and Bearer, `100 Continue`, keep-alive, bodies streamed as
+> client certificate, no resumption), Basic over TLS alone (on the loopback edge too since A-686, below) and Bearer,
+> `100 Continue`, keep-alive, bodies streamed as
 > slices or inflated runs, typed refusals, and the staged close for a refusal with bytes unread (A-183). `cargo test -p
 > slates-http-edge --lib` 31 of 31 on the Mac Studio, red first (29 of 31 on stubs). Owed (part 2): the daemon's
 > listener and tasks with each phase's wait learned and the bounds derived from the shard's budget; git's site (routes,
@@ -539,6 +540,14 @@
 > port refused while the daemon restarted; green over main 4dca63df7): the anchor's handover, the adoption check, the
 > starter's option, and a killed daemon's successor answering a request made meanwhile at the same port. Owed:
 > Windows holds no listener across a restart (`docs/wip/platforms.md`, gap 2).
+> **A-686 (2026-11-19, g258; main's ruling, revising A-625 part 3's "never in cleartext"):** the shared edge takes
+> Basic with the token as the password on the loopback cleartext edge as over TLS (`--vcs-http` serves cleartext on
+> loopback alone, where Bearer was already taken), and every `401` offers Basic's challenge first and Bearer's after
+> it, TLS included: stock Mercurial 7.2 reads the first challenge alone and crashed on a Bearer first, and stock git
+> and Subversion send Basic alone, so a lone anchor's cleartext edge took none of their credentials. EVIDENCE_PENDING
+> Owed: the daemon serving the hg site beside git's (its site is git's alone, so stock hg against a running anchor
+> meets git's `404`; A-680 part 2 and the sites' composition), then g083's stock-hg anchor tests un-ignored; stock
+> svn over the loopback edge (A-681); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

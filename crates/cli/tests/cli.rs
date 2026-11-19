@@ -13844,15 +13844,16 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
 /// authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
 /// stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 the daemon's edge serves git's site
 /// alone (`DaemonSite`), so hg's request is answered `404` (hg: `abort: HTTP Error 404: Not Found`; Mac Studio, kiln
-/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offers Bearer alone, which crashes 7.2
+/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offered Bearer alone, which crashed 7.2
 /// ("** unknown exception encountered", `ValueError: AbstractDigestAuthHandler does not support the following scheme:
 /// 'Bearer'`, raised at Python 3.12's `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1; measured on
 /// the Mac Studio on 2026-11-19 against a stub answering that `401`), since urllib's digest handler reads the first
-/// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
-/// (g258).
+/// challenge alone and refuses any scheme but Digest and Basic. Since A-686 (g258) Basic's challenge comes first on
+/// every connection and stock 7.2 reads it (`slates-server`'s
+/// `stock_hg_meets_basic_first_on_a_loopback_edge_and_reaches_the_hg_site`, stock hg against the edge serving the hg
+/// site).
 #[test]
-#[ignore = "waits on A-680 (g303: the hg site's stores and lender) and A-686 (g258: Basic's challenge first; \
-            stock hg 7.2 crashes on a first Bearer challenge)"]
+#[ignore = "waits on A-680 (g303: the hg site's stores and lender)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13886,13 +13887,13 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and
 /// pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips
 /// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: as of main 34d10acb5 the CLI has no
-/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), the daemon's edge serves git's site alone and
-/// the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them), and the
-/// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
-/// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
+/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), and the daemon's edge serves git's site alone
+/// and the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them). The
+/// edge's own part is built (A-686, g258): Basic's challenge first, and Basic with the token as its password taken on
+/// the loopback edge as over TLS ([`stock_hg_without_credentials_is_refused_in_its_own_words`]).
 #[test]
-#[ignore = "waits on A-685 (g305: slates repository create <name> --tool hg), A-680 (g303: the hg site's stores and \
-            lender) and A-686 (g258: Basic with the token as password on the loopback edge, Basic's challenge first)"]
+#[ignore = "waits on A-685 (g305: slates repository create <name> --tool hg) and A-680 (g303: the hg site's stores \
+            and lender)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
