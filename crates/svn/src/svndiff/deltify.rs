@@ -190,7 +190,9 @@ impl Ops {
       *last_length = last_length.saturating_add(length);
       return;
     }
-    self.instructions.push(Instruction::Source { offset, length });
+    self
+      .instructions
+      .push(Instruction::Source { offset, length });
   }
 
   /// Takes back up to `most` bytes the last instructions made, back to front, so a match can reach over them
@@ -260,7 +262,8 @@ fn hash(sum: u32) -> u32 {
 
 /// The byte of the flags table a sum names (`hash_flags`) and its bit.
 fn flag(sum: u32) -> (usize, u8) {
-  let byte = usize::try_from(sum.wrapping_shr(FLAG_SHIFT)).unwrap_or(0) & FLAG_BYTES.saturating_sub(1);
+  let byte =
+    usize::try_from(sum.wrapping_shr(FLAG_SHIFT)).unwrap_or(0) & FLAG_BYTES.saturating_sub(1);
   (byte, 1u8.wrapping_shl(sum & FLAG_BITS))
 }
 
@@ -393,7 +396,14 @@ struct Match {
 
 /// The match of the target's block at `at`, if the source holds one, extended forward as far as both run, and back as
 /// far as both run past no byte before `floor` (`find_match`).
-fn find_match(blocks: &Blocks<'_>, sum: u32, source: &[u8], target: &[u8], at: usize, floor: usize) -> Option<Match> {
+fn find_match(
+  blocks: &Blocks<'_>,
+  sum: u32,
+  source: &[u8],
+  target: &[u8],
+  at: usize,
+  floor: usize,
+) -> Option<Match> {
   let block = target.get(at..at.checked_add(BLOCK)?)?;
   let mut from = blocks.find(sum, block)?;
   let mut to = at;
@@ -440,7 +450,11 @@ fn trailer(ops: &mut Ops, source: &[u8], target: &[u8], start: usize) {
   if end <= SHORTEST_KEPT {
     end = 0;
   }
-  ops.new_data(rest.get(..rest.len().saturating_sub(end)).unwrap_or_default());
+  ops.new_data(
+    rest
+      .get(..rest.len().saturating_sub(end))
+      .unwrap_or_default(),
+  );
   if end > 0 {
     ops.source_copy(source.len().saturating_sub(end), end);
   }
@@ -498,7 +512,13 @@ fn rolled(target: &[u8], sum: u32, at: usize) -> u32 {
 }
 
 /// Moves past the positions whose sums the flags say have no block, up to `upper` (`compute_delta`'s quick skip).
-fn skip_unmatched(blocks: &Blocks<'_>, target: &[u8], sum: u32, at: usize, upper: usize) -> (u32, usize) {
+fn skip_unmatched(
+  blocks: &Blocks<'_>,
+  target: &[u8],
+  sum: u32,
+  at: usize,
+  upper: usize,
+) -> (u32, usize) {
   let (mut sum, mut at) = (sum, at);
   while !blocks.may_hold(sum) && at < upper {
     sum = rolled(target, sum, at);

@@ -496,14 +496,21 @@ impl<'a> Drive<'a> {
       }
       _ => Ok(PropertyPlan {
         delta: false,
-        entries: list.into_iter().map(|(name, value)| (name, Some(value))).collect(),
+        entries: list
+          .into_iter()
+          .map(|(name, value)| (name, Some(value)))
+          .collect(),
       }),
     }
   }
 
   /// A text section: the node's whole text, or (format 3) the deltifier's windows against `before`'s text, the empty
   /// text when there is no comparison or it has none (`store_delta`).
-  fn text_plan(&self, before: Option<&Facts>, now: &Facts) -> Result<TextPlan<'a>, MigrationRefusal> {
+  fn text_plan(
+    &self,
+    before: Option<&Facts>,
+    now: &Facts,
+  ) -> Result<TextPlan<'a>, MigrationRefusal> {
     let target = self.text_bytes(now)?;
     let Some(room) = self.deltas else {
       return Ok(TextPlan::Whole(target));
@@ -622,7 +629,9 @@ fn deltas_room(format: Format) -> Result<Option<NonZeroUsize>, MigrationRefusal>
     return Ok(None);
   }
   let room = usize::try_from(WINDOW_LIMIT).map_err(|_| MigrationRefusal::Corrupt)?;
-  NonZeroUsize::new(room).map(Some).ok_or(MigrationRefusal::Corrupt)
+  NonZeroUsize::new(room)
+    .map(Some)
+    .ok_or(MigrationRefusal::Corrupt)
 }
 
 /// The svndiff length of `windows`: the header and each window as svndiff version 0 writes it.

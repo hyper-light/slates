@@ -23,7 +23,11 @@ fn varied(count: usize, seed: u8) -> Vec<u8> {
   (0..count)
     .map(|place| {
       let place = u32::try_from(place).unwrap();
-      (place.wrapping_mul(2_654_435_761).wrapping_add(u32::from(seed)) >> 13).to_le_bytes()[0]
+      (place
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(u32::from(seed))
+        >> 13)
+        .to_le_bytes()[0]
     })
     .collect()
 }
@@ -75,7 +79,12 @@ fn an_empty_source_makes_the_target_new_data() {
   let made = windows(b"", &target, 100);
   assert_eq!(made.len(), 3);
   for (window, piece) in made.iter().zip(target.chunks(100)) {
-    assert_eq!(window.instructions, [Instruction::New { length: piece.len() as u64 }]);
+    assert_eq!(
+      window.instructions,
+      [Instruction::New {
+        length: piece.len() as u64
+      }]
+    );
     assert_eq!(window.new_data, piece);
   }
 }
@@ -92,13 +101,25 @@ fn a_common_start_or_end_is_copied_only_past_four_bytes() {
   assert_eq!(
     five[0].instructions,
     [
-      Instruction::Source { offset: 0, length: 5 },
+      Instruction::Source {
+        offset: 0,
+        length: 5
+      },
       Instruction::New { length: 5 },
-      Instruction::Source { offset: 15, length: 5 },
+      Instruction::Source {
+        offset: 15,
+        length: 5
+      },
     ]
   );
   let prefix = windows(source, b"abc", 64);
-  assert_eq!(prefix[0].instructions, [Instruction::Source { offset: 0, length: 3 }]);
+  assert_eq!(
+    prefix[0].instructions,
+    [Instruction::Source {
+      offset: 0,
+      length: 3
+    }]
+  );
 }
 
 /// A-652 (`compute_delta`'s match): do delta a target holding 128 bytes of the source's middle between bytes of its
@@ -120,7 +141,10 @@ fn a_moved_stretch_is_copied_from_where_it_stands_in_the_source() {
     made[0].instructions,
     [
       Instruction::New { length: 30 },
-      Instruction::Source { offset: 100, length: 128 },
+      Instruction::Source {
+        offset: 100,
+        length: 128
+      },
       Instruction::New { length: 30 },
     ]
   );
@@ -156,7 +180,8 @@ fn holds(source: &[u8], target: &[u8], made: &[Window], count: usize) -> Result<
   for window in made {
     prop_assert!(window.target_len <= count as u64 && window.source_len <= count as u64);
   }
-  let remade = apply_all(source, made).map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
+  let remade =
+    apply_all(source, made).map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
   prop_assert_eq!(remade, target.to_vec());
   let mut encoder = Encoder::new(Version::Zero);
   let mut bytes = encoder.header().to_vec();
@@ -165,7 +190,8 @@ fn holds(source: &[u8], target: &[u8], made: &[Window], count: usize) -> Result<
       .window(window, Compression::Stored, &mut bytes)
       .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
   }
-  let (_, decoded) = decode_all(&bytes).map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
+  let (_, decoded) =
+    decode_all(&bytes).map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
   prop_assert_eq!(decoded, made.to_vec());
   Ok(())
 }

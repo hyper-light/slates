@@ -232,12 +232,22 @@ fn a_history_exported_in_parts_imports_to_the_history_exported_whole() {
 /// windows against its comparison, every property section of a change or a copy a change to its comparison's list.
 #[test]
 fn every_history_exports_in_format_three_as_svnadmin_dump_deltas_wrote_it() {
-  let sources: [&[&str]; 3] = [&["full.dump"], &["deltas.dump"], &["part1.dump", "part2.dump"]];
+  let sources: [&[&str]; 3] = [
+    &["full.dump"],
+    &["deltas.dump"],
+    &["part1.dump", "part2.dump"],
+  ];
   for names in sources {
     let repository = imported(names);
     let whole = export_deltas(&repository).unwrap();
     assert!(whole == vector("deltas.dump"), "{names:?}: deltas.dump");
-    let tail = export_in(&repository, PART1_LAST + 1, repository.youngest(), Format::Three).unwrap();
+    let tail = export_in(
+      &repository,
+      PART1_LAST + 1,
+      repository.youngest(),
+      Format::Three,
+    )
+    .unwrap();
     assert!(tail == vector("part2.dump"), "{names:?}: part2.dump");
   }
 }
