@@ -945,6 +945,22 @@ fn admit_right(
   }
 }
 
+/// Whether `principal` holds `right` on `name` by `record`'s policy, `compiled` once for many names: judged as [`admit`]
+/// judges a change's own right, so a name no rule speaks to is the owner's alone. What upload-pack's refs are read by,
+/// each ref lent to a reader that may read it (`crate::vcs_store::upload`, A-680).
+pub(crate) fn permits(
+  compiled: &Compiled,
+  (record, principal): (&RepositoryRecord, &Principal),
+  (name, right): (Name<'_>, Right),
+) -> bool {
+  let change = Asked {
+    name,
+    right,
+    brings: None,
+  };
+  admit_right(compiled, record, principal, &change, 0).is_ok()
+}
+
 /// One push's requirements, judged against its repository's compiled policy for its principal (A-644).
 struct Judged<'j> {
   compiled: &'j Compiled,

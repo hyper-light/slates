@@ -10,11 +10,15 @@
 //! of any size passes in bounded memory and never holds its shard. A request upload-pack refuses is answered too, in
 //! git's words (`ERR`, or band 3 under `sideband-all`), so the reply is `200` with those words, as `http-backend`'s is.
 //!
-//! **What is owed.** The server holding a repository's store on its owner shard and lending it ([`StoreLender`]'s
-//! implementation, with A-653's pack source over the store's stream); until then no store is held and upload-pack is
-//! `503`. receive-pack answers `503` until its session's entry point lands (A-654).
+//! **What each step is lent** (A-680). The step that answers the request, the advertisement or a command, is lent the
+//! refs its asker may read and the branch `HEAD` names, read when it runs ([`StoreLender::lend`]); every later step only
+//! writes the answer, handing the store to the pack's source, which names what it sends by position, so it is lent the
+//! objects alone ([`StoreLender::lend_objects`]) and costs its room and one packet whatever the repository's refs. The
+//! daemon's lender is the owner shard's map of stores (`crate::vcs_store::upload::ShardStores`, A-662's map, with A-639's
+//! stream as the pack's source); a repository whose store it does not hold is `503`. receive-pack answers `503` until
+//! its session's entry point lands (A-654).
 
-use slates_db::catalog::RepositoryId;
+use slates_db::catalog::{Principal, RepositoryId};
 use slates_git::Admission;
 use slates_git::http::{Service, Version};
 use slates_git::pktline::MAX_LEN;
@@ -32,9 +36,19 @@ pub(crate) trait StoreLender {
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
 
-  /// Runs `step` over repository `id`'s store as upload-pack serves it, with the pack source; none when the store is not
-  /// held here.
+  /// Runs `step` over repository `id`'s store as upload-pack answers a request of `reader`, with the pack source: the refs
+  /// `reader` may read, in name order and each once, and the branch `HEAD` names, read as the step runs; none when the
+  /// store is not held here.
   fn lend<R>(
+    &mut self,
+    (id, reader): (RepositoryId, &Principal),
+    step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
+  ) -> Option<R>;
+
+  /// Runs `step` over repository `id`'s store for an answer's next bytes, with the pack source: its objects alone, no ref
+  /// read (the refs and `HEAD` lent empty), since such a step hands the store to the pack's source alone (the module
+  /// doc); none when the store is not held here.
+  fn lend_objects<R>(
     &mut self,
     id: RepositoryId,
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
@@ -68,6 +82,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
     Ok(Upload {
       lender: self.lender.clone(),
       repository: start.repository.id,
+      reader: start.principal.clone(),
       version: start.version,
       advertise: start.advertise,
       admission: Admission::new(self.room),
@@ -84,6 +99,8 @@ pub(crate) struct Upload<L: StoreLender> {
   lender: L,
   /// The repository.
   repository: RepositoryId,
+  /// Who asks: the refs the request's step is lent are the ones this principal may read.
+  reader: Principal,
   /// The protocol version the client asked for.
   version: Version,
   /// Whether the exchange is the advertisement.
@@ -110,6 +127,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Self {
       lender,
       repository,
+      reader,
       version,
       advertise,
       admission,
@@ -122,7 +140,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
       Asked::Request(request.as_slice())
     };
     let made = lender
-      .lend(*repository, |served, packs| {
+      .lend((*repository, reader), |served, packs| {
         upload::serve(served, *version, asked, packs, admission)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
@@ -141,7 +159,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
     let written = lender
-      .lend(*repository, |served, packs| {
+      .lend_objects(*repository, |served, packs| {
         answer.write(served, packs, out, MAX_LEN)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;

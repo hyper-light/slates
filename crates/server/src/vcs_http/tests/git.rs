@@ -20,7 +20,7 @@ use slates_vcs::ContentStore;
 
 use super::{
   Authenticator, GitServices, GitSite, Located, Proven, Refused, Repositories, ServiceRefused,
-  Start, StoreLender, Unproven, Unserved, UploadServices,
+  Start, StoreLender, Unproven, UploadServices,
 };
 use crate::vcs_http::{Answer, Decided, Exchange, Failed};
 
@@ -50,6 +50,36 @@ const STRANGER_BEARER: &str = "Authorization: Bearer stranger-token";
 const BASIC_CHALLENGE: &str = "Basic realm=\"slates\", charset=\"UTF-8\"";
 /// Shape: as [`BASIC_CHALLENGE`].
 const BEARER_CHALLENGE: &str = "Bearer realm=\"slates\"";
+
+/// Services that start nothing, each answering [`ServiceRefused::Unavailable`]: the stand-in for the tests of the
+/// site's own order (route, credentials, repository, policy), which no service's answer reaches.
+#[derive(Clone, Copy, Debug, Default)]
+struct Unserved;
+
+/// The exchange [`Unserved`] never starts: no value has this type.
+enum NoExchange {}
+
+impl Exchange for NoExchange {
+  async fn body(&mut self, _run: &[u8]) -> Result<(), Failed> {
+    match *self {}
+  }
+
+  async fn body_end(&mut self) -> Result<(), Failed> {
+    match *self {}
+  }
+
+  async fn reply(&mut self, _out: &mut Vec<u8>) -> Result<bool, Failed> {
+    match *self {}
+  }
+}
+
+impl GitServices for Unserved {
+  type Exchange = NoExchange;
+
+  fn start(&mut self, _start: &Start<'_>) -> Result<NoExchange, ServiceRefused> {
+    Err(ServiceRefused::Unavailable)
+  }
+}
 
 /// The principal with uid `uid` on host 0.
 fn principal(uid: u32) -> Principal {
@@ -576,7 +606,27 @@ impl StoreLender for Lends {
 
   fn lend<R>(
     &mut self,
+    (id, _reader): (RepositoryId, &Principal),
+    step: impl FnOnce(&UploadServed<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    self.lent(id, UNBORN_HEAD, step)
+  }
+
+  fn lend_objects<R>(
+    &mut self,
     id: RepositoryId,
+    step: impl FnOnce(&UploadServed<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    self.lent(id, &[], step)
+  }
+}
+
+impl Lends {
+  /// Runs `step` over the empty store with `head` as `HEAD`'s branch, when `id` is the one held.
+  fn lent<R>(
+    &mut self,
+    id: RepositoryId,
+    head: &[u8],
     step: impl FnOnce(&UploadServed<'_>, &mut NoPacks) -> R,
   ) -> Option<R> {
     let held = self.held;
@@ -584,7 +634,7 @@ impl StoreLender for Lends {
       repository: &held.repository,
       store: &held.store,
       refs: &[],
-      head: UNBORN_HEAD,
+      head,
     };
     self.holds(id).then(|| step(&served, &mut self.packs))
   }
