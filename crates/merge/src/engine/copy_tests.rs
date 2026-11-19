@@ -12,7 +12,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::copy::{appearance_bytes, in_tree, joined, relative};
-use super::{Green, Increment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
+use super::{Green, Increment, Judgment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
 use crate::chain_entry;
 use crate::increment::Base;
 use crate::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
@@ -1997,4 +1997,26 @@ fn every_copy_reads_as_its_model_over_every_history() {
     met.iter().all(|&count| count > 0),
     "a case never met: {census:?}"
   );
+}
+
+/// A-658 (a work's copies judged again once the green moved). Do: compute, on a copy of a trunk at version 1, a work
+/// copying `trunk` at version 1 to `b`; land on the owner an overwrite of `trunk/a` as version 2; hand the owner the
+/// computed verdict. Expect: the copies' unit judged again, the verdict held at version 2 equal to the one the owner
+/// computes there itself (the copy fixed to bring `trunk/a` as it stood at version 1); committed, `b/a` holds `alpha`.
+#[test]
+fn a_copy_computed_before_the_green_moved_is_judged_again_by_position() {
+  let copy = trunk();
+  let mut owner = trunk();
+  let work = one_copy("trunk", "b", 1).at(3, 1);
+  let computed = copy.compute(&work).expect("computed at version 1");
+  accept(&mut owner, Work::default().overwrite("trunk/a", 0, b"ALPHA"), 2);
+  let again = owner.judged_again();
+  let own = owner.compute(&work).expect("computed at version 2");
+  let Ok(Judgment::Accepted(held)) = owner.judge_computed(&work, computed) else {
+    panic!("not accepted by position");
+  };
+  let judged = (owner.judged_again() - again, held.at(), Some(held.applied()));
+  assert_eq!(judged, (1, 2, own.applied()));
+  owner.commit_judged(held).expect("committed at its head");
+  assert_eq!(owner.content("b/a"), Some(&b"alpha"[..]));
 }

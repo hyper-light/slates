@@ -12,7 +12,10 @@ use std::collections::BTreeSet;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
-use super::{ComputeRefused, Computed, Green, Increment, Judged, Judgment, Outcome, Rebased};
+use super::{
+  ComputeRefused, Computed, Green, Increment, Judged, Judgment, Outcome, PositionRefused, Rebased,
+};
+use crate::chain_entry::Applied;
 use crate::increment::Base;
 use crate::ops_doc::{Op, OpKind, OpsDoc};
 use crate::origin::Origin;
@@ -270,6 +273,11 @@ fn work(green: &Green, base: u64, edits: &[Edit], id: u64) -> Increment {
     used.extend(paths);
     edit.emit(&mut draft, &at);
   }
+  increment(draft, base, id)
+}
+
+/// The increment `id` of `draft`, based at `base`.
+fn increment(draft: Draft, base: u64, id: u64) -> Increment {
   let mut identity = [0u8; 32];
   identity[..8].copy_from_slice(&id.to_le_bytes());
   Increment {
@@ -612,4 +620,417 @@ fn the_owner_answers_a_base_past_its_head_unknown() {
   assert!(matches!(green.submit(&ahead), Outcome::BaseUnavailable { base: 5, .. }));
   assert_eq!(green.rebase(&ahead), Rebased::BaseAhead { base: 5, head: 1 });
   assert_eq!(seen(&mut green), before);
+}
+
+/// One event of a generated concurrent history (A-658).
+#[derive(Clone, Debug)]
+enum Event {
+  /// A work based `back` versions behind the owner's head, computed on the copy once the copy has followed the owner to
+  /// its base and up to `lead` versions further; held until a commit takes it.
+  Compute { back: u8, lead: u8, edits: Vec<Edit> },
+  /// The work of an earlier event computed on the copy again and held: a work sent again.
+  Again { which: u8 },
+  /// A work submitted to the serial green and to the owner at once, moving both heads under what is held.
+  Land { back: u8, edits: Vec<Edit> },
+  /// A held computation committed: by position on the owner, as a submit judges it on the serial green.
+  Commit { which: u8 },
+}
+
+fn event() -> impl Strategy<Value = Event> {
+  (
+    0..10u8,
+    0..4u8,
+    0..4u8,
+    proptest::collection::vec(edit(), 1..4),
+    any::<u8>(),
+  )
+    .prop_map(|(kind, back, lead, edits, which)| match kind {
+      0..=2 => Event::Compute { back, lead, edits },
+      3 => Event::Again { which },
+      4..=6 => Event::Land { back, edits },
+      _ => Event::Commit { which },
+    })
+}
+
+/// The kind of an answer, for the census.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+  Accepted,
+  Before,
+  Conflict,
+  Unknown,
+}
+
+/// The kind of a computed verdict.
+fn computed_answer(computed: &Computed) -> Answer {
+  match (computed.accepted_before(), computed.windows()) {
+    (Some(_), _) => Answer::Before,
+    (None, Some(_)) => Answer::Conflict,
+    (None, None) => Answer::Accepted,
+  }
+}
+
+/// The kind of a judgment.
+fn judged_answer(judgment: &Judgment) -> Answer {
+  match judgment {
+    Judgment::Accepted(_) => Answer::Accepted,
+    Judgment::AcceptedBefore { .. } => Answer::Before,
+    Judgment::Conflict { .. } => Answer::Conflict,
+    Judgment::BaseUnavailable { .. } => Answer::Unknown,
+  }
+}
+
+/// What the concurrent histories met: the oracle's non-vacuity counters (A-658).
+#[derive(Debug, Default)]
+struct Moves {
+  /// Commits at the head their verdict was computed against.
+  at_position: u64,
+  /// Commits after the green moved since.
+  moved: u64,
+  /// Moved commits that judged units again: the increment since met the work.
+  increments: u64,
+  /// Moved commits that judged nothing again: the increment since met nothing the work read.
+  untouched: u64,
+  accepted: u64,
+  conflicts: u64,
+  before: u64,
+  /// Commits answered another kind than computed (an identical span changed since, a conflict met since).
+  flipped: u64,
+}
+
+impl Moves {
+  /// Counts one commit: whether the green moved since its verdict was computed, the units it judged again, and the
+  /// kinds of answer computed and committed.
+  fn count(&mut self, moved: bool, again: u64, (computed, judged): (Answer, Answer)) {
+    let counter = match (moved, again) {
+      (false, _) => &mut self.at_position,
+      (true, 0) => &mut self.untouched,
+      (true, _) => &mut self.increments,
+    };
+    *counter += 1;
+    self.moved += u64::from(moved);
+    self.flipped += u64::from(computed != judged);
+    self.count_answer(judged);
+  }
+
+  fn count_answer(&mut self, judged: Answer) {
+    match judged {
+      Answer::Accepted => self.accepted += 1,
+      Answer::Before => self.before += 1,
+      Answer::Conflict => self.conflicts += 1,
+      Answer::Unknown => {}
+    }
+  }
+
+  /// Whether every kind the oracle must meet was met.
+  fn met(&self) -> bool {
+    [
+      self.at_position,
+      self.moved,
+      self.increments,
+      self.untouched,
+      self.accepted,
+      self.conflicts,
+      self.before,
+      self.flipped,
+    ]
+    .iter()
+    .all(|&count| count > 0)
+  }
+}
+
+/// Three greens over one origin: one judging every work serially at its head, the owner committing by position the
+/// verdicts its copy computed, and the copy, rebuilt from the owner's chain entries alone and lagging behind it.
+struct Concurrent {
+  serial: Green,
+  owner: Green,
+  copy: Green,
+  /// The owner's chain entries: version `v`'s at `v - 1`.
+  chain: Vec<(Increment, Vec<Applied>)>,
+  /// The verdicts computed and not yet committed, each with its work.
+  held: Vec<(Increment, Computed)>,
+  made: Vec<Increment>,
+}
+
+impl Concurrent {
+  fn new() -> Concurrent {
+    let caching = || {
+      let mut green = Green::with_origin(origin());
+      green.set_rejected_budget(usize::MAX);
+      green
+    };
+    Concurrent {
+      serial: caching(),
+      owner: caching(),
+      copy: Green::with_origin(origin()),
+      chain: Vec::new(),
+      held: Vec::new(),
+      made: Vec::new(),
+    }
+  }
+
+  /// Runs event `n`.
+  fn run(&mut self, n: usize, event: &Event, moves: &mut Moves) -> Result<(), TestCaseError> {
+    let id = n as u64 + 1;
+    match event {
+      Event::Compute { back, lead, edits } => {
+        let base = self.owner.head().saturating_sub(u64::from(*back));
+        self.compute(work(&self.owner, base, edits, id), *lead)
+      }
+      Event::Again { which } => {
+        let earlier = self
+          .made
+          .get(usize::from(*which) % self.made.len().max(1))
+          .cloned();
+        earlier.map_or(Ok(()), |inc| self.compute(inc, 0))
+      }
+      Event::Land { back, edits } => {
+        let base = self.owner.head().saturating_sub(u64::from(*back));
+        self.land(work(&self.owner, base, edits, id))
+      }
+      Event::Commit { which } => self.commit(*which, moves),
+    }
+  }
+
+  /// The copy brought to `target` by the owner's chain entries, one version at a time, as a holder follows its owner.
+  fn follow(&mut self, target: u64) -> Result<(), TestCaseError> {
+    while self.copy.head() < target {
+      let next = usize::try_from(self.copy.head()).unwrap_or(usize::MAX);
+      let Some((inc, applied)) = self.chain.get(next) else {
+        return Err(TestCaseError::fail("the chain ends before the owner's head"));
+      };
+      let version = self.copy.apply_recorded(inc, applied);
+      prop_assert_eq!(version, self.copy.head(), "the copy followed to another version");
+    }
+    Ok(())
+  }
+
+  /// `inc` computed on the copy, brought first to the work's base and up to `lead` versions further, and held.
+  fn compute(&mut self, inc: Increment, lead: u8) -> Result<(), TestCaseError> {
+    let target = self
+      .copy
+      .head()
+      .max(inc.base)
+      .saturating_add(u64::from(lead))
+      .min(self.owner.head());
+    self.follow(target)?;
+    let computed = self
+      .copy
+      .compute(&inc)
+      .map_err(|refused| TestCaseError::fail(format!("the copy refused: {refused:?}")))?;
+    self.made.push(inc.clone());
+    self.held.push((inc, computed));
+    Ok(())
+  }
+
+  /// `inc` submitted to the serial green and to the owner, answered alike, and the owner's version kept in its chain.
+  fn land(&mut self, inc: Increment) -> Result<(), TestCaseError> {
+    let serial = self.serial.submit_resolved(&inc);
+    let owner = self.owner.submit_resolved(&inc);
+    prop_assert_eq!(&serial, &owner, "a submit answered otherwise");
+    if let (Outcome::Accepted { .. }, Some(applied)) = owner {
+      self.chain.push((inc.clone(), applied));
+    }
+    self.made.push(inc);
+    Ok(())
+  }
+
+  /// A held verdict committed: by position on the owner, serially on the serial green, both answers held equal and
+  /// both accepted verdicts committed.
+  fn commit(&mut self, which: u8, moves: &mut Moves) -> Result<(), TestCaseError> {
+    if self.held.is_empty() {
+      return Ok(());
+    }
+    let (inc, computed) = self.held.remove(usize::from(which) % self.held.len());
+    let moved = computed.at() < self.owner.head();
+    let (again, answer) = (self.owner.judged_again(), computed_answer(&computed));
+    let by_position = self
+      .owner
+      .judge_computed(&inc, computed)
+      .map_err(|refused| TestCaseError::fail(format!("the owner refused: {refused:?}")))?;
+    let serially = self.serial.judge(&inc);
+    let answers = (answer, judged_answer(&serially));
+    moves.count(moved, self.owner.judged_again() - again, answers);
+    if let Some(held) = same_judgment(serially, by_position)? {
+      self.commit_both(&inc, held)?;
+    }
+    Ok(())
+  }
+
+  /// Commits both held verdicts, each at its green's head, and keeps the owner's version in its chain.
+  fn commit_both(&mut self, inc: &Increment, (serial, owner): (Judged, Judged)) -> Result<(), TestCaseError> {
+    let fail = |moved| TestCaseError::fail(format!("{moved:?}"));
+    let serial = self.serial.commit_judged(serial).map_err(fail)?;
+    let owner = self.owner.commit_judged(owner).map_err(fail)?;
+    prop_assert_eq!(&serial, &owner, "committed otherwise");
+    self.chain.push((inc.clone(), owner.1));
+    Ok(())
+  }
+}
+
+/// The serial judgment and the judgment by position agree; both held verdicts, when they accept.
+fn same_judgment(
+  serially: Judgment,
+  by_position: Judgment,
+) -> Result<Option<(Judged, Judged)>, TestCaseError> {
+  match (serially, by_position) {
+    (Judgment::Accepted(serial), Judgment::Accepted(owner)) => {
+      same_answer((serial.at(), serial.applied()), (owner.at(), owner.applied()))?;
+      Ok(Some((serial, owner)))
+    }
+    (Judgment::AcceptedBefore { version }, Judgment::AcceptedBefore { version: again }) => {
+      same_answer(version, again).map(|()| None)
+    }
+    (Judgment::Conflict { windows }, Judgment::Conflict { windows: again }) => {
+      same_answer(windows, again).map(|()| None)
+    }
+    (serially, by_position) => Err(TestCaseError::fail(format!(
+      "serially {serially:?}, by position {by_position:?}"
+    ))),
+  }
+}
+
+/// Runs `events` on [`Concurrent`]'s three greens: after every event the serial green and the owner read the same.
+fn committed_by_position_is_serial(
+  events: &[Event],
+  moves: &mut Moves,
+) -> Result<(), TestCaseError> {
+  let mut greens = Concurrent::new();
+  for (n, event) in events.iter().enumerate() {
+    greens.run(n, event, moves)?;
+    prop_assert_eq!(
+      seen(&mut greens.serial),
+      seen(&mut greens.owner),
+      "event {}: {:?}",
+      n,
+      event
+    );
+  }
+  Ok(())
+}
+
+/// A-658 (committed by position; A-645 "Merges computed anywhere, committed by position"). Do: run generated concurrent
+/// histories on three greens: one judging every work serially at its head as a submit does, an owner taking by
+/// position the verdicts a copy computed, and the copy, rebuilt from the owner's chain entries alone and lagging behind
+/// it. A work is computed on the copy at some head and held; other works land on both greens or commit meanwhile; held
+/// verdicts commit in any order; works are sent again. Expect: every verdict taken by position equals the serial verdict
+/// at the same head (the version and what the chain records, the windows, a version accepted before), both greens
+/// read the same after every event, and the census shows commits at their position and after the green moved, moved
+/// commits that judged the increment since again and ones that judged nothing again, accepts, conflicts, works sent
+/// again, and commits answered another kind than computed.
+#[test]
+fn a_verdict_committed_by_position_is_the_serial_verdict_over_every_concurrent_history() {
+  let moves = RefCell::new(Moves::default());
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: slates_test_seeds::cases(256),
+    ..Config::default()
+  }));
+  let result = runner.run(&proptest::collection::vec(event(), 1..48), |events| {
+    committed_by_position_is_serial(&events, &mut moves.borrow_mut())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  let moves = moves.into_inner();
+  assert!(moves.met(), "a kind of commit never met: {moves:?}");
+}
+
+/// Shape: the versions that overwrite the hot file before the work is computed, each 8 bytes further on.
+const HOT_VERSIONS: u64 = 50;
+/// Shape: the files the work edits beside the hot file, each a unit of its own.
+const COLD_FILES: usize = 100;
+
+/// An overwrite of each `(path, at, bytes)`, as increment `id` based at `base`.
+fn overwrites(base: u64, id: u64, edits: &[(String, u64, &[u8])]) -> Increment {
+  let mut draft = Draft::default();
+  for (path, at, bytes) in edits {
+    draft.content(OpKind::Overwrite, path, *at, bytes);
+  }
+  increment(draft, base, id)
+}
+
+/// A green holding a 4 KiB `hot` file, `COLD_FILES` small ones and `other`, then `HOT_VERSIONS` versions, each an
+/// overwrite of the next 8 bytes of `hot`.
+fn hot_green() -> Green {
+  let mut origin = Origin::default();
+  origin.files.push(("hot".to_owned(), vec![b'.'; 4096]));
+  origin.files.push(("other".to_owned(), b"other".to_vec()));
+  for cold in 0..COLD_FILES {
+    origin.files.push((format!("c{cold:03}"), b"cold".to_vec()));
+  }
+  let mut green = Green::with_origin(origin);
+  for version in 1..=HOT_VERSIONS {
+    let edit = [("hot".to_owned(), (version - 1) * 8, &b"hothotho"[..])];
+    let landed = green.submit(&overwrites(version - 1, version, &edit));
+    assert_eq!(landed, Outcome::Accepted { version });
+  }
+  green
+}
+
+/// A-658 (a moved green judges again only the increment since, never the whole work: the counter). Do: compute, on a
+/// copy at version 50, a work based at version 0 that overwrites the hot file (changed at each of versions 1 to 50)
+/// and the 100 cold files; land version 51 on the owner, an overwrite of the hot file and of `other`; hand the owner
+/// the computed verdict. Expect: one unit of the work's 102 judged again (the hot file's) through one delta (version
+/// 51's), where the serial verdict at version 51 maps the hot file through all 51; both accept, recording the same.
+#[test]
+fn a_moved_green_judges_again_only_the_increment_since_the_position() {
+  let (copy, mut owner, mut serial) = (hot_green(), hot_green(), hot_green());
+  let mut edits = vec![("hot".to_owned(), 1000, &b"workwork"[..])];
+  edits.extend((0..COLD_FILES).map(|cold| (format!("c{cold:03}"), 0, &b"WARM"[..])));
+  let job = overwrites(0, 1000, &edits);
+  let computed = copy.compute(&job).expect("computed at version 50");
+  assert_eq!(computed.at(), HOT_VERSIONS);
+  let moving = [("hot".to_owned(), 2000, &b"newnewne"[..]), ("other".to_owned(), 0, &b"OTHER"[..])];
+  for green in [&mut owner, &mut serial] {
+    let landed = green.submit(&overwrites(HOT_VERSIONS, 1001, &moving));
+    assert_eq!(landed, Outcome::Accepted { version: HOT_VERSIONS + 1 });
+  }
+  let counted = |green: &Green| (green.judged_again(), green.deltas_visited());
+  let before = counted(&owner);
+  let by_position = owner.judge_computed(&job, computed).expect("taken by position");
+  let after = counted(&owner);
+  assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1), "judged again");
+  let serial_before = serial.deltas_visited();
+  let serially = serial.judge(&job);
+  assert_eq!(serial.deltas_visited() - serial_before, HOT_VERSIONS + 1);
+  let both = same_judgment(serially, by_position).expect("the same verdict");
+  assert!(both.is_some_and(|(held, _)| held.applied().len() == COLD_FILES + 1));
+}
+
+/// A-658 (the owner's typed refusals). Do: hand the owner, at version 1, a verdict computed for another increment, one
+/// computed on a green at version 2, and one from a green that had accepted, as version 2, an increment the owner
+/// never accepted. Expect: `OtherWork`; `Ahead` naming both heads; `NotRecorded` naming the version; the owner reads
+/// as before each time.
+#[test]
+fn the_owner_refuses_a_verdict_it_cannot_take_typed() {
+  let mut owner = caching_green();
+  let before = seen(&mut owner);
+  let one = work(&owner, 1, &[Edit::Write(1, b"x".to_vec())], 7);
+  let another = work(&owner, 1, &[Edit::Write(1, b"y".to_vec())], 8);
+  let computed = owner.compute(&one).expect("computed");
+  let taken = owner.judge_computed(&another, computed).map(|_| ());
+  assert_eq!(taken, Err(PositionRefused::OtherWork));
+  let (at_two, _) = owner_and_copy();
+  let ahead = at_two.compute(&one).expect("computed at version 2");
+  let taken = owner.judge_computed(&one, ahead).map(|_| ());
+  assert_eq!(taken, Err(PositionRefused::Ahead { at: 2, head: 1 }));
+  assert_eq!(seen(&mut owner), before);
+}
+
+/// A-658 (a copy of another green). Do: compute, on a green that accepted increment 2 as its version 2, increment 2
+/// again, and hand it to a green at version 2 that never accepted it. Expect: `NotRecorded` naming version 2; the green
+/// reads as before.
+#[test]
+fn a_verdict_from_a_copy_of_another_green_is_refused_typed() {
+  let (at_two, _) = owner_and_copy();
+  let mut stranger = Green::with_origin(origin());
+  landed(&mut stranger, &[Edit::Write(0, b"one".to_vec())], 1);
+  let second = work(&stranger, 1, &[Edit::Write(1, b"two".to_vec())], 2);
+  landed(&mut stranger, &[Edit::Write(2, b"nine".to_vec())], 9);
+  let before = seen(&mut stranger);
+  let claimed = at_two.compute(&second).expect("answered");
+  assert_eq!(claimed.accepted_before(), Some(2));
+  let taken = stranger.judge_computed(&second, claimed).map(|_| ());
+  assert_eq!(taken, Err(PositionRefused::NotRecorded { version: 2 }));
+  assert_eq!(seen(&mut stranger), before);
 }

@@ -296,6 +296,8 @@ pub struct Computed {
   base: u64,
   /// The head it was computed against: the position the owner checks.
   at: u64,
+  /// The fold floor of the green that computed it: a copy's verdict reads it (`position`).
+  floor: u64,
   /// What the verdict reached there.
   reached: Reached,
 }
@@ -304,15 +306,39 @@ pub struct Computed {
 enum Reached {
   /// The green that computed it had accepted the same increment before, as this version.
   Before(u64),
-  /// Accepted: the effects in the order a commit applies them, and what the chain records of each.
-  Accepted {
-    /// The effects.
-    effects: Vec<Effect>,
-    /// What the chain records of them.
+  /// The verdict, unit by unit (`position`), with what the chain records of it when it accepts and its windows when it
+  /// conflicts.
+  Verdict {
+    /// The units, in order.
+    units: Vec<position::Unit>,
+    /// What the chain records of every effect, when no unit holds a window.
     applied: Vec<crate::chain_entry::Applied>,
+    /// Every unit's windows, in order.
+    windows: Vec<ConflictWindow>,
   },
-  /// The conflict windows.
-  Conflict(Vec<ConflictWindow>),
+}
+
+impl Reached {
+  /// The verdict of `units`.
+  fn of(units: Vec<position::Unit>) -> Reached {
+    let windows: Vec<ConflictWindow> = units
+      .iter()
+      .flat_map(|unit| unit.windows.iter().cloned())
+      .collect();
+    let applied = if windows.is_empty() {
+      units
+        .iter()
+        .flat_map(|unit| unit.effects.iter().map(Effect::applied))
+        .collect()
+    } else {
+      Vec::new()
+    };
+    Reached::Verdict {
+      units,
+      applied,
+      windows,
+    }
+  }
 }
 
 impl Computed {
@@ -335,23 +361,25 @@ impl Computed {
   pub fn accepted_before(&self) -> Option<u64> {
     match &self.reached {
       Reached::Before(version) => Some(*version),
-      Reached::Accepted { .. } | Reached::Conflict(_) => None,
+      Reached::Verdict { .. } => None,
     }
   }
 
   /// What the chain would record of the version it makes, when it accepts.
   pub fn applied(&self) -> Option<&[crate::chain_entry::Applied]> {
     match &self.reached {
-      Reached::Accepted { applied, .. } => Some(applied),
-      Reached::Before(_) | Reached::Conflict(_) => None,
+      Reached::Verdict {
+        applied, windows, ..
+      } if windows.is_empty() => Some(applied),
+      Reached::Before(_) | Reached::Verdict { .. } => None,
     }
   }
 
   /// The conflict windows, when it conflicts.
   pub fn windows(&self) -> Option<&[ConflictWindow]> {
     match &self.reached {
-      Reached::Conflict(windows) => Some(windows),
-      Reached::Before(_) | Reached::Accepted { .. } => None,
+      Reached::Verdict { windows, .. } if !windows.is_empty() => Some(windows),
+      Reached::Before(_) | Reached::Verdict { .. } => None,
     }
   }
 }
@@ -735,6 +763,9 @@ pub struct Green {
   /// The paths merged through the content fast path (the non-vacuity counter). A cell, so the verdict stays a function
   /// of an immutable green (A-658), as `deltas_visited` is.
   fast_path_hits: std::cell::Cell<u64>,
+  /// The units of computed verdicts judged again because the green moved since they were computed
+  /// ([`Green::judged_again`], A-658).
+  judged_again: u64,
   /// The change index (§4.16 `changed_since`, A-264): the paths each version changed in any dimension, each version's
   /// sorted and each path once, recorded as the version commits at the cost of its own changes, so what changed since a
   /// version is read in the changes since it and never the green's whole tree. A hard link is recorded at a version that
@@ -3034,28 +3065,18 @@ impl Green {
   /// overlap (T-6.x). A length-changing op (insert/delete/truncate) that overlaps is not yet decided
   /// per range — its coordinate mapping under a conflicting neighbour is owed — so the whole-file
   /// identity check still stands for the path in that case, exactly as before (never a regression).
+  ///
+  /// The unit keeps where each op stood at this head (A-658, `position::Placed`). Judged again at a later head from
+  /// those placements (`placed`), each op is mapped on through the deltas since that head alone: the same as mapping
+  /// it from the base, since mapping composes, at the cost of the changes since.
   fn merge_content(
     &self,
     inc: &Increment,
     path: &str,
-    ops: &[Op],
-  ) -> Result<Option<Effect>, Vec<ConflictWindow>> {
-    if !self.content.contains_key(path) {
-      if self.occupied_by_nonfile(path) {
-        return Err(vec![Green::window(path, MergeConflictClass::TypeChanged)]);
-      }
-      return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
-    }
-    // A copy after the base replaced the file whole, which no delta records: the edit was declared against other bytes
-    // (A-586).
-    if self.replaced_after(path, inc.base) {
-      return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
-    }
-    // The file the work edited is gone when the path's file was removed after its base, whatever stands at the path
-    // now: delete against modify (§4.16 "The verdict"), never an edit mapped into the file that took its place, whose
-    // delta (one insert of its whole length) every op of the work would shift past (A-612).
-    if self.file_removed_since(path, inc.base) {
-      return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
+    (ops, placed): (&[Op], Option<(u64, Vec<position::Placed>)>),
+  ) -> position::Unit {
+    if let Some(class) = self.content_refused(inc, path) {
+      return position::Unit::of(Err(Green::window(path, class)));
     }
     let base_changed = self.changed_last(self.last_changed.get(path), path);
     let unchanged = base_changed <= inc.base;
@@ -3064,35 +3085,78 @@ impl Green {
         .fast_path_hits
         .set(self.fast_path_hits.get().saturating_add(1));
     }
-    let intervening = if unchanged {
-      Vec::new()
-    } else {
-      self.intervening(path, inc.base)
+    let placed: Vec<position::Placed> = match placed {
+      Some((at, placed)) if placed.len() == ops.len() => {
+        let since = if unchanged {
+          Vec::new()
+        } else {
+          self.intervening(path, at)
+        };
+        placed.into_iter().map(|place| place.advanced(&since)).collect()
+      }
+      _ => {
+        let intervening = if unchanged {
+          Vec::new()
+        } else {
+          self.intervening(path, inc.base)
+        };
+        ops
+          .iter()
+          .map(|op| position::Placed::of(op, &intervening))
+          .collect()
+      }
     };
+    let mut unit = position::Unit::content(self.content_at_head(inc, path, (ops, &placed)));
+    unit.placed = placed;
+    unit
+  }
+
+  /// Why an edit of `path` is refused before its ops are placed, if it is: no file at the path (a type change, or delete
+  /// against modify); a copy after the base replaced the file whole, which no delta records, so the edit was declared
+  /// against other bytes (A-586); or the file the work edited was removed after its base, whatever stands at the path
+  /// now (§4.16 "The verdict"), never an edit mapped into the file that took its place, whose delta (one insert of its
+  /// whole length) every op of the work would shift past (A-612).
+  fn content_refused(&self, inc: &Increment, path: &str) -> Option<MergeConflictClass> {
+    if !self.content.contains_key(path) {
+      return Some(if self.occupied_by_nonfile(path) {
+        MergeConflictClass::TypeChanged
+      } else {
+        MergeConflictClass::DeleteModify
+      });
+    }
+    (self.replaced_after(path, inc.base) || self.file_removed_since(path, inc.base))
+      .then_some(MergeConflictClass::DeleteModify)
+  }
+
+  /// The two passes over an edit's ops as they stand at the head (`placed`, one an op).
+  fn content_at_head(
+    &self,
+    inc: &Increment,
+    path: &str,
+    (ops, placed): (&[Op], &[position::Placed]),
+  ) -> Result<Option<Effect>, Vec<ConflictWindow>> {
     // Pass one: classify each op. Disjoint ops go to `mapped` (accept at the shifted position);
     // overlapping overwrites become same-range candidates; a length-changing op that overlaps falls
     // the path back to the whole-file identity check (owed).
     let mut mapped = Vec::with_capacity(ops.len());
-    let mut candidates: Vec<&Op> = Vec::new();
+    let mut candidates: Vec<(&Op, u64)> = Vec::new();
     let mut shifting_overlap: Option<Range> = None;
     let head_len = self.content.get(path).map_or(0, len_of);
-    for op in ops {
-      match crate::map::map_range(&intervening, touched_range(op)) {
+    for (op, place) in ops.iter().zip(placed) {
+      match place.range() {
         crate::map::Mapped::Shifted(shifted) => {
           let mut moved = *op;
           moved.at = shifted.start;
           mapped.push(at_head(moved, head_len));
         }
+        crate::map::Mapped::Overlaps if op.kind == OpKind::Overwrite => {
+          candidates.push((op, place.head_start(op)));
+        }
         crate::map::Mapped::Overlaps => {
-          if op.kind == OpKind::Overwrite {
-            candidates.push(op);
-          } else {
-            shifting_overlap.get_or_insert(touched_range(op));
-          }
+          shifting_overlap.get_or_insert(touched_range(op));
         }
       }
     }
-
     // A length-changing op overlapped: the whole-file identity check decides the path (owed: full
     // per-range identity for shifting ops), so a currently-accepted convergent case never regresses.
     if let Some(range) = shifting_overlap {
@@ -3105,39 +3169,10 @@ impl Green {
         class: MergeConflictClass::Overlap,
       }]);
     }
-
-    // Pass two: each overlapping overwrite must reproduce, byte for byte, what the intervening
-    // change already placed at that span; a differing span is a byte-exact conflict. An identical
-    // span is a no-op (the green already holds those bytes), so it is not added to `mapped`. Every differing span of
-    // the file is named (the reply is the windows the agent rebases against, §4.16), in the ops' order, which is the
-    // file's: until 2026-11-04 the first one ended the verdict, so an agent learned of a file's conflicts one rebase at
-    // a time.
-    let mut differing: Vec<ConflictWindow> = Vec::new();
-    for op in &candidates {
-      let span = touched_range(op);
-      let head_start = match crate::map::map_range(&intervening, Range::new(span.start, 0)) {
-        crate::map::Mapped::Shifted(head) => head.start,
-        // A zero-length point cannot overlap (the edge rule), so this arm is unreachable; take the
-        // base offset rather than panic.
-        crate::map::Mapped::Overlaps => span.start,
-      };
-      let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
-      let current = self.content.get(path).unwrap_or_default();
-      let start = usize::try_from(head_start).unwrap_or(usize::MAX);
-      let end = start.saturating_add(agent_bytes.len());
-      let identical = current.get(start..end) == Some(agent_bytes);
-      if !identical {
-        differing.push(ConflictWindow {
-          path: path.to_owned(),
-          range: span,
-          class: MergeConflictClass::Overlap,
-        });
-      }
-    }
+    let differing = self.differing_spans(inc, path, &candidates);
     if !differing.is_empty() {
       return Err(differing);
     }
-
     // Every op accepted. When only identical overlaps remained (nothing disjoint to apply), the
     // green already holds the result: accept with no new effect, as an identical edit always has.
     if mapped.is_empty() {
@@ -3151,6 +3186,35 @@ impl Green {
       mapped,
       ContentSource::Mapped,
     )))
+  }
+
+  /// Pass two: each overlapping overwrite must reproduce, byte for byte, what the intervening
+  /// change already placed at that span, its first byte standing at the head where `candidates` says; a differing span
+  /// is a byte-exact conflict. An identical span is a no-op (the green already holds those bytes). Every differing span
+  /// of the file is named (the reply is the windows the agent rebases against, §4.16), in the ops' order, which is the
+  /// file's: until 2026-11-04 the first one ended the verdict, so an agent learned of a file's conflicts one rebase at
+  /// a time.
+  fn differing_spans(
+    &self,
+    inc: &Increment,
+    path: &str,
+    candidates: &[(&Op, u64)],
+  ) -> Vec<ConflictWindow> {
+    let current = self.content.get(path).unwrap_or_default();
+    candidates
+      .iter()
+      .filter(|(op, head_start)| {
+        let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
+        let start = usize::try_from(*head_start).unwrap_or(usize::MAX);
+        let end = start.saturating_add(agent_bytes.len());
+        current.get(start..end) != Some(agent_bytes)
+      })
+      .map(|(op, _)| ConflictWindow {
+        path: path.to_owned(),
+        range: touched_range(op),
+        class: MergeConflictClass::Overlap,
+      })
+      .collect()
   }
 
   /// Merges a directory creation.
@@ -3452,38 +3516,58 @@ impl Green {
 
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
-    let mut effects = Vec::new();
-    // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
-    let fixes = self.copy_fixes(r);
-    let mut windows: Vec<_> = r
-      .invalid
-      .iter()
-      .chain(self.unfit_content(inc, r).iter())
-      .chain(self.unfit_copied(inc, (r, &fixes)).iter())
-      .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
-      .collect();
+    let mut units = position::Units::first();
+    self.decide_units(inc, r, &mut units);
+    position::verdict(units.into_units().0)
+  }
+
+  /// Decides every dimension of an increment unit by unit into `units` (A-658, `position`): each unit one verdict
+  /// function over its own paths, in the order the whole verdict pushes its effects and windows, so the verdict reached
+  /// at one head is reached at a later one by judging again only the units the versions since changed.
+  fn decide_units(&self, inc: &Increment, r: &Resolved, units: &mut position::Units) {
+    // What the work and its base alone decide: an operation no verdict applies, an edit that does not fit its base.
+    units.constant(|| {
+      position::Unit::windows(
+        r.invalid
+          .iter()
+          .chain(self.unfit_content(inc, r).iter())
+          .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
+          .collect(),
+      )
+    });
     // Copies first, and what lands on their trees after them (A-586): their effects lead, as commit applies them.
-    self.decide_copies(inc, (r, &fixes), &mut effects, &mut windows);
-    self.decide_copied(inc, (r, &fixes), &mut effects, &mut windows);
+    if !r.copies.is_empty() {
+      units.copies(|| self.decide_copy_unit(inc, r));
+    }
     for (path, node) in &r.specials {
-      record(
-        &mut effects,
-        &mut windows,
-        self.merge_special(path, inc.base, *node),
-      );
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_special(path, inc.base, *node))
+      });
     }
     // The paths the increment removes itself: a rename over a file and a directory's removal read
     // them.
     let cleared = r.cleared();
-    self.decide_content(inc, (r, &cleared), &mut effects, &mut windows);
-    self.decide_directories((inc.base, r, &cleared), &mut effects, &mut windows);
-    self.decide_metadata(inc, r, &mut effects, &mut windows);
-    self.decide_node_exclusive(inc, &mut windows);
-    if windows.is_empty() {
-      Ok(effects)
-    } else {
-      Err(windows)
-    }
+    self.decide_content(inc, (r, &cleared), units);
+    self.decide_directories((inc.base, r, &cleared), units);
+    self.decide_metadata(inc, r, units);
+    self.decide_node_exclusive(inc, units);
+  }
+
+  /// A work's copies and what it does in their trees, one unit (A-586, A-626; `position`): the copied ops that do not
+  /// fit what a copy brings, then each copy's verdict, then the copied ops'.
+  fn decide_copy_unit(&self, inc: &Increment, r: &Resolved) -> position::Unit {
+    // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
+    let fixes = self.copy_fixes(r);
+    let mut unit = position::Unit::windows(
+      self
+        .unfit_copied(inc, (r, &fixes))
+        .iter()
+        .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
+        .collect(),
+    );
+    self.decide_copies(inc, (r, &fixes), &mut unit.effects, &mut unit.windows);
+    self.decide_copied(inc, (r, &fixes), &mut unit.effects, &mut unit.windows);
+    unit
   }
 
   /// The node-exclusive rule (§4.17.4 item 3, rules 1 and 2; A-542): a path an operation marked node-exclusive changes,
@@ -3491,16 +3575,20 @@ impl Green {
   /// disjoint the bytes and however identical the change, as FSFS's commit-time merge judges a node (`tree.c`
   /// `merge()`: a file changed on both sides fails, "even an identical replacement", and two additions are "not
   /// auto-mergeable"). The dimension verdicts have run and added their own windows; this pass refuses only what they
-  /// would accept. Each path is one lookup of its last change in the change index (`latest_change`), and is judged once.
-  fn decide_node_exclusive(&self, inc: &Increment, windows: &mut Vec<ConflictWindow>) {
+  /// would accept. Each path is one lookup of its last change in the change index (`latest_change`), and is judged once,
+  /// a unit of its own.
+  fn decide_node_exclusive(&self, inc: &Increment, units: &mut position::Units) {
     let mut judged: BTreeSet<&str> = BTreeSet::new();
     for op in inc.doc.ops.iter().filter(|op| op.is_node_exclusive()) {
       for (index, class) in node_exclusive_paths(op) {
         let Some(path) = inc.doc.paths.path(index) else {
           continue;
         };
-        if judged.insert(path) && self.changed_after(path, inc.base) {
-          windows.push(Green::window(path, class));
+        if judged.insert(path) {
+          units.unit(position::Footprint::path(path), |_| {
+            let changed = self.changed_after(path, inc.base);
+            position::Unit::windows(changed.then(|| Green::window(path, class)).into_iter().collect())
+          });
         }
       }
     }
@@ -3514,97 +3602,93 @@ impl Green {
     self.changed_last(self.latest_change.get(path), path) > base
   }
 
-  /// The content dimension: renames, creates, unlinks and edits.
+  /// The content dimension: renames, creates, unlinks and edits, a unit each.
   fn decide_content(
     &self,
     inc: &Increment,
     (r, cleared): (&Resolved, &BTreeSet<String>),
-    effects: &mut Vec<Effect>,
-    windows: &mut Vec<ConflictWindow>,
+    units: &mut position::Units,
   ) {
     for (dst, from) in &r.renames {
       let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
-      let source = (from.as_str(), cleared);
-      if let Err(window) =
-        self.merge_rename((dst, ops), (inc.base, &inc.post_state), source, effects)
-      {
-        windows.push(window);
-      }
+      units.unit(position::Footprint::pair(dst, from), |_| {
+        let mut unit = position::Unit::default();
+        let source = (from.as_str(), cleared);
+        let moved = (inc.base, inc.post_state.as_slice());
+        if let Err(window) = self.merge_rename((dst, ops), moved, source, &mut unit.effects) {
+          unit.windows.push(window);
+        }
+        unit
+      });
     }
     for path in &r.creates {
-      let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-      let bytes = apply(&[], content, &inc.post_state);
-      record(effects, windows, self.merge_create(path, bytes, content));
+      units.unit(position::Footprint::path(path), |_| {
+        let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let bytes = apply(&[], content, &inc.post_state);
+        position::Unit::of(self.merge_create(path, bytes, content))
+      });
     }
     for path in &r.unlinks {
-      record(effects, windows, self.merge_unlink(path, inc.base));
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_unlink(path, inc.base))
+      });
     }
     for (path, ops) in &r.content {
       if r.creates.contains(path) || r.renames.contains_key(path) {
         continue; // content of a created or renamed-into file is handled with that effect
       }
-      match self.merge_content(inc, path, ops) {
-        Ok(Some(effect)) => effects.push(effect),
-        Ok(None) => {}
-        Err(mut found) => windows.append(&mut found),
-      }
+      units.unit(position::Footprint::path(path), |placed| {
+        self.merge_content(inc, path, (ops, placed))
+      });
     }
   }
 
-  /// The directory dimension: creation and removal (removal against the increment's own removals).
+  /// The directory dimension: creation and removal (removal against the increment's own removals), a unit each.
   fn decide_directories(
     &self,
     (base, r, cleared): (u64, &Resolved, &BTreeSet<String>),
-    effects: &mut Vec<Effect>,
-    windows: &mut Vec<ConflictWindow>,
+    units: &mut position::Units,
   ) {
     for path in &r.mkdirs {
-      record(effects, windows, self.merge_mkdir(path));
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_mkdir(path))
+      });
     }
     for path in &r.rmdirs {
-      record(effects, windows, self.merge_rmdir(path, base, cleared));
+      units.unit(position::Footprint::directory(path), |_| {
+        position::Unit::of(self.merge_rmdir(path, base, cleared))
+      });
     }
   }
 
-  /// The metadata dimensions: mode, symlink, hard link and xattrs.
-  fn decide_metadata(
-    &self,
-    inc: &Increment,
-    r: &Resolved,
-    effects: &mut Vec<Effect>,
-    windows: &mut Vec<ConflictWindow>,
-  ) {
+  /// The metadata dimensions: mode, symlink, hard link and xattrs, a unit each; a hard link's reads the node it names.
+  fn decide_metadata(&self, inc: &Increment, r: &Resolved, units: &mut position::Units) {
+    let base = inc.base;
     for (path, mode) in &r.modes {
-      record(
-        effects,
-        windows,
-        self.merge_setmode(path, inc.base, *mode, r.establishes(path)),
-      );
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_setmode(path, base, *mode, r.establishes(path)))
+      });
     }
     for (path, target) in &r.symlinks {
-      record(effects, windows, self.merge_symlink(path, inc.base, target));
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_symlink(path, base, target))
+      });
     }
     for (path, target) in &r.hardlinks {
       let (target, made) = r.link_node(target);
-      record(
-        effects,
-        windows,
-        self.merge_hardlink(path, inc.base, (target, made)),
-      );
+      units.unit(position::Footprint::pair(path, target), |_| {
+        position::Unit::of(self.merge_hardlink(path, base, (target, made)))
+      });
     }
     for (path, name, value) in &r.xattr_sets {
-      record(
-        effects,
-        windows,
-        self.merge_set_xattr(path, name, inc.base, value, r.establishes(path)),
-      );
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_set_xattr(path, name, base, value, r.establishes(path)))
+      });
     }
     for (path, name) in &r.xattr_removes {
-      record(
-        effects,
-        windows,
-        self.merge_remove_xattr(path, name, inc.base, r.establishes(path)),
-      );
+      units.unit(position::Footprint::path(path), |_| {
+        position::Unit::of(self.merge_remove_xattr(path, name, base, r.establishes(path)))
+      });
     }
   }
 
@@ -4237,11 +4321,12 @@ impl Green {
   /// position. An increment this green accepted before is answered its version. Refused, typed, when this green lacks a
   /// version the work is judged over: its base below the version this green was restored at, or past its head.
   pub fn compute(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
-    let at = self.head();
+    let (at, floor) = (self.head(), self.floor());
     let computed = |reached| Computed {
       id: inc.id,
       base: inc.base,
       at,
+      floor,
       reached,
     };
     if let Some(version) = self.accepted.get(&inc.id) {
@@ -4260,13 +4345,46 @@ impl Green {
       });
     }
     let resolved = Green::resolve(inc);
-    Ok(computed(match self.decide(inc, &resolved) {
-      Ok(effects) => {
-        let applied = effects.iter().map(Effect::applied).collect();
-        Reached::Accepted { effects, applied }
-      }
-      Err(windows) => Reached::Conflict(windows),
-    }))
+    let mut units = position::Units::first();
+    self.decide_units(inc, &resolved, &mut units);
+    Ok(computed(Reached::of(units.into_units().0)))
+  }
+
+  /// The owner's take of a verdict computed anywhere (A-658; A-645 "committed by position"; A-635's rule): answered as a
+  /// submit answers (an increment accepted before its version, a conflict the rejected-result cache holds its windows, a
+  /// base below the checkpoint unknown), else held at the head for [`Green::commit_judged`]. At the position it was
+  /// computed against it stands as computed; when the green has moved, only what the versions since changed is judged
+  /// again, the units whose paths the change index names since (`position`), never the whole work; a content edit from
+  /// where its ops stood. The verdict held equals the one [`Green::judge`] reaches at the head. Refused, typed, nothing
+  /// judged or applied: a verdict for another increment or base, one computed at a head past this green's, or one whose
+  /// copy had accepted the increment at a version this green's record does not hold.
+  pub fn judge_computed(
+    &mut self,
+    inc: &Increment,
+    computed: Computed,
+  ) -> Result<Judgment, PositionRefused> {
+    if computed.id != inc.id || computed.base != inc.base {
+      return Err(PositionRefused::OtherWork);
+    }
+    let head = self.head();
+    if computed.at > head {
+      return Err(PositionRefused::Ahead {
+        at: computed.at,
+        head,
+      });
+    }
+    if let Reached::Before(version) = computed.reached
+      && !self.accepted.contains_key(&inc.id)
+    {
+      return Err(PositionRefused::NotRecorded { version });
+    }
+    Ok(self.hold_computed(inc, computed))
+  }
+
+  /// The units judged again at a later head than the one they were computed at ([`Green::judge_computed`]): the
+  /// non-vacuity counter that a moved green judges only what changed since, never a whole work.
+  pub fn judged_again(&self) -> u64 {
+    self.judged_again
   }
 
   /// Judges an increment and holds the verdict (A-635): what a submit decides, nothing of it applied to the green but the
@@ -4285,7 +4403,7 @@ impl Green {
       };
     }
     match self.compute(inc) {
-      Ok(computed) => self.held(computed),
+      Ok(computed) => self.hold_computed(inc, computed),
       Err(ComputeRefused::BaseUnavailable { base, floor }) => {
         Judgment::BaseUnavailable { base, floor }
       }
@@ -4298,23 +4416,81 @@ impl Green {
     }
   }
 
-  /// A verdict this green computed at its head, held by its owner: a conflict kept in the rejected-result cache, as a
-  /// submit keeps one.
-  fn held(&mut self, computed: Computed) -> Judgment {
-    let Computed { id, at, reached, .. } = computed;
-    match reached {
-      Reached::Before(version) => Judgment::AcceptedBefore { version },
-      Reached::Accepted { effects, applied } => Judgment::Accepted(Judged {
-        id,
-        at,
-        effects,
-        applied,
-      }),
-      Reached::Conflict(windows) => {
-        self.retain_rejected(id, &windows);
+  /// A verdict computed at or before this green's head, held by its owner (A-635, A-658): answered as a submit answers it
+  /// (an increment accepted before its version, a conflict the cache holds its windows, a base below the checkpoint
+  /// unknown), else brought to the head ([`Green::at_head`]) and held there, a conflict kept in the rejected-result
+  /// cache as a submit keeps one.
+  fn hold_computed(&mut self, inc: &Increment, computed: Computed) -> Judgment {
+    if let Some(version) = self.accepted.get(&inc.id) {
+      return Judgment::AcceptedBefore { version: *version };
+    }
+    if let Some(windows) = self.rejected.get(&inc.id) {
+      return Judgment::Conflict {
+        windows: windows.clone(),
+      };
+    }
+    if inc.base < self.deltas_from {
+      return Judgment::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
+    }
+    let units = match computed.reached {
+      Reached::Before(version) => return Judgment::AcceptedBefore { version },
+      Reached::Verdict { units, .. } => self.at_head(inc, (computed.at, computed.floor), units),
+    };
+    match position::verdict(units) {
+      Ok(effects) => {
+        let applied = effects.iter().map(Effect::applied).collect();
+        Judgment::Accepted(Judged {
+          id: inc.id,
+          at: self.head(),
+          effects,
+          applied,
+        })
+      }
+      Err(windows) => {
+        self.retain_rejected(inc.id, &windows);
         Judgment::Conflict { windows }
       }
     }
+  }
+
+  /// The units of `inc`'s verdict reached at `at` over the fold floor `floor`, brought to the head (A-658, `position`):
+  /// as reached when nothing they read changed since, else with the units the versions since changed judged again.
+  fn at_head(
+    &mut self,
+    inc: &Increment,
+    (at, floor): (u64, u64),
+    units: Vec<position::Unit>,
+  ) -> Vec<position::Unit> {
+    // Red-first stub (A-658 part 2): every unit taken as computed, whatever changed since.
+    let _ = (inc, self.since(at, floor));
+    units
+  }
+
+  /// What changed in `(at, head]` (A-658, `position`): the paths the change index names there, the copies made among
+  /// them, and whether a work's copies are judged again (the head moved, or this green's fold floor is not `floor`).
+  /// O(the changes since `at`).
+  fn since(&self, at: u64, floor: u64) -> position::Since {
+    let head = self.head();
+    let changed: BTreeSet<String> = self.changed_between(at, head).into_iter().collect();
+    let copied = changed
+      .iter()
+      .filter(|path| {
+        self
+          .copies
+          .get(path.as_str())
+          .is_some_and(|records| records.iter().any(|record| record.version > at))
+      })
+      .cloned()
+      .collect();
+    position::Since::new(at, (changed, copied), at != head || floor != self.floor())
+  }
+
+  /// The oldest version whose values this green still holds: the version it was restored at, or its fold floor.
+  fn floor(&self) -> u64 {
+    self.folded_below.max(self.deltas_from)
   }
 
   /// Commits a held verdict as the version after the head it was judged at (A-635), with what the chain records of it:
@@ -5114,6 +5290,9 @@ mod copy_tests;
 
 mod reanchor;
 pub use reanchor::{ReanchorRefused, Reanchored};
+
+mod position;
+pub use position::PositionRefused;
 
 #[cfg(test)]
 mod judge_tests;
