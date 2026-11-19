@@ -5,6 +5,9 @@
 //!
 //! A path out of Subversion's canonical form names nothing here, as FSFS's `open_path` finds no
 //! entry named `..`: the report's paths are the client's.
+//!
+//! It is the crate's one walk of copy roots: the read commands (`reads`: `get-locations`,
+//! `get-deleted-rev`) call it too, rather than keep a second (main's decision, 2026-11-19).
 
 use crate::index::{Index, IndexRefusal, Node, Revision};
 
@@ -21,7 +24,7 @@ const MOST_HALVINGS: u32 = u64::BITS + 1;
 ///
 /// # Errors
 /// The index's refusal of the revision or of its own rows.
-pub(super) fn present<'index>(
+pub(crate) fn present<'index>(
   index: &'index Index,
   path: &str,
   revision: Revision,
@@ -40,7 +43,7 @@ pub(super) fn present<'index>(
 ///
 /// # Errors
 /// The index's refusal of the revision or of its own rows.
-pub(super) fn closest_copy(
+pub(crate) fn closest_copy(
   index: &Index,
   path: &str,
   revision: Revision,
@@ -104,7 +107,7 @@ fn chain(path: &str) -> impl Iterator<Item = &str> {
 ///
 /// # Errors
 /// The index's refusal of a revision or of its own rows.
-pub(super) fn deleted_revision(
+pub(crate) fn deleted_revision(
   index: &Index,
   path: &str,
   start: Revision,
