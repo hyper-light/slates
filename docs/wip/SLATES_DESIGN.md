@@ -11346,6 +11346,26 @@ node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 ite
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
 Subversion client's commit needs.
 
+> **Status (2026-11-19, A-612: a work never changes bytes it did not see).** Two rules the verdict now keeps, each a
+> defect A-596's oracle found:
+> - *A file removed after the work's base is deleted, whatever stands at its path now.* The green records the last
+>   version that removed the file at each path (`Green::file_removed`): an unlink, a rename away, or a rename onto it,
+>   which removes the file it replaces. Replay rebuilds it, and it is never folded. A work based before it that edits the
+>   path is delete against modify (`DeleteModify`), and one that renames it is rename against rename (`RenameRename`),
+>   though a file was made there again, renamed onto it, or moved onto it beneath a directory's rename. Before, the
+>   verdict mapped the work's ops through the replacement's one-insert delta and spliced them at the new file's end, and
+>   a rename moved the replacement.
+> - *A truncate removes the bytes it saw.* In a net op set it is a removal of base bytes, `[at, at + len)`, reaching the
+>   base's end: a hunk over base bytes, as the interval algebra composes it (`slates_vfs::algebra`), judged by its span
+>   with the edge rule. Mapped to a head that grew past that span after its base (an append at the end), it is the delete
+>   of its span (`at_head`), in a submit, a rebase and a rename's edits, so the append is kept and the version's delta
+>   states exactly what left. Before, the splice cut to the head's end and removed the append, a lost update.
+>
+> The sweep's other cases already held, judged by the spans in both directions: an overwrite ending at the cut, an
+> insert at the cut and an append past it kept beside a truncate; an overwrite inside the cut span or a shorter
+> truncate a conflict; the same truncate identical. Tests: `crates/merge/src/engine/unseen_bytes_tests.rs`; A-596's
+> oracle generates both cases again (`engine/reanchor/tests.rs`).
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -11876,9 +11896,9 @@ is one more version, and the chain itself is never rewritten.
 > approvals a policy predicate names (A-597's matcher plugs in), and the standing ones are the evidence a policy counts.
 > The records are the repository's partition's (`crates/db/src/review.rs`): six operations, guarded then applied, carried
 > by the snapshot, charged to the merge byte budget, each refusal typed (`ReviewRefusal`). The oracle holds the walk to a
-> diff of the whole texts over generated histories, and found two verdict defects, filed in GAPS with parked tests: a
-> work based before its file was replaced is spliced into the replacement, and a truncate based before an append drops
-> the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
+> diff of the whole texts over generated histories, and found two verdict defects, both fixed by A-612 (§4.16 "The
+> verdict"): a work based before its file was replaced was spliced into the replacement, and a truncate based before an
+> append dropped the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
 > close), their wire refusals typed, and a comment's version held as a live reader of its green's fold floor.
 - A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
   unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
@@ -11913,6 +11933,26 @@ is one more version, and the chain itself is never rewritten.
   task's shard and never holds the green: admission ends before the work reaches the merge task, so a slow hook delays
   only its own push.
 - The write modes still decide whether a merge may happen at all (A-285), and a signature never permits one (A-321).
+
+> **Status (2026-11-19, A-597: the policy's matcher, the hooks' protocol and the hook runner built).** `crates/server`
+> holds them as pure modules that nothing calls yet. `vcs_policy` keeps a repository's rules, each allowing or denying
+> one right (read, submit, rewrite, delete) to some principals on the names a pattern covers, and finds the rule that
+> decides by the tool's own precedence. For git, a ref pattern covers what `git for-each-ref` matches (the name itself,
+> a prefix ending at a slash, or `wildmatch` with `WM_PATHNAME`), and the last covering rule wins, as
+> `transfer.hideRefs` documents. For Mercurial, a branch, bookmark or topic name or `*`, in the `acl` extension's order:
+> a denial first, then the allow list a principal must be on. For Subversion, an authz path, literal or `:glob:`: the
+> deepest depth at which a rule matches decides, then the rule defined last, as authz's lookup does. When no rule
+> speaks, the repository's own rule stands (the owner's rights, A-575; capabilities, §4.13). `vcs_hooks` names the
+> points (git's `pre-receive`, `update` and `post-receive`; Mercurial's `pretxnchangegroup` and `changegroup`;
+> Subversion's `pre-commit`, `pre-revprop-change` and `post-commit`), builds each hook's input in its tool's terms, and
+> runs one hook as an event-driven state machine whose outcome is accepted, refused with the hook's words, timed out at
+> its learned bound, abandoned when its client left, or unstartable. Each hook's deadline is learned from its own runs
+> with `LearnedWait` (RFC 6298, Karn's rule, the back-off): a hook with no finished run has no deadline but its client's
+> connection, and a run its client cut short teaches nothing. A run never outlives its client. Owed: the policy in the
+> repository record with a verb that sets it; the branch verbs and push paths asking it; each tool's read-only view
+> for its hooks and the driver that starts a hook over it in its own process group; each tool's words for the
+> outcomes; the hooks of review events; and a repository-owned queue for observing hooks that must outlive their push
+> (§4.17.3).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12019,7 +12059,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 6. Review records: comments anchored and moved by position mapping; approvals as evidence (built in the engine and the
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
-   commit, under learned deadlines.
+   commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
+   learned deadlines and the runner; the policy's place in the record, the views and the driver are owed).
 
 Each server's pieces follow these, in its own section.
 
@@ -13255,6 +13296,27 @@ path the server sends (absent entries, log's access levels, `get-file`, `get-dir
 (write on the path and its parent; recursive write to delete or replace a directory; recursive read of a copy source).
 A principal with read on the whole repository and no rule beneath meets one comparison and no per-path check.
 
+> **Status (2026-11-19, A-606).** Built: authorization (`slates-svn`'s `authz`, piece 10). The rules file, and a
+> separate groups file, are read as `svn_config__parse_stream` reads them and their sections, groups, aliases and
+> entries taken as `authz_parse.c` takes them; groups are resolved without being expanded. Each principal's rules in a
+> repository are compiled into Subversion's tree of path segments and walked with its precedence: the deepest matching
+> level, then the rule defined last; a later `**` eclipsing the rules beneath it; 1.14.1's choice between a global and
+> a repository rule for one path. Answers are read, write or none at a path, beneath it (`svn_authz_recursive`) and
+> anywhere (`svn_authz__get_global_rights`). A principal whose rules all give one access is answered by one
+> comparison, counted. Every refusal is typed, with its line and its Subversion error. Held to Subversion's own authz
+> tests (`authz-test.c` with `authz.rules` and `authz.groups`, and the authz tests of `repos-test.c`), APR's
+> `apr_fnmatch` table, the documentation's files, and a naive oracle over generated rule sets. Where 1.14.x's code
+> departs from its own documentation, the documentation is followed and each case is a named test:
+> - the root has no segments (`lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there);
+> - a recursive question at the root weighs every rule (Subversion weighs only those an empty segment matches, so it
+>   grants recursive read at a root above a denied `/secret`);
+> - a suffix pattern leaves the segment as it was for the other rules of its level (`lookup` reverses it in place);
+> - `[//x]` is refused (Subversion takes it for the root).
+>
+> Owed: the server's questions (piece 7: every path sent, every path a commit changes); the file read from the
+> repository (`authz-db` as a `^/` URL) and compiled per file identity; `svnserve`'s `force-username-case`; and
+> `mod_authz_svn`'s questions with HTTP (piece 13).
+
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
 the large-file class by content-defined chunking, so a copy or a branch of a large file costs a reference. Locks and
@@ -13268,7 +13330,7 @@ value from the first request's own inputs, never a literal).
 | Compress a window (svndiff 2) or send it stored | the argmin of predicted time: stored bytes over the connection's delivery rate, against LZ4's time plus compressed bytes over that rate | the connection's delivered bytes a second; the shard's LZ4 bytes a second; the compression ratio of the repository's content class (D-17) | every window sent | a choice of two; stored for a peer that did not announce svndiff 2 | the first window is compressed and timed, which gives its own ratio and rate |
 | The cap on a path, a property value or a log message | the connection's share of the shard's admittable memory, divided among the connections served now (A-188's share) | the shard's room (§4.2); live connections | every connection that opens or closes | the shard's admittable room; refused `E210009` past it | the share when the connection is accepted |
 | Socket send and receive buffers | the connection's bandwidth-delay product | its measured round trip and delivery rate | every window | the connection's memory share | the first exchange's round trip and rate |
-| A hook's deadline | a regression of the hook's run time on the commit's size (paths and bytes); the bound is the prediction plus the largest residual seen | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
+| A hook's deadline | §4.17.1's (A-597): the tail of that hook's own finished runs by RFC 6298's estimator (`LearnedWait`), with Karn's rule for runs cut short and the bound doubled after a run cut at it; a regression on the commit's size (paths and bytes), the prediction plus the largest residual seen, takes its place only once measurement shows a hook's run time following the size | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
 | An idle HTTP transaction's bound | the longest gap seen between two requests of one transaction that went on to commit | the gaps of committed transactions | every commit over HTTP | the shard's room for held works: past it the longest-idle goes first | none until a transaction has committed; the room alone |
 | The index's table size and tail seal (§4.17.1's rule, A-581) | derived, never learned: a table is one window of the content plane (D-6's chunk, from the base page), and the tail seals its full tables once its rows no longer fit one | the store's window | each insert | the window; a row too long for a table of its own refused `RowPastWindow` | the window |
 | The index's merge point (§4.17.1's rule, A-581) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, one problem for each `j`; the largest due `j`) | each lookup's visits, counted by the index; the times the owner measured for its lookups, inserts and merges | each timed batch and each merge | the shard's room, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
@@ -13383,7 +13445,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
    oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
-   log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+   log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
+   12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
     (A-609); the editor drives and the write methods' bodies are its second.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
@@ -40813,6 +40876,199 @@ Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crat
 `tests/pack_fixtures.rs`, the SHA-256 pack, each pack's format and index and the listing's depth;
 `entry::longest_header`; `lib.rs`'s module line; `Cargo.toml`, flate2 from the workspace); `Cargo.lock` (flate2 1.1.11
 and zlib-rs 0.6.8 alone).
+
+### A-597 — Policy by name pattern under each tool's own precedence, and the hooks' protocol under learned deadlines (2026-11-19, g255, UI goal 92; §4.17.1 "Policy: protected branches, access and hooks" and shared piece 7; R3, D-28)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7);
+- §4.17.4 item 12's hook-deadline row (below, "One estimator");
+- GAPS (the §4.17 entry); `research/vcs-servers.md` §6 (the sources read, with their revisions, lines and sha256);
+- `crates/server` (`wildmatch.rs`, `vcs_policy.rs` and `vcs_hooks.rs`, new; `lib.rs`).
+
+- **What a rule is.** A right (read, submit, rewrite, delete), an effect (allow or deny), the principals it speaks to
+  (everyone, or entries naming a principal or every principal but one: acl's `!user`, authz's `~user`), and a pattern in
+  the repository's tool's form. The verdict is the deciding rule, or unruled, which leaves the question to the
+  repository's own rule: its owner holds every right (A-575), another principal what its capability grants (§4.13).
+- **git's precedence.** A pattern covers a ref as `git for-each-ref` covers one: "either using `fnmatch`(3) or
+  literally, in the latter case matching completely or from the beginning up to a slash" (`for-each-ref-options.adoc`
+  1-5). The glob is `wildmatch` with `WM_PATHNAME`, and a pattern ending in `/` covers everything beneath it
+  (`ref-filter.c` `match_name_as_path`, 2696-2723). The last covering rule decides: "If you have multiple hideRefs
+  values, later entries override earlier ones" (`config/transfer.adoc` 117-120; `refs.c` `ref_is_hidden` reads them from
+  the last, 1741-1771), the one precedence git documents among a server's ref patterns. A hosting server's own order
+  for its protection rules is that server's choice, not git's, and was not taken.
+- **Mercurial's precedence.** A name or `*` in each namespace, as `hgext/acl.py` (7.2.4) keys its sections ("a branch
+  name, or an asterisk, to match any branch"), in its order, "1) Deny list for branches 2) Allow list for branches"
+  (25-30). A denial that covers the name and names the principal decides first. Where any rule allows the right in the
+  namespace, the allow rules are a list the principal must be on: `buildmatch` answers `util.never` to a user with no
+  entry in a present section (326 on), and acl refuses that user "not allowed". Topics take bookmarks' form: acl has no
+  topic rules, and the topic extension's options read for §4.17.3 (`research/mercurial-server.md` §5) give none. acl's
+  documented example configuration and its `ring = !gollum` example are tests. Not read: how Mercurial's configuration
+  parser treats an allow section with no entries. acl's docstring says that beside an empty `[acl.allow.branches]`
+  "anyone else can still commit to any other branch"; an allow list here is its allow rules, which agrees with that.
+- **Subversion's precedence.** An authz path: `/path` literally, or `:glob:/path` with `*` for one segment and `**` for
+  any number (the 1.10 release notes), segment wildcards read by `wildmatch` within the segment. authz's lookup walks the
+  path a segment at a time. At each depth it takes the matching rule "with the highest SEQUENCE_NUMBER ... i.e. the
+  latest one defined in the authz file" (`authz.c` 56-59, `combine_access` 103-111; `authz.h` 255-258), and where none
+  matches it inherits from the depth above (`lookup`, 1277 on); a section with nothing for the user takes no part
+  (`process_acl`, 558 on). So the deepest matching depth decides, then the rule defined last. A `**` matches at every
+  depth it spans, since the lookup adds a `**` node again at every level: a later `/trunk/**` eclipses an earlier
+  `/trunk/a` (`trim_tree`), and an earlier `/trunk/**` still decides at `/trunk/a/b` beneath a later `/trunk/a`, where it
+  matches deeper. One rule is one statement: the union an authz file gives a user named by several lines of one section
+  belongs to the authorization file's reading (A-606), not to the policy.
+- **The matcher.** Each policy is indexed once, when it is made. git's rules go by their pattern's bytes, since a name
+  is covered literally only by itself or by a prefix ending at a slash (a look-up a slash), and the globs are kept apart
+  under the literal bytes each must begin with. Mercurial's go by namespace and name, with `*` apart. Subversion's
+  literal rules go by their canonical path (a look-up a depth), and the rules holding wildcards by the depths their
+  segments reach. git's `wildmatch` is read once into tokens and matched by carrying the set of text positions reached:
+  no recursion, and time in proportion to the tokens times the text, where `dowild` recurses at every star.
+- **The hooks.** The points and their phases. The inputs in each tool's terms: git's `old new ref` lines and
+  `GIT_PUSH_OPTION_*`, the count unset when no push options were negotiated, `update`'s three arguments, and
+  `post-receive` given only the commands that applied (`builtin/receive-pack.c` 834-995); Mercurial's `HG_HOOKTYPE`,
+  `HG_HOOKNAME`, `HG_NODE`, `HG_NODE_LAST`, `HG_SOURCE` (`serve`), `HG_URL`, and `HG_PENDING` naming the view for
+  `pretxnchangegroup`; Subversion's arguments and its `LOCK-TOKENS:` input (`hooks.c` 510-683). The words: git's and
+  Mercurial's from both streams, Subversion's from standard error alone (`hooks.c` 228 sends standard output to the null
+  device). And what a point with no hook answers: accept, except `pre-revprop-change`, "default to MASSIVE PARANOIA"
+  (`hooks.c` 668-678).
+- **The deadline.** Each configured hook's runs are learned with `LearnedWait`. Before its first finished run a hook has
+  no deadline: its client's connection bounds the run (§4.17.1). After, the bound is the tail of the finished runs plus
+  a liveness window. A run cut at its bound is no sample and doubles the next bound (RFC 6298 §5.5). A run cut by its
+  client leaving is no sample and no back-off (Karn's rule: its length is unknown). The back-off has no ceiling of the
+  runner's own, since every run ends when its client leaves (§4.17.2's table).
+- **One estimator.** §4.17.4 item 12 had named, for Subversion, a regression of a hook's run time on the commit's size.
+  The runner holds every tool's hooks to one rule, `LearnedWait`'s, as the codebase's five other learned waits are ("One
+  rule, so they never drift apart"); RFC 6298's deviation term already widens the bound of a hook whose runs vary with
+  their input. The regression takes its place only once measurement shows a hook's run time following the commit's
+  size, owed with that measurement.
+- **The runner.** A state machine with no I/O. The driver reports output, the output's end, the exit, the timer and the
+  client leaving; the runner answers wait (with the timer at the deadline), kill, or done with the outcome: accepted,
+  refused with the hook's exit and words, timed out naming the bound, abandoned, or unstartable with the cause. A hook
+  that exits while something it started still holds its output is judged by its own exit, and that leftover is ended
+  at the deadline or when the client leaves. Its words are kept up to a cap the caller derives (the connection's share
+  of the shard's memory), the rest counted. A run never outlives its client (§2 ban 9). git lets a `post-receive` run on
+  after its client has gone; a notification that must outlive its push belongs in a repository-owned queue (§4.17.3).
+- **Tests** (`cargo test --locked -p slates-server --lib -- wildmatch:: vcs_policy:: vcs_hooks::`, Mac Studio M3 Ultra,
+  kiln, debug, load 7 to 11, 2026-11-19): 26 of 26; `cargo fmt --all --check` clean.
+  - Golden: git's 190 t3070 vectors, answered alike by the compiled matcher and by `dowild` transcribed line for line.
+  - Oracles: the compiled matcher against `dowild` on 4,096 generated cases; each policy against every rule tried in
+    order, over generated rules and questions (git's through `dowild` and its literal test, transcribed).
+  - Documented examples: for-each-ref's coverage, acl's example configuration and its `!gollum` example, the release
+    notes' three equivalent globs, authz's depth and order.
+  - The runner: each outcome, the first run with no deadline, the learned bound and its back-off, Karn's rule, the
+    words' cap, a hook whose children hold its output, and a property over generated event orders: a run ends once, is
+    sampled exactly when it exited while running and cut exactly when the timer reached the deadline first, and keeps
+    its first bytes.
+  - Red on a mutated copy, each caught by its named tests: `**/` read as `*` (the vectors and the `dowild` oracle); the
+    first git rule winning (the git test and oracle); not listed read as unruled (acl's example and the Mercurial
+    oracle); depth ignored (both Subversion tests and the oracle); a sample from a run its client cut short (the client
+    test and the property); no back-off (the bound test and the property).
+- **Owed:** the policy in the repository record and the verb that sets it (with shared piece 2's register entry); the
+  branch verbs and each server's push path asking it; each tool's read-only view for its hooks (git piece 10's bare
+  repository, Mercurial piece 9's revlog view, Subversion piece 11's `svnlook`); the driver that starts a hook over its
+  view in its own process group (on Linux inside the launcher's namespace, §4.6); each tool's words for the outcomes
+  (git's `pre-receive hook declined` and `hook declined`, `receive-pack.c` 1634 and 2127; Mercurial's `<hook> hook exited
+  with status <n>`; Subversion's `Commit blocked by pre-commit hook (exit code <n>) with output:`, `hooks.c` 65-162); the
+  hooks of review events; and a repository-owned queue for observing hooks that must outlive their push.
+
+### A-612 — the verdict refuses a work based before its file was replaced, and a truncate removes only the bytes it saw (2026-11-19, g267, UI goal 93; §4.16 "The verdict" and "Splice"; D-27; A-596's findings)
+Applied in the same change to:
+- §4.16's status (after "The verdict, two pure passes"); §4.17.1's A-596 status; GAPS (both findings, fixed; A-596's
+  paragraph of the §4.17 entry);
+- `crates/merge/src/engine.rs`: `Green::file_removed`, `file_removed_since`, `len_of`, `at_head`, and the checks in
+  `merge_content`, `merge_rename` and `edits_after_rename`;
+- `crates/merge/src/engine/unseen_bytes_tests.rs`, new; `crates/merge/src/engine/reanchor/tests.rs`, where the oracle's
+  guards are gone and the parked tests move to the new module;
+- the two bug records in `docs/bugs/`, rewritten as fixed with their root causes and edits.
+- **The rule for a replaced file**, by §4.16's "delete against modify in either direction". A file the green removed
+  after a work's base is gone for that work, whatever stands at its path now. The engine records the last version that
+  removed the file at each path:
+  - an unlink or a rename away (each `RemoveContent`);
+  - a rename onto a path that held a file (a `SetContent` from `ContentSource::Copied` while the path held content).
+
+  `merge_content` answers a later-based edit `DeleteModify`, and `merge_rename` a later-based rename of it
+  `RenameRename`. Replay rebuilds the record, since `apply_recorded` makes the same effects. It is never folded, so a
+  base below the fold floor meets it too. A green restored from a checkpoint, or made as a branch, starts with it
+  empty, since its bases are never before its first version. Its bound: one entry a path the green ever removed a file
+  at, as `last_changed` holds one a path it ever changed.
+- **The rule for a truncate**, by the interval algebra (`slates_vfs::algebra`, whose hunks are over base bytes). A
+  truncate in a net op set removes the base bytes it covers, `[at, at + len)`. An append at the base's end is a
+  zero-length insert at that span's end, disjoint by the edge rule, so the two commute and both are kept: last-writer-
+  wins is one of D-27's lost designs. `at_head` turns a mapped truncate whose span no longer reaches the head's end
+  into the delete of that span, the head's canonical form for such a removal, in `merge_content` and
+  `edits_after_rename`. `apply`, the version's delta, the chain entry's `Spliced` ops, the history's spliced value and a
+  rebase's restated journal (`content_volume_ops`) then all remove exactly the span.
+- **Not changed.** A version a holder recomputes is judged by its own build. A holder of an older build than its owner
+  would answer such a version otherwise and refuse it, fatal and loud, as for any verdict change, so a fleet's holders
+  move to a new verdict together. Chain entries recorded before the change replay their recorded effects unchanged.
+- **Tests** (debug, Mac Studio, 2026-11-19, kiln r613, load 7.8 to 8.7):
+  - green: `cargo test -p slates-merge --lib`, 43 of 43; `cargo fmt -p slates-merge -- --check` clean;
+  - red with the fix reversed: the six new tests and A-596's oracle (its generators on again) failed. A work based
+    before its file was made again was accepted as version 3, for its edit and for a rename of it; each truncate case
+    left `<1>\n`.
+- **The sweep** of the siblings:
+  - a file replaced beneath a directory's rename: refused, a case of the test;
+  - a truncate against an overwrite, an insert or a truncate at its cut, in both directions: judged by the spans, and
+    unchanged by this fix (the sweep test);
+  - a rebase, and a rename's edits: fixed as above.
+
+  Seen by reading only, not changed, and reported:
+  - a mode or attribute change to a file replaced after the work's base is judged by that dimension's own last change;
+  - a rename whose source is a symlink or a hard link replaced after the base moves the new one;
+  - `intervening` read a version's delta once for each history entry at that version, removal and set alike, now
+    unreachable from both callers;
+  - an append at the old end of a file a whole-file rewrite replaced is accepted at the new end, by the edge rule (a
+    question for the design, not a defect of the code).
+
+### A-606 — Subversion's authorization file, parsed as Subversion parses it and evaluated with its precedence, where its code departs from its own documentation the documentation followed (2026-11-19, g229, UI goal 92; §4.17.4 item 10 and piece 10; A-500)
+Applied in the same change to:
+- §4.17.4 item 10's status and the pieces list, and GAPS (the §4.17.4 entry);
+- `crates/svn` (`authz.rs`; `authz/ini.rs`, `glob.rs`, `model.rs`, `tree.rs`; `authz/tests.rs`, `authz/tests/oracle.rs`;
+  all new; `lib.rs`'s module line);
+- `research/vcs-servers-subversion.md` §7 (the sources read, with their hashes, and the departures).
+- **The file.** Read as `svn_config__parse_stream` reads it. A byte order mark is skipped. `#` and `[` count in the
+  first column only. A header ends at its first `]`, so no bracket expression can be written in one. `:` before the
+  first `=` separates. An indented line continues a value with one space, an indented `#` included; a blank line ends
+  it. Carriage returns are dropped at a line's start and after `[`. Sections, groups, aliases and entries are taken as
+  `authz_parse.c` takes them; so is a separate groups file, after which the rules file may define no group. Groups
+  keep their direct members, and a user's groups are found by walking up from the user. So nested groups cost memory
+  in proportion to the file's bytes, where Subversion expands every group into its users.
+- **The precedence.** Each principal's rules in a repository are compiled into Subversion's tree of path segments.
+  For one path, the repository's rule is taken if it speaks for the principal, the global one otherwise (1.14.1, issue
+  4762). Rules eclipsed by a later `**` are taken out (`trim_tree`). A path is walked level by level: the deepest
+  level with a matching rule decides, the rule defined last there wins, and a level without one inherits. A recursive
+  question takes the least access over the reached nodes' subtrees, as Subversion's does, so a rule that cannot
+  govern any path beneath still counts. A question without a path takes Subversion's global rights, transcribed. A
+  principal whose rules all give one access is answered by one comparison, counted by `uniform_answers`.
+- **Departures from 1.14.x's code**, each a named test; Subversion's own documentation is followed:
+  - the root has no segments: `lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there,
+    although `*` "Matches any single non-empty path segment" (`authz.h`);
+  - a recursive question at the root weighs every rule: Subversion's weighs only the rules an empty segment matches,
+    so with `[/] * = rw` and `[/secret] * =` it grants recursive read at `/`, and a commit that copies `/` would pass
+    over `/secret`;
+  - a suffix match leaves the segment as it was: `lookup` reverses it in place for the rest of the level, so
+    `[:glob:/**/public]` beside `[:glob:/*.secret]` misses `/public` and matches `/cilbup`;
+  - `[//x]` is refused as non-canonical: `parse_rule_path` takes it for the root and ignores the rest.
+  Where Subversion's outcome depends on hash order, one way is decided: a group whose expansion never ends (on a cycle,
+  or leading into one) is refused at the first such group in definition order, and a file with several refusals is
+  refused at the first in file order, then at the definition or entry a later check names. A NUL byte and an option
+  with no name are refused outright: Subversion's C strings cut at the first, and it reads before its buffer for the
+  second.
+- **Bounds.** One, the caller's: a file's bytes, checked before anything is read. Nothing recurses: a rule path of
+  50,000 segments and a chain of 50,000 nested groups (and the same chain closed into a cycle) are tests.
+- **Tests** (`cargo test -p slates-svn --lib authz`, Mac Studio M3 Ultra, kiln, 2026-11-19):
+  - red first with the module stubbed: 50 of 55 failed, the five that passed asserting only that nothing panics or
+    that a file parses;
+  - then 57 of 57 in 2.1 s: every case of `authz-test.c` (its `authz.rules` and `authz.groups` byte for byte, and
+    `test_global_rights`, issues 4741 and 4762) and of `repos-test.c`'s authz tests (`authz`, `test_authz_wildcards`,
+    `test_authz_prefixes`, `test_authz_recursive_override`, `test_authz_pattern_tests`, `groups_authz`, the in-repo
+    tests, `issue_4060`, and `commit_editor_authz` as the questions item 10 has a commit ask); APR's `testfnmatch.c` at
+    flags 0; the `conf/authz` `svnadmin create` writes; the book's examples and the 1.10 and 1.14 notes with their
+    stated outcomes; every refusal kind with its line and Subversion error; the four departures; hostile input;
+  - the naive oracle (256 generated rule sets in assorted styles, every principal, four repositories, every path to
+    depth three), held non-vacuous by a rich hand-built set whose answers take every access, fall below beneath, and
+    are walked;
+  - the crate's lib suite, 110 of 110.
+- **Owed:** the server's questions (piece 7); the file read from the repository and compiled per file identity;
+  `svnserve`'s `force-username-case`; `mod_authz_svn`'s questions (piece 13). Main's: clippy and `xtask` over the
+  module, and the four departures confirmed against stock Subversion (run request).
 
 ### A-617 part 1 — A-602's lock check answers the first failing lock in Subversion's path order, as FSFS's `verify_locks` does (2026-11-19, g268 for UI goal 93; §4.17.4 item 3.4; A-592's finding, A-602)
 Applied in the same change to: §4.17.4 item 3.4 (the order the first failing lock answers in), GAPS (the §4.17.4

@@ -338,10 +338,6 @@ struct History {
   others: Vec<Option<Vec<u8>>>,
   /// Whether each version removed or replaced FILE.
   replaced: Vec<bool>,
-  /// The last version that made, removed or replaced FILE (slot 0) and OTHER (slot 1). A work is never based before
-  /// it: the verdict maps a work's edit of a replaced file onto its replacement today (A-596's first finding,
-  /// `a_work_based_before_its_file_was_replaced_conflicts`), which this oracle does not judge.
-  made: [u64; 2],
   /// The highest floor the histories were folded below.
   floor: u64,
   comments: Vec<Comment>,
@@ -364,7 +360,6 @@ impl History {
       texts: vec![Some(file)],
       others: vec![Some(other)],
       replaced: vec![false],
-      made: [0, 0],
       floor: 0,
       comments: Vec::new(),
       serial,
@@ -382,15 +377,8 @@ impl History {
     texts.get(index(version)).cloned().flatten()
   }
 
-  /// Submits `work` based at `base`; when accepted, records what the new head holds, whether it replaced FILE, and
-  /// marks the files of `slots` made at it.
-  fn submit(
-    &mut self,
-    work: Work,
-    base: u64,
-    replaces: bool,
-    slots: &[usize],
-  ) -> Result<(), TestCaseError> {
+  /// Submits `work` based at `base`; when accepted, records what the new head holds and whether it replaced FILE.
+  fn submit(&mut self, work: Work, base: u64, replaces: bool) -> Result<(), TestCaseError> {
     self.works += 1;
     let mut id = [0u8; 32];
     id[..8].copy_from_slice(&self.works.to_le_bytes());
@@ -410,9 +398,6 @@ impl History {
         .others
         .push(self.green.content(OTHER).map(<[u8]>::to_vec));
       self.replaced.push(replaces);
-      for slot in slots {
-        self.made[*slot] = version;
-      }
     }
     Ok(())
   }
@@ -435,30 +420,30 @@ impl History {
       }
       Step::Edit { back, other, edits } => self.edit(*back, *other, edits),
       Step::Create { other, lines } => self.create(*other, *lines),
-      Step::Unlink => self.replace(FILE, &[0], |work| {
+      Step::Unlink => self.replace(FILE, |work| {
         work.op(OpKind::Unlink, FILE, 0, 0, u64::MAX);
       }),
-      Step::RenameOnto => self.replace(OTHER, &[0, 1], |work| {
+      Step::RenameOnto => self.replace(OTHER, |work| {
         let src = work.name(OTHER);
         work.op(OpKind::Rename, FILE, 0, 0, src);
       }),
-      Step::RenameAway => self.replace(FILE, &[0], |work| {
+      Step::RenameAway => self.replace(FILE, |work| {
         let src = work.name(FILE);
         work.op(OpKind::Rename, AWAY, 0, 0, src);
       }),
     }
   }
 
-  /// A work based `back` versions behind the head (never before the floor, nor before its file was last made) making
-  /// `edits` to FILE, or to OTHER when `other`, where the file stands at that base.
+  /// A work based `back` versions behind the head (never before the floor) making `edits` to FILE, or to OTHER when
+  /// `other`, where the file stands at that base. A work based before its file was replaced, or truncating behind an
+  /// append, is judged by the verdict as any other (A-612): refused, or kept with what the green made meanwhile.
   fn edit(&mut self, back: u8, other: bool, edits: &[LineEdit]) -> Result<(), TestCaseError> {
-    let (path, slot) = if other { (OTHER, 1) } else { (FILE, 0) };
+    let path = if other { OTHER } else { FILE };
     let base = self
       .green
       .head()
       .saturating_sub(u64::from(back))
-      .max(self.floor)
-      .max(self.made[slot]);
+      .max(self.floor);
     let Some(text) = self.text_of(path, base) else {
       return Ok(());
     };
@@ -468,19 +453,15 @@ impl History {
       .collect();
     let mut work = Work::default();
     work.splices(path, text.len(), &disjoint(splices));
-    // A truncate based behind the head drops whatever the green appended at its end after its base, and its delta
-    // states only the bytes it saw (A-596's second finding, `a_truncate_based_before_an_append_keeps_the_appended_bytes`):
-    // this oracle judges comments, not that, so such a work is not submitted.
-    let truncates = work.doc.ops.iter().any(|op| op.kind == OpKind::Truncate);
-    if work.doc.ops.is_empty() || (truncates && base < self.green.head()) {
+    if work.doc.ops.is_empty() {
       return Ok(());
     }
-    self.submit(work, base, false, &[])
+    self.submit(work, base, false)
   }
 
   /// FILE, or OTHER when `other`, made with `lines` fresh lines at the head, where it is absent.
   fn create(&mut self, other: bool, lines: u8) -> Result<(), TestCaseError> {
-    let (path, slot) = if other { (OTHER, 1) } else { (FILE, 0) };
+    let path = if other { OTHER } else { FILE };
     let head = self.green.head();
     if self.text_of(path, head).is_some() {
       return Ok(());
@@ -492,24 +473,18 @@ impl History {
     work.op(OpKind::Create, path, 0, 0, u64::MAX);
     let src = work.stash(&bytes);
     work.op(OpKind::Insert, path, 0, bytes.len() as u64, src);
-    self.submit(work, head, !other, &[slot])
+    self.submit(work, head, !other)
   }
 
-  /// A work at the head that `build` lays out, removing or replacing FILE, where `needs` stands at the head; it makes
-  /// the files of `slots`.
-  fn replace(
-    &mut self,
-    needs: &str,
-    slots: &[usize],
-    build: impl FnOnce(&mut Work),
-  ) -> Result<(), TestCaseError> {
+  /// A work at the head that `build` lays out, removing or replacing FILE, where `needs` stands at the head.
+  fn replace(&mut self, needs: &str, build: impl FnOnce(&mut Work)) -> Result<(), TestCaseError> {
     let head = self.green.head();
     if self.text_of(needs, head).is_none() {
       return Ok(());
     }
     let mut work = Work::default();
     build(&mut work);
-    self.submit(work, head, true, slots)
+    self.submit(work, head, true)
   }
 
   /// Writes a comment on FILE at the version `back` behind the head, on line `first` (modulo its lines) and `extent`
@@ -893,75 +868,5 @@ fn a_comment_is_refused_past_the_head_backward_below_the_floor_or_off_whole_line
   assert_eq!(
     green.reanchor(FILE, Range::new(9, 4), (2, 3)),
     Ok(Reanchored::Moved(Range::new(11, 4)))
-  );
-}
-
-/// A-596's finding, parked until the verdict is fixed (GAPS, §4.16; A-596). Do: on one green unlink the file and make
-/// it again with other bytes, on another rename the other file onto it; then submit a work based before that change
-/// that inserts a byte into the file it saw. Expect a conflict both times: the file the work edited is gone. Today the
-/// verdict maps the work's insert through the replacement's one-insert delta and accepts it, splicing it into the new
-/// file (`merge_content` finds the path's content present and maps through every delta since the base; `fits_base`
-/// judged the ops against the base's file only).
-#[test]
-#[ignore = "A-596's finding: a work based before its file was replaced is spliced into the replacement; un-ignore with the verdict's fix"]
-fn a_work_based_before_its_file_was_replaced_conflicts() {
-  let text = b"<1>\n<2>\n";
-  let mut remade = green_of(text, b"other\n");
-  let unlink = one(OpKind::Unlink, FILE, 0, 0, b"");
-  assert_eq!(
-    submit(&mut remade, unlink, 0, 1),
-    Outcome::Accepted { version: 1 }
-  );
-  let mut create = one(OpKind::Create, FILE, 0, 0, b"");
-  let src = create.stash(b"<9>\n");
-  create.op(OpKind::Insert, FILE, 0, 4, src);
-  assert_eq!(
-    submit(&mut remade, create, 1, 2),
-    Outcome::Accepted { version: 2 }
-  );
-  let mut onto = green_of(text, b"other\n");
-  let mut rename = Work::default();
-  let src = rename.name(OTHER);
-  rename.op(OpKind::Rename, FILE, 0, 0, src);
-  assert_eq!(
-    submit(&mut onto, rename, 0, 1),
-    Outcome::Accepted { version: 1 }
-  );
-  for (green, what) in [(&mut remade, "made again"), (&mut onto, "renamed onto")] {
-    let head = green.head();
-    let edit = one(OpKind::Insert, FILE, 1, 1, b"x");
-    let answer = submit(green, edit, 0, 9);
-    assert!(
-      matches!(answer, Outcome::Conflict { .. }),
-      "{what}: {answer:?}, the file now {:?}",
-      green.content(FILE).map(String::from_utf8_lossy)
-    );
-    assert_eq!(green.head(), head, "{what}");
-  }
-}
-
-/// A-596's second finding, parked until the verdict is fixed (GAPS, §4.16; A-596; found by this module's oracle, Mac
-/// Studio kiln r504). Do: append a line to a two-line file, then submit a work based before the append that deletes
-/// the file's last line, its removal to the end composed as the deriver composes it, a truncate. Expect the appended
-/// line kept (the work removed only what it saw) or a conflict, never the appended line gone with nothing refused.
-/// Today the truncate meets the append only at its edge, so the verdict accepts it, and the splice truncates to the
-/// end of the head's file (`apply`, `OpKind::Truncate`), removing the append the work never saw; the version's delta
-/// still states the four bytes the work saw.
-#[test]
-#[ignore = "A-596's second finding: a truncate based before an append removes the appended bytes; un-ignore with the verdict's fix"]
-fn a_truncate_based_before_an_append_keeps_the_appended_bytes() {
-  let mut green = green_of(b"<1>\n<2>\n", b"other\n");
-  let append = one(OpKind::Extend, FILE, 8, 4, b"<3>\n");
-  assert_eq!(
-    submit(&mut green, append, 0, 1),
-    Outcome::Accepted { version: 1 }
-  );
-  let truncate = one(OpKind::Truncate, FILE, 4, 4, b"");
-  let answer = submit(&mut green, truncate, 0, 2);
-  let file = green.content(FILE).map(<[u8]>::to_vec);
-  assert!(
-    matches!(answer, Outcome::Conflict { .. }) || file.as_deref() == Some(&b"<1>\n<3>\n"[..]),
-    "{answer:?}, the file now {:?}",
-    file.as_deref().map(String::from_utf8_lossy)
   );
 }
