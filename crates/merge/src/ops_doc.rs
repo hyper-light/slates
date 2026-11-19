@@ -8,6 +8,17 @@
 //! Bytes are never in the document (§4.16 "Declared operations": bytes are never in the
 //! journal); an operation names its range and, for content it adds, a source offset into the
 //! increment's post-state chunks, which the splice resolves later.
+//!
+//! **Names without a fixed cap (A-621).** A path index is 64 bits, in memory and on the wire, and the header counts its
+//! paths and operations in 64 bits, so a work names as many paths as its caller's admission allows: a first push of a
+//! kernel tree (about 97,000 files) is one work. Until version 2 an index was 16 bits and interning answered `u16::MAX`
+//! for every name past the 65,535th, so the 65,536th and every later name aliased one path: a correctness bug, not a
+//! limit. Interning looks a name up in an ordered map, so a table of n names costs O(n log n) comparisons where the
+//! scan it replaced cost O(n²); its tests count them.
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 /// The declared operation kinds (§4.16 `OpKind`), in their wire order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +99,7 @@ pub struct Op {
   /// Kind-specific flags (e.g. a rename's replace semantics); zero when unused.
   pub flags: u8,
   /// The path this operates on, as an index into the path table.
-  pub path: u16,
+  pub path: u64,
   /// The operation's offset in the file (or the target path index for a rename's source).
   pub at: u64,
   /// The operation's length in bytes (or the new mode for `SetMode`).
@@ -113,51 +124,86 @@ impl Op {
   }
 }
 
+/// A path as the table's index orders it: by its bytes, as `String` orders them, so the index's order is the canonical
+/// order [`OpsDoc::canonicalize`] imposes. Its own type only so the tests can count the comparisons interning makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Name(String);
+
+impl Ord for Name {
+  fn cmp(&self, other: &Name) -> Ordering {
+    #[cfg(test)]
+    tests::count_comparison();
+    self.0.cmp(&other.0)
+  }
+}
+
+impl PartialOrd for Name {
+  fn partial_cmp(&self, other: &Name) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
 /// The path table: the distinct paths an ops document names, sorted, so a path index is stable
 /// and the document's identity does not depend on the order operations were declared in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PathTable {
+  /// The paths, by index.
   paths: Vec<String>,
+  /// Each path's index, by path: what interning looks a name up in (A-621), O(log n) comparisons a name, where a scan
+  /// of `paths` was O(n). Its order is the canonical one, which [`OpsDoc::canonicalize`] reads off it.
+  index: BTreeMap<Name, u64>,
 }
 
 impl PathTable {
   /// An empty table.
   pub fn new() -> PathTable {
-    PathTable { paths: Vec::new() }
+    PathTable::default()
   }
 
   /// Interns `path`, returning its stable index (deduplicated, insertion order); the sorted,
-  /// canonical order is imposed later by [`OpsDoc::canonicalize`].
-  pub fn intern(&mut self, path: &str) -> u16 {
-    if let Some(i) = self.paths.iter().position(|p| p == path) {
-      return u16::try_from(i).unwrap_or(u16::MAX);
+  /// canonical order is imposed later by [`OpsDoc::canonicalize`]. Every distinct path has its own index, however many
+  /// the table holds: a table's length always fits 64 bits on the targets slates builds for, and the conversion's
+  /// unreachable refusal answers `u64::MAX`, which names no path (A-621).
+  pub fn intern(&mut self, path: &str) -> u64 {
+    let next = u64::try_from(self.paths.len()).unwrap_or(u64::MAX);
+    match self.index.entry(Name(path.to_owned())) {
+      Entry::Occupied(found) => *found.get(),
+      Entry::Vacant(slot) => {
+        slot.insert(next);
+        self.paths.push(path.to_owned());
+        next
+      }
     }
-    let i = self.paths.len();
-    self.paths.push(path.to_owned());
-    u16::try_from(i).unwrap_or(u16::MAX)
   }
 
   /// Sorts the paths and returns, for each old index, its new index (so the ops can be
-  /// remapped). Called by [`OpsDoc::canonicalize`].
-  fn sort_and_remap(&mut self) -> Vec<u16> {
-    let mut order: Vec<(usize, String)> = std::mem::take(&mut self.paths)
-      .into_iter()
-      .enumerate()
-      .collect();
-    order.sort_by(|(_, a), (_, b)| a.cmp(b));
-    let mut new_index = vec![0u16; order.len()];
-    for (new, (old, _)) in order.iter().enumerate() {
-      if let Some(slot) = new_index.get_mut(*old) {
-        *slot = u16::try_from(new).unwrap_or(u16::MAX);
+  /// remapped). Called by [`OpsDoc::canonicalize`]. The index map holds the paths in the canonical order already, so the
+  /// sort is one pass over it, each path moved, none copied.
+  fn sort_and_remap(&mut self) -> Vec<u64> {
+    let mut old_paths = std::mem::take(&mut self.paths);
+    let mut remap = vec![u64::MAX; old_paths.len()];
+    for (rank, index) in (0u64..).zip(self.index.values_mut()) {
+      let old = usize::try_from(*index).unwrap_or(usize::MAX);
+      if let Some(slot) = remap.get_mut(old) {
+        *slot = rank;
       }
+      self.paths.push(
+        old_paths
+          .get_mut(old)
+          .map(std::mem::take)
+          .unwrap_or_default(),
+      );
+      *index = rank;
     }
-    self.paths = order.into_iter().map(|(_, path)| path).collect();
-    new_index
+    remap
   }
 
   /// The path at `index`.
-  pub fn path(&self, index: u16) -> Option<&str> {
-    self.paths.get(usize::from(index)).map(String::as_str)
+  pub fn path(&self, index: u64) -> Option<&str> {
+    self
+      .paths
+      .get(usize::try_from(index).ok()?)
+      .map(String::as_str)
   }
 
   /// The paths, sorted.
@@ -168,8 +214,10 @@ impl PathTable {
 
 /// Format: the ops document magic, `SLOD` in little-endian ASCII.
 const MAGIC: u32 = 0x444f_4c53;
-/// Format: the document version.
-const VERSION: u32 = 1;
+/// Format: the document version. 2 since A-621: a path index and the header's path and operation counts are 64 bits
+/// (they were 16 and 32), so a work names as many paths as its admission allows; a version 1 document is refused
+/// (`BadVersion`), never read under the other layout.
+const VERSION: u32 = 2;
 
 /// An ops document: the sorted path table and the operations, in a canonical order (by path
 /// index, then by offset), so the same declared work always serializes to the same bytes.
@@ -199,15 +247,18 @@ impl OpsDoc {
         op.src = usize::try_from(op.src)
           .ok()
           .and_then(|index| remap.get(index))
-          .map_or(u64::MAX, |index| u64::from(*index));
+          .map_or(u64::MAX, |index| *index);
       }
       if matches!(op.kind, OpKind::SetXattr | OpKind::RemoveXattr) {
         op.at = usize::try_from(op.at)
           .ok()
           .and_then(|index| remap.get(index))
-          .map_or(u64::MAX, |index| u64::from(*index));
+          .map_or(u64::MAX, |index| *index);
       }
-      if let Some(new) = remap.get(usize::from(op.path)) {
+      if let Some(new) = usize::try_from(op.path)
+        .ok()
+        .and_then(|index| remap.get(index))
+      {
         op.path = *new;
       }
     }
@@ -219,21 +270,22 @@ impl OpsDoc {
     });
   }
 
-  /// The canonical byte encoding: the header (magic, version, path count, op count), then each
-  /// path as a length-prefixed byte string, then each operation as a fixed record. Little-endian
-  /// throughout; no host-dependent padding.
+  /// The canonical byte encoding: the header (magic and version, `u32` each; path count and op count, `u64` each), then
+  /// each path as a `u32` length-prefixed byte string, then each operation as a fixed record of [`OP_BYTES`] (kind and
+  /// flags, a byte each; path, offset, length and source, `u64` each). Little-endian throughout; no host-dependent
+  /// padding. A count's conversion to 64 bits cannot fail on the targets slates builds for.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(
-      &u32::try_from(self.paths.paths().len())
-        .unwrap_or(u32::MAX)
+      &u64::try_from(self.paths.paths().len())
+        .unwrap_or(u64::MAX)
         .to_le_bytes(),
     );
     out.extend_from_slice(
-      &u32::try_from(self.ops.len())
-        .unwrap_or(u32::MAX)
+      &u64::try_from(self.ops.len())
+        .unwrap_or(u64::MAX)
         .to_le_bytes(),
     );
     for path in self.paths.paths() {
@@ -271,20 +323,24 @@ impl OpsDoc {
     if reader.u32()? != VERSION {
       return Err(DocDecodeError::BadVersion);
     }
-    let path_count = reader.u32()? as usize;
-    let op_count = reader.u32()? as usize;
-    // A path is at least its 4-byte length prefix and an op is a fixed 28-byte record; if the header's
+    let path_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    let op_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    // A path is at least its 4-byte length prefix and an op is a fixed record of `OP_BYTES`; if the header's
     // counts cannot fit in the bytes that remain, the entry is corrupt — checked before any allocation
     // so a wild count never reserves memory it cannot fill.
     if path_count > reader.remaining() / PATH_MIN_BYTES {
       return Err(DocDecodeError::Truncated);
     }
     let mut paths = PathTable::new();
-    for _ in 0..path_count {
+    for expected in (0u64..).take(path_count) {
       let len = reader.u32()? as usize;
       let raw = reader.bytes(len)?;
       let path = std::str::from_utf8(raw).map_err(|_| DocDecodeError::BadPath)?;
-      paths.intern(path);
+      // A table never holds a path twice (interning deduplicates), so a second one is a corrupt entry, refused: read
+      // as the first, every later index would have named the path after its own (A-621).
+      if paths.intern(path) != expected {
+        return Err(DocDecodeError::DuplicatePath);
+      }
     }
     if op_count > reader.remaining() / OP_BYTES {
       return Err(DocDecodeError::Truncated);
@@ -293,7 +349,7 @@ impl OpsDoc {
     for _ in 0..op_count {
       let kind = OpKind::from_wire(reader.u8()?).ok_or(DocDecodeError::BadKind)?;
       let flags = reader.u8()?;
-      let path = reader.u16()?;
+      let path = reader.u64()?;
       let at = reader.u64()?;
       let len = reader.u64()?;
       let src = reader.u64()?;
@@ -315,11 +371,12 @@ impl OpsDoc {
 
 /// The smallest a path entry can be in the encoding: its length prefix (a `u32`), for an empty path.
 const PATH_MIN_BYTES: usize = size_of::<u32>();
-/// A fixed operation record's size: kind + flags (`u8` each), path (`u16`), and `at`, `len`, `src`
-/// (`u64` each) — the fields of [`Op`] as they are written by [`OpsDoc::encode`].
-const OP_BYTES: usize = size_of::<u8>()
+/// Format: a fixed operation record's size: kind + flags (`u8` each), and path, `at`, `len`, `src` (`u64` each), the
+/// fields of [`Op`] as [`OpsDoc::encode`] writes them, 34 bytes since version 2 (A-621). The chain entry writes an op's
+/// record the same way (`crate::chain_entry`).
+pub(crate) const OP_BYTES: usize = size_of::<u8>()
   + size_of::<u8>()
-  + size_of::<u16>()
+  + size_of::<u64>()
   + size_of::<u64>()
   + size_of::<u64>()
   + size_of::<u64>();
@@ -340,6 +397,8 @@ pub enum DocDecodeError {
   BadPath,
   /// Bytes remained after the last operation.
   TrailingBytes,
+  /// A path table named one path twice (A-621): read as the first, every later index would name the path after its own.
+  DuplicatePath,
 }
 
 impl std::fmt::Display for DocDecodeError {
@@ -351,6 +410,7 @@ impl std::fmt::Display for DocDecodeError {
       DocDecodeError::BadKind => "an operation kind is unknown",
       DocDecodeError::BadPath => "a path is not valid UTF-8",
       DocDecodeError::TrailingBytes => "the ops document has trailing bytes",
+      DocDecodeError::DuplicatePath => "the ops document names a path twice",
     };
     f.write_str(reason)
   }
@@ -395,13 +455,6 @@ impl<'a> Reader<'a> {
     b.first().copied().ok_or(DocDecodeError::Truncated)
   }
 
-  pub(crate) fn u16(&mut self) -> Result<u16, DocDecodeError> {
-    let b = self.bytes(size_of::<u16>())?;
-    let mut word = [0u8; size_of::<u16>()];
-    word.copy_from_slice(b);
-    Ok(u16::from_le_bytes(word))
-  }
-
   pub(crate) fn u32(&mut self) -> Result<u32, DocDecodeError> {
     let b = self.bytes(size_of::<u32>())?;
     let mut word = [0u8; size_of::<u32>()];
@@ -416,3 +469,6 @@ impl<'a> Reader<'a> {
     Ok(u64::from_le_bytes(word))
   }
 }
+
+#[cfg(test)]
+mod tests;

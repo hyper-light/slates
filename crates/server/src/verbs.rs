@@ -8510,10 +8510,9 @@ fn assemble_post_state(
       encoded_node = node.encode();
       (&encoded_node, 0)
     } else if op.kind == OpKind::SetXattr {
-      let Ok(name_index) = u16::try_from(op.at) else {
-        continue;
-      };
-      let Some(name) = doc.paths.path(name_index) else {
+      // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
+      // naming more than 65,535 paths had no value laid in.
+      let Some(name) = doc.paths.path(op.at) else {
         continue;
       };
       let Some(value) = declared_xattr(journal, path, name) else {
