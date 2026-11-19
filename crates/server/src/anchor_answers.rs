@@ -1,4 +1,16 @@
-//! The anchor's answers on the Windows hold channel, and how long an exchange waits for one (A-552; R3's class D).
+//! The anchor's answers on the Windows hold channel, and how long an exchange waits for one (A-552; R3's class D, D-c).
+//!
+//! A Windows daemon asks its anchor to hold a mount's handles, a Shards stream's resync end or DAX section, to replace a
+//! held entry's record, and to release each (A-198, A-427, A-448), one exchange at a time over the hold channel, which
+//! the anchor answers as soon as its loop wakes on the channel's posted read (A-213). How long that takes is this
+//! machine's to measure, not a setting, so the daemon learns its anchor's answers as `crate::learned_wait` learns a
+//! wait: RFC 6298's estimator over the exchanges answered (a refusal is an answer too), the bound their tail plus a
+//! liveness window (the lateness a live party may show before it is judged, A-228); an exchange given up at its bound is
+//! no sample (Karn's rule) and doubles the next bound (RFC 6298 §5.5), backed off no further than the failover delay the
+//! fleet measures (`F = D + E + R`, A-363), the ceiling the helpers a shard waits on are backed off to (A-525). One
+//! estimator for holds and releases alike: one party answers both on one channel. Until A-552 a hold waited the
+//! recovery budget and a window and a release a window, whatever the anchor took. Cfg-free, so the rule is tested on
+//! every host; its only caller is Windows' (`anchor_hold_windows.rs`).
 
 /// The anchor's answers one daemon waited on.
 #[derive(Debug, Default)]
@@ -20,10 +32,11 @@ impl AnchorAnswers {
     self.answers.ran_out();
   }
 
-  /// How long the next exchange waits for the anchor's answer.
+  /// Derived: how long the next exchange waits for the anchor's answer: the learned bound of the answers this daemon
+  /// waited on, backed off for those unanswered no further than the failover delay `failover_ns` (the module doc).
   #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-  pub(crate) fn bound_ns(&self, _failover_ns: u64) -> u64 {
-    slates_db::replay::RECOVERY_BUDGET_NS.saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+  pub(crate) fn bound_ns(&self, failover_ns: u64) -> u64 {
+    self.answers.bound_ns(failover_ns)
   }
 }
 

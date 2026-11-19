@@ -36533,8 +36533,11 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
 Applied in the same change to: §4.6 (A-227's kept mounts: the gate's wait), GAPS (the failover delay's entry, its class
 D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`, `Daemon::starve_control_shard`'s doc,
 `stop_parts`, `start_with_fleet`'s gate, the test), `crates/server/src/watchdog.rs` (`shard_window_ns`,
-`own_window_ns`), `crates/machine/src/log.rs` (`LogWriter::stop`, its progress count, the sink seam and the test) and
-`crates/base/src/own_mounts.rs` (`Gate`, `Learning`'s drop, `await_learned`, the test).
+`own_window_ns`), `crates/machine/src/log.rs` (`LogWriter::stop`, its progress count, the sink seam and the test),
+`crates/base/src/own_mounts.rs` (`Gate`, `Learning`'s drop, `await_learned`, the test), `crates/server/src/anchor_answers.rs`
+(new, cfg-free: `AnchorAnswers` and its test), `crates/server/src/lib.rs`, `crates/server/src/anchor_hold_windows.rs`
+(`ANSWERS`, `ANSWER_BOUND_NS`, `answer_bound_ns`, `learn`, `exchange`, `release_bound_ns`; `HOLD_BUDGET_NS`,
+`RELEASE_ATTEMPT_NS` and `RELEASE_BOUND_NS` deleted; its test's first deadline) and `crates/server/src/winfsp.rs`.
 - **What was there.** A-359's sweep left the daemon's own supervision waits on the liveness window `W` (class D, D-c),
   each owed its own change: a starved hold's CPU (`starved_share_ns`), the log writer's drain wait at a stop
   (`stop_parts`), the learning gate's crossing wait (`start_with_fleet`), the Windows hold channel's two bounds
@@ -36564,6 +36567,18 @@ D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`
   never spinning: a check that spun past a window of CPU would have its own shard judged spinning, and one parked past
   a window would have it judged still, while a beat's wake shows its watchdog CPU progress at every look. The wait is
   bounded by the daemon's shards: each ends its learning once.
+- **The Windows hold channel's two bounds (`anchor_hold_windows`, A-198).** A mount's hold, a Shards stream's resync
+  end and DAX section holds and a record's replacement waited the recovery budget and a window for the anchor's answer,
+  and a release a window an attempt, whatever this machine's anchor took. The anchor answers as soon as its loop wakes
+  on the channel's posted read (A-213), so how long it takes is the machine's to measure: the daemon learns its
+  anchor's answers (`crate::anchor_answers`, cfg-free, over `learned_wait`: RFC 6298's estimator over the exchanges
+  answered, a refusal being an answer too; the bound their tail plus a liveness window; an exchange given up at its
+  bound no sample, by Karn's rule, and the next bound doubled, no further than the failover delay `F`, the ceiling
+  A-525 gave the FUSE helpers). One estimator for every exchange: one party answers them on one channel. It lives on
+  the shard owning the pipe, where every exchange runs; that shard publishes the next bound after each, and an
+  exchange reads it once as it begins, so the asking shard waits for the owner shard (in its own time, A-440) by the
+  same span the owner waits for the anchor. A detach answers its client a refusal once a release is late past that
+  bound (`release_bound_ns`), and goes on asking as before.
 - **Tests.** `a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by` (`crates/server/src/daemon.rs`: a quiet
   shard's hold half the liveness window, a shard held two and a half windows half of those, a span under a beat a beat
   at most); red with today's rule (the held shard's hold half the liveness window) on the Mac Studio.
@@ -36574,3 +36589,8 @@ D line), `crates/server/src/daemon.rs` (`starved_share_ns`, `starve_this_thread`
   (`crates/base/src/own_mounts.rs`: six shards ending their learning a quarter window apart, the check answered once
   the last has, a window and a half on; a shard that never ends, `EAGAIN` after a window); red with today's rule
   (`EAGAIN` after one window while shards were still ending theirs).
+  `an_exchanges_wait_follows_the_anchors_answers_and_backs_off_to_the_failover_delay` (`crates/server/src/anchor_answers.rs`:
+  a window before any answer, a little past it after quick answers, doubled for an exchange unanswered, held at the
+  failover delay, back under the doubled bound once one is answered); red with today's rule (two seconds before any
+  answer). The Windows wiring and its pipe test (`a_missed_deadline_keeps_the_hold_channel_and_a_late_answer_answers_nothing`,
+  its first deadline now the estimator's first bound) are Windows-only and filed for main's build.

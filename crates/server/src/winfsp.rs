@@ -41,8 +41,9 @@
 //!
 //! **The file system is deleted only after the anchor released its hold.** The anchor's copies keep the volume and the
 //! drive whoever else closes theirs, so a file system deleted first leaves a drive nobody serves. A `detach` therefore
-//! asks the anchor while the mount goes on serving, repeating the request for [`crate::anchor_hold::RELEASE_BOUND_NS`],
-//! and only an answer ends the attachment and removes the drive. Past the bound the detach is answered a typed refusal:
+//! asks the anchor while the mount goes on serving, repeating the request within the bound the anchor's answers are
+//! waited for ([`crate::anchor_hold::release_bound_ns`], learned from them, A-552), and only an answer ends the
+//! attachment and removes the drive. Past the bound the detach is answered a typed refusal:
 //! the drive stays served and held. The request stands, since it may already be waiting in the pipe for the anchor's
 //! next turn, so it goes on being repeated, and the anchor's answer ends the mount then. Every other end (a destroy, a
 //! revocation, a mount refused or lost) has already ended the attachment, so it stops serving and waits for the same
@@ -393,7 +394,7 @@ pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) ->
   let shard = state.shard;
   let record = record.clone();
   let task = async move {
-    let answered = release_within(attachment, crate::anchor_hold::RELEASE_BOUND_NS).await;
+    let answered = release_within(attachment, crate::anchor_hold::release_bound_ns()).await;
     let refused = answered.is_err();
     let _ = state::with_state_counted(|s| {
       let reply = complete(s, request, cause, attachment, |s| match &answered {

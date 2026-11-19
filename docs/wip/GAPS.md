@@ -4041,9 +4041,12 @@
 > giving it up a window (the widest its shards are judged by) after its last, where it gave up a slow writer after one
 > `W` in all; a crossing check waits while its daemon's shards go on ending their learning (`start_with_fleet`'s gate),
 > woken at each end and parked a beat between looks, giving up once its own shard's window passes with none ending,
-> where it spun one `W` in all.
+> where it spun one `W` in all; the Windows hold channel's exchanges wait for the anchor by a bound learned from its
+> answers (RFC 6298's tail plus a window, Karn's rule, backed off to the failover delay; `crate::anchor_answers`),
+> where a hold waited the recovery budget and a window and a release a window (the wiring is Windows-only, built by
+> main).
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
-> the anchor's hold windows, `held_copy`; D-c), and a laptop's
+> `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
