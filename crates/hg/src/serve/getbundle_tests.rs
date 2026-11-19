@@ -1435,13 +1435,18 @@ proptest! {
 
   /// AC-HG.9 (hostile input), A-619 part 3: do feed the session arbitrary bytes, step after step. Expect each step to
   /// ask for more than it holds, or to take between one byte and all of it, until the session ends or the input runs
-  /// out; never a panic.
+  /// out: ended cleanly only by an empty line (one byte), ended by a refusal only with the rest taken; never a panic.
   #[test]
   fn arbitrary_session_input_never_panics(input in proptest::collection::vec(any::<u8>(), 0..300)) {
     let served = cloned();
     let mut rest = input.as_slice();
     while let (Read::Done(done, used), _, _) = step(&served, rest, 1 << 16) {
       prop_assert!(used > 0 && used <= rest.len());
+      match done {
+        Step::Ended { refused: None } => prop_assert!(used == 1 && rest.first() == Some(&b'\n')),
+        Step::Ended { refused: Some(_) } => prop_assert_eq!(used, rest.len()),
+        Step::Answered { .. } => {}
+      }
       rest = rest.get(used..).unwrap_or_default();
       if matches!(done, Step::Ended { .. }) {
         break;
