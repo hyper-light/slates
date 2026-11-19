@@ -22,7 +22,8 @@ use crate::unpack::{NoIndex, read_whole};
 use crate::store::Push;
 
 use super::{
-  EXCHANGE, Made, Source, Ticks, blob, brought_by, commit, pack_of, push_and_move, store, tree,
+  EXCHANGE, Made, Source, Ticks, blob, brought_by, commit, pack_of, push_and_move, reached_now,
+  store, tree,
 };
 
 /// A text of numbered lines, `lines` long, the lines in `edited` edited.
@@ -211,7 +212,11 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
   for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
     let mut store = store();
     let (repository, first, second) = two_versions(format, &mut store);
-    let pack = pack_of(&repository, &store, &brought_by(&repository, 1, 0..=1));
+    let pack = pack_of(
+      &repository,
+      &store,
+      &brought_by(&repository, &store, 1, 0..=1),
+    );
     let read = unpacked(format, &pack);
     let made: BTreeMap<ObjectId, Vec<u8>> = first
       .iter()
@@ -287,7 +292,11 @@ fn similar_files_in_one_version_are_offset_deltas_within_the_learned_depth() {
   );
   let read = unpacked(
     format,
-    &pack_of(&repository, &store, &brought_by(&repository, 1, [0])),
+    &pack_of(
+      &repository,
+      &store,
+      &brought_by(&repository, &store, 1, [0]),
+    ),
   );
   assert_eq!(read.len(), objects.len());
   repository.release(&mut store).unwrap();
@@ -303,7 +312,11 @@ fn a_fragments_entries_keep_their_offsets_and_crcs() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, ..) = two_versions(format, &mut store);
-  let pack = pack_of(&repository, &store, &brought_by(&repository, 1, [0]));
+  let pack = pack_of(
+    &repository,
+    &store,
+    &brought_by(&repository, &store, 1, [0]),
+  );
   let objects = read_whole(&pack, format, &NoIndex, &mut Admission::new(u64::MAX))
     .unwrap()
     .objects;
@@ -356,7 +369,7 @@ fn a_clone_is_its_base_pack_and_the_fragments_after_it() {
     .collect();
   let cloned = unpacked(
     format,
-    &pack_of(&repository, &store, repository.reached(1).unwrap()),
+    &pack_of(&repository, &store, &reached_now(&repository, &store, 1)),
   );
   assert_eq!(cloned.keys().copied().collect::<BTreeSet<_>>(), reach);
   let third = commit_over(format, &text(200, &[3]), &[second[0].id], 3);
@@ -372,7 +385,7 @@ fn a_clone_is_its_base_pack_and_the_fragments_after_it() {
     .unwrap();
   let cloned = unpacked(
     format,
-    &pack_of(&repository, &store, repository.reached(1).unwrap()),
+    &pack_of(&repository, &store, &reached_now(&repository, &store, 1)),
   );
   assert!(third.iter().all(|object| cloned.contains_key(&object.id)));
   assert_eq!(repository.counters().rebuilds, 1);
@@ -391,7 +404,11 @@ fn a_sample_pack_for_verify_pack() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, ..) = two_versions(format, &mut store);
-  let pack = pack_of(&repository, &store, &brought_by(&repository, 1, 0..=1));
+  let pack = pack_of(
+    &repository,
+    &store,
+    &brought_by(&repository, &store, 1, 0..=1),
+  );
   let hex: String = pack.iter().map(|byte| format!("{byte:02x}")).collect();
   std::io::stdout().write_all(hex.as_bytes()).unwrap();
   repository.release(&mut store).unwrap();
@@ -428,7 +445,11 @@ fn double_hashing_costs() {
   repository
     .encode_fragments(&mut store, (1, 0), &mut Ticks(0), EXCHANGE)
     .unwrap();
-  let pack = pack_of(&repository, &store, &brought_by(&repository, 1, [0]));
+  let pack = pack_of(
+    &repository,
+    &store,
+    &brought_by(&repository, &store, 1, [0]),
+  );
   let start = Instant::now();
   let read = read_whole(&pack, format, &NoIndex, &mut Admission::new(u64::MAX)).unwrap();
   let reading = start.elapsed();
