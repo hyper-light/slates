@@ -112,10 +112,11 @@ cc = "1.4"
 # `AWS_LC_SYS_NO_JITTER_ENTROPY`), so AWS-LC seeds from the operating system's generator and a new process pays no
 # start-up latency for its first random bytes. Vetted primitives — the project never hand-rolls cryptography.
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "alloc"] }
-# SHA-1 with collision detection for git's object names (§4.17.2, A-600), as git's own sha1dc detects the SHAttered and
-# later attacks: RustCrypto's pure-Rust port of Stevens and Shumow's sha1collisiondetection (repository
-# RustCrypto/hashes), over RustCrypto's `sha1` and `digest`. Approved by main (2026-11-19) as RustCrypto's, pure Rust,
-# and refusing git's own t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`). No default features: neither
+# SHA-1 with collision detection for git's object names (§4.17.2, A-600) and Mercurial's nodes (§4.17.3, A-588), as git's
+# own sha1dc and Mercurial 7.2's sha1dc binding (`thirdparty/sha1dc/cext.c`) detect the SHAttered and later attacks:
+# RustCrypto's pure-Rust port of Stevens and Shumow's sha1collisiondetection (repository RustCrypto/hashes), over
+# RustCrypto's `sha1` and `digest`. Approved by main (2026-11-19) as RustCrypto's, pure Rust, and refusing git's own
+# t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`, `crates/hg/src/node.rs`). No default features: neither
 # `std` nor the OID tables are used.
 sha1-checked = { version = "0.10.0", default-features = false }
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).

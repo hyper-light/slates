@@ -14,6 +14,14 @@
 #       (`filelog.renamed`), every value hex-encoded;
 #   log.txt        the graph.
 # Last it prints the SHA-1 7.2's `hashutil` uses (sha1dc's when its C extension is built) and every file's SHA-256.
+#
+# Run twice to make the fixtures beside this script, on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 03:52 and
+# 03:54 UTC, with uv's Mercurial 7.2 from PyPI on CPython 3.12, through kiln (sync off), from a clone of the branch at
+# ea134bdf6, exactly:
+#   D=$(mktemp -d ~/.cache/g291-a588.XXXXXX) && mkdir "$D/out" && bash crates/hg/fixtures/objects/make-object-fixtures.sh "$D/out"
+# Both runs printed `hashutil.sha1 is <class 'sha1dc.sha1'>` (7.2 hashed every node with collision detection) and the
+# same SHA-256 for all 42 files, and the copies here were checked equal to them. The stored texts are byte for byte the
+# ones the storage API's `revision()` gave this script's first version.
 set -euo pipefail
 OUT=$(cd "$1" && pwd)
 export HGPLAIN=1 HGRCPATH= HGENCODING=utf-8 PYTHONHASHSEED=0 TZ=UTC LC_ALL=C

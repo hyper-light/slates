@@ -15,18 +15,16 @@
 
 use core::slice::Split;
 
+use crate::node::{from_hex, write_hex};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
-use crate::{NODE_LEN, Node};
+use crate::Node;
 
 /// Format: the byte that ends each line.
 const NEWLINE: u8 = b'\n';
 
 /// Format: the byte between a path and its node.
 const NUL: u8 = 0;
-
-/// Format: hexadecimal, the base of a node's digits.
-const HEX_RADIX: u32 = 16;
 
 /// Format: the hexadecimal digits that write a node.
 const NODE_HEX_LEN: usize = 40;
@@ -158,14 +156,10 @@ fn parse(line: &[u8]) -> Option<Entry<'_>> {
     [byte] => Flag::from_byte(*byte)?,
     _ => return None,
   };
-  let (pairs, _) = hex.as_chunks::<2>();
-  let mut node = [0; NODE_LEN];
-  for (byte, pair) in node.iter_mut().zip(pairs) {
-    if pair.iter().any(u8::is_ascii_uppercase) {
-      return None;
-    }
-    *byte = crate::quote::hex_pair(pair)?;
+  if hex.iter().any(u8::is_ascii_uppercase) {
+    return None;
   }
+  let node = from_hex(hex)?;
   Some(Entry { path, node, flag })
 }
 
@@ -217,12 +211,7 @@ fn write(entries: &[Entry<'_>], out: &mut impl Out) {
   for entry in entries {
     out.put(entry.path);
     out.put(&[NUL]);
-    for byte in entry.node {
-      for digit in [u32::from(byte) / HEX_RADIX, u32::from(byte) % HEX_RADIX] {
-        let character = char::from_digit(digit, HEX_RADIX).unwrap_or('0');
-        out.put(&[u8::try_from(character).unwrap_or(b'0')]);
-      }
-    }
+    write_hex(&entry.node, out);
     if let Some(flag) = entry.flag.byte() {
       out.put(&[flag]);
     }
@@ -340,6 +329,37 @@ mod tests {
       let mut text = Vec::new();
       encode(&entries, &mut text).unwrap();
       prop_assert_eq!(decode(&text).unwrap().collect::<Vec<_>>(), entries);
+    }
+
+    /// AC-HG.9, A-588: do change one byte of a manifest 7.2 would write to any value, or cut the manifest at any byte.
+    /// Expect a refusal, or entries that write back to exactly the changed bytes; never a panic.
+    #[test]
+    fn changed_manifests_read_back_or_are_refused(
+      generated in proptest::collection::btree_map("[a-z/._-]{1,10}", (any::<[u8; 20]>(), 0_u8..3), 1..6),
+      at in any::<proptest::sample::Index>(),
+      byte in any::<u8>(),
+      cut in any::<bool>(),
+    ) {
+      let flags = [Flag::Regular, Flag::Executable, Flag::Link];
+      let entries: Vec<Entry<'_>> = generated.iter().map(|(path, (node, flag))| Entry {
+        path: path.as_bytes(),
+        node: *node,
+        flag: flags[usize::from(*flag)],
+      }).collect();
+      let mut text = Vec::new();
+      encode(&entries, &mut text).unwrap();
+      let at = at.index(text.len());
+      if cut {
+        text.truncate(at);
+      } else {
+        text[at] = byte;
+      }
+      if let Ok(read) = decode(&text) {
+        let read: Vec<_> = read.collect();
+        let mut out = Vec::new();
+        encode(&read, &mut out).unwrap();
+        prop_assert_eq!(out, text);
+      }
     }
 
     /// AC-HG.9, A-588: do read arbitrary bytes as a manifest. Expect entries that write back to the same bytes, or a

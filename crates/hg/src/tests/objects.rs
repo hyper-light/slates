@@ -1,20 +1,42 @@
-//! Golden tests of the objects (A-588): every revision one repository's history stored through stock Mercurial 7.2
-//! (`fixtures/objects`): each node computed from its parents and text, each changeset, manifest and file revision read
-//! as 7.2 reads it, and each written back to its stored bytes.
+//! Golden tests of the objects (A-588; AC-HG.2): every revision one repository's history stored through stock
+//! Mercurial 7.2 (`fixtures/objects`), each log listed by 7.2's `debugindex --debug` and each text written by its
+//! `debugdata`: each node computed from its parents and text, each changeset, manifest and file revision read as 7.2
+//! reads it, and each written back to its stored bytes.
 
-use crate::fixtures::{hex, objects::file};
+use crate::fixtures::{
+  hex,
+  objects::{file, names},
+};
 use crate::manifest::Flag;
 use crate::{Admission, Node, changeset, filerev, manifest, node};
 
-/// One revision of the index 7.2's storage wrote: its log, its name in that log, its number, node, parents and file.
+/// A log's listing file and the prefix of its revisions' text files.
+const CHANGELOG: (&str, &str) = ("index-changelog.txt", "changeset");
+
+/// The manifest log's.
+const MANIFEST_LOG: (&str, &str) = ("index-manifest.txt", "manifest");
+
+/// The prefix of a file log's listing.
+const FILE_LOG_PREFIX: &str = "index-file-";
+
+/// One revision as 7.2's `debugindex --debug` listed it, with the text its `debugdata` wrote.
 struct Stored {
-  log: String,
-  name: String,
-  rev: String,
+  /// Its number in its log.
+  rev: usize,
+  /// The changeset that introduced it (`linkrev`).
+  link: usize,
+  /// Its node.
   node: Node,
+  /// Its first parent's node.
   p1: Node,
+  /// Its second parent's node.
   p2: Node,
-  file: String,
+  /// Its text's length as 7.2's index records it.
+  full_size: usize,
+  /// Its index flags.
+  flags: u16,
+  /// Its text.
+  text: &'static [u8],
 }
 
 /// Bytes from hexadecimal, `-` for none.
@@ -34,22 +56,47 @@ fn to_node(text: &str) -> Node {
   Node::try_from(unhex(text).as_slice()).unwrap()
 }
 
-/// Every revision `index.txt` lists.
-fn stored() -> Vec<Stored> {
-  let index = core::str::from_utf8(file("index.txt")).unwrap();
-  index
-    .lines()
+/// Every revision of the log `listing` names, its texts in the files `<prefix>-<rev>.txt`: each row's columns found by
+/// the header's names, every row as wide as the header.
+fn log(listing: &str, prefix: &str) -> Vec<Stored> {
+  let text = core::str::from_utf8(file(listing)).unwrap();
+  let mut lines = text.lines();
+  let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+  let column = |name: &str| header.iter().position(|known| *known == name).unwrap();
+  let (rev, link, node, p1, p2, size, flags) = (
+    column("rev"),
+    column("linkrev"),
+    column("nodeid"),
+    column("p1-nodeid"),
+    column("p2-nodeid"),
+    column("full-size"),
+    column("flags"),
+  );
+  lines
     .map(|line| {
-      let fields: Vec<&str> = line.split(' ').collect();
+      let fields: Vec<&str> = line.split_whitespace().collect();
+      assert_eq!(fields.len(), header.len(), "{listing}: {line}");
       Stored {
-        log: fields[0].to_string(),
-        name: fields[1].to_string(),
-        rev: fields[2].to_string(),
-        node: to_node(fields[3]),
-        p1: to_node(fields[4]),
-        p2: to_node(fields[5]),
-        file: fields[6].to_string(),
+        rev: fields[rev].parse().unwrap(),
+        link: fields[link].parse().unwrap(),
+        node: to_node(fields[node]),
+        p1: to_node(fields[p1]),
+        p2: to_node(fields[p2]),
+        full_size: fields[size].parse().unwrap(),
+        flags: fields[flags].parse().unwrap(),
+        text: file(&format!("{prefix}-{}.txt", fields[rev])),
       }
+    })
+    .collect()
+}
+
+/// Every file log: each path and its revisions.
+fn file_logs() -> Vec<(String, Vec<Stored>)> {
+  names()
+    .filter_map(|name| name.strip_prefix(FILE_LOG_PREFIX)?.strip_suffix(".txt"))
+    .map(|path| {
+      let listing = format!("{FILE_LOG_PREFIX}{path}.txt");
+      (path.to_string(), log(&listing, &format!("file-{path}")))
     })
     .collect()
 }
@@ -64,28 +111,19 @@ fn expected(kind: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-/// The stored revisions of one log.
-fn of_log(log: &str) -> Vec<Stored> {
-  stored()
-    .into_iter()
-    .filter(|revision| revision.log == log)
-    .collect()
-}
-
-/// A changeset's extras as 7.2 reads them: its own, with `branch` `default` where it names no branch, sorted by key.
+/// A changeset's extras as 7.2 reads them: its own, the later of a key given twice, with `branch` `default` where it
+/// names no branch, sorted by key.
 fn extras(read: &changeset::Changeset<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
   let mut buffer = Vec::new();
-  let mut found: Vec<(Vec<u8>, Vec<u8>)> = read
+  let mut found = std::collections::BTreeMap::new();
+  found.insert(b"branch".to_vec(), b"default".to_vec());
+  for (key, value) in read
     .extras(&mut Admission::new(1 << 20), &mut buffer)
     .unwrap()
-    .into_iter()
-    .map(|(key, value)| (key.to_vec(), value.to_vec()))
-    .collect();
-  if !found.iter().any(|(key, _)| key == b"branch") {
-    found.push((b"branch".to_vec(), b"default".to_vec()));
+  {
+    found.insert(key.to_vec(), value.to_vec());
   }
-  found.sort();
-  found
+  found.into_iter().collect()
 }
 
 /// The extras `expected.txt` lists for a changeset: `key:value` pairs in hexadecimal.
@@ -107,39 +145,50 @@ fn expected_extras(field: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     .collect()
 }
 
-/// A-588 (golden): do compute the node of every revision 7.2 stored, from its parents and its text (a file revision's
-/// metadata block included). Expect each node 7.2 gave it: eleven changesets, nine manifests and ten file revisions.
+/// A-588 (golden; AC-HG.2): do compute the node of every revision 7.2 stored, from the parents its `debugindex` lists
+/// and the text its `debugdata` wrote (a file revision's metadata block included). Expect each node 7.2 gave it, each
+/// text as long as 7.2's index says, no flag set, and every log present: eleven changesets, nine manifests, and ten
+/// file revisions in eight file logs.
 #[test]
 fn every_revision_hashes_to_its_node() {
-  let all = stored();
-  assert_eq!(all.len(), 30);
-  for revision in &all {
-    let text = file(&revision.file);
-    assert_eq!(
-      node::check(&revision.node, &revision.p1, &revision.p2, text),
-      Ok(()),
-      "{} {} {}",
-      revision.log,
-      revision.name,
-      revision.rev
-    );
+  let mut logs = vec![
+    ("changelog".to_string(), log(CHANGELOG.0, CHANGELOG.1)),
+    ("manifest".to_string(), log(MANIFEST_LOG.0, MANIFEST_LOG.1)),
+  ];
+  let files = file_logs();
+  assert_eq!(files.len(), 8);
+  logs.extend(files);
+  let counts: Vec<usize> = logs.iter().map(|(_, revisions)| revisions.len()).collect();
+  assert_eq!(counts[..2], [11, 9]);
+  assert_eq!(counts[2..].iter().sum::<usize>(), 10);
+  for (name, revisions) in &logs {
+    for (position, stored) in revisions.iter().enumerate() {
+      assert_eq!(stored.rev, position, "{name}");
+      assert_eq!(stored.text.len(), stored.full_size, "{name} {}", stored.rev);
+      assert_eq!(stored.flags, 0, "{name} {}", stored.rev);
+      assert_eq!(
+        node::check(&stored.node, &stored.p1, &stored.p2, stored.text),
+        Ok(()),
+        "{name} {}",
+        stored.rev
+      );
+    }
   }
 }
 
 /// A-588 (golden): do read every changeset 7.2 stored. Expect the manifest, user, time, timezone, description, files
 /// and extras 7.2 reads from each: a branch's empty file list, the timezone of `-3600`, the description of several
-/// lines, the closed head's `close`, the user beyond ASCII, and the extras holding every escaped byte.
+/// lines, the closed head's `close`, the user beyond ASCII, and the extras holding every escaped byte; and each
+/// changeset its own link.
 #[test]
 fn every_changeset_reads_as_mercurial_reads_it() {
-  let changesets = of_log("changeset");
-  for (revision, fields) in changesets.iter().zip(expected("changeset")) {
-    let read = changeset::decode(file(&revision.file)).unwrap();
-    assert_eq!(
-      read.manifest_node(),
-      Ok(to_node(&fields[2])),
-      "{}",
-      revision.rev
-    );
+  let changesets = log(CHANGELOG.0, CHANGELOG.1);
+  let wanted = expected("changeset");
+  assert_eq!(changesets.len(), wanted.len());
+  for (stored, fields) in changesets.iter().zip(wanted) {
+    assert_eq!((stored.link, stored.rev.to_string()), (stored.rev, fields[1].clone()));
+    let read = changeset::decode(stored.text).unwrap();
+    assert_eq!(read.manifest_node(), Ok(to_node(&fields[2])), "{}", stored.rev);
     assert_eq!(
       (read.user, read.time, read.timezone),
       (
@@ -150,29 +199,26 @@ fn every_changeset_reads_as_mercurial_reads_it() {
     );
     assert_eq!(read.description, unhex(&fields[6]).as_slice());
     let files: Vec<Vec<u8>> = read.file_names().map(<[u8]>::to_vec).collect();
-    let wanted: Vec<Vec<u8>> = fields[7]
+    let touched: Vec<Vec<u8>> = fields[7]
       .split(',')
       .filter(|name| *name != "-")
       .map(unhex)
       .collect();
-    assert_eq!(files, wanted);
-    assert_eq!(
-      extras(&read),
-      expected_extras(&fields[8]),
-      "{}",
-      revision.rev
-    );
+    assert_eq!(files, touched);
+    assert_eq!(extras(&read), expected_extras(&fields[8]), "{}", stored.rev);
   }
 }
 
-/// A-588 (golden): do write every changeset 7.2 stored back from what was read of it. Expect its stored bytes.
+/// A-588 (golden): do write every changeset 7.2 stored back from what was read of it. Expect its stored bytes, at the
+/// length `encoded_len` gave.
 #[test]
 fn every_changeset_writes_back_to_its_bytes() {
-  for revision in of_log("changeset") {
-    let text = file(&revision.file);
+  for stored in log(CHANGELOG.0, CHANGELOG.1) {
+    let read = changeset::decode(stored.text).unwrap();
     let mut out = Vec::new();
-    changeset::encode(&changeset::decode(text).unwrap(), &mut out).unwrap();
-    assert_eq!(out, text, "{}", revision.rev);
+    changeset::encode(&read, &mut out).unwrap();
+    assert_eq!(out, stored.text, "{}", stored.rev);
+    assert_eq!(changeset::encoded_len(&read), Ok(u64::try_from(stored.full_size).unwrap()));
   }
 }
 
@@ -186,27 +232,22 @@ fn flag_letter(flag: Flag) -> &'static str {
 }
 
 /// A-588 (golden): do read every changeset's manifest 7.2 stored, found by the node the changeset names, and write it
-/// back. Expect the paths, file nodes and flags (`x`, `l`) 7.2 reads, in order, and the stored bytes.
+/// back. Expect the paths, file nodes and flags (`x`, `l`) 7.2 reads, in order, each file node one its path's log
+/// holds, and the stored bytes.
 #[test]
 fn every_manifest_reads_as_mercurial_reads_it() {
-  let manifests = of_log("manifest");
+  let manifests = log(MANIFEST_LOG.0, MANIFEST_LOG.1);
+  let files = file_logs();
   let entries = expected("entry");
   for fields in expected("changeset") {
     let stored = manifests
       .iter()
       .find(|revision| hex(&revision.node) == fields[2])
       .unwrap();
-    let text = file(&stored.file);
-    let read: Vec<manifest::Entry<'_>> = manifest::decode(text).unwrap().collect();
+    let read: Vec<manifest::Entry<'_>> = manifest::decode(stored.text).unwrap().collect();
     let found: Vec<(Vec<u8>, Node, String)> = read
       .iter()
-      .map(|entry| {
-        (
-          entry.path.to_vec(),
-          entry.node,
-          flag_letter(entry.flag).to_string(),
-        )
-      })
+      .map(|entry| (entry.path.to_vec(), entry.node, flag_letter(entry.flag).to_string()))
       .collect();
     let wanted: Vec<(Vec<u8>, Node, String)> = entries
       .iter()
@@ -214,35 +255,51 @@ fn every_manifest_reads_as_mercurial_reads_it() {
       .map(|entry| (unhex(&entry[2]), to_node(&entry[3]), entry[4].clone()))
       .collect();
     assert_eq!(found, wanted, "changeset {}", fields[1]);
+    for entry in &read {
+      let (_, revisions) = files
+        .iter()
+        .find(|(path, _)| path.as_bytes() == entry.path)
+        .unwrap();
+      assert!(revisions.iter().any(|revision| revision.node == entry.node));
+    }
     let mut out = Vec::new();
     manifest::encode(&read, &mut out).unwrap();
-    assert_eq!(out, text);
+    assert_eq!(out, stored.text);
+    assert_eq!(manifest::encoded_len(&read), Ok(u64::try_from(stored.full_size).unwrap()));
   }
 }
 
-/// A-588 (golden): do split every file revision 7.2 stored and pack it again. Expect the copy 7.2 reads (`c` copied
-/// from `a` at `a`'s node), the empty block 7.2 wrote before bytes that begin as one does, and the stored bytes.
+/// A-588 (golden): do split every file revision 7.2 stored, read its copy with the first parent 7.2's index lists,
+/// write the split back, pack its entries again, and order its parents as 7.2 stores them. Expect the copy 7.2's
+/// `renamed` reads (`c` copied from `a` at `a`'s second node, and nothing else), the empty block 7.2 wrote before bytes
+/// that begin as one does, the stored bytes from both writers, and the parents as 7.2's index lists them.
 #[test]
 fn every_file_revision_keeps_its_metadata_apart() {
-  let files = of_log("file");
-  for fields in expected("filerev") {
+  let files = file_logs();
+  let wanted = expected("filerev");
+  assert_eq!(wanted.len(), 10);
+  for fields in wanted {
     let path = unhex(&fields[1]);
-    let stored = files
+    let (_, revisions) = files
       .iter()
-      .find(|revision| revision.name.as_bytes() == path && revision.rev == fields[2])
+      .find(|(name, _)| name.as_bytes() == path)
       .unwrap();
-    let text = file(&stored.file);
-    let read = filerev::split(text).unwrap();
+    let stored = &revisions[fields[2].parse::<usize>().unwrap()];
+    let read = filerev::split(stored.text).unwrap();
     let copy = read
-      .copy()
+      .copy(&stored.p1)
       .unwrap()
       .map(|copy| (copy.path.to_vec(), copy.node));
-    let wanted = (fields[3] != "-").then(|| (unhex(&fields[3]), to_node(&fields[4])));
-    assert_eq!(copy, wanted, "{}", stored.name);
+    let copied = (fields[3] != "-").then(|| (unhex(&fields[3]), to_node(&fields[4])));
+    assert_eq!(copy, copied, "{}", fields[1]);
+    let mut again = Vec::new();
+    read.encode(&mut again).unwrap();
+    assert_eq!(again, stored.text);
     let entries: Vec<(&[u8], &[u8])> = read.entries().collect();
-    let mut out = Vec::new();
-    filerev::pack(&entries, read.bytes, &mut out).unwrap();
-    assert_eq!(out, text, "{}", stored.name);
+    let mut packed = Vec::new();
+    filerev::pack(&entries, read.bytes, &mut packed).unwrap();
+    assert_eq!(packed, stored.text);
+    assert_eq!(read.parents_as_stored(stored.p1, stored.p2), (stored.p1, stored.p2));
   }
   let meta = filerev::split(file("file-meta-0.txt")).unwrap();
   assert_eq!(meta.metadata, Some(&[][..]));

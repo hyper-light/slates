@@ -1,17 +1,28 @@
-//! A file revision's text (A-588; `utils/storageutil.py` `parsemeta` and `packmeta`, `filelog.py` `filelog.add` and
-//! `renamed` [C]): the file's bytes, behind a metadata block when it has one: `\x01\n`, a `key: value` line per key
-//! (sorted), and `\x01\n` again. 7.2 writes a block for a copy (`copy`, the source's path, and `copyrev`, the source's
-//! file node in hexadecimal) and, empty, before bytes that themselves begin with `\x01\n`, so that they are not read as
-//! one. The design keeps the block apart from the bytes (§4.17.3, the index), so a file's bytes are the same content
-//! in every tree.
+//! A file revision's text (A-588; `utils/storageutil.py` `parsemeta` and `packmeta`, `filelog.py` `add`, `has_meta`
+//! and `renamed`, `revlogutils/rewrite.py` `_has_bad_parents` [C]): the file's bytes, behind a metadata block when it
+//! has one: `\x01\n`, a `key: value` line per key (sorted), and `\x01\n` again. 7.2 writes a block for a copy (`copy`,
+//! the source's path, and `copyrev`, the source's file node in hexadecimal) and, empty, before bytes that themselves
+//! begin with `\x01\n`, so that they are not read as one. The design keeps the block apart from the bytes (§4.17.3, the
+//! index), so a file's bytes are the same content in every tree.
 //!
-//! A text is split in place; a block is checked whole first. 7.2 fails on a block that is never closed and on a line
-//! without `: `, and these are refused by kind; so is a copy without its source's node, which 7.2's `renamed` fails on.
+//! A text is split in place, its block checked whole first, and [`FileRevision::encode`] writes a split text back to
+//! exactly its bytes: whatever [`split`] reads, the writer writes back, and whatever the writer writes, `split` reads
+//! back as the same block and bytes. [`pack`] instead writes a new text from entries, as 7.2's `filelog.add` does. 7.2
+//! fails on a block that is never closed and on a block line without `: `, and both are refused by kind.
+//!
+//! **A copy, as 7.2 reads one.** `renamed` reads a copy only from a revision whose first parent is null (7.2's commit
+//! gives a copy a null first parent, so a revision with another first parent "has no copy metadata"), and only when the
+//! block names both `copy` and `copyrev`: "copy and copyrev occur in pairs. In rare cases due to old bugs, one can occur
+//! without the other", and such a block reads as no copy. A `copyrev` that is not forty hexadecimal digits is refused
+//! (7.2's `bin` raises on most, and a shorter node names nothing). Which parent comes first is 7.2's to keep: since
+//! Mercurial 5.8 wrote some copies' parents the other way round (issue6528), 7.2 swaps them back on every incoming file
+//! revision ([`FileRevision::parents_as_stored`]); the node is unchanged, as it hashes the parents in order of value.
 
 use crate::lines::lines;
+use crate::node::from_hex;
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
-use crate::{NODE_LEN, Node};
+use crate::{NULL_NODE, Node};
 
 /// Format: the bytes that open and close a metadata block (`\x01\n`).
 pub const MARKER: &[u8] = b"\x01\n";
@@ -45,7 +56,7 @@ pub struct FileRevision<'a> {
 
 /// A copy: its source's path and file node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Copy<'a> {
+pub struct CopySource<'a> {
   /// The source's path.
   pub path: &'a [u8],
   /// The source's file node.
@@ -62,19 +73,23 @@ pub enum Refusal {
     /// The line's index.
     line: u64,
   },
-  /// A copy without its source's node, or one that is not forty hexadecimal digits.
+  /// A copy whose `copyrev` is not forty hexadecimal digits.
   Copy,
 }
 
 /// Why a file revision could not be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeRefusal {
-  /// A key holding `: ` or a line end, or a value holding a line end or ending as a marker begins, which would read
-  /// back as other lines.
+  /// A key holding `: ` or a line end, a value holding a line end or ending as a marker begins, which would read back
+  /// as other lines, or a key given twice, which 7.2's dictionary cannot hold.
   Entry {
     /// The entry's index.
     entry: usize,
   },
+  /// A block [`split`] would not read back as itself: a line without `: `, or the closing marker inside it.
+  Block,
+  /// Bytes that begin as a block does with no block before them, which would read back as a block.
+  Bytes,
 }
 
 /// A block line's key and value, split at its first `: `.
@@ -88,6 +103,18 @@ fn split_entry(line: &[u8]) -> Option<(&[u8], &[u8])> {
   ))
 }
 
+/// The index of a block's first line without `: `, as 7.2's `parsemeta` cuts it (`splitlines`), if one has none.
+fn bad_line(block: &[u8]) -> Option<usize> {
+  lines(block).position(|line| split_entry(line).is_none())
+}
+
+/// Where a marker first stands in `bytes`.
+fn find_marker(bytes: &[u8]) -> Option<usize> {
+  bytes
+    .windows(MARKER.len())
+    .position(|window| window == MARKER)
+}
+
 /// A file revision's text split into its block and its bytes, the block checked whole first.
 pub fn split(text: &[u8]) -> Result<FileRevision<'_>, Refusal> {
   let Some(rest) = text.strip_prefix(MARKER) else {
@@ -96,15 +123,12 @@ pub fn split(text: &[u8]) -> Result<FileRevision<'_>, Refusal> {
       bytes: text,
     });
   };
-  let end = rest
-    .windows(MARKER.len())
-    .position(|window| window == MARKER)
-    .ok_or(Refusal::Unclosed)?;
+  let end = find_marker(rest).ok_or(Refusal::Unclosed)?;
   let block = rest.get(..end).unwrap_or_default();
-  for (index, line) in lines(block).enumerate() {
-    split_entry(line).ok_or(Refusal::Entry {
+  if let Some(index) = bad_line(block) {
+    return Err(Refusal::Entry {
       line: to_u64(index),
-    })?;
+    });
   }
   Ok(FileRevision {
     metadata: Some(block),
@@ -129,29 +153,73 @@ impl<'a> FileRevision<'a> {
       .map(|(_, value)| value)
   }
 
-  /// The copy the block records, if it records one (`renamed`).
-  pub fn copy(&self) -> Result<Option<Copy<'a>>, Refusal> {
-    let Some(path) = self.value(COPY) else {
+  /// The copy 7.2's `renamed` reads from this revision when `p1` is its first parent: none unless `p1` is null and the
+  /// block names both `copy` and `copyrev`.
+  pub fn copy(&self, p1: &Node) -> Result<Option<CopySource<'a>>, Refusal> {
+    if *p1 != NULL_NODE {
+      return Ok(None);
+    }
+    let (Some(path), Some(hex)) = (self.value(COPY), self.value(COPY_REV)) else {
       return Ok(None);
     };
-    let hex = self.value(COPY_REV).ok_or(Refusal::Copy)?;
-    let (pairs, odd) = hex.as_chunks::<2>();
-    if !odd.is_empty() || pairs.len() != NODE_LEN {
-      return Err(Refusal::Copy);
+    let node = from_hex(hex).ok_or(Refusal::Copy)?;
+    Ok(Some(CopySource { path, node }))
+  }
+
+  /// The parents in the order 7.2 stores them (`_has_bad_parents`, applied to every incoming file revision unless
+  /// `storage.revlog.issue6528.fix-incoming` is off): a revision with a block and one null parent keeps the null one
+  /// first, and one without a block keeps it second. A censored revision is never reordered, as 7.2 reads none of it;
+  /// its caller passes its parents as they came.
+  pub fn parents_as_stored(&self, p1: Node, p2: Node) -> (Node, Node) {
+    let swapped = if self.metadata.is_some() {
+      p1 != NULL_NODE && p2 == NULL_NODE
+    } else {
+      p1 == NULL_NODE && p2 != NULL_NODE
+    };
+    if swapped { (p2, p1) } else { (p1, p2) }
+  }
+
+  /// Appends the text this split came from: the block between its markers when there is one, then the bytes; refused
+  /// where [`split`] would read the text back as another.
+  pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+    self.check()?;
+    self.write(out);
+    Ok(())
+  }
+
+  /// The length of the text [`FileRevision::encode`] writes, for a caller that charges it first; refused as it refuses.
+  pub fn encoded_len(&self) -> Result<u64, EncodeRefusal> {
+    self.check()?;
+    let mut measure = Measure(0);
+    self.write(&mut measure);
+    Ok(measure.0)
+  }
+
+  /// Refuses a split [`split`] would read back as another.
+  fn check(&self) -> Result<(), EncodeRefusal> {
+    match self.metadata {
+      None if self.bytes.starts_with(MARKER) => Err(EncodeRefusal::Bytes),
+      Some(block) if find_marker(block).is_some() || bad_line(block).is_some() => Err(EncodeRefusal::Block),
+      _ => Ok(()),
     }
-    let mut node = [0; NODE_LEN];
-    for (byte, pair) in node.iter_mut().zip(pairs) {
-      *byte = crate::quote::hex_pair(pair).ok_or(Refusal::Copy)?;
+  }
+
+  /// Writes a split [`FileRevision::check`] passed.
+  fn write(&self, out: &mut impl Out) {
+    if let Some(block) = self.metadata {
+      out.put(MARKER);
+      out.put(block);
+      out.put(MARKER);
     }
-    Ok(Some(Copy { path, node }))
+    out.put(self.bytes);
   }
 }
 
 /// The length of the text [`pack`] writes, for a caller that charges it first; refused as it refuses.
 pub fn packed_len(metadata: &[(&[u8], &[u8])], bytes: &[u8]) -> Result<u64, EncodeRefusal> {
-  check(metadata)?;
+  check_entries(metadata)?;
   let mut measure = Measure(0);
-  write(metadata, bytes, &mut measure);
+  write_packed(metadata, bytes, &mut measure);
   Ok(measure.0)
 }
 
@@ -162,28 +230,33 @@ pub fn pack(
   bytes: &[u8],
   out: &mut Vec<u8>,
 ) -> Result<(), EncodeRefusal> {
-  check(metadata)?;
-  write(metadata, bytes, out);
+  check_entries(metadata)?;
+  write_packed(metadata, bytes, out);
   Ok(())
 }
 
-/// Refuses an entry that would read back as other lines.
-fn check(metadata: &[(&[u8], &[u8])]) -> Result<(), EncodeRefusal> {
+/// Refuses an entry that would read back as other lines, and a key given twice.
+fn check_entries(metadata: &[(&[u8], &[u8])]) -> Result<(), EncodeRefusal> {
   let breaks = |byte: &u8| *byte == NEWLINE || *byte == RETURN;
   for (index, (key, value)) in metadata.iter().enumerate() {
     let key_splits = key
       .windows(KEY_SEPARATOR.len())
       .any(|window| window == KEY_SEPARATOR);
     let closes = value.last() == Some(&MARKER_START);
-    if key_splits || closes || key.iter().any(breaks) || value.iter().any(breaks) {
+    let again = metadata
+      .get(..index)
+      .unwrap_or_default()
+      .iter()
+      .any(|(earlier, _)| earlier == key);
+    if key_splits || closes || again || key.iter().any(breaks) || value.iter().any(breaks) {
       return Err(EncodeRefusal::Entry { entry: index });
     }
   }
   Ok(())
 }
 
-/// Writes a text [`check`] passed.
-fn write(metadata: &[(&[u8], &[u8])], bytes: &[u8], out: &mut impl Out) {
+/// Writes a text [`check_entries`] passed.
+fn write_packed(metadata: &[(&[u8], &[u8])], bytes: &[u8], out: &mut impl Out) {
   if !metadata.is_empty() || bytes.starts_with(MARKER) {
     let mut sorted: Vec<&(&[u8], &[u8])> = metadata.iter().collect();
     sorted.sort_by(|left, right| left.0.cmp(right.0));
@@ -201,13 +274,16 @@ fn write(metadata: &[(&[u8], &[u8])], bytes: &[u8], out: &mut impl Out) {
 
 #[cfg(test)]
 mod tests {
-  use super::{Copy, EncodeRefusal, FileRevision, Refusal, pack, packed_len, split};
+  use super::{CopySource, EncodeRefusal, FileRevision, Refusal, pack, packed_len, split};
+  use crate::NULL_NODE;
+  use crate::fixtures::node;
   use proptest::prelude::*;
 
   const SOURCE_NODE: &[u8] = b"b6d7ec209a65c0afe68d5b7b14b68848981fd7fa";
 
-  /// A-588: do split a copy's text and pack it again. Expect its block apart from its bytes, the copy's source and
-  /// node, and the same text at the length `packed_len` gave.
+  /// A-588: do split a copy's text, read its copy with a null first parent and with another, write the split back,
+  /// and pack its entries again. Expect its block apart from its bytes, the copy's source and node with the null
+  /// parent and no copy with the other (7.2's `renamed`), and the same text from both writers at the lengths they gave.
   #[test]
   fn a_copy_keeps_its_block_apart() {
     let text = [
@@ -218,11 +294,16 @@ mod tests {
     .concat();
     let read = split(&text).unwrap();
     assert_eq!(read.bytes, b"a\nb\n");
-    let copy = read.copy().unwrap().unwrap();
+    let copy = read.copy(&NULL_NODE).unwrap().unwrap();
     assert_eq!(
       (copy.path, crate::fixtures::hex(&copy.node).as_bytes()),
       (&b"a"[..], SOURCE_NODE)
     );
+    assert_eq!(read.copy(&[1; 20]), Ok(None));
+    let mut again = Vec::new();
+    read.encode(&mut again).unwrap();
+    assert_eq!(again, text);
+    assert_eq!(read.encoded_len(), Ok(u64::try_from(text.len()).unwrap()));
     let entries: Vec<(&[u8], &[u8])> = read.entries().collect();
     let mut out = Vec::new();
     pack(&entries, read.bytes, &mut out).unwrap();
@@ -259,8 +340,44 @@ mod tests {
     );
   }
 
-  /// AC-HG.9 (hostile input), A-588: do split a block never closed and a block line without `: `, and read copies
-  /// without a node and with a short one. Expect `Unclosed`, `Entry` at its line, and `Copy`.
+  /// A-588 (7.2's `renamed`: "copy and copyrev occur in pairs. In rare cases due to old bugs, one can occur without the
+  /// other"). Do: read the copy of blocks naming `copy` alone, `copyrev` alone, and both with `copyrev` short. Expect no
+  /// copy for either half alone, as 7.2 reads them, and the short node refused.
+  #[test]
+  fn half_a_copy_is_no_copy() {
+    let lone_copy = split(b"\x01\ncopy: a\n\x01\nx").unwrap();
+    assert_eq!(lone_copy.copy(&NULL_NODE), Ok(None));
+    let lone_rev = [&b"\x01\ncopyrev: "[..], SOURCE_NODE, b"\n\x01\nx"].concat();
+    assert_eq!(split(&lone_rev).unwrap().copy(&NULL_NODE), Ok(None));
+    let short = split(b"\x01\ncopy: a\ncopyrev: abc\n\x01\nx").unwrap();
+    assert_eq!(short.copy(&NULL_NODE), Err(Refusal::Copy));
+    assert_eq!(split(b"x").unwrap().copy(&NULL_NODE), Ok(None::<CopySource<'_>>));
+  }
+
+  /// A-588 (7.2's `_has_bad_parents` and its doctest). Do: order the parents of a revision with a block and of one
+  /// without, for each way one parent or none is null. Expect 7.2's order: with a block the null parent first, without
+  /// one the null parent second, two non-null or two null parents as they came.
+  #[test]
+  fn parents_are_kept_in_7_2_s_order() {
+    let with_block = split(b"\x01\n\x01\nx").unwrap();
+    let without = split(b"x").unwrap();
+    let (null, a, b) = (NULL_NODE, node(&"18".repeat(20)), node(&"42".repeat(20)));
+    for (revision, (p1, p2), stored) in [
+      (with_block, (null, null), (null, null)),
+      (with_block, (null, b), (null, b)),
+      (with_block, (a, null), (null, a)),
+      (with_block, (a, b), (a, b)),
+      (without, (null, null), (null, null)),
+      (without, (null, b), (b, null)),
+      (without, (a, null), (a, null)),
+      (without, (a, b), (a, b)),
+    ] {
+      assert_eq!(revision.parents_as_stored(p1, p2), stored);
+    }
+  }
+
+  /// AC-HG.9 (hostile input), A-588: do split a block never closed, a block line without `: `, and an empty line inside
+  /// a block. Expect `Unclosed`, and `Entry` at the line's index.
   #[test]
   fn blocks_mercurial_would_fail_on_are_refused() {
     assert_eq!(split(b"\x01\ncopy: a\n"), Err(Refusal::Unclosed));
@@ -268,29 +385,57 @@ mod tests {
       split(b"\x01\ncopy: a\nbroken\n\x01\n"),
       Err(Refusal::Entry { line: 1 })
     );
-    let no_node = split(b"\x01\ncopy: a\n\x01\nx").unwrap();
-    assert_eq!(no_node.copy(), Err(Refusal::Copy));
-    let short = split(b"\x01\ncopy: a\ncopyrev: abc\n\x01\nx").unwrap();
-    assert_eq!(short.copy(), Err(Refusal::Copy));
-    assert_eq!(split(b"x").unwrap().copy(), Ok(None::<Copy<'_>>));
+    assert_eq!(
+      split(b"\x01\na: b\n\nc: d\n\x01\n"),
+      Err(Refusal::Entry { line: 1 })
+    );
   }
 
-  /// A-588: do pack metadata whose key holds `: `, whose value holds a newline, and whose value ends as a marker begins.
-  /// Expect each refused naming it.
+  /// A-588: do pack metadata whose key holds `: `, whose value holds a newline, whose value ends as a marker begins,
+  /// and whose key is given twice; and write splits whose bytes begin as a block does with no block, whose block holds
+  /// a closing marker, and whose block holds a line without `: `. Expect each refused naming it.
   #[test]
-  fn entries_that_would_not_read_back_are_not_packed() {
-    assert_eq!(
-      pack(&[(b"a: b", b"c")], b"", &mut Vec::new()),
-      Err(EncodeRefusal::Entry { entry: 0 })
-    );
-    assert_eq!(
-      pack(&[(b"a", b"c"), (b"d", b"e\nf")], b"", &mut Vec::new()),
-      Err(EncodeRefusal::Entry { entry: 1 })
-    );
-    assert_eq!(
-      pack(&[(b"a", b"c\x01")], b"", &mut Vec::new()),
-      Err(EncodeRefusal::Entry { entry: 0 })
-    );
+  fn entries_and_splits_that_would_not_read_back_are_not_written() {
+    for (entries, entry) in [
+      (vec![(&b"a: b"[..], &b"c"[..])], 0),
+      (vec![(&b"a"[..], &b"c"[..]), (b"d", b"e\nf")], 1),
+      (vec![(&b"a"[..], &b"c\x01"[..])], 0),
+      (vec![(&b"k"[..], &b"1"[..]), (b"j", b"2"), (b"k", b"3")], 2),
+    ] {
+      assert_eq!(
+        pack(&entries, b"", &mut Vec::new()),
+        Err(EncodeRefusal::Entry { entry })
+      );
+      assert_eq!(packed_len(&entries, b""), Err(EncodeRefusal::Entry { entry }));
+    }
+    for (revision, refusal) in [
+      (
+        FileRevision {
+          metadata: None,
+          bytes: b"\x01\nx",
+        },
+        EncodeRefusal::Bytes,
+      ),
+      (
+        FileRevision {
+          metadata: Some(b"a: b\n\x01\nc: d\n"),
+          bytes: b"",
+        },
+        EncodeRefusal::Block,
+      ),
+      (
+        FileRevision {
+          metadata: Some(b"no separator\n"),
+          bytes: b"",
+        },
+        EncodeRefusal::Block,
+      ),
+    ] {
+      let mut out = Vec::new();
+      assert_eq!(revision.encode(&mut out), Err(refusal));
+      assert_eq!(revision.encoded_len(), Err(refusal));
+      assert!(out.is_empty());
+    }
   }
 
   proptest! {
@@ -311,19 +456,19 @@ mod tests {
       prop_assert_eq!(read.bytes, bytes.as_slice());
     }
 
-    /// AC-HG.9, A-588: do split arbitrary bytes, pack what was read and split that. Expect a refusal at either step,
-    /// or the same bytes and the same entries sorted by key, as 7.2's `packmeta` writes them; never a panic.
+    /// AC-HG.9, A-588: do split arbitrary bytes, behind a marker or not, and write the split back. Expect a refusal,
+    /// or exactly the same bytes at the length `encoded_len` gave; never a panic.
     #[test]
-    fn arbitrary_bytes_split_and_pack_alike_or_are_refused(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
-      if let Ok(read) = split(&bytes) {
-        let mut entries: Vec<_> = read.entries().collect();
+    fn arbitrary_bytes_split_and_write_back_or_are_refused(
+      bytes in proptest::collection::vec(any::<u8>(), 0..64),
+      behind_a_marker in any::<bool>(),
+    ) {
+      let text = if behind_a_marker { [super::MARKER, &bytes].concat() } else { bytes };
+      if let Ok(read) = split(&text) {
         let mut out = Vec::new();
-        if pack(&entries, read.bytes, &mut out).is_ok() {
-          let again = split(&out).unwrap();
-          entries.sort_by(|left, right| left.0.cmp(right.0));
-          prop_assert_eq!(again.entries().collect::<Vec<_>>(), entries);
-          prop_assert_eq!(again.bytes, read.bytes);
-        }
+        prop_assert_eq!(read.encode(&mut out), Ok(()));
+        prop_assert_eq!(read.encoded_len(), Ok(u64::try_from(text.len()).unwrap()));
+        prop_assert_eq!(out, text.clone());
       }
     }
   }

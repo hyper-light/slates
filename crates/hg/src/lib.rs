@@ -18,7 +18,10 @@
 //! run and is followed where the two disagree: `bundle2.py` (every size a signed 32-bit integer; a part type of
 //! `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter; the interrupt), `changegroup.py` (the delta headers
 //! of versions `01` to `05`; a chunk length of 1 to 4 refused as a negative one is; the tree-manifest list every
-//! version from `03` carries, empty or not) and `mpatch.c` (a delta's hunks).
+//! version from `03` carries, empty or not) and `mpatch.c` (a delta's hunks); for the objects (A-588), `changelog.py`
+//! (a changeset's text and its extras' escapes), `cext/manifest.c` (a manifest's lines), `utils/storageutil.py` and
+//! `filelog.py` (a file revision's metadata block, its copy and its parents' order), `utils/hashutil.py` and
+//! `thirdparty/sha1dc/cext.c` (the node's SHA-1).
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted. Every length is read as Mercurial reads it, a signed big-endian
 //! 32-bit integer, so `0xFFFF_FFFF` is −1: a refused length, or in a bundle2 payload the interrupt. Every length is
@@ -39,7 +42,16 @@
 //! from the deltas, and encode each bundle back to its own bytes. `fixtures/payloads/` (A-545) holds what 7.2's client
 //! sent and its server answered in three pushes over SSH, captured on the wire, and two obsstores 7.2 wrote, made by
 //! `fixtures/payloads/make-payload-fixtures.sh` the same way; every part payload in them is decoded to what 7.2's
-//! listings and logs say and encoded back to its bytes.
+//! listings and logs say and encoded back to its bytes. `fixtures/objects/` (A-588) holds every revision of one
+//! repository's changelog, manifest log and file logs as 7.2's `debugdata` wrote it, each log as its `debugindex
+//! --debug` lists it, and what 7.2's own readers (`changectx`, `manifest`, `filelog.renamed`) read from each, made by
+//! `fixtures/objects/make-object-fixtures.sh` twice, byte for byte alike; every node is computed from its parents and
+//! text and every object read as 7.2 reads it and written back to its bytes.
+//!
+//! **Nodes are SHA-1 with collision detection** (A-588, [`node`]), as 7.2's `hashutil.sha1` is sha1dc's wherever its C
+//! extension is built (the fixtures' runs printed it): a known collision attack is refused by kind, as 7.2 raises on
+//! one, and `fixtures/sha1dc/` holds SHAttered's two prefixes (git's t0013 vector and its twin, as A-600 cut them) that
+//! prove it.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt;
 // out-of-bounds indexing and slicing are denied workspace-wide.

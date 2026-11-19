@@ -318,9 +318,10 @@ pub(crate) mod wire {
   }
 }
 
-/// The objects' golden vectors (A-588): every revision of one repository stock 7.2 stored, its node and parents, and
-/// what 7.2 reads from each, as `fixtures/objects/make-object-fixtures.sh` wrote them (its header names the exact
-/// command), compiled in by name.
+/// The objects' golden vectors (A-588): every revision of one repository stock 7.2 stored, each log's index as 7.2's
+/// `debugindex --debug` lists it, every revision's text as its `debugdata` writes it, and what 7.2 reads from each, as
+/// `fixtures/objects/make-object-fixtures.sh` wrote them (its header names the exact command and the run), compiled in
+/// by name.
 pub(crate) mod objects {
   /// Lists each file's name with its bytes.
   macro_rules! stored {
@@ -331,17 +332,17 @@ pub(crate) mod objects {
   }
 
   stored![
-    "changeset---0.txt",
-    "changeset---1.txt",
-    "changeset---10.txt",
-    "changeset---2.txt",
-    "changeset---3.txt",
-    "changeset---4.txt",
-    "changeset---5.txt",
-    "changeset---6.txt",
-    "changeset---7.txt",
-    "changeset---8.txt",
-    "changeset---9.txt",
+    "changeset-0.txt",
+    "changeset-1.txt",
+    "changeset-10.txt",
+    "changeset-2.txt",
+    "changeset-3.txt",
+    "changeset-4.txt",
+    "changeset-5.txt",
+    "changeset-6.txt",
+    "changeset-7.txt",
+    "changeset-8.txt",
+    "changeset-9.txt",
     "expected.txt",
     "file-a-0.txt",
     "file-a-1.txt",
@@ -353,17 +354,26 @@ pub(crate) mod objects {
     "file-meta-0.txt",
     "file-run-0.txt",
     "file-u-0.txt",
-    "index.txt",
+    "index-changelog.txt",
+    "index-file-a.txt",
+    "index-file-c.txt",
+    "index-file-d.txt",
+    "index-file-e.txt",
+    "index-file-link.txt",
+    "index-file-meta.txt",
+    "index-file-run.txt",
+    "index-file-u.txt",
+    "index-manifest.txt",
     "log.txt",
-    "manifest---0.txt",
-    "manifest---1.txt",
-    "manifest---2.txt",
-    "manifest---3.txt",
-    "manifest---4.txt",
-    "manifest---5.txt",
-    "manifest---6.txt",
-    "manifest---7.txt",
-    "manifest---8.txt",
+    "manifest-0.txt",
+    "manifest-1.txt",
+    "manifest-2.txt",
+    "manifest-3.txt",
+    "manifest-4.txt",
+    "manifest-5.txt",
+    "manifest-6.txt",
+    "manifest-7.txt",
+    "manifest-8.txt",
   ];
 
   /// The file named `name`.
@@ -373,5 +383,10 @@ pub(crate) mod objects {
       .find(|(known, _)| *known == name)
       .map(|(_, bytes)| *bytes)
       .unwrap_or_else(|| panic!("no stored file {name}"))
+  }
+
+  /// Every file's name, in order.
+  pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    FILES.iter().map(|(name, _)| *name)
   }
 }
