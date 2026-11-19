@@ -4505,9 +4505,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   process the ask names, once the handle that process names is shown to be this stream's own object;
 - a VM's save and restore (Shards' D176 part 5; A-303): a SAVE, which the device sends while it is paused and so
   between requests, waits for the guest's stores through its maps to reach the volume, then takes a snapshot of the
-  volume for the attachment's own principal, publishes it, and is answered with the stream's tables, opaque to Shards
-  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, the form of SETXATTR
-  the guest's kernel sends (A-378), and each inode the guest holds with its references and opens. A RESTORE is taken
+  volume for the attachment's own principal, publishes it, waits on a live-shipped volume until its log is durable
+  where that publication put it, as a guest's `fsync` waits (A-516; refused with its reason when it is not within the
+  liveness budget), and is answered with the stream's tables, opaque to Shards and checked by a CRC-32C: the volume
+  and the snapshot, the directory presented, the owner view, the form of SETXATTR the guest's kernel sends (A-378),
+  and each inode the guest holds with its references and opens. A RESTORE is taken
   only as a fresh stream's first frame, onto the volume saved while unchanged since the cut or a clone of the cut's
   snapshot, presenting the same directory; the stream's attachment then holds what the saved one did, a file the guest
   held with no name left included, its guest is shown the same owners and its requests are read in the same form. A handle the restored guest's kernel kept gives its open back at its release, as one from
@@ -4719,6 +4721,10 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > (`crates/server/tests/shards.rs`; the tables' codec `crates/server/src/shards/tables.rs`; `Volume::held_by` and
 > `Volume::adopt_held`, `crates/vfs/tests/held.rs`). Owed on Shards' side: `shards restore` handing a restored VM a
 > served share (`--slates-fs-fd`, `--slates-fs-handle`), and its real-VM test of a save and a restore over slates.
+> **Since A-516 (2026-11-19)** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable
+> where the save's publication put it (`shards.save_held`), and is refused with its reason when it is not within the
+> liveness budget; a volume shipped nowhere is answered at once, as before (the server's lib test
+> `a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it`).
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -4894,6 +4900,19 @@ root-relative path as an explicit alternative; it does not report that the reque
 > instrumented CI case first fails at 5.01 s; 100 corrected native Linux runs and all nine ring cases pass, as do
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
+> **Status (2026-11-19, A-522: a claim names its process; staging and status captures keep their own deadlines).**
+> A claim on macOS and Windows carries its claimant's start beside its pid (the claim slot's `AT_STARTED`, the bootstrap
+> layout `SLB5`): on macOS the start time the kernel keeps for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`, in
+> microseconds), on Windows its creation time (`GetProcessTimes`). The daemon's hang-up watch is taken on that process
+> alone (`ExitWatch::on_started`): macOS registers its exit note and then reads the pid's start, so a pid another process
+> took before the watch reads exited at once and the dead client is retired; Windows opens the handle and checks the
+> creation time. Neither route has a socket at the claim to ask the kernel for its peer (`LOCAL_PEERTOKEN`,
+> `GetNamedPipeClientProcessId`); macOS's region is fetched by the Mach audit token, after the daemon seats and watches
+> the client. And the reap loop's tick no longer releases abandoned staging buffers and status captures: the shard's
+> keeper (`crate::deadlines`) sleeps on the timing wheel until the earliest of their deadlines, releases what is due,
+> and is woken only by a deadline set earlier than the one it sleeps for. Off the tick so far: dead clients (A-475),
+> staging buffers and status captures (A-522).
 
 > **Status (2026-11-18, A-475: a dead client is reclaimed at its hang-up).** The daemon no longer finds a dead client by
 > a poll. Each seated client has a watch, a task of its shard that awaits the client's hang-up through the shard's
@@ -11133,15 +11152,27 @@ decides the details.
 | Concept | slates | git (§4.17.2) | Mercurial (§4.17.3) | Subversion (§4.17.4) |
 |---|---|---|---|---|
 | Repository | a repository record (§4.8) and its greens | a repository | a repository | a repository |
-| Branch: a name whose value a push moves | a green | each ref (`refs/heads/*`, `refs/tags/*` and every other ref) | each bookmark, and each named branch's head; a name with several heads is §4.17.3's to decide | the whole repository: one green whose version N is revision N; a branch is a directory in it |
+| Branch: a name whose value a push moves | a green | each ref (`refs/heads/*`, `refs/tags/*` and every other ref) | each bookmark, and each head of a named branch (one green a head, §4.17.3) | the whole repository: one green whose version N is revision N; a branch is a directory in it |
 | Push | a work submitted to the green; the verdict is the push's answer | `receive-pack`'s update commands | `unbundle`, with its heads check | `commit`: the request and its editor drive |
 | What the client says it saw | the work's base | each command's old value | the `heads` argument, or the `check:heads`, `check:updated-heads` and `check:bookmarks` parts | the base revision of each path the drive touches |
-| Stacked changes; a rebase | a chain of works | a series of commits reviewed in order; a server-side rebase | a stack of draft changesets (§4.17.3 decides) | §4.17.4 decides |
-| A review request and the requests built on it | a work held for review; works over works | a pull request and its stack | §4.17.3 decides | §4.17.4 decides |
+| Stacked changes; a rebase | a chain of works | a series of commits reviewed in order; a server-side rebase | a stack of draft changesets: topics, a chain of works (§4.17.3) | §4.17.4 decides |
+| A review request and the requests built on it | a work held for review; works over works | a pull request and its stack | a topic, or a bookmark the policy marks for review (§4.17.3) | §4.17.4 decides |
 | Objects | content in the volume store, deduplicated by identity, indexed by the tool's id | blobs, trees, commits and tags | changesets, manifests and file revisions | node revisions, their contents and revision properties |
 | History of a branch | the green's chain of versions | the successive values of the ref (the server's reflog) | the successive values of the bookmark or head | the revision sequence |
 
 **The repository and its greens.**
+
+> **Status (2026-11-18, A-515).** The record and its namespace are built in the metadata database
+> (`crates/db/src/repository.rs`, the records in `catalog.rs`, five operations of the log): a repository's name is
+> unique on its partition; a name binds a green of the repository's own partition that no other name binds; an empty
+> name or one holding a NUL byte is refused; retiring a name leaves its green, so binding it again restores the
+> branch; destroying a repository leaves its greens; a destroyed green leaves its name; a partition rebuilt from its
+> snapshot answers the same. A model test holds the namespace to these rules over generated histories. Owed: the
+> verbs that create repositories and their greens (with the namespace riding one register with the greens, item 3,
+> shared piece 2), the record's replication in a fleet (shared piece 2), and a green made at another green's version
+> without a walk (item 4: the engine holds a green's state in ordered maps, so making one at a version copies them; it
+> needs maps shared by identity, shared piece 1's second half).
+
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
    namespace, from each branch's name to its green.
@@ -11232,7 +11263,11 @@ is one more version, and the chain itself is never rewritten.
    client's work is decided at whole-file granularity, which the operations of item 2 give; it is never merged into
    byte ranges it did not send. Byte-range accepts, where two edits to one file both land, are for works the server
    itself turns into the tool's objects: an agent's work through the SDK or a mount, a server-side merge of a review
-   request, a server-side rebase. The server makes the new commit, changeset or revision, and clients fetch it.
+   request, a server-side rebase. The server makes the new commit, changeset or revision, and clients fetch it. What
+   the server makes needs what a client's commit carries: a message, which such a work's submit must carry, and its
+   principal's name and address in the tool's form (git's author and committer, Mercurial's `Name <address>`), which
+   the principal's record holds (§4.13). A submit to a green of a repository without a message, or by a principal with
+   no such identity, is refused typed (`MessageRequired`, `IdentityRequired`) before any work is built.
 5. **The answers.** For each tool:
    - git: the push's old value is the green's head, and whether each command is a fast-forward is the policy's check
      (`receive.denyNonFastForwards` [B: git-receive-pack]), made after the admission hooks and before the verdict.
@@ -11246,7 +11281,10 @@ is one more version, and the chain itself is never rewritten.
      it merges a transaction into the newest revision node by node and fails a file "whenever source, target, and
      ancestor are all distinct node revisions" [B: svn_fs.h `svn_fs_merge`], and it calls a path out of date when its
      base revision "is less than the last-changed-revision of the path" [B: svn_fs.h `svn_fs_lock_many`], which is the
-     negation of §4.16's fast path (`last_changed[path] <= base`).
+     negation of §4.16's fast path (`last_changed[path] <= base`). Subversion's exact rule is §4.17.4 item 3's, FSFS's
+     commit-time merge, and it is stricter than §4.16's verdict over whole-file operations: it accepts no identical
+     replacement, a directory whose properties changed meanwhile conflicts with any change beneath it, and a
+     directory's last change is its subtree's.
 6. **A base that is no version.** A review request or a merge may need a base that is a commit inside an earlier push,
    so not the head of any version. Such a base is given as a tree, and what the green changed since it is read as the
    whole-file differences between that tree and the head's, which is all that stock pushes ever declared. It costs
@@ -11293,8 +11331,10 @@ is one more version, and the chain itself is never rewritten.
   Subversion's `pre-commit` [B: svn_repos.h]); after the commit, where hooks only observe (`post-receive`,
   `changegroup`, `post-commit`); and on review events. A hook is a program the repository's owner configured, run over
   a read-only attachment of the work's post-state (on Linux inside the launcher's namespace, `slates exec`, §4.6),
-  under a deadline learned from that hook's own runs. A hook never runs on the merge task's shard and never holds the
-  green: admission ends before the work reaches the merge task, so a slow hook delays only its own push.
+  under a deadline learned from that hook's own runs. Before a hook has run, its deadline is its push's connection:
+  the run ends when the client that pushed leaves, and that run is the first sample. A hook never runs on the merge
+  task's shard and never holds the green: admission ends before the work reaches the merge task, so a slow hook delays
+  only its own push.
 - The write modes still decide whether a merge may happen at all (A-285), and a signature never permits one (A-321).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
@@ -11368,21 +11408,25 @@ reads git's answer for a ref that moved; nothing he sent is kept. He fetches, re
 C817: version 814. An agent works on version 814 through the SDK and replaces bytes 1,200 to 1,480 of `init/main.c`,
 while another agent's SDK work, accepted as version 815 with the server's commit C818, changed bytes 40,100 to 40,250 of
 the same file: the first agent's byte-range work is accepted as version 816, and the server makes commit C819 for it
-(the agent as author, C818 as parent), which every client fetches. Had version 815 come from a stock push, its
-whole-file replacement of `init/main.c` would have made the agent's edit a conflict, and the agent would rebase. In
-Subversion's terms the same rule reads: Carol commits `/trunk/a.c` against revision 40 while the repository is at 42,
-where 41 and 42 changed only `/trunk/b.c`; `a.c` last changed at or before 40, so the fast path makes revision 43. Dan
-then commits `/trunk/b.c` against 40; `b.c` last changed at 42, after his base, so his commit is out of date, and he
-updates and commits again.
+(the agent's identity as author, its submit's message as the message, C818 as parent), which every client fetches. Had
+version 815 come from a stock push, its whole-file replacement of `init/main.c` would have made the agent's edit a
+conflict, and the agent would rebase. In Subversion's terms the same rule reads: Carol commits `/trunk/a.c` against
+revision 40 while the repository is at 42, where 41 and 42 changed only `/trunk/b.c`; `a.c` last changed at or before
+40, so the fast path makes revision 43. Dan then commits `/trunk/b.c` against 40; `b.c` last changed at 42, after his
+base, so his commit is out of date, and he updates and commits again.
 
 **Laptop degenerate.** One node: the repository's register is its partition's log in the anchor segment, f = 0, the
 holder set is the owner, and every arrow above is an in-process call. The code is the fleet's (R8).
 
 **Pieces that follow (shared, in order).** Each is one piece with its own tests.
-1. The repository record and its namespace; green ids carrying the repository's partition; a green made at another
-   green's version, or at one commit's tree, without walking it.
+1. The repository record and its namespace; green ids carrying the repository's partition (built, A-515: the
+   record, the namespace and their rules in the metadata database); a green made at another green's version, or at one
+   commit's tree, without walking it (owed: maps shared by identity in the engine).
 2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
-   recomputation on holders.
+   recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
+   namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
+   them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
+   `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival.
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
@@ -11566,7 +11610,7 @@ create or update a reference named "refs/for/master", but may create or update a
 `GET` of the bytes; locks are per path. An LFS object is content in the volume store, deduplicated by BLAKE3 like every
 other byte, with its SHA-256 name an index row and the bytes checked against it on upload. A version's tree holds the
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
-is served as well.
+is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
 
 **Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS; SSH: the user's public key. Each
 proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and `git-receive-pack`
@@ -19337,6 +19381,8 @@ Status: built 2026-11-06.
   6.93, 7.81 and 7.03 ms; a ping (one forwarded `versions`) 6.13, 7.74 and 7.66 ms. One request costs one round trip.
   The p99 is the link's in both forms (70 to 158 ms).
 ### A-226 — An idle shard gives back only the recovery memory written since its last give-back (accepted and built 2026-11-06; amends A-117; the supervisor's item (c), the macOS paced tail)
+> Amended 2026-11-18 by A-491: a give-back step's slice is learned from the shard thread's own CPU, not the wall
+> clock, steps a coarse thread clock shows no CPU for folded into the next it shows.
 Applied in the same change to:
 - `crates/vfs/src/checkpoint_log.rs` (`Journal`'s `committed_written`, `stale_written`, `log_written`,
   `UNKNOWN_EXTENT`, `Journal::checkpointed`, `Journal::given_back`, the bounded `Journal::dead_ranges`);
@@ -26349,6 +26395,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
 - **Amended by A-360 (2026-11-18).** The stated difference is WinFsp's driver's as released: a driver carrying
   `docs/wip/winfsp-patches` forwards a hard link, and the drive makes it. Where a lane's driver makes links, the stated
   lines stop differing and the harness fails them, so the list shrinks in that change.
+- **Amended by A-498 (2026-11-18).** Both drivers serve one transport, so the list is chosen by the drive the run uses:
+  the harness gives one file of the mount's workload root a second name before the workloads run, and the stated lines
+  hold only where the drive refused it. A drive that links is held to NTFS's link counts like every other line.
 
 ### A-292 — A held durable reply gives up when its holders are silent, not at a deadline (2026-11-17, built for goal g244; found 2026-11-09 by bug-sweep)
 
@@ -26647,9 +26696,10 @@ Applied in the same change to:
   refused restore changes nothing. The live volume holds no file the saved guest held with no name once the saved
   stream ended (its sweep reclaimed it), so such a guest is restored onto a clone of the cut.
 - **Not here.** A SAVE's snapshot is published on the owner shard; a live-shipped volume's candidates (§4.10) are not
-  waited for, as a `FSYNC`'s durable reply waits. A clone keeps no orphan record for a nameless file it carries from
-  its snapshot, so once a restored guest lets such a file go nothing reclaims it until the clone is destroyed; that is
-  so for any clone of a snapshot taken while a file was held with no name, restored or not (GAPS).
+  waited for, as a `FSYNC`'s durable reply waits (built since, A-516, 2026-11-19: the tables wait for them). A clone
+  keeps no orphan record for a nameless file it carries from its snapshot, so once a restored guest lets such a file go
+  nothing reclaims it until the clone is destroyed; that is so for any clone of a snapshot taken while a file was held
+  with no name, restored or not (GAPS).
 - **Evidence.** The tables' unit tests (a round trip, the same bytes twice, every cut, every bit flipped, another
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
@@ -35229,6 +35279,218 @@ Applied in the same change to: §4.17.4 (new), `research/vcs-servers-subversion.
   the new crate are main's (the run-request queue, 2026-11-18).
 - **Owed.** §4.17.4's pieces 2 to 14, after §4.17.1's shared pieces they need; then main's runs: Subversion's Python
   suite over both URLs, the differential run, and the order-of-magnitude measurements.
+
+### A-516 — A SAVE's tables wait until a live-shipped volume's log is durable where the save put it (2026-11-19, goal 90; what Shards needs from slates; A-303's first "Not here"; §4.6 the Shards form, §4.10, A-200; Shards' D176 part 5)
+Applied in the same change to: §4.6, the Shards form's save-and-restore bullet and A-303's status; A-303's entry (its
+"Not here", the first item marked built); GAPS, A-281's entry (A-303's paragraph); and:
+- `crates/server`: `shards.rs` (`answer_save` holds the tables on `live_ship::durable_target`; `DurableOwed` names what
+  a held reply becomes, `Undurable::Errno` for a guest's `FSYNC` and `Undurable::Save`; `settle_durable` sends the
+  tables or refuses the SAVE; the counter `shards.save_held`; the module's notes; the lib test module, new);
+  `live_ship.rs` (`ship_to_silent_holders`, test support under `cfg(test)`).
+
+- **What was there.** A SAVE took its snapshot at the cut and published the owner shard before answering, so the
+  slates snapshot the VM's snapshot names survived a daemon restart. On a live-shipped volume it did not wait for the
+  volume's candidates, as a guest's `FSYNC` on the same stream waits (A-200): its tables went out while the publication
+  that holds the snapshot was on the owner alone. Shards keeps the tables in the VM's snapshot and hands them back at
+  its restore (Shards' coordinator's contract, 2026-11-18: SAVE answers `[0, tables]` and names a slates snapshot taken
+  at the cut; RESTORE accepts that snapshot, a clone of it, or the live volume unchanged since the cut, else
+  `[1, why]`). An owner lost after the answer left a successor without the snapshot the saved VM names, so its
+  restore had nothing to stand on.
+- **The rule.** After the publication captures the volume, the SAVE asks where the volume's log must be durable before
+  a verb that just published it may answer (`live_ship::durable_target`). Where nothing need wait (a volume shipped
+  nowhere, every laptop: `f = 0` is the same code with nothing to wait for, R8) it is answered at once, as before.
+  Otherwise its tables are owed and held (`shards.save_held`); the stream's task waits as a held `FSYNC` waits
+  (`live_ship::wait_durable`, the one bound every transport judges a held durable reply by), and then sends them
+  (`shards.saved`), or, when the log did not become durable there, replaces them with the SAVE's refusal and its
+  reason, "the save's snapshot could not be made durable" (`shards.save_refused`). Shards' wire is unchanged: a SAVE
+  is still answered `[0, tables]` or `[1, why]`, only later. A refused SAVE leaves its snapshot, as a SAVE refused
+  after its snapshot was taken always has.
+- **Tests.** The server's lib test
+  `a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it` (Unix): on an audit daemon, a
+  volume shipped nowhere and one shipped live to two holders at `f = 1` that never answer
+  (`live_ship::ship_to_silent_holders`), a Shards stream attached to each and a SAVE sent on it as Shards' device
+  sends one. The first is answered its tables at once and counted saved, nothing held; the second is held, then
+  refused with the undurable reason once its wait gives up, never answered with tables, counted held and refused.
+- **Evidence.** Red first, on main `6696fda78` with the test alone, on the Mac Studio (2026-11-19): the second SAVE was
+  answered at once, `(0, [2, 0, 0, 0, 187, ...])`, its tables, where the test asks for the refusal. Green with the
+  change, the same machine: `cargo test --locked -p slates-server --lib -- shards:: live_ship::` 29 of 29 in 2.79 s, the
+  new test among them (its hold given up within the bound). Filed for main: the Windows build, the server's Shards
+  suites, and Shards' own run of a save and a restore over a live-shipped share.
+
+### A-498 — The WinFsp drive's link counts are stated only where the drive refuses a link: the harness learns it from the drive (2026-11-18, g258, UI goal 85; Part 6 "Real workloads", §4.6 Windows; amends A-300 and A-360)
+Applied in the same change to: A-300's record in Part 6 (its A-360 note), GAPS (the WinFsp version-control entry),
+`crates/conformance/src/workload.rs` (`HardLinks`, `stated_differences`, the module's account, and the tests),
+`xtask/src/conformance/workloads.rs` (`mount_links`, `LINK_PROBE`, the record's note, `run_one`).
+- **What was there.** The WinFsp route stated three link-count lines whatever drive it ran on (`WINFSP_STATED`: git's
+  history, `objects with two names after the clone`; Mercurial's, `store files with two names after the clone` and
+  `after the clone's commit`), and a stated line that stops differing fails the run. A drive under a driver carrying
+  `docs/wip/winfsp-patches` links (A-360) and prints NTFS's counts, so the harness failed exactly the drive that made
+  Mercurial's hard-linked clone and store byte-identical to the host's; A-360 said the list would shrink when a lane's
+  driver linked, but both drivers are one transport, and CI's runners can load only WinFsp's as released.
+- **The rule.** Whether a mount makes a hard link is the run's own data, learned before its workloads: the harness makes
+  `.hard-link-probe` in the mount's workload root, gives it a second name, and removes both (`mount_links`). The WinFsp
+  route's stated lines apply only where that link was refused (`HardLinks::Refused`); everywhere else nothing is stated,
+  so a drive that links is held to every count NTFS prints, and a clone that copied there is a difference. The record
+  notes which the mount did, and a refusal prints its error.
+- **Tests.** `a_drive_that_makes_links_is_held_to_its_hosts_link_counts` (`crates/conformance/src/workload.rs`): a
+  Mercurial run that linked as NTFS did is identical on a drive that made the link; one that copied there is a
+  difference naming the clone's line; and the same copy on a drive that refused the link records the two stated lines.
+  The three earlier tests run on a drive that refused it, as WinFsp's driver as released does. On the Mac Studio
+  (2026-11-18, kiln, load 9.2 to 13.1, debug): `cargo test --locked -p slates-conformance --lib workload` 18 passed;
+  with the rule reversed (the lines stated whatever the drive) the new test failed once, as the harness had: `Differs
+  { "a stated difference no longer differs: no line starting \"store files with two names after the clone: \"" }`,
+  where `Identical` was expected.
+- **Owed** (main's): the xtask unit tests, `cargo xtask check` and clippy; the Windows lanes' workloads on WinFsp as
+  released (unchanged: the record notes the refusal); and the workloads on the test-signing VM's patched driver, where
+  git's history and Mercurial must now run identical with no stated line.
+
+### A-515 — A repository is a record of its partition, and its namespace binds each branch name to a green of that partition (2026-11-18, g261 for UI goal 91; §4.17.1 shared piece 1's first half; D-28)
+- **What was there.** §4.17.1 (A-497) designed the repository record and its namespace; nothing held them.
+- **What is built.** `crates/db/src/repository.rs` and the records in `catalog.rs`: `RepositoryRecord` (id, name, tool,
+  object format, default branch, owner), `BranchRecord` (a name bound to a green), `RepositoryId` (minted as a volume id
+  is, its bytes 8-9 naming the owner partition, which `RepositoryId::partition` and the new `VolumeId::partition` read),
+  and five operations appended to the log: `RepositoryCreated`, `RepositoryBranchAdded`, `RepositoryBranchRetired`,
+  `RepositoryDefaultSet`, `RepositoryDestroyed`. The partition's guard keeps §4.17.1's rules: a repository's name and id
+  are its own (`AlreadyExists`), at most the partition's volume capacity of them (`Capacity`); a name binds a green of
+  the catalog (`NotFound` for none; `NotGreen` for a plain volume, a new database refusal mapped to the wire's existing
+  `NotGreen`, as the new `InvalidName` is to its namesake) whose id names the repository's partition (`NotFound`
+  otherwise) and that no name binds yet (`AlreadyExists`); an empty name or one holding a NUL is `InvalidName`. Retiring
+  a name leaves its green; destroying a repository drops its namespace and leaves its greens; a destroyed green leaves
+  its name (`remove_volume`). A partition snapshot carries the records and bindings (two fields appended), and the two
+  derived indexes (names to ids, greens to names) are rebuilt; a binding naming no repository, or a green bound twice,
+  is a corrupt snapshot, refused. The wire order of the database publishes `ObjectFormat`, `VcsTool` and the five
+  operations (hand-written from the enums, `crates/db/tests/wire_order.txt`).
+- **Tests (`--lib`).** `a_repository_binds_only_unbound_greens_of_its_own_partition` (every refusal by name, the names
+  in order and by prefix, a rebuilt partition answering the same);
+  `a_destroyed_green_leaves_its_name_and_a_destroyed_repository_leaves_its_greens`; and
+  `the_namespace_equals_the_rules_over_every_history`, a model test: generated histories of creates, binds, retires,
+  default changes and destroys of repositories and of greens, the partition's answer and whole state equal to the rules
+  kept over plain maps after every step, and its snapshot rebuilt and compared after every step. On the Mac Studio
+  (kiln, 2026-11-18): `cargo test --locked -p slates-db --lib` 108 of 108 (the three new among them), `cargo test
+  --locked -p slates-server --lib error` 3 of 3 (the server's refusal mapping compiles), `cargo fmt --check` clean.
+  Red-checked on a throwaway copy: without the destroyed green's cascade two tests fail; without the partition rule the
+  first fails.
+- **g291's asks, answered here.** Shared piece 2's entry carries the repository's own state (Mercurial's phase roots and
+  obsolescence markers) and checks on greens it does not move (`check:heads`); a work the server turns into the tool's
+  objects needs a message and its principal's identity in the tool's form, refused `MessageRequired` or
+  `IdentityRequired` without them; one Git LFS store serves git and Mercurial's `lfs` extension; and a hook's first
+  deadline, before any run, is its push's connection. The terms table's Mercurial cells now state §4.17.3's decisions.
+- **Owed.** A green made at another green's version without a walk (the engine's maps shared by identity), the verbs
+  that create repositories and their greens, and the record's replication in a fleet (with shared piece 2).
+
+Applied in the same change to: §4.17.1 (a status block, the terms table, the client-fidelity rule's message and
+identity, the hooks' first deadline, the worked example, the pieces list), §4.17.2 (large files), GAPS (the §4.17
+entry), `research/vcs-servers.md` §4, `crates/db/src/{repository,catalog,op,partition,error,lib}.rs`,
+`crates/db/tests/wire_order.{rs,txt}`, `crates/server/src/error.rs`.
+
+### A-530 — A DAX range's fill begins with its budget charge, before anything is made for it (2026-11-18, goal 85, g079; §4.6 the backed route, the fill budget; A-163, A-180, A-419)
+Applied in the same change to: GAPS (A-419's sibling line), `crates/bridge-core/src/dax_backing.rs` (`begin_range`
+over `RangeStart`, `StartingRange`; the ordering test), and the bug record
+`docs/bugs/2026-11-18-a-windows-dax-range-was-committed-before-its-budget-charge-was-asked.md`.
+- **What was there.** A range's fill began by readying the range for the VMM's map (`DaxObject::prepare_range`), then
+  clearing it where owed (A-419, A-526), then counting it against the fill budget, refused `Budget` at the bound.
+  Windows commits a range whole as it readies it (A-180) and never gives a section's committed page back, so a range
+  the budget refused stayed committed and counted by nothing: one more range for every ask refused at the bound, up to
+  the object's size, which is the machine's memory. Unix readies nothing, so only Windows held such ranges.
+- **The rule.** The charge comes first: the range is marked filled and counted, and a refusal stops the start `Budget`
+  with nothing readied or cleared. Then the range is readied, then cleared where owed; a readying or clear the OS
+  refuses gives the charge back and refuses `Object`. The order is one pure function over its steps (`begin_range`),
+  held by a test on every host.
+- **Why the undo does not leak on Windows.** A clear refused after a readying gives back the charge of a range that
+  stays committed only where the clear was owed by A-419, whose uncleared range stays counted; A-526's inherited ranges
+  are a Unix stream's alone, since Windows streams hold no resync.
+- **Tests.** `a_range_is_charged_before_anything_is_made_for_it` (`crates/bridge-core/src/dax_backing.rs`, the lib's
+  unit tests, every host): a refused charge stops the start before any readying; a readying or clear refused after it
+  gives the charge back. Red with the old order on the Mac Studio (`prepare`, `clear`, `charge` where `charge` alone
+  was owed); the module's tests 7 of 7 with it.
+
+
+### A-522 — A claim names its claimant's process by its pid and its start, so the hang-up watch is taken on that process alone; staging buffers and status captures are released at their own deadlines on the shard's timing wheel (2026-11-19, built for goal g255; the event-driven reaper's piece 2; §4.7 "Failure matrix"; A-447, A-468, A-475)
+
+- **What was there.** On macOS and Windows a claim named its claimant by its pid alone, the claimant's word in shared
+  memory. A client that died between its claim and its watch, its pid taken meanwhile by another process, left its
+  watch on that other process: its seat, attachments and id held for as long as the other process lived (A-475's owed
+  item). And the reap loop's tick released abandoned staging buffers and status captures once a liveness window,
+  asking every client's capture at every tick, whether any deadline was near or not.
+- **The claim's process.** Each claim slot now carries its claimant's start beside its pid (`AT_STARTED`, eight bytes
+  at offset 80, the bootstrap layout `SLB5`, which refuses `SLB4` either way): on macOS the start time the kernel keeps
+  for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec` and `pbi_start_tvusec`, in microseconds since
+  1970; the claim service's parent check reads the same record, `exit_watch::bsd_info`); on Windows its creation time
+  (`GetProcessTimes`, 100 ns intervals since 1601). Two processes that held one pid never share a start, since the
+  second starts after the first ended. The daemon takes its watch with `ExitWatch::on_started(pid, started)`:
+  - macOS registers `EVFILT_PROC` with `NOTE_EXIT` first and reads the pid's start after: the note is bound to the
+    process it was registered on (kqueue(2): "If a process can normally see another process, it can attach an event to
+    it"), so the claimant's exit is never missed between the two, and a start that does not match says the process the
+    note holds is not the claimant, which then reads exited at once;
+  - Windows opens the process for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` and compares the creation time
+    (`on_created`, A-447's judgment of the daemon), the open handle keeping the pid while it is held.
+
+  Rejected: the peer's audit token from a socket (`LOCAL_PEERTOKEN`, `<sys/un.h>`) or `GetNamedPipeClientProcessId`:
+  neither claim route has a socket or a pipe. The macOS region is fetched by a Mach message whose audit token the
+  claim service checks against the claim's pid, but the fetch comes after the daemon has seated and watched the client,
+  and from the instance's owner, the anchor when one holds it. A claimant's start is its own word, as its pid is: a
+  process that names another's pid and start fetches no region (macOS checks the fetcher's audit token) and only
+  strands its own seat, which the hostile claimant could already do by claiming.
+- **The deadlines (`crate::deadlines`).** One task a shard, the keeper, sleeps on the shard's timing wheel until the
+  earliest deadline among the staging buffers (their existing expiry index, `Staging::next_expiry`) and the status
+  captures (a new index of seats by their capture's deadline, `ShardState::capture_deadlines`), releases what is due
+  then, and sleeps again; a deadline set earlier than the one it sleeps for (a staging begin or put, a status capture
+  begun) wakes it (`deadlines::noted`), and a later one waits for it to re-arm. Each pass reads only the due entries.
+  A seat is entered once at most (`StatusPages::index` replaces its entry) and a seat that ends takes its entry with it
+  (`deadlines::forget_seat`, in `end_unproven` and the reaper's `finish`). The staging verbs still release what is due
+  at their own call. The shard's task bound counts the keeper (`LOOP_TASKS_PER_SHARD` 6 → 7).
+- **Left on the reap loop's tick:** leases, lapsed CLI attachments, destroys, grants, the owed audit, departed hosts'
+  attachments (A-222), the held copies' reclaim, the pressure hold, NFS purges, base hints with their delegation
+  recalls, the idle seal and the huge-page re-arm.
+- **Tests.** `crates/ipc/src/exit_watch.rs`: `a_watch_by_pid_and_start_takes_no_other_process_for_its_own` (a live
+  child watched by its pid and start is not exited until killed; by its pid and another start, exited at once).
+  `crates/ipc/src/rendezvous.rs`: `a_claim_names_its_process_by_its_pid_and_its_start` (the golden vector: the start
+  eight bytes little-endian at 80, read back into the accepted client) and the magic's golden, `SLB5`.
+  `crates/server/src/hangup.rs`: `a_client_whose_pid_another_process_took_is_ended_at_its_watchs_first_poll`.
+  `crates/server/src/deadlines.rs`: `an_abandoned_staging_buffer_is_released_at_its_expiry_without_a_tick` and
+  `an_abandoned_status_capture_is_released_at_its_deadline_without_a_tick` (a seat that ends takes its entry along).
+- **Evidence.** On the Mac Studio (kiln, d1323898, 2026-11-19 00:30–00:31 UTC, load 15–22, debug build): `cargo test
+  --locked -p slates-ipc --lib` (the exit watch's three tests, the claim's golden, the magic's golden and two claim
+  tests) 6 of 6; `cargo test --locked -p slates-server --lib -- hangup::tests reap::tests deadlines::tests
+  a_retired_clients_offers` 9 of 9: a staging buffer due in 100 ms released 105.6 ms after it began, a status capture
+  due in 100 ms released 101.2 ms after, where the tick took up to a second. Red-checked once on a mutated copy, the
+  macOS watch's start check removed and the keeper never woken by a deadline set: exactly the four tests they guard
+  failed (the exit watch's, the reused pid's, both deadlines'), the rest passed. The Windows arms (the claim's start,
+  `on_started` over `on_created`, the shared process opener that leaves `slates-ipc` two `unsafe` blocks fewer) and
+  the Linux build are filed for main.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line; A-475's owed pid item closed),
+`crates/ipc/src/exit_watch.rs`, `crates/ipc/src/mach_claim.rs`, `crates/ipc/src/rendezvous.rs`,
+`crates/server/src/deadlines.rs` (new), `crates/server/src/hangup.rs`, `crates/server/src/reap.rs`,
+`crates/server/src/daemon.rs`, `crates/server/src/state.rs`, `crates/server/src/staging.rs`,
+`crates/server/src/status_pages.rs`, `crates/server/src/verbs.rs`, `crates/server/src/config.rs`,
+`crates/server/src/lib.rs`, `crates/server/src/shards_route.rs` (rustfmt of A-475's merged call).
+
+### A-491 — An idle give-back step learns its slice from its shard thread's own CPU, not the wall clock (2026-11-18, g230, goal 85; A-226, CLAUDE.md "Bounded work everywhere")
+Applied in the same change to: A-226's entry (a note), GAPS (the give-back slice's entry closed),
+`docs/bugs/2026-11-18-the-give-back-slice-was-learned-from-the-wall-clock.md` (new), and
+`crates/server/src/daemon.rs` (`GiveBackRate`, `learn_give_back_rate`, `shard_thread_cpu_ns`, `spent_since`, and the
+steps `return_dead_recovery` and `purge_write_log`, each timed by a clock it is given) and `crates/server/src/state.rs`
+(`ShardState::give_back_rate` for `give_back_slice_bytes`).
+- **What was there.** Each idle give-back step (the recovery memory no restart reads, A-117 and A-226; the emptied
+  write log's pages) walked a slice learned from the step before: the bytes it walked over the time it took, scaled to
+  the step quantum. The time was the shard's clock, the host's monotonic wall clock, so a step the host descheduled
+  read as slow by every moment it waited and the next slice was cut by as much: at load about 100 a Mac's give-back of
+  18 to 21 ms of CPU took 2,572 to 3,042 steps (GAPS, 2026-11-08), and the recovery test's give-back case failed once
+  under load on adacachy (main's run r271) and passed on its rerun. The per-iteration budget holds a step to a quantum
+  of the shard's own CPU; the slice followed the host's scheduling instead.
+- **The rule.** A step is timed by the shard thread's own CPU clock (`slates_rt::registry::calling_thread_cpu`, the
+  clock the watchdog and the recovery's slices read), which load does not stretch: the slice is the bytes walked per
+  quantum of that CPU. A clock coarser than a step (Windows charges thread time a scheduler tick at a time) shows most
+  steps as no CPU and one as a whole tick, so the steps are folded until the clock shows some, and the slice is their
+  bytes over the CPU shown (`GiveBackRate::fold`). A step that walked nothing, or whose clock reads nothing, teaches
+  nothing. No wall clock is read.
+- **Test.** `a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock` (`daemon`'s unit tests: real
+  give-back steps on a shard whose recovery memory is all dead, timed by a controlled CPU clock: a quantum, half a
+  quantum, then a coarse clock's none, none and a quantum). Expect the slices a page, two pages, two, two, then the
+  three steps' six. Green on the Mac Studio (kiln r154, debug, 0.76 s: 16 KiB pages, a 3,889 ns quantum); red with the
+  steps timed by the wall clock again, which learned 21,239 bytes and then 82,598 from the steps' real wall time where
+  the CPU said 16,384, 32,768 and 98,304. The recovery test's give-back case is filed for main.
 
 ### A-529 — A takeover's share is done only once the successor serves each volume it adopted from its own placement (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover", §4.10 "the healer"; the content release signal's first half; A-335, A-276, A-345)
 Applied in the same change to: GAPS (A-335's release entry), `crates/server/src/takeover.rs` (`share_done`,

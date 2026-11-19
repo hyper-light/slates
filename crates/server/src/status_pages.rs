@@ -11,6 +11,9 @@ use slates_mem::budget::{MetadataBudget, MetadataCredit};
 pub(crate) struct StatusPages {
   pending: Option<(u64, u64)>,
   held: Option<Held>,
+  /// The deadline this client's seat is entered under in its shard's index of capture deadlines (A-522,
+  /// `crate::deadlines`), kept past a clear so the next capture replaces the entry: a seat holds one entry at most.
+  indexed: Option<u64>,
 }
 
 struct Held {
@@ -37,6 +40,31 @@ impl StatusPages {
   pub(crate) fn expire(&mut self, now: u64, budget: &mut MetadataBudget) {
     if self.pending.is_some_and(|(_, expires)| now >= expires) {
       self.clear(budget);
+    }
+  }
+
+  /// Records that this seat is entered in its shard's deadline index under `at`, and answers the deadline it was
+  /// entered under before, which the caller takes out of the index (A-522).
+  pub(crate) fn index(&mut self, at: u64) -> Option<u64> {
+    self.indexed.replace(at)
+  }
+
+  /// The deadline this seat is entered under in its shard's index, if any.
+  pub(crate) fn indexed(&self) -> Option<u64> {
+    self.indexed
+  }
+
+  /// Whether a capture is pending: begun, not yet completed, cleared or expired.
+  #[cfg(test)]
+  pub(crate) fn pending(&self) -> bool {
+    self.pending.is_some()
+  }
+
+  /// The index's entry under `at` left it (its deadline came): the seat is entered under nothing, unless a later
+  /// capture entered it under another deadline.
+  pub(crate) fn unindex(&mut self, at: u64) {
+    if self.indexed == Some(at) {
+      self.indexed = None;
     }
   }
 

@@ -1,13 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping and the git server are designed, nothing is built (2026-11-18,
-> A-497, D-28; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> **§4.17 version-control servers: the shared mapping and the git server are designed, and the repository record is
+> built (2026-11-18, A-497, D-28, A-515; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
 > of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
 > object store and its index; works from a client's push, with the head operation and the client-fidelity test; works
 > over works and bases given as trees; review records; policy and hooks), then each tool's pieces (§4.17.2's fifteen for
 > git, starting with the pkt-line codec). No speed is claimed until main measures it by §4.17.1's and §4.17.2's method.
+> **A-515 (2026-11-18):** shared piece 1's first half is built: the repository record and its namespace in the metadata
+> database (`crates/db/src/repository.rs`), with its rules model-tested. Owed from piece 1: a green made at another
+> green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
+> greens; the record's replication in a fleet (with piece 2).
 
 > **§4.17.3 the Mercurial server: designed, nothing is built (2026-11-18, A-499; UI goal 91; owner g291).** Built on
 > §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move toward public, and a
@@ -859,7 +863,12 @@
 > the volume saved while unchanged since the cut or a clone of the cut's snapshot, else `[1, why]` with nothing changed.
 > Found with it: a clone keeps no orphan record for a nameless file it carries from its snapshot, so nothing reclaims
 > it until the clone is destroyed (any clone of a snapshot taken while a file was held with no name). A SAVE's snapshot
-> is published on the owner shard, not yet waited for at a live-shipped volume's candidates (§4.10).
+> was published on the owner shard and not waited for at a live-shipped volume's candidates (§4.10). **Built since
+> (A-516, 2026-11-19):** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable where
+> the save's publication put it, as a guest's `FSYNC` on the stream waits (A-200), and is refused with its reason when
+> it is not within the liveness budget (`shards.save_held`, `shards.save_refused`); a volume shipped nowhere is
+> answered at once. Proven by the server's lib test over a real stream; Shards' own run of a save and a restore over a
+> live-shipped share is owed with its `shards restore` below. Still open of A-303's: the clone's orphan record above.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
@@ -1248,7 +1257,12 @@
 > --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
 > create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
 > (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
-> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> Center account (a slates-signed driver). **A-498 (2026-11-18, g258):** the harness stated the three lines on any WinFsp
+> drive, so it failed exactly a patched drive, whose clones link as NTFS's do. It now asks the drive: one file of the
+> mount's workload root is given a second name before the workloads run, and the lines are stated only where that is
+> refused (`HardLinks`, `mount_links`). On the patched driver git's history and Mercurial are held to every count NTFS
+> prints; on WinFsp as released the record notes the refusal and states the lines as before. Owed (main's): that run on
+> the test-signing VM, where Mercurial's hard-linked clone and store must come out identical. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
@@ -1918,10 +1932,14 @@
 > acknowledgement settles it, 25,868 to 28,995 times a run, each a pause and a resend. Fixed on agents/perf-replies
 > (every result waits for room while its shard lives). BENCHMARKS, "Why main's two figures differ".
 
-> **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
-> shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
-> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds. Since
-> A-226's amendment it no longer costs other work a turn, only time to finish on a shard otherwise idle. Not changed.
+> **Fixed (2026-11-18, A-491): the give-back's slice was learned from wall time.** `learn_give_back_rate` divided by
+> the shard's clock, so on a loaded host a preempted step taught a small slice and a give-back took thousands of steps
+> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds, and
+> the recovery test's give-back case failed once under load on adacachy (main's r271). A step is now timed by its shard
+> thread's own CPU clock, steps a coarse clock (Windows) shows no CPU for folded into the next it shows
+> (`daemon::GiveBackRate`; `a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock`). **Owed (main's):**
+> `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` under load, and the give-back's step count at load against
+> the 2,572 to 3,042 above.
 
 > **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
 > The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran
@@ -3920,6 +3938,12 @@
 > delegation recalls, the idle seal and the huge-page re-arm. Owed beside it: a claim's pid is the client's word, so a
 > pid reused between a client's death and its watch is watched instead (Windows could carry the creation time, as the
 > daemon's header does, A-447); and the SDKs' heartbeat slot feeds nothing now.
+> **Since A-522 (piece 2)** the claim names its claimant's process by its pid and its start (the claim slot's
+> `AT_STARTED`, layout `SLB5`), so the watch is taken on that process alone and a pid reused before it reads exited at
+> once (the hole above, closed); and staging buffers and status captures are released at their own deadlines by the
+> shard's keeper on its timing wheel (`crate::deadlines`), off the tick. Still on the tick: leases, lapsed CLI
+> attachments, destroys, grants, the owed audit, departed hosts' attachments (A-222), held copies, the pressure hold,
+> NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
@@ -18968,8 +18992,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     `docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
     **Left:** those bytes are counted by nothing until the range is filled or the backing goes (at most the ranges the
     dead daemon's fills had begun and not finished).
-  - **Open, the other sibling (from reading, owed a failing test, a Windows one):** on Windows a range is committed
-    before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
+  - **Fixed 2026-11-18 (A-530, goal 85, g079): on Windows a range was committed before its charge was asked, so a
+    `Budget` refusal left a committed range uncounted that Windows never gives back.** A range's fill now begins with its
+    charge (`dax_backing::begin_range`): refused, nothing is readied or cleared; a readying or clear the OS refuses after
+    it gives the charge back and refuses `Object`. The ordering is held on every host by
+    `a_range_is_charged_before_anything_is_made_for_it` (bridge-core's unit tests), red with the old order on the Mac
+    Studio. Record: `docs/bugs/2026-11-18-a-windows-dax-range-was-committed-before-its-budget-charge-was-asked.md`.
+    **Owed (main's):** the Windows run of the lib tests and a Windows Shards DAX map past the budget.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
     prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost
