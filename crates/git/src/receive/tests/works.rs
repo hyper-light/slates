@@ -110,7 +110,10 @@ impl Served {
     let built = work::build(&first, &green, &objects, ROOM).unwrap();
     drop(objects);
     let verdict = green.submit(&built.increment);
-    assert!(matches!(verdict, Verdict::Accepted { version: 1 }), "{verdict:?}");
+    assert!(
+      matches!(verdict, Verdict::Accepted { version: 1 }),
+      "{verdict:?}"
+    );
     let moved = repository.admit(&store, &push, GREEN, Some(head)).unwrap();
     repository.commit(&mut store, &mut push, &[moved]).unwrap();
     Self {
@@ -227,9 +230,18 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
   let mut quarantine = Push::new(ObjectFormat::Sha1);
   for object in session.checked().unwrap().objects() {
     let (store, repository) = (&mut served.store, &served.repository);
-    admitted(store, repository, &mut quarantine, object.kind, &object.content);
+    admitted(
+      store,
+      repository,
+      &mut quarantine,
+      object.kind,
+      &object.content,
+    );
   }
-  served.repository.seal(&served.store, &mut quarantine).unwrap();
+  served
+    .repository
+    .seal(&served.store, &mut quarantine)
+    .unwrap();
   let indexed = IndexedObjects::new(&served.repository, &served.store, ROOM);
   let objects = PushedObjects::new(&served.repository, &served.store, &quarantine);
   let read = Read { served };
@@ -313,7 +325,10 @@ fn an_update_is_its_branchs_next_work_appended_at_the_position_read() {
   assert!(at_read, "{:?}", logs.appended);
   let increment = only_increment(&logs).unwrap();
   let verdict = served.green.submit(increment);
-  assert!(matches!(verdict, Verdict::Accepted { version: 2 }), "{verdict:?}");
+  assert!(
+    matches!(verdict, Verdict::Accepted { version: 2 }),
+    "{verdict:?}"
+  );
   assert_holds(&served.green, b"two\n", next);
 }
 
@@ -343,15 +358,23 @@ fn an_old_value_no_version_held_is_a_ref_that_moved() {
 fn a_create_is_a_new_green_holding_the_clients_tree() {
   let mut served = Served::new();
   let (objects, topic) = next_commit(&[served.head], b"topic\n");
-  let bytes = push_of(&[(zero(), topic, b"refs/heads/topic")], &objects, b" report-status");
+  let bytes = push_of(
+    &[(zero(), topic, b"refs/heads/topic")],
+    &objects,
+    b" report-status",
+  );
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
-  let named = matches!(logs.appended.as_slice(), [Entry::Create { name, .. }] if name == b"refs/heads/topic");
+  let named =
+    matches!(logs.appended.as_slice(), [Entry::Create { name, .. }] if name == b"refs/heads/topic");
   assert!(named, "{:?}", logs.appended);
   let mut green = Green::new();
   let verdict = green.submit(only_increment(&logs).unwrap());
-  assert!(matches!(verdict, Verdict::Accepted { version: 1 }), "{verdict:?}");
+  assert!(
+    matches!(verdict, Verdict::Accepted { version: 1 }),
+    "{verdict:?}"
+  );
   assert_holds(&green, b"topic\n", topic);
 }
 
@@ -368,13 +391,20 @@ fn an_annotated_tag_is_a_green_of_its_commits_tree() {
   .into_bytes();
   let tag_id = id_of(Kind::Tag, &tag);
   let objects = vec![(Kind::Tag, tag)];
-  let bytes = push_of(&[(zero(), tag_id, b"refs/tags/v1")], &objects, b" report-status");
+  let bytes = push_of(
+    &[(zero(), tag_id, b"refs/tags/v1")],
+    &objects,
+    b" report-status",
+  );
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
   let mut green = Green::new();
   let verdict = green.submit(only_increment(&logs).unwrap());
-  assert!(matches!(verdict, Verdict::Accepted { version: 1 }), "{verdict:?}");
+  assert!(
+    matches!(verdict, Verdict::Accepted { version: 1 }),
+    "{verdict:?}"
+  );
   assert_holds(&green, b"one\n", tag_id);
 }
 

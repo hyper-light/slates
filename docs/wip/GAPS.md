@@ -366,11 +366,13 @@
 > objects to the store's quarantine. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
 > (`fixtures/push/make-push-fixtures.sh`), answered byte for byte, the fsck push's band 2 but for git's prose. `cargo
 > test -p slates-git --lib` on the Mac Studio: part 1's 194 of 194, 287 merged; the continuation's 349 of 349 merged
-> with main, 17 failing first against stubs, red ten ways by mutation; the split, 377 of 377, red four ways. Owed: part 2, `Judge` over the engine (each
-> ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable versions, A-645; several
-> together under `atomic`, A-635; appended per A-642 through a trait until g261's append lands); then review requests
-> over `refs/for/`, signed pushes, `.have` lines, the warnings git's strict check writes on band 2, and A-590's blob
-> checks. Clippy, `xtask` and the lint matrix over the change are main's (run requests).
+> with main, 17 failing first against stubs, red ten ways by mutation; the split, 377 of 377, red four ways; part
+> 2's judge (`works::Works`: A-618's work over A-638's `PushedObjects`, appended through `Appends`, A-642's stand-in),
+> 386 of 386, six of seven failing first, red five ways. Owed: the server's push path (the quarantine admitted between
+> check and answer, g261's per-green append and A-614's store commit), A-635's several works under `atomic`, A-622's
+> policy checks and hooks; then review requests over `refs/for/`, signed pushes, `.have` lines, the warnings git's
+> strict check writes on band 2, A-590's blob checks and a tag of a tag. Clippy, `xtask` and the lint matrix over the
+> change are main's (run requests).
 > **A-618 (2026-11-19, g225; shared piece 4, works from a client's push):** built in the engine
 > (`slates_merge::push`). A push's base tree and pushed tree are compared by the tool's ids through `PushObjects`, never
 > reading a subtree whose id stayed, and become the work §4.17.1 items 2 and 3 name, the head as `slates.vcs.head` on

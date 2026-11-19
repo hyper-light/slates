@@ -12477,9 +12477,13 @@ engine: the verdict, rebase, position mapping, the register).
 > appends). `Session` runs them over one connection, sans-io: bytes in as they arrive, the repository handed to each call
 > that reads, the push then waiting checked while the caller admits its objects to the store's quarantine, and decided
 > through the judge and answered to the caller's sink. Proven byte for byte against eleven pushes stock git 2.50.1
-> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
-> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
-> versions (A-645), appended per A-642.
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2's
+> judge is built (`works::Works`): each ref's update a work through A-618's `build` over A-638's `PushedObjects`, each
+> green read as the push found it (`Greens`), immutable (A-645). An update's base is the version whose head is its old
+> value, a ref that moved when none held it; a create is built over an empty green; a delete retires the green at its
+> head; a tag names its commit's tree. Each work is appended on its green's own log through `Appends`, A-642's stand-in
+> until g261's append lands, all or none under `atomic`. Owed: the server's push path that admits the checked objects
+> to the quarantine and drives the session with g261's appends and A-614's store commit.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -42936,14 +42940,43 @@ Applied in the same change to:
     by mutation four ways: the checked push lost (4 failed), its objects hidden (2), a delete-only push waiting for a
     pack (4); the fourth, `end` discarding a waiting push, passed every test, so the new test now ends the input first
     and catches it (1 failed). Then 377 of 377 again (load 6.9, 16.5 s), `cargo fmt --check` clean.
-- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
-  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
-  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
-  per-green append lands. Then:
+- **Then, part 2's second piece (2026-11-19): the judge over the store** (`receive::works`). `Works` is receive-pack's
+  `Judge`. It reads each green as the push found it (`Greens`: the green a ref names, at the position its own log was
+  read, and the version whose head is a given commit), immutable, so the work is computed anywhere (A-645):
+  - an update's base is the version whose head is the command's old value (§4.17.1 item 1). A value no version held is
+    answered as git answers a ref that moved, `failed to update ref`, before any work is built;
+  - its work is A-618's `build` against that green, reading the push's trees and blobs through A-638's `PushedObjects`
+    (the index, then the push's quarantine, which the caller admits from `Checked::objects` and seals);
+  - a create's work is built over an empty green, and a create of a ref that names a green is a ref that moved; a delete
+    retires the green, its old value the green's head;
+  - a ref's tree is its commit's, or the tree it names; an annotated tag (a tag is a green, §4.17.1 item 6) names its
+    commit's tree. A tag of a tag, or a ref naming a blob, is `ref names no tree` (owed: git peels any chain).
+  The verdict's entry is appended through `Appends`, A-642's stand-in until g261's per-green append lands: one entry on
+  the green's own log, only while it is at the position read, or under `atomic` every entry or none. A green that moved,
+  or a conflict on the head at the append, is `failed to update ref` (under `atomic`, `atomic transaction failed`), its
+  band-2 line naming the ref. A-618's refusals answer in git's words where git has them (a moved base or one the green
+  disagrees with: a ref that moved; an object the store cannot give: `missing necessary objects`) and in slates' own
+  otherwise, one reason each (`path not held`, `duplicate entries`, `link target not held`, `path changes kind`, `push
+  past its room`, `path without bytes`), the band-2 line naming the path.
+  - Tests (seven, over a real store and engine, through a session): an update appended at the position read, its work
+    the green's next version holding the client's bytes and head; an old value no version held, and a create of a ref
+    that exists, each a ref that moved; a create a new green; an annotated tag a green of its commit's tree; a delete
+    retired at its head and refused at another value; a branch another push moved before the append, alone and under
+    `atomic` beside a create; a file made a directory refused `path changes kind` naming it.
+  - Checks on the Mac Studio (2026-11-19): the first build met main's A-637, which made a submodule link a served node,
+    so that refusal's words went. Then 386 of 386 under `--locked` (two of main's ignored; load 12.2, 14.3 s). Failing
+    first: with the judge stubbed to read no green, six of the seven failed, all but the moved-ref test, which mutation 1
+    guards. Red five ways: any base taken (1 failed), a delete retiring anywhere (1), the atomic line naming the wrong ref
+    (1), a kind change answered as a moved ref (1), a tag's tree read from the tag (1). `cargo fmt` (brought back by
+    blob hash), `cargo fmt --check` clean.
+- **Owed.** The server's push path: the caller that admits `Checked::objects` to a store quarantine and seals it, then
+  answers through `Works` with g261's per-green append (A-642) and A-614's `Repository::admit` and `commit` beside it;
+  several works judged together under `atomic` (A-635); the policy's checks (fast-forward, deletes, linear history,
+  signatures, evidence; A-622's check point) and the admission hooks. Then:
   - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
   - the `.have` lines of objects a fork shares (git's alternates);
-  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
-    blobs.
+  - the warnings git's strict check writes on band 2, A-590's checks of the `.gitmodules` and `.gitattributes` blobs,
+    and a tag of a tag peeled.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);

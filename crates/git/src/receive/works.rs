@@ -270,7 +270,12 @@ where
 
   /// The tree the object `head` names: a commit's, or that of the commit or tree an annotated tag
   /// names.
-  fn tree_of(&self, head: &ObjectId, pushed: &Pushed<'_>, name: &[u8]) -> Result<ObjectId, Declined> {
+  fn tree_of(
+    &self,
+    head: &ObjectId,
+    pushed: &Pushed<'_>,
+    name: &[u8],
+  ) -> Result<ObjectId, Declined> {
     let format = head.format();
     let (kind, content) = self.object(head, pushed).ok_or_else(|| missing(name))?;
     let mut scratch = Admission::new(u64::MAX);
@@ -289,7 +294,11 @@ where
         commit.tree(format).ok_or_else(|| missing(name))
       }
       Some(Kind::Tree) => Ok(target),
-      _ => Err(declined(NO_TREE, name, b"names neither a commit nor a tree")),
+      _ => Err(declined(
+        NO_TREE,
+        name,
+        b"names neither a commit nor a tree",
+      )),
     }
   }
 
@@ -326,9 +335,7 @@ where
       .appends
       .append(entry)
       .map(|()| Vec::new())
-      .map_err(|unappended| {
-        not_appended(FAILED_TO_UPDATE, &[command.name.as_slice()], &unappended)
-      })
+      .map_err(|unappended| not_appended(FAILED_TO_UPDATE, &[command.name.as_slice()], &unappended))
   }
 
   fn append_atomic(
