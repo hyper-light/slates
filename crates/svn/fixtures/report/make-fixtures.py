@@ -437,7 +437,8 @@ def main():
                     summary.write("  exit %d\n" % result.returncode)
                     for line in result.stderr.splitlines():
                         summary.write("  stderr: %s\n" % line.replace(work + "/", ""))
-        names = sorted(f for f in os.listdir(out) if f != "SHA256SUMS")
+        inputs = ("SHA256SUMS", "make-fixtures.py", "history.txt")
+        names = sorted(f for f in os.listdir(out) if f not in inputs)
         with open(os.path.join(out, "SHA256SUMS"), "w") as sums:
             for file_name in names:
                 with open(os.path.join(out, file_name), "rb") as fixture:
