@@ -12164,6 +12164,13 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    commit's tree, without walking it (built at another green's version: A-534's persistent maps and `Lineage::branch`
    in the engine, §4.16, and A-575's verbs over one lineage a repository on its partition, recovered from the log and
    the snapshot; at a commit that is no version's head, owed with piece 3's trees).
+2. (A-642, Ada 2026-11-19, supersedes the repository-wide position below: the unit of work is a changeset appended
+   to a write-ahead log; commits are server-side, lock-free and incremental; no global references. Each green
+   keeps its own log and its changesets append there; a repository has no position every change passes through.
+   An atomic push across greens is one entry on each green it moves, appended only while each green is still at
+   the position the push read, refused otherwise; the checks on greens it does not move compare their positions
+   the same way. The repository's own state, Mercurial's phase roots and markers and the LFS locks, is kept in
+   logs of its own.)
 2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
    recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
@@ -43001,3 +43008,27 @@ Applied in the same change to:
     suffix chosen instead of the longest. A control passed 59 of 59.
 - **Owed:** the store's own bundle list and URI packs (each a run of A-614 part 2's fragments, with its hash and URI),
   and the fetch path that asks for them (piece 7); `object-info`'s `type` when a git release ships it.
+
+### A-642 — changesets in write-ahead logs, lock-free incremental commits, no global references (2026-11-19, Ada; main; UI goal 93 (kiln 51cef9f7); §4.17.1 shared piece 2; supersedes A-603's repository-wide position)
+
+- **What Ada asked.** "Write-ahead log & lock-free commits. The fundamental unit of work is a "changeset" stored as an
+  entry in a write-ahead log. ... server-side, lock-free incremental commits and avoids global references to keep merge
+  throughput high."
+- **What already holds.** A push becomes a work, an ops document: a changeset. It is judged against its base and
+  appended as a log entry that recovery replays (the db's guard-then-apply log). A commit carries its changeset's
+  operations, never a tree snapshot. A repository lives on one owner shard with one writer, so no commit takes a
+  lock (R2, D-7).
+- **What changes.** A-603 made every change of a repository take the next position in one repository-wide register.
+  That position is a global reference: a push to one branch waits behind a push to another, and in a fleet every
+  change replicates through one ordered record. Instead:
+  - each green keeps its own log; its changesets append there, ordered by that green's own positions;
+  - a repository has no position every change passes through;
+  - an atomic push across greens is one entry on each green it moves. It appends only while each green is still at the
+    position the push read, and is refused otherwise, typed, naming the green that moved;
+  - checks on greens a push does not move (Mercurial's `check:heads`) compare those greens' positions the same way;
+  - the repository's own state (Mercurial's phase roots and obsolescence markers, LFS locks) is kept in logs of its
+    own, never a counter every push must pass.
+- **Owed.** A-603's entry rebuilt to this shape, and its fleet half on each green's log (g261, with A-635 and A-636).
+  The pushes coding against it (receive-pack A-620, Mercurial's unbundle A-641, LFS locks A-629) keep their traits.
+- **Applied in the same change to:** §4.17.1 shared piece 2's text; GAPS' §4.17 entry.
+
