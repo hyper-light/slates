@@ -3929,6 +3929,12 @@
 > delegation recalls, the idle seal and the huge-page re-arm. Owed beside it: a claim's pid is the client's word, so a
 > pid reused between a client's death and its watch is watched instead (Windows could carry the creation time, as the
 > daemon's header does, A-447); and the SDKs' heartbeat slot feeds nothing now.
+> **Since A-522 (piece 2)** the claim names its claimant's process by its pid and its start (the claim slot's
+> `AT_STARTED`, layout `SLB5`), so the watch is taken on that process alone and a pid reused before it reads exited at
+> once (the hole above, closed); and staging buffers and status captures are released at their own deadlines by the
+> shard's keeper on its timing wheel (`crate::deadlines`), off the tick. Still on the tick: leases, lapsed CLI
+> attachments, destroys, grants, the owed audit, departed hosts' attachments (A-222), held copies, the pressure hold,
+> NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.

@@ -6,8 +6,9 @@
 //! Bounds: every buffer's bytes, and a fixed charge for its record, are reserved from the shard's metadata budget
 //! when it begins, whole or not at all, so the buffers a shard holds are bounded by that budget; an empty buffer is
 //! refused (an empty insert fits one request). A buffer expires one lease after its last use and is released then,
-//! by the shard's reaper or by the next staging call, whichever comes first, so an abandoned upload holds its
-//! credit for at most a lease. Buffers are not durable: a daemon restart drops them, and the client stages again.
+//! by the shard's deadline keeper at that moment (`crate::deadlines`, A-522) or by the next staging call if it comes
+//! first, so an abandoned upload holds its credit for at most a lease. Buffers are not durable: a daemon restart drops
+//! them, and the client stages again.
 //!
 //! A buffer belongs to the principal that began it: a put or an apply by any other principal is refused as if the
 //! token did not exist, so a token is never a capability.
@@ -176,6 +177,11 @@ impl Staging {
         budget.release(buffer.credit);
       }
     }
+  }
+
+  /// The earliest expiry among the buffers, the deadline the shard's keeper sleeps until (A-522, `crate::deadlines`).
+  pub(crate) fn next_expiry(&self) -> Option<u64> {
+    self.by_expiry.first().map(|(expires, _)| *expires)
   }
 
   /// How many buffers are held.
