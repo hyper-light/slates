@@ -4311,7 +4311,11 @@
 >   now learned from its own rounds (`crate::reader_patience`: RFC 6298's estimator over the rounds that found every
 >   record held, backed off at each overrun, never past the failover delay;
 >   `a_live_mount_slower_than_a_window_is_kept_up_with_once_its_pace_is_learned`); the two mounts' wiring is Linux's and
->   Windows' to build (main's lanes). Owed in C-c: `verbs::await_materialization` (part 3). Class B (the
+>   Windows' to build (main's lanes). Part 3: a verb held for its volume's materialization after a takeover looked at
+>   the pending map each heartbeat and gave up at one window, so a materialization slower than that sent its client a
+>   refusal and a retry each second; it now waits for the materialization's own end, woken when the pending entry is
+>   removed, however it ends (`state::PendingMaterializations`;
+>   `a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound`). C-c is closed. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -12586,7 +12590,8 @@ staging refused like a new admission. A takeover is now recovery, admitted past 
 - Open: the takeover flake itself, until it recurs with its counters.
 - Done the same day: the successor holds its client's verb while the volume's materialization is pending, for at
   most one liveness budget, then refuses retryably (`verbs::await_materialization`). A pause-free client had been
-  refused 2.8 million times in 400 s.
+  refused 2.8 million times in 400 s. Since A-548 (2026-11-19) the hold has no bound of its own: it waits for the
+  materialization's end, woken when the pending entry is removed.
 
 ### 2026-10-07: fixed (reproduced, then fixed): a client's reply deadline was shorter than a forwarded verb's own bound
 

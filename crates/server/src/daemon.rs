@@ -4701,7 +4701,7 @@ async fn init_shard(
     put_outcomes: crate::fleet::PutOutcomes::default(),
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
-    pending_materializations: std::collections::BTreeMap::new(),
+    pending_materializations: crate::state::PendingMaterializations::default(),
     making_taken_over: std::collections::BTreeMap::new(),
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),

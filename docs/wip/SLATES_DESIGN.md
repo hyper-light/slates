@@ -36971,7 +36971,9 @@ Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192'
 `crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
 until part 2), `crates/bridge-core/tests/invalidation.rs`. Part 2: §4.5, §4.6 (A-141's mount that falls behind), GAPS,
 `crates/vfs/src/{journal,volume}.rs` (`ReaderRounds`, `take_rounds`, `set_patience`),
-`crates/server/src/reader_patience.rs` (new), `crates/server/src/{fuse,winfsp,learned_wait,lib}.rs`.
+`crates/server/src/reader_patience.rs` (new), `crates/server/src/{fuse,winfsp,learned_wait,lib}.rs`. Part 3: GAPS (the
+R3 debt's class C, the 2026-10-07 hold), `crates/server/src/state.rs` (`PendingMaterializations`),
+`crates/server/src/{verbs,daemon}.rs`.
 - **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
   the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
   overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
@@ -37020,6 +37022,22 @@ until part 2), `crates/bridge-core/tests/invalidation.rs`. Part 2: §4.5, §4.6 
   `slates-vfs --lib journal` 12 of 12, `slates-server --lib reader_patience` 2 of 2 and `learned_wait` 2 of 2; red with
   the fold made a no-op (the patience kept at the one-window prior): all six rounds overran, where only the first
   should. The mounts' wiring (`fuse.rs` on Linux, `winfsp.rs` on Windows) is not compiled on macOS: main's lanes.
+- **Part 3, a verb held for a materialization** (`verbs::await_materialization`). A verb on a volume this node owns
+  but has not materialized yet (it adopted the head in a takeover) is held while the materialization is pending, and
+  the retryable refusal that follows meets the materialized volume on the client's retry. The hold looked at the
+  pending map each heartbeat and gave up at one liveness window, so a materialization slower than a second sent its
+  client a refusal, and a retry, each second for nothing. Now the hold waits for the materialization's own end: the
+  pending map is a type of its own (`state::PendingMaterializations`) whose `remove` is the only way an entry leaves,
+  however the materialization ends (made, given up past the failover SLO's worth of attempts without progress, or its
+  volume tombstoned), and it wakes every task waiting on that object (`wait_for_end`), so no held verb outlives its
+  event and none waits on a timer. The client waits while its daemon lives (`defers_reply`, A-232). The waiters are
+  one waker a task, a task that waits again replacing its own, drained at the object's end, so they are bounded by the
+  held verbs, which the shard's task arena bounds.
+- **Tests (part 3).** `a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound` (`verbs.rs`: a volume
+  marked pending, a task waiting as a held verb does, the test thread past one window and a half, then the entry
+  removed). On the Mac Studio (debug, 2026-11-19, load 19 to 21): green, and `slates-server --lib takeover` 27 of 27
+  over the new type; red with the old wait put back: "the held verb was let go while its materialization was still
+  pending". C-c is closed: no class C wait waits on a fixed second.
 
 ### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
 
