@@ -309,10 +309,10 @@ fn read_node(store: &ContentStore, id: ContentId) -> Result<Node, BlameRefused> 
     return Err(malformed);
   };
   let mut names = node.names();
-  let (Some(content), Some(spans), _) = (names.next(), names.next(), names.next()) else {
+  let (Some(content), Some(spans), None) = (names.next(), names.next(), names.next()) else {
     return Err(malformed);
   };
-  let Some((&BLAME, rest)) = node.payload().split_first() else {
+  let Some((_, rest)) = node.payload().split_first() else {
     return Err(malformed);
   };
   let Some((lines, rest)) = rest.split_first_chunk::<COUNT_BYTES>() else {
