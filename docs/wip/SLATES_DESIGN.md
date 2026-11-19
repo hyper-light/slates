@@ -13961,10 +13961,10 @@ signature verification).
 > looked up, as in 7.2. A client asking for hidden changesets is warned as 7.2 warns a user its
 > `experimental.server.allow-hidden-access` does not name, the principal named, and then served the view, since no right
 > grants hidden access; a store gone mid-session ends it in the site's not-served words. Proven on macOS arm64 (Mac
-> Studio, kiln r128 and, over main 2f73eb075 as it lands, r363, 2026-11-19): red first with the site starting no
+> Studio, kiln r128 and, over main 0462bd922 as it lands, r378, 2026-11-19): red first with the site starting no
 > Mercurial session, checking no argument and the command answering nothing (`cargo test --locked -p slates-server --lib
 > -- vcs_ssh`: 25 passed, the 7 new failed at their assertions), then green, `-- vcs_ssh vcs_http::hg` 39 of 39 (44 of
-> 44 over main 2f73eb075, A-651 parts 3 and 4's tests among them), no warning, fmt clean: the probe stock `hg serve
+> 44 over main 0462bd922, A-651 parts 3 and 4's tests among them), no warning, fmt clean: the probe stock `hg serve
 > --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake, answered byte for byte at every cut down
 > to a byte and over the real edge with a scripted SSH client, exit-status 0, EOF and close in order; 7.2's refusals
 > as recorded from stock 7.2 (research §27). Until A-680 part 2 hands the lender A-662's stores no repository has one,
@@ -51807,10 +51807,12 @@ a Built line, the owed list, and the interop tests' line on what the SSH round t
   -server compiled afresh: the same filters 42 of 42 (740 filtered out), no warning, `cargo fmt -p slates-server -p
   slates-cli -- --check` clean, and `cargo test --locked -p slates-cli --test cli
   stock_hg_clones_pulls_and_pushes_over_the_ssh_edge` 1 ignored, its reason naming A-684, A-685 and A-680. Over main
-  2f73eb075 as it lands (353c598ae, kiln r363, 23:06-23:08Z, load 20), A-651 part 4's harness making a site on each
-  shard from one `Send` maker, so the tests' vanishing-store flag an `AtomicBool` (E0277 in kiln r359 until it was):
-  the same filters 44 of 44 (740 filtered out), A-651 part 4's two and the seven new among them, no warning, fmt
-  clean. No integration test reaches the SSH edge while the daemon does not start it: that round trip with stock hg
+  2f73eb075 (353c598ae, kiln r363, 23:06-23:08Z, load 20), A-651 part 4's harness making a site on each shard from
+  one `Send` maker, so the tests' vanishing-store flag an `AtomicBool` (E0277 in kiln r359 until it was): the same
+  filters 44 of 44 (740 filtered out), A-651 part 4's two and the seven new among them, no warning, fmt clean. Over
+  main 0462bd922 as it lands (ffab4d9d7, kiln r378, 23:10-23:12Z, load 15; slates-merge, -client, -hg, -git and
+  -server compiled afresh): the same filters 44 of 44 (746 filtered out), no warning, fmt clean for slates-server
+  and slates-cli. No integration test reaches the SSH edge while the daemon does not start it: that round trip with stock hg
   7.2 over SSH is its test once those three land.
 - **Owed.** A-680's lender over A-662's stores, without which no Mercurial store is lent and the edge serves `hg` in
   tests alone; the daemon starting the SSH edge (A-684's `--vcs-ssh <addr>`); main's live `hg clone` and `hg pull`
