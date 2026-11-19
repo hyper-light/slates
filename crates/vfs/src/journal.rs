@@ -4,7 +4,10 @@
 //! Retention keeps what a live reader still needs (A-157). The budget starts at the floor its owner gives it (a
 //! page), and the oldest records leave first while it is full. A record leaves only if every open reader has read past
 //! it ([`OpLog::open_reader`]), or if it has waited longer than the patience of the reader still owing it: that reader
-//! is presumed gone, and overruns if it returns. Otherwise the budget grows by what the incoming record needs, reserved
+//! is presumed gone, and overruns if it returns. A reader's owner names its patience by what its reads wait on
+//! ([`Patience`], A-548): a reader consumed at the change itself on the volume's own shard holds its records while it is
+//! open, since nothing but its closing keeps a record from it; one whose rounds wait on another party is presumed gone
+//! past a bound its owner names. Otherwise the budget grows by what the incoming record needs, reserved
 //! from the shard's metadata ledger. A refused growth keeps the budget, drops the oldest, and is counted. Writers never
 //! wait. The budget never shrinks while the log lives; its growth is returned at the volume's teardown ([`OpLog::grown`]).
 //! So the budget is the design's formula realized at the moment of need: the largest backlog a live reader ever had,
@@ -166,6 +169,30 @@ pub struct JournalMeasure {
   pub longest_lag_ns: u64,
 }
 
+/// How long a record an open reader has not read holds the log's budget for it ([`OpLog::append`], A-157, A-548): what
+/// the reader's owner knows of the party its reads wait on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Patience {
+  /// Until the reader reads it or closes. For a reader its owner consumes at the change itself, on the volume's own
+  /// shard: the record is read as soon as that shard runs the reader's task, and no other party can keep it longer, so
+  /// presuming such a reader gone on the wall's time would only misjudge a shard kept off its CPU (the NFS write-back
+  /// tracker, A-548). Its records are bounded by the shard's metadata ledger, whose refusal drops the oldest, counted.
+  WhileOpen,
+  /// Until the record has waited this many nanoseconds: past it the reader is presumed gone, and overruns if it
+  /// returns. For a reader whose rounds wait on another party, which may stall while the reader stays open.
+  Bounded(u64),
+}
+
+impl Patience {
+  /// Whether a record that has waited `waited_ns` is still within this patience.
+  pub const fn holds(self, waited_ns: u64) -> bool {
+    match self {
+      Patience::WhileOpen => true,
+      Patience::Bounded(patience_ns) => waited_ns < patience_ns,
+    }
+  }
+}
+
 /// An open reader of the log ([`OpLog::open_reader`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reader {
@@ -173,7 +200,7 @@ struct Reader {
   point: u64,
   /// How long a record may wait for it before it is presumed gone, so the record no longer holds the log's budget
   /// ([`OpLog::append`]).
-  patience_ns: u64,
+  patience: Patience,
 }
 
 /// The log.
@@ -212,11 +239,11 @@ impl OpLog {
     }
   }
 
-  /// Opens reader `key` at `point` with `patience_ns`: until it closes, the reader may read every record after `point`,
+  /// Opens reader `key` at `point` with `patience`: until it closes, the reader may read every record after `point`,
   /// and each of its rounds moves `point` to the round's start ([`OpLog::note_round`]). A record it has not read holds
-  /// the log's budget until it has waited `patience_ns` ([`OpLog::append`]). Opening a key already open moves its point.
-  pub fn open_reader(&mut self, key: u64, point: u64, patience_ns: u64) {
-    self.readers.insert(key, Reader { point, patience_ns });
+  /// the log's budget while it is within `patience` ([`OpLog::append`]). Opening a key already open moves its point.
+  pub fn open_reader(&mut self, key: u64, point: u64, patience: Patience) {
+    self.readers.insert(key, Reader { point, patience });
   }
 
   /// Closes reader `key`; a key that is not open is left alone.
@@ -240,7 +267,7 @@ impl OpLog {
     self
       .readers
       .values()
-      .any(|reader| reader.point < seq && waited_ns < reader.patience_ns)
+      .any(|reader| reader.point < seq && reader.patience.holds(waited_ns))
   }
 
   /// The bytes the shard's metadata ledger granted the budget beyond its floor, which the volume's owner returns at its
@@ -660,8 +687,8 @@ mod tests {
         0,
       );
     }
-    log.open_reader(7, 2, u64::MAX);
-    log.open_reader(9, 4, u64::MAX);
+    log.open_reader(7, 2, Patience::WhileOpen);
+    log.open_reader(9, 4, Patience::WhileOpen);
     assert_eq!((log.readers(), log.slowest_reader()), (2, Some(2)));
     log.note_round(7, 5, 10);
     assert_eq!(
@@ -889,7 +916,8 @@ mod tests {
   }
 
   /// One step of a generated retention history (A-157): an append with its path length after some time, a reader opened
-  /// some records behind the head with a patience, a reader's round moving its point forward, or a reader closed.
+  /// some records behind the head with a patience (bounded, or none while it is open: A-548), a reader's round moving its
+  /// point forward, or a reader closed.
   #[derive(Clone, Debug)]
   enum Retain {
     Append {
@@ -899,7 +927,7 @@ mod tests {
     Open {
       key: u64,
       behind: u64,
-      patience_ns: u64,
+      patience_ns: Option<u64>,
     },
     Round {
       key: u64,
@@ -915,16 +943,17 @@ mod tests {
     use proptest::prelude::*;
     prop_oneof![
       6 => (0..48usize, 0..400u64).prop_map(|(path, after_ns)| Retain::Append { path, after_ns }),
-      1 => (0..3u64, 0..6u64, 1..4_000u64).prop_map(|(key, behind, patience_ns)| Retain::Open { key, behind, patience_ns }),
+      1 => (0..3u64, 0..6u64, proptest::option::of(1..4_000u64)).prop_map(|(key, behind, patience_ns)| Retain::Open { key, behind, patience_ns }),
       2 => (0..3u64, 0..12u64).prop_map(|(key, forward)| Retain::Round { key, forward }),
       1 => (0..3u64).prop_map(|key| Retain::Close { key }),
     ]
   }
 
   /// A-157's retention rule, kept apart from [`OpLog`]: records (sequence, time, charge) in order; readers by key with
-  /// their point and patience; a budget, and a ledger's room. While the incoming record does not fit, the oldest leaves,
-  /// unless an open reader that has not read past it is still within its patience of it: then, once an append, the
-  /// budget grows by the shortfall if the room holds it, and a refusal is counted.
+  /// their point and patience (`None`: held while open, A-548); a budget, and a ledger's room. While the incoming record
+  /// does not fit, the oldest leaves, unless an open reader that has not read past it is still within its patience of it
+  /// (always, for one held while open): then, once an append, the budget grows by the shortfall if the room holds it,
+  /// and a refusal is counted.
   struct RetentionModel {
     retained: VecDeque<(u64, u64, u64)>,
     /// Every record appended, (sequence, time), retained or not: what the direct check walks.
@@ -935,8 +964,9 @@ mod tests {
     room: u64,
     grown: u64,
     refused: u64,
-    /// Key → (point, patience, the oldest record retained when it opened): records before that had left already.
-    readers: BTreeMap<u64, (u64, u64, u64)>,
+    /// Key → (point, patience, the oldest record retained when it opened): records before that had left already. A
+    /// patience of `None` holds every record while the reader is open.
+    readers: BTreeMap<u64, (u64, Option<u64>, u64)>,
   }
 
   impl RetentionModel {
@@ -948,10 +978,9 @@ mod tests {
         let Some(&(oldest, oldest_at, oldest_cost)) = self.retained.front() else {
           break;
         };
-        let owed = self
-          .readers
-          .values()
-          .any(|&(point, patience, _)| point < oldest && at - oldest_at < patience);
+        let owed = self.readers.values().any(|&(point, patience, _)| {
+          point < oldest && patience.is_none_or(|patience| at - oldest_at < patience)
+        });
         if !asked && owed {
           asked = true;
           let short = self.bytes + cost - self.budget;
@@ -1016,7 +1045,8 @@ mod tests {
           }
           Retain::Open { key, behind, patience_ns } => {
             let point = log.head_seq().saturating_sub(behind);
-            log.open_reader(key, point, patience_ns);
+            let patience = patience_ns.map_or(Patience::WhileOpen, Patience::Bounded);
+            log.open_reader(key, point, patience);
             model.readers.insert(key, (point, patience_ns, log.oldest_seq()));
           }
           // A reader's point only moves forward, as a mount's does: a refused round is gathered again from its start.
@@ -1040,13 +1070,15 @@ mod tests {
         proptest::prop_assert_eq!(log.growth_refused(), model.refused);
         proptest::prop_assert_eq!(ledger.committed(), model.grown);
         // The rule's promise, checked apart from the model: with every growth admitted, no record an open reader has not
-        // read, appended while it was open (at or after its floor) and still within its patience, has left. A record within
-        // a reader's patience now was within it at every earlier append, and a reader's point only moves forward.
+        // read, appended while it was open (at or after its floor) and still within its patience, has left; for a reader
+        // held while open (A-548), no record it has not read. A record within a reader's patience now was within it at
+        // every earlier append, and a reader's point only moves forward.
         if model.refused == 0 {
           let oldest = log.oldest_seq();
           for &(point, patience, floor) in model.readers.values() {
             for &(seq, at) in &model.all {
-              let owed = seq > point && seq >= floor && now - at < patience;
+              let within = patience.is_none_or(|patience| now - at < patience);
+              let owed = seq > point && seq >= floor && within;
               proptest::prop_assert!(!owed || seq >= oldest, "record {} owed to a reader at {} has left", seq, point);
             }
           }

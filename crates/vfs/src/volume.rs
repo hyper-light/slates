@@ -1109,13 +1109,14 @@ impl Volume {
     self.journal.note_round(reader, cursor, now)
   }
 
-  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount that consumes the journal from the
-  /// moment it serves, so the records after the head now are the first it may read. A record it has not read holds the
-  /// journal's budget until it has waited `patience_ns`, the transport's liveness (A-157). Its owner closes it when the
-  /// mount ends ([`Volume::close_journal_reader`]).
-  pub fn open_journal_reader(&mut self, key: u64, patience_ns: u64) {
+  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount, or another consumer of the journal,
+  /// from the moment it serves, so the records after the head now are the first it may read. A record it has not read
+  /// holds the journal's budget while it is within `patience`, which the owner names by what the reader's reads wait on
+  /// (A-157, A-548: [`crate::journal::Patience`]). Its owner closes it when its attachment ends
+  /// ([`Volume::close_journal_reader`]).
+  pub fn open_journal_reader(&mut self, key: u64, patience: crate::journal::Patience) {
     let head = self.journal.head_seq();
-    self.journal.open_reader(key, head, patience_ns);
+    self.journal.open_reader(key, head, patience);
   }
 
   /// The bytes the shard's metadata ledger granted the journal beyond its floor (A-157): what the volume's owner

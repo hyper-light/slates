@@ -2164,8 +2164,11 @@ drift check `fstat`s.
   redirect and drift records are journaled the same way; retention is bounded by a memory budget
   derived from the volume's measured mutation rate and the longest subscriber lag (A-157). The
   journal keeps what a live reader still owes. It starts at a one-page floor and grows from the
-  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader
-  silent past its transport's liveness pins nothing, and a refused growth is counted.
+  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader's
+  owner names its patience by what the reader's reads wait on (A-548): the NFS write-back tracker,
+  consumed at the change itself on the volume's own shard, holds its records while it is open; a
+  reader whose rounds wait on a mount's kernel is presumed gone past its transport's liveness, and
+  pins nothing then. A refused growth is counted.
 
 **Failure matrix.** Hash collision on equivalence (two names fold equal): Refused (`EEXIST`),
 which is APFS behaviour. Cut-over conversion mid-operation: Masked (conversion is a copy of a
@@ -3048,7 +3051,8 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
 the rest of the page as it fetched it. Apple's client does so for a page dirtied through a shared map while another path
 changed the file, and no recall makes it flush first. So the server keeps, per connection, A-140's byte states for each
 file the connection's READs and WRITEs touched. A READ makes bytes fresh, the connection's own changes refresh them,
-and every other change, fed by a per-volume keeper reading the journal (A-157), makes fetched bytes stale. A WRITE
+and every other change, fed by a per-volume keeper reading the journal (A-157; its reader held while the tracker is
+open, A-548), makes fetched bytes stale. A WRITE
 whose stale bytes differ from the file's bytes now is refused whole, `NFS3ERR_IO`, never merged (banned item 11). A
 write over bytes never fetched, or over stale bytes equal to the file's, is applied. The states go with their
 connection, on the shards its calls were served on, however it ends (`crates/server/src/nfs_writeback.rs`). Apple's
@@ -36527,3 +36531,34 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
+Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
+`crates/vfs/src/{journal,volume}.rs` (`Patience`), `crates/vfs/tests/journal_cost.rs`,
+`crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
+until part 2), `crates/bridge-core/tests/invalidation.rs`.
+- **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
+  the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
+  overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
+  and WinFsp readers' patience, the NFS write-back tracker's, and `verbs::await_materialization`.
+- **Part 1, the NFS write-back tracker** (`nfs_writeback::tracking`). The tracker's reader is consumed by its keeper, a
+  task on the volume's own shard woken by the change that journals the record, so only that shard's own turns stand
+  between a record and its consumer. A record waiting `W` on the wall therefore meant a shard kept off its CPU, never a
+  tracker gone, and dropping it was the costliest answer: the keeper's consume found its cursor behind the journal and
+  lost every connection's states, so each write-back of those connections was refused (`NFS3ERR_IO`) until the
+  connection ended. Now the reader holds its records while the tracker is open (`Patience::WhileOpen`); it closes with
+  the tracker when the tracker's last connection ends. Its records stay bounded by the shard's metadata ledger, whose
+  refusal drops the oldest, counted (`growth_refused`). A tracker whose keeper could not be spawned (a counted tripwire,
+  `nfs.writeback_keeper_refused`) is consumed at its connections' calls and holds its records until then, within the
+  same ledger.
+- **Tests (part 1).** `a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window` (`nfs_writeback.rs`:
+  a connection's fetch tracked, another path's change, the shard held a window and a tenth at a fifth of its CPU, the
+  journal filled past its budget, then the connection's write-back of a byte it fetched judged). On the Mac Studio
+  (debug, 2026-11-19, load 13 to 32): `slates-server --lib nfs_writeback` 2 of 2 and `slates-vfs --lib journal` 11 of 11;
+  red with the one-window patience put back: the write-back judged `Unknown`, the connection's states lost, where
+  `Apply` was expected.
+- **The journal's rule.** `Patience` names what a reader's reads wait on: `WhileOpen` for a reader consumed at the
+  change on the volume's own shard, `Bounded(ns)` for one whose rounds wait on another party, which may stall while the
+  reader stays open. The retention oracle (`retention_keeps_what_a_live_reader_needs_as_the_model_does`) generates
+  both, its model stating each rule, and checks directly that while no growth was refused no record a reader held
+  while open has not read has left.
