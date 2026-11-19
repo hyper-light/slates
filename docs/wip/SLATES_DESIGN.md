@@ -10248,12 +10248,15 @@ entry either old or new, never torn).
    exchange's temporary and a clear's fresh directory take the aside name, so the displaced entry
    lands there. An exchange back removes only the temporary by its descriptor's inode, or the fresh
    directory by the identity it had at its hidden name; anything else there is kept. The seam offers
-   no rename that replaces its destination. A refusal the seam gives a number is typed by the numbering it is in
-   (A-527): an errno (`HostError::Unavailable`) or a Win32 error code (`HostError::Win32`). The engine tells refusals
-   apart by an errno's number (a name that exists, a full disk, a verb the filesystem lacks), so the Windows writer gives
-   a Win32 code of such a kind that kind's errno and keeps every other one as the Win32 code it is: a Win32 code whose
-   number is one of those errnos (`ERROR_NOT_SAME_DEVICE` 17, `EEXIST`'s) never reads as it, and ends the landing as any
-   refusal the engine does not tell apart does.
+   no rename that replaces its destination. The seam names the kinds the engine tells apart (A-539): a name that exists
+   (`HostError::Exists`), no room (`NoSpace`), a verb the filesystem lacks (`Unsupported`); each writer reads its own
+   platform's numbers into them (Linux's `EDQUOT` 122 and macOS's 69, a Linux exchange's `EINVAL` and macOS's
+   `ENOTSUP`, Windows' `ERROR_ALREADY_EXISTS`), so the engine compares no number. Every refusal carries its code typed by
+   its numbering (`OsCode`: an errno or a Win32 error code, A-527) to the end: the landing report's failed entry and
+   crash, the volume's `BaseUnavailable`, and the wire, where each errno variant carries an errno alone and a Win32
+   variant appended beside it carries a Win32 code (`HostAnswer::Win32`, `LandingDegradation::CrashedWin32`,
+   `TargetRefusal::HostWin32`, `Refusal::BaseUnavailableWin32`; D-15's append-only rule), pinned by golden vectors
+   (`crates/ipc/src/os_code_vectors.rs`); the library contract's `HostFault::Base` names an `OsCode`.
 7. *Batches inside the landing (A-130).* A file is staged — written, given its mode and mtime, and
    written out — and waits, open at its hidden name, for its batch's barrier; then the batch's files
    are placed. A batch holds at most one copy window of pages (`chunk_bytes`), each file counted as at

@@ -90,8 +90,8 @@ pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
 pub use container::ContainerBind;
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
-  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
-  RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
+  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, OsCode, PathFault,
+  ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
@@ -246,9 +246,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// attachment and the entry the host's OCI runtime performs ([`OciBinding`], with its [`HostMountEvidence`]), refused
 /// typed as the daemon refuses the form (`Invalid::ChosenPath`, `Unsupported::Attachment`, `Denied::Rights`); the
 /// simulator answers it from the mounts it recorded (kiln's container engine, kiln goal 01a1f124; the same day).
+/// 45: a host's refusal code carries its numbering (A-539): [`HostFault::Base`] names an [`OsCode`], an errno or a
+/// Win32 error code (none where the host named none), where it held a bare number; the wire's
+/// `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
+/// `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 44;
+pub const CONTRACT: u32 = 45;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

@@ -19280,7 +19280,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   told the host is Windows' reads a Win32 code, and any other reads an errno; typing them is the wire's own piece, a
   contract change; and the engine's own errnos are Linux's and macOS's numbers side by side, so an errno one platform
   numbers as the other's kind (Linux's 45 `EL2NSYNC` as macOS's `ENOTSUP`, 69 `ESRMNT` as macOS's `EDQUOT`) would read
-  as that kind, which no call the writer makes is known to answer).
+  as that kind, which no call the writer makes is known to answer; both **built by A-539 the same day** (`OsCode` carried
+  to the report, the volume and the wire, a Win32 variant appended beside each errno variant, contract 45, golden
+  vectors; the seam's named kinds `Exists`, `NoSpace`, `Unsupported`, which each writer gives from its own platform's
+  numbers; its unit tests ran on the Mac Studio, the Windows lanes filed for main; still owed with it: a completion
+  record an older Windows daemon wrote may hold a Win32 code in an errno variant, which a newer reader takes for an
+  errno — a past refusal's number misnamed once after an upgrade, nothing misdecoded, so the anchor's layout stands;
+  and the client's own OS calls (`HostFault::Os`, the mount faults) still name a bare number in this process's own
+  numbering, which is right where client and daemon share a platform and is typed nowhere else yet).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
