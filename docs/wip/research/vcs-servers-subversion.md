@@ -34,6 +34,11 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_subr/xml.c` (read 2026-11-19 for A-602) | `aeffb5c3effa073f` | C |
 | `subversion/libsvn_subr/ctype.c` (read 2026-11-19 for A-602) | `8c00533a27dc55f5` | C |
 | `subversion/include/svn_ctype.h` (read 2026-11-19 for A-602) | `2928f028e729a7b1` | B |
+| `subversion/libsvn_fs_fs/fs_fs.c` (read 2026-11-19 for A-592) | `b12b91eb0418577d` | C |
+| `subversion/libsvn_fs_fs/dag.c` (read 2026-11-19 for A-592) | `9efbb054b8818693` | C |
+| `subversion/libsvn_subr/path.c` (read 2026-11-19 for A-592) | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/sorts.c` (read 2026-11-19 for A-592) | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_subr/dirent_uri.c` (read 2026-11-19 for A-592) | `fe05687a2dedb22c` | C |
 | `subversion/include/svn_dav.h` (read 2026-11-19 for A-609) | `f4740ee24bf1864d` | B |
 | `subversion/include/private/svn_dav_protocol.h` (A-609) | `10fa33c966fe4a8f` | B |
 | `subversion/libsvn_ra_serf/update.c`, `merge.c`, `get_deleted_rev.c` (A-609) | `b78f28a0945d7499`, `ac378386d20faff9`, `b7f6704777bccf62` | C |
@@ -51,6 +56,9 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_ra_svn/marshal.c` | `908ccdd914cae15b` | C |
 | `subversion/svnserve/svnserve.c` | `43155c2bd557492f` | C |
 | `subversion/svnserve/serve.c` | `acb1cac75ea86ba7` | C |
+| `subversion/libsvn_ra_svn/cram.c` | `64e6271eacf19286` (A-599) | C |
+| `subversion/libsvn_ra_svn/internal_auth.c` | `61f373448a9c878c` (A-599) | C |
+| `subversion/libsvn_ra_svn/client.c` | `3c3b9263dd7223a9` (A-599) | C |
 | `subversion/mod_dav_svn/repos.c` | `940bc5282be7b763` | C |
 | `subversion/libsvn_repos/hooks.c` | `96392d3013a7f6bb` | C |
 | `subversion/libsvn_repos/log.c` | `d5f97de3e455314b` | C |
@@ -63,6 +71,13 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
 (`subversion.apache.org/docs/release-notes/1.10.html`, `1.14.html`, tier B); the book's path-based authorization page
 (`svnbook.red-bean.com/en/1.7/svn.serverconfig.pathbasedauthz.html`, tier B); RFC 2195, CRAM-MD5
 (`www.rfc-editor.org/rfc/rfc2195.txt`, tier B).
+
+For the handshake (A-599, 2026-11-19), RFC 2104 (HMAC, sha256 `64d5245a91019290`) and RFC 2202 (its HMAC-MD5 test
+cases, `c19effeca47e801b`), tier B; and the files of the release the fixtures were recorded with, Subversion 1.15.0,
+from `raw.githubusercontent.com/apache/subversion/1.15.0/<path>`, tier C: `libsvn_ra_svn/cram.c`, `internal_auth.c` and
+the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `8154654e07aa4eb4`, which differs from
+`d434dc14`'s by a Windows include and a comment; `libsvn_ra_svn/marshal.c` `361702975baa8c70`; `client.c`
+`b1d9607af70baf9c`; `cyrus_auth.c` `3bd4ba09916282fd`.
 
 ## 2. The wire: ra_svn (`svn://`, and `svn+ssh://` through a tunnel)
 
@@ -84,6 +99,23 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   with `edit-pipeline svndiff1 accepts-svndiff2 absent-entries commit-revprops depth log-revprops atomic-revprops
   partial-replay inherited-props ephemeral-txnprops file-revs-reverse list`; `mergeinfo` is a repository capability, in
   `repos-info` (`protocol` 169-176, 201-202).
+- **Authentication** [B: `protocol` 98-176; C: `serve.c` 580-721 and 4209-4433, `cram.c`, `internal_auth.c`;
+  M: `crates/svn/fixtures/handshake/`, stock 1.15.0's sessions, A-599]. The auth request lists `ANONYMOUS` (anonymous
+  read allowed), `EXTERNAL` (a tunnel's user, authenticated read allowed) and `CRAM-MD5` (a password database,
+  authenticated read allowed), in that order (`send_mechs`); a repository allowing none is refused "No access allowed
+  to this repository" (170001) before any request. `auth` takes `EXTERNAL` as the tunnel's user unless its token names
+  another ("Requested username does not match"), `ANONYMOUS` as no one, its token ignored, and `CRAM-MD5` by a
+  challenge `<random.microseconds@host>` (`cram.c` 154-156), the response a string `user hexdigest` split at its last
+  space with exactly 32 lowercase digits after it ("Malformed client response in authentication"), then "Username not
+  found" or "Password incorrect"; a response that is no string is passed over without a word. Any other mechanism is
+  "Must authenticate with listed mechanism". A failure lets the client answer again, with no limit
+  (`internal_auth_request`'s loop); a success writes `( success ( ) )` and `repos-info`. The answer to the greeting is
+  read as `nlc?c(?c)`: a `ra-client` without the client list after it is "Malformed network data" (recorded), and every
+  refusal before `find_repos` ends the connection with nothing written, the ones after it with a command failure whose
+  file is empty and line 0 in a release build (recorded). HMAC-MD5 in `compute_digest` hashes a password longer than 64
+  bytes first, as RFC 2104 does (recorded with 64- and 70-byte secrets). A client built with Cyrus SASL, as Homebrew's
+  1.15.0 is, sends `ANONYMOUS` base64 of `anonymous@` and its host with a line feed, and `CRAM-MD5` unencoded
+  (`cyrus_auth.c` 498-505, 553-555).
 - **Commands** [B: `protocol` 216-607]: the main set (reparent, get-latest-rev, get-dated-rev, change-rev-prop(2),
   rev-proplist, rev-prop, commit, get-file, get-dir, check-path, stat, get-mergeinfo, update, switch, status, diff, log,
   get-locations, get-location-segments, get-file-revs, lock(-many), unlock(-many), get-lock(s), replay(-range),
@@ -229,6 +261,23 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   `E210001` unknown command, `E210004` malformed data, `E210009` request size, `E220001` unreadable, `E220002`
   partially readable, `E220004` unwritable, `E125005` bad property value. (Derivation script kept outside the tree;
   `grep -n 'SVN_ERRDEF' svn_error_codes.h` shows each offset.)
+- **The merge, then the locks** [C: `tree.c` `svn_fs_fs__commit_txn` 2194 on, `merge_changes` 2284; `transaction.c`
+  `commit_body` 3797; read 2026-11-19 for A-592]: FSFS merges the head into the transaction first, and only a merged
+  transaction reaches `commit_body`, whose `verify_locks` checks the locks; so a work that conflicts is answered with
+  the conflict whatever locks stand in its way. The drive checks locks too: `fs-wrap.c` 151-152 begins a commit's
+  transaction with `SVN_FS_TXN_CHECK_LOCKS`, which `tree.c` honours at each editor call (1614, 2497, 2554, 2645).
+- **Subversion's path order** [C: `sorts.c` `svn_sort_compare_items_as_paths` 69-79, which is `path.c`
+  `svn_path_compare_paths` 418-453]: "Children of paths are greater than their parents, but less than greater siblings
+  of their parents": a `/` sorts before every other byte, so `/a/b` comes before `/a-b`, which byte order puts first.
+  `svn_fspath__skip_ancestor` (`dirent_uri.c` 2664, through `svn_relpath_skip_ancestor` 1530-1551) is what
+  `verify_locks` skips a checked subtree's paths by.
+- **Property lists compare by content** [C: `fs_fs.c` `svn_fs_fs__prop_rep_equal` 1608-1665]: the same representation
+  is equal, committed representations with different MD5s differ, and otherwise both lists are read and compared, so
+  an empty list and no list are equal.
+- **A transaction root's created revision** [C: `dag.c` `svn_fs_fs__dag_get_revision`]: "In the special case that
+  this is an unmodified transaction root, we need to actually get the revision of the noderev's predecessor (the
+  revision root); see Issue #2608"; every other node the transaction made answers no revision, so the drive's
+  out-of-date test passes it unless the client named a revision past the transaction's base.
 
 ## 7. Properties, locks, mergeinfo, hooks, authorization
 
@@ -343,3 +392,54 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
 4. Every constant the reference servers expose (§8) is a tunable slates learns (§4.17.1's rule).
 5. The test suite drives `svnadmin` and `svnlook` against a repository path, so slates must answer those verbs over its
    own repository, and the server must read the repository directory's `conf/` and `hooks/` (§9).
+
+## 11. Mergeinfo (A-605, §4.17.4 item 8 and piece 9)
+
+Read 2026-11-19 by g262 at the same revision (`1.14.x` at `d434dc14`), fetched as in §1. The sha256 prefixes:
+
+| File | sha256 (prefix) | Tier |
+|---|---|---|
+| `subversion/include/svn_mergeinfo.h` | `129d6739fee73856` (as §1) | B |
+| `subversion/include/private/svn_mergeinfo_private.h` | `d5b71c114d393f66` | B |
+| `subversion/include/svn_types.h` | `6167309dad233964` | B |
+| `subversion/libsvn_subr/mergeinfo.c` | `538cc82a8d6bca2f` | C |
+| `subversion/tests/libsvn_subr/mergeinfo-test.c` | `28381a00f69941fd` | C |
+| `subversion/libsvn_subr/types.c` | `8c9fe593b18d24cf` | C |
+| `subversion/libsvn_subr/string.c` | `62b5ad96280ba127` | C |
+| `subversion/libsvn_subr/dirent_uri.c` | `fe05687a2dedb22c` | C |
+| `subversion/libsvn_subr/path.c` | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/sorts.c` | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_fs_fs/dag.c` | `9efbb054b8818693` | C |
+| `subversion/libsvn_fs_util/fs-util.c` | `2c9eb29504df0be3` | C |
+| `subversion/libsvn_client/mergeinfo.c` | `b92a177e7a6abae0` | C |
+
+and `tree.c`, `fs-wrap.c`, `log.c`, `serve.c` and the protocol at §1's hashes.
+
+- **The parser** [C: `mergeinfo.c` `parse_pathname`, `parse_rangelist`, `parse_revision_line`, `parse_top`,
+  `svn_rangelist__canonicalize`; `types.c` `svn_revnum_parse`; `string.c` `svn__strtoul`]: a line's last colon divides;
+  the path is `svn_fspath__canonicalize`d (`dirent_uri.c` `canonicalize`: empty and `.` segments dropped, `..` kept); a
+  revision is digits alone (`svn__strtoul` reads no sign and no space), "longer than 10 digits" and a ten-digit value past
+  `APR_INT32_MAX` refused; `0` refused; horizontal space skipped only after the colon; "Range list parsing ended before
+  hitting newline" refuses a comma at the value's end while a comma before a newline passes; a key named twice is merged
+  (`svn_rangelist_merge2`, the comment on issue #3547); the value is read with `strlen`, and `verify_mergeinfo`
+  (`fs-wrap.c`) refuses a value whose `strlen` is not its length before parsing it. `svn_mergeinfo_parse` returns
+  `SVN_ERR_MERGEINFO_PARSE_ERROR` (200020) on top of every refusal.
+- **The algebra** [C: `mergeinfo.c`]: 1.14's union is a sweep over both lists' intervals in which a revision takes the
+  larger of `MI_NONE`, `MI_NON_INHERITABLE`, `MI_INHERITABLE` (`rangelist_merge`); intersection and removal are one walk
+  (`rangelist_intersect_or_remove`) that pushes through `combine_with_lastrange`. With `consider_inheritance` the walk is
+  not exact per revision: a first-list range met by a second-list range of the other kind is passed when it sorts first,
+  so `1-10` intersected with `3-4*,5-6` is empty and `1-10` with `3-4*,5-6` removed is `1-10` (traced by hand on the
+  code; the module's bound tests hold what is exact). The stock client computes `svn mergeinfo --show-revs` with these
+  functions (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`: `svn_mergeinfo_intersect2(..., TRUE)`,
+  `svn_rangelist_remove(..., TRUE)`, `svn_rangelist_diff(..., TRUE)`), so a server's answer equal to it needs these
+  functions as they are.
+- **The queries** [C: `tree.c` 4133-4420; `dag.c` 270-300; `fs-util.c` `svn_fs__append_to_merged_froms`; `fs-wrap.c`
+  `svn_repos_fs_get_mergeinfo2`]: the path must exist (`open_path` with no flags); the nearest node with `minfo-here` from
+  the path up (nearest-ancestor starts at the parent and answers none at the root; explicit looks at the path alone); a
+  value that fails to parse is none and ends the search (issue #3896); an ancestor's value is `svn_mergeinfo_inheritable2`
+  then extended by the path beneath it; descendants are crawled entering a directory only when `minfo-cnt` > 1, or = 1
+  without `minfo-here`; "claims to have mergeinfo but doesn't" is `SVN_ERR_FS_CORRUPT`; the repository layer filters the
+  requested paths by read access and not the descendants, and always adjusts what is inherited.
+- **Elision** [C: `libsvn_client/mergeinfo.c` `should_elide_mergeinfo`, `svn_client__elide_mergeinfo`]: no mergeinfo
+  never elides; empty elides to none or empty; any other never to none or empty, else when `svn_mergeinfo__equals` with
+  inheritance considered.

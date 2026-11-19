@@ -874,6 +874,23 @@ impl Index {
     Ok(revision)
   }
 
+  /// The transaction `work` makes on revision `base` (§4.17.4 item 3), as FSFS builds it from the drive, never
+  /// committed: each node it made, cloned, copied or left, with the identities FSFS gives them, for the commit verdict to
+  /// compare with the base's and the head's (`crate::commit`). Its rows are checked as a record's are against the
+  /// youngest revision ([`Index::append`]), here against `base`, and its new identities are the next revision's numbers,
+  /// so none equals one the index holds. Refused, typed, as a record is.
+  pub fn trial(&self, base: Revision, work: &RevisionRecord) -> Result<Trial<'_>, IndexRefusal> {
+    self.check_revision(base)?;
+    check_transaction_name(&work.transaction)?;
+    let revision = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
+    let changes = sorted_rows(work.changes.clone())?;
+    let mut builder = Builder::new_on(self, revision, base)?;
+    for change in &changes {
+      builder.apply(change)?;
+    }
+    Ok(Trial { builder })
+  }
+
   /// The node at `path` in `revision`, or `None` when the path is absent there.
   pub fn node(&self, path: &str, revision: Revision) -> Result<Option<Node<'_>>, IndexRefusal> {
     let path = checked_path(path)?;
@@ -1164,6 +1181,45 @@ enum Inherit {
   Fresh,
 }
 
+/// A work applied to a base revision as FSFS builds its transaction, never committed ([`Index::trial`]).
+pub struct Trial<'index> {
+  builder: Builder<'index>,
+}
+
+/// A node of a trial's transaction: its node-revision (one the index holds when the work left it, or one the work
+/// made), its kind, its identities and its property list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrialNode {
+  /// Its node-revision.
+  pub id: NodeRevisionId,
+  /// Its kind.
+  pub kind: NodeKind,
+  /// Its node identity.
+  pub node_id: NodeId,
+  /// Its copy identity.
+  pub copy_id: CopyId,
+  /// Its property list.
+  pub properties: PropertyList,
+}
+
+impl Trial<'_> {
+  /// The transaction's node at `path`, or `None` when the work left the path absent.
+  pub fn node(&self, path: &str) -> Result<Option<TrialNode>, IndexRefusal> {
+    let path = checked_path(path)?;
+    let Some(current) = self.builder.current(path)? else {
+      return Ok(None);
+    };
+    let row = self.builder.row(current.node)?;
+    Ok(Some(TrialNode {
+      id: current.node,
+      kind: row.kind,
+      node_id: row.node_id,
+      copy_id: row.copy_id,
+      properties: row.properties,
+    }))
+  }
+}
+
 /// A node as the revision being built stands now.
 #[derive(Clone, Copy, Debug)]
 struct Current {
@@ -1221,7 +1277,16 @@ struct Builder<'index> {
 impl<'index> Builder<'index> {
   /// A revision begun with its new root (`transaction.c` `create_new_txn_noderev_from_rev`).
   fn new(index: &'index Index, revision: Revision) -> Result<Self, IndexRefusal> {
-    let previous = index.youngest;
+    Self::new_on(index, revision, index.youngest)
+  }
+
+  /// A transaction numbered `revision` begun on revision `previous`, its new root's predecessor that revision's root:
+  /// the next revision when `previous` is the youngest, and a work's transaction on its base otherwise ([`Trial`]).
+  fn new_on(
+    index: &'index Index,
+    revision: Revision,
+    previous: Revision,
+  ) -> Result<Self, IndexRefusal> {
     let mut builder = Self {
       index,
       revision,
@@ -1437,7 +1502,10 @@ impl<'index> Builder<'index> {
     source: &CopySource,
     replaced: Option<NodeRevisionId>,
   ) -> Result<(NodeRevisionId, Row), IndexRefusal> {
-    if source.revision > self.previous {
+    // A copy reads any committed revision (`svn_fs_copy` takes any revision root): past the youngest is none. A record's
+    // base is the youngest, so a record's source is at most the previous revision; a work's on an older base may be
+    // newer than its base ([`Index::trial`]).
+    if source.revision > self.index.youngest {
       return Err(IndexRefusal::NoSuchRevision {
         revision: source.revision,
       });
@@ -1794,4 +1862,4 @@ impl<'index> Builder<'index> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
