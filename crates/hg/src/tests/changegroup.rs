@@ -143,12 +143,11 @@ fn versions_01_and_02_decode_as_mercurial_lists_them() {
   assert!(decoded.trees.is_empty());
 }
 
-/// AC-HG.1 (golden), A-514: do decode the changegroups 7.2 wrote as versions 03 and 04. Expect version 03's changelog
-/// and manifest as 7.2 lists them (its listing stops there), its files the same revisions as version 02's, and an
-/// empty tree list read; version 04's changesets in the order 7.2's plain listing names them, every revision's node,
-/// parents and link equal to version 03's, and every one carrying delta information.
+/// AC-HG.1 (golden), A-514: do decode the changegroup 7.2 wrote as version 03. Expect its changelog and manifest as
+/// 7.2 lists them (its listing stops there), its files the same revisions as version 02's, and an empty tree list
+/// read.
 #[test]
-fn versions_03_and_04_decode_as_mercurial_lists_them() {
+fn version_03_decodes_as_mercurial_lists_it() {
   let (_, bytes02) = payload(fixtures::CG02);
   let cg02 = Changegroup::decode(&bytes02, Version::V02, &mut room()).unwrap();
   let (version, bytes03) = payload(fixtures::CG03);
@@ -159,6 +158,15 @@ fn versions_03_and_04_decode_as_mercurial_lists_them() {
   assert_eq!(listed(&cg03)[..2], listing[..]);
   assert_eq!(listed(&cg03)[2..], listed(&cg02)[2..]);
   assert!(cg03.trees.is_empty());
+}
+
+/// AC-HG.1 (golden), A-514: do decode the changegroup 7.2 wrote as version 04. Expect its changesets in the order
+/// 7.2's plain listing names them, every revision's node, parents and link equal to version 03's, and every one
+/// carrying delta information, some of them full texts.
+#[test]
+fn version_04_decodes_as_mercurial_lists_it() {
+  let (_, bytes03) = payload(fixtures::CG03);
+  let cg03 = Changegroup::decode(&bytes03, Version::V03, &mut room()).unwrap();
   let (version, bytes04) = payload(fixtures::CG04);
   assert_eq!(version, Version::V04);
   let cg04 = Changegroup::decode(&bytes04, version, &mut room()).unwrap();

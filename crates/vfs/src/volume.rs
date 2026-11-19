@@ -1112,13 +1112,14 @@ impl Volume {
     self.journal.note_round(reader, cursor, now)
   }
 
-  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount that consumes the journal from the
-  /// moment it serves, so the records after the head now are the first it may read. A record it has not read holds the
-  /// journal's budget until it has waited `patience_ns`, the transport's liveness (A-157). Its owner closes it when the
-  /// mount ends ([`Volume::close_journal_reader`]).
-  pub fn open_journal_reader(&mut self, key: u64, patience_ns: u64) {
+  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount, or another consumer of the journal,
+  /// from the moment it serves, so the records after the head now are the first it may read. A record it has not read
+  /// holds the journal's budget while it is within `patience`, which the owner names by what the reader's reads wait on
+  /// (A-157, A-548: [`crate::journal::Patience`]). Its owner closes it when its attachment ends
+  /// ([`Volume::close_journal_reader`]).
+  pub fn open_journal_reader(&mut self, key: u64, patience: crate::journal::Patience) {
     let head = self.journal.head_seq();
-    self.journal.open_reader(key, head, patience_ns);
+    self.journal.open_reader(key, head, patience);
   }
 
   /// The bytes the shard's metadata ledger granted the journal beyond its floor (A-157): what the volume's owner
@@ -1130,6 +1131,18 @@ impl Volume {
   /// Closes the journal reader of transport attachment `key`; a key with no reader open is left alone.
   pub fn close_journal_reader(&mut self, key: u64) {
     self.journal.close_reader(key);
+  }
+
+  /// What the rounds of the journal reader of transport attachment `key` found since this was last asked, `None` when
+  /// none is open (A-548, [`crate::journal::OpLog::take_rounds`]): what its owner learns the reader's patience from.
+  pub fn take_journal_rounds(&mut self, key: u64) -> Option<crate::journal::ReaderRounds> {
+    self.journal.take_rounds(key)
+  }
+
+  /// Names the patience of the journal reader of transport attachment `key` again (A-548): its owner's learned bound. A
+  /// key with no reader open is left alone.
+  pub fn set_journal_patience(&mut self, key: u64, patience: crate::journal::Patience) {
+    self.journal.set_patience(key, patience);
   }
 
   /// The number of live snapshots.
@@ -1707,7 +1720,7 @@ impl Volume {
         // Unpinned disk bytes need the host: `Overlay::read` serves them.
         let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
-          return Err(VfsError::BaseUnavailable(0));
+          return Err(VfsError::BaseUnavailable(None));
         }
         for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
@@ -7213,7 +7226,7 @@ pub(crate) fn read_frozen_body(
       }
       let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
       if unpinned {
-        return Err(VfsError::BaseUnavailable(0));
+        return Err(VfsError::BaseUnavailable(None));
       }
       for e in overlapping(&b.pinned, off, read_end) {
         store.content.read_extent_into(e, off, out)?;

@@ -1,0 +1,3 @@
+Stream params: {}
+reply:changegroup -- {in-reply-to: 4, return: 1} (mandatory: False)
+reply:obsmarkers -- {in-reply-to: 5, new: 0} (mandatory: True)

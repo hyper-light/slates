@@ -1,0 +1,4 @@
+3 3f9da5ae4bf7758fc91c8a56cf9def051a891e3b draft strict
+2 976eb9d7cd11eb8a63d94860fb7186069eef4a10 public feature, amended
+1 86d599a1904caf7869263a4d824bcb40473ed8fc draft feature
+0 ad120869acf0c6c266f1293ca5da567d8b382f1d public base

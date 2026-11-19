@@ -484,6 +484,18 @@ pub struct ShardState {
   /// Anchors that departed and whose attachments some shard has not yet ended, owed to the next look (A-222). Bounded
   /// by the fleet's members.
   pub(crate) departed_owed: Vec<u64>,
+  /// Whether the shard's reaper owes a look at departures (A-222, A-554): set on the control shard when the fleet's
+  /// members or a member's anchor changed (`crate::remote_attach::look_for_departures`), and by the deadline keeper at
+  /// a retry's deadline; the reaper takes it.
+  pub(crate) departures_owed: bool,
+  /// When the control shard looks at departures again after a look some shard did not answer (A-554): a retry window
+  /// on (`crate::deadlines::retry_window_ns`), kept by the deadline keeper; `None` while none is owed.
+  pub(crate) departures_retry_at: Option<u64>,
+  /// Whether the shard's reaper owes the reclaim of the taken-back maps whose claim is past its deadline (A-197,
+  /// A-554): set by the deadline keeper at that deadline, taken by the reaper (`crate::held_copy::reclaim_owed`). Linux
+  /// alone takes such maps back.
+  #[cfg(target_os = "linux")]
+  pub(crate) held_copies_owed: bool,
   /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
   pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.

@@ -118,9 +118,10 @@ fn status_refusal(status: NTSTATUS) -> HostError {
   }
 }
 
-/// A Win32 error code as the host's refusal, typed as Win32's (A-527): no reader takes it for the errno of its number.
+/// A Win32 error code as the host's refusal, typed as Win32's (A-527, A-539): no reader takes it for the errno of its
+/// number.
 fn code_refusal(code: u32) -> HostError {
-  HostError::Win32(code)
+  HostError::Unavailable(slates_vfs::host::OsCode::Win32(code))
 }
 
 /// A malformed record the OS filled: the host cannot serve it (`ERROR_INVALID_DATA`).

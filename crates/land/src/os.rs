@@ -35,7 +35,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use slates_base::OsHost;
 use slates_vfs::host::{
   Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities,
-  LandFs, WatchState,
+  LandFs, OsCode, WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -99,13 +99,42 @@ impl std::fmt::Debug for OsLand {
   }
 }
 
+/// The seam's refusal for an errno (A-539): the typed refusals, then the kinds the landing tells apart, each named by
+/// this platform's own numbers (`EEXIST`; `ENOSPC` and `EDQUOT`, 122 on Linux and 69 on macOS; `EOPNOTSUPP` and
+/// `ENOTSUP`, one number on Linux and two on macOS), so the engine compares no number; anything else as the errno it is.
 fn refusal(e: rustix::io::Errno) -> HostError {
-  match e {
-    rustix::io::Errno::NOENT => HostError::NotFound,
-    rustix::io::Errno::NOTDIR => HostError::NotDirectory,
-    rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR => HostError::NotFile,
-    other => HostError::Unavailable(other.raw_os_error()),
+  use rustix::io::Errno;
+  let code = OsCode::Errno(e.raw_os_error());
+  if e == Errno::NOENT {
+    HostError::NotFound
+  } else if e == Errno::NOTDIR {
+    HostError::NotDirectory
+  } else if e == Errno::LOOP || e == Errno::ISDIR {
+    HostError::NotFile
+  } else if e == Errno::EXIST {
+    HostError::Exists(code)
+  } else if e == Errno::NOSPC || e == Errno::DQUOT {
+    HostError::NoSpace(code)
+  } else if e == Errno::OPNOTSUPP || e == Errno::NOTSUP {
+    HostError::Unsupported(code)
+  } else {
+    HostError::Unavailable(code)
   }
+}
+
+/// An exchange's refusal (A-539): a filesystem without one answers Linux's `renameat2(RENAME_EXCHANGE)` `EINVAL` and
+/// macOS's `renameatx_np(RENAME_SWAP)` `ENOTSUP`, the verb it lacks; anything else as [`refusal`] reads it.
+fn exchange_refusal(e: rustix::io::Errno) -> HostError {
+  if e == rustix::io::Errno::INVAL {
+    HostError::Unsupported(OsCode::Errno(e.raw_os_error()))
+  } else {
+    refusal(e)
+  }
+}
+
+/// An errno the writer names itself, as the seam's refusal of anything it could not serve.
+fn unavailable(e: rustix::io::Errno) -> HostError {
+  HostError::Unavailable(OsCode::Errno(e.raw_os_error()))
 }
 
 /// The directory flags every containment step uses.
@@ -332,22 +361,21 @@ impl OsLand {
 
   #[cfg(not(target_os = "linux"))]
   fn link_unnamed(&self, _file: HostFile, _dir: HostDir, _name: &str) -> Result<(), HostError> {
-    Err(HostError::Unavailable(
-      rustix::io::Errno::OPNOTSUPP.raw_os_error(),
-    ))
+    Err(refusal(rustix::io::Errno::OPNOTSUPP))
   }
 }
 
 /// The exchange: Linux `renameat2(RENAME_EXCHANGE)`.
 #[cfg(target_os = "linux")]
 fn exchange_names(dir: BorrowedFd<'_>, a: &str, b: &str) -> Result<(), HostError> {
-  rustix::fs::renameat_with(dir, a, dir, b, rustix::fs::RenameFlags::EXCHANGE).map_err(refusal)
+  rustix::fs::renameat_with(dir, a, dir, b, rustix::fs::RenameFlags::EXCHANGE)
+    .map_err(exchange_refusal)
 }
 
 /// The exchange: macOS `renameatx_np(RENAME_SWAP)`.
 #[cfg(target_os = "macos")]
 fn exchange_names(dir: BorrowedFd<'_>, a: &str, b: &str) -> Result<(), HostError> {
-  renameatx(dir, a, dir, b, libc::RENAME_SWAP)
+  renameatx(dir, a, dir, b, libc::RENAME_SWAP).map_err(exchange_refusal)
 }
 
 /// A rename that never replaces (AUD-29-04): Linux `renameat2(RENAME_NOREPLACE)`, refused `EEXIST` when
@@ -371,7 +399,7 @@ fn rename_without_replacing(
   to_dir: BorrowedFd<'_>,
   to: &str,
 ) -> Result<(), HostError> {
-  renameatx(dir, from, to_dir, to, libc::RENAME_EXCL)
+  renameatx(dir, from, to_dir, to, libc::RENAME_EXCL).map_err(refusal)
 }
 
 /// A named temporary moved from `from` to `to`, refused `EEXIST` when `to` exists, holding the one name after: the
@@ -409,13 +437,11 @@ fn rename_without_replacing(
   _to_dir: BorrowedFd<'_>,
   _to: &str,
 ) -> Result<(), HostError> {
-  Err(HostError::Unavailable(
-    rustix::io::Errno::OPNOTSUPP.raw_os_error(),
-  ))
+  Err(refusal(rustix::io::Errno::OPNOTSUPP))
 }
 
 /// macOS `renameatx_np` from `a` under `dir` to `b` under `to_dir`, with `flag` (`RENAME_SWAP` or
-/// `RENAME_EXCL`).
+/// `RENAME_EXCL`): the errno it refused with, which the caller reads (an exchange its own way, A-539).
 #[cfg(target_os = "macos")]
 fn renameatx(
   dir: BorrowedFd<'_>,
@@ -423,11 +449,9 @@ fn renameatx(
   to_dir: BorrowedFd<'_>,
   b: &str,
   flag: libc::c_uint,
-) -> Result<(), HostError> {
-  let a = std::ffi::CString::new(a)
-    .map_err(|_| HostError::Unavailable(rustix::io::Errno::INVAL.raw_os_error()))?;
-  let b = std::ffi::CString::new(b)
-    .map_err(|_| HostError::Unavailable(rustix::io::Errno::INVAL.raw_os_error()))?;
+) -> Result<(), rustix::io::Errno> {
+  let a = std::ffi::CString::new(a).map_err(|_| rustix::io::Errno::INVAL)?;
+  let b = std::ffi::CString::new(b).map_err(|_| rustix::io::Errno::INVAL)?;
   // SAFETY: `dir` and `to_dir` are directory descriptors this host owns for the call's duration; `a` and
   // `b` are NUL-terminated C strings that outlive the call; `renameatx_np` reads them and
   // writes nothing to memory the caller holds.
@@ -443,17 +467,15 @@ fn renameatx(
   if rc == 0 {
     Ok(())
   } else {
-    Err(refusal(rustix::io::Errno::from_raw_os_error(
+    Err(rustix::io::Errno::from_raw_os_error(
       std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-    )))
+    ))
   }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exchange_names(_dir: BorrowedFd<'_>, _a: &str, _b: &str) -> Result<(), HostError> {
-  Err(HostError::Unavailable(
-    rustix::io::Errno::OPNOTSUPP.raw_os_error(),
-  ))
+  Err(refusal(rustix::io::Errno::OPNOTSUPP))
 }
 
 /// A file's write-out on Linux: its writeback started (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits
@@ -554,9 +576,9 @@ fn sync_on_streams(fds: &[(BorrowedFd<'_>, Durability)], streams: usize) -> Resu
       synced = synced.and(sync_stream(fds, stream, streams));
     }
     for thread in started {
-      let joined = thread.join().unwrap_or(Err(HostError::Unavailable(
-        rustix::io::Errno::IO.raw_os_error(),
-      )));
+      let joined = thread
+        .join()
+        .unwrap_or(Err(unavailable(rustix::io::Errno::IO)));
       synced = synced.and(joined);
     }
     synced
@@ -758,7 +780,7 @@ impl LandFs for OsLand {
       let n =
         rustix::io::pwrite(fd, bytes.get(written..).unwrap_or_default(), at).map_err(refusal)?;
       if n == 0 {
-        return Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()));
+        return Err(unavailable(rustix::io::Errno::IO));
       }
       written = written.saturating_add(n);
     }
@@ -784,7 +806,7 @@ impl LandFs for OsLand {
           .file(*file)?
           .try_clone_to_owned()
           .map(|fd| (fd, durability))
-          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+          .map_err(|error| HostError::Unavailable(OsCode::of_io(&error)))
       })
       .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(OsBarrier { files }))
@@ -811,7 +833,7 @@ impl LandFs for OsLand {
     let opened = self.host.open_dir(dir, name)?;
     let held = self.host.dir_fd(opened).and_then(|fd| {
       fd.try_clone_to_owned()
-        .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+        .map_err(|error| HostError::Unavailable(OsCode::of_io(&error)))
     });
     self.host.close_dir(opened);
     self.host.adopt_file(held?)
@@ -926,5 +948,46 @@ impl LandFs for OsLand {
 
   fn sync_media(&mut self, dir: HostDir) -> Result<(), HostError> {
     media_barrier(self.dir(dir)?)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rustix::io::Errno;
+
+  /// A-539 (the seam names the kinds the engine tells apart). Do: read through the Unix writer's rule the errnos of a
+  /// name that exists, a full disk and a spent quota, a verb the filesystem lacks, and an exchange the filesystem lacks
+  /// (Linux's `EINVAL`, macOS's `ENOTSUP`). Expect each named as its kind by its own errno: the engine compares no number,
+  /// so none is read across platforms (Linux numbers `EDQUOT` 122 and `ENOTSUP` 95, macOS 69 and 45).
+  #[test]
+  fn the_writer_names_each_kind_the_engine_tells_apart() {
+    let code = |e: Errno| OsCode::Errno(e.raw_os_error());
+    assert_eq!(refusal(Errno::EXIST), HostError::Exists(code(Errno::EXIST)));
+    for full in [Errno::NOSPC, Errno::DQUOT] {
+      assert_eq!(refusal(full), HostError::NoSpace(code(full)), "{full:?}");
+    }
+    for lacking in [Errno::OPNOTSUPP, Errno::NOTSUP] {
+      assert_eq!(
+        refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
+    }
+    for lacking in [Errno::INVAL, Errno::NOTSUP] {
+      assert_eq!(
+        exchange_refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
+    }
+    for other in [Errno::INVAL, Errno::IO, Errno::ACCESS] {
+      assert_eq!(
+        refusal(other),
+        HostError::Unavailable(code(other)),
+        "{other:?}"
+      );
+    }
+    assert_eq!(refusal(Errno::NOENT), HostError::NotFound);
   }
 }

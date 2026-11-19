@@ -13,26 +13,34 @@
 > green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
 > greens; the record's replication in a fleet (with piece 2).
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1's framings built (2026-11-19, A-514; UI goal 91; owner
-> g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move
-> toward public, and a public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review
-> requests; a stock push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a
-> line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
-> (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups
-> `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input, every structure
-> counted and charged exactly to the caller's admission before it is built, no recursion; proven by `cargo test -p
-> slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg`
-> 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text
-> rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed).
-> Owed, in order, after §4.17.1's seven pieces: (1, rest) the parts' payloads (phase-heads, bookmarks, the check parts,
-> markers, pushkey values), and compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired (D-17); (2) the SSH and
-> HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory; (4) read serving; (5)
-> pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the
-> revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog;
-> (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
-> differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
-> `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
-> is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
+> (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks
+> are greens; phases only move toward public, and a public changeset is never dropped or rewritten; markers are kept and
+> exchanged; topics are review requests; a stock push is judged whole-file and answered with Mercurial's own race abort,
+> and rebase on push is a line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code
+> and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input,
+> every structure counted and charged exactly to the caller's admission before it is built, no recursion; proven by
+> `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden
+> vectors stock `hg` 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle`
+> lists it, every text rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed,
+> four tests failed). **Built (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and
+> `check:bookmarks`, `check:heads` and `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies,
+> listkeys lines and namespace nodes), nothing allocated in decoding, every encoder's exact length given before it
+> writes; proven by `cargo test -p slates-hg --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against
+> golden vectors stock `hg` 7.2 made twice, byte for byte alike but the replies' cut
+> (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over SSH captured on the wire, the server's
+> replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask findings in the crate are folded in (the
+> no-panic root attribute among them); clippy and xtask are main's to rerun. Measured on stock 7.2 and recorded
+> (research §13): its C and pure marker readers disagree on a marker's size and on parent counts 0 and past 3. Owed, in
+> order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
+> (D-17); (2) the SSH and HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory;
+> (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8)
+> access and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow,
+> ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own
+> suite through a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a
+> 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
+> run checks it). No speed is claimed until main measures it.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
@@ -3273,10 +3281,15 @@
 >     - A deferred verb's task records its final reply, and some tasks end on `Overloaded`: a granted landing whose
 >       target lease went unanswered (`landing::acquire_target_lease`, answered through `finish_unrun`), so its
 >       resend meets it for good.
->     - A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
+>     - ~~A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
 >       and `retry_deferred` records it, so its resend meets it for good (found by A-557, 2026-11-19, g225;
 >       `settle_refused`'s `paged` and the refusal branch of `gather` and `gather_grants`; the status scatter and
->       `xshard::AnswerUnstarted` deliver theirs unrecorded).
+>       `xshard::AnswerUnstarted` deliver theirs unrecorded).~~ Fixed 2026-11-19 by A-563 (g225): `retry_deferred`
+>       leaves a `not_started` reply unrecorded, as `recorded_unless_deferred` does, so the resend runs the scatter
+>       again (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
+>       `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`). Open beside it:
+>       `consensus_on_control` answers `Overloaded` after its operation ran, and its resend now runs it again (a
+>       bootstrap is idempotent; `Recover`'s second run is not yet read).
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
@@ -3435,6 +3448,28 @@
 >     the daemon's reply was written; and one kept off right after its drain's clock read still stamps the reply it
 >     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
 >     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
+>
+>     **The harness splits each latency by the producers' stamps, measures its own noise, and charges the server only
+>     for its own part (2026-11-19, g083, A-559).** Main's reading of r100: the rounds with a bad p99 were the rounds
+>     where `load_bench` itself stalled (accepted submits' p99 29.2 and 22.9 ms beside sweeps of 33.8 and 37.5 ms and
+>     unseen windows of 44.0 and 37.6 ms; 2.7 and 0.42 ms beside 11.0 and 5.1 ms). Every slot now carries its
+>     producer's stamp in the four bytes that were padding (`slates_ipc::slot`, "The stamp": the low 32 bits of the
+>     host's monotonic clock as the slot was written, the lowest bit set so zero is unstamped), so the client knows when
+>     its request landed and the daemon's reply landed, not only when the sweep took it. An attempt's harness part is
+>     the time before its request landed and after its reply did (`slates_machine::attribution::harness_part`); a
+>     latency's sums its attempts' and its client's held sends; the server part is the rest. The `floor` rows are
+>     replaced by `latency_server`, `latency_harness`, `operation_server` and `operation_harness`; an attempt with a stamp
+>     missing or out of order is the server's whole (`unsplit`). Before each level, as many threads as it has workers
+>     watch the clock for 100 ms (`slates_machine::bench::longest_gap_ns`, `destroy_rows`' probe), and the longest gap
+>     is the level's noise floor (the `noise` row). The `bound` row judges each kind by its server part
+>     (`slates_machine::attribution::judge`): `met\tharness` when every server part is under the bound and some latency
+>     is not, never charged to the server, `met\tno` when a server part is at or over it. Tests, failing first:
+>     `slates-machine`'s attribution rule (a reply a stalled sweep left in the ring is the harness's time; an unstamped
+>     or disordered exchange keeps its whole latency the server's; a quantile charged only for its server part), the
+>     slot's stamp (widened back to its landing within a wrap; zero and a pre-clock landing are none; carried through a
+>     write and a read), and the bench's own (`a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`).
+>     **Owed (main's):** the bench and the suites compiled and run (the example is no `--lib` target), and the A/B again
+>     on a quiet machine with the split rows.
 >
 >     **Where a slow request's time goes (2026-11-18, g083's trace diagnostic, never on main).** Each attempt the
 >     harness timed was joined with every span the daemon's shards held for its request (each shard's sink sized to
@@ -4058,6 +4093,16 @@
 > on, never spun on (job 3's red check found that spin). Still on the tick: grants, the owed audit (piece 4), departed
 > hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the
 > idle seal and the huge-page re-arm.
+> **Since A-554 (piece 4)** grants past their term, the owed audit, departed hosts and held copies are off the tick:
+> the grants table indexes its issued grants by the end of their term and the keeper sleeps to the next due (an issue or
+> a restore notes it, each state borrow hands the note to the keeper); what a shard owes the audit is looked at a retry
+> window after the record that armed the look, sent again if its front has not moved, and looked at again only while
+> anything is owed; a departed host's attachments are ended by the control shard's reaper when the fleet's members or a
+> member's anchor change (A-222), a look some shard did not answer asked for again a retry window on; an unclaimed
+> taken-back copy (Linux, A-197) is reclaimed by the reaper at its claim's deadline, which the keeper sleeps to (built
+> and tested on Linux by main, the agent's host being macOS); a deadline whose job was refused is retried the named
+> retry window on (`deadlines::retry_window_ns`, A-455's shard window). Still on the tick: the pressure hold, NFS
+> purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
@@ -4254,7 +4299,19 @@
 >   `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`,
 >   `a_held_mount_keeps_its_id_in_its_attachments_record`, and in `slates-db`
 >   `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`); an attachment never seen mounted keeps the
->   rule before, since the table's silence about its point proves nothing. Class B (the
+>   rule before, since the table's silence about its point proves nothing. C-c's rest since A-548 (2026-11-19, g232),
+>   part 1: the NFS write-back tracker's journal reader was presumed gone once a record had waited a liveness window on
+>   the wall, so a shard kept off its CPU that long lost the record to the next append past the budget and every tracked
+>   connection's states with it, each of their write-backs refused until the connection ended; the tracker's keeper
+>   consumes each change on the volume's own shard, so its reader now holds its records while the tracker is open
+>   (`slates_vfs::journal::Patience::WhileOpen`), within the shard's metadata ledger
+>   (`a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window`). Part 2: a FUSE or WinFsp mount's
+>   journal reader was presumed gone once a record had waited one window, so a live mount whose kernel took longer
+>   overran at every round that met a full budget, its whole kernel cache dropped each time; each reader's patience is
+>   now learned from its own rounds (`crate::reader_patience`: RFC 6298's estimator over the rounds that found every
+>   record held, backed off at each overrun, never past the failover delay;
+>   `a_live_mount_slower_than_a_window_is_kept_up_with_once_its_pace_is_learned`); the two mounts' wiring is Linux's and
+>   Windows' to build (main's lanes). Owed in C-c: `verbs::await_materialization` (part 3). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -19415,7 +19472,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   told the host is Windows' reads a Win32 code, and any other reads an errno; typing them is the wire's own piece, a
   contract change; and the engine's own errnos are Linux's and macOS's numbers side by side, so an errno one platform
   numbers as the other's kind (Linux's 45 `EL2NSYNC` as macOS's `ENOTSUP`, 69 `ESRMNT` as macOS's `EDQUOT`) would read
-  as that kind, which no call the writer makes is known to answer).
+  as that kind, which no call the writer makes is known to answer; both **built by A-539 the same day** (`OsCode`
+  carried to the report, the volume and the wire, a Win32 variant appended beside each errno variant, golden vectors;
+  the seam's named kinds `Exists`, `NoSpace`, `Unsupported`, each writer giving them from its own platform's numbers,
+  read alike where the landing tells none apart: a metadata entry's open, a refused `rmdir`; a path on the daemon's own
+  mount and a base path past the longest recorded typed too, where Windows had put `ERROR_POSSIBLE_DEADLOCK` in an
+  errno's place and the MSVC runtime's `ENAMETOOLONG` 38, a number no Windows call answers, for its own
+  `ERROR_FILENAME_EXCED_RANGE`; library contract 49, wire major 3 and anchor layout 11, so a
+  peer or a segment of the older form is refused, never read; its unit tests ran on the Mac Studio, red first; the
+  Windows lanes and the anchor's cross-process test filed for main; still owed with it: `TargetRefusal::MountRefused`
+  carries a WinFsp mount's Win32 code in its `errno` field on Windows, the same change for that field; an `OsCode`
+  says an errno but not whose, and Linux's and macOS's errnos differ past the low numbers (`ENAMETOOLONG` 36 and 63),
+  so a fleet mixing the two would put a forwarded reply's errno in the reader's own words; and the client's own OS calls
+  (`HostFault::Os`, the mount faults) still name a bare number in this process's own numbering, which is right where
+  client and daemon share a platform and is typed nowhere else yet).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

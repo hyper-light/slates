@@ -266,7 +266,7 @@ fn host_for<'h>(
   overlay: bool,
 ) -> Result<Option<&'h mut dyn HostFs>, VfsError> {
   match host.as_mut() {
-    None if overlay => Err(VfsError::BaseUnavailable(0)),
+    None if overlay => Err(VfsError::BaseUnavailable(None)),
     served => Ok(served),
   }
 }
