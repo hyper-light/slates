@@ -2431,8 +2431,16 @@
 >   content as before. Tests: `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation`
 >   (red before), the A-335 test on an uncertified takeover (red with an uncertified takeover's content let go),
 >   `a_layout_five_configuration_reads_its_takeovers_as_uncertified`, `a_takeover_this_build_makes_certifies_its_content`.
->   Owed: an owner's settle certifies content the same way (A-508's holders then drop content too); a settled line's
->   lagging holder still keeps content (it judges no successor's placement).
+>   **Fixed (A-546, g250, 2026-11-19): an owner's settle certifies content the same way.** An owner reports its
+>   neighbourhood placed only once every volume it owns is served from within it (the healer replacing, while the
+>   change is in flight, a placement naming a host outside the current neighbourhood: `fleet.heal.unsettled_replaced`),
+>   so a settle certifies that no head it serves names a holder outside its neighbourhoods; A-508's holders then let go
+>   the content their own records name (`fleet.settle.released_content`). The configuration lists the certified settles
+>   (regional layout 7; layouts 6 and 5 read with every settle uncertified, whose holders keep content). Tests:
+>   `a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go` (red before), A-508's test on an uncertified
+>   settle (red with an uncertified settle's content let go), `an_unsettled_owners_placement_outside_its_current_
+>   neighbourhood_is_replaced`, `a_settle_this_build_records_certifies_its_content`, the layout test. Owed: a settled
+>   line's lagging holder still keeps content (it judges no successor's placement).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
