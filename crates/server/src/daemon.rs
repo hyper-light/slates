@@ -3629,6 +3629,7 @@ impl Daemon {
           principal: record.owner.clone(),
           rights: verbs::rights_of(&record, &record.owner),
           token,
+          mount: None,
         },
       };
       // One durable transaction, as the verb path writes it (`Db::begin` … `commit`, AC-2.3): the
