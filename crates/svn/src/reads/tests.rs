@@ -7,7 +7,9 @@
 //! transcripts do not reach, case by case, and hostile commands, which never panic.
 
 use super::*;
+use crate::handshake::ClientCapabilities;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
+use crate::svndiff::decode_all;
 use crate::ra_svn::{Bounds, Parsed, Parser};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -374,6 +376,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
   let answers = items(server);
   let commands = items(client);
   let mut base = session_base(&commands[0]);
+  let capabilities = session_capabilities(&commands[0]);
   let mut at = 4;
   let mut answered = 0;
   for command in commands.iter().skip(2) {
@@ -381,6 +384,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
     let session = Session {
       base: &base,
       uuid: UUID,
+      capabilities,
     };
     let mut out = Vec::new();
     let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
@@ -446,6 +450,52 @@ fn reparented(command: &Value<'_>) -> String {
   }
 }
 
+/// The capabilities the client's greeting announces (its second item, a list of words).
+fn session_capabilities(greeting: &Value<'_>) -> ClientCapabilities {
+  let Value::List(parts) = greeting else {
+    panic!("a greeting that is no list");
+  };
+  let Some(Value::List(words)) = parts.get(1) else {
+    panic!("a greeting without its capabilities");
+  };
+  let words: Vec<&str> = words
+    .iter()
+    .filter_map(|word| match word {
+      Value::Word(word) => Some(*word),
+      _ => None,
+    })
+    .collect();
+  ClientCapabilities::of(&words)
+}
+
+/// A `get-file-revs` answer as the tests compare it: each item written out with its property lists as sets, and each
+/// delta, its strings up to the empty one, decoded to its version and windows (an LZ4 section is `lz4_flex`'s where
+/// `svnserve`'s is liblz4's, so it may differ in bytes while it makes the same window).
+fn file_revs_normalized(items: &[Value<'_>]) -> Vec<String> {
+  let mut normalized_items = Vec::new();
+  let mut delta = Vec::new();
+  let mut in_delta = false;
+  for item in items {
+    match item {
+      Value::String(bytes) if bytes.is_empty() => {
+        normalized_items.push(if in_delta {
+          format!("{:?}", decode_all(&delta))
+        } else {
+          String::from("no delta")
+        });
+        delta.clear();
+        in_delta = false;
+      }
+      Value::String(bytes) => {
+        delta.extend_from_slice(bytes);
+        in_delta = true;
+      }
+      other => normalized_items.push(normalized(other)),
+    }
+  }
+  normalized_items
+}
+
 /// A client command's word.
 fn command_word<'a>(name: &str, command: &'a Value<'_>) -> &'a str {
   match command {
@@ -467,7 +517,9 @@ fn same_answer(
   at: usize,
 ) -> usize {
   let theirs = &answers[at..at + mine.len()];
-  let (mine, theirs): (Vec<String>, Vec<String>) = if PROPERTY_LISTS.contains(&word) {
+  let (mine, theirs): (Vec<String>, Vec<String>) = if word == "get-file-revs" {
+    (file_revs_normalized(mine), file_revs_normalized(theirs))
+  } else if PROPERTY_LISTS.contains(&word) {
     (
       sorted(mine.iter().map(normalized).collect()),
       sorted(theirs.iter().map(normalized).collect()),
@@ -581,6 +633,7 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("get-deleted-rev"), 15),
     (transcript!("log"), 16),
     (transcript!("log-merged"), 7),
+    (transcript!("get-file-revs"), 13),
     (transcript!("hostile-log-word"), 0),
     (transcript!("hostile-log-path"), 0),
     (transcript!("hostile-log-seven"), 0),
@@ -608,6 +661,8 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-ls"), 2),
     (transcript!("svn-log"), 4),
     (transcript!("svn-log-g"), 4),
+    (transcript!("svn-blame"), 5),
+    (transcript!("svn-blame-g"), 5),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
@@ -624,6 +679,9 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "get-file-revs",
+    "svn-blame",
+    "svn-blame-g",
     "svn-mergeinfo-eligible",
     "svn-mergeinfo-merged",
     "log-merged",
@@ -696,10 +754,7 @@ fn answered(command: &[u8]) -> (Outcome, Vec<u8>) {
   let outcome = answer(
     &fixture.index,
     &fixture.green,
-    &Session {
-      base: "/",
-      uuid: UUID,
-    },
+    &ROOT_SESSION,
     &value,
     &mut out,
   )
@@ -832,6 +887,18 @@ fn dates_are_read_and_written_as_subversion_reads_and_writes_them() {
 const ROOT_SESSION: Session<'static> = Session {
   base: "/",
   uuid: UUID,
+  capabilities: STOCK_CAPABILITIES,
+};
+
+/// What stock `svn` 1.15.0 announces (recorded: every session's greeting): `svndiff1`, `accepts-svndiff2`,
+/// `absent-entries`, `depth`, `mergeinfo` and `log-revprops` among them.
+const STOCK_CAPABILITIES: ClientCapabilities = ClientCapabilities {
+  svndiff1: true,
+  accepts_svndiff2: true,
+  absent_entries: true,
+  depth: true,
+  mergeinfo: true,
+  log_revprops: true,
 };
 
 /// One command's whole answer against `repository`, a streamed rest resumed in `room` until it is whole and once more;
@@ -1424,7 +1491,7 @@ proptest! {
     name in prop::sample::select(vec![
       "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
       "get-mergeinfo", "get-iprops", "get-file", "list", "get-location-segments", "get-deleted-rev",
-      "log", "no-such-command",
+      "log", "get-file-revs", "no-such-command",
     ]),
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {

@@ -643,8 +643,8 @@ fn hex_digit(nibble: u8) -> u8 {
 
 /// An encoded window split as `window_handler` writes it: its integers, its instruction section and
 /// its new-data section. Refused when the encoding does not hold its own lengths, which the encoder
-/// never writes.
-fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], EditorRefused> {
+/// never writes. `get-file-revs` writes its deltas' windows with it too (`crate::reads`, A-613).
+pub(crate) fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], EditorRefused> {
   let malformed = EditorRefused::Window(SvndiffError::CorruptWindowHeader);
   let mut at = 0usize;
   let mut integers = [0u64; WINDOW_HEADER_INTEGERS];
