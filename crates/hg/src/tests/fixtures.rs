@@ -691,7 +691,10 @@ pub(crate) mod store {
 
   /// The file named `name`, if there is one.
   pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
-    FILES.iter().find(|(known, _)| *known == name).map(|(_, bytes)| *bytes)
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
   }
 
   /// The file named `name`.

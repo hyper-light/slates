@@ -262,7 +262,8 @@
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588), its revlog reader (A-611) and its index's tables (A-588 part 2) (2026-11-19; UI goals 91 to 93; owners
+> built (A-588), its revlog reader (A-611), its index's tables (A-588 part 2) and a store's names (A-630 part 1)
+> (2026-11-19; UI goals 91 to 93; owners
 > g291, and g079 for A-598).** Built
 > on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
@@ -319,10 +320,12 @@
 > as 7.2's `addgroup` numbers them and refused whole on a missing parent or link, Mercurial's node rule as the shared
 > store's `Naming`; the revlog reader's chunks now inflated by A-598's `compression::inflate`, the crate's one inflater;
 > proven by `cargo test -p slates-hg --lib` on the Mac Studio against A-588's fixtures' numbers and a model of
-> `addgroup` (see the amendment). Owed, in order, after §4.17.1's seven pieces: (3, rest) the import's walk of a store
-> (the fncache, the path encodings, a version 2 store's file index) and censored, ellipsis and externally stored
-> revisions; (4) read serving, the `0.2` answers compressed by A-598's engines at the learned level; (5) pushes, a
-> compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
+> `addgroup` (see the amendment). **Built (A-630 part 1):** a store's names (both of 7.2's encodings, hashed long names)
+> and its fncache, every entry of two stores 7.2 wrote encoded to exactly its files. Owed, in order, after §4.17.1's
+> seven pieces: (3, rest) the import into the index, version 2's file index, and censored, ellipsis and externally
+> stored revisions; (4) read serving, the `0.2` answers compressed by A-598's engines at the learned level; (5) pushes,
+> a compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one
+> call,
 > bounded by the admission); (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access
 > and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and
 > remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through

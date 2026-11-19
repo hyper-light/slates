@@ -16,6 +16,11 @@
 # And, once (the two histories are the same): <log>-<rev>.txt `hg debugdata` of every revision of the changelog,
 # the manifest log and each file's log (`f<n>` for the n-th path of R-paths.txt), every other repository's texts
 # compared with these byte for byte (`cmp`, the script stops on a difference). Last it prints every file's SHA-256.
+#
+# Run on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 05:14 UTC, with uv's Mercurial 7.2 from PyPI on CPython
+# 3.12, through kiln (sync off), from a clone of the branch at b16ddf6, exactly:
+#   D=$(mktemp -d ~/.cache/g291-a630.XXXXXX) && mkdir "$D/out" && bash crates/hg/fixtures/store/make-store-fixtures.sh "$D/out"
+# It made these 94 files, every SHA-256 printed there and checked equal here after the copy.
 set -euo pipefail
 OUT=$(cd "$1" && pwd)
 export HGPLAIN=1 HGRCPATH= HGENCODING=utf-8 PYTHONHASHSEED=0 TZ=UTC LC_ALL=C

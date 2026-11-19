@@ -124,17 +124,24 @@ fn replace_all(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 pub fn encode_dir(path: &[u8]) -> Vec<u8> {
   ENCODE_DIR
     .iter()
-    .fold(path.to_vec(), |renamed, (from, to)| replace_all(&renamed, from, to))
+    .fold(path.to_vec(), |renamed, (from, to)| {
+      replace_all(&renamed, from, to)
+    })
 }
 
 /// A store path as 7.2's `decodedir` renames it back.
 pub fn decode_dir(path: &[u8]) -> Vec<u8> {
-  if !path.windows(DIR_MARK.len()).any(|window| window == DIR_MARK) {
+  if !path
+    .windows(DIR_MARK.len())
+    .any(|window| window == DIR_MARK)
+  {
     return path.to_vec();
   }
   DECODE_DIR
     .iter()
-    .fold(path.to_vec(), |renamed, (from, to)| replace_all(&renamed, from, to))
+    .fold(path.to_vec(), |renamed, (from, to)| {
+      replace_all(&renamed, from, to)
+    })
 }
 
 /// Whether 7.2 escapes `byte` as `~xx` (`_reserved`).
@@ -145,7 +152,10 @@ fn reserved(byte: u8) -> bool {
 /// Appends `byte` as `~` and two lower-case hexadecimal digits.
 fn escape(byte: u8, out: &mut Vec<u8>) {
   out.push(TILDE);
-  for digit in [byte.checked_shr(NIBBLE).unwrap_or_default(), byte & LOW_NIBBLE] {
+  for digit in [
+    byte.checked_shr(NIBBLE).unwrap_or_default(),
+    byte & LOW_NIBBLE,
+  ] {
     out.push(HEX.get(usize::from(digit)).copied().unwrap_or(b'0'));
   }
 }
@@ -223,14 +233,21 @@ fn aux_encode(segments: &mut [Vec<u8>], dotencode: bool) {
 
 /// A path's segments, split at `/`.
 fn segments(path: &[u8]) -> Vec<Vec<u8>> {
-  path.split(|byte| *byte == SLASH).map(<[u8]>::to_vec).collect()
+  path
+    .split(|byte| *byte == SLASH)
+    .map(<[u8]>::to_vec)
+    .collect()
 }
 
 /// A file name's extension as Python's `os.path.splitext` finds it: from its last period, if a byte other than a period
 /// comes before it.
 fn extension(name: &[u8]) -> &[u8] {
   match name.iter().rposition(|byte| *byte == PERIOD) {
-    Some(dot) if name.get(..dot).is_some_and(|before| before.iter().any(|byte| *byte != PERIOD)) => {
+    Some(dot)
+      if name
+        .get(..dot)
+        .is_some_and(|before| before.iter().any(|byte| *byte != PERIOD)) =>
+    {
       name.get(dot..).unwrap_or_default()
     }
     _ => &[],
@@ -318,7 +335,10 @@ impl From<PastAdmission> for FncacheRefused {
 
 /// The revlog paths an fncache lists, each after `decodedir`, sorted and each once (7.2 reads them into a set). Their
 /// bytes and entries are charged to `admission` first.
-pub fn read_fncache(bytes: &[u8], admission: &mut Admission) -> Result<Vec<Vec<u8>>, FncacheRefused> {
+pub fn read_fncache(
+  bytes: &[u8],
+  admission: &mut Admission,
+) -> Result<Vec<Vec<u8>>, FncacheRefused> {
   if bytes.is_empty() {
     return Ok(Vec::new());
   }
@@ -379,7 +399,8 @@ pub fn read_layout(requires: &[u8]) -> Layout {
 #[cfg(test)]
 mod tests {
   use super::{
-    FncacheRefused, aux_encode, decode_dir, encode_dir, encode_filename, encode_path, read_fncache, segments,
+    FncacheRefused, aux_encode, decode_dir, encode_dir, encode_filename, encode_path, read_fncache,
+    segments,
   };
   use crate::Admission;
 
@@ -412,7 +433,10 @@ mod tests {
       assert_eq!(encode_filename(name), encoded);
     }
     let path = encode_dir(b"foo.i/bar.d/bla.hg/hi:world?/HELLO");
-    assert_eq!(encode_filename(&path), b"foo.i.hg/bar.d.hg/bla.hg.hg/hi~3aworld~3f/_h_e_l_l_o");
+    assert_eq!(
+      encode_filename(&path),
+      b"foo.i.hg/bar.d.hg/bla.hg.hg/hi~3aworld~3f/_h_e_l_l_o"
+    );
   }
 
   /// A-630 (7.2's doctests of `_auxencode`): do encode the segments of 7.2's two examples, with and without
@@ -423,12 +447,27 @@ mod tests {
       (
         b".foo/aux.txt/txt.aux/con/prn/nul/foo.",
         true,
-        &[b"~2efoo", b"au~78.txt", b"txt.aux", b"co~6e", b"pr~6e", b"nu~6c", b"foo~2e"],
+        &[
+          b"~2efoo",
+          b"au~78.txt",
+          b"txt.aux",
+          b"co~6e",
+          b"pr~6e",
+          b"nu~6c",
+          b"foo~2e",
+        ],
       ),
       (
         b".com1com2/lpt9.lpt4.lpt1/conprn/com0/lpt0/foo.",
         false,
-        &[b".com1com2", b"lp~749.lpt4.lpt1", b"conprn", b"com0", b"lpt0", b"foo~2e"],
+        &[
+          b".com1com2",
+          b"lp~749.lpt4.lpt1",
+          b"conprn",
+          b"com0",
+          b"lpt0",
+          b"foo~2e",
+        ],
       ),
       (b"foo. ", true, &[b"foo.~20"]),
     ];
@@ -457,13 +496,19 @@ mod tests {
   /// admission. Expect each refused by its kind, the admission untouched.
   #[test]
   fn damaged_fncaches_are_refused() {
-    assert_eq!(read_fncache(b"data/a.i", &mut Admission::new(1 << 20)), Err(FncacheRefused::NoFinalNewline));
+    assert_eq!(
+      read_fncache(b"data/a.i", &mut Admission::new(1 << 20)),
+      Err(FncacheRefused::NoFinalNewline)
+    );
     assert_eq!(
       read_fncache(b"data/a.i\n\ndata/b.i\n", &mut Admission::new(1 << 20)),
       Err(FncacheRefused::EmptyEntry { line: 2 })
     );
     let mut small = Admission::new(4);
-    assert!(matches!(read_fncache(b"data/a.i\n", &mut small), Err(FncacheRefused::PastAdmission(_))));
+    assert!(matches!(
+      read_fncache(b"data/a.i\n", &mut small),
+      Err(FncacheRefused::PastAdmission(_))
+    ));
     assert_eq!(small.left(), 4);
   }
 }
