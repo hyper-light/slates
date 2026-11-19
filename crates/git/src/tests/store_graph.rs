@@ -58,7 +58,7 @@ fn git_pack(response: &[u8], served: &served::Served) -> BTreeSet<ObjectId> {
 #[test]
 fn the_store_reads_back_as_the_negotiations_graph() {
   let served = served::served();
-  let graph = StoreGraph::new(&served.repository, &served.store, &REFS).unwrap();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   for object in &served.objects {
     let node = graph.node(&object.id).unwrap();
     assert_eq!(graph.id(node), object.id);
@@ -121,7 +121,7 @@ fn refs_versions_and_fast_forwards_read_as_the_store_kept_them() {
     &[],
     &[(SIDE, FIRST)],
   );
-  let graph = StoreGraph::new(&served.repository, &served.store, &REFS).unwrap();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   let [first, second, third, tag] =
     [FIRST, SECOND, THIRD, TAG].map(|hex| graph.node(&id(hex)).unwrap());
   assert_eq!(
@@ -177,7 +177,7 @@ fn the_graphs_fast_forward_is_the_stores_own_verdict_at_admission() {
   }
   let verdicts: Vec<bool> = judged.iter().map(|(_, _, verdict)| *verdict).collect();
   assert_eq!(verdicts, [true, true, false, false, false, true]);
-  let graph = StoreGraph::new(&served.repository, &served.store, &REFS).unwrap();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   for (green, version, verdict) in judged {
     assert_eq!(
       graph.fast_forward(green, version),
@@ -193,7 +193,7 @@ fn the_graphs_fast_forward_is_the_stores_own_verdict_at_admission() {
 #[test]
 fn a_read_the_store_cannot_make_is_kept_as_the_first_fault() {
   let served = served::served();
-  let graph = StoreGraph::new(&served.repository, &served.store, &REFS).unwrap();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   assert_eq!(
     graph.id(9_999),
     id("0000000000000000000000000000000000000000")
@@ -209,7 +209,7 @@ fn a_read_the_store_cannot_make_is_kept_as_the_first_fault() {
 #[test]
 fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
   let served = served::served();
-  let graph = StoreGraph::new(&served.repository, &served.store, &REFS).unwrap();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   let wants = [id(THIRD)];
   let haves = [id(FIRST)];
   let request = Request {

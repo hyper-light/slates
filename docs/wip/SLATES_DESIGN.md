@@ -12614,6 +12614,15 @@ engine: the verdict, rebase, position mapping, the register).
 > two pushes moving one link apart from one base conflict `CreateCreate`. A path changing to or from a link is a typed
 > kind change (GAPS §8f). A link's form in a volume and in a checkout is owed (git checks a submodule out as an empty
 > directory).
+>
+> **Status (2026-11-19, A-640 part 2: upload-pack's v2 service behind one entry point).** `crates/git` (`upload`)
+> answers each exchange a transport hands it through `upload::serve`: the advertisement this section's "The wire"
+> names; a request held to it as `serve.c` holds one; `ls-refs` from the served refs, read at one position, each prefix
+> a run of the sorted refs; `fetch` mapped onto A-615's negotiation over part 1's graph, its sections in the document's
+> order and its pack framed on band 1 from a pack source (A-639 writes it); and `object-info` over A-624's answer.
+> Refusals are answered in git's words. The answer is written a slice at a time within the caller's room, the
+> repository lent afresh each step. Proven against stock git 2.50.1's own answers, and against a stock clone's own
+> requests served from the repository it cloned, rebuilt in the store. Protocol v0 and v1 are A-640's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -13784,6 +13793,17 @@ and export by landing).
 > asks for; the facts' revision as `dav_svn__get_safe_cr` gives it (A-616's facts carry `svn_fs_node_created_rev`'s,
 > which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
 > Apache with `mod_dav_svn`.
+>
+> **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
+> connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
+> `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
+> before every call (`abort-edit`, then 210004 "Successful edit status returned too soon" or the client's errors);
+> `close-edit`'s answer read (`( success ( ) )`, or `abort-edit` and the client's errors written back as
+> `svn_ra_svn__handle_failure_status` reads them); a drive's refusal answered with its error and the client's after
+> it. Held to every recorded report command replayed whole against `svnserve`'s bytes (34 sessions), an early answer
+> before each of a checkout's calls, fourteen answers to `close-edit`, any budget and any cut; red six ways. Owed: the
+> server's connection task that runs it (piece 7's), the deltas of changed texts (A-652's generator), and a recorded
+> session of copy sources.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -43957,6 +43977,110 @@ Part 1 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 en
 new; `store/repository.rs`, the child module's line; `store/mod.rs`, its re-export; `tests/store_graph.rs` and
 `tests/served.rs`, new; `lib.rs`, the test module's line).
 
+**Part 2: upload-pack's v2 service behind one entry point** (`crates/git/src/upload`; §4.17.2 "The wire", "A fetch"
+items 1 to 4, "Pieces (git)" piece 7). Sources, read 2026-11-19 at git v2.50.1: `serve.c`
+(`protocol_v2_advertise_capabilities`, `process_request`, `parse_command`, `receive_client_capability`), `ls-refs.c`
+(`ls_refs`, `send_ref`, `send_possibly_unborn_head`), `upload-pack.c` (`upload_pack_advertise`, `upload_pack_v2`,
+`process_args`, `parse_want`, `parse_want_ref`, `process_shallow`, `process_deepen_not`, `send_acks`,
+`process_haves_and_send_acks`, `send_shallow_info`, `send_wanted_ref_info`, `create_pack_file`), `refs.c`
+(`expand_ref`, `ref_rev_parse_rules`) and `pkt-line.c` (`packet_writer_error`) [C]; `gitprotocol-v2` [B].
+
+- **One entry point**, for the HTTPS edge (A-625 part 2) and the SSH server's `git-upload-pack` command (A-633):
+
+  ```rust
+  pub fn serve<P: PackSource>(
+    served: &Served<'_>,
+    version: http::Version,
+    asked: Asked<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+  ) -> Answer<P::Pack>
+  ```
+
+  `Served` lends the repository, its content, the refs a client may see (in name order, each naming its green) and
+  `HEAD`'s branch. `Asked` is the advertisement, or one request held whole: an HTTP `POST`'s body, or what
+  `v2::request::whole_len` measured of an SSH session's input. The `Answer` borrows nothing.
+  `Answer::write(&served, &mut packs, &mut out, room)` writes at most `room` bytes and lends the repository afresh
+  each step, so a shard never holds its state across a wait; it answers `Written::End` once the answer is whole.
+  `refusal()`, `counters()` (one round or walked) and `ends_session()` (a flush alone, an SSH session's last request)
+  say what happened.
+- **Everything but the pack at one position.** `serve` decides and encodes everything but the pack in one turn over
+  the repository, each list and the bytes charged to the request's admission before they are made.
+  - The advertisement, in `serve.c`'s order: `agent`, `ls-refs=unborn`, `fetch=shallow wait-for-done filter
+    ref-in-want sideband-all packfile-uris`, `server-option`, `object-format`, `session-id`, `object-info`.
+    `bundle-uri` waits for a bundle list.
+  - A request is held to the advertisement as `serve.c` holds one: a command not advertised is `invalid command`, a
+    capability not advertised (`promisor-remote`) is `unknown capability`, and an object format other than the
+    repository's is `mismatched object format`.
+  - `ls-refs`: `HEAD` first where a prefix takes it, `unborn` with its target only when both `unborn` and `symrefs`
+    were asked, as git lists it; then each ref a prefix takes, in name order, an annotated tag peeled through every
+    tag it names. The refs are in name order, so each prefix is a run found by a search, and a prefix a shorter one
+    begins is dropped, so no ref comes twice.
+  - `fetch`: `want-ref` is looked up by its full name, `HEAD` read through to the default branch. `deepen-not` is
+    tried as each of git's patterns (`ref_rev_parse_rules`) and must name exactly one ref. The filter is parsed, and
+    the rest go to A-615's negotiation. The sections follow the document's order: acknowledgments, `shallow-info`
+    (its lines without an LF, as git writes them), `wanted-refs`, then the packfile section's header.
+- **The pack**, through `PackSource`, which A-639 implements: `begin` takes the plan (runs of versions, single objects,
+  the filter for the runs, `thin-pack`, `ofs-delta`); then `write` gives a packet's data at a time. The answer frames
+  it on band 1 in full packets of 65,515 bytes (the format's limit), then the flush. A source that refuses, or writes
+  nothing while saying more is coming, ends the response with git's band-3 words: "aborting due to possible
+  repository corruption on the remote side." Until A-639 lands, the tests' source writes whole objects.
+- **Refusals** are answered with `ERR <words>`, or on band 3 under `sideband-all`, git's words where it has them:
+  `upload-pack: not our ref <id>`, `unknown ref <name>`, `invalid command '<name>'`, and git's `deepen-not` words.
+- **Stricter than git, by the document's words.** A `want-ref` sent twice is refused ("It is a protocol error to send
+  want-ref for the same ref more than once"); git 2.50.1 answers it. And `shallow-info` comes before `wanted-refs`,
+  the document's order and the one git's client requires (A-582 part 2).
+- **Tests** (`src/upload/tests/`, 30):
+  - Golden against stock git 2.50.1's own answers from the repository it served (A-582's fixtures):
+    - `ls-refs`, byte for byte;
+    - the five fetch exchanges (clone, a have, `deepen 1`, `want-ref`, progress), section for section, each pack
+      holding exactly the objects git's held;
+    - the advertisement, holding every key git advertised, in its order.
+  - A stock clone's own requests (A-595's `fixtures/http`, exchanges 04 and 05), served from small.git rebuilt in the
+    store. The rebuild is held to the clone's 31 wants, one sent twice for `HEAD` and `main`. Its `ls-refs` lists
+    every branch, `HEAD` first; its fetch gets all 32 objects.
+  - The `ls-refs` oracle: 256 generated repositories and prefix lists against a filter of every ref.
+  - The negotiation's paths: one round for a client versions behind, the walk for a clone. Also `sideband-all`,
+    the section order, `want-ref HEAD`, `deepen-not` by a short name, acknowledgments alone, `wait-for-done`, and no
+    want at all.
+  - `object-info`, against the sizes git's `cat-file -s` printed.
+  - Steps: rooms at every edge, rooms generated, and a 200,000-byte pack in full packets.
+  - Refusals:
+    - not our ref, plain and on band 3;
+    - an unknown `want-ref`, and one sent twice;
+    - a `deepen-not` that names no ref, and one that names two;
+    - the filters;
+    - admissions too small;
+    - v0 and v1;
+    - a flush alone, and refs out of order;
+    - a pack failing or stalling midway;
+    - every cut and every bit flip of a request.
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 368 of 368 (2 of main's ignored),
+  `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first: with `serve` stubbed to answer
+  nothing, 25 of the first 27 tests failed. The two that passed compared a stepped answer with a whole one, which an
+  empty answer satisfies, so both are now held to stock git's answers first. Under the stub, 29 of the final 30 fail;
+  the one that passes reads only the clone's request. Red eight ways, one guard at a time:
+  - prefixes not deduplicated: 2 tests failed;
+  - `HEAD` always listed: 2;
+  - a `want-ref` sent twice taken: 1;
+  - `wanted-refs` before `shallow-info`: 1;
+  - `unborn` listed without `symrefs`: 1, the oracle alone;
+  - every ref peeled: 3, git's golden among them;
+  - an ambiguous `deepen-not` taken: 1;
+  - band 3 never used: 1.
+- **Next** (A-640's parts):
+  - v0 and v1 behind the same entry point (part 3, refused with `ERR` until then), with v0's ref names held to
+    A-615's rule;
+  - `sparse:oid` (part 4);
+  - `packfile-uris` and `bundle-uri` answered from the store's URI packs and bundle list (A-624's choice is built);
+  - progress on band 2;
+  - the walk in cooperative slices;
+  - hidden refs, which are policy (§4.17.2 "Access").
+
+Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload`, new:
+`mod.rs`, `advertise.rs`, `refs.rs`, `fetch.rs`, `answer.rs` and `tests/`; `store/graph.rs`, `StoreGraph::new` made
+infallible through `ObjectId::null` and `head` added, with `tests/store_graph.rs`; the `mod` line in `lib.rs`).
+
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
 `report/editor.rs` with its tests, new; `report/recorded.rs`, the recorded sessions in one table both test modules
@@ -45076,6 +45200,41 @@ Applied in the same change to:
 
   Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
   removal of `TARGET`, which left `h` a link naming nothing.
+
+### A-616, continued (3) — One report command's exchange on an ra_svn connection (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/exchange.rs` and its
+tests, new; `report.rs`'s `Context` gains the caller's `most_open` and `Refused` an `Editor` refusal;
+`report/drive.rs`'s `Sources` public; the fixtures' green and the drives' shared form in `report/drive/green.rs`).
+
+- **The exchange** (`report::exchange`; `serve.c` `accept_report`, `editorp.c`, `marshal.c` at `d434dc14`, 1.15.0
+  alike): `Exchange::begin` answers the command (part 1's `Reporter`), `receive` reads the report, then writes the
+  drive's calls through the editor writer until the caller's room is used or the drive's steps are spent
+  (`Turn::Wrote`), at least one call a turn. Before every call but `close-edit` and `abort-edit` (and an absent entry
+  not sent) it looks for the client's answer, as `check_for_error` does: one there is answered `abort-edit`, read, and
+  the command fails with 210004 "Successful edit status returned too soon" after a success, else with the client's
+  errors. `close-edit`'s answer ends the command with `( success ( ) )`, or with `abort-edit` and the client's errors
+  written back; a drive's refusal is answered with its own error and the client's after it
+  (`svn_error_compose_create`).
+- **The client's errors** as `svn_ra_svn__read_cmd_response` and `svn_ra_svn__handle_failure_status` read them: read
+  from the last back, a command-error wrapper (210000) dropped, the number kept as an `apr_status_t` (its low 32 bits,
+  sign-extended when written back), message and file read as C strings; "Empty error list", "Malformed error list",
+  "Malformed network data" and "Unknown status '…' in command response" (210004 each) for the shapes it refuses.
+- **Where it differs from `svnserve`**, in when and what, never in what a stock client reads: it looks for an early
+  answer before every command, where `svnserve` looks after 4,096 bytes written or a flush (`error_check_interval`,
+  `svnserve.c` 801), so it notices one no later; an answer that is no item, or nested past three lists, ends the
+  connection, where `svnserve` reads 64 levels and refuses the command; an error the client sent without a message is
+  written back without one, where `svnserve` writes `svn_strerror`'s text.
+- **Tests.** Every recorded session with a report command (34; the malformed one's connection ends unflushed) replayed
+  from its command, the client's answer handed over only once asked, as a stock client sends it: `svnserve`'s items
+  before and after the drive byte for byte, its drive call for call in the shared form; an early success and an early
+  failure after each of a checkout's calls; fourteen answers to `close-edit`; a drive's refusal with and without the
+  client's errors; answers past the bounds; one byte and one step a turn, and the report cut at every byte, writing
+  alike. `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: red first (`receive` refusing at
+  once: 6 of 6 failed), then 371 of 371; red five more ways by mutation (the early check dropped, wrappers kept, the
+  client's errors dropped after a refusal, C strings uncut, the list read from the front), each caught; rustfmt's
+  layout from the Studio.
+- **Owed** (GAPS): the server's connection task that runs an exchange (piece 7's, with `get-latest-rev` and the other
+  reads); the deltas of changed texts through A-652's generator; a recorded session asking for copy sources.
 
 ### A-626 part 2 — A copy from a version its source changed after brings the tree as it stood then: the head's graft fixed by what the change index names since, the fix recorded whole in the chain entry, its room derived before the verdict (2026-11-19, g295 for UI goal 93; §4.16 "The state's maps" and "The verdict", §4.17.4 item 3 and piece 3; A-586, A-626 part 1)
 Applied in the same change to: §4.16 (a status block, the verdict's sentence on `Copy`, the "Copies" bullet), §4.17.4
