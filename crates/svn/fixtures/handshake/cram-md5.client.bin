@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 20:svn://127.0.0.1/cram 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( CRAM-MD5 ( ) ) 38:alice 988c9f284ea35500a38f1cb139a5341a ( get-latest-rev ( ) ) ( stat ( 0: ( 0 ) ) ) ( get-latest-rev ( ) ) ( get-lock ( 0: ) ) 
