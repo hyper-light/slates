@@ -12230,8 +12230,11 @@ is one more version, and the chain itself is never rewritten.
 > (`crates/git/src/store/reach.rs`). Ancestry is one since A-666 part 1 (`derived/ancestry.rs`): each version's value
 > holds Mononoke's commit-graph fields (its generation, first-parent and skip-tree skew jumps, its run bottom and its
 > skip-tree parent, a dominator), so is-ancestor, the merge bases and bisect's midpoint are answered from the values,
-> logarithmic along runs and linear only in the merges a question must open. Owed: A-553's and A-588's stores as types,
-> and the server's use (A-647's and A-666's entries).
+> logarithmic along runs and linear only in the merges a question must open. Path history is one since A-666 part 2
+> (`derived/history.rs`): each version's value names its map and a history tree of each path's node, kept from the
+> first parent the path is TREESAME to, so `log <path>` and `--follow` (past recorded renames and copies) read one node
+> a version they list, git's default mode exactly. Owed: A-553's and A-588's stores as types, blame, and the server's
+> use (A-647's and A-666's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -44213,7 +44216,9 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     client. (Built, A-666 part 1: is-ancestor, the merge bases as `git merge-base --all` answers them, and bisect's
     midpoint, from a type of derived data under A-647 holding Mononoke's commit-graph fields; no exact answer is
     constant-time on histories of merges (Pǎtraşcu 2011), so each costs a search logarithmic along runs and a step for
-    each merge it must open. Owed: path history and blame; the server's verbs over the type.)
+    each merge it must open. A-666 part 2: a path's history, `log <path>` and `--follow`, from a type naming each path's
+    node (Mononoke's unodes) under git's default-mode rule exactly, renames and copies as the works recorded them; a
+    question reads one node a version it lists. Owed: blame; the server's verbs over the types.)
   - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
     request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
     above it (with goal 91's federation).
@@ -46848,3 +46853,107 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/vcs/src/derived/ancestry.rs` and `derived/ancestry/tests.rs` (new),
   `crates/vcs/src/derived.rs` (the module and its docs); `docs/wip/research/ancestry-queries.md` (new); A-645's entry
   ("Queries by API"); §4.17.1 "Reads"' status; GAPS' A-645 line.
+
+### A-666 part 2 — Path history as derived data: `log <path>` and `--follow` answered from each version's value, git's default-mode history simplification exactly, renames and copies as the works recorded them, a question's reads its path's changes (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Queries by API", part 2; A-647; §4.17.1 "Reads")
+
+- **Why.** A-645: "Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+  client." Part 1 answered ancestry; this part answers a path's history. Blame is part 3.
+- **The question** (`research/path-history.md` §2). `git log -- <path>` in its default mode includes a commit "if
+  [it is] not TREESAME to any parent ... If the commit was a merge, and it was TREESAME to one parent, follow only that
+  parent. (Even if there are several TREESAME parents, follow only one of them.) Otherwise, follow all parents."
+  \[C: git `rev-list-options.adoc` 507-513\]; the one followed is the first in parent order (`revision.c` 1001-1003,
+  1039-1066), and a root is compared to an empty tree (525-526). The type answers that mode; `--full-history`,
+  `--simplify-merges` and `--show-pulls` list other sets and are owed as types of their own. A path is TREESAME in a
+  version and a parent when it holds nothing in both, the same file (class and content), or a directory of the same
+  files; a directory stands while a file is beneath it, the root too, as a git tree does. `--follow` continues past the
+  renames and copies the works declared (§4.16 `Rename`, `Copy`), never ones found by comparing contents, as git's
+  does (`git-log.adoc` 30-32): "comparing file states to reconstruct operations is inference and does not exist in
+  slates" (§4.16 "Composition at seal").
+- **The value** (`crates/vcs/src/derived/history.rs`, `PathHistory`, the type `slates-vcs path history 1` with the
+  window its maps split by): Mononoke's unodes \[C: `mononoke_types/src/unode.rs` 31-57\] made to answer git's rule. A
+  version's value names its path map (A-647 part 1's value of the version) and its history tree, a path map whose files
+  are each path's node, the node of `p` at `p/\0` and the root's at `\0`, so a file and a directory once at one path
+  share one history. A NUL is no name in git, Mercurial, Subversion or POSIX, and a change or a question naming one is
+  refused. A path's node is a derived node naming its parents' nodes, its source's node and its file's content, and
+  holding what its version left (nothing, a file and its class, a directory), the version's generation and name, and
+  the source's path.
+- **The rule.** A version keeps a path's node from the first parent the path is TREESAME to (none when that parent had
+  none), else makes one, its parents the parents' nodes in parent order, each once. Only the paths of the version's
+  change and the directories on them are judged: every other path is TREESAME to the first parent and keeps its node by
+  path copying. A removal is a node of no file, so `log` lists it and reaches the history before it. By induction over
+  the history the nodes reachable from a path's node are exactly git's default-mode list. Two choices differ from
+  Mononoke's, each with its reason (`research/path-history.md` §4):
+  - A directory is compared by its trie's root in the path map, a function of its files; Mononoke's unodes v2 reuse a
+    tree unode only when its subentries (its children's unodes) are equal \[C: `derived_data/unodes/derive.rs`
+    390-408\], which compares history, so where a merge takes one side's `d/x` and the other side's `d` whole it would
+    list the merge for `d` where git lists the second side.
+  - A removal is a node of the one tree; Mononoke keeps removals in a second structure with merge rules of its own, the
+    deleted manifest \[C: `derived_data/deleted_manifest/derive.rs` 60-99\].
+- **Renames and copies** (`PathSources`, `Sources`): each path a version's change makes from another, every file and
+  directory beneath a moved or copied directory named too, with its source path and the version that held it (a copy
+  names any earlier version, Subversion's copy-from revision). A node made there names its source's node, so
+  `--follow` continues in one step; a source is part of the node, since it is what the work declared and a value never
+  changes (Mononoke keeps copy-from outside the unode "so that we can retroactively change it", `unode.rs` 41-42). A
+  derivation reads the source version's value, so the mechanism lets a type name inputs beyond its parents
+  (`DerivedType::inputs`, parents by default) and a fill derives them first. A source whose destination does not stand,
+  whose source path did not stand at its version or stood as the other kind, or whose version is no older is refused
+  `BadSource`.
+- **The question** (`log`): the path's node is looked up in the version's history tree, then nodes are listed newest
+  first (the greatest generation, then the version's name, then the path), each listed node's parents and, with
+  `--follow`, its source put on the frontier, each node once a path, until the limit. A full answer reads the value,
+  the trie nodes on the path's key and at most one node for each version it lists; one cut at a limit of n at most
+  2 + n(1 + P), P the most parents a node has. Neither depends on the history's length. Mononoke's fastlog reads the
+  same chain in batches of at most 110 to spare a blobstore round trip a node \[C: `fastlog_batch.rs` 51-55, 89-104\];
+  this store is in memory, so each node is one read.
+- **Typed refusals** (`HistoryRefused`): `NoVersion`, `Inputs`, `ReservedName`, `BadSource`, `Malformed` (bytes, or a
+  parent or source no older than the node naming it), `Exhausted`, and the path map's and the store's own.
+- **Tests** (`crates/vcs/src/derived/history/tests.rs`; `cargo test --locked -p slates-vcs --lib`, Windows x86_64,
+  jupiter, 2026-11-19, a fresh clone of each pushed branch and a target directory of its own each run; the Mac Studio
+  was offline, so the macOS run is owed).
+  - Red first (b05e17991, branch `agents/g302-a666p2-red`, not for main): with the derivation and `log` refusing at
+    once, 55 passed and 10 failed: every new test but the hostile-bytes readers', which call no stub; the 55 are main's
+    54 and that one.
+  - The first green (408bb0c91): 65 of 65 in 112.68 s. It warned of an import kept for a doc link alone, and the
+    oracle's bound on a cut question read the walk's own count of what it listed, so a walk that read everything and
+    said so would have bounded itself; the bound now uses the answer's length and checks the count against it
+    (4263443d6).
+  - Green at 4263443d6: 65 of 65 in 104.41 s, no warning.
+  - The oracle (`t_a666_p2_every_history_equals_gits_default_walk_within_its_bound`, 32 cases): generated histories of
+    up to 240 versions (edits anywhere, a file made where a directory stood and back, runs of edits to a hot file,
+    renames of files and directories some edited as they move, copies from the first parent and from versions up to
+    six back, merges of two and three resolving each differing path every way, criss-cross merges, unrelated roots,
+    removals of whole directories), every version derived eagerly and again lazily in another order, and `log` and
+    `log --follow` asked of generated versions and paths in full and cut at a limit, of every branch tip's hot file and
+    of the first destination of every version that renamed or copied. Every answer is git's default-mode walk with the
+    recorded sources followed, newest first; every derivation judged exactly its change's paths and the directories on
+    them, the root included (the non-vacuity count); every value's map is its files' map built from scratch; the lazy
+    values are the eager ones, identity for identity; every full answer read at most one node more than it listed and
+    every cut one within its bound; and the store is empty after. Its census: 1,648 versions, 174 merges, 19 octopus
+    merges, 54 versions renaming or copying from their parent and 30 copying from older versions; 4,311 nodes made, 342
+    removals, 124 naming a source, 291 paths diverted to a later parent; 770 questions, 447 empty, 78 listing a
+    removal, 66 a merge, 90 a source's path, 13 a file and a directory at one path; 72 cut at their limit; 136 a walk
+    would have cost four times over; at most 79 reads for any question.
+  - Beside it: a line of 20,000 versions answers `log hot` (1,000 changes) in 1,001 reads where the model's walk visits
+    all 20,000 versions, `log cold` (6 versions) in 7, and `log hot` cut at 10 in 12; renames followed only with
+    `--follow`, each version at the path it changed then; a copy from an older version followed there and not to the
+    source's later edit, its inputs its parent and that version, and a lazy read of it alone filling that version
+    first; git's merge rule three ways (TREESAME to the second parent; both sides the same, the first followed; a
+    resolution listed with both sides); a directory and a file beneath it following different parents of one merge; a
+    path removed, made again and made a directory, and the root's history; the format's bytes written by hand (a
+    one-file version: the map's leaf, the two nodes, the history tree's two leaves and the value, each named by BLAKE3's
+    key derivation); hostile node and value bytes refused twelve and four ways; a forged parent no older than its child
+    refused by the question, its charge given back; `BadSource` four ways, `ReservedName` twice, a removal of nothing,
+    too many values, the store's `OverBudget` and a question of a root that is no value, the store as it was.
+  - A mutation (f0cc723f7, branch `agents/g302-a666p2-walk`, not for main): the walk lists a path's whole history, then
+    cuts it at the limit. The answers are unchanged; 63 passed and 2 failed: the oracle (version 177's hot file cut at
+    2: 122 reads against its bound of 10, 121 versions in all) and the long history's cut question. A regression to
+    reading a path's whole history fails the bounds.
+  - Main's: the macOS run, clippy, `xtask check` and the doc gate (the run-request queue).
+- **Owed.** Blame (A-666 part 3, built on these nodes); the server's verbs over the type (each repository's values on
+  its owner shard, A-662) and a `PathSources` over each green's versions, the works' composed ops naming each path they
+  make with its source; git's other simplification modes, each a type; nodes offered between tiers in batches, once
+  values travel between tiers.
+- **Applied in the same change to:** `crates/vcs/src/derived/history.rs` and `derived/history/tests.rs` (new);
+  `crates/vcs/src/derived.rs` (`DerivedType::inputs`, the fill reading inputs, the module's docs);
+  `crates/vcs/src/derived/paths.rs` (`At`, `at`); `docs/wip/research/path-history.md` (new); A-645's entry ("Queries by
+  API"); §4.17.1 "Reads"' status; GAPS' A-645 line.

@@ -45,9 +45,10 @@
 //! non-vacuity counter: an incremental derivation enters only the directories on its change's paths) and every fill's
 //! derivations counted against the versions it had to fill.
 //!
-//! **Owed:** A-614's D(k) as a type (A-647 part 2); the other stores as types (A-553's node revisions, A-588's
-//! manifests); dropping a value no version needs, and releasing a value a slice at a time (one call today, as A-581's
-//! releases); a derivation larger than a slice derived in parts; values replicated between tiers by identity.
+//! **Owed:** the other stores as types (A-553's node revisions, A-588's manifests; A-614's D(k) is one since A-647 part
+//! 2, in `slates-git`); blame (A-666 part 3); dropping a value no version needs, and releasing a value a slice at a time
+//! (one call today, as A-581's releases); a derivation larger than a slice derived in parts; values replicated between
+//! tiers by identity.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
