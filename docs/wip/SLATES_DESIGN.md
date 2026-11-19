@@ -11282,9 +11282,9 @@ struct VersionRecord { version: Version, snapshot: SnapshotId, manifest: Option<
 struct Increment { id: IncrementId /* blake3(work_volume, base, post_state, ops_doc, filter) */, work_volume: VolumeId,
                    base: (VolumeId, Version), post_state: SnapshotId, ops_doc: Blake3 /* a sealed chunk */, filter: FilterId,
                    evidence: SmallVec<Blake3> /* opaque to slates */ }
-#[repr(C)] struct OpRecord { kind: u8, flags: u8, path_idx: u16, reserved: u32, at: u64, len: u64, src: u64 }   // 32 bytes, little-endian
+struct OpRecord { kind: u8, flags: u8, path: u64, at: u64, len: u64, src: u64 }   // 34 bytes, little-endian, written field by field (version 2, A-621)
 enum OpKind { Overwrite, Extend, Truncate, Insert, Delete, Create, Unlink, Mkdir, Rmdir, Rename, Link, Symlink, SetMode, SetXattr, RemoveXattr, Mknod }
-struct OpsDoc { header: WireHeader, paths: PathTable /* path_idx → path bytes, sorted */, ops: [OpRecord] }
+struct OpsDoc { header: WireHeader /* magic, version 2, path and op counts as u64 */, paths: PathTable /* path → bytes, sorted, unique */, ops: [OpRecord] }
 struct CanonicalDelta { version: Version, ops: Handle<OpsDoc>, effects: Art<PathKey, RangeSet> /* per path: ranges touched and size shifts */ }
 struct MergeRecord { green: VolumeId, version: Version, increment: IncrementId, verdict: VerdictSummary, manifest: Blake3, host_epoch: u64 }
 struct ConflictWindow { path: PathKey, mine: (u64, u64), theirs: (u64, u64), theirs_version: Version, class: MergeConflictClass }
@@ -11295,6 +11295,19 @@ post-state are sealed chunks and a snapshot on the work volume's owner shard, re
 shard by handle while pinned (D-7); the merge record is an entry of the green's ledger register
 (a partition log append on a laptop; a record sent to the green's candidate holders in a fleet,
 §4.8); nothing in this plane is shared mutable state.
+
+> **Status (2026-11-19, A-621: a work names as many paths as it declares).** An op's path index is 64 bits, in memory
+> and on the wire, and the ops document's header counts its paths and operations in 64 bits (`crates/merge/src/ops_doc.rs`,
+> version 2; the chain entry, which writes an op's record the same way, version 5). So a work names as many paths as
+> its caller's admission allows, with no fixed cap: a kernel tree's first push (about 97,000 files) is one work. Until
+> then an index was 16 bits, and interning answered `u16::MAX` for every name past the 65,535th, so the 65,536th and
+> every later name aliased one path. The deriver's index lookup, the verdict's reading of a rename's or an attribute's
+> index, and the server's laying-in of an attribute's value narrowed the same way, the last silently skipping the
+> value. Interning looks a name up in an ordered map, so a table of n names costs O(n log n) comparisons, where the
+> scan it replaced cost O(n²); a test counts them. A table naming a path twice is refused at decode (`DuplicatePath`):
+> read as the first, every later index would name the path after its own. A version 1 document, and a version 4 chain
+> entry, are refused `BadVersion`, never read under the other layout. The golden vectors are version 2's, derived by
+> an independent encoder and BLAKE3 that reproduce version 1's vector from version 1's layout.
 
 **Declared operations (the journal, §4.5).** Every mutation is declared at the boundary where it
 happens: through a mount, `write(off, len)` is `Overwrite` (or `Extend` past the end) and
@@ -41141,3 +41154,57 @@ Applied in the same change to:
   challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
   in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
   DAV reading their requests through it.
+
+### A-621 — an ops document names as many paths as its work declares: 64-bit path indices and interning through a map (2026-11-19, g267, UI goal 93; §4.16 "Data model"; found on the push path by g225, A-618)
+Applied in the same change to:
+- §4.16's data model (the op record and the document's header) and its status; GAPS (a §4.16 entry, the A-612 siblings
+  filed open, and a sibling found here);
+- `crates/merge`:
+  - `ops_doc.rs`: version 2, `Op::path` `u64`, `PathTable`'s ordered index, `DuplicatePath`; its tests moved from
+    `tests/ops_doc.rs` into `src/ops_doc/tests.rs`;
+  - `chain_entry.rs`: version 5, an op's record the ops document's;
+  - `engine.rs` and `increment.rs`: the index conversions;
+  - `tests/increment.rs`, `tests/special.rs` and `tests/chain_replay.rs`, updated to the wider index;
+- `crates/server/src/verbs.rs`: an attribute's name index read whole;
+- `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+- **The defect.** An op named its path by a 16-bit index, and `PathTable::intern` answered `u16::MAX` for every name
+  past the 65,535th, so the 65,536th and every later name of one work aliased one path: their edits would land on the
+  wrong file. The same narrowing stood in the deriver (`index_of`), in the verdict's reading of a rename's source and an
+  attribute's name, and in the server's laying-in of an attribute's value, which skipped it. Interning scanned every
+  name, O(n²) for a table of n.
+- **The format, the design's way.**
+  - The ops document's version is 2: a path index, and the header's path and op counts, are 64 bits, the op record 34
+    bytes written field by field. Its golden vectors are re-derived: the 152 bytes of the golden document, recorded field
+    by field in the test, and its identity
+    `11ede55e9cfe1c944e971c5bd45cc1628911d8c93d92ea5ea51c1ff8d370763b`. Both came from an independent encoder and
+    BLAKE3 (Python), which reproduces version 1's vector `67613f8e…19b677d` from version 1's layout of the same
+    document.
+  - The determinism gate holds at 65,537 names: the document is built twice, its names declared in opposite orders,
+    with the same bytes and identity.
+  - The chain entry, which writes an op's record the same way, is version 5.
+  - Old versions are refused `BadVersion` (a version 1 document, a version 4 entry): replaced, not layered.
+- **No fixed cap.** A table's length always fits 64 bits on the targets slates builds for, so the conversion never
+  fails. Its unreachable refusal answers `u64::MAX`, which names no path, so it can never alias another path as
+  `u16::MAX` did. A work's names are bounded by its caller's admission (g225's push path charges them, A-618).
+- **Interning.** An ordered map from name to index (`BTreeMap`). Its order is the canonical one, so
+  `canonicalize` reads the sort off the map in one pass, moving each path once. Decode refuses a table naming a path
+  twice (`DuplicatePath`).
+- **Tests** (debug, Mac Studio, 2026-11-19, load 8 to 26), green on kiln r692:
+  - `cargo test -p slates-merge --lib`, the whole suite, 60 of 60;
+  - `cargo test -p slates-server --lib -- green merge_origin`, 31 of 31;
+  - `cargo fmt -p slates-merge -p slates-server -- --check`, clean.
+
+  The failing-first tests:
+  - 65,537 distinct names each keep their own index, and each op names the path it was declared for, through
+    canonicalization, encode and decode;
+  - the comparison counter shows doubling the names less than triples the comparisons (a scan quadruples them), and
+    the total stays far below a scan's;
+  - the chain entry keeps an op's index past 16 bits.
+
+  Red on r705, with the old scan and 16-bit index restored inside the new types and the chain entry keeping an index's
+  low 16 bits: all four failed. The 65,537th name took the 65,536th's index (65,535); the determinism gate's two
+  orders differed; the chain entry's index came back clipped. Doubling the names took 2,149,245,934 comparisons against
+  537,633,163, four times, the scan's square.
+- **Sibling found, not changed** (GAPS): a chain entry's encoding finds each splice's declared ops by scanning every op
+  of the increment (`chain_entry::declared_ops`). That is O(splices × ops) for a version that edits many existing
+  files, though not for a first push, whose files are created.
