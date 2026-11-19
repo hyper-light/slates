@@ -5723,6 +5723,666 @@ fn assert_the_clone_moved_and_unpinned(moved: &CloneMoved, described: &str) {
   );
 }
 
+/// Shape: the captured file the capture-landing tests' agent rewrites (A-544, A-565).
+const CHANGED_AS_CAPTURED: &[u8] = b"the captured file the agent rewrites";
+/// Shape: the captured file the agent removes.
+const REMOVED_AS_CAPTURED: &[u8] = b"the captured file the agent removes";
+/// Shape: the captured file the agent leaves alone, which an outsider edits in the landing's target.
+const KEPT_AS_CAPTURED: &[u8] = b"the captured file the agent leaves alone";
+/// Shape: the tree the capture-landing tests overlay and capture, by path.
+const CAPTURED_TREE: [(&str, &[u8]); 3] = [
+  ("/changed", CHANGED_AS_CAPTURED),
+  ("/removed", REMOVED_AS_CAPTURED),
+  ("/kept", KEPT_AS_CAPTURED),
+];
+/// Shape: what the agent rewrites `/changed` to.
+const REWRITTEN: &[u8] = b"the agent's rewrite of the captured file";
+/// Shape: the file the agent makes.
+const MADE: (&str, &[u8]) = ("/made", b"a file the agent made");
+/// Shape: an outsider's edit to `/kept` in the landing's target, a file the agent never touched.
+const OUTSIDERS_EDIT: &[u8] = b"an outsider's edit to the file the agent left alone";
+/// Format: the owner's count of captured clones' heads whose capture record it recorded (`carry::CARRY_RECORDED`,
+/// A-544).
+const CARRY_RECORDED: &str = "fleet.carry.recorded";
+
+/// A directory holding the captured tree: the base an overlay captures, or a landing's target before an outsider edits
+/// it.
+fn captured_tree_dir() -> common::target::TargetDir {
+  let dir = common::target::target_dir();
+  for (path, bytes) in CAPTURED_TREE {
+    dir.seed(path.trim_start_matches('/'), bytes);
+  }
+  dir
+}
+
+/// A landing's target holding the captured tree, its `/kept` edited by an outsider after the capture.
+fn target_with_an_outsiders_edit() -> common::target::TargetDir {
+  let target = captured_tree_dir();
+  target.seed("kept", OUTSIDERS_EDIT);
+  target
+}
+
+/// On a, through `client_a`: an overlay of `base`, its base captured, and the captured snapshot cloned once for each of
+/// `names`. Returns the clones in `names`' order.
+fn captured_and_cloned(client_a: &mut Client, base: &str, names: &[&str]) -> Vec<VolumeId> {
+  let ReplyBody::Created { id: overlay } = client_a.call(&RequestBody::Create {
+    name: "captured-tree".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(base.to_owned()),
+  }) else {
+    panic!("overlay of the captured tree on node a");
+  };
+  let captured = client_a.call(&RequestBody::CaptureBase { volume: overlay });
+  let ReplyBody::BaseCaptured { snapshot } = captured else {
+    panic!("capture of the overlay's base: {captured:?}");
+  };
+  names
+    .iter()
+    .map(|name| {
+      let cloned = client_a.call(&RequestBody::Clone {
+        volume: overlay,
+        snapshot,
+        name: (*name).to_owned(),
+      });
+      let ReplyBody::Cloned { id } = cloned else {
+        panic!("clone {name} of the captured snapshot: {cloned:?}");
+      };
+      id
+    })
+    .collect()
+}
+
+/// The agent's work in `clone` through `client`, a client of its owner: `/changed` rewritten, `/made` made and
+/// `/removed` removed, through one write attachment.
+fn agents_changes(client: &mut Client, clone: VolumeId) {
+  let attachment = write_attachment(client, clone);
+  for (path, bytes) in [("/changed", REWRITTEN), MADE] {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: clone,
+      attachment,
+      path: path.to_owned(),
+      bytes: bytes.to_vec(),
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "the agent's write of {path}: {written:?}"
+    );
+  }
+  let removed = client.call(&RequestBody::FsRemove {
+    volume: clone,
+    attachment,
+    path: "/removed".to_owned(),
+  });
+  assert!(
+    matches!(removed, ReplyBody::FsDone { .. }),
+    "the agent's removal of /removed: {removed:?}"
+  );
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the agent's attachment ended: {detached:?}"
+  );
+}
+
+/// The tree the agent left in its clone, as a reader of the clone sees it: `/changed` rewritten, `/made` made and
+/// `/kept` as captured (`/removed` is gone).
+fn agents_tree() -> [(&'static str, &'static [u8]); 3] {
+  [("/changed", REWRITTEN), MADE, ("/kept", KEPT_AS_CAPTURED)]
+}
+
+/// What a landing left in its target: each file of the captured tree and the agent's, `None` where the target holds
+/// none.
+#[derive(Debug, PartialEq, Eq)]
+struct OnDisk {
+  changed: Option<Vec<u8>>,
+  made: Option<Vec<u8>>,
+  removed: Option<Vec<u8>>,
+  kept: Option<Vec<u8>>,
+}
+
+/// The files of the captured tree and the agent's as `target` holds them now.
+fn on_disk(target: &str) -> OnDisk {
+  #[allow(clippy::disallowed_methods)] // reading the landing's target back, read-only
+  let read = |name: &str| std::fs::read(format!("{target}/{name}")).ok();
+  OnDisk {
+    changed: read("changed"),
+    made: read("made"),
+    removed: read("removed"),
+    kept: read("kept"),
+  }
+}
+
+/// A target the agent's changes landed in alone: `/changed` rewritten, `/made` made, `/removed` removed, and the
+/// outsider's `/kept` kept.
+fn landed_alone() -> OnDisk {
+  OnDisk {
+    changed: Some(REWRITTEN.to_vec()),
+    made: Some(MADE.1.to_vec()),
+    removed: None,
+    kept: Some(OUTSIDERS_EDIT.to_vec()),
+  }
+}
+
+/// A target nothing was landed in: the captured tree with the outsider's edit.
+fn untouched() -> OnDisk {
+  OnDisk {
+    changed: Some(CHANGED_AS_CAPTURED.to_vec()),
+    made: None,
+    removed: Some(REMOVED_AS_CAPTURED.to_vec()),
+    kept: Some(OUTSIDERS_EDIT.to_vec()),
+  }
+}
+
+/// The plan of the agent's changes since the capture alone: one file replaced, one made and one removed, and no entry for
+/// the file it left alone (§4.15 "Plan", A-424: a captured clone lands its change since the capture).
+fn the_agents_changes_alone() -> slates_ipc::protocol::ActionTally {
+  slates_ipc::protocol::ActionTally {
+    create: 1,
+    replace: 1,
+    delete: 1,
+    ..slates_ipc::protocol::ActionTally::default()
+  }
+}
+
+/// What one landing of the capture tests saw: its presentation, the grant's answer, and the landing's.
+struct LandingSeen {
+  presented: ReplyBody,
+  granted: Option<ReplyBody>,
+  landed: Option<ReplyBody>,
+}
+
+/// Presents `volume`'s head for landing into `target` through `client`, approves it as the human's surface does (a
+/// proof under the issuer secret of `owner`, the node that serves the volume; §4.13 "Grants"), and lands it under the
+/// grant. Stops at the first answer that is not the next step's.
+fn present_grant_and_land(
+  client: &mut Client,
+  owner: &Daemon,
+  volume: VolumeId,
+  target: &str,
+) -> LandingSeen {
+  let land = |grant: Option<u64>| RequestBody::Land {
+    volume,
+    snapshot: None,
+    target: target.to_owned(),
+    filter: slates_ipc::protocol::Filter::default(),
+    grant,
+    signature: None,
+  };
+  let presented = client.call(&land(None));
+  let asked = match &presented {
+    ReplyBody::GrantRequired {
+      landing, manifest, ..
+    } => Some((*landing, *manifest)),
+    _ => None,
+  };
+  let Some((landing, manifest)) = asked else {
+    return LandingSeen {
+      presented,
+      granted: None,
+      landed: None,
+    };
+  };
+  let secret = owner.segment().issuer_secret().unwrap();
+  let scope = slates_ipc::protocol::GrantScope::Once;
+  let term_ns = common::landing::GRANT_TERM_NS;
+  let proof = slates_server::landing::grant_proof(&secret, landing, &manifest, scope, term_ns);
+  let granted = client.call(&RequestBody::Grant {
+    landing,
+    manifest,
+    scope,
+    term_ns,
+    proof,
+  });
+  let issued = match &granted {
+    ReplyBody::Granted { grant } => Some(*grant),
+    _ => None,
+  };
+  let Some(grant) = issued else {
+    return LandingSeen {
+      presented,
+      granted: Some(granted),
+      landed: None,
+    };
+  };
+  let landed = client.call(&land(Some(grant)));
+  LandingSeen {
+    presented,
+    granted: Some(granted),
+    landed: Some(landed),
+  }
+}
+
+/// The capture tests' expectations of a landing: presented with the agent's three changes alone and no conflict, granted,
+/// landed whole, and its target holding the agent's changes beside the outsider's edit.
+fn assert_the_agents_changes_landed_alone(seen: &LandingSeen, disk: &OnDisk, described: &str) {
+  let ReplyBody::GrantRequired {
+    summary, conflicts, ..
+  } = &seen.presented
+  else {
+    panic!(
+      "the landing was presented: {:?}; {described}",
+      seen.presented
+    );
+  };
+  assert_eq!(
+    summary.actions,
+    the_agents_changes_alone(),
+    "the plan holds the agent's changes since the capture alone: {summary:?}; {described}"
+  );
+  assert!(
+    conflicts.is_empty(),
+    "an outsider's edit to a file the agent left alone is no conflict: {conflicts:?}"
+  );
+  assert!(
+    matches!(&seen.granted, Some(ReplyBody::Granted { .. })),
+    "the approval issued a grant: {:?}",
+    seen.granted
+  );
+  assert!(
+    matches!(&seen.landed, Some(ReplyBody::Landed { outcome }) if outcome.state == "done"),
+    "the granted landing landed whole: {:?}; {described}",
+    seen.landed
+  );
+  assert_eq!(
+    *disk,
+    landed_alone(),
+    "the target holds the agent's changes and the outsider's edit"
+  );
+}
+
+/// What a held before its loss in A-544's test: whether it recorded the sealed clone's capture record, whether both
+/// survivors held that clone's sealed head with the catalog carrying the record for it, and whether both held the
+/// never-sealed clone's catalog.
+struct HeldBeforeTheLoss {
+  recorded: bool,
+  carried: bool,
+  catalogued: bool,
+}
+
+impl HeldBeforeTheLoss {
+  /// Whether the loss tests what it is meant to: every precondition held.
+  fn all(&self) -> bool {
+    self.recorded && self.carried && self.catalogued
+  }
+}
+
+/// Whether `daemon` holds `object`'s head naming `manifest` and the catalog whose capture record is for that head
+/// (A-544): what a successor adopts to land the clone against its capture.
+fn holds_the_carried_head(
+  daemon: &Daemon,
+  object: ObjectId,
+  manifest: [u8; 32],
+) -> Result<bool, ObserveError> {
+  let head = daemon
+    .fleet_holder_head(object)?
+    .and_then(|(_, value)| HeadValue::from_record_bytes(&value));
+  let catalog = daemon
+    .fleet_holder_head(object.catalog())?
+    .and_then(|(_, value)| slates_server::catalog::CatalogValue::from_record_bytes(&value));
+  Ok(
+    head.is_some_and(|head| head.manifest == Some(manifest))
+      && catalog.is_some_and(|catalog| {
+        catalog
+          .carried
+          .is_some_and(|record| record.head == manifest)
+      }),
+  )
+}
+
+/// Waits, on all of `members`, until a recorded `sealed`'s capture record and both survivors hold its sealed head with
+/// the catalog carrying that record, and both hold `unsealed`'s catalog.
+fn held_before_the_loss(
+  members: &ThreeMembers,
+  sealed: VolumeId,
+  unsealed: VolumeId,
+) -> HeldBeforeTheLoss {
+  let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+  let owner = &members.daemons[0];
+  let survivors: Vec<&Daemon> = members.daemons[1..].iter().collect();
+  let object = ObjectId(sealed.bytes);
+  let recorded = poll_until(&fleet, SERVE_DEADLINE, || {
+    Ok(move_counter(owner, CARRY_RECORDED)? >= 1)
+  });
+  let carried = recorded
+    && poll_until(&fleet, SERVE_DEADLINE, || {
+      let Some(manifest) = owner.fleet_sealed_manifest(object)? else {
+        return Ok(false);
+      };
+      let mut all = true;
+      for survivor in &survivors {
+        all &= holds_the_carried_head(survivor, object, manifest)?;
+      }
+      Ok(all)
+    });
+  let catalogued = poll_all_hold(&survivors, ObjectId(unsealed.bytes).catalog());
+  HeldBeforeTheLoss {
+    recorded,
+    carried,
+    catalogued,
+  }
+}
+
+/// The index in `members`' hosts and instances of the survivor of a's loss that takes `volume` over, as the takeover
+/// ranks the survivors (b is 1, c is 2).
+fn successor_of(members: &ThreeMembers, volume: VolumeId) -> usize {
+  let successor = rendezvous_first(
+    &[members.hosts[1], members.hosts[2]],
+    ObjectId(volume.bytes),
+  )
+  .expect("a survivor takes the volume over");
+  if successor == members.hosts[1] { 1 } else { 2 }
+}
+
+/// The running daemon whose instance is `members`' `at`-th.
+fn survivor_at(members: &ThreeMembers, at: usize) -> &Daemon {
+  members
+    .daemons
+    .iter()
+    .find(|daemon| daemon.instance() == members.instances[at].as_str())
+    .expect("the successor is a survivor")
+}
+
+/// What the sealed clone's successor did after a's loss: took its head and catalog over, served the agent's tree, and
+/// landed it; and what the landing's target holds after.
+struct TakenOverAndLanded {
+  placed: bool,
+  served: bool,
+  last: Option<ReplyBody>,
+  landing: Option<LandingSeen>,
+  disk: OnDisk,
+}
+
+/// After a's loss, on the survivors in `members`: `volume`'s successor takes its head and catalog over and serves the
+/// agent's tree, then its landing into `target` is presented, granted and landed through a client of the successor.
+fn taken_over_and_landed(
+  members: &ThreeMembers,
+  volume: VolumeId,
+  target: &str,
+) -> TakenOverAndLanded {
+  let survivors: Vec<&Daemon> = members.daemons.iter().collect();
+  let at = successor_of(members, volume);
+  let successor = survivor_at(members, at);
+  let object = ObjectId(volume.bytes);
+  let placed = poll_head_placed(&survivors, successor, object)
+    && poll_head_placed(&survivors, successor, object.catalog());
+  let mut client = Client::connect(&members.instances[at]);
+  let (served, last) = if placed {
+    read_back(&survivors, &mut client, volume, &agents_tree())
+  } else {
+    (false, None)
+  };
+  let landing = served.then(|| present_grant_and_land(&mut client, successor, volume, target));
+  TakenOverAndLanded {
+    placed,
+    served,
+    last,
+    landing,
+    disk: on_disk(target),
+  }
+}
+
+/// What the never-sealed clone's successor did after a's loss: served the clone (its root's listing), and answered its
+/// landing's presentation; and what the landing's target holds after.
+struct NeverSealedAfterTheLoss {
+  served: bool,
+  listed: Option<ReplyBody>,
+  presented: Option<ReplyBody>,
+  disk: OnDisk,
+}
+
+/// After a's loss, on the survivors in `members`: `volume`'s successor serves it, listing its root, and is asked to
+/// present its landing into `target`.
+fn never_sealed_after_the_loss(
+  members: &ThreeMembers,
+  volume: VolumeId,
+  target: &str,
+) -> NeverSealedAfterTheLoss {
+  let survivors: Vec<&Daemon> = members.daemons.iter().collect();
+  let at = successor_of(members, volume);
+  let mut client = Client::connect(&members.instances[at]);
+  let mut listed = None;
+  let served = poll_until(&survivors, SERVE_DEADLINE, || {
+    let reply = client.call(&RequestBody::ReadDir {
+      volume,
+      path: "/".to_owned(),
+      at: ReadAt::Head,
+      cursor: 0,
+    });
+    let served = matches!(reply, ReplyBody::DirPage { .. });
+    listed = Some(reply);
+    Ok(served)
+  });
+  let presented = served.then(|| {
+    client.call(&RequestBody::Land {
+      volume,
+      snapshot: None,
+      target: target.to_owned(),
+      filter: slates_ipc::protocol::Filter::default(),
+      grant: None,
+      signature: None,
+    })
+  });
+  NeverSealedAfterTheLoss {
+    served,
+    listed,
+    presented,
+    disk: on_disk(target),
+  }
+}
+
+/// A-544's fleet test (§4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover"; filed by g267 for main): a
+/// captured clone taken over after its owner's loss lands against its capture on its successor, and one never sealed is
+/// refused by kind. Three daemons at `f = 1`. Do: on a, overlay the captured tree, capture its base and clone the capture
+/// twice; in each clone rewrite `/changed`, make `/made` and remove `/removed`; snapshot the first alone, and share both
+/// with b's and c's accounts; wait until a has recorded the first clone's capture record, both survivors hold its sealed
+/// head and the catalog carrying the record for it, and both hold the second clone's catalog; then a dies. On each
+/// clone's successor, present its landing into a directory holding the captured tree with an outsider's edit to
+/// `/kept`. Expect: the first clone served whole by its successor, its plan the agent's three changes alone (one
+/// replacement, one create, one removal) with no conflict, and, granted and landed, its target holding the agent's
+/// changes and the outsider's `/kept`; the second served as its creation head, an empty tree, and its landing refused
+/// `Unsupported`, its target untouched. Before A-544 the successor adopted a catalog that carried nothing for the head,
+/// so it planned every file as a create and met the captured files as conflicts.
+#[test]
+fn a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture() {
+  let _serial = serialize_fleet_tests();
+  let mut members = three_members();
+  let base = captured_tree_dir();
+  let sealed_target = target_with_an_outsiders_edit();
+  let unsealed_target = target_with_an_outsiders_edit();
+  let mut client_a = Client::connect(&members.instances[0]);
+  let clones = captured_and_cloned(
+    &mut client_a,
+    &base.path,
+    &["sealed-workspace", "never-sealed-workspace"],
+  );
+  let (sealed, unsealed) = (clones[0], clones[1]);
+  for clone in [sealed, unsealed] {
+    agents_changes(&mut client_a, clone);
+    for node in &members.daemons[1..] {
+      share_with_node(&mut client_a, clone, node, ALL_RIGHTS);
+    }
+  }
+  let snapshotted = client_a.call(&RequestBody::Snapshot { volume: sealed });
+  let before = held_before_the_loss(&members, sealed, unsealed);
+  drop(client_a);
+  // a dies: its daemon stops abruptly, as the takeover tests' owner does, and nothing of it is handed over.
+  members.daemons.remove(0).stop();
+  let after = before.all().then(|| {
+    let landed = taken_over_and_landed(&members, sealed, &sealed_target.path);
+    let refused = never_sealed_after_the_loss(&members, unsealed, &unsealed_target.path);
+    let survivors: Vec<&Daemon> = members.daemons.iter().collect();
+    (landed, refused, describe(&survivors))
+  });
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(snapshotted, ReplyBody::Snapshotted { .. }),
+    "the agent's first clone was snapshotted: {snapshotted:?}"
+  );
+  assert!(
+    before.recorded,
+    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`)"
+  );
+  assert!(
+    before.carried,
+    "both survivors held the clone's sealed head and the catalog carrying the record for it before a's loss"
+  );
+  assert!(
+    before.catalogued,
+    "both survivors held the never-sealed clone's catalog before a's loss"
+  );
+  let (landed, refused, described) = after.expect("the loss ran once its preconditions held");
+  assert!(
+    landed.placed,
+    "the successor took the sealed clone's head and catalog over; {described}"
+  );
+  assert!(
+    landed.served,
+    "the successor serves the agent's tree (last: {:?}); {described}",
+    landed.last
+  );
+  let landing = landed
+    .landing
+    .as_ref()
+    .expect("the successor's landing was presented");
+  assert_the_agents_changes_landed_alone(landing, &landed.disk, &described);
+  assert!(
+    refused.served,
+    "the never-sealed clone's successor serves it (last: {:?}); {described}",
+    refused.listed
+  );
+  assert!(
+    matches!(&refused.listed, Some(ReplyBody::DirPage { entries, next: None }) if entries.is_empty()),
+    "the never-sealed clone is served as its creation head, an empty tree: {:?}",
+    refused.listed
+  );
+  assert!(
+    matches!(
+      &refused.presented,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::Unsupported { .. }
+      })
+    ),
+    "the never-sealed clone's landing is refused by kind, never landed as its empty tree: {:?}",
+    refused.presented
+  );
+  assert_eq!(
+    refused.disk,
+    untouched(),
+    "nothing of the refused landing was written"
+  );
+}
+
+/// What A-565's test saw: the clone's live shipping, its snapshot, its capture record, its move to b and b's reading
+/// of it, b's landing, and what the landing's target holds after.
+struct MovedLiveClone {
+  shipped: ReplyBody,
+  snapshotted: ReplyBody,
+  recorded: bool,
+  moved: bool,
+  answers: Vec<String>,
+  served: bool,
+  last: Option<ReplyBody>,
+  landing: Option<LandingSeen>,
+  disk: OnDisk,
+}
+
+/// A-565's fleet test (§4.15 `capture_base`, §4.10 "Live shipping" and "Ownership follows the writer"; filed by g267 for
+/// main): a live-shipped captured clone moved to another node lands there against its capture, its new owner holding
+/// the mark. Three daemons at `f = 1`. Do: on a, overlay the captured tree, capture its base and clone the capture; ship
+/// the clone live; in it rewrite `/changed`, make `/made` and remove `/removed`, snapshot it and share it with b's and
+/// c's accounts; once a has recorded its capture record, move it to b until the move is done. On b, read the agent's
+/// tree, then present its landing into a directory holding the captured tree with an outsider's edit to `/kept`, grant
+/// it and land it. Expect: the clone live-shipped, moved and served whole by b; b's plan the agent's three changes
+/// alone (one replacement, one create, one removal) with no conflict; and the landing writing them and leaving the
+/// outsider's `/kept`. Before A-565 b rebuilt the moved clone from its live log and marked nothing, so its landing was
+/// refused `Unsupported` ("a moved captured clone whose moved head this node does not hold").
+#[test]
+fn a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture() {
+  let _serial = serialize_fleet_tests();
+  let members = three_members();
+  let base = captured_tree_dir();
+  let target = target_with_an_outsiders_edit();
+  let (seen, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let clone = captured_and_cloned(&mut client_a, &base.path, &["live-workspace"])[0];
+    let shipped = client_a.call(&RequestBody::LiveShip {
+      volume: clone,
+      live_shipped: true,
+    });
+    agents_changes(&mut client_a, clone);
+    let snapshotted = client_a.call(&RequestBody::Snapshot { volume: clone });
+    for node in &members.daemons[1..] {
+      share_with_node(&mut client_a, clone, node, ALL_RIGHTS);
+    }
+    let recorded = poll_until(&fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[0], CARRY_RECORDED)? >= 1)
+    });
+    let (moved, answers) = if recorded {
+      move_until_done(&fleet, &mut client_a, clone, members.hosts[1])
+    } else {
+      (false, Vec::new())
+    };
+    let mut client_b = Client::connect(&members.instances[1]);
+    let (served, last) = if moved {
+      read_back(&fleet, &mut client_b, clone, &agents_tree())
+    } else {
+      (false, None)
+    };
+    let landing = served
+      .then(|| present_grant_and_land(&mut client_b, &members.daemons[1], clone, &target.path));
+    let seen = MovedLiveClone {
+      shipped,
+      snapshotted,
+      recorded,
+      moved,
+      answers,
+      served,
+      last,
+      landing,
+      disk: on_disk(&target.path),
+    };
+    (seen, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(
+      seen.shipped,
+      ReplyBody::LiveShippingSet { live_shipped: true }
+    ),
+    "the clone ships live: {:?}",
+    seen.shipped
+  );
+  assert!(
+    matches!(seen.snapshotted, ReplyBody::Snapshotted { .. }),
+    "the agent's clone was snapshotted: {:?}",
+    seen.snapshotted
+  );
+  assert!(
+    seen.recorded,
+    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`); {described}"
+  );
+  assert!(
+    seen.moved,
+    "the clone's move to b was done (answers: {:?}); {described}",
+    seen.answers
+  );
+  assert!(
+    seen.served,
+    "b serves the agent's tree (last: {:?}); {described}",
+    seen.last
+  );
+  let landing = seen.landing.as_ref().expect("b's landing was presented");
+  assert_the_agents_changes_landed_alone(landing, &seen.disk, &described);
+}
+
 /// AC-8.15's first half (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` M2): a snapshot placed in its home
 /// region is shipped to the owner's neighbourhood in the mirror region and held there whole by `f + 1` hosts. Two
 /// regions of three daemons at `f = 1`, each the other's mirror. Do: write a file into a volume on a (region 0),
