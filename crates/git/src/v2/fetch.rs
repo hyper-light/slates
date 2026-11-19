@@ -1,6 +1,6 @@
-//! `fetch` (A-582, part 2; gitprotocol-v2 "fetch" [B]; `upload-pack.c` `process_args`, `send_acks`,
+//! `fetch` (A-582, part 2; gitprotocol-v2 "fetch" \[B\]; `upload-pack.c` `process_args`, `send_acks`,
 //! `send_shallow_info`, `send_wanted_ref_info`, `create_pack_file`, and `fetch-pack.c` `send_fetch_request`,
-//! `do_fetch_pack_v2`, `process_ack` [C]): its arguments, and its response's sections.
+//! `do_fetch_pack_v2`, `process_ack` \[C\]): its arguments, and its response's sections.
 //!
 //! **Arguments.** `want <id>`, `want-ref <ref>`, `have <id>`, `done`, `thin-pack`, `no-progress`, `include-tag`,
 //! `ofs-delta`, `shallow <id>`, `deepen <depth>`, `deepen-since <time>`, `deepen-not <rev>`, `deepen-relative`, `filter

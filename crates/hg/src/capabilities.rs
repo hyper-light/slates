@@ -1,6 +1,6 @@
-//! Capabilities (A-569; `internals.wireprotocol` "Capabilities" [B]; `wireprotov1server.py` `_capabilities`,
+//! Capabilities (A-569; `internals.wireprotocol` "Capabilities" \[B\]; `wireprotov1server.py` `_capabilities`,
 //! `capabilities`, `hello`, `sshpeer.py` `_performhandshake`, `wireprotov1peer.py` `capable`, and `bundle2.py`
-//! `encodecaps`, `decodecaps` [C]).
+//! `encodecaps`, `decodecaps` \[C\]).
 //!
 //! A server lists what it supports as one line of capabilities separated by spaces, each a name or `name=value`: the
 //! answer to `capabilities`, and to `hello` after `capabilities: ` and before a newline. One of them, `bundle2=`,

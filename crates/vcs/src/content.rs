@@ -45,7 +45,7 @@ use std::num::NonZeroUsize;
 pub const IDENTITY_BYTES: usize = blake3::OUT_LEN;
 
 /// Format: the context a list's identity is derived under ([`Form::List`]), in the form the `blake3` crate's
-/// `derive_key` documents: "[application] [commit timestamp] [purpose]".
+/// `derive_key` documents: "\[application\] \[commit timestamp\] \[purpose\]".
 const LIST_CONTEXT: &str =
   "slates-vcs 2026-11-19 object store: the identities of an object's windows";
 
@@ -279,6 +279,9 @@ impl<'b> Tree<'b> {
     span.map(move |position| (below.unwrap_or(0), position))
   }
 }
+
+/// What giving back a content's last count frees: its bytes and its form, or nothing while other holders remain.
+type Released = Option<(Box<[u8]>, Form)>;
 
 impl ContentStore {
   /// An empty store whose budget is `budget` bytes and whose window, the longest content it holds, is `window` bytes:
@@ -556,15 +559,19 @@ impl ContentStore {
     let mut first = Ok(());
     if form == Form::List {
       let mut named: Vec<ContentId> = bytes
-        .chunks_exact(IDENTITY_BYTES)
-        .filter_map(ContentId::from_slice)
+        .as_chunks::<IDENTITY_BYTES>()
+        .0
+        .iter()
+        .filter_map(|identity| ContentId::from_slice(identity))
         .collect();
       while let Some(next) = named.pop() {
         match self.release_one(&next) {
           Ok(Some((freed, Form::List))) => named.extend(
             freed
-              .chunks_exact(IDENTITY_BYTES)
-              .filter_map(ContentId::from_slice),
+              .as_chunks::<IDENTITY_BYTES>()
+              .0
+              .iter()
+              .filter_map(|identity| ContentId::from_slice(identity)),
           ),
           Ok(_) => {}
           Err(refused) => first = first.and(Err(refused)),
@@ -575,10 +582,7 @@ impl ContentStore {
   }
 
   /// One count of `identity` given back; its bytes and form when it was the last.
-  fn release_one(
-    &mut self,
-    identity: &ContentId,
-  ) -> Result<Option<(Box<[u8]>, Form)>, ContentRefused> {
+  fn release_one(&mut self, identity: &ContentId) -> Result<Released, ContentRefused> {
     let held = self
       .entries
       .get_mut(identity)
@@ -803,7 +807,7 @@ mod tests {
   /// tall under the narrow window.
   fn six_windows() -> Vec<u8> {
     let mut bytes = Vec::new();
-    for fill in [b'a', b'b', b'a', b'c', b'd'] {
+    for fill in *b"abacd" {
       bytes.extend(std::iter::repeat_n(fill, NARROW));
     }
     bytes.extend_from_slice(b"tail");

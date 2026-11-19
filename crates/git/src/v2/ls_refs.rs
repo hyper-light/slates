@@ -1,5 +1,5 @@
-//! `ls-refs` (A-582, part 2; gitprotocol-v2 "ls-refs" [B]; `ls-refs.c` `ls_refs` and `send_ref`, `connect.c`
-//! `get_remote_refs` and `process_ref_v2` [C]): its arguments, and its answer, one line a ref.
+//! `ls-refs` (A-582, part 2; gitprotocol-v2 "ls-refs" \[B\]; `ls-refs.c` `ls_refs` and `send_ref`, `connect.c`
+//! `get_remote_refs` and `process_ref_v2` \[C\]): its arguments, and its answer, one line a ref.
 //!
 //! The arguments are `peel`, `symrefs`, `unborn` and `ref-prefix <prefix>`, each a whole line, in any order, any of
 //! them again; anything else is refused, as `ls-refs.c` dies on it ("unexpected line"). A prefix is any bytes of a
