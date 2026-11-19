@@ -48153,3 +48153,34 @@ the copy oracle restoring every history at every version; `tests/checkpoint.rs`,
     carrying copies and 335 listing copied keys. `cargo test --locked -p slates-merge --test checkpoint checkpoint` 4 of
     4 and `--test chain_replay checkpoint` 3 of 3; `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and
     `--test anchor a_segment_` 5 of 5, the layout 11 refusal among them; both crates' fmt checks clean.
+
+### A-660 — The deadlines tests hold their failover delay through the daemon's seam, and their look counts the descheduling their shard measured (2026-11-19, g229, main's bug for the server's gates; A-574, A-536, A-525)
+Applied in the same change to: `crates/server/src/deadlines.rs`'s tests;
+`docs/bugs/2026-11-19-the-deadlines-tests-wrote-the-failover-delay-the-beat-overwrites.md`, new.
+
+- **The bug.** `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` failed
+  on every machine (`deadlines.rs:830`), and every server agent's green run carried it (A-648's entry among others).
+  Since A-574 the control shard's beat publishes `injected_failover_ns.unwrap_or(estimate)` into `failover_ns` at
+  every beat. The test wrote `failover_ns` itself and captured two delays later, so the capture was held the estimate,
+  past the half window it looks for. The CLI attachment's test wrote it the same way and passed only because it reads
+  its delay in the same observe.
+- **The fix.** Both tests inject their delay with `Daemon::inject_failover`, which every beat then publishes; nothing
+  else in the module writes `failover_ns`. The seven other test sites that write it (`fleet.rs`'s fan test among
+  them) each read it within one `audit_on_shard` closure, where no beat runs between, so none needs it.
+- **Under load.** Asked to check the write lease's test under load: one whole-suite run of eleven with the fix missed
+  the bare half window in it and in the CLI attachment's test (load average 14.7). With the look allowed ten seconds,
+  every release in the whole suite came 101 to 166 ms after its 100 ms term. `look_until` now widens its half window
+  by the descheduling the shard measured (`slates_rt::futures::scheduler_overrun_ns`), which is next to nothing on a
+  quiet host, and a miss reports how long it looked and what the shard measured. The miss was not reproduced in twelve
+  suites run two at a time since, with or without the widening: the widening is a measured noise floor, not a proven
+  cure.
+- **Tests** macOS arm64, Mac Studio, 2026-11-19 (kiln r66), on a8c2fc09b, main 2e4433040 with this change merged, the
+  code this commit lands: `cargo fmt -p slates-server -- --check` clean; `cargo test --locked -p slates-server --lib
+  deadlines:: -- --test-threads=4` 10 of 10, the status capture's test among them (main's file failed it 10 of 10
+  alone; the bug record holds the red); and, each by name with `--test-threads=4`, the 19 integration tests that inject
+  the failover delay through the same seam, 19 of 19: `slates-server`'s `attachment_term` (its four),
+  `landing_fairness`'s `a_landing_longer_than_its_lease_term_renews_it_and_lands_everything`, twelve of `fleet`'s (the
+  forward's paths floor, the durability refusal at the failover delay, both live-shipped held-reply bounds, the
+  forward's location budget, and the seven takeovers on `lone_fleet_node`), and `slates-client`'s `reap` and `client`
+  term tests. The same counts on 3ed9ad19f (main b1926d201, kiln r53), before A-657 part 3 and A-626 part 3 changed
+  what `slates-server` builds from. The Linux and Windows runs are owed.
