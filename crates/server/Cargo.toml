@@ -38,6 +38,8 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+# SSH's sans-io core: the daemon's SSH edge drives it (`crate::vcs_ssh`, A-651), and the version-control credentials
+# enroll an SSH key only when its user authentication takes it (`crate::credentials`, A-625 part 3; A-633's parser).
 slates-ssh = { workspace = true }
 # Mercurial (§4.17.3): slates-hg answers HTTP version 1 for the edge (A-650, `crate::vcs_http::hg`), and reads, verifies
 # and places a push landed on the repository's logs (A-657, `crate::repository::hg_push`); its index and content

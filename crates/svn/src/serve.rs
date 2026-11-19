@@ -26,7 +26,10 @@
 //! once the client is established ([`Turn::Established`]) the command runs again at the next call,
 //! with the new principal's guards and no trivial auth request before its answer, or is refused
 //! "Authorization failed" (170001) where the new principal lacks the access too. The read commands
-//! ask for none yet: they apply no authorization (A-606, owed in `reads`).
+//! judge every path by the rules the repository's authorization file gives the session's principal
+//! (A-606, A-613's eighth slice), compiled at the first read and again once an authentication has
+//! changed the principal (`Established::reads_session`); they ask for no authentication yet, so a
+//! read an anonymous session could authenticate for is refused where `svnserve` asks (owed).
 //!
 //! **A commit.** The client's `commit` is handed to the caller ([`Turn::CommitAsked`]), which gives
 //! the transaction's name, its instant and its room ([`Connection::commit`]). A-655's entry point
@@ -335,6 +338,10 @@ pub enum Refused {
   /// An item that is no command, or a command's parameters `svnserve` refuses: "Malformed network
   /// data" (210004), on which `svnserve` ends the connection without a word.
   Malformed,
+  /// Where `svnserve`'s process aborts on an assertion that fails: `get-file-revs` of a file whose
+  /// first location the session may not read (A-613's eighth slice). It sets no malfunction
+  /// handler, so Subversion's default aborts and the connection ends without a further word.
+  Aborted,
   /// A call the connection does not take where it stands: the caller's error, not the client's.
   OutOfTurn,
   /// A call after the session's establishment without the repository's sources: the caller's error.
@@ -381,6 +388,61 @@ struct Established {
   repository_url: String,
   /// How the client may authenticate for one command.
   mechanisms: Mechanisms,
+  /// The rules the session's reads are judged by, with the principal they were compiled for; `None`
+  /// until a read needs them ([`Established::reads_session`]).
+  read_rules: Option<ReadRules>,
+}
+
+/// A session's read rules and the principal they were compiled for (A-606): `svnserve` keeps one
+/// compiled set per user and repository, so a principal's rules are compiled at the first read that
+/// needs them and again only once an authentication has changed the principal.
+#[derive(Clone, Debug)]
+struct ReadRules {
+  /// Whom they were compiled for.
+  principal: Principal,
+  /// The repository's rules for that principal; `None` where it names no authorization file, and
+  /// then every path is readable.
+  rules: Option<authz::PrincipalRules>,
+}
+
+impl Established {
+  /// The session the read commands run in: the path the session's URL names, the repository's
+  /// UUID, what the client takes, and the rules `policy`'s authorization file gives the principal,
+  /// compiled again where an authentication has changed the principal since they were compiled.
+  fn reads_session(&mut self, policy: &Policy<'_>) -> reads::Session<'_> {
+    let principal = &self.session.principal;
+    if self
+      .read_rules
+      .as_ref()
+      .is_some_and(|compiled| compiled.principal != *principal)
+    {
+      self.read_rules = None;
+    }
+    let compiled = self.read_rules.get_or_insert_with(|| {
+      let user = authz::Principal::named(user_of(principal));
+      ReadRules {
+        principal: principal.clone(),
+        rules: policy
+          .authz
+          .map(|(rules_file, name)| rules_file.rules(name, user)),
+      }
+    });
+    reads::Session {
+      base: &self.base,
+      uuid: &self.uuid,
+      capabilities: self.session.capabilities,
+      authz: compiled.rules.as_ref(),
+    }
+  }
+}
+
+/// The user `principal` names, as an authorization file's rules match it: none for an anonymous
+/// one.
+fn user_of(principal: &Principal) -> Option<&[u8]> {
+  match principal {
+    Principal::Anonymous => None,
+    Principal::User(name) => Some(name.as_slice()),
+  }
 }
 
 /// A command an authentication for it interrupted, run again once the client is established.
@@ -876,6 +938,7 @@ impl Connection {
       uuid,
       repository_url: resolved.repository_url,
       mechanisms: resolved.mechanisms,
+      read_rules: None,
     }));
     Ok(())
   }
@@ -942,11 +1005,7 @@ impl Connection {
       }
       Parsed::Item { value, consumed } => (value, consumed),
     };
-    let session = reads::Session {
-      base: &established.base,
-      uuid: &established.uuid,
-      capabilities: established.session.capabilities,
-    };
+    let session = established.reads_session(&sources.policy);
     let outcome = reads::answer(sources.index, sources.repository, &session, &value, out)
       .map_err(Refused::Item)?;
     match outcome {
@@ -1317,7 +1376,7 @@ impl Connection {
   /// A read's answer resumed within the room.
   fn stream<'a, R, G>(
     &mut self,
-    established: Box<Established>,
+    mut established: Box<Established>,
     mut stream: Box<Stream>,
     sources: &Sources<'_, R, G>,
     out: &mut Vec<u8>,
@@ -1327,11 +1386,7 @@ impl Connection {
     R: reads::Repository + ?Sized,
     G: ?Sized,
   {
-    let session = reads::Session {
-      base: &established.base,
-      uuid: &established.uuid,
-      capabilities: established.session.capabilities,
-    };
+    let session = established.reads_session(&sources.policy);
     let progress = stream
       .resume(
         sources.index,
@@ -1344,6 +1399,7 @@ impl Connection {
     self.phase = match progress {
       reads::Progress::More => Phase::Streaming(established, stream),
       reads::Progress::Done => Phase::Commands(established),
+      reads::Progress::Close => return Err(Refused::Aborted),
     };
     Ok(Turn::Wrote)
   }

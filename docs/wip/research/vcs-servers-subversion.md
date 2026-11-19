@@ -741,6 +741,31 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   recording held, until A-616 continued (6); both writers now judge such a window by its `simple_insertion`. FSFS sends
   a stored delta as it is when its base is the source's representation and otherwise makes one
   with `svn_txdelta2`; both are `compute_window` over 100 KiB pieces, so the deltifier's windows are the same.
+- **Read access** [C: `serve.c` `authz_check_access`, `lookup_access`, `must_have_access`, `current_access`, the
+  handshake's checks at 4347-4360, `get_dir`'s entries at 1877, every command's `authz_check_access_cb_func`;
+  `fs-wrap.c` `svn_repos_fs_revision_prop`, `svn_repos_fs_revision_proplist`, `svn_repos_fs_get_mergeinfo2`,
+  `svn_repos_fs_get_inherited_props`; `log.c` `svn_repos_check_revision_access`, `detect_changed`, `fill_log_entry`,
+  `get_history`, `get_path_histories`, `get_paths_history_as_mergeinfo`, `svn_repos_get_logs5`'s shortcut; `rev_hunt.c`
+  `check_readability`, `svn_repos_trace_node_locations`, `svn_repos_node_location_segments`,
+  `find_interesting_revisions`, `get_file_revs_backwards`, `svn_repos_get_file_revs2`'s `SVN_ERR_ASSERT`; `list.c`
+  `svn_repos_list`, `do_list`; at 1.15.0, `svnserve/svnserve.c` `3de22e31a26902f9` and `libsvn_subr/error.c` (the
+  default malfunction handler aborts, and neither `svnserve` nor `svn_cmdline_init` sets another); recorded on the Mac
+  Studio, 2026-11-19, kiln r88]: the
+  handshake checks only the blanket access (`anon-access`, `auth-access`), never the rules, so a session opens beneath a
+  hidden root. Six commands check their path with `must_have_access` (`get-file`, `get-dir`, `check-path`, `stat`,
+  `get-iprops`, `list`): denied, and no way to authenticate, the answer is `SVN_ERR_RA_NOT_AUTHORIZED` made without a
+  message, "Authorization failed", with no authentication request before it; a session that is anonymous and could
+  authenticate is sent an authentication request mid-command instead, and after it the command goes on without the
+  trivial one. The rest hand the rules to `libsvn_repos`, whose checks differ by site: a revision's access level counts
+  each changed path and, for one a copy added, its source (none readable: nothing; some: author and date; a revision
+  that changed nothing is whole); `check_readability` answers 220001 with its own words, while `get_path_histories` and
+  the log shortcut make the error without one, which the client reads as "Item is not readable"; `get_path_histories`
+  refuses before `ignore_missing_locations` is consulted, so a merge source the session may not read refuses a whole
+  `log -g`; `svn_repos_fs_get_mergeinfo2` filters the requested paths and, by its own comment, not the paths its catalog
+  names; `get_file_revs_backwards` has no assertion, the forward walk does, and a failed `SVN_ERR_ASSERT` aborts
+  `svnserve` before its buffered authentication request is flushed: the recording holds nothing after the handshake,
+  and `svnserve`'s standard error "E235000: In file 'subversion/libsvn_repos/rev_hunt.c' line 1695: assertion failed
+  (mainline_path_revisions->nelts > 0)".
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and

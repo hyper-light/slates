@@ -19,7 +19,7 @@ use slates_http::reply::Status;
 use slates_http_edge::connection::Fields;
 use slates_http_edge::credential::Credential;
 
-use super::super::git::{Authenticator, Repositories};
+use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use super::{Fastest, HgSite, HgStores, NoStores};
 use crate::vcs_http::{Answer, Decided, Exchange, Failed};
 
@@ -47,6 +47,14 @@ const HG: RepositoryId = RepositoryId { bytes: [1; 16] };
 const BARE: RepositoryId = RepositoryId { bytes: [2; 16] };
 /// Shape: the id of the git repository `r.git`.
 const GIT: RepositoryId = RepositoryId { bytes: [3; 16] };
+/// Shape: credentials whose record did not answer (its partition quiet).
+const UNANSWERED_BEARER: &str = "Authorization: Bearer unanswered-token";
+/// Shape: the token they carry.
+const UNANSWERED_TOKEN: &[u8] = b"unanswered-token";
+/// Shape: a Mercurial repository another runtime shard holds.
+const AWAY: &str = "away";
+/// Shape: the runtime shard that holds it.
+const AWAY_SHARD: u16 = 3;
 /// Shape: an empty repository's `heads`: the null node, then a line end (7.2's `heads` of no changeset).
 const EMPTY_HEADS: &[u8] = b"0000000000000000000000000000000000000000\n";
 
@@ -58,30 +66,46 @@ fn principal(uid: u32) -> Principal {
   }
 }
 
-/// Proves [`OWNER_TOKEN`] the owner and [`STRANGER_TOKEN`] the stranger, from a bearer token.
+/// Proves [`OWNER_TOKEN`] the owner and [`STRANGER_TOKEN`] the stranger, from a bearer token; its record does not
+/// answer for [`UNANSWERED_TOKEN`].
 struct Tokens;
 
 impl Authenticator for Tokens {
-  fn principal(&self, credential: &Credential) -> Option<Principal> {
+  async fn prove(&self, credential: &Credential) -> Result<Proven, Unproven> {
     let secret = match credential {
       Credential::Basic { password, .. } => password.as_slice(),
       Credential::Bearer(token) => token.as_slice(),
     };
+    if secret == UNANSWERED_TOKEN {
+      return Err(Unproven::Unanswered);
+    }
     [(OWNER_TOKEN, OWNER), (STRANGER_TOKEN, STRANGER)]
       .into_iter()
       .find(|(token, _)| *token == secret)
-      .map(|(_, uid)| principal(uid))
+      .map(|(_, uid)| Proven {
+        principal: principal(uid),
+        bearer_expires_ns: None,
+      })
+      .ok_or(Unproven::Unknown)
   }
 }
 
 /// Holds the Mercurial repositories `hg` (the owner's, its policy `rules`) and `bare` (no store on this shard), and the
-/// git repository `r.git`.
+/// git repository `r.git`; [`AWAY`] lives on runtime shard [`AWAY_SHARD`].
 struct Held {
   /// The rules of `hg`'s policy.
   rules: Vec<PolicyRule>,
 }
 
 impl Repositories for Held {
+  fn locate(&self, name: &str) -> Located {
+    if name == AWAY {
+      Located::Elsewhere(AWAY_SHARD)
+    } else {
+      Located::Here
+    }
+  }
+
   fn find(&self, name: &str) -> Option<RepositoryRecord> {
     let (id, tool, rules) = match name {
       "hg" => (HG, VcsTool::Mercurial, self.rules.clone()),
@@ -209,11 +233,11 @@ fn request(method: &str, target: &str, fields: &[&str]) -> Vec<u8> {
   text.into_bytes()
 }
 
-/// A refusal's status and fields, or `None` for a served request.
+/// A refusal's status and fields, or `None` for a served or moved request.
 fn refusal<E>(decided: &Decided<E>) -> Option<(Status, Fields)> {
   match &decided.answer {
     Answer::Refuse { status, fields } => Some((*status, fields.clone())),
-    Answer::Serve { .. } => None,
+    Answer::Serve { .. } | Answer::Move { .. } => None,
   }
 }
 
@@ -225,7 +249,7 @@ fn refused_status(
   fields: &[&str],
 ) -> Option<Status> {
   let bytes = request(method, target, fields);
-  refusal(&site.answer(&head(&bytes), false)).map(|(status, _)| status)
+  refusal(&ready(site.answer(&head(&bytes), false))).map(|(status, _)| status)
 }
 
 /// A rule letting the stranger reach `hg` with `right` on every named branch.
@@ -354,7 +378,7 @@ fn refusals_name_what_the_client_may_do_instead() {
   let mut site = site(Vec::new());
   let mut named = |method: &str, target: &str, fields: &[&str]| {
     let bytes = request(method, target, fields);
-    let decided = site.answer(&head(&bytes), false);
+    let decided = ready(site.answer(&head(&bytes), false));
     (refusal(&decided).unwrap().1, decided.proven)
   };
   let allow = |methods: &str| vec![(b"Allow".to_vec(), methods.as_bytes().to_vec())];
@@ -427,7 +451,38 @@ fn requests_past_their_room_and_a_damaged_policy_are_refused() {
   );
 }
 
-/// Runs `future`, which the tests' exchanges finish without waiting.
+/// A-650 part 1 on A-625 part 3's edge. Do: ask for [`AWAY`], a repository another runtime shard holds, as the owner,
+/// with no credentials, and with a token the credential record did not answer for. Expect the owner's request moved to
+/// that shard whole, proven (`Move`), and the others decided here before any move: `401`, and `503` for the record that
+/// did not answer, as git's site answers them.
+#[test]
+fn a_request_for_a_repository_another_shard_holds_moves_there_once_proven() {
+  let mut site = site(Vec::new());
+  let mut decide = |fields: &[&str]| {
+    let bytes = request("GET", "/away?cmd=capabilities", fields);
+    let decided = ready(site.answer(&head(&bytes), false));
+    let refused = refusal(&decided).map(|(status, _)| status);
+    let moved = match &decided.answer {
+      Answer::Move { shard } => Some(*shard),
+      Answer::Serve { .. } | Answer::Refuse { .. } => None,
+    };
+    (moved, refused, decided.proven)
+  };
+  assert_eq!(
+    [
+      decide(&[OWNER_BEARER]),
+      decide(&[]),
+      decide(&[UNANSWERED_BEARER]),
+    ],
+    [
+      (Some(AWAY_SHARD), None, true),
+      (None, Some(Status::UNAUTHORIZED), false),
+      (None, Some(Status::SERVICE_UNAVAILABLE), false),
+    ]
+  );
+}
+
+/// Runs `future`, which the tests' sites and exchanges finish without waiting.
 fn ready<F: Future>(future: F) -> F::Output {
   let mut context = Context::from_waker(Waker::noop());
   match std::pin::pin!(future).poll(&mut context) {
@@ -458,7 +513,7 @@ fn served<S: HgStores + Clone>(
   let mut all = vec![OWNER_BEARER];
   all.extend_from_slice(fields);
   let bytes = request(method, target, &all);
-  match site.answer(&head(&bytes), false).answer {
+  match ready(site.answer(&head(&bytes), false)).answer {
     Answer::Serve {
       fields,
       head_only,
@@ -468,6 +523,7 @@ fn served<S: HgStores + Clone>(
       exchange
     }
     Answer::Refuse { status, .. } => panic!("{method} {target} refused {status:?}"),
+    Answer::Move { shard } => panic!("{method} {target} moved to shard {shard}"),
   }
 }
 

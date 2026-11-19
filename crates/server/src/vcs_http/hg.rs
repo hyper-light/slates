@@ -8,15 +8,18 @@
 //! **The order**, each refusal with its status:
 //! 1. The route. A path whose escapes are malformed or name a slash or a NUL, or a query that cannot be read, is
 //!    `400`. A wire request (a `cmd` 7.2's table holds) by a method other than `GET` or `POST` is `405` with `Allow`.
-//! 2. The credentials, judged as git's site judges them: none, or none proving a principal, is `401` with the
-//!    challenges the connection accepts; a repeated or malformed `Authorization` is `400`.
-//! 3. The repository. None of that name, or one of another tool, is `404`.
-//! 4. The policy. A principal the policy lets read none of the repository is `403`, for every request, as hgweb's
+//! 2. The credentials, judged as git's site judges them (its `prove`, over A-625 part 3's credential record): none, or
+//!    none proving a principal (unknown, expired, a revoked consumer's, an SSH key's), is `401` with the challenges
+//!    the connection accepts; a repeated or malformed `Authorization` is `400`; a record that did not answer is `503`.
+//! 3. The repository's shard. A repository another shard holds moves the proven request's connection there whole
+//!    (`Answer::Move`, A-625 part 3), where it is decided again.
+//! 4. The repository. None of that name, or one of another tool, is `404`.
+//! 5. The policy. A principal the policy lets read none of the repository is `403`, for every request, as hgweb's
 //!    `checkauthz` reads `deny_read` and `allow_read` first. A push (`unbundle`, `pushkey`) also needs `POST` (`405`
 //!    with `Allow: POST`, hgweb's "push requires POST request") and a right to submit, rewrite or delete (`403`).
-//! 5. The service. hgweb's pages (a request naming no command of 7.2's table: the repository's browsing URLs,
+//! 6. The service. hgweb's pages (a request naming no command of 7.2's table: the repository's browsing URLs,
 //!    §4.17.3 piece 12) are `503`, and so is a repository whose store this shard does not hold (A-662 keeps each
-//!    repository's on its owner shard; until it lands no repository has one here, [`NoStores`]).
+//!    repository's on its owner shard; until the site is handed them no repository has one here, [`NoStores`]).
 //!
 //! A served request is `200`: its body is the command's answer and its media type the one the answer names
 //! (`application/mercurial-0.1`, `-0.2` or `application/hg-error`), given as the reply begins.
@@ -50,7 +53,7 @@ use slates_http::reply::Status;
 use slates_http_edge::connection::Fields;
 use slates_http_edge::credential;
 
-use super::git::{Authenticator, Repositories};
+use super::git::{Authenticator, Located, Repositories, Unproven};
 use super::{Answer, Decided, Exchange, Failed, Site};
 use crate::vcs_policy::{self, Right};
 
@@ -218,7 +221,8 @@ enum Proof {
   Principal(Principal),
   /// None proved: `401` with the challenges.
   Unauthorized,
-  /// The `Authorization` line itself refused, with this status (`400`).
+  /// None decided, with this status: the `Authorization` line itself refused (`400`), or a credential record that did
+  /// not answer (`503`).
   Refused(Status),
 }
 
@@ -256,7 +260,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
   }
 
   /// The answer to `head`, on a connection that is TLS when `secure`, in the module doc's order.
-  pub(crate) fn answer(&mut self, head: &Head<'_>, secure: bool) -> Decided<HgExchange<S>> {
+  pub(crate) async fn answer(&mut self, head: &Head<'_>, secure: bool) -> Decided<HgExchange<S>> {
     let routed = match route(head, self.room) {
       Ok(routed) => routed,
       Err(status) => return refused_with(status, Fields::new(), false),
@@ -264,11 +268,17 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     if routed.permission.is_some() && head.method != GET && head.method != PUSH_METHOD {
       return refused_with(Status::METHOD_NOT_ALLOWED, allow(WIRE_METHODS), false);
     }
-    let principal = match self.proof(head, secure) {
+    let principal = match self.proof(head, secure).await {
       Proof::Principal(principal) => principal,
       Proof::Unauthorized => return self.unauthorized(secure),
       Proof::Refused(status) => return refused_with(status, Fields::new(), false),
     };
+    if let Located::Elsewhere(shard) = self.repositories.locate(&routed.name) {
+      return Decided {
+        answer: Answer::Move { shard },
+        proven: true,
+      };
+    }
     let Some(repository) = self
       .repositories
       .find(&routed.name)
@@ -296,15 +306,19 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
   }
 
   /// What `head`'s credentials prove, as git's site reads them.
-  fn proof(&self, head: &Head<'_>, secure: bool) -> Proof {
-    match credential::credential(head, secure) {
-      Ok(Some(credential)) => self
-        .authenticator
-        .principal(&credential)
-        .map_or(Proof::Unauthorized, Proof::Principal),
-      Ok(None) => Proof::Unauthorized,
-      Err(refused) if refused.status() == Status::UNAUTHORIZED => Proof::Unauthorized,
-      Err(refused) => Proof::Refused(refused.status()),
+  async fn proof(&self, head: &Head<'_>, secure: bool) -> Proof {
+    let credential = match credential::credential(head, secure) {
+      Ok(Some(credential)) => credential,
+      Ok(None) => return Proof::Unauthorized,
+      Err(refused) if refused.status() == Status::UNAUTHORIZED => return Proof::Unauthorized,
+      Err(refused) => return Proof::Refused(refused.status()),
+    };
+    match self.authenticator.prove(&credential).await {
+      Ok(proven) => Proof::Principal(proven.principal),
+      Err(Unproven::Unanswered) => Proof::Refused(Status::SERVICE_UNAVAILABLE),
+      Err(Unproven::Unknown | Unproven::Expired | Unproven::Revoked | Unproven::NotAToken) => {
+        Proof::Unauthorized
+      }
     }
   }
 
@@ -326,7 +340,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> Site for HgSite<A, 
   type Exchange = HgExchange<S>;
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    self.answer(head, secure)
+    self.answer(head, secure).await
   }
 }
 

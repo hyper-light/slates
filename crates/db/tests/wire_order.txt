@@ -27,6 +27,8 @@ Consumer 3 Mount
 Consumer 4 Guest
 Consumer 5 Remote
 Consumer 6 Termed
+CredentialKind 0 SshKey
+CredentialKind 1 HttpToken
 GrantScope 0 Once
 GrantScope 1 Session
 GrantState 0 Issued
@@ -171,6 +173,8 @@ Op 95 ReviewClosed
 Op 96 RepositoryAdvanced
 Op 97 RepositoryPolicySet
 Op 98 IdentitiesSet
+Op 99 CredentialEnrolled
+Op 100 CredentialRevoked
 PlacementState 0 Local
 PlacementState 1 Placed
 PolicyEffect 0 Allow
