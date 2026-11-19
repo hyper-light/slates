@@ -37776,3 +37776,11 @@ delay; its test), `crates/server/src/daemon.rs` (the boot reading in `init_shard
   two-shard daemon with no fleet, the lapse bound published in its block as its anchor does; every shard's delay comes to
   hold it, the control shard's detection the widest window and then exactly the lapse), and
   `a_shard_is_fanned_the_failover_delay_when_it_moves` (`crates/server/src/fleet.rs`, now the beat's fan).
+- **Evidence.** On the Mac Studio (kiln r256, 2026-11-19, load 2.4, debug build). Red first, on the tests alone
+  (`da2c2d30e`): the supervision read `Term { ns: 1000000000, samples: 0 }` where the rule gives 2.2 s and a reading, and
+  the laptop daemon's delay never held the published lapse within ten seconds. Green on the change merged with main
+  (`714f2ce20`): `cargo test --locked -p slates-cluster --lib -- failover::` 12 of 12, `-p slates-anchor --lib` 40 of
+  40, `-p slates-server --lib -- laptop_failover_tests fleet::tests::a_shard_is_fanned fleet::tests::an_installed_fan
+  watchdog late_beat_tests starved_share_tests` 34 of 34, `-p slates-api --lib -- role::anchor` 13 of 13 (one ignored,
+  the held process's role), `cargo fmt --all --check` clean. A real anchor's publication and the beat's fan in a
+  formed fleet are main's to run (the anchor and CLI flows, the fleet formation test).
