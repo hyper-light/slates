@@ -663,6 +663,8 @@ struct Census {
   made_again: u64,
   /// A link to a file the work made.
   to_made: u64,
+  /// Works whose four readings agreed (shown, not required).
+  agreed: u64,
   /// Works the deriver refused: compositions owed, typed (shown, not required).
   refused: u64,
   /// Works the verdict refused, rebased and submitted alike (shown, not required).
@@ -674,6 +676,7 @@ impl Census {
   fn count(&mut self, found: &Restated, work: &Census) {
     match found {
       Restated::Agreed(_) => {
+        self.agreed += 1;
         self.replaced += work.replaced;
         self.renamed_then_linked += work.renamed_then_linked;
         self.linked_then_renamed += work.linked_then_renamed;
@@ -971,5 +974,7 @@ fn every_restated_work_reads_as_its_own_order() {
     panic!("{failure}");
   }
   let census = census.into_inner();
+  // The figures the evidence quotes (`-- --nocapture`).
+  eprintln!("restate oracle census: {census:?}");
   assert!(census.met(), "a case never met: {census:?}");
 }
