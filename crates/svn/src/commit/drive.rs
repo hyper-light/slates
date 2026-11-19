@@ -74,7 +74,7 @@ use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
   Revision, RevisionRecord, Text,
 };
-use crate::authz::{Access, PrincipalRules, RepositoryPath};
+use crate::authz::{Access, Authz, Principal, PrincipalRules, RepositoryPath};
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
 use crate::mergeinfo::{Mergeinfo, MergeinfoRefusal};
 use crate::ra_svn::{ItemError, Value, write};
@@ -316,6 +316,74 @@ pub struct Setup {
   /// The authorization rules the principal meets in this repository (A-606), compiled; `None` when the repository
   /// names no authz file, which `svnserve` takes as every path allowed (`serve.c` `authz_check_access`).
   pub rules: Option<PrincipalRules>,
+  /// The revision properties the commit records but its date ([`revision_properties`]).
+  pub revision_properties: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// The session a `commit` arrives on, as the svn:// connection task holds it (A-656): what `svnserve`'s
+/// `must_have_access` and commit editor read from its server baton (`serve.c` 571-575, 760-850).
+#[derive(Clone, Copy, Debug)]
+pub struct Session<'s> {
+  /// The session's path in the repository, canonical (`fs_path`).
+  pub base_path: &'s str,
+  /// The repository's root URL, canonical and decoded.
+  pub repository_url: &'s str,
+  /// The green's name ([`Setup::filesystem`]).
+  pub filesystem: &'s str,
+  /// The authenticated principal; `None` for an anonymous session.
+  pub user: Option<&'s str>,
+  /// What `svnserve.conf` gives an anonymous session (`anon-access`).
+  pub anonymous: Access,
+  /// What it gives an authenticated one (`auth-access`).
+  pub authenticated: Access,
+  /// Whether the client could authenticate: a tunnel's user, a password database or SASL (`serve.c` 834-835).
+  pub can_authenticate: bool,
+  /// The authorization rules and the name they know this repository by (`authz_repos_name`); `None` when the
+  /// repository names no authz file.
+  pub authz: Option<(&'s Authz, &'s [u8])>,
+}
+
+/// What the owner gives a commit as it begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Start {
+  /// The transaction's name (§4.17.4 item 3.1).
+  pub transaction: String,
+  /// The owner's instant.
+  pub now: AprTime,
+  /// The room the work's texts and property lists may hold ([`Setup::room`]).
+  pub room: usize,
+  /// Whether the client has just authenticated for this commit ([`Begun::Authenticate`]): then no trivial
+  /// authentication request is written (`serve.c` 832-849).
+  pub authenticated_now: bool,
+}
+
+/// How a `commit` began ([`commit`]).
+#[derive(Debug)]
+pub enum Begun {
+  /// Its answer is written: hand the drive every item that follows ([`Drive::command`]).
+  Driving(Box<Drive>),
+  /// The client must authenticate for write first (`serve.c` 832-836), nothing written: run the authentication exchange
+  /// (A-599's mechanisms) and call [`commit`] again with the session it proved, [`Start::authenticated_now`] set.
+  Authenticate,
+  /// Refused and over: its failure written.
+  Answered,
+  /// Parameters `svnserve` cannot read: the connection ends, nothing written.
+  Close,
+}
+
+/// The one entry point for `commit` (A-655; the svn:// connection task, A-656, calls it with the command's
+/// parameters).
+///
+/// # Errors
+/// [`ItemError`] when an answer cannot be written, which none here can give.
+pub fn commit(
+  params: &[Value<'_>],
+  session: &Session<'_>,
+  start: Start,
+  out: &mut Vec<u8>,
+) -> Result<Begun, ItemError> {
+  let _ = (params, session, start, out);
+  Ok(Begun::Close)
 }
 
 /// Why a command was refused, each written as `svnserve` writes it ([`DriveRefusal::subversion_code`],
