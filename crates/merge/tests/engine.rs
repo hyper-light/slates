@@ -642,12 +642,18 @@ fn rmdir_merges() {
   );
 }
 
-/// A hard link merges as a namespace edge: identical accepts, differing conflicts, file/link is a
-/// type conflict.
+/// A hard link names the node at its target at the work's base (A-646): an identical link
+/// accepts, a link to another node after the name changed conflicts create against create, a link
+/// naming no node is refused delete against modify, and a file over a link is a type conflict.
 #[test]
 fn hard_link_merges() {
   let mut green = Green::new();
-  green.submit(&Build::new().create("f", b"shared").at(1, 0));
+  green.submit(
+    &Build::new()
+      .create("f", b"shared")
+      .create("other", b"other")
+      .at(1, 0),
+  );
   assert_eq!(
     green.submit(&Build::new().link("l", "f").at(2, 1)),
     Outcome::Accepted { version: 2 }
@@ -665,6 +671,13 @@ fn hard_link_merges() {
   assert_eq!(
     conflict_class(&green.submit(&Build::new().create("l", b"file").at(5, 3))),
     Some(MergeConflictClass::TypeChanged)
+  );
+  // Nothing stood at `missing` at version 2, so the link names no node, which no work can make
+  // (`link(2)` answers ENOENT). Judging its name would compare that node's home with the head's
+  // link there, so the node is judged first, even though version 3 changed the name as well.
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().link("l", "missing").at(6, 2))),
+    Some(MergeConflictClass::DeleteModify)
   );
 }
 

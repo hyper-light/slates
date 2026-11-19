@@ -361,6 +361,16 @@
 > ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
 > nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
 > run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
+> **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
+> whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
+> slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
+> transcribed, is a file of its own that slates-vcs's tests and slates-server's policy tests both compile, under
+> `#[cfg(test)]` in each, so no product build links it. A cargo feature was rejected: its code builds as product code,
+> where the lint wall refuses the transcription's indexing.
+> Runs (macOS arm64, Mac Studio, kiln r61 over main a6306963e with the change): slates-server's `vcs_policy` 15 of 15
+> and its two callers' tests (the HTTP edge's git site 10, LFS 4); the module's tests in slates-vcs 3 of 3; fmt clean.
+> No integration target reaches either: neither has a caller outside tests yet. Owed (main): the Linux and Windows
+> runs, clippy, `cargo xtask check` (the `#[path]` include), and the doc links to `slates_vcs::wildmatch`.
 > **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
 > (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
 > hooks-env in its policy (refused by section, `DatabaseRefusal` 11, when no hook's environment can carry it or the
@@ -485,10 +495,11 @@
 > files of forty judges two. A `blob:limit` clone takes its small blobs from the kept parts; each object still wanted
 > after the head cover is offered the parts of the version its row says brought it, so a partial clone's later fetch
 > of blobs by id is answered from the fragments. One pack source, g296's `upload::Fragments` (A-640 part 3); this
-> piece's own adapter was dropped for it. Closes A-639's "a part only partly wanted read entry by entry". Owed: the
-> real clone's requests (small.git, A-582's five) answered through `Fragments` with every version encoded and a base
-> pack made, each object once (the next piece; A-640 part 3 landed at f607f424c); a delta search past a window; the
-> fragments' encoding sliced; the marking's red-checks and the other platforms' runs (main's).
+> piece's own adapter was dropped for it. Closes A-639's "a part only partly wanted read entry by entry". A-653
+> continued (1): stock git's clone of small.git and A-582's five fetches answered through `Fragments` from the
+> store's parts, every version encoded and a base pack made, each object once; `Streamed::counters`. Owed: the live
+> clone over the HTTP edge (A-625 part 3's store per repository); a delta search past a window; the fragments'
+> encoding sliced; the red-checks and the other platforms' runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
