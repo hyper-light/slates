@@ -37488,7 +37488,12 @@ helpers), `crates/ipc/src/protocol.rs` (the doc of `Refusal::DurabilityPending`;
   window and its CPU budget each `CREDIT_WAIT`), its condition polls (`wait_until`, `wait_for_count`), its attach's
   answer and its stream reads still run on five seconds of the wall; `daemon.rs` keeps the same raw client, constant and
   two waits; `common/client.rs`'s `START_WAIT` retries a connect five seconds while a daemon starts.
-- **Checks.** CHECKS-PENDING
+- **Checks.** On the Mac Studio (debug, 2026-11-19, load 12.7 to 38): `slates-ipc --lib` 74 passed (2 ignored),
+  `slates-client --lib` 7 of 7, `cargo fmt --check` clean. A daemon gone before the wait was seen at the first look,
+  `DaemonGone` after 1.94 ms; a ring a live daemon drained after a fifth of a second was written after 377.7 ms, with
+  12 parks from a 200 µs wake estimate. Red with the old raw clients' rule put back (spin for five seconds, then
+  `RingFull`): the gone daemon's wait failed `RingFull` five seconds in, and the live one spun, "0 parks across
+  274.201041ms from a 200000 ns wake".
 - **Tests.** `slates_ipc::endpoint`'s `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`
   and `a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`; the schedule's walk
   (`a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`) moved from `slates-client` to

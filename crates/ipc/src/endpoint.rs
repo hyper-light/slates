@@ -1861,9 +1861,9 @@ mod departure {
 
   /// A-571 (A-523's rule, now every client end's). Do: fill a live daemon's command ring; on its own thread the daemon
   /// takes one request a fifth of a second later; meanwhile send one more, waiting for room. Expect: the request written
-  /// once the daemon took a slot, never before; the wait parked at least once and no more often than the doubling
-  /// allows, the logarithm of the wait over the wake estimate plus two. Before A-571 each raw client of the daemon's
-  /// tests spun its core on a full ring for up to five seconds.
+  /// once the daemon took a slot, never before; the wait parked at least once and logarithmically often, at most twice
+  /// the doubling's count (the logarithm of the wait over the wake estimate, plus two), where a spinning wait parks
+  /// never. Before A-571 each raw client of the daemon's tests spun its core on a full ring for up to five seconds.
   #[test]
   fn a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees() {
     let _gate = crate::descriptor_test_gate();
@@ -1904,8 +1904,10 @@ mod departure {
       written >= freeing,
       "written only once the daemon began to take a slot"
     );
+    // The doubling parks once between looks; a park the OS ends early takes one more in its interval (the Mac Studio's
+    // first green run parked 12 times across 377.7 ms, the doubling's own count at that length).
     let took_ns = u64::try_from(took.as_nanos()).unwrap();
-    let bound = u64::from((took_ns / wake).max(1).ilog2()) + 2;
+    let bound = 2 * (u64::from((took_ns / wake).max(1).ilog2()) + 2);
     assert!(
       (1..=bound).contains(&parks),
       "{parks} parks across {took:?} from a {wake} ns wake"
