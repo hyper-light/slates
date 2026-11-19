@@ -864,7 +864,12 @@
 > the save's publication put it, as a guest's `FSYNC` on the stream waits (A-200), and is refused with its reason when
 > it is not within the liveness budget (`shards.save_held`, `shards.save_refused`); a volume shipped nowhere is
 > answered at once. Proven by the server's lib test over a real stream; Shards' own run of a save and a restore over a
-> live-shipped share is owed with its `shards restore` below. Still open of A-303's: the clone's orphan record above.
+> live-shipped share is owed with its `shards restore` below. **Built since (A-532, 2026-11-19):** the clone's orphan
+> record above: a snapshot keeps the orphans it froze (its image too, image version 32), and a clone of it carries each
+> with an orphan record, so the clone reclaims the file at its restored guest's let-go, or at a restart's settle when
+> nothing holds it, and a clone made after a restart carries them again. Proven by the vfs lib tests (the let-go, and a
+> restart rebuilt beside the origin); the server's restore over a clone and a real daemon's restart of one are filed
+> for main. A clone made for a restore not yet come keeps its carried files only until a restart.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;

@@ -7716,7 +7716,12 @@ mod clone_orphan_tests {
     let root = origin.root_inode(store).unwrap();
     let nameless = origin.create_file_no(store, root, "g", 0o644).unwrap();
     origin
-      .write(store, nameless, 0, &NAMELESS.repeat(NAMELESS_LEN / NAMELESS.len()))
+      .write(
+        store,
+        nameless,
+        0,
+        &NAMELESS.repeat(NAMELESS_LEN / NAMELESS.len()),
+      )
       .unwrap();
     let saved = RefOwner::Attachment(SAVED);
     origin.reference_for(store, nameless, saved).unwrap();
