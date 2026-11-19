@@ -143,6 +143,7 @@ pub(super) fn answer<P: PackSource>(
     deepen: asked.deepen(),
     filter: asked.filter.as_ref(),
     include_tag: asked.flags.include_tag,
+    thin: asked.flags.thin,
   };
   let outcome = negotiation::negotiate(graph, &request, admission)
     .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;

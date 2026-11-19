@@ -148,6 +148,10 @@ pub struct Request<'r> {
   pub filter: Option<&'r Filter>,
   /// `include-tag`: send the annotated tags of objects the pack carries.
   pub include_tag: bool,
+  /// `thin-pack`: the client takes a pack whose deltas name bases it holds. In a shallow exchange git's server then
+  /// leaves out every had commit's tree, not the edges' alone (`pack-objects --objects-edge-aggressive`), and so does
+  /// this.
+  pub thin: bool,
 }
 
 /// The acknowledgments section.

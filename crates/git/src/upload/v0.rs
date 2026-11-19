@@ -531,6 +531,7 @@ pub(super) fn answer<P: PackSource>(
     deepen: deepen(&asked, &not, chosen.relative),
     filter: filter.as_ref(),
     include_tag: chosen.include_tag,
+    thin: chosen.thin,
   };
   let answered = answered(&graph, served, &request, &asked, chosen, packs, admission)?;
   match graph.fault() {

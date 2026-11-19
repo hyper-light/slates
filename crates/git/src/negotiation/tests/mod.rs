@@ -289,6 +289,7 @@ struct Asks {
   deepen: Option<OwnedDeepen>,
   filter: Option<Filter>,
   include_tag: bool,
+  thin: bool,
 }
 
 /// A deepening, owned.
@@ -315,6 +316,7 @@ impl Asks {
       }),
       filter: self.filter.as_ref(),
       include_tag: self.include_tag,
+      thin: self.thin,
     }
   }
 }
@@ -726,10 +728,12 @@ fn oracle_sent(
     .collect()
 }
 
-/// What the oracle leaves out: everything in the trees of the sent commits' unsent parents and of the commits a cut made
-/// whole (git's `extra_edge_obj`), and in the haves that are no commits.
+/// What the oracle leaves out: everything in the trees of the sent commits' unsent parents, and in the haves that are
+/// no commits; and, for a thin pack in a shallow exchange, everything in the tree of each have git lists and each commit
+/// a cut made whole (git's `--objects-edge-aggressive`).
 fn oracle_left_out(
   graph: &TestGraph,
+  asks: &Asks,
   common: &[u32],
   cut: &OracleCut,
   sent: &BTreeSet<u32>,
@@ -744,15 +748,48 @@ fn oracle_left_out(
       left_out.extend(graph.reach([graph.objects[at(*parent)].tree]));
     }
   }
-  for whole in &cut.haves {
-    left_out.extend(graph.reach([graph.objects[at(*whole)].tree]));
-  }
+  left_out.extend(oracle_aggressive(graph, asks, cut));
   for have in common.iter().filter_map(|node| peeled(graph, *node)) {
     if graph.objects[at(have)].kind != Kind::Commit {
       left_out.extend(graph.reach([have]));
     }
   }
   left_out
+}
+
+/// For a thin pack in a shallow exchange, everything in the tree of each have git lists and each commit a cut made
+/// whole; nothing otherwise.
+fn oracle_aggressive(graph: &TestGraph, asks: &Asks, cut: &OracleCut) -> BTreeSet<u32> {
+  if !asks.thin || cut.grafts.is_empty() {
+    return BTreeSet::new();
+  }
+  oracle_listed_haves(graph, &asks.haves)
+    .into_iter()
+    .chain(cut.haves.iter().copied())
+    .filter(|had| graph.objects[at(*had)].kind == Kind::Commit)
+    .flat_map(|had| graph.reach([graph.objects[at(had)].tree]))
+    .collect()
+}
+
+/// The haves git lists for `pack-objects` (`have_obj`): in the order sent, a commit only when no have before it named it
+/// or named it as a parent, any other object each time.
+fn oracle_listed_haves(graph: &TestGraph, haves: &[ObjectId]) -> Vec<u32> {
+  let mut marked = BTreeSet::new();
+  let mut listed = Vec::new();
+  for node in haves.iter().filter_map(|id| graph.node(id)) {
+    let object = &graph.objects[at(node)];
+    let counts = if object.kind == Kind::Commit {
+      let new = marked.insert(node);
+      marked.extend(object.parents.iter().copied());
+      new
+    } else {
+      true
+    };
+    if counts {
+      listed.push(node);
+    }
+  }
+  listed
 }
 
 /// A walked want: its chain of tags and, when it ends at a tree or blob, that object, chosen; a wanted tree's entries
@@ -858,7 +895,7 @@ fn oracle_objects(
 ) -> Vec<u32> {
   let filter = asks.filter.as_ref();
   let sent = oracle_sent(graph, walk_wants, one_round, common, cut);
-  let left_out = oracle_left_out(graph, common, cut, &sent);
+  let left_out = oracle_left_out(graph, asks, common, cut, &sent);
   let mut chosen: BTreeSet<u32> = sent
     .iter()
     .copied()
@@ -1149,6 +1186,7 @@ fn build_asks(graph: &TestGraph, plan: &Plan, greens: &Greens, commits: &[u32]) 
     deepen: None,
     filter: None,
     include_tag: plan.flags & 32 != 0,
+    thin: plan.flags & 64 != 0,
   }
 }
 
