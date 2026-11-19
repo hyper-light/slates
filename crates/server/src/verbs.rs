@@ -22083,6 +22083,137 @@ mod tests {
     );
   }
 
+  /// Shape: the id of the client the read-scatter test seats on the shard it asks from, beside the audit daemon's own,
+  /// which seat none.
+  const ASKING: u32 = 31;
+
+  /// The principal the read-scatter test asks as.
+  fn scatter_asker() -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid: 0,
+    }
+  }
+
+  /// Seats client [`ASKING`] on `state`'s shard as an admission does, over a region made here in the shard's geometry:
+  /// its seat's index, and the client's own mapping of the region, which the test reads its replies from.
+  fn seat_asking(state: &mut crate::state::ShardState) -> (u32, slates_ipc::ClientRegion) {
+    static REGIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+      "slates-cr-scatter-{}-{}",
+      std::process::id(),
+      REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut region =
+      slates_ipc::ClientRegion::create(&name, ASKING, state.shard, state.config.region).unwrap();
+    #[cfg(target_os = "macos")]
+    region.unlink_name().unwrap();
+    #[cfg(unix)]
+    let client = region.open_again().unwrap();
+    #[cfg(windows)]
+    let client = {
+      let (handoff, len) = region.handoff().unwrap();
+      slates_ipc::ClientRegion::open(&handoff, len).unwrap()
+    };
+    let seat = state
+      .clients
+      .insert(crate::state::ClientSlot {
+        status_pages: crate::status_pages::StatusPages::default(),
+        end: slates_ipc::DaemonEnd::new(region),
+        principal: scatter_asker(),
+        client_id: ASKING,
+        pid: 0,
+        retiring: false,
+        watch: None,
+        proven: true,
+        control: None,
+        revoked: false,
+        consumer_policy: None,
+        owner_route: None,
+        read_ahead: None,
+        read_ahead_pending: 0,
+        remote_volumes: Vec::new(),
+        maps_sent: std::collections::BTreeSet::new(),
+      })
+      .unwrap();
+    (seat.index(), client)
+  }
+
+  /// What a client seated on the second shard of a two-shard daemon whose control shard is fenced is answered, by
+  /// request sequence, for a listing (1), its grants (2) and the daemon's status (3), each waited for within the
+  /// observation budget; and the fenced shard.
+  fn asked_past_a_fenced_shard() -> (Option<u16>, std::collections::BTreeMap<u32, ReplyBody>) {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, region, all_sent) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let asked = |sequence| {
+        slates_wire::request::RequestId {
+          client: ASKING,
+          sequence,
+        }
+        .word()
+      };
+      // Each is answered later, through `deliver`, once its last part is home.
+      let sent = [
+        super::scatter_list(state, seat, asked(1), scatter_asker(), None),
+        super::scatter_grants(state, seat, asked(2), scatter_asker(), None),
+        super::scatter_status(state, seat, asked(3)),
+      ];
+      let all_sent = sent
+        .iter()
+        .all(|served| matches!(served, super::Served::Forwarded));
+      (state.shards.first().copied(), region, all_sent)
+    });
+    assert!(all_sent, "each scatter sent its part to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let mut answers = std::collections::BTreeMap::new();
+    while answers.len() < 3 {
+      match end.wait(Some(crate::daemon::OBSERVE_BUDGET_NS)) {
+        Ok(reply) => {
+          let body: ReplyBody =
+            slates_ipc::protocol::unpack(end.region(), reply.kind, &reply.payload).unwrap();
+          answers.insert(
+            slates_wire::request::RequestId::from_word(reply.request).sequence,
+            body,
+          );
+        }
+        Err(error) => {
+          eprintln!("no further answer: {error}");
+          break;
+        }
+      }
+    }
+    daemon.stop();
+    (fenced, answers)
+  }
+
+  /// A-557 (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`'s sibling; §4.8 "Lookup": an
+  /// enumeration is a scatter-gather over owners; §4.14 `slates.status`). Do: on a two-shard daemon, fence the control
+  /// shard as a failed consensus publication does, so every borrow of its state is refused; from a client seated on the
+  /// other shard, list the volumes, ask for the grants and ask for the daemon's status. Expect: each answered
+  /// `Overloaded { shard }` naming the fenced shard. Before, the fenced shard's part came home as an empty one and each
+  /// was answered as if whole: a listing without that shard's volumes, grants without its grants, a status without its
+  /// report.
+  #[test]
+  fn a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard() {
+    let (fenced, answers) = asked_past_a_fenced_shard();
+    let fenced = fenced.expect("the daemon has a control shard");
+    for (verb, sequence) in [("list", 1u32), ("grants", 2), ("status", 3)] {
+      let answer = answers.get(&sequence);
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::Overloaded { shard }
+          }) if *shard == fenced
+        ),
+        "{verb} with the control shard {fenced} fenced: {answer:?}"
+      );
+    }
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
