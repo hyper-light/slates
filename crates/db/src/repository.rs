@@ -29,14 +29,27 @@
 //! source's durable checkpoint may not pass ([`Repositories::branch_floor`]), so that version is still there to branch
 //! from. A membership leaves with its green, and outlives its repository's record, since a destroyed repository leaves
 //! its greens.
+//!
+//! **The register (A-603).** A repository's greens share one register, and every change of the repository is an entry
+//! of it at the next position: an `Op::RepositoryAdvanced` entry commits several greens' versions, greens joining the
+//! lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence markers) as one
+//! step, its checks read at its position first (`entry`); every other operation that changes a repository is an entry
+//! of that one change (a namespace operation, a member's version recorded alone, a member's destroy), so the position
+//! counts every change and one position names one state of the repository. The register is created with its
+//! repository, carried whole by a partition snapshot, and goes with its repository.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
-  BranchRecord, MemberOrigin, MemberRecord, RepositoryId, RepositoryRecord, VolumeId,
+  BranchRecord, MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
+  RepositoryRecord, StateChange, VolumeId,
 };
 use crate::error::DbError;
 use crate::op::Op;
+
+mod entry;
+
+pub use entry::StateBytes;
 
 /// What the partition's catalog holds under a volume id, as the guard needs it (§4.17.1: a namespace binds greens).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +77,144 @@ pub struct Repositories {
   members: BTreeMap<VolumeId, MemberRecord>,
   /// Each lineage's members in the order they joined, the order a recovery rebuilds them in (A-575).
   lineages: BTreeMap<RepositoryId, Vec<VolumeId>>,
+  /// Each repository's register: its next position and its own state (A-603).
+  registers: BTreeMap<RepositoryId, Register>,
+}
+
+/// A repository's register (§4.17.1 shared piece 2, A-603): the position its next entry takes, and the repository's
+/// own state, which its entries move.
+#[derive(Debug, Default)]
+struct Register {
+  /// The position the next entry takes: every change of the repository takes one, so it counts them.
+  next: u64,
+  /// The phase roots: each phase's root nodes.
+  phase_roots: BTreeMap<u8, BTreeSet<Vec<u8>>>,
+  /// The obsolescence markers, in the order the register received them.
+  markers: Vec<Vec<u8>>,
+  /// Derived: each held marker's identity (`entry::marker_id`).
+  marker_ids: BTreeSet<[u8; 32]>,
+}
+
+impl Register {
+  /// Whether `node` is a root of `phase`.
+  fn holds_root(&self, phase: u8, node: &[u8]) -> bool {
+    self
+      .phase_roots
+      .get(&phase)
+      .is_some_and(|nodes| nodes.contains(node))
+  }
+
+  /// Applies one state change, unconditionally, as a replay must: a root added that is one, a root removed that is not,
+  /// or a marker held changes nothing and counts nothing. What it added and released.
+  fn apply(&mut self, change: &StateChange) -> StateBytes {
+    match change {
+      StateChange::PhaseRootAdded { phase, node } => {
+        if self
+          .phase_roots
+          .entry(*phase)
+          .or_default()
+          .insert(node.clone())
+        {
+          return StateBytes {
+            added: entry::root_bytes(node),
+            released: 0,
+          };
+        }
+        StateBytes::default()
+      }
+      StateChange::PhaseRootRemoved { phase, node } => {
+        let Some(nodes) = self.phase_roots.get_mut(phase) else {
+          return StateBytes::default();
+        };
+        let removed = nodes.remove(node.as_slice());
+        if nodes.is_empty() {
+          self.phase_roots.remove(phase);
+        }
+        if !removed {
+          return StateBytes::default();
+        }
+        StateBytes {
+          added: 0,
+          released: entry::root_bytes(node),
+        }
+      }
+      StateChange::MarkerAdded { marker } => {
+        if !self.marker_ids.insert(entry::marker_id(marker)) {
+          return StateBytes::default();
+        }
+        self.markers.push(marker.clone());
+        StateBytes {
+          added: marker.len(),
+          released: 0,
+        }
+      }
+    }
+  }
+
+  /// The bytes its state holds, as the merge budget charged them.
+  fn bytes(&self) -> usize {
+    let roots = self
+      .phase_roots
+      .values()
+      .flatten()
+      .map(|node| entry::root_bytes(node))
+      .fold(0, usize::saturating_add);
+    let markers = self
+      .markers
+      .iter()
+      .map(Vec::len)
+      .fold(0, usize::saturating_add);
+    roots.saturating_add(markers)
+  }
+
+  /// The register as a snapshot carries it.
+  fn record(&self, repository: RepositoryId) -> RegisterRecord {
+    RegisterRecord {
+      repository,
+      next: self.next,
+      phase_roots: self
+        .phase_roots
+        .iter()
+        .flat_map(|(phase, nodes)| {
+          nodes.iter().map(|node| PhaseRoot {
+            phase: *phase,
+            node: node.clone(),
+          })
+        })
+        .collect(),
+      markers: self.markers.clone(),
+    }
+  }
+
+  /// The register a snapshot carried. A root or a marker listed twice is a corrupt snapshot, refused rather than half
+  /// restored.
+  fn restored(record: &RegisterRecord) -> Result<Register, DbError> {
+    let corrupt = DbError::Corrupt {
+      seq: 0,
+      reason: "a snapshot's repository register lists a phase root or a marker twice",
+    };
+    let mut register = Register {
+      next: record.next,
+      ..Register::default()
+    };
+    for root in &record.phase_roots {
+      if !register
+        .phase_roots
+        .entry(root.phase)
+        .or_default()
+        .insert(root.node.clone())
+      {
+        return Err(corrupt);
+      }
+    }
+    for marker in &record.markers {
+      if !register.marker_ids.insert(entry::marker_id(marker)) {
+        return Err(corrupt);
+      }
+      register.markers.push(marker.clone());
+    }
+    Ok(register)
+  }
 }
 
 /// Refuses an empty name or one holding a NUL byte (§4.17.1, A-515).
@@ -199,13 +350,65 @@ impl Repositories {
       })
   }
 
+  /// The position the next entry of `repository`'s register takes (A-603); `None` for no such repository.
+  pub fn position(&self, repository: RepositoryId) -> Option<u64> {
+    self
+      .registers
+      .get(&repository)
+      .map(|register| register.next)
+  }
+
+  /// `repository`'s phase roots, each `(phase, node)`, in that order (A-603).
+  pub fn phase_roots(&self, repository: RepositoryId) -> impl Iterator<Item = (u8, &[u8])> + '_ {
+    self
+      .registers
+      .get(&repository)
+      .into_iter()
+      .flat_map(|register| register.phase_roots.iter())
+      .flat_map(|(phase, nodes)| nodes.iter().map(move |node| (*phase, node.as_slice())))
+  }
+
+  /// `repository`'s obsolescence markers, in the order its register received them (A-603).
+  pub fn markers(&self, repository: RepositoryId) -> impl Iterator<Item = &[u8]> + '_ {
+    self
+      .registers
+      .get(&repository)
+      .into_iter()
+      .flat_map(|register| register.markers.iter().map(Vec::as_slice))
+  }
+
+  /// Every register, in repository order: what a snapshot carries (A-603).
+  pub fn registers(&self) -> impl Iterator<Item = RegisterRecord> + '_ {
+    self
+      .registers
+      .iter()
+      .map(|(repository, register)| register.record(*repository))
+  }
+
+  /// The bytes the repositories' own state holds, as the partition's merge budget charged them (A-603).
+  pub fn state_bytes(&self) -> usize {
+    self
+      .registers
+      .values()
+      .map(Register::bytes)
+      .fold(0, usize::saturating_add)
+  }
+
+  /// What an entry the guard admitted adds to the merge budget and gives back of it: its versions' chain entries and
+  /// the state it adds, against the state it removes (A-603).
+  pub fn entry_bytes(entry: &crate::catalog::RepositoryEntry) -> StateBytes {
+    entry::bytes(entry)
+  }
+
   /// The guard for a repository operation (`Partition::check`): refuses what the log must never record. `capacity`
-  /// bounds the repositories; `held` says what the partition's catalog holds under a volume id.
+  /// bounds the repositories; `held` says what the partition's catalog holds under a volume id; `head` is a green's
+  /// head as its durable records hold it, which an entry's versions follow and its checks read (A-603).
   pub fn check(
     &self,
     op: &Op,
     capacity: usize,
     held: impl Fn(VolumeId) -> Held,
+    head: impl Fn(VolumeId) -> u64,
   ) -> Result<(), DbError> {
     match op {
       Op::RepositoryCreated { record } => self.check_created(record, capacity),
@@ -223,6 +426,7 @@ impl Repositories {
         .map(|_| ())
         .ok_or(DbError::NotFound),
       Op::RepositoryGreenJoined { record } => self.check_joined(record, held),
+      Op::RepositoryAdvanced { entry } => entry::check(self, entry, held, head),
       _ => Ok(()),
     }
   }
@@ -332,18 +536,22 @@ impl Repositories {
   }
 
   /// Applies a guarded repository operation; unconditional, so replay is deterministic. A record the operation names
-  /// that is missing (a corrupted history) is a typed refusal. Other operations are not the repositories' and change
-  /// nothing.
-  pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
+  /// that is missing (a corrupted history) is a typed refusal, before anything changes. Every operation that changes a
+  /// repository takes its register's next position (A-603). Returns what the repositories' own state gained and
+  /// released, which the partition charges to its merge budget (an entry's versions are the partition's chains, charged
+  /// there). Other operations are not the repositories' and change nothing.
+  pub fn apply(&mut self, op: &Op) -> Result<StateBytes, DbError> {
     match op {
       Op::RepositoryCreated { record } => {
         self.by_name.insert(record.name.clone(), record.id);
         self.records.insert(record.id, record.clone());
-        Ok(())
+        self.registers.insert(record.id, Register::default());
+        Ok(StateBytes::default())
       }
       Op::RepositoryBranchAdded { record } => {
         self.bind(record);
-        Ok(())
+        self.advance(record.repository);
+        Ok(StateBytes::default())
       }
       Op::RepositoryBranchRetired { repository, name } => {
         let green = self
@@ -351,17 +559,21 @@ impl Repositories {
           .remove(&(*repository, name.clone()))
           .ok_or(DbError::NotFound)?;
         self.bound.remove(&green);
-        Ok(())
+        self.advance(*repository);
+        Ok(StateBytes::default())
       }
       Op::RepositoryDefaultSet { repository, branch } => {
         let record = self.records.get_mut(repository).ok_or(DbError::NotFound)?;
         record.default_branch = branch.clone();
-        Ok(())
+        self.advance(*repository);
+        Ok(StateBytes::default())
       }
       Op::RepositoryGreenJoined { record } => {
         self.join(record);
-        Ok(())
+        self.advance(record.repository);
+        Ok(StateBytes::default())
       }
+      Op::RepositoryAdvanced { entry } => self.apply_entry(entry),
       Op::RepositoryDestroyed { repository } => {
         let record = self.records.remove(repository).ok_or(DbError::NotFound)?;
         self.by_name.remove(&record.name);
@@ -376,9 +588,74 @@ impl Repositories {
             self.bound.remove(&green);
           }
         }
-        Ok(())
+        // The register goes with its repository, and gives back what its state held.
+        let released = self
+          .registers
+          .remove(repository)
+          .map_or(0, |register| register.bytes());
+        Ok(StateBytes { added: 0, released })
       }
-      _ => Ok(()),
+      _ => Ok(StateBytes::default()),
+    }
+  }
+
+  /// Applies an entry the guard admitted (A-603), unconditionally: its members join, its names change and its state
+  /// moves, in order, and it takes the register's next position; its versions are the partition's chains. An entry of a
+  /// repository this partition does not hold is a corrupted history, refused before anything changes.
+  fn apply_entry(
+    &mut self,
+    entry: &crate::catalog::RepositoryEntry,
+  ) -> Result<StateBytes, DbError> {
+    if !self.records.contains_key(&entry.repository)
+      || !self.registers.contains_key(&entry.repository)
+    {
+      return Err(DbError::NotFound);
+    }
+    for member in &entry.joined {
+      self.join(member);
+    }
+    for change in &entry.names {
+      match change {
+        NameChange::Bind { name, green } => self.bind(&BranchRecord {
+          repository: entry.repository,
+          name: name.clone(),
+          green: *green,
+        }),
+        NameChange::Retire { name } => {
+          if let Some(green) = self.branches.remove(&(entry.repository, name.clone())) {
+            self.bound.remove(&green);
+          }
+        }
+        NameChange::Default { branch } => {
+          if let Some(record) = self.records.get_mut(&entry.repository) {
+            record.default_branch = branch.clone();
+          }
+        }
+      }
+    }
+    let mut bytes = StateBytes::default();
+    if let Some(register) = self.registers.get_mut(&entry.repository) {
+      for change in &entry.state {
+        bytes.add(register.apply(change));
+      }
+      register.next = register.next.saturating_add(1);
+    }
+    Ok(bytes)
+  }
+
+  /// `repository`'s register takes its next position, for a change of the repository made by an operation other than
+  /// an entry (A-603). A repository that is gone has no register to move.
+  fn advance(&mut self, repository: RepositoryId) {
+    if let Some(register) = self.registers.get_mut(&repository) {
+      register.next = register.next.saturating_add(1);
+    }
+  }
+
+  /// A version of `green` was recorded alone (`Op::GreenAdvanced`): a member's is an entry of its repository's register,
+  /// so the register takes a position for it (A-603). A green no lineage holds moves no register.
+  pub fn versioned(&mut self, green: VolumeId) {
+    if let Some(repository) = self.members.get(&green).map(|member| member.repository) {
+      self.advance(repository);
     }
   }
 
@@ -403,28 +680,36 @@ impl Repositories {
   }
 
   /// A destroyed green leaves the namespace that bound it (§4.17.1: deleting a branch's green deletes the branch), and
-  /// its lineage (A-575).
+  /// its lineage (A-575). Each repository it leaves changed, so its register takes a position (A-603).
   pub fn green_removed(&mut self, green: VolumeId) {
+    let mut changed = BTreeSet::new();
     if let Some(key) = self.bound.remove(&green) {
+      changed.insert(key.0);
       self.branches.remove(&key);
     }
-    if let Some(member) = self.members.remove(&green)
-      && let Some(order) = self.lineages.get_mut(&member.repository)
-    {
-      order.retain(|joined| *joined != green);
-      if order.is_empty() {
-        self.lineages.remove(&member.repository);
+    if let Some(member) = self.members.remove(&green) {
+      changed.insert(member.repository);
+      if let Some(order) = self.lineages.get_mut(&member.repository) {
+        order.retain(|joined| *joined != green);
+        if order.is_empty() {
+          self.lineages.remove(&member.repository);
+        }
       }
+    }
+    for repository in changed {
+      self.advance(repository);
     }
   }
 
   /// The repositories a snapshot carries, rebuilt with their derived indexes. A binding naming no carried repository,
-  /// a second binding of one green, a member joining twice or before the member it was made from, is a corrupt
-  /// snapshot, refused rather than half restored.
+  /// a second binding of one green, a member joining twice or before the member it was made from, a register naming no
+  /// carried repository or a second for one, or a repository without its register (A-603), is a corrupt snapshot,
+  /// refused rather than half restored.
   pub fn restore(
     records: &[RepositoryRecord],
     bindings: &[BranchRecord],
     members: &[MemberRecord],
+    registers: &[RegisterRecord],
   ) -> Result<Repositories, DbError> {
     let mut repositories = Repositories::new();
     for record in records {
@@ -457,6 +742,25 @@ impl Repositories {
         });
       }
       repositories.join(member);
+    }
+    for register in registers {
+      if !repositories.records.contains_key(&register.repository)
+        || repositories.registers.contains_key(&register.repository)
+      {
+        return Err(DbError::Corrupt {
+          seq: 0,
+          reason: "a snapshot's repository register names no repository, or a second register for one",
+        });
+      }
+      repositories
+        .registers
+        .insert(register.repository, Register::restored(register)?);
+    }
+    if repositories.registers.len() != repositories.records.len() {
+      return Err(DbError::Corrupt {
+        seq: 0,
+        reason: "a snapshot's repository carries no register",
+      });
     }
     Ok(repositories)
   }

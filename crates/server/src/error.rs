@@ -262,6 +262,15 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::InvalidName => Refusal::InvalidName,
     // A green live members of its lineage were made from is pinned by them, as a snapshot by its clones (A-575).
     DbError::BranchedFrom { .. } => volume(VolumeRefusal::Pinned),
+    // An entry of a repository's register refused at its position (A-603): made against another state of the register,
+    // a check that no longer holds there, or a state change made against another state. Each server answers its
+    // tool's words for a repository that moved under the push.
+    DbError::OutOfOrder { named, expected } => database(DatabaseRefusal::OutOfOrder {
+      named: *named,
+      expected: *expected,
+    }),
+    DbError::CheckFailed { index } => database(DatabaseRefusal::CheckFailed { index: *index }),
+    DbError::StateChanged { index } => database(DatabaseRefusal::StateChanged { index: *index }),
   }
 }
 

@@ -105,6 +105,27 @@ pub enum DbError {
     /// The live members made from it.
     members: u64,
   },
+  /// An entry of a repository's register made for a position that is not the register's next, or naming a version of
+  /// a green that is not the one after its head (§4.17.1 shared piece 2, A-603): it was made against another state of
+  /// the register than the one it would follow. Never entered in the log.
+  OutOfOrder {
+    /// The position or version the entry named.
+    named: u64,
+    /// The one the register holds next.
+    expected: u64,
+  },
+  /// An entry's check does not hold at the entry's register position (A-603): what it checks moved since it was read.
+  /// Never entered in the log.
+  CheckFailed {
+    /// The check's index among the entry's checks.
+    index: u32,
+  },
+  /// An entry's change of its repository's own state was made against another state (A-603): a phase root it adds is
+  /// one already, one it removes is not, or a marker it adds is held. Never entered in the log.
+  StateChanged {
+    /// The change's index among the entry's state changes.
+    index: u32,
+  },
 }
 
 impl fmt::Display for DbError {
@@ -152,6 +173,20 @@ impl fmt::Display for DbError {
       Self::BranchedFrom { members } => write!(
         f,
         "{members} live members of its lineage were made from this green"
+      ),
+      Self::OutOfOrder { named, expected } => write!(
+        f,
+        "a register entry naming {named} where the register holds {expected} next"
+      ),
+      Self::CheckFailed { index } => {
+        write!(
+          f,
+          "a register entry's check {index} does not hold at its position"
+        )
+      }
+      Self::StateChanged { index } => write!(
+        f,
+        "a register entry's state change {index} was made against another state"
       ),
     }
   }

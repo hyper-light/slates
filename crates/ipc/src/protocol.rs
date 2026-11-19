@@ -4185,6 +4185,27 @@ pub enum DatabaseRefusal {
   },
   /// A record's encoding was refused.
   Encoding,
+  /// An entry of a repository's register made for a position other than the register's next, or naming a version of a
+  /// green other than the one after its head (§4.17.1 shared piece 2, A-603): made against another state of the
+  /// register. Appended.
+  OutOfOrder {
+    /// The position or version the entry named.
+    named: u64,
+    /// The one the register holds next.
+    expected: u64,
+  },
+  /// An entry's check does not hold at the entry's register position (A-603): what it checks moved since it was read,
+  /// as Mercurial's `check:heads` fails when a head moved. Appended.
+  CheckFailed {
+    /// The check's index among the entry's checks.
+    index: u32,
+  },
+  /// An entry's change of its repository's own state was made against another state (A-603): a phase root it adds is
+  /// one already, one it removes is not, or a marker it adds is held. Appended.
+  StateChanged {
+    /// The change's index among the entry's state changes.
+    index: u32,
+  },
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
