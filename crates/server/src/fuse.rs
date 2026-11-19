@@ -812,7 +812,13 @@ async fn serve(attachment: u64) {
           let _ = state::with_state_counted(|s| ended(s, attachment));
           return;
         }
-        Some(Turned::Idle | Turned::Served) => {}
+        Some(Turned::Idle | Turned::Served) => {
+          // A round its slice cut that sent nothing has no return to wake the task, and the wait answers at once while
+          // it is owed (A-562): the shard's other tasks run between its slices.
+          if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
+            let _ = futures::yield_now().await;
+          }
+        }
       }
       continue;
     }

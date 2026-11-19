@@ -37753,7 +37753,8 @@ after a whole round), `scoped.rs`, `volume_bridge.rs` (the gather walks one reco
 replaces `owes_takeover_round`; `take_sliced_counts`; `told_through` bounded while an overrun round is owed; the byte
 states fed once a record across slices, `states_fed_through`, and a write-back's pending records counted from it;
 `slice_ns` is `None`, rounds whole, until an owner bounds it), `crates/server/src/fuse.rs` (the wake while any round is
-owed; the turn's budget is `copy_slice_ns`, `TAKEOVER_SLICE_PERMILLE` gone; `fuse.rounds_outgrown`,
+owed, and a yield between slices that sent nothing; the turn's budget is `copy_slice_ns`, `TAKEOVER_SLICE_PERMILLE`
+gone; `fuse.rounds_outgrown`,
 `fuse.slices_resumed`), `winfsp.rs` (the gather sliced the same way, `Turned::Continued`, `winfsp.rounds_outgrown`,
 `winfsp.slices_resumed`), `config.rs` (`copy_slice_ns` names the rounds), and the integration tests' gathers, which pass
 a `more` that never stops them.
