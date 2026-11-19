@@ -3,8 +3,8 @@
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
 //! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's ([`svn`],
-//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, answered by `slates_svn::dav::site`) on the same
-//! edge. A reply's status is `200` unless the exchange names another as its reply begins ([`Exchange::reply_status`]:
+//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, and the `log-report`, answered by
+//! `slates_svn::dav::site`) on the same edge. A reply's status is `200` unless the exchange names another as its reply begins ([`Exchange::reply_status`]:
 //! a PROPFIND's `207`, or a refusal its body explains).
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task

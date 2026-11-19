@@ -20,7 +20,11 @@
 //!
 //! A served request's body is read whole within the request's room (`413` past it), then answered at its end from the
 //! store as `slates_svn::dav::site` decides: its status, which the reply names as it begins (`207` for a PROPFIND), its
-//! headers and its body; a file's text a piece a reply run, lent from the green each run, never held whole.
+//! headers and its body; a file's text a piece a reply run, lent from the green each run, never held whole; a REPORT's
+//! answer a slice of the room a reply run, the store lent again for each, its first slices stepped at the body's end
+//! (the task yielding between them) until it has written its first bytes or ended, since they decide its status: a
+//! walk refused before its first byte is answered with its error, as `mod_dav` answers one, and one refused after it
+//! ends the connection (a refusal within those first slices after the first byte is `500`, nothing sent).
 //!
 //! **Names.** A repository is the one named by the URL's first path segment, decoded; the rest of the path is below
 //! its root (`/repo/!svn/rvr/5/trunk` is `repo`'s `/!svn/rvr/5/trunk`). A repository whose name holds a slash cannot be

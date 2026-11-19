@@ -2127,11 +2127,11 @@ struct LogCase {
 const STANDARD_THREE: &[&str] = &["svn:author", "svn:date", "svn:log"];
 
 /// The cases, each with whether it is read by the `locked` repository's anonymous rules: the root's shortcut over every
-/// revision with every property; a file's history with its merged revisions; a branch oldest first with a limit,
+/// revision, the youngest first, with every property; a file's history with its merged revisions; a branch oldest first with a limit,
 /// crossing its copy; the branch's history stopping at its copy, no property; two paths with a custom property named;
 /// under the rules, the root refused and the trunk censored; a missing path and a revision past the youngest refused.
 const DAV_LOG_CASES: [(LogCase, bool); 9] = [
-  (LogCase { paths: &[""], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, false),
+  (LogCase { paths: &[""], start: None, end: Some(0), changed: true, strict: false, limit: 0, merged: false, revprops: None }, false),
   (LogCase { paths: &["trunk/a.txt"], start: None, end: Some(1), changed: true, strict: false, limit: 0, merged: true, revprops: Some(STANDARD_THREE) }, false),
   (LogCase { paths: &["branches/b1"], start: Some(1), end: None, changed: true, strict: false, limit: 3, merged: false, revprops: Some(STANDARD_THREE) }, false),
   (LogCase { paths: &["branches/b1"], start: None, end: Some(0), changed: false, strict: true, limit: 0, merged: false, revprops: Some(&[]) }, false),
@@ -2407,11 +2407,36 @@ fn dav_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) ->
 fn a_log_report_answers_the_entries_svnserve_answers() {
   let fixture = Fixture::new();
   let rules = locked_rules();
+  let mut shapes = Vec::new();
   for (case, locked) in &DAV_LOG_CASES {
     let rules = locked.then_some(&rules);
     let (expected, found) = (items_log(&fixture, case, rules), dav_log(&fixture, case, rules));
     assert_eq!(found, expected, "{case:?}");
+    shapes.push((found.0.len(), found.1.map(|(code, _)| code)));
   }
+  assert_eq!(dav_log_shapes(&shapes), DAV_LOG_SHAPES);
+}
+
+/// What each case came to, so the comparison is never of two empty answers: the root's twelve revisions; entries for
+/// each other walk; the root refused under the rules (`SVN_ERR_AUTHZ_UNREADABLE`); a missing path and a revision past
+/// the youngest refused (`SVN_ERR_FS_NOT_FOUND`, `SVN_ERR_FS_NO_SUCH_REVISION`).
+const DAV_LOG_SHAPES: [&str; 9] = [
+  "12 entries", "entries", "entries", "entries", "entries", "refused 220001", "entries", "refused 160013",
+  "refused 160006",
+];
+
+/// Each case's entry count (exact for the root's walk, `entries` for any other) or its refusal's number.
+fn dav_log_shapes(shapes: &[(usize, Option<u64>)]) -> Vec<String> {
+  shapes
+    .iter()
+    .enumerate()
+    .map(|(at, shape)| match shape {
+      (count, None) if at == 0 => format!("{count} entries"),
+      (count, None) if *count > 0 => String::from("entries"),
+      (_, Some(code)) => format!("refused {code}"),
+      (_, None) => String::from("no entry"),
+    })
+    .collect()
 }
 
 /// A-681 (`dav_svn__log_report`; the module doc's departure): do ask a `log-report` with a negative `S:limit`, which
