@@ -732,6 +732,17 @@ pub enum Op {
     /// The policy, its version the next.
     policy: crate::catalog::RepositoryPolicy,
   },
+  /// A version-control credential was enrolled by the human surface (§4.13, §4.17.2 "Access"; A-625 part 3), on the
+  /// partition its id routes to. Appended.
+  CredentialEnrolled {
+    /// The record.
+    record: crate::catalog::CredentialRecord,
+  },
+  /// A version-control credential was revoked by the human surface: its record leaves (A-625 part 3). Appended.
+  CredentialRevoked {
+    /// The credential's id.
+    id: [u8; 32],
+  },
 }
 
 impl Op {
@@ -836,6 +847,8 @@ impl Op {
       Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
       Op::RepositoryDefaultSet { .. } => "repository_default_set",
       Op::RepositoryDestroyed { .. } => "repository_destroyed",
+      Op::CredentialEnrolled { .. } => "credential_enrolled",
+      Op::CredentialRevoked { .. } => "credential_revoked",
     }
   }
 }

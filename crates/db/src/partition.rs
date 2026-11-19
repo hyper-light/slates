@@ -188,6 +188,8 @@ pub struct PartitionSnapshot {
   pub repository_registers: Vec<crate::catalog::RegisterRecord>,
   /// The atomic records kept, by key, each with the positions pointing to it still (A-642; appended).
   pub atomic_records: Vec<crate::catalog::AtomicHeld>,
+  /// The version-control credentials this partition holds (§4.13, §4.17.2 "Access"; A-625 part 3; appended), by id.
+  pub credentials: Vec<crate::catalog::CredentialRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -343,6 +345,9 @@ pub struct Partition {
   /// The review records of those repositories (§4.17.1 shared piece 6, A-596): their bytes counted in
   /// `green_chain_bytes` against the merge byte budget; they leave with their review's close and their repository.
   reviews: crate::review::Reviews,
+  /// The version-control credentials whose ids route here (§4.13, §4.17.2 "Access"; A-625 part 3): their bytes counted
+  /// in `green_chain_bytes` against the table byte budget; each leaves with its revocation.
+  credentials: crate::credentials::Credentials,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -475,8 +480,15 @@ impl Partition {
       carried: BTreeMap::new(),
       repositories: crate::repository::Repositories::new(),
       reviews: crate::review::Reviews::new(),
+      credentials: crate::credentials::Credentials::new(),
       tombstones: BTreeMap::new(),
     }
+  }
+
+  /// The version-control credentials whose ids route to this partition (§4.13, §4.17.2 "Access"; A-625 part 3): what
+  /// the HTTP edge's authenticator and the SSH edge's key holders look a presented credential up in.
+  pub fn credentials(&self) -> &crate::credentials::Credentials {
+    &self.credentials
   }
 
   /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
@@ -1550,6 +1562,17 @@ impl Partition {
         let (released, added) = self.reviews.charge(op);
         self.merge_bytes_fit(released, added)
       }
+      // A version-control credential (A-625 part 3): `crate::credentials`; its bytes fit the table byte budget, and the
+      // refusal names the table the human was adding to.
+      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+        self.credentials.check(op)?;
+        let (released, added) = self.credentials.charge(op);
+        self
+          .merge_bytes_fit(released, added)
+          .map_err(|_| DbError::Capacity {
+            table: "credentials",
+          })
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -2101,6 +2124,15 @@ impl Partition {
       | Op::ReviewClosed { .. } => {
         let (released, added) = self.reviews.charge(op);
         self.reviews.apply(op)?;
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(added);
+        Ok(())
+      }
+      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+        let (released, added) = self.credentials.charge(op);
+        self.credentials.apply(op)?;
         self.green_chain_bytes = self
           .green_chain_bytes
           .saturating_sub(released)
@@ -2789,6 +2821,7 @@ impl Partition {
       review_approvals: self.reviews.approval_records().cloned().collect(),
       repository_registers: self.repositories.registers().collect(),
       atomic_records: self.repositories.atomic_held(),
+      credentials: self.credentials.records().cloned().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -3051,6 +3084,9 @@ impl Partition {
       |id| p.repositories.repository(id).is_some(),
     )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
+    // The version-control credentials, charged to the table byte budget as when each was enrolled (A-625 part 3).
+    p.credentials = crate::credentials::Credentials::restore(&snapshot.credentials)?;
+    p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.credentials.bytes());
     Ok(p)
   }
 

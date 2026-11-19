@@ -170,6 +170,10 @@ mod vcs_hooks;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod hook_driver;
+// The version-control credentials a human enrolls for a principal (A-625 part 3): SSH keys by fingerprint and HTTP tokens
+// by their hash, on the partition each id routes to; the enroll and revoke verbs the issuer proves, and the lookup the
+// HTTP and SSH edges authenticate through. Public for the issuer's proofs, the token's text and the key line's reading.
+pub mod credentials;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
 // phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
