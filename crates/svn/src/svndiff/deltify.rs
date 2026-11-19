@@ -133,7 +133,7 @@ fn piece(text: &[u8], start: usize, room: usize) -> &[u8] {
 /// One window of `target` from `source`, the source's piece starting at `source_offset` (`compute_window`).
 fn window(source: &[u8], target: &[u8], source_offset: usize) -> Window {
   let mut ops = Ops::default();
-  if source.is_empty() || target.len() < usize::MAX {
+  if source.is_empty() {
     ops.new_data(target);
   } else {
     compute_delta(&mut ops, source, target);
