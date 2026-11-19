@@ -6676,6 +6676,17 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-19, A-564: an owner that cannot answer is never read as no volume).** A verb forwarded to its
+> volume's owner shard was answered `NotFound` when the owner's state refused it. That happened from another node:
+> `call_in_shard_time`'s `None` became `NotFound` in `named_if_unshared`. It happened on the same node too, where a
+> refused owner borrow became `NotFound`. So a volume on a fenced owner read as absent. The owner's refusal is now
+> answered by its kind (`call_owner`, `refusal_of_access`):
+> - a fenced owner (or a retention check that fences it) answers `ConsensusRecoveryUnavailable`;
+> - a call that did not run answers `Overloaded`, not started.
+>
+> (`a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`;
+> `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`).
+
 > **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
 > forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
 > again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
@@ -38210,6 +38221,36 @@ oracle's tree a type alias.
   slates-server --lib -- base_wait error::` 6 of 6, `-p slates-base --lib -- s3` 55 of 55, `-p slates-vfs --lib --
   base::` 4 of 4, `-p slates-land --lib -- engine` 2 of 2, `-p slates-bridge-fuse --lib -- bridge::tests` 1 of 1,
   `-p slates-bridge-nfs --lib -- procedures::tests` 1 of 1, `cargo fmt --check` clean.
+
+### A-564 — A verb for a volume whose owner shard refuses its state is answered by the refusal's kind, never `NotFound` (2026-11-19, goal 85 via g225; §4.8 "Lookup"; found by A-557; A-394)
+
+- **What was there.** A verb for a volume runs on its owner shard. From another node, `serve_forward` called the owner
+  through `xshard::call_in_shard_time`, whose `None` means not sent, given up, or the owner's borrow refused, and
+  `named_if_unshared` turned that `None` into `NotFound`. On the same node, `send_forward`'s task turned a refused owner
+  borrow into `NotFound`. A fenced owner refuses every borrow; a failed consensus publication fences the control shard,
+  which owns a partition of the volumes. So a volume on a fenced owner read as absent.
+- **The rule.** "The answer comes from the current owner and is authoritative" (§4.8 "Lookup"): an owner that did not
+  answer is never read as an answer of no volume. `refusal_of_access` answers a refused borrow by its kind:
+  - fenced, or closed by the retention check that fences, is `ConsensusRecoveryUnavailable`, the refusal a failed
+    publication answers;
+  - no state, or a borrow already held, is `Overloaded`, not started.
+
+  `call_owner` runs a forward's work on its owner with `try_with_state`, waits in the owner's own time, and answers a
+  call not sent or given up `Overloaded`. Every path of `serve_forward` uses them: a read, a write and its deferred
+  completion, `PromoteRegion`, and the partition lookup on the serving shard. So does `send_forward`'s owner task.
+  `NotFound` stays the answer for a partition no shard of this node holds.
+- **Test.** `a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`
+  (`crates/server/src/verbs.rs`): a volume on the second shard of two, that shard fenced, its status asked from a
+  client on the control shard and as a verb forwarded from another node. Red before the fix: the same-node ask
+  answered `NotFound` (0.75 s, Mac Studio). Green: both asks `ConsensusRecoveryUnavailable`. Seventeen nearby tests
+  still pass.
+- **Not changed.** `remote_attach::serve_unforwardable` answers `Overloaded` for any call that has no answer, a fenced
+  owner included: retryable, and never `NotFound`.
+
+Applied in the same change to: §4.8 "Lookup" (its status), GAPS (a new entry after A-394's), `crates/server/src/verbs.rs`
+(`serve_forward`, `refusal_of_access`, `call_owner`, `answer_forwarded_write`, `await_deferred_completion`,
+`named_if_unshared`, `send_forward`, the test and its helpers), the bug record
+`docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`.
 
 ### A-571 — A full command ring is waited out by one rule on every client end, and the daemon tests' raw clients keep it: a connect is one claim, a hold's start waits on its observation (2026-11-19, UI goal 86 via g251b, part 1 of "The rest of class C": the `CREDIT_WAIT` copies; §4.7 "Failure matrix"; A-232, A-454, A-468, A-523)
 

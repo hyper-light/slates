@@ -134,6 +134,23 @@
 > invariant held, 91.9 s and 63.5 s; on main bf58691 without it (r212), 3 of 3 failed ReadSafety alone, five reads each.
 > **Owed (the supervisor's):** the seed on both Linux arches on the fix.
 
+> **A volume whose owner shard refused its state read as absent: fixed (2026-11-19, A-564, §4.8 "Lookup"; g225; found by
+> A-557).** A verb forwarded to its volume's owner shard was answered `NotFound` whenever the owner did not run it:
+> - from another node, `serve_forward` took `xshard::call_in_shard_time`'s `None` (not sent, given up, or the owner's
+>   borrow refused), and `named_if_unshared` turned it into `NotFound`;
+> - on the same node, `send_forward`'s task turned a refused owner borrow into `NotFound`.
+>
+> So a volume on a fenced owner (a failed consensus publication) read as absent. The owner's refusal is now answered by
+> its kind:
+> - a fenced owner, or a retention check that fences it, answers `ConsensusRecoveryUnavailable`, the refusal a failed
+>   publication answers;
+> - a call that did not run answers `Overloaded`, not started.
+>
+> `PromoteRegion` and the partition lookup on a refused control shard are answered the same way, and so is a deferred
+> write's completion poll. Test: `a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`
+> (`crates/server/src/verbs.rs`), red before with `NotFound`. Record:
+> `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`.
+
 > **A host admitted again refused its successor's records for good, so its live copy never caught up: fixed
 > (2026-11-18, A-382, §4.8 "Authority scope"; g230; the chaos nemesis's convergence, seeds 6876545201569229162 and
 > 7236833171758868842 on arm64, CI diag 44345243646).** The superseded adopter, admitted again under its id, kept its
