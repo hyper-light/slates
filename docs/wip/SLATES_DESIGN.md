@@ -3996,14 +3996,16 @@ reaches the daemon through the rendezvous's socket file (A-187).
 >      `ShardsBackings::placements` reads where each placed range lies (its PMD mapping in `/proc/self/smaps`). A placed
 >      range is zeroed by stores, never a hole punch, which would split its page.
 >
->      **A decline is remembered until the reap tick.** A declined collapse is not free: the kernel tries to compact
+>      **A decline is remembered for a retry window.** A declined collapse is not free: the kernel tries to compact
 >      memory first, and on adacachy at load 90 a fill step that was declined took 1,954 and 2,832 µs, where calm runs
 >      placed every range. Asked once a range, a host out of huge pages would charge the shard that much for every range
 >      a guest maps, and a guest churning its ranges could make it pay again and again. So a decline likely to hold is
->      remembered, the next ranges are served on base pages without asking (counted as declined), and the daemon's reap
->      tick re-arms it (`ShardsBackings::place`, `rearm_placement`). The kernel is asked at most
->      once a tick per shard while it declines. A transient decline (`EAGAIN`, a page locked or held for the moment) is
->      not remembered. Proven in a child process whose huge pages the kernel refuses (`PR_SET_THP_DISABLE`): three
+>      remembered, the next ranges are served on base pages without asking (counted as declined), and the shard's
+>      deadline keeper re-arms it a retry window after the decline (`ShardsBackings::place`, `take_declined`,
+>      `rearm_placement`; A-570, the reap loop's tick until then). The kernel is asked at most once a window per shard
+>      while it declines, and nothing wakes while no decline is held. A transient decline (`EAGAIN`, a page locked or
+>      held for the moment) is not remembered.
+>      Proven in a child process whose huge pages the kernel refuses (`PR_SET_THP_DISABLE`): three
 >      ranges ask the kernel once, and a re-arm asks again
 >      (`a_declined_placement_is_remembered_until_re_armed`, `crates/bridge-core/tests/dax_backing.rs`).
 >
@@ -4309,7 +4311,8 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > gate (its registry, pins, two-phase revoke, `reopen`-on-map and reseal, and snapshot recall), the writable-DAX and
 > integrity-guard opt-ins, L1's zones, L2's shift, B2's net, the daemon's shift loop and scrub pass, the `Bridge`
 > trait's content-block methods, and the device's content-block map paths. The daemon starts no DAX loop of its own: its
-> reap tick re-arms placement and nothing else. A snapshot reader's `advance` marks the device's backings stale
+> deadline keeper re-arms a declined placement a retry window after the decline, and nothing else (A-570). A snapshot
+> reader's `advance` marks the device's backings stale
 > (`Device::view_advanced`), and a snapshot recalls nothing. Admission still refuses DAX over the in-process seam, now
 > for the reason that holds: no in-process VMM has run a guest over it (AC-9.7).
 >
@@ -5004,9 +5007,11 @@ root-relative path as an explicit alternative; it does not report that the reque
 > task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
 > them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
 > dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536),
-> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold and NFS purges (A-570): the NFSv4
-> table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands the reaper a round at once
-> at a start that owes purges and a retry window after any access that leaves it owing. Base hints are next.
+> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold, NFS purges and the huge-page
+> re-arm (A-570): the NFSv4 table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands
+> the reaper a round at once at a start that owes purges and a retry window after any access that leaves it owing; a
+> lasting decline of a huge-page placement is noted as each state borrow closes and re-armed by the keeper a retry
+> window after it. Left on the tick: base hints with their delegation drain, and the idle seal.
 
 > **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
 > named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
@@ -12558,8 +12563,12 @@ and export by landing).
 > **Status (2026-11-19, A-542, its first half).** Built: node-exclusive operations in the merge engine
 > (`slates-merge`): `NODE_EXCLUSIVE`, the high bit of an operation's flags, and the verdict's pass that refuses a
 > node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
-> Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
-> (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
+> Its second half, `Copy`, part 1 (2026-11-19): Copy's maps. Every map of a green's state copies a path's tree by
+> reference (`crates/merge/src/dims/copy.rs`: the source's keys beneath it held as one subtree of A-534's radix tree
+> and grafted beneath the destination, its own key set to the source's value), O(the two paths' lengths) whatever the
+> tree holds, a copied file one more holder of its block, no walk (the arena's visited count does not move).
+> Owed, part 2: the engine's `Copy` operation, recorded by one entry for the destination's prefix in the histories, the
+> change index and `last_changed`, never a walk (the A-542 entry's plan).
 >
 > **Status (2026-11-19, A-553).** Built: the Subversion index (`slates-svn`'s `index`, piece 4, item 2): node rows with
 > FSFS's node, copy and copy-root identities, predecessors and counts, texts, property lists and mergeinfo counts;
@@ -12954,8 +12963,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
    vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
    cut anywhere).
-3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
-   persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
+3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
+   A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation owed, with
+   §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -36731,6 +36741,39 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   key to the destination and `graft` the source's `subtree` under it in each current-value map, O(path length) per
   map, and begin each copied key's history at the copy's version with its source recorded. Building a second
   persistent structure here was ruled out, and g261 built its tree so a prefix is one shared node.
+- **Copy, part 1: its maps (2026-11-19, g292; A-534 on main since f8ba01f61).** Applied to `crates/merge/src/dims.rs`
+  (the module's "A tree is copied by reference"; `escaped`, the attribute key's path bytes) and
+  `crates/merge/src/dims/copy.rs` with its tests (new). `Dim::copy_tree(from, to)` checks the destination by descents
+  alone (its own key, and a count taken and given back on the prefix beneath it), holds the source's keys beneath it as
+  one subtree, grafts them beneath the destination and sets the destination's own key to the source's value; `Files`
+  makes each copied file one more holder of its block; `Xattrs` copies a path's own attributes and its descendants'
+  as two prefixes, both held before either graft. Cost: two descents, two counts, the nodes of the destination's path
+  and the subtree's top node: O(the two paths' lengths), whatever the tree holds (a radix node's children start with
+  distinct bytes, so the top node's copy is bounded by the byte alphabet); no walk. Refused, nothing changed, onto a
+  present destination or one with a key beneath it (Subversion's copy needs its destination absent), and from or onto
+  the root, whose tree no one prefix names. The subtree is held before the graft, so a copy into its own subtree
+  (which FSFS allows, `tree.c` `copy_helper`) copies the source as it was. Tests: the cost against a tree of 1 and of
+  4,096 files (the arena's visited count unmoved, no block made, at most twice the destination path's nodes and two
+  more gained); the refusals; a copy beneath itself; and an oracle (generated puts, removals and copies, from and onto
+  any path and the root, forked at a generated step, on the file, mode and attribute maps, each equal after every step
+  to a reference that copies key by key, the originals unchanged by the fork's copies, every node and block freed at
+  the end; its census requires copies that grafted, copies into their own source, both refusals and forks). Evidence
+  (the Mac Studio, kiln, 2026-11-19 02:49 UTC, load 27, debug): red with both copies returning nothing, the four new
+  tests failed and the two older `dims` tests passed; green, `cargo test --locked -p slates-merge --lib dims::` 6 of
+  6 and the crate's whole `--lib` 26 of 26. Until part 2 calls them, the copies are reached only from tests, which the
+  module states as a dead-code expectation that fails once part 2 calls them.
+- **Copy, part 2, owed: the engine's operation.** `OpKind::Copy`, appended as wire value 16, its source in `src` as a
+  rename's is; applied by `copy_tree` in every map; judged node-exclusively (a destination present, or changed since the
+  base, conflicts). The one history rule (A-534) reads a key with no history as present since version 0, which a
+  grafted key is not, so the copy is recorded as one entry for the destination's prefix: an appearance record (the
+  prefix, the version, the source and its version), one change-index entry and one `last_changed` entry for the prefix;
+  a key's reader takes the latest appearance above it after its own last entry as its first value, and a key's first
+  change after an appearance records, at the appearance's version, the value it held. Found while reading the engine,
+  for part 2 to settle: the identity's set hash (A-202) folds each changed key's entry, and a graft brings a whole
+  subtree's entries under new names, so either the identity's next read pays the subtree once, or entries are hashed
+  relative to their nearest copy so a graft moves a subtree's sum in one step; a copied hard link's reverse map
+  (`links_to`) gains the copy's links, one per link, so a source holding hard links is either refused (Subversion has
+  none) or paid per link; and the root's copy (Subversion's copy of `/`) is not one prefix in the attribute map.
 - **Tests** (`node_exclusive_tests.rs`, a module of the engine). Seven cases, each running one work plain and
   node-exclusive against the same change since its base (§4.16 accepts the plain one, the flag refuses it): an
   identical overwrite, a disjoint one, a property change against a text change, an identical addition, a move whose
@@ -38180,12 +38223,26 @@ entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `cr
   `cargo fmt --check` clean; `slates-machine --lib memory_pressure` 1 of 1 (the dispatch source opens and drops on
   macOS); `slates-server --lib -- pressure:: purge_round_tests nfs_state:: deadlines:: reap:: remote_attach:: landing::
   config::` 39 of 39, the fall held back 1.9 ms after it and the refused purge sent again 1.0013 s after its round.
-- **Left for the next piece, in order.** Base hints with their delegation drain, the idle seal, the huge-page re-arm;
-  then the reap loop and its tick are deleted, and §4.7's status says so.
+- **The huge-page re-arm (job 5).** A decline of a huge-page placement likely to hold (§4.6, the backed route's L1,
+  A-193) is remembered so the next ranges are served unplaced without asking, and the shard's deadline keeper re-arms
+  it a retry window after the decline: `ShardsBackings::place` remembers it (`remember_decline`) and notes it
+  (`take_declined`, read as each state borrow closes), the keeper sleeps to `ShardState::placement_rearm_at`, and
+  nothing wakes while no decline is held. The reap loop's tick re-armed at its looks whatever their phase, so a decline
+  just before a look was asked again at once, before the host could have freed anything. Test:
+  `crates/server/src/deadlines.rs` `a_declined_placement_is_asked_again_a_window_after_the_decline` (past the tick's
+  first look: re-armed no sooner than a window after the decline and within half a window more). macOS never declines
+  (the collapse is Linux's), so the test drives the decline the product remembers; it cannot run on main's code,
+  which has no way to remember one, so its red is by mutation (the keeper's re-arm removed, the tick's put back). The
+  Mac Studio (2026-11-19 18:44 local, load 22, debug): red by that mutation, re-armed 484 ms after the decline at the
+  tick's next look; green on a36c98b, `cargo fmt --check` clean and `slates-server --lib -- deadlines:: pressure::
+  purge_round_tests reap::` 14 of 14, re-armed 1.006 s after the decline.
+- **Left, in order.** Base hints with their delegation drain, the idle seal; then the reap loop and its tick are
+  deleted, and §4.7's status says so.
 
 Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper series' line), `unsafe-budget.toml`,
 `xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
-`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.
+`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`,
+`crates/vfs/src/shards_backing.rs`, CLAUDE.md (the huge-page re-arm's canonical example).
 
 ### A-567 — A mount taken over from a daemon that died adopts each file its kernel held from before the successor's first journal record, so a replayed write's bytes are stale, never taken as fresh (2026-11-19, goal 85 B8 via g083; §4.6 "Cache posture", the dirty-page write-back rule; A-61, A-63, A-147, A-152, A-158, A-192, A-231)
 
