@@ -3473,8 +3473,9 @@ impl Green {
       self.push_content(path, version, None);
     }
     for (path, bytes, ops, renamed) in set_content {
-      // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already.
-      if renamed && self.content.contains_key(&path) {
+      // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already. A file
+      // this version's own copy brought and its increment edited (A-586) was no other file: nothing was removed.
+      if renamed && self.content.contains_key(&path) && !self.copied_in(&path, version) {
         self.file_removed.insert(path.clone(), version);
       }
       // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the

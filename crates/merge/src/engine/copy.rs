@@ -284,6 +284,14 @@ impl Green {
       .map_or(own, |(_, record)| own.max(record.version))
   }
 
+  /// Whether the latest copy above `path` was made at `version`: what the path holds then is that copy's, edited by its
+  /// own increment at most.
+  pub(super) fn copied_in(&self, path: &str, version: u64) -> bool {
+    self
+      .copy_above(path)
+      .is_some_and(|(_, record)| record.version == version)
+  }
+
   /// Whether a copy above `path` replaced its tree after `base` (module docs): an edit declared against `base` meets
   /// bytes the copy brought whole.
   pub(super) fn replaced_after(&self, path: &str, base: u64) -> bool {

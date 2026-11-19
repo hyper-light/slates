@@ -41262,6 +41262,11 @@ unknown).
   path's own content history. A path that holds a copy's value now reads, from the copy's version on, as a path with no
   history, so a comment on a copied file moves with it. Before, the path's history, which ends in an older file's
   removal, refused it as no file. A comment on that older file is still outdated by the removal.
+- **With A-612's removals**, which also landed beside this: the verdict keeps both rules, a file removed after the
+  base (`file_removed`) and a copy above the path made after it, each a delete/modify conflict. A-612 records a rename
+  onto a file as that file's removal, and a copy's own increment records its edits beneath it as a rename's edited
+  destination is, so a file the version's own copy brought and its increment edited records none (`Green::copied_in`):
+  it replaced no file.
 - **A branch made before a copy** (`Lineage::branch` at a version below one) cuts the copy's tree from its maps first, by
   `Ptrie::cut`, a graft's inverse: one descent, the prefix's path copied, the subtree unlinked whole, O(the prefix's
   length). It takes the copy's entry out of its identity and puts back the entry the copy gave each key that changed
@@ -41294,6 +41299,7 @@ unknown).
   - An edit declared before a replacing copy conflicts.
   - Branches before and after a copy hash as greens that applied the same versions.
   - A review comment on a copied file moves with it (A-596), red first on the merged tree.
+  - A file a copy brought and its own increment edited records no removal (A-612), live and replayed, red first.
   - A green with a copy is not checkpointed from the copy's version; a rebase of a copy is refused.
   - The oracle: generated histories on a green and on a reference green that makes each copy key by key through the
     engine's plain operations. The two decide every copy alike and read alike at every version, their change indexes
