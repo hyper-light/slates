@@ -37,17 +37,24 @@
 //! of that one change (a namespace operation, a member's version recorded alone, a member's destroy), so the position
 //! counts every change and one position names one state of the repository. The register is created with its
 //! repository, carried whole by a partition snapshot, and goes with its repository.
+//!
+//! **The policy (A-622).** A repository's policy, its rules by name pattern and its hooks (§4.17.1 "Policy"), is part
+//! of its record: empty at creation, set whole by `Op::RepositoryPolicySet` from the version its setter read (`policy`
+//! keeps what the log must never record of one), an entry of its register of that one change. Its rules' and hooks'
+//! encoded bytes are charged to the partition's merge budget, as the register's state is, and given back when it is
+//! replaced or its repository leaves.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
   BranchRecord, MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
-  RepositoryRecord, StateChange, VolumeId,
+  RepositoryPolicy, RepositoryRecord, StateChange, VolumeId,
 };
 use crate::error::DbError;
 use crate::op::Op;
 
 mod entry;
+mod policy;
 
 pub use entry::StateBytes;
 
@@ -385,13 +392,19 @@ impl Repositories {
       .map(|(repository, register)| register.record(*repository))
   }
 
-  /// The bytes the repositories' own state holds, as the partition's merge budget charged them (A-603).
+  /// The bytes the repositories' own state holds, as the partition's merge budget charged them: their registers' state
+  /// (A-603) and their policies' rules and hooks (A-622).
   pub fn state_bytes(&self) -> usize {
-    self
+    let registers = self
       .registers
       .values()
       .map(Register::bytes)
-      .fold(0, usize::saturating_add)
+      .fold(0, usize::saturating_add);
+    self
+      .records
+      .values()
+      .map(|record| policy::bytes(&record.policy))
+      .fold(registers, usize::saturating_add)
   }
 
   /// What an entry the guard admitted adds to the merge budget and gives back of it: its versions' chain entries and
@@ -427,6 +440,7 @@ impl Repositories {
         .ok_or(DbError::NotFound),
       Op::RepositoryGreenJoined { record } => self.check_joined(record, held),
       Op::RepositoryAdvanced { entry } => entry::check(self, entry, held, head),
+      Op::RepositoryPolicySet { repository, policy } => self.check_policy(*repository, policy),
       _ => Ok(()),
     }
   }
@@ -498,7 +512,33 @@ impl Repositories {
         table: "repositories",
       });
     }
+    // A repository starts with no policy, version 0: only its own setting gives it one (A-622).
+    if record.policy != RepositoryPolicy::default() {
+      return Err(DbError::PolicyChanged { current: 0 });
+    }
     Ok(())
+  }
+
+  /// A policy set whole on a repository that exists, as the version after its current one, each rule naming what the
+  /// repository's tool has and each hook at one of the tool's points (A-622, `policy`).
+  fn check_policy(&self, repository: RepositoryId, policy: &RepositoryPolicy) -> Result<(), DbError> {
+    let record = self.repository(repository).ok_or(DbError::NotFound)?;
+    let current = record.policy.version;
+    if current.checked_add(1) != Some(policy.version) {
+      return Err(DbError::PolicyChanged { current });
+    }
+    policy::check(record.tool, policy)
+  }
+
+  /// What setting `policy` on `repository` adds to the merge budget and gives back of it: its rules' and hooks' bytes,
+  /// against those of the policy it replaces (A-622). Nothing for a repository that is not here.
+  pub fn policy_bytes(&self, repository: RepositoryId, policy: &RepositoryPolicy) -> StateBytes {
+    StateBytes {
+      added: policy::bytes(policy),
+      released: self
+        .repository(repository)
+        .map_or(0, |record| policy::bytes(&record.policy)),
+    }
   }
 
   /// A branch binds a green of its repository's partition that no name binds yet, under a name the repository does not
@@ -574,6 +614,16 @@ impl Repositories {
         Ok(StateBytes::default())
       }
       Op::RepositoryAdvanced { entry } => self.apply_entry(entry),
+      Op::RepositoryPolicySet { repository, policy } => {
+        let record = self.records.get_mut(repository).ok_or(DbError::NotFound)?;
+        let bytes = StateBytes {
+          added: policy::bytes(policy),
+          released: policy::bytes(&record.policy),
+        };
+        record.policy = policy.clone();
+        self.advance(*repository);
+        Ok(bytes)
+      }
       Op::RepositoryDestroyed { repository } => {
         let record = self.records.remove(repository).ok_or(DbError::NotFound)?;
         self.by_name.remove(&record.name);
@@ -588,11 +638,12 @@ impl Repositories {
             self.bound.remove(&green);
           }
         }
-        // The register goes with its repository, and gives back what its state held.
+        // The register goes with its repository, and gives back what its state held, as its policy does (A-622).
         let released = self
           .registers
           .remove(repository)
-          .map_or(0, |register| register.bytes());
+          .map_or(0, |register| register.bytes())
+          .saturating_add(policy::bytes(&record.policy));
         Ok(StateBytes { added: 0, released })
       }
       _ => Ok(StateBytes::default()),
@@ -818,6 +869,7 @@ mod tests {
       format: ObjectFormat::Sha1,
       default_branch: None,
       owner: owner(),
+      policy: crate::catalog::RepositoryPolicy::default(),
     }
   }
 
@@ -1568,5 +1620,149 @@ mod tests {
         prop_assert_eq!(answers(&rebuilt), answers(&partition));
       }
     }
+  }
+
+  /// A rule allowing everyone to submit to refs matching `pattern`.
+  fn ref_rule(pattern: &str) -> crate::catalog::PolicyRule {
+    crate::catalog::PolicyRule {
+      names: crate::catalog::PolicyNames::Refs,
+      pattern: pattern.to_owned(),
+      right: crate::catalog::PolicyRight::Submit,
+      effect: crate::catalog::PolicyEffect::Allow,
+      who: crate::catalog::PolicyWho::Anyone,
+    }
+  }
+
+  /// A policy of `rules`, version `version`, no hooks.
+  fn rules_policy(version: u64, rules: Vec<crate::catalog::PolicyRule>) -> RepositoryPolicy {
+    RepositoryPolicy {
+      version,
+      rules,
+      hooks: Vec::new(),
+    }
+  }
+
+  /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule and a hook; set
+  /// it again from the stale version 0; set one holding a branch rule, which a git repository has not, and one running
+  /// a relative program; create a repository already holding a policy; then rebuild the partition from its snapshot,
+  /// and apart from it replay its recorded operations. Expect: the record holds the policy at version 1 and the register
+  /// moved one position; the stale setting is refused naming version 1, the malformed ones by kind and index, the create
+  /// naming version 0, none of them changing anything; the rebuilt and the replayed partitions answer as the live one.
+  #[test]
+  fn a_policy_is_set_whole_from_the_version_read_and_kept_by_a_snapshot_and_a_replay() {
+    let mut partition = Partition::new(caps(), 0);
+    let mut log = Vec::new();
+    let record = repository(9, "linux");
+    let repo = record.id;
+    let created = Op::RepositoryCreated { record };
+    run(&mut partition, &created).unwrap();
+    log.push(created);
+    let position = partition.repositories().position(repo);
+    let mut policy = rules_policy(1, vec![ref_rule("refs/heads/release/*")]);
+    policy.hooks.push(crate::catalog::HookConfig {
+      point: crate::catalog::HookPointName::GitPreReceive,
+      name: "pre-receive".to_owned(),
+      program: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+    });
+    let set = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: policy.clone(),
+    };
+    run(&mut partition, &set).unwrap();
+    log.push(set);
+    assert_eq!(partition.repositories().repository(repo).unwrap().policy, policy);
+    assert_eq!(
+      partition.repositories().position(repo),
+      position.map(|position| position + 1)
+    );
+    let before = answers(&partition);
+    let stale = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: rules_policy(1, Vec::new()),
+    };
+    assert_eq!(run(&mut partition, &stale), Err(DbError::PolicyChanged { current: 1 }));
+    let mut branches = ref_rule("main");
+    branches.names = crate::catalog::PolicyNames::Branches;
+    let wrong_kind = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: rules_policy(2, vec![ref_rule("refs/tags/*"), branches]),
+    };
+    assert_eq!(
+      run(&mut partition, &wrong_kind),
+      Err(DbError::PolicyRuleMalformed { index: 1 })
+    );
+    let mut relative = rules_policy(2, Vec::new());
+    relative.hooks.push(crate::catalog::HookConfig {
+      point: crate::catalog::HookPointName::GitUpdate,
+      name: "update".to_owned(),
+      program: "hooks/update".to_owned(),
+    });
+    assert_eq!(
+      run(
+        &mut partition,
+        &Op::RepositoryPolicySet {
+          repository: repo,
+          policy: relative,
+        }
+      ),
+      Err(DbError::PolicyHookMalformed { index: 0 })
+    );
+    let mut holding = repository(10, "holding");
+    holding.policy = rules_policy(1, Vec::new());
+    assert_eq!(
+      run(&mut partition, &Op::RepositoryCreated { record: holding }),
+      Err(DbError::PolicyChanged { current: 0 })
+    );
+    assert_eq!(answers(&partition), before, "a refused setting changes nothing");
+    let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    assert_eq!(answers(&rebuilt), answers(&partition));
+    assert_eq!(rebuilt.repositories().position(repo), partition.repositories().position(repo));
+    let mut replayed = Partition::new(caps(), 0);
+    for op in &log {
+      replayed.apply(op).unwrap();
+    }
+    assert_eq!(answers(&replayed), answers(&partition));
+  }
+
+  /// A-622 (the merge budget, by use). Do: under a merge budget of four rules' bytes, set a three-rule policy on one
+  /// repository; replace it with another three-rule policy; set a two-rule policy on a second repository, on the live
+  /// partition and on one rebuilt from its snapshot; destroy the first repository and set it again on the second.
+  /// Expect: the replacement fits, since the policy it replaces is given back; the second repository's policy is
+  /// refused `Capacity` on both partitions, so the rebuilt one charges the first repository's policy as the live one
+  /// does; and once the first repository has left, its policy's bytes are back and the second's fits.
+  #[test]
+  fn a_policys_bytes_are_charged_given_back_and_charged_again_after_a_snapshot() {
+    let one = slates_wire::Wire::to_bytes(&ref_rule("refs/heads/r0")).len();
+    let budget = PartitionCaps {
+      green_chain_bytes: 4 * one,
+      ..caps()
+    };
+    let rules = |names: &[&str]| names.iter().map(|name| ref_rule(name)).collect::<Vec<_>>();
+    let mut partition = Partition::new(budget, 0);
+    let first = repository(9, "first");
+    let second = repository(10, "second");
+    let (first_id, second_id) = (first.id, second.id);
+    run(&mut partition, &Op::RepositoryCreated { record: first }).unwrap();
+    run(&mut partition, &Op::RepositoryCreated { record: second }).unwrap();
+    let set = |repository, policy| Op::RepositoryPolicySet { repository, policy };
+    run(
+      &mut partition,
+      &set(first_id, rules_policy(1, rules(&["refs/heads/r0", "refs/heads/r1", "refs/heads/r2"]))),
+    )
+    .unwrap();
+    run(
+      &mut partition,
+      &set(first_id, rules_policy(2, rules(&["refs/heads/r3", "refs/heads/r4", "refs/heads/r5"]))),
+    )
+    .expect("a replacement gives back the policy it replaces");
+    let crowded = set(second_id, rules_policy(1, rules(&["refs/heads/r6", "refs/heads/r7"])));
+    let full = Err(DbError::Capacity {
+      table: "green_chains",
+    });
+    assert_eq!(run(&mut partition, &crowded), full);
+    let mut rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), budget, 0).unwrap();
+    assert_eq!(run(&mut rebuilt, &crowded), full, "the rebuilt partition charges the first policy");
+    run(&mut rebuilt, &Op::RepositoryDestroyed { repository: first_id }).unwrap();
+    run(&mut rebuilt, &crowded).expect("a destroyed repository gives its policy's bytes back");
   }
 }

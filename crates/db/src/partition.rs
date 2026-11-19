@@ -1530,6 +1530,18 @@ impl Partition {
         let bytes = crate::repository::Repositories::entry_bytes(entry);
         self.merge_bytes_fit(bytes.released, bytes.added)
       }
+      // A repository's policy, set whole (A-622): `crate::repository`; its rules and hooks fit the merge byte budget,
+      // the policy it replaces given back.
+      Op::RepositoryPolicySet { repository, policy } => {
+        self.repositories.check(
+          op,
+          self.caps.volumes,
+          |id| self.held(id),
+          |green| self.green_head(green),
+        )?;
+        let bytes = self.repositories.policy_bytes(*repository, policy);
+        self.merge_bytes_fit(bytes.released, bytes.added)
+      }
       // A review record keeps §4.17.1's rules (A-596): `crate::review`; its bytes fit the merge byte budget.
       Op::ReviewCommented { .. }
       | Op::ReviewCommentMoved { .. }
@@ -2022,7 +2034,8 @@ impl Partition {
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryGreenJoined { .. }
-      | Op::RepositoryAdvanced { .. } => self.apply_repository(op),
+      | Op::RepositoryAdvanced { .. }
+      | Op::RepositoryPolicySet { .. } => self.apply_repository(op),
       // A destroyed repository's review records leave with it, their bytes back to the merge budget (A-596), as its
       // register's state does (A-603).
       Op::RepositoryDestroyed { repository } => {
