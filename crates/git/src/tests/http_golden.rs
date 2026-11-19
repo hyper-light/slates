@@ -122,7 +122,10 @@ fn unframe(framing: Framing, pieces: &[&[u8]]) -> (Vec<u8>, usize) {
     let mut at = 0;
     loop {
       match reader.step(&piece[at..], &mut admission).unwrap() {
-        Step::Data { data: run, consumed } => {
+        Step::Data {
+          data: run,
+          consumed,
+        } => {
           data.extend_from_slice(run);
           at += consumed;
         }
@@ -173,12 +176,42 @@ fn every_request_git_sent_reads_and_routes_as_git_meant_it() {
     version,
   };
   let cases: [(u32, Route, Framing, Coding); 12] = [
-    (1, advertise("small.git", Service::UploadPack, Version::V0), Framing::None, Coding::Identity),
-    (2, advertise("small.git", Service::UploadPack, Version::V1), Framing::None, Coding::Identity),
-    (3, advertise("small.git", Service::UploadPack, Version::V2), Framing::None, Coding::Identity),
-    (4, serve("small.git", Version::V2), Framing::Length(182), Coding::Identity),
-    (5, serve("small.git", Version::V2), Framing::Length(895), Coding::Gzip),
-    (6, advertise("small.git", Service::ReceivePack, Version::V0), Framing::None, Coding::Identity),
+    (
+      1,
+      advertise("small.git", Service::UploadPack, Version::V0),
+      Framing::None,
+      Coding::Identity,
+    ),
+    (
+      2,
+      advertise("small.git", Service::UploadPack, Version::V1),
+      Framing::None,
+      Coding::Identity,
+    ),
+    (
+      3,
+      advertise("small.git", Service::UploadPack, Version::V2),
+      Framing::None,
+      Coding::Identity,
+    ),
+    (
+      4,
+      serve("small.git", Version::V2),
+      Framing::Length(182),
+      Coding::Identity,
+    ),
+    (
+      5,
+      serve("small.git", Version::V2),
+      Framing::Length(895),
+      Coding::Gzip,
+    ),
+    (
+      6,
+      advertise("small.git", Service::ReceivePack, Version::V0),
+      Framing::None,
+      Coding::Identity,
+    ),
     (
       7,
       Route::Serve {
@@ -189,22 +222,59 @@ fn every_request_git_sent_reads_and_routes_as_git_meant_it() {
       Framing::Length(360),
       Coding::Identity,
     ),
-    (8, advertise("many.git", Service::UploadPack, Version::V2), Framing::None, Coding::Identity),
-    (9, serve("many.git", Version::V0), Framing::Length(4), Coding::Identity),
-    (10, serve("many.git", Version::V2), Framing::Chunked, Coding::Identity),
-    (11, serve("many.git", Version::V0), Framing::Length(4), Coding::Identity),
-    (12, serve("many.git", Version::V2), Framing::Chunked, Coding::Identity),
+    (
+      8,
+      advertise("many.git", Service::UploadPack, Version::V2),
+      Framing::None,
+      Coding::Identity,
+    ),
+    (
+      9,
+      serve("many.git", Version::V0),
+      Framing::Length(4),
+      Coding::Identity,
+    ),
+    (
+      10,
+      serve("many.git", Version::V2),
+      Framing::Chunked,
+      Coding::Identity,
+    ),
+    (
+      11,
+      serve("many.git", Version::V0),
+      Framing::Length(4),
+      Coding::Identity,
+    ),
+    (
+      12,
+      serve("many.git", Version::V2),
+      Framing::Chunked,
+      Coding::Identity,
+    ),
   ];
   for (number, expected, framing, coding) in cases {
     let head = request(number);
-    assert_eq!((head.version, head.framing, head.coding), (HttpVersion::Http11, framing, coding), "exchange {number}");
+    assert_eq!(
+      (head.version, head.framing, head.coding),
+      (HttpVersion::Http11, framing, coding),
+      "exchange {number}"
+    );
     assert!(head.keep_alive, "exchange {number}");
-    assert_eq!(route(&head, &mut slates_http::Admission::new(ROOM)), Ok(expected), "exchange {number}");
+    assert_eq!(
+      route(&head, &mut slates_http::Admission::new(ROOM)),
+      Ok(expected),
+      "exchange {number}"
+    );
     let bytes = part(number, "request-head.bin");
     let mut reader = HeadReader::new();
     let mut admission = slates_http::Admission::new(ROOM);
     for cut in 0..bytes.len() {
-      assert_eq!(reader.read(&bytes[..cut], &mut admission), Ok(Progress::Partial), "exchange {number} cut {cut}");
+      assert_eq!(
+        reader.read(&bytes[..cut], &mut admission),
+        Ok(Progress::Partial),
+        "exchange {number} cut {cut}"
+      );
     }
     let Ok(Progress::Complete { value, .. }) = reader.read(bytes, &mut admission) else {
       panic!("exchange {number} did not complete a byte at a time");
@@ -221,8 +291,15 @@ fn every_body_git_sent_reads_back_as_git_wrote_it() {
   for (number, length) in [(4, 182), (9, 4), (11, 4)] {
     let body = part(number, "request-body.bin");
     assert_eq!(body.len(), length);
-    assert_eq!(unframe(Framing::Length(crate::to_u64(length)), &[body]), (body.to_vec(), length));
-    assert_eq!(packets(body).last(), Some(&Packet::Flush), "exchange {number}");
+    assert_eq!(
+      unframe(Framing::Length(crate::to_u64(length)), &[body]),
+      (body.to_vec(), length)
+    );
+    assert_eq!(
+      packets(body).last(),
+      Some(&Packet::Flush),
+      "exchange {number}"
+    );
   }
   assert_eq!(packets(part(9, "request-body.bin")), vec![Packet::Flush]);
   for number in [10, 12] {
@@ -232,7 +309,11 @@ fn every_body_git_sent_reads_back_as_git_wrote_it() {
     assert_eq!(taken, raw.len(), "exchange {number}");
     assert_eq!(sha256(&data), recorded.trim_end(), "exchange {number}");
     let bytes: Vec<&[u8]> = raw.chunks(1).collect();
-    assert_eq!(unframe(Framing::Chunked, &bytes), (data.clone(), raw.len()), "exchange {number}");
+    assert_eq!(
+      unframe(Framing::Chunked, &bytes),
+      (data.clone(), raw.len()),
+      "exchange {number}"
+    );
     let lines = packets(&data);
     assert_eq!(lines.last(), Some(&Packet::Flush), "exchange {number}");
     if number == 12 {
@@ -284,7 +365,11 @@ fn every_reply_head_is_written_as_http_backend_wrote_it() {
     expected.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
     let mut ours = Vec::new();
     reply_head(reply, HttpVersion::Http11, true, &mut ours).unwrap();
-    assert_eq!(String::from_utf8(ours).unwrap(), String::from_utf8(expected).unwrap(), "exchange {number}");
+    assert_eq!(
+      String::from_utf8(ours).unwrap(),
+      String::from_utf8(expected).unwrap(),
+      "exchange {number}"
+    );
   }
 }
 
@@ -304,8 +389,14 @@ fn every_advertisement_starts_as_http_backend_started_it() {
     let mut prelude = Vec::new();
     advertisement_prelude(service, version, &mut prelude).unwrap();
     assert_eq!(prelude.is_empty(), version == Version::V2);
-    let rest = body.strip_prefix(prelude.as_slice()).unwrap_or_else(|| panic!("exchange {number}"));
+    let rest = body
+      .strip_prefix(prelude.as_slice())
+      .unwrap_or_else(|| panic!("exchange {number}"));
     assert!(rest.starts_with(next), "exchange {number}");
-    assert_eq!(packets(body).last(), Some(&Packet::Flush), "exchange {number}");
+    assert_eq!(
+      packets(body).last(),
+      Some(&Packet::Flush),
+      "exchange {number}"
+    );
   }
 }
