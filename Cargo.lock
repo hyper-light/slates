@@ -1942,6 +1942,7 @@ dependencies = [
  "md-5",
  "proptest",
  "slates-test-seeds",
+ "unicode-normalization",
 ]
 
 [[package]]

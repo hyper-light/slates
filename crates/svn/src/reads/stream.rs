@@ -111,6 +111,7 @@ impl Stream {
       base: session.base,
       uuid: session.uuid,
       authz: session.authz,
+      authentication: session.authentication,
       out,
     };
     match &mut self.rest {

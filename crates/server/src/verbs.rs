@@ -5132,11 +5132,12 @@ fn dispatch_inner(
       rules,
       hooks,
       hooks_env,
+      signers,
     } => crate::repository::set_policy(
       state,
       principal,
       (&repository, read),
-      (&rules, &hooks, &hooks_env),
+      (&rules, &hooks, &hooks_env, &signers),
     ),
     // A Mercurial repository's directory imported into its store, answered when the import ends (A-678).
     RequestBody::ImportRepository { repository, path } => {
