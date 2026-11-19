@@ -232,13 +232,15 @@ fn raw_fields(text: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
   text
     .split(|byte| *byte == FIELD_SEPARATOR)
     .filter(|field| !field.is_empty())
-    .map(|field| match field.iter().position(|byte| *byte == ASSIGN) {
-      Some(at) => (
-        field.get(..at).unwrap_or_default(),
-        field.get(at.saturating_add(1)..).unwrap_or_default(),
-      ),
-      None => (field, &[][..]),
-    })
+    .map(
+      |field| match field.iter().position(|byte| *byte == ASSIGN) {
+        Some(at) => (
+          field.get(..at).unwrap_or_default(),
+          field.get(at.saturating_add(1)..).unwrap_or_default(),
+        ),
+        None => (field, &[][..]),
+      },
+    )
 }
 
 /// A form's decoded bytes and its fields.
@@ -380,7 +382,13 @@ impl<'b> Fields<'b> {
     peak: &mut Admission,
     kept: &mut Admission,
   ) -> Result<Vec<(&'b [u8], &'b [u8])>, Refusal> {
-    let all = || self.query.iter().chain(&self.arguments).map(|(name, _)| *name);
+    let all = || {
+      self
+        .query
+        .iter()
+        .chain(&self.arguments)
+        .map(|(name, _)| *name)
+    };
     let total = all().count();
     peak.charge_items::<(&[u8], usize)>(total)?;
     peak.charge_items::<bool>(total)?;
@@ -565,7 +573,10 @@ mod tests {
   /// mid-field. Expect the command, the named arguments, and the dictionary's entries decoded.
   #[test]
   fn arguments_read_from_numbered_headers_split_anywhere() {
-    let headers: [(&[u8], &[u8]); 2] = [(b"X-hgarg-2", b"wo=deux"), (b"X-hgarg-1", b"four=caf%C3%A9&one=un&t")];
+    let headers: [(&[u8], &[u8]); 2] = [
+      (b"X-hgarg-2", b"wo=deux"),
+      (b"X-hgarg-1", b"four=caf%C3%A9&one=un&t"),
+    ];
     let mut buffer = Vec::new();
     let read = decode(b"cmd=debugwireargs", &headers, b"", &mut buffer).unwrap();
     assert_eq!(read.command(), Some(&b"debugwireargs"[..]));
@@ -618,7 +629,8 @@ mod tests {
   fn requests_mercurial_would_misread_are_refused() {
     let long: [(&[u8], &[u8]); 1] = [(b"X-HgArgs-Post", b"11")];
     let signed: [(&[u8], &[u8]); 1] = [(b"X-HgArgs-Post", b"+1")];
-    let read = |headers: &[(&[u8], &[u8])]| decode(b"", headers, b"0123456789", &mut Vec::new()).map(|_| ());
+    let read =
+      |headers: &[(&[u8], &[u8])]| decode(b"", headers, b"0123456789", &mut Vec::new()).map(|_| ());
     assert_eq!(read(&long), Err(Refusal::PostArguments));
     assert_eq!(read(&signed), Err(Refusal::PostArguments));
     let mut buffer = Vec::new();
@@ -644,7 +656,10 @@ mod tests {
   /// Expect its capabilities, its engines in its order, and `zlib` and `none` for the other.
   #[test]
   fn protocol_capabilities_name_media_types_and_engines() {
-    let headers: [(&[u8], &[u8]); 2] = [(b"X-HgProto-1", b"0.1 0.2 comp=zstd,"), (b"X-HgProto-2", b"zlib,none partial-pull")];
+    let headers: [(&[u8], &[u8]); 2] = [
+      (b"X-HgProto-1", b"0.1 0.2 comp=zstd,"),
+      (b"X-HgProto-2", b"zlib,none partial-pull"),
+    ];
     let request = Request {
       query: b"",
       headers: &headers,
@@ -652,8 +667,19 @@ mod tests {
     };
     let caps = protocol_caps(&request, &mut room()).unwrap();
     assert!(caps.has(b"0.2") && caps.has(b"partial-pull") && !caps.has(b"0.3"));
-    assert_eq!(caps.engines().collect::<Vec<_>>(), [&b"zstd"[..], b"zlib", b"none"]);
-    let bare = protocol_caps(&Request { query: b"", headers: &[], body: b"" }, &mut room()).unwrap();
+    assert_eq!(
+      caps.engines().collect::<Vec<_>>(),
+      [&b"zstd"[..], b"zlib", b"none"]
+    );
+    let bare = protocol_caps(
+      &Request {
+        query: b"",
+        headers: &[],
+        body: b"",
+      },
+      &mut room(),
+    )
+    .unwrap();
     assert_eq!(bare.engines().collect::<Vec<_>>(), [&b"zlib"[..], b"none"]);
   }
 
@@ -670,8 +696,14 @@ mod tests {
     for broken in [&b""[..], b"\x00none", b"\x09zstd"] {
       assert_eq!(decode_v2(broken), Err(Refusal::MediaHeader));
     }
-    assert_eq!(encode_v2_header(b"", &mut Vec::new()), Err(EncodeRefusal::EngineName));
-    assert_eq!(encode_v2_header(&[b'z'; 256], &mut Vec::new()), Err(EncodeRefusal::EngineName));
+    assert_eq!(
+      encode_v2_header(b"", &mut Vec::new()),
+      Err(EncodeRefusal::EngineName)
+    );
+    assert_eq!(
+      encode_v2_header(&[b'z'; 256], &mut Vec::new()),
+      Err(EncodeRefusal::EngineName)
+    );
   }
 
   /// A-569: do write a push's answers without bundle2 and split arguments into headers at 7.2's default limit. Expect
@@ -686,15 +718,25 @@ mod tests {
     encode_push_error(b"push failed", &mut refused);
     assert_eq!(refused, b"0\npush failed\n");
     let value = vec![b'a'; 2020];
-    let sizes: Vec<usize> = header_values(&value, ARGUMENT_HEADER, 1024).unwrap().map(<[u8]>::len).collect();
+    let sizes: Vec<usize> = header_values(&value, ARGUMENT_HEADER, 1024)
+      .unwrap()
+      .map(<[u8]>::len)
+      .collect();
     assert_eq!(sizes, [1009, 1009, 2]);
-    assert_eq!(header_values(&value, ARGUMENT_HEADER, 15).err(), Some(EncodeRefusal::HeaderLimit));
+    assert_eq!(
+      header_values(&value, ARGUMENT_HEADER, 15).err(),
+      Some(EncodeRefusal::HeaderLimit)
+    );
   }
 
   /// Generated fields: lower-case names, any values.
   fn arbitrary_fields() -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
-    proptest::collection::btree_map("[a-z]{1,6}", proptest::collection::vec(any::<u8>(), 0..12), 0..6)
-      .prop_map(|map| map.into_iter().collect())
+    proptest::collection::btree_map(
+      "[a-z]{1,6}",
+      proptest::collection::vec(any::<u8>(), 0..12),
+      0..6,
+    )
+    .prop_map(|map| map.into_iter().collect())
   }
 
   proptest! {

@@ -151,7 +151,10 @@ pub fn arguments<'a>(
 
 /// One chunk of `unbundle`'s input, `<length>\n<data>`: `Done(Some(data), consumed)`, or `Done(None, consumed)` for
 /// the `0\n` that ends the input. A length past what `admission` leaves the caller is refused.
-pub fn chunk<'a>(input: &'a [u8], admission: &Admission) -> Result<Read<Option<&'a [u8]>>, Refusal> {
+pub fn chunk<'a>(
+  input: &'a [u8],
+  admission: &Admission,
+) -> Result<Read<Option<&'a [u8]>>, Refusal> {
   let room = admission.left();
   let (size, used) = match length_line(input, room, "chunk length")? {
     Read::Done(size, used) => (size, used),
@@ -346,15 +349,16 @@ fn header<'a>(
     }
   };
   let refusal = Refusal::ArgumentLine { at: to_u64(at) };
-  let space = text
-    .iter()
-    .position(|byte| *byte == SPACE)
-    .ok_or(refusal)?;
+  let space = text.iter().position(|byte| *byte == SPACE).ok_or(refusal)?;
   let name = text.get(..space).unwrap_or_default();
   if name.is_empty() || name.iter().any(|byte| WHITESPACE.contains(byte)) {
     return Err(refusal);
   }
-  let number = length(text.get(space.saturating_add(1)..).unwrap_or_default(), what, at)?;
+  let number = length(
+    text.get(space.saturating_add(1)..).unwrap_or_default(),
+    what,
+    at,
+  )?;
   Ok(Read::Done((name, number), at.saturating_add(used)))
 }
 
@@ -670,10 +674,16 @@ mod tests {
     respond(b"capabilities: lookup", &mut out);
     assert_eq!(out, b"20\ncapabilities: lookup");
     assert_eq!(respond_len(b"capabilities: lookup"), 23);
-    assert_eq!(string(&out, &room()), Ok(Read::Done(&b"capabilities: lookup"[..], 23)));
+    assert_eq!(
+      string(&out, &room()),
+      Ok(Read::Done(&b"capabilities: lookup"[..], 23))
+    );
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     respond_error(b"bundle2 required", &mut stdout, &mut stderr);
-    assert_eq!((stdout, stderr), (b"\n".to_vec(), b"bundle2 required\n-\n".to_vec()));
+    assert_eq!(
+      (stdout, stderr),
+      (b"\n".to_vec(), b"bundle2 required\n-\n".to_vec())
+    );
     let mut push = Vec::new();
     respond_push(-1, &mut push);
     assert_eq!(push, b"0\n2\n-1");
@@ -681,8 +691,12 @@ mod tests {
 
   /// A generated argument: a lower-case name and any bytes.
   fn arbitrary_arguments() -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
-    proptest::collection::btree_map("[a-z]{1,8}", proptest::collection::vec(any::<u8>(), 0..16), 0..5)
-      .prop_map(|map| map.into_iter().collect())
+    proptest::collection::btree_map(
+      "[a-z]{1,8}",
+      proptest::collection::vec(any::<u8>(), 0..16),
+      0..5,
+    )
+    .prop_map(|map| map.into_iter().collect())
   }
 
   proptest! {

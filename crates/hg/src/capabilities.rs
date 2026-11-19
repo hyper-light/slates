@@ -63,13 +63,15 @@ impl<'a> Capabilities<'a> {
       .line
       .split(|byte| *byte == SEPARATOR)
       .filter(|token| !token.is_empty())
-      .map(|token| match token.iter().position(|byte| *byte == ASSIGN) {
-        Some(at) => (
-          token.get(..at).unwrap_or_default(),
-          token.get(at.saturating_add(1)..),
-        ),
-        None => (token, None),
-      })
+      .map(
+        |token| match token.iter().position(|byte| *byte == ASSIGN) {
+          Some(at) => (
+            token.get(..at).unwrap_or_default(),
+            token.get(at.saturating_add(1)..),
+          ),
+          None => (token, None),
+        },
+      )
   }
 
   /// What 7.2's `capable` answers for `name`: `Some(None)` for a capability without a value, `Some(Some(value))` for
@@ -137,12 +139,10 @@ pub struct Bundle2Capabilities<'b> {
 impl<'b> Bundle2Capabilities<'b> {
   /// Each capability, in the blob's order: its name and its values.
   pub fn iter(&self) -> impl Iterator<Item = (&'b [u8], &[&'b [u8]])> + '_ {
-    self.entries.iter().map(|(name, range)| {
-      (
-        *name,
-        self.values.get(range.clone()).unwrap_or_default(),
-      )
-    })
+    self
+      .entries
+      .iter()
+      .map(|(name, range)| (*name, self.values.get(range.clone()).unwrap_or_default()))
   }
 
   /// The values of `name`; the last if the blob names it twice, as 7.2 keeps it (`caps[key] = vals`).
@@ -243,7 +243,11 @@ pub fn encode_bundle2(capabilities: &[(&[u8], &[&[u8]])], out: &mut Vec<u8>) {
     }
     quote::quote(name, PATH_SAFE, out);
     for (position, value) in values.iter().enumerate() {
-      out.push(if position == 0 { ASSIGN } else { VALUE_SEPARATOR });
+      out.push(if position == 0 {
+        ASSIGN
+      } else {
+        VALUE_SEPARATOR
+      });
       quote::quote(value, PATH_SAFE, out);
     }
   }
@@ -272,8 +276,8 @@ pub fn decode_bundle2_value<'b>(
 #[cfg(test)]
 mod tests {
   use super::{
-    Capabilities, EncodeRefusal, decode, decode_bundle2, decode_bundle2_value, decode_hello, encode,
-    encode_bundle2, encode_bundle2_value, encode_hello,
+    Capabilities, EncodeRefusal, decode, decode_bundle2, decode_bundle2_value, decode_hello,
+    encode, encode_bundle2, encode_bundle2_value, encode_hello,
   };
   use crate::Admission;
   use crate::out::{Measure, Out};
@@ -307,7 +311,11 @@ mod tests {
   #[test]
   fn a_hello_answer_reads_back() {
     let mut line = Vec::new();
-    encode(&[(b"lookup", None), (b"httpheader", Some(b"1024"))], &mut line).unwrap();
+    encode(
+      &[(b"lookup", None), (b"httpheader", Some(b"1024"))],
+      &mut line,
+    )
+    .unwrap();
     assert_eq!(line, b"lookup httpheader=1024");
     let mut hello = Vec::new();
     encode_hello(&line, &mut hello);

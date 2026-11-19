@@ -86,12 +86,18 @@ mod tests {
   #[test]
   fn a_spec_names_its_arguments_and_its_dictionary() {
     let wireargs = Spec(b"one two *");
-    assert_eq!(wireargs.names().collect::<Vec<_>>(), [&b"one"[..], b"two", b"*"]);
+    assert_eq!(
+      wireargs.names().collect::<Vec<_>>(),
+      [&b"one"[..], b"two", b"*"]
+    );
     assert_eq!(wireargs.named().collect::<Vec<_>>(), [&b"one"[..], b"two"]);
     assert!(wireargs.takes_dictionary() && Spec(b"*").takes_dictionary());
     assert!(!Spec(b"").takes_dictionary() && Spec(b"").names().next().is_none());
     assert_eq!(
-      (Spec(b"namespace key old new").longest_name(), Spec(b"").longest_name()),
+      (
+        Spec(b"namespace key old new").longest_name(),
+        Spec(b"").longest_name()
+      ),
       (9, 0)
     );
   }

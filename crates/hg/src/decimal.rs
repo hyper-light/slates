@@ -77,8 +77,14 @@ mod tests {
   #[test]
   fn the_extremes_are_written_whole() {
     assert_eq!(Decimal::unsigned(0).as_bytes(), b"0");
-    assert_eq!(Decimal::unsigned(u64::MAX).as_bytes(), b"18446744073709551615");
-    assert_eq!(Decimal::signed(i64::MIN).as_bytes(), b"-9223372036854775808");
+    assert_eq!(
+      Decimal::unsigned(u64::MAX).as_bytes(),
+      b"18446744073709551615"
+    );
+    assert_eq!(
+      Decimal::signed(i64::MIN).as_bytes(),
+      b"-9223372036854775808"
+    );
     assert_eq!(Decimal::signed(-7).as_bytes(), b"-7");
   }
 
@@ -88,8 +94,10 @@ mod tests {
     /// A-569: do write any signed and any unsigned number. Expect the text Rust's own formatting writes.
     #[test]
     fn every_number_is_written_as_rust_writes_it(signed in any::<i64>(), unsigned in any::<u64>()) {
-      prop_assert_eq!(Decimal::signed(signed).as_bytes(), signed.to_string().as_bytes());
-      prop_assert_eq!(Decimal::unsigned(unsigned).as_bytes(), unsigned.to_string().as_bytes());
+      let (written, expected) = (Decimal::signed(signed), signed.to_string());
+      prop_assert_eq!(written.as_bytes(), expected.as_bytes());
+      let (written, expected) = (Decimal::unsigned(unsigned), unsigned.to_string());
+      prop_assert_eq!(written.as_bytes(), expected.as_bytes());
     }
   }
 }

@@ -355,10 +355,19 @@ mod tests {
       read(b"heads ;known a=b=c", &mut room()),
       Err(Refusal::Argument { call: 1 })
     );
-    assert_eq!(read(b"lookup key=a:x", &mut room()), Err(Refusal::Escape { call: 0 }));
-    assert_eq!(read(b"lookup key=a:", &mut room()), Err(Refusal::Escape { call: 0 }));
+    assert_eq!(
+      read(b"lookup key=a:x", &mut room()),
+      Err(Refusal::Escape { call: 0 })
+    );
+    assert_eq!(
+      read(b"lookup key=a:", &mut room()),
+      Err(Refusal::Escape { call: 0 })
+    );
     let mut small = Admission::new(4);
-    assert!(matches!(read(b"heads ", &mut small), Err(Refusal::PastAdmission(_))));
+    assert!(matches!(
+      read(b"heads ", &mut small),
+      Err(Refusal::PastAdmission(_))
+    ));
     assert_eq!(small.left(), 4);
   }
 
@@ -369,7 +378,10 @@ mod tests {
     let mut out = Vec::new();
     encode_results(&answers, &mut out);
     assert_eq!(out, b"1:s2;;a:cb:oc:ed");
-    assert_eq!(results(&out, &mut room(), &mut Vec::new()).unwrap(), answers);
+    assert_eq!(
+      results(&out, &mut room(), &mut Vec::new()).unwrap(),
+      answers
+    );
   }
 
   proptest! {

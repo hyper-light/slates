@@ -55,7 +55,10 @@ fn chunks(rest: &[u8]) -> (Vec<u8>, usize) {
     input.extend_from_slice(data);
     at += used;
   }
-  assert_eq!(ssh::chunk(&rest[at..], &room()), Ok(ssh::Read::Done(None, 2)));
+  assert_eq!(
+    ssh::chunk(&rest[at..], &room()),
+    Ok(ssh::Read::Done(None, 2))
+  );
   (input, at + 2)
 }
 
@@ -68,11 +71,22 @@ fn requests(capture: &[u8]) -> Vec<Sent<'_>> {
     let Ok(ssh::Read::Done(command, used)) = ssh::command(rest, longest) else {
       panic!("a command line at {at}")
     };
-    let Ok(ssh::Read::Done(arguments, read)) = ssh::arguments(&rest[used..], spec(command), &mut room()) else {
+    let Ok(ssh::Read::Done(arguments, read)) =
+      ssh::arguments(&rest[used..], spec(command), &mut room())
+    else {
       panic!("{} arguments at {at}", String::from_utf8_lossy(command))
     };
-    let (input, taken) = if command == b"unbundle" { chunks(&rest[used + read..]) } else { (Vec::new(), 0) };
-    sent.push(Sent { command, arguments, bytes: &rest[..used + read], input });
+    let (input, taken) = if command == b"unbundle" {
+      chunks(&rest[used + read..])
+    } else {
+      (Vec::new(), 0)
+    };
+    sent.push(Sent {
+      command,
+      arguments,
+      bytes: &rest[..used + read],
+      input,
+    });
     at += used + read + taken;
   }
   sent
@@ -81,8 +95,13 @@ fn requests(capture: &[u8]) -> Vec<Sent<'_>> {
 /// A request written again as 7.2's client writes it.
 fn written(sent: &Sent<'_>) -> Vec<u8> {
   let spec = spec(sent.command);
-  let named: Vec<(&[u8], &[u8])> = spec.named().zip(sent.arguments.named.iter().copied()).collect();
-  let dictionary = spec.takes_dictionary().then_some(sent.arguments.dictionary.as_slice());
+  let named: Vec<(&[u8], &[u8])> = spec
+    .named()
+    .zip(sent.arguments.named.iter().copied())
+    .collect();
+  let dictionary = spec
+    .takes_dictionary()
+    .then_some(sent.arguments.dictionary.as_slice());
   let mut out = Vec::new();
   ssh::encode_request(sent.command, &named, dictionary, &mut out);
   out
@@ -129,17 +148,35 @@ fn an_ssh_clients_requests_read_as_mercurial_wrote_them() {
   let capture = file("ssh-wireargs.client");
   let sent = requests(capture);
   let commands: Vec<&[u8]> = sent.iter().map(|sent| sent.command).collect();
-  assert_eq!(commands, [&b"hello"[..], b"between", b"protocaps", b"debugwireargs", b"debugwireargs"]);
+  assert_eq!(
+    commands,
+    [
+      &b"hello"[..],
+      b"between",
+      b"protocaps",
+      b"debugwireargs",
+      b"debugwireargs"
+    ]
+  );
   let zeros = [b'0'; 40];
-  assert_eq!(sent[1].arguments.named, [[&zeros[..], b"-", &zeros[..]].concat().as_slice()]);
-  assert_eq!(sent[2].arguments.named, [&b"comp=zstd,zlib,none,bzip2 partial-pull"[..]]);
+  assert_eq!(
+    sent[1].arguments.named,
+    [[&zeros[..], b"-", &zeros[..]].concat().as_slice()]
+  );
+  assert_eq!(
+    sent[2].arguments.named,
+    [&b"comp=zstd,zlib,none,bzip2 partial-pull"[..]]
+  );
   let expected = Arguments {
     named: vec![&b"un"[..], &b"deux"[..]],
     dictionary: vec![(&b"three"[..], THREE), (&b"four"[..], FOUR)],
   };
   assert_eq!(sent[3].arguments, expected);
   assert!(sent.iter().all(|sent| written(sent) == sent.bytes));
-  assert_eq!(sent.iter().map(|sent| sent.bytes.len()).sum::<usize>(), capture.len());
+  assert_eq!(
+    sent.iter().map(|sent| sent.bytes.len()).sum::<usize>(),
+    capture.len()
+  );
 }
 
 /// A-569 (golden): do read the server's answers to that session. Expect `hello`'s capabilities line (read and written
@@ -208,13 +245,36 @@ fn an_ssh_pull_batches_discovery_then_takes_a_stream() {
   let mut buffer = Vec::new();
   let calls = batch::calls(cmds, &mut room(), &mut buffer).unwrap();
   let pairs: Vec<Vec<(&[u8], &[u8])>> = calls.iter().map(|call| call.arguments.clone()).collect();
-  let encoded: Vec<(&[u8], &[(&[u8], &[u8])])> = calls.iter().zip(&pairs).map(|(call, pairs)| (call.command, pairs.as_slice())).collect();
+  let encoded: Vec<(&[u8], &[(&[u8], &[u8])])> = calls
+    .iter()
+    .zip(&pairs)
+    .map(|(call, pairs)| (call.command, pairs.as_slice()))
+    .collect();
   let mut again = Vec::new();
   batch::encode_calls(&encoded, &mut again);
   assert_eq!(again, cmds);
-  assert_eq!((calls[0].command, calls[1].arguments[0].0), (&b"heads"[..], &b"nodes"[..]));
-  let keys: Vec<&[u8]> = sent[4].arguments.dictionary.iter().map(|(key, _)| *key).collect();
-  assert_eq!(keys, [&b"bundlecaps"[..], b"common", b"heads", b"cg", b"phases", b"bookmarks", b"listkeys"]);
+  assert_eq!(
+    (calls[0].command, calls[1].arguments[0].0),
+    (&b"heads"[..], &b"nodes"[..])
+  );
+  let keys: Vec<&[u8]> = sent[4]
+    .arguments
+    .dictionary
+    .iter()
+    .map(|(key, _)| *key)
+    .collect();
+  assert_eq!(
+    keys,
+    [
+      &b"bundlecaps"[..],
+      b"common",
+      b"heads",
+      b"cg",
+      b"phases",
+      b"bookmarks",
+      b"listkeys"
+    ]
+  );
   let server = file("ssh-pull.server");
   let (found, used) = answers(server, 4);
   let mut results = Vec::new();
@@ -229,7 +289,10 @@ fn an_ssh_pull_batches_discovery_then_takes_a_stream() {
 #[test]
 fn an_ssh_push_sends_its_bundle_in_chunks() {
   let sent = requests(file("ssh-push.client"));
-  let unbundle = sent.iter().find(|sent| sent.command == b"unbundle").unwrap();
+  let unbundle = sent
+    .iter()
+    .find(|sent| sent.command == b"unbundle")
+    .unwrap();
   assert_eq!(unbundle.arguments.named, [&b"666f726365"[..]]);
   assert!(Bundle2::decode(&unbundle.input, &mut room()).is_ok());
   assert_eq!(sent.last().map(|sent| sent.command), Some(&b"listkeys"[..]));
@@ -240,7 +303,10 @@ fn an_ssh_push_sends_its_bundle_in_chunks() {
   assert!(Bundle2::decode(&server[used..end], &mut room()).is_ok());
   let (last, rest) = answers(&server[end..], 1);
   assert_eq!(end + rest, server.len());
-  assert_eq!(pushkey::listkeys(last[0]).unwrap().collect::<Vec<_>>(), [(&b"publishing"[..], &b"True"[..])]);
+  assert_eq!(
+    pushkey::listkeys(last[0]).unwrap().collect::<Vec<_>>(),
+    [(&b"publishing"[..], &b"True"[..])]
+  );
 }
 
 /// One HTTP request as the capture holds it: its query, its headers and its body.
@@ -252,38 +318,75 @@ struct Raw<'a> {
 
 /// Splits a captured request at its head's end, its request line at `?`, each header line at `: `.
 fn raw(request: &[u8]) -> Raw<'_> {
-  let end = request.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
-  let mut lines = request[..end].split(|byte| *byte == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
-  let target = lines.next().unwrap().split(|byte| *byte == b' ').nth(1).unwrap();
-  let query = target.splitn(2, |byte| *byte == b'?').nth(1).unwrap_or_default();
+  let end = request
+    .windows(4)
+    .position(|window| window == b"\r\n\r\n")
+    .unwrap();
+  let mut lines = request[..end]
+    .split(|byte| *byte == b'\n')
+    .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+  let target = lines
+    .next()
+    .unwrap()
+    .split(|byte| *byte == b' ')
+    .nth(1)
+    .unwrap();
+  let query = target
+    .splitn(2, |byte| *byte == b'?')
+    .nth(1)
+    .unwrap_or_default();
   let headers = lines
     .map(|line| {
       let colon = line.iter().position(|byte| *byte == b':').unwrap();
       (&line[..colon], line[colon + 1..].trim_ascii())
     })
     .collect();
-  Raw { query, headers, body: &request[end + 4..] }
+  Raw {
+    query,
+    headers,
+    body: &request[end + 4..],
+  }
 }
 
 /// A captured exchange's request, response type and response body.
 fn exchange(name: &str, number: u32) -> (Vec<u8>, Vec<u8>, &'static [u8]) {
   let request = file(&format!("{name}.{number:02}.request")).to_vec();
   let head = file(&format!("{name}.{number:02}.response-head"));
-  let content_type = raw(&[head, b"\r\n".as_slice()].concat()).headers.iter().find(|(name, _)| name.eq_ignore_ascii_case(b"content-type")).unwrap().1.to_vec();
-  (request, content_type, file(&format!("{name}.{number:02}.response-body")))
+  let content_type = raw(&[head, b"\r\n".as_slice()].concat())
+    .headers
+    .iter()
+    .find(|(name, _)| name.eq_ignore_ascii_case(b"content-type"))
+    .unwrap()
+    .1
+    .to_vec();
+  (
+    request,
+    content_type,
+    file(&format!("{name}.{number:02}.response-body")),
+  )
 }
 
 /// The arguments of `debugwireargs` as a captured HTTP request carries them, read for its spec.
 fn wireargs(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
   let (request, _, _) = exchange(name, 2);
   let parsed = raw(&request);
-  let request = http::Request { query: parsed.query, headers: &parsed.headers, body: parsed.body };
+  let request = http::Request {
+    query: parsed.query,
+    headers: &parsed.headers,
+    body: parsed.body,
+  };
   let mut buffer = Vec::new();
   let fields = http::fields(&request, &mut room(), &mut buffer).unwrap();
-  let arguments = fields.arguments(spec(b"debugwireargs"), &mut room()).unwrap();
+  let arguments = fields
+    .arguments(spec(b"debugwireargs"), &mut room())
+    .unwrap();
   (
     fields.command().unwrap().to_vec(),
-    arguments.dictionary.iter().map(|(key, value)| (key.to_vec(), value.to_vec())).collect(),
+    arguments
+      .dictionary
+      .iter()
+      .map(|(key, value)| (key.to_vec(), value.to_vec()))
+      .collect(),
     arguments.named.iter().map(|value| value.to_vec()).collect(),
   )
 }
@@ -293,7 +396,10 @@ fn wireargs(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
 /// same dictionary (in 7.2's order: `four`, then `three`) all three ways, the UTF-8 value as sent.
 #[test]
 fn http_arguments_read_alike_in_headers_body_and_query() {
-  let dictionary = vec![(b"four".to_vec(), FOUR.to_vec()), (b"three".to_vec(), THREE.to_vec())];
+  let dictionary = vec![
+    (b"four".to_vec(), FOUR.to_vec()),
+    (b"three".to_vec(), THREE.to_vec()),
+  ];
   for name in ["http-wireargs", "http-postargs", "http-query"] {
     let (command, read, named) = wireargs(name);
     assert_eq!(command, b"debugwireargs", "{name}");
@@ -307,21 +413,46 @@ fn http_arguments_read_alike_in_headers_body_and_query() {
 /// Expect each request's own bytes, and the `X-HgProto` header naming `0.1`, `0.2` and the engines in its order.
 #[test]
 fn http_arguments_write_as_mercurials_client_wrote_them() {
-  let fields: [(&[u8], &[u8]); 4] = [(b"four", FOUR), (b"one", b"un"), (b"three", THREE), (b"two", b"deux")];
+  let fields: [(&[u8], &[u8]); 4] = [
+    (b"four", FOUR),
+    (b"one", b"un"),
+    (b"three", THREE),
+    (b"two", b"deux"),
+  ];
   let mut form = Vec::new();
   http::encode_form(&fields, &mut form);
   let (headers, _, _) = exchange("http-wireargs", 2);
   let parsed = raw(&headers);
-  let values: Vec<&[u8]> = http::header_values(&form, http::ARGUMENT_HEADER, 1024).unwrap().collect();
-  assert_eq!(values, [parsed.headers.iter().find(|(name, _)| *name == b"x-hgarg-1").unwrap().1]);
+  let values: Vec<&[u8]> = http::header_values(&form, http::ARGUMENT_HEADER, 1024)
+    .unwrap()
+    .collect();
+  assert_eq!(
+    values,
+    [parsed
+      .headers
+      .iter()
+      .find(|(name, _)| *name == b"x-hgarg-1")
+      .unwrap()
+      .1]
+  );
   let (post, _, _) = exchange("http-postargs", 2);
   assert_eq!(raw(&post).body, form);
   let (query, _, _) = exchange("http-query", 2);
-  assert_eq!(raw(&query).query, [&b"cmd=debugwireargs&"[..], &form].concat());
-  let request = http::Request { query: parsed.query, headers: &parsed.headers, body: parsed.body };
+  assert_eq!(
+    raw(&query).query,
+    [&b"cmd=debugwireargs&"[..], &form].concat()
+  );
+  let request = http::Request {
+    query: parsed.query,
+    headers: &parsed.headers,
+    body: parsed.body,
+  };
   let caps = http::protocol_caps(&request, &mut room()).unwrap();
   assert!(caps.has(b"0.1") && caps.has(b"0.2") && caps.has(b"partial-pull"));
-  assert_eq!(caps.engines().collect::<Vec<_>>(), [&b"zstd"[..], b"zlib", b"none", b"bzip2"]);
+  assert_eq!(
+    caps.engines().collect::<Vec<_>>(),
+    [&b"zstd"[..], b"zlib", b"none", b"bzip2"]
+  );
 }
 
 /// A-569 (golden): do read the answers of a clone over HTTP. Expect `capabilities` as `0.1` (its line written again to
@@ -334,7 +465,10 @@ fn http_answers_name_their_media_type_and_engine() {
   assert_eq!(caps_line(capabilities::decode(body)), body);
   let (_, compressed_type, compressed) = exchange("http-clone", 3);
   assert_eq!(compressed_type, http::MEDIA_TYPE_V2);
-  assert_eq!(http::decode_v2(compressed).map(|(engine, _)| engine), Ok(&b"zstd"[..]));
+  assert_eq!(
+    http::decode_v2(compressed).map(|(engine, _)| engine),
+    Ok(&b"zstd"[..])
+  );
   let (_, plain_type, plain) = exchange("http-none", 3);
   assert_eq!(plain_type, http::MEDIA_TYPE_V2);
   let (engine, payload) = http::decode_v2(plain).unwrap();
@@ -349,7 +483,11 @@ fn http_answers_name_their_media_type_and_engine() {
 fn an_http_push_carries_its_bundle_and_a_refusal_its_message() {
   let (request, _, _) = exchange("http-push", 7);
   let parsed = raw(&request);
-  let request = http::Request { query: parsed.query, headers: &parsed.headers, body: parsed.body };
+  let request = http::Request {
+    query: parsed.query,
+    headers: &parsed.headers,
+    body: parsed.body,
+  };
   let mut buffer = Vec::new();
   let fields = http::fields(&request, &mut room(), &mut buffer).unwrap();
   assert_eq!(fields.value(b"heads"), Some(&b"666f726365"[..]));
