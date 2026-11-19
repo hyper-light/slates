@@ -18,6 +18,7 @@ use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use super::{Green, Increment, Outcome};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
 use crate::origin::Origin;
+use crate::special::{SpecialKind, SpecialNode};
 use crate::verdict::MergeConflictClass;
 
 /// An increment under construction, laid out as the deriver lays one out.
@@ -105,9 +106,11 @@ const HARDLINK: &str = "h";
 const DIR: &str = "d";
 /// Shape: the attribute the tests set and remove.
 const NAME: &str = "user.k";
+/// Shape: the IPC node (a FIFO) the green holds.
+const SPECIAL: &str = "p";
 
 /// A green of `FILE` (mode 0o644, with `NAME`), `TARGET`, `SYMLINK` and `HARDLINK` to `TARGET`,
-/// and the empty `DIR`.
+/// the empty `DIR` and the FIFO `SPECIAL`.
 fn green() -> Green {
   let mut origin = Origin::default();
   origin.files.push((FILE.to_owned(), b"<f>\n".to_vec()));
@@ -123,6 +126,18 @@ fn green() -> Green {
     .hardlinks
     .push((HARDLINK.to_owned(), TARGET.to_owned()));
   origin.dirs.push(DIR.to_owned());
+  origin.specials.push((
+    SPECIAL.to_owned(),
+    SpecialNode {
+      kind: SpecialKind::Fifo,
+      uid: 1,
+      gid: 1,
+      atime: 1,
+      mtime: 1,
+      ctime: 1,
+      btime: 1,
+    },
+  ));
   Green::with_origin(origin)
 }
 
@@ -712,6 +727,111 @@ fn a_hard_link_to_a_target_removed_after_its_base_conflicts() -> Result<(), Stri
   Ok(())
 }
 
+/// A-646 (A-643's first sibling; POSIX `rename` replaces any destination but a directory). Do:
+/// rename the file, and on other greens the symlink, over an unchanged symlink, hard link or IPC
+/// node, each by a work based at the head. Expect each accepted, the destination holding the
+/// source's node alone and the source's path empty. Before, each was refused `TypeChanged` though
+/// nothing had changed after the base.
+#[test]
+fn a_rename_over_an_unchanged_link_or_ipc_node_replaces_it() -> Result<(), String> {
+  for (source, kind) in [(FILE, Kind::File), (SYMLINK, Kind::Symlink)] {
+    for destination in [SYMLINK, HARDLINK, SPECIAL] {
+      if source == destination {
+        continue;
+      }
+      let mut green = green();
+      let rename = Work::default().naming(OpKind::Rename, destination, source);
+      let answer = green.submit(&rename.at(0, 1));
+      let found = (kinds_at(&green, destination), kinds_at(&green, source));
+      if !matches!(answer, Outcome::Accepted { .. }) || found != (vec![kind], Vec::new()) {
+        return Err(format!(
+          "{source} over {destination}: {answer:?}, {found:?}"
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A-646. Do: remove the symlink and make it again after version 0, then submit works based at 0
+/// renaming the file over it, and over the directory. Expect `TypeChanged` each time and nothing
+/// moved: a link changed after the base, and a directory, are still refused.
+#[test]
+fn a_rename_over_a_link_changed_after_its_base_or_a_directory_is_refused() -> Result<(), String> {
+  let mut green = green();
+  remake(&mut green, SYMLINK, 1)?;
+  for (id, destination) in [(9, SYMLINK), (10, DIR)] {
+    let head = green.head();
+    let answer = green.submit(
+      &Work::default()
+        .naming(OpKind::Rename, destination, FILE)
+        .at(0, id),
+    );
+    let refused = classes_on(&answer, destination) == Some(vec![MergeConflictClass::TypeChanged]);
+    if !refused || green.head() != head || kinds_at(&green, FILE) != vec![Kind::File] {
+      return Err(format!("over {destination}: {answer:?}"));
+    }
+  }
+  Ok(())
+}
+
+/// What a green answers of `TARGET` and the hard links naming it: its kinds and bytes, and the
+/// file `HARDLINK` and `second` name.
+type Names<'a> = (Vec<Kind>, Option<Vec<u8>>, Option<&'a str>, Option<&'a str>);
+
+/// What `green` answers of `TARGET` and the hard links `HARDLINK` and `second`.
+fn names_of(green: &Green) -> Names<'_> {
+  (
+    kinds_at(green, TARGET),
+    green.content(TARGET).map(<[u8]>::to_vec),
+    green.hardlink(HARDLINK),
+    green.hardlink("second"),
+  )
+}
+
+/// A-646 (POSIX `rename` does nothing for two names of one file; A-643 settled a hard link renamed
+/// over the file it names). Do: rename `TARGET` over its hard link `HARDLINK`; and, on another
+/// green with a second hard link to `TARGET`, rename `HARDLINK` over it; each by a work based at
+/// the head. Expect each accepted and nothing changed: the file with its bytes, each link naming
+/// it. Before, each was refused `TypeChanged`.
+#[test]
+fn two_names_of_one_file_renamed_one_over_the_other_change_nothing() -> Result<(), String> {
+  let before = (
+    vec![Kind::File],
+    Some(b"<g>\n".to_vec()),
+    Some(TARGET),
+    None,
+  );
+  let mut over_its_link = green();
+  accept(
+    &mut over_its_link,
+    Work::default().naming(OpKind::Rename, HARDLINK, TARGET),
+    1,
+  )?;
+  if names_of(&over_its_link) != before {
+    return Err(format!(
+      "the file over its link: {:?}",
+      names_of(&over_its_link)
+    ));
+  }
+  let mut over_a_link = green();
+  accept(
+    &mut over_a_link,
+    Work::default().naming(OpKind::Link, "second", TARGET),
+    1,
+  )?;
+  accept(
+    &mut over_a_link,
+    Work::default().naming(OpKind::Rename, "second", HARDLINK),
+    2,
+  )?;
+  let expected = (before.0, before.1, Some(TARGET), Some(TARGET));
+  if names_of(&over_a_link) != expected {
+    return Err(format!("a link over a link: {:?}", names_of(&over_a_link)));
+  }
+  Ok(())
+}
+
 /// Shape: the paths A-643's oracle changes, `FILE`, `TARGET` (the file the links name), the
 /// symlink, the hard link and the directory, each made at the origin as `ORIGINAL` names.
 const PATHS: [&str; 5] = [FILE, TARGET, SYMLINK, HARDLINK, DIR];
@@ -726,13 +846,14 @@ const ORIGINAL: [Kind; 5] = [
 /// Shape: the indices in `PATHS` of the nodes with a mode and attributes, the files and the
 /// directory.
 const WITH_METADATA: [usize; 3] = [0, 1, 4];
-/// Shape: the indices in `PATHS` of the files a new hard link names and a link is renamed over.
+/// Shape: the indices in `PATHS` of the files a new hard link names.
 const LINKABLE: [usize; 2] = [0, 1];
-/// Shape: the indices in `PATHS` of the links a work renames over a file.
-const RENAMEABLE: [usize; 2] = [2, 3];
-/// Shape: the indices in `PATHS` of the hard link and of the file it names, `TARGET`: a rename of
-/// the one over the other changes nothing.
-const SAME_FILE: (usize, usize) = (3, 1);
+/// Shape: the indices in `PATHS` of the nodes a work renames: `FILE` and the two links.
+const RENAMEABLE: [usize; 3] = [0, 2, 3];
+/// Shape: the indices in `PATHS` of the nodes a rename replaces: the files and the two links.
+const REPLACEABLE: [usize; 4] = [0, 1, 2, 3];
+/// Shape: the index in `PATHS` of `TARGET`, the file every hard link of `PATHS` names.
+const LINKED: usize = 1;
 
 /// One generated event of A-643's oracle; an index names a path of `PATHS`, and `back` the
 /// versions behind the head a work is based.
@@ -748,13 +869,14 @@ enum Event {
   Remove(usize, u8),
   /// A work making a new hard link to the file at the path.
   Link(usize, u8),
-  /// A work renaming the link at the first path over the file at the second.
+  /// A work renaming the node at the first path over the node at the second.
   RenameOver(usize, usize, u8),
 }
 
 fn event() -> impl Strategy<Value = Event> {
-  // Shape: twelve selectors weighing the events, and a base up to four versions back.
-  (0u8..12, 0..PATHS.len(), 0u8..5).prop_map(|(selector, which, back)| match selector {
+  // Shape: twelve selectors weighing the events, two paths, and a base up to four versions back.
+  let draw = (0u8..12, 0..PATHS.len(), 0..PATHS.len(), 0u8..5);
+  draw.prop_map(|(selector, which, other, back)| match selector {
     0..2 => Event::Remake(which),
     2..4 => Event::Mode(WITH_METADATA[which % WITH_METADATA.len()]),
     4..5 => Event::Attribute(WITH_METADATA[which % WITH_METADATA.len()]),
@@ -762,7 +884,7 @@ fn event() -> impl Strategy<Value = Event> {
     8..10 => Event::Link(LINKABLE[which % LINKABLE.len()], back),
     _ => Event::RenameOver(
       RENAMEABLE[which % RENAMEABLE.len()],
-      LINKABLE[(which / RENAMEABLE.len()) % LINKABLE.len()],
+      REPLACEABLE[other % REPLACEABLE.len()],
       back,
     ),
   })
@@ -787,8 +909,11 @@ struct Answers {
   over_refused: u64,
   /// A link's rename over the file, accepted: the link replaced the file.
   over_accepted: u64,
-  /// The hard link's rename over the file it names, accepted: nothing changed.
+  /// A rename of two names of one file, one over the other, accepted: nothing changed.
   over_unchanged: u64,
+  /// A rename over a symlink or a hard link the base held unchanged, accepted: the node replaced
+  /// it (A-646).
+  over_link: u64,
 }
 
 impl Answers {
@@ -804,7 +929,7 @@ impl Answers {
   }
 
   /// Every count, in the order the fields name them.
-  fn counts(&self) -> [u64; 9] {
+  fn counts(&self) -> [u64; 10] {
     [
       self.removal_refused,
       self.removal_accepted,
@@ -815,6 +940,7 @@ impl Answers {
       self.over_refused,
       self.over_accepted,
       self.over_unchanged,
+      self.over_link,
     ]
   }
 }
@@ -1033,24 +1159,34 @@ impl Whole {
     Ok(())
   }
 
-  /// The class a rename of the link at `PATHS[index]` over the file at `PATHS[over]`, based at
+  /// The file the node at `PATHS[index]` names now: `TARGET` for a hard link, else its own path.
+  fn file_named(&self, index: usize) -> usize {
+    if self.now(index) == Kind::Hardlink {
+      LINKED
+    } else {
+      index
+    }
+  }
+
+  /// The class a rename of the node at `PATHS[index]` over the node at `PATHS[over]`, based at
   /// `base`, is refused by, or none when it is accepted: `merge_rename`'s rules in its order (the
-  /// source gone or removed after the base; a node other than a file at the destination; the
+  /// source gone or removed after the base; a link at the destination changed after the base; the
   /// destination's bytes changed after the base).
   fn over_answer(&self, (index, over): (usize, usize), base: u64) -> Option<MergeConflictClass> {
     if self.now(index) == Kind::Absent || self.removed[index] > base {
       return Some(MergeConflictClass::RenameRename);
     }
-    if !matches!(self.now(over), Kind::File | Kind::Absent) {
+    let link = matches!(self.now(over), Kind::Symlink | Kind::Hardlink);
+    if link && self.changed[over] > base {
       return Some(MergeConflictClass::TypeChanged);
     }
     (self.bytes_changed[over] > base).then_some(MergeConflictClass::RenameRename)
   }
 
-  /// A work based `back` behind the head renaming the link at `PATHS[index]` over the file at
-  /// `PATHS[over]`, where both stood at that base, the link and a file. The hard link over the file
-  /// it names changes nothing, accepted while the link stands (POSIX `rename`); any other is
-  /// refused as `over_answer` says, or accepted, the link replacing the file (A-643).
+  /// A work based `back` behind the head renaming the node at `PATHS[index]` (a file or a link)
+  /// over the node at `PATHS[over]`, where both stood at that base. Two names of one file change
+  /// nothing (POSIX `rename`); any other rename is refused as `over_answer` says, or accepted, the
+  /// source's node replacing what stood at the destination (A-643, A-646).
   fn rename_over(
     &mut self,
     (index, over): (usize, usize),
@@ -1058,11 +1194,11 @@ impl Whole {
     answers: &mut Answers,
   ) -> Result<(), TestCaseError> {
     let base = self.base(back);
-    let link = ORIGINAL[index];
-    if self.kind(base, index) != link || self.kind(base, over) != Kind::File {
+    let stood = |kind: Kind| matches!(kind, Kind::File | Kind::Symlink | Kind::Hardlink);
+    if index == over || !stood(self.kind(base, index)) || !stood(self.kind(base, over)) {
       return Ok(());
     }
-    let same_file = (index, over) == SAME_FILE && self.now(index) == link;
+    let same_file = self.file_named(index) == self.file_named(over);
     let expected = if same_file {
       None
     } else {
@@ -1086,12 +1222,25 @@ impl Whole {
     if same_file {
       answers.over_unchanged += 1;
     } else {
-      self.removed_now(over);
-      self.made_now(over, link);
-      self.removed_now(index);
-      answers.over_accepted += 1;
+      self.replaced(index, over, answers);
     }
     Ok(())
+  }
+
+  /// Records that the head version moved the node at `PATHS[index]` over `PATHS[over]`, replacing
+  /// what stood there.
+  fn replaced(&mut self, index: usize, over: usize, answers: &mut Answers) {
+    let (moved, stood) = (self.now(index), self.now(over));
+    match stood {
+      Kind::Absent => {}
+      Kind::File => answers.over_accepted += 1,
+      _ => answers.over_link += 1,
+    }
+    if stood != Kind::Absent {
+      self.removed_now(over);
+    }
+    self.made_now(over, moved);
+    self.removed_now(index);
   }
 
   /// The green whole and as the model holds it: each of `PATHS` holds the one node the model
