@@ -11857,9 +11857,15 @@ decides the details.
 > in memory, secures retention, holds every work's verdict (`Green::judge`), judges the whole entry with its new greens
 > counted held (`Partition::check_creating`), and only then commits the verdicts (`Green::commit_judged`) and records
 > the new greens and the entry as one log record; a refusal names every change refused and why, or the entry's
-> refusal, and gives back what it held. Owed: the fleet half (A-636): each green's log and each state log replicated on
-> its own, holders applying atomic records at their joins, replicas refusing split cuts, takeovers adopting each log
-> and each record whole; and the repository policy's check before the verdict (A-622's next part).
+> refusal, and gives back what it held. The fleet half's protocol is built (A-636 part 1, `crates/db/src/ledger/logs.rs`,
+> the fenced ledger over a repository's logs): each log is a register of its own, placed by its own object id and
+> committing at `f + 1` of its own holders; a record is committed once every log it moves holds it on `f + 1` and every
+> record before it is committed, so the repository's committed state is the greatest cut at or below each log's
+> committed length that holds every record whole; holders apply that cut at their joins; a replica answers a read at a
+> vector of positions and refuses one past what it applied or one that splits a record; a takeover fences every log's
+> quorum or none, adopts each log, and keeps a record only where every log's read holds it whole, dropping it and what
+> follows it otherwise. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs' register
+> class, the server's takeover by this rule); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12285,9 +12291,10 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
-   (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); owed: the
-   fleet half (A-636: each log replicated on its own, holders applying atomic records at their joins, replicas refusing
-   split cuts, takeovers adopting each log and each record whole).
+   (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); the fleet
+   half's protocol built as the fenced ledger over a repository's logs (A-636 part 1: each log replicated on its own,
+   holders applying records at their joins, replicas refusing split cuts, takeovers fencing every log or none and
+   keeping each record whole); owed: its live plane (A-636 part 2).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -45811,3 +45818,42 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   `phaseroots` lines 7.2 cannot read, each refused by its line with nothing left held; an unheld root, a public root,
   tabs and a carriage return, a root twice; nine bookmark lines of every kind; an obsstore cut by a byte, and an empty
   one.
+
+### A-636 part 1 — A repository's logs over the fenced ledger: each log replicated on its own, every record committed whole and applied at the holders' joins, a takeover fencing every log or none and keeping each record whole or dropping it, replicas reading by a vector of positions (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half; §4.8 "Promotion and takeover"; with A-642 and A-635)
+
+- **What it is.** `crates/db/src/ledger/logs.rs`: the fenced ledger (`crates/db/src/ledger.rs`, §4.8) over a
+  repository's logs, a pure, deterministic simulation as the ledger itself is (R8: `f = 0` is the laptop). Each log, a
+  green's chain or one of the state logs, is a register of its own (a `Cohort`) placed by its own object id among the
+  owner's neighbourhood. So logs land on different copysets, and a push to one green waits on that green's holders
+  alone (A-642: only a green's own later pushes wait). One owner proposes to every log (`LogsOwner`).
+- **A record held whole.** A record (`LogRecord`: an identity and A-635's `LogSpan`s) is proposed at every position it
+  moves on every log it moves. It is committed once every one of those logs holds it on `f + 1` of its holders and every
+  record before it there is committed. The repository's committed state is the greatest cut at or below each log's
+  committed length that holds every record it touches whole (`LogsCohort::committed_cut`, the oracle;
+  `LogsOwner::committed_cut`, what the owner learned from its acknowledgements).
+  - A holder applies that cut at its joins (`LogsOwner::announce`): a record once every log of it the holder holds has
+    reached it, on the owner's word for a log it does not hold.
+  - A replica answers a read at a vector of positions (`LogsCohort::read`). It refuses one past what it applied
+    (`NotApplied`), one naming a log it holds no copy of (`NotHeld`), and one that holds part of a record and not the
+    rest (`Split`). The split rule is A-635's, now `catalog::spans_split_by`, the function the owner's
+    `AtomicRecord::split_by` uses.
+- **Takeover.** Every log's round is asked first (`Cohort::can_take_over`, the ledger's phase one without the fence), so
+  a takeover that cannot fence every log fences none. Then each log is fenced, read and adopted as `Owner::take_over`
+  adopts one register. A record the adopted logs do not hold at every position it moves is dropped, with what follows it
+  in each of its logs, until every record left is whole (`LogsOwner::take_over`).
+  - Why it is safe: a committed record's positions are in the committed prefix of each of its logs, which every later
+    read meets (the ledger's NoLoss, a log at a time). So it is adopted on every log and kept, and everything before it
+    is committed too, so no drop reaches it. A dropped record was never committed whole, so no holder applied it and no
+    replica answered with it. The superseded owner reaches at most `f` holders of any log the takeover fenced
+    (StaleNeverCommits).
+  - A tail a takeover dropped stays on the holders the new owner has not offered that log to. A later takeover judges
+    it again by the same rule, and a record committed at its positions since outranks it there by its epoch.
+- **The ledger's additions.** `Cohort::can_take_over` and `Cohort::held`; `Owner::log`, `Owner::truncate` (sound only
+  for a tail no quorum committed) and `Owner::offer_again` (the owner's whole log offered again, proposing nothing).
+  `Owner::take_over` makes the same checks as before, now in one place (`phase_one`).
+- **Tests.** TESTS_PENDING
+- **Owed (A-636 part 2).** The live plane: each log's register on the wire (the cluster plane's ledger promotion a log
+  at a time, `LedgerPromise`), the state logs' register class (whose object ids a caller names here), the partition's
+  records shipped a log at a time, and the server's takeover adopting a repository's logs by this rule.
+- **Applied in the same change to:** §4.17.1's status and shared piece 2; GAPS (A-642's headline and the §4.17 entry);
+  this entry.

@@ -5,7 +5,7 @@
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
 > **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** OWED: derived data as one mechanism (the tool stores as types under it); merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
-> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** OWED: A-603's repository-wide register position replaced by each green's own log; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own (g261, with A-635/A-636).
+> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts, takeovers fencing every log or none. OWED: its live plane (A-636 part 2, g261).
 >
 > §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
@@ -226,6 +226,14 @@
 > refused. Tests on the Mac Studio: merge 94/94, db 138/138 (model test with crashes: Agreement, StaleNeverCommits,
 > NoLoss), ipc 74, server 577 with main's known failure; red sixteen ways. Owed: the fleet half (A-636), the policy's
 > check (A-622's next part), stacks of works on one green (piece 5).
+> **A-636 part 1 (2026-11-19, g261; the fleet half's protocol):** `crates/db/src/ledger/logs.rs`, the fenced ledger over
+> a repository's logs. Each log is a register of its own, placed by its own object id and committing at `f + 1` of its
+> own holders, so a push to one green waits on that green's holders alone. A record is committed once every log it
+> moves holds it and every record before it is committed; the committed state is the greatest cut holding every record
+> whole, which holders apply at their joins. A replica reads by a vector of positions and refuses one past what it
+> applied, a log it holds no copy of, or a split cut. A takeover fences every log's quorum or none and keeps a record
+> only where every log's read holds it whole. Tests: TESTS_PENDING. Owed: the live plane (A-636 part 2: each log's
+> register on the wire, the state logs' register class, the server's takeover by this rule).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
