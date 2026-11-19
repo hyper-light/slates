@@ -21,6 +21,7 @@ trap 'rm -rf "$WORK"' EXIT
 cat > "$WORK/served.py" <<'PY'
 import sys
 from mercurial import hg, pushkey, repoview, ui as uimod
+from mercurial.node import hex
 
 path, out = sys.argv[1].encode(), sys.argv[2]
 u = uimod.ui.load()
@@ -41,16 +42,17 @@ def text(value):
     return value.decode('utf-8', 'surrogateescape')
 
 
-write('served', ['%s %s' % (served[r].hex(), served[r].phasestr()) for r in served])
-write('served-heads', [h.hex() for h in served.heads()])
-write('served-branchmap', ['%s %s' % (text(branch), ' '.join(n.hex() for n in heads))
-                           for branch, heads in sorted(served.branchmap().items())])
+write('served', ['%s %s' % (text(served[r].hex()), text(served[r].phasestr())) for r in served])
+write('served-heads', [text(hex(h)) for h in served.heads()])
+branchmap = served.branchmap()
+write('served-branchmap', ['%s %s' % (text(branch), ' '.join(text(hex(n)) for n in branchmap[branch]))
+                           for branch in sorted(branchmap)])
 write('served-bookmarks', sorted('%s %s' % (text(k), text(v))
                                  for k, v in pushkey.list(served, b'bookmarks').items()))
 write('served-phases', sorted('%s %s' % (text(k), text(v))
                               for k, v in pushkey.list(served, b'phases').items()))
 unfiltered = repo.unfiltered()
-write('unserved', ['%s %s' % (unfiltered[r].hex(), 'hidden' if r in hidden else 'secret')
+write('unserved', ['%s %s' % (text(unfiltered[r].hex()), 'hidden' if r in hidden else 'secret')
                    for r in unfiltered if r not in served])
 PY
 for repo in states states-store; do
