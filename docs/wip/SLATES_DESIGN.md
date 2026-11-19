@@ -13319,10 +13319,11 @@ and export by landing).
 > client computes with it; inheritance and elision; and `get-mergeinfo`'s answers over the index (explicit, inherited,
 > nearest-ancestor; descendants found by the index's counts, a crawl the server pulls a slice at a time; a value that
 > does not parse answering none, issue #3896). Held to `mergeinfo-test.c`'s vectors, to the per-revision model wherever
-> Subversion's algebra is exact, and to a naive filesystem on generated histories. Owed: `svn mergeinfo --show-revs`'s
-> eligible and merged revisions, composed from this algebra with piece 7's location segments and log
-> (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`, `filter_log_entry_with_rangelist`); the property's UTF-8 and
-> CR checks at commit, which are piece 7's property validation (`svn_repos__validate_prop`).
+> Subversion's algebra is exact, and to a naive filesystem on generated histories. `svn mergeinfo --show-revs`'s
+> eligible and merged revisions are the stock client's own work (`libsvn_client/mergeinfo.c`
+> `svn_client__mergeinfo_log`) over the server's `get-mergeinfo`, `log` and location segments, so slates owes only those
+> answers (Ada's scope, 2026-11-18: slates offers the server portion). Owed: the property's UTF-8 and CR checks at
+> commit, which are piece 7's property validation (`svn_repos__validate_prop`).
 >
 > **Status (2026-11-19, A-592).** Built: the commit rule (`slates-svn`'s `commit`, piece 5, items 3.2 to 3.4): the
 > drive's out-of-date test (`check_out_of_date`, `commit.c`'s); and the verdict at `close-edit` (`verdict`): FSFS's
@@ -13388,8 +13389,12 @@ and export by landing).
 > `get-dir` (the node's and the entry properties, the dirent fields asked for, the ancestors' properties) and
 > `get-locations` (`svn_repos_trace_node_locations` over the index: the closest copy by FSFS's youngest copy root, its
 > source, the same line at the same path), with `svn info` of a file and `svn proplist --show-inherited-props` replayed
-> whole. Owed: `get-file`, `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
-> `get-deleted-rev`, then `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
+> whole. Its second slice (2026-11-19, g297): `get-file` (the checksum from the node row, the properties and inherited
+> properties, then the text in `svnserve`'s 4,096-byte strings, the empty string and a second response), the text read
+> from the green a piece at a time and written a slice at a time in the room the caller gives (a `Stream` the server
+> resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Owed: `list`, `log` with merged
+> revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`; read access by the authorization rules
+> (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -13871,8 +13876,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    part 1, its editor drive owed); commit; log, locations, segments, file revisions, deleted revision, replay;
    revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
-   oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
-   log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
+   oracle). 9. Mergeinfo queries (built, A-605; `svn mergeinfo --show-revs` is the client's work over piece 7's
+   `get-mergeinfo`, `log` and segments). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
     (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
@@ -42269,10 +42274,34 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   writes 2^64 - 1), the stored date as it is and time 0's date for an entry without one; both commands' entries come
   in hash order, compared as sets. The session value gains the repository's UUID (`svn:entry:uuid`). Studio:
   `cargo test -p slates-svn --lib reads` all passing, fixtures' sums checked.
-- **Owed** (the next slices): `get-file`, `list`, `log` with merged revisions, `get-location-segments`,
-  `get-file-revs`, `get-deleted-rev`, each with its transcripts; then `svn mergeinfo --show-revs`'s eligible and
-  merged revisions from the segments and the log; read access by A-606's rules, and the authentication request a
-  denied anonymous read makes when the session could authenticate.
+- **Part 2, its second slice** (2026-11-19, g297): `get-file` (`reads/file.rs`) and the first streamed answer
+  (`reads/stream.rs`). The fixtures were recorded again with revisions 8 to 11 (a 10,000-byte text and its change, an
+  empty text, a name in capitals, a path added again after its deletion, a file replaced by a copy, a revision without
+  an author, mergeinfo taken from a tag) and the sessions of every command still owed, scripted and stock (`svn cat`,
+  `ls`, `log`, `log -g`, `blame`, `blame -g`, `mergeinfo --show-revs`): 85 files, SHA-256 checked on the Studio and
+  here. Fifteen old transcripts changed: where the new revisions reach them (the youngest is now 11, the tag's
+  mergeinfo gone at 11) and where `svnserve`'s seeded hash order fell differently (revision 3's properties,
+  `get-locations`' entries), both already compared as the tests compare them. `get-file`: the parameters `c(?r)bb?B`;
+  the revision opened, then the checksum, the node row's MD5 (the MD5 of no bytes for a file without a text, as
+  `svn_fs_file_checksum` forces one), a directory refused "Attempted to get checksum of a *non*-file node" (160017,
+  `svn_fs_fs__dag_file_checksum`); the property list written even when not wanted, the inherited list only when asked
+  and empty when no ancestor has properties; the text as strings of 4,096 bytes (`get_file`'s buffer; recorded 4,096,
+  4,096 and 1,818 for a 10,010-byte text), the empty string and `( success ( ) )`, or the empty string and a refusal
+  when the green lost a text the index names. The `Repository` seam gains `text` (the bytes of a text from an offset,
+  a piece at a time), and `Outcome` gains `Streaming`: a command whose answer grows with the repository writes its head
+  and hands back a `Stream`, which the caller resumes with the room it gives each slice; each slice writes at least one
+  item and stops past the room, so a slice holds the caller's room and one string. Tests (the Mac Studio,
+  `cargo test -p slates-svn --lib`, 2026-11-19): 287 of 287, `cargo fmt --check` clean; the `get-file` session (18
+  commands) and its hostile one, and `svn cat` of a small and a large file, replayed whole; a text sliced in a room of
+  one byte and of all, the same bytes; a text the green lost; a file without a text; the parameters. Red-checked six
+  ways (strings of 4,000 bytes, a directory not refused, the empty MD5 wrong, no empty string at the end, inherited
+  properties inverted, `get-file` handed elsewhere): each failed named tests.
+- **Scope** (Ada, 2026-11-18, through main): slates offers the server's portion; `svn mergeinfo --show-revs`'s eligible
+  and merged revisions are the stock client's work over `get-mergeinfo`, `log` and the location segments, so no
+  server piece computes them.
+- **Owed** (the next slices): `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+  `get-deleted-rev`, each replayed against the transcripts already recorded; read access by A-606's rules, and the
+  authentication request a denied anonymous read makes when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
