@@ -81,6 +81,10 @@ impl Work {
     self.push(OpKind::Unlink, path, 0, 0, u64::MAX)
   }
 
+  fn rmdir(&mut self, path: &str) -> &mut Work {
+    self.push(OpKind::Rmdir, path, 0, 0, u64::MAX)
+  }
+
   fn mkdir(&mut self, path: &str) -> &mut Work {
     self.push(OpKind::Mkdir, path, 0, 0, u64::MAX)
   }
@@ -887,22 +891,24 @@ fn replaced_up_to(head: u64) -> Green {
   green
 }
 
-/// A-626 (a green made at another's version, before and after a replace and copies nested in one increment). Do: replace
-/// the branch `b` at version 3, copy the trunk to `e` with `b/d` copied into it at 4, and branch the green at every
-/// version. Expect: each branch reads as a green that applied the same versions reads at its head, and hashes as it; no
-/// branch walks a map.
-#[test]
-fn a_branch_before_a_replace_holds_the_tree_it_took_away() {
-  let expected: Vec<([u8; 32], Base)> = (1..=4)
+/// Asserts that a branch of `up_to(head)` at every version from 1 reads as `up_to(version)` reads at its head and hashes
+/// as it, and that making it walks no map.
+fn assert_branches_read_as_their_versions(up_to: impl Fn(u64) -> Green, head: u64) {
+  let expected: Vec<([u8; 32], Base)> = (1..=head)
     .map(|version| {
-      let mut prefix = replaced_up_to(version);
+      let mut prefix = up_to(version);
       (prefix.head_identity(), sorted(prefix.base_at(version)))
     })
     .collect();
-  let (mut lineage, source) = Lineage::new(replaced_up_to(4));
-  let walked = lineage.walked();
-  for (version, expected) in (1..=4).zip(expected) {
+  let (mut lineage, source) = Lineage::new(up_to(head));
+  for (version, expected) in (1..=head).zip(expected) {
+    let walked = lineage.walked();
     let branch = lineage.branch(source, version).expect("a branch");
+    assert_eq!(
+      lineage.walked(),
+      walked,
+      "the branch at {version} walked a map"
+    );
     let found = lineage
       .with(branch, |green| {
         (green.head_identity(), sorted(green.base_at(0)))
@@ -910,7 +916,74 @@ fn a_branch_before_a_replace_holds_the_tree_it_took_away() {
       .expect("the branch");
     assert_eq!(found, expected, "the branch at {version}");
   }
-  assert_eq!(lineage.walked(), walked, "a branch walked a map");
+}
+
+/// A-626 (a green made at another's version, before and after a replace and copies nested in one increment). Do: replace
+/// the branch `b` at version 3, copy the trunk to `e` with `b/d` copied into it at 4, and branch the green at every
+/// version. Expect: each branch reads as a green that applied the same versions reads at its head, and hashes as it; no
+/// branch walks a map.
+#[test]
+fn a_branch_before_a_replace_holds_the_tree_it_took_away() {
+  assert_branches_read_as_their_versions(replaced_up_to, 4);
+}
+
+/// A-626, found by its oracle (A-586's branch left a key of a cut copy's tree cut when the copy brought it back with the
+/// bytes it held before). Do: hold `d/x` and `t/x` with the same bytes, remove `d/x`, copy `t` to `d`, and branch the
+/// green at every version. Expect: each branch reads as a green that applied the same versions (`d/x` there at 1, gone
+/// at 2, there at 3) and hashes as it.
+#[test]
+fn a_branch_before_a_copy_sets_back_a_key_it_brought_back_unchanged() {
+  let up_to = |head: u64| {
+    let mut green = Green::new();
+    accept(
+      &mut green,
+      Work::default()
+        .create("d/x", b"same")
+        .create("t/x", b"same"),
+      1,
+    );
+    if head >= 2 {
+      accept(&mut green, Work::default().unlink("d/x"), 2);
+    }
+    if head >= 3 {
+      accept(&mut green, &one_copy("t", "d", 2), 3);
+    }
+    green
+  };
+  assert_branches_read_as_their_versions(up_to, 3);
+}
+
+/// A-626, found while fixing the above (A-586's branch read a key at its version from the key's own history alone,
+/// before the copy that gave it its value, and gave back no copy's entry for a key whose history ended before the copy).
+/// Do: make `d` with a mode, remove it (its mode with it, A-618), copy `t` (another mode) to `d`, then set a property
+/// on `d`, and branch the green at every version. Expect: each branch reads as a green that applied the same versions
+/// (the branch at 3 holds `d` with the copy's mode) and hashes as it.
+#[test]
+fn a_branch_reads_a_key_through_the_copy_that_gave_it_its_value() {
+  let up_to = |head: u64| {
+    let mut green = Green::new();
+    accept(
+      &mut green,
+      Work::default()
+        .mkdir("d")
+        .mode("d", 0o700)
+        .mkdir("t")
+        .mode("t", 0o755)
+        .create("t/f", b"f"),
+      1,
+    );
+    if head >= 2 {
+      accept(&mut green, Work::default().rmdir("d"), 2);
+    }
+    if head >= 3 {
+      accept(&mut green, &one_copy("t", "d", 2), 3);
+    }
+    if head >= 4 {
+      accept(&mut green, Work::default().xattr("d", PROPS, b"p"), 4);
+    }
+    green
+  };
+  assert_branches_read_as_their_versions(up_to, 4);
 }
 
 /// The attribute every file of the oracle's histories carries.
