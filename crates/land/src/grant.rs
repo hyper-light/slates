@@ -10,7 +10,7 @@
 //! grant covered any plan on its shard (AUD-29-01,
 //! docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A grant's id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,11 +155,26 @@ pub enum GrantRefusal {
   },
 }
 
-/// The grants table.
+/// The grants table, its issued grants indexed by the end of their term (A-554), so the grants past their term and the
+/// next one due are read from the index alone, never a walk of the table.
 #[derive(Debug, Default)]
 pub struct Grants {
   records: BTreeMap<GrantId, GrantRecord>,
+  /// The issued grants by the end of their term, each `(expires_ns, id)` (A-554): one entry an issued grant, entered at
+  /// its issue or restore and taken out when it leaves the table or leaves `Issued` (consumed, revoked), so it holds
+  /// exactly the grants a sweep may end.
+  by_term: BTreeSet<(u64, GrantId)>,
+  /// The earliest instant a grant entered in [`Grants::by_term`] falls due, since the caller last asked
+  /// ([`Grants::take_noted`]): what tells the shard's deadline keeper a grant was entered to lapse before the deadline it
+  /// sleeps for (A-554), whichever path entered it.
+  noted: Option<u64>,
   next: u64,
+}
+
+/// The first instant a grant whose term ends at `expires_ns` is past it: a grant is usable through its term's last
+/// nanosecond and refused after it ([`Grants::check`]).
+fn due_after(expires_ns: u64) -> u64 {
+  expires_ns.saturating_add(1)
 }
 
 impl Grants {
@@ -177,19 +192,18 @@ impl Grants {
   ) -> Option<GrantId> {
     self.next = self.next.checked_add(1)?;
     let id = GrantId(self.next);
-    self.records.insert(
+    let record = GrantRecord {
       id,
-      GrantRecord {
-        id,
-        surface,
-        manifest,
-        binding,
-        scope,
-        issued_ns: now_ns,
-        expires_ns: now_ns.saturating_add(term_ns),
-        state: GrantState::Issued,
-      },
-    );
+      surface,
+      manifest,
+      binding,
+      scope,
+      issued_ns: now_ns,
+      expires_ns: now_ns.saturating_add(term_ns),
+      state: GrantState::Issued,
+    };
+    self.index(&record);
+    self.records.insert(id, record);
     Some(id)
   }
 
@@ -198,7 +212,21 @@ impl Grants {
   /// never issued twice across a restart. A record whose id is already held is ignored.
   pub fn restore(&mut self, record: GrantRecord) {
     self.next = self.next.max(record.id.0);
-    self.records.entry(record.id).or_insert(record);
+    if self.records.contains_key(&record.id) {
+      return;
+    }
+    self.index(&record);
+    self.records.insert(record.id, record);
+  }
+
+  /// Enters `record`'s term in [`Grants::by_term`] when it is issued, and notes when it falls due (A-554).
+  fn index(&mut self, record: &GrantRecord) {
+    if record.state != GrantState::Issued {
+      return;
+    }
+    self.by_term.insert((record.expires_ns, record.id));
+    let due = due_after(record.expires_ns);
+    self.noted = Some(self.noted.map_or(due, |noted| noted.min(due)));
   }
 
   /// Restores the highest grant id the durable records ever issued (A-266): the table holds live grants only, so an
@@ -210,30 +238,56 @@ impl Grants {
   /// Ends `id`'s grant: it leaves the table at its terminal step (A-266; consumed, expired or revoked), its history
   /// kept by the audit log. An id it held stays refused as ended ([`Grants::check`]).
   pub fn end(&mut self, id: GrantId) {
-    self.records.remove(&id);
+    if let Some(record) = self.records.remove(&id) {
+      self.by_term.remove(&(record.expires_ns, id));
+    }
   }
 
   /// Keeps only the grants `held` says the durable table holds (A-266; AC-2.3): after an atom that issued a grant here
   /// was rolled back, the grant leaves this table too, so nothing lands under a grant whose issue was refused. An id it
   /// held stays refused as ended, as one [`Grants::end`] removed is.
   pub fn retain(&mut self, mut held: impl FnMut(GrantId) -> bool) {
-    self.records.retain(|id, _| held(*id));
+    let by_term = &mut self.by_term;
+    self.records.retain(|id, record| {
+      let keep = held(*id);
+      if !keep {
+        by_term.remove(&(record.expires_ns, *id));
+      }
+      keep
+    });
   }
 
-  /// The grants past their term at `now_ns` that are still usable, for the sweep that ends them.
+  /// The grants past their term at `now_ns` that are still usable, for the sweep that ends them, in the order their
+  /// terms ended: read from the index of terms alone (A-554).
   pub fn expired_at(&self, now_ns: u64) -> Vec<GrantId> {
     self
-      .records
-      .values()
-      .filter(|g| g.state == GrantState::Issued && now_ns > g.expires_ns)
-      .map(|g| g.id)
+      .by_term
+      .iter()
+      .take_while(|(expires_ns, _)| now_ns > *expires_ns)
+      .map(|(_, id)| *id)
       .collect()
   }
 
-  /// Revokes a grant.
+  /// The first instant a grant of this table is past its term (A-554): the earliest issued grant's term end and a
+  /// nanosecond, the deadline the shard's keeper sleeps until for grants. `None` while no issued grant is held.
+  pub fn next_due_ns(&self) -> Option<u64> {
+    self
+      .by_term
+      .first()
+      .map(|(expires_ns, _)| due_after(*expires_ns))
+  }
+
+  /// The earliest instant a grant entered since the last call falls due, taken (A-554): the shard's keeper wakes for it
+  /// when it sleeps for a later deadline.
+  pub fn take_noted(&mut self) -> Option<u64> {
+    self.noted.take()
+  }
+
+  /// Revokes a grant: it leaves the index of terms, since no sweep ends a revoked grant.
   pub fn revoke(&mut self, id: GrantId) {
     if let Some(g) = self.records.get_mut(&id) {
       g.state = GrantState::Revoked;
+      self.by_term.remove(&(g.expires_ns, id));
     }
   }
 
@@ -281,13 +335,15 @@ impl Grants {
     Ok(g.clone())
   }
 
-  /// Consumes a single-use grant after its landing finished.
+  /// Consumes a single-use grant after its landing finished: it leaves the index of terms, since no sweep ends a
+  /// consumed grant.
   pub fn consume(&mut self, id: GrantId) {
     if let Some(g) = self.records.get_mut(&id)
       && g.scope == GrantScope::Once
       && g.state == GrantState::Issued
     {
       g.state = GrantState::Consumed;
+      self.by_term.remove(&(g.expires_ns, id));
     }
   }
 
@@ -545,6 +601,146 @@ mod tests {
       next,
       GrantId(6),
       "a new grant's id passes every restored one"
+    );
+  }
+
+  /// The issued grants of `grants` past their term at `now`, by a walk of the table, in the order their terms ended: the
+  /// rule the index of terms must answer by (A-266's sweep, which walked the table until A-554).
+  fn walked_due(grants: &Grants, now: u64) -> Vec<GrantId> {
+    let mut due: Vec<(u64, GrantId)> = grants
+      .records
+      .values()
+      .filter(|g| g.state == GrantState::Issued && now > g.expires_ns)
+      .map(|g| (g.expires_ns, g.id))
+      .collect();
+    due.sort_unstable();
+    due.into_iter().map(|(_, id)| id).collect()
+  }
+
+  /// The first instant an issued grant of `grants` is past its term, by a walk of the table.
+  fn walked_next(grants: &Grants) -> Option<u64> {
+    grants
+      .records
+      .values()
+      .filter(|g| g.state == GrantState::Issued)
+      .map(|g| g.expires_ns.saturating_add(1))
+      .min()
+  }
+
+  /// Shape: the instants every step of the history is asked about: before, at and after each term it sets, and the
+  /// clock's two ends.
+  const INSTANTS: [u64; 16] = [
+    0,
+    119,
+    120,
+    121,
+    130,
+    131,
+    140,
+    150,
+    151,
+    190,
+    191,
+    200,
+    201,
+    1_000,
+    1_001,
+    u64::MAX,
+  ];
+
+  /// Asks `grants` for the grants due and the next due instant at each of [`INSTANTS`], and for what it noted since the
+  /// last ask: each answer must be a walk's of the table, and the noted instant `noted`.
+  fn agrees_with_a_walk(grants: &mut Grants, noted: Option<u64>, step: &str) {
+    for now in INSTANTS {
+      assert_eq!(
+        grants.expired_at(now),
+        walked_due(grants, now),
+        "{step}: due at {now}"
+      );
+    }
+    assert_eq!(
+      grants.next_due_ns(),
+      walked_next(grants),
+      "{step}: next due"
+    );
+    assert_eq!(grants.take_noted(), noted, "{step}: noted");
+  }
+
+  /// A grant issued from the command line binding [`binding`], `term` from `now`.
+  fn issued(grants: &mut Grants, scope: GrantScope, now: u64, term: u64) -> GrantId {
+    grants
+      .issue(Surface::Cli, [1; 32], binding(), scope, now, term)
+      .expect("a grant id")
+  }
+
+  /// A-554 (the index of terms). Do: run one history over a grants table: issue grants of several terms and scopes (two
+  /// ending at one instant), consume one, revoke one and consume it, end one, restore an issued grant, restore it again
+  /// under another term, restore a consumed one, keep all but one, issue one with no term and one whose term reaches the
+  /// clock's end, then end every grant due. After each step ask for the grants due and the next due instant around every
+  /// term's end, and for what was noted. Expect: every answer a walk's of the table, in the order the terms ended (ties
+  /// by id), and the noted instant the earliest due among the grants entered since the last ask, none after a step that
+  /// entered none.
+  #[test]
+  fn the_index_of_terms_answers_as_a_walk_of_the_table() {
+    let mut grants = Grants::default();
+    let a = issued(&mut grants, GrantScope::Once, 100, 50);
+    agrees_with_a_walk(&mut grants, Some(151), "issue a, ending at 150");
+    let b = issued(&mut grants, GrantScope::Once, 100, 20);
+    let c = issued(&mut grants, GrantScope::Session, 110, 80);
+    let d = issued(&mut grants, GrantScope::Once, 100, 20);
+    agrees_with_a_walk(
+      &mut grants,
+      Some(121),
+      "issue b and d, ending at 120, and c at 190",
+    );
+    grants.consume(b);
+    agrees_with_a_walk(&mut grants, None, "consume b");
+    grants.revoke(c);
+    grants.consume(c);
+    agrees_with_a_walk(&mut grants, None, "revoke c, then consume it");
+    grants.end(a);
+    agrees_with_a_walk(&mut grants, None, "end a");
+    let restored = GrantRecord {
+      id: GrantId(9),
+      surface: Surface::Cli,
+      manifest: [9; 32],
+      binding: binding(),
+      scope: GrantScope::Once,
+      issued_ns: 100,
+      expires_ns: 130,
+      state: GrantState::Issued,
+    };
+    grants.restore(restored.clone());
+    agrees_with_a_walk(&mut grants, Some(131), "restore an issued grant");
+    grants.restore(GrantRecord {
+      expires_ns: 1_000,
+      ..restored.clone()
+    });
+    agrees_with_a_walk(&mut grants, None, "restore it again under another term");
+    grants.restore(GrantRecord {
+      id: GrantId(10),
+      expires_ns: 140,
+      state: GrantState::Consumed,
+      ..restored
+    });
+    agrees_with_a_walk(&mut grants, None, "restore a consumed grant");
+    grants.retain(|id| id != d);
+    agrees_with_a_walk(&mut grants, None, "keep all but d");
+    issued(&mut grants, GrantScope::Once, 200, 0);
+    issued(&mut grants, GrantScope::Once, 1, u64::MAX);
+    agrees_with_a_walk(
+      &mut grants,
+      Some(201),
+      "issue one with no term and one to the clock's end",
+    );
+    for id in grants.expired_at(u64::MAX) {
+      grants.end(id);
+    }
+    agrees_with_a_walk(&mut grants, None, "end every grant due");
+    assert_eq!(
+      grants.next_due_ns(),
+      Some(u64::MAX),
+      "the grant whose term reaches the clock's end is the one left"
     );
   }
 

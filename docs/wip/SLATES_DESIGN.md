@@ -4923,6 +4923,17 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-19, A-554: grants leave the tick; the retry window named).** A grant past its term ends at the
+> first instant past it, kept by the shard's deadline keeper: the grants table keeps its issued grants in an index by the
+> end of their term (`slates_land::grant::Grants`, one entry an issued grant, taken out at its consumption, revocation or
+> end), so the keeper sleeps to the next grant due and its sweep reads the due alone, where the tick walked every grant
+> once a window. An issue or a restore notes the earliest it entered, and each state borrow hands that to the keeper. A
+> deadline its job could not end (a grant whose expiry record the catalog refused, a refused destroy record) is tried
+> again the retry window on (`deadlines::retry_window_ns`, counted `deadline.stuck`): the shard's window of A-455, the
+> liveness window `W` (the recovery budget by rent or buy, A-359) raised to the scheduler overrun the shard measured,
+> never past the observation budget. Off the tick so far: dead clients (A-475), staging buffers and status captures
+> (A-522), leases, CLI attachments and destroys (A-536), grants (A-554); the owed audit is next.
+
 > **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
 > (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
 > term, and to the next CLI attachment's lapse, which the partition now keeps in an index of terms (derived from the
@@ -36527,3 +36538,34 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-554 — Grants, the owed audit, departed hosts, held copies and the pressure hold leave the reap loop's tick, each at its own deadline or event (2026-11-19, goal 86, g255; the event-driven reaper's piece 4; §4.7; A-265, A-266, A-222, A-197, A-475, A-522, A-536)
+
+- **What was there.** The reap loop's tick, once a liveness window on every shard, ended the grants past their term
+  (`landing::end_expired_grants`, a walk of every grant the shard holds), then sent again what the shard owed the audit
+  and had not been acknowledged since the tick before (`landing::resend_stuck_audit`); then, on the control shard, it
+  looked for departed hosts (A-222), and it reclaimed unclaimed held copies (Linux, A-197), sampled the pressure hold,
+  purged NFS state, drained base hints and delegation recalls, sealed idle content and re-armed huge-page placement.
+- **Grants (job 1).** The grants table (`slates_land::grant::Grants`) keeps its issued grants in an index by the end of
+  their term (`by_term`, one entry an issued grant: entered at an issue or a restore, taken out when the grant is
+  consumed, revoked, ended or dropped by `retain`), so `expired_at` reads the due alone, in the order their terms ended,
+  and `next_due_ns` is the first instant one is past its term: its end and a nanosecond, since a grant is usable through
+  its term's last nanosecond (`Grants::check`). The shard's deadline keeper (`crate::deadlines`, A-522) sleeps to it
+  and runs `end_expired_grants` in its pass when it is due. An issue or a restore notes the earliest due it entered
+  (`Grants::take_noted`) and each state borrow hands that to the keeper (`deadlines::after_borrow`), as the partition's
+  lease and term notes are. `end_expired_grants` now sends the owed audit only when it recorded an expiry: every tick
+  sent whatever was owed through it, which hid the resend's own cadence.
+- **The retry window, named.** A deadline still past after the keeper's pass (a job that could not end it: a grant whose
+  expiry record the catalog refused) and a refused destroy record are tried again the retry window on
+  (`deadlines::retry_window_ns`, counted `deadline.stuck`): the shard's window (A-455, `watchdog::watch_window_ns`), the
+  liveness window `W` raised to the scheduler overrun the shard measured, never past the observation budget. A-536 took
+  that window at both sites and named it only as "a window".
+- **Tests.** `crates/land/src/grant.rs`: `the_index_of_terms_answers_as_a_walk_of_the_table` (one history over every
+  change the table takes, each step's answers compared with a walk of the table at instants around every term's end,
+  and the noted instant with the earliest entered since the last ask). `crates/server/src/deadlines.rs`:
+  `a_grant_past_its_term_ends_at_its_term_without_a_tick` (a grant issued under the policy with a term of a tenth of a
+  window, ended, out of both tables and audited within half a window). The server test failed first on main's code
+  (cf17cae, the Mac Studio, 2026-11-19): not ended within half a window.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
+`crates/server/src/{deadlines,landing,verbs,daemon}.rs`.

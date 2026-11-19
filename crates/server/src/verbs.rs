@@ -12081,13 +12081,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
   any || releasing
 }
 
-/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
-/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
-/// change, and kept by the deadline keeper, never a tick (A-536).
+/// Derived: a destroy whose completion record was refused is tried again the retry window after `now`
+/// (`deadlines::retry_window_ns`, A-455's window over the scheduler overrun this shard measured): no sooner than a pass
+/// of the refusing condition could change, and kept by the deadline keeper, never a tick (A-536).
 fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
-  let at = now.saturating_add(crate::watchdog::watch_window_ns(
-    slates_rt::futures::scheduler_overrun_ns(),
-  ));
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
   state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
   crate::deadlines::noted(state, at);
 }

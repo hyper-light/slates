@@ -2992,21 +2992,26 @@ fn end_grants_recorded_ended(state: &mut ShardState, ops: &[Op]) {
   }
 }
 
-/// The grants past their term end (A-266), once a reap tick: each is recorded `Expired`, which takes it out of the
+/// The grants past their term end (A-266), by the shard's deadline keeper at the first instant past the earliest term
+/// (A-554, `crate::deadlines`; the reap loop's tick until then): each is recorded `Expired`, which takes it out of the
 /// durable table, with its `grant_expired` audit record in the same atom ([`record_expiry`]), and then leaves the
-/// runtime one. A grant that cannot be recorded stays, and the next tick tries again; one in use by a running landing is
-/// unaffected, since the run holds its own copy of the grant it checked. On a shard other than the control shard each
-/// committed expiry's audit record is owed in its own atom (the partition's outbox), and what is owed goes to the control
-/// partition as one batch once the sweep is done.
+/// runtime one. A grant that cannot be recorded stays due, and the keeper tries again a retry window on; one in use by a
+/// running landing is unaffected, since the run holds its own copy of the grant it checked. On a shard other than the
+/// control shard each committed expiry's audit record is owed in its own atom (the partition's outbox), and what is owed
+/// goes to the control partition as one batch once the sweep has ended any.
 pub fn end_expired_grants(state: &mut ShardState) {
   let now = state.clock.monotonic_ns();
+  let mut ended = false;
   for id in state.landing.grants.expired_at(now) {
     if record_expiry(state, id.0, now) {
       state.landing.grants.end(id);
       state.count(GRANTS_EXPIRED, 1);
+      ended = true;
     }
   }
-  send_owed_audit(state);
+  if ended {
+    send_owed_audit(state);
+  }
 }
 
 /// Records grant `id`'s expiry and its audit record as one atom (A-266; AC-2.10, every grant's history in the audit):
@@ -3056,7 +3061,7 @@ fn record_expiry(state: &mut ShardState, id: u64, now: u64) -> bool {
   }
 }
 
-/// Counter: grants ended at their term by the reap tick's sweep (A-266).
+/// Counter: grants ended at their term by the deadline keeper's sweep (A-266, A-554).
 pub const GRANTS_EXPIRED: &str = "landing.grants_expired";
 
 /// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
