@@ -11571,7 +11571,11 @@ the chain's entries) computes the same `Computed`, which names the head it was c
 elsewhere by position (`Green::judge_computed`, A-658 part 2): at the head it was computed against it stands, and once
 the green has moved only the units of the verdict whose paths the change index names since, or that read the links
 naming a file one of whose links changed since (A-669, A-670), are judged again, a content edit from where its ops stood,
-never the whole work.
+never the whole work. A verdict crosses from the copy that computed it to the owner in a wire form (A-658 part 3a,
+`Computed::encode`): the units in the order the work's are visited, each its effects as the chain entry records them
+(content by reference to the increment's post-state), its windows and where its content ops stood; the owner reads it
+back against the increment it judged (`Green::computed_from`), each effect rebuilt as a replay rebuilds it, a splice left
+unmade for the commit to make.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -45211,8 +45215,9 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     (Built, A-658: `Green::compute` and `Green::rebase` read the green and change nothing, a `Computed` holds nothing
     of the green that computed it and names the head it was computed against, and a copy lacking the versions refuses
     typed (part 1); the owner takes a computed verdict by position, `Green::judge_computed`, judging again only the
-    units of the verdict the versions since changed (part 2). Owed: the fleet's route, a holder computing and the owner
-    appending.)
+    units of the verdict the versions since changed (part 2); a computed verdict crosses to the owner in a wire form
+    the owner reads back against the increment it judged, `Computed::encode` and `Green::computed_from` (part 3a).
+    Owed: the fleet's route, a holder computing and the owner appending.)
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
@@ -52340,6 +52345,57 @@ the crate; `dav/locking.rs`'s `convert_status` with `dav_svn__convert_err`'s who
   inherited-props, get-locks, list, file-revs), then the update-report through A-627's drive for `svn checkout`, with
   the site composed into the daemon's edge (main's ask: git's site alone answers today, so a stock client of another
   tool meets `404`); part 2, the write side; main's runs (clippy, `xtask`, the other platforms, red-checks).
+
+### A-658 part 3a — A computed verdict's wire form: what a holder sends the owner, read back against the increment it judged (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); A-645 "Merges computed anywhere, committed by position"; §4.16 "Commit" and "Apply on holders"; after A-658 parts 1 and 2)
+
+Applied in the same change to: §4.16 "Commit" (the wire form's sentence), A-645's entry, GAPS (the A-645 entry's A-658
+clause), `crates/merge/src/engine/computed_wire.rs` (new: `Computed::encode`, `Green::computed_from`),
+`crates/merge/src/engine/computed_wire_tests.rs` (new), `crates/merge/src/engine/compute_tests.rs` (the oracle takes
+every held verdict through the wire form), `crates/merge/src/engine/position.rs` (`Placed::parts`,
+`Placed::from_parts`), `crates/merge/src/chain_entry.rs` (`Declared`, `put_applied`, `take_applied` crate-visible),
+`crates/merge/src/engine.rs` (the module).
+- **What was there.** Part 2 let the owner take a `Computed` by position, but a `Computed` lived only in the memory of
+  the copy that made it: the fleet's route (a holder computes on its replica and the owner appends, A-645) had no way to
+  carry one between nodes.
+- **The form.** The increment's identity and base, the head the verdict was computed against, the computing copy's
+  fold floor, and what it reached: the version the copy had accepted the increment as, or the verdict unit by unit in
+  the order the work's units are visited, since the owner pairs a moved verdict's units with its own by that order
+  (`position::Units`). Each unit is its effects, its conflict windows (path, range, class by a tag appended to and
+  never reordered) and where its content ops stood (each placement's range and first byte, shifted or overlapping). An
+  effect is written as the chain entry writes it (`put_applied`: content by reference to the increment's post-state, a
+  splice written as "as declared" when it is the increment's own ops), so the form carries no file's bytes and the
+  entry's hostile-tested decoder reads its effects. Magic `GCMP`, version 1, little-endian, every count checked against
+  the bytes left before anything is reserved, a BLAKE3 digest of everything before it last, as the chain entry's.
+- **Read back by the owner** (`Green::computed_from`) against the increment, which it holds: each effect rebuilt as a
+  replica's replay rebuilds it (`Green::effect_of`, the head's bytes and the increment's post-state, the copies of the
+  whole verdict as an entry's), except a splice, which stays unmade as the live verdict leaves it (`None`,
+  `ContentSource::Mapped`), so a conflict builds no file and the commit makes it over the head the hold was judged at.
+  A unit whose paths changed since its position is judged again, its effects read back dropped; any other reads the
+  same bytes at both heads, so its effects are the computing copy's. The form is the copy's to write correctly: a
+  holder is trusted as its replica is (its head identity compared at every version, §4.16 "Apply on holders"); the
+  digest finds a damaged message.
+- **Not taken.** Effects carrying their bytes: a mapped file's bytes are the head's with the ops applied, which the
+  owner holds; a created or renamed file's are the increment's, which the owner holds too. A new effect encoding: the
+  chain entry's already holds what a replay needs, and a replay is exactly what the owner does with them.
+- **Tests.** `computed_wire_tests.rs`: the forms of a verdict answered before and of one of two units (a splice left
+  unmade, a directory and its mode; a window and a placement) equal bytes assembled field by field from the documented
+  layout (golden vectors), and read back write the same bytes again; every cut and every flipped bit refused; forms
+  whose digest holds but whose fields do not (another magic, another version, a unit count of `u32::MAX`, an effect
+  count past the bytes left, unknown tags of what was reached, of a class and of a placement, a trailing byte) each
+  refused by its kind. The oracle (`compute_tests`'s generated concurrent histories) now takes every held verdict
+  through the form, read back by the owner wherever its head stands at the commit, and checks the form read back writes
+  the same bytes: every verdict taken by position still equals the serial one.
+- **Runs.** macOS arm64, Mac Studio (kiln r391, 2026-11-19 23:17-23:24Z, debug, rustc 1.98.1, `CARGO_BUILD_JOBS=2`, a
+  fresh clone of the branch at 445aa2fbd): `cargo test --locked -p slates-merge --lib -- engine::computed_wire_tests
+  engine::compute_tests:: chain_entry::` 22 of 22 in 1.7 s (the three wire tests; compute_tests' fourteen, the oracle
+  taking every held verdict through the form among them; the chain entry's five, whose effect codec the form shares);
+  `cargo fmt -p slates-merge -- --check` asked for two reflows in the new tests, applied. No integration target
+  reaches the form yet (3b's route is its first caller). Main's: clippy, `xtask check`, the doc gates, the other
+  platforms.
+- **Owed.** 3b: the fleet's route for a submit: a node holding the green's replica computes on it and the request to
+  the owner carries the form; the owner's submit takes it by `judge_computed` then `commit_judged`, its own verdict only
+  on a typed refusal, with a two-node test whose counter shows verdicts taken by position. 3c: git's and Mercurial's
+  pushes taking computed verdicts the same way.
 
 ### A-665 part 3 — git's push runs its hooks: receive-pack's three points in git's order and words, a step at a time over a presenter that shows each view at a path (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-644, A-654, A-665 parts 1 and 2)
 Applied in the same change to:
