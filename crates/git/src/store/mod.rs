@@ -56,16 +56,23 @@
 //! of work up to the owner's quantum and holds nothing borrowed between turns; every answered pack holds exactly the
 //! answer's objects, each once. upload-pack's service writes it through A-640's pack source over it.
 //!
+//! **Fragments and base packs encoded in turns (A-653 continued (2)).** A version's two fragments and a green's base
+//! pack are encoded a unit at a time under the owner's quantum ([`Encoding`]): a pair of trees walked for the bases a
+//! reference delta may name, a window's worth of rows read into the encoding's order, or one object encoded, a unit;
+//! the parts kept last. The encoding holds no borrow between turns and writes, over any turns, the bytes one pass does.
+//!
 //! **A hook's repository (A-665, [`hook_view`]).** A git hook runs in a read-only bare repository
 //! made from what the store keeps: `HEAD`, `config` and `packed-refs` from the refs a push read,
 //! and packs from the base packs and fragments, each whole by itself, with the push's objects in
 //! git's quarantine; every file's bytes made when a read reaches them.
 //!
-//! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks,
-//! a commit and a fragment's encoding sliced under the shard's budget, and their transient sets charged; a delta search
-//! for an object past a window; the versions' records kept as content, replicated as the index's tables are.
+//! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks
+//! and a commit sliced under the shard's budget, and their transient sets charged; within an encoding, one object, a
+//! pair of trees and a part's put each still a unit whole (`encoding`'s docs); a delta search for an object past a
+//! window; the versions' records kept as content, replicated as the index's tables are.
 
 mod deltas;
+mod encoding;
 mod fragment;
 pub mod hook_view;
 pub mod learn;
@@ -78,6 +85,7 @@ mod upload;
 pub mod views;
 
 pub use deltas::delta_of;
+pub use encoding::{Encoding, EncodingCounters};
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
