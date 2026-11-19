@@ -8,17 +8,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
-use super::{Answer, AppendRefused, Cut, LogRecord, LogsCohort, LogsOwner, ReadRefused};
+use super::{
+  Answer, AppendRefused, Cut, LogRecord, LogsCohort, LogsOwner, LogsTakeoverRefused, ReadRefused,
+};
 use crate::catalog::{LogName, LogSpan, RepositoryId, StateLog, VolumeId, spans_split_by};
-use crate::ledger::{Reach, TakeoverError};
-use crate::register::{HostId, ObjectId, Quorum, candidates_for};
+use crate::ledger::{Heard, LedgerPromise, PhaseOne, Reach, TakeoverError};
+use crate::register::{
+  HostEpoch, HostId, ObjectId, Prepare, Quorum, RegisterClass, candidates_for,
+};
 
 /// Shape: the host that owns every test's repository.
 const OWNER: HostId = HostId(1);
-/// Shape: the repository whose state logs the tests keep.
-const REPOSITORY: RepositoryId = RepositoryId { bytes: [0x2a; 16] };
-/// Shape: the first object counter a state log's id takes, past every green's a test names.
-const STATE_OBJECTS: u64 = 0x100;
+/// Shape: the repository whose state logs the tests keep, minted by the owner as a volume id is, past every green's
+/// counter a test names.
+const REPOSITORY: RepositoryId = RepositoryId {
+  bytes: ObjectId::new(OWNER, 0x100).0,
+};
+/// The four state logs, in log order.
+const STATE_LOGS: [StateLog; 4] = [
+  StateLog::Names,
+  StateLog::Phases,
+  StateLog::Markers,
+  StateLog::Locks,
+];
 /// Shape: the greens a generated history keeps, enough that its records land on both of the owner's copysets.
 const GREENS: u64 = 3;
 /// Shape: the greens probed for one the owner's other copyset holds; rendezvous misses it in all of them with
@@ -59,18 +71,6 @@ fn state(log: StateLog) -> LogName {
   }
 }
 
-/// The object id of state log `log`, past every green's.
-fn state_object(log: StateLog) -> ObjectId {
-  // Format: each state log's offset past the first state object.
-  let offset = match log {
-    StateLog::Names => 0,
-    StateLog::Phases => 1,
-    StateLog::Markers => 2,
-    StateLog::Locks => 3,
-  };
-  ObjectId::new(OWNER, STATE_OBJECTS.saturating_add(offset))
-}
-
 /// The record numbered `number`'s identity.
 fn identity(number: u64) -> [u8; 32] {
   let bytes = number.to_be_bytes();
@@ -97,7 +97,8 @@ fn only(hosts: &[HostId]) -> Reach {
   Reach::Only(hosts.iter().copied().collect())
 }
 
-/// A repository at `f = 1` whose two greens keep their logs on the owner's two copysets, beside its names log.
+/// A repository at `f = 1` whose two greens keep their logs on the owner's two copysets, beside its names and phases
+/// logs, which share the repository's holders.
 struct Apart {
   /// The holders of every log.
   cohort: LogsCohort,
@@ -107,6 +108,8 @@ struct Apart {
   b: LogName,
   /// The names log.
   names: LogName,
+  /// The phases log.
+  phases: LogName,
 }
 
 impl Apart {
@@ -118,18 +121,16 @@ impl Apart {
     let other = (1..PROBES)
       .find(|index| place(green_object(*index)) != first)
       .expect("a green on the other copyset");
-    let (a, b, names) = (green(0), green(other), state(StateLog::Names));
-    let logs = [
-      (a, green_object(0)),
-      (b, green_object(other)),
-      (names, state_object(StateLog::Names)),
-    ];
+    let (a, b) = (green(0), green(other));
+    let (names, phases) = (state(StateLog::Names), state(StateLog::Phases));
+    let logs = [a, b, names, phases];
     let cohort = LogsCohort::new(OWNER, &hosts, &BTreeMap::new(), &logs, Quorum { f: 1 });
     Apart {
       cohort,
       a,
       b,
       names,
+      phases,
     }
   }
 
@@ -191,7 +192,7 @@ fn each_log_commits_on_its_own_holders_and_a_push_waits_on_no_other_log() {
     "B's push waits on B's holders; A's commit on A's at once"
   );
   let announced = owner.announce(&mut world.cohort, &Reach::All);
-  let expected = cut(&[(a, 2), (b, 1), (world.names, 0)]);
+  let expected = cut(&[(a, 2), (b, 1), (world.names, 0), (world.phases, 0)]);
   assert_eq!(
     announced, expected,
     "every push committed once B's holders are back"
@@ -416,7 +417,7 @@ fn a_takeover_keeps_a_record_every_read_holds_and_finishes_it() {
   taken.owner.announce(&mut world.cohort, &Reach::All);
   assert_eq!(
     world.cohort.committed_cut(),
-    cut(&[(a, 1), (b, 1), (world.names, 0)]),
+    cut(&[(a, 1), (b, 1), (world.names, 0), (world.phases, 0)]),
     "committed whole, on both logs"
   );
   let stale = first
@@ -474,12 +475,14 @@ fn a_superseded_owner_commits_nothing_on_any_log() {
   );
 }
 
-/// A-636 (a takeover that cannot fence every log fences none): do commit a push to green A; take the repository over
-/// with the owner and B's co-holders out of reach, so A's round could run and B's could not; then append to A as the
-/// first owner. Expect the takeover refused, naming B and its quorum, and the first owner's push to A committed:
-/// nothing was fenced.
+/// A-636 part 2a (a takeover runs a log at a time, as the live plane's rounds do): do commit a push to green A; take the
+/// repository over with the owner and B's co-holders out of reach, so A's round reads its quorum and B's cannot; have
+/// the first owner push to A and to B with every host back; then take the repository over again with every host in
+/// reach. Expect the first takeover refused at B with nothing adopted, naming A as fenced before it; the first owner's
+/// push to A not committed (A's quorum is fenced) and its push to B committed (B's round never ran); and the second
+/// takeover adopting every log, B's committed push kept (NoLoss) and A's committed push with it.
 #[test]
-fn a_takeover_that_cannot_fence_every_log_fences_none() {
+fn a_takeover_that_cannot_read_every_log_adopts_none_and_the_logs_it_read_stay_fenced() {
   let mut world = Apart::new();
   let (a, b) = (world.a, world.b);
   let mut first = LogsOwner::bootstrap(&world.cohort);
@@ -488,23 +491,219 @@ fn a_takeover_that_cannot_fence_every_log_fences_none() {
     .unwrap();
   let successor = world.co_holders(&a).first().copied().unwrap();
   let reach = only(&world.co_holders(&a));
-  let refused = LogsOwner::take_over(&mut world.cohort, successor, &reach);
-  let refusal = refused.map(|_| ()).unwrap_err();
+  let refusal = LogsOwner::take_over(&mut world.cohort, successor, &reach)
+    .map(|_| ())
+    .unwrap_err();
+  let needed = TakeoverError::NoQuorum {
+    reachable: 0,
+    needed: 2,
+  };
   assert_eq!(
-    (refusal.log, refusal.error),
-    (
-      b,
-      TakeoverError::NoQuorum {
-        reachable: 0,
-        needed: 2
-      }
-    ),
-    "refused at B, whose holders are out of reach"
+    (refusal.log, refusal.error, refusal.fenced),
+    (b, needed, vec![a]),
+    "refused at B, A's round having run"
   );
-  let next = first
-    .append(&mut world.cohort, record(2, &[(a, 1, 2)]), &Reach::All)
+  let pushes = [record(2, &[(a, 1, 2)]), record(3, &[(b, 0, 1)])].map(|push| {
+    first
+      .append(&mut world.cohort, push, &Reach::All)
+      .unwrap()
+      .whole
+  });
+  assert_eq!(pushes, [false, true], "A fenced, B not");
+  let taken = LogsOwner::take_over(&mut world.cohort, successor, &Reach::All).unwrap();
+  let history = world.cohort.committed_history();
+  assert_eq!(
+    (history.get(&a), history.get(&b)),
+    (Some(&vec![identity(1)]), Some(&vec![identity(3)])),
+    "the committed pushes"
+  );
+  assert!(
+    taken.owner.log(&a).starts_with(&[identity(1)]) && taken.owner.log(&b) == [identity(3)],
+    "the second takeover kept every committed push"
+  );
+}
+
+/// A-636 part 2a (each log is its own register; the state logs' class): do place a repository's three greens and its
+/// four state logs at `f = 1`. Expect seven distinct registers: each green's log the green's own register; each state
+/// log the repository's register of the log's class, the four on the repository's candidates; and the greens spread
+/// over the owner's copysets, so the state logs' sharing is the class's doing.
+#[test]
+fn each_log_is_a_register_of_its_own_and_the_state_logs_share_the_repositorys_holders() {
+  let hosts = hosts(1);
+  let mut logs: Vec<LogName> = (0..GREENS).map(green).collect();
+  logs.extend(STATE_LOGS.map(state));
+  let cohort = LogsCohort::new(OWNER, &hosts, &BTreeMap::new(), &logs, Quorum { f: 1 });
+  let registers: BTreeSet<ObjectId> = logs.iter().map(LogName::register).collect();
+  assert_eq!(registers.len(), logs.len(), "one register a log");
+  let place = |object| candidates_for(OWNER, &hosts, &BTreeMap::new(), object, Quorum { f: 1 });
+  let repository = ObjectId(REPOSITORY.bytes);
+  let misplaced: Vec<LogName> = logs
+    .iter()
+    .copied()
+    .filter(|log| !registered_as_named(log) || cohort.candidates(log) != place(home_of(log)))
+    .collect();
+  assert_eq!(misplaced, Vec::new(), "every log on its register's home");
+  let homes: BTreeSet<Vec<HostId>> = (0..PROBES)
+    .map(|index| place(green_object(index)))
+    .collect();
+  assert!(
+    homes.len() > 1
+      && STATE_LOGS
+        .iter()
+        .all(|log| cohort.candidates(&state(*log)) == place(repository)),
+    "greens spread, the state logs on the repository's holders"
+  );
+}
+
+/// Whether `log`'s register names what it should: a green's log the green's own register, a state log its repository's
+/// register of the log's class.
+fn registered_as_named(log: &LogName) -> bool {
+  let register = log.register();
+  match log {
+    LogName::Green { green } => {
+      register == ObjectId(green.bytes) && register.class() == RegisterClass::Own
+    }
+    LogName::State { repository, log } => {
+      register.class() == RegisterClass::State(*log)
+        && register.placement_key() == ObjectId(repository.bytes)
+    }
+  }
+}
+
+/// The object whose placement `log` follows: the green, or the repository.
+fn home_of(log: &LogName) -> ObjectId {
+  match log {
+    LogName::Green { green } => ObjectId(green.bytes),
+    LogName::State { repository, .. } => ObjectId(repository.bytes),
+  }
+}
+
+/// A-636 part 2a (each log's promise on the wire, a log at a time): a holder of several of a repository's logs answers
+/// each log's round with that log alone, and a round counts only its own log's promises. Do: commit a record over the
+/// names and phases logs at `f = 1`, whose holders are the repository's; run the names log's round at a new epoch; offer
+/// it, from one holder, that holder's promise for the phases log, its names promise sent as another holder's, a
+/// promise from a host holding no copy, a promise at an older epoch, a refusal's empty reply and a promise cut short;
+/// then each holder's own names promise, and one of them twice. Expect each offer uncounted and typed, the holders' own
+/// promises counted, the second one refused as twice; and the round adopting the names log at `f + 1`.
+#[test]
+fn each_logs_promise_counts_only_for_its_own_round() {
+  let mut world = Apart::new();
+  let (names, phases) = (world.names, world.phases);
+  let mut owner = LogsOwner::bootstrap(&world.cohort);
+  owner
+    .append(
+      &mut world.cohort,
+      record(1, &[(names, 0, 1), (phases, 0, 1)]),
+      &Reach::All,
+    )
     .unwrap();
-  assert!(next.whole, "A was not fenced");
+  let holders = world.holders(&names);
+  assert_eq!(
+    holders,
+    world.holders(&phases),
+    "the state logs share holders"
+  );
+  let prepare = round_prepare(names, holders[1]);
+  let mut round = PhaseOne::new(prepare, &holders, Quorum { f: 1 });
+  let offers = foreign_offers(&mut world, &prepare, &holders);
+  let heard: Vec<Heard> = offers
+    .iter()
+    .map(|(from, bytes)| round.hear(*from, bytes))
+    .collect();
+  assert_eq!(
+    heard,
+    FOREIGN_HEARD.to_vec(),
+    "every foreign offer uncounted"
+  );
+  assert_eq!(round.adopted(), None, "nothing counted yet");
+  let own = holders
+    .iter()
+    .map(|holder| (*holder, own_promise(&mut world, names, &prepare, *holder)))
+    .collect::<Vec<_>>();
+  let mut heard: Vec<Heard> = own
+    .iter()
+    .map(|(from, bytes)| round.hear(*from, bytes))
+    .collect();
+  heard.push(round.hear(own[0].0, &own[0].1));
+  assert_eq!(
+    heard,
+    [Heard::Counted, Heard::Counted, Heard::Counted, Heard::Twice],
+    "the holders' own"
+  );
+  assert_eq!(
+    round.adopted(),
+    Some(vec![identity(1)]),
+    "the names log, adopted"
+  );
+}
+
+/// What the names round makes of [`foreign_offers`], in order.
+const FOREIGN_HEARD: [Heard; 6] = [
+  Heard::Unbound,
+  Heard::Forged,
+  Heard::NotCandidate,
+  Heard::Unbound,
+  Heard::Malformed,
+  Heard::Malformed,
+];
+
+/// A round's question for `log` at the second epoch, asked by `successor`.
+fn round_prepare(log: LogName, successor: HostId) -> Prepare {
+  Prepare {
+    owner: successor,
+    object: log.register(),
+    epoch: HostEpoch(2),
+    generation: 0,
+  }
+}
+
+/// `holder`'s promise for `log` in the round `prepare` asks, as it puts it on the wire.
+fn own_promise(world: &mut Apart, log: LogName, prepare: &Prepare, holder: HostId) -> Vec<u8> {
+  let cohort = world.cohort.logs.get_mut(&log).unwrap();
+  let asked = Prepare {
+    object: log.register(),
+    ..*prepare
+  };
+  cohort.promise(holder, &asked, &Reach::All).unwrap()
+}
+
+/// Replies the names round `prepare` asks must not count, each with the host it comes from: the first holder's promise
+/// for the phases log; its names promise sent by the second holder; a names promise from a host holding no copy; one
+/// at an older epoch; a refusal's empty reply; and a promise cut short.
+fn foreign_offers(
+  world: &mut Apart,
+  prepare: &Prepare,
+  holders: &[HostId],
+) -> Vec<(HostId, Vec<u8>)> {
+  let (names, phases) = (world.names, world.phases);
+  let (first, second) = (holders[0], holders[1]);
+  let other_log = own_promise(world, phases, prepare, first);
+  let mut own = own_promise(world, names, prepare, first);
+  let outsider = hosts(1)
+    .into_iter()
+    .find(|host| !holders.contains(host))
+    .unwrap();
+  let held = LedgerPromise::decode(&own).unwrap();
+  let from_outsider = LedgerPromise {
+    holder: outsider,
+    ..held.clone()
+  }
+  .encode();
+  let older = LedgerPromise {
+    epoch: HostEpoch(1),
+    ..held
+  }
+  .encode();
+  let sent_as_second = own.clone();
+  own.pop();
+  vec![
+    (first, other_log),
+    (second, sent_as_second),
+    (outsider, from_outsider),
+    (first, older),
+    (first, Vec::new()),
+    (first, own),
+  ]
 }
 
 /// A-636 and A-642 (an append reads each log's position, or is refused whole): do commit a push to green A; append a
@@ -575,8 +774,10 @@ struct Census {
   stale: u32,
   /// Takeovers that ran.
   takeovers: u32,
-  /// Takeovers refused, nothing fenced.
+  /// Takeovers refused, nothing adopted.
   takeovers_refused: u32,
+  /// Takeovers refused after the rounds of some logs ran: those logs stay fenced, nothing adopted (A-636 part 2a).
+  refused_after_fencing: u32,
   /// Records a takeover dropped whole.
   dropped_whole: u32,
   /// Records a takeover kept whole that had not committed: finished by its offers.
@@ -595,7 +796,7 @@ struct Census {
 
 impl Census {
   /// Every count, in field order.
-  fn met(&self) -> [u32; 15] {
+  fn met(&self) -> [u32; 16] {
     [
       self.single_committed,
       self.atomic_committed,
@@ -605,6 +806,7 @@ impl Census {
       self.stale,
       self.takeovers,
       self.takeovers_refused,
+      self.refused_after_fencing,
       self.dropped_whole,
       self.kept_unfinished,
       self.applied_at_join,
@@ -626,6 +828,7 @@ impl Census {
     sum(&mut self.stale, other.stale);
     sum(&mut self.takeovers, other.takeovers);
     sum(&mut self.takeovers_refused, other.takeovers_refused);
+    sum(&mut self.refused_after_fencing, other.refused_after_fencing);
     sum(&mut self.dropped_whole, other.dropped_whole);
     sum(&mut self.kept_unfinished, other.kept_unfinished);
     sum(&mut self.applied_at_join, other.applied_at_join);
@@ -775,22 +978,14 @@ struct World {
 }
 
 impl World {
-  /// A repository at `f` over its hosts, with three greens and the four state logs.
+  /// A repository at `f` over its hosts, with three greens and the four state logs, each log placed by its register.
   fn new(f: u32) -> World {
     let hosts = hosts(f);
-    let states = [
-      StateLog::Names,
-      StateLog::Phases,
-      StateLog::Markers,
-      StateLog::Locks,
-    ];
-    let mut placed: Vec<(LogName, ObjectId)> = (0..GREENS)
-      .map(|index| (green(index), green_object(index)))
-      .collect();
-    placed.extend(states.map(|log| (state(log), state_object(log))));
-    let cohort = LogsCohort::new(OWNER, &hosts, &BTreeMap::new(), &placed, Quorum { f });
+    let mut logs: Vec<LogName> = (0..GREENS).map(green).collect();
+    logs.extend(STATE_LOGS.map(state));
+    let cohort = LogsCohort::new(OWNER, &hosts, &BTreeMap::new(), &logs, Quorum { f });
     World {
-      logs: placed.iter().map(|(log, _)| *log).collect(),
+      logs,
       owner: LogsOwner::bootstrap(&cohort),
       hosts,
       cohort,
@@ -941,9 +1136,9 @@ impl World {
   fn take_over(&mut self, host: u8) -> Result<(), TestCaseError> {
     let new_id = self.hosts[usize::from(host) % self.hosts.len()];
     let committed: BTreeSet<[u8; 32]> = self.history.values().flatten().copied().collect();
-    let Ok(taken) = LogsOwner::take_over(&mut self.cohort, new_id, &self.reach) else {
-      self.census.takeovers_refused = self.census.takeovers_refused.saturating_add(1);
-      return Ok(());
+    let taken = match LogsOwner::take_over(&mut self.cohort, new_id, &self.reach) {
+      Ok(taken) => taken,
+      Err(refusal) => return self.refused(&refusal),
     };
     for dropped in &taken.dropped {
       prop_assert!(!committed.contains(dropped), "a committed record dropped");
@@ -964,6 +1159,29 @@ impl World {
     self.stale.push(superseded);
     if self.stale.len() > STALE_KEPT {
       self.stale.remove(0);
+    }
+    Ok(())
+  }
+
+  /// Counts a refused takeover, and holds its refusal to the rules: the log it names is one the repository keeps, and
+  /// the logs it fenced are those before it, in log order.
+  fn refused(&mut self, refusal: &LogsTakeoverRefused) -> Result<(), TestCaseError> {
+    prop_assert!(
+      self.cohort.logs.contains_key(&refusal.log),
+      "refused at a log the repository does not keep"
+    );
+    let before: Vec<LogName> = self
+      .cohort
+      .logs
+      .keys()
+      .copied()
+      .take_while(|log| *log != refusal.log)
+      .collect();
+    prop_assert_eq!(&refusal.fenced, &before, "fenced, wrongly");
+    let census = &mut self.census;
+    census.takeovers_refused = census.takeovers_refused.saturating_add(1);
+    if !refusal.fenced.is_empty() {
+      census.refused_after_fencing = census.refused_after_fencing.saturating_add(1);
     }
     Ok(())
   }
@@ -1139,13 +1357,16 @@ fn run(f: u32, steps: &[Step]) -> Result<(Answer, Census), TestCaseError> {
 }
 
 /// A-636 and A-642's robustness rules, by generated histories: do run histories of appends (one log and several, some
-/// misread), a superseded owner's appends, partitions, heals, offers, takeovers from any host and replica reads at any
-/// host by any vector, at `f` from 0 to 2, over three greens and the four state logs on the owner's two copysets; run
-/// each twice. Expect after every step no position held by two quorums (Agreement), every committed record kept at its
-/// position (NoLoss), no superseded owner's record whole or committed (StaleNeverCommits), no committed record dropped
-/// by a takeover, every holder's applied cut the committed history with no record split and never behind itself, and
+/// misread), a superseded owner's appends, partitions, heals, offers, takeovers from any host (a log at a time, each
+/// log's holders answering on the wire, A-636 part 2a) and replica reads at any host by any vector, at `f` from 0 to 2,
+/// over three greens placed by their own registers on the owner's two copysets and the four state logs on their
+/// repository's holders; run each twice. Expect after every step no position held by two quorums (Agreement), every
+/// committed record kept at its position (NoLoss), no superseded owner's record whole or committed (StaleNeverCommits),
+/// no committed record dropped by a takeover, every refused takeover naming as fenced exactly the logs before the one
+/// it stopped at, every holder's applied cut the committed history with no record split and never behind itself, and
 /// every replica answer the committed history at an unsplit vector, every refusal true; the two runs alike
-/// (determinism); and every kind of step met across the histories.
+/// (determinism); and every kind of step met across the histories, takeovers refused after fencing some logs among
+/// them.
 #[test]
 fn every_history_of_crashes_partitions_and_takeovers_keeps_each_record_whole() {
   let census = RefCell::new(Census::default());

@@ -6,6 +6,8 @@
 
 use slates_wire::Wire;
 
+use crate::register::{ObjectId, RegisterClass};
+
 /// A volume id: 128 random bits whose high half names the creator host (§4.8 "Lookup").
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct VolumeId {
@@ -1847,6 +1849,22 @@ pub enum LogName {
     /// The log.
     log: StateLog,
   },
+}
+
+impl LogName {
+  /// The register that holds this log in the fleet (A-636 part 2a; §4.8 "Data model"): a green's log is the green's
+  /// own register, its chain of versions; a state log is its repository's register of the log's class
+  /// ([`RegisterClass::State`]), placed and taken over as the repository is, so a repository's state moves as one, as
+  /// a volume's catalog moves with its volume. No two logs of one repository share a register, so a holder of several
+  /// tells each log's records and promises apart by it.
+  pub fn register(&self) -> ObjectId {
+    match self {
+      LogName::Green { green } => ObjectId(green.bytes),
+      LogName::State { repository, log } => {
+        ObjectId(repository.bytes).in_class(RegisterClass::State(*log))
+      }
+    }
+  }
 }
 
 /// What one record moved of one log (A-642): from the position it found the log at to the one it left it at.
