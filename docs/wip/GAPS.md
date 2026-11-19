@@ -18064,13 +18064,25 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   - **Siblings, opened below:** a dirty pre-takeover page judged fresh; an effect served before its publication; an
     outsider's base change during the gap; kernels before FUSE 7.44 keep renamed-away names; A-141's and the journal
     gather's unsliced rounds; a create's redundant entry invalidation.
-- **A dirty page from before a takeover is judged fresh (open, from A-158).** A restored mount's byte states start
-  fresh as of its start (A-156), so a dirty shared-map page the kernel held across the takeover is applied whole when
-  written back, including bytes a change the dead daemon never delivered had made stale. The takeover round's
-  invalidation launders such a page at once; the kernel would have written it back later anyway, so the outcome is the
-  same. The precise fix marks as stale, in adopted files' states, the ranges the last publications and the replayed
-  writes changed. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not
-  reproduced.
+- **A dirty page from before a takeover is judged fresh (the replayed writes closed 2026-11-19, A-567, goal 85 B8;
+  the last publications' changes open, from A-158).** A restored mount's byte states started fresh as of its start
+  (A-156), the head at its first turn, after the successor had replayed the dead daemon's logged writes (A-63), so a
+  dirty shared-map page the kernel held across the takeover was applied whole when written back, the replayed writes'
+  bytes with it. The takeover round's invalidation launders such a page at once. **Fixed for the replayed writes:** a
+  taken-over mount adopts each file it held open from before the successor's first journal record
+  (`coherence::TAKEN_OVER_FROM`, where A-231 places a held NFS connection's carried states), with every change since
+  applied (`coherence::taken_over`, for the restored opens and for each handle a request first names), so a replayed
+  write's bytes are stale until re-fetched and a write-back over them is judged by the volume's bytes: applied where
+  they equal it, refused `EIO` where one differs, never applied whole. A journal that no longer reaches back to the
+  successor's first record loses the file, whose write-backs are refused. Test, failing first:
+  `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`crates/bridge-fuse/src/coherence.rs`; red
+  `Some([])` where the write's bytes were due stale). **Its cost:** the write log names no writer, so a replayed write the mount's own
+  kernel made is taken as another path's, and a store through a shared map over those very bytes before a re-fetch is
+  refused once (`EIO` at the next `msync`/`fsync`, its page invalidated and re-fetched after); logging each write's
+  attachment and seeding the mount's own records from it would end that. **Still open:** a change before the last
+  publication whose invalidation the dead daemon never delivered is in no journal of the successor, so it is not
+  marked; carrying a FUSE mount's byte states in each publication, as A-231 carries a held NFS connection's, would end
+  it. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not reproduced.
 - **An effect served before its publication (from A-158) — fixed 2026-11-19 (A-573, B10 (a)) for every inode the
   successor holds.** A mutation is applied, then published before its reply. A mount that reads the new bytes in
   between, followed by the daemon dying before the publication, holds bytes the successor never had. If its kernel

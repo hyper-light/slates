@@ -38097,6 +38097,43 @@ Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper
 `xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
 `crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.
 
+### A-567 — A mount taken over from a daemon that died adopts each file its kernel held from before the successor's first journal record, so a replayed write's bytes are stale, never taken as fresh (2026-11-19, goal 85 B8 via g083; §4.6 "Cache posture", the dirty-page write-back rule; A-61, A-63, A-147, A-152, A-158, A-192, A-231)
+
+Applied in the same change to: GAPS ("A dirty page from before a takeover is judged fresh": the replayed writes closed,
+the last publications' changes left open), `crates/bridge-fuse/src/coherence.rs` (`TAKEN_OVER_FROM`, `TakenOver`,
+`taken_over`, `changes_since`; the test), `crates/bridge-fuse/src/channel.rs` (`adopt_restored`, `adopt_unseen_handle`
+and `pending_changes` through them), and the bug record
+`docs/bugs/2026-11-19-a-taken-over-mount-took-a-replayed-writes-bytes-as-fresh.md`.
+
+- **What was wrong.** A restored mount tracked each file its kernel held open before the takeover as fresh as of its own
+  start, the journal's head at its first turn. The successor replays the dead daemon's logged writes (A-63) before that
+  turn, so they are records before the head, and no adoption saw them: a dirty shared-map page the kernel held across
+  the takeover was judged fresh and applied whole when written back, the replayed write's bytes with it.
+- **The rule.** A taken-over mount adopts such a file from before the successor's first journal record
+  (`coherence::TAKEN_OVER_FROM`, the point A-231 places a held NFS connection's carried states at), with every change
+  the journal holds since applied in order, each the mount's own where its own records took it (`coherence::taken_over`,
+  for the restored opens at the first turn and for each handle a request first names). A replayed write's bytes are
+  stale until the kernel re-fetches them, and a write-back over them is judged by the volume's bytes
+  (`coherence::judge_writeback`): applied where they equal it, refused `EIO` where one differs, never applied whole. A
+  journal that no longer reaches back to the successor's first record loses the file, and its write-backs are refused,
+  as an untracked file's were. The rule is cfg-free, so it is tested on every host; the Linux channel calls it.
+- **What it costs.** The write log names no writer, so a replayed write the mount's own kernel made is taken as another
+  path's: a store through a shared map over exactly those bytes, before the kernel re-fetches them, is refused once
+  (`EIO` at the next `msync` or `fsync`), and the refused range is invalidated, so the page is re-fetched. Logging each
+  write's attachment and seeding the mount's own records from the replay would end that.
+- **Left open.** A change made before the last publication whose invalidation the dead daemon never delivered is in no
+  journal of the successor, so it is not marked. Carrying a FUSE mount's byte states in each publication, as A-231
+  carries a held NFS connection's, would end it.
+- **Test.** `a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states` (`crates/bridge-fuse/src/coherence.rs`):
+  the bytes of a file written before a taken-over mount's start must be stale in the adopted file's states and the
+  rest fresh. Failing first on the Mac Studio (debug, r138, 2026-11-19): the rule moved unchanged into
+  `coherence::taken_over` left them fresh (`Some([])`, the write then at bytes 16..48). The fix's first run (r258) then
+  failed on the test's own premise: a write past the end of an empty file is recorded as an extension from its old end,
+  0..48, so the test now writes bytes 0..32 and expects exactly them stale. Green on the Mac Studio (r284):
+  `cargo test --locked -p slates-bridge-fuse --lib coherence` 14 of 14 and the library whole 36 of 36; rustfmt changes
+  nothing. The Linux channel's glue is not compiled on macOS: its build, its unit tests and the takeover tests are
+  main's (Linux).
+
 ### A-574 — A laptop's failover detection is what its watchdog and its anchor measure: the widest shard window, then the anchor's lapse bound, read at every beat on every node (2026-11-19, UI goal 86 via g076b; R3's class D, its last fixed-window term; R8; §4.4 "Derived constants", §4.14 `daemon.alive`; A-363, A-405, A-455, A-467)
 Applied in the same change to: §4.4's status (the failover delay's paragraph), GAPS (the failover delay's entry: A-405's
 sentence and the class D line), `docs/cli.md` (an unrenewed CLI attachment's lapse on a laptop),
