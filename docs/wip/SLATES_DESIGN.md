@@ -14575,6 +14575,27 @@ and export by landing).
 > `RepositoryLogs::append` at the revision's head with the Subversion record in the one durable entry, a `Moved` append
 > judged again at the head by position (A-658), as FSFS merges again, a real conflict alone refused; and its recovery.
 >
+> **Status (2026-11-19, A-655, part 2b).** Built: the commit landed by the repository's owner through its store
+> (`slates-server`'s `repository::svn_commit`, over A-662's map; `slates-svn`'s `commit::record`). A Subversion
+> repository's store holds its records (`migration::Repository`), made from the record its first entry holds: its UUID,
+> its id's sixteen bytes in RFC 4122's form, so every holder names it alike, and revision 0's `svn:date`, the owner's
+> instant, as `svnadmin create` gives both; charged to the shard's budget by the bytes they hold, their index's entries
+> bounded by those bytes over the fewest an entry takes. The step, one for a client's accepted work and an imported
+> revision, in one turn on the owner: a client's work judged again where its verdict's facts moved
+> (`Repository::judge_again`: a work whose head the repository moved past merged again at the youngest by A-592's
+> verdict over the revisions since its head, as `svn_fs_fs__commit_txn` merges a transaction whose base moved, so it is
+> refused only where that merge finds a conflict; its locks verified against the table as it stands, as `commit_body`'s
+> `verify_locks`; a refusal in the drive's words, `StepRefusal::Verdict`); the check; the green's next version built
+> from the rows (a file's whole text; a node's property list named by its identity in the attribute `slates.svn.props`;
+> a copy by reference, with `REPLACE` over what its destination holds; a deletion naming each node beneath it; every
+> operation node-exclusive) and appended through A-635's `RepositoryLogs::append` with the revision's record in the
+> same entry; then the apply. A recovery and a rebuild replay the records through the same check and apply. Not
+> declared yet, refused typed (`Unsupported`, counted): a directory deleted or replaced beneath a copy the same revision
+> made from a revision older than the head, whose tree no public read of the engine lists at that version, and a
+> replacement without history that changes a node's kind (the engine's `TypeChanged`, GAPS §8f). Owed: the svn://
+> connection task's call of the step (A-656) and the import's (A-652 part 3); the lock verbs' entries recorded as a
+> commit's are; the records' texts held once rather than beside the green's content and in the record.
+>
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
 > makes, in `reporter.c`'s order, each with the editor's own arguments and the raw facts of the node it names; A-627's
@@ -50960,13 +50981,114 @@ Applied in the same change to:
   partition alone (`Repositories::find`), where the HTTP edge locates one held elsewhere and moves the connection
   there (main's finding, its own piece).
 
+### A-655 part 2b — The Subversion commit landed by the repository's owner through its store: the records in A-662's Subversion arm, a work judged again where its verdict's facts moved, the green's next version and the revision's record appended as one entry, the records replayed by a recovery (2026-11-19, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 items 1, 3.3 to 3.5 and piece 7; §4.17.1 "A push is a work" and "Durability and residency"; A-592, A-635, A-645, A-658, A-662)
+Applied in the same change to: §4.17.4's status (A-655, part 2b); GAPS (the §4.17.4 entry, A-656's and A-662's owed
+lists); `crates/svn` (`commit/record.rs` and its tests, new; `commit/revision.rs`: `StepRefusal::Verdict`;
+`commit/drive.rs`: the commit rule's words shared as `commit_words`; `migration/records.rs`: `Repository::set_room`,
+`judge_again`, `check_work`, `Before` and `before`; `index.rs`: `Index::ENTRY_BYTES`; `migration.rs`, `commit.rs`,
+`lib.rs`; the drive's and the step's tests); `crates/merge` (`Green::beneath`, with its test); `crates/server`
+(`repository/svn_commit.rs` and its tests, new; `vcs_store.rs`: the Subversion arm's records, their replay, lend,
+reservation and settle, `make_from_log`; `repository.rs`: the creation's record; `repository/push.rs`:
+`EntryParts::objects`; `repository/hg_push.rs` and `lfs.rs`: the new field; `vcs_store/tests.rs`: A-662's arm test).
+- **What was there.** Part 2a's step (`Repository::check`, then `apply`) committed a revision into records only the
+  crate's tests held. A-662's Subversion arm held a bare index, and its recovery refused a Subversion record `Owed`.
+  Nothing moved a Subversion repository's green, and the daemon refused every accepted work (A-656's `NotServed`).
+- **The records on the owner** (A-662's map). `SvnStore` holds `migration::Repository` and what the shard is charged for
+  it. A Subversion repository's first entry, which joins its root and binds its default branch, also holds its
+  creation's record (`Record::Created`): the UUID, the repository id's sixteen bytes in RFC 4122's form, so every holder
+  and every recovery names it alike and no two repositories share one; and revision 0's `svn:date`, the owner's
+  wall-clock instant written by `svn_time_to_cstring`'s rule (refused `Unsupported` before 1970 or past the year 9999,
+  which no clock reads), made before anything of the verb is recorded. `install_root` makes the store from the log
+  (`vcs_store::make_from_log`), the recovery's own replay, so creation and recovery are one path. The records' bytes
+  (texts, property lists, revision properties) are charged to the shard's budget as retention: a step is lent the room
+  the shard could admit (`lend_svn`), the growth its check found is charged before its append (`reserve_svn`, given back
+  if the append refuses), and the charge is trued up after (`settle_svn`). The index's entries are bounded by those
+  bytes over `Index::ENTRY_BYTES`, the smaller of a node row's and a deletion's size as the compiler lays them out, so
+  the entries alone never pass the room; the index's own bytes stay uncharged (A-662's owed item).
+- **The step** (`repository::svn_commit::commit`): the repository's one green, its default branch's, here and not
+  fenced; the records lent room; a client's work judged again (below), an imported revision as made; the revision's
+  record written (`Record::revision_bytes`) and the revision checked (`Repository::check`); the green's next version
+  built (below) over a green that must be at the records' youngest revision (version N is revision N, §4.17.4 item 1;
+  otherwise `Diverged`, counted); the growth reserved; one entry through A-635's `RepositoryLogs::append`, the green
+  moved by the version's increment and the record in `EntryParts::objects` (new); then `Repository::apply`. A refusal
+  before the append changes nothing. After it the revision is the log's: a green answering another version, or an apply
+  refused, neither met in a correct use, is counted and the records are made again from the log, which holds the
+  revision. The answer is `commit-info`'s: the revision, its `svn:date` and its `svn:author`.
+- **A moved work is judged again, not refused out of date** (main's word, from FSFS). `svn_fs_fs__commit_txn` merges a
+  transaction whose base moved with the youngest and commits it (`tree.c` 2255-2310), so a commit is refused only where
+  that merge finds a conflict, and `commit_body` checks the locks at the commit (`transaction.c` 3797). When the
+  connection task calls the step in its `close-edit` turn nothing moves between the verdict and the step; a work
+  computed elsewhere (A-645, A-658) meets a moved head, and a lock may be taken between. `judge_again` runs A-592's
+  verdict again with the work's head as its base, the merge over the revisions since (FSFS's second merge, whose
+  ancestor is the head its first merge made the transaction's base), and the lock table's check as it stands at the
+  owner's instant; the revision's head and lock entries become the step's, its rows stay the work's (the index applies
+  them against the youngest). A-658 part 2's `Green::judge_computed` judges again only the units of a green's work the
+  versions since changed; `judge_again` is Subversion's instance of that rule, stated over the index, whose verdict is
+  FSFS's merge over the revisions since the work's head.
+- **The green's version** (`Building`). Files hold Subversion's repository-normal bytes; a node's property list is named
+  by its content identity in `slates.svn.props` (item 1: one reference a node, the list held once by the records); a
+  copy is the engine's `Copy` of the source at its revision (A-586), with `REPLACE` where the destination holds a node,
+  the replaced one or one a row removed (A-626); a text the row sets replaces the node's whole (a `Delete` of the old
+  length, then an `Insert`); every operation is node-exclusive (A-542). Rows are read in path order, parents first. A
+  deletion names every node beneath it, since a node-exclusive `Rmdir` needs the increment to empty its directory
+  (`merge_rmdir`): the head's tree beneath the path is read through `Green::beneath` (new: it walks the keys beneath the
+  path alone), a copy's tree at its source when the copy is of the head; the engine drops a removed node's attributes
+  itself (`drop_metadata`, since A-618). A node one row removes and a later row makes again as its own kind is changed
+  in place, since `merge_create` refuses a creation over a node the head holds. The work's identity is BLAKE3 of the
+  record under its own key-derivation context.
+- **Not declared yet** (refused `Unsupported`, counted `repository.svn.unsupported`, nothing changed): a directory
+  deleted, or replaced without history, beneath a copy the same revision made from a revision older than the head,
+  whose tree no public read of the engine lists at that version (the engine's own `SourceAt` view holds it); and a
+  replacement without history that changes a node's kind, which the engine refuses as `TypeChanged` (GAPS §8f). A file
+  deleted beneath such a copy, and a directory beneath a copy of the head, are declared.
+- **The record** (`slates_svn::commit::record`): `Record::Created { uuid, date }` and `Record::Revision(Revision)`,
+  little-endian, magic "SSVR", version 1, then a kind byte; every count checked against the bytes that remain before
+  anything is allocated; refused typed (`RecordRefused`): truncated, another magic or version, a tag of no kind, a count
+  past the bytes, a string not UTF-8, a UUID not in RFC 4122's form, a lock token `svn_fs_lock_many` would refuse,
+  revision properties or contents out of their order or named twice (the encoding is canonical: one value a record), a
+  content not its identity's, bytes after the last item. A recovery replays a creation into empty records and a revision
+  through `Repository::commit` (check, then apply, its lock entries as recorded); one out of its order or refused by the
+  step leaves the store unrecovered with why (`ReplayRefused::SvnRecord`, `SvnCreated`, `SvnStep`, `SvnOrder`).
+- **Departures.** None from FSFS's rules. The step judges the locks again where the head did not move too, as
+  `commit_body` does at every commit; in the verdict's own turn it answers what the verdict answered.
+- **Tests.** slates-svn: the record pinned byte for byte by hand (a creation, and a revision of every part), every shape
+  read back and encoded again the same, every truncation refused, hostile inputs by kind, every byte flipped never a
+  panic and what then reads canonical; every recorded commit's revision (the drive's replay of the seventeen recorded
+  commits) read back whole; a work judged at a moved head merged again and landing as the next revision with its own rows
+  (the recorded property changes of `/trunk/project` and `/trunk/project/sub`, both judged at revision 3), and a
+  conflicting one refused "Conflict at '/trunk/project'" (`E160024`); a lock taken after a work's verdict refusing it at
+  the step (`E160039`), and the holder presenting its token releasing it. slates-merge: `Green::beneath` deepest first,
+  a copy's graft among it. slates-server: a repository made with its creation's record; a revision landing as the
+  green's next version with its record; a copy, a change and a directory's deletion beneath it, a tree's deletion, and a
+  replacement without history, each on the green; three works judged at one head (the second judged again and landing,
+  the third a conflict changing nothing); refusals (out of date, a content not brought, another principal's append, a
+  deletion beneath a copy of an older revision) each changing nothing, the reservation given back; the records made
+  again from the log equal whole, every record replayed; A-662's arm test refusing a Subversion record by its kind.
+- **Evidence** (kiln, macOS arm64, Mac Studio d1323898, debug, 2026-11-19). The landing's tree (kiln r22, over the merge
+  with main bb535bd4d, rustfmt's layout taken from `cargo fmt -p slates-svn -p slates-server -p slates-merge` there, the
+  patch's sha256 matched, the tests run on the formatted tree): `cargo test --locked -p slates-svn --lib -- commit::
+  migration::` 88 of 88, 407 filtered out; `cargo test --locked -p slates-merge --lib -- engine::copy_tests::t_a655` 1 of
+  1; `cargo test --locked -p slates-server --lib -- repository:: vcs_store:: lfs:: --test-threads=4` 51 of 51, 695
+  filtered out; no compiler warning. No integration test creates a repository, so none reaches the step or the store's
+  replay. The first run (kiln r221, the unmerged change 37f52be33) built slates-merge and slates-server green but for
+  main's `each_verb_moves_the_names_log_and_each_members_version_its_own_log`, failing then on main's own tree and
+  passing on the merge, and failed slates-svn's test build on one borrow in the record's round-trip test (fixed). The
+  new tests name what main lacks and do not build on main's tree; the mutation red-checks are main's (§8).
+- **Owed.** The svn:// connection task's call of the step (A-656) and the import's (A-652 part 3); the lock verbs'
+  entries recorded as a commit's are; the engine's read of a tree at a version (for a directory deleted beneath a copy
+  of an older revision) and its composition of a kind change (§8f); the records' texts held once, read from the green's
+  content rather than held beside it and in each record; the Subversion index charged by its bytes; main's runs
+  (clippy, `xtask check`, the doc gate, Linux and Windows builds, the mutation red-checks).
+
 ### A-679 — Mercurial's `serve --stdio` behind the daemon's SSH edge: slates-hg's `serve::stdio` over the store the HTTP site's lender holds, its refusals in 7.2's words (2026-11-19, g304 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Transports" and piece 4; §4.17.2 "Transports" item 2; after A-650 part 2, A-651 and A-662)
 Applied in the same change to: `crates/server` (`vcs_ssh/hg.rs`, new; `vcs_ssh/site.rs`: `ToolServices<L, H>`,
 `ToolCommand`, `not_served`, the refusal of a repository argument starting `--`, the module doc's steps 1 and 3;
 `vcs_ssh.rs`: `channel_window`, the owed list; `vcs_http.rs`: `hg` visible to the crate; `vcs_ssh/tests/hg.rs`, new;
 `vcs_ssh/tests/serve.rs`: `served_by`, written as A-651 part 3 writes it; `vcs_ssh/tests/git.rs`: `NoStores` as the
-Mercurial lender), §4.17.2's status, §4.17.3's status and piece 4, GAPS (the §4.17.3 entry: a Built line and the owed
-list), `research/mercurial-server.md` (§26).
+Mercurial lender), `crates/cli/tests/cli.rs` (the SSH round trip with stock hg: its doc and its ignore reason, which
+now wait on A-680's lender in A-679's place), §4.17.2's status, §4.17.3's status and piece 4, GAPS (the §4.17.3 entry:
+a Built line, the owed list, and the interop tests' line on what the SSH round trip waits on),
+`research/mercurial-server.md` (§26).
 - **What was there.** A-650 part 2 built the session over a byte channel (`serve::stdio`), the entry point the SSH edge
   was to call. A-651 built the edge and its site, whose services started git's upload-pack alone (part 2) and answered
   `hg -R <path> serve --stdio` as not served. A-650 part 1's HTTP site reads Mercurial's stores through a lender

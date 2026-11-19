@@ -32,7 +32,8 @@
 
 use std::collections::BTreeMap;
 
-use super::drive::Work;
+use super::CommitRefusal;
+use super::drive::{Work, commit_words};
 use crate::index::{self, ContentIdentity, IndexRefusal, RevisionRecord};
 use crate::lock::{AprTime, LockEntry, LockRefusal};
 use crate::migration::Properties;
@@ -166,6 +167,16 @@ pub enum StepRefusal {
     /// The instant.
     now: AprTime,
   },
+  /// A client's work judged again where its verdict's facts moved (A-655 part 2b,
+  /// [`crate::migration::Repository::check_work`]): the conflict FSFS's merge finds at the youngest revision, or the
+  /// lock its commit meets, each answered as the drive's verdict answers it (`E160024`, `E160034`, `E160037`,
+  /// `E160039`).
+  Verdict {
+    /// The verdict's refusal.
+    refusal: CommitRefusal,
+    /// The committing principal, whom a lock's words name.
+    user: Option<String>,
+  },
 }
 
 impl StepRefusal {
@@ -177,6 +188,7 @@ impl StepRefusal {
       Self::Lock(refusal) => refusal.subversion_code(),
       Self::Room { .. } | Self::Date { .. } => SVN_ERR_FS_GENERAL,
       Self::Corrupt => SVN_ERR_FS_CORRUPT,
+      Self::Verdict { refusal, .. } => refusal.subversion_code(),
     }
   }
 
@@ -190,6 +202,7 @@ impl StepRefusal {
       Self::Corrupt => FILESYSTEM_IS_CORRUPT.to_owned(),
       Self::Index(refusal) => format!("{refusal:?}"),
       Self::Lock(refusal) => format!("{refusal:?}"),
+      Self::Verdict { refusal, user } => commit_words(refusal, user.as_deref()),
     }
   }
 }
