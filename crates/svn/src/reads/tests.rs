@@ -373,15 +373,15 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
   let fixture = Fixture::new();
   let answers = items(server);
   let commands = items(client);
-  let base = session_base(&commands[0]);
-  let session = Session {
-    base: &base,
-    uuid: UUID,
-  };
+  let mut base = session_base(&commands[0]);
   let mut at = 4;
   let mut answered = 0;
   for command in commands.iter().skip(2) {
     let word = command_word(name, command);
+    let session = Session {
+      base: &base,
+      uuid: UUID,
+    };
     let mut out = Vec::new();
     let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
     match drained(outcome, &fixture, &session, &mut out) {
@@ -395,6 +395,9 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
           elsewhere.contains(&word),
           "{name}: {word} is another piece's"
         );
+        if word == "reparent" {
+          base = reparented(command);
+        }
         at += 2;
       }
       Outcome::Close => return closed(name, word, at, answers.len(), answered),
@@ -415,6 +418,25 @@ fn session_base(greeting: &Value<'_>) -> String {
   };
   let Some(Value::String(url)) = parts.get(2) else {
     panic!("a greeting without its URL");
+  };
+  let path = std::str::from_utf8(url).unwrap().strip_prefix(URL).unwrap();
+  if path.is_empty() {
+    "/".to_owned()
+  } else {
+    path.to_owned()
+  }
+}
+
+/// The session's base after a `reparent`, which another piece answers: the path of its URL past the repository's.
+fn reparented(command: &Value<'_>) -> String {
+  let Value::List(parts) = command else {
+    panic!("a reparent that is no command");
+  };
+  let Some(Value::List(params)) = parts.get(1) else {
+    panic!("a reparent without parameters");
+  };
+  let Some(Value::String(url)) = params.first() else {
+    panic!("a reparent without its URL");
   };
   let path = std::str::from_utf8(url).unwrap().strip_prefix(URL).unwrap();
   if path.is_empty() {
@@ -486,6 +508,34 @@ macro_rules! transcript {
   };
 }
 
+/// One connection of a recorded session that made several.
+macro_rules! transcript_of {
+  ($name:literal, $connection:literal) => {
+    (
+      concat!($name, ".", $connection),
+      include_bytes!(concat!("../../fixtures/reads/", $name, ".", $connection, ".client.bin")).as_slice(),
+      include_bytes!(concat!("../../fixtures/reads/", $name, ".", $connection, ".server.bin")).as_slice(),
+    )
+  };
+}
+
+/// A-613 part 2: stock `svn mergeinfo --show-revs eligible` and `merged`, which the client computes itself from the
+/// server's `get-mergeinfo`, location segments and `log` over two and three connections: each connection answered as
+/// `svnserve` answered it, its `reparent` another piece's, the base it names taken as `svnserve` takes it.
+#[test]
+fn stock_mergeinfo_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript_of!("svn-mergeinfo-eligible", "1"), 2),
+    (transcript_of!("svn-mergeinfo-eligible", "2"), 5),
+    (transcript_of!("svn-mergeinfo-merged", "1"), 2),
+    (transcript_of!("svn-mergeinfo-merged", "2"), 2),
+    (transcript_of!("svn-mergeinfo-merged", "3"), 1),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(replay(name, client, server, &["reparent"]), commands, "{name}");
+  }
+}
+
 /// A-613: the scripted sessions: every command answered as `svnserve` answered it (`get-latest-rev`, `get-dated-rev`
 /// at, between, before and after the revisions' dates and refusing two bogus dates; `rev-proplist` and `rev-prop`,
 /// one absent and one past the youngest; `check-path` and `stat` of the root, files, directories, absent paths, a
@@ -512,6 +562,7 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("get-location-segments"), 16),
     (transcript!("get-deleted-rev"), 15),
     (transcript!("log"), 16),
+    (transcript!("log-merged"), 7),
     (transcript!("hostile-log-word"), 0),
     (transcript!("hostile-log-path"), 0),
     (transcript!("hostile-log-seven"), 0),
@@ -538,6 +589,7 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-cat-big"), 3),
     (transcript!("svn-ls"), 2),
     (transcript!("svn-log"), 4),
+    (transcript!("svn-log-g"), 4),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
@@ -554,6 +606,10 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "svn-mergeinfo-eligible",
+    "svn-mergeinfo-merged",
+    "log-merged",
+    "svn-log-g",
     "log",
     "hostile-log-word",
     "hostile-log-path",
@@ -595,6 +651,16 @@ fn every_fixture_has_its_recorded_sum() {
         "{file}"
       );
     }
+  }
+  for file in [
+    "svn-mergeinfo-eligible.2.client.bin",
+    "svn-mergeinfo-eligible.2.server.bin",
+    "svn-mergeinfo-merged.2.client.bin",
+    "svn-mergeinfo-merged.2.server.bin",
+    "svn-mergeinfo-merged.3.client.bin",
+    "svn-mergeinfo-merged.3.server.bin",
+  ] {
+    assert!(sums.lines().any(|line| line.ends_with(&format!("  {file}"))), "{file}");
   }
   assert!(sums.lines().any(|line| line.ends_with("  repository.txt")));
 }
@@ -1085,21 +1151,20 @@ fn log_parameters_are_read_as_vparse_tuple_reads_them() {
 }
 
 /// A-613 part 2 (`log`): the log streams a revision a step, the same bytes in a room of one byte as in a room past the
-/// answer; and until merged revisions are built a log asking for them is refused after `done` with Subversion's
-/// refusal of a feature not offered, never answered without them.
+/// answer, with merged revisions as without.
 #[test]
-fn a_log_streams_a_revision_a_step_and_refuses_merged_revisions_until_built() {
+fn a_log_streams_a_revision_a_step() {
   let fixture = Fixture::new();
   let command = b"( log ( ( 0: ) ( 11 ) ( 0 ) false false 0 false revprops ( ) ) ) ";
   let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
   let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
   assert_eq!(narrow, wide);
   assert!(narrow_slices > 12 && wide_slices == 1, "{narrow_slices}");
-  let command = b"( log ( ( 5:trunk ) ( 11 ) ( 0 ) false false 0 true revprops ( ) ) ) ";
-  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
-  assert!(
-    out.ends_with(b"done ( failure ( ( 200007 36:Trying to use an unsupported feature 0: 0 ) ) ) ")
-  );
+  let command = b"( log ( ( 9:tags/t1 5:trunk ) ( 11 ) ( 0 ) true false 0 true all-revprops ( ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert!(narrow_slices > 10 && wide_slices == 1, "{narrow_slices}");
 }
 
 /// A-613 part 2 (`log`): `fill_log_entry` hands over every revision property when the names asked are as many as the

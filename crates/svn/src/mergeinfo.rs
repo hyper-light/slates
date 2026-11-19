@@ -1684,6 +1684,43 @@ pub fn mergeinfo_at<C: Contents + ?Sized>(
   revision: Revision,
   inheritance: MergeinfoInheritance,
 ) -> Result<Option<Mergeinfo>, QueryRefusal> {
+  let found = nearest_mergeinfo(index, contents, path, revision, inheritance)?;
+  Ok(found.map(|(mergeinfo, relative)| {
+    if relative.is_empty() {
+      mergeinfo
+    } else {
+      mergeinfo.inheritable_part().with_suffix(relative)
+    }
+  }))
+}
+
+/// The same search as [`mergeinfo_at`], the value as the node holding it has it (`svn_fs__get_mergeinfo_for_path` with
+/// `adjust_inherited_mergeinfo` FALSE, which `log.c` asks for issue #4022's check of a copy's inherited mergeinfo): an
+/// ancestor's value neither narrowed to its inheritable ranges nor extended by the path beneath it.
+///
+/// # Errors
+/// [`QueryRefusal`] as [`mergeinfo_at`] refuses.
+pub fn mergeinfo_as_held<C: Contents + ?Sized>(
+  index: &Index,
+  contents: &C,
+  path: &str,
+  revision: Revision,
+  inheritance: MergeinfoInheritance,
+) -> Result<Option<Mergeinfo>, QueryRefusal> {
+  let found = nearest_mergeinfo(index, contents, path, revision, inheritance)?;
+  Ok(found.map(|(mergeinfo, _)| mergeinfo))
+}
+
+/// FSFS's search for the nearest node holding `svn:mergeinfo` (`get_mergeinfo_for_path`): the mergeinfo found and the
+/// path beneath the node holding it (empty for the path itself); `None` when none holds it, or when the one found holds
+/// a value that does not parse (issue #3896).
+fn nearest_mergeinfo<'path, C: Contents + ?Sized>(
+  index: &Index,
+  contents: &C,
+  path: &'path str,
+  revision: Revision,
+  inheritance: MergeinfoInheritance,
+) -> Result<Option<(Mergeinfo, &'path str)>, QueryRefusal> {
   present(index, path, revision)?;
   let mut places = places_upward(path);
   if inheritance == MergeinfoInheritance::NearestAncestor {
@@ -1697,11 +1734,7 @@ pub fn mergeinfo_at<C: Contents + ?Sized>(
       let Ok(mergeinfo) = Mergeinfo::parse(value) else {
         return Ok(None);
       };
-      return Ok(Some(if relative.is_empty() {
-        mergeinfo
-      } else {
-        mergeinfo.inheritable_part().with_suffix(relative)
-      }));
+      return Ok(Some((mergeinfo, relative)));
     }
     if inheritance == MergeinfoInheritance::Explicit {
       break;
