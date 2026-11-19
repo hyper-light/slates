@@ -694,7 +694,7 @@ enum Flow {
 /// `overdue` is called, once, and the same work goes on until it ends or its task is reaped (never dropped mid-way, so a
 /// write past its deadline loses no byte it handed the kernel). The work's output and whether it was overdue; refused
 /// only where no deadline can be armed (off a shard).
-async fn awaited<F: Future>(
+pub(crate) async fn awaited<F: Future>(
   work: F,
   deadline_ns: u64,
   mut overdue: impl FnMut(),
