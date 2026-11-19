@@ -12085,9 +12085,10 @@ is one more version, and the chain itself is never rewritten.
 > trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
 > and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
 > client pushed keeps the client's commit. Item 4's identities are kept in each principal's record (A-664 part 1,
-> `slates-db`'s `IdentityRecord`). Owed: setting them on the control channel, a session carrying them from its first
-> submit, and the refusals at submit (part 1's server half), the commit recorded with the version and admitted (part
-> 3), Mercurial's and Subversion's.
+> `slates-db`'s `IdentityRecord`), set by their owner on the control channel (`SetIdentities`), read once a session at
+> its first submit and carried by every submit with its message (`Authorship`); a repository's green refuses a submit
+> without either, `MessageRequired` or `IdentityRequired`, before any work is built (A-664 part 1). Owed: the commit
+> recorded with the version and admitted (part 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12924,6 +12925,12 @@ engine: the verdict, rebase, position mapping, the register).
 > encoding's order, or one object encoded, a unit; both parts kept last. Between turns it holds no borrow, and over any
 > turns it writes the bytes one pass writes. Owed: one object, a pair of trees and a part's put each still one unit.
 >
+> **Status (2026-11-19, A-614 part 3 superseded by A-666).** The commit rows keep no changed-path Bloom filter: no
+> path-limited walk the server makes needs one (the amendment lists the walks checked). slates' API answers a path's
+> `log`, `--follow` and blame from A-666's derived types, the version their unit; upload-pack walks no path's history,
+> receive-pack judges ref names, a hook's git walks the hook view itself, and Subversion's path reads walk its own node
+> history over revisions. A-614 is complete with parts 1 and 2.
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -13032,8 +13039,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    hashes `<type> <length>\0<content>`; the store keeps the content, and for a blob that content is the file's bytes in
    the checkout (§4.17.1, objects item 1).
 2. **Index rows.** Each object's row (§4.17.1, objects item 3) holds its type, length, content identity and the version
-   that brought it. A commit's row adds what git's commit-graph keeps: its parents by position, root tree, commit date,
-   generation number and the Bloom filter of the paths it changed against its first parent [B: gitformat-commit-graph].
+   that brought it. A commit's row adds what git's commit-graph keeps for walks: its parents by position, root tree,
+   commit date and generation number [B: gitformat-commit-graph]. The changed-path Bloom filter a commit-graph may add
+   is not kept: a path's history and blame are A-666's derived types, and no walk here reads paths (A-614 part 3,
+   superseded).
    The rows are computed when the push that brings the commits is admitted, in time proportional to the new commits;
    nothing rewrites them later.
 3. **What each version brought.** Version k records D(k): the objects reachable from its head and not from version k-1's
@@ -13164,9 +13173,10 @@ presents it to the hook driver on the owner shard.
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
 merged, at the merge record's time) or rebases the request's commits, keeping their authors, by the policy's method.
-`log` and `blame` of a path through slates' API: the change index and `last_changed` narrow the path's history to
-versions, and the commit rows' Bloom filters narrow it to commits. Blame's line attribution uses git's own diff
-algorithm, so its answer equals `git blame`'s; it is a read of history, decides no write, and never feeds a verdict.
+`log` and `blame` of a path through slates' API are A-666's derived types (A-645 "Queries by API"): a path's history
+reads one node a version it lists and blame each file's spans, the version their unit, so a stock push's several
+commits are one version there and a history inside one push is its client's own, over its clone (A-614 part 3,
+superseded); each is a read of history, decides no write, and never feeds a verdict.
 
 **Tunables, each learned (§4.17.1's rule).**
 
@@ -13252,8 +13262,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack
    (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 built:
-   the fragments and the base pack, their window, depth, zlib level and rebuild point learned; part 3 the commit rows'
-   changed-path Bloom filters).
+   the fragments and the base pack, their window, depth, zlib level and rebuild point learned; part 3, the commit
+   rows' changed-path Bloom filters, superseded by A-666's path history and blame).
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
@@ -14193,9 +14203,10 @@ and export by landing).
 > does (hidden entries, ancestors and mergeinfo paths left out, revision properties censored, locations, segments,
 > histories and file revisions ended, 220001 where a command needs a hidden path whole), and the connection judging
 > each read by its principal's rules; held to a second repository served under an authorization file, its four scripted
-> and seven stock sessions replayed whole (macOS arm64, Mac Studio, 54 of 54). Owed: the svndiff 0 session's recording;
-> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); a denied read in a session that could
-> authenticate, which `svnserve` asks to, mid-command, before it refuses.
+> and seven stock sessions replayed whole (macOS arm64, Mac Studio, 54 of 54); svndiff 0 held to `svnserve`'s own writes
+> since A-616 continued (7) recorded its session. Owed: the fold of a name beyond ASCII (utf8proc's case folding and
+> mark stripping); a denied read in a session that could authenticate, which `svnserve` asks to, mid-command, before it
+> refuses.
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -14288,12 +14299,13 @@ and export by landing).
 > `dav::Drive` consumes the same calls. `EditorWriter` writes each as `editorp.c` and `marshal.c` do: tokens `d` and
 > `c` from one counter, absent entries only to a client that announced `absent-entries`, svndiff 2 to a client that
 > accepts it and 0 to any other, each window as `svndiff.c`'s three chunks (corrected 2026-11-19, A-616 continued (6):
-> a version-0 window of new data alone is `send_simple_insertion_window`'s two, the stream's header in the first),
-> and a call out of the editor's order refused with nothing written. Held to every drive in the recordings (28: 22
-> stock, six hand-made), each read back and written again: the same calls and windows, and every item byte for byte but
-> a chunk `svnserve` stored LZ4-compressed. Owed of part 2: the drive over the index and the green, with
-> `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the
-> client's early answer and its answers to `close-edit` and `abort-edit`.
+> a version-0 window of new data alone is `send_simple_insertion_window`'s two, the stream's header in the first; one
+> writer of those writes, `DeltaWrites`, for the editor and `get-file-revs` alike, held to `svnserve`'s recorded svndiff
+> 0 writes since A-616 continued (7)), and a call out of the editor's order refused with nothing written. Held to every
+> drive in the recordings (28: 22 stock, six hand-made), each read back and written again: the same calls and windows,
+> and every item byte for byte but a chunk `svnserve` stored LZ4-compressed. Owed of part 2: the drive over the index
+> and the green, with `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; and the handler
+> that reads the client's early answer and its answers to `close-edit` and `abort-edit`.
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
@@ -48942,6 +48954,166 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   entry after A-643's siblings); `crates/merge/src/engine.rs` (`node_home`, `node_stood_at`),
   `crates/merge/src/engine/node_tests.rs`, `crates/merge/src/engine/replaced_node_tests.rs` (`Work::fifo`, `fifo_node`);
   `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md` (new).
+
+### A-664 part 1, the server half — A submit carries its message and its session's identities, and a repository's green refuses one without either before any work is built (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.13; §4.17.1 "A push is a work" item 4; after A-664 part 1's record, A-285, A-247)
+
+- **The submit carries what the commit needs** (`slates_ipc::protocol::Authorship`, appended to the six submit
+  variants): the message the client gives, and the session's tool identities (`ToolIdentities`: git's name and email,
+  Mercurial's user). `RequestBody::submit(work, evidence)` is the one way a `Submit` is made and `with_message` adds a
+  message, so a field a submit gains is not restated at its callers: 69 sites make one through it, every test's among
+  them. No second way to submit is added: a client sends a message in the request it makes (`Client::call`), and the
+  typed client's submit methods carrying one are owed with the SDKs and the CLI (`Client::submit_with_message`, which
+  sent a message without evidence beside `submit_with_evidence`, was withdrawn before landing). The api maps the two
+  refusals (`Invalid::MessageRequired`, `Invalid::IdentityRequired(VcsTool)`, `VcsTool` re-exported; contract 51).
+- **Set by the owner** (`SetIdentities`, `slates-server`'s `identities`): the launcher's act on the control channel,
+  proven by the keyed hash under its secret (`landing::identities_proof`, its own domain), refused `Forbidden` on a
+  consumer's channel whatever its proof and `GrantIssuerUnverified` without it; git's identity held to git's own rules
+  (`slates_git::derived::Identity`) and Mercurial's user to what Mercurial writes as it is: not empty, one line, and no
+  byte Mercurial strips from its ends (`identities::MERCURIAL_STRIPS`: Mercurial 7.2's `changelog.add` strips the user
+  with Python's `bytes.strip()`, then refuses an empty one or one holding a newline [C: `mercurial/changelog.py`, read
+  2026-11-19], so " Ada <a@example.com>" would be recorded as bytes no changeset of Mercurial's carries), else
+  `BadRequest` naming the part; recorded on the
+  principal's partition (a consumer's, the one its id names; any other's, the one its key's bytes hash to,
+  `verbs::owner_of_key`, the hash `owner_of_name` places a name by) as the version after the one read
+  (`PolicyChanged` from a stale read), answered `IdentitiesSet`.
+- **Read once a session** (main's ruling, 2026-11-19): at a session's first submit the channel reads the principal's
+  identities from its partition as a task, keeps them with the session (`ClientSlot::identities`), then routes the
+  submit as any request (`verbs::route_gated`, the tail of `verbs::serve` it shares); every later submit of the session
+  carries the kept identities, written over whatever the client sent. The green's owner never reads a record for a
+  merge, and a setting made mid-session applies from the next session. Every session's first submit asks one
+  partition, so the read waits for room on its channel (`xshard::call_in_shard_time_given_room`) rather than being
+  refused at a burst; a read the partition never answers refuses the submit `Overloaded`, unrecorded, as a verb that
+  never ran is (A-563), so its resend runs. Two submits a session sends before its first read returns each read, and
+  the session keeps the first read to return, so all its submits carry one set (`identities.read` counts the reads
+  made). What `verbs::serve` holds of a request before it routes it holds when the submit resumes: a revocation that
+  reached the session while the read was away refuses it `ConsumerRevoked`, and its reply's route is its own
+  (`ShardState::reply_route`), so a submit whose acceptance waits for its commit (`merge_service::defer_acceptance`,
+  f > 0) answers its own request, never a route another request left behind.
+- **Refused before any work is built** (`identities::refused_for_its_commit`, in `verbs::judge_submission` beside
+  `EvidenceRequired`, before the increment is built, on the owner whether the work's shard asked it or not, A-247): a
+  submit to a green of a repository's lineage without a message is refused `MessageRequired`, and one whose session has
+  no identity in a git or Mercurial repository's tool `IdentityRequired { tool }`. A plain green takes either. A stock
+  client's push is judged on the push path and is never a submit. Subversion's author is the principal's own name,
+  owed with its revisions.
+- **Wire** (`slates-ipc`, published): `RequestBody::SetIdentities` tag 89, `Refusal::MessageRequired` 76 and
+  `IdentityRequired` 77, `ReplyBody::IdentitiesSet` 76. The branch had appended them at 87 and 74; A-625 part 3 landed
+  first with `EnrollCredential` 87, `RevokeCredential` 88, `CredentialEnrolled` 74 and `CredentialRevoked` 75, so this
+  change's variants follow main's, and no published tag moved.
+- **Tests** (`crates/server/src/identities/tests.rs`, 13, each guard its own; `repository.rs`'s writes now submit with
+  a message and identities, `identities::authored`): a repository's green refuses a submit without a message, or with
+  an empty one, `MessageRequired` in git, Mercurial and Subversion, then accepts it at version 1; with no identity in
+  its tool `IdentityRequired` naming git, and Mercurial, then accepts it; a Subversion repository's takes one with none;
+  a plain green takes either; an agent's channel is refused `Forbidden`, a proof not the launcher's
+  `GrantIssuerUnverified`, a git name git would change `BadRequest`, and so is each Mercurial user Mercurial would
+  refuse or change (two lines, empty, a leading space, a trailing vertical tab), a stale setting `PolicyChanged`. On
+  audit daemons with seated clients: a session's claim of git's identity is written over with its own none and
+  refused, a setting made mid-session reaches the next session and not this one, two reads counted for two sessions; a
+  revocation while the read is away refuses the submit, which built nothing; a later read never replaces what a
+  session keeps; a read that returns to a seat another session (an agent's) now holds, or to one retiring, is refused
+  `NotFound`, kept by neither seat, counted by none, and builds nothing; a read the fenced partition never answers
+  refuses `Overloaded`, nothing recorded.
+- **Runs** (macOS arm64, the Mac Studio, 2026-11-19, rustc 1.98.1, debug). The first build, at 5b4a4ce26, stopped at
+  E0599: `identities::record` read the clock with `slates_vfs::clock::Clock` out of scope; the import is in this
+  change. Red first, over main b1926d201 (agents/g308-server-half 6daffdb98), the Mercurial user's test over the
+  one-line rule (the two strip checks made no-ops): `cargo test --locked -p slates-server --lib t_a664_a_mercurial_user`
+  failed, answered `[Some(BadRequest ..), Some(BadRequest ..), None, None]`, the leading space and the trailing vertical
+  tab recorded. Green over main 545181b30 (2bd393419), slates-server compiled afresh: `cargo test --locked -p
+  slates-server --lib -- identities verbs::tests deadlines::tests reap::tests repository::tests` 89 passed, 2 ignored,
+  1 failed: the 13 tests above, the tests of every module whose code or helpers this change edited, and two others the
+  filter names. The one failure, `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
+  (a branch at the version the root folded is made, not refused `UnknownBase`), fails alike on main at 3329211e0
+  without this change: main's, reported. `-p slates-ipc --lib protocol::` 5 passed and 1 ignored (the health table's
+  writer), and `--test wire_order every_wire_enum` 2 of 2, the tags above published; `-p slates-api --lib --
+  the_contract_history error::` 12 of 12; `-p slates-client --lib` 7 of 7. The integration tests whose code the change
+  edited, directly or through a helper, filtered to those: `-p slates-client --test edit_and_submit` 1 of 1; `-p
+  slates-server --test daemon` 7 of 7, `--test verdict_pages` 4 of 4, `--test works_off_owner` 6 of 6 and `--test
+  fleet` 36 of 36 (276.2 s), every session's first submit there reading its identities before it is routed, at f = 1
+  too, where its acceptance waits for its commit and answers its own request; the same set passed over main b1926d201
+  and 1b480bd70. `cargo build --locked -p slates-client --example load_bench`; `cargo fmt -- --check` clean for the
+  four crates. The Windows x86_64 and Linux runs, clippy, xtask and the doc gate are main's.
+- **Owed.** The clients' surfaces (the typed client's submits carrying a message, the SDKs, the MCP and the CLI,
+  setting identities); Subversion's author; part 3 (the merge record carrying the message and the identities, and the
+  commit admitted, over A-662).
+- **Applied in the same change to:** `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`;
+  `crates/server/src/identities.rs`, `identities/tests.rs` (new), `verbs.rs` (`owner_of_key`, `refusal_name`'s two
+  arms, the submit verbs), `work_home.rs`, `state.rs`, `landing.rs`, `lib.rs`, `daemon.rs`, `deadlines.rs`, `reap.rs`,
+  `repository.rs`; `crates/api/src/error.rs`, `crates/api/src/lib.rs` (contract 51, `VcsTool`);
+  `crates/client/src/client.rs`; the submit sites of `crates/server/tests/{daemon,fleet,verdict_pages,works_off_owner}.rs`,
+  `crates/client/tests/edit_and_submit.rs`, `crates/client/examples/load_bench.rs`; §4.17.1 "A push is a work"'s
+  status; GAPS' §4.17 entry.
+
+### A-614 part 3 — superseded by A-666: the commit rows keep no changed-path Bloom filters (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 2, "Operations on the server", piece 5; A-645 "Queries by API"; A-666 parts 2 and 3)
+
+Applied in the same change to: §4.17.2 (item 2, "Operations on the server", piece 5's line, a status block), GAPS
+(A-614's entry), `crates/git`'s store module docs (their owed list).
+
+- **What part 3 was for.** git's commit-graph may keep, for each commit, a Bloom filter of the paths it changed against
+  its first parent, so a path-limited walk skips the commits that cannot have touched the path \[B:
+  gitformat-commit-graph\]. §4.17.2 planned them for one walk: `log` and `blame` of a path through slates' API, the
+  change index narrowing a path's history to versions and the filters narrowing it to the commits within them.
+- **Why superseded.** Since A-645 (Ada, 2026-11-19, "Queries by API"), history and blame are answered from derived
+  data, and A-666 built both: part 2's history reads one node a version it lists, under git's default-mode
+  simplification exactly, and part 3's blame reads the path's trie nodes and the file's spans, never a diff of the
+  history. Neither walks commits, so a filter has nothing to skip. Their unit is the version, a ref's head move: a stock
+  push's several commits are listed as that one version, and a commit-granular history inside one push is the client's
+  own computation over its clone, with its own commit-graph and filters (`git commit-graph write --changed-paths`),
+  which the server portion does not rebuild. The commits the server makes are one a version (A-664), so for native
+  work the version is the commit.
+- **The walks checked** (the server's code at main e50757a1a, read, not run):
+  - upload-pack walks no path's history: `sparse:oid` filters objects by path patterns over trees (A-640 part 4), and
+    the negotiation (A-615) walks commits by generation, never by path.
+  - receive-pack judges ref names (`vcs_policy`, A-597); a protected branch's questions walk D(k)'s commits for a merge
+    or an unsigned commit (A-644), not paths.
+  - A hook's git walks the read-only view itself (A-665), which serves no commit-graph: that walk is git's, in the
+    hook's process.
+  - Subversion's `log`, `get-file-revs`, `get-deleted-rev` and the report's drive walk FSFS's node history over
+    revisions on the Subversion index (`crates/svn/src/reads/history.rs`, A-613 part 2); a revision is a version, and
+    git's commit rows hold nothing for them.
+  - Mercurial's server walks no path's history: its clients hold theirs.
+  - slates' API answers `log <path>`, `--follow` and blame from A-666's types; no server verb over them exists yet
+    (A-666's owed "the server's verbs over the types"), and when built they read those types.
+- **What stays.** The commit rows keep what the walks above read: parents by position, root tree, commit date and
+  generation number. Should a server walk ever need a commit's changed paths (a per-commit path rule, a commit-granular
+  history the API is asked for), a type of A-647's derived data per commit is the place for it, not a field of the
+  rows.
+- **Owed.** Nothing of A-614: parts 1 and 2 built, part 3 superseded. The server's verbs over A-666's types stay
+  A-666's.
+
+### A-616, continued (7) — One writer of an svndiff stream's writes, held to `svnserve`'s recorded svndiff 0 (2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-613's reads and part 2's first slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/report/editor.rs` (`DeltaWrites`, `Writes`) and its tests; `crates/svn/src/reads/file_revs.rs`;
+`crates/svn/src/reads/tests.rs`; `crates/svn/fixtures/reads` (`get-file-revs-svndiff0`'s two transcripts,
+`SHA256SUMS`, `sessions.txt`); `crates/svn/fixtures/report/make-fixtures.py`;
+`docs/bugs/2026-11-19-a-version-0-delta-sent-its-header-as-a-chunk-of-its-own.md`.
+
+- **Found** by g297: the layout of an svndiff stream's writes (`svndiff.c`'s `window_handler` and
+  `send_simple_insertion_window`, A-616 continued (6)) was written twice, in the report editor's
+  `EditorWriter::window` and in `get-file-revs`' delta writer (A-613's seventh slice), each with its own header flag
+  and its own join of the header, the integers and the instruction; the two shared only the rule that picks an
+  insertion and the split of an encoded window.
+- **One writer.** `report::editor::DeltaWrites` writes a stream a window at a time: it encodes the window into the
+  caller's buffer and answers its writes as slices of it (`Writes`, at most four; a part `svndiff.c` leaves unwritten,
+  being empty, is no write), the header leading a version-0 insertion's first write or written alone first, and at the
+  stream's end the header alone when no window came. The editor sends each write as a `textdelta-chunk` and moves its
+  delta past a window only once every chunk is written; `get-file-revs` sends each as a string. `simple_insertion` and
+  `window_sections` are the writer's own again, and `window_sections` refuses as the codec does (`SvndiffError`).
+  Neither caller's bytes change: both wrote these writes already.
+- **Recorded.** g297's recording of `get-file-revs-svndiff0` against stock `svnserve` 1.15.0 (the Mac Studio, kiln
+  r88, 2026-11-19; the recorder's own session, its client's greeting without `svndiff1` and `accepts-svndiff2`): five
+  `get-file-revs` commands, 17 revisions, 14 deltas, all svndiff 0, 4 opening with a window of new data alone, 9 with
+  the header alone and an empty text's header alone. Its two transcripts are added with their sums, checked against
+  the recording's, and its line in `sessions.txt`; the run's other transcripts stay as main holds them. This settles
+  the recording A-616 continued (6) left owed: the two report sessions added to the report recorder for it, never
+  recorded, are taken out, since `svnserve`'s own svndiff 0 writes now hold the one writer through both callers.
+- **Tests.** `both_callers_of_the_one_delta_writer_send_svnserves_svndiff_0_writes` (`reads/tests.rs`): the session
+  replayed through `get-file-revs`, every delta string `svnserve`'s byte for byte; then each of its 14 deltas, its
+  windows decoded from `svnserve`'s strings, written through the report editor for the same client, its
+  `textdelta-chunk`s `svnserve`'s strings byte for byte; the shapes counted, so neither half can pass empty. The sums
+  test names the session. Run (macOS arm64, Mac Studio, 2026-11-19, over main at `545181b30`): `cargo test --locked -p
+  slates-svn --lib -- report::editor:: report::exchange:: reads:: serve::` 69 of 69, `cargo fmt -p slates-svn --
+  --check` clean; the crate has no integration target. The first build refused the shape count's closure returning its
+  argument's borrow, a lifetime a closure cannot name; it is a function now.
+- **Owed.** The Windows run and red-checks (main's).
 
 ### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
 Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's

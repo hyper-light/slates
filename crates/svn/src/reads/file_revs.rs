@@ -21,10 +21,11 @@
 //!   and computes), svndiff 2 to a client that accepts it and 0 to any other (never 1, zlib: the report editor's rule),
 //!   a string for each write `svn_txdelta_to_svndiff3` makes: the header at the first window, or alone when the target
 //!   is empty and there is none; each window's integers, then its instruction and new-data sections when not empty (the
-//!   report editor's `window_sections`). In svndiff 0 a window of new data alone is `send_simple_insertion_window`'s:
-//!   the header if it is not out, the integers and the instruction in one string, then the new data. A section an LZ4
-//!   block shortens is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it may differ in bytes while it decodes to
-//!   the same window; svndiff 0 is `svnserve`'s byte for byte.
+//!   report editor's `DeltaWrites`, the one writer of these writes, whose `textdelta-chunk`s are the same strings, as
+//!   `svnserve`'s are: A-616 continued (7)). In svndiff 0 a window of new data alone is
+//!   `send_simple_insertion_window`'s: the header if it is not out, the integers and the instruction in one string,
+//!   then the new data. A section an LZ4 block shortens is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it may
+//!   differ in bytes while it decodes to the same window; svndiff 0 is `svnserve`'s byte for byte.
 //! - Then `done`, then `( success ( ) )` or the refusal.
 //!
 //! Merged revisions of one number from more than one file (a revision that changed two merged sources) have no order to
@@ -46,8 +47,8 @@ use crate::handshake::ClientCapabilities;
 use crate::index::{Node, NodeKind, PropertyList, Revision, Text};
 use crate::mergeinfo::{Compare, Mergeinfo, MergeinfoInheritance, mergeinfo_at};
 use crate::ra_svn::{ItemError, Value, write};
-use crate::report::editor::{simple_insertion, window_sections};
-use crate::svndiff::{Compression, Encoder, Version, WINDOW_LIMIT, deltas};
+use crate::report::editor::DeltaWrites;
+use crate::svndiff::{Compression, Version, WINDOW_LIMIT, deltas};
 use std::collections::{BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
@@ -262,10 +263,8 @@ impl FileRevsStream {
   }
 
   /// The delta from the previous revision's text (none for the first) to `node`'s, a string for each write
-  /// `svn_txdelta_to_svndiff3` makes (`svndiff.c` `window_handler`): the header at the first window, or alone when
-  /// there is none; each window's integers, then its instruction and new-data sections when they are not empty. In
-  /// svndiff 0 a window of new data alone is written as `send_simple_insertion_window` writes it: the header if it is
-  /// not out, the integers and the instruction in one string, then the new data.
+  /// `svn_txdelta_to_svndiff3` makes (`serve.c` `svndiff_handler`), the writes the report editor's `DeltaWrites` makes,
+  /// the one writer of them (A-616 continued (7)).
   fn delta<R: Repository + ?Sized>(
     &self,
     reads: &mut Reads<'_, R>,
@@ -278,31 +277,18 @@ impl FileRevsStream {
     let target = reads.whole_text(node.text())?;
     let room = NonZeroUsize::new(usize::try_from(WINDOW_LIMIT).map_err(|_| Failure::corrupt())?)
       .ok_or_else(Failure::corrupt)?;
-    let mut encoder = Encoder::new(self.version);
-    let header = encoder.header();
-    let mut header_out = false;
+    let mut writes = DeltaWrites::new(self.version);
     let mut encoded = Vec::new();
     for window in deltas(&source, &target, room).map_err(|_| Failure::corrupt())? {
-      encoded.clear();
-      encoder
+      let window_writes = writes
         .window(&window, self.compression, &mut encoded)
         .map_err(|_| Failure::corrupt())?;
-      let [integers, instructions, new_data] =
-        window_sections(&encoded).map_err(|_| Failure::corrupt())?;
-      let unwritten_header: &[u8] = if header_out { &[] } else { &header };
-      if simple_insertion(self.version, &window) {
-        let joined = [unwritten_header, integers, instructions].concat();
-        write_sections(&[joined.as_slice(), new_data], reads.out)?;
-      } else {
-        write_sections(
-          &[unwritten_header, integers, instructions, new_data],
-          reads.out,
-        )?;
+      for piece in window_writes.iter() {
+        write(&Value::String(piece), reads.out)?;
       }
-      header_out = true;
     }
-    if !header_out {
-      write_sections(&[header.as_slice()], reads.out)?;
+    if let Some(header) = writes.end() {
+      write(&Value::String(&header), reads.out)?;
     }
     Ok(())
   }
@@ -565,19 +551,6 @@ fn same_text(first: Option<Text>, second: Option<Text>) -> bool {
       .map(|text| (text.md5, text.sha1))
   };
   digests(first) == digests(second)
-}
-
-/// Each section that is not empty as a string, in order, as each stream write sends one (`serve.c`
-/// `svndiff_handler`).
-fn write_sections(sections: &[&[u8]], out: &mut Vec<u8>) -> Result<(), ItemError> {
-  for section in sections
-    .iter()
-    .copied()
-    .filter(|section| !section.is_empty())
-  {
-    write(&Value::String(section), out)?;
-  }
-  Ok(())
 }
 
 /// `svn_prop_diffs`: the changes from `previous` to `properties`, deletions with no value; in byte order of the names,

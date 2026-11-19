@@ -840,8 +840,9 @@ mod tests {
     )
   }
 
-  /// Makes `green`'s next version through a work of its own, file `f` set to `bytes`; the work is destroyed after, so
-  /// no reader is left holding the green's floor. The version made.
+  /// Makes `green`'s next version through a work of its own, file `f` set to `bytes`, submitted with a message and the
+  /// session's identities as a repository's green requires (A-664); the work is destroyed after, so no reader is left
+  /// holding the green's floor. The version made.
   fn write(state: &mut ShardState, green: VolumeId, bytes: &[u8], serial: u32) -> u64 {
     let ReplyBody::WorkCreated { id: work, .. } = ask(
       state,
@@ -866,14 +867,8 @@ mod tests {
       },
     );
     assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-    let submitted = ask(
-      state,
-      &owner(),
-      RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
-    );
+    let message = format!("f, version {serial}");
+    let submitted = ask(state, &owner(), crate::identities::authored(work, &message));
     let ReplyBody::Submitted {
       version: Some(version),
       ..

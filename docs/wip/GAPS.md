@@ -17,13 +17,19 @@
 > Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
 > the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
 > by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
-> macOS run owed). OWED: part 1's server half (after main's `slates-server` baseline on jupiter): the owner's setting on
-> the control channel (the launcher's proof, `Forbidden` on a consumer's channel, each identity held to its tool's
-> rules); a session's identities resolved once, at its first submit, from the principal's partition and kept with the
-> session (main's ruling: the owner never reads them per merge, and a change mid-session applies from the next
-> session); the submit carrying its message and the session's identities, refused at the green's owner
-> `MessageRequired` without a message and `IdentityRequired` without an identity in the repository's tool, before any
-> work is built; part 3, the made commit recorded with the version (the merge record
+> macOS run owed). Part 1's server half BUILT (`crates/server/src/identities/tests.rs`; A-664's entry has the runs, on
+> macOS arm64, the fleet's submits through sessions at f = 1 among them; Windows and Linux main's):
+> `SetIdentities` on the control channel (the launcher's proof, `Forbidden` on a consumer's channel, git's identity held
+> to `slates_git::derived::Identity`, a Mercurial user as Mercurial 7.2's `changelog.add` writes it: not empty, one
+> line, no byte it strips from either end), recorded on the principal's partition; a session's
+> identities read once, at its first submit, kept with the session and written into each submit over the client's
+> claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
+> submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
+> constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
+> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
+> (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
+> message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
+> commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
 > it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
 > `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
@@ -480,12 +486,20 @@
 > nothing; a version's head, root tree and any path read from rows and trees with no walk. An oracle holds the store to
 > a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
 > slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
-> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
-> commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614 part 2):** each version's
+> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters (superseded,
+> below); the walks and a commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614
+> part 2):** each version's
 > D(k) kept as two fragments (commits, trees and tags; blobs) of pack entries with their CRC32s, an edit a REF delta against
 > its path's previous object and similar objects OFS deltas, the window, zlib level, depth and rebuild point learned; the
 > base pack self-contained; packs read back through A-608's reader in the oracle; eleven mutations red. Owed of part 2:
-> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs.
+> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs. **Part 3 superseded
+> (2026-11-19, g083):** the commit rows keep no changed-path Bloom filters. They were for one walk, `log` and `blame`
+> of a path through slates' API narrowed from versions to commits; since A-645 those are A-666's derived types (part
+> 2's history reads one node a version it lists, part 3's blame the file's spans), the version their unit, so no walk
+> is left to skip. Checked: upload-pack walks no path's history (`sparse:oid` filters objects over trees); receive-pack
+> judges ref names and D(k)'s merges and signatures; a hook's git walks the hook view, which serves no commit-graph;
+> Subversion's path reads walk its own node history over revisions; Mercurial's server walks none. A commit-granular
+> history inside one stock push is the client's own, over its clone. A-614: parts 1 and 2 built, part 3 superseded.
 > **A-639 (2026-11-19, g083; piece 7's packs from fragments):** `slates-git` (`store::upload`) streams upload-pack's
 > pack from A-615's answer, taken through a trait (`Answered`): the runs from their fragments (filtered, the want always),
 > the walk's objects covered by whole kept parts (a clone so the base pack and the fragments after it; a filter that
@@ -973,8 +987,8 @@
 > thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
 > replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
 > `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
-> among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
-> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0; its eighth slice
+> among them), not yet red-checked; svndiff 0 is held to stock `svnserve` 1.15.0's own writes since A-616 continued
+> (7) recorded the `get-file-revs-svndiff0` session; its eighth slice
 > (g297), read access by A-606's rules (the `locked` repository's four scripted and seven stock sessions replayed
 > whole, the connection judging each read by its principal's rules; macOS arm64, Mac Studio, 54 of 54), not yet
 > red-checked. Owed
@@ -1102,10 +1116,14 @@
 > A-652's generator.
 > A-616 continued (6) (2026-11-19, g234, a bug g297 found): a version-0 delta's chunks as `svnserve` writes them, a
 > window of new data alone `send_simple_insertion_window`'s two with the stream's header in the first (the writer had
-> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64).
-> Owed: two hand-made sessions from a client announcing neither svndiff version, recorded against `svnserve` 1.15.0
-> (the Mac Studio), and their drives held to its chunks byte for byte; the macOS run. Swept: only the reporter's
-> editor writes `textdelta-chunk`s.
+> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64);
+> its owed recording settled and its macOS run done by A-616 continued (7). Swept: only the reporter's editor writes
+> `textdelta-chunk`s.
+> A-616 continued (7) (2026-11-19, g234, the duplicate g297 found): one writer of an svndiff stream's writes, the
+> report editor's `DeltaWrites`, for its `textdelta-chunk`s and `get-file-revs`' delta strings; both callers held byte
+> for byte to stock `svnserve` 1.15.0's `get-file-revs-svndiff0` session (g297's recording, kiln r88), its 14 deltas
+> through each (macOS arm64, Mac Studio, 69 of 69); the report recorder's two svndiff 0 sessions, never recorded,
+> taken out. Owed: the Windows run and red-checks (main's).
 > A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
 > command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
 > land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.

@@ -279,6 +279,8 @@ Refusal 72 VerdictReplaced
 Refusal 73 MoveRefused
 Refusal 74 ArchiveRefused
 Refusal 75 BaseUnavailableWin32
+Refusal 76 MessageRequired
+Refusal 77 IdentityRequired
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -355,6 +357,7 @@ ReplyBody 72 ArchiveExported
 ReplyBody 73 ArchiveImported
 ReplyBody 74 CredentialEnrolled
 ReplyBody 75 CredentialRevoked
+ReplyBody 76 IdentitiesSet
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -444,6 +447,7 @@ RequestBody 85 RetireBranch
 RequestBody 86 SetRepositoryPolicy
 RequestBody 87 EnrollCredential
 RequestBody 88 RevokeCredential
+RequestBody 89 SetIdentities
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
