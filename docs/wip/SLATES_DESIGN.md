@@ -13936,6 +13936,22 @@ and export by landing).
 > session that must authenticate for write before `commit`, and the owner's commit step with the connection task that
 > runs the drive.
 >
+> **Status (2026-11-19, A-655, part 1).** Built: the commit's remaining checks and its one entry point (`slates-svn`'s
+> `commit::drive`). `commit::drive::commit`, which the svn:// connection task calls with `commit`'s parameters (A-656),
+> decides the principal's access as `svnserve`'s `must_have_access` does: allowed, the trivial authentication request;
+> an anonymous session that could authenticate for write is asked to (`Begun::Authenticate`) and calls again once it
+> has, no trivial request then; else "Authorization failed" (`E170001`); each lock token's path must be writable by a
+> named principal (`add_lock_tokens`). In the drive, an added path holding a control character is refused
+> (`svn_repos__validate_new_path`, `E160005`); `svn_repos_fs_change_node_prop`'s checks refuse `svn:mergeinfo` holding a
+> NUL or not parsing (A-605's parser), a property `svn:wc:` or `svn:entry:` (`E165002`), an `svn:` value not UTF-8 or
+> holding a carriage return, and an `svn:date` that is no date as `svn_time_from_cstring` reads one, each written with
+> every error of Subversion's chain; and `check_authz` asks A-606's rules, compiled for the principal, at each of
+> `commit.c`'s calls ("Access denied", `E220004` and `E220001`). Held to the recorded commits, which now begin through
+> `commit`, and to fifteen cases of the checks and three of access, each red first. Owed (part 2): the owner's commit
+> step through A-635's `RepositoryLogs::append`, which a dump's import (A-652 part 3) also drives, a revision at a time
+> with the dump's author, date and log; the mergeinfo parser's own words beneath `verify_mergeinfo`'s (A-605's
+> messages).
+>
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
 > makes, in `reporter.c`'s order, each with the editor's own arguments and the raw facts of the node it names; A-627's
@@ -46306,6 +46322,30 @@ the `Revlog` facade over them; `import`: the ranged seam and reader, the rebuild
   that run, and the two warnings part 2 had left in the tests removed. The golden imports of every store unchanged;
   new: every split or docketed file of the dotencode and version 2 stores read in more than one range and none as long
   as the file, an inline revlog read whole, and texts rebuilt from the cache.
+
+### A-655 part 1 — The commit's remaining checks in `commit.c`'s order and words, and its one entry point for the svn:// connection task (2026-11-19, g268 for UI goal 93; §4.17.4 items 3.2 and 10, "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.17.4 entry),
+`crates/svn/src/commit/drive.rs` and `crates/svn/src/commit/drive/tests.rs`.
+- **What was there.** A-617's drive refused what was out of date or locked, but took any property, any added path and
+  any principal, and its beginning assumed a session already allowed to write.
+- **The decision.** One entry point, `commit(params, &Session, Start, &mut out) -> Result<Begun, ItemError>`: the
+  `Session` is what `svnserve`'s server baton holds (the base path, the root URL, the green's name, the principal,
+  `anon-access` and `auth-access`, whether the client could authenticate, the authz rules and the repository's name in
+  them), the `Start` what the owner gives (the transaction's name, the instant, the room, whether the client has just
+  authenticated), and `Begun` says what follows: drive every item (`Driving`), authenticate then call again
+  (`Authenticate`), refused (`Answered`) or closed (`Close`). The checks sit where `commit.c` makes them, before FSFS's:
+  the new path first in an addition; the authorization at each call; the property's checks before the node's locks. A
+  failure is written with every error of Subversion's chain (`svn_ra_svn__write_cmd_failure`), the code's own words for
+  an error made without any. Departures: a date in the format `svn` stopped writing in 2002 is refused; beneath
+  `verify_mergeinfo`'s words, the parser's own are owed with A-605's messages.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). Red (07:08 UTC): the checks' test failed at its first case, the control character taken; green (07:12
+  UTC): the drive's 7 of 7. The entry point red (07:15 UTC, a stub that closed): 9 of 9 drive tests failed, the replay
+  among them; green (07:16 UTC): 9 of 9. `cargo fmt` from the Studio (sha256 dcf19ad4). On the tree merged with main
+  (f52466962, 07:18 UTC): `cargo test --locked -p slates-svn --lib` 426 of 426 in 7.88 s, rustfmt clean. Clippy, `xtask
+  check` and the doc gate are main's (the run-request queue).
+- **Owed.** Part 2: the owner's commit step through A-635's `RepositoryLogs::append`, at the position the commit read
+  (`Moved` answered as `svnserve`'s out-of-date), which a dump's import drives too (A-652 part 3).
 
 ### A-665 — The read-only bare repository a git hook runs in, part 1: the view made from the store when it is read, its packs each whole by itself, the push in git's quarantine (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-591, A-614, A-622, A-638, A-645)
 Applied in the same change to:

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use aws_lc_rs::digest::{SHA256, digest};
 
 use super::*;
+use crate::authz;
 use crate::lock::{HeadView, LockRequest, LockTarget};
 use crate::ra_svn::{Bounds, Parsed, Parser};
 
@@ -294,7 +295,7 @@ fn recorded_date(server: &[Read<'_>]) -> String {
 }
 
 /// Commits an accepted work as the owner would and writes `svnserve`'s answer.
-fn commit(replay: &mut Replay, work: Work, user: &str, date: &str, out: &mut Vec<u8>) {
+fn commit_work(replay: &mut Replay, work: Work, user: &str, date: &str, out: &mut Vec<u8>) {
   let revision = replay.index.append(work.record, ROOM).unwrap();
   replay.green.texts.extend(work.texts);
   replay.green.lists.extend(work.property_lists);
@@ -320,22 +321,19 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
   let Some(Value::List(params)) = parts.get(1) else {
     panic!("{name}: params")
   };
-  let request = CommitRequest::read(params).unwrap();
   let mut out = Vec::new();
-  let locks = begin(&request, &base_path, Some(user), &mut out)
-    .unwrap()
-    .unwrap();
   replay.transactions += 1;
-  let setup = Setup {
-    base_path,
-    repository_url: REPOSITORY.to_owned(),
-    filesystem: "fixture".to_owned(),
+  let start = Start {
     transaction: format!("{}-{}", replay.index.youngest(), replay.transactions),
-    locks,
     now: AprTime(0),
     room: ROOM,
+    authenticated_now: false,
   };
-  let mut drive = Drive::new(setup);
+  let session = recorded_session(&base_path, Some(user), None);
+  let begun = commit(params, &session, start, &mut out).unwrap();
+  let Begun::Driving(mut drive) = begun else {
+    panic!("{name}: {begun:?}")
+  };
   for (item, _) in &client[at + 1..] {
     if let Some(race) = race.filter(|_| is_command(item, "close-edit")) {
       let answered = replay_commit(replay, race, None);
@@ -345,7 +343,7 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
       .command(&replay.index, &replay.green, &replay.locks, item, &mut out)
       .unwrap();
     if let Step::Accepted(work) = step {
-      commit(
+      commit_work(
         replay,
         *work,
         user,
@@ -622,6 +620,8 @@ fn check_hostile(replay: &Replay, case: &Hostile) {
     },
     now: AprTime(0),
     room: ROOM,
+    rules: None,
+    revision_properties: Vec::new(),
   };
   let mut drive = Drive::new(setup);
   let mut out = Vec::new();
@@ -689,6 +689,8 @@ fn a_resulting_text_whose_md5_is_not_the_clients_is_refused() {
     locks: CommitLocks::default(),
     now: AprTime(0),
     room: ROOM,
+    rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
@@ -720,6 +722,8 @@ fn a_work_past_its_room_is_refused() {
     locks: CommitLocks::default(),
     now: AprTime(0),
     room: 4,
+    rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
@@ -759,6 +763,8 @@ fn a_lock_in_the_way_refuses_the_call_that_meets_it() {
     },
     now: AprTime(0),
     room: ROOM,
+    rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   let mut last = Last::Taken;
@@ -816,6 +822,8 @@ fn a_path_beneath_a_copy_reads_the_copys_source() {
     locks: CommitLocks::default(),
     now: AprTime(0),
     room: ROOM,
+    rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   let mut rows = Vec::new();
@@ -831,4 +839,344 @@ fn a_path_beneath_a_copy_reads_the_copys_source() {
     (String::from_utf8_lossy(&out).into_owned(), rows),
     (String::new(), expected)
   );
+}
+
+/// The authorization rules the authorization cases run under: everyone reads, alice writes, but only reads beneath
+/// `sub` and cannot read `gone`.
+const RULES: &[u8] =
+  b"[/]\n* = r\nalice = rw\n[/trunk/project/sub]\nalice = r\n[/trunk/project/gone]\nalice =\n";
+
+/// A drive's case: its commands, whether it runs under [`RULES`], the failure's errors it writes, and its last step.
+struct Check {
+  /// What the case does.
+  name: &'static str,
+  /// The editor commands.
+  commands: &'static [u8],
+  /// Whether alice runs under [`RULES`]; otherwise the repository names no authz file.
+  authz: bool,
+  /// The failure's errors, each number and words, outermost first; `None` for no failure.
+  failure: Option<&'static [(u32, &'static str)]>,
+  /// How the last step ends.
+  last: Last,
+}
+
+/// The commit's remaining checks (A-655), each over the repository after `edit` (revision 3), at `/trunk/project`.
+const CHECKS: &[Check] = &[
+  Check {
+    name: "a control character in an added path",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( add-file ( 3:a\x01b 2:d0 2:c1 ( ) ) ) ",
+    authz: false,
+    failure: Some(&[(
+      160_005,
+      "Invalid control character '0x01' in path 'a\\001b'",
+    )]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "a non-regular property",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( open-file ( 5:a.txt 2:d0 2:c1 ( 3 ) ) ) \
+( change-file-prop ( 2:c1 14:svn:entry:uuid ( 1:x ) ) ) ",
+    authz: false,
+    failure: Some(&[(
+      165_002,
+      "Storage of non-regular property 'svn:entry:uuid' is disallowed through the repository interface, and could \
+indicate a bug in your client",
+    )]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "a non-regular property deleted",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( open-file ( 5:a.txt 2:d0 2:c1 ( 3 ) ) ) \
+( change-file-prop ( 2:c1 14:svn:entry:uuid ( ) ) ) ",
+    authz: false,
+    failure: None,
+    last: Last::Taken,
+  },
+  Check {
+    name: "an svn: property that is not UTF-8",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( open-file ( 5:a.txt 2:d0 2:c1 ( 3 ) ) ) \
+( change-file-prop ( 2:c1 13:svn:eol-style ( 2:\xff\xfe ) ) ) ",
+    authz: false,
+    failure: Some(&[(
+      125_005,
+      "Cannot accept 'svn:eol-style' property because it is not encoded in UTF-8",
+    )]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "an svn: property with a carriage return",
+    commands:
+      b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 10:svn:ignore ( 3:a\r\n ) ) ) ",
+    authz: false,
+    failure: Some(&[
+      (125_005, "Invalid property value"),
+      (
+        125_017,
+        "Cannot accept non-LF line endings in 'svn:ignore' property",
+      ),
+    ]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "a regular property with a carriage return",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 6:colour ( 3:a\r\n ) ) ) ",
+    authz: false,
+    failure: None,
+    last: Last::Taken,
+  },
+  Check {
+    name: "an svn:date that is not a date",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 8:svn:date ( 3:bad ) ) ) ",
+    authz: false,
+    failure: Some(&[
+      (125_005, "Wrong or unexpected property value"),
+      (125_003, "Bogus date"),
+    ]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "an svn:date that is one",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) \
+( change-dir-prop ( 2:d0 8:svn:date ( 27:2026-11-19T05:05:34.384728Z ) ) ) ",
+    authz: false,
+    failure: None,
+    last: Last::Taken,
+  },
+  Check {
+    name: "mergeinfo holding a NUL",
+    commands:
+      b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 13:svn:mergeinfo ( 6:/a:1\x00x ) ) ) ",
+    authz: false,
+    failure: Some(&[(
+      200_020,
+      "Commit rejected because mergeinfo on '/trunk/project' contains unexpected string terminator",
+    )]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "mergeinfo that does not parse",
+    commands:
+      b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 13:svn:mergeinfo ( 5:/a:xx ) ) ) ",
+    authz: false,
+    failure: Some(&[(
+      200_020,
+      "Commit rejected because mergeinfo on '/trunk/project' is syntactically invalid",
+    )]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "a deletion of a directory alice only reads",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( delete-entry ( 3:sub ( 3 ) 2:d0 ) ) ",
+    authz: true,
+    failure: Some(&[(220_004, "Access denied")]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "a text change of a file alice only reads",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( open-file ( 9:sub/b.txt 2:d0 2:c1 ( 3 ) ) ) \
+( apply-textdelta ( 2:c1 ( ) ) ) ",
+    authz: true,
+    failure: Some(&[(220_004, "Access denied")]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "a copy from a path alice cannot read",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) \
+( add-dir ( 1:x 2:d0 2:d1 ( 45:svn+fixture://fixture/repo/trunk/project/gone 3 ) ) ) ",
+    authz: true,
+    failure: Some(&[(220_001, "Access denied")]),
+    last: Last::Refused,
+  },
+  Check {
+    name: "an open of a file alice reads",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( open-file ( 9:sub/b.txt 2:d0 2:c1 ( 3 ) ) ) ",
+    authz: true,
+    failure: None,
+    last: Last::Taken,
+  },
+  Check {
+    name: "a property of a directory alice writes",
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 6:colour ( 4:blue ) ) ) ",
+    authz: true,
+    failure: None,
+    last: Last::Taken,
+  },
+];
+
+/// Every error of a failure item, outermost first.
+fn errors_of(item: &Value<'_>) -> Option<Vec<(u64, String)>> {
+  let Value::List(parts) = item else {
+    return None;
+  };
+  let [Value::Word("failure"), Value::List(errors)] = parts.as_slice() else {
+    return None;
+  };
+  let read = |error: &Value<'_>| {
+    let Value::List(error) = error else {
+      return None;
+    };
+    let [Value::Number(code), Value::String(words), ..] = error.as_slice() else {
+      return None;
+    };
+    Some((*code, String::from_utf8_lossy(words).into_owned()))
+  };
+  errors.iter().map(read).collect()
+}
+
+/// Alice's rules under [`RULES`].
+fn alice_rules() -> authz::PrincipalRules {
+  let rules = authz::Authz::parse(RULES, None, authz::Bounds::of(RULES, None)).unwrap();
+  rules.rules(b"repo", authz::Principal::named(Some(b"alice")))
+}
+
+/// Runs one case over `replay` and checks it.
+fn check_case(replay: &Replay, case: &Check) {
+  let setup = Setup {
+    base_path: "/trunk/project".to_owned(),
+    repository_url: REPOSITORY.to_owned(),
+    filesystem: "fixture".to_owned(),
+    transaction: "3-1".to_owned(),
+    locks: CommitLocks {
+      user: Some("alice".to_owned()),
+      ..CommitLocks::default()
+    },
+    now: AprTime(0),
+    room: ROOM,
+    rules: case.authz.then(alice_rules),
+    revision_properties: Vec::new(),
+  };
+  let mut drive = Drive::new(setup);
+  let mut out = Vec::new();
+  let mut last = Last::Taken;
+  for (item, _) in items(case.commands) {
+    let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
+    last = kind_of(&step.unwrap());
+  }
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
+  let expected = case.failure.map(|errors| {
+    let owned = errors
+      .iter()
+      .map(|(code, words)| (u64::from(*code), (*words).to_owned()));
+    owned.collect::<Vec<_>>()
+  });
+  assert_eq!((failure, last), (expected, case.last), "{}", case.name);
+}
+
+/// A-655 (`fs-wrap.c` `svn_repos__validate_prop` 202-263 and `verify_mergeinfo` 297-324; `repos.c`
+/// `svn_repos__validate_new_path` 2097, `path.c` `svn_path_check_valid`; `commit.c` `check_authz` 243-262 and its
+/// calls). Do: drive the repository after `edit` with each case. Expect: an added path with a control character, a
+/// non-regular property, an `svn:` property not in UTF-8 or with a carriage return, an `svn:date` that is no date and
+/// mergeinfo that holds a NUL or does not parse each refused with every error `svnserve` writes, in its numbers and
+/// words; a write or a read the rules deny refused "Access denied"; and the deletions, values and accesses Subversion
+/// allows taken.
+#[test]
+fn the_commits_remaining_checks_refuse_as_svnserve_refuses() {
+  let replay = replayed_until("edit-large");
+  for case in CHECKS {
+    check_case(&replay, case);
+  }
+}
+
+/// A session as the recordings' `svnserve.conf` makes one (`make-fixtures.py`: `anon-access = none`, `auth-access =
+/// write`, the tunnel's user authenticating).
+fn recorded_session<'s>(
+  base_path: &'s str,
+  user: Option<&'s str>,
+  authz: Option<(&'s authz::Authz, &'s [u8])>,
+) -> Session<'s> {
+  Session {
+    base_path,
+    repository_url: REPOSITORY,
+    filesystem: "fixture",
+    user,
+    anonymous: authz::Access::None,
+    authenticated: authz::Access::Write,
+    can_authenticate: true,
+    authz,
+  }
+}
+
+/// A `commit`'s parameters: a log message, the lock tokens given, keep-locks false, no revision properties.
+fn commit_params(tokens: &[(&'static [u8], &'static [u8])]) -> Vec<Value<'static>> {
+  let pairs = tokens
+    .iter()
+    .map(|(path, token)| Value::List(vec![Value::String(path), Value::String(token)]));
+  vec![
+    Value::String(b"log"),
+    Value::List(pairs.collect()),
+    Value::Word("false"),
+  ]
+}
+
+/// A start of the transaction `3-1`.
+fn start(authenticated_now: bool) -> Start {
+  Start {
+    transaction: "3-1".to_owned(),
+    now: AprTime(0),
+    room: ROOM,
+    authenticated_now,
+  }
+}
+
+/// What a commit began as, every error of the failure it wrote, if any, and what it wrote.
+type Began = (&'static str, Option<Vec<(u64, String)>>, Vec<u8>);
+
+/// Begins a commit on `session` with `params`.
+fn begun(session: &Session<'_>, params: &[Value<'_>], now: bool) -> Began {
+  let mut out = Vec::new();
+  let kind = match commit(params, session, start(now), &mut out).unwrap() {
+    Begun::Driving(_) => "driving",
+    Begun::Authenticate => "authenticate",
+    Begun::Answered => "answered",
+    Begun::Close => "close",
+  };
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
+  (kind, failure, out)
+}
+
+/// A-655 (`serve.c` `must_have_access` 807-850, `lookup_access` 760-791). Do: begin a commit on an anonymous session
+/// whose `svnserve.conf` lets only the authenticated write, then again as alice once she authenticated. Expect: the
+/// first asks the client to authenticate, writing nothing; the second drives, writing `( success ( ) )` alone, no
+/// trivial authentication request after a real one.
+#[test]
+fn an_anonymous_session_authenticates_for_write_before_its_commit() {
+  let params = commit_params(&[]);
+  let anonymous = recorded_session("/trunk/project", None, None);
+  assert_eq!(
+    begun(&anonymous, &params, false),
+    ("authenticate", None, Vec::new())
+  );
+  let alice = recorded_session("/trunk/project", Some("alice"), None);
+  let driving = ("driving", None, b"( success ( ) ) ".to_vec());
+  assert_eq!(begun(&alice, &params, true), driving);
+}
+
+/// The rules of `text`, read whole.
+fn ruled(text: &'static [u8]) -> authz::Authz {
+  authz::Authz::parse(text, None, authz::Bounds::of(text, None)).unwrap()
+}
+
+/// A-655 (`serve.c` 840-844 and `add_lock_tokens` 1388-1390). Do: begin commits as alice where she may not write: her
+/// `auth-access` only reads; the rules let her read alone; a lock token on a file the rules let her read alone.
+/// Expect: each refused "Authorization failed" (`E170001`), the last after the trivial authentication request.
+#[test]
+fn a_commit_alice_may_not_write_is_refused_authorization() {
+  let refused = Some(vec![(170_001, "Authorization failed".to_owned())]);
+  let mut reading = recorded_session("/trunk/project", Some("alice"), None);
+  reading.authenticated = authz::Access::Read;
+  let (kind, failure, _) = begun(&reading, &commit_params(&[]), false);
+  assert_eq!((kind, failure), ("answered", refused.clone()));
+  let read_only = ruled(b"[/]\nalice = r\n");
+  let only = recorded_session("/trunk/project", Some("alice"), Some((&read_only, b"repo")));
+  assert_eq!(begun(&only, &commit_params(&[]), false).1, refused.clone());
+  let file = ruled(b"[/]\nalice = rw\n[/trunk/project/a.txt]\nalice = r\n");
+  let locked = recorded_session("/trunk/project", Some("alice"), Some((&file, b"repo")));
+  let token = commit_params(&[(b"a.txt", b"opaquelocktoken:x")]);
+  let (kind, failure, out) = begun(&locked, &token, false);
+  assert_eq!((kind, failure), ("answered", refused));
+  assert!(out.starts_with(b"( success ( ( ) 0: ) ) "));
 }

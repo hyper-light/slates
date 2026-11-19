@@ -721,7 +721,13 @@
 > lock and conflict refusals among them), and to hostile drives, each guard red-checked; `cargo test --locked -p
 > slates-svn --lib` on the Mac Studio (see A-617 part 2b). Owed from it: `svn_repos__validate_prop`'s checks,
 > authorization (A-606), `svn_repos__validate_new_path`, authenticating for write, the owner's commit step and the
-> connection task. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
+> connection task. A-655 part 1 (2026-11-19, g268, UI goal 93): the commit's remaining checks in `commit.c`'s order and
+> words (`svn_repos__validate_new_path`, `svn_repos__validate_prop` with `verify_mergeinfo`, `check_authz` through
+> A-606) and authenticating for write (`must_have_access`, the lock tokens' writes), through one entry point for the
+> svn:// connection task (`commit::drive::commit`, A-656); `cargo test --locked -p slates-svn --lib` on the Mac Studio,
+> red first (see A-655 part 1). Owed from it: part 2, the owner's commit step through A-635's `RepositoryLogs::append`,
+> which a dump's import drives too (A-652 part 3). A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with
+> stealing) and `unlock`
 > (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
 > applied unconditionally; its oracle FSFS's lock rules transcribed, equal on generated histories; `cargo test -p
