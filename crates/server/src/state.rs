@@ -103,6 +103,13 @@ pub struct VolumeSlot {
   /// A strict (`--locked`) volume's entitlement, held against the daemon's lock capacity (§4.2 D-12,
   /// `lock_ledger`); returned when the slot drops.
   pub lock_credit: Option<crate::lock_ledger::LockCredit>,
+  /// The seal this volume's owner shard took once it served the volume a planned move handed it (A-291,
+  /// `verbs::seal_adopted_head`): the adopted head snapshot the seal superseded and the seal's head epoch. The control
+  /// shard learns the seal only from this shard's answer, and an answer lost to a shard that stopped for a window (the
+  /// caller forgot the call, and the shard ran it once it resumed) left the control shard asking again, which took a
+  /// second seal and left the adopted snapshot behind for good (A-488). A second ask answers this record. It lives and
+  /// ends with the slot, so a volume released and made again never carries one adoption's seal into another.
+  pub adopted_seal: Option<(slates_db::catalog::SnapshotId, u64)>,
 }
 
 impl std::fmt::Debug for VolumeSlot {
@@ -776,6 +783,10 @@ pub struct ShardState {
   /// How long this shard's writers waited for their volume's FUSE mounts to be told, and the back-off after overdue
   /// waits: what the told bound is learned from (AC-3.3, A-431; `crate::told::bound_ns`). Two words and an estimator.
   pub(crate) told_times: crate::told::ToldTimes,
+  /// How long the kernel took, after sending each `UMNT` this shard confirmed, to take the mount out of its mount table,
+  /// and the back-off after confirmations that ran out: what the confirmation's bound is learned from (A-493;
+  /// `crate::nfs::unmount_bound_ns`), as the told bound is. Two words and an estimator.
+  pub(crate) unmount_times: crate::learned_wait::LearnedWait,
   /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
   /// Bounded by the metadata ledger and the listener's connections.
   pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,
@@ -957,6 +968,11 @@ pub struct ShardState {
   pub(crate) learner_fetch: crate::fleet::LearnerFetchLog,
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
+  /// On the control shard: the newest root configuration version a peer showed this node it holds, past the one this
+  /// node holds, and that peer (§4.8 Lookup, D-14 learners, A-489): a location query is bound to its asker's root view,
+  /// so one bound to a newer view than this node's says this node is behind and who is not. The root learner's next
+  /// period fetches from that peer and takes it (`fleet::root_learner_fetch`). One entry, the newest version seen.
+  pub(crate) root_newer_seen: Option<(u64, slates_db::register::HostId)>,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
   /// per-peer link task (`crate::fleet::establish_record_link`) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving

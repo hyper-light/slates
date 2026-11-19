@@ -902,13 +902,13 @@ fn hand_out(
 }
 
 /// macOS: the end is offered on the socket route under `secret` (`crate::shards_route`), the device's end of its resync
-/// channel beside it when one was made (A-339), and the reply carries the secret. An offer whose expiry could not be
-/// armed is dropped at once, closing the ends, so the stream ends its attachment, and the attach is refused
-/// `Overloaded`.
+/// channel beside it when one was made (A-339), and the reply carries the secret. The offer is the requesting client's,
+/// named by the request's word: it waits for that client's claim while the client lives, and goes with it when the
+/// reaper retires it (A-492).
 #[cfg(target_os = "macos")]
 fn hand_out(
   s: &mut ShardState,
-  _request: u64,
+  request: u64,
   attached: ShardsAttached,
   capability: slates_ipc::protocol::AttachmentCapability,
   secret: Prepared,
@@ -919,16 +919,13 @@ fn hand_out(
     stream,
     resync,
   } = attached;
-  if !crate::shards_route::offer(
+  crate::shards_route::offer(
     s,
     (slates_ipc::route::OfferKind::Stream, attachment),
+    slates_wire::request::RequestId::from_word(request).client,
     secret,
     (stream, resync),
-  ) {
-    return slates_ipc::protocol::ReplyBody::Refused {
-      refusal: Refusal::Overloaded { shard: s.shard },
-    };
-  }
+  );
   slates_ipc::protocol::ReplyBody::ShardsOffered {
     attachment,
     lease_epoch,
@@ -1397,11 +1394,9 @@ async fn serve(attachment: u64) {
           let _ = state::with_state_counted(|s| abandoned(s, attachment));
           continue;
         }
+        // A session change made outside the task is told by the turn it wakes, which owes it (`Turned::Session`).
         #[cfg(windows)]
-        Woke::Session => {
-          resync_handle::tell(attachment).await;
-          continue;
-        }
+        Woke::Session => Ok(()),
       }
     };
     if ready.is_err() {
@@ -1440,9 +1435,7 @@ async fn serve(attachment: u64) {
           let _ = state::with_state_counted(|s| settle_durable(s, attachment, durable));
         }
         #[cfg(windows)]
-        Some(Turned::Session) => resync_handle::tell(attachment).await,
-        #[cfg(windows)]
-        Some(Turned::Section) => dax_hold::hold_owed(attachment).await,
+        Some(owed @ (Turned::Session | Turned::Section)) => anchor_owed(attachment, &owed).await,
         Some(Turned::Told(owed)) => {
           // Every FUSE mount of the volume is told of the change, or the bound passes, before the reply goes out
           // (AC-3.3); the next turn sends it. Shards' VMM sends nothing more meanwhile, since it waits for this reply.
@@ -1459,6 +1452,17 @@ async fn serve(attachment: u64) {
         }
       }
     }
+  }
+}
+
+/// The anchor's part a Windows stream's turn owes before its reply goes out (A-427, A-448): the DAX section the answer
+/// hands held (`dax_hold::hold_owed`), or the session told (`resync_handle::tell`).
+#[cfg(windows)]
+async fn anchor_owed(attachment: u64, owed: &Turned) {
+  if matches!(owed, Turned::Section) {
+    dax_hold::hold_owed(attachment).await;
+  } else {
+    resync_handle::tell(attachment).await;
   }
 }
 

@@ -893,7 +893,7 @@ mod tests {
   /// `Malformed` and counted, with nothing changed.
   #[test]
   fn a_resync_end_is_held_alone_and_its_record_moves_with_its_session() {
-    use crate::handles::{RECORD_CAP, WHAT_SHARDS_RESYNC};
+    use crate::handles::WHAT_SHARDS_RESYNC;
     let (_anchor, daemon) = channel().unwrap();
     let mut held = Held::new(attachments(4));
     let (end, other) = (one_event(), one_event());
@@ -918,24 +918,37 @@ mod tests {
       "a resync end is one handle"
     );
     let named = b"the guest named its owner".to_vec();
+    a_record_moves_with_its_session(&mut held, &daemon, &named);
+    a_refused_record_changes_nothing(&mut held, &daemon, &named);
+  }
+
+  /// Replaces held resync end 1's record with `named`: answered `Held`, and the next process handed the new record under
+  /// the resync kind with its one handle.
+  fn a_record_moves_with_its_session(held: &mut Held, daemon: &Channel, named: &[u8]) {
+    use crate::handles::WHAT_SHARDS_RESYNC;
     assert_eq!(
       held.apply(
         myself(),
         HandleMessage::Record {
           id: 1,
-          record: named.clone()
+          record: named.to_vec()
         }
       ),
       Some(HandleMessage::Held { id: 1 })
     );
-    let handoff = held.handoff(&daemon).unwrap();
-    let (_, entries) = handed(&handoff, 4);
+    let (_, entries) = handed(&held.handoff(daemon).unwrap(), 4);
     assert_eq!(entries.len(), 1);
     assert_eq!(
       (entries[0].id, entries[0].what, entries[0].values.len()),
       (1, WHAT_SHARDS_RESYNC, 1)
     );
     assert_eq!(entries[0].record, named);
+  }
+
+  /// Replaces the record of an entry not held, and one past the cap: each refused `Malformed` and counted, and the record
+  /// held still `named`.
+  fn a_refused_record_changes_nothing(held: &mut Held, daemon: &Channel, named: &[u8]) {
+    use crate::handles::RECORD_CAP;
     for (id, record) in [(9, Vec::new()), (1, vec![0; RECORD_CAP + 1])] {
       assert_eq!(
         held.apply(myself(), HandleMessage::Record { id, record }),
@@ -946,7 +959,7 @@ mod tests {
       );
     }
     assert_eq!((held.len(), held.refusals()), (1, 3));
-    let (_, kept) = handed(&held.handoff(&daemon).unwrap(), 4);
+    let (_, kept) = handed(&held.handoff(daemon).unwrap(), 4);
     assert_eq!(
       kept[0].record, named,
       "a refused replacement changes nothing"
