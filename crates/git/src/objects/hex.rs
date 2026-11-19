@@ -7,5 +7,6 @@ use crate::object_name::ObjectFormat;
 /// `parse_oid_hex(buffer, &oid, &p) || *p != then`, inverted): the digits; none otherwise.
 pub(crate) fn id_then(text: &[u8], format: ObjectFormat, then: u8) -> Option<&[u8]> {
   let digits = text.get(..format.hex_len())?;
-  (digits.iter().all(u8::is_ascii_hexdigit) && text.get(format.hex_len()) == Some(&then)).then_some(digits)
+  (digits.iter().all(u8::is_ascii_hexdigit) && text.get(format.hex_len()) == Some(&then))
+    .then_some(digits)
 }

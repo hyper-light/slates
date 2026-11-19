@@ -36,13 +36,17 @@ fn character_at(name: &[u8], from: usize) -> Option<(u32, usize)> {
   let window = rest.get(..UTF8_LONGEST).unwrap_or(rest);
   let valid = match core::str::from_utf8(window) {
     Ok(text) => text,
-    Err(error) => core::str::from_utf8(window.get(..error.valid_up_to()).unwrap_or_default()).unwrap_or_default(),
+    Err(error) => core::str::from_utf8(window.get(..error.valid_up_to()).unwrap_or_default())
+      .unwrap_or_default(),
   };
   let character = valid.chars().next()?;
   if REFUSED_NONCHARACTERS.contains(&character) {
     return None;
   }
-  Some((u32::from(character), from.saturating_add(character.len_utf8())))
+  Some((
+    u32::from(character),
+    from.saturating_add(character.len_utf8()),
+  ))
 }
 
 /// Whether HFS+ ignores `code` in a name (utf8.c's `next_hfs_char`).
@@ -87,7 +91,9 @@ fn is_hfs_dot(name: &[u8], needle: &[u8]) -> bool {
 /// Whether `name` begins with `prefix`, ASCII case folded (`strncasecmp`); the rest of `name` when it does.
 fn strip_prefix_folded<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
   let head = name.get(..prefix.len())?;
-  head.eq_ignore_ascii_case(prefix).then(|| name.get(prefix.len()..).unwrap_or_default())
+  head
+    .eq_ignore_ascii_case(prefix)
+    .then(|| name.get(prefix.len()..).unwrap_or_default())
 }
 
 /// Whether `rest` holds nothing but spaces and dots up to its end or a byte of `ends` (path.c's
@@ -126,7 +132,10 @@ const REGULAR_SHORT_NAME_LAST: u8 = b'4';
 /// characters, `~` and 1 to 4), or a fall-back short name (`prefix`'s characters, `~`, and a number from 1 that does
 /// not begin with 0); then only spaces and dots up to the end or a `:`.
 fn is_ntfs_dot(name: &[u8], dotgit_name: &[u8], prefix: &[u8; SHORT_NAME_PREFIX]) -> bool {
-  if let Some(rest) = name.strip_prefix(b".").and_then(|rest| strip_prefix_folded(rest, dotgit_name)) {
+  if let Some(rest) = name
+    .strip_prefix(b".")
+    .and_then(|rest| strip_prefix_folded(rest, dotgit_name))
+  {
     return only_spaces_and_dots(rest, STREAM);
   }
   let short = dotgit_name.get(..SHORT_NAME_PREFIX).unwrap_or(dotgit_name);
@@ -134,10 +143,13 @@ fn is_ntfs_dot(name: &[u8], dotgit_name: &[u8], prefix: &[u8; SHORT_NAME_PREFIX]
     && at(name, SHORT_NAME_PREFIX) == b'~'
     && (b'1'..=REGULAR_SHORT_NAME_LAST).contains(&at(name, SHORT_NAME_PREFIX.saturating_add(1)))
   {
-    let rest = name.get(SHORT_NAME_PREFIX.saturating_add(2)..).unwrap_or_default();
+    let rest = name
+      .get(SHORT_NAME_PREFIX.saturating_add(2)..)
+      .unwrap_or_default();
     return only_spaces_and_dots(rest, STREAM);
   }
-  fall_back_short_name(name, prefix).is_some_and(|end| only_spaces_and_dots(name.get(end..).unwrap_or_default(), STREAM))
+  fall_back_short_name(name, prefix)
+    .is_some_and(|end| only_spaces_and_dots(name.get(end..).unwrap_or_default(), STREAM))
 }
 
 /// path.c's fall-back short-name loop over the first eight characters: up to six of `prefix` (either case, never a
@@ -157,7 +169,9 @@ fn fall_back_short_name(name: &[u8], prefix: &[u8; SHORT_NAME_PREFIX]) -> Option
       saw_tilde = true;
       at(name, index).is_ascii_digit() && at(name, index) != b'0'
     } else {
-      index < SHORT_NAME_PREFIX && byte.is_ascii() && prefix.get(index) == Some(&byte.to_ascii_lowercase())
+      index < SHORT_NAME_PREFIX
+        && byte.is_ascii()
+        && prefix.get(index) == Some(&byte.to_ascii_lowercase())
     };
     if !fits {
       return None;

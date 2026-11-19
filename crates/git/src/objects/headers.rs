@@ -9,8 +9,8 @@
 //! from.
 
 use super::{ObjectRefused, Refusal};
-use crate::out::Out;
 use crate::Admission;
+use crate::out::Out;
 
 /// One header of a commit or a tag, as written: its name, the bytes before the first space of its first line; and its
 /// value, the bytes after that space up to the newline that ends its last continuation line, the newlines and the

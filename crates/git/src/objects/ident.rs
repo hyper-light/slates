@@ -72,7 +72,9 @@ impl<'a> Ident<'a> {
 pub(crate) fn check(rest: &[u8]) -> (usize, Result<Ident<'_>, FsckId>) {
   let newline = rest.iter().position(|byte| *byte == b'\n');
   let advance = newline.map_or(rest.len(), |at| at.saturating_add(1));
-  let line = rest.get(..newline.unwrap_or(rest.len())).unwrap_or_default();
+  let line = rest
+    .get(..newline.unwrap_or(rest.len()))
+    .unwrap_or_default();
   (advance, Ident::parse(line))
 }
 
@@ -140,7 +142,8 @@ fn date(line: &[u8], from: usize) -> Result<(u64, usize), FsckId> {
 
 /// The time zone at `from`: a sign, four digits and the line's end; or `badTimezone`.
 fn zone(line: &[u8], from: usize) -> Result<&[u8], FsckId> {
-  let digits = (1..=ZONE_DIGITS).all(|offset| at(line, from.saturating_add(offset)).is_ascii_digit());
+  let digits =
+    (1..=ZONE_DIGITS).all(|offset| at(line, from.saturating_add(offset)).is_ascii_digit());
   let end = from.saturating_add(ZONE_DIGITS).saturating_add(1);
   if !matches!(at(line, from), b'+' | b'-') || !digits || at(line, end) != b'\n' {
     return Err(FsckId::BadTimezone);

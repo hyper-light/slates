@@ -70,7 +70,10 @@ impl<'a> Commit<'a> {
   /// The root tree's id in `format`, from the first header, which must be `tree` (commit.c's `parse_commit_buffer`
   /// reads it there); none when it is not one.
   pub fn tree(&self, format: ObjectFormat) -> Option<ObjectId> {
-    let first = self.headers.first().filter(|header| header.name == b"tree")?;
+    let first = self
+      .headers
+      .first()
+      .filter(|header| header.name == b"tree")?;
     ObjectId::from_hex(format, first.value?).ok()
   }
 
@@ -112,7 +115,10 @@ impl<'a> Commit<'a> {
 
   /// The `mergetag` headers: each a whole tag object, which [`Header::unfold`] writes out.
   pub fn mergetags(&self) -> impl Iterator<Item = &Header<'a>> + '_ {
-    self.headers.iter().filter(|header| header.name == b"mergetag")
+    self
+      .headers
+      .iter()
+      .filter(|header| header.name == b"mergetag")
   }
 
   /// The headers git gives no meaning of its own, kept as written (gitformat-signature, "extra headers").
@@ -184,7 +190,9 @@ fn check(bytes: &[u8], format: ObjectFormat) -> Result<(), FsckId> {
     1 => {}
     _ => return Err(FsckId::MultipleAuthors),
   }
-  let after = rest.strip_prefix(b"committer ").ok_or(FsckId::MissingCommitter)?;
+  let after = rest
+    .strip_prefix(b"committer ")
+    .ok_or(FsckId::MissingCommitter)?;
   ident::check(after).1.map(|_| ())
 }
 

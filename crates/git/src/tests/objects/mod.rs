@@ -16,7 +16,10 @@ use crate::object_name::{Kind, ObjectFormat, ObjectId};
 /// The objects of `fixtures/fsck`, compiled in by the table `make-fsck-fixtures.sh` wrote: each file's path under the
 /// directory and its bytes.
 mod table {
-  include!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/fsck/table.rs"));
+  include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/fsck/table.rs"
+  ));
 }
 
 /// What `make-fsck-fixtures.sh` recorded of each object: a line each.
@@ -120,7 +123,11 @@ fn said(report: &Report) -> String {
 /// `golden` checked as its type is checked, under `strictness`.
 fn check(golden: &Golden, strictness: super::Strictness) -> Report {
   match golden.kind {
-    Kind::Tree => super::tree::fsck(golden.bytes, golden.format, strictness, &mut ample()).unwrap().report,
+    Kind::Tree => {
+      super::tree::fsck(golden.bytes, golden.format, strictness, &mut ample())
+        .unwrap()
+        .report
+    }
     Kind::Commit => super::commit::fsck(golden.bytes, golden.format, strictness),
     Kind::Tag => super::tag::fsck(golden.bytes, golden.format, strictness),
     Kind::Blob => panic!("no blob is a fixture of this piece"),

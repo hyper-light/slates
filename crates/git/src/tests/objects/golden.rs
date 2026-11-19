@@ -29,7 +29,11 @@ fn every_fixture_is_the_bytes_its_sum_names_and_the_object_its_id_names() {
     .map(|(sum, path)| (path, sum))
     .collect();
   let goldens = goldens();
-  assert_eq!(sums.len(), goldens.len() + 2, "every object, the manifest and the version line");
+  assert_eq!(
+    sums.len(),
+    goldens.len() + 2,
+    "every object, the manifest and the version line"
+  );
   for (path, sum) in &sums {
     let bytes = match *path {
       "manifest.txt" => MANIFEST.as_bytes(),
@@ -40,11 +44,23 @@ fn every_fixture_is_the_bytes_its_sum_names_and_the_object_its_id_names() {
   }
   for golden in &goldens {
     let path = format!("{}/{}", golden.format.name(), golden.name);
-    assert!(sums.iter().any(|(listed, _)| *listed == path), "{path} has its sum");
-    assert_eq!(name_of(golden.format, golden.kind, golden.bytes), Ok(golden.id), "{path}");
+    assert!(
+      sums.iter().any(|(listed, _)| *listed == path),
+      "{path} has its sum"
+    );
+    assert_eq!(
+      name_of(golden.format, golden.kind, golden.bytes),
+      Ok(golden.id),
+      "{path}"
+    );
   }
   assert_eq!(GIT_VERSION, "git version 2.50.1 (Apple Git-155)\n");
-  let in_format = |format| goldens.iter().filter(|golden| golden.format == format).count();
+  let in_format = |format| {
+    goldens
+      .iter()
+      .filter(|golden| golden.format == format)
+      .count()
+  };
   assert_eq!(in_format(ObjectFormat::Sha256), 90);
   assert_eq!(in_format(ObjectFormat::Sha1), 90 + 180);
 }
@@ -78,16 +94,35 @@ fn every_object_git_reads_is_read_and_written_back_byte_for_byte() {
   for golden in goldens() {
     let unreadable = match golden.kind {
       Kind::Tree => golden.fsck.contains("error:badTree"),
-      _ => matches!(first_named(golden.fsck), Some(FsckId::NulInHeader | FsckId::UnterminatedHeader)),
+      _ => matches!(
+        first_named(golden.fsck),
+        Some(FsckId::NulInHeader | FsckId::UnterminatedHeader)
+      ),
     };
     match parse_and_write(&golden) {
       Ok(written) => {
-        assert!(!unreadable, "{} {}: git cannot read it", golden.format.name(), golden.name);
-        assert_eq!(written, golden.bytes, "{} {}", golden.format.name(), golden.name);
+        assert!(
+          !unreadable,
+          "{} {}: git cannot read it",
+          golden.format.name(),
+          golden.name
+        );
+        assert_eq!(
+          written,
+          golden.bytes,
+          "{} {}",
+          golden.format.name(),
+          golden.name
+        );
       }
       Err(ObjectRefused { refusal, at }) => {
         refused += 1;
-        assert!(unreadable, "{} {}: refused {refusal:?}", golden.format.name(), golden.name);
+        assert!(
+          unreadable,
+          "{} {}: refused {refusal:?}",
+          golden.format.name(),
+          golden.name
+        );
         let expected = match golden.kind {
           Kind::Tree => FsckId::BadTree,
           _ => first_named(golden.fsck).unwrap(),
@@ -113,11 +148,18 @@ fn every_object_is_judged_as_stock_git_judges_it_under_both_strictnesses() {
   let mut divergences = Vec::new();
   for golden in goldens() {
     let named = format!("{} {}", golden.format.name(), golden.name);
-    for (strictness, column) in [(Strictness::Default, golden.fsck), (Strictness::Strict, golden.strict)] {
+    for (strictness, column) in [
+      (Strictness::Default, golden.fsck),
+      (Strictness::Strict, golden.strict),
+    ] {
       let report = check(&golden, strictness);
       if column == "unparsed" {
         let (_, reason) = golden.hash_object.split_once(':').unwrap();
-        assert_eq!(report.refusal(), FsckId::from_name(reason), "{named} under {strictness:?}");
+        assert_eq!(
+          report.refusal(),
+          FsckId::from_name(reason),
+          "{named} under {strictness:?}"
+        );
       } else {
         assert_eq!(said(&report), column, "{named} under {strictness:?}");
       }
@@ -128,13 +170,20 @@ fn every_object_is_judged_as_stock_git_judges_it_under_both_strictnesses() {
       Some(("refused", printed)) => assert_eq!(first, Some(printed), "{named}"),
       None => assert_eq!((golden.hash_object, first), ("ok", None), "{named}"),
       Some(("ok", printed)) => {
-        assert_eq!(strict.refusal().map(FsckId::name), Some(printed), "{named}: slates refuses it");
+        assert_eq!(
+          strict.refusal().map(FsckId::name),
+          Some(printed),
+          "{named}: slates refuses it"
+        );
         divergences.push(golden.name);
       }
       Some(other) => panic!("{named}: hash-object said {other:?}"),
     }
   }
-  assert_eq!(divergences, ["bad-tag-tagger-extra-header"; 2], "the one divergence, once in each format");
+  assert_eq!(
+    divergences, ["bad-tag-tagger-extra-header"; 2],
+    "the one divergence, once in each format"
+  );
 }
 
 /// A-590. Do: read what each fixture's name says it is (`ok-` clean, `warn-` and `info-` kept with warnings, `bad-`
@@ -142,7 +191,10 @@ fn every_object_is_judged_as_stock_git_judges_it_under_both_strictnesses() {
 /// each is what its name says, so the corpus is what its script says it made.
 #[test]
 fn each_fixture_is_what_its_name_says_under_gits_default_check() {
-  for golden in goldens().iter().filter(|golden| !golden.name.starts_with("name-")) {
+  for golden in goldens()
+    .iter()
+    .filter(|golden| !golden.name.starts_with("name-"))
+  {
     let report = check(golden, Strictness::Default);
     let (prefix, _) = golden.name.split_once('-').unwrap();
     let warned = report.warnings().count() > 0;
@@ -173,7 +225,10 @@ fn every_fsck_id_has_one_name_and_its_level_follows_the_strictness() {
   assert_eq!(names.len(), FsckId::ALL.len());
   assert_eq!(FsckId::from_name("BadTree"), None, "names compare exactly");
   for id in FsckId::ALL {
-    let levels = (id.severity().reported(Strictness::Default), id.severity().reported(Strictness::Strict));
+    let levels = (
+      id.severity().reported(Strictness::Default),
+      id.severity().reported(Strictness::Strict),
+    );
     let expected = match id.severity() {
       Severity::Fatal | Severity::Error => (Severity::Error, Severity::Error),
       Severity::Warn => (Severity::Warn, Severity::Error),

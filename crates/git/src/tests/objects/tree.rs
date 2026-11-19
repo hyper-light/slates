@@ -46,9 +46,13 @@ fn a_tree_is_read_in_every_mode_git_writes_and_written_again_from_its_parts() {
       Entry::new(entry.standard_mode().unwrap(), entry.name, id.as_bytes()).write(&mut written);
     }
     assert_eq!(written, golden.bytes);
-    let root = golden(format, "ok-commit-root");
+    let root = super::golden(format, "ok-commit-root");
     let root = super::super::commit::Commit::parse(root.bytes, &mut ample()).unwrap();
-    assert_eq!(tree.entries()[2].object_id(format), root.tree(format), "the subtree is the root commit's tree");
+    assert_eq!(
+      tree.entries()[2].object_id(format),
+      root.tree(format),
+      "the subtree is the root commit's tree"
+    );
   }
 }
 
@@ -92,15 +96,38 @@ fn a_mode_is_read_as_git_reads_it_and_served_as_written() {
       assert_eq!(written, golden.bytes);
       (entry.mode_text.to_vec(), entry.mode, entry.standard_mode())
     };
-    assert_eq!(entry_of("ok-tree-mode-wraps"), (b"1100644".to_vec(), 0o100644, Some(Mode::File)));
-    assert_eq!(entry_of("warn-tree-zero-padded"), (b"040000".to_vec(), 0o40000, Some(Mode::Directory)));
-    assert_eq!(entry_of("ok-tree-mode-664"), (b"100664".to_vec(), 0o100664, None));
-    assert_eq!(entry_of("info-tree-bogus-mode"), (b"100000".to_vec(), 0o100000, None));
+    assert_eq!(
+      entry_of("ok-tree-mode-wraps"),
+      (b"1100644".to_vec(), 0o100644, Some(Mode::File))
+    );
+    assert_eq!(
+      entry_of("warn-tree-zero-padded"),
+      (b"040000".to_vec(), 0o40000, Some(Mode::Directory))
+    );
+    assert_eq!(
+      entry_of("ok-tree-mode-664"),
+      (b"100664".to_vec(), 0o100664, None)
+    );
+    assert_eq!(
+      entry_of("info-tree-bogus-mode"),
+      (b"100000".to_vec(), 0o100000, None)
+    );
     let group_writable = golden(format, "ok-tree-mode-664");
-    let check = |strictness| tree::fsck(group_writable.bytes, format, strictness, &mut ample()).unwrap().report;
+    let check = |strictness| {
+      tree::fsck(group_writable.bytes, format, strictness, &mut ample())
+        .unwrap()
+        .report
+    };
     assert_eq!(check(Strictness::Default).reported().count(), 0);
-    assert_eq!(check(Strictness::Strict).warnings().collect::<Vec<_>>(), [FsckId::BadFilemode]);
-    assert_eq!(check(Strictness::Strict).refusal(), None, "an info stays a warning under the strict check");
+    assert_eq!(
+      check(Strictness::Strict).warnings().collect::<Vec<_>>(),
+      [FsckId::BadFilemode]
+    );
+    assert_eq!(
+      check(Strictness::Strict).refusal(),
+      None,
+      "an info stays a warning under the strict check"
+    );
   }
   for mode in Mode::ALL {
     assert_eq!(Mode::from_bits(mode.bits()), Some(mode));
@@ -159,11 +186,22 @@ fn a_tree_past_its_admission_is_refused_before_anything_is_kept() {
   );
   assert_eq!(short.left(), room - 1);
   let mut exact = Admission::new(room);
-  assert_eq!(Tree::parse(golden.bytes, ObjectFormat::Sha1, &mut exact).unwrap().entries().len(), 6);
+  assert_eq!(
+    Tree::parse(golden.bytes, ObjectFormat::Sha1, &mut exact)
+      .unwrap()
+      .entries()
+      .len(),
+    6
+  );
   assert_eq!(exact.left(), 0);
   let special = golden_tree(ObjectFormat::Sha1, "ok-tree-special-blobs");
   let one_id = u64::try_from(core::mem::size_of::<&[u8]>()).unwrap();
-  let refused = tree::fsck(special, ObjectFormat::Sha1, Strictness::Strict, &mut Admission::new(one_id));
+  let refused = tree::fsck(
+    special,
+    ObjectFormat::Sha1,
+    Strictness::Strict,
+    &mut Admission::new(one_id),
+  );
   assert!(matches!(refused, Err(PastAdmission { .. })));
 }
 

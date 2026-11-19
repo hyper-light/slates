@@ -37,7 +37,9 @@ impl Severity {
   /// `fsck_vreport`): an error, a warning, or, for an ignored one, nothing ([`Severity::Ignore`]).
   pub const fn reported(self, strictness: Strictness) -> Severity {
     match (self, strictness) {
-      (Severity::Fatal, _) | (Severity::Error, _) | (Severity::Warn, Strictness::Strict) => Severity::Error,
+      (Severity::Fatal, _) | (Severity::Error, _) | (Severity::Warn, Strictness::Strict) => {
+        Severity::Error
+      }
       (Severity::Warn, Strictness::Default) | (Severity::Info, _) => Severity::Warn,
       (Severity::Ignore, _) => Severity::Ignore,
     }
@@ -425,7 +427,6 @@ impl FsckId {
     }
   }
 }
-
 
 impl FsckId {
   /// The id git prints as `name` ([`FsckId::name`]), compared exactly; none for any other.

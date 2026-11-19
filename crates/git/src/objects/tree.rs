@@ -58,7 +58,13 @@ pub enum Mode {
 
 impl Mode {
   /// Format: every mode git writes, the five `fsck_tree` takes as standard.
-  pub const ALL: [Mode; 5] = [Mode::File, Mode::Executable, Mode::Symlink, Mode::Directory, Mode::Gitlink];
+  pub const ALL: [Mode; 5] = [
+    Mode::File,
+    Mode::Executable,
+    Mode::Symlink,
+    Mode::Directory,
+    Mode::Gitlink,
+  ];
 
   /// The mode's bits.
   pub const fn bits(self) -> u16 {
@@ -192,7 +198,11 @@ impl<'a> Tree<'a> {
   /// entry git cannot read, as `fsck` reports `badTree` of it; otherwise every entry, counted and charged to
   /// `admission` before any is kept. A tree whose names or order fsck finds fault with is still read: judging it is
   /// [`fsck`]'s.
-  pub fn parse(bytes: &'a [u8], format: ObjectFormat, admission: &mut Admission) -> Result<Self, ObjectRefused> {
+  pub fn parse(
+    bytes: &'a [u8],
+    format: ObjectFormat,
+    admission: &mut Admission,
+  ) -> Result<Self, ObjectRefused> {
     let mut count = 0_usize;
     for entry in entries(bytes, format) {
       entry?;
@@ -223,7 +233,11 @@ impl<'a> Tree<'a> {
 }
 
 /// Decodes the entry at `from` as `decode_tree_entry` does: the entry and where the next begins, or the refusal.
-fn entry_at(bytes: &[u8], from: usize, format: ObjectFormat) -> Result<(Entry<'_>, usize), ObjectRefused> {
+fn entry_at(
+  bytes: &[u8],
+  from: usize,
+  format: ObjectFormat,
+) -> Result<(Entry<'_>, usize), ObjectRefused> {
   let refused = |at: usize, refusal: Refusal| ObjectRefused { at, refusal };
   let rest = bytes.get(from..).unwrap_or_default();
   let raw = format.raw_len();
@@ -256,7 +270,10 @@ fn entry_at(bytes: &[u8], from: usize, format: ObjectFormat) -> Result<(Entry<'_
   let id_from = name_from.saturating_add(name_len).saturating_add(1);
   let next = id_from.saturating_add(raw);
   // The check above makes both present; a tree that somehow lacks them is the same too-short tree, never a panic.
-  let (Some(name), Some(id)) = (rest.get(name_from..id_from.saturating_sub(1)), rest.get(id_from..next)) else {
+  let (Some(name), Some(id)) = (
+    rest.get(name_from..id_from.saturating_sub(1)),
+    rest.get(id_from..next),
+  ) else {
     return Err(refused(from, Refusal::TooShortTree));
   };
   let entry = Entry {
@@ -280,7 +297,10 @@ fn parse_mode(digits: &[u8]) -> u16 {
 }
 
 /// Every entry of `bytes` in order, ending at the first refusal.
-fn entries(bytes: &[u8], format: ObjectFormat) -> impl Iterator<Item = Result<Entry<'_>, ObjectRefused>> {
+fn entries(
+  bytes: &[u8],
+  format: ObjectFormat,
+) -> impl Iterator<Item = Result<Entry<'_>, ObjectRefused>> {
   let mut from = 0;
   let mut stopped = false;
   core::iter::from_fn(move || {
@@ -360,7 +380,11 @@ fn verify_ordered<'a>(
   } else if c2 == b'/' && below_slash(c1) && repeats_a_candidate(b.name, candidates) {
     return Ok(Order::Duplicate);
   }
-  Ok(if c1 < c2 { Order::Ordered } else { Order::Unordered })
+  Ok(if c1 < c2 {
+    Order::Ordered
+  } else {
+    Order::Unordered
+  })
 }
 
 /// `verify_ordered`'s look back from a subtree named `dir`: pops the candidates `dir` cannot repeat, and says whether
@@ -436,7 +460,12 @@ pub fn fsck<'a>(
   let mut previous: Option<Entry<'a>> = None;
   let mut candidates = Vec::new();
   loop {
-    check_names(&current, format, &mut flags, (&mut checked, &mut *admission))?;
+    check_names(
+      &current,
+      format,
+      &mut flags,
+      (&mut checked, &mut *admission),
+    )?;
     // git decodes the next entry before it judges this one's mode and order (`update_tree_entry_gently`): one it
     // cannot read is `badTree`, reported now, and the walk ends with this entry's mode and order unjudged.
     let next = match walk.next() {
@@ -467,7 +496,8 @@ pub fn fsck<'a>(
 /// Whether `fsck_tree` takes `mode` as standard under `strictness`: a mode git writes, or the old group-writable file
 /// unless the check is strict.
 fn standard_mode(mode: u16, strictness: Strictness) -> bool {
-  Mode::from_bits(mode).is_some() || (mode == MODE_GROUP_WRITABLE && strictness == Strictness::Default)
+  Mode::from_bits(mode).is_some()
+    || (mode == MODE_GROUP_WRITABLE && strictness == Strictness::Default)
 }
 
 /// The checks `fsck_tree` makes of an entry's name as it reaches it, before it decodes the next.
@@ -519,7 +549,11 @@ fn check_names<'a>(
 }
 
 /// A `.gitmodules` entry: a symbolic link is `gitmodulesSymlink`, anything else is kept to be checked as the file.
-fn gitmodules<'a>(entry: &Entry<'a>, checked: &mut Checked<'a>, admission: &mut Admission) -> Result<(), PastAdmission> {
+fn gitmodules<'a>(
+  entry: &Entry<'a>,
+  checked: &mut Checked<'a>,
+  admission: &mut Admission,
+) -> Result<(), PastAdmission> {
   if entry.is_symlink() {
     checked.report.report(FsckId::GitmodulesSymlink);
     Ok(())

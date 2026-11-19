@@ -27,7 +27,11 @@ fn read(kind: Kind, format: ObjectFormat, bytes: &[u8]) -> Result<Vec<u8>, Objec
 /// `bytes` checked as an object of `kind` in `format`: every finding, under each strictness.
 fn findings(kind: Kind, format: ObjectFormat, bytes: &[u8], strictness: Strictness) -> Vec<FsckId> {
   let report = match kind {
-    Kind::Tree => tree::fsck(bytes, format, strictness, &mut ample()).unwrap().report,
+    Kind::Tree => {
+      tree::fsck(bytes, format, strictness, &mut ample())
+        .unwrap()
+        .report
+    }
     Kind::Commit => commit::fsck(bytes, format, strictness),
     Kind::Tag => tag::fsck(bytes, format, strictness),
     Kind::Blob => panic!("blobs are not this piece's"),
@@ -45,17 +49,29 @@ fn judge(kind: Kind, format: ObjectFormat, bytes: &[u8]) {
     match &parsed {
       Ok(written) => {
         assert_eq!(written, bytes);
-        let unreadable = [FsckId::BadTree, FsckId::NulInHeader, FsckId::UnterminatedHeader];
-        assert!(!found.iter().any(|id| unreadable.contains(id)), "{kind:?} {bytes:x?}: {found:?}");
+        let unreadable = [
+          FsckId::BadTree,
+          FsckId::NulInHeader,
+          FsckId::UnterminatedHeader,
+        ];
+        assert!(
+          !found.iter().any(|id| unreadable.contains(id)),
+          "{kind:?} {bytes:x?}: {found:?}"
+        );
       }
       Err(ObjectRefused { at, refusal }) => {
         assert!(*at <= bytes.len());
-        let reason = refusal.fsck_id().unwrap_or_else(|| panic!("an ample admission never refuses: {refusal:?}"));
+        let reason = refusal
+          .fsck_id()
+          .unwrap_or_else(|| panic!("an ample admission never refuses: {refusal:?}"));
         let first = match kind {
           Kind::Tree => found.contains(&reason),
           _ => found.first() == Some(&reason),
         };
-        assert!(first, "{kind:?} refused {refusal:?}, checked {found:?}: {bytes:x?}");
+        assert!(
+          first,
+          "{kind:?} refused {refusal:?}, checked {found:?}: {bytes:x?}"
+        );
       }
     }
   }
@@ -64,14 +80,26 @@ fn judge(kind: Kind, format: ObjectFormat, bytes: &[u8]) {
 /// `verify_headers`' rule, restated: a NUL before the first empty line's second newline is `nulInHeader` there; an
 /// empty line or a last newline makes the headers whole; anything else is `unterminatedHeader` at the end.
 fn headers_verdict(bytes: &[u8]) -> Result<(), ObjectRefused> {
-  let blank = bytes.windows(2).position(|pair| pair == b"\n\n").map(|at| at + 1);
+  let blank = bytes
+    .windows(2)
+    .position(|pair| pair == b"\n\n")
+    .map(|at| at + 1);
   let nul = bytes.iter().position(|byte| *byte == 0);
   match (nul, blank) {
-    (Some(at), Some(end)) if at < end => Err(ObjectRefused { at, refusal: Refusal::NulInHeader }),
-    (Some(at), None) => Err(ObjectRefused { at, refusal: Refusal::NulInHeader }),
+    (Some(at), Some(end)) if at < end => Err(ObjectRefused {
+      at,
+      refusal: Refusal::NulInHeader,
+    }),
+    (Some(at), None) => Err(ObjectRefused {
+      at,
+      refusal: Refusal::NulInHeader,
+    }),
     (_, Some(_)) => Ok(()),
     (None, None) if bytes.last() == Some(&b'\n') => Ok(()),
-    (None, None) => Err(ObjectRefused { at: bytes.len(), refusal: Refusal::UnterminatedHeader }),
+    (None, None) => Err(ObjectRefused {
+      at: bytes.len(),
+      refusal: Refusal::UnterminatedHeader,
+    }),
   }
 }
 
@@ -103,12 +131,28 @@ fn every_cut_of_every_object_is_read_or_refused_by_kind() {
       match (golden.kind, &ends) {
         (Kind::Tree, Some(ends)) => match ends.iter().position(|end| *end == cut) {
           Some(count) => {
-            assert_eq!(Tree::parse(bytes, golden.format, &mut ample()).unwrap().entries().len(), count);
+            assert_eq!(
+              Tree::parse(bytes, golden.format, &mut ample())
+                .unwrap()
+                .entries()
+                .len(),
+              count
+            );
           }
-          None => assert_eq!(parsed.unwrap_err().refusal.fsck_id(), Some(FsckId::BadTree), "{} at {cut}", golden.name),
+          None => assert_eq!(
+            parsed.unwrap_err().refusal.fsck_id(),
+            Some(FsckId::BadTree),
+            "{} at {cut}",
+            golden.name
+          ),
         },
         (Kind::Tree, None) => {}
-        _ => assert_eq!(parsed.map(|_| ()), headers_verdict(bytes), "{} at {cut}", golden.name),
+        _ => assert_eq!(
+          parsed.map(|_| ()),
+          headers_verdict(bytes),
+          "{} at {cut}",
+          golden.name
+        ),
       }
       cuts += 1;
     }
@@ -126,7 +170,10 @@ const FLIP_LIMIT: usize = 1024;
 #[test]
 fn every_bit_flip_of_every_object_is_read_or_refused_by_kind() {
   let mut flips = 0_usize;
-  for golden in goldens().iter().filter(|golden| golden.bytes.len() <= FLIP_LIMIT) {
+  for golden in goldens()
+    .iter()
+    .filter(|golden| golden.bytes.len() <= FLIP_LIMIT)
+  {
     let mut bytes = golden.bytes.to_vec();
     for at in 0..bytes.len() {
       for bit in 0..8 {
@@ -164,8 +211,16 @@ fn over_long_names_lines_modes_and_dates_are_read_without_overflow() {
   commit.extend_from_slice(ident);
   commit.extend_from_slice(b"\nm\n");
   let parsed = Commit::parse(&commit, &mut ample()).unwrap();
-  assert_eq!(Ident::parse(parsed.author().unwrap()).unwrap().name.len(), 1 << 20);
-  assert_eq!(commit::fsck(&commit, ObjectFormat::Sha1, Strictness::Strict).reported().count(), 0);
+  assert_eq!(
+    Ident::parse(parsed.author().unwrap()).unwrap().name.len(),
+    1 << 20
+  );
+  assert_eq!(
+    commit::fsck(&commit, ObjectFormat::Sha1, Strictness::Strict)
+      .reported()
+      .count(),
+    0
+  );
 
   let mut unended = tree_line.clone().into_bytes();
   unended.extend_from_slice(b"x-extra ");
@@ -173,14 +228,23 @@ fn over_long_names_lines_modes_and_dates_are_read_without_overflow() {
   let at = unended.len();
   assert_eq!(
     Commit::parse(&unended, &mut ample()),
-    Err(ObjectRefused { at, refusal: Refusal::UnterminatedHeader })
+    Err(ObjectRefused {
+      at,
+      refusal: Refusal::UnterminatedHeader
+    })
   );
 
   let id = [0x55; 20];
   let long_name = mebibyte(b'n');
   let mut long_entry = Vec::new();
   tree::Entry::new(Mode::File, &long_name, &id).write(&mut long_entry);
-  let checked = tree::fsck(&long_entry, ObjectFormat::Sha1, Strictness::Default, &mut ample()).unwrap();
+  let checked = tree::fsck(
+    &long_entry,
+    ObjectFormat::Sha1,
+    Strictness::Default,
+    &mut ample(),
+  )
+  .unwrap();
   assert_eq!(checked.report.findings(), [FsckId::LargePathname]);
 
   let mut long_mode = vec![b'7'; 100_000];
@@ -188,20 +252,41 @@ fn over_long_names_lines_modes_and_dates_are_read_without_overflow() {
   long_mode.extend_from_slice(&id);
   let tree = Tree::parse(&long_mode, ObjectFormat::Sha1, &mut ample()).unwrap();
   assert_eq!(tree.entries()[0].mode, u16::MAX);
-  let checked = tree::fsck(&long_mode, ObjectFormat::Sha1, Strictness::Default, &mut ample()).unwrap();
+  let checked = tree::fsck(
+    &long_mode,
+    ObjectFormat::Sha1,
+    Strictness::Default,
+    &mut ample(),
+  )
+  .unwrap();
   assert_eq!(checked.report.findings(), [FsckId::BadFilemode]);
 
   let mut long_tag = format!("object {}\ntype commit\ntag ", "4".repeat(40)).into_bytes();
   long_tag.extend(mebibyte(b'a'));
   long_tag.extend_from_slice(b"\ntagger T <t@e> 1 +0000\n\nm\n");
-  assert_eq!(tag::fsck(&long_tag, ObjectFormat::Sha1, Strictness::Strict).reported().count(), 0);
-  assert_eq!(Tag::parse(&long_tag, &mut ample()).unwrap().name().unwrap().len(), 1 << 20);
+  assert_eq!(
+    tag::fsck(&long_tag, ObjectFormat::Sha1, Strictness::Strict)
+      .reported()
+      .count(),
+    0
+  );
+  assert_eq!(
+    Tag::parse(&long_tag, &mut ample())
+      .unwrap()
+      .name()
+      .unwrap()
+      .len(),
+    1 << 20
+  );
 
   let mut long_date = tree_line.into_bytes();
   long_date.extend_from_slice(b"author A <a@b> ");
   long_date.extend(vec![b'9'; 100_000]);
   long_date.extend_from_slice(b" +0000\ncommitter C <c@d> 1 +0000\n");
-  assert_eq!(commit::fsck(&long_date, ObjectFormat::Sha1, Strictness::Default).refusal(), Some(FsckId::BadDateOverflow));
+  assert_eq!(
+    commit::fsck(&long_date, ObjectFormat::Sha1, Strictness::Default).refusal(),
+    Some(FsckId::BadDateOverflow)
+  );
 }
 
 /// A-590 (§4.9; fsck.c's `multipleAuthors`). Do: read a commit of 100000 `parent` lines, under an ample admission and
@@ -217,14 +302,22 @@ fn a_hundred_thousand_headers_are_charged_first_and_judged() {
   parents.extend_from_slice(b"author A <a@b> 1 +0000\ncommitter C <c@d> 1 +0000\n");
   let commit = Commit::parse(&parents, &mut ample()).unwrap();
   assert_eq!(commit.parents(ObjectFormat::Sha1).count(), 100_000);
-  assert_eq!(commit::fsck(&parents, ObjectFormat::Sha1, Strictness::Strict).reported().count(), 0);
+  assert_eq!(
+    commit::fsck(&parents, ObjectFormat::Sha1, Strictness::Strict)
+      .reported()
+      .count(),
+    0
+  );
   let room = u64::try_from(core::mem::size_of::<super::super::Header<'_>>() * 100_003).unwrap();
   let mut short = Admission::new(room - 1);
   assert_eq!(
     Commit::parse(&parents, &mut short),
     Err(ObjectRefused {
       at: 0,
-      refusal: Refusal::PastAdmission(PastAdmission { asked: room, left: room - 1 })
+      refusal: Refusal::PastAdmission(PastAdmission {
+        asked: room,
+        left: room - 1
+      })
     })
   );
   assert_eq!(short.left(), room - 1);
@@ -233,7 +326,10 @@ fn a_hundred_thousand_headers_are_charged_first_and_judged() {
     authors.extend_from_slice(b"author A <a@b> 1 +0000\n");
   }
   authors.extend_from_slice(b"committer C <c@d> 1 +0000\n");
-  assert_eq!(commit::fsck(&authors, ObjectFormat::Sha1, Strictness::Default).refusal(), Some(FsckId::MultipleAuthors));
+  assert_eq!(
+    commit::fsck(&authors, ObjectFormat::Sha1, Strictness::Default).refusal(),
+    Some(FsckId::MultipleAuthors)
+  );
 }
 
 /// A-590 (fsck.c: `missingType` and `missingTag` cannot be met once the headers are whole). Do: check every cut of
@@ -246,7 +342,10 @@ fn a_type_or_tag_line_with_no_newline_is_met_first_by_another_check() {
     let golden = golden(format, "ok-tag");
     for cut in 0..=golden.bytes.len() {
       let found = findings(Kind::Tag, format, &golden.bytes[..cut], Strictness::Strict);
-      assert!(!found.contains(&FsckId::MissingType) && !found.contains(&FsckId::MissingTag), "{cut}: {found:?}");
+      assert!(
+        !found.contains(&FsckId::MissingType) && !found.contains(&FsckId::MissingTag),
+        "{cut}: {found:?}"
+      );
     }
   }
 }

@@ -14,11 +14,17 @@ fn a_tag_is_read_header_by_header_and_written_back_byte_for_byte() {
   for format in FORMATS {
     let golden = golden(format, "ok-tag");
     let tag = Tag::parse(golden.bytes, &mut ample()).unwrap();
-    assert_eq!(tag.object(format), Some(super::golden(format, "ok-commit-root").id));
+    assert_eq!(
+      tag.object(format),
+      Some(super::golden(format, "ok-commit-root").id)
+    );
     assert_eq!(tag.kind(), Some(Kind::Commit));
     assert_eq!(tag.name(), Some(&b"v1"[..]));
     let tagger = Ident::parse(tag.tagger().unwrap()).unwrap();
-    assert_eq!((tagger.name, tagger.seconds, tagger.zone), (&b"C O Mitter"[..], 1_112_911_993, &b"+0000"[..]));
+    assert_eq!(
+      (tagger.name, tagger.seconds, tagger.zone),
+      (&b"C O Mitter"[..], 1_112_911_993, &b"+0000"[..])
+    );
     assert_eq!(tag.message(), Some(&b"version one\n"[..]));
     assert_eq!(tag.signature(), None);
     let mut written = Vec::new();
@@ -38,7 +44,10 @@ fn a_signed_tag_splits_where_its_last_signature_block_begins() {
     let tag = Tag::parse(golden.bytes, &mut ample()).unwrap();
     let (signed, block) = tag.signature().unwrap();
     assert_eq!(signed, super::golden(format, "ok-tag").bytes);
-    assert_eq!(block, b"-----BEGIN PGP SIGNATURE-----\n\nbm90IGEgc2lnbmF0dXJl\n-----END PGP SIGNATURE-----\n");
+    assert_eq!(
+      block,
+      b"-----BEGIN PGP SIGNATURE-----\n\nbm90IGEgc2lnbmF0dXJl\n-----END PGP SIGNATURE-----\n"
+    );
   }
   let head = "object 0000000000000000000000000000000000000001\ntype commit\ntag v\n\nm\n";
   for start in [
@@ -50,11 +59,20 @@ fn a_signed_tag_splits_where_its_last_signature_block_begins() {
     let text = format!("{head}-----BEGIN PGP SIGNATURE-----\nfirst\n{start}\nsecond\n");
     let tag = Tag::parse(text.as_bytes(), &mut ample()).unwrap();
     let (signed, block) = tag.signature().unwrap();
-    assert_eq!(block, format!("{start}\nsecond\n").as_bytes(), "the last block begins the signature");
+    assert_eq!(
+      block,
+      format!("{start}\nsecond\n").as_bytes(),
+      "the last block begins the signature"
+    );
     assert!(signed.ends_with(b"first\n"));
   }
   let inline = format!("{head}see -----BEGIN PGP SIGNATURE-----\n");
-  assert_eq!(Tag::parse(inline.as_bytes(), &mut ample()).unwrap().signature(), None);
+  assert_eq!(
+    Tag::parse(inline.as_bytes(), &mut ample())
+      .unwrap()
+      .signature(),
+    None
+  );
 }
 
 /// A-590 (fsck.c's `fsck_tag_standalone`: the tagger's result is not looked at before the extra-header check, whose
@@ -66,16 +84,26 @@ fn a_signed_tag_splits_where_its_last_signature_block_begins() {
 fn a_bad_tagger_before_an_extra_header_is_refused_where_git_accepts_it() {
   for format in FORMATS {
     let golden = golden(format, "bad-tag-tagger-extra-header");
-    assert_eq!(golden.hash_object, "ok:missingEmail", "git wrote it after printing the tagger's error");
+    assert_eq!(
+      golden.hash_object, "ok:missingEmail",
+      "git wrote it after printing the tagger's error"
+    );
     for strictness in [Strictness::Default, Strictness::Strict] {
       let report = tag::fsck(golden.bytes, format, strictness);
-      assert_eq!(report.findings(), [FsckId::MissingEmail, FsckId::ExtraHeaderEntry]);
+      assert_eq!(
+        report.findings(),
+        [FsckId::MissingEmail, FsckId::ExtraHeaderEntry]
+      );
       assert_eq!(said(&report), "error:missingEmail");
       assert_eq!(report.refusal(), Some(FsckId::MissingEmail));
     }
     let clean = golden_report(format, "ignore-tag-extra-header");
     assert_eq!(clean.findings(), [FsckId::ExtraHeaderEntry]);
-    assert_eq!(clean.refusal(), None, "an extra header alone is ignored, as in git");
+    assert_eq!(
+      clean.refusal(),
+      None,
+      "an extra header alone is ignored, as in git"
+    );
   }
 }
 
@@ -96,7 +124,10 @@ fn a_bad_tag_name_and_a_missing_tagger_are_warnings_under_either_strictness() {
       let reported: Vec<_> = report.reported().collect();
       assert_eq!(
         reported,
-        [(FsckId::BadTagName, Severity::Warn), (FsckId::MissingTaggerEntry, Severity::Warn)]
+        [
+          (FsckId::BadTagName, Severity::Warn),
+          (FsckId::MissingTaggerEntry, Severity::Warn)
+        ]
       );
       assert_eq!(report.refusal(), None);
     }

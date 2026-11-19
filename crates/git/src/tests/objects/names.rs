@@ -39,7 +39,10 @@ fn git_pick_one_utf8_char(s: &[u8]) -> Option<(u32, usize)> {
     {
       return None;
     }
-    Some((((s0 & 0x07) << 18) | ((s1 & 0x3f) << 12) | ((s2 & 0x3f) << 6) | (s3 & 0x3f), 4))
+    Some((
+      ((s0 & 0x07) << 18) | ((s1 & 0x3f) << 12) | ((s2 & 0x3f) << 6) | (s3 & 0x3f),
+      4,
+    ))
   } else {
     None
   }
@@ -55,8 +58,8 @@ fn git_next_hfs_char(s: &[u8]) -> (u32, Option<&[u8]>) {
     };
     rest = rest.get(taken..).unwrap_or_default();
     match out {
-      0x200c | 0x200d | 0x200e | 0x200f | 0x202a | 0x202b | 0x202c | 0x202d | 0x202e | 0x206a | 0x206b | 0x206c
-      | 0x206d | 0x206e | 0x206f | 0xfeff => continue,
+      0x200c | 0x200d | 0x200e | 0x200f | 0x202a | 0x202b | 0x202c | 0x202d | 0x202e | 0x206a
+      | 0x206b | 0x206c | 0x206d | 0x206e | 0x206f | 0xfeff => continue,
       _ => return (out, Some(rest)),
     }
   }
@@ -133,7 +136,13 @@ fn has_dotgit(name: &[u8]) -> bool {
   let id = [0x44; 20];
   let mut bytes = Vec::new();
   Entry::new(Mode::File, name, &id).write(&mut bytes);
-  let checked = tree::fsck(&bytes, ObjectFormat::Sha1, Strictness::Default, &mut ample()).unwrap();
+  let checked = tree::fsck(
+    &bytes,
+    ObjectFormat::Sha1,
+    Strictness::Default,
+    &mut ample(),
+  )
+  .unwrap();
   checked.report.findings().contains(&FsckId::HasDotgit)
 }
 
@@ -180,7 +189,10 @@ fn a_dotgit_name_is_judged_as_gits_utf8_reader_judges_it() {
   }
   // 128 leads by 70 seconds; 32 leads by 70 by 70; 8 leads by 70 by 70 by 4; each placed after and inside `.git`.
   assert_eq!(names, 2 * (128 * 70 + 32 * 70 * 70 + 8 * 70 * 70 * 4));
-  assert!(found > 0 && found < names, "both answers met: {found} of {names}");
+  assert!(
+    found > 0 && found < names,
+    "both answers met: {found} of {names}"
+  );
 }
 
 /// A-590 (path.c's `is_ntfs_dotgit`, after each backslash in fsck.c). Do: name a file with `.git` or `git~1` after
@@ -194,7 +206,12 @@ fn a_dotgit_after_a_backslash_is_judged_as_git_judges_it() {
     for second in parts {
       for third in parts {
         let name = [first, second, third].concat();
-        assert_eq!(has_dotgit(&name), git_has_dotgit(&name), "{:?}", String::from_utf8_lossy(&name));
+        assert_eq!(
+          has_dotgit(&name),
+          git_has_dotgit(&name),
+          "{:?}",
+          String::from_utf8_lossy(&name)
+        );
         count += 1;
       }
     }

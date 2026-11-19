@@ -24,13 +24,19 @@ fn a_commit_is_read_header_by_header_and_written_back_byte_for_byte() {
   for format in FORMATS {
     let golden = golden(format, "ok-commit-merge");
     let commit = Commit::parse(golden.bytes, &mut ample()).unwrap();
-    assert_eq!(commit.tree(format), Some(super::golden(format, "ok-tree").id));
+    assert_eq!(
+      commit.tree(format),
+      Some(super::golden(format, "ok-tree").id)
+    );
     let parents: Vec<_> = commit.parents(format).collect();
     assert_eq!(parents.len(), 2);
     assert_eq!(parents[0], super::golden(format, "ok-commit-root").id);
     assert_eq!(Ident::parse(commit.author().unwrap()), Ok(AUTHOR));
     let committer = Ident::parse(commit.committer().unwrap()).unwrap();
-    assert_eq!((committer.name, committer.email), (&b"C O Mitter"[..], &b"committer@example.com"[..]));
+    assert_eq!(
+      (committer.name, committer.email),
+      (&b"C O Mitter"[..], &b"committer@example.com"[..])
+    );
     assert_eq!(commit.message(), Some(&b"merge\n"[..]));
     assert_eq!(commit.encoding(), None);
     assert_eq!(commit.extra_headers().count(), 0);
@@ -41,7 +47,11 @@ fn a_commit_is_read_header_by_header_and_written_back_byte_for_byte() {
       ObjectFormat::Sha1 => ObjectFormat::Sha256,
       ObjectFormat::Sha256 => ObjectFormat::Sha1,
     };
-    assert_eq!(commit.tree(other), None, "an id of the other format's length is no id");
+    assert_eq!(
+      commit.tree(other),
+      None,
+      "an id of the other format's length is no id"
+    );
   }
 }
 
@@ -56,7 +66,10 @@ fn a_signature_unfolds_to_its_lines_and_covers_the_commit_without_it() {
   for format in FORMATS {
     let golden = golden(format, "ok-commit-gpgsig");
     let commit = Commit::parse(golden.bytes, &mut ample()).unwrap();
-    for (signature_format, name) in [(ObjectFormat::Sha1, "gpgsig"), (ObjectFormat::Sha256, "gpgsig-sha256")] {
+    for (signature_format, name) in [
+      (ObjectFormat::Sha1, "gpgsig"),
+      (ObjectFormat::Sha256, "gpgsig-sha256"),
+    ] {
       let signature = commit.signature(signature_format).unwrap();
       assert_eq!(signature.name, name.as_bytes());
       let mut unfolded = Vec::new();
@@ -69,7 +82,11 @@ fn a_signature_unfolds_to_its_lines_and_covers_the_commit_without_it() {
     let mut written = Vec::new();
     commit.write(&mut written);
     assert_eq!(written, golden.bytes);
-    assert_eq!(commit.extra_headers().count(), 0, "both signature headers are git's own");
+    assert_eq!(
+      commit.extra_headers().count(),
+      0,
+      "both signature headers are git's own"
+    );
   }
 }
 
@@ -87,7 +104,10 @@ fn a_mergetag_carries_the_whole_signed_tag() {
     mergetags[0].unfold(&mut carried);
     assert_eq!(carried, super::golden(format, "ok-tag-signed").bytes);
     let tag = Tag::parse(&carried, &mut ample()).unwrap();
-    assert_eq!(tag.object(format), Some(super::golden(format, "ok-commit-root").id));
+    assert_eq!(
+      tag.object(format),
+      Some(super::golden(format, "ok-commit-root").id)
+    );
     let (signed, block) = tag.signature().unwrap();
     assert_eq!(signed, super::golden(format, "ok-tag").bytes);
     assert!(block.starts_with(b"-----BEGIN PGP SIGNATURE-----\n"));
@@ -114,7 +134,13 @@ fn an_encoding_an_extra_header_and_no_message_are_kept_as_written() {
     assert_eq!(encoded.message(), Some(&b"caf\xe9\n"[..]));
     let extra = read("ok-commit-extra");
     let extras: Vec<&Header<'_>> = extra.extra_headers().collect();
-    assert_eq!(extras, [&Header { name: b"x-extra", value: Some(b"one value") }]);
+    assert_eq!(
+      extras,
+      [&Header {
+        name: b"x-extra",
+        value: Some(b"one value")
+      }]
+    );
     let bare = read("ok-commit-nomessage");
     assert_eq!(bare.message(), None);
     assert_eq!(bare.headers().len(), 3);
@@ -128,12 +154,24 @@ fn an_encoding_an_extra_header_and_no_message_are_kept_as_written() {
 #[test]
 fn an_identity_is_read_into_its_parts_or_refused_with_gits_first_finding() {
   let read = |line: &'static str| Ident::parse(line.as_bytes());
-  assert_eq!(read("A U Thor <author@example.com> 1112911993 +0000"), Ok(AUTHOR));
+  assert_eq!(
+    read("A U Thor <author@example.com> 1112911993 +0000"),
+    Ok(AUTHOR)
+  );
   let parts = |line| read(line).map(|ident| (ident.name, ident.email, ident.seconds, ident.zone));
-  assert_eq!(parts(" <a@b> 1 -0130"), Ok((&b""[..], &b"a@b"[..], 1, &b"-0130"[..])));
-  assert_eq!(parts("A <a@b> \t 0 +0000"), Ok((&b"A"[..], &b"a@b"[..], 0, &b"+0000"[..])));
+  assert_eq!(
+    parts(" <a@b> 1 -0130"),
+    Ok((&b""[..], &b"a@b"[..], 1, &b"-0130"[..]))
+  );
+  assert_eq!(
+    parts("A <a@b> \t 0 +0000"),
+    Ok((&b"A"[..], &b"a@b"[..], 0, &b"+0000"[..]))
+  );
   let most = u64::try_from(i64::MAX).unwrap();
-  assert_eq!(read("A <a@b> 9223372036854775807 +0000").map(|ident| ident.seconds), Ok(most));
+  assert_eq!(
+    read("A <a@b> 9223372036854775807 +0000").map(|ident| ident.seconds),
+    Ok(most)
+  );
   let refused = [
     ("<a@b> 1 +0000", FsckId::MissingNameBeforeEmail),
     ("A a@b> 1 +0000", FsckId::BadName),
@@ -147,7 +185,10 @@ fn an_identity_is_read_into_its_parts_or_refused_with_gits_first_finding() {
     ("A <a@b> 1x +0000", FsckId::BadDate),
     ("A <a@b> 01 +0000", FsckId::ZeroPaddedDate),
     ("A <a@b> 9223372036854775808 +0000", FsckId::BadDateOverflow),
-    ("A <a@b> 18446744073709551617 +0000", FsckId::BadDateOverflow),
+    (
+      "A <a@b> 18446744073709551617 +0000",
+      FsckId::BadDateOverflow,
+    ),
     ("A <a@b> 1 0000", FsckId::BadTimezone),
     ("A <a@b> 1 +000", FsckId::BadTimezone),
     ("A <a@b> 1 +00000", FsckId::BadTimezone),
@@ -159,5 +200,9 @@ fn an_identity_is_read_into_its_parts_or_refused_with_gits_first_finding() {
   let mut digits = "A <a@b> ".to_owned();
   digits.push_str(&"9".repeat(100_000));
   digits.push_str(" +0000");
-  assert_eq!(Ident::parse(digits.as_bytes()), Err(FsckId::BadDateOverflow), "a date of 100000 digits");
+  assert_eq!(
+    Ident::parse(digits.as_bytes()),
+    Err(FsckId::BadDateOverflow),
+    "a date of 100000 digits"
+  );
 }

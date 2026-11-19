@@ -106,7 +106,9 @@ impl<'a> Tag<'a> {
       line = rest
         .iter()
         .position(|byte| *byte == b'\n')
-        .map_or(self.bytes.len(), |end| line.saturating_add(end).saturating_add(1));
+        .map_or(self.bytes.len(), |end| {
+          line.saturating_add(end).saturating_add(1)
+        });
     }
     start.map(|at| self.bytes.split_at(at))
   }
@@ -145,10 +147,16 @@ fn line(rest: &[u8]) -> Option<(&[u8], &[u8])> {
 /// it went on past reported as it met them. `missingType` and `missingTag` (a `type` or `tag` line with no newline) are
 /// kept as git keeps them, though whole headers never let them happen.
 fn check(bytes: &[u8], format: ObjectFormat, report: &mut Report) -> Result<(), FsckId> {
-  let after = bytes.strip_prefix(b"object ").ok_or(FsckId::MissingObject)?;
+  let after = bytes
+    .strip_prefix(b"object ")
+    .ok_or(FsckId::MissingObject)?;
   let object = hex::id_then(after, format, b'\n').ok_or(FsckId::BadObjectSha1)?;
-  let rest = after.get(object.len().saturating_add(1)..).unwrap_or_default();
-  let after = rest.strip_prefix(b"type ").ok_or(FsckId::MissingTypeEntry)?;
+  let rest = after
+    .get(object.len().saturating_add(1)..)
+    .unwrap_or_default();
+  let after = rest
+    .strip_prefix(b"type ")
+    .ok_or(FsckId::MissingTypeEntry)?;
   let (kind, rest) = line(after).ok_or(FsckId::MissingType)?;
   Kind::from_name(kind).map_err(|_| FsckId::BadType)?;
   let after = rest.strip_prefix(b"tag ").ok_or(FsckId::MissingTagEntry)?;
