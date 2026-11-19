@@ -7890,6 +7890,8 @@ mod clone_count_tests {
   /// Shape: the files the origin holds at its snapshot, and the ones it makes after it.
   const BEFORE: usize = 3;
   const AFTER: usize = 5;
+  /// Shape: the files the entries test's origin holds in its subdirectory at its snapshot.
+  const INNER: usize = 2;
   /// Format: a file's and a directory's mode.
   const FILE_MODE: u32 = 0o644;
   const DIR_MODE: u32 = 0o755;
@@ -8075,5 +8077,135 @@ mod clone_count_tests {
     counted_as_its_tree(&recovered, &fresh, "the clone's restart");
     let later = Volume::clone_of(&fresh, &mut recovered_origin, cut, config(LATER_PREFIX)).unwrap();
     counted_as_its_tree(&later, &fresh, "a clone of the recovered snapshot");
+  }
+
+  /// The entries a walk of `volume`'s namespace from its root reaches: every directory's children as a transport lists
+  /// them, which §4.2's namespace dimension counts.
+  fn entries_reachable(volume: &Volume, store: &Store) -> u64 {
+    let mut entries = 0;
+    let mut directories = vec![volume.root_inode(store).unwrap()];
+    while let Some(directory) = directories.pop() {
+      for row in volume.readdir_no(store, directory).unwrap() {
+        entries += 1;
+        if row.kind == Kind::Dir {
+          directories.push(row.inode);
+        }
+      }
+    }
+    entries
+  }
+
+  /// Checks `volume`'s entry count against the entries its namespace reaches after `step`.
+  fn entries_counted_as_its_tree(volume: &Volume, store: &Store, step: &str) {
+    assert_eq!(
+      volume.entry_usage().0,
+      entries_reachable(volume, store),
+      "the live-entry count after {step}"
+    );
+  }
+
+  /// An origin holding a directory with [`INNER`] files in it and [`BEFORE`] files beside it at its snapshot, which then
+  /// makes [`AFTER`] more files and one more in the directory, and removes one of each: the origin and the snapshot.
+  fn origin_whose_entries_changed_since_its_cut(store: &mut Store) -> (Volume, SnapshotId) {
+    let mut origin = Volume::create(store, config(ORIGIN_PREFIX)).unwrap();
+    let root = origin.root_inode(store).unwrap();
+    let inner = origin.mkdir_no(store, root, "d", DIR_MODE).unwrap();
+    for n in 0..INNER {
+      origin
+        .create_file_no(store, inner, &format!("inner-{n}"), FILE_MODE)
+        .unwrap();
+    }
+    for n in 0..BEFORE {
+      origin
+        .create_file_no(store, root, &format!("before-{n}"), FILE_MODE)
+        .unwrap();
+    }
+    entries_counted_as_its_tree(&origin, store, "the origin's first entries");
+    let cut = origin.snapshot(store).unwrap();
+    for n in 0..AFTER {
+      origin
+        .create_file_no(store, root, &format!("after-{n}"), FILE_MODE)
+        .unwrap();
+    }
+    origin
+      .create_file_no(store, inner, "inner-after", FILE_MODE)
+      .unwrap();
+    origin.unlink_no(store, root, "before-0").unwrap();
+    origin.unlink_no(store, inner, "inner-0").unwrap();
+    entries_counted_as_its_tree(&origin, store, "the origin's changes since its snapshot");
+    (origin, cut)
+  }
+
+  /// A-549 (A-541's sibling). Do: clone a snapshot whose origin has since made and removed entries, in its root and in a
+  /// subdirectory; make and remove entries in the clone; snapshot the clone and clone that; give the clone an entry
+  /// allowance of one more than its namespace holds and make files until refused; then restart and clone the recovered
+  /// snapshot. After every step compare each entry count with the entries a walk of its namespace reaches. Expect them
+  /// equal at every step, and exactly one file admitted under the allowance before `NoSpace`. Before A-549 a clone
+  /// started from its origin's count at the clone, so every step was off by the origin's net change since the
+  /// snapshot, and the allowance was refused below the entries the clone held.
+  #[test]
+  fn a_clone_counts_its_snapshots_entries_whatever_its_origin_did_since() {
+    let mut store = store();
+    let (mut origin, cut) = origin_whose_entries_changed_since_its_cut(&mut store);
+    let mut clone = Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)).unwrap();
+    entries_counted_as_its_tree(
+      &clone,
+      &store,
+      "the clone of a snapshot its origin changed since",
+    );
+    let root = clone.root_inode(&store).unwrap();
+    let inner = clone.lookup_no(&store, root, "d").unwrap().inode;
+    clone
+      .create_file_no(&mut store, root, "clone-made", FILE_MODE)
+      .unwrap();
+    clone.unlink_no(&mut store, inner, "inner-1").unwrap();
+    clone.mkdir_no(&mut store, root, "e", DIR_MODE).unwrap();
+    entries_counted_as_its_tree(&clone, &store, "entries made and removed in the clone");
+    let clone_cut = clone.snapshot(&mut store).unwrap();
+    clone
+      .create_file_no(&mut store, root, "after-the-clones-snapshot", FILE_MODE)
+      .unwrap();
+    let clone_of_clone =
+      Volume::clone_of(&store, &mut clone, clone_cut, config(CLONE_OF_CLONE_PREFIX)).unwrap();
+    entries_counted_as_its_tree(&clone_of_clone, &store, "a clone of the clone's snapshot");
+    let origin_image = origin.to_image(&store, None).unwrap();
+    let clone_image = clone.to_image(&store, None).unwrap();
+    let reachable = entries_reachable(&clone, &store);
+    clone.set_entry_allowance(reachable + 1).unwrap();
+    clone
+      .create_file_no(&mut store, root, "within-the-allowance", FILE_MODE)
+      .unwrap();
+    assert!(
+      matches!(
+        clone.create_file_no(&mut store, root, "past-the-allowance", FILE_MODE),
+        Err(VfsError::NoSpace)
+      ),
+      "the allowance admits one entry past the namespace the clone holds, then refuses"
+    );
+    let mut fresh = surviving(&store);
+    let claims = Claims::prepare(&mut fresh, [&origin_image, &clone_image]).unwrap();
+    let mut recovered_origin = Volume::from_image(
+      &mut fresh,
+      &origin_image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      None,
+    )
+    .unwrap();
+    let recovered = Volume::clone_from_image(
+      &mut fresh,
+      &clone_image,
+      &claims,
+      &recovered_origin,
+      cut,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      None,
+    )
+    .unwrap();
+    entries_counted_as_its_tree(&recovered, &fresh, "the clone's restart");
+    let later = Volume::clone_of(&fresh, &mut recovered_origin, cut, config(LATER_PREFIX)).unwrap();
+    entries_counted_as_its_tree(&later, &fresh, "a clone of the recovered snapshot");
   }
 }
