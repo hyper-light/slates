@@ -1,0 +1,9 @@
+0012command=fetch
+0017object-format=sha1
+0001000eofs-delta
+0010no-progress
+0011sideband-all
+001cpackfile-uris ftp,https
+0032want 2e01529673a750e4b001c538bc95d5a4b7c9d7e3
+0009done
+0000

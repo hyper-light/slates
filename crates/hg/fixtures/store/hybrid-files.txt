@@ -1,0 +1,27 @@
+00changelog.d
+00changelog.i
+00manifest.i
+data/ space.i
+data/.leading.i
+data/_capital___under.txt.i
+data/_f_o_o.i
+data/au~78.txt.i
+data/colon~3aquest~3fstar~2a.txt.i
+data/co~6d1.i
+data/co~6e.i
+data/foo.i
+data/lp~749.x.i
+data/plain.txt.i
+data/pr~6e.d.i
+data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i
+data/tilde~7e~c3~a9.txt.i
+data/trailing .i
+data/trailing..i
+data/x.i.hg/inside.txt.i
+data/y.d.hg/inside.txt.i
+data/z.hg.hg/inside.txt.i
+dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i
+dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i
+dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i
+fncache
+requires

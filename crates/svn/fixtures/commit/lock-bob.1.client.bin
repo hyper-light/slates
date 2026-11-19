@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 40:svn+fixture://fixture/repo/trunk/project 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( EXTERNAL ( 0: ) ) ( lock-many ( ( 5:bob's ) false ( ( 5:a.txt ( 11 ) ) ) ) ) 
