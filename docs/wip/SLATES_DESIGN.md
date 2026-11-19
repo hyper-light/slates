@@ -45149,6 +45149,12 @@ Applied in the same change to: §4.16 (a status block, the verdict's sentence on
   - Red seven ways (r1040, 06:42 to 06:48 UTC), each on a copy of the tree with one guard taken out, the whole `--lib`
     suite run: copies of a changed source refused again, 4 failed; no cuts, 2; no empty start, 2; the fix left out of
     the entry, 4; replay reading the head's bytes, 1; the verdict reading the head's bytes, 1; no room, 1.
+  - Merged with main (A-646's hard links naming their nodes, clean; `verbs.rs`'s admission now `Op::GreenAdvanced`,
+    the room joining its bound): at `e728908e6` (06:50 UTC, load 8.3) slates-merge's `--lib` 133 of 133, 25.95 s, fmt
+    clean, the census 106 accepted, 390 refused, 23 from the root, 60 from an older version, 40 into their own tree,
+    23 from a changed source, 37 keys changed beneath, 48 replaces, 46 nested pairs (2 inner replaces), 26 moves;
+    slates-server's `--lib` 614 passed, 3 ignored, and the same one of main's failed (3 of 3 with main `dc46c9f`'s
+    `verbs.rs`).
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
 - **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: its copies and the identity's sum
   carried); a rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
