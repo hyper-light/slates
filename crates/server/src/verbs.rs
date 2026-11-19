@@ -9659,7 +9659,7 @@ pub(crate) fn owner_sizes(
     engine
       .file_lens_at(version)
       .into_iter()
-      .map(|(path, len)| (path.to_owned(), u64::try_from(len).unwrap_or(u64::MAX)))
+      .map(|(path, len)| (path, u64::try_from(len).unwrap_or(u64::MAX)))
       .collect(),
   );
   fetched

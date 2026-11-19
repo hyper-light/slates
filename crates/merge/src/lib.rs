@@ -34,6 +34,7 @@
 pub mod chain_entry;
 pub mod checkpoint;
 pub mod derive;
+mod dims;
 pub mod engine;
 mod history;
 mod identity;

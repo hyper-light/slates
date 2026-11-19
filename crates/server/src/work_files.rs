@@ -119,16 +119,17 @@ impl WorkFiles {
   }
 
   /// Every file the work sees, sorted by path: the base's files it did not change and the files it holds. Without
-  /// the base (its green gone) only the files the work holds are known.
-  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, Cow<'a, [u8]>)> {
-    let mut files: BTreeMap<&str, Cow<'a, [u8]>> = base
+  /// the base (its green gone) only the files the work holds are known. The paths are owned, as the green's walk gives
+  /// them (its maps are persistent radix trees, A-534).
+  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(String, Cow<'a, [u8]>)> {
+    let mut files: BTreeMap<String, Cow<'a, [u8]>> = base
       .green
       .map(|green| green.files_at(base.version).into_iter().collect())
       .unwrap_or_default();
     for (path, entry) in &self.changed {
       match entry {
         Some(bytes) => {
-          files.insert(path.as_str(), Cow::Borrowed(bytes.as_slice()));
+          files.insert(path.clone(), Cow::Borrowed(bytes.as_slice()));
         }
         None => {
           files.remove(path.as_str());
@@ -165,8 +166,8 @@ impl WorkFiles {
   }
 
   /// Every file the work sees with its length, sorted by path: [`WorkFiles::files`] without the bytes.
-  pub fn sizes<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, u64)> {
-    let mut sizes: BTreeMap<&str, u64> = base
+  pub fn sizes(&self, base: Base<'_>) -> Vec<(String, u64)> {
+    let mut sizes: BTreeMap<String, u64> = base
       .green
       .map(|green| {
         green
@@ -180,7 +181,7 @@ impl WorkFiles {
         Some(
           fetched
             .iter()
-            .map(|(path, len)| (path.as_str(), *len))
+            .map(|(path, len)| (path.clone(), *len))
             .collect(),
         )
       })
@@ -189,7 +190,7 @@ impl WorkFiles {
       match entry {
         Some(bytes) => {
           sizes.insert(
-            path.as_str(),
+            path.clone(),
             u64::try_from(bytes.len()).unwrap_or(u64::MAX),
           );
         }
