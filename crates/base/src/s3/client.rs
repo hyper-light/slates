@@ -1349,6 +1349,61 @@ mod tests {
     assert_eq!(requests_rx.try_iter().count(), 0, "no request sent");
   }
 
+  /// A-524: do run an S3 base host's two fetches through the client: a listing page of the base's root and a range
+  /// bound to an object's ETag. Expect the page and the bytes as the store answered them, and each request as its fetch
+  /// named it: the delimited, encoded listing of the prefix, and the range with its `If-Match`.
+  #[test]
+  fn a_hosts_fetches_run_through_the_client() {
+    use crate::s3::fetch::{Fetch, Fetched, run};
+    let page = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>base/a</Key><Size>2</Size>\
+                <ETag>&quot;e&quot;</ETag><LastModified>2009-10-12T17:50:30.000Z</LastModified></Contents>\
+                </ListBucketResult>";
+    let replies = vec![
+      Reply::Bytes(
+        format!(
+          "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{page}",
+          page.len()
+        )
+        .into_bytes(),
+      ),
+      Reply::Bytes(
+        b"HTTP/1.1 206 Partial Content\r\nETag: \"e\"\r\nContent-Range: bytes 0-1/2\r\nContent-Length: 2\r\n\r\nok"
+          .to_vec(),
+      ),
+    ];
+    let ((listed, read), requests) = against(replies, false, |mut client| {
+      Box::pin(async move {
+        let list = Fetch::List {
+          prefix: "base/".to_owned(),
+          token: None,
+        };
+        let range = Fetch::Range {
+          key: "base/a".to_owned(),
+          first: 0,
+          len: 2,
+          etag: "\"e\"".to_owned(),
+          version: None,
+        };
+        let listed = run(&mut client, &list).await;
+        let read = run(&mut client, &range).await;
+        (listed, read)
+      })
+    });
+    let Ok(Fetched::Page(page)) = listed else {
+      panic!("a page: {listed:?}");
+    };
+    assert_eq!(page.objects[0].key, "base/a");
+    let Ok(Fetched::Range(read)) = read else {
+      panic!("a range: {read:?}");
+    };
+    assert_eq!(read.bytes, b"ok");
+    assert!(requests[0].starts_with(
+      "GET /examplebucket?delimiter=%2F&encoding-type=url&list-type=2&max-keys=1000&prefix=base%2F HTTP/1.1"
+    ));
+    assert_eq!(field(&requests[1], "if-match"), Some("\"e\""));
+    assert_eq!(field(&requests[1], "range"), Some("bytes=0-1"));
+  }
+
   /// A-471: do make a client for a plain endpoint off loopback, and ask an empty range. Expect each refused before
   /// anything is sent.
   #[test]

@@ -4923,6 +4923,18 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
+> (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
+> term, and to the next CLI attachment's lapse, which the partition now keeps in an index of terms (derived from the
+> records and made again at a restore), so no attachment is walked to find the lapsed. Whatever path records a lease or
+> a term (a take, a renewal, a replay), the partition notes the earliest it entered and each state borrow closes by
+> handing that to the keeper (`deadlines::after_borrow`). Destroys are stepped by the serve loop once woken: a takeover's
+> relinquish now wakes it, as a destroy and a move's release already did, and a refused completion record is tried
+> again at its own deadline, the shard's window on. A deadline still past after the keeper's pass (a job that could not
+> end it) is tried again a window on, never spun on (`deadlines::armed_for`, counted `deadline.stuck`). Off the tick so
+> far: dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536);
+> grants and the owed audit are next.
+
 > **Status (2026-11-19, A-522: a claim names its process; staging and status captures keep their own deadlines).**
 > A claim on macOS and Windows carries its claimant's start beside its pid (the claim slot's `AT_STARTED`, the bootstrap
 > layout `SLB5`): on macOS the start time the kernel keeps for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`, in
@@ -10065,6 +10077,40 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > roots or the operating system's store); name resolution (the caller resolves the endpoint's address; the runtime has
 > no resolver); a live run against a real S3-compatible store, which also reads the longest continuation token a
 > listing names (`Counts::longest_token`) against the caps' assumption that none is longer than an encoded key.
+
+> **Status (2026-11-19, A-524 part 3: the base's host, its oracle and its name).** Built in `crates/base/src/s3`:
+> - `host`: `S3Host`, the read-only host seam answered from the base's objects, sans-io. A miss answers
+>   `HostError::Pending` (new in the seam; `VfsError::BasePending` in the volume core; `Refusal::Unpublished`, retryable
+>   under the same id, on the wire) and names its fetch (`next_fetch`); the driver hands the store's answer back
+>   (`landed`) and the parked call, asked again, is answered from it; one fetch however many calls miss on it. A
+>   directory is its delimited listing, every page of it; a listing serves for one round trip of the path from its
+>   landing (RFC 9002's estimator over the fetches' own round trips), and a call after that is answered from it while
+>   the directory is listed again, the next call seeing the change with the directory's fingerprint moved (its entries'
+>   count as its size, its newest `LastModified` as its modification, when the host saw its entries change as its
+>   change). A file is bound to its object by `If-Match` and, once the store names it, its version: on a versioned
+>   bucket a replaced object's handle reads its own version, as a disk's open descriptor reads its inode; elsewhere a
+>   `412` (or `404`) makes the handle stale and its directory listed again. Ranges are the volume's chunks, fetched as
+>   a run from the first a read misses and cached with the listings within the caller's budget, the least recently
+>   used shed first; a listing larger than the whole budget is refused `ENOMEM`. A refusal answers the calls of one
+>   round trip (`EACCES` for a refused or expired credential, `NotFound` for a missing bucket, `EIO` for the rest).
+> - `sim`: `SimS3`, the oracle: versioned and unversioned buckets, an outsider's puts and deletes, delimited listings
+>   paged with opaque tokens (a forged one refused `400`), reads bound by `If-Match` or a version answering `412`,
+>   `404 NoSuchKey` or `NoSuchVersion`, `416`, and a refused or expired credential, each as S3's reference states it.
+> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 43): the endpoint
+>   (`https`, or plain `http` to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys'
+>   rules, and the addressing (a dotted bucket refused virtual-hosted over HTTPS), each refused by its kind; its
+>   identity, a digest of the endpoint's host and port, the bucket and the prefix, is the device of every fingerprint.
+> - `fetch`: the host's requests and the store's answers, run through A-471's client; `time`: the calendar the
+>   signing timestamp is written in and `LastModified` read in.
+>
+> Owed (GAPS A-464): the volume over an S3 base. The wire's create naming a base and the credential's hand-off (held in
+> RAM by the owner shard and by the anchor across a restart); the shard's driver running the host's fetches on the
+> client; the server parking a request on `BasePending` and running it again when its fetch lands, for every bridge
+> (until then a bridge answers it by its catch-all, FUSE `EIO` and NFS `NFS3ERR_SERVERFAULT`, though no volume over an
+> S3 base can be made before the parking lands); the base plane's call sites audited for a pending answer, since some
+> take a host refusal for an absence; recovery over an S3 base; the read-ahead from the
+> measured bandwidth-delay product; the platform's trust roots and name resolution; and the N=1 differential through
+> `SimS3`.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -36324,6 +36370,117 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   change, refused; nodes unchanged, accepted). With it, 8 of 8, and the crate's whole `--lib` suite 11 of 11, before
   and after `cargo fmt`. The crate's integration suites (`crates/merge/tests/`), its clippy and `cargo xtask check` are
   main's (the run-request queue); no test there sets the flag, so their verdicts are the ones they were.
+
+### A-524 — The S3 base's host: a miss parked as a pending answer, a directory its listing for one round trip, a file bound to its object; `SimS3`, its oracle; and the library's naming of a base (2026-11-19, goal g268; Mantle's CP-T10.5 part 3; §4.15 "An S3 base"; §4.5, §4.9; R3, R8; RFC 9002; A-151, A-163, A-464, A-471)
+Applied in the same change to: `crates/base/src/s3` (`host`, `sim`, `name`, `fetch` and `time`, each with its tests;
+`sigv4::amz_timestamp` on `time`'s calendar; `keys::check_name` shared with the naming; a client test running a host's
+fetches); `crates/vfs` (`HostError::Pending`, `VfsError::BasePending` and its errno name, the base plane's mapping);
+`crates/server` (`BasePending` on the wire as `Unpublished`; a landing's host answer for a pending host);
+`crates/land` (a landing's entry against a pending host fails alone); `crates/api` (`S3Base`, `S3Style`, `S3Scheme`,
+`S3Credentials` and the naming's refusals exported; contract 43); §4.15's status; GAPS (A-464's entry).
+
+- **Why.** Parts 1 and 2 signed, parsed and sent; nothing answered the host seam from S3, and nothing named a base.
+  Part 3 is the base itself, tested against a store that answers as S3 does, and the name Mantle gives it.
+- **A miss is a typed pending answer.** The seam is synchronous and the store is a network away, so a call the host
+  cannot answer from what it holds answers `HostError::Pending` and names its fetch; the driver runs it and hands the
+  answer back, and the parked call is answered when asked again. A fetch is asked once however many calls miss on it,
+  so the fetches under way never outnumber the parked requests. In the volume core the answer is `VfsError::BasePending`
+  (nothing changed; `EAGAIN`), and on the wire `Unpublished`, retryable under the same id, as a delegated file's is.
+- **A listing serves one round trip (R3: learned).** S3 offers no watcher, and asking it on every lookup would make
+  every lookup a round trip. A listing is the directory's state for one round trip of the path from its landing: an
+  answer to a listing asked again would be that old when it arrived. The round trip is learned from the host's own
+  fetches by RFC 9002's estimator (its initial RTT until one is measured). After it, a call is answered from the listing
+  while the directory is listed again, so a lookup never waits on a directory it has seen; the change shows on the next
+  call after that listing lands, the directory's fingerprint moved. The window cannot starve a parked request: the
+  first listing of a directory is the only listing a call waits for.
+- **A file is bound to its object (A-151, A-163).** A handle is bound to the ETag its listing named, and to the version
+  once the store names one: every range carries `If-Match`, and the version when known. On a versioned bucket a
+  replaced object's open handle reads its own version, as a disk's open descriptor reads its inode; on an unversioned
+  one the replacement answers `412`, a deletion `404`, and the handle is stale, its cached chunks dropped and its
+  directory listed again, so no handle ever reads two objects' bytes. A file's fingerprint is the base's identity as
+  its device, a digest of its path as its inode number (stable across listings and restarts), its size, `LastModified`
+  as its times and a digest of its ETag as its birth, so a replaced object is a new file.
+- **Ranges are chunks, within a budget.** A read's miss fetches the run of the volume's chunks (§4.5) from the first it
+  needs to the first held or under way, at most what the cache holds; the cache holds chunks and listings within the
+  bytes its caller gives (the shard's admittable room), the least recently used shed first. A listing larger than the
+  whole budget is refused `ENOMEM`, never held past it.
+- **Refusals answer one round trip.** A fetch the store refused answers the calls that waited for it and those within
+  one round trip of its landing, then a call asks again: `EACCES` for a refused or expired credential, `NotFound` for a
+  missing bucket, `EIO` for the rest (§4.15's `BaseUnavailable`). A relisting the store refuses leaves the older
+  listing answering.
+- **`SimS3`, the oracle.** An in-RAM bucket answering the host's fetches as S3's API reference states S3 answers them
+  (the module's list); the oracle test lets an outsider put and delete root and nested keys and a directory marker on
+  versioned and unversioned buckets through a cache of two chunks, and after each round trip the host must show exactly
+  the tree the bucket's keys map to (`keys::tree_of`), every file's bytes the object's current ones.
+- **The library's naming.** `S3Base` names the endpoint, the region, the bucket, the prefix and the addressing, each
+  checked when it is made (the module's list; the bucket by S3's general purpose bucket naming rules, fetched
+  2026-11-19, its reserved prefixes and suffixes allowed since access point aliases and directory buckets are read as
+  buckets are); its identity, a digest of what names the objects, is the device the host reports.
+- **Rejected.** A fixed listing lifetime: any number would be one machine's guess; the path's measured round trip is the
+  learned one. Answering every lookup by listing again: a round trip per lookup, where the window costs at most one
+  round trip of staleness. Treating a pending answer as an unavailable base: a miss is no failure, and the parked
+  request must be answered, not refused.
+- **Owed.** The volume over an S3 base (§4.15's status: the wire, the credential's hand-off and hold, the driver, the
+  server's parking for every bridge, the base plane's audit for a pending answer, recovery, read-ahead, trust roots,
+  name resolution, the N=1 differential).
+- **Evidence.** Mac Studio (debug, 2026-11-19, scratch d0ddb3e3c): `cargo test --locked -p slates-base --lib -- s3`, 49
+  of 49 in 6.9 s: the host's eight (a directory across three truncated pages with a `..` key refused and counted; two
+  misses, one fetch, and a listing serving its round trip then listed again; a read's run of chunks bound by `If-Match`;
+  a replaced object's `412` leaving the handle stale and the reopened file a new object; a versioned object's handle
+  reading its own version; a deleted object; a refused credential answering its window; the cache within two chunks),
+  the oracle over 256 generated histories on versioned and unversioned buckets, `SimS3`'s two, the naming's four, the
+  calendar's three and the client running a host's fetches; `cargo test --locked -p slates-api --lib -- s3_naming
+  contract_history` 2 of 2; the server's `error` tests 3 of 3, the volume core's `base::` 3 and the land engine's 2
+  built with the new variants. Failing first (adas-mac-studio-3, the same day, the Studio being offline): with a landed
+  range's chunks not kept the read stayed pending (`Err(Pending)` where `Ok(20)` was due); with a `412` taken for an
+  unavailable store the handle answered `EIO`, not stale; with the store's version not bound the replaced object's
+  second chunk was asked unbound; with a stale listing never listed again the new key never showed (1 entry where 2 were
+  due) and the oracle's look missed a put file.
+
+
+### A-536 — Leases, CLI attachments and destroys leave the reap loop's tick, each kept at its own deadline or woken by its own event (2026-11-19, built for goal g255; the event-driven reaper's piece 3, jobs 1–3 of 5; §4.7; D-16, A-230, A-475, A-522)
+
+- **What was there.** The reap loop's tick, once a liveness window, released lapsed write leases (`verbs::expire_leases`,
+  the partition's lease wheel popped), ended lapsed CLI attachments (`verbs::expire_lapsed_attachments`, a walk of every
+  attachment record), and stepped destroys (`verbs::step_destroys`), which besides the serve loop's own rounds was the
+  only thing that started a takeover's relinquished teardown and retried a destroy whose completion record the catalog
+  refused.
+- **Leases (job 1).** The keeper (`crate::deadlines`, A-522) sleeps to the lease wheel's next deadline as well
+  (`Partition::next_lease_expiry`, the wheel's tick at or after the earliest expiry, so a pass then finds it due) and
+  runs `expire_leases` in its pass (a lease a live write attachment keeps is renewed, A-414). A lease is recorded by many
+  paths (a take, the keeper's own renewal, a replay), so the partition notes the earliest it entered
+  (`Partition::take_noted_lease`), and every state borrow closes by handing that note to the keeper
+  (`deadlines::after_borrow`, in `state::try_with_state`), which wakes it only for a deadline before the one it sleeps
+  for. The serve round's own lease pass stays (a wheel pop, nothing scanned).
+- **CLI attachments (job 2).** The partition keeps its termed attachments in an index by their lapse
+  (`termed_by_expiry`: one entry a termed attachment, kept at the add, the renewal and every removal, derived from the
+  records and made again at a restore), so `expire_lapsed_attachments` reads the lapsed alone (`Partition::lapsed_terms`)
+  where it walked every attachment; the keeper sleeps to the next lapse (`next_term_lapse`), noted as leases are
+  (`take_noted_term`).
+- **Destroys (job 3).** The serve loop steps destroys in its rounds once woken: a takeover's relinquish
+  (`verbs::relinquish_superseded`) now wakes it, as a destroy and a move's release already did. A completion record the
+  catalog refused is tried again at its own deadline, the shard's window on (`verbs::retry_destroy_at_window`,
+  `ShardState::destroy_retry_at`), when the keeper wakes the serve loop to step it.
+- **Never a spin.** Job 3's red check (the keeper never taking a retry it had armed for) found the keeper spinning: a
+  deadline still past after its pass re-armed a zero span, `within` answered at once, and the watchdog ended the test
+  daemon, its shard 3.5 s on its CPU without a step. So a deadline still past after a pass (a job that could not end it,
+  a record refused) is tried again the shard's window on (`deadlines::armed_for`) and counted `deadline.stuck`.
+- **Tests.** `crates/server/src/deadlines.rs`: `a_lapsed_write_lease_is_released_at_its_term_without_a_tick`,
+  `a_lapsed_cli_attachment_ends_at_its_term_without_a_tick`, `a_refused_destroys_retry_is_kept_at_its_deadline_without_a_tick`,
+  `a_deadline_still_past_after_its_pass_is_tried_again_a_window_on`; `crates/server/src/verbs.rs`:
+  `a_relinquished_volume_is_torn_down_without_a_tick`. Each failed first against its job's mutation (one red run each).
+- **Evidence.** On the Mac Studio (kiln, d1323898, 2026-11-19 00:38–00:54 UTC, load 15–34, debug build), each job's run
+  green then red: a lease due in 100 ms released 105–110 ms after it was recorded, a CLI attachment with a 100 ms term
+  ended 113.7–114.5 ms after it was made, a relinquished volume torn down 40.9 ms after the relinquish, a destroy's
+  retry due in 100 ms kept at 101.9 ms; the last run 15 of 15 (`deadlines::tests`, the two lease tests, the relinquish,
+  `hangup::tests`, `reap::tests`), `slates-db --lib` 109 of 109. Each red run failed exactly its guarded tests.
+- **Left on the tick for piece 4:** grants past their term, the owed audit's resend; and after them departed hosts'
+  attachments, held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the idle seal and
+  the huge-page re-arm.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/db/src/partition.rs`,
+`crates/server/src/deadlines.rs`, `crates/server/src/state.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`.
 
 ### A-547 — An edit after a rename is merged with the renamed bytes, and the chain entry's copy carries it (2026-11-19, goal 85 via g225; §4.16 "Composition at seal", "Position mapping"; A-202)
 

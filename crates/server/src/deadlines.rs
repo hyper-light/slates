@@ -1,10 +1,17 @@
-//! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522; the event-driven
-//! reaper's piece 2): a staging buffer expires a lease after its last use (`crate::staging`), and a status capture at its
-//! absolute deadline (`crate::status_pages`). One task a shard, the keeper, sleeps on the wheel until the earliest of
-//! them, releases what is due then, and sleeps until the next; a deadline set earlier than the one it sleeps for wakes it
-//! at once, so it re-arms. Nothing is scanned on a tick: each pass reads only the due entries of two ordered indexes,
-//! the staging buffers by expiry and the seats by their capture's deadline. Until A-522 the reap loop's tick released
-//! both each liveness window, every client's status capture asked at every tick, and a shard with none woke anyway.
+//! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536; the
+//! event-driven reaper's pieces 2 and 3): a staging buffer expires a lease after its last use (`crate::staging`), a
+//! status capture at its absolute deadline (`crate::status_pages`), a volume's write lease at its term (D-16, the
+//! partition's lease wheel), a CLI attachment at its term's lapse (A-230, the partition's index of terms), and a destroy
+//! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again). One task a shard, the keeper, sleeps on the wheel until the earliest of them, releases what
+//! is due then, and sleeps until the next; a deadline set earlier than the one it sleeps for wakes it at once, so it
+//! re-arms. Nothing is scanned on a tick: each pass reads only the due entries of ordered indexes (the staging buffers by
+//! expiry, the seats by their capture's deadline, the lease wheel). Until A-522 and A-536 the reap loop's tick released
+//! each once a liveness window, every client's status capture asked at every tick, and a shard with none woke anyway.
+//!
+//! **Woken by whatever sets an earlier deadline.** The staging verbs and the status verb tell the keeper themselves
+//! ([`noted`], [`capture_set`]). A lease or a term is recorded by many paths (a take, a renewal, a replay), so the
+//! partition notes the earliest it entered and every state borrow closes by handing that to the keeper
+//! ([`after_borrow`]): two reads of an `Option` a borrow.
 //!
 //! **Bounds.** A seat is entered in the capture index once at most: a new capture replaces its entry
 //! (`StatusPages::index`), and a seat that ends takes its entry with it ([`forget_seat`]). Staging buffers are bounded by
@@ -49,8 +56,20 @@ pub(crate) async fn keeper() {
 
 /// Releases what is due now and arms the keeper for the next deadline: the span to it, or `None` when none is set.
 fn release_due(state: &mut ShardState) -> Option<u64> {
+  // The leases first, at their own clock read: a lease whose holder keeps a live write attachment is renewed rather than
+  // released (`verbs::expire_leases`).
+  let _acted = crate::verbs::expire_leases(state);
+  // A CLI attachment whose term lapsed ends, within its term of its last use (A-230).
+  let _ended = crate::verbs::expire_lapsed_attachments(state);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
+  // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
+  if state.destroy_retry_at.is_some_and(|at| at <= now) {
+    state.destroy_retry_at = None;
+    if let Some(server) = state.server_task {
+      slates_rt::registry::wake(server.0);
+    }
+  }
   while let Some(&(at, index, generation)) = state.capture_deadlines.first() {
     if at > now {
       break;
@@ -61,15 +80,55 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
       client.status_pages.expire(now, &mut state.store.metadata);
     }
   }
-  let next = [
+  let earliest = [
     state.staging.next_expiry(),
     state.capture_deadlines.first().map(|(at, ..)| *at),
+    state.db.partition_mut().next_lease_expiry(),
+    state.db.partition().next_term_lapse(),
+    state.destroy_retry_at,
   ]
   .into_iter()
   .flatten()
   .min();
+  if earliest.is_some_and(|at| at <= now) {
+    state.count(DEADLINE_STUCK, 1);
+  }
+  let window = crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
+  let next = armed_for(earliest, now, window);
   state.deadline_armed = next;
   next.map(|at| at.saturating_sub(now))
+}
+
+/// When the keeper sleeps until, given the earliest deadline its pass left: that deadline, or, for one still past after
+/// the pass (a job that could not end it: a record the catalog refused), `window` after `now`, so it is tried again a
+/// window on and never spun on. The red check of a retry the keeper never took found the spin: the watchdog ended the
+/// test daemon, its shard 3.5 s on its CPU without a step (A-536).
+fn armed_for(earliest: Option<u64>, now: u64, window: u64) -> Option<u64> {
+  earliest.map(|at| {
+    if at <= now {
+      now.saturating_add(window)
+    } else {
+      at
+    }
+  })
+}
+
+/// Format: the counter of the keeper's passes that left a deadline past due (a job's record refused), each tried again a
+/// window later ([`armed_for`]).
+const DEADLINE_STUCK: &str = "deadline.stuck";
+
+/// Closes every state borrow (`state::try_with_state`): a lease or a CLI attachment's term the borrow entered to lapse
+/// before the deadline the keeper sleeps for wakes it, so it re-arms (A-536). The keeper's own pass notes the leases it
+/// renews, after it armed for them, so they wake nothing.
+pub(crate) fn after_borrow(state: &mut ShardState) {
+  let partition = state.db.partition_mut();
+  let earliest = [partition.take_noted_lease(), partition.take_noted_term()]
+    .into_iter()
+    .flatten()
+    .min();
+  if let Some(at) = earliest {
+    noted(state, at);
+  }
 }
 
 /// A deadline was set at `at`: wakes the keeper when it sleeps for a later one, or for none, so it re-arms for this.
@@ -179,6 +238,131 @@ mod tests {
     daemon.stop();
     let released = released.expect("the buffer was released within half a liveness window");
     println!("a staging buffer due in {SOON_NS} ns released {released:?} after it began");
+  }
+
+  /// A-536 (leases off the tick). Do: on a one-shard daemon, create a volume and record its write lease to lapse a tenth
+  /// of a liveness window from now, no attachment holding it, as a take records it; look until it is released. Expect:
+  /// released within half a window, by the keeper at the lease wheel's tick for it. The reap loop's tick, which released
+  /// it before, runs once a window, and an idle daemon runs no serve round, whose own pass also releases leases.
+  #[test]
+  fn a_lapsed_write_lease_is_released_at_its_term_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = Instant::now();
+    let volume = crate::daemon::observe_first(&daemon, |state| {
+      let volume = crate::verbs::to_db_volume(created(state, "lapsing"));
+      let now = state.clock.monotonic_ns();
+      state
+        .db
+        .mutate(
+          &mut state.segment,
+          &slates_db::Op::LeaseTaken {
+            volume,
+            lease: slates_db::catalog::LeaseRecord {
+              holder: principal(),
+              epoch: 1,
+              expires_ns: now.saturating_add(SOON_NS),
+            },
+          },
+          now,
+        )
+        .unwrap();
+      volume
+    });
+    let released = look_until(&daemon, begun, move |state| {
+      state
+        .db
+        .partition()
+        .volume(volume)
+        .is_some_and(|record| record.lease.is_none())
+    });
+    daemon.stop();
+    let released = released.expect("the lease was released within half a liveness window");
+    println!("a write lease due in {SOON_NS} ns released {released:?} after it was recorded");
+  }
+
+  /// A-536. Do: arm the keeper for no deadline, for one ahead of now, for one at now and for one behind it, as a pass
+  /// leaves them. Expect: none, that one, and the window after now for both the others: a deadline its job could not end
+  /// is tried again a window on, never spun on (job 3's red check found the spin).
+  #[test]
+  fn a_deadline_still_past_after_its_pass_is_tried_again_a_window_on() {
+    assert_eq!(super::armed_for(None, 10, 5), None);
+    assert_eq!(super::armed_for(Some(12), 10, 5), Some(12));
+    assert_eq!(super::armed_for(Some(10), 10, 5), Some(15));
+    assert_eq!(super::armed_for(Some(3), 10, 5), Some(15));
+  }
+
+  /// A-536 (destroys off the tick). Do: on a one-shard daemon, set a refused destroy record's retry a tenth of a
+  /// liveness window from now, as `verbs::step_destroys` sets it at a refusal; look until the keeper has taken it.
+  /// Expect: taken within half a window, at its deadline, the serve loop woken then to step the destroy again. Before,
+  /// the reap loop's tick stepped destroys once a window, whether a record was refused or not.
+  #[test]
+  fn a_refused_destroys_retry_is_kept_at_its_deadline_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let at = state.clock.monotonic_ns().saturating_add(SOON_NS);
+      state.destroy_retry_at = Some(at);
+      super::noted(state, at);
+    });
+    let taken = look_until(&daemon, begun, |state| state.destroy_retry_at.is_none());
+    daemon.stop();
+    let taken = taken.expect("the retry was kept within half a liveness window");
+    println!("a destroy's retry due in {SOON_NS} ns kept {taken:?} after it was set");
+  }
+
+  /// A volume named `name` that [`principal`] creates on `state`'s shard, through the verb: its id.
+  fn created(state: &mut ShardState, name: &str) -> slates_ipc::protocol::VolumeId {
+    let reply = crate::verbs::dispatch(
+      state,
+      1,
+      &principal(),
+      slates_ipc::protocol::RequestBody::Create {
+        name: name.to_owned(),
+        size: slates_ipc::protocol::SizeClass::Bounded { limit: 1 << 20 },
+        names: slates_ipc::protocol::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::Created { id } = reply else {
+      panic!("the volume was not created: {reply:?}")
+    };
+    id
+  }
+
+  /// A-536 (CLI attachments off the tick). Do: on a one-shard daemon whose failover delay, a CLI attachment's term, is a
+  /// tenth of a liveness window, create a volume and attach it for reading in the CLI's form; look until the attachment
+  /// is gone. Expect: ended within half a window, by the keeper at its term's lapse, found in the partition's index of
+  /// terms. The reap loop's tick, which walked every attachment for a lapsed term once a window, no longer does.
+  #[test]
+  fn a_lapsed_cli_attachment_ends_at_its_term_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = Instant::now();
+    let attachment = crate::daemon::observe_first(&daemon, |state| {
+      state.failover_ns = SOON_NS;
+      let volume = created(state, "termed");
+      let reply = crate::verbs::dispatch(
+        state,
+        1,
+        &principal(),
+        slates_ipc::protocol::RequestBody::Attach {
+          volume,
+          snapshot: None,
+          intent: slates_ipc::protocol::Intent::Read,
+          form: slates_ipc::protocol::AttachRequest::Termed,
+        },
+      );
+      let slates_ipc::protocol::ReplyBody::Attached { attachment, .. } = reply else {
+        panic!("the volume was not attached: {reply:?}")
+      };
+      attachment
+    });
+    let ended = look_until(&daemon, begun, move |state| {
+      state.db.partition().attachment(attachment).is_none()
+    });
+    daemon.stop();
+    let ended = ended.expect("the attachment ended within half a liveness window");
+    println!("a CLI attachment with a {SOON_NS} ns term ended {ended:?} after it was made");
   }
 
   /// Seats a client that never proved its id on `state`'s shard, as an admission does (its watch left out): its seat.
