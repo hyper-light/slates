@@ -34738,7 +34738,11 @@ Applied in the same change to: A-300's record in Part 6 (its A-360 note), GAPS (
 - **Tests.** `a_drive_that_makes_links_is_held_to_its_hosts_link_counts` (`crates/conformance/src/workload.rs`): a
   Mercurial run that linked as NTFS did is identical on a drive that made the link; one that copied there is a
   difference naming the clone's line; and the same copy on a drive that refused the link records the two stated lines.
-  The three earlier tests run on a drive that refused it, as WinFsp's driver as released does.
+  The three earlier tests run on a drive that refused it, as WinFsp's driver as released does. On the Mac Studio
+  (2026-11-18, kiln, load 9.2 to 13.1, debug): `cargo test --locked -p slates-conformance --lib workload` 18 passed;
+  with the rule reversed (the lines stated whatever the drive) the new test failed once, as the harness had: `Differs
+  { "a stated difference no longer differs: no line starting \"store files with two names after the clone: \"" }`,
+  where `Identical` was expected.
 - **Owed** (main's): the xtask unit tests, `cargo xtask check` and clippy; the Windows lanes' workloads on WinFsp as
   released (unchanged: the record notes the refusal); and the workloads on the test-signing VM's patched driver, where
   git's history and Mercurial must now run identical with no stated line.

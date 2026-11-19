@@ -20,8 +20,8 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::{Counts, WorkloadResult, WorkloadStatus};
 use slates_conformance::workload::{
-  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ENVIRONMENT, Entry, EntryKind, HardLinks, Manifest, ROSTER,
-  Workload, compare_with, stated_differences,
+  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ENVIRONMENT, Entry, EntryKind, HardLinks, Manifest,
+  ROSTER, Workload, compare_with, stated_differences,
 };
 
 use super::slates::{Session, folds_names};
@@ -501,11 +501,14 @@ mod tests {
   /// A run's output as a clone that copies prints it: each line of the workload's stated link counts with its count of
   /// files with two names as 0, the rest of the line kept (`5 of 5` becomes `0 of 5`, as on the WinFsp drive).
   fn as_a_copying_clone_prints(output: &str, workload: &str) -> String {
-    let starts: Vec<&str> = stated_differences(slates_conformance::Transport::NativeWindowsWinfsp, HardLinks::Refused)
-      .iter()
-      .filter(|entry| entry.workload == workload)
-      .map(|entry| entry.line_start)
-      .collect();
+    let starts: Vec<&str> = stated_differences(
+      slates_conformance::Transport::NativeWindowsWinfsp,
+      HardLinks::Refused,
+    )
+    .iter()
+    .filter(|entry| entry.workload == workload)
+    .map(|entry| entry.line_start)
+    .collect();
     output
       .lines()
       .map(|line| {
@@ -536,7 +539,10 @@ mod tests {
       crate::conformance::build_output(&format!("slates-vcs-stated-{}", std::process::id()))
         .unwrap();
     let scratch = super::super::Scratch { path, keep: false };
-    let stated = stated_differences(slates_conformance::Transport::NativeWindowsWinfsp, HardLinks::Refused);
+    let stated = stated_differences(
+      slates_conformance::Transport::NativeWindowsWinfsp,
+      HardLinks::Refused,
+    );
     for (name, stated_lines) in [("git-history", 1), ("mercurial", 2)] {
       let workload = ROSTER
         .iter()
