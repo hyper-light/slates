@@ -1331,7 +1331,11 @@ impl Drive {
   }
 
   /// What a command's outcome makes of the drive, and its step.
-  fn answer(&mut self, outcome: Result<Outcome, Stop>, out: &mut Vec<u8>) -> Result<Step, ItemError> {
+  fn answer(
+    &mut self,
+    outcome: Result<Outcome, Stop>,
+    out: &mut Vec<u8>,
+  ) -> Result<Step, ItemError> {
     match outcome {
       Ok(Outcome::Taken) => Ok(Step::Taken),
       Ok(Outcome::Aborted) => {

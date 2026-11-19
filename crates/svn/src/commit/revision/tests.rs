@@ -46,7 +46,10 @@ fn work() -> Work {
     }],
     revision_properties: vec![
       (b"svn:author".to_vec(), b"alice".to_vec()),
-      (b"svn:date".to_vec(), b"1999-01-01T00:00:00.000000Z".to_vec()),
+      (
+        b"svn:date".to_vec(),
+        b"1999-01-01T00:00:00.000000Z".to_vec(),
+      ),
       (b"svn:log".to_vec(), b"an edit".to_vec()),
     ],
     texts: BTreeMap::from([(TEXT_IDENTITY, b"alpha\n".to_vec())]),
@@ -66,12 +69,18 @@ fn a_work_is_dated_by_the_owners_instant_at_the_step() {
   let revision = Revision::of_work(work(), NOW).unwrap();
   let expected = Properties::from([
     (b"svn:author".to_vec(), b"alice".to_vec()),
-    (b"svn:date".to_vec(), b"2026-11-19T07:26:35.123456Z".to_vec()),
+    (
+      b"svn:date".to_vec(),
+      b"2026-11-19T07:26:35.123456Z".to_vec(),
+    ),
     (b"svn:log".to_vec(), b"an edit".to_vec()),
   ]);
   assert_eq!(revision.properties, expected);
   let answered = (revision.date(), revision.author());
-  assert_eq!(answered, (Some("2026-11-19T07:26:35.123456Z"), Some("alice")));
+  assert_eq!(
+    answered,
+    (Some("2026-11-19T07:26:35.123456Z"), Some("alice"))
+  );
 }
 
 /// A-655 (§4.17.4 item 3.5; `hash.c` `svn_hash_write2`). Do: make the work into a revision. Expect: its text held as

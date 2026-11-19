@@ -2260,7 +2260,13 @@ fn a_plan_is_refused_once_a_revision_was_appended_after_it() {
   let before = format!("{index:?}");
   let refusal = index.commit_planned(stale).unwrap_err();
   let answered = (refusal.subversion_code(), format!("{index:?}"));
-  assert_eq!(refusal, IndexRefusal::OutOfDate { planned: 2, next: 3 });
+  assert_eq!(
+    refusal,
+    IndexRefusal::OutOfDate {
+      planned: 2,
+      next: 3
+    }
+  );
   assert_eq!(answered, (160_028, before));
   let mut appended = index.clone();
   let fresh = index.plan(record(), ALL_ROOM).unwrap();

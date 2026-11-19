@@ -164,10 +164,18 @@ fn a_revision_judged_against_an_older_head_is_out_of_date_and_changes_nothing() 
   let mut repository = created();
   repository.commit(first()).unwrap();
   let before = snapshot(&repository);
-  let refusal = repository.commit(edit(0, b"beta\n", Vec::new())).unwrap_err();
+  let refusal = repository
+    .commit(edit(0, b"beta\n", Vec::new()))
+    .unwrap_err();
   let answered = (refusal.subversion_code(), refusal.message());
   assert_eq!(answered, (160_028, "Transaction out of date".to_owned()));
-  assert_eq!(refusal, StepRefusal::OutOfDate { head: 0, youngest: 1 });
+  assert_eq!(
+    refusal,
+    StepRefusal::OutOfDate {
+      head: 0,
+      youngest: 1
+    }
+  );
   assert_eq!(snapshot(&repository), before);
 }
 
@@ -183,7 +191,13 @@ fn a_check_is_refused_once_another_revision_was_applied_after_it() {
   assert_eq!(repository.apply(one), Ok(2));
   let before = snapshot(&repository);
   let refusal = repository.apply(two).unwrap_err();
-  assert_eq!(refusal, StepRefusal::OutOfDate { head: 1, youngest: 2 });
+  assert_eq!(
+    refusal,
+    StepRefusal::OutOfDate {
+      head: 1,
+      youngest: 2
+    }
+  );
   assert_eq!(snapshot(&repository), before);
 }
 
@@ -194,7 +208,9 @@ fn a_lock_entry_the_table_does_not_take_refuses_the_revision_whole() {
   let mut repository = created();
   repository.commit(first()).unwrap();
   let before = snapshot(&repository);
-  let refusal = repository.commit(edit(1, b"beta\n", release())).unwrap_err();
+  let refusal = repository
+    .commit(edit(1, b"beta\n", release()))
+    .unwrap_err();
   let unrecorded = LockRefusal::Unrecorded {
     path: FILE.to_owned(),
   };

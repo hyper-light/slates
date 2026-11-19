@@ -211,7 +211,12 @@ impl Replay {
   }
 
   /// The drive's step once its hook answered `answer`.
-  fn resume(&self, drive: &mut Drive, answer: Result<(), Vec<(u32, String)>>, out: &mut Vec<u8>) -> Step {
+  fn resume(
+    &self,
+    drive: &mut Drive,
+    answer: Result<(), Vec<(u32, String)>>,
+    out: &mut Vec<u8>,
+  ) -> Step {
     let records = &self.repository;
     drive
       .resume(records.index(), records, records.locks(), answer, out)
@@ -393,13 +398,23 @@ fn take_lock(replay: &mut Replay, server: &[u8]) {
   let records = &replay.repository;
   let decision = records
     .locks()
-    .lock(&request, &Head(records.index()), AprTime(0), ROOM, &mut draw)
+    .lock(
+      &request,
+      &Head(records.index()),
+      AprTime(0),
+      ROOM,
+      &mut draw,
+    )
     .unwrap();
   replay
     .repository
     .apply_lock_entries(&decision.entries)
     .unwrap();
-  let held = replay.repository.locks().get_lock(LOCKED, AprTime(0)).unwrap();
+  let held = replay
+    .repository
+    .locks()
+    .get_lock(LOCKED, AprTime(0))
+    .unwrap();
   assert_eq!(
     held.token.as_str(),
     token,
@@ -1212,7 +1227,12 @@ fn alice_setup(base_path: &str, revision_properties: Vec<(Vec<u8>, Vec<u8>)>) ->
 }
 
 /// The hooks a drive of `commands` over `replay` waited for, each passed as it came due, and how its last step ended.
-fn hooks_met(replay: &Replay, drive: &mut Drive, commands: &[u8], out: &mut Vec<u8>) -> (Vec<Due>, Last) {
+fn hooks_met(
+  replay: &Replay,
+  drive: &mut Drive,
+  commands: &[u8],
+  out: &mut Vec<u8>,
+) -> (Vec<Due>, Last) {
   let mut dues = Vec::new();
   let mut last = Last::Taken;
   for (item, _) in items(commands) {
@@ -1266,7 +1286,10 @@ fn refused_by_hook(replay: &Replay, refused: &str) -> (Option<Vec<(u64, String)>
   let mut drive = Drive::new(alice_setup("/trunk/project", Vec::new()));
   let mut out = Vec::new();
   let mut steps = Vec::new();
-  for (item, _) in items(DIRECTORY_PROPERTY).into_iter().chain(items(b"( abort-edit ( ) ) ")) {
+  for (item, _) in items(DIRECTORY_PROPERTY)
+    .into_iter()
+    .chain(items(b"( abort-edit ( ) ) "))
+  {
     let records = &replay.repository;
     let mut step = drive
       .command(records.index(), records, records.locks(), &item, &mut out)
@@ -1276,19 +1299,29 @@ fn refused_by_hook(replay: &Replay, refused: &str) -> (Option<Vec<(u64, String)>
         Due::StartCommit { .. } => "start-commit",
         Due::PreCommit { .. } => "pre-commit",
       };
-      let answer = if hook == refused { Err(hook_errors(hook)) } else { Ok(()) };
+      let answer = if hook == refused {
+        Err(hook_errors(hook))
+      } else {
+        Ok(())
+      };
       step = replay.resume(&mut drive, answer, &mut out);
     }
     steps.push(kind_of(&step));
   }
-  let failure = items(&out).into_iter().find_map(|(item, _)| errors_of(&item));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
   (failure, steps)
 }
 
 /// The errors `hook`'s refusal is written with.
 fn written(hook: &str) -> Option<Vec<(u64, String)>> {
   let errors = hook_errors(hook).into_iter();
-  Some(errors.map(|(code, words)| (u64::from(code), words)).collect())
+  Some(
+    errors
+      .map(|(code, words)| (u64::from(code), words))
+      .collect(),
+  )
 }
 
 /// A-661 (`fs-wrap.c` 172-178 and 69-71; `editorp.c` 1149-1208). Do: drive the property change of `/trunk/project`
@@ -1299,15 +1332,30 @@ fn written(hook: &str) -> Option<Vec<(u64, String)>> {
 fn a_hook_that_refuses_is_the_failure_of_the_command_that_waited() {
   let replay = replayed_until("edit-large");
   let (failure, steps) = refused_by_hook(&replay, "start-commit");
-  let after_start = vec![Last::Refused, Last::Dropped, Last::Dropped, Last::Dropped, Last::Ended];
+  let after_start = vec![
+    Last::Refused,
+    Last::Dropped,
+    Last::Dropped,
+    Last::Dropped,
+    Last::Ended,
+  ];
   assert_eq!((failure, steps), (written("start-commit"), after_start));
   let (failure, steps) = refused_by_hook(&replay, "pre-commit");
-  let after_pre = vec![Last::Taken, Last::Taken, Last::Taken, Last::Refused, Last::Ended];
+  let after_pre = vec![
+    Last::Taken,
+    Last::Taken,
+    Last::Taken,
+    Last::Refused,
+    Last::Ended,
+  ];
   assert_eq!((failure, steps), (written("pre-commit"), after_pre));
 }
 
 /// A drive of `open-root` alone with `revision_properties`: the failure it wrote, if any, and its step.
-fn opened_with(replay: &Replay, revision_properties: &[(&[u8], &[u8])]) -> (Option<Vec<(u64, String)>>, Last) {
+fn opened_with(
+  replay: &Replay,
+  revision_properties: &[(&[u8], &[u8])],
+) -> (Option<Vec<(u64, String)>>, Last) {
   let owned = revision_properties
     .iter()
     .map(|(name, value)| (name.to_vec(), value.to_vec()))
@@ -1322,7 +1370,9 @@ fn opened_with(replay: &Replay, revision_properties: &[(&[u8], &[u8])]) -> (Opti
       .unwrap();
     last = kind_of(&step);
   }
-  let failure = items(&out).into_iter().find_map(|(item, _)| errors_of(&item));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
   (failure, last)
 }
 
@@ -1337,7 +1387,10 @@ fn a_revision_property_svnserve_refuses_is_refused_at_open_root() {
   let carriage = opened_with(&replay, &[(b"svn:log".as_slice(), b"a\r\n".as_slice())]);
   let eol = vec![
     (125_005, "Invalid property value".to_owned()),
-    (125_017, "Cannot accept non-LF line endings in 'svn:log' property".to_owned()),
+    (
+      125_017,
+      "Cannot accept non-LF line endings in 'svn:log' property".to_owned(),
+    ),
   ];
   assert_eq!(carriage, (Some(eol), Last::Refused));
   let dated = opened_with(
@@ -1371,7 +1424,10 @@ fn an_item_while_a_hook_is_due_or_a_resume_with_none_ends_the_drive() {
   }
   let mut idle = Drive::new(alice_setup("/trunk/project", Vec::new()));
   steps.push(kind_of(&replay.resume(&mut idle, Ok(()), &mut out)));
-  assert_eq!((steps, out), (vec![Last::Hook, Last::Close, Last::Close], Vec::new()));
+  assert_eq!(
+    (steps, out),
+    (vec![Last::Hook, Last::Close, Last::Close], Vec::new())
+  );
 }
 
 /// The work a drive of `commands` at `base_path` over `replay` accepted, each hook passed.
@@ -1405,9 +1461,25 @@ fn a_revision_judged_at_a_moved_head_is_refused_by_the_records() {
   let refusal = replay.repository.commit(first).unwrap_err();
   let answered = (refusal.subversion_code(), refusal.message());
   assert_eq!(answered, (160_028, "Transaction out of date".to_owned()));
-  assert_eq!(refusal, StepRefusal::OutOfDate { head: 3, youngest: 4 });
-  let changed: Vec<String> = replay.repository.index().changes(4).unwrap().iter().map(|row| row.path.clone()).collect();
-  assert_eq!((replay.repository.youngest(), changed), (4, vec!["/trunk/project/sub".to_owned()]));
+  assert_eq!(
+    refusal,
+    StepRefusal::OutOfDate {
+      head: 3,
+      youngest: 4
+    }
+  );
+  let changed: Vec<String> = replay
+    .repository
+    .index()
+    .changes(4)
+    .unwrap()
+    .iter()
+    .map(|row| row.path.clone())
+    .collect();
+  assert_eq!(
+    (replay.repository.youngest(), changed),
+    (4, vec!["/trunk/project/sub".to_owned()])
+  );
 }
 
 /// What a hook read of the transaction: its name, its base, its revision properties and the paths of its rows.
@@ -1433,7 +1505,12 @@ fn read_at_pre_commit(
         let pending = drive.pending();
         let rows: Vec<String> = pending.rows.keys().cloned().collect();
         let properties = pending.revision_properties.to_vec();
-        read = Some((pending.transaction.to_owned(), pending.base, properties, rows));
+        read = Some((
+          pending.transaction.to_owned(),
+          pending.base,
+          properties,
+          rows,
+        ));
       }
       step = replay.resume(&mut drive, Ok(()), &mut out);
     }
