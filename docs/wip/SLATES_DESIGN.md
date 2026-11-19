@@ -36537,6 +36537,37 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
 
+### A-556 — A carried takeover's cohort holds back only the objects its round ranked to the carrier (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; GAPS, live-durability 2026-11-09; A-272 (ii), A-309)
+Applied in the same change to: GAPS (the live-durability entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::readiness_cohorts`, `readiness_current_cohorts`, `falls_through`; `within_tolerance` judges
+the same cohorts) and `crates/server/src/takeover.rs` (the round's readiness waits on them). Also
+`crates/cluster/src/raft_wire.rs`, where the regional encoder's retirements are split into their own step
+(`encode_retired`) for main's clippy gate.
+- **What was there.** A host that retires owing its share of an earlier takeover carries it
+  (`Retirement::unconfirmed`). The round of its own takeover then joined the carried retirement's cohort to every one
+  of its objects. In the store-destroyed flow the owner died before confirming the destroyed node's takeover, and its
+  own volume was joined with the destroyed node's cohort, which had lost two of its three hosts. Before A-309 the
+  volume read lost. Since A-309 it read past tolerance: the round waited for every survivor, gave the volume up if one
+  never answered within the promise wait (A-304), reported it recovered past tolerance (A-332), and an unasked holder
+  kept its copy (`within_tolerance` false).
+- **The rule.** A round waits on a carried retirement's cohort only for an object that retirement's round ranked
+  along a line into the departed host: each kept retirement, from the carried one, ranks the object to the next until
+  it reaches the departed host (`falls_through`). The rankings are fixed at each retirement, so every node reads the
+  same.
+- **Why it is safe.** A carried cohort holds the only copy of a record only of an object the carried host owned and
+  the departed host was taking over from it, and that is an object its round ranked to the departed host. An object
+  it ranked elsewhere is that successor's to recover: its holders route it there, and the departed host's round never
+  learns it. An object the carried host never owned, such as the departed host's own, its cohort never held. The
+  successors are still ranked over every recovery cohort, so a fleet of mixed builds names the same successor for each
+  object; only the wait narrows. The record's judgment keeps every recovery cohort, since a completion record keeps no
+  ranking.
+- **Tests.** `a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_the_carrier`
+  (`crates/db/src/register.rs`, red before): the carrier's own object is waited on through its own cohort alone and
+  reads within tolerance, while an object the first takeover ranked to the carrier is waited on through both cohorts.
+  Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `register::` 88 of 88, `slates-cluster` `raft_wire::` 22 of
+  22, `slates-server` takeover and holder tests 28 of 28. Red once on a mutated copy that joined every carried cohort,
+  as before: the carrier's own object waited on two cohorts (`(2, 2, 2)`).
+
 ### A-520, second piece — The container engine's profile and the check just before a runtime binds are library calls, which the command line makes (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9, §4.12; AUD-29-66, AUD-29-67; `CONTRACT` = 47)
 Applied in the same change to: §4.6 (A-9's OCI record: the form through the library), §4.12's contract log
 (`CONTRACT` = 47), GAPS (the library's entry), `docs/library.md` (the serving list, what is owed),

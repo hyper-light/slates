@@ -2488,8 +2488,15 @@
 >   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
 >   `NotRecovered` by name.
 
-> **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
-> predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
+> **Fixed (A-556, g250, 2026-11-19; was open since live-durability, 2026-11-09; A-272 ii adjacent): an object whose line
+> never passed through an unconfirmed predecessor read lost, then past tolerance, on a second failure inside that
+> predecessor's takeover window.** A round now waits on a carried retirement's cohort only for the objects that
+> retirement's round ranked along a line into the departed host (`RegionalConfiguration::readiness_cohorts`,
+> `falls_through`; `within_tolerance` judges the same): a carried cohort holds the only copy of a record only of an
+> object it owned and ranked to the departed host. The successors are still ranked over every recovery cohort, so a
+> fleet of mixed builds names the same ones. Test: `a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_
+> the_carrier` (`crates/db/src/register.rs`, red before: the carrier's own object read past tolerance). The text below
+> is the record of the finding. A host that retires before
 > confirming its share of an earlier retirement records it as `unconfirmed`, and `RegionalConfiguration::recovery_cohorts`
 > then recovers **every** object of the host jointly with the predecessor's cohort, not only the objects it was taking
 > over from it. In the store-destroyed flow (diag-live-durability-77, x86 run 1): old b destroyed, the owner killed
