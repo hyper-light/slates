@@ -1,10 +1,16 @@
 //! Tests of the version-control credentials (A-625 part 3): the ids against OpenSSH's and FIPS 180-2's own vectors, the
 //! public key line as `ssh-keygen` writes it, the human surface's verbs through the daemon's dispatch on a real shard,
-//! and the lookup the edges ask from another shard.
+//! the lookup the edges ask from another shard, and (A-692) an ra_svn session's CRAM-MD5 proved by a token's record.
+
+use std::ffi::CStr;
 
 use slates_db::HostId;
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal};
 use slates_ipc::protocol::{CredentialMaterial, Refusal, ReplyBody, RequestBody};
+use slates_svn::handshake::{
+  Access, AuthFailure, Principal as SessionPrincipal, Progress, Refused as SessionRefused,
+  Repository, Server, Verdict,
+};
 
 use super::*;
 
@@ -123,7 +129,10 @@ fn a_credentials_id_is_the_sha256_openssh_and_fips_180_name() {
     ssh_key_id(&blob)
   );
   assert_eq!(
-    id_of(&CredentialMaterial::HttpToken { id: ABC_SHA256 }),
+    id_of(&CredentialMaterial::HttpToken {
+      id: ABC_SHA256,
+      cram_md5_contexts: cram_md5_contexts(b"abc"),
+    }),
     ABC_SHA256
   );
 }
@@ -230,27 +239,37 @@ fn refused_to_others(state: &mut ShardState, key: CredentialMaterial, asked: Req
   assert_eq!(counted(state, ISSUER_UNVERIFIED), unverified + 1);
 }
 
-/// A-625 part 3. Do, through the daemon's dispatch: enroll a token by its hash with an expiry; enroll a blob whose type
-/// no SSH edge algorithm takes, and an Ed25519 blob of 31 key bytes. Expect: the token's record, its kind `HttpToken`
-/// and its expiry, and neither the token nor anything else of it held; each key refused `BadRequest`, nothing recorded.
+/// A-625 part 3 and A-692. Do, through the daemon's dispatch: enroll a token by its hash and its CRAM-MD5 contexts with
+/// an expiry; enroll a blob whose type no SSH edge algorithm takes, and an Ed25519 blob of 31 key bytes. Expect: the
+/// token's record, its kind `HttpToken` with the token's contexts and its expiry, and the token's bytes nowhere in the
+/// record's encoding; each key refused `BadRequest`, nothing recorded.
 #[test]
-fn a_token_is_held_as_its_hash_and_a_key_the_edge_cannot_take_is_refused() {
+fn a_token_is_held_as_its_hash_and_contexts_and_a_key_the_edge_cannot_take_is_refused() {
   crate::daemon::audit_on_shard(|state| {
-    let id = token_id(b"slates_0123");
-    let token = CredentialMaterial::HttpToken { id };
+    let id = token_id(TOKEN);
+    let token = CredentialMaterial::HttpToken {
+      id,
+      cram_md5_contexts: cram_md5_contexts(TOKEN),
+    };
     let asked = enrollment(state, token, Some(EXPIRES_NS));
     assert_eq!(
       dispatched(state, &human(), asked),
       ReplyBody::CredentialEnrolled { id }
     );
-    assert_eq!(
-      held(state, &id),
-      Some(CredentialRecord {
-        id,
-        principal: proven(),
-        kind: CredentialKind::HttpToken,
-        expires_ns: Some(EXPIRES_NS),
-      })
+    let record = CredentialRecord {
+      id,
+      principal: proven(),
+      kind: CredentialKind::HttpToken {
+        cram_md5_contexts: cram_md5_contexts(TOKEN),
+      },
+      expires_ns: Some(EXPIRES_NS),
+    };
+    assert_eq!(held(state, &id), Some(record.clone()));
+    let mut encoded = Vec::new();
+    slates_wire::Wire::encode(&record, &mut encoded);
+    assert!(
+      !encoded.windows(TOKEN.len()).any(|window| window == TOKEN),
+      "the record holds no token"
     );
     for blob in [ssh_blob(b"ssh-dss", 32), ssh_blob(b"ssh-ed25519", 31)] {
       let id = ssh_key_id(&blob);
@@ -286,11 +305,11 @@ fn a_credential_is_found_from_any_shard_on_the_partition_its_id_routes_to() {
     let partition = usize::from(owner_of(id, 2));
     let id = *id;
     let reply = crate::daemon::observe_at(&daemon, partition, move |state| {
-      let asked = enrollment(
-        state,
-        CredentialMaterial::HttpToken { id },
-        Some(EXPIRES_NS),
-      );
+      let material = CredentialMaterial::HttpToken {
+        id,
+        cram_md5_contexts: [0; 32],
+      };
+      let asked = enrollment(state, material, Some(EXPIRES_NS));
       dispatched(state, &human(), asked)
     });
     assert_eq!(reply, ReplyBody::CredentialEnrolled { id });
@@ -324,4 +343,209 @@ fn a_credential_is_found_from_any_shard_on_the_partition_its_id_routes_to() {
     );
   }
   assert_eq!(stranger, Ok(None));
+}
+
+/// Format: a token's text as the issuer mints it ([`token_text`]), its random bytes 0 to 31: the token whose digest
+/// Python's `hmac` made for the challenge `<1.2@h>` (slates-svn's `kept_contexts_are_dovecots_bytes_and_answer_as_the_
+/// secret` holds its contexts to the same derivation).
+const TOKEN: &[u8] = b"slates_000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+/// Format: `hmac.new(TOKEN, b"<1.2@h>", "md5").hexdigest()` in Python (`cram_contexts_golden.py`, 2026-11-19): what a
+/// stock client answers that challenge with, the token its password, made by no code of slates'.
+const TOKEN_DIGEST: &str = "bed5de4734b671c78ff6f12a3a8ca7b2";
+/// Format: [`TOKEN_DIGEST`] with its last digit changed: a client that holds another password.
+const WRONG_DIGEST: &str = "bed5de4734b671c78ff6f12a3a8ca7b3";
+/// Format: the challenge's random number, which with [`TIME_MICROS`] and [`HOST`] makes it `<1.2@h>` (`cram.c`'s
+/// `<nonce.time@host>`).
+const NONCE: u64 = 1;
+/// Format: the challenge's instant.
+const TIME_MICROS: i64 = 2;
+/// Format: the challenge's host.
+const HOST: &CStr = c"h";
+/// Shape: the bytes a client's item may take in the session: far above the handshake's longest answer.
+const ITEM_BYTES: usize = 4096;
+/// Format: the URL the client answers the greeting with, naming the repository at the server's root.
+const URL: &[u8] = b"svn://127.0.0.1/project";
+/// Format: a token enrolled to expire a nanosecond after the Unix epoch, long past.
+const EXPIRED_TOKEN: &[u8] = b"slates_expired";
+/// Format: a token enrolled, then revoked.
+const REVOKED_TOKEN: &[u8] = b"slates_revoked";
+/// Shape: when [`EXPIRED_TOKEN`] expired, in nanoseconds since the Unix epoch.
+const LONG_AGO_NS: u64 = 1;
+
+/// The repository the session opens: authenticated users read it and it holds their keys (`CRAM-MD5`), anonymous users
+/// do not, and no tunnel's user comes in.
+fn cram_repository() -> Repository<'static> {
+  Repository {
+    uuid: b"00000000-0000-4000-8000-00000000a692",
+    root_url: URL,
+    realm: b"slates",
+    mergeinfo: false,
+    anonymous: false,
+    tunnel_user: None,
+    cram_md5: true,
+  }
+}
+
+/// `item` as ra_svn's string, its length and a colon first, a space after.
+fn ra_string(item: &[u8]) -> Vec<u8> {
+  [format!("{}:", item.len()).as_bytes(), item, b" "].concat()
+}
+
+/// An ra_svn handshake that greeted, read a stock client's answer naming [`URL`], opened [`cram_repository`], read the
+/// client's choice of CRAM-MD5, sent the challenge `<1.2@h>` and read the client's response naming `user` with
+/// `digest`: the handshake, waiting on the user's key; or the step that did not answer as a server's must.
+fn awaiting_key(user: &[u8], digest: &str) -> Result<Server, &'static str> {
+  let mut out = Vec::new();
+  let mut server = Server::new(ITEM_BYTES, &mut out).map_err(|_| "the greeting")?;
+  let answer = [b"( 2 ( edit-pipeline ) ".as_slice(), &ra_string(URL), b") "].concat();
+  let opened = server.receive(&answer, &mut out);
+  matches!(opened, Ok(Progress::Opened { .. }))
+    .then_some(())
+    .ok_or("the answer")?;
+  (server.open(&cram_repository(), &mut out) == Ok(Access::Asked))
+    .then_some(())
+    .ok_or("the request")?;
+  let chose = server.receive(b"( CRAM-MD5 ( ) ) ", &mut out);
+  matches!(chose, Ok(Progress::ChallengeNeeded { .. }))
+    .then_some(())
+    .ok_or("the choice")?;
+  server
+    .challenge(NONCE, TIME_MICROS, HOST, &mut out)
+    .map_err(|_| "the challenge")?;
+  let response = ra_string(&[user, b" ".as_slice(), digest.as_bytes()].concat());
+  let named = server.receive(&response, &mut out);
+  matches!(named, Ok(Progress::KeyNeeded { .. }))
+    .then_some(())
+    .ok_or("the response")?;
+  Ok(server)
+}
+
+/// What one CRAM-MD5 attempt came to: the key's lookup ([`cram_md5_key`]: the principal its token proves, or why there
+/// was no key), and the session's verdict given that key, or none.
+type Attempt = (Result<Principal, Unkeyed>, Result<Verdict, SessionRefused>);
+
+/// Runs each attempt of `attempts` (a user and the digest it answers with) through its own session on the daemon's
+/// first shard, the key looked up as a connection looks it up, from whichever shard its record's partition is on.
+fn attempted(
+  daemon: &crate::daemon::Daemon,
+  attempts: Vec<(Vec<u8>, &'static str)>,
+) -> Vec<Attempt> {
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut outcomes = Vec::new();
+      for (user, digest) in attempts {
+        let Ok(mut server) = awaiting_key(&user, digest) else {
+          outcomes.push(None);
+          continue;
+        };
+        let found = cram_md5_key(&user).await;
+        let mut out = Vec::new();
+        let verdict = server.key(found.as_ref().ok().map(|user| &user.key), &mut out);
+        outcomes.push(Some((found.map(|user| user.principal), verdict)));
+      }
+      let _ = sent.send(outcomes);
+    })
+    .expect("the session's task spawns");
+    slates_rt::futures::detach(task).expect("the session's task detaches");
+  });
+  let outcomes = answered
+    .recv_timeout(std::time::Duration::from_nanos(
+      ANSWER_WAIT_NS.saturating_mul(4),
+    ))
+    .expect("the sessions answered");
+  outcomes
+    .into_iter()
+    .map(|outcome| outcome.expect("each session reached its key"))
+    .collect()
+}
+
+/// Enrolls `material` for [`proven`] until `expires_ns` on the partition its id routes to, through the dispatch.
+fn enrolled_at(
+  daemon: &crate::daemon::Daemon,
+  material: CredentialMaterial,
+  expires_ns: Option<u64>,
+) {
+  let id = id_of(&material);
+  let partition = usize::from(owner_of(&id, 2));
+  let reply = crate::daemon::observe_at(daemon, partition, move |state| {
+    let asked = enrollment(state, material, expires_ns);
+    dispatched(state, &human(), asked)
+  });
+  assert_eq!(reply, ReplyBody::CredentialEnrolled { id });
+}
+
+/// The token `token` as the issuer enrolls it: its id and its contexts.
+fn minted(token: &[u8]) -> CredentialMaterial {
+  CredentialMaterial::HttpToken {
+    id: token_id(token),
+    cram_md5_contexts: cram_md5_contexts(token),
+  }
+}
+
+/// `id` in lowercase hex, as the CLI prints a credential's id: the user a client names its token by.
+fn user_of(id: &[u8; 32]) -> Vec<u8> {
+  id.iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>()
+    .into_bytes()
+}
+
+/// A-692 (§4.17.4 item 10; RFC 2195 §4). Do: on a two-shard daemon, enroll a minted token through the dispatch, as the
+/// CLI's issuer sends it (its id and its CRAM-MD5 contexts, never the token), another that expired long ago, a third
+/// then revoked, and an SSH key; then, from the first shard, run an ra_svn session's CRAM-MD5 per attempt: the token's
+/// id with the digest a stock client makes of the challenge `<1.2@h>` with the token as its password (Python's `hmac`,
+/// no code of slates'), and with another digest; the expired and the revoked tokens' ids; the key's id; `alice`; and the
+/// live token's id in capitals. Expect: the token's record keyed the session, which established the user its id names,
+/// the token proving [`proven`]; the other digest "Password incorrect" with the same lookup; and every other attempt no
+/// key, each for its reason (expired, unknown once revoked, not a token, not an id twice), answered as `svnserve`
+/// answers a user it has no password for.
+#[test]
+fn an_ra_svn_session_proves_a_tokens_principal_by_cram_md5_from_its_record() {
+  let daemon = crate::daemon::audit_daemon_of(2);
+  enrolled_at(&daemon, minted(TOKEN), None);
+  enrolled_at(&daemon, minted(EXPIRED_TOKEN), Some(LONG_AGO_NS));
+  enrolled_at(&daemon, minted(REVOKED_TOKEN), None);
+  let revoked = token_id(REVOKED_TOKEN);
+  let reply =
+    crate::daemon::observe_at(&daemon, usize::from(owner_of(&revoked, 2)), move |state| {
+      dispatched(state, &human(), revocation(state, revoked))
+    });
+  assert_eq!(reply, ReplyBody::CredentialRevoked);
+  enrolled_at(
+    &daemon,
+    CredentialMaterial::SshKey { blob: rsa_blob() },
+    None,
+  );
+  let live = user_of(&token_id(TOKEN));
+  let attempts = vec![
+    (live.clone(), TOKEN_DIGEST),
+    (live.clone(), WRONG_DIGEST),
+    (user_of(&token_id(EXPIRED_TOKEN)), TOKEN_DIGEST),
+    (user_of(&revoked), TOKEN_DIGEST),
+    (user_of(&ssh_key_id(&rsa_blob())), TOKEN_DIGEST),
+    (b"alice".to_vec(), TOKEN_DIGEST),
+    (live.to_ascii_uppercase(), TOKEN_DIGEST),
+  ];
+  let outcomes = attempted(&daemon, attempts);
+  daemon.stop();
+  let unknown = Ok(Verdict::Failed(AuthFailure::UnknownUser));
+  assert_eq!(
+    outcomes,
+    vec![
+      (
+        Ok(proven()),
+        Ok(Verdict::Established(SessionPrincipal::User(live)))
+      ),
+      (
+        Ok(proven()),
+        Ok(Verdict::Failed(AuthFailure::WrongPassword))
+      ),
+      (Err(Unkeyed::Expired), unknown.clone()),
+      (Err(Unkeyed::Unknown), unknown.clone()),
+      (Err(Unkeyed::NotAToken), unknown.clone()),
+      (Err(Unkeyed::NotAnId), unknown.clone()),
+      (Err(Unkeyed::NotAnId), unknown),
+    ]
+  );
 }
