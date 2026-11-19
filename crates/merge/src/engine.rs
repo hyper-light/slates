@@ -5063,6 +5063,9 @@ mod node_tests;
 mod restate_tests;
 
 #[cfg(test)]
+mod copy_restate_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
