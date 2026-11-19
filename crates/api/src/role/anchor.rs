@@ -181,6 +181,31 @@ fn hold_fleet_serve(
   Ok(())
 }
 
+/// Binds the version-control servers' shared HTTP edge's listener at the address the operator gave (`--vcs-http`; A-625
+/// part 3), as the daemon binds its own (`slates_server::daemon::bind_vcs_http_listener`), and gives it to `supervisor`
+/// to hand to every daemon it spawns ([`slates_anchor::ENV_VCS_HTTP`]), so the edge's port never drops while a daemon
+/// restarts: a client that connects then waits in the listener's queue for the next daemon. An address that cannot be
+/// bound refuses the anchor's start by name, as a fleet node's serve sockets do: the operator asked for the edge there.
+/// One that cannot be made inheritable is not held, and each daemon binds its own, as for the NFS listener.
+#[cfg(unix)]
+fn hold_vcs_http_listener(
+  supervisor: &mut Supervisor,
+  config: &DaemonConfig,
+  address: slates_rt::tcp::SocketAddrV4,
+) -> Result<(), Failure> {
+  let listener = slates_server::daemon::bind_vcs_http_listener(config, address)
+    .map_err(|e| failed("vcs-http", format!("{address}: {e}")))?;
+  let fd = listener.into_owned();
+  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+    slates_machine::log_line!(
+      "slates anchor: the version-control edge's listener cannot be made inheritable ({e}); each daemon binds its own"
+    );
+    return Ok(());
+  }
+  supervisor.hold_vcs_http_listener(fd);
+  Ok(())
+}
+
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
@@ -273,6 +298,12 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   #[cfg(unix)]
   if let Some(selection) = &options.fleet {
     hold_fleet_serve(&mut supervisor, selection)?;
+  }
+  // The version-control edge's listener is held the same way (A-625 part 3): bound once here, at the address the
+  // operator gave, and handed to every daemon, so a restart never drops the edge's port.
+  #[cfg(unix)]
+  if let Some(address) = options.vcs_http {
+    hold_vcs_http_listener(&mut supervisor, &config, address)?;
   }
   // The FUSE devices daemons mount are held the same way (A-61): a daemon sends each to the anchor, and the
   // next daemon takes back the mounts it recovers. A channel that cannot be opened refuses the anchor's start:
