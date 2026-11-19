@@ -145,6 +145,18 @@ pub(crate) enum LoggedOp {
     /// The name it links to.
     target: String,
   },
+  /// [`VolumeOp::Copy`] (A-626 part 4): appended last, so every variant before it keeps its wire tag; the anchor's
+  /// layout 13 refuses a segment of an earlier layout, whose log never held one.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from.
+    version: u64,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
+  },
 }
 
 /// A file a work holds of its own, in a restatement: its bytes, or `None` for a file it removed.
@@ -227,6 +239,17 @@ impl LoggedOp {
       VolumeOp::SetXattr { path, name, value } => LoggedOp::SetXattr { path, name, value },
       VolumeOp::RemoveXattr { path, name } => LoggedOp::RemoveXattr { path, name },
       VolumeOp::Link { path, target } => LoggedOp::Link { path, target },
+      VolumeOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      } => LoggedOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      },
     }
   }
 
@@ -253,6 +276,17 @@ impl LoggedOp {
       LoggedOp::SetXattr { path, name, value } => VolumeOp::SetXattr { path, name, value },
       LoggedOp::RemoveXattr { path, name } => VolumeOp::RemoveXattr { path, name },
       LoggedOp::Link { path, target } => VolumeOp::Link { path, target },
+      LoggedOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      } => VolumeOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      },
     })
   }
 }
@@ -497,6 +531,12 @@ mod tests {
       VolumeOp::Link {
         path: "h".to_owned(),
         target: p(),
+      },
+      VolumeOp::Copy {
+        from: p(),
+        to: "c".to_owned(),
+        version: 3,
+        replace: true,
       },
     ]
   }

@@ -530,6 +530,7 @@ pub(super) fn answer<P: PackSource>(
     shallow: &asked.shallow,
     deepen: deepen(&asked, &not, chosen.relative),
     filter: filter.as_ref(),
+    sparse: None,
     include_tag: chosen.include_tag,
     thin: chosen.thin,
   };
