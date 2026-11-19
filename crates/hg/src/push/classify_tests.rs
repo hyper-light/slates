@@ -16,6 +16,7 @@ use crate::phases::{Phase, PhaseHead};
 use crate::push::reply::{Refused, Replied, heads_changed};
 use crate::push::verify::{Arrived, Held, verify};
 use crate::push::{Asks, BookmarkAt, ChangegroupPart, PushkeyAsk, Taken, Unbundle, read};
+use crate::serve::discovery::branch_head_revs;
 use crate::serve::{Repository, Rev};
 use crate::{Admission, NULL_NODE, Node};
 
@@ -563,8 +564,276 @@ fn check_phases(
   Ok(())
 }
 
+/// The view with the push's changesets added after its own (their phases are not read).
+fn view_after(whole: &Whole, view: &View) -> View {
+  let mut after = view.clone();
+  for at in whole.old..whole.nodes.len() {
+    after.changesets.push(Old {
+      node: whole.nodes[at],
+      parents: whole.parents[at].map(|parent| parent.map(|at| Rev::try_from(at).unwrap())),
+      branch: whole.branches[at].clone(),
+      closes: whole.closes[at],
+      phase: Phase::Draft,
+    });
+  }
+  after
+}
+
+/// Each branch's heads as the server answers `branchmap` and judges `check:updated-heads` (A-667's
+/// `branch_head_revs`).
+fn served_heads(view: &View) -> BTreeMap<Vec<u8>, BTreeSet<Node>> {
+  let mut heads: BTreeMap<Vec<u8>, BTreeSet<Node>> = BTreeMap::new();
+  for rev in branch_head_revs(view, &mut room()).unwrap() {
+    heads
+      .entry(view.branch(rev).to_vec())
+      .or_default()
+      .insert(view.node(rev).unwrap());
+  }
+  heads
+}
+
+/// The lines a push reads where every line is a served head: each branch's heads numbered from 0 in revision order,
+/// and `default`'s empty line where the view has no head of `default`.
+fn served_lines(view: &View) -> Vec<LineRead> {
+  let mut numbers: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+  let mut lines = Vec::new();
+  for rev in branch_head_revs(view, &mut room()).unwrap() {
+    let branch = view.branch(rev).to_vec();
+    let number = numbers.entry(branch.clone()).or_default();
+    lines.push(LineRead {
+      branch,
+      number: *number,
+      head: view.node(rev),
+    });
+    *number += 1;
+  }
+  if !numbers.contains_key(b"default".as_slice()) {
+    lines.push(LineRead {
+      branch: b"default".to_vec(),
+      number: 0,
+      head: None,
+    });
+  }
+  lines
+}
+
+/// Places the push of `whole`'s brought changesets on the lines the served heads of `view` give, and holds the lines
+/// afterwards to the served heads of the view with the push added; the lines read and the plan.
+fn placed_on_served(
+  whole: &Whole,
+  view: &View,
+  (unbundle, publishing): (&Unbundle, bool),
+) -> Result<(Vec<LineRead>, Plan), TestCaseError> {
+  let lines = served_lines(view);
+  let arrived = brought_of(whole);
+  let plan = classify(
+    unbundle,
+    (&arrived, &[]),
+    view,
+    (&lines, &[]),
+    publishing,
+    &mut room(),
+  )
+  .map_err(|refused| TestCaseError::fail(format!("{refused:?}")))?;
+  let (heads, _) = applied(&lines, &plan);
+  prop_assert_eq!(heads, served_heads(&view_after(whole, view)));
+  Ok((lines, plan))
+}
+
+/// Whether the push ended a line's head only through another branch: the head read keeps no child on its branch, so the
+/// rule A-619 kept (a head is what no child on its branch continues) leaves it a head, and is no served head after.
+fn ended_through_another_branch(lines: &[LineRead], after: &View) -> bool {
+  let served = served_heads(after);
+  lines.iter().filter_map(|line| line.head).any(|head| {
+    let rev = after.rev(&head).unwrap();
+    let branch = after.branch(rev);
+    let child_on_branch = (0..after.count())
+      .any(|child| after.branch(child) == branch && after.parents(child).contains(&Some(rev)));
+    !child_on_branch
+      && !served
+        .get(branch)
+        .is_some_and(|heads| heads.contains(&head))
+  })
+}
+
+/// A history made by hand: each changeset's parents (earlier indices), branch and close, the first `old` the view's,
+/// every one of the view's public.
+fn made(changesets: &[([Option<usize>; 2], &[u8], bool)], old: usize) -> (Whole, View) {
+  let mut whole = Whole {
+    old,
+    ..Whole::default()
+  };
+  for (index, (parents, branch, closes)) in changesets.iter().enumerate() {
+    whole.nodes.push([u8::try_from(index + 1).unwrap(); 20]);
+    whole.parents.push(*parents);
+    whole.branches.push(branch.to_vec());
+    whole.closes.push(*closes);
+  }
+  let mut view = View::default();
+  for at in 0..old {
+    view.changesets.push(Old {
+      node: whole.nodes[at],
+      parents: whole.parents[at].map(|parent| parent.map(|at| Rev::try_from(at).unwrap())),
+      branch: whole.branches[at].clone(),
+      closes: whole.closes[at],
+      phase: Phase::Public,
+    });
+  }
+  (whole, view)
+}
+
+/// A push of a changegroup alone.
+fn changegroup_alone() -> Unbundle {
+  Unbundle {
+    parts: vec![part(0, changegroup())],
+  }
+}
+
+/// A-657 against A-667 (g304's history; stock 7.2's `hg heads default` answers 2 alone): do push `default` 2 on
+/// `stable` 1, itself on `default` 0, onto `default`'s line at 0 and `stable`'s at 1. Expect `default`'s line moved to
+/// 2, no line made or retired, since 2 descends from 0 through `stable`; the lines' heads afterwards the served heads.
+#[test]
+fn a_line_left_through_another_branch_moves_to_its_new_head() {
+  let (whole, view) = made(
+    &[
+      ([None, None], b"default", false),
+      ([Some(0), None], b"stable", false),
+      ([Some(1), None], b"default", false),
+    ],
+    2,
+  );
+  let (lines, plan) = placed_on_served(&whole, &view, (&changegroup_alone(), false)).unwrap();
+  assert_eq!(lines.len(), 2);
+  assert_eq!(
+    plan.lines,
+    vec![LineMove::Moved {
+      line: 0,
+      head: whole.nodes[2]
+    }]
+  );
+  assert!(plan.created.is_empty());
+}
+
+/// A-657 against A-667 (a merge whose parent on its branch is an ancestor of its other parent): do push `default` 3 on
+/// `stable` 2 and `default` 0 onto `default`'s line at 1 (on 0) and `stable`'s at 2 (on 1). Expect `default`'s line
+/// moved to 3 and nothing made, by the rule, where stock 7.2's shortcut (`branchmap.py` 478-483) keeps 1 a head.
+#[test]
+fn a_merge_reaching_a_line_through_another_branch_moves_it() {
+  let (whole, view) = made(
+    &[
+      ([None, None], b"default", false),
+      ([Some(0), None], b"default", false),
+      ([Some(1), None], b"stable", false),
+      ([Some(2), Some(0)], b"default", false),
+    ],
+    3,
+  );
+  let (_, plan) = placed_on_served(&whole, &view, (&changegroup_alone(), false)).unwrap();
+  assert_eq!(
+    plan.lines,
+    vec![LineMove::Moved {
+      line: 0,
+      head: whole.nodes[3]
+    }]
+  );
+  assert!(plan.created.is_empty());
+}
+
+/// A-657 against A-667 (a closed head): do push `stable` 1 on `default` 0, closing its branch, and `default` 2 on 1,
+/// onto `default`'s line at 0. Expect `default`'s line moved to 2 through `stable`, and a line of `stable` made at its
+/// closed head 1 from `default`'s line, as 7.2's branchmap keeps a closed head.
+#[test]
+fn a_closed_head_keeps_a_line_and_ends_one_through_it() {
+  let (whole, view) = made(
+    &[
+      ([None, None], b"default", false),
+      ([Some(0), None], b"stable", true),
+      ([Some(1), None], b"default", false),
+    ],
+    1,
+  );
+  let (_, plan) = placed_on_served(&whole, &view, (&changegroup_alone(), false)).unwrap();
+  assert_eq!(
+    plan.lines,
+    vec![LineMove::Moved {
+      line: 0,
+      head: whole.nodes[2]
+    }]
+  );
+  let stable = NewLine {
+    branch: b"stable".to_vec(),
+    number: 0,
+    head: whole.nodes[1],
+    base: 0,
+  };
+  assert_eq!(plan.created, vec![stable]);
+}
+
+/// Shape: the fixed samples the cross-check's non-vacuity places.
+const SAMPLES: u64 = 256;
+/// Shape: the changesets of a fixed sample's view, and of its push: the generated tests' most.
+const SAMPLE_CHANGESETS: u64 = 8;
+
+/// The shape of changeset `index` of fixed sample `sample`: bytes of a BLAKE3 hash of both, so samples are fixed and
+/// spread.
+fn fixed_shape(sample: u64, index: u64) -> Shape {
+  let seed = [sample.to_le_bytes(), index.to_le_bytes()].concat();
+  let hash = blake3::hash(&seed);
+  let [first, second, branch, closes, public, ..] = *hash.as_bytes();
+  (
+    first,
+    second,
+    branch,
+    closes.is_multiple_of(2),
+    public.is_multiple_of(2),
+  )
+}
+
+/// A-657 against A-667 (the cross-check's non-vacuity): do place pushes made from fixed samples, as the generated
+/// cross-check makes them, on lines read from the served heads. Expect each held to the served heads afterwards, and
+/// some ending a line's head only through another branch, where the rule A-619 kept would leave it a head, so the
+/// cross-check cannot be passed by that rule.
+#[test]
+fn fixed_pushes_end_a_line_through_another_branch() {
+  let mut ended = 0_u64;
+  for sample in 0..SAMPLES {
+    let shapes = |from: u64| -> Vec<Shape> {
+      (from..from + SAMPLE_CHANGESETS)
+        .map(|index| fixed_shape(sample, index))
+        .collect()
+    };
+    let (old, brought) = (shapes(0), shapes(SAMPLE_CHANGESETS));
+    let (whole, view) = generated(&old, &brought);
+    let (unbundle, _) = pushed(&whole, &brought);
+    let (lines, _) = placed_on_served(&whole, &view, (&unbundle, false)).unwrap();
+    ended += u64::from(ended_through_another_branch(
+      &lines,
+      &view_after(&whole, &view),
+    ));
+  }
+  assert!(
+    ended > 0,
+    "no sample of {SAMPLES} ends a line's head through another branch"
+  );
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// A-657 against A-667 (the served heads): do place generated pushes, as the test below, on lines read from the heads
+  /// the server answers `branchmap` with (`branch_head_revs`). Expect the lines afterwards to hold exactly the served
+  /// heads of the view with the push added: no line `branchmap` does not list, and no listed head without the line
+  /// `check:updated-heads` finds it by.
+  #[test]
+  fn lines_after_a_push_hold_the_served_branch_heads(
+    old in prop::collection::vec(any::<Shape>(), 0..8),
+    brought in prop::collection::vec(any::<Shape>(), 0..8),
+    publishing in any::<bool>(),
+  ) {
+    let (whole, view) = generated(&old, &brought);
+    let (unbundle, _) = pushed(&whole, &brought);
+    placed_on_served(&whole, &view, (&unbundle, publishing))?;
+  }
 
   /// A-657, AC-HG.3 and AC-HG.4 (T-HG.3, T-HG.4: the serial model of lines and phases). Do: place generated pushes of
   /// up to eight changesets on three branches, some marked public by a `phase-heads` part, on generated histories of up
