@@ -20,9 +20,9 @@ mod order;
 
 use slates_db::catalog::{
   AttachForm, AuditKind, BaseRecord, Consumer, GrantScope, GrantState, GrantSurface, HookPointName,
-  LandingState, MemberOrigin, NameChange, NamePolicy, ObjectFormat, PlacementState, PolicyEffect,
-  PolicyEntry, PolicyNames, PolicyRight, PolicyWho, Principal, RepositoryCheck, Role, SealKeyOwner,
-  SizeClass, StateChange, VcsTool, VolumeState, WriteMode,
+  LandingState, LogName, MemberOrigin, NameChange, NamePolicy, ObjectFormat, PlacementState,
+  PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyWho, Principal, RepositoryCheck, Role,
+  SealKeyOwner, SizeClass, StateChange, StateLog, VcsTool, VolumeState, WriteMode,
 };
 use slates_db::op::Op;
 use slates_wire::Wire;
@@ -42,6 +42,7 @@ fn schemas() -> Vec<&'static str> {
     <GrantSurface as Wire>::SCHEMA,
     <HookPointName as Wire>::SCHEMA,
     <LandingState as Wire>::SCHEMA,
+    <LogName as Wire>::SCHEMA,
     <MemberOrigin as Wire>::SCHEMA,
     <NameChange as Wire>::SCHEMA,
     <NamePolicy as Wire>::SCHEMA,
@@ -59,6 +60,7 @@ fn schemas() -> Vec<&'static str> {
     <SealKeyOwner as Wire>::SCHEMA,
     <SizeClass as Wire>::SCHEMA,
     <StateChange as Wire>::SCHEMA,
+    <StateLog as Wire>::SCHEMA,
     <VcsTool as Wire>::SCHEMA,
     <VolumeState as Wire>::SCHEMA,
     <WriteMode as Wire>::SCHEMA,

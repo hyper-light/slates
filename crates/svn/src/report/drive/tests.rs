@@ -219,7 +219,8 @@ fn the_history_rebuilt_is_the_one_svnserve_served() {
       rendered.push_str(&svnlook_line(change));
     }
   }
-  assert_eq!(rendered, CHANGED);
+  let ours: Vec<&str> = rendered.lines().collect();
+  assert_eq!(ours, CHANGED.lines().collect::<Vec<_>>());
 }
 
 /// One changed path as `svnlook changed --copy-info` writes it.
