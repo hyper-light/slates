@@ -1047,50 +1047,114 @@ fn apply(files: &Files, step: &[Option<(u8, bool)>]) -> Files {
   next
 }
 
-proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+/// What the generated histories met, so the oracle's agreement is shown to cover every case it states.
+#[derive(Default)]
+struct Census {
+  /// Pushes accepted.
+  accepted: Cell<u64>,
+  /// Subtrees left unread, the base's and the push's ids equal.
+  skipped: Cell<u64>,
+  /// Pushes refused for a path changing kind.
+  kind_changes: Cell<u64>,
+  /// Directories removed.
+  removed_dirs: Cell<u64>,
+  /// Modes set.
+  modes: Cell<u64>,
+  /// Links made or retargeted.
+  links: Cell<u64>,
+  /// Files replaced whole: a `Delete` of the base's bytes.
+  replaced: Cell<u64>,
+}
 
-  /// A-618 (§4.17.1 items 2 to 4; the oracle and the client-fidelity test). Do: run histories of up to eight pushes,
-  /// each changing, adding or removing any of twelve paths, deep and shallow, as files of four contents (one empty) with
-  /// or without the executable bit, or as links of two targets; each pushed over the last landed tree. Expect: each
-  /// build the oracle's work byte for byte, with exactly the reads a walk by identity makes; a path changing kind
-  /// refused naming one of the paths that do, the green unchanged; every other push accepted, leaving the green holding
-  /// exactly what was pushed, and its head.
-  #[test]
-  fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is(
-    steps in proptest::collection::vec(
-      proptest::collection::vec(proptest::option::of((0u8..7, any::<bool>())), SLOTS.len()),
-      1..8,
-    )
-  ) {
-    let mut store = Store::default();
-    let mut green = Green::new();
-    let mut landed = Files::new();
-    let mut landed_tree = None;
-    for (n, step) in steps.iter().enumerate() {
-      let files = apply(&landed, step);
-      let tree = put(&mut store, &files);
-      let head = head(n as u64 + 1);
-      let push = push(green.head(), landed_tree, tree, &head);
-      let built = build(&push, &green, &store, u64::MAX);
-      match oracle(&store, &green, &push) {
-        Expected::KindChanged(paths) => {
-          let Err(PushRefused::KindChanged { path }) = built else {
-            panic!("expected a kind change at one of {paths:?}, built {built:?}");
-          };
-          prop_assert!(paths.contains(&path), "{} is not one of {:?}", path, paths);
-        }
-        Expected::Work(increment, reads) => {
-          let built = built.unwrap();
-          prop_assert_eq!(&built.increment, &increment);
-          prop_assert_eq!(built.reads, reads);
-          let version = green.head() + 1;
-          prop_assert_eq!(green.submit(&built.increment), Outcome::Accepted { version });
-          holds_exactly(&green, &files, &head);
-          landed = files;
-          landed_tree = Some(tree);
-        }
+impl Census {
+  /// Counts what `built` holds.
+  fn count(&self, built: &Built) {
+    let add = |cell: &Cell<u64>, n: u64| cell.set(cell.get() + n);
+    add(&self.accepted, 1);
+    add(&self.skipped, built.reads.skipped);
+    for op in &built.increment.doc.ops {
+      match op.kind {
+        OpKind::Rmdir => add(&self.removed_dirs, 1),
+        OpKind::SetMode => add(&self.modes, 1),
+        OpKind::Symlink => add(&self.links, 1),
+        OpKind::Delete => add(&self.replaced, 1),
+        _ => {}
       }
     }
+  }
+}
+
+/// Runs one generated history (the test below): each push built, held to the oracle, submitted and read back.
+fn history(steps: &[Vec<Option<(u8, bool)>>], census: &Census) {
+  let mut store = Store::default();
+  let mut green = Green::new();
+  let mut landed = Files::new();
+  let mut landed_tree = None;
+  for (n, step) in steps.iter().enumerate() {
+    let files = apply(&landed, step);
+    let tree = put(&mut store, &files);
+    let head = head(n as u64 + 1);
+    let push = push(green.head(), landed_tree, tree, &head);
+    let built = build(&push, &green, &store, u64::MAX);
+    match oracle(&store, &green, &push) {
+      Expected::KindChanged(paths) => {
+        let Err(PushRefused::KindChanged { path }) = built else {
+          panic!("expected a kind change at one of {paths:?}, built {built:?}");
+        };
+        assert!(paths.contains(&path), "{path} is not one of {paths:?}");
+        census.kind_changes.set(census.kind_changes.get() + 1);
+      }
+      Expected::Work(increment, reads) => {
+        let built = built.unwrap();
+        assert_eq!(built.increment, increment, "the oracle's work");
+        assert_eq!(built.reads, reads, "the oracle's reads");
+        let version = green.head() + 1;
+        assert_eq!(
+          green.submit(&built.increment),
+          Outcome::Accepted { version }
+        );
+        holds_exactly(&green, &files, &head);
+        census.count(&built);
+        landed = files;
+        landed_tree = Some(tree);
+      }
+    }
+  }
+}
+
+/// A-618 (§4.17.1 items 2 to 4; the oracle and the client-fidelity test). Do: run 256 generated histories of up to seven
+/// pushes, each changing, adding or removing any of twelve paths, deep and shallow, as files of four contents (one
+/// empty) with or without the executable bit, or as links of two targets; each pushed over the last landed tree.
+/// Expect: each build the oracle's work byte for byte, with exactly the reads a walk by identity makes; a path changing
+/// kind refused naming one of the paths that do, the green unchanged; every other push accepted, leaving the green
+/// holding exactly what was pushed and its head; and the histories, counted, reaching every case: subtrees skipped,
+/// kind changes refused, directories removed, modes set, links made, files replaced whole.
+#[test]
+fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
+  let census = Census::default();
+  let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
+    proptest::test_runner::Config::default(),
+  ));
+  let histories = proptest::collection::vec(
+    proptest::collection::vec(proptest::option::of((0u8..7, any::<bool>())), SLOTS.len()),
+    1..8,
+  );
+  runner
+    .run(&histories, |steps| {
+      history(&steps, &census);
+      Ok(())
+    })
+    .unwrap();
+  let met = [
+    ("accepted", census.accepted.get()),
+    ("skipped", census.skipped.get()),
+    ("kind changes", census.kind_changes.get()),
+    ("removed directories", census.removed_dirs.get()),
+    ("modes", census.modes.get()),
+    ("links", census.links.get()),
+    ("replaced", census.replaced.get()),
+  ];
+  for (case, count) in met {
+    assert!(count > 0, "the histories never met {case}: {met:?}");
   }
 }
