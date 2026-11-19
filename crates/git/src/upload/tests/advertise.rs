@@ -51,7 +51,13 @@ fn the_advertisement_names_what_the_design_names_in_gits_order() {
     assert!(ours.supports(b"fetch", feature));
   }
   assert_eq!(ours.object_format(), Some(ObjectFormat::Sha1));
-  assert!(ours.get(b"agent").flatten().unwrap().starts_with(b"slates/"));
+  assert!(
+    ours
+      .get(b"agent")
+      .flatten()
+      .unwrap()
+      .starts_with(b"slates/")
+  );
 }
 
 /// A-640 part 2 (git's advertisement of the same repository, `fixtures/advertisement.bin`): do read stock git 2.50.1's
@@ -90,7 +96,10 @@ fn a_request_past_the_advertisement_is_refused_in_gits_words() {
   ]
   .concat();
   let (bytes, answer) = answer_v2(&fixture, &bundle);
-  assert_eq!(answer.refusal(), Some(&Refusal::Command(Command::BundleUri)));
+  assert_eq!(
+    answer.refusal(),
+    Some(&Refusal::Command(Command::BundleUri))
+  );
   assert_eq!(bytes, pkt(b"ERR invalid command 'bundle-uri'"));
 
   let promisor = [

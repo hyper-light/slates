@@ -18,7 +18,7 @@
 //! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped.
 
 use super::answer::Answer;
-use super::{PackPlan, PackSource, Refused, Refusal, Served, Sink, charged, refs};
+use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
 use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, Pack, ShallowInfo};
 use crate::object_name::{ObjectFormat, ObjectId};
@@ -174,7 +174,8 @@ fn with_room<'a>(
   arguments: &[Line<Argument<'a>>],
   admission: &mut Admission,
 ) -> Result<Asked<'a>, Refusal> {
-  let count = |kind: fn(&Argument<'_>) -> bool| arguments.iter().filter(|line| kind(&line.value)).count();
+  let count =
+    |kind: fn(&Argument<'_>) -> bool| arguments.iter().filter(|line| kind(&line.value)).count();
   let haves = count(|argument| matches!(argument, Argument::Have(_)));
   let shallow = count(|argument| matches!(argument, Argument::Shallow(_)));
   let not = count(|argument| matches!(argument, Argument::DeepenNot(_)));
@@ -231,12 +232,10 @@ fn once_each(wanted: &[WantedRef<'_>], admission: &mut Admission) -> Result<(), 
     .map_err(Refusal::PastAdmission)?;
   let mut names: Vec<&[u8]> = wanted.iter().map(|wanted| wanted.name).collect();
   names.sort_unstable();
-  match names
-    .windows(2)
-    .find_map(|pair| match pair {
-      [earlier, later] if earlier == later => Some(*later),
-      _ => None,
-    }) {
+  match names.windows(2).find_map(|pair| match pair {
+    [earlier, later] if earlier == later => Some(*later),
+    _ => None,
+  }) {
     Some(name) => Err(Refusal::WantRefTwice {
       name: name.to_vec(),
     }),
@@ -273,7 +272,9 @@ fn written<P: PackSource>(
         thin: asked.flags.thin,
         ofs_delta: asked.flags.ofs_delta,
       };
-      let source = packs.begin(served, &plan, admission).map_err(Refusal::Pack)?;
+      let source = packs
+        .begin(served, &plan, admission)
+        .map_err(Refusal::Pack)?;
       let (bytes, (response, at)) = charged(admission, |out| {
         before_pack(&pack, &asked.wanted, format, multiplexed, out)
       })?;

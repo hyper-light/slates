@@ -3,6 +3,7 @@
 //! in for A-639's.
 
 mod advertise;
+mod clone;
 mod fetch;
 mod ls_refs;
 mod refused;
@@ -19,7 +20,7 @@ use crate::Admission;
 use crate::entry::{self, Representation};
 use crate::http::Version;
 use crate::negotiation::Graph;
-use crate::object_name::{ObjectFormat, ObjectId};
+use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::out::Out;
 use crate::pack;
 use crate::pktline::{self, Packet};
@@ -75,7 +76,10 @@ impl PackSource for WholeObjects<'_> {
   ) -> Result<WholePack, PackRefused> {
     self.begun += 1;
     let graph = StoreGraph::new(served.repository, served.store, served.refs);
-    Ok((whole_pack(&graph, &positions(&graph, plan), self.objects), 0))
+    Ok((
+      whole_pack(&graph, &positions(&graph, plan), self.objects),
+      0,
+    ))
   }
 
   fn write(
@@ -116,21 +120,32 @@ pub(super) fn whole_pack(
   positions: &BTreeSet<u64>,
   objects: &[Object],
 ) -> Vec<u8> {
+  let entries: Vec<(Kind, &[u8])> = positions
+    .iter()
+    .map(|node| {
+      let id = graph.id(*node);
+      let object = objects.iter().find(|object| object.id == id).unwrap();
+      (object.kind, object.content.as_slice())
+    })
+    .collect();
+  pack_of(&entries)
+}
+
+/// A pack of `entries`, each object whole and deflated, in order.
+pub(super) fn pack_of(entries: &[(Kind, &[u8])]) -> Vec<u8> {
   let mut bytes = Vec::new();
-  let count = u32::try_from(positions.len()).unwrap();
+  let count = u32::try_from(entries.len()).unwrap();
   let mut writer = pack::Writer::new(ObjectFormat::Sha1, count, &mut bytes);
   let mut at = entry::PACK_HEADER_LEN;
-  for node in positions {
-    let id = graph.id(*node);
-    let object = objects.iter().find(|object| object.id == id).unwrap();
+  for (kind, content) in entries {
     let header = entry::Header {
-      representation: Representation::Whole(object.kind),
-      size: u64::try_from(object.content.len()).unwrap(),
+      representation: Representation::Whole(*kind),
+      size: u64::try_from(content.len()).unwrap(),
     };
     let mut written = Vec::new();
     entry::write(header, at, &mut written).unwrap();
     let mut deflate = ZlibEncoder::new(Vec::new(), Compression::default());
-    deflate.write_all(&object.content).unwrap();
+    deflate.write_all(content).unwrap();
     written.extend(deflate.finish().unwrap());
     writer.put(&written);
     at += u64::try_from(written.len()).unwrap();
@@ -168,7 +183,13 @@ pub(super) fn answer_of(
 /// What the v2 request `request` is answered with by the fixture repository as A-582's fixtures name it, and the
 /// answer.
 pub(super) fn answer_v2(fixture: &served::Served, request: &[u8]) -> (Vec<u8>, Answer<WholePack>) {
-  answer_of(fixture, &REFS, MAIN_REF, Version::V2, Asked::Request(request))
+  answer_of(
+    fixture,
+    &REFS,
+    MAIN_REF,
+    Version::V2,
+    Asked::Request(request),
+  )
 }
 
 /// A data packet of `text`.

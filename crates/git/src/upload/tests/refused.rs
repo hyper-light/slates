@@ -1,6 +1,8 @@
 //! Refusals, each answered in git's words (A-640 part 2; the module's **Refusals**), and hostile requests.
 
-use super::{MAIN_REF, WholeObjects, WholePack, answer_of, answer_v2, command, naming, pkt, serving};
+use super::{
+  MAIN_REF, WholeObjects, WholePack, answer_of, answer_v2, command, naming, pkt, serving,
+};
 use crate::fixtures::{FETCH_CLONE_REQUEST, FETCH_HAVES_REQUEST};
 use crate::http::Version;
 use crate::negotiation;
@@ -11,8 +13,8 @@ use crate::store::NamedRef;
 use crate::upload::{
   ABORT, Asked, PackPlan, PackRefused, PackSource, Refusal, Served, Written, serve,
 };
-use crate::v2::fetch::{Event, Section, decode_response};
 use crate::v2::Line;
+use crate::v2::fetch::{Event, Section, decode_response};
 use crate::{Admission, PastAdmission};
 
 /// Format: an id no object of the fixture has.
@@ -40,7 +42,10 @@ fn a_want_the_store_lacks_is_not_our_ref_plainly_or_on_band_three() {
   );
   let words = format!("upload-pack: not our ref {UNKNOWN}");
   assert_eq!(bytes, pkt(&[b"ERR ", words.as_bytes()].concat()));
-  let multiplexed = command("fetch", &[b"sideband-all", &naming("want", UNKNOWN), b"done"]);
+  let multiplexed = command(
+    "fetch",
+    &[b"sideband-all", &naming("want", UNKNOWN), b"done"],
+  );
   let (bytes, _) = answer_v2(&fixture, &multiplexed);
   assert_eq!(bytes, on_band_three(words.as_bytes()));
 }
@@ -61,7 +66,12 @@ fn a_ref_wanted_by_name_must_exist_and_be_wanted_once() {
   assert_eq!(bytes, pkt(b"ERR unknown ref refs/heads/nope"));
   let twice = command(
     "fetch",
-    &[b"want-ref refs/heads/side", b"want-ref refs/heads/main", b"want-ref refs/heads/side", b"done"],
+    &[
+      b"want-ref refs/heads/side",
+      b"want-ref refs/heads/main",
+      b"want-ref refs/heads/side",
+      b"done",
+    ],
   );
   let (_, answer) = answer_v2(&fixture, &twice);
   assert_eq!(
@@ -77,7 +87,10 @@ fn a_ref_wanted_by_name_must_exist_and_be_wanted_once() {
 #[test]
 fn deepen_not_must_name_exactly_one_ref() {
   let mut fixture = served::served();
-  let nowhere = command("fetch", &[&naming("want", THIRD), b"deepen-not nowhere", b"done"]);
+  let nowhere = command(
+    "fetch",
+    &[&naming("want", THIRD), b"deepen-not nowhere", b"done"],
+  );
   let (bytes, answer) = answer_v2(&fixture, &nowhere);
   assert_eq!(
     answer.refusal(),
@@ -89,7 +102,12 @@ fn deepen_not_must_name_exactly_one_ref() {
     bytes,
     pkt(b"ERR git upload-pack: deepen-not is not a ref: deepen-not nowhere")
   );
-  served::commit(&mut fixture.repository, &mut fixture.store, &[], &[(4, FIRST)]);
+  served::commit(
+    &mut fixture.repository,
+    &mut fixture.store,
+    &[],
+    &[(4, FIRST)],
+  );
   let refs = [
     REFS[0],
     REFS[1],
@@ -99,8 +117,17 @@ fn deepen_not_must_name_exactly_one_ref() {
     },
     REFS[2],
   ];
-  let ambiguous = command("fetch", &[&naming("want", THIRD), b"deepen-not v1", b"done"]);
-  let (_, answer) = answer_of(&fixture, &refs, MAIN_REF, Version::V2, Asked::Request(&ambiguous));
+  let ambiguous = command(
+    "fetch",
+    &[&naming("want", THIRD), b"deepen-not v1", b"done"],
+  );
+  let (_, answer) = answer_of(
+    &fixture,
+    &refs,
+    MAIN_REF,
+    Version::V2,
+    Asked::Request(&ambiguous),
+  );
   assert_eq!(
     answer.refusal(),
     Some(&Refusal::DeepenNotAmbiguous {
@@ -114,7 +141,10 @@ fn deepen_not_must_name_exactly_one_ref() {
 #[test]
 fn a_filter_git_does_not_read_is_refused_and_sparse_oid_waits_for_part_four() {
   let fixture = served::served();
-  let nonsense = command("fetch", &[&naming("want", THIRD), b"filter nonsense", b"done"]);
+  let nonsense = command(
+    "fetch",
+    &[&naming("want", THIRD), b"filter nonsense", b"done"],
+  );
   let (bytes, answer) = answer_v2(&fixture, &nonsense);
   assert!(matches!(answer.refusal(), Some(Refusal::Filter(_))));
   assert_eq!(bytes, pkt(b"ERR upload-pack: invalid filter-spec"));
@@ -156,8 +186,14 @@ fn an_answer_past_its_admission_is_refused() {
       answer.refusal()
     );
     let mut bytes = Vec::new();
-    assert_eq!(answer.write(&served, &mut source, &mut bytes, usize::MAX), Written::End);
-    assert!(bytes.get(4..).is_some_and(|data| data.starts_with(b"ERR ")), "room {room}");
+    assert_eq!(
+      answer.write(&served, &mut source, &mut bytes, usize::MAX),
+      Written::End
+    );
+    assert!(
+      bytes.get(4..).is_some_and(|data| data.starts_with(b"ERR ")),
+      "room {room}"
+    );
   }
   let (_, answer) = answer_v2(&fixture, FETCH_CLONE_REQUEST);
   assert_eq!(answer.refusal(), None);
@@ -172,7 +208,10 @@ fn protocol_v0_and_v1_are_refused_until_part_three() {
     for asked in [Asked::Advertise, Asked::Request(FETCH_CLONE_REQUEST)] {
       let (bytes, answer) = answer_of(&fixture, &REFS, MAIN_REF, version, asked);
       assert_eq!(answer.refusal(), Some(&Refusal::Version(version)));
-      assert_eq!(bytes, pkt(b"ERR upload-pack: protocol v0 and v1 are not served yet"));
+      assert_eq!(
+        bytes,
+        pkt(b"ERR upload-pack: protocol v0 and v1 are not served yet")
+      );
     }
   }
 }
@@ -258,7 +297,13 @@ fn a_pack_that_fails_midway_ends_with_gits_band_three_words() {
     while answer.write(&served, &mut source, &mut bytes, 7) == Written::More {}
     assert_eq!(answer.refusal(), Some(&Refusal::Pack(kept)));
     assert!(bytes.ends_with(&on_band_three(ABORT)));
-    let events = decode_response(&bytes, ObjectFormat::Sha1, false, &mut Admission::new(u64::MAX)).unwrap();
+    let events = decode_response(
+      &bytes,
+      ObjectFormat::Sha1,
+      false,
+      &mut Admission::new(u64::MAX),
+    )
+    .unwrap();
     let packed: Vec<u8> = events
       .iter()
       .filter_map(|event| match event {
@@ -269,10 +314,16 @@ fn a_pack_that_fails_midway_ends_with_gits_band_three_words() {
       .copied()
       .collect();
     assert_eq!(packed.len(), 20);
-    let others: Vec<&Event<'_>> = events.iter().filter(|event| !matches!(event, Event::Pack(_))).collect();
+    let others: Vec<&Event<'_>> = events
+      .iter()
+      .filter(|event| !matches!(event, Event::Pack(_)))
+      .collect();
     assert_eq!(
       others,
-      [&Event::Header(Line::lf(Section::Packfile)), &Event::Error(ABORT)]
+      [
+        &Event::Header(Line::lf(Section::Packfile)),
+        &Event::Error(ABORT)
+      ]
     );
   }
 }
@@ -303,11 +354,17 @@ fn every_cut_and_flip_of_a_request_is_refused_or_answered_whole() {
       &mut Admission::new(1 << 20),
     );
     let mut bytes = Vec::new();
-    assert_eq!(answer.write(&served, &mut source, &mut bytes, usize::MAX), Written::End);
+    assert_eq!(
+      answer.write(&served, &mut source, &mut bytes, usize::MAX),
+      Written::End
+    );
     match answer.refusal() {
       Some(_) => refused += 1,
       None => answered += 1,
     }
   }
-  assert!(refused > 0 && answered > 0, "refused {refused}, answered {answered}");
+  assert!(
+    refused > 0 && answered > 0,
+    "refused {refused}, answered {answered}"
+  );
 }

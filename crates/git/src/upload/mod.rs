@@ -223,8 +223,13 @@ impl Refusal {
       ]),
       Refusal::UnknownRef { name } => said(&[b"unknown ref ", name]),
       Refusal::WantRefTwice { name } => said(&[b"upload-pack: want-ref sent twice: ", name]),
-      Refusal::DeepenNotRef { rev } => said(&[b"git upload-pack: deepen-not is not a ref: deepen-not ", rev]),
-      Refusal::DeepenNotAmbiguous { rev } => said(&[b"git upload-pack: ambiguous deepen-not: deepen-not ", rev]),
+      Refusal::DeepenNotRef { rev } => said(&[
+        b"git upload-pack: deepen-not is not a ref: deepen-not ",
+        rev,
+      ]),
+      Refusal::DeepenNotAmbiguous { rev } => {
+        said(&[b"git upload-pack: ambiguous deepen-not: deepen-not ", rev])
+      }
       Refusal::Filter(_) => said(&[b"upload-pack: invalid filter-spec"]),
       Refusal::Negotiation(refusal) => negotiation_words(refusal),
       Refusal::Store(_) | Refusal::Pack(_) => said(&[ABORT]),
@@ -243,9 +248,10 @@ fn negotiation_words(refusal: &negotiation::Refusal) -> Vec<u8> {
   match refusal {
     negotiation::Refusal::NotOurs { id } => said(&[b"upload-pack: not our ref ", &hex(id)]),
     negotiation::Refusal::ShallowNotCommit { id } => said(&[b"invalid shallow object ", &hex(id)]),
-    negotiation::Refusal::DeepenNotHeld { id } => {
-      said(&[b"upload-pack: deepen-not names an object not held: ", &hex(id)])
-    }
+    negotiation::Refusal::DeepenNotHeld { id } => said(&[
+      b"upload-pack: deepen-not names an object not held: ",
+      &hex(id),
+    ]),
     negotiation::Refusal::NothingSelected => said(&[b"no commits selected for shallow requests"]),
     negotiation::Refusal::ZeroDepth => said(&[b"Invalid deepen: 0"]),
     negotiation::Refusal::Filter(_) => said(&[b"upload-pack: filter not served"]),

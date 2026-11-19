@@ -122,7 +122,12 @@ fn overlapping_prefixes_list_each_ref_once_in_name_order() {
       (Some(id(THIRD)), b"HEAD".to_vec(), None, None),
       (Some(id(THIRD)), b"refs/heads/main".to_vec(), None, None),
       (Some(id(FIRST)), b"refs/heads/side".to_vec(), None, None),
-      (Some(id(TAG)), b"refs/tags/v1".to_vec(), None, Some(id(SECOND))),
+      (
+        Some(id(TAG)),
+        b"refs/tags/v1".to_vec(),
+        None,
+        Some(id(SECOND))
+      ),
     ]
   );
 }
@@ -176,9 +181,15 @@ fn named(names: &[&str], name: &str, peel: bool) -> Option<(ObjectId, Option<Obj
 
 /// The oracle: `HEAD`'s line where a prefix (or none) takes it, then every ref any prefix begins, in name order, each
 /// as the store holds it.
-fn expected(names: &[&str], prefixes: &[&str], head: &str, flags: (bool, bool, bool)) -> Vec<Listed> {
+fn expected(
+  names: &[&str],
+  prefixes: &[&str],
+  head: &str,
+  flags: (bool, bool, bool),
+) -> Vec<Listed> {
   let (peel, symrefs, unborn) = flags;
-  let takes = |name: &str| prefixes.is_empty() || prefixes.iter().any(|prefix| name.starts_with(prefix));
+  let takes =
+    |name: &str| prefixes.is_empty() || prefixes.iter().any(|prefix| name.starts_with(prefix));
   let mut lines = Vec::new();
   if takes("HEAD") {
     let symref = symrefs.then(|| head.as_bytes().to_vec());
@@ -196,7 +207,12 @@ fn expected(names: &[&str], prefixes: &[&str], head: &str, flags: (bool, bool, b
 }
 
 /// What the store answers: a repository with `names`, each a green at its target, served with `head`.
-fn answered(names: &[&str], prefixes: &[&str], head: &str, flags: (bool, bool, bool)) -> Vec<Listed> {
+fn answered(
+  names: &[&str],
+  prefixes: &[&str],
+  head: &str,
+  flags: (bool, bool, bool),
+) -> Vec<Listed> {
   let mut fixture = served::served();
   let moves: Vec<(u64, &str)> = (0..names.len())
     .map(|index| (green(index), TARGETS[index % TARGETS.len()]))
@@ -218,10 +234,20 @@ fn answered(names: &[&str], prefixes: &[&str], head: &str, flags: (bool, bool, b
     .filter(|(asked, _)| *asked)
     .map(|(_, word)| word.as_bytes().to_vec())
     .collect();
-  arguments.extend(prefixes.iter().map(|prefix| format!("ref-prefix {prefix}").into_bytes()));
+  arguments.extend(
+    prefixes
+      .iter()
+      .map(|prefix| format!("ref-prefix {prefix}").into_bytes()),
+  );
   let arguments: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
   let request = command("ls-refs", &arguments);
-  let (bytes, answer) = answer_of(&fixture, &refs, head.as_bytes(), Version::V2, Asked::Request(&request));
+  let (bytes, answer) = answer_of(
+    &fixture,
+    &refs,
+    head.as_bytes(),
+    Version::V2,
+    Asked::Request(&request),
+  );
   assert_eq!(answer.refusal(), None);
   listed(&bytes)
 }

@@ -2,15 +2,15 @@
 
 use proptest::prelude::*;
 
-use super::{MAIN_REF, WholeObjects, answer_v2, serving};
+use super::{MAIN_REF, WholeObjects, answer_v2, read_fetch, serving};
 use crate::Admission;
-use crate::fixtures::{FETCH_CLONE_REQUEST, LS_REFS_REQUEST};
+use crate::fixtures::{FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE, LS_REFS_REQUEST, LS_REFS_RESPONSE};
 use crate::http::Version;
+use crate::object_name::ObjectFormat;
 use crate::served::{self, REFS};
 use crate::sideband::MAX_BAND_DATA;
 use crate::upload::{Asked, PackPlan, PackRefused, PackSource, Served, Written, serve};
 use crate::v2::fetch::{Event, decode_response};
-use crate::object_name::ObjectFormat;
 
 /// The answer to `request`, its pack from `source`, written in steps of at most `room` bytes: its bytes, and how many
 /// bytes each step wrote.
@@ -49,7 +49,12 @@ struct Counting {
 impl PackSource for Counting {
   type Pack = usize;
 
-  fn begin(&mut self, _: &Served<'_>, _: &PackPlan<'_>, _: &mut Admission) -> Result<usize, PackRefused> {
+  fn begin(
+    &mut self,
+    _: &Served<'_>,
+    _: &PackPlan<'_>,
+    _: &mut Admission,
+  ) -> Result<usize, PackRefused> {
     Ok(0)
   }
 
@@ -71,20 +76,40 @@ impl PackSource for Counting {
 /// either side, and more than the whole answer.
 const ROOMS: [usize; 9] = [1, 2, 4, 5, 65_519, 65_520, 65_521, 4096, 1 << 22];
 
+/// The clone's answer written in one step, held first to stock git's: its sections, and its pack's objects.
+fn clone_answer(fixture: &served::Served) -> Vec<u8> {
+  let (whole, _) = answer_v2(fixture, FETCH_CLONE_REQUEST);
+  assert_eq!(
+    read_fetch(&whole, false, &fixture.objects),
+    read_fetch(FETCH_CLONE_RESPONSE, false, &fixture.objects)
+  );
+  whole
+}
+
 /// A-640 part 2 (a step writes at most its room, and always moves): do write the clone's answer and the `ls-refs`
-/// answer in steps of each edge room. Expect: the same bytes as one step writes, every step within its room, every step
-/// but the last writing at least one byte, and one byte a step at a room of one.
+/// answer, each first held to stock git's, in steps of each edge room. Expect: the same bytes as one step writes,
+/// every step within its room, every step but the last writing at least one byte, and one byte a step at a room of one.
 #[test]
 fn an_answer_written_in_steps_of_any_room_is_the_answer_written_whole() {
   let fixture = served::served();
-  for request in [FETCH_CLONE_REQUEST, LS_REFS_REQUEST] {
-    let (whole, _) = answer_v2(&fixture, request);
+  let (ls_refs, _) = answer_v2(&fixture, LS_REFS_REQUEST);
+  assert_eq!(ls_refs, LS_REFS_RESPONSE);
+  let clone = clone_answer(&fixture);
+  for (request, whole) in [(FETCH_CLONE_REQUEST, &clone), (LS_REFS_REQUEST, &ls_refs)] {
     for room in ROOMS {
-      let (bytes, steps) = stepped(&fixture, request, room, &mut WholeObjects::new(&fixture.objects));
-      assert_eq!(bytes, whole, "room {room}");
+      let (bytes, steps) = stepped(
+        &fixture,
+        request,
+        room,
+        &mut WholeObjects::new(&fixture.objects),
+      );
+      assert_eq!(&bytes, whole, "room {room}");
       assert!(steps.iter().all(|step| *step <= room), "room {room}");
       let (last, before) = steps.split_last().unwrap();
-      assert!(before.iter().all(|step| *step > 0) && *last <= room, "room {room}");
+      assert!(
+        before.iter().all(|step| *step > 0) && *last <= room,
+        "room {room}"
+      );
       if room == 1 {
         assert_eq!(steps.iter().filter(|step| **step == 1).count(), whole.len());
       }
@@ -98,12 +123,12 @@ proptest! {
     ..proptest::test_runner::Config::default()
   }))]
 
-  /// A-640 part 2: do write the clone's answer in steps of a generated room. Expect: the answer written whole, each step
-  /// within its room.
+  /// A-640 part 2: do write the clone's answer, held first to stock git's, in steps of a generated room. Expect: the
+  /// answer written whole, each step within its room.
   #[test]
   fn any_room_writes_the_same_answer(room in 1usize..200_000) {
     let fixture = served::served();
-    let (whole, _) = answer_v2(&fixture, FETCH_CLONE_REQUEST);
+    let whole = clone_answer(&fixture);
     let (bytes, steps) = stepped(&fixture, FETCH_CLONE_REQUEST, room, &mut WholeObjects::new(&fixture.objects));
     prop_assert_eq!(bytes, whole);
     prop_assert!(steps.iter().all(|step| *step <= room));
@@ -117,8 +142,19 @@ proptest! {
 fn a_pack_longer_than_a_packet_goes_out_in_full_packets() {
   let fixture = served::served();
   let len = 200_000;
-  let (whole, _) = stepped(&fixture, FETCH_CLONE_REQUEST, usize::MAX, &mut Counting { len });
-  let events = decode_response(&whole, ObjectFormat::Sha1, false, &mut Admission::new(u64::MAX)).unwrap();
+  let (whole, _) = stepped(
+    &fixture,
+    FETCH_CLONE_REQUEST,
+    usize::MAX,
+    &mut Counting { len },
+  );
+  let events = decode_response(
+    &whole,
+    ObjectFormat::Sha1,
+    false,
+    &mut Admission::new(u64::MAX),
+  )
+  .unwrap();
   let packets: Vec<&[u8]> = events
     .iter()
     .filter_map(|event| match event {
@@ -126,9 +162,14 @@ fn a_pack_longer_than_a_packet_goes_out_in_full_packets() {
       _ => None,
     })
     .collect();
-  assert_eq!(packets.concat(), (0..len).map(|byte| byte as u8).collect::<Vec<u8>>());
+  assert_eq!(
+    packets.concat(),
+    (0..len).map(|byte| byte as u8).collect::<Vec<u8>>()
+  );
   let (last, full) = packets.split_last().unwrap();
-  assert!(full.len() == len / MAX_BAND_DATA && full.iter().all(|packet| packet.len() == MAX_BAND_DATA));
+  assert!(
+    full.len() == len / MAX_BAND_DATA && full.iter().all(|packet| packet.len() == MAX_BAND_DATA)
+  );
   assert_eq!(last.len(), len % MAX_BAND_DATA);
   for room in ROOMS {
     let (bytes, steps) = stepped(&fixture, FETCH_CLONE_REQUEST, room, &mut Counting { len });

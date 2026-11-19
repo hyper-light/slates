@@ -247,13 +247,22 @@ fn error_line(refusal: &Refusal, multiplexed: bool) -> Vec<u8> {
   let words = refusal.words();
   let mut line = Vec::new();
   if multiplexed {
-    sideband::write(Band::Error, words.get(..MAX_BAND_DATA).unwrap_or(&words), &mut line);
+    sideband::write(
+      Band::Error,
+      words.get(..MAX_BAND_DATA).unwrap_or(&words),
+      &mut line,
+    );
     return line;
   }
   let text = [ERR, &words].concat();
   // The text is cut to what a packet's data holds, so the write cannot be refused; were it refused, the answer would be
   // empty rather than malformed.
-  if pktline::write(Packet::Data(text.get(..pktline::MAX_DATA).unwrap_or(&text)), &mut line).is_err() {
+  if pktline::write(
+    Packet::Data(text.get(..pktline::MAX_DATA).unwrap_or(&text)),
+    &mut line,
+  )
+  .is_err()
+  {
     line.clear();
   }
   line

@@ -21,9 +21,21 @@ use crate::v2::{Ending, Line};
 const EXCHANGES: [(&str, &[u8], &[u8]); 5] = [
   ("fetch-clone", FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE),
   ("fetch-haves", FETCH_HAVES_REQUEST, FETCH_HAVES_RESPONSE),
-  ("fetch-shallow", FETCH_SHALLOW_REQUEST, FETCH_SHALLOW_RESPONSE),
-  ("fetch-ref-in-want", FETCH_REF_IN_WANT_REQUEST, FETCH_REF_IN_WANT_RESPONSE),
-  ("fetch-progress", FETCH_PROGRESS_REQUEST, FETCH_PROGRESS_RESPONSE),
+  (
+    "fetch-shallow",
+    FETCH_SHALLOW_REQUEST,
+    FETCH_SHALLOW_RESPONSE,
+  ),
+  (
+    "fetch-ref-in-want",
+    FETCH_REF_IN_WANT_REQUEST,
+    FETCH_REF_IN_WANT_RESPONSE,
+  ),
+  (
+    "fetch-progress",
+    FETCH_PROGRESS_REQUEST,
+    FETCH_PROGRESS_RESPONSE,
+  ),
 ];
 
 /// A-640 part 2 (§4.17.2 "A fetch"; git's `fetch-clone`, `fetch-haves`, `fetch-shallow`, `fetch-ref-in-want` and
@@ -72,7 +84,10 @@ fn a_multiplexed_request_is_answered_on_band_one_throughout() {
     events,
     [Event::Header(Line::lf(Section::Packfile)), Event::Flush]
   );
-  assert_eq!(names, read_fetch(FETCH_CLONE_RESPONSE, false, &fixture.objects).1);
+  assert_eq!(
+    names,
+    read_fetch(FETCH_CLONE_RESPONSE, false, &fixture.objects).1
+  );
 }
 
 /// A-640 part 2 (the document's order, which git's client requires): do want `main` by name and deepen by one.
@@ -81,7 +96,10 @@ fn a_multiplexed_request_is_answered_on_band_one_throughout() {
 #[test]
 fn shallow_info_comes_before_wanted_refs_as_the_document_orders_them() {
   let fixture = served::served();
-  let request = command("fetch", &[b"want-ref refs/heads/main", b"deepen 1", b"done"]);
+  let request = command(
+    "fetch",
+    &[b"want-ref refs/heads/main", b"deepen 1", b"done"],
+  );
   let (bytes, answer) = answer_v2(&fixture, &request);
   assert_eq!(answer.refusal(), None);
   let (events, _) = read_fetch(&bytes, false, &fixture.objects);
@@ -108,7 +126,10 @@ fn shallow_info_comes_before_wanted_refs_as_the_document_orders_them() {
 #[test]
 fn a_ref_wanted_by_name_is_read_through_head_and_named_back() {
   let fixture = served::served();
-  let request = command("fetch", &[b"want-ref HEAD", b"want-ref refs/tags/v1", b"done"]);
+  let request = command(
+    "fetch",
+    &[b"want-ref HEAD", b"want-ref refs/tags/v1", b"done"],
+  );
   let (bytes, answer) = answer_v2(&fixture, &request);
   assert_eq!(answer.refusal(), None);
   let (events, names) = read_fetch(&bytes, false, &fixture.objects);
@@ -138,7 +159,10 @@ fn a_ref_wanted_by_name_is_read_through_head_and_named_back() {
 #[test]
 fn deepen_not_finds_a_ref_by_its_short_name() {
   let fixture = served::served();
-  let request = command("fetch", &[&naming("want", THIRD), b"deepen-not side", b"done"]);
+  let request = command(
+    "fetch",
+    &[&naming("want", THIRD), b"deepen-not side", b"done"],
+  );
   let (bytes, answer) = answer_v2(&fixture, &request);
   assert_eq!(answer.refusal(), None);
   let (events, names) = read_fetch(&bytes, false, &fixture.objects);
@@ -175,7 +199,11 @@ fn acknowledgments_alone_end_a_round_that_is_not_ready() {
   );
   let waiting = command(
     "fetch",
-    &[&naming("want", THIRD), &naming("have", FIRST), b"wait-for-done"],
+    &[
+      &naming("want", THIRD),
+      &naming("have", FIRST),
+      b"wait-for-done",
+    ],
   );
   let (bytes, _) = answer_v2(&fixture, &waiting);
   assert_eq!(
