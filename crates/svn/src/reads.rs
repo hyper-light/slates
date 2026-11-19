@@ -32,10 +32,10 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments` and `get-deleted-rev` (each its own
-//! module, `file`, `list`, `segments` and `deleted`). Owed with this piece: `log` with merged revisions,
-//! `get-file-revs`, and read access by the authorization rules (A-606): today every path is readable, as in an
-//! `anon-access = read` repository with no rules.
+//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments`, `get-deleted-rev` and `log` (each
+//! its own module, `file`, `list`, `segments`, `deleted` and `log`, over FSFS's node history in `history`). Owed with
+//! this piece: `log`'s merged revisions, `get-file-revs`, and read access by the authorization rules (A-606): today
+//! every path is readable, as in an `anon-access = read` repository with no rules.
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
@@ -169,7 +169,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 18] = [
+const ELSEWHERE: [&str; 17] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -178,7 +178,6 @@ const ELSEWHERE: [&str; 18] = [
   "switch",
   "status",
   "diff",
-  "log",
   "get-file-revs",
   "lock",
   "lock-many",
@@ -375,6 +374,7 @@ pub fn answer<R: Repository + ?Sized>(
     "list" => reads.list(params),
     "get-location-segments" => reads.location_segments(params),
     "get-deleted-rev" => reads.deleted_revision(params),
+    "log" => reads.log(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -1724,7 +1724,9 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 mod deleted;
 mod file;
+mod history;
 mod list;
+mod log;
 mod segments;
 mod stream;
 

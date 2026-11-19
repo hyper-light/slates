@@ -218,7 +218,13 @@ impl Fixture {
         .unwrap(),
     });
     let had = tree.get(&path).is_some_and(|node| node.1.has_mergeinfo());
-    let properties = field("props").map(|list| self.list(list));
+    // FSFS records no property change for a node added with an empty property block (recorded: `/trunk A` with
+    // `( dir false false )` in the `log` session), so such a row carries no property list.
+    let properties = field("props")
+      .map(|list| self.list(list))
+      .filter(|list| {
+        !(matches!(action, Action::Add | Action::Replace) && *list == PropertyList::Empty)
+      });
     let text = field("text").map(|text| {
       let bytes = unhex(text);
       let (md5, sha1) = (unhex(field("md5").unwrap()), unhex(field("sha1").unwrap()));
@@ -507,6 +513,10 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("hostile-list"), 0),
     (transcript!("get-location-segments"), 16),
     (transcript!("get-deleted-rev"), 15),
+    (transcript!("log"), 16),
+    (transcript!("hostile-log-word"), 0),
+    (transcript!("hostile-log-path"), 0),
+    (transcript!("hostile-log-seven"), 0),
     (transcript!("unknown-command"), 2),
     (transcript!("hostile-malformed"), 0),
   ];
@@ -529,6 +539,7 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-cat"), 4),
     (transcript!("svn-cat-big"), 3),
     (transcript!("svn-ls"), 2),
+    (transcript!("svn-log"), 4),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
@@ -545,6 +556,11 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "log",
+    "hostile-log-word",
+    "hostile-log-path",
+    "hostile-log-seven",
+    "svn-log",
     "get-deleted-rev",
     "get-location-segments",
     "list",
@@ -1047,6 +1063,62 @@ fn deleted_revision_parameters_are_read_as_svnserve_reads_them() {
   }
 }
 
+/// A-613 part 2 (`log`): its parameters as `vparse_tuple` reads `"l(?r)(?r)bb?n?Bwl"`: four, seven or eight items, a
+/// limit that is no number, a word for the merged flag that is no boolean, a revision-property name that is no string
+/// and a word that is neither `all-revprops` nor `revprops` each end the connection with nothing written.
+#[test]
+fn log_parameters_are_read_as_vparse_tuple_reads_them() {
+  for malformed in [
+    b"( log ( ( 5:trunk ) ( ) ( ) false ) ) ".as_slice(),
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false revprops ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false word ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 maybe revprops ( ) ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false revprops ( name ) ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false props ( ) ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+}
+
+/// A-613 part 2 (`log`): the log streams a revision a step, the same bytes in a room of one byte as in a room past the
+/// answer; and until merged revisions are built a log asking for them is refused after `done` with Subversion's
+/// refusal of a feature not offered, never answered without them.
+#[test]
+fn a_log_streams_a_revision_a_step_and_refuses_merged_revisions_until_built() {
+  let fixture = Fixture::new();
+  let command = b"( log ( ( 0: ) ( 11 ) ( 0 ) false false 0 false revprops ( ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert!(narrow_slices > 12 && wide_slices == 1, "{narrow_slices}");
+  let command = b"( log ( ( 5:trunk ) ( 11 ) ( 0 ) false false 0 true revprops ( ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert!(out.ends_with(b"done ( failure ( ( 200007 36:Trying to use an unsupported feature 0: 0 ) ) ) "));
+}
+
+/// A-613 part 2 (`log`): a path past `MAX_OPEN_HISTORIES` has its history opened again at each step
+/// (`get_history`), one step past the last location and two after the first time; its log is the same as the same
+/// path's with its history kept open, across a copy.
+#[test]
+fn a_history_opened_again_at_each_step_walks_as_one_kept_open() {
+  let fixture = Fixture::new();
+  let mut many = String::new();
+  for _ in 0..32 {
+    many.push_str("9:trunk/dir ");
+  }
+  let reopened = format!("( log ( ( {many}11:tags/t1/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) ");
+  let kept = b"( log ( ( 11:tags/t1/dir 9:trunk/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) ";
+  let (_, reopened, _) = streamed(&fixture, &fixture.green, reopened.as_bytes(), usize::MAX);
+  let (_, kept, _) = streamed(&fixture, &fixture.green, kept, usize::MAX);
+  assert_eq!(String::from_utf8(reopened).unwrap(), String::from_utf8(kept).unwrap());
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -1093,7 +1165,7 @@ proptest! {
     name in prop::sample::select(vec![
       "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
       "get-mergeinfo", "get-iprops", "get-file", "list", "get-location-segments", "get-deleted-rev",
-      "no-such-command",
+      "log", "no-such-command",
     ]),
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {
