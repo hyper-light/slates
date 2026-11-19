@@ -9,7 +9,11 @@
 //! claim names its kind (a version-2 hello). Both ids carry their owner partition in their high 16 bits, which is how
 //! an exchange finds the shard that holds the offer.
 //! The offer is claimed once: an exchange asks the owner shard to check the claim's proof and hand over the end and its
-//! resync end ([`take`]), so the secret never leaves the shard that made it.
+//! resync end ([`take`]), so the secret never leaves the shard that made it. The owner keeps the ends until the exchange
+//! settles its claim (A-512): the take marks the offer claimed by the exchange and answers copies of the ends, so an
+//! answer lost on its way back loses nothing and the exchange's second ask is answered the same ends, while every other
+//! exchange finds no offer; the exchange then retires the offer once the client has its ends, or leaves it claimable
+//! again when the hand-over failed ([`settle`]).
 //!
 //! **An offer waits for its claim while the client it is for lives (A-492).** It goes when it is claimed, when what it
 //! offers ends first (a stream's attachment, a map's copy let go: [`withdraw`]), or when the reaper retires its client on
@@ -66,6 +70,10 @@ pub(crate) struct Offer {
   client: u32,
   descriptor: OwnedFd,
   resync: Option<OwnedFd>,
+  /// The exchange whose claim took the offer, by its daemon nonce, until that exchange settles the claim ([`settle`],
+  /// A-512): its asks are answered copies of the ends, every other exchange finds no offer, and the ends stay here, so an
+  /// answer lost on its way back loses nothing.
+  claimed_by: Option<[u8; NONCE_BYTES]>,
 }
 
 /// What a claim takes from an offer: the offered descriptor, and a stream's resync end beside it.
@@ -104,6 +112,7 @@ pub(crate) fn offer(
       client,
       descriptor,
       resync,
+      claimed_by: None,
     },
   );
 }
@@ -133,10 +142,17 @@ pub(crate) fn let_go_of_client(s: &mut ShardState, client: u32) -> usize {
   let_go
 }
 
-/// Hands over the descriptors of the offer `hello` names to the claim whose `proof` opens under the offer's secret with
-/// these nonces, retiring the offer, with the daemon's confirmation to send beside them; or the refusal: no offer (none
-/// made, claimed, withdrawn, or let go with its client), a proof that does not hold. Run on the shard that holds the
-/// offer, where its secret is.
+/// Hands copies of the descriptors of the offer `hello` names to the claim whose `proof` opens under the offer's secret
+/// with these nonces, claiming the offer for that exchange (its `daemon_nonce`), with the daemon's confirmation to send
+/// beside them; or the refusal: no offer (none made, claimed by another exchange or retired, withdrawn, or let go with
+/// its client), a proof that does not hold, or `Busy` when the process's descriptor limit refuses the copies (the offer
+/// left as it was). Run on the shard that holds the offer, where its secret is.
+///
+/// **Claimed, then settled (A-512).** The ends stay with the offer until the exchange settles its claim ([`settle`]):
+/// retired once the client has its own, claimable again when the hand-over failed. An exchange's ask whose answer is lost
+/// (an owner shard stopped for a window runs it once it resumes, after the exchange forgot it) loses only the copies, and
+/// the exchange's next ask is answered the same claim and copies of the same ends. Until A-512 the take retired the
+/// offer and moved its ends into the answer, so a lost answer closed them, and a claim asked again found no offer.
 pub(crate) fn take(
   s: &mut ShardState,
   hello: Hello,
@@ -144,9 +160,15 @@ pub(crate) fn take(
   proof: [u8; SEALED_BYTES],
 ) -> Result<([u8; SEALED_BYTES], Taken), RouteRefusal> {
   let offers = offers_of(s, hello.kind);
-  let Some(offer) = offers.get(&hello.id) else {
+  let Some(offer) = offers.get_mut(&hello.id) else {
     return Err(RouteRefusal::NoOffer);
   };
+  if offer
+    .claimed_by
+    .is_some_and(|claimant| claimant != daemon_nonce)
+  {
+    return Err(RouteRefusal::NoOffer);
+  }
   let exchange = Exchange::new(
     &offer.secret,
     (hello.kind, hello.id),
@@ -160,14 +182,52 @@ pub(crate) fn take(
   let confirmation = exchange
     .confirmation()
     .map_err(|_| RouteRefusal::Malformed)?;
-  let offer = offers.remove(&hello.id).ok_or(RouteRefusal::NoOffer)?;
-  Ok((
-    confirmation,
-    Taken {
-      descriptor: offer.descriptor,
-      resync: offer.resync,
-    },
-  ))
+  let descriptor = offer
+    .descriptor
+    .try_clone()
+    .map_err(|_| RouteRefusal::Busy)?;
+  let resync = match offer.resync.as_ref() {
+    Some(end) => Some(end.try_clone().map_err(|_| RouteRefusal::Busy)?),
+    None => None,
+  };
+  offer.claimed_by = Some(daemon_nonce);
+  Ok((confirmation, Taken { descriptor, resync }))
+}
+
+/// How an exchange's claim ended ([`settle`], A-512).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+  /// The client has the ends: the offer is retired.
+  Handed,
+  /// The hand-over failed, or no answer came back: the offer is claimable again.
+  NotHanded,
+}
+
+/// Settles the claim exchange `daemon_nonce` made on the `kind` offer `id` (A-512): `Handed` retires the offer, its ends
+/// here closed since the client holds its own; `NotHanded` leaves it claimable again, its ends kept, so a failed
+/// hand-over loses nothing. An offer this exchange holds no claim on (it was refused, or the offer was withdrawn or let go
+/// with its client meanwhile) is left as it is. Run on the shard that holds the offer, after every ask of that exchange,
+/// since the same channel carries them before it. Whether the exchange's claim was there.
+pub(crate) fn settle(
+  s: &mut ShardState,
+  (kind, id): (OfferKind, u64),
+  daemon_nonce: [u8; NONCE_BYTES],
+  settled: Settled,
+) -> bool {
+  let offers = offers_of(s, kind);
+  let Some(offer) = offers.get_mut(&id) else {
+    return false;
+  };
+  if offer.claimed_by != Some(daemon_nonce) {
+    return false;
+  }
+  match settled {
+    Settled::Handed => {
+      offers.remove(&id);
+    }
+    Settled::NotHanded => offer.claimed_by = None,
+  }
+  true
 }
 
 /// Serves the route's listener on this shard (the control shard): each wake accepts every waiting connection and runs
@@ -246,15 +306,7 @@ enum Ended {
 /// (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`).
 async fn exchange(connection: OwnedFd) {
   let ended = match claim(connection.as_fd()).await {
-    Ok(claim) => match hand_over(connection.as_fd(), claim).await {
-      Ok(sent) => {
-        // The client's close, or its process's end, says its receive has returned; the ends are closed only after it.
-        client_closes(connection.as_fd()).await;
-        drop(sent);
-        None
-      }
-      Err(ended) => Some(ended),
-    },
+    Ok(claim) => claimed(connection.as_fd(), claim).await,
     Err(ended) => Some(ended),
   };
   if let Some(Ended::Refused(refusal)) = &ended {
@@ -337,23 +389,62 @@ async fn claim(connection: BorrowedFd<'_>) -> Result<Claim, Ended> {
   })
 }
 
-/// The daemon's part: the owner shard's verdict ([`take_from_owner`]), then the confirmation with the end (and a
-/// stream's resync end beside it); the ends returned, still held, for the caller to close once the client has its own.
-async fn hand_over(connection: BorrowedFd<'_>, claim: Claim) -> Result<Taken, Ended> {
+/// The daemon's part of a claim and its settling (A-512): the hand-over ([`hand_over`]); once it sent the ends, the wait
+/// for the client to close, the ends closed only after it; then the claim settled on the owner shard ([`settle`]),
+/// `Handed` once the client has its ends and `NotHanded` otherwise, so a failed hand-over leaves the offer claimable
+/// again. Every take asked is settled, a refused one too: a first ask whose answer was lost may hold the claim while the
+/// second was refused (the descriptor limit refusing its copies), and a settle where this exchange holds no claim
+/// changes nothing. The settle is waited for in the owner shard's own time, as the take is; an answer lost there still
+/// ran, or runs once that shard resumes, after the take's asks. Why the exchange ended without a claim, if it did.
+async fn claimed(connection: BorrowedFd<'_>, claim: Claim) -> Option<Ended> {
+  let Some(route) = owner_route(claim.hello.id) else {
+    return Some(Ended::Refused(RouteRefusal::NoOffer));
+  };
+  let key = (claim.hello.kind, claim.hello.id);
+  let daemon_nonce = claim.daemon_nonce;
+  let (ended, settled) = match hand_over(connection, route, claim).await {
+    Ok(sent) => {
+      // The client's close, or its process's end, says its receive has returned; the ends are closed only after it.
+      client_closes(connection).await;
+      drop(sent);
+      (None, Settled::Handed)
+    }
+    Err(ended) => (Some(ended), Settled::NotHanded),
+  };
+  let (origin, owner) = route;
+  let _settled = crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |s| settle(s, key, daemon_nonce, settled),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  ended
+}
+
+/// This shard and the shard that holds the offer `id` names: an attachment and a mapping alike carry their owner
+/// partition in their high 16 bits. `None` where no shard serves that partition.
+fn owner_route(id: u64) -> Option<(u16, u16)> {
+  state::with_state(|s| {
+    let partition = crate::verbs::owner_of_attachment(id);
+    crate::verbs::shard_of_partition(s, partition).map(|owner| (s.shard, owner))
+  })
+  .flatten()
+}
+
+/// The daemon's part of the exchange: the owner shard's verdict ([`take_from_owner`]), then the confirmation with the
+/// end (and a stream's resync end beside it); the ends returned, still held, for the caller to close once the client has
+/// its own.
+async fn hand_over(
+  connection: BorrowedFd<'_>,
+  (origin, owner): (u16, u16),
+  claim: Claim,
+) -> Result<Taken, Ended> {
   let Claim {
     hello,
     daemon_nonce,
     proof,
   } = claim;
-  let route = state::with_state(|s| {
-    // An attachment and a mapping alike carry their owner partition in their high 16 bits.
-    let partition = crate::verbs::owner_of_attachment(hello.id);
-    crate::verbs::shard_of_partition(s, partition).map(|owner| (s.shard, owner))
-  })
-  .flatten();
-  let Some((origin, owner)) = route else {
-    return Err(Ended::Refused(RouteRefusal::NoOffer));
-  };
   let (confirmation, taken) = take_from_owner(origin, owner, hello, daemon_nonce, proof).await?;
   slates_ipc::route::send_confirmation(
     connection,
@@ -367,10 +458,12 @@ async fn hand_over(connection: BorrowedFd<'_>, claim: Claim) -> Result<Taken, En
 
 /// The owner shard's verdict on a claim ([`take`]), waited for in that shard's own time (A-440; R3's class A): judged by
 /// the shard's progress over the liveness window, as every cross-shard wait in its target's own time is
-/// (`crate::xshard::within_shard_time`, A-65's rule), never by a wait of the exchange's own (A-492). The take retires
-/// the offer and hands its ends over, once: it was waited one window on the wall, so a busy owner shard took the offer
-/// after the exchange had given up, the ends were dropped with the late answer, and the client, its claim failed, found
-/// no offer to claim again. Only a shard that stopped, or ran its budget without answering, fails it.
+/// (`crate::xshard::within_shard_time`, A-65's rule), never by a wait of the exchange's own (A-492). It was waited one
+/// window on the wall, so a busy owner shard took the offer after the exchange had given up, the ends were dropped with
+/// the late answer, and the client, its claim failed, found no offer to claim again. A shard that stopped, or ran its
+/// budget without answering, is asked once more (A-512): the second ask runs behind the first on that shard's channel,
+/// so it is answered the claim the first made, with copies of the same ends, and never takes another's. Only when both
+/// answers are lost does the exchange fail, and its settle then leaves the offer claimable again.
 async fn take_from_owner(
   origin: u16,
   owner: u16,
@@ -378,13 +471,18 @@ async fn take_from_owner(
   daemon_nonce: [u8; NONCE_BYTES],
   proof: [u8; SEALED_BYTES],
 ) -> Result<([u8; SEALED_BYTES], Taken), Ended> {
-  let taken = crate::xshard::call_in_shard_time(
-    origin,
-    owner,
-    move |s| take(s, hello, daemon_nonce, proof),
-    crate::daemon::LIVENESS_BUDGET_NS,
-  )
-  .await;
+  let ask = || {
+    crate::xshard::call_in_shard_time(
+      origin,
+      owner,
+      move |s| take(s, hello, daemon_nonce, proof),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+  };
+  let taken = match ask().await {
+    Some(answer) => Some(answer),
+    None => ask().await,
+  };
   match taken {
     Some(Ok(taken)) => Ok(taken),
     Some(Err(refusal)) => Err(Ended::Refused(refusal)),
@@ -475,6 +573,8 @@ mod tests {
   const CLIENT_NONCE: [u8; NONCE_BYTES] = [1; NONCE_BYTES];
   /// Shape: the daemon's nonce, a byte repeated: any value does, since the test hands it to the take itself.
   const DAEMON_NONCE: [u8; NONCE_BYTES] = [2; NONCE_BYTES];
+  /// Shape: another exchange's daemon nonce, another byte repeated: any value but [`DAEMON_NONCE`]'s does.
+  const OTHER_NONCE: [u8; NONCE_BYTES] = [3; NONCE_BYTES];
 
   /// Keeps `descriptor` as the `key` offer for `client` under [`SECRET`], as an attach or a map does.
   fn offered(s: &mut ShardState, key: (OfferKind, u64), client: u32, descriptor: OwnedFd) {
@@ -513,9 +613,10 @@ mod tests {
   /// R3's class A (A-440). Do: on a two-shard daemon, offer a map's descriptor on the second shard under a known secret,
   /// hold that shard in one poll for a window and a half of wall time on its CPU a fifth of it (a busy or starved shard),
   /// and from the first shard take the offer with a proof made under the secret. Expect: the take answered with the
-  /// offer, after more than one window of waiting, and the offer gone from its shard. The take waited one window on the
-  /// wall, so the exchange failed with the owner alive and working, and the owner's late take retired the offer and
-  /// dropped its descriptor with the answer, leaving the client nothing to claim again.
+  /// offer, after more than one window of waiting, and the offer claimed on its shard for this exchange (A-512: its
+  /// settle retires it once the client has the ends; no other exchange can take it meanwhile). The take waited one
+  /// window on the wall, so the exchange failed with the owner alive and working, and the owner's late take retired the
+  /// offer and dropped its descriptor with the answer, leaving the client nothing to claim again.
   #[test]
   fn a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget() {
     let daemon = crate::daemon::audit_daemon_of(2);
@@ -560,7 +661,11 @@ mod tests {
         let left = crate::xshard::call_in_shard_time(
           origin,
           owner,
-          move |s| s.map_offers.contains_key(&id),
+          move |s| {
+            s.map_offers
+              .get(&id)
+              .is_some_and(|offer| offer.claimed_by == Some(DAEMON_NONCE))
+          },
           TAKE_WINDOW_NS,
         )
         .await;
@@ -584,14 +689,189 @@ mod tests {
       waited > std::time::Duration::from_nanos(TAKE_WINDOW_NS),
       "the take ended within one window ({waited:?}), before its owner shard's busy poll did"
     );
-    assert_eq!(left, Some(false), "the take retired the offer");
+    assert_eq!(
+      left,
+      Some(true),
+      "the take claimed the offer for its exchange, which settles it"
+    );
+  }
+
+  /// What the lost-answer take test saw: the first ask's confirmation, whether the stream's other side was still open
+  /// after that answer was lost, the second ask's confirmation, the byte read through the end the second ask answered,
+  /// and another exchange's take.
+  struct TakenTwice {
+    first: Result<[u8; SEALED_BYTES], String>,
+    peer_open: bool,
+    again: Result<[u8; SEALED_BYTES], String>,
+    through: Option<u8>,
+    other: Result<(), String>,
+  }
+
+  /// The lost-answer take test's scenario on its daemon's shard `s`: the offer, the first ask with its answer dropped,
+  /// the second ask, the byte read through its end, and another exchange's take.
+  fn taken_twice_after_a_lost_answer(s: &mut ShardState) -> TakenTwice {
+    let (end, peer) = slates_ipc::stream::pair().unwrap();
+    offered(s, (OfferKind::Stream, FIRST_ID), CLIENT, end);
+    let hello = hello_for(OfferKind::Stream, FIRST_ID);
+    let proof = proof_of(OfferKind::Stream, FIRST_ID, &DAEMON_NONCE);
+    let first = take(s, hello, DAEMON_NONCE, proof)
+      .map(|(confirmation, _lost)| confirmation)
+      .map_err(|refusal| format!("{refusal:?}"));
+    rustix::io::ioctl_fionbio(&peer, true).unwrap();
+    let mut byte = [0u8; 1];
+    let peer_open = matches!(
+      rustix::net::recv(&peer, &mut byte, rustix::net::RecvFlags::empty()),
+      Err(rustix::io::Errno::AGAIN)
+    );
+    let again = take(s, hello, DAEMON_NONCE, proof);
+    let through = again.as_ref().ok().and_then(|(_, taken)| {
+      rustix::net::send(&peer, b"x", rustix::net::SendFlags::empty()).ok()?;
+      let mut read = [0u8; 1];
+      match rustix::net::recv(
+        &taken.descriptor,
+        &mut read,
+        rustix::net::RecvFlags::empty(),
+      ) {
+        Ok((1, _)) => Some(read[0]),
+        _ => None,
+      }
+    });
+    let other = take(
+      s,
+      hello,
+      OTHER_NONCE,
+      proof_of(OfferKind::Stream, FIRST_ID, &OTHER_NONCE),
+    )
+    .map(|_| ())
+    .map_err(|refusal| format!("{refusal:?}"));
+    TakenTwice {
+      first,
+      peer_open,
+      again: again
+        .map(|(confirmation, _)| confirmation)
+        .map_err(|refusal| format!("{refusal:?}")),
+      through,
+      other,
+    }
+  }
+
+  /// A-512 (A-488's sibling, goal 85). Do: on a daemon, offer a stream end for a client; take it with a claim's proof, as
+  /// an exchange's first ask, and drop what the take answered, as a lost answer is dropped when its owner shard stopped
+  /// for a window (`xshard::call_in_shard_time` forgets the call, and the shard runs it once it resumes); take it again
+  /// with the same claim, as the exchange's second ask; write a byte on the stream's other side and read it through the
+  /// end the second ask answered; then take the offer with another exchange's nonce and proof. Expect: the stream's other
+  /// side still open after the lost answer; the second ask answered the same confirmation and an end of the same stream
+  /// (the byte comes through); the other exchange refused `NoOffer`, so the ends are handed once. Before, the first take
+  /// retired the offer and moved its ends into the answer, whose loss closed them: the stream's other side read its end,
+  /// the second ask found no offer, and the client nothing to claim again.
+  #[test]
+  fn a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice() {
+    let daemon = crate::daemon::audit_daemon();
+    let saw = crate::daemon::observe_first(&daemon, taken_twice_after_a_lost_answer);
+    daemon.stop();
+    println!(
+      "a take asked again after a lost answer: first {}, the stream's other side open {}, again {}, through {:?}, \
+       another exchange {:?}",
+      saw.first.is_ok(),
+      saw.peer_open,
+      saw.again.is_ok(),
+      saw.through,
+      saw.other
+    );
+    assert!(
+      saw.first.is_ok(),
+      "the first ask took the offer: {:?}",
+      saw.first
+    );
+    assert!(
+      saw.peer_open,
+      "the lost answer closed the stream's end: the ends were lost with it"
+    );
+    assert_eq!(
+      saw.again, saw.first,
+      "the second ask of the same claim was not answered that claim"
+    );
+    assert_eq!(
+      saw.through,
+      Some(b'x'),
+      "the second ask's end is not the offered stream's"
+    );
+    assert_eq!(
+      saw.other,
+      Err("NoOffer".to_owned()),
+      "another exchange took an offer this exchange holds: its ends handed twice"
+    );
+  }
+
+  /// What the settle test saw, in order: the first exchange's claim, its settle `NotHanded`, the second exchange's claim,
+  /// a settle by the first exchange that no longer holds a claim, the second's settle `Handed`, a third claim, and whether
+  /// the offer is still kept.
+  type SettledInTurn = (
+    Result<(), String>,
+    bool,
+    Result<(), String>,
+    bool,
+    bool,
+    Result<(), String>,
+    bool,
+  );
+
+  /// The settle test's scenario on its daemon's shard `s` ([`a_claim_settled_not_handed_frees_its_offer_and_one_handed_retires_it`]).
+  fn settled_in_turn(s: &mut ShardState) -> SettledInTurn {
+    let key = (OfferKind::Map, FIRST_ID);
+    let (descriptor, _peer) = slates_ipc::stream::pair().unwrap();
+    offered(s, key, CLIENT, descriptor);
+    let claim = |s: &mut ShardState, nonce: [u8; NONCE_BYTES]| {
+      take(
+        s,
+        hello_for(OfferKind::Map, FIRST_ID),
+        nonce,
+        proof_of(OfferKind::Map, FIRST_ID, &nonce),
+      )
+      .map(|_| ())
+      .map_err(|refusal| format!("{refusal:?}"))
+    };
+    let first = claim(s, DAEMON_NONCE);
+    let freed = settle(s, key, DAEMON_NONCE, Settled::NotHanded);
+    let second = claim(s, OTHER_NONCE);
+    let stale = settle(s, key, DAEMON_NONCE, Settled::Handed);
+    let retired = settle(s, key, OTHER_NONCE, Settled::Handed);
+    let third = claim(s, DAEMON_NONCE);
+    let kept = s.map_offers.contains_key(&FIRST_ID);
+    (first, freed, second, stale, retired, third, kept)
+  }
+
+  /// A-512. Do: on a daemon, offer a map's descriptor; claim it with one exchange and settle that claim `NotHanded`, as
+  /// an exchange whose hand-over failed does; claim it with a second exchange; settle as `Handed` with the first exchange,
+  /// which no longer holds the claim, then with the second; then claim it with a third. Expect: the first claim taken
+  /// and freed by its settle, so the second exchange takes the offer; the first exchange's late settle changing nothing;
+  /// the second's retiring the offer, so the third finds no offer and none is kept.
+  #[test]
+  fn a_claim_settled_not_handed_frees_its_offer_and_one_handed_retires_it() {
+    let daemon = crate::daemon::audit_daemon();
+    let saw = crate::daemon::observe_first(&daemon, settled_in_turn);
+    daemon.stop();
+    assert_eq!(
+      saw,
+      (
+        Ok(()),
+        true,
+        Ok(()),
+        false,
+        true,
+        Err("NoOffer".to_owned()),
+        false
+      ),
+      "(first claim, freed, second claim, stale settle, retired, third claim, kept)"
+    );
   }
 
   /// A-492 (R3's class C; §4.6 the socket route): an offer waits for its claim while its client lives, never for a fixed
   /// life. Do: on a daemon, offer a map's descriptor for a client that lives, wait past the life offers had until A-492
   /// (two liveness budgets) and half a budget more, then take it with a proof made under its secret. Expect: taken, the
-  /// offer gone after. Before, the offer's timer let it go at two budgets (`shards.route_expired`) and the take was
-  /// refused `NoOffer`: a live client slower than that to claim, a loaded machine's, found nothing.
+  /// offer claimed for this exchange after (A-512). Before, the offer's timer let it go at two budgets
+  /// (`shards.route_expired`) and the take was refused `NoOffer`: a live client slower than that to claim, a loaded
+  /// machine's, found nothing.
   #[test]
   fn an_offer_waits_for_its_live_clients_claim_past_any_fixed_life() {
     let daemon = crate::daemon::audit_daemon();
@@ -607,7 +887,11 @@ mod tests {
       let taken = take(s, hello_for(OfferKind::Map, FIRST_ID), DAEMON_NONCE, proof)
         .map(|_| ())
         .map_err(|refusal| format!("{refusal:?}"));
-      (taken, s.map_offers.contains_key(&FIRST_ID))
+      let claimed = s
+        .map_offers
+        .get(&FIRST_ID)
+        .is_some_and(|offer| offer.claimed_by == Some(DAEMON_NONCE));
+      (taken, claimed)
     });
     daemon.stop();
     assert_eq!(
@@ -615,7 +899,7 @@ mod tests {
       Ok(()),
       "an offer whose client lives was not claimable past the old fixed life"
     );
-    assert!(!left, "the take retired the offer");
+    assert!(left, "the take claimed the offer for its exchange (A-512)");
   }
 
   /// A-492 (R3's class C; §4.6 the socket route): an exchange waits on its client while the client's connection lives.

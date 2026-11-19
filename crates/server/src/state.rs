@@ -686,6 +686,12 @@ pub struct ShardState {
   pub(crate) dead_clients: std::collections::VecDeque<(slates_mem::Handle<ClientSlot>, u32)>,
   /// The shard's reaper task, woken when a client's watch reports it gone while the reaper idles (A-475).
   pub(crate) reaper_task: Option<slates_rt::TaskId>,
+  /// The seats whose status capture has a deadline, by it (A-522, `crate::deadlines`): a seat once at most.
+  pub(crate) capture_deadlines: crate::deadlines::CaptureDeadlines,
+  /// The shard's deadline keeper, woken when a deadline is set earlier than the one it sleeps for (A-522).
+  pub(crate) deadline_task: Option<slates_rt::TaskId>,
+  /// The deadline the keeper sleeps until, `None` while none is set (`crate::deadlines::noted` reads it).
+  pub(crate) deadline_armed: Option<u64>,
   /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
   /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
   pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
