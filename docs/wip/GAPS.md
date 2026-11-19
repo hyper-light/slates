@@ -268,6 +268,20 @@
 > its path's previous object and similar objects OFS deltas, the window, zlib level, depth and rebuild point learned; the
 > base pack self-contained; packs read back through A-608's reader in the oracle; eleven mutations red. Owed of part 2:
 > the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs.
+> **A-639 (2026-11-19, g083; piece 7's packs from fragments):** `slates-git` (`store::upload`) streams upload-pack's
+> pack from A-615's answer, taken through a trait (`Answered`): the runs from their fragments (filtered, the want always),
+> the walk's objects covered by whole kept parts (a clone so the base pack and the fragments after it; a filter that
+> sends no blobs taking the parts without blobs whole), the rest encoded one object at a time with the learned rules.
+> A part is copied byte for byte when the client reads it as kept, entry by entry otherwise (an offset delta's distance
+> measured again, its base named by id without `ofs-delta`, a delta whose base the client cannot read sent whole), so a
+> client without `thin-pack` gets no base it lacks and the pack holds exactly the answer's objects. Streamed in units of
+> at most a window until the owner's quantum is spent, no borrow held between turns; a base pack in two parts; a push's
+> positions by type; `ContentStore::window_at` reads a window by its index. Held to an oracle over generated histories
+> (every answered pack read back through A-608's reader as the wanted closure less the client's, each object once),
+> thirteen mutations red (`cargo test -p slates-git --lib`, the store's 32 of 32, Mac Studio). This closes A-614 part
+> 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
+> only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
+> the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;

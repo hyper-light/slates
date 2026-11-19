@@ -12360,6 +12360,23 @@ engine: the verdict, rebase, position mapping, the register).
 > `tree:<depth>`, `object:type` and `combine:` (`sparse:oid` read and refused, owed); and `include-tag`. Proven against
 > an oracle computing each answer from full reachability over generated histories. Building the pack from the runs and
 > the objects is piece 7's next part.
+>
+> **Status (2026-11-19, A-639: piece 7's packs from fragments built, upload-pack's pack streamed).** `crates/git`
+> (`store::upload`) streams the pack that answers A-615's answer, taken through a trait (`Answered`): its runs and its
+> objects one by one, the client's `thin-pack` and `ofs-delta`, and its filter. The runs are sent from their versions'
+> fragments, their objects passed through the filter and the want sent whatever it is. The objects still wanted that
+> whole kept parts hold are sent from those parts: base packs' parts first, largest first, then each version's
+> fragments after its green's base. So a clone is the base pack and the fragments after it, a version a rewrite left
+> behind is not taken, and a filter that sends no blobs takes the parts without blobs whole. The rest is encoded by
+> the fragments' encoder, now one object at a time, with the learned window, depth and level. A part is copied byte for
+> byte when the client reads it as kept; otherwise entry by entry: an offset delta's distance measured again, or its
+> base named by id for a client without `ofs-delta`, and a delta whose base the client cannot read sent whole. So a
+> client that asked no thin pack is sent no base it lacks, and the pack holds exactly the answer's objects. A turn does
+> units of work, each at most a window, until the owner's quantum is spent, and holds no borrow between turns. A base
+> pack is now two parts, as a version's fragments are, and a push's new positions run by type, so each part's set is a
+> run. Proven against an oracle over generated histories that reads every answered pack back through A-608's reader, a
+> thin one with the client's objects, as exactly the wanted closure less the client's. Owed: a part only partly wanted
+> read entry by entry; a delta search for an object past a window; the fragments' encoding sliced.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12505,12 +12522,15 @@ create or update a reference named "refs/for/master", but may create or update a
      "acknowledgments section"]. The walk runs in slices; its memory is admitted from the shard's budget with a typed
      refusal.
 3. The pack: a header with the object count, then the fragments for D(M+1) to D(N) in order, then any objects the walk
-   found, encoded from their kept compressed forms, then the trailer hash, computed as the bytes stream out. A
-   fragment's offset deltas stay valid when fragments are joined, and its id deltas name bases either earlier in the
-   same pack or, in a thin pack, held by the client. A client that did not ask for `thin-pack` ("A client MUST NOT
-   request the 'thin-pack' capability if it cannot turn a thin pack into a self-contained pack" [B:
-   gitprotocol-capabilities]) is sent the base whole, ahead of the delta that names it.
-   - A clone is the base pack and then the fragments after version C.
+   found: those whole kept parts hold copied from the parts, the rest encoded with the fragments' learned rules; then
+   the trailer hash, computed as the bytes stream out (A-639). A fragment's offset deltas stay valid when fragments are
+   joined, and its id deltas name bases either in the same pack or, in a thin pack, held by the client. A client that
+   did not ask for `thin-pack` ("A client MUST NOT request the 'thin-pack' capability if it cannot turn a thin pack into
+   a self-contained pack" [B: gitprotocol-capabilities]) is sent the object whole in place of a delta whose base it
+   lacks, so the pack holds no object the client has (A-639). A client that did not ask for `ofs-delta` is sent each
+   offset delta with its base named by id.
+   - A clone is the base pack and then the fragments after version C: the walk's objects covered by the kept parts that
+     hold them whole (A-639).
    - Shallow requests (`deepen`, `deepen-since`, `deepen-not`, `deepen-relative`) walk commit rows by depth or commit
      date and answer the `shallow-info` section; the boundary commits' trees go whole, encoded from their kept forms.
    - Filters [B: rev-list-options `--filter`]: `blob:none` and `object:type` choose fragment classes; `blob:limit`,
@@ -12636,8 +12656,10 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
-7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise; packs from
-   fragments; shallow; filters; `include-tag`; `object-info`.
+7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise (built,
+   A-615); packs from fragments (built, A-639: runs from their fragments, the walk's objects covered by whole kept parts
+   and the rest encoded, `thin-pack` and `ofs-delta` as the client says, streamed in turns); shallow; filters;
+   `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
 10. Hooks over a read-only bare-repository view; push options; push to review with report-status-v2.
@@ -42829,3 +42851,81 @@ Applied in the same change to:
   `unwrap`, `assert` or `panic` in a function returning `Option` or `Result`.
 - **Owed** (GAPS): part 2, the editor drive answering a finished report; URLs read as `svn_uri_canonicalize` reads
   them; and the authentication `svnserve` asks for mid-session when an anonymous `update` may not read.
+
+### A-639 — upload-pack's pack from fragments: the negotiation's runs from their fragments, the walk's objects covered by whole kept parts (a clone the base pack and the fragments after it) and the rest encoded, `thin-pack` and `ofs-delta` as the client says, streamed in turns (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch" item 3, "Pieces (git)" piece 7; A-591, A-608, A-614, A-615)
+
+Applied in the same change to: §4.17.2 (a status block; "A fetch" item 3, where a client without `thin-pack` is now sent
+the object whole in place of the base ahead of it; piece 7's line), GAPS (the §4.17 entry), `crates/git` (`store`: the
+new `upload`; `fragment`'s encoder one object at a time with each entry's position, type and base kept; a base pack in
+two parts; a push's new positions by type; `Positions`' set operations; `Repository::pack` and `clone_pack` gone, the
+stream in their place; `pack::put_header`), `crates/vcs` (`ContentStore::window_at`).
+
+- **The answer through a trait.** `Answered` gives the negotiation's runs (`Versions`: a green's versions `after + 1`
+  to `through`) and objects by position, the client's `thin-pack` and `ofs-delta`, and the filter as a per-object
+  decision by kind and size (A-615's own per-object filters; A-640 implements the trait over the negotiation's answer).
+- **What it sends**, each object of the answer once, in three stages:
+  - The runs, from their fragments: each run's objects gathered before the header counts them, every one of its D(k)s
+    with no filter, otherwise each by its row; the run's head whenever the run brought it, since it is the want.
+  - The cover: the greens a head of whose versions is still wanted, largest base pack first; each one's base pack's two
+    parts, then the fragments of each version after its base. A part is taken when every object it holds is still
+    wanted. A clone is answered so (§4.17.2: "A clone is the base pack and then the fragments after version C"), with
+    no clone path of its own; a version a rewrite left behind is not taken; a filter that sends no blobs takes the parts
+    without blobs whole. A part only partly wanted is left: reading it whole for a few objects would cost more than
+    encoding them.
+  - The rest, in position order, through the fragments' encoder: a delta against an earlier one of its kind within the
+    learned window and depth, at the learned level, the rules copied from the repository at the stream's start. An
+    object past a window is deflated whole, a window a unit.
+- **What the client reads.** A part is copied byte for byte when every object it holds is to be sent, the client said
+  `ofs-delta` or the part has no offset delta, and the client reads every base its reference deltas name. A base is read
+  when it is sent already; for a run's part, also when it comes later in the pack ("ref-delta" names any object of the
+  pack; no cycle, every version of a run fast-forwarded) or, thin, when the client holds it: outside the pack such a
+  base lies in what the client's version reaches, and under a filter it is held where the filter would have sent it. A
+  part the cover took names bases sent before it alone, since across a rewrite two versions may name each other's
+  objects. Otherwise the part is read entry by entry: an offset delta's distance measured again, or its base named by
+  id without `ofs-delta`; a delta whose base the client cannot read sent whole from its object. The design had a client
+  without `thin-pack` sent the base whole ahead of the delta; the object is sent whole instead, so the pack holds no
+  object the client has, which the oracle holds it to.
+- **Streamed.** `Upload::advance` does units of work until the owner's quantum (§4.3's step budget) is spent, at least
+  one, checking the owner's clock after each. The units: a window of a kept part copied; a window of an object deflated;
+  one object at most a window long encoded; a window's worth of the answer's handles read; one object of a filtered run
+  judged; one entry of a part judged. Between turns the stream holds no borrow: it names parts by green, version, class
+  and content, reads a window by its index (`ContentStore::window_at`, down the one list a level that names it), and
+  keeps the wanted and sent sets as runs of positions. The trailer is the checksum of every byte, made as they pass,
+  written once the entries sent are the header's count (`CountChanged` otherwise). A base pack made again while a
+  stream reads one of its parts entry by entry ends the stream refused, `BaseRebuilt`; the owner makes base packs
+  between streams.
+- **The store's changes.** The encoder takes one object at a time at any place in a pack (`fragment::Encoder`). It
+  keeps, of the entries before it, those its learned window can try now, so a fragment encoded so is byte for byte the
+  one part 2 made. Each entry's record keeps its object's position and type and its base (`Placed`). A base pack is two
+  parts, as a version's fragments are. A push's new objects take positions by type and then id, so each fragment's two
+  parts are a run each; the position rows are written in position order.
+- **Tests** (`cargo test --locked -p slates-git --lib`, 317 of 317 and 3 ignored, the store's 32 and 3 ignored, and
+  `-p slates-vcs --lib` 31 of 31, the Mac Studio, 2026-11-19, at 3f4cd19c8; `cargo fmt --check` clean), failing first
+  against a stream that sent nothing:
+  - `every_answered_pack_reads_back_as_the_wanted_closure_less_the_clients`: generated histories, some base packs made
+    halfway, then for every green a clone and a fetch from each earlier head as A-615 answers them (a run where every
+    version after the have fast-forwarded, the objects one by one otherwise), under generated filters, thin or not,
+    `ofs-delta` or not, in turns of a generated quantum. Each pack read back through A-608's reader, a thin one with
+    the client's objects the filter sends, is exactly the wanted closure less the client's, each object once.
+  - `a_clone_is_the_base_pack_then_the_fragments_after_it` (the four parts byte for byte),
+    `a_fetch_is_its_runs_fragments_then_what_no_fragment_covers`,
+    `a_thin_pack_names_the_clients_objects_and_a_full_one_never_does`,
+    `without_ofs_delta_no_entry_names_its_base_by_offset`,
+    `a_pack_streamed_a_unit_a_turn_is_the_pack_in_one_turn`,
+    `a_filter_sends_the_runs_objects_it_admits_and_the_want_always`,
+    `a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded`,
+    `a_part_the_cover_takes_names_no_base_that_neither_side_holds`,
+    `a_base_pack_made_again_under_a_stream_ends_it_refused`, `position_sets_answer_as_a_set_model`, and vcs's
+    `a_window_read_by_its_index_is_the_walks_window`.
+  - Part 2's tests now read their packs through the stream, and the store oracle's packs hold each object once.
+  - Main's run, ignored: `upload_packs_for_git_index_pack`.
+- **Red-checks** (the Studio, each mutation once on a copy, the tree untouched): every part copied whole (the oracle
+  red), offset deltas copied for a client without `ofs-delta` (2), every base read (2), a cover part's bases read as a
+  run's (red once the history rewritten twice was added), a cover entry's base read as a run's (the oracle), a base
+  held without `thin-pack` (2), a run's objects past the filter (2), the run's want dropped (2), a part partly wanted
+  taken (1), an offset base kept for a client without `ofs-delta` (1), a deflate never finished (3), a base pack made
+  again unseen (1), a window's digit in the wrong base (1).
+- **Owed.** A part only partly wanted (a `blob:limit` fetch's blobs) read entry by entry. A delta search for an object
+  past a window. The fragments' encoding and the base pack's rebuild sliced. Wiring the stream into upload-pack's
+  `fetch` response is A-640. Main's runs are filed: `git index-pack --strict` and `git verify-pack -v` over the
+  stream's packs, a thin one with `--fix-thin`; clippy, `xtask` and the docs.
