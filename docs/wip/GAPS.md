@@ -260,6 +260,11 @@
 > naive filesystem on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-605). Owed from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra
 > with piece 7's location segments and log; the property's UTF-8 and CR checks with piece 7's property validation.
+> A-613 (2026-11-19, g262, UI goal 93), its first part: the ra_svn read commands' sans-io handler, `get-latest-rev`,
+> `get-dated-rev`, `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to
+> transcripts of stock `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn
+> --lib reads` on the Mac Studio, red-checked six ways (see A-613). Owed from it: the other read commands, then
+> `svn mergeinfo --show-revs`, and read access by A-606's rules.
 > A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state machine that does no I/O held to
 > stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by a relay
 > (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the greeting's

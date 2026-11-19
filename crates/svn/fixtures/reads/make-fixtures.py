@@ -18,7 +18,11 @@ Usage: python3 -I make-fixtures.py OUTDIR WORKDIR
 Writes NAME.N.client.bin and NAME.N.server.bin per connection N of each session, sessions.txt (each session's command
 or commands, its exit code and its standard error), repository.txt (each revision's rows, texts with their MD5 and
 SHA-1, property lists and revision properties, as the tests rebuild the repository), subversion-version.txt and
-SHA256SUMS. Every file is the same on every run. WORKDIR holds the repository and is removed at the end.
+SHA256SUMS. Every file is the same on every run but those holding a property list of more than one property:
+`svnserve` writes a property list in its hash table's order, which APR seeds per table (`apr_hash_make` since APR 1.5),
+so three recordings gave revision 3's four properties three orders (`revision-properties.1.server.bin`,
+`svn-revprop-list.1.server.bin`), and the tests compare property lists as sets. WORKDIR holds the repository and is
+removed at the end.
 
 Sources: Subversion's `subversion/libsvn_ra_svn/protocol` §2 and §3.1.1, `svnserve/serve.c`, `svnserve/svnserve.c`
 (`-i`), `notes/dump-load-format.txt`; all at `1.14.x` `d434dc14` as `docs/wip/research/vcs-servers-subversion.md`
