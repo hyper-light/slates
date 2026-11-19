@@ -17563,6 +17563,29 @@ struct ResetAttempt {
   reached: Option<Duration>,
   /// When b's reset count first moved.
   reset_seen: Option<Duration>,
+  /// b's link and forward counters that moved over the attempt ([`ATTEMPT_COUNTERS`]): what an attempt that did not
+  /// count met instead of the reset (its session lent, handed back stale, judged dead or out of contact).
+  moved: Vec<(&'static str, u64)>,
+}
+
+/// b's counters an attempt reports as moved: a judgment of a, a session out of contact or lent, one handed back stale,
+/// no session, and the reset itself.
+const ATTEMPT_COUNTERS: [&str; 6] = [
+  "fleet.link.invalid.believed_dead",
+  "fleet.link.out_of_contact",
+  "fleet.link.stale_return",
+  "fleet.forward.session_out",
+  "fleet.forward.no_session",
+  "fleet.link.peer_reset",
+];
+
+/// b's [`ATTEMPT_COUNTERS`] now.
+fn attempt_counters(b: &Daemon) -> Vec<u64> {
+  let refusals = b.fleet_refusals().unwrap();
+  ATTEMPT_COUNTERS
+    .iter()
+    .map(|name| refusals.get(*name).copied().unwrap_or(0))
+    .collect()
 }
 
 /// b's counters the verdict reads: believed dead, reset.
@@ -17582,6 +17605,7 @@ fn restart_and_reach(
   read: &RequestBody,
 ) -> ResetAttempt {
   let before = link_counters(&daemons[1]);
+  let counters_before = attempt_counters(&daemons[1]);
   daemons.remove(0).stop();
   daemons.insert(0, restart());
   let restarted = Instant::now();
@@ -17621,6 +17645,16 @@ fn restart_and_reach(
     judged_first,
     reached,
     reset_seen,
+    moved: ATTEMPT_COUNTERS
+      .iter()
+      .zip(
+        attempt_counters(&daemons[1])
+          .into_iter()
+          .zip(counters_before),
+      )
+      .filter(|(_, (after, before))| after > before)
+      .map(|(name, (after, before))| (*name, after - before))
+      .collect(),
   }
 }
 
