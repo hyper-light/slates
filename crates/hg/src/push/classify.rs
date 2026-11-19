@@ -326,7 +326,11 @@ fn divergent(name: &[u8]) -> bool {
 
 impl<'v, V: Repository> Graph<'v, V> {
   /// The graph of `brought` over `view`, each brought changeset's branch and close read from its text.
-  fn new(view: &'v V, brought: &[Arrived], admission: &mut Admission) -> Result<Self, Unclassified> {
+  fn new(
+    view: &'v V,
+    brought: &[Arrived],
+    admission: &mut Admission,
+  ) -> Result<Self, Unclassified> {
     admission.charge_items::<Brought>(brought.len())?;
     admission.charge_items::<(Node, usize)>(brought.len())?;
     admission.charge_items::<Phase>(brought.len())?;
@@ -489,7 +493,12 @@ impl<'v, V: Repository> Graph<'v, V> {
   }
 
   /// Whether `ancestor` is `at` or an ancestor of it.
-  fn descends(&self, at: At, ancestor: At, admission: &mut Admission) -> Result<bool, PastAdmission> {
+  fn descends(
+    &self,
+    at: At,
+    ancestor: At,
+    admission: &mut Admission,
+  ) -> Result<bool, PastAdmission> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![at];
     while let Some(next) = stack.pop() {
@@ -601,7 +610,10 @@ pub fn classify(
 }
 
 /// `reply:changegroup`'s `return` for what the push brought (module docs).
-fn heads_change<V: Repository>(graph: &Graph<'_, V>, admission: &mut Admission) -> Result<i64, PastAdmission> {
+fn heads_change<V: Repository>(
+  graph: &Graph<'_, V>,
+  admission: &mut Admission,
+) -> Result<i64, PastAdmission> {
   let count = graph.brought.len();
   admission.charge_items::<bool>(count)?;
   let mut has_child = vec![false; count];
@@ -669,7 +681,8 @@ fn pushphase<V: Repository>(
       .and_then(|text| text.parse::<i64>().ok())
       .map(i64::unsigned_abs)
   };
-  let (Some(node), Some(old), Some(new)) = (hex_node(&ask.key), number(&ask.old), number(&ask.new)) else {
+  let (Some(node), Some(old), Some(new)) = (hex_node(&ask.key), number(&ask.old), number(&ask.new))
+  else {
     return Ok(false);
   };
   let Some(at) = graph.known(&node) else {
@@ -824,7 +837,11 @@ impl Marks {
 
 /// The line a bookmark at `to` is made from: the line whose head is `to`, else the first line of `to`'s branch, else
 /// the first line.
-fn mark_base<V: Repository>(graph: &Graph<'_, V>, lines: &[LineRead], to: &Node) -> Result<usize, Unclassified> {
+fn mark_base<V: Repository>(
+  graph: &Graph<'_, V>,
+  lines: &[LineRead],
+  to: &Node,
+) -> Result<usize, Unclassified> {
   if let Some(line) = lines.iter().position(|line| line.head == Some(*to)) {
     return Ok(line);
   }
@@ -961,7 +978,10 @@ fn place_branch<V: Repository>(
       .difference(&taken)
       .map(|line| LineMove::Retired { line: *line }),
   );
-  let mut used: BTreeSet<u32> = own.iter().filter_map(|line| lines.get(*line).map(|read| read.number)).collect();
+  let mut used: BTreeSet<u32> = own
+    .iter()
+    .filter_map(|line| lines.get(*line).map(|read| read.number))
+    .collect();
   let mut made = Vec::new();
   for ((head, line), lines_of) in heads.iter().zip(&matched).zip(&edges) {
     if line.is_some() {
@@ -970,7 +990,9 @@ fn place_branch<V: Repository>(
     let Some(node) = graph.node(At::New(*head)) else {
       continue;
     };
-    let number = (0..=u32::MAX).find(|number| !used.contains(number)).unwrap_or(u32::MAX);
+    let number = (0..=u32::MAX)
+      .find(|number| !used.contains(number))
+      .unwrap_or(u32::MAX);
     used.insert(number);
     admission.charge_items::<NewLine>(1)?;
     made.push(NewLine {
@@ -1005,7 +1027,10 @@ fn edges<V: Repository>(
       .filter(|line| {
         lines.get(*line).is_some_and(|read| match read.head {
           None => true,
-          Some(node) => graph.view.rev(&node).is_some_and(|rev| reached.contains(&rev)),
+          Some(node) => graph
+            .view
+            .rev(&node)
+            .is_some_and(|rev| reached.contains(&rev)),
         })
       })
       .collect();
@@ -1017,7 +1042,10 @@ fn edges<V: Repository>(
 
 /// A maximum matching of new heads to lines (augmenting paths found breadth first, the heads in order): each head's
 /// line, or none.
-fn matching(edges: &[Vec<usize>], admission: &mut Admission) -> Result<Vec<Option<usize>>, PastAdmission> {
+fn matching(
+  edges: &[Vec<usize>],
+  admission: &mut Admission,
+) -> Result<Vec<Option<usize>>, PastAdmission> {
   admission.charge_items::<Option<usize>>(edges.len())?;
   let mut line_of: Vec<Option<usize>> = vec![None; edges.len()];
   let mut head_of: BTreeMap<usize, usize> = BTreeMap::new();
@@ -1088,16 +1116,23 @@ fn line_base<V: Repository>(
     return first_line(lines, None);
   };
   let node = graph.view.node(rev);
-  if let Some(line) = lines.iter().position(|line| line.head.is_some() && line.head == node) {
+  if let Some(line) = lines
+    .iter()
+    .position(|line| line.head.is_some() && line.head == node)
+  {
     return Ok(line);
   }
   first_line(lines, Some(graph.view.branch(rev)))
 }
 
 /// The draft roots' changes (module docs).
-fn roots<V: Repository>(graph: &Graph<'_, V>, admission: &mut Admission) -> Result<Vec<RootChange>, PastAdmission> {
+fn roots<V: Repository>(
+  graph: &Graph<'_, V>,
+  admission: &mut Admission,
+) -> Result<Vec<RootChange>, PastAdmission> {
   let view = graph.view;
-  let old_public = |parent: Option<Rev>| parent.is_none_or(|parent| view.phase(parent) == Phase::Public);
+  let old_public =
+    |parent: Option<Rev>| parent.is_none_or(|parent| view.phase(parent) == Phase::Public);
   let mut removed = BTreeSet::new();
   for rev in &graph.published {
     if view.parents(*rev).into_iter().all(old_public)

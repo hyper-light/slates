@@ -100,14 +100,19 @@ fn escape(byte: u8, out: &mut String) {
   out.push(char::from(ESCAPE));
   let high = byte.checked_shr(NIBBLE).unwrap_or_default();
   out.extend(HEX.get(usize::from(high)).map(|digit| char::from(*digit)));
-  out.extend(HEX.get(usize::from(byte & LOW_NIBBLE)).map(|digit| char::from(*digit)));
+  out.extend(
+    HEX
+      .get(usize::from(byte & LOW_NIBBLE))
+      .map(|digit| char::from(*digit)),
+  );
 }
 
 /// Appends the label of a Mercurial name (module docs).
 fn label(bytes: &[u8], out: &mut String) {
   for chunk in bytes.utf8_chunks() {
     for character in chunk.valid().chars() {
-      let escaped = character == char::from(END) || character == char::from(ESCAPE) || character.is_control();
+      let escaped =
+        character == char::from(END) || character == char::from(ESCAPE) || character.is_control();
       if !escaped {
         out.push(character);
         continue;
@@ -266,7 +271,11 @@ impl Read {
         (mark, bound.map(|green| named(state, (&name, green))))
       })
       .collect();
-    let position = |log| repositories.log_position(repository, log).unwrap_or_default();
+    let position = |log| {
+      repositories
+        .log_position(repository, log)
+        .unwrap_or_default()
+    };
     Read {
       names,
       lines,
@@ -514,11 +523,23 @@ fn changes<H: Held>(
       name: line_name(&made.branch, made.number),
       from: base.green,
       version: base.version,
-      work: Some(work(state, (base, &made.head), revisions, terms, admission)?),
+      work: Some(work(
+        state,
+        (base, &made.head),
+        revisions,
+        terms,
+        admission,
+      )?),
     });
   }
   for moved in &plan.bookmarks {
-    changes.push(mark_change(state, (moved, read), revisions, terms, admission)?);
+    changes.push(mark_change(
+      state,
+      (moved, read),
+      revisions,
+      terms,
+      admission,
+    )?);
   }
   Ok(changes)
 }
@@ -585,13 +606,20 @@ fn client_checks(unbundle: &Unbundle, read: &Read, checks: &mut Vec<RepositoryCh
           check_once(checks, head_of(named));
         }
         let (_, markers) = read.logs;
-        check_once(checks, RepositoryCheck::Log {
-          log: StateLog::Markers,
-          position: markers,
-        });
+        check_once(
+          checks,
+          RepositoryCheck::Log {
+            log: StateLog::Markers,
+            position: markers,
+          },
+        );
       }
       Asks::CheckUpdatedHeads(nodes) => {
-        for (named, branch, _) in read.lines.iter().filter(|(named, ..)| named.head.is_some_and(|head| nodes.contains(&head))) {
+        for (named, branch, _) in read
+          .lines
+          .iter()
+          .filter(|(named, ..)| named.head.is_some_and(|head| nodes.contains(&head)))
+        {
           check_once(checks, head_of(named));
           check_once(checks, read.names_under(branch_prefix(branch)));
         }
@@ -606,10 +634,13 @@ fn client_checks(unbundle: &Unbundle, read: &Read, checks: &mut Vec<RepositoryCh
       }
       Asks::CheckPhases(_) => {
         let (phases, _) = read.logs;
-        check_once(checks, RepositoryCheck::Log {
-          log: StateLog::Phases,
-          position: phases,
-        });
+        check_once(
+          checks,
+          RepositoryCheck::Log {
+            log: StateLog::Phases,
+            position: phases,
+          },
+        );
       }
       _ => {}
     }
@@ -632,10 +663,13 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
   }
   if !plan.roots.is_empty() {
     let (phases, _) = read.logs;
-    check_once(&mut checks, RepositoryCheck::Log {
-      log: StateLog::Phases,
-      position: phases,
-    });
+    check_once(
+      &mut checks,
+      RepositoryCheck::Log {
+        log: StateLog::Phases,
+        position: phases,
+      },
+    );
   }
   let state = plan
     .roots
@@ -672,7 +706,10 @@ fn asked(plan: &Plan, read: &Read) -> Vec<(Namespace, String, Right)> {
   let mut asked: Vec<(Namespace, String, Right)> = Vec::new();
   let mut ask = |namespace: Namespace, name: &[u8], right: Right| {
     let name = policy_name(name);
-    if !asked.iter().any(|(held, named, wanted)| *held == namespace && *named == name && *wanted == right) {
+    if !asked
+      .iter()
+      .any(|(held, named, wanted)| *held == namespace && *named == name && *wanted == right)
+    {
       asked.push((namespace, name, right));
     }
   };
@@ -687,17 +724,29 @@ fn asked(plan: &Plan, read: &Read) -> Vec<(Namespace, String, Right)> {
       .lines
       .iter()
       .any(|(named, branch, _)| *branch == made.branch && named.head.is_some());
-    let right = if headed { Right::Rewrite } else { Right::Submit };
+    let right = if headed {
+      Right::Rewrite
+    } else {
+      Right::Submit
+    };
     ask(Namespace::Branch, made.branch.as_slice(), right);
   }
   for moved in &plan.bookmarks {
     match moved {
       BookmarkMove::Moved { name, forward, .. } => {
-        let right = if *forward { Right::Submit } else { Right::Rewrite };
+        let right = if *forward {
+          Right::Submit
+        } else {
+          Right::Rewrite
+        };
         ask(Namespace::Bookmark, name.as_slice(), right);
       }
-      BookmarkMove::Created { name, .. } => ask(Namespace::Bookmark, name.as_slice(), Right::Submit),
-      BookmarkMove::Deleted { name, .. } => ask(Namespace::Bookmark, name.as_slice(), Right::Delete),
+      BookmarkMove::Created { name, .. } => {
+        ask(Namespace::Bookmark, name.as_slice(), Right::Submit)
+      }
+      BookmarkMove::Deleted { name, .. } => {
+        ask(Namespace::Bookmark, name.as_slice(), Right::Delete)
+      }
     }
   }
   asked
