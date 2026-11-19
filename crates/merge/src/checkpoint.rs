@@ -53,7 +53,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"GCKP");
 /// Format: the checkpoint encoding's version; a decoder refuses any other. 3 since A-321 added the signed versions'
 /// verdicts beside the accepted identities; 4 since A-626 part 3 added the copies' records, their trees' keys and the
 /// identity's sum. A version 3 checkpoint is refused (`BadVersion`), never read under version 4's layout: replaced,
-/// not layered.
+/// not layered; and a segment that holds one is refused at adoption (the anchor's layout 12), so none is ever met.
 const VERSION: u32 = 4;
 /// Format: a signature verdict's fingerprint, a SHA-256 hash (`crate::chain_entry::Signature::fingerprint`).
 const FINGERPRINT_BYTES: usize = 32;
