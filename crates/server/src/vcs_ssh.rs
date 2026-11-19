@@ -64,13 +64,13 @@
 //! by the anchor across daemon restarts (the fleet node's own key on a fleet node); and the daemon's log names its
 //! address and its host key's fingerprint.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the four services' server halves, each refused as not served until it lands (git's
-//! upload-pack through the stores' lender, A-682; receive-pack, A-683; Mercurial's `serve --stdio`, A-650; Subversion's
-//! tunnel, §4.17.4 piece 12); Subversion's tunnel moved to the shard of the repository its greeting names; the live
-//! `git clone` over SSH (main's run).
+//! **Owed** (GAPS, the §4.17 entry): the two services whose server halves have not landed, each refused as not served
+//! until it does (receive-pack, A-620 and A-683; Subversion's tunnel, §4.17.4 piece 12); Subversion's tunnel moved to
+//! the shard of the repository its greeting names; the live `git clone` and `hg clone` over SSH (main's runs).
 
 mod daemon_edge;
 mod git;
+mod hg;
 pub(crate) mod site;
 mod waits;
 
@@ -109,6 +109,13 @@ const PACKET_CAP: usize = MAX_PACKET_EVERY_PEER_ACCEPTS;
 /// Derived: the bytes one read takes from a connection's socket: a packet cap, so a read never splits a packet it could
 /// have taken whole.
 const READ_BYTES: usize = PACKET_CAP;
+
+/// Derived: the window a connection's session channel offers over an edge whose room is `room`
+/// (`SessionConfig::channel_window`): the room, as much of it as the window's 32-bit field holds (RFC 4254 §5.1). A
+/// command that bounds the input it holds bounds it by this (Mercurial's, `hg`).
+fn channel_window(room: u64) -> u32 {
+  u32::try_from(room).unwrap_or(u32::MAX)
+}
 
 /// Format: the refusal counts the edge keeps in the daemon's status report beside its own [`Counts`] (banned item 9:
 /// every connection ended other than by its client is counted by its reason).
@@ -452,7 +459,7 @@ impl EdgeState {
       },
       banner: None,
       failure_limit: RECOMMENDED_FAILURE_LIMIT,
-      channel_window: u32::try_from(self.bounds.room).unwrap_or(u32::MAX),
+      channel_window: channel_window(self.bounds.room),
     };
     Session::new(config, host_key, SystemEntropy::new(), keys, now_ns).ok()
   }

@@ -718,6 +718,21 @@ enum Answer {
   Unknown,
 }
 
+/// `computed` as the owner takes it from a holder (A-658 part 3a): sent in its wire form and read back by `owner`
+/// against `inc`, wherever the owner's head stands now; the form read back writes the same bytes again.
+fn carried(owner: &Green, inc: &Increment, computed: &Computed) -> Result<Computed, TestCaseError> {
+  let wire = computed.encode(inc);
+  let carried = owner
+    .computed_from(inc, &wire)
+    .map_err(|refused| TestCaseError::fail(format!("the owner could not read it: {refused:?}")))?;
+  prop_assert_eq!(
+    carried.encode(inc),
+    wire,
+    "the wire form read back writes otherwise"
+  );
+  Ok(carried)
+}
+
 /// The kind of a computed verdict.
 fn computed_answer(computed: &Computed) -> Answer {
   match (computed.accepted_before(), computed.windows()) {
@@ -907,9 +922,10 @@ impl Concurrent {
     let (inc, computed) = self.held.remove(usize::from(which) % self.held.len());
     let moved = computed.at() < self.owner.head();
     let (again, answer) = (self.owner.judged_again(), computed_answer(&computed));
+    let carried = carried(&self.owner, &inc, &computed)?;
     let by_position = self
       .owner
-      .judge_computed(&inc, computed)
+      .judge_computed(&inc, carried)
       .map_err(|refused| TestCaseError::fail(format!("the owner refused: {refused:?}")))?;
     let serially = self.serial.judge(&inc);
     let answers = (answer, judged_answer(&serially));

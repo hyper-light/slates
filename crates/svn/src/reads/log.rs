@@ -33,8 +33,10 @@
 //!   `svnserve` writes them (`interesting_merge` calls the client's receiver first).
 //! - Then `done`, then `( success ( ) )` or the refusal.
 //!
-//! The walk is a [`super::Stream`] whose state is a stack of frames, one revision a step.
+//! The walk is a [`super::Stream`] whose state is a stack of frames, one revision a step. Its entries go to one of two
+//! writers: `svnserve`'s receivers' items, or `mod_dav_svn`'s `log-report` (module [`dav`], A-681), the walk the same.
 
+pub(super) mod dav;
 mod merged;
 
 use super::history::History;
@@ -215,7 +217,10 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       return Ok(Outcome::Close);
     };
     self.trivial_auth()?;
-    Ok(Outcome::Streaming(Stream::log(LogStream::new(request))))
+    let writer = Writer::Items { started: false };
+    Ok(Outcome::Streaming(Stream::log(LogStream::new(
+      request, writer,
+    ))))
   }
 }
 
@@ -310,13 +315,26 @@ enum Frame {
   Release,
 }
 
-/// What `revision_receiver` keeps between entries (`log_baton_t`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// What the receivers keep between entries (`serve.c`'s `log_baton_t`, `reports/log.c`'s `log_receiver_baton`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Receiver {
-  /// Whether an entry's two lists are open: its changed paths have begun.
-  started: bool,
   /// How many entries with children are open.
   stack_depth: u64,
+  /// Where the entries are written.
+  writer: Writer,
+}
+
+/// Where a log's entries are written: as `svnserve`'s receivers write them on an ra_svn connection, or as
+/// `mod_dav_svn`'s write a `log-report` ([`dav`], A-681).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Writer {
+  /// `serve.c`'s `path_change_receiver` and `revision_receiver`.
+  Items {
+    /// Whether an entry's two lists are open: its changed paths have begun.
+    started: bool,
+  },
+  /// `reports/log.c`'s `log_change_receiver` and `log_revision_receiver`.
+  Dav(dav::DavWriter),
 }
 
 /// A log still to write.
@@ -341,14 +359,17 @@ pub(super) struct LogStream {
 }
 
 impl LogStream {
-  /// A log of a request, not begun.
-  fn new(request: LogRequest) -> Self {
+  /// A log of a request, not begun, its entries going to `writer`.
+  fn new(request: LogRequest, writer: Writer) -> Self {
     Self {
       request,
       frames: Vec::new(),
       begun: false,
       ended: false,
-      receiver: Receiver::default(),
+      receiver: Receiver {
+        stack_depth: 0,
+        writer,
+      },
       history: Mergeinfo::default(),
       nested: None,
       processed: None,
@@ -723,17 +744,24 @@ impl LogStream {
   }
 
   /// `path_change_receiver`: one changed path, the entry's two lists opened first; its copy source written when the
-  /// session may read it.
+  /// session may read it. A `log-report`'s writer writes it as `log_change_receiver` does.
   fn changed_path<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
     change: &ChangedPath,
     source_readable: bool,
   ) -> Result<(), ItemError> {
-    if !self.receiver.started {
+    let started = match &mut self.receiver.writer {
+      Writer::Items { started } => started,
+      Writer::Dav(writer) => {
+        writer.changed_path(reads.out, change, source_readable);
+        return Ok(());
+      }
+    };
+    if !*started {
       reads.out.extend_from_slice(LIST_OPEN);
       reads.out.extend_from_slice(LIST_OPEN);
-      self.receiver.started = true;
+      *started = true;
     }
     let action = match change.action {
       Action::Modify => "M",
@@ -817,9 +845,8 @@ impl LogStream {
     Some(chosen)
   }
 
-  /// `revision_receiver`: the entry's changed-path list closed (opened first when it holds none), then the revision,
-  /// the author, date and message in their places, the flags, the other revision properties counted and listed, and
-  /// whether it is a reverse merge.
+  /// `revision_receiver`, or a `log-report`'s writer's `log_revision_receiver`: the entry written, then one more entry
+  /// with children open when it has them.
   fn entry<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
@@ -828,49 +855,18 @@ impl LogStream {
     properties: Option<Vec<(&[u8], &[u8])>>,
   ) -> Result<(), ItemError> {
     let properties = properties.unwrap_or_default();
-    let find = |name: &[u8]| {
-      properties
-        .iter()
-        .find(|(held, _)| *held == name)
-        .map(|(_, value)| *value)
-    };
-    let (author, date, message) = (
-      find(AUTHOR_PROPERTY),
-      find(DATE_PROPERTY),
-      find(LOG_PROPERTY),
-    );
-    let rest: Vec<(&[u8], &[u8])> = properties
-      .iter()
-      .copied()
-      .filter(|(name, _)| !STANDARD_REVPROPS.contains(name))
-      .collect();
-    if !self.receiver.started {
-      reads.out.extend_from_slice(LIST_OPEN);
-      reads.out.extend_from_slice(LIST_OPEN);
+    match &mut self.receiver.writer {
+      Writer::Items { started } => items_entry(reads.out, started, revision, flags, &properties)?,
+      Writer::Dav(writer) => writer.entry(reads.out, revision, flags, &properties),
     }
-    reads.out.extend_from_slice(LIST_CLOSE);
-    self.receiver.started = false;
-    for item in [
-      Value::Number(revision),
-      optional_string(author),
-      optional_string(date),
-      optional_string(message),
-      Value::Word(super::bool_word(flags.has_children)),
-      Value::Word(super::bool_word(flags.invalid)),
-      Value::Number(u64::try_from(rest.len()).unwrap_or(u64::MAX)),
-      super::proplist(rest),
-      Value::Word(super::bool_word(flags.subtractive)),
-    ] {
-      write(&item, reads.out)?;
-    }
-    reads.out.extend_from_slice(LIST_CLOSE);
     if flags.has_children {
       self.receiver.stack_depth = self.receiver.stack_depth.saturating_add(1);
     }
     Ok(())
   }
 
-  /// `done`, then `( success ( ) )` or the refusal.
+  /// `done`, then `( success ( ) )` or the refusal; a `log-report`'s writer ends its answer, or keeps the refusal for
+  /// its caller.
   fn finish<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
@@ -878,6 +874,10 @@ impl LogStream {
   ) -> Result<(), ItemError> {
     self.ended = true;
     self.frames.clear();
+    if let Writer::Dav(writer) = &mut self.receiver.writer {
+      writer.finish(reads.out, failure);
+      return Ok(());
+    }
     write(&Value::Word(DONE), reads.out)?;
     match failure {
       None => reads.success(Vec::new())?,
@@ -885,6 +885,55 @@ impl LogStream {
     };
     Ok(())
   }
+}
+
+/// `revision_receiver` (`serve.c`): the entry's changed-path list closed (opened first when it holds none, as `started`
+/// says), then the revision, the author, date and message in their places, the flags, the other revision properties
+/// counted and listed, and whether it is a reverse merge.
+fn items_entry(
+  out: &mut Vec<u8>,
+  started: &mut bool,
+  revision: Revision,
+  flags: EntryFlags,
+  properties: &[(&[u8], &[u8])],
+) -> Result<(), ItemError> {
+  let find = |name: &[u8]| {
+    properties
+      .iter()
+      .find(|(held, _)| *held == name)
+      .map(|(_, value)| *value)
+  };
+  let (author, date, message) = (
+    find(AUTHOR_PROPERTY),
+    find(DATE_PROPERTY),
+    find(LOG_PROPERTY),
+  );
+  let rest: Vec<(&[u8], &[u8])> = properties
+    .iter()
+    .copied()
+    .filter(|(name, _)| !STANDARD_REVPROPS.contains(name))
+    .collect();
+  if !*started {
+    out.extend_from_slice(LIST_OPEN);
+    out.extend_from_slice(LIST_OPEN);
+  }
+  out.extend_from_slice(LIST_CLOSE);
+  *started = false;
+  for item in [
+    Value::Number(revision),
+    optional_string(author),
+    optional_string(date),
+    optional_string(message),
+    Value::Word(super::bool_word(flags.has_children)),
+    Value::Word(super::bool_word(flags.invalid)),
+    Value::Number(u64::try_from(rest.len()).unwrap_or(u64::MAX)),
+    super::proplist(rest),
+    Value::Word(super::bool_word(flags.subtractive)),
+  ] {
+    write(&item, out)?;
+  }
+  out.extend_from_slice(LIST_CLOSE);
+  Ok(())
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
