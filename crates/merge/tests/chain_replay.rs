@@ -267,6 +267,7 @@ fn kind_of(applied: &chain_entry::Applied) -> &'static str {
     A::RemoveHardlink(..) => "remove-hardlink",
     A::SetXattr(..) => "set-xattr",
     A::RemoveXattr(..) => "remove-xattr",
+    A::CopyTree { .. } => "copy-tree",
   }
 }
 
