@@ -11282,9 +11282,9 @@ struct VersionRecord { version: Version, snapshot: SnapshotId, manifest: Option<
 struct Increment { id: IncrementId /* blake3(work_volume, base, post_state, ops_doc, filter) */, work_volume: VolumeId,
                    base: (VolumeId, Version), post_state: SnapshotId, ops_doc: Blake3 /* a sealed chunk */, filter: FilterId,
                    evidence: SmallVec<Blake3> /* opaque to slates */ }
-#[repr(C)] struct OpRecord { kind: u8, flags: u8, path_idx: u16, reserved: u32, at: u64, len: u64, src: u64 }   // 32 bytes, little-endian
+struct OpRecord { kind: u8, flags: u8, path: u64, at: u64, len: u64, src: u64 }   // 34 bytes, little-endian, written field by field (version 2, A-621)
 enum OpKind { Overwrite, Extend, Truncate, Insert, Delete, Create, Unlink, Mkdir, Rmdir, Rename, Link, Symlink, SetMode, SetXattr, RemoveXattr, Mknod }
-struct OpsDoc { header: WireHeader, paths: PathTable /* path_idx → path bytes, sorted */, ops: [OpRecord] }
+struct OpsDoc { header: WireHeader /* magic, version 2, path and op counts as u64 */, paths: PathTable /* path → bytes, sorted, unique */, ops: [OpRecord] }
 struct CanonicalDelta { version: Version, ops: Handle<OpsDoc>, effects: Art<PathKey, RangeSet> /* per path: ranges touched and size shifts */ }
 struct MergeRecord { green: VolumeId, version: Version, increment: IncrementId, verdict: VerdictSummary, manifest: Blake3, host_epoch: u64 }
 struct ConflictWindow { path: PathKey, mine: (u64, u64), theirs: (u64, u64), theirs_version: Version, class: MergeConflictClass }
@@ -11295,6 +11295,19 @@ post-state are sealed chunks and a snapshot on the work volume's owner shard, re
 shard by handle while pinned (D-7); the merge record is an entry of the green's ledger register
 (a partition log append on a laptop; a record sent to the green's candidate holders in a fleet,
 §4.8); nothing in this plane is shared mutable state.
+
+> **Status (2026-11-19, A-621: a work names as many paths as it declares).** An op's path index is 64 bits, in memory
+> and on the wire, and the ops document's header counts its paths and operations in 64 bits (`crates/merge/src/ops_doc.rs`,
+> version 2; the chain entry, which writes an op's record the same way, version 5). So a work names as many paths as
+> its caller's admission allows, with no fixed cap: a kernel tree's first push (about 97,000 files) is one work. Until
+> then an index was 16 bits, and interning answered `u16::MAX` for every name past the 65,535th, so the 65,536th and
+> every later name aliased one path. The deriver's index lookup, the verdict's reading of a rename's or an attribute's
+> index, and the server's laying-in of an attribute's value narrowed the same way, the last silently skipping the
+> value. Interning looks a name up in an ordered map, so a table of n names costs O(n log n) comparisons, where the
+> scan it replaced cost O(n²); a test counts them. A table naming a path twice is refused at decode (`DuplicatePath`):
+> read as the first, every later index would name the path after its own. A version 1 document, and a version 4 chain
+> entry, are refused `BadVersion`, never read under the other layout. The golden vectors are version 2's, derived by
+> an independent encoder and BLAKE3 that reproduce version 1's vector from version 1's layout.
 
 **Declared operations (the journal, §4.5).** Every mutation is declared at the boundary where it
 happens: through a mount, `write(off, len)` is `Overwrite` (or `Extend` past the end) and
@@ -12624,6 +12637,22 @@ signature verification).
 > version 2), sparse-revlog's intermediate snapshots among its chains, every entry equal to 7.2's `debugindex --debug`
 > and every text to its `debugdata`. Owed with the import: walking a store (the fncache, the path encodings, a version 2
 > store's file index) and censored, ellipsis and externally stored revisions, refused by kind for now.
+>
+> **Status (2026-11-19, A-588 part 2: the index's tables on the shared object store built).** `slates-hg`'s `index`
+> keeps a repository's changelog, manifest log and file logs as rows of one A-581 `slates-vcs` index, so they are
+> content tables under a tail, shared by a fork and folded by the shared rule, and nothing of a log is held anywhere
+> else: a log row (`L`, the log's key, the revision's number big-endian) holds the node, the parents' and the link's
+> numbers, 7.2's flags, the length and the content (a changeset's text with its manifest node, branch and closed head;
+> a file revision's bytes and its block apart), and a node row (`N`, the node, the log's key) its number, since one
+> file node can stand in several file logs. A group is numbered as 7.2's `revlog.addgroup` numbers one (a node held
+> passed over; a parent missing from the log and the group, or a link the changelog lacks, refuses the whole group, with
+> nothing written); a log's length is read from its rows by doubling lookups. Mercurial's naming is the shared store's
+> `Naming` parameter (`HgNaming`: the parents and a file revision's framed block as context, the bytes alone as the
+> object). Proven against the history 7.2 stored in A-588's fixtures (every number, parent and link as its `debugindex`
+> lists them), the shared quarantine admitting each of its 30 revisions under its node and refusing a node one bit off,
+> and a model of `addgroup` over generated histories. The revlog reader's compressed chunks are now inflated by the
+> crate's one inflater, A-598's `compression::inflate`. Owed: the phase roots, markers and branch heads of the index
+> sketched below (pieces 5 and 7), and the import's walk of a store.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12737,6 +12766,10 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   never changes a node, which hashes them in order of value.
 - The tail is folded into a new table when the lookups it served since the last fold cost more than a fold (the table
   of learned tunables).
+- As built (A-588 part 2): the logs are rows of one shared `slates-vcs` index rather than tables apart, keyed so that
+  a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
+  that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
+  and bytes as two contents of its row.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -13009,7 +13042,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    index's tables, and an existing repository's store imported as a base. Built (A-588, `crates/hg`: `changeset`,
    `manifest`, `filerev`, `node`): the objects and their nodes. Built (A-611, `crates/hg`: `revlog`): the import's
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
-   holding inflated bytes. Owed: the index's tables on A-581's `slates-vcs`, then the import's walk of a store.
+   holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
+   Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
@@ -41970,6 +42004,102 @@ Applied in the same change to:
   Subversion push pieces call, with a typed refusal), and the hook driver (an owned hook process over a read-only
   attachment of the work, its learned deadline from A-597's runner). A client and CLI form of the verb are owed with
   the servers' administration.
+
+### A-588 part 2 — Mercurial's index on the shared object store's tables: logs as rows of one slates-vcs index, numbered as 7.2's addgroup numbers them, Mercurial's node rule as the store's naming (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.17.1 shared piece 3; A-581, A-588, A-598, A-611)
+Applied in the same change to: §4.17.3 (its status, the index's "as built" line, piece 3), `crates/hg` (`index`, new;
+`node::compute_prefixed`; `revlog`'s compressed chunks inflated by `compression::inflate`, its own inflaters gone and
+its `Inflate` refusal now `Stream`, the engine's own; `changeset`'s tests' `written` split so that no function
+returning `Result` asserts or unwraps, main's clippy findings, and its other tests' types named and long tests split;
+`revlog`'s four- and eight-byte reads and the docket's sizes given their `Format:` markers), `Cargo.lock` (slates-hg's
+entry names slates-vcs, which git's object store had already made a workspace dependency), GAPS (the §4.17.3 entry).
+- **What it does.** `index::HgIndex` keeps a repository's logs in one `slates-vcs` `Index`: a log row (`L`, the log's
+  key: `c`, `m`, or `f`, the path and a NUL; then the number big-endian) with the node, the parents' and link's
+  numbers (`u32::MAX` for none), 7.2's flags, the length, a changeset's manifest node, closed head and branch, and as
+  contents a changeset's or manifest's text or a file revision's bytes and block; and a node row (`N`, the node, the
+  log's key) with the number. `append_changesets` and `append_revisions` take a group in the order it arrived, as
+  7.2's `revlog.addgroup` does ("this can happen if two branches make the same change": a held node passed over; each
+  parent looked up, "unknown parent", in the log or earlier in the group), refuse a group whole on a missing parent or
+  link, and write it as one sorted batch. A log's length is the first number without a row, found by doubling and
+  halving lookups. `HgNaming` is Mercurial's node rule as the shared store's `Naming`: its context the two parents
+  then a file revision's block between its markers, its object the bytes alone, hashed in place
+  (`node::compute_prefixed`), a collision attack refused.
+- **Why rows of one index.** A-581's index holds rows by key under a tail and folds them by the shared rule; keying a
+  log's rows by its key and the number makes each log contiguous and ordered, and a fork shares them all. The log's
+  length kept nowhere but its rows means a fork or a restart needs no counter.
+- **One inflater (main, 2026-11-19).** The revlog reader (A-611) had its own zlib and zstd inflaters beside A-598's;
+  its chunks now go through `compression::inflate`, which also charges the decoder's memory to the admission, so the
+  crate inflates in one place and a chunk's refusal is the engine's own kind.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 188 of 188 at 02e608d67
+  (the first build, before the inflater and clippy changes), 188 of 188 at dbcee659e, 189 of 189 at d522d8a27 (the
+  damaged-revlog test now two), and 189 of 189 with `cargo fmt -p slates-hg -- --check` clean on the tree merged with
+  main at 38e48e3df (load 5.1). Golden: A-588's
+  fixtures' history appended log by log, every revision's number, parents and link as 7.2's `debugindex` lists them,
+  each node found under its number and its number under its node, the branches and the closed head kept, a copy's block
+  apart; the shared quarantine admitting all 30 revisions by `HgNaming` and refusing each node one bit off. Hostile: a
+  missing parent, a missing link, a parent from another file's log, each refusing its group with nothing written; a
+  group passed over whole when brought again; one node in two files' logs; a fork keeping its own revision. Model:
+  generated histories in generated groups (parents anywhere in the history, revisions brought twice) equal to a model
+  of `addgroup` after every group.
+- **Owed.** The phase roots, markers and branch heads of §4.17.3's index (pieces 5 and 7); the import's walk of a
+  store, which appends what the revlog reader reads into this index.
+
+### A-621 — an ops document names as many paths as its work declares: 64-bit path indices and interning through a map (2026-11-19, g267, UI goal 93; §4.16 "Data model"; found on the push path by g225, A-618)
+Applied in the same change to:
+- §4.16's data model (the op record and the document's header) and its status; GAPS (a §4.16 entry, the A-612 siblings
+  filed open, and a sibling found here);
+- `crates/merge`:
+  - `ops_doc.rs`: version 2, `Op::path` `u64`, `PathTable`'s ordered index, `DuplicatePath`; its tests moved from
+    `tests/ops_doc.rs` into `src/ops_doc/tests.rs`;
+  - `chain_entry.rs`: version 5, an op's record the ops document's;
+  - `engine.rs` and `increment.rs`: the index conversions;
+  - `tests/increment.rs`, `tests/special.rs` and `tests/chain_replay.rs`, updated to the wider index;
+- `crates/server/src/verbs.rs`: an attribute's name index read whole;
+- `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+- **The defect.** An op named its path by a 16-bit index, and `PathTable::intern` answered `u16::MAX` for every name
+  past the 65,535th, so the 65,536th and every later name of one work aliased one path: their edits would land on the
+  wrong file. The same narrowing stood in the deriver (`index_of`), in the verdict's reading of a rename's source and an
+  attribute's name, and in the server's laying-in of an attribute's value, which skipped it. Interning scanned every
+  name, O(n²) for a table of n.
+- **The format, the design's way.**
+  - The ops document's version is 2: a path index, and the header's path and op counts, are 64 bits, the op record 34
+    bytes written field by field. Its golden vectors are re-derived: the 152 bytes of the golden document, recorded field
+    by field in the test, and its identity
+    `11ede55e9cfe1c944e971c5bd45cc1628911d8c93d92ea5ea51c1ff8d370763b`. Both came from an independent encoder and
+    BLAKE3 (Python), which reproduces version 1's vector `67613f8e…19b677d` from version 1's layout of the same
+    document.
+  - The determinism gate holds at 65,537 names: the document is built twice, its names declared in opposite orders,
+    with the same bytes and identity.
+  - The chain entry, which writes an op's record the same way, is version 5.
+  - Old versions are refused `BadVersion` (a version 1 document, a version 4 entry): replaced, not layered.
+- **No fixed cap.** A table's length always fits 64 bits on the targets slates builds for, so the conversion never
+  fails. Its unreachable refusal answers `u64::MAX`, which names no path, so it can never alias another path as
+  `u16::MAX` did. A work's names are bounded by its caller's admission (g225's push path charges them, A-618).
+- **Interning.** An ordered map from name to index (`BTreeMap`). Its order is the canonical one, so
+  `canonicalize` reads the sort off the map in one pass, moving each path once. Decode refuses a table naming a path
+  twice (`DuplicatePath`).
+- **Tests** (debug, Mac Studio, 2026-11-19, load 8 to 26), green on kiln r692:
+  - `cargo test -p slates-merge --lib`, the whole suite, 60 of 60;
+  - `cargo test -p slates-server --lib -- green merge_origin`, 31 of 31;
+  - `cargo fmt -p slates-merge -p slates-server -- --check`, clean.
+
+  The failing-first tests:
+  - 65,537 distinct names each keep their own index, and each op names the path it was declared for, through
+    canonicalization, encode and decode;
+  - the comparison counter shows doubling the names less than triples the comparisons (a scan quadruples them), and
+    the total stays far below a scan's;
+  - the chain entry keeps an op's index past 16 bits.
+
+  Red on r705, with the old scan and 16-bit index restored inside the new types and the chain entry keeping an index's
+  low 16 bits: all four failed. The 65,537th name took the 65,536th's index (65,535); the determinism gate's two
+  orders differed; the chain entry's index came back clipped. Doubling the names took 2,149,245,934 comparisons against
+  537,633,163, four times, the scan's square.
+- **Merged with A-586** (Subversion's `Copy`, op kind 16, landed meanwhile). Its copy lookups narrowed an index to 16
+  bits the same way: `chain_entry::declared_copy`, which would never have found a copy past the 65,535th path, and
+  `Green::copy_records_reservation`. Both read the 64-bit index now. `Copy`, an appended kind, needs no version of its
+  own.
+- **Sibling found, not changed** (GAPS): a chain entry's encoding finds each splice's declared ops by scanning every op
+  of the increment (`chain_entry::declared_ops`). That is O(splices × ops) for a version that edits many existing
+  files, though not for a first push, whose files are created.
 
 ### A-622 part 2 — The push's check point: one function every push path calls, its refusal typed (2026-11-19, g255, UI goal 93; §4.17.1 "Policy" and shared piece 7's rest; after A-622 part 1)
 Applied in the same change to:
