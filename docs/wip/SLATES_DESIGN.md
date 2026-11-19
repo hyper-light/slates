@@ -39045,4 +39045,12 @@ engine (`state`, `daemon`, `verbs`, `merge_service`, `checkout`, `listing`, `err
   first, on the clone with one rule taken out each time: the branch floor (the recovery test fails), the destroy guard
   (the database's lineage and model tests and the server's destroy test fail), the release a node a unit (both stepped
   release tests fail), and a member's lend (all three server tests fail). The integration suites, clippy, `xtask`, the
-  wire-order tests and the other targets are main's (run requests).
+  wire-order tests and the other targets are main's (run requests). At the merged trees (main aef6faea1, then
+  57d25dd88): `cargo fmt --all --check` clean; `slates-merge --lib` 30 of 30, with A-542's copy tests, which had called
+  the whole release this change removes and failed to compile until their `release_all` stepped; `slates-db --lib` 116
+  of 116, then `repository` 4 of 4; `slates-ipc --lib` 74 passed, 2 ignored; `slates-server --lib` 522 passed, 4
+  ignored, the three repository tests among them, and one failed:
+  `a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`, which fails the same way on main
+  without this change (3 of 3 alone at aef6faea1; g255's report puts its cause between b7081c388 and f24745e). In one of
+  three whole runs `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it` failed as well; alone it
+  passes, 3 of 3 on main and 3 of 3 with this change.
