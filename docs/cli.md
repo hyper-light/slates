@@ -51,7 +51,9 @@ pick one); the daemon logs where it serves (`slates daemon: the version-control 
 IP:PORT`). A fleet node's edge serves HTTPS with the node's own certificate and key, the ones its fleet
 manifest names. A daemon that is no fleet node has no certificate, so it serves plain HTTP, on a loopback
 address alone: any other address is refused as a usage error before anything starts. Clients sign in with
-a token from `slates credential token`, as a bearer token or, over HTTPS, as Basic's password. The anchor
+a token from `slates credential token`, as a bearer token or, over HTTPS, as Basic's password. Over `svn://`
+the same token is CRAM-MD5's password, its id (the `id:` line) the user name: the daemon keeps the token's
+CRAM-MD5 keyed contexts beside its hash, never the token. The anchor
 binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
 daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon.
 An address the anchor cannot bind ends its start with an error naming it.
