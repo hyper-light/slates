@@ -13276,6 +13276,14 @@ signature verification).
 > failed with the step held waiting): the three captured sessions handed in a byte, seven bytes, a kilobyte and the
 > whole at a time, each answering as the session answers the same bytes whole; one answer held until taken; the
 > window's refusals; the end of input; arbitrary bytes at arbitrary cuts.
+>
+> **Status (2026-11-19, A-649 part 3a: no revlog held whole).** The import's seam asks a file's length and reads its
+> bytes by ranges, and the revlog reader's one algorithm runs over a byte source (`revlog::Source`, `revlog::Outline`):
+> whole slices are one source (the `Revlog` facade, its tests unchanged), the import's ranged reads another, so a split
+> revlog's index and data and a docket's files are read an entry or a chunk at a time, and only an inline revlog (under
+> 128 KiB, as 7.2 keeps one) whole. A text is rebuilt from the text before it where its chain passes through that one,
+> as 7.2's revision cache does, and counted. Proven by the same golden imports, and by every split or docketed file of
+> two stores read in several ranges, none as long as the file.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13678,7 +13686,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    encodings, the hashed long names) and its fncache. Built (A-630 parts 2 and 3, `crates/hg`: `import`,
    `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
    read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
-   phase roots, bookmarks and markers imported with the history. Owed: the import sliced and by ranges, and the
+   phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
+   never whole, and texts rebuilt from the one before. Owed: the import sliced under the shard's step budget, and the
    server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
@@ -46338,3 +46347,27 @@ store's `Admitted` and `ContentStore`, which an implementer of the `Objects` sea
   `remade` names, the module), `store/positions.rs` (`run_pairs`, `from_runs`), `store/mod.rs` (the export and its
   docs), `crates/git/src/tests/store/reach.rs` (new) and `tests/store/mod.rs`; §4.17.2's status; A-645's entry; §4.17.1
   "Reads"' status; GAPS' §4.17 entry.
+
+### A-649 part 3a — Revlogs read by ranges through the import's seam, never whole, the reader's one algorithm over a byte source (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; A-645's scale, A-611, A-630)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`revlog`: `Source`, `Slices`, `Outline`,
+the `Revlog` facade over them; `import`: the ranged seam and reader, the rebuild cache), GAPS (the §4.17.3 entry).
+- **What it does.** `RepositoryFiles` now asks a file's length (`len`) and reads `len` bytes from an offset (`read`);
+  a small file is read from its start in one range. The revlog reader's algorithm (entries, chunks, chains, texts and
+  their checks) is `revlog::Outline` over any `revlog::Source` of index and data bytes: `Slices`, a revlog's whole
+  bytes borrowed, is what the `Revlog` facade reads (A-611's tests unchanged), and the import's `Reader` reads a split
+  revlog's index and data files, or the files a docket names, by ranges through the seam, an entry or a chunk a read,
+  within the length the file had when it was opened (or the docket's sizes) and refused as cut short past it. An inline
+  revlog, which 7.2 keeps under 128 KiB (`_maxinline`), or an index shorter than a header, is read whole. A docket's
+  files are held to hold the bytes it says before any is read (7.2: "too few index data").
+- **The rebuild cache.** A text is rebuilt from the last text the import rebuilt where its chain passes through that
+  revision (7.2's `_deltachain` with its `stoprev`, and `_revisioncache`), so a linear history's text costs its own
+  chunk rather than its chain's; the reader reports when it did, and `Imported::rebuilt_from_cache` counts it.
+- **Why.** A-645 holds the servers to a 1 TB history: a revlog read whole would hold the largest log's data at once, a
+  file of many gigabytes; by ranges the import holds an entry, a chunk and two texts.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-ranges-red` (b7ae56ed3, not for main:
+  the ranged read stubbed to fetch the whole file and slice it, the cache ignored), `cargo test --locked -p slates-hg
+  --lib` 270 passed and 1 failed, the new test by its assertion. Green: 271 of 271 at db6b2fa13 (the first build's one
+  error, a call left on the whole-file seam, fixed before it), in a target directory of its own; rustfmt's layout from
+  that run, and the two warnings part 2 had left in the tests removed. The golden imports of every store unchanged;
+  new: every split or docketed file of the dotencode and version 2 stores read in more than one range and none as long
+  as the file, an inline revlog read whole, and texts rebuilt from the cache.

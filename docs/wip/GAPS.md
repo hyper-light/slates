@@ -612,13 +612,11 @@
 > Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
 > history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
-> import, with later pieces: the import sliced under the shard's step
-> budget and resumed after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a
-> text rebuilt from the one before it where its chain passes through it (7.2's revision cache), rather than from its
-> chain's base; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's
-> host seam to `RepositoryFiles` (one name at a time; a store name that is not UTF-8, which only the plain encoding
-> leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1
-> request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
+> import, with later pieces: the import sliced under the shard's step budget and resumed after a host's pending read,
+> rather than run again; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from
+> §4.15's host seam to `RepositoryFiles` (one name at a time; a store name that is not UTF-8, which only the plain
+> encoding leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH
+> version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
 > stub), the three captured sessions served whole. **Built (A-649 part 1):** every key of the index tagged by its kind
 > (`L`, `N`, and `O` for a push's object rows, `HgIndex::commit_objects`), so no log row can meet an object's id
@@ -636,9 +634,12 @@
 > point the daemon's SSH edge (A-651) calls with the session channel's bytes: one answer held at a time, standard error
 > before standard output, the consumed bytes given back to the window, a request needing more than the window refused
 > out of band; proven by 259 of 259 on the Mac Studio (red 5 of 5 with the step held waiting), the three captured
-> sessions handed in at every cut down to a byte. Owed, in order, after §4.17.1's seven pieces: (4, rest) read
-> serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump, the process around
-> `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
+> sessions handed in at every cut down to a byte. **Built (A-649 part 3a):** revlogs read by ranges through the seam
+> (its length, then ranges), the reader's one algorithm over a byte source (whole slices for the `Revlog` facade, ranges
+> for the import), never a split or docketed revlog whole; texts rebuilt from the one before where the chain passes
+> through it (7.2's revision cache), counted; red first (1 failed), 271 of 271. Owed, in order, after §4.17.1's seven
+> pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
+> the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
 > (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
