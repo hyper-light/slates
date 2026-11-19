@@ -161,8 +161,8 @@
 > fast-forward is the store's own verdict at admission (held to it over six moves, a tag moved onto itself among them),
 > the caller names the refs' greens, and a read the store cannot make is kept as a fault the service refuses on. Over
 > the repository stock git 2.50.1 served from, loaded into a real store, the negotiation sends exactly git's objects
-> for a clone and for a fetch with a have (GAPS-CHECKS-PENDING). This closes A-615's "A-614's store implementing
-> `Graph`". Owed in A-640: the v2 service with one entry point; `ls-refs`; the v0 and v1 service, with v0's ref names
+> for a clone and for a fetch with a have (338 of 338 on the Mac Studio merged with main, red four ways). This closes
+> A-615's "A-614's store implementing `Graph`". Owed in A-640: the v2 service with one entry point; `ls-refs`; the v0 and v1 service, with v0's ref names
 > held to A-615's rule; the pack from A-639's fragments; `sparse:oid`.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets

@@ -169,7 +169,11 @@ fn the_graphs_fast_forward_is_the_stores_own_verdict_at_admission() {
       &[],
       &[(green, head)],
     );
-    judged.extend(made.into_iter().map(|(version, verdict)| (green, version, verdict)));
+    judged.extend(
+      made
+        .into_iter()
+        .map(|(version, verdict)| (green, version, verdict)),
+    );
   }
   let verdicts: Vec<bool> = judged.iter().map(|(_, _, verdict)| *verdict).collect();
   assert_eq!(verdicts, [true, true, false, false, false, true]);

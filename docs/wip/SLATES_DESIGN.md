@@ -43223,8 +43223,8 @@ versions and D(k) the store keeps, and neither module names the other's internal
   A version fast-forwarded the one before when the store judged its move so at admission (`Move::is_fast_forward`).
   Versions keep no verdict, so the graph finds it again by the store's rule: both heads are commits, and the later is
   the earlier or reaches it, searched back through parents no lower than the earlier head's generation number. A tag
-  moved onto itself is no fast-forward, as the store judged it, though its D(k) is empty; the first draft called it
-  one, which the test against the store's verdicts caught.
+  moved onto itself is no fast-forward, as the store judged it, though its D(k) is empty. The first draft called any
+  two equal heads one; the test against the store's verdicts fails on that draft.
 - **Refs.** The store holds greens, not names, so the caller (the server, which keeps the repository's record) names
   each ref's green (`NamedRef`). Every ref's head is a tip, and the refs under `refs/tags/` whose head is an annotated
   tag are the tags `include-tag` reads.
@@ -43247,7 +43247,12 @@ versions and D(k) the store keeps, and neither module names the other's internal
   `ready`, and one round over `main`'s versions 1 and 2 with nothing walked, carrying exactly the objects of git's thin
   pack (read with its bases from the repository, as `index-pack --fix-thin` reads one). For `fetch-clone` the walk
   sends exactly the objects of git's clone pack.
-- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): CHECKS-PENDING
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 309 of 309 on the branch, then 338
+  of 338 merged with main (2 of main's ignored); `cargo fmt --check` clean. The golden test's first run failed reading
+  git's `fetch-haves` pack, which is thin (the request asked `thin-pack`), until its bases were taken from the
+  repository. Red in the Studio's clone, one guard at a time: the first draft's fast-forward failed the test against
+  the store's verdicts; a fast-forward always answered failed 2 tests; and, on the branch before the merge, the head
+  map never found failed 2, the golden fetch among them, and a tree's entries read empty failed 3.
 - **Next** (A-640's parts): the service over v2, with one entry point: `fetch`'s arguments mapped onto the negotiation
   (`want-ref` and `deepen-not` through the refs), the answer's sections in order over side-band, and the pack from
   A-639's fragments through a trait until it lands; `ls-refs` from the refs; the same service over v0 and v1
