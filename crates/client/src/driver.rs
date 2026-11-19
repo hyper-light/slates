@@ -16,10 +16,11 @@
 //! call goes on waiting, its deadline re-armed, so the next deadline asks again: a daemon answers every call it is
 //! given, a long one (a granted landing, a forward across the fleet) and a starved one alike, and a daemon judged
 //! stuck is ended by its supervisor, or by its own watchdog when it runs alone, which this client then sees as gone.
-//! A gone daemon starts recovery — single reconnect attempts paced as the synchronous reconnect paces them, the
+//! A gone daemon starts recovery — single reconnect steps, a claim polled as an async connect polls it, the
 //! channel bound to the consumer without a blocking round trip, then every call still awaited resent under its own id
-//! (the daemon answers a call it already served from its completion record) and the queue admitted. Past the
-//! reconnect budget every call fails `DaemonGone`. A binding whose reader fails, or whose descriptor closes, fails
+//! (the daemon answers a call it already served from its completion record) and the queue admitted. Recovery goes on
+//! while the instance's rendezvous has a holder, its anchor restarting the daemon; with none every call fails
+//! `DaemonGone` at once (A-468). A binding whose reader fails, or whose descriptor closes, fails
 //! every call with [`Driver::fail_all`]; a cancelled call is released at once with [`Driver::cancel`]. Nothing is left
 //! waiting on a reply that cannot come.
 //!
@@ -84,7 +85,6 @@ struct Call {
 
 /// A lost channel's recovery.
 struct Lost {
-  since: Instant,
   next_attempt: Instant,
   pause_ns: u64,
 }
@@ -341,7 +341,6 @@ impl Driver {
     if self.lost.is_none() {
       let now = Instant::now();
       self.lost = Some(Lost {
-        since: now,
         next_attempt: now,
         pause_ns: 1,
       });
@@ -350,8 +349,9 @@ impl Driver {
 
   /// One recovery step, when due: a single reconnect step (never waiting on the daemon); connected, every
   /// call in flight is marked to resend under its id, the queue's clocks restart, and the queue is
-  /// admitted; still no daemon, the next attempt is paced (doubling, at most a tenth of the budget, as the
-  /// synchronous reconnect paces); past the reconnect budget, every call fails `DaemonGone`.
+  /// admitted; the claim still due, or refused for now while the instance's rendezvous has a holder, the next step is
+  /// paced as an async connect's polls are (doubling, at most a tenth of the claim wait); with no holder, every call
+  /// fails `DaemonGone` (A-468).
   fn recover(&mut self, client: &mut Client, events: &mut Vec<Event>) {
     let Some(lost) = &self.lost else {
       return;
@@ -359,7 +359,6 @@ impl Driver {
     if Instant::now() < lost.next_attempt {
       return;
     }
-    let budget = client.deadlines().reconnect_ns;
     match client.try_reconnect() {
       Ok(true) => {
         self.lost = None;
@@ -376,8 +375,8 @@ impl Driver {
         }
         self.resend_and_admit(client, events);
       }
-      Ok(false) if elapsed_ns(lost.since) < budget => {
-        let pause_ns = crate::client::next_pause_ns(lost.pause_ns, budget);
+      Ok(false) => {
+        let pause_ns = crate::client::next_pause_ns(lost.pause_ns, slates_ipc::CLAIM_WAIT_NS);
         if let Some(lost) = self.lost.as_mut() {
           lost.pause_ns = pause_ns;
           let now = Instant::now();
@@ -385,9 +384,6 @@ impl Driver {
             .checked_add(std::time::Duration::from_nanos(pause_ns))
             .unwrap_or(now);
         }
-      }
-      Ok(false) => {
-        events.extend(self.fail_all(client, &ClientError::DaemonGone { after_ns: budget }))
       }
       Err(error) => events.extend(self.fail_all(client, &error)),
     }

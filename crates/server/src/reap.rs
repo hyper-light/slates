@@ -254,7 +254,10 @@ fn owner_window_ns(shard: u16) -> u64 {
 /// running later; only frozen attachment ids cross the mutating boundary, never a live client query.
 /// On each shard the client's direct maps held there (§4.6, A-188) bracket the removal: a writable map's stores reach
 /// its file only through the attachment it was made under, so they are written back first (A-186), a store to a shared
-/// map outliving its process; and the copies are let go once the attachments are gone.
+/// map outliving its process; and the copies are let go once the attachments are gone. On macOS the offers the client
+/// never claimed on the socket route go last (A-492, `crate::shards_route::let_go_of_client`): an offer waits for its
+/// claim while its client lives, and a stream's offer holds the end its stream waits on, so letting it go ends the stream
+/// and its attachment, which no removal of the client's own attachments reaches (a guest's).
 ///
 /// Each call waits in its shard's own time (A-432; R3's class A, A-65): a window of `window_of(shard)`, then on while the
 /// shard works or waits for a CPU, until it has run that window of CPU (held to this build), so a shard alive and busy
@@ -263,7 +266,7 @@ fn owner_window_ns(shard: u16) -> u64 {
 /// Each waited one window on the wall, so a busy owner deferred every reap that met it and the next sweep sent the same
 /// write-back again beside the first. The window is each owner's own (A-475, [`owner_window_ns`]), where it was the reap
 /// loop's cadence.
-async fn remove_on_owners(
+pub(crate) async fn remove_on_owners(
   origin: u16,
   shards: &[u16],
   batch: usize,
@@ -313,6 +316,15 @@ async fn remove_on_owners(
       origin,
       shard,
       move |state| crate::direct_map::let_go_held(state, client),
+      budget_ns,
+    )
+    .await
+    .ok_or(Refusal::Overloaded { shard })?;
+    #[cfg(target_os = "macos")]
+    crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| crate::shards_route::let_go_of_client(state, client),
       budget_ns,
     )
     .await

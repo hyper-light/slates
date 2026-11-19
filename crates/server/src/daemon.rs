@@ -888,13 +888,9 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
     // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
-    // connections, served again on the listener's shard below. Windows parses at most every entry its anchor may hold,
-    // of every class: the attachments' and the DAX sections' (A-448).
-    let handed = crate::anchor_hold::adopt(
-      config
-        .held_device_bound()
-        .saturating_add(config.held_dax_bound()),
-    );
+    // connections, served again on the listener's shard below. Each platform reads the handoff table against every
+    // entry its anchor may hold, as the configuration derives the anchor's bounds (A-448, A-460, A-462).
+    let handed = crate::anchor_hold::adopt(&config);
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that
@@ -4614,6 +4610,7 @@ async fn init_shard(
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     told_times: crate::told::ToldTimes::default(),
+    unmount_times: crate::learned_wait::LearnedWait::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
@@ -4658,6 +4655,7 @@ async fn init_shard(
     council_learner_pace: crate::fleet::LearnerPace::default(),
     learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
+    root_newer_seen: None,
     record_sessions: std::collections::BTreeMap::new(),
     record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
@@ -6248,6 +6246,7 @@ async fn control_loop(
                 read_ahead: None,
                 read_ahead_pending: 0,
                 remote_volumes: Vec::new(),
+                maps_sent: std::collections::BTreeSet::new(),
               }) {
                 Ok(seat) => {
                   if crate::reap::start_watch(s, seat, client_id, hangup) {
@@ -7301,7 +7300,7 @@ mod tests {
       }));
       assert!(state.council.configuration().version > installed);
       let query = crate::owner_location::Query::new(state, object, 0);
-      crate::owner_location::serve(state, &query.to_bytes())
+      crate::owner_location::serve(state, HostId(local.0 ^ 1), &query.to_bytes())
     });
     assert!(
       matches!(claimed, Ok((_, None))),
@@ -9426,27 +9425,27 @@ mod tests {
     assert_eq!(reclaimed, 0, "nothing is reclaimed");
   }
 
-  /// A-341 (A-309's owed rule, its safe part): a holder the takeover never asked lets its copy go as a stale one goes when
-  /// its successor's confirmation in the kept retirement shows the object recovered within tolerance, and keeps it where
-  /// nothing shows that. Do: make the audit node hold copies of three objects of a member although it is in none of that
-  /// member's neighbourhoods (copies an earlier neighbourhood of the member left there), in a six-member `f = 1` region
-  /// whose neighbourhoods are three: a plain register and a head naming this holder for content it holds, both falling
-  /// to one successor, and a plain register falling to another, each successor placing them away from the audit node.
-  /// Take the member over and install; have the first successor alone confirm and install; then every other survivor,
-  /// so the takeover completes, and install again. Expect all three moved to their successors at the first install; at
-  /// the first confirmation, judged within tolerance, the first register let go and the head kept for its content; on
-  /// the completed takeover's record, which keeps no neighbourhood to judge by, the head and the second register kept.
-  /// Counted `fleet.takeover.unasked_covered` twice, `fleet.takeover.reclaimed` once,
-  /// `fleet.takeover.kept_holding_content` once and `fleet.takeover.kept_unasked` twice. Before A-341 every such copy
-  /// was kept for good (A-309); the lineage model (`crates/db/tests/lineage_model.rs`) found the history where one let
-  /// go past tolerance was the last copy of a record placed at `f + 1`.
+  /// A-341 (A-309's owed rule, its safe part) and A-484 (its owed piece, the completion record): a holder the takeover
+  /// never asked lets its copy go as a stale one goes when the copy's writer's takeover shows the object recovered within
+  /// tolerance, judged on its kept retirement or its completion record. Do: make the audit node hold copies of three
+  /// objects of a member although it is in none of that member's neighbourhoods (copies an earlier neighbourhood of the
+  /// member left there), in a six-member `f = 1` region whose neighbourhoods are three: a plain register and a head
+  /// naming this holder for content it holds, both falling to one successor, and a plain register falling to another,
+  /// each successor placing them away from the audit node. Take the member over and install; have the first successor
+  /// alone confirm and install; then every other survivor, so the takeover completes, give the audit node a fourth copy
+  /// of the member's (a lagging holder's, still routed to the member) and install again. Expect all three moved to their
+  /// successors at the first install; at the first confirmation the first register let go and the head kept for its
+  /// content; on the completed takeover's record the head kept for its content again, and the second register and the
+  /// fourth copy let go. Counted `fleet.takeover.unasked_covered` five times, `fleet.takeover.reclaimed` three times,
+  /// `fleet.takeover.kept_holding_content` twice and `fleet.takeover.kept_unasked` never. Before A-341 every such copy
+  /// was kept for good (A-309), and before A-484 every copy first judged on the record, which kept no neighbourhood to
+  /// judge by; the lineage model (`crates/db/tests/lineage_model.rs`) found the history where one let go past tolerance
+  /// was the last copy of a record placed at `f + 1`.
   #[test]
   fn a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance() {
     let (moved, after_one, after_all, counts) = audit_on_shard(|state| {
       use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
-      use slates_db::register::{
-        Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
-      };
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
       let local = state.fleet.host();
       // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
       let scatter = 3;
@@ -9530,25 +9529,7 @@ mod tests {
         (named, head.to_record_bytes()),
         (other, b"head".to_vec()),
       ] {
-        let mut acceptor = Acceptor::new(
-          local,
-          Authority {
-            generation,
-            owner: departed,
-          },
-        );
-        acceptor
-          .accept(&Record {
-            owner: departed,
-            object,
-            sequence: 0,
-            epoch: FIRST_EPOCH,
-            generation,
-            value,
-          })
-          .unwrap();
-        state.holder_records.insert(object, acceptor);
-        state.fleet.track_object_owner(object, departed);
+        hold_written_copy(state, (departed, generation), object, value);
       }
       state
         .held_content
@@ -9606,9 +9587,12 @@ mod tests {
           .contains_key(&departed),
         "the takeover completed"
       );
+      // A copy this holder first judges on the record: a lagging holder's, still routed to the member that wrote it.
+      let late = ObjectId::new(departed, 256);
+      hold_written_copy(state, (departed, generation), late, b"head".to_vec());
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
-      let after_all = held(state);
+      let after_all = (held(state), state.holder_records.contains_key(&late));
       let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
       let counts = [
         count("fleet.takeover.unasked_covered"),
@@ -9626,13 +9610,373 @@ mod tests {
     );
     assert_eq!(
       after_all,
-      (false, true, true),
-      "on the completed takeover's record both are kept"
+      ((false, true, false), false),
+      "on the completed takeover's record the head stays for its content, the other register and the late copy go"
     );
     assert_eq!(
       counts,
-      [2, 1, 1, 2],
-      "covered twice, reclaimed once, kept for content once, kept unasked twice"
+      [5, 3, 2, 0],
+      "covered five times, reclaimed three times, kept for content twice, never kept unasked"
+    );
+  }
+
+  /// Gives the audit shard a copy of `object` that `writer` wrote under configuration `generation`, routed to `writer`:
+  /// its acceptor serves `writer` and accepted the record `value` at sequence 0 (A-341, A-484).
+  fn hold_written_copy(
+    state: &mut crate::state::ShardState,
+    (writer, generation): (slates_db::register::HostId, u64),
+    object: slates_db::register::ObjectId,
+    value: Vec<u8>,
+  ) {
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Record};
+    let local = state.fleet.host();
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: writer,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: writer,
+        object,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value,
+      })
+      .unwrap();
+    state.holder_records.insert(object, acceptor);
+    state.fleet.track_object_owner(object, writer);
+  }
+
+  /// A-484, red before it: a holder no round asked judges its copy by the first takeover since the copy was written, its
+  /// writer's, never by a later one in the object's line. Do: in an eight-member `f = 1` region whose neighbourhoods are
+  /// three, make the audit node hold a copy of an object a member wrote, though it is in none of the member's
+  /// neighbourhoods; take over another host of the object's cohort (its takeover completes) and then the member, so the
+  /// member's takeover is past tolerance for the object; have the object's successor, the cohort's one survivor, confirm
+  /// without it (nobody its round asked held it) and report its neighbourhood placed, and install; then take that
+  /// successor over, have its own successor confirm, and install. Expect the copy kept both times, counted
+  /// `fleet.takeover.kept_unasked` twice and `fleet.takeover.unasked_covered` never: no round learned the object, and this
+  /// copy may be its last. Before, the second install judged the copy by the successor's takeover, within tolerance for
+  /// the object, and let it go.
+  #[test]
+  fn a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover() {
+    let (kept, routed_to_later, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the eight members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the writer's and its six others', apart from the next one's.
+      let stride = 8;
+      // The history, dry-run on a configuration of each candidate region until one leaves the audit node out of every
+      // neighbourhood and placement that would ask it or reach it: rendezvous decides them from the random ids alone.
+      let (members, writer, first_gone, successor, later) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..8).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let writer = *members.get(1)?;
+          let object = ObjectId::new(writer, 0);
+          let mut dry = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          let cohort = dry.configuration_for(writer)?.place(object).candidates;
+          let others: Vec<HostId> = cohort
+            .iter()
+            .copied()
+            .filter(|host| *host != writer)
+            .collect();
+          let [first_gone, successor] = <[HostId; 2]>::try_from(others).ok()?;
+          let leaves_out = |dry: &RegionalConfiguration, owner: HostId| {
+            dry
+              .neighbourhoods
+              .get(&owner)
+              .is_some_and(|neighbourhood| !neighbourhood.hosts.contains(&local))
+              && dry
+                .configuration_for(owner)
+                .is_some_and(|placement| !placement.place(object).candidates.contains(&local))
+          };
+          if !leaves_out(&dry, writer) {
+            return None;
+          }
+          dry.take_over(first_gone, scatter)?;
+          for survivor in dry.survivors_of(first_gone) {
+            dry.confirm(first_gone, survivor);
+          }
+          if !leaves_out(&dry, writer) {
+            return None;
+          }
+          dry.take_over(writer, scatter)?;
+          if dry.successor(writer, object) != Some(successor)
+            || dry.survivors_of(writer).contains(&local)
+            || dry.within_tolerance(writer, object)
+          {
+            return None;
+          }
+          dry.confirm(writer, successor);
+          let generation = dry.neighbourhoods.get(&successor)?.generation;
+          dry.settle(successor, generation);
+          if !leaves_out(&dry, successor) {
+            return None;
+          }
+          dry.take_over(successor, scatter)?;
+          let later = dry.successor(successor, object)?;
+          (leaves_out(&dry, later)
+            && !dry.survivors_of(successor).contains(&local)
+            && dry.within_tolerance(successor, object))
+          .then_some((members, writer, first_gone, successor, later))
+        })
+        .expect(
+          "a region whose neighbourhoods and placements of the object leave the audit node out",
+        );
+      let object = ObjectId::new(writer, 0);
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      hold_written_copy(state, (writer, generation), object, b"head".to_vec());
+      let step = |state: &mut crate::state::ShardState, changes: Vec<Reconfiguration>| {
+        for change in changes {
+          state.council.propose(change);
+        }
+        install_council(state);
+        crate::takeover::resolve_held_objects(state, local);
+      };
+      step(state, vec![Reconfiguration::TakeOver(first_gone)]);
+      let confirmations: Vec<Reconfiguration> = state
+        .council
+        .configuration()
+        .survivors_of(first_gone)
+        .into_iter()
+        .map(|survivor| Reconfiguration::Confirm {
+          departed: first_gone,
+          successor: survivor,
+        })
+        .collect();
+      step(state, confirmations);
+      step(state, vec![Reconfiguration::TakeOver(writer)]);
+      let generation = state
+        .council
+        .configuration()
+        .neighbourhoods
+        .get(&successor)
+        .map(|neighbourhood| neighbourhood.generation)
+        .expect("the successor is a member");
+      step(
+        state,
+        vec![
+          Reconfiguration::Confirm {
+            departed: writer,
+            successor,
+          },
+          Reconfiguration::Settle {
+            owner: successor,
+            generation,
+          },
+        ],
+      );
+      let kept_first = state.holder_records.contains_key(&object);
+      step(state, vec![Reconfiguration::TakeOver(successor)]);
+      step(
+        state,
+        vec![Reconfiguration::Confirm {
+          departed: successor,
+          successor: later,
+        }],
+      );
+      assert!(
+        state
+          .council
+          .configuration()
+          .within_tolerance(successor, object),
+        "the later takeover is within tolerance for the object"
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        (kept_first, state.holder_records.contains_key(&object)),
+        state.fleet.object_owner(object) == Some(later),
+        [
+          count("fleet.takeover.kept_unasked"),
+          count("fleet.takeover.unasked_covered"),
+        ],
+      )
+    });
+    assert_eq!(
+      kept,
+      (true, true),
+      "the copy is kept through both takeovers"
+    );
+    assert!(
+      routed_to_later,
+      "the copy follows its line to the later successor"
+    );
+    assert_eq!(counts, [2, 0], "kept unasked twice, never covered");
+  }
+
+  /// A-508, red before it: a holder a live owner's neighbourhood settled away from lets the owner's copies go once the
+  /// owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever content a head still names it
+  /// for. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
+  /// and a head naming this holder for content it holds, both of a member's own writing, though it is in none of that
+  /// member's neighbourhoods, and install; then take over one of the member's neighbours, give the audit node a third
+  /// copy of the member's and install; then have the member settle its new neighbourhood and install. Expect the plain
+  /// register let go at the first install and the head kept for its content; the third copy kept while the member's
+  /// settled cohort lacks a member, and let go once the member settled; counted `fleet.settle.released` twice,
+  /// `fleet.settle.kept_outside` twice (the head and the third copy at the second install) and
+  /// `fleet.takeover.kept_holding_content` twice. Before, every such copy was kept for good.
+  #[test]
+  fn a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go() {
+    let (first, second, third, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the owner's and its four others', apart from the next one's.
+      let stride = 8;
+      // A member whose neighbourhoods leave the audit node out, before and after one of its neighbours is taken over:
+      // rendezvous decides them from the random ids alone, so search a few regions.
+      let (members, owner, neighbour) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..6).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let owner = *members.get(1)?;
+          let mut dry = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          if dry.holds_for(owner, local) {
+            return None;
+          }
+          let neighbour = dry
+            .neighbourhoods
+            .get(&owner)?
+            .hosts
+            .iter()
+            .copied()
+            .find(|host| *host != owner)?;
+          dry.take_over(neighbour, scatter)?;
+          (!dry.holds_for(owner, local)).then_some((members, owner, neighbour))
+        })
+        .expect("a member whose neighbourhoods leave the audit node out");
+      let (plain, named, third) = (
+        ObjectId::new(owner, 0),
+        ObjectId::new(owner, 1),
+        ObjectId::new(owner, 2),
+      );
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![owner.0, local.0],
+        sealing: None,
+      };
+      hold_written_copy(state, (owner, generation), plain, b"head".to_vec());
+      hold_written_copy(state, (owner, generation), named, head.to_record_bytes());
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the named head's content");
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let held = |state: &crate::state::ShardState, object: ObjectId| {
+        state.holder_records.contains_key(&object)
+      };
+      let first = (held(state, plain), held(state, named));
+      assert!(state.council.propose(Reconfiguration::TakeOver(neighbour)));
+      let generation = state.fleet.configuration().version;
+      hold_written_copy(state, (owner, generation), third, b"head".to_vec());
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let second = held(state, third);
+      let settled_generation = state
+        .council
+        .configuration()
+        .neighbourhoods
+        .get(&owner)
+        .map(|neighbourhood| neighbourhood.generation)
+        .expect("the owner is a member");
+      assert!(state.council.propose(Reconfiguration::Settle {
+        owner,
+        generation: settled_generation,
+      }));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let third_held = (
+        held(state, named) && state.held_content.holds_manifest(named, &manifest),
+        held(state, third),
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        first,
+        second,
+        third_held,
+        [
+          count("fleet.settle.released"),
+          count("fleet.settle.kept_outside"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert_eq!(
+      first,
+      (false, true),
+      "the plain register goes at once, the head stays for its content"
+    );
+    assert!(
+      second,
+      "the third copy stays while the owner's settled cohort lacks a member"
+    );
+    assert_eq!(
+      third,
+      (true, false),
+      "once the owner settled, the head still stays for its content and the third copy goes"
+    );
+    assert_eq!(
+      counts,
+      [2, 2, 2],
+      "released twice, kept outside twice, kept for content twice"
     );
   }
 

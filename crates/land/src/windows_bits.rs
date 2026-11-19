@@ -232,35 +232,54 @@ mod tests {
   #[test]
   fn the_word_replaces_what_the_volume_keeps_and_keeps_what_it_does_not() {
     let stale = HIDDEN | SYSTEM | OFFLINE | NOT_CONTENT_INDEXED | ARCHIVE;
-    assert_eq!(set_word(stale | TEMPORARY, 0, Made::File), TEMPORARY);
-    assert_eq!(
-      set_word(stale, WindowsAttributes::HIDDEN, Made::File),
-      HIDDEN
-    );
-    assert_eq!(
-      set_word(stale, 0, Made::File),
-      NORMAL,
-      "no bit: NORMAL alone"
-    );
-    assert_eq!(
-      set_word(DIRECTORY | stale, WindowsAttributes::READONLY, Made::Dir),
-      READONLY,
-      "a directory's read-only is a bit"
-    );
-    assert_eq!(
-      set_word(READONLY, 0, Made::File),
-      READONLY,
-      "a file's read-only is its mode's, kept"
-    );
-    assert_eq!(
-      set_word(
+    let rows: [(u32, u16, Made, u32, &str); 6] = [
+      (
+        stale | TEMPORARY,
+        0,
+        Made::File,
+        TEMPORARY,
+        "the untracked bit kept",
+      ),
+      (
+        stale,
+        WindowsAttributes::HIDDEN,
+        Made::File,
+        HIDDEN,
+        "the volume's bit replaces the stale ones",
+      ),
+      (stale, 0, Made::File, NORMAL, "no bit: NORMAL alone"),
+      (
+        DIRECTORY | stale,
+        WindowsAttributes::READONLY,
+        Made::Dir,
+        READONLY,
+        "a directory's read-only is a bit",
+      ),
+      (
+        READONLY,
+        0,
+        Made::File,
+        READONLY,
+        "a file's read-only is its mode's, kept",
+      ),
+      (
         REPARSE_POINT | DIRECTORY,
         WindowsAttributes::LINK_DIRECTORY,
-        Made::Link
+        Made::Link,
+        NORMAL,
+        "a link's kind is never a bit set",
       ),
-      NORMAL,
-      "a link's kind is never a bit set"
-    );
+    ];
+    for (current, volume, made, word, why) in rows {
+      assert_eq!(set_word(current, volume, made), word, "{why}");
+    }
+  }
+
+  /// A-262, A-451. Do: ask whether the volume's bits make a link a directory link, and the word a file's mode sets.
+  /// Expect a link a directory link exactly where its bits hold the directory kind, and a file read-only exactly where its
+  /// mode has no write bit, its other bits kept.
+  #[test]
+  fn a_links_kind_is_its_bits_and_a_files_read_only_state_its_mode() {
     assert!(directory_link(
       WindowsAttributes::LINK_DIRECTORY | WindowsAttributes::HIDDEN
     ));

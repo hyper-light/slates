@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
-use slates_vfs::base::{BaseConfig, Divergence, DriftKind};
+use slates_vfs::base::{BaseConfig, Diverged, Divergence, DriftKind};
 use slates_vfs::clock::StepClock;
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
@@ -655,6 +655,87 @@ fn a_drift_recheck_the_host_refuses_is_reported_unverified() {
   host.clear_faults();
   let status = vol.with_host(&mut host).status(&mut store).unwrap();
   assert!(status.unverified.is_empty(), "{:?}", status.unverified);
+}
+
+/// A-501 (a base directory's mode alone is witnessed). Do: `chmod` the base directory `/src` through the overlay; take
+/// the status; let an outsider add a file inside it and take the status again; image the volume and recover it; let an
+/// outsider change the directory's mode, take the status and rewitness. Expect `/src` diverged by its witness alone, a
+/// divergence the recovery keeps; no drift while the disk keeps the directory's own metadata (a file made inside it
+/// moves its times, which the volume follows); `Modified` drift once the disk's mode moved, which `rewitness` clears,
+/// the volume's mode left as it set it. Before A-501 a base directory's chmod took no witness; a witness with no home
+/// would have refused the image (`RecoveryIncomplete`), and a directory re-checked as a file reported `TypeChanged`.
+#[test]
+fn a_base_directorys_mode_change_is_witnessed_and_drifts_only_by_its_own_metadata() {
+  /// Shape: the directory's mode on the disk, the volume's, and an outsider's later one.
+  const DISK_MODE: u32 = 0o040_755;
+  /// Shape: see `DISK_MODE`.
+  const VOLUME_MODE: u32 = 0o040_700;
+  /// Shape: see `DISK_MODE`.
+  const OUTSIDER_MODE: u32 = 0o040_750;
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.chmod("/src", DISK_MODE);
+  host.replace_file("/src/lib.rs", b"pub fn lib() {}");
+  host.advance_ns(2);
+  let mut before = store();
+  let mut vol = overlay(&mut host, &mut before);
+  let src = vol
+    .with_host(&mut host)
+    .resolve(&mut before, "/src")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut before, src, VOLUME_MODE)
+    .unwrap();
+  let divergence = vol.diverged(&before);
+  assert_eq!(
+    divergence,
+    vec![Diverged {
+      path: "/src".to_owned(),
+      kind: Divergence::Witnessed,
+    }]
+  );
+  let quiet =
+    |status: slates_vfs::base::BaseStatus| status.drift.is_empty() && status.unverified.is_empty();
+  assert!(quiet(vol.with_host(&mut host).status(&mut before).unwrap()));
+  host.advance_ns(1_000_000_000);
+  host.replace_file("/src/new.rs", b"an outsider's file");
+  assert!(
+    quiet(vol.with_host(&mut host).status(&mut before).unwrap()),
+    "a file made inside the directory is no drift of its own"
+  );
+  let image = vol.to_image(&before, Some(&mut host)).unwrap();
+  let image = slates_vfs::recover::VolumeImage::from_content(&image.to_content()).unwrap();
+  let mut after = common::surviving(&before);
+  let root = host.root();
+  let claims = common::claims(&mut after, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut after,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .unwrap();
+  assert_eq!(recovered.diverged(&after), divergence);
+  host.chmod("/src", OUTSIDER_MODE);
+  let status = recovered.with_host(&mut host).status(&mut after).unwrap();
+  assert_eq!(status.drift, vec![("/src".to_owned(), DriftKind::Modified)]);
+  let redone = recovered
+    .with_host(&mut host)
+    .rewitness(&mut after, None)
+    .unwrap();
+  assert_eq!(redone, vec!["/src".to_owned()]);
+  assert!(quiet(
+    recovered.with_host(&mut host).status(&mut after).unwrap()
+  ));
+  assert_eq!(
+    recovered.stat(&after, src).unwrap().mode & 0o7777,
+    VOLUME_MODE & 0o7777,
+    "the volume's mode left as it set it"
+  );
 }
 
 /// The worked example, second half: `git pull` replaces both files on the host; drift is
