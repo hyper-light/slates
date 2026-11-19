@@ -9,6 +9,9 @@ readme.workspace = true
 description = "git's wire formats (§4.17.2, A-582): pkt-lines and side-band-64k, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission."
 
 [dependencies]
+# A gzip request body's inflate (A-595: git sends `Content-Encoding: gzip` for a long request); its backend is chosen by
+# measurement (§4.17.2 piece 3).
+flate2 = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }

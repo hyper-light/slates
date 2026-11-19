@@ -40,6 +40,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod admission;
+pub mod http;
 pub mod out;
 pub mod pktline;
 pub mod sideband;

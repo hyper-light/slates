@@ -112,6 +112,9 @@ cc = "1.4"
 # `AWS_LC_SYS_NO_JITTER_ENTROPY`), so AWS-LC seeds from the operating system's generator and a new process pays no
 # start-up latency for its first random bytes. Vetted primitives — the project never hand-rolls cryptography.
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "alloc"] }
+# gzip and deflate (A-595: a smart HTTP request body git gzips; §4.17.2 piece 3, a pack's objects): its backend is
+# chosen by measurement, the crate's default (miniz_oxide, pure Rust) until then.
+flate2 = "1"
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }
