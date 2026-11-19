@@ -7,7 +7,8 @@ against stock `svnserve -d`, every byte of every connection each way logged by a
 forwarded; and hand-made clients for the refusals of a report.
 
 Usage: python3 -I make-fixtures.py OUTDIR [NAME,...]
-With NAME,..., only those hand-made sessions are recorded into OUTDIR beside the fixtures already there, after the
+With NAME,..., only those sessions are recorded into OUTDIR beside the fixtures already there (hand-made ones, and
+stock ones that need no working copy: the `read-auth-*` reads of a URL), after the
 repository built again is checked against changed.txt and tree.txt (its offsets aside) and the tools against
 subversion-version.txt; sessions.txt gains their lines and SHA256SUMS is made again over every file.
 Writes, per stock session, NAME.K.client.bin and NAME.K.server.bin for the K-th connection its command opened; per
@@ -47,9 +48,9 @@ UUID = "00000000-0000-4000-8000-0000000a0616"
 LINE = "line %d of a text long enough to need several windows\n"
 EDITED_LINE = "line %d, edited on the branch of history\n"
 # svnserve.conf: anonymous users read; alice writes (a lock needs write); the authorization file hides /trunk/secret
-# from all but alice.
+# from all but alice. bob holds a key too, and the rules keep him out of /trunk/secret as they keep everyone but alice.
 SVNSERVE_CONF = "[general]\nanon-access = read\nauth-access = write\npassword-db = passwd\nauthz-db = authz\n"
-PASSWD = "[users]\nalice = secret\n"
+PASSWD = "[users]\nalice = secret\nbob = bob's secret\n"
 AUTHZ = "[/]\n* = r\nalice = rw\n[/trunk/secret]\n* =\nalice = rw\n"
 
 
@@ -323,7 +324,7 @@ def main():
         sessions = []
 
         def stock(name, argv):
-            if only is not None:
+            if only is not None and name not in only:
                 return None
             result = relay.session(name, lambda: subprocess.run(
                 svn + argv, capture_output=True, text=True, timeout=STEP_SECONDS, env=env, cwd=work))
@@ -367,6 +368,13 @@ def main():
         if only is None:
             run(["svnadmin", "rmlocks", repository, "/trunk/a.txt"], env=env, capture_output=True)
         stock("update-with-broken-lock", ["update", wc("wc-g")])
+        # A read the anonymous principal may not make, where users hold keys (A-613 part 2, step 7; `serve.c`
+        # `must_have_access`): the client, anonymous after the handshake, is asked to authenticate in the middle of the
+        # command and answers as the user it was given; alice's read then goes on with no trivial auth request before
+        # its answer, and bob, whom the rules keep out too, is refused after his authentication.
+        stock("read-auth-cat", ["cat", "--username", "alice", "--password", "secret", trunk + "/secret/s.txt"])
+        stock("read-auth-ls", ["ls", "--username", "alice", "--password", "secret", trunk + "/secret"])
+        stock("read-auth-cat-bob", ["cat", "--username", "bob", "--password", "bob's secret", trunk + "/secret/s.txt"])
         # Hand-made reports. Each is a list of steps: bytes to send, or bytes to wait for in what svnserve wrote, so a
         # client answers the drive only once the drive has ended (svnserve looks for input before every editor command
         # and aborts on any, `editorp.c` `check_for_error`); then the client half-closes and reads to the end.

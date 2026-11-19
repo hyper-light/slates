@@ -861,6 +861,94 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   assert!(log.contains("13:/trunk/secret A"), "{log}");
 }
 
+/// `check-path` of `secret` beneath the session's `/trunk`, which the fixtures' rules keep from all
+/// but alice.
+const CHECK_SECRET: &[u8] = b"( check-path ( 6:secret ( ) ) ) ";
+
+/// A directory's kind answered after the trivial auth request.
+const A_DIRECTORY: &str = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
+
+/// The request for an authentication for one command through a tunnel: `EXTERNAL` alone, in the
+/// repository's realm, its UUID.
+fn external_request() -> String {
+  let realm = std::str::from_utf8(UUID).unwrap();
+  format!("( success ( ( EXTERNAL ) {}:{realm} ) ) ", realm.len())
+}
+
+/// A-613 part 2, step 7 (`serve.c` `must_have_access` 809-850 for a read: the request made with a
+/// username needed, then the lookup made again): anonymously, where users hold keys, check `dir`,
+/// then `secret`; authenticate as alice by CRAM-MD5; call again; check `secret` once more; expect
+/// `dir` a directory after the trivial auth request, then the request listing `CRAM-MD5` alone with
+/// nothing before it, the challenge and `( success ( )` alone, then `secret` a directory with no
+/// trivial auth request before it (alice's rules compiled once the principal changed, the
+/// anonymous principal's having been compiled for `dir`), then, alice's still, a directory after
+/// the trivial request.
+#[test]
+fn a_read_the_principal_may_not_make_authenticates_first_and_is_judged_by_the_new_principals_rules() {
+  let fixture = fixture();
+  let anonymous = FixtureGuards::anonymous();
+  let mut connection = established();
+  let (out, _) = send(&fixture, &anonymous, &mut connection, b"( check-path ( 3:dir ( ) ) ) ");
+  assert_eq!(out, A_DIRECTORY);
+  let (out, turn) = send(&fixture, &anonymous, &mut connection, CHECK_SECRET);
+  assert_eq!((out, turn.map(|turn| turn.starts_with("Took"))), (cram_md5_request(), Ok(true)));
+  let (out, verdict) = cram_md5(&mut connection, b"alice", ALICE_SECRET);
+  assert_eq!(verdict, Verdict::Established(Principal::User(b"alice".to_vec())));
+  assert!(out.ends_with("> ) ) ( success ( ) ) "), "{out}");
+  let alice = FixtureGuards::default();
+  let (out, turn) = send(&fixture, &alice, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+  assert_eq!(connection.waiting(), Waiting::Command);
+  let (out, _) = send(&fixture, &alice, &mut connection, CHECK_SECRET);
+  assert_eq!(out, A_DIRECTORY);
+}
+
+/// A-613 part 2, step 7 (`must_have_access`' second lookup, 841-846): anonymously, where users hold
+/// keys, stat `secret`; authenticate as bob, whom the rules keep out of it too; call again; expect
+/// the request listing `CRAM-MD5` alone, bob's success, then "Authorization failed" (170001) with
+/// no trivial auth request before it, and the next command awaited.
+#[test]
+fn a_read_still_refused_after_the_authentication_is_refused_with_no_trivial_request() {
+  let fixture = fixture();
+  let anonymous = FixtureGuards::anonymous();
+  let mut connection = established();
+  let (out, _) = send(&fixture, &anonymous, &mut connection, b"( stat ( 6:secret ( ) ) ) ");
+  assert_eq!(out, cram_md5_request());
+  let (_, verdict) = cram_md5(&mut connection, b"bob", b"bob's secret");
+  assert_eq!(verdict, Verdict::Established(Principal::User(b"bob".to_vec())));
+  let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out, turn), (not_authorized(), wrote));
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// A-613 part 2, step 7 (`must_have_access` through a tunnel: `send_mechs` lists `EXTERNAL` for the
+/// tunnel's user, never `ANONYMOUS` where a username is needed): through alice's tunnel, where
+/// anonymous users read too, established anonymously, check `secret`; answer `EXTERNAL`; call
+/// again; expect the request listing `EXTERNAL` alone, the session alice's with `( success ( ) )`
+/// alone, then `secret` a directory with no trivial auth request before it.
+#[test]
+fn a_tunnels_anonymous_read_authenticates_as_the_tunnels_user() {
+  let fixture = fixture();
+  let tunnel = Repository {
+    anonymous: true,
+    ..alices_tunnel()
+  };
+  let mut connection = established_on(&tunnel, ANONYMOUSLY);
+  let (out, _) = send(&fixture, &FixtureGuards::anonymous(), &mut connection, CHECK_SECRET);
+  assert_eq!(out, external_request());
+  let none = None::<&Sources<'_, Green, FixtureGuards>>;
+  let mut out = Vec::new();
+  let external = connection.receive(none, EXTERNALLY.as_bytes(), &mut out, PLENTY);
+  let alice = Principal::User(b"alice".to_vec());
+  assert!(matches!(external, Ok(Turn::Established { principal, .. }) if principal == alice));
+  assert_eq!(String::from_utf8_lossy(&out), "( success ( ) ) ");
+  let (out, turn) = send(&fixture, &FixtureGuards::default(), &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+}
+
 /// A-656 with A-655 (`serve.c` `commit` 1471-1580): commit, through a tunnel as alice, a drive
 /// adding `newdir` beneath `/trunk`; answer the work as made into revision 7; expect the commit
 /// handed to the caller with nothing written, then the trivial auth request and the commit's
