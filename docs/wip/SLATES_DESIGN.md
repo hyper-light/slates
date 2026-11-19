@@ -11572,6 +11572,14 @@ signature verification).
 > **Status (2026-11-18, A-499).** Designed; nothing is built. Built on §4.17.1 without redefining it, from Mercurial
 > 7.2's own documents and code and hg-evolve 12.0.0 (the topic and evolve extensions). The reading notes, every source
 > named to its file, are `research/mercurial-server.md`. The pieces are listed at the end, after the shared ones.
+>
+> **Status (2026-11-19, A-514: piece 1's framings built).** `crates/hg` (`slates-hg`) decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas as pure functions over bytes: every length read as 7.2 reads it
+> (signed 32-bit, so `0xFFFF_FFFF` is −1), checked against the bytes left, every structure counted before it is built
+> and charged exactly to the caller's admission, no recursion however deep bundle2's interruptions nest. Proven against
+> golden vectors stock Mercurial 7.2 made (`crates/hg/fixtures`, the command in `make-fixtures.sh`): each bundle decodes
+> as 7.2's own `debugbundle` lists it, every text rebuilds from its deltas, each encodes back to its bytes. Still owed
+> from piece 1: the parts' own payloads (phase-heads, bookmarks, the check parts, markers, pushkey values).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -11935,7 +11943,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties.
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, `crates/hg`): the framings,
+   bundle1 and the deltas; owed: the parts' payloads, from phase-heads to pushkey values.
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping.
@@ -34189,3 +34198,53 @@ carries a turn's messages; `apply` and `replay` take them in order and acknowled
   doc builds and the suites are main's (CLAUDE.md §8).
 - **Owed.** The supervisor's A/B again, the same arms (without the replicas 95bbed246; with them this landing): if it
   is still not green, the replicas come out, recorded measured-and-rejected.
+
+### A-514 — Mercurial's bundle2, bundle1, changegroups and deltas, decoded and encoded as a pure core and held to golden vectors stock Mercurial 7.2 made (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-16, A-499)
+Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (new, `slates-hg`: `bundle2`, `bundle1`,
+`changegroup`, `delta`, the cursor and the admission, with `fixtures/` and its `make-fixtures.sh`), `Cargo.lock`,
+`unsafe-budget.toml` (`slates-hg = 0`), `.gitattributes` (the fixtures' bundles binary), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§12).
+- **What it does.** Reads and writes the three framings a Mercurial exchange uses, byte for byte as 7.2 writes them:
+  a bundle2 stream (`HG20`: stream parameters, parts with mandatory and advisory parameters, chunked payloads, the
+  interrupt), a bundle1 (`HG10UN` and a changegroup `01`), and changegroups `01` to `05` (the changelog's group, the
+  manifest's, from `03` the tree-manifest list, the file list; each version's delta header from 7.2's code), with the
+  deltas inside them (mpatch's hunks, checked by its C rules, applied into one vector of the exact length). Nothing
+  else: no node is hashed (piece 3), no part is handled (piece 5), and a stream compressed with `GZ`, `BZ` or `ZS` is
+  refused by kind until the engines are wired (D-17).
+- **From the sources (read 2026-11-18 and 2026-11-19, `research/mercurial-server.md` §2, §3 and §12).** Every length is
+  a signed big-endian 32-bit integer as 7.2 reads it, so `0xFFFF_FFFF` is −1: a refused length, or in a bundle2
+  payload the interrupt. A changegroup chunk length from 1 to 4 is refused, not read as empty. The tree-manifest list is
+  in every changegroup from `03`, empty or not, though `internals.changegroups` says otherwise. Changegroup `04` is
+  7.2's 130-byte delta-information header (its code), not the sidedata version its document describes (moved to `05`).
+  A part type is 1 to 255 bytes of `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter. A stream parameter
+  is matched without case, and only `Compression` is known.
+- **Stricter than 7.2, on purpose.** A part header whose parameters run past it, or that leaves bytes unread, is
+  refused (7.2 slices short and ignores the rest); a repeated parameter key is refused (the document's "MUST be
+  unique"; 7.2 keeps the last); an empty part type and bytes after a stream's or a changegroup's end are refused.
+- **Caps, none a literal.** The input (a length past the bytes left is `Truncated`) and the caller's `Admission`, the
+  room its request's budget gives (A-16): a decode walks its input once to check and count it, charges the exact
+  total, then builds every vector once at its final size. Interruptions nest without recursion, counted, so ten
+  thousand nested parts decode within their admission and are refused one byte short of it.
+- **Golden vectors.** Made once on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock Mercurial 7.2 from PyPI
+  through `uvx` (CPython 3.12.16), exactly: `OUT=$(mktemp -d ~/.cache/g291-fixtures.XXXXXX) &&
+  ~/.cache/g291-scratch/make-fixtures.sh "$OUT"`, the script checked in as `crates/hg/fixtures/make-fixtures.sh`: one
+  repository (a named branch, a copy, a bookmark, a merge, a subdirectory, a draft amended under evolution), bundled as
+  `none-v1` and `none-v2;cg.version=02|03|04;phases=true;obsolescence=true`, with 7.2's `debugbundle` of each and its
+  log. The ten files' SHA-256 matched after the copy. Two of 7.2's own listing limits showed up and are recorded there:
+  `debugbundle --all` fails on a `04` bundle's full texts (`TypeError` at `debugcommands.py:398`) and lists no file of
+  a `03` bundle.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug, load 18.9 to 26.4).** `cargo test --locked -p slates-hg --lib`: 39 of
+  39 in 1.2 s; `cargo fmt -p slates-hg --check` clean. Golden: the three bundle2 streams hold the parts 7.2 lists and
+  encode back to their bytes; changegroups `01` and `02` decode as 7.2 lists every revision (nodes, parents, link,
+  delta base, delta length), `03` and `04` as far as 7.2's listing goes and equal to `02` beyond it; every file text,
+  the copy's metadata block included, rebuilds from its deltas in all four versions alike, each changeset's text
+  beginning with its manifest's node and ending with its description; every changegroup encodes back to its bytes.
+  Hostile: foreign magics; `len = u32::MAX` and `i32::MAX` in every length; every cut of every fixture; every bit of a
+  fixture flipped one at a time (refused, or read and encoded back: to itself for a stream, to the same bytes for a
+  changegroup); stream parameters as 7.2 judges them;
+  misread part headers; nesting past the admission; arbitrary bytes (property tests). An oracle: `apply` equals a splice
+  model over generated hunks. Red-checked once in a disposable copy: with the chunk-length rule, the trailing-bytes
+  check and mpatch's start-past-end rule removed, the four tests written for them failed and 35 passed.
+- **Owed.** The parts' payloads (phase-heads, bookmarks, the check parts, markers in formats 0 and 1, pushkey values),
+  compressed bundle streams once the D-17 engines are wired, and a golden `05` changegroup (7.2's bundle types offer
+  `01` to `04`; `05` is held to its layout in 7.2's code by a round trip).
