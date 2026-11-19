@@ -29,6 +29,9 @@ const REFUSED: i32 = 3;
 const CAP: usize = 1 << 16;
 /// Shape: the repository's directory the tests name as REPOS.
 const REPOS: &str = "/srv/svn/repository";
+/// Shape: how long a test lets a run take before giving up on it: ten liveness windows (`hook_driver`'s tests), so a
+/// hook that never ends fails its test rather than hanging the suite.
+const TEST_BOUND_NS: u64 = 10 * crate::daemon::LIVENESS_BUDGET_NS;
 
 /// A hook at `point`, named for it, running `program`.
 fn hook(point: HookPointName, program: &str) -> HookConfig {
@@ -196,7 +199,7 @@ fn as_role(mut input: HookInput) -> HookInput {
 }
 
 /// Runs the hook `policy` configures at `input`'s point to its answer, the test binary as its program, with no
-/// bound and a client that stays.
+/// learned bound and a client that stays; the test gives up past [`TEST_BOUND_NS`].
 fn ran(policy: RepositoryPolicy, input: HookInput) -> SvnHookRan {
   let runtime = runtime();
   let (sent, got) = channel();
@@ -209,12 +212,17 @@ fn ran(policy: RepositoryPolicy, input: HookInput) -> SvnHookRan {
         view_root: &view,
         words_cap: CAP,
       };
-      let answered = run(&site, &input, None, std::future::pending()).await;
-      let _ = sent.send(answered);
+      let running = run(&site, &input, None, std::future::pending());
+      let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
+      let _ = sent.send(answered.ok().flatten());
     })
     .expect("the run's task");
   runtime.run_until_idle();
-  got.recv().expect("the run answered")
+  got
+    .recv()
+    .ok()
+    .flatten()
+    .expect("the run answered within the test's bound")
 }
 
 /// The test binary's path, as a policy names its program.
