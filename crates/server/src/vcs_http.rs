@@ -51,13 +51,13 @@
 //!
 //! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
 //! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
-//! receive-pack through the push driver on the repository's owner shard (A-654 part 3).
+//! upload-pack served from each repository's store on its owner shard, lent from A-662's map by
+//! `crate::vcs_store::upload::ShardStores` (A-682); receive-pack through the push driver on the repository's owner shard
+//! (A-654 part 3).
 //!
-//! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
-//! handed the stores (A-615, A-662), which answers `503` until then;
-//! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
-//! Subversion's site; the MCP edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's
-//! runs).
+//! **Owed** (GAPS, the §4.17 entry): Mercurial's site handed A-662's stores (each kept on its owner shard), which it
+//! answers `503` without until then; Subversion's site; the MCP edge onto this engine; the live `git clone`, `git push`
+//! and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;

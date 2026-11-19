@@ -68,6 +68,7 @@ pub(crate) mod hg_import;
 pub(crate) mod record;
 #[cfg(test)]
 mod tests;
+pub(crate) mod upload;
 
 use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 

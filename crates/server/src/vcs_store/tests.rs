@@ -49,7 +49,7 @@ const DEEP: u64 = 2;
 const FORMAT: ObjectFormat = ObjectFormat::Sha1;
 
 /// Format: the first committer date the histories use, seconds since the epoch.
-const FIRST_DATE: u64 = 1_700_000_000;
+pub(super) const FIRST_DATE: u64 = 1_700_000_000;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Objects as git writes them.
@@ -99,7 +99,7 @@ fn commit(tree: ObjectId, parents: &[ObjectId], date: u64) -> (ObjectId, Vec<u8>
 }
 
 /// One object a push brings: its type, id and content.
-type Brought = (Kind, ObjectId, Vec<u8>);
+pub(super) type Brought = (Kind, ObjectId, Vec<u8>);
 
 /// `brought` as a source hands it in, claimed by its id, at `depth`.
 fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
@@ -112,7 +112,7 @@ fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
 }
 
 /// A commit of a tree of `files` over `parents` at `date`: its blobs, its tree and itself, in that order, and its id.
-fn commit_of(
+pub(super) fn commit_of(
   files: &[(Vec<u8>, Vec<u8>)],
   parents: &[ObjectId],
   date: u64,
@@ -975,7 +975,7 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The owner shard.
 
-fn owner() -> Principal {
+pub(super) fn owner() -> Principal {
   Principal::Uid {
     host: slates_db::HostId(0),
     uid: 1234,
@@ -983,7 +983,11 @@ fn owner() -> Principal {
 }
 
 /// Creates repository `name` of `tool` on the shard: its id and its root green.
-fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryId, DbVolumeId) {
+pub(super) fn repository(
+  state: &mut ShardState,
+  name: &str,
+  tool: VcsTool,
+) -> (RepositoryId, DbVolumeId) {
   let reply = dispatch(
     state,
     1,
@@ -1099,7 +1103,11 @@ fn begun_at(
 }
 
 /// A push begun on the shard with `objects` admitted whole.
-fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
+pub(super) fn begun(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  objects: &[Brought],
+) -> GitPush {
   begun_at(state, repository, objects, 0)
 }
 
@@ -1135,7 +1143,7 @@ fn work_of(
 }
 
 /// `changes` appended with `sealed`'s objects and `moves` through A-635's append.
-fn appended(
+pub(super) fn appended(
   state: &mut ShardState,
   repository: RepositoryId,
   changes: Vec<BranchChange>,
@@ -1152,7 +1160,7 @@ fn appended(
 
 /// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
 /// move and appended. The version it made.
-fn push_through(
+pub(super) fn push_through(
   state: &mut ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
@@ -1174,7 +1182,7 @@ fn push_through(
 }
 
 /// The root tree a commit's content names.
-fn tree_of(objects: &[Brought]) -> ObjectId {
+pub(super) fn tree_of(objects: &[Brought]) -> ObjectId {
   objects
     .iter()
     .find(|(kind, ..)| *kind == Kind::Tree)
