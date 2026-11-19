@@ -1028,9 +1028,14 @@ impl Repository {
         payload: rows::encode(&row),
       });
     }
-    for (id, position) in positions {
+    let mut by_position: Vec<(u64, &ObjectId)> = positions
+      .iter()
+      .map(|(id, position)| (*position, id))
+      .collect();
+    by_position.sort_unstable();
+    for (position, id) in by_position {
       owned.push(OwnedRow {
-        key: rows::position_key(*position),
+        key: rows::position_key(position),
         contents: Vec::new(),
         payload: id.as_bytes().to_vec(),
       });
