@@ -197,6 +197,10 @@ pub struct FleetPlan {
   /// This node's identity, the fleet's TLS name, each peer with its dial addresses, and this node's own
   /// serve addresses — bound by [`FleetTransport::bind`] when the daemon starts, never by planning.
   pub transport: FleetTransport<ServeAddresses>,
+  /// This node's identity as the version-control servers' shared HTTP edge presents it (§4.17.2 "Transports" item 1;
+  /// A-625 part 3): the certificate and key its transport and its RPC-with-TLS export present, for the daemon role to
+  /// hand `DaemonConfig::vcs_http` when the operator starts an edge, so the daemon reads no file (R1).
+  pub edge_identity: crate::config::EdgeIdentity,
 }
 
 /// Which of a node's two serve sockets: the SWIM probe plane or the register record plane (the two ride
@@ -564,6 +568,10 @@ pub fn plan(
       reason,
     })?;
   }
+  // The version-control edge presents what the transport and the RPC-with-TLS export present (A-625 part 3): the
+  // node's certificate and key, copied before the key moves into the transport's identity, which keeps it private.
+  let edge_identity =
+    crate::config::EdgeIdentity::new(vec![entry.certificate.to_vec()], key.secret_der().to_vec());
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
   check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
@@ -594,6 +602,7 @@ pub fn plan(
       peers,
       resolver,
     },
+    edge_identity,
   })
 }
 
@@ -1188,5 +1197,68 @@ mod tests {
     assert!(plan.transport.peers.is_empty());
     assert!(plan.membership.peers.is_empty());
     assert_eq!(plan.membership.quorum, Quorum { f: 0 });
+  }
+
+  /// Shape: the passes, each way, a TLS 1.3 handshake takes in memory (RFC 8446 §2: a round trip and a half), with room;
+  /// a handshake still going after them has stalled.
+  const HANDSHAKE_PASSES: usize = 4;
+
+  /// Moves every TLS record `from` has to send into `to`, which reads and processes them.
+  fn pass(from: &mut rustls::Connection, to: &mut rustls::Connection) {
+    let mut records = Vec::new();
+    while from.wants_write() {
+      from.write_tls(&mut records).expect("records written");
+    }
+    let mut unread = records.as_slice();
+    while !unread.is_empty() {
+      to.read_tls(&mut unread).expect("records read");
+      to.process_new_packets().expect("records processed");
+    }
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: plan node b, make the TLS server of its version-control HTTP edge
+  /// from the plan, and shake hands in memory with a client that trusts b's certificate under the fleet's name. Expect:
+  /// the handshake completes and the client was shown b's own certificate, the one its peers pin and its RPC-with-TLS
+  /// export presents: the plan hands the edge the node's identity, so the daemon reads no file for it (R1).
+  #[test]
+  fn a_plan_hands_the_http_edge_the_nodes_own_identity() {
+    let (manifest, keys) = manifest();
+    let plan = plan(&manifest, "b", key_of(&keys, "b"), None).expect("b's plan");
+    let certificate = manifest.nodes[1].certificate.clone();
+    let server = plan
+      .edge_identity
+      .serving()
+      .expect("the edge's TLS identity")
+      .connection()
+      .expect("a server connection");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+      .add(certificate.clone())
+      .expect("b's certificate trusted");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+      .with_safe_default_protocol_versions()
+      .expect("TLS's versions")
+      .with_root_certificates(roots)
+      .with_no_client_auth();
+    let client = rustls::ClientConnection::new(
+      std::sync::Arc::new(config),
+      rustls::pki_types::ServerName::try_from(NAME).expect("the fleet's name"),
+    )
+    .expect("a client connection");
+    let mut client = rustls::Connection::Client(client);
+    let mut server = rustls::Connection::Server(server);
+    for _ in 0..HANDSHAKE_PASSES {
+      pass(&mut client, &mut server);
+      pass(&mut server, &mut client);
+    }
+    assert!(
+      !client.is_handshaking() && !server.is_handshaking(),
+      "the handshake completes"
+    );
+    assert_eq!(
+      client.peer_certificates(),
+      Some(std::slice::from_ref(&certificate))
+    );
   }
 }

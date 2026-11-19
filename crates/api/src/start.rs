@@ -112,6 +112,7 @@ impl StartSpec {
       quick: self.quick,
       shards: self.shards,
       fleet: self.fleet.clone(),
+      vcs_http: None,
     })
   }
 

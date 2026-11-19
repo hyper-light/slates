@@ -293,6 +293,14 @@
 > 111; as it landed over main 71a43cd97, `--lib vcs_ssh` 19 of 19, macOS arm64, Mac Studio). Owed: the daemon
 > starting the edge, the credentials record, the stores and entry points, four of five red-checks (main's runs under
 > §8), and main's live OpenSSH `git clone` over SSH.
+> **A-651 part 2 (2026-11-19, g294; git's upload-pack behind the SSH edge):** `vcs_ssh::git` drives A-640's entry
+> point over an SSH session, the store lent a step at a time by the HTTP edge's `StoreLender`: each request measured
+> whole, a flush ending the session 0, a refused request and the end of input inside a request ending it with git's
+> `die` status 128 (an end before a request's first packet is whole ends it 0, as git's reader does); a v0 or v1 session
+> refused with an `ERR` line naming v2, since slates-git answers v0 statelessly alone while a v0 client over SSH
+> negotiates in rounds (`--lib vcs_ssh`: red 23 of 25 at 8dfd557f, green 25 of 25 at caa2fc0f, macOS arm64, Mac
+> Studio). Owed: the `StoreLender` over A-662's map (A-662's), without which no store is lent and the edge's services
+> stay `NotYet`; the stateful v0 session over SSH; main's live `git clone` over SSH.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -476,9 +484,15 @@
 > credentials` 5 of 5, `slates-server --lib credentials` 9 of 9 and `--lib vcs_http` 32 of 32, `slates-http-edge --lib`
 > 31 of 31, `slates-cli` `credential` 1 of 1, `--test wire_order` 2 of 2 in `slates-db` and `slates-ipc`. Owed:
 > upload-pack served once A-662's stores land (`503` until then), A-654's session, LFS's routes on the site (main's
-> Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet identity's hand-in, a consumer's
-> revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live
-> `git clone` (main's).
+> Streamed/AfterBody ruling), a consumer's revocation in the SSH edge's key holders (A-651), listing credentials,
+> Mercurial's and Subversion's sites, the live `git clone` (main's).
+> **A-625 part 3, continued: `--vcs-http ADDRESS` (2026-11-19, g299):** `slates anchor|daemon --vcs-http ADDRESS`
+> starts the shared edge there, and the daemon logs where it serves; a fleet node's edge presents the node's own
+> certificate and key, handed over by its deployment plan (`FleetPlan::edge_identity`); a daemon that is no fleet node
+> serves cleartext, on loopback alone, any other address refused as usage before anything starts. macOS arm64 (Mac
+> Studio, red first, then green over main 1ef718820): the roles' and the command's grammar, the plan's identity shown
+> in a TLS handshake, and an anchor started with `--vcs-http 127.0.0.1:0` whose daemon's edge answers `401`. Owed:
+> the anchor holding the edge's listener across a daemon's restart; the option on a library starter's anchor.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -794,9 +808,10 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); and the daemon's import of a repository's directory through the server's adapter (A-649 part 4), a turn at
-> a time on the repository's owner shard, its index handed to the repository's Mercurial store in A-662's
-> per-repository map (`vcs_store`'s `HgStore`), never a second holder. **Built (A-619 part 3):**
+> `verify`); the verb that asks for a directory's import (A-675 built the import itself); and the import made durable:
+> the register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the
+> directory again or replays its record (until then an import is not served, and a restart leaves its store empty).
+> **Built (A-619 part 3):**
 > `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
@@ -850,6 +865,12 @@
 > begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
 > 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, its own piece with its failing
 > test first (main's to start): a query's fields past the request's room are `400` where a path past it is `414`.
+> **Built (A-675):** the daemon's import of a Mercurial repository's directory (`slates-server`'s
+> `vcs_store::hg_import`): started into a repository's empty store, advanced a turn at a time on its owner shard within
+> the shard's quantum, its index then in the empty index's place; at most one client region's bytes held, charged while
+> it runs; refused, abandoned or freed midway, everything given back; proven by the `states` repository imported a unit
+> a turn equal row for row to its import in one call (macOS arm64, Mac Studio: `vcs_store::` 18 of 18 with A-662's 13;
+> red first, the five new tests failing against stubs).
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1187,9 +1208,15 @@
 > for all four tests). Three mutations kept as tests each break histories (a promise without its fence 39/48 and 44/48;
 > a restart that forgets the fence 16/192 and 9/192; promotion on a minority 23/48 and 7/48), and ReadSafety has a
 > direct red check. Found: the fence carries the load only across an owner's restart under one generation; a takeover's
-> generation refuses the stale owner first. **Owed:** the same nemesis over the live log (`slates_db::live`, whose
-> `crates/db/tests/live.rs` nemesis checks Agreement, NoLoss, StaleNeverCommits and Convergence but not ReadSafety), and
-> the real-process runs of `crates/cli/tests/live_chaos.rs` (main's).
+> generation refuses the stale owner first. **The live log's half: built (2026-11-19, A-601).**
+> `crates/db/tests/live.rs` now judges ReadSafety too, beside Agreement, NoLoss, StaleNeverCommits and Convergence:
+> every read phase one could make were the current owner lost adopts a state holding every durable write, judged after
+> every step and every settling delivery (the Mac Studio, kiln r176: 7,198 and 6,329 reads judged at `f = 1` and
+> `f = 2`, 3,721 and 3,035 of them past a holder without a durable write, none broken). Its first run found the model's
+> successor naming fresh members as holders without `following`, which the daemon's does not; the model now takes the
+> superseded shipper's committed holders. **Owed:** the real-process runs of `crates/cli/tests/live_chaos.rs`
+> (main's); and main's answer to whether a live-shipped volume can be taken over with no holders recorded, where the
+> daemon's successor falls back to the configuration's candidates (`live_ship`).
 
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
