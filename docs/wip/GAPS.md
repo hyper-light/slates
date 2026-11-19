@@ -958,9 +958,12 @@
 > replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
 > `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
 > among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
-> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0. Owed
+> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0; its eighth slice
+> (g297), read access by A-606's rules (the `locked` repository's four scripted and seven stock sessions replayed
+> whole, the connection judging each read by its principal's rules; macOS arm64, Mac Studio, 54 of 54), not yet
+> red-checked. Owed
 > from it: `list`'s fold of a name beyond ASCII (utf8proc's case
-> folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
+> folding and mark stripping need Unicode's tables; over ASCII it is exact); and a denied read's mid-command authentication request. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
 > greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's
