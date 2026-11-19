@@ -45,6 +45,7 @@ mod positions;
 mod push;
 mod repository;
 pub mod rows;
+pub mod views;
 
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;

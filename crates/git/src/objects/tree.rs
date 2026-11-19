@@ -17,6 +17,8 @@ use crate::{Admission, PastAdmission};
 
 /// Format: a mode's file-type bits (`S_IFMT`).
 const S_IFMT: u16 = 0o170000;
+/// Format: a regular file's file type (`S_IFREG`).
+const S_IFREG: u16 = 0o100000;
 /// Format: a directory's file type (`S_IFDIR`), and the mode git writes for a subtree.
 const S_IFDIR: u16 = 0o040000;
 /// Format: a symbolic link's file type (`S_IFLNK`), and the mode git writes for one.
@@ -30,6 +32,9 @@ const MODE_EXECUTABLE: u16 = 0o100755;
 /// Format: the nonstandard mode git wrote "early on when we honored the full set of mode bits" (fsck.c), `S_IFREG |
 /// 0664`: standard unless the check is strict.
 const MODE_GROUP_WRITABLE: u16 = 0o100664;
+/// Format: the owner's execute bit, by which git's checkout reads a regular file as executable or not
+/// (`ce_permissions`, read-cache-ll.h).
+const OWNER_EXECUTE: u16 = 0o100;
 /// Format: the longest name fsck accepts without `largePathname`, in bytes (fsck.c's `max_tree_entry_len`, the default
 /// of `fsck.largePathname`).
 const LARGE_PATHNAME: usize = 4096;
@@ -141,6 +146,20 @@ impl<'a> Entry<'a> {
   /// The mode, when it is one git writes.
   pub fn standard_mode(&self) -> Option<Mode> {
     Mode::from_bits(self.mode)
+  }
+
+  /// The mode git's tree walk reads the entry with, which a checkout writes: `decode_tree_entry` applies `canon_mode`
+  /// to every mode it reads \[C: tree-walk.c, read-cache-ll.h, git v2.50.1\]. A regular file is executable when its
+  /// owner's execute bit is set and a plain file otherwise, so a legacy `100664` reads as `100644`; a symbolic link and
+  /// a directory read as themselves; any other mode, one of no known type included, reads as a submodule's link.
+  /// Stock git 2.50.1 reads `100600` and `100664` as `100644`, `100700` and `100775` as `100755`, and `644` as
+  /// `160000` (`git ls-tree`, and `git ls-files -s` after `git read-tree`, 2026-11-19).
+  pub fn canonical_mode(&self) -> Mode {
+    if self.mode & S_IFMT == S_IFREG | OWNER_EXECUTE {
+      Mode::Executable
+    } else {
+      Mode::File
+    }
   }
 
   /// The entry's object id in `format`; none when its bytes are not that format's length.
