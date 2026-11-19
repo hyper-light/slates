@@ -43044,6 +43044,22 @@ Applied in the same change to:
   - checks on greens a push does not move (Mercurial's `check:heads`) compare those greens' positions the same way;
   - the repository's own state (Mercurial's phase roots and obsolescence markers, LFS locks) is kept in logs of its
     own, never a counter every push must pass.
+- **Why, under the worst case (Ada, 2026-11-19: "Assume worst case").** On one node the two shapes cost the same:
+  the owner shard runs a repository's operations one at a time and neither takes a lock. In a replicated fleet a single
+  ordered register makes every later change wait for an earlier one to commit at f + 1. In the worst case a large
+  push, a kernel-size first push of hundreds of MB, then stalls every other branch's pushes until it has replicated.
+  With a log per green only that green's later pushes wait.
+- **Robustness, by design.** The single register's strengths are kept by these rules:
+  - An atomic push across greens is one record naming each green and the position it expects, committed whole or not
+    at all, with each green's log pointing at it. A holder applies it only once every named green has reached its
+    predecessor: a join that only atomic pushes pay.
+  - On the owner, a read of every green's head in one turn is consistent by construction, since the shard is the
+    single writer. A replica's read carries a vector of per-green positions and refuses a cut an atomic record would
+    split.
+  - Recovery replays each green's log in its own order and applies an atomic record at its join. A takeover adopts
+    each log, and an atomic record whole or not at all, held to the register's invariants (NoLoss, Agreement,
+    StaleNeverCommits) by a model test that crashes and recovers at random points.
+  - Subversion is unaffected: a Subversion repository is one green (§4.17.4), so it keeps one ordered log.
 - **Owed.** A-603's entry rebuilt to this shape, and its fleet half on each green's log (g261, with A-635 and A-636).
   The pushes coding against it (receive-pack A-620, Mercurial's unbundle A-641, LFS locks A-629) keep their traits.
 - **Applied in the same change to:** §4.17.1 shared piece 2's text; GAPS' §4.17 entry.
