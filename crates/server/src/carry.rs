@@ -26,6 +26,7 @@ use slates_db::catalog::{CarriedRecord, SnapshotId as DbSnapshotId, VolumeId as 
 use slates_db::op::Op;
 use slates_db::register::ObjectId;
 use slates_vfs::captured::{CarriedCapture, CarryWalk};
+use slates_vfs::clock::Clock;
 use slates_vfs::names::NameEquivalence;
 use slates_wire::Wire;
 
