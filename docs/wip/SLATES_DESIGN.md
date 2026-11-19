@@ -11426,9 +11426,11 @@ that host, and issued only when every identity the version references is placed.
 increment id already in `seen` returns its original result (the completion record holds the
 reply); retries are always safe. A signed submit's verdict rides the version's chain entry and the green's accepted
 record, a checkpoint keeping it once it folds the entry (A-321): the version's provenance, read back by `MergeRecord`
-and answering every later reply that names the version. A green that is a member of a repository commits each version
-as an entry of the repository's register, which one step can share with the repository's other greens' versions, its
-namespace and its own state (§4.17.1 shared piece 2, A-603).
+and answering every later reply that names the version. A green keeps its own log, its chain: each version is an
+append to it, and a push of several greens' versions is one entry appended to each green it moves only while each is
+at the position the push read, kept as one atomic record those positions point to (§4.17.1 shared piece 2; A-603,
+rebuilt by A-635 per A-642). A push is judged whole before anything is applied: `Green::judge` holds each work's verdict
+and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -11752,6 +11754,28 @@ decides the details.
 > mismatch refuses the repository on that holder; a takeover adopts whole entries; and the repository record's own
 > replication rides it (A-515's owed half). Until then each member's version still ships on its green's own register,
 > so in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
+>
+> **Status (2026-11-19, A-635: the push over several works, and A-603's entry rebuilt per A-642).** The repository-wide
+> position is gone: each green keeps its own log (its chain), and the repository's own state is kept in logs of its own,
+> the names log (the namespace and the lineage's joins), the phases, markers and locks logs, each at its own position
+> and moved only by its own changes; the policy's version is its own log's position (A-622). A version appends only
+> while its green is at the position the push read, refused `Moved` naming the green, the position read and the one
+> it is at; a check of an unmoved green compares its position the same way; `RepositoryCheck::Log` compares a state
+> log's. An entry that moves two logs or more, a green's among them, is one atomic record (`AtomicRecord`): each
+> position it took on each green's log points to it; a holder applies it only at its join (`AtomicRecord::join`: every
+> log at its predecessor); a cut that holds part of it is refused (`Repositories::split_by`); a recovery, which replays
+> the partition's log, rebuilds it whole, and a snapshot carries each record with the positions still pointing to it.
+> Records go once no green's log points to them (its checkpoint, its destroy). Git LFS's locks are state changes of
+> their own (`LockTaken`, `LockReleased`). The push itself is `crates/server/src/repository/push.rs`: one interface,
+> `RepositoryLogs::append`, which the shard's state implements, takes each branch a push changes (a work A-618's
+> `push::build` made, a new branch made at a version and moved by a work, a delete at the version read) beside the
+> entry's checks, names and state; it plans every change by its rules and each green's merge gates, makes new branches
+> in memory, secures retention, holds every work's verdict (`Green::judge`), judges the whole entry with its new greens
+> counted held (`Partition::check_creating`), and only then commits the verdicts (`Green::commit_judged`) and records
+> the new greens and the entry as one log record; a refusal names every change refused and why, or the entry's
+> refusal, and gives back what it held. Owed: the fleet half (A-636): each green's log and each state log replicated on
+> its own, holders applying atomic records at their joins, replicas refusing split cuts, takeovers adopting each log
+> and each record whole; and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -11763,10 +11787,11 @@ decides the details.
    changesets and moves bookmarks are each one durable step, with no coordination call on the write path (§2 ban 10).
    Repositories spread across the fleet; one repository's greens serialize on its owner shard. §4.16 gives each green a
    register of its own; a register shared by a repository's greens, whose entry carries one or more of their merge
-   records, is the change this needs (shared piece 2; built on the owner by A-603, its fleet half owed: status above).
+   records, was A-603's answer. A-642 replaced it: each green keeps its own log, and a push of several is one entry on
+   each green it moves, an atomic record (built on the owner by A-635, its fleet half owed: status above).
 3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
-   of it, so two clients creating one name race on one append and one of them is refused (built, A-603: every change of
-   a repository takes one position of its register).
+   of it, so two clients creating one name race on one append and one of them is refused (built: A-603, and A-635's
+   names log, A-642).
 4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
    identity, so creating it costs no walk of the tree. (The engine makes a green at another green's version without a
    walk since A-534, §4.16; the verb, `CreateGreen { base }`, still walks its base until piece 1's repository verbs use
@@ -12176,8 +12201,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
-   (A-603); owed: the push that judges several works before any commits, and the fleet half (the register as one ledger
-   object, holders recomputing whole entries, takeovers adopting them).
+   (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); owed: the
+   fleet half (A-636: each log replicated on its own, holders applying atomic records at their joins, replicas refusing
+   split cuts, takeovers adopting each log and each record whole).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -43163,3 +43189,77 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
 - **Owed.** receive-pack's part 2 submitting each ref's work through these views (A-620's part 2). The submodule link's
   special-node kind (A-637). Charging the transient tables A-618's walk holds, beside the store's room.
+
+### A-635 — The push over several works, all or none, and A-603's entry rebuilt to A-642's logs: each green its own log, an atomic record a holder applies at its join, a cut that splits one refused (2026-11-19, g261 for UI goal 93; §4.17.1 items 2 and 3 and shared piece 2; §4.16 "Commit"; §4.17.2 "A push" steps 6 and 7; §4.17.3 decision 6; A-642; after A-603, A-618)
+Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
+GAPS (the §4.17 entry), `crates/merge/src/engine.rs` (`Judged`, `Judgment`, `HeadMoved`, `Green::judge`,
+`Green::commit_judged`; `submit_resolved` made of them) and `engine/judge_tests.rs` (new), `crates/merge/src/lib.rs`,
+`crates/db/src/{catalog,error,lib,partition,repository}.rs` and `repository/entry.rs` with its tests (rewritten),
+`crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/protocol.rs` (`DatabaseRefusal::Moved`, appended; `OutOfOrder`
+superseded, kept on the wire), `crates/ipc/tests/wire_order.txt`, `crates/server/src/{error,repository,verbs}.rs` and
+`crates/server/src/repository/push.rs` with its tests (new).
+- **What was there.** A-603's register gave every change of a repository the next position of one repository-wide
+  register; a push of several greens had no verdict that judged all of its works before any committed; A-618 made a
+  client's push into one work per green. Ada's A-642 (2026-11-19, worst case: a huge push to one green would stall
+  every other green's commits behind it until it replicated) replaced the register with each green's own log.
+- **The verdict split.** `Green::judge` decides an increment as a submit does and holds the verdict (`Judged`: the
+  increment, the head it was judged at, its effects and what the chain records of them), applying nothing but a
+  conflict's entry in the rejected-result cache; `Green::commit_judged` commits it as the version after that head, or
+  refuses `HeadMoved` with nothing applied once the green moved. `submit_resolved` is a judgment committed at once, so a
+  submit and a push run one verdict.
+- **The push.** `crates/server/src/repository/push.rs`, one interface: `RepositoryLogs::append(principal, repository,
+  changes, parts) -> Result<Pushed, PushRefused>`, implemented by the shard's state (`push`), and fakeable by a tool's
+  tests. Each change is `BranchChange::Update { green, work }` (A-618's work against the branch's green),
+  `Create { name, from, version, work }` (a new branch made at `version` of member `from`, moved by a work made against
+  `from` at `version`, which applies to the new green at its version 0) or `Delete { name, version }` (retired, its green
+  kept, unless it moved past the version the client saw); `EntryParts` carries checks, names and state changes. Nothing
+  is applied until everything passed: each change's rules (a member, a free or bound name, a version a branch can be made
+  at, one change a green or a name, each green's write policy, evidence and signature gates, A-285 and A-321); the new
+  branches made in memory (`Lineage::branch`); each green's retention secured; every work's verdict held; the whole
+  entry judged by the register's guard with its new greens counted held (`Partition::check_creating`, which judges
+  their records and then the entry before either is recorded). Then the verdicts commit, at the heads they were judged
+  at, and the new greens' records and the entry are one log record. A refusal names every change refused and why
+  (`ChangeRefused { index, why }`: the verdict's windows, `Moved`, `Twice`, `ApprovalRequired` naming the work an
+  approver would approve, or the wire's typed refusal) or the entry's (`PushRefused::Entry`), and gives back what it
+  held: a branch made in memory is retired, every retention trued up. A work sent again is answered its version and
+  records nothing.
+- **A-642's logs.** No position of a whole repository: each green keeps its own log (its chain), and the repository's
+  own state is kept in logs of its own, the names log (the namespace and the lineage's joins), the phases, markers and
+  locks logs, each at its own position, moved only by its own changes; the policy's version is its own (A-622). A
+  version appends only while its green is at the position the push read, else the entry is refused `Moved { green,
+  read, at }`; a head check compares a green's position the same way; `RepositoryCheck::Log` compares a state log's.
+  Git LFS's locks are state changes (`LockTaken`, refused on a locked path; `LockReleased`, refused unless the path
+  holds exactly that lock). A member's version alone is again `Op::GreenAdvanced`, its own log's append.
+- **Atomic records.** An entry that moves two logs or more, a green's among them, is an `AtomicRecord`: its spans list
+  each log it moved, from the position it found to the one it left. Each position it took on each green's log points to
+  it (`Repositories::atomic_at`); a holder applies it only at its join (`AtomicRecord::join`: `Ready` with every log at
+  its predecessor, `Waiting`, `Applied`, `Diverged`); a cut that holds part of it is refused
+  (`Repositories::split_by`); a recovery replays the partition's log, which holds the record whole, and a snapshot
+  carries each record with the positions still pointing to it (`AtomicHeld`): the model test's first run found a
+  restore that derived the pointers from the spans bring back one a checkpoint had folded. A record goes once no green's
+  log points to it (its checkpoints and destroys).
+- **Tests** (Mac Studio, 2026-11-19, on the tree merged with main at 06d05cbca): `cargo test -p slates-merge --lib`
+  94 of 94, `-p slates-db --lib` 138 of 138, `-p slates-ipc --lib` 74 passed and 2 ignored, `-p slates-server --lib`
+  577 passed, 3 ignored, 1 failed (main's status-capture deadline test); `cargo fmt --all` applied from the Studio's
+  diff. The engine's oracle holds judging then committing equal to a submit over 256 generated histories (census: 1,977
+  accepts, 251 works sent again, 609 conflicts). The db's unit tests drive each rule (several greens together or none,
+  `Moved` naming the green; checks of heads, names and state logs; the state's logs and locks; the budget; no change
+  waiting on another log's position; a holder's join and a split cut; a record's life), and its model test runs 128
+  generated histories through a database over a real anchor segment with crashes at random points: Agreement (every
+  answer and the whole repository equal to the rules over plain maps, an entry all or none by construction),
+  StaleNeverCommits (an entry made against a moved green refused naming it, nothing of it applied) and NoLoss (every
+  recovered partition equal to the live one whole); census: 181 atomic records over several greens, 344 single-green
+  appends interleaved with records, 408 state moves with versions and 153 alone, 119 stale entries refused, 134 by a
+  check, 50 by a state change, 398 by a rule, 76 records folded, 18 members destroyed, and 307 recoveries from a snapshot
+  and 32 from the log with a record held. The server's tests push A-618's works built over a store: two branches in one
+  record, the same push again recording nothing, a stale work refusing the whole push with nothing applied and its
+  retention given back; a create, a delete and a move in one record; every refused change named by its index and kind;
+  a conflict retiring the branch made for it; the gates (forbidding and asking policies, a failed check, a stranger, no
+  repository). Red sixteen ways: in the engine, a commit without its head check and a verdict held at the wrong head; in
+  the database, the version's position, the head check's `Moved`, the state log check, the record kept, its fold, the
+  snapshot's pointers, the join, the split, the names log and the lock's precondition; in the server, a refused verdict
+  ignored, a branch made in memory kept, a delete's version unchecked and a retention not given back.
+- **Owed.** The fleet half (A-636): each green's log and each state log replicated on its own, holders applying atomic
+  records at their joins, replicas refusing split cuts, takeovers adopting each log and each record whole; the
+  repository policy's check before the verdict (A-622's next part); a stack of several works on one green in one push
+  (works over works, piece 5).
