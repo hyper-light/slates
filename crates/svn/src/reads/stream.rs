@@ -14,6 +14,7 @@
 
 use super::file::TextStream;
 use super::list::ListStream;
+use super::log::LogStream;
 use super::segments::SegmentStream;
 use super::{Reads, Repository, Session};
 use crate::index::Index;
@@ -35,6 +36,8 @@ enum Rest {
   List(ListStream),
   /// `get-location-segments`' walk, its `done` and its answer.
   Segments(SegmentStream),
+  /// `log`'s walk, its `done` and its answer, boxed: its frames make it the largest.
+  Log(Box<LogStream>),
 }
 
 /// Whether a streaming answer has more to write.
@@ -58,6 +61,13 @@ impl Stream {
   pub(super) fn list(list: ListStream) -> Self {
     Self {
       rest: Rest::List(list),
+    }
+  }
+
+  /// A log to stream.
+  pub(super) fn log(log: LogStream) -> Self {
+    Self {
+      rest: Rest::Log(Box::new(log)),
     }
   }
 
@@ -92,6 +102,7 @@ impl Stream {
       Rest::Text(text) => text.resume(reads.repository, reads.out, room),
       Rest::List(list) => list.resume(&mut reads, room),
       Rest::Segments(segments) => segments.resume(&mut reads, room),
+      Rest::Log(log) => log.resume(&mut reads, room),
     }
   }
 }

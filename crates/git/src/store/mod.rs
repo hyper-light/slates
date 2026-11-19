@@ -30,15 +30,29 @@
 //! resolved one tree a component down ([`Repository::entry`]): no walk of history and none of the tree. Making a
 //! green's maps (A-534) from a commit that is no version's head is receive-pack's create (piece 6).
 //!
+//! **A protected branch's questions** (A-644, `protect`): how a move changes its ref ([`Repository::change`]: a create,
+//! a fast-forward, a rewrite or a delete), judged against the ref's own head with no walk where generation numbers
+//! decide it; and which commits a move brings, D(k)'s, with the first merge commit among them
+//! ([`Repository::merge_commit`]) and the first no trusted key signed ([`Repository::unsigned_commit`], through a
+//! [`CommitSigners`]).
+//!
 //! **Bounds.** Every byte the store keeps is in the shared store's derived budget: the objects and the index as
 //! `slates-vcs` charges them, and the versions' sets and the head map as this store charges them ([`Repository`]); a
 //! commit past the budget is refused with nothing changed. Nothing here is a tuning constant: positions are counted,
 //! generation numbers computed, and the walks bounded by the repository they read.
 //!
-//! **Owed (A-614's parts 2 and 3, and later pieces):** each version's D(k) kept encoded as a pack fragment and the base
-//! pack, with the learned delta window and depth, zlib level and rebuild point (part 2); the changed-path Bloom filters
-//! of the commit rows (part 3); the walks and a commit sliced under the shard's budget, and their transient sets charged;
-//! the versions' records kept as content, replicated as the index's tables are.
+//! **upload-pack's pack (A-639).** A fetch's pack is streamed from what the store keeps ([`Upload`]): the
+//! negotiation's runs of versions (A-615, taken through [`Answered`]) from their fragments, then the objects still
+//! wanted that whole kept parts hold (a clone so becomes the base pack and the fragments after it), then the rest
+//! encoded with the fragments' learned rules; each part copied byte for byte when the client reads it as kept, entry by
+//! entry otherwise, so no client is sent an offset delta it did not ask for or a base it lacks. A turn does units of
+//! work up to the owner's quantum and holds nothing borrowed between turns; every answered pack holds exactly the
+//! answer's objects, each once.
+//!
+//! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks,
+//! a commit and a fragment's encoding sliced under the shard's budget, and their transient sets charged; a part partly
+//! wanted (a `blob:limit` fetch's blobs) read entry by entry rather than encoded afresh; a delta search for an object
+//! past a window; the versions' records kept as content, replicated as the index's tables are.
 
 mod deltas;
 mod fragment;
@@ -48,6 +62,7 @@ mod positions;
 mod push;
 mod repository;
 pub mod rows;
+mod upload;
 pub mod views;
 
 pub use deltas::delta_of;
@@ -56,7 +71,9 @@ pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
+pub use repository::protect::{Change, CommitSigners, Unsigned};
 pub use repository::{Found, Move, Repository, StoreCounters, StoreRefused};
+pub use upload::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 
 #[cfg(test)]
 #[path = "../tests/store/mod.rs"]

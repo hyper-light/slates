@@ -32,10 +32,10 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments` and `get-deleted-rev` (each its own
-//! module, `file`, `list`, `segments` and `deleted`). Owed with this piece: `log` with merged revisions,
-//! `get-file-revs`, and read access by the authorization rules (A-606): today every path is readable, as in an
-//! `anon-access = read` repository with no rules.
+//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments`, `get-deleted-rev` and `log` (each
+//! its own module, `file`, `list`, `segments`, `deleted` and `log`, over FSFS's node history in `history`). Owed with
+//! this piece: `log`'s merged revisions, `get-file-revs`, and read access by the authorization rules (A-606): today
+//! every path is readable, as in an `anon-access = read` repository with no rules.
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
@@ -49,6 +49,7 @@
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
 use crate::ra_svn::{ItemError, Value, write};
+use crate::report::drive::history as copies;
 
 /// `SVN_ERR_BAD_DATE`, "Bogus date".
 /// Format: the bad-input category's start, 120,000 + 1 × 5,000 = 125,000, plus 3 (`svn_error_codes.h` 107-108, 177-178).
@@ -169,7 +170,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 18] = [
+const ELSEWHERE: [&str; 17] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -178,7 +179,6 @@ const ELSEWHERE: [&str; 18] = [
   "switch",
   "status",
   "diff",
-  "log",
   "get-file-revs",
   "lock",
   "lock-many",
@@ -375,6 +375,7 @@ pub fn answer<R: Repository + ?Sized>(
     "list" => reads.list(params),
     "get-location-segments" => reads.location_segments(params),
     "get-deleted-rev" => reads.deleted_revision(params),
+    "log" => reads.log(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -1049,60 +1050,18 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     )))
   }
 
-  /// `svn_fs_closest_copy` (`tree.c` `fs_closest_copy`): the revision and path of the copy that made the node at `path`
-  /// in `revision` what it is: the youngest copy root on the path, unless the node there in that revision is another
-  /// line, or was made fresh in it beneath the copy; `None` without one. Refused when the path is absent.
+  /// `svn_fs_closest_copy` (`tree.c` `fs_closest_copy`), asked of the crate's one walk of copy roots
+  /// (`crate::report::drive::history`): the revision and path of the copy that made the node at `path` in `revision`
+  /// what it is; `None` without one. Refused when the path is absent, as FSFS's `open_path` refuses it.
   fn closest_copy(
     &self,
     path: &str,
     revision: Revision,
   ) -> Result<Option<(Revision, String)>, Failure> {
-    let node = self
-      .node(path, revision)?
-      .ok_or_else(|| Failure::not_found(path, revision))?;
-    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
-      return Ok(None);
-    };
-    let Some(copied) = self.node(path, copied_in)? else {
-      return Ok(None);
-    };
-    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
-    if copied.node_id() != node.node_id() || fresh {
-      return Ok(None);
+    if self.node(path, revision)?.is_none() {
+      return Err(Failure::not_found(path, revision));
     }
-    Ok(Some((copied_in, copy_path)))
-  }
-
-  /// FSFS's `find_youngest_copyroot`: the youngest copy root of the path's node and its directories in `revision`, a
-  /// child's preferred over its parent's of the same revision; `None` when it is revision 0's root.
-  fn youngest_copy_root(
-    &self,
-    path: &str,
-    revision: Revision,
-  ) -> Result<Option<(Revision, String)>, Failure> {
-    let mut youngest: Option<(Revision, String)> = None;
-    let mut chain: Vec<&str> = Vec::new();
-    let mut place = Some(path);
-    while let Some(at) = place {
-      chain.push(at);
-      place = parent(at);
-    }
-    for at in chain.into_iter().rev() {
-      let Some(node) = self.node(at, revision)? else {
-        continue;
-      };
-      let root = self
-        .index
-        .node_revision(node.copy_root())
-        .map_err(|refusal| Failure::of_index(&refusal))?;
-      if youngest
-        .as_ref()
-        .is_none_or(|(kept, _)| root.created_revision() >= *kept)
-      {
-        youngest = Some((root.created_revision(), root.created_path().to_owned()));
-      }
-    }
-    Ok(youngest.filter(|(copied_in, _)| *copied_in != 0))
+    copies::closest_copy(self.index, path, revision).map_err(|refusal| Failure::of_index(&refusal))
   }
 
   /// An unknown command: "Unknown editor command", with no authentication request first.
@@ -1724,7 +1683,9 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 mod deleted;
 mod file;
+mod history;
 mod list;
+mod log;
 mod segments;
 mod stream;
 

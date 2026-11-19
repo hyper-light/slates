@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8c15aaa60f4700e2c4cf9ad02498c39f24f70500057be3b37f4181c424a4d919 # found by g264 on main a5dffc913, the command names then twelve: name = "list", params = ["5:trunk ", "( ) ", "true "]; a stream of three items (A-613 part 2; pinned by a_list_with_a_word_for_its_depth_is_three_items_as_svnserve_answers_it, since the strategy has grown)

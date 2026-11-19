@@ -20,10 +20,11 @@
 //! recovery can still branch from, `UnknownBase`; a fenced source `ContentUnavailable`; the partition's tables at their
 //! derived capacity `TableAtCapacity`.
 //!
-//! **The register (A-603).** Every change a verb makes of a repository is one entry of the repository's register at its
-//! next position (`slates_db::repository`): a repository's root joining and its default branch's binding, a branch's
-//! member joining and its name's binding, a bind, a retire, and every version of a member ([`version_record`]), so
-//! the register counts every change and its checks read one position.
+//! **The logs (A-603, rebuilt by A-642).** Every change a verb makes of a repository's namespace is one entry
+//! (`slates_db::repository`): a repository's root joining and its default branch's binding, a branch's member joining
+//! and its name's binding, a bind, a retire, each moving the names log alone; a member's version is an append to its
+//! own green's log (`Op::GreenAdvanced`), never a position of the whole repository; and a push of several is one entry,
+//! all or none (`push`).
 //!
 //! **Durability.** Each verb's records commit as one atom with its completion record (the verb's transaction), the
 //! engine installed only after them: a refused record leaves no engine ahead of its log, and a rolled-back one is undone
@@ -35,8 +36,8 @@
 //! its id.
 
 use slates_db::catalog::{
-  BaseRecord, GreenVersion, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy,
-  PolicyRecord, Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
+  BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
+  Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
   SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::op::Op;
@@ -47,6 +48,11 @@ use crate::error::refusal_of_db;
 use crate::greens::ReleaseProgress;
 use crate::state::ShardState;
 use crate::verbs::{forbidden, refused, to_db_volume, to_wire_volume};
+
+// The push's callers, git's receive-pack and Mercurial's unbundle, land after it (A-620's second part; §4.17.3's push):
+// until one calls it, a daemon build calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod push;
 
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
@@ -101,54 +107,18 @@ fn record(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
     .map_err(|error| refusal_of_db(&error))
 }
 
-/// An entry of `repository`'s register at its next position, changing nothing yet (A-603): `NotFound` for no such
-/// repository.
+/// An entry of `repository`'s logs, changing nothing yet (A-603, A-642): `NotFound` for no such repository.
 fn next_entry(state: &ShardState, repository: RepositoryId) -> Result<RepositoryEntry, Refusal> {
-  let position = state
+  state
     .db
     .partition()
     .repositories()
-    .position(repository)
+    .repository(repository)
     .ok_or(Refusal::NotFound)?;
   Ok(RepositoryEntry {
     repository,
-    position,
     ..RepositoryEntry::default()
   })
-}
-
-/// The record of `green`'s `version` and its chain entry: an entry of its repository's register when it is a member of
-/// a repository that stands, which every version of a repository's green is (§4.17.1 shared piece 2, A-603), else the
-/// green's own `GreenAdvanced`.
-pub(crate) fn version_record(
-  state: &ShardState,
-  green: DbVolumeId,
-  version: u64,
-  entry: Vec<u8>,
-) -> Op {
-  let repositories = state.db.partition().repositories();
-  let register = repositories
-    .member(green)
-    .map(|member| member.repository)
-    .and_then(|repository| Some((repository, repositories.position(repository)?)));
-  match register {
-    Some((repository, position)) => Op::RepositoryAdvanced {
-      entry: RepositoryEntry {
-        repository,
-        position,
-        versions: vec![GreenVersion {
-          green,
-          version,
-          entry,
-        }],
-        ..RepositoryEntry::default()
-      },
-    },
-    None => Op::GreenAdvanced {
-      green,
-      increment: entry,
-    },
-  }
 }
 
 /// The repository named `name` on this partition, when `principal` owns it: `NotFound` for none, `Forbidden` for
@@ -559,17 +529,18 @@ pub(crate) fn retire_branch(
 }
 
 /// Sets repository `repository`'s policy whole (§4.17.1 "Policy", A-622): its owner's verb, made from policy version
-/// `read`, the version its owner read. One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
-/// position. The database's guard refuses a version the policy has moved past (`PolicyChanged`, naming the version
-/// now) and a rule or hook the repository cannot hold (`Database`, naming the first by index), before anything is
-/// recorded.
+/// `read`, the version its owner read: its rules, its hooks and, for Subversion, its hooks-env (A-648). One entry of
+/// the repository's register: `Op::RepositoryPolicySet` takes its next position. The database's guard refuses a version
+/// the policy has moved past (`PolicyChanged`, naming the version now) and a rule, hook or hooks-env section the
+/// repository cannot hold (`Database`, naming the first by index), before anything is recorded.
 pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks): (
+  (rules, hooks, hooks_env): (
     &[slates_ipc::protocol::PolicyRule],
     &[slates_ipc::protocol::HookConfig],
+    &[slates_ipc::protocol::HooksEnvSection],
   ),
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "set_repository_policy") {
@@ -585,6 +556,7 @@ pub(crate) fn set_policy(
     version,
     rules: rules.iter().map(db_rule).collect(),
     hooks: hooks.iter().map(db_hook).collect(),
+    hooks_env: hooks_env.iter().map(db_hooks_env_section).collect(),
   };
   let op = Op::RepositoryPolicySet {
     repository: record.id,
@@ -659,9 +631,32 @@ fn db_hook(hook: &slates_ipc::protocol::HookConfig) -> slates_db::catalog::HookC
       Given::SvnPreCommit => Point::SvnPreCommit,
       Given::SvnPreRevpropChange => Point::SvnPreRevpropChange,
       Given::SvnPostCommit => Point::SvnPostCommit,
+      Given::SvnStartCommit => Point::SvnStartCommit,
+      Given::SvnPostRevpropChange => Point::SvnPostRevpropChange,
+      Given::SvnPreLock => Point::SvnPreLock,
+      Given::SvnPostLock => Point::SvnPostLock,
+      Given::SvnPreUnlock => Point::SvnPreUnlock,
+      Given::SvnPostUnlock => Point::SvnPostUnlock,
     },
     name: hook.name.clone(),
     program: hook.program.clone(),
+  }
+}
+
+/// The database's form of a hooks-env section (A-648).
+fn db_hooks_env_section(
+  section: &slates_ipc::protocol::HooksEnvSection,
+) -> slates_db::catalog::HooksEnvSection {
+  slates_db::catalog::HooksEnvSection {
+    name: section.name.clone(),
+    variables: section
+      .variables
+      .iter()
+      .map(|variable| slates_db::catalog::HooksEnvVariable {
+        name: variable.name.clone(),
+        value: variable.value.clone(),
+      })
+      .collect(),
   }
 }
 
@@ -962,77 +957,99 @@ mod tests {
     });
   }
 
-  /// A-603 (§4.17.1 shared piece 2: every change of a repository is one entry of its register). Do: create a repository,
-  /// write its root twice, branch it at a version it folded and then at its head, retire the branch's name and bind it
-  /// again, write the branch; then write a green no repository holds, and send a bind the register refuses. Expect: the
-  /// create is one entry, and each verb and each member's version takes exactly one position more, its chain entry
-  /// recorded under the green; the refused branch, the lone green's version and the refused bind take none.
+  /// A-603, A-642 (§4.17.1 shared piece 2: each green keeps its own log; the namespace is a log of its own). Do: create a
+  /// repository, write its root twice, branch it at a version it folded and then at its head, retire the branch's name
+  /// and bind it again, write the branch; then write a green no repository holds, and send a bind the guard refuses.
+  /// Expect: each verb moves the names log alone, by each change it makes; each member's version moves its own green's
+  /// log alone; the refused branch, the lone green's version and the refused bind move no log of the repository; and no
+  /// verb or lone version is an atomic record.
   #[test]
-  fn every_verb_and_every_members_version_is_one_entry_of_the_register() {
+  fn each_verb_moves_the_names_log_and_each_members_version_its_own_log() {
     crate::daemon::audit_on_shard(|state| {
       let root = green_of(create(state, "tree", "main"));
       let repo = repository(state, "tree");
-      let position = |state: &ShardState| state.db.partition().repositories().position(repo);
-      assert_eq!(position(state), Some(1), "the create is one entry");
+      let names = |state: &ShardState| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .log_position(repo, slates_db::catalog::StateLog::Names)
+      };
+      let head_of =
+        |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
+      assert_eq!(names(state), Some(2), "the root joined and its name bound");
       write(state, root, b"v1", 1);
       write(state, root, b"v2", 2);
-      assert_eq!(position(state), Some(3));
-      assert_eq!(state.db.partition().green_head(to_db_volume(root)), 2);
-      // No reader held version 1, so the root folded it: a branch there is refused before any record, and takes no
-      // position.
+      assert_eq!((names(state), head_of(state, root)), (Some(2), 2));
+      // No reader held version 1, so the root folded it: a branch there is refused before any record.
       assert!(matches!(
         refusal(branch(state, ("tree", "early", "main"), Some(1))),
         Refusal::UnknownBase { .. }
       ));
-      assert_eq!(position(state), Some(3));
       let topic = green_of(branch(state, ("tree", "topic", "main"), None));
-      assert_eq!(position(state), Some(4));
-      let retired = ask(
-        state,
-        &owner(),
-        RequestBody::RetireBranch {
-          repository: "tree".to_owned(),
-          name: "topic".to_owned(),
-        },
-      );
-      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
-      let bound = ask(
-        state,
-        &owner(),
-        RequestBody::BindBranch {
-          repository: "tree".to_owned(),
-          name: "topic".to_owned(),
-          green: topic,
-        },
-      );
-      assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
-      assert_eq!(position(state), Some(6));
+      assert_eq!(names(state), Some(4));
+      retire_and_bind_again(state, topic);
+      assert_eq!(names(state), Some(6));
       write(state, topic, b"t1", 3);
-      assert_eq!(position(state), Some(7));
-      assert_eq!(state.db.partition().green_head(to_db_volume(topic)), 1);
-      let lone = green_of(ask(
-        state,
-        &owner(),
-        RequestBody::CreateGreen {
-          name: "lone".to_owned(),
-          require_evidence: false,
-          base: None,
-        },
-      ));
-      write(state, lone, b"l1", 4);
-      assert_eq!(state.db.partition().green_head(to_db_volume(lone)), 1);
-      let taken = ask(
-        state,
-        &owner(),
-        RequestBody::BindBranch {
-          repository: "tree".to_owned(),
-          name: "main".to_owned(),
-          green: topic,
-        },
+      assert_eq!(
+        (names(state), head_of(state, topic), head_of(state, root)),
+        (Some(6), 1, 2)
       );
-      assert!(matches!(refusal(taken), Refusal::AlreadyExists { .. }));
-      assert_eq!(position(state), Some(7));
+      assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic);
+      assert_eq!(names(state), Some(6));
+      assert_eq!(
+        state.db.partition().repositories().atomic_records().count(),
+        0
+      );
     });
+  }
+
+  /// Retires `topic`'s name and binds it again.
+  fn retire_and_bind_again(state: &mut ShardState, topic: VolumeId) {
+    let retired = ask(
+      state,
+      &owner(),
+      RequestBody::RetireBranch {
+        repository: "tree".to_owned(),
+        name: "topic".to_owned(),
+      },
+    );
+    assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+    let bound = ask(
+      state,
+      &owner(),
+      RequestBody::BindBranch {
+        repository: "tree".to_owned(),
+        name: "topic".to_owned(),
+        green: topic,
+      },
+    );
+    assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
+  }
+
+  /// Writes a green no repository holds, and binds a taken name: the one moves its own log, the other nothing.
+  fn assert_a_lone_green_and_a_refused_bind_move_nothing(state: &mut ShardState, topic: VolumeId) {
+    let lone = green_of(ask(
+      state,
+      &owner(),
+      RequestBody::CreateGreen {
+        name: "lone".to_owned(),
+        require_evidence: false,
+        base: None,
+      },
+    ));
+    write(state, lone, b"l1", 4);
+    assert_eq!(state.db.partition().green_head(to_db_volume(lone)), 1);
+    let taken = ask(
+      state,
+      &owner(),
+      RequestBody::BindBranch {
+        repository: "tree".to_owned(),
+        name: "main".to_owned(),
+        green: topic,
+      },
+    );
+    assert!(matches!(refusal(taken), Refusal::AlreadyExists { .. }));
   }
 
   /// A-575 (§4.16 the retire sliced; §4.17.1 item 4's destroy). Do: branch a repository's root, write the branch, then
@@ -1234,6 +1251,7 @@ mod tests {
             read,
             rules,
             hooks,
+            hooks_env: Vec::new(),
           },
         )
       };
@@ -1300,6 +1318,139 @@ mod tests {
           version: 2,
           ..RepositoryPolicy::default()
         }
+      );
+    });
+  }
+
+  /// A-648 (§4.17.4 item 9). Do: create a Subversion repository; set its policy with a hook at each of the six points
+  /// the record gained and a hooks-env of a default section and a pre-lock one; then set one whose second section names
+  /// a variable holding `=`; and, in a git repository, one holding a hooks-env at all. Expect: the first acknowledged and
+  /// held whole, each point and section as given; the second refused naming section 1 and the git one section 0, with
+  /// nothing changed.
+  #[test]
+  fn a_subversion_repositorys_policy_holds_its_six_new_points_and_its_hooks_env() {
+    use slates_db::catalog::HookPointName as Held;
+    use slates_ipc::protocol::{
+      DatabaseRefusal, HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable,
+    };
+    crate::daemon::audit_on_shard(|state| {
+      let svn = RequestBody::CreateRepository {
+        name: "svn".to_owned(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Sha1,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      };
+      green_of(ask(state, &owner(), svn));
+      let program = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      let points = [
+        (
+          HookPointName::SvnStartCommit,
+          "start-commit",
+          Held::SvnStartCommit,
+        ),
+        (
+          HookPointName::SvnPostRevpropChange,
+          "post-revprop-change",
+          Held::SvnPostRevpropChange,
+        ),
+        (HookPointName::SvnPreLock, "pre-lock", Held::SvnPreLock),
+        (HookPointName::SvnPostLock, "post-lock", Held::SvnPostLock),
+        (
+          HookPointName::SvnPreUnlock,
+          "pre-unlock",
+          Held::SvnPreUnlock,
+        ),
+        (
+          HookPointName::SvnPostUnlock,
+          "post-unlock",
+          Held::SvnPostUnlock,
+        ),
+      ];
+      let hooks: Vec<HookConfig> = points
+        .iter()
+        .map(|(point, name, _)| HookConfig {
+          point: *point,
+          name: (*name).to_owned(),
+          program: program.clone(),
+        })
+        .collect();
+      let section = |name: &str, variable: &str, value: &[u8]| HooksEnvSection {
+        name: name.to_owned(),
+        variables: vec![HooksEnvVariable {
+          name: variable.to_owned(),
+          value: value.to_vec(),
+        }],
+      };
+      let env = vec![
+        section("default", "LANG", b"en_US.UTF-8"),
+        section("pre-lock", "ONLY", b"pre-lock"),
+      ];
+      let set = |state: &mut ShardState, repository: &str, read: u64, hooks, hooks_env| {
+        ask(
+          state,
+          &owner(),
+          RequestBody::SetRepositoryPolicy {
+            repository: repository.to_owned(),
+            read,
+            rules: Vec::new(),
+            hooks,
+            hooks_env,
+          },
+        )
+      };
+      let held = |state: &ShardState, name: &str| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named(name)
+          .map(|record| record.policy.clone())
+          .unwrap()
+      };
+      assert_eq!(set(state, "svn", 0, hooks, env), ReplyBody::Acknowledged);
+      let first = held(state, "svn");
+      let points_held: Vec<Held> = first.hooks.iter().map(|hook| hook.point).collect();
+      let expected: Vec<Held> = points.iter().map(|(_, _, held)| *held).collect();
+      assert_eq!(points_held, expected);
+      let held_section =
+        |name: &str, variable: &str, value: &[u8]| slates_db::catalog::HooksEnvSection {
+          name: name.to_owned(),
+          variables: vec![slates_db::catalog::HooksEnvVariable {
+            name: variable.to_owned(),
+            value: value.to_vec(),
+          }],
+        };
+      let given = vec![
+        held_section("default", "LANG", b"en_US.UTF-8"),
+        held_section("pre-lock", "ONLY", b"pre-lock"),
+      ];
+      assert_eq!(first.hooks_env, given);
+      let bad = vec![
+        section("default", "LANG", b"C"),
+        section("pre-lock", "A=B", b"1"),
+      ];
+      assert_eq!(
+        refusal(set(state, "svn", 1, Vec::new(), bad)),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 1 }
+        }
+      );
+      green_of(create(state, "linux", "main"));
+      let git_env = vec![section("default", "LANG", b"C")];
+      assert_eq!(
+        refusal(set(state, "linux", 0, Vec::new(), git_env)),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 0 }
+        }
+      );
+      assert_eq!(
+        held(state, "svn"),
+        first,
+        "a refused setting changes nothing"
       );
     });
   }

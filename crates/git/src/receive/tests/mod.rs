@@ -1,11 +1,12 @@
 //! receive-pack's tests (A-620): eleven pushes stock git made as golden vectors, the request
 //! reader, each command's checks, the report and the admission. `append` holds the tests of the
 //! appends that move refs (A-642), `checks` those of the pushed objects' fsck and of hidden refs,
-//! `session` those of one push over one connection.
+//! `session` those of one push over one connection, `works` those of part 2's judge over a store.
 
 mod append;
 mod checks;
 mod session;
+mod works;
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -233,6 +234,7 @@ impl Judge for GitPolicy<'_> {
       .concat();
       return Err(Declined {
         reason: b"non-fast-forward".to_vec(),
+        hook: Vec::new(),
         message: Some(message(&line)),
       });
     }
@@ -842,6 +844,7 @@ fn a_ref_name_git_refuses_is_a_funny_refname() {
     let expected = if funny {
       Outcome::Ng(Declined {
         reason: b"funny refname".to_vec(),
+        hook: Vec::new(),
         message: Some(message(&line)),
       })
     } else {
@@ -973,6 +976,7 @@ fn three_reported(id: ObjectId) -> Received {
   received.outcomes[0] = Outcome::Ok(vec![first, second]);
   received.outcomes[2] = Outcome::Ng(Declined {
     reason: b"hook declined".to_vec(),
+    hook: Vec::new(),
     message: Some(message(b"hook declined to update refs/heads/c")),
   });
   received
