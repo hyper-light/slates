@@ -4504,6 +4504,10 @@ async fn init_shard(
     image: crate::image::ImageState::default(),
     configured_members: Vec::new(),
     departed_owed: Vec::new(),
+    departures_owed: false,
+    departures_retry_at: None,
+    #[cfg(target_os = "linux")]
+    held_copies_owed: false,
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -4743,6 +4747,10 @@ async fn init_shard(
   state.landing.next_landing = verbs::next_landing_counter(state.db.partition());
   // The runtime grants, rebuilt from the durable ones in their recorded states (AUD-29-06).
   crate::landing::restore_grants(&mut state);
+  // What the partition owed the audit when its predecessor stopped (a batch a crash cut off) is looked at a retry
+  // window into the start, by the deadline keeper (A-265, A-554).
+  let started_ns = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  crate::landing::arm_owed_audit_look(&mut state, started_ns);
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
@@ -4851,14 +4859,16 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: grants, the audit owed,
-/// departed hosts' attachments, held copies, the pressure hold, NFS purges, base hints and the idle seal. Dead clients are
-/// no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper retires it then
-/// (`crate::reap`); nor, since A-522 and A-536, are abandoned staging buffers, status captures, lapsed write leases and
-/// lapsed CLI attachments, which the shard's keeper releases at their own deadlines (`crate::deadlines`), nor destroys,
-/// which the serve loop steps once woken and the keeper retries at a refused record's deadline. The jobs left
-/// here leave a piece at a time for the events or deadlines that own them, and then the loop and its tick go (the reaper
-/// series, GAPS). Derived: the cadence is the budget.
+/// The shard's tick for the cold work it still owns, at the liveness cadence: the pressure hold, NFS purges, base hints
+/// and the idle seal; since A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
+/// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
+/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`). Dead clients are no longer its: since A-475
+/// each client's watch reports its hang-up and the shard's reaper retires it then (`crate::reap`); nor, since A-522,
+/// A-536 and A-554, are abandoned staging buffers, status captures, lapsed write leases, lapsed CLI attachments, grants
+/// past their term and the owed audit's resend, which the shard's keeper takes at their own deadlines
+/// (`crate::deadlines`), nor destroys, which the serve loop steps once woken and the keeper retries at a refused
+/// record's deadline. The jobs left here leave a piece at a time for the events or deadlines that own them, and then
+/// the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4868,18 +4878,6 @@ async fn reap_loop() {
   .get();
   loop {
     pace(cadence).await;
-    state::with_state(|s| {
-      // A grant past its term leaves the tables (A-266); its history is the audit log.
-      crate::landing::end_expired_grants(s);
-      // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
-      // crash, a restart or an unanswered wait reaches the control partition, which appends nothing twice.
-      crate::landing::resend_stuck_audit(s);
-    });
-    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
-    crate::remote_attach::sweep_departed().await;
-    // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
-    #[cfg(target_os = "linux")]
-    let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
     refresh_pressure_hold().await;
 
     crate::nfs::purge_owed_here().await;

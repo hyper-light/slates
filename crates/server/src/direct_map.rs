@@ -861,7 +861,15 @@ pub(crate) struct DirectMapState {
 /// Linux's (`crate::held_copy`).
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub(crate) fn claim_overdue(taken_back_ns: u64, now_ns: u64, failover_ns: u64) -> bool {
-  now_ns >= taken_back_ns.saturating_add(failover_ns)
+  now_ns >= claim_due_ns(taken_back_ns, failover_ns)
+}
+
+/// Derived: when the claim of a map taken back at `taken_back_ns` falls due, by the failover delay `failover_ns` the
+/// shard holds now ([`claim_overdue`]'s rule): the instant the shard's deadline keeper sleeps to for the earliest one
+/// (A-554, `crate::held_copy::next_claim_deadline`).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn claim_due_ns(taken_back_ns: u64, failover_ns: u64) -> u64 {
+  taken_back_ns.saturating_add(failover_ns)
 }
 
 /// A retry of a map still being filled joins it: the verb does not run again, and the reply goes where this attempt

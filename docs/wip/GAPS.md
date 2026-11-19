@@ -13,26 +13,34 @@
 > green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
 > greens; the record's replication in a fleet (with piece 2).
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1's framings built (2026-11-19, A-514; UI goal 91; owner
-> g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move
-> toward public, and a public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review
-> requests; a stock push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a
-> line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
-> (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups
-> `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input, every structure
-> counted and charged exactly to the caller's admission before it is built, no recursion; proven by `cargo test -p
-> slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg`
-> 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text
-> rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed).
-> Owed, in order, after §4.17.1's seven pieces: (1, rest) the parts' payloads (phase-heads, bookmarks, the check parts,
-> markers, pushkey values), and compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired (D-17); (2) the SSH and
-> HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory; (4) read serving; (5)
-> pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the
-> revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog;
-> (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
-> differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
-> `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
-> is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
+> (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks
+> are greens; phases only move toward public, and a public changeset is never dropped or rewritten; markers are kept and
+> exchanged; topics are review requests; a stock push is judged whole-file and answered with Mercurial's own race abort,
+> and rebase on push is a line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code
+> and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input,
+> every structure counted and charged exactly to the caller's admission before it is built, no recursion; proven by
+> `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden
+> vectors stock `hg` 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle`
+> lists it, every text rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed,
+> four tests failed). **Built (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and
+> `check:bookmarks`, `check:heads` and `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies,
+> listkeys lines and namespace nodes), nothing allocated in decoding, every encoder's exact length given before it
+> writes; proven by `cargo test -p slates-hg --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against
+> golden vectors stock `hg` 7.2 made twice, byte for byte alike but the replies' cut
+> (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over SSH captured on the wire, the server's
+> replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask findings in the crate are folded in (the
+> no-panic root attribute among them); clippy and xtask are main's to rerun. Measured on stock 7.2 and recorded
+> (research §13): its C and pure marker readers disagree on a marker's size and on parent counts 0 and past 3. Owed, in
+> order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
+> (D-17); (2) the SSH and HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory;
+> (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8)
+> access and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow,
+> ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own
+> suite through a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a
+> 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
+> run checks it). No speed is claimed until main measures it.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
@@ -4085,6 +4093,16 @@
 > on, never spun on (job 3's red check found that spin). Still on the tick: grants, the owed audit (piece 4), departed
 > hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the
 > idle seal and the huge-page re-arm.
+> **Since A-554 (piece 4)** grants past their term, the owed audit, departed hosts and held copies are off the tick:
+> the grants table indexes its issued grants by the end of their term and the keeper sleeps to the next due (an issue or
+> a restore notes it, each state borrow hands the note to the keeper); what a shard owes the audit is looked at a retry
+> window after the record that armed the look, sent again if its front has not moved, and looked at again only while
+> anything is owed; a departed host's attachments are ended by the control shard's reaper when the fleet's members or a
+> member's anchor change (A-222), a look some shard did not answer asked for again a retry window on; an unclaimed
+> taken-back copy (Linux, A-197) is reclaimed by the reaper at its claim's deadline, which the keeper sleeps to (built
+> and tested on Linux by main, the agent's host being macOS); a deadline whose job was refused is retried the named
+> retry window on (`deadlines::retry_window_ns`, A-455's shard window). Still on the tick: the pressure hold, NFS
+> purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
 > **Since A-552 (D-c, 2026-11-19, g076b) the daemon's own supervision waits follow the windows its shards are judged
 > by, or wait while what they wait on goes on:** a starved hold (test support, `starved_share_ns`) spins half the window
 > the watchdog judges its shard by, where it spun half of `W`; a stop waits for its log writer while it writes lines,
@@ -4095,8 +4113,9 @@
 > answers (RFC 6298's tail plus a window, Karn's rule, backed off to the failover delay; `crate::anchor_answers`),
 > where a hold waited the recovery budget and a window and a release a window (the wiring is Windows-only, built by
 > main); and a taken-back writable copy's claim (`held_copy`, Linux) is owed for the failover delay its shard holds,
-> the term its holder's write lease runs for (A-414), where it mirrored the client's old two-second reconnect budget
-> (the wiring is Linux-only, built by main). D-c is closed by these.
+> the term its holder's write lease runs for (A-414), and A-554's keeper sleeps to the earliest taken back plus the
+> delay held at each pass, where it mirrored the client's old two-second reconnect budget (the wiring is Linux-only,
+> built by main). D-c is closed by these.
 > Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
 > in the event-driven reaper series), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
