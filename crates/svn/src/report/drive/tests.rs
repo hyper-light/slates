@@ -434,3 +434,37 @@ proptest! {
     prop_assert!(calls > 0);
   }
 }
+
+/// A-616 part 2 with A-652 (`delta_files` through Subversion's deltifier): drive `/trunk` from r5
+/// to r6, where one line of `big.txt`'s 6,000 changed; expect its delta against the r5 text's MD5,
+/// windows that copy from that text and carry far less new data than the text, and the r6 text
+/// made of them.
+#[test]
+fn a_changed_text_is_sent_as_a_delta_against_its_base() {
+  let (index, green) = repository();
+  let guards = FixtureGuards::anonymous();
+  let mut drive = Drive::new(trunk_report(5, 6, false), b"u");
+  let calls = run(&mut drive, &index, &green, &guards);
+  let at = calls
+    .iter()
+    .position(|call| matches!(call, Written::Open(NodeKind::File, path, _) if path == "big.txt"))
+    .unwrap();
+  let Some(Written::Delta(base, _, windows)) = calls[at..]
+    .iter()
+    .find(|call| matches!(call, Written::Delta(..)))
+  else {
+    panic!("big.txt sent no delta");
+  };
+  let texts = texts_by_md5(&green);
+  let source = &texts[&base.unwrap()];
+  let target = crate::svndiff::apply_all(source, windows).unwrap();
+  let copies = windows
+    .iter()
+    .flat_map(|window| &window.instructions)
+    .filter(|instruction| matches!(instruction, crate::svndiff::Instruction::Source { .. }))
+    .count();
+  let new_data: usize = windows.iter().map(|window| window.new_data.len()).sum();
+  assert!(copies > 0, "no window copied from the base");
+  assert!(new_data * 100 < target.len(), "{new_data} new bytes of {}", target.len());
+  assert_eq!(target.len(), source.len() + "edited on the branch of history".len() - "of a text long enough to need several windows".len());
+}
