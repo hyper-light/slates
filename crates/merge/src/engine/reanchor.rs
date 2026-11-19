@@ -98,7 +98,7 @@ impl Green {
     // history, if any, ends before the copy.
     let history = self.content_history.get(path).filter(|history| {
       self
-        .covered_since(path, super::last_version(Some(*history)))
+        .covered_since(path, super::last_entry(Some(*history)))
         .is_none_or(|since| from < since)
     });
     let Some(history) = history else {

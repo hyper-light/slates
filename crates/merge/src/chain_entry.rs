@@ -107,8 +107,9 @@ pub enum Applied {
   /// Remove an xattr: path, name.
   RemoveXattr(String, String),
   /// Copy `from`'s tree to `dst` by reference (A-586): what the head holds of it, which the verdict found unchanged
-  /// since `version`, the source's version the increment declared. Encoded as its two paths; `version` is read back
-  /// from the increment's own `Copy` operation, so the entry costs no more than its bound's two strings.
+  /// since `version`, the source's version the increment declared, replacing what `dst` holds when `replace` (A-626).
+  /// Encoded as its two paths; `version` and `replace` are read back from the increment's own `Copy` operation, so the
+  /// entry costs no more than its bound's two strings.
   CopyTree {
     /// The destination.
     dst: String,
@@ -116,6 +117,8 @@ pub enum Applied {
     from: String,
     /// The version of the source the increment copies.
     version: u64,
+    /// Whether the copy replaces what the destination holds ([`crate::ops_doc::REPLACE`]).
+    replace: bool,
   },
 }
 
@@ -572,16 +575,22 @@ fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applie
     tag::COPY_TREE => {
       let dst = take_str(reader)?;
       let from = take_str(reader)?;
-      let version = declared_copy(increment, &dst, &from).ok_or(DocDecodeError::BadKind)?;
-      Applied::CopyTree { dst, from, version }
+      let (version, replace) =
+        declared_copy(increment, &dst, &from).ok_or(DocDecodeError::BadKind)?;
+      Applied::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+      }
     }
     _ => return Err(DocDecodeError::BadKind),
   })
 }
 
-/// The source version of the `Copy` operation `increment` declares from `from` to `dst` (A-586); `None` when it declares
-/// none, which no entry the engine recorded holds.
-fn declared_copy(increment: &Increment, dst: &str, from: &str) -> Option<u64> {
+/// The source version of the `Copy` operation `increment` declares from `from` to `dst` (A-586), and whether it replaces
+/// (A-626); `None` when it declares none, which no entry the engine recorded holds.
+fn declared_copy(increment: &Increment, dst: &str, from: &str) -> Option<(u64, bool)> {
   let path = |index: u64| {
     u16::try_from(index)
       .ok()
@@ -594,5 +603,5 @@ fn declared_copy(increment: &Increment, dst: &str, from: &str) -> Option<u64> {
     .find(|op| {
       op.kind == OpKind::Copy && path(u64::from(op.path)) == Some(dst) && path(op.src) == Some(from)
     })
-    .map(|op| op.at)
+    .map(|op| (op.at, op.replaces()))
 }

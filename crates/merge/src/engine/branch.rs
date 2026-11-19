@@ -42,7 +42,7 @@ use std::ops::{Deref, DerefMut};
 
 use super::{
   Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry,
-  history_at, last_version, link_entry, mode_entry, present_at, relink, special_entry, xattr_entry,
+  history_at, last_entry, link_entry, mode_entry, present_at, relink, special_entry, xattr_entry,
 };
 use crate::dims::{Arenas, GreenRelease};
 use crate::identity::{Entry, SetHash};
@@ -87,6 +87,10 @@ pub enum LineageRefused {
   /// member can be read, written, branched or released until it is put back (A-575).
   Busy,
 }
+
+/// One dimension's last change of its own at a path, with the key it names there ([`Green::keys_changed_after`]): the
+/// change's version and whether it removed the key.
+type LastChange = (Option<(u64, bool)>, fn(String) -> IdentityKey);
 
 /// The value a branch sets a key back to, when it differs from the head's: `history`'s entry at `version` against
 /// `now`. A key with no history never changed, so it is never set back.
@@ -238,29 +242,29 @@ impl Green {
 
   /// `path`'s keys, in every dimension, with a change of their own after `version`.
   fn keys_changed_after(&self, path: &str, version: u64) -> Vec<IdentityKey> {
-    let after = |last: Option<u64>| last.is_some_and(|last| last > version);
-    let lasts: [(Option<u64>, fn(String) -> IdentityKey); 6] = [
+    let after = |last: Option<(u64, bool)>| last.is_some_and(|(last, _)| last > version);
+    let lasts: &[LastChange] = &[
       (
-        last_version(self.content_history.get(path)),
+        last_entry(self.content_history.get(path)),
         IdentityKey::File,
       ),
       (
-        last_version(self.special_history.get(path)),
+        last_entry(self.special_history.get(path)),
         IdentityKey::Special,
       ),
-      (last_version(self.dir_history.get(path)), IdentityKey::Dir),
-      (last_version(self.mode_history.get(path)), IdentityKey::Mode),
+      (last_entry(self.dir_history.get(path)), IdentityKey::Dir),
+      (last_entry(self.mode_history.get(path)), IdentityKey::Mode),
       (
-        last_version(self.symlink_history.get(path)),
+        last_entry(self.symlink_history.get(path)),
         IdentityKey::Symlink,
       ),
       (
-        last_version(self.hardlink_history.get(path)),
+        last_entry(self.hardlink_history.get(path)),
         IdentityKey::Hardlink,
       ),
     ];
     let mut keys: Vec<IdentityKey> = lasts
-      .into_iter()
+      .iter()
       .filter(|(last, _)| after(*last))
       .map(|(_, key)| key(path.to_owned()))
       .collect();
@@ -270,7 +274,7 @@ impl Green {
         .xattr_history
         .range(from..)
         .take_while(|((at, _), _)| at == path)
-        .filter(|(_, history)| after(history.last().map(|(recorded, _)| *recorded)))
+        .filter(|(_, history)| after(last_entry(Some(*history))))
         .map(|((_, name), _)| IdentityKey::Xattr(path.to_owned(), name.clone())),
     );
     keys
