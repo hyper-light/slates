@@ -354,8 +354,22 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
   /// holders had said `holding` (an answer of [`Holding::Unknown`] again is taken as nobody), and reading goes on. A
   /// refusal it brings (too many failures) closes the connection.
   pub fn key_resolved(&mut self, holding: Holding<H::Principal>) -> Result<(), SessionUse> {
-    let _ = holding;
-    Err(SessionUse::NoKeyWanted)
+    let Some(payload) = self.deferred.take() else {
+      return Err(SessionUse::NoKeyWanted);
+    };
+    let Some(authenticator) = self.authenticator.as_mut() else {
+      return Err(SessionUse::Closed);
+    };
+    let mut answered = Answered {
+      holding: Some(holding),
+    };
+    match authenticator.request(&payload, &mut answered) {
+      Ok(answer) => {
+        self.take_answer(answer);
+        self.flush().map_err(SessionUse::Fatal)
+      }
+      Err(refusal) => Err(SessionUse::Fatal(self.fail(SessionRefusal::Auth(refusal)))),
+    }
   }
 
   /// Answers the raised [`SessionEvent::Exec`]: the command runs when `accept`.
