@@ -863,6 +863,71 @@ impl KernelHolds {
   }
 }
 
+/// How a mount taken over from a daemon that died (A-61) adopts a file its kernel held open before the takeover (A-147,
+/// A-152): the journal point every byte of it is fresh as of, and the journal's changes to it since, each with whether
+/// it is one of this mount's own ([`PageStates::adopted`]; none when the journal no longer reaches back, which loses
+/// the file).
+#[derive(Debug)]
+pub struct TakenOver {
+  /// The point every byte is fresh as of.
+  pub from: u64,
+  /// The journal's changes to the file since, oldest first, each with whether it is this mount's own.
+  pub changes: Option<Vec<(std::ops::Range<u64>, u64, bool)>>,
+}
+
+impl TakenOver {
+  /// The most ranges adopting the file can add: its one range, and a split at each end of each change.
+  pub fn most_ranges(&self) -> usize {
+    self
+      .changes
+      .as_ref()
+      .map_or(0, Vec::len)
+      .saturating_mul(MOST_ADDED_BY_AN_UPDATE)
+      .saturating_add(1)
+  }
+}
+
+/// How a mount taken over from a daemon that died adopts file `ino` ([`TakenOver`]): fresh as of `started_at`, the point
+/// the mount began serving, with the journal's changes to it since.
+pub fn taken_over(
+  own: &OwnRecords,
+  ino: u64,
+  started_at: u64,
+  bridge: &mut dyn slates_bridge_core::Bridge,
+  cx: &slates_bridge_core::OpContext,
+) -> TakenOver {
+  TakenOver {
+    from: started_at,
+    changes: changes_since(own, ino, started_at, bridge, cx),
+  }
+}
+
+/// Every change the volume's journal recorded to `ino`'s bytes after `since`, oldest first, each with whether `own` took
+/// it ([`OwnRecords::took`]); `None` when the journal no longer reaches back to `since`
+/// ([`slates_bridge_core::Bridge::data_changes`]).
+pub fn changes_since(
+  own: &OwnRecords,
+  ino: u64,
+  since: u64,
+  bridge: &mut dyn slates_bridge_core::Bridge,
+  cx: &slates_bridge_core::OpContext,
+) -> Option<Vec<(std::ops::Range<u64>, u64, bool)>> {
+  let mut changes = Vec::new();
+  if !bridge.data_changes(cx, since, &mut changes).ok()? {
+    return None;
+  }
+  Some(
+    changes
+      .into_iter()
+      .filter(|change| change.ino == ino)
+      .map(|change| {
+        let took = own.took(change.seq);
+        (change.range, change.seq, took)
+      })
+      .collect(),
+  )
+}
+
 #[cfg(test)]
 mod tests {
   use super::{OwnRecords, PageStates};
@@ -1537,5 +1602,92 @@ mod tests {
       holds.forgot(9, 1);
       assert_eq!(holds.everything(), (Vec::new(), Vec::new()));
     }
+  }
+
+  /// Shape: the scratch store's page and its RAM region, in pages: as the bridge tests build one.
+  const PAGE: usize = 4096;
+  const REGION_PAGES: usize = 1024;
+  /// Format: `S_IFREG | 0644`.
+  const FILE_MODE: u32 = 0o100_644;
+
+  /// A scratch store and a journalled volume in it with one empty file, `f`, as the bridge tests build them.
+  fn volume_with_a_file() -> (
+    slates_vfs::volume::Store,
+    slates_vfs::volume::Volume,
+    slates_vfs::ids::InodeNo,
+  ) {
+    let mut arena = slates_mem::arena::ChunkArena::new(PAGE);
+    arena
+      .add_region(slates_mem::region::Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    let mut store = slates_vfs::volume::Store::new(
+      &slates_vfs::volume::StoreConfig {
+        page: PAGE,
+        cache_line: 128,
+        max_dirs: 64,
+        max_inodes: 256,
+        max_chunks: REGION_PAGES,
+        max_dir_blocks: 64,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    );
+    let mut volume = slates_vfs::volume::Volume::create(
+      &mut store,
+      slates_vfs::volume::VolumeConfig {
+        prefix: 1,
+        names: slates_vfs::names::NameEquivalence::Exact,
+        quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: 1 << 16,
+        clock: Box::new(slates_vfs::clock::HostClock::default()),
+      },
+    )
+    .unwrap();
+    let root = volume.root_inode(&store).unwrap();
+    let file = volume
+      .create_file_no(&mut store, root, "f", FILE_MODE)
+      .unwrap();
+    (store, volume, file)
+  }
+
+  /// A-567 (B8; GAPS, "A dirty page from before a takeover is judged fresh"). Do: write bytes 16..48 of a file before a
+  /// mount taken over from a daemon that died begins to serve, as this daemon replays a write its predecessor
+  /// acknowledged after its last publication (A-63); then adopt the file as the mount does when its kernel names a
+  /// handle of it (A-147, A-152). Expect: those bytes stale in the file's states, so a cache write-back over them is
+  /// judged against the volume's bytes and never taken as fresh, and the bytes the write did not touch fresh.
+  #[test]
+  fn a_replayed_write_leaves_its_bytes_stale_in_a_taken_over_mounts_states() {
+    use slates_bridge_core::Bridge;
+    let (mut store, mut volume, file) = volume_with_a_file();
+    volume.write(&mut store, file, 16, &[7; 32]).unwrap();
+    let volume_id = slates_db::catalog::VolumeId { bytes: [3; 16] };
+    let mut attachments = slates_bridge_core::Attachments::new();
+    let attachment = attachments
+      .attach(
+        volume_id,
+        slates_bridge_core::View::Current,
+        slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        slates_bridge_core::Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap();
+    let cx = attachments.context(attachment).unwrap();
+    let mut bridge = slates_bridge_core::VolumeBridge::new(volume_id, &mut volume, &mut store);
+    let started_at = bridge.seen(&cx).journal_seq;
+    let adoption = super::taken_over(&OwnRecords::default(), file.0, started_at, &mut bridge, &cx);
+    let mut states = PageStates::default();
+    states.grow_room(adoption.most_ranges());
+    states.adopted(file.0, adoption.from, adoption.changes.as_deref());
+    assert_eq!(
+      states.stale_after(file.0, 0..64, started_at, &[]),
+      Some(vec![16..48]),
+      "the replayed write's bytes are stale, and only they"
+    );
   }
 }

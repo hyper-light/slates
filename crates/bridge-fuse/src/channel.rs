@@ -1692,10 +1692,12 @@ fn adopt_restored(
   let seen = bridge.seen(cx);
   state.coherence.begin_at(seen);
   let start = *state.started_at.get_or_insert(seen.journal_seq);
-  let files = bridge.restored_open_files(cx);
-  make_room(bridge, cx, state, files.len());
-  for ino in files {
-    state.states.adopted(ino, start, Some(&[]));
+  for ino in bridge.restored_open_files(cx) {
+    let adoption = crate::coherence::taken_over(&state.own, ino, start, bridge, cx);
+    make_room(bridge, cx, state, adoption.most_ranges());
+    state
+      .states
+      .adopted(ino, adoption.from, adoption.changes.as_deref());
   }
 }
 
@@ -1735,14 +1737,11 @@ fn adopt_unseen_handle(
   if state.states.tracks(ino) {
     return;
   }
-  let changes = pending_changes(ino, started_at, bridge, cx, state);
-  let most = changes
-    .as_ref()
-    .map_or(0, Vec::len)
-    .saturating_mul(MOST_ADDED_BY_AN_UPDATE)
-    .saturating_add(1);
-  make_room(bridge, cx, state, most);
-  state.states.adopted(ino, started_at, changes.as_deref());
+  let adoption = crate::coherence::taken_over(&state.own, ino, started_at, bridge, cx);
+  make_room(bridge, cx, state, adoption.most_ranges());
+  state
+    .states
+    .adopted(ino, adoption.from, adoption.changes.as_deref());
 }
 
 /// Feeds what `request` made the kernel hold now that its reply of `len` bytes reached it — or at once, for a request
@@ -1997,20 +1996,7 @@ fn pending_changes(
   } else {
     started_at
   };
-  let mut changes = Vec::new();
-  if !bridge.data_changes(cx, since, &mut changes).ok()? {
-    return None;
-  }
-  Some(
-    changes
-      .into_iter()
-      .filter(|change| change.ino == nodeid)
-      .map(|change| {
-        let own = state.own.took(change.seq);
-        (change.range, change.seq, own)
-      })
-      .collect(),
-  )
+  crate::coherence::changes_since(&state.own, nodeid, since, bridge, cx)
 }
 
 /// Whether a `READ` made through a handle with these open flags may have bypassed the kernel's page cache (A-144): a
