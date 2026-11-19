@@ -30,9 +30,9 @@ const PLENTY: Budget = Budget {
 /// The smallest budget: one byte, so one of the drive's calls a turn, and one step.
 const SMALLEST: Budget = Budget { room: 1, steps: 1 };
 
-/// The sessions the golden replay must meet: every recorded one with a report command (22 stock, 13
+/// The sessions the golden replay must meet: every recorded one with a report command (22 stock, 15
 /// hand-made) but the malformed one, whose connection ends before `svnserve` flushed anything.
-const REPLAYED: usize = 34;
+const REPLAYED: usize = 36;
 
 /// A client's success, as a stock client answers `close-edit`.
 const SUCCESS_ANSWER: &[u8] = b"( success ( ) ) ";

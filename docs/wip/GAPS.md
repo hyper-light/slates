@@ -792,8 +792,9 @@
 > A-616 part 2, its third slice (2026-11-19, g234): one report command's exchange on ra_svn (`report::exchange`), the
 > reporter, drive and writer joined as `accept_report` and `editorp.c` join them, the early answer, `close-edit`'s and
 > `abort-edit`'s answers and the client's errors read as `svnserve` reads them; all 34 recorded report commands
-> replayed against `svnserve`'s bytes; red six ways. Owed of A-616 now: the server's connection task that runs it
-> (piece 7's); the deltas of changed texts through A-652's generator; a recorded session of copy sources.
+> replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
+> them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
+> A-652's generator.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

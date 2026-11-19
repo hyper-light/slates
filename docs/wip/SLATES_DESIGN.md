@@ -13840,9 +13840,11 @@ and export by landing).
 > `close-edit`'s answer read (`( success ( ) )`, or `abort-edit` and the client's errors written back as
 > `svn_ra_svn__handle_failure_status` reads them); a drive's refusal answered with its error and the client's after
 > it. Held to every recorded report command replayed whole against `svnserve`'s bytes (34 sessions), an early answer
-> before each of a checkout's calls, fourteen answers to `close-edit`, any budget and any cut; red six ways. Owed: the
-> server's connection task that runs it (piece 7's), the deltas of changed texts (A-652's generator), and a recorded
-> session of copy sources.
+> before each of a checkout's calls, fourteen answers to `close-edit`, any budget and any cut; red six ways. Copy
+> sources are held to two more recorded sessions that ask `svnserve` for them (an update across a move, a checkout
+> from nothing): the copy named as `svnserve` names it, `/trunk/new.txt` at r3, and no text sent for a copy of the
+> same text. Owed: the server's connection task that runs it (piece 7's), and the deltas of changed texts (A-652's
+> generator).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -45516,3 +45518,23 @@ Applied in the same change to (its first part, the index):
   of part 2's refusals in a reply.
 - **Applied in the same change to:** §4.17.3's status (part 2) and piece 5's line; GAPS' §4.17.3 entry;
   `research/mercurial-server.md` §20; `crates/hg/Cargo.toml` and `Cargo.lock` (slates-merge, blake3).
+
+### A-616, continued (4) — Copy sources held to `svnserve` (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn/fixtures/report`
+(`make-fixtures.py` records named hand-made sessions alone; `hostile-update-copy-sources.1` and
+`hostile-checkout-copy-sources.1`, new; `sessions.txt`; `SHA256SUMS`); the reporter's tests (the shared table and
+three counts).
+
+- **Recorded.** No stock client asks for copy sources (`svn update` sends `send-copyfrom-args` false), so two
+  hand-made clients do, against stock `svnserve` 1.15.0 on the Mac Studio through the relay, 2026-11-19: `/trunk` from
+  r3 to r4, where `new.txt` moved to `renamed.txt`, and `/trunk` at r4 from nothing. `svnserve` wrote
+  `add-file ( renamed.txt d0 c4 ( /trunk/new.txt 3 ) )` (a repository path with its slash), no text delta for a copy
+  whose text is its source's, and `new.txt` deleted with revision 4.
+- **The recorder** takes a second argument, the hand-made sessions to record alone into the fixtures already there: it
+  builds the repository again and refuses to record unless `svnlook changed` matches `changed.txt` and
+  `svnlook tree --show-ids` matches `tree.txt` (FSFS's offsets aside), and the tools `subversion-version.txt`;
+  `sessions.txt` gains the sessions' lines; `SHA256SUMS` is made again over the recorded files, the recorder's inputs
+  (`history.txt`, `make-fixtures.py`) left out as before. The 38 earlier sessions are untouched.
+- **Tests.** The drive's copy sources, the writer's bytes and the whole exchange held to both sessions (the drives
+  compared 29, the writer's replays 30, the exchanges 36). `cargo test --locked -p slates-svn --lib` on the Mac
+  Studio, 2026-11-19: 402 of 402.

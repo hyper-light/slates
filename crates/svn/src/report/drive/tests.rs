@@ -24,9 +24,9 @@ use proptest::prelude::*;
 /// The steps a test gives each call: past any one call's walk in the fixtures.
 const STEPS: usize = 1 << 20;
 
-/// The drives the replay test must compare: the 22 stock sessions' and five hand-made ones' (the
+/// The drives the replay test must compare: the 22 stock sessions' and seven hand-made ones' (the
 /// early answer's is the handler's).
-const COMPARED_DRIVES: usize = 27;
+const COMPARED_DRIVES: usize = 29;
 
 /// The most nodes a writer checking a generated drive holds open: past any path a report names.
 const MOST_OPEN: usize = 64;
