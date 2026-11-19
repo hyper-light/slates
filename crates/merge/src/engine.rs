@@ -2717,6 +2717,7 @@ impl Green {
   }
 
   /// The content dimension: renames, creates, unlinks and edits.
+  fn decide_content(
     &mut self,
     inc: &Increment,
     r: &Resolved,
