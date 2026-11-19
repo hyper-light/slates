@@ -462,15 +462,15 @@ fn challenge_parts(item: &[u8]) -> Option<ChallengeParts> {
     return None;
   };
   let [Value::String(challenge)] = inner.as_slice() else {
-    panic!("a step holds one string");
+    return None;
   };
-  let text = std::str::from_utf8(challenge).unwrap();
+  let text = std::str::from_utf8(challenge).ok()?;
   let (numbers, host) = text.strip_prefix('<')?.strip_suffix('>')?.split_once('@')?;
   let (nonce, time_micros) = numbers.split_once('.')?;
   Some(ChallengeParts {
-    nonce: nonce.parse().unwrap(),
-    time_micros: time_micros.parse().unwrap(),
-    host: CString::new(host).unwrap(),
+    nonce: nonce.parse().ok()?,
+    time_micros: time_micros.parse().ok()?,
+    host: CString::new(host).ok()?,
   })
 }
 
@@ -601,6 +601,44 @@ fn a_stock_anonymous_session_is_answered_as_svnserve_answered_it() {
   };
   assert_answered_as_svnserve(session, &caller, &expected);
   assert_commands_follow(session, &caller);
+}
+
+/// A-616 (the session an established handshake hands every command): replay the stock anonymous
+/// session to its end; expect the session to name no one, the 1.15 client's capabilities as its answer
+/// listed them (`svndiff1`, `accepts-svndiff2`, `absent-entries`, `depth`, `mergeinfo`, `log-revprops`),
+/// and the repository's UUID and root URL as `repos-info` sent them; and no session before the end.
+#[test]
+fn an_established_handshake_hands_on_its_session() {
+  let client = session!("anonymous").client;
+  let mut written = Vec::new();
+  let mut server = Server::new(roomy(client), &mut written).unwrap();
+  assert_eq!(server.session(), None);
+  let answer_end = items(client)[0].len();
+  assert!(matches!(
+    server.receive(&client[..answer_end], &mut written),
+    Ok(Progress::Opened { .. })
+  ));
+  assert_eq!(server.session(), None);
+  assert_eq!(server.open(&anon_repository(), &mut written), Ok(Access::Asked));
+  let rest = &client[answer_end..];
+  assert!(matches!(
+    server.receive(rest, &mut written),
+    Ok(Progress::Established { .. })
+  ));
+  let expected = Session {
+    principal: Principal::Anonymous,
+    capabilities: ClientCapabilities {
+      svndiff1: true,
+      accepts_svndiff2: true,
+      absent_entries: true,
+      depth: true,
+      mergeinfo: true,
+      log_revprops: true,
+    },
+    uuid: UUID_ANON.to_vec(),
+    root_url: b"svn://127.0.0.1/anon".to_vec(),
+  };
+  assert_eq!(server.session(), Some(&expected));
 }
 
 /// A-599 (stock sessions `cram-md5`, `cram-md5-secret-64` and `cram-md5-secret-70`: CRAM-MD5 with a secret shorter
@@ -843,7 +881,7 @@ fn a_url_svnserve_cannot_use_is_refused_in_its_words() {
 fn hex_bytes(hex: &str) -> Vec<u8> {
   (0..hex.len())
     .step_by(2)
-    .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+    .map(|at| u8::from_str_radix(hex.get(at..at + 2).unwrap(), 16).unwrap())
     .collect()
 }
 
@@ -986,7 +1024,7 @@ fn cram_c_hex(digit: u8) -> Option<u8> {
 /// the bytes: `strrchr` finds the last space before the first NUL; the digest's length is counted from there to the
 /// response's true end; `hex_decode` reads 32 bytes there, failing on any but a lowercase digit, a NUL among them.
 fn cram_c_split(response: &[u8]) -> Option<(Vec<u8>, [u8; DIGEST_BYTES])> {
-  let c_string = response.split(|byte| *byte == 0).next().unwrap();
+  let c_string = response.split(|byte| *byte == 0).next()?;
   let separator = c_string.iter().rposition(|byte| *byte == b' ')?;
   if response.len() - (separator + 1) != 2 * DIGEST_BYTES {
     return None;
@@ -1016,7 +1054,7 @@ fn a_response_splits_as_cram_c_reads_it_a_nul_anywhere_refusing_it() {
     format!("a b c {digest}").into_bytes(),
     format!(" {digest}").into_bytes(),
     format!("alice {}", digest.to_uppercase()).into_bytes(),
-    format!("alice {}", &digest[1..]).into_bytes(),
+    format!("alice {}", digest.get(1..).unwrap()).into_bytes(),
     format!("alice {digest}0").into_bytes(),
     format!("alice{digest}").into_bytes(),
     cat(&[b"al\0ice ", digest.as_bytes()]),
@@ -1106,23 +1144,34 @@ fn the_auth_response_is_read_as_vparse_tuple_reads_it() {
   );
 }
 
-/// What a fresh handshake makes of the answer `answer`: its URL, `ra-client` and client, or its refusal.
-type AnswerRead = Result<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>), Refused>;
+/// What a fresh handshake made of an answer: the URL, `ra-client` and client it read, or its refusal.
+#[derive(Debug, PartialEq, Eq)]
+enum AnswerRead {
+  /// The answer was read whole.
+  Opened {
+    url: Vec<u8>,
+    ra_client: Option<Vec<u8>>,
+    client: Option<Vec<u8>>,
+  },
+  /// The answer was refused.
+  Refused(Refused),
+}
 
 /// Reads `answer` on a fresh handshake.
 fn read_answer(answer: &[u8]) -> AnswerRead {
   let mut written = Vec::new();
   let mut server = Server::new(roomy(answer), &mut written).unwrap();
-  match server.receive(answer, &mut written)? {
-    Progress::Opened { open, consumed } => {
+  match server.receive(answer, &mut written) {
+    Ok(Progress::Opened { open, consumed }) => {
       assert_eq!(consumed, answer.len());
-      Ok((
-        open.url.to_vec(),
-        open.ra_client.map(<[u8]>::to_vec),
-        open.client.map(<[u8]>::to_vec),
-      ))
+      AnswerRead::Opened {
+        url: open.url.to_vec(),
+        ra_client: open.ra_client.map(<[u8]>::to_vec),
+        client: open.client.map(<[u8]>::to_vec),
+      }
     }
-    other => panic!("an answer read as {other:?}"),
+    Ok(other) => panic!("an answer read as {other:?}"),
+    Err(refused) => AnswerRead::Refused(refused),
   }
 }
 
@@ -1132,15 +1181,13 @@ fn read_answer(answer: &[u8]) -> AnswerRead {
 #[test]
 fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
   let url = || b"url".to_vec();
-  let named = |ra: &str, client: Option<&str>| -> AnswerRead {
-    Ok((
-      url(),
-      Some(ra.as_bytes().to_vec()),
-      client.map(|client| client.as_bytes().to_vec()),
-    ))
+  let named = |ra: &str, client: Option<&str>| AnswerRead::Opened {
+    url: url(),
+    ra_client: Some(ra.as_bytes().to_vec()),
+    client: client.map(|client| client.as_bytes().to_vec()),
   };
   let table: [(&[u8], AnswerRead); 18] = [
-    (b"( 2 ( edit-pipeline ) 3:url ) ", Ok((url(), None, None))),
+    (b"( 2 ( edit-pipeline ) 3:url ) ", AnswerRead::Opened { url: url(), ra_client: None, client: None }),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) ) ",
       named("abc", None),
@@ -1159,35 +1206,35 @@ fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc 7 ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ( 7 ) ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 7 ( ) ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
-    (b"( 2 ( edit-pipeline ) url ) ", Err(Refused::NotAnswer)),
-    (b"( 2 edit-pipeline 3:url ) ", Err(Refused::NotAnswer)),
-    (b"( two ( edit-pipeline ) 3:url ) ", Err(Refused::NotAnswer)),
-    (b"2 ", Err(Refused::NotAnswer)),
-    (b"( 2 ( 7 ) 3:url 3:abc ) ", Err(Refused::NotAnswer)),
+    (b"( 2 ( edit-pipeline ) url ) ", AnswerRead::Refused(Refused::NotAnswer)),
+    (b"( 2 edit-pipeline 3:url ) ", AnswerRead::Refused(Refused::NotAnswer)),
+    (b"( two ( edit-pipeline ) 3:url ) ", AnswerRead::Refused(Refused::NotAnswer)),
+    (b"2 ", AnswerRead::Refused(Refused::NotAnswer)),
+    (b"( 2 ( 7 ) 3:url 3:abc ) ", AnswerRead::Refused(Refused::NotAnswer)),
     (
       b"( 1 ( edit-pipeline ) 3:url ) ",
-      Err(Refused::UnsupportedVersion(1)),
+      AnswerRead::Refused(Refused::UnsupportedVersion(1)),
     ),
-    (b"( 3 ( 7 ) 3:url ) ", Err(Refused::UnsupportedVersion(3))),
+    (b"( 3 ( 7 ) 3:url ) ", AnswerRead::Refused(Refused::UnsupportedVersion(3))),
     (
       b"( 2 ( 7 edit-pipeline ) 3:url ) ",
-      Err(Refused::CapabilityNotWord),
+      AnswerRead::Refused(Refused::CapabilityNotWord),
     ),
-    (b"( 2 ( ) 3:url ) ", Err(Refused::NoEditPipeline)),
+    (b"( 2 ( ) 3:url ) ", AnswerRead::Refused(Refused::NoEditPipeline)),
   ];
   for (answer, expected) in table {
     assert_eq!(

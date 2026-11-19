@@ -277,6 +277,52 @@ pub enum Principal {
   User(Vec<u8>),
 }
 
+/// The capabilities a client announced in its answer that a command's answer depends on (`protocol` §2.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientCapabilities {
+  /// `svndiff1`: the client takes svndiff version 1, zlib, which slates never sends.
+  pub svndiff1: bool,
+  /// `accepts-svndiff2`: the client takes svndiff version 2, LZ4.
+  pub accepts_svndiff2: bool,
+  /// `absent-entries`: the client takes `absent-dir` and `absent-file`.
+  pub absent_entries: bool,
+  /// `depth`: the client sends and understands depths.
+  pub depth: bool,
+  /// `mergeinfo`: the client asks for mergeinfo.
+  pub mergeinfo: bool,
+  /// `log-revprops`: the client asks `log` for revision properties by name.
+  pub log_revprops: bool,
+}
+
+impl ClientCapabilities {
+  /// The capabilities among `words`, the client's announced list; a word it does not know is no capability.
+  pub fn of(words: &[&str]) -> Self {
+    let has = |capability: &str| words.contains(&capability);
+    Self {
+      svndiff1: has("svndiff1"),
+      accepts_svndiff2: has("accepts-svndiff2"),
+      absent_entries: has("absent-entries"),
+      depth: has("depth"),
+      mergeinfo: has("mergeinfo"),
+      log_revprops: has("log-revprops"),
+    }
+  }
+}
+
+/// An established connection's session, what the handshake hands every command it serves: who the client
+/// authenticated as, what it can take, and the repository it opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+  /// Who the client authenticated as.
+  pub principal: Principal,
+  /// What the client announced it can take.
+  pub capabilities: ClientCapabilities,
+  /// The repository's UUID.
+  pub uuid: Vec<u8>,
+  /// The URL of the repository's root, as `repos-info` sent it.
+  pub root_url: Vec<u8>,
+}
+
 /// An authentication attempt that failed. The client may answer again, as `svnserve`'s loop lets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthFailure {
@@ -449,6 +495,7 @@ impl CramKey {
 /// What the repository allows and tells, kept from [`Server::open`] for the rest of the handshake.
 #[derive(Clone, Debug)]
 struct Offer {
+  capabilities: ClientCapabilities,
   anonymous: bool,
   tunnel_user: Option<Vec<u8>>,
   cram_md5: bool,
@@ -462,8 +509,8 @@ struct Offer {
 enum State {
   /// The greeting is written; the client's answer is awaited.
   Greeted,
-  /// The client answered; the caller's [`Server::open`] or [`Server::refuse`] is awaited.
-  Opening,
+  /// The client answered with these capabilities; the caller's [`Server::open`] or [`Server::refuse`] is awaited.
+  Opening(ClientCapabilities),
   /// The authentication request is written; the client's mechanism is awaited.
   Asked(Offer),
   /// The client chose CRAM-MD5; the caller's challenge is awaited.
@@ -477,8 +524,8 @@ enum State {
     user: Vec<u8>,
     digest: [u8; DIGEST_BYTES],
   },
-  /// The repository's information is written: the handshake is done.
-  Established,
+  /// The repository's information is written: the handshake is done, and this is its session.
+  Established(Session),
   /// A command failure is written, or the client was refused: the connection ends.
   Ended,
 }
@@ -530,7 +577,15 @@ impl Server {
 
   /// Whether the handshake is done: the repository's information is written, and the client's next item is a command.
   pub fn established(&self) -> bool {
-    matches!(self.state, State::Established)
+    matches!(self.state, State::Established(_))
+  }
+
+  /// The session the handshake established, once it is done; every command the connection serves takes it.
+  pub fn session(&self) -> Option<&Session> {
+    match &self.state {
+      State::Established(session) => Some(session),
+      _ => None,
+    }
   }
 
   /// Reads on in `buffer`, the same buffer with more at its end, as the item codec takes it ([`Parser::parse`]): the
@@ -559,7 +614,7 @@ impl Server {
     match std::mem::replace(&mut self.state, State::Ended) {
       State::Greeted => {
         let open = answer(value)?;
-        self.state = State::Opening;
+        self.state = State::Opening(ClientCapabilities::of(&open.capabilities));
         Ok(Progress::Opened { open, consumed })
       }
       State::Asked(offer) => self.mechanism(offer, &value, consumed, out),
@@ -584,9 +639,9 @@ impl Server {
     repository: &Repository<'_>,
     out: &mut Vec<u8>,
   ) -> Result<Access, Refused> {
-    if !matches!(self.state, State::Opening) {
+    let State::Opening(capabilities) = self.state else {
       return Err(Refused::OutOfTurn);
-    }
+    };
     let mechanisms = offered_mechanisms(repository);
     if mechanisms.is_empty() {
       self.refuse(Unserved::NoAccess, out)?;
@@ -598,6 +653,7 @@ impl Server {
     ]);
     write_response(SUCCESS, request, out)?;
     self.state = State::Asked(Offer {
+      capabilities,
       anonymous: repository.anonymous,
       tunnel_user: repository.tunnel_user.map(<[u8]>::to_vec),
       cram_md5: repository.cram_md5,
@@ -613,7 +669,7 @@ impl Server {
   /// # Errors
   /// `OutOfTurn` unless the client's answer was just read ([`Progress::Opened`]).
   pub fn refuse(&mut self, unserved: Unserved<'_>, out: &mut Vec<u8>) -> Result<(), Refused> {
-    if !matches!(self.state, State::Opening) {
+    if !matches!(self.state, State::Opening(_)) {
       return Err(Refused::OutOfTurn);
     }
     let (code, message) = match unserved {
@@ -822,7 +878,12 @@ impl Server {
       Value::List(capabilities),
     ]);
     write_response(SUCCESS, information, out)?;
-    self.state = State::Established;
+    self.state = State::Established(Session {
+      principal: principal.clone(),
+      capabilities: offer.capabilities,
+      uuid: offer.uuid,
+      root_url: offer.root_url,
+    });
     Ok(principal)
   }
 }
@@ -861,7 +922,11 @@ fn write_challenge_failure(failure: AuthFailure, out: &mut Vec<u8>) -> Result<()
 
 /// Appends a command failure of one error, `( failure ( ( code message file line ) ) )`
 /// (`svn_ra_svn__write_cmd_failure`), with no source file and line, as a release build of `svnserve` sends them.
-fn write_command_failure(code: u32, message: &[u8], out: &mut Vec<u8>) -> Result<(), Refused> {
+pub(crate) fn write_command_failure(
+  code: u32,
+  message: &[u8],
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
   let error = Value::List(vec![
     Value::Number(u64::from(code)),
     Value::String(message),
