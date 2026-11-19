@@ -104,7 +104,7 @@ const UUID_VARIANT_RFC: u8 = 0x80;
 /// The control characters XML carries, which a comment may hold: tab, line feed, carriage return and delete.
 /// Format: `libsvn_subr/xml.c` `svn_xml_is_xml_safe`, which refuses every other byte `svn_ctype_iscntrl` names (0 to
 /// 31 and 127, `libsvn_subr/ctype.c`, the same bytes as `u8::is_ascii_control`).
-const XML_SAFE_CONTROLS: [u8; 4] = [b'\t', b'\n', b'\r', b'\x7f'];
+const XML_SAFE_CONTROLS: [u8; 4] = *b"\t\n\r\x7f";
 
 /// Nanoseconds in a microsecond: the clock seam reads nanoseconds and Subversion keeps microseconds.
 /// Format: `apr_time_t` counts microseconds (`apr_time.h`, `APR_USEC_PER_SEC`).

@@ -67,10 +67,12 @@ const GROUP_BITS: u32 = 7;
 /// 49-55).
 const COPY_OPERANDS: [(u8, Operand, u32); 7] = [
   (0x01, Operand::Offset, 0),
+  // Format: the copy operands continue (the doc above).
   (0x02, Operand::Offset, 8),
   (0x04, Operand::Offset, 16),
   (0x08, Operand::Offset, 24),
   (0x10, Operand::Len, 0),
+  // Format: the copy operands continue (the doc above).
   (0x20, Operand::Len, 8),
   (0x40, Operand::Len, 16),
 ];

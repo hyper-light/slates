@@ -77,6 +77,7 @@ pub enum Kind {
 const KINDS: [(Kind, &[u8], u8); 4] = [
   (Kind::Commit, b"commit", 1),
   (Kind::Tree, b"tree", 2),
+  // Format: the types continue (the doc above).
   (Kind::Blob, b"blob", 3),
   (Kind::Tag, b"tag", 4),
 ];
