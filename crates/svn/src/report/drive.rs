@@ -26,8 +26,9 @@
 //! **The drive.** [`Drive`] walks the report and the two revisions as `reporter.c` does, over the
 //! index (A-553) for every node's identity, kind, created revision, text and property list, the
 //! green ([`Repository`]) for directories' entries, property lists, revision properties and texts,
-//! and the session's [`Guards`] for its locks and what its principal may read. Its walk is an
-//! explicit stack of frames, never recursion, so the depth of a path is data, not stack: the
+//! the session's [`Guards`] for its locks, and the rules its principal reads by ([`Sources::rules`],
+//! the session's one read rule, which its read commands ask too). Its walk is an explicit stack of
+//! frames, never recursion, so the depth of a path is data, not stack: the
 //! anchor, each directory being compared (`delta_dirs`), each file being sent (`delta_files`). The
 //! report's paths are read as `reporter.c` reads its spill buffer: one ahead, each consumed by the
 //! directory it falls beneath (`fetch_path_info`, `skip_path_info`, `any_path_info`).
@@ -57,6 +58,7 @@ pub(crate) mod history;
 mod tests;
 
 use super::{Depth, PathInfo, Report, join_fspath, join_relpath};
+use crate::authz::{PrincipalRules, may_read};
 use crate::index::{
   ContentIdentity, Index, IndexRefusal, Node, NodeId, NodeKind, NodeRevisionId, PropertyList,
   Revision, Text,
@@ -214,14 +216,11 @@ const SVN_ERR_FS_NOT_FOUND: u32 = 160_013;
 /// Format: the authorization category's start, 220,000, plus 0 (`svn_error_codes.h`).
 const SVN_ERR_AUTHZ_ROOT_UNREADABLE: u32 = 220_000;
 
-/// What a drive asks of the session beyond the repository: the locks held now and what its
-/// principal may read (§4.17.4 items 9 and 10).
+/// What a drive asks of the session beyond the repository and its read rules: the locks held now
+/// (§4.17.4 item 10).
 pub trait Guards {
   /// The token of the lock held on `path` now (`svn_fs_get_lock`); none when it is not locked.
   fn lock_token(&self, path: &str) -> Option<&[u8]>;
-
-  /// Whether the session's principal may read `path` (`svnserve`'s `authz_check_access_cb`).
-  fn may_read(&self, path: &str) -> bool;
 }
 
 /// A refusal the drive met, answered after its [`Call::AbortEdit`]: Subversion's error number and
@@ -584,15 +583,20 @@ enum Frame {
   File(Box<FileFrame>),
 }
 
-/// What a drive reads: the index, the green and the session's guards.
+/// What a drive reads: the index, the green, the session's guards and its read rules.
 #[derive(Debug)]
 pub struct Sources<'s, R: ?Sized, G: ?Sized> {
   /// The index (A-553).
   pub index: &'s Index,
   /// The green: entries, property lists, revision properties and texts.
   pub repository: &'s R,
-  /// The session's locks and read access.
+  /// The session's locks.
   pub guards: &'s G,
+  /// The rules the session's principal reads by (A-606), the ones its read commands ask, compiled once
+  /// for the principal by the connection: [`may_read`] judges every path the drive reads by them
+  /// (`authz_check_access_cb`). None where the repository names no authorization file, and then
+  /// every path is readable.
+  pub rules: Option<&'s PrincipalRules>,
 }
 
 /// A drive answering one finished report (module documentation).
@@ -668,16 +672,9 @@ impl Drive {
   /// first, [`Next::Ended`] after the last call.
   pub fn next<R: Repository + ?Sized, G: Guards + ?Sized>(
     &mut self,
-    index: &Index,
-    repository: &R,
-    guards: &G,
+    sources: &Sources<'_, R, G>,
     steps: usize,
   ) -> Next<'_> {
-    let sources = Sources {
-      index,
-      repository,
-      guards,
-    };
     self.current = None;
     let mut left = steps;
     while self.pending.is_empty() && !self.ended {
@@ -685,7 +682,7 @@ impl Drive {
         return Next::Paused;
       };
       left = rest;
-      if let Err(failure) = self.step(&sources) {
+      if let Err(failure) = self.step(sources) {
         self.fail(failure);
       }
     }
@@ -742,7 +739,7 @@ impl Drive {
     } else {
       dirname(&self.target_path).to_owned()
     };
-    if !sources.guards.may_read(&t_anchor) {
+    if !may_read(sources.rules, &t_anchor) {
       return Err(DriveFailure {
         code: SVN_ERR_AUTHZ_ROOT_UNREADABLE,
         message: String::from("Not authorized to open root of edit operation"),
@@ -996,7 +993,7 @@ impl Drive {
       self.skip_path_info(&entry.e_path);
       return Ok(());
     };
-    if !sources.guards.may_read(&entry.t_path) {
+    if !may_read(sources.rules, &entry.t_path) {
       self
         .pending
         .push_back(Owned::Absent(t_entry.kind, entry.e_path.clone()));
@@ -1202,7 +1199,7 @@ impl Drive {
       let (path, revision) = node.copy_from()?;
       Some((path.to_owned(), revision))
     });
-    Ok(source.filter(|(path, _)| sources.guards.may_read(path)))
+    Ok(source.filter(|(path, _)| may_read(sources.rules, path)))
   }
 
   /// One step of a file's sending.

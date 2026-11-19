@@ -125,7 +125,7 @@ impl Encoding {
     version: usize,
   ) -> Result<Encoding, StoreRefused> {
     let target = Target::Version { green, version };
-    let Some(brought) = repository.unencoded(green, version)? else {
+    let Some(brought) = repository.unencoded(store, green, version)? else {
       return Ok(Encoding::new(target, Positions::new(), Stage::Done));
     };
     let old = version
@@ -139,8 +139,12 @@ impl Encoding {
   }
 
   /// The making of `green`'s base pack again, from every object its head reaches, no base named.
-  pub fn base(repository: &Repository, green: u64) -> Result<Encoding, StoreRefused> {
-    let (version, reached) = repository.head_reach(green)?;
+  pub fn base(
+    repository: &Repository,
+    store: &ContentStore,
+    green: u64,
+  ) -> Result<Encoding, StoreRefused> {
+    let (version, reached) = repository.head_reach(store, green)?;
     let target = Target::Base { green, version };
     Ok(Encoding::new(target, reached, Stage::Gather { from: 0 }))
   }

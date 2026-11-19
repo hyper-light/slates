@@ -346,7 +346,7 @@ impl Exchange {
     let start = out.len();
     let steps = budget.steps.max(1);
     loop {
-      let next = drive.next(sources.index, sources.repository, sources.guards, steps);
+      let next = drive.next(sources, steps);
       let call = match next {
         Next::Call(call) => call,
         Next::Paused => {

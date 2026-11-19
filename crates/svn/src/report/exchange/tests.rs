@@ -13,7 +13,7 @@ use super::*;
 use crate::index::Index;
 use crate::report::RequestKind;
 use crate::report::drive::green::{
-  FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5,
+  FixtureGuards, Green, guards_of, normalize, repository, rules_of, texts_by_md5,
 };
 use crate::report::recorded::{
   Recorded, SESSIONS, command, context, drive_items, finished_report, items, read_drive, recorded,
@@ -73,7 +73,8 @@ struct Replay<'r> {
 /// What a replay wrote, how it ended, and how many of its turns wrote.
 type Replayed = (Vec<u8>, Ending, usize);
 
-/// Replays an exchange begun with `request` in `context`.
+/// Replays an exchange begun with `request` in `context`, its drive's reads judged by the anonymous
+/// principal's rules.
 fn replay(
   fixture: &Fixture,
   guards: &FixtureGuards,
@@ -86,10 +87,12 @@ fn replay(
     Opened::Reporting(exchange) => exchange,
     Opened::Failed(failure) => return (out, Ending::Failed(failure), 0),
   };
+  let anonymous = rules_of(None);
   let sources = Sources {
     index: &fixture.index,
     repository: &fixture.green,
     guards,
+    rules: Some(&anonymous),
   };
   let mut pieces = plan.pieces.into_iter();
   let mut held: Vec<u8> = Vec::new();
@@ -157,7 +160,7 @@ fn session_guards(recorded: Recorded) -> FixtureGuards {
   if recorded.name == "update-with-lock.1" {
     guards_of(recorded.name, &finished_report(recorded))
   } else {
-    FixtureGuards::anonymous()
+    FixtureGuards::default()
   }
 }
 
@@ -347,7 +350,7 @@ fn early(fixture: &Fixture, turns: usize, answer: &[u8]) -> Replayed {
   };
   replay(
     fixture,
-    &FixtureGuards::anonymous(),
+    &FixtureGuards::default(),
     &context,
     request,
     replay_of,
@@ -397,7 +400,7 @@ fn answered(fixture: &Fixture, name: &str, answer: &[u8]) -> Vec<u8> {
   };
   let (out, ending, _) = replay(
     fixture,
-    &FixtureGuards::anonymous(),
+    &FixtureGuards::default(),
     &context,
     request,
     replay_of,
@@ -538,7 +541,7 @@ fn an_answer_past_its_bounds_ends_the_connection() {
     };
     let (out, ending, _) = replay(
       &fixture,
-      &FixtureGuards::anonymous(),
+      &FixtureGuards::default(),
       &context,
       request,
       replay_of,

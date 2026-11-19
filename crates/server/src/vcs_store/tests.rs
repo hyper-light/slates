@@ -554,7 +554,7 @@ fn ref_facts(content: &ContentStore, store: &GitStore, green: u64) -> RefFacts {
         .ok()
         .flatten();
       (
-        store.repository.brought(green, at).cloned(),
+        store.repository.brought(content, green, at).ok(),
         store.repository.head(content, green, at),
         store.repository.tree(content, green, at),
         value,
@@ -563,7 +563,11 @@ fn ref_facts(content: &ContentStore, store: &GitStore, green: u64) -> RefFacts {
     .collect();
   (
     versions,
-    store.repository.reached(green).cloned(),
+    store
+      .repository
+      .versions(green)
+      .checked_sub(1)
+      .and_then(|newest| store.repository.reached(content, green, newest).ok()),
     store.versions(green).to_vec(),
   )
 }
