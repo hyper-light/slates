@@ -10352,6 +10352,16 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > Owed: its start where a volume over an S3 base is made or recovered (the wire's create, A-555's next piece), and
 > fetches side by side within the requests that wait on them, which a measurement decides.
 
+> **Status (2026-11-19, A-555's third piece: a FUSE request kept while its base fetches; Linux).** Written, not yet
+> compiled (Linux-only, filed for main's build): a FUSE request answered the retry because a base host call of it met a
+> fetch under way (`EAGAIN` with the fetch the mount's lens noted) is kept rather than answered (`crate::fuse`'s `keep`):
+> a task of the shard waits for that fetch (`base_wait::wait`, the failover delay from its first wait, the shard's base
+> waits' bound) and hands the request back to its mount, which dispatches it again before reading the device
+> (`slates_bridge_fuse::channel::dispatch_kept`), the kernel's other requests served meanwhile, since FUSE answers each by
+> its own `unique`. A request still pending past its deadline, or past the bound, is answered the retry, as are those
+> whose task cannot be spawned. The unit test (`a_kept_request_is_dispatched_again_before_the_device_is_read`) holds a
+> mount over a socket pair on an audit shard and expects a kept request answered before the device's.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -38911,3 +38921,55 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
 
 Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
 `.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
+
+### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
+Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
+`crates/server/tests/fleet.rs` (the test and its helpers beside A-583's; `assert_the_agents_changes_landed_alone` now
+takes the target it expects).
+- **What was owed.** A-503 moved a captured clone once in its lib tests, by hand. No fleet had moved one and moved it
+  on, so nothing showed the second owner holds the capture's record, nor that an old owner never serves a stale copy.
+- **The test.** `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`. Three
+  daemons at `f = 1`. Setup on a:
+  - The clone is made over A-583's captured tree, and the agent's three changes are made in it.
+  - It is snapshotted and shared with b's and c's accounts.
+  - a's catalog record's access list is read.
+  - The clone moves to b once a counts `fleet.carry.recorded`.
+
+  After each move (a to b, then b to c, through the owner's client):
+  - The new owner serves the tree whole without `/removed`. Its catalog record carries the access list a held, and its
+    status names the volume.
+  - It takes a write that changes a file's bytes (`/changed` on b, `/made` on c) and serves it.
+  - Every previous owner is asked for that file at once and again once the old owner has let its copy go. Each answer
+    must be the new bytes (forwarded) or a refusal by kind, never the bytes its own copy held.
+  - The counters must show the move: the old owner's `fleet.move.begun` and `fleet.move.released`, the new owner's
+    `fleet.move.adopted` once and `fleet.move.adoption_reported`.
+
+  Last, c lands the clone into the captured tree with an outsider's edit to `/kept`. Its plan must be the agent's
+  changes since the capture alone, and the landing must write `/changed` as b left it and `/made` as c did, the
+  outsider's file kept.
+- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
+  helper.
+
+### A-555, third piece — A FUSE request that meets a pending base is kept off the device and dispatched again when its fetch lands (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base", §4.6 "Linux (own /dev/fuse driver)"; A-555; Linux-only, written and filed for main's build)
+Applied in the same change to: `crates/bridge-fuse` (`channel`: `dispatch_kept` beside `dispatch_ready`, both through
+one admitted path, `Dispatched::request`, `ServeState::allocation_running`; `bridge`: `EAGAIN` public);
+`crates/server` (`fuse`: the mount's kept requests and its task's waker, `next_kept`, `answer`, `keep`, `settle_kept`,
+`kept_ready`, the lens at the mount's lend, and the unit test; `base_wait::full`); §4.15's status; GAPS (A-464's entry).
+
+- **Why.** A-555's first piece parked an NFS call on the fetch it met and answered a FUSE request the retry (`EAGAIN`),
+  which a program reading a file takes for a failure. A FUSE request holds its kernel's locks on what it touches until
+  answered, so it cannot wait inside the mount's turn; but FUSE answers each request by its own `unique`, so it can wait
+  off the device while the mount serves the kernel's others.
+- **Kept, not answered.** A request answered `EAGAIN` after its lens noted a pending fetch is kept: its bytes go to a task
+  of the shard that waits for that fetch (`base_wait::wait`), then back to the mount's kept requests, and the mount's task
+  is woken. A request turn dispatches a kept request before reading the device (the kernel has waited for it longest),
+  through the same admitted path a read request takes (`dispatch_kept`), so its reply, barrier, write log and coherence
+  are a read request's.
+- **Bounded as an NFS call is.** The wait is one of the shard's base waits (its client credit), and its deadline is the
+  failover delay from the request's first wait, carried by the request through every wait it makes; past either, or if
+  its task cannot be spawned, the request is answered the retry. A kept request goes after an allocation's slices, never
+  between them.
+- **Owed.** Main's Linux build: the clippy of `crates/server/src/fuse.rs` and `crates/bridge-fuse/src/channel.rs` and the
+  unit test (`cargo test -p slates-server --lib -- fuse::tests::a_kept_request` on Linux), none compiled by me; and the
+  end-to-end run once a volume over an S3 base can be made (a FUSE read of an unfetched base file answered with its bytes,
+  never `EIO` or `EAGAIN`).

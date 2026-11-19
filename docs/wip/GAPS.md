@@ -1182,8 +1182,9 @@
 >   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
 >   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
 >   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
->   their first compile and run owed to main; owed of it, A-503's own move test (a clone moved b to c after a to b),
->   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
+>   their first compile and run owed to main, as is A-503's own move test (A-589:
+>   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
+>   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
 >   (3) a kind
@@ -12208,8 +12209,10 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
 >     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
 >     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
->   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
->     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
+>   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
+>     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
+>     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
+>   - A-555's remainder: WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
 >     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
 >     a volume over an S3 base through a daemon, its fetch answered by `SimS3`, once a volume over an S3 base can be
 >     made. A volume destroyed (or its host replaced) while requests wait on its fetches leaves them to their deadline,
