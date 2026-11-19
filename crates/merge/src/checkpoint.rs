@@ -25,6 +25,13 @@
 //! - the identity's running sum at `F` ([`Sum`]): a restore takes it as the green's, since what a copy's entry stands
 //!   for (its source's tree at the source's version) is read from histories a restored green no longer holds.
 //!
+//! The copies' section (the records and the copied tables) and the sum each sit behind a presence byte, written only
+//! beside a copy's record (A-626 part 3, continued (1)): without one, the restored state's own entries are the identity,
+//! so a green that never copied pays two bytes for them. Version 4 wrote the sum's 2,048 bytes into every checkpoint,
+//! and the service's doubling rule, which takes a checkpoint once the increments it would fold reach the size of the
+//! one it holds, then waited on 2,048 bytes of increments for every green: a root written twice held its first version
+//! where it had folded it (194 bytes of increment against a 2,233-byte checkpoint, Mac Studio, 2026-11-19).
+//!
 //! A copied tree's keys are listed key by key, so its checkpoint costs the tree, where the green holds it by reference:
 //! a restore that grafts a tree whose source is unchanged since its version is owed, if a measurement shows it worth
 //! its rules (GAPS). Until A-626 part 3 a green holding a copy at or before `F` was not checkpointed at all, and the
@@ -52,9 +59,11 @@ use crate::special::SpecialNode;
 const MAGIC: u32 = u32::from_le_bytes(*b"GCKP");
 /// Format: the checkpoint encoding's version; a decoder refuses any other. 3 since A-321 added the signed versions'
 /// verdicts beside the accepted identities; 4 since A-626 part 3 added the copies' records, their trees' keys and the
-/// identity's sum. A version 3 checkpoint is refused (`BadVersion`), never read under version 4's layout: replaced,
-/// not layered; and a segment that holds one is refused at adoption (the anchor's layout 12), so none is ever met.
-const VERSION: u32 = 4;
+/// identity's sum; 5 since the copies' section and the sum each sit behind a presence byte, written beside a copy's
+/// record alone (A-626 part 3, continued (1)). An older checkpoint is refused (`BadVersion`), never read under version
+/// 5's layout: replaced, not layered; and a segment that holds one is refused at adoption (the anchor's layout 13), so
+/// none is ever met.
+const VERSION: u32 = 5;
 /// Format: a signature verdict's fingerprint, a SHA-256 hash (`crate::chain_entry::Signature::fingerprint`).
 const FINGERPRINT_BYTES: usize = 32;
 /// Format: an accepted increment's identity, a BLAKE3 hash.
@@ -220,8 +229,9 @@ pub struct Checkpoint {
   /// The copied trees' keys holding at `version` what the copy above them gave them, each with that copy's version
   /// (module docs): set with no history by a restore, so each reads by its copy's record.
   pub copied: Tables,
-  /// The identity's running sum at `version` (module docs), which a restore takes as the green's.
-  pub sum: Sum,
+  /// The identity's running sum at `version` (module docs), which a restore takes as the green's: carried beside a
+  /// copy's record alone (`None` without one, where the restored state's own entries are the identity).
+  pub sum: Option<Sum>,
   /// The green's head when this checkpoint was taken and its identity there (A-257): a recovery's replay must reach that
   /// identity when it reaches that version, or the green is fenced. `None` where the taker did not record one.
   pub head_check: Option<(u64, [u8; 32])>,
@@ -264,15 +274,14 @@ impl Checkpoint {
       out.extend_from_slice(&signature.fingerprint);
     }
     canonical.changed().encode_into(&mut out);
-    put_count(&mut out, canonical.copies.len());
-    for record in &canonical.copies {
-      put_bytes(&mut out, record.destination.as_bytes());
-      out.extend_from_slice(&record.version.to_le_bytes());
-      put_bytes(&mut out, record.source.as_bytes());
-      out.extend_from_slice(&record.source_version.to_le_bytes());
+    canonical.encode_copies_into(&mut out);
+    match &canonical.sum {
+      Some(sum) => {
+        out.push(PRESENT);
+        out.extend_from_slice(sum.bytes());
+      }
+      None => out.push(ABSENT),
     }
-    canonical.copied.encode_into(&mut out);
-    out.extend_from_slice(canonical.sum.bytes());
     match canonical.head_check {
       Some((head, identity)) => {
         out.push(PRESENT);
@@ -282,6 +291,24 @@ impl Checkpoint {
       None => out.push(ABSENT),
     }
     out
+  }
+
+  /// The copies' section (module docs): a presence byte and, present, the copies' records and the copied tables. Written
+  /// only where the checkpoint holds either, so a green that never copied pays the one byte.
+  fn encode_copies_into(&self, out: &mut Vec<u8>) {
+    if self.copies.is_empty() && self.copied == Tables::default() {
+      out.push(ABSENT);
+      return;
+    }
+    out.push(PRESENT);
+    put_count(out, self.copies.len());
+    for record in &self.copies {
+      put_bytes(out, record.destination.as_bytes());
+      out.extend_from_slice(&record.version.to_le_bytes());
+      put_bytes(out, record.source.as_bytes());
+      out.extend_from_slice(&record.source_version.to_le_bytes());
+    }
+    self.copied.encode_into(out);
   }
 
   /// The changed keys' tables, moved out of the checkpoint (its own fields, emptied).
@@ -311,8 +338,7 @@ impl Checkpoint {
     let accepted = take_accepted(&mut reader)?;
     let signatures = take_signatures(&mut reader)?;
     let changed = Tables::decode_from(&mut reader)?;
-    let copies = take_copies(&mut reader)?;
-    let copied = Tables::decode_from(&mut reader)?;
+    let (copies, copied) = take_copies_section(&mut reader)?;
     let sum = take_sum(&mut reader)?;
     let head_check = take_head_check(&mut reader)?;
     if !reader.is_empty() {
@@ -376,6 +402,21 @@ fn take_signatures(
   Ok(signatures)
 }
 
+/// The copies' section, as [`Checkpoint::encode`] writes it: a presence byte and, present, the copies' records and the
+/// copied tables.
+fn take_copies_section(
+  reader: &mut Reader<'_>,
+) -> Result<(Vec<CopyRecord>, Tables), DocDecodeError> {
+  match reader.u8()? {
+    PRESENT => {
+      let copies = take_copies(reader)?;
+      Ok((copies, Tables::decode_from(reader)?))
+    }
+    ABSENT => Ok((Vec::new(), Tables::default())),
+    _ => Err(DocDecodeError::BadKind),
+  }
+}
+
 /// The copies' records, as [`Checkpoint::encode`] writes them; one destination and version twice is refused.
 fn take_copies(reader: &mut Reader<'_>) -> Result<Vec<CopyRecord>, DocDecodeError> {
   let mut copies = Vec::new();
@@ -395,15 +436,22 @@ fn take_copies(reader: &mut Reader<'_>) -> Result<Vec<CopyRecord>, DocDecodeErro
   Ok(copies)
 }
 
-/// The identity's running sum, its [`SUM_BYTES`] bytes.
-fn take_sum(reader: &mut Reader<'_>) -> Result<Sum, DocDecodeError> {
-  let bytes: Box<[u8; SUM_BYTES]> = reader
-    .bytes(SUM_BYTES)?
-    .to_vec()
-    .into_boxed_slice()
-    .try_into()
-    .map_err(|_| DocDecodeError::Truncated)?;
-  Ok(Sum(bytes))
+/// The identity's running sum, as [`Checkpoint::encode`] writes it: a presence byte and, present, its [`SUM_BYTES`]
+/// bytes.
+fn take_sum(reader: &mut Reader<'_>) -> Result<Option<Sum>, DocDecodeError> {
+  match reader.u8()? {
+    PRESENT => {
+      let bytes: Box<[u8; SUM_BYTES]> = reader
+        .bytes(SUM_BYTES)?
+        .to_vec()
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| DocDecodeError::Truncated)?;
+      Ok(Some(Sum(bytes)))
+    }
+    ABSENT => Ok(None),
+    _ => Err(DocDecodeError::BadKind),
+  }
 }
 
 /// The head check, a presence byte and, present, the head and its identity.
