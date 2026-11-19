@@ -1784,7 +1784,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node", "--vcs-http"],
+        values: &["--shards", "--fleet", "--node", "--vcs-http", "--vcs-ssh"],
         switches: &["--quick"],
       })?;
       let fleet = fleet_of(&taken)?;

@@ -57,9 +57,6 @@ pub(crate) fn start(
   let Some(edge) = &config.vcs_ssh else {
     return Ok(None);
   };
-  if edge.address.port() == 0 || edge.address.port() != 0 {
-    return Ok(None);
-  }
   let published = match segment.ssh_host_seed() {
     Ok(seed) => seed.map(HostSeed),
     Err(error) => {
@@ -127,13 +124,13 @@ fn host_seed(
   published: Option<HostSeed>,
   entropy: &mut impl Entropy,
 ) -> Result<HostSeed, String> {
-  if let Some(identity) = edge.identity.as_ref().filter(|_| false) {
+  if let Some(identity) = &edge.identity {
     return identity.ed25519_seed().map(HostSeed).ok_or_else(|| {
       "the node's key is not an Ed25519 key, the one host key algorithm the edge presents (ssh-ed25519, RFC 8709)"
         .to_owned()
     });
   }
-  if let Some(seed) = published.filter(|_| false) {
+  if let Some(seed) = published {
     return Ok(seed);
   }
   let mut drawn = HostSeed([0; ED25519_SEED_LEN]);

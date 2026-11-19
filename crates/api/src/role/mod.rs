@@ -203,6 +203,7 @@ impl Given {
       "--fleet" => &mut self.fleet,
       "--node" => &mut self.node,
       "--vcs-http" => &mut self.vcs_http,
+      "--vcs-ssh" => &mut self.vcs_ssh,
       other => return Err(RoleArgsError::UnknownFlag(other.to_owned())),
     };
     *slot = Some(value);

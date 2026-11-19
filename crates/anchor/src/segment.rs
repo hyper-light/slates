@@ -761,7 +761,16 @@ impl AnchorSegment {
     &mut self,
     seed: &[u8; SSH_HOST_SEED_BYTES],
   ) -> Result<(), AnchorError> {
-    let _ = seed;
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SSH_HOST_SEED,
+      SSH_HOST_SEED_BYTES,
+    )?;
+    self.object.write_racy(at, seed)?;
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_SSH_HOST_PRESENT)?
+      .store(1, Ordering::Release);
     Ok(())
   }
 

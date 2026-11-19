@@ -729,8 +729,11 @@ impl Supervisor {
     if let Some(fd) = &self.vcs_http_listener {
       env.push((ENV_VCS_HTTP.to_owned(), fd.as_raw_fd().to_string()));
     }
+    // And the SSH edge's, the same way (A-684).
     #[cfg(unix)]
-    let _ = &self.vcs_ssh_listener;
+    if let Some(fd) = &self.vcs_ssh_listener {
+      env.push((ENV_VCS_SSH.to_owned(), fd.as_raw_fd().to_string()));
+    }
     // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
     // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
     // dead daemon left. The table's object is kept until the spawn holds its own copy.
