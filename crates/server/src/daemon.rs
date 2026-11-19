@@ -790,6 +790,8 @@ impl Daemon {
       ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(match error {
         slates_vfs::host::HostError::Unavailable(code)
         | slates_vfs::host::HostError::OwnMount(code) => code,
+        // A Win32 code as its own number (A-527).
+        slates_vfs::host::HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
         _ => 0,
       }))
     })?;
@@ -3224,7 +3226,7 @@ impl Daemon {
         // Only a shard with a committed image has dead memory to give back.
         let _ = crate::verbs::publish_shard(s);
         s.journal.forget_what_was_given_back();
-        s.give_back_slice_bytes = 0;
+        s.give_back_rate = GiveBackRate::default();
         s.purge_seen_allocations = s.store.content.arena().allocations();
         if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
           let _ = futures::detach(task);
@@ -3825,11 +3827,6 @@ impl Daemon {
     if let Some(watchdog) = self.watchdog.as_ref() {
       watchdog.stopping();
     }
-    // Every replica of a green leaves before its owner is given up (A-457, A-273 step 5a; `slates_mem::sealed`,
-    // "Lifetimes"), while the shards still run to carry the registrations home.
-    if self.runtime.is_some() {
-      self.give_back_replicas();
-    }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
@@ -3844,47 +3841,6 @@ impl Daemon {
     // window, then left to the process's end, never waited for without end.
     if let Some(mut log_writer) = self.log_writer.take() {
       log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
-    }
-  }
-}
-
-impl Daemon {
-  /// Closes every shard's green replicas and waits until no shard holds a registration of one, a replica, or a
-  /// registration owed home (A-457, A-273 step 5a; `crate::green_replicas::close`, `outstanding`), within an
-  /// observation's budget: an owner dropped with a replica registered keeps its blocks to the process's end
-  /// (`slates_mem::sealed::dropped_with_readers`). A shard that cannot be asked, and what is left at the budget, are
-  /// logged, never silent.
-  fn give_back_replicas(&self) {
-    for shard in &self.shards {
-      if let Err(error) = self.observe(Some(*shard), crate::green_replicas::close) {
-        slates_machine::log_line!(
-          "slates-server: stopping: shard {} gives back no replica: {error}",
-          shard.0
-        );
-      }
-    }
-    let started = slates_machine::clock::monotonic_ns();
-    loop {
-      let outstanding = self
-        .shards
-        .iter()
-        .filter_map(|shard| {
-          self
-            .observe(Some(*shard), crate::green_replicas::outstanding)
-            .ok()
-        })
-        .fold(0usize, usize::saturating_add);
-      if outstanding == 0 {
-        return;
-      }
-      if slates_machine::clock::monotonic_ns().saturating_sub(started) > OBSERVE_BUDGET_NS {
-        slates_machine::log_line!(
-          "slates-server: stopping with {outstanding} green replica registrations not given back: their owners keep \
-           their blocks to the process's end"
-        );
-        return;
-      }
-      std::thread::yield_now();
     }
   }
 }
@@ -4496,7 +4452,7 @@ async fn init_shard(
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,
-    give_back_slice_bytes: 0,
+    give_back_rate: GiveBackRate::default(),
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
@@ -4551,6 +4507,8 @@ async fn init_shard(
     learned_fuse: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    unmount_watch: false,
     #[cfg(windows)]
     winfsp_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
@@ -4613,7 +4571,6 @@ async fn init_shard(
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     told_times: crate::told::ToldTimes::default(),
-    unmount_times: crate::learned_wait::LearnedWait::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
@@ -4702,7 +4659,6 @@ async fn init_shard(
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
-    green_replicas: crate::green_replicas::GreenReplicas::default(),
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
@@ -4823,6 +4779,10 @@ async fn init_shard(
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The NFS mounts this shard learned from its predecessor end their attachments when the kernel lets them go, as a
+  // mount bound later does (A-511): the shard's watch of the kernel's unmounts starts once it holds an own mount.
+  #[cfg(target_os = "macos")]
+  let _ = state::with_state_counted(crate::own_nfs::watch);
   Ok(slices.finish())
 }
 
@@ -5046,41 +5006,96 @@ async fn seal_idle_content() {
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
 fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
+  purge_write_log_timed(s, &mut shard_thread_cpu_ns)
+}
+
+/// [`purge_write_log`], its step timed by `cpu`, the shard thread's own CPU clock ([`shard_thread_cpu_ns`]; a
+/// controlled one in the unit tests).
+fn purge_write_log_timed(
+  s: &mut ShardState,
+  cpu: &mut impl FnMut() -> Option<u64>,
+) -> (usize, bool) {
   let slice = give_back_slice(s);
-  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let started = cpu();
   let purged = match (s.content.as_mut(), s.write_log.as_mut()) {
     (Some(object), Some(log)) => log.purge(object, slice),
     _ => crate::write_log::Purged::default(),
   };
-  learn_give_back_rate(s, purged.walked, started);
+  learn_give_back_rate(s, purged.walked, spent_since(started, cpu()));
   (purged.bytes, purged.more)
 }
 
-/// The bytes one give-back step may walk (A-226): what the OS gave back in one step quantum the last time
-/// (`give_back_slice_bytes`), at least a page, so a step holds the shard about one quantum whatever the memory.
+/// The bytes one give-back step may walk (A-226): what the shard gave back in one step quantum of its own CPU, as the
+/// steps before measured it ([`GiveBackRate`]), at least a page, so a step holds the shard about one quantum whatever
+/// the memory and whatever the host's load.
 fn give_back_slice(s: &ShardState) -> usize {
   let page = usize::try_from(s.config.geometry.page).unwrap_or(1).max(1);
-  s.give_back_slice_bytes.max(page)
+  s.give_back_rate.slice_bytes.max(page)
 }
 
-/// Learns the next give-back slice from this step's: `walked` bytes since `started` (the shard clock), scaled to one
-/// step quantum. A step that walked nothing teaches nothing.
-fn learn_give_back_rate(s: &mut ShardState, walked: usize, started: u64) {
-  if walked == 0 {
-    return;
+/// The shard thread's own CPU clock now, nanoseconds (`slates_rt::registry::calling_thread_cpu`, the clock the
+/// watchdog reads): what a give-back step is timed by, since a loaded host stretches the wall time a step takes and
+/// not the CPU it spends. `None` where the platform reads none.
+fn shard_thread_cpu_ns() -> Option<u64> {
+  registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// The CPU a step spent between the readings `started` and `ended`, `None` unless both were read.
+fn spent_since(started: Option<u64>, ended: Option<u64>) -> Option<u64> {
+  started
+    .zip(ended)
+    .map(|(started, ended)| ended.saturating_sub(started))
+}
+
+/// Learns the next give-back slice from this step's: `walked` bytes for the `spent` nanoseconds of its shard thread's
+/// own CPU, scaled to one step quantum ([`GiveBackRate::fold`]). A step that walked nothing, or whose CPU could not be
+/// read, teaches nothing.
+fn learn_give_back_rate(s: &mut ShardState, walked: usize, spent: Option<u64>) {
+  let quantum = futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
+  s.give_back_rate.fold(walked, spent, quantum);
+}
+
+/// The rate the idle give-back has learned of its own steps (A-226, A-491): the bytes one step may walk, and what the
+/// steps folded since that slice was learned walked and spent. A step is timed by its shard thread's own CPU, which a
+/// loaded host does not stretch, as the per-iteration budget holds a step to its quantum of that CPU. Timed by the wall
+/// clock until A-491, a step the host descheduled read as slow by every moment it waited and cut the next slice short
+/// by as much, so under load the slice followed the host's scheduling rather than the shard's work (the recovery
+/// test's give-back case failed once under load on adacachy and passed on its rerun).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GiveBackRate {
+  /// The bytes one step may walk: zero until a rate is learned, when a step takes a page.
+  pub(crate) slice_bytes: usize,
+  /// The bytes the steps folded since the slice was learned walked.
+  walked: u64,
+  /// The CPU those steps spent, nanoseconds.
+  spent_ns: u64,
+}
+
+impl GiveBackRate {
+  /// Folds one step that walked `walked` bytes and spent `spent` nanoseconds of its shard thread's CPU (`None` where
+  /// the thread's clock reads nothing), learning the slice, the bytes one `quantum_ns` of that CPU walks, once the
+  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step (Windows charges thread
+  /// time a scheduler tick at a time) shows most steps' CPU as none and one step's as a whole tick, so the steps are
+  /// folded until one shows any: their bytes over the CPU shown.
+  pub(crate) fn fold(&mut self, walked: usize, spent: Option<u64>, quantum_ns: u64) {
+    let Some(spent) = spent.filter(|_| walked > 0) else {
+      return;
+    };
+    self.walked = self
+      .walked
+      .saturating_add(u64::try_from(walked).unwrap_or(u64::MAX));
+    self.spent_ns = self.spent_ns.saturating_add(spent);
+    if self.spent_ns == 0 {
+      return;
+    }
+    let per_quantum = u128::from(self.walked)
+      .saturating_mul(u128::from(quantum_ns.max(1)))
+      .checked_div(u128::from(self.spent_ns))
+      .unwrap_or(0);
+    self.slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
+    self.walked = 0;
+    self.spent_ns = 0;
   }
-  let quantum = futures::step_budget_ns()
-    .unwrap_or(s.config.runtime.step_budget_ns)
-    .max(1);
-  let took = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock)
-    .saturating_sub(started)
-    .max(1);
-  let per_quantum = u128::try_from(walked)
-    .unwrap_or(u128::MAX)
-    .saturating_mul(u128::from(quantum))
-    .checked_div(u128::from(took))
-    .unwrap_or(0);
-  s.give_back_slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
 }
 
 /// The idle steps taken so far on this shard.
@@ -5139,6 +5154,15 @@ pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 /// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
 /// next give-back. The bytes given back, and whether any is left.
 fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
+  return_dead_recovery_timed(s, &mut shard_thread_cpu_ns)
+}
+
+/// [`return_dead_recovery`], its step timed by `cpu`, the shard thread's own CPU clock ([`shard_thread_cpu_ns`]; a
+/// controlled one in the unit tests).
+fn return_dead_recovery_timed(
+  s: &mut ShardState,
+  cpu: &mut impl FnMut() -> Option<u64>,
+) -> (usize, bool) {
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
@@ -5148,7 +5172,7 @@ fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
     return (0, false);
   };
   let slice = give_back_slice(s);
-  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let started = cpu();
   let Some(object) = s.content.as_mut() else {
     return (0, false);
   };
@@ -5171,7 +5195,7 @@ fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
   );
-  learn_give_back_rate(s, slice.saturating_sub(left), started);
+  learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
     .saturating_add(log_past_tail.map_or(0, |(_, bytes)| bytes));
@@ -6715,7 +6739,7 @@ mod limits {
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
+  audit_on_shard_configured, hold_busy, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -6961,17 +6985,6 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
-      .expect("the observation completed")
-  }
-
-  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
-  pub(crate) fn observe_at<T: Send + 'static>(
-    daemon: &super::Daemon,
-    partition: usize,
-    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-  ) -> T {
-    daemon
-      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 
@@ -7885,6 +7898,85 @@ mod tests {
     assert_eq!(
       failures, None,
       "the folded held pieces equal what the shard holds"
+    );
+  }
+
+  /// What [`a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock`] saw after each step: the slice
+  /// learned, and whether dead memory was left (so the step walked a whole slice).
+  #[derive(Debug)]
+  struct Learned {
+    /// The shard's step quantum and page.
+    quantum: u64,
+    page: usize,
+    /// After each step: the slice learned, and whether dead memory was left.
+    steps: Vec<(usize, bool)>,
+  }
+
+  /// Takes one give-back step of `state`'s dead recovery memory, its CPU clock reading `started` before it and
+  /// `ended` after it: the slice then learned, and whether dead memory was left.
+  fn give_back_step_timed(
+    state: &mut crate::state::ShardState,
+    started: u64,
+    ended: u64,
+  ) -> (usize, bool) {
+    let mut readings = [Some(started), Some(ended)].into_iter();
+    let mut clock = || readings.next().flatten();
+    let (_, more) = super::return_dead_recovery_timed(state, &mut clock);
+    (state.give_back_rate.slice_bytes, more)
+  }
+
+  /// A-491 (A-226's slice; CLAUDE.md "Bounded work everywhere": a step is held to its shard's quantum of its own CPU).
+  /// Do: on a shard whose recovery memory is all dead (an image committed, the journal's record of what it gave back
+  /// forgotten, as after a restart), take give-back steps timed by a controlled CPU clock: one spending a quantum, one
+  /// half a quantum, then three timed as Windows' coarse thread clock times them, the first two showing no CPU and the
+  /// third a quantum. Expect each slice learned to be the bytes the steps walked per quantum of the CPU they spent: a
+  /// page, then two, then two still while the clock shows nothing, then the three steps' six pages, whatever wall time
+  /// the steps took. Before, a step was timed by the wall clock, so the slice followed the host's scheduling (here the
+  /// steps' real wall time, microseconds, not the quantum the clock says they spent).
+  #[test]
+  fn a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock() {
+    let seen = audit_on_shard(|state| {
+      let _ = crate::verbs::publish_shard(state);
+      state.journal.forget_what_was_given_back();
+      state.give_back_rate = super::GiveBackRate::default();
+      let quantum = slates_rt::futures::step_budget_ns()
+        .unwrap_or(state.config.runtime.step_budget_ns)
+        .max(2);
+      let page = usize::try_from(state.config.geometry.page)
+        .unwrap_or(1)
+        .max(1);
+      let half = quantum / 2;
+      let steps = vec![
+        give_back_step_timed(state, 0, quantum),
+        give_back_step_timed(state, quantum, quantum + half),
+        give_back_step_timed(state, 2 * quantum, 2 * quantum),
+        give_back_step_timed(state, 2 * quantum, 2 * quantum),
+        give_back_step_timed(state, 2 * quantum, 3 * quantum),
+      ];
+      Learned {
+        quantum,
+        page,
+        steps,
+      }
+    });
+    let per_quantum = |walked: usize, spent: u64| -> usize {
+      usize::try_from(
+        u128::try_from(walked).unwrap() * u128::from(seen.quantum) / u128::from(spent),
+      )
+      .unwrap()
+    };
+    let half = seen.quantum / 2;
+    let two = per_quantum(seen.page, half);
+    let expected = [seen.page, two, two, two, per_quantum(3 * two, seen.quantum)];
+    assert!(
+      seen.steps.iter().all(|(_, more)| *more),
+      "every step left dead memory, so each walked a whole slice: {seen:?}"
+    );
+    let learned: Vec<usize> = seen.steps.iter().map(|(slice, _)| *slice).collect();
+    assert_eq!(
+      learned, expected,
+      "each slice is the bytes walked per quantum of the CPU spent, steps a coarse clock shows none of folded into the \
+       next it shows: {seen:?}"
     );
   }
 

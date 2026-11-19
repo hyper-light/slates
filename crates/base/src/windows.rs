@@ -91,7 +91,12 @@ fn refusal(e: &std::io::Error) -> HostError {
     std::io::ErrorKind::NotFound => HostError::NotFound,
     std::io::ErrorKind::NotADirectory => HostError::NotDirectory,
     std::io::ErrorKind::IsADirectory => HostError::NotFile,
-    _ => HostError::Unavailable(e.raw_os_error().unwrap_or(0)),
+    // Its OS code is a Win32 code here, typed as one (A-527).
+    _ => code_refusal(
+      e.raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .unwrap_or(0),
+    ),
   }
 }
 
@@ -108,15 +113,14 @@ fn status_refusal(status: NTSTATUS) -> HostError {
     STATUS_FILE_IS_A_DIRECTORY => HostError::NotFile,
     other => {
       // SAFETY: a pure translation of a status value; it reads and writes no memory of ours.
-      let code = unsafe { RtlNtStatusToDosError(other) };
-      HostError::Unavailable(i32::try_from(code).unwrap_or(i32::MAX))
+      code_refusal(unsafe { RtlNtStatusToDosError(other) })
     }
   }
 }
 
-/// A Win32 error code as the host's refusal.
+/// A Win32 error code as the host's refusal, typed as Win32's (A-527): no reader takes it for the errno of its number.
 fn code_refusal(code: u32) -> HostError {
-  HostError::Unavailable(i32::try_from(code).unwrap_or(i32::MAX))
+  HostError::Win32(code)
 }
 
 /// A malformed record the OS filled: the host cannot serve it (`ERROR_INVALID_DATA`).
@@ -349,8 +353,11 @@ fn fingerprint_of_handle(
   // writable record of the type the call fills.
   let ok = unsafe { GetFileInformationByHandle(handle.cast(), &mut info) };
   if ok == 0 {
-    return Err(HostError::Unavailable(
-      std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    return Err(code_refusal(
+      std::io::Error::last_os_error()
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .unwrap_or(0),
     ));
   }
   let mut basic = FILE_BASIC_INFO {
