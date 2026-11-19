@@ -12485,6 +12485,15 @@ engine: the verdict, rebase, position mapping, the register).
 > lookup on their partitions), the services behind the seam, Mercurial's and Subversion's sites, the MCP edge onto this
 > engine, and the live `git clone` over HTTPS (main's).
 >
+> **Status (2026-11-19, A-625 part 3, first slice: upload-pack behind the edge).** git's site serves upload-pack
+> (A-640 part 2) from a repository's store: `vcs_http::git::UploadServices` starts it for a repository whose store a
+> `StoreLender` holds, answers `info/refs` with v2's advertisement and a `POST` with its request held whole, charged to
+> the request's room, and writes each answer one whole pkt-line's room a step through `slates_git::upload::Answer::write`,
+> the store lent afresh for each step (A-640 part 2's rule); a request upload-pack refuses is answered in git's words.
+> Owed: the server holding each repository's store on its owner shard and lending it (with A-653's pack source), the
+> daemon starting an edge (address, identity, an authenticator over §4.13's keys, the lookup across partitions),
+> receive-pack's session (A-654), then the live `git clone`.
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -13238,6 +13247,19 @@ signature verification).
 > a secret changeset, three bookmarks and two markers, in `.hg` and in the store (`crates/hg/fixtures/state`, the
 > command in `make-state-fixtures.sh`): every changeset's phase computed from the imported roots as 7.2 lists it, every
 > bookmark and marker as 7.2 lists them, the markers written back to the obsstore's bytes.
+>
+> **Status (2026-11-19, A-650 part 2: the session over a byte channel).** `serve::stdio` runs the session over the
+> bytes of `hg serve --stdio`'s standard streams, as the SSH server's session channel carries them (A-633; the daemon's
+> SSH edge that calls it is A-651's): the channel's bytes go in as they arrive, a step serves the request at the front
+> once it is whole and the last answer has been taken (so one answer is held at most, as a process writing to a full
+> pipe stops reading), standard error goes out before standard output (7.2's order for an error), and the bytes each
+> step consumed go back to the channel's window. The input held is at most the window; a request that needs more than
+> the window could never be whole, so it is answered out of band and ends the session. The session ends at an empty
+> line, an unreadable request or the end of input, and the channel then closes with exit status 0, as `hg serve
+> --stdio` exits. Proven by `cargo test --locked -p slates-hg --lib` on the Mac Studio, 259 of 259, red first (5 of 5
+> failed with the step held waiting): the three captured sessions handed in a byte, seven bytes, a kilobyte and the
+> whole at a time, each answering as the session answers the same bytes whole; one answer held until taken; the
+> window's refusals; the end of input; arbitrary bytes at arbitrary cuts.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13645,7 +13667,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
-   3); owed: the process around it, HTTP.
+   3), and the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`); owed: the process
+   around it, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -13791,8 +13814,9 @@ and export by landing).
 > their directory's close). Held to the golden dumps: `full.dump` and `part1.dump` exported again byte for byte,
 > `deltas.dump` and `part1.dump` then `part2.dump` importing to `full.dump`'s history, every revision's changed paths
 > `svnlook changed`'s account of the repository `svnadmin` dumped, and import(export(R)) equal to R for those and for
-> generated histories held to a model tree. Owed: the export in format 3 (Subversion's deltifier, its second part), and
-> the wiring (a `CreateRepository` repository's records held by its shard, the two verbs on the control channel).
+> generated histories held to a model tree. The export in format 3 built by A-652 (Subversion's deltifier ported as
+> `svndiff::deltas`, the crate's one delta generator; `deltas.dump` and `part2.dump` written again byte for byte).
+> Owed: the wiring (a `CreateRepository` repository's records held by its shard, the two verbs on the control channel).
 >
 > **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
 > piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
@@ -14450,7 +14474,7 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built for format 2, A-628; format 3's export and the wiring owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the wiring owed).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -45593,6 +45617,48 @@ Applied in the same change to (its first part, the index):
   identity, its own copy root, the replaced node-revision its predecessor, its count one more, created in its revision,
   related to what it replaced, the nodes beneath the directory the same node-revisions again.
 
+Applied in the same change to (its second part, the deltifier and format 3):
+- `crates/svn` (`svndiff.rs` and `svndiff/deltify.rs` new, with `svndiff/deltify/tests.rs`: `deltas`, the crate's one
+  delta generator; `migration/export.rs`: format 3; `migration.rs`: `DeltasOwed` goes; `dump/tests/golden.rs`: every
+  recorded delta remade; `migration/tests`: format 3's golden exports and round trips), §4.17.4's A-628 status and piece
+  6, GAPS (the §4.17.4 entry) and research §15.
+- **The deltifier.** `svndiff::deltas(source: &[u8], target: &[u8], window_room: NonZeroUsize) -> Result<Deltas<'_>,
+  SvndiffError>`, an iterator of `Window`s made one at a time, refused `WindowTooLarge` for a room past `WINDOW_LIMIT`;
+  a stock server's windows are those of the room `WINDOW_LIMIT` (`SVN_DELTA_WINDOW_SIZE`). The windows are
+  `text_delta.c`'s: the target in pieces of the room, the source in pieces of the room beside them until it runs out,
+  then an empty view where it ended (`txdelta_next_window`; the push form FSFS stores deltas with, `tpush_write_handler`,
+  makes the same windows, and FSFS answers a delta between two texts with its stored delta only when it was stored
+  against that very base, `cached_data.c` `svn_fs_fs__get_file_delta_stream` 2476, so a stock dump's or drive's delta is
+  a function of the two texts). Each window's instructions are `xdelta.c`'s `compute_delta`: a common start past four
+  bytes copied; the source's whole 64-byte blocks in an open-addressing table by a pseudo-Adler-32 sum, a flags table
+  screening sums first; the target walked with the rolling sum, a found block extended forward and back (not before the
+  last instruction's end), the bytes between kept as new data, a match that meets the last instruction taking back what
+  it reaches over (`svn_txdelta__remove_copy`: new data cut, a copy taken back only whole); a common end past four bytes
+  copied; instructions merged as `svn_txdelta__insert_op` merges them. A window with an empty view is its target as new
+  data. The sums wrap in 32 bits as C's do. It is the generator A-616's drive takes its changed texts' deltas from.
+- **Format 3.** `Exporter::new` takes `Format::Three`: a change's or a copy's property section is `Prop-delta: true`,
+  what is set or changed in name order and then what is deleted in name order (`hash.c` `svn_hash_write_incremental`
+  266-315), an addition's without history whole; every text is the deltifier's windows against the record's comparison
+  (the empty text for an addition without history), written in svndiff version 0 (`dump.c` `store_delta`), with the
+  comparison's checksums as `Text-delta-base-md5`/`-sha1` where it has a text.
+- **Tests** (Mac Studio, 2026-11-19, kiln, debug, `cargo test -p slates-svn --lib --locked`). Red first (a402eae77, its
+  own target directory), the deltifier's choice stubbed to new data alone, a valid delta and not `svnadmin`'s: 4 failed
+  of 413, the golden test of every recorded window, the golden format-3 export, and two hand-worked vectors; the
+  properties passed, as a valid delta should. Green (401f62382, then 909016345 after the golden test's threshold took
+  `part2.dump`'s six deltas): 413 of 413, rustfmt clean. Golden: every delta `svnadmin dump --deltas` wrote in
+  `deltas.dump` and `part2.dump` remade window for window from its base and its text (two-window ones, copies changed,
+  additions against the empty text); the histories imported from format 2, format 3 and two parts exported in format 3
+  as `deltas.dump` byte for byte, and from revision 4 as `part2.dump`; import(export(R)) = R through format 3. Unit: the
+  views in step with the target until the source runs out, an empty source's new data, common starts and ends copied
+  only past four bytes, a moved stretch copied from its place. Generated: deltas of edited and unrelated texts in rooms
+  from one byte remake their targets, keep to their room and survive version 0's encoding; the migration's generated
+  histories round-trip through format 3 to the same history and bytes.
+- **Owed of A-652: the import and export as repository verbs.** An imported revision is a commit: its green version
+  and its Subversion record are one durable step (item 3.5), so the import must commit through the owner's commit step a
+  client's commit takes, A-655's (through A-635's append), not a second path; and the export reads the shard's
+  Subversion index and records that step keeps (A-655, A-656). Neither is on main yet (A-655's branch is at the commit's
+  checks), so this part follows A-655's commit step.
+
 ### A-641 part 2 — a push's changegroup verified against what the repository holds, and a line's move made A-618's work over its flat manifests laid out as directories (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 2 and 3, decision 6 and piece 5; §4.17.1 "A push is a work" items 2 to 4; A-588, A-618, A-641 part 1)
 
 - **What.** `crates/hg/src/push/verify.rs`: `verify(&ChangegroupPart, &impl Held, &mut Admission) -> Result<Verified,
@@ -46018,6 +46084,56 @@ Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crat
   query refused `403`); the paging model charges each record's text. On the Mac Studio (2026-11-19): red at 06:59Z
   with `transfer_allowed` stubbed, 2 failing (that test and the reader's); green at 07:00Z on 440f9d646,
   `cargo test -p slates-git --lib` 387 passed, 2 ignored; fmt clean.
+
+### A-650 (part 2) — Mercurial over SSH: one entry point that runs the session over the channel's bytes, one answer held at a time within the channel's window (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface" and piece 4; §4.17.2 "Transports" item 2; A-619 part 3, A-633; the daemon's SSH edge that calls it is A-651)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (new: `serve::stdio` with
+`Stdio`, `Progress`, `PastWindow`, `EXIT_STATUS`; `serve::session::Refused::PastWindow`; the session's `message`
+shared with it; `getbundle`'s test store, sessions and whole-session replay opened to the sibling tests), GAPS (the
+§4.17.3 entry).
+- **What it does.** `Stdio::new(capacity)` is one `hg -R <repo> serve --stdio` session over a byte channel whose window
+  is `capacity` bytes. `receive(data)` takes the client's bytes as the channel delivers them (refused, taking nothing,
+  past the window; dropped once the session has ended); `eof()` marks the end of the client's input; `step(store, room)`
+  serves the request at the front through `session::serve`, each request admitted `room` bytes, once it is whole and
+  nothing of the last answer waits, and says how many input bytes it consumed; `stderr()` and `stdout()` hold what is to
+  be sent, stderr first, and `sent_stderr(n)`, `sent_stdout(n)` drop what the channel took; `finished()` says the
+  session ended with every answer sent, and the channel then ends with `EXIT_STATUS`, 0.
+- **The SSH edge's loop (A-651).** On `SessionEvent::Data`, `receive` the bytes; send what `stderr()` then `stdout()`
+  hold with `Session::send_stderr` and `send_data`, telling the session what each took; once both are empty, `step`,
+  and give the window back the consumed bytes with `Session::consumed`; on `Writable`, send again; on `Eof`, `eof`; once
+  `finished`, `Session::finish(EXIT_STATUS)`.
+- **Decided.** One answer held at a time, as 7.2's process writing to a full pipe stops reading; the window is the
+  input's bound, so a request that needs more than the window could never be whole and is answered out of band with the
+  session ended (`Refused::PastWindow`), where waiting would hold the channel; a request cut short by the end of input
+  is dropped, where 7.2 serves a last line without its newline less its last byte.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 18.4 to 12.0): `cargo test --locked -p slates-hg --lib`, 259 of 259;
+  `cargo fmt -p slates-hg -- --check`, clean. Red first: the same tests with the step held waiting, 5 of 5 failed. The
+  three captured sessions of stock `hg serve --stdio` 7.2 (`fixtures/serve`) handed in a byte, seven bytes, a kilobyte
+  and the whole at a time, each answering byte for byte as the session answers the same bytes whole, every request
+  answered, all input consumed, the session finished; two requests sent at once, the second waiting while the first
+  answer waits; a piece past a 24-byte window refused, and a request needing 98 bytes answered out of band and the
+  session ended; the end of input after a whole request and a part; arbitrary bytes at arbitrary cuts over generated
+  windows, the input held never past the window and every session finished.
+- **Owed.** The SSH edge's loop above (A-651); the session's answers sliced within the shard's step budget (a
+  `getbundle` is made whole in one step, bounded by the request's room).
+
+### A-625 part 3, first slice — upload-pack behind the edge, the store lent a step at a time (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" item 1; after A-625 part 2, A-640 part 2)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/server` (`vcs_http::git::upload`,
+new; git's site's tests; the manifest's dev-dependency on `slates-vcs`) and the lock.
+- **What.** `UploadServices<L: StoreLender>` is git's services with upload-pack served: `start` refuses `503` for
+  receive-pack (its entry point, A-654, has not landed) and for a repository whose store the lender does not hold; the
+  `Upload` exchange holds a `POST`'s request whole (upload-pack reads a command request whole), charging its bytes to
+  the request's room (`413` past it), and at the body's end calls `slates_git::upload::serve` with `Asked::Request`, or
+  with `Asked::Advertise` for `info/refs`; each reply run is one `Answer::write` step of one whole pkt-line's room
+  (`pktline::MAX_LEN`, so a band-1 packet goes out whole), the store lent afresh by `StoreLender::lend` for each step.
+- **Why a lender.** A-640 part 2 lends `Served` for each step "so a shard's state is never held across a wait". The
+  store will live on the repository's owner shard, so the lender is the seam the server's piece implements: on that
+  shard, or by moving the connection there (A-645's owed cross-shard serving).
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_`, Mac Studio, debug, 2026-11-19, kiln): red at cb6deefe7
+  (3 of 3 failing: the stub refused upload-pack and, inverted, served receive-pack), green at 4b816d17a, 76 of 76, fmt
+  clean. Through git's site over an empty repository's store: v2's advertisement (`version 2` first, `ls-refs=unborn`),
+  `ls-refs` answered with the flush alone, a body that is no pkt-line answered `ERR`, receive-pack and an unheld store
+  `503`.
+- **Owed.** As the status says.
 
 ### A-629 part 2b-ii — Git LFS on the daemon: the edge's call, access by the repository's policy, locks in its locks log (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files" and "Access"; after A-629 part 2b-i, A-622 part 2, A-625 part 2 and A-635)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/server` (`lfs.rs` and `lfs/tests.rs`,

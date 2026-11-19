@@ -863,3 +863,13 @@ the first 16 hex digits of each file's sha256:
   written with its code's own (`svn_err_best_message`): `svn_checksum_parse_hex`'s refusal is "Invalid character in hex
   checksum" and an undecodable LZ4 block "LZ4 decompression failed" (`svn_error_codes.h` 221, 1498). A checksum is read
   as its first 32 hexadecimal digits, the rest ignored, and the all-zero digest is no checksum at all.
+- **The deltifier** (A-652) [C: `libsvn_delta/text_delta.c` `fc69ad86f58de9b9` (`compute_window` 146-170,
+  `svn_txdelta__insert_op` 209-278, `svn_txdelta__remove_copy` 280-323, `txdelta_next_window` 356-397,
+  `tpush_write_handler` 508-556); `libsvn_delta/xdelta.c` `54b4ca6d79472013` (`init_adler32`, `adler32_replace`,
+  `init_blocks_table`, `find_match`, `store_delta_trailer`, `compute_delta` 371-480); `libsvn_subr/string.c`
+  `62b5ad96280ba127` (`svn_cstring__match_length`, `svn_cstring__reverse_match_length`, plain byte loops at this
+  revision); `libsvn_fs_fs/cached_data.c` `24e324dfec74f1a5` (`svn_fs_fs__get_file_delta_stream` 2476: a stored delta
+  sent as it is only when it was stored against the very base asked for)]: the pull and push forms cut the same windows
+  (a source piece read when a target piece begins, a short piece ending the source's views), so every delta a stock
+  server sends or dumps is a function of its two texts; `svnadmin dump --deltas` writes it in svndiff version 0
+  (`store_delta`). Every recorded delta of the golden dumps is remade by the port window for window.

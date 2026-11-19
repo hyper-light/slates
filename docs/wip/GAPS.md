@@ -336,6 +336,11 @@
 > only while every seat is taken and a new connection needs one, the reap teaching nothing and backing the phase off
 > once per bound (g294's SSH rule). `slates-server --lib vcs_` 69 of 69 and `slates-rt --lib round_trip` 2 of 2 on the
 > Mac Studio, red first twice (3 + 2, then 8 of 8). Owed: the Linux and Windows readers compiled and run.
+> **A-625 part 3, first slice (2026-11-19, g299):** git's site serves upload-pack (A-640 part 2) from a repository's
+> store a step at a time (`vcs_http::git::UploadServices` over a `StoreLender` that lends `Served` afresh each step);
+> receive-pack and a store not held answer `503`. `slates-server --lib vcs_` 76 of 76 on the Mac Studio, red first (3
+> of 3). Owed: the server's store per repository and its lender (with A-653's pack source), the daemon starting an edge,
+> receive-pack's session (A-654), the live `git clone`.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -508,8 +513,9 @@
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
 > objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
 > 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619); piece 5's first part, a push's bundle read, its race checks and its reply (A-641 part 1) (2026-11-19; UI
-> goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079 for A-598 and A-619, g301 for A-641).**
+> (A-619), and the session over a byte channel (A-650 part 2); piece 5's first part, a push's bundle read, its race
+> checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
+> for A-598 and A-619, g301 for A-641, g303 for A-650).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -618,8 +624,13 @@
 > bookmarks returned typed for the register, the repository's mutable state (an import is not served before the
 > register's entry holds them); the markers kept as the index's `M` rows in the obsstore's order; red first (5 failed),
 > 261 of 261, against a history 7.2 kept with drafts, an amend, a secret changeset, bookmarks and markers
-> (`crates/hg/fixtures/state`). Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
-> `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
+> (`crates/hg/fixtures/state`). **Built (A-650 part 2):** the session over a byte channel (`serve::stdio`), the entry
+> point the daemon's SSH edge (A-651) calls with the session channel's bytes: one answer held at a time, standard error
+> before standard output, the consumed bytes given back to the window, a request needing more than the window refused
+> out of band; proven by 259 of 259 on the Mac Studio (red 5 of 5 with the step held waiting), the three captured
+> sessions handed in at every cut down to a byte. Owed, in order, after §4.17.1's seven pieces: (4, rest) read
+> serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump, the process around
+> `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
 > (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
@@ -774,8 +785,12 @@
 > again byte for byte after import, every revision's changed paths `svnlook changed`'s, import(export(R)) = R for them
 > and for generated histories held to a model tree; `cargo test -p slates-svn --lib --locked` 313 of 313 on the Mac
 > Studio, and 357 of 358 on the tree merged with main, the one failure main's own A-613 `reads` proptest, which fails
-> alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
-> deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
+> alone on main from its seed (see A-628). The export in format 3 built by A-652 (2026-11-19, g264): Subversion's
+> deltifier ported as `svndiff::deltas(source, target, window room)`, the crate's one delta generator, remaking every
+> window `svnadmin dump --deltas` wrote, `deltas.dump` and `part2.dump` written again byte for byte (413 of 413 on the
+> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. Owed from it: the wiring, after
+> A-655's owner commit step, since an imported revision commits through it (A-652's third part; a
+> `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
 > shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
