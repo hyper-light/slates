@@ -12615,6 +12615,18 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-651 part 4: the SSH edge serves a repository from its owner shard).** An `exec` that names a
+> repository another shard's partition holds moves its connection there, as the HTTP edge moves one once a head names
+> its repository (main's ruling, A-625 part 3): the site locates the repository by its name's route (D-14), and the
+> edge hands that shard the connection whole, with the `exec` undecided: its socket's handle, its session (the keys,
+> sequence numbers and channel, and whatever the client sent after the `exec`), the client's bytes the session has not
+> taken, its waits, its phase and its proven principal. Its seat comes back first; there it takes a seat as a new
+> connection would, at most as many arrivals waiting as the shard has seats, and the `exec` is dispatched where the
+> repository's record, policy and store are read with no crossing. Each shard keeps its own edge state, and only the
+> listener's holds the host key. Subversion's tunnel names its repository in its greeting, not its `exec`, so it is
+> served where it was accepted until its own move (A-688). Keeping an edge state on every shard as the daemon starts
+> the edge is A-684's.
+>
 > **Status (2026-11-19, A-651 part 3: the SSH edge proves a key by the credential record).** A key the session cannot
 > answer for at once waits for the record: the edge's key holders (`RecordKeys`, which replaced `NoKeyRecord`) answer
 > every key "not yet" (`slates-ssh`'s `Holding::Unknown`), and the session holds that authentication request unanswered
@@ -13154,9 +13166,10 @@ engine: the verdict, rebase, position mapping, the register).
 > client's bytes go to the driver as they arrive; the checked push is answered with git's report and exit 0, a flush
 > alone, a push of nothing, with nothing; a refusal ends the session in git's `die` words with 128, a shard not lent in
 > the site's not-served words. Stock git 2.50.1's `create` push, sent over a real SSH session to the production site on
-> an audit daemon's shard, is answered with git's bytes, and `main` holds its tree. Owed: moving a connection to its
-> repository's owner shard, as the HTTP edge moves one (with the daemon's start of the SSH edge, A-684), and a live
-> `git push` over SSH with stock git's binary (main's run).
+> an audit daemon's shard, is answered with git's bytes, and `main` holds its tree. A connection reaches the
+> repository's owner shard by A-651 part 4's move before the command is made there. Owed: a push over a moved
+> connection (a two-shard daemon, as the HTTP site's push test runs), and a live `git push` over SSH with stock git's
+> binary (main's run).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -51492,6 +51505,56 @@ tests, new; `vcs_http.rs`'s `Exchange::reply_status` and module documentation).
   browser's `?p=` and `?r=` and a directory's HTML listing; Basic on the cleartext loopback edge (A-686); main's runs
   (clippy, `xtask`, the other platforms, red-checks).
 
+### A-651 part 4 — The SSH edge serves a repository from its owner shard: an `exec` naming a repository another shard holds moves its connection there whole, as the HTTP edge moves one, and is dispatched there (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2; D-14; main's ruling for the HTTP edge, A-625 part 3; main's finding (a) after A-651 part 3)
+Applied in the same change to:
+- §4.17.2's status (part 4's); GAPS (the §4.17 entry: part 4's line after part 3's, whose owed line it closes);
+- `crates/server` (`vcs_ssh`: the move, `Exit`, `Exec`, `Moving`, `migrate`, `arrived`, `serve_arrival`, `seated`,
+  `seat_arrival` and `Arriving`; an edge state kept per shard, `keep_here`, `here` and `EdgeState::arrivals`, the host
+  key held by the listener's alone; the waiters for a seat a list; the counts `moved`, `arrived` and
+  `arrivals_refused` and the refusals `vcs_ssh.move_refused`, `vcs_ssh.arrival_lost` and `vcs_ssh.arrival_refused`;
+  `serve` takes a site maker that is `Clone + Send`; `vcs_ssh::site`: `SshSite::locate`, `ToolSite`'s through its
+  repositories' `locate`; `vcs_http`: `ShardRepositories` re-exported for the SSH edge; the tests).
+- **The finding.** Main's finding (a) after part 3: the SSH site found a repository on its own shard's partition alone
+  (`Repositories::find`), so an `exec` naming a repository whose name routes to another shard's partition was refused
+  as the tool refuses a missing repository (git: `fatal: '<path>' does not appear to be a git repository`, 128), where
+  the HTTP edge locates it and moves the connection there.
+- **The rule** (the HTTP edge's, main's ruling of 2026-11-19). Once an `exec` names a repository another shard's
+  partition holds, the connection goes there whole, and the `exec` is dispatched and answered there. What moves: the
+  socket's handle (`TcpStream::into_owned`, adopted there by `from_owned`), the session (its transport's keys and
+  sequence numbers, the channel, and whatever the client sent after the `exec`), the client's bytes the session has
+  not taken, its waits (each shard learns its own), its phase, its proven principal and when it was accepted (a
+  lifetime sample for the key time counts from the accept). Its seat comes back on the shard it leaves first, so that
+  shard's listener may seat a new connection at once; there it takes a seat as a new connection is seated: a free one,
+  else the most overdue connection's, reaped for it, else it waits, at most as many arrivals waiting as the shard has
+  seats, past which it is closed and counted. A connection moves only once its key proved a principal: an `exec`
+  without one is refused where it came. A command that names no repository (`svnserve -t`, whose client names the
+  repository in its greeting) is decided where its connection was accepted.
+- **Who waits for a seat.** The listener's one waker became a list, each kept once (`Waker::will_wake`), since
+  connections that moved to a shard wait for its seats beside its listener; a seat's return or an overdue mark wakes
+  them all, and each looks again. The list holds at most the listener and the arrivals admitted, one per seat.
+- **The host key.** Only the listener's shard makes sessions, so only its state holds the host key's seed; every other
+  shard keeps one without (`EdgeState::arrivals`). A connection that moved carries its session, whose host key signs
+  its rekeys.
+- **Tests** (macOS arm64, Mac Studio d1323898, debug, 2026-11-19).
+  - `cargo test --locked -p slates-server --lib -- vcs_ssh --test-threads=4`: the site locates git's two services and
+    Mercurial's on a repository another shard holds, a path with its slash and one without, and git's on a repository
+    here and Subversion's tunnel here; and on a two-shard audit daemon whose SSH edge listens on its first shard, the
+    owner's key enrolled in the credential record and a git repository created on each shard's partition,
+    `git-upload-pack` over a connection each runs its command for its own repository on the shard that holds it, the
+    first shard counting two accepted, one moved and one run and the second one arrival and one run. That test serves
+    the production site (`ToolSite` over `RecordKeys` and `ShardRepositories`), its services a test's.
+  - Red at aa16b067 (the tests over a `locate` that answered here; over main 9f349d66, kiln r298): 28 of 30, the two
+    new tests failing: the site located every command here, and the second repository's `git-upload-pack` was refused
+    as git refuses a missing repository (`fatal: '/ssh-1.git' does not appear to be a git repository`). Green at
+    ae8071d7 (kiln r324): 30 of 30 on its first build, no warning, `cargo fmt -p slates-server -- --check` clean. As it
+    lands, over main 693bc8fe (gate copy 679b5677, kiln r335; slates-http, -http-edge, -svn, -git, -hg and -server
+    compiled afresh): 30 of 30, no warning, fmt clean.
+  - No integration target reaches the edge: nothing outside its tests starts it until A-684.
+- **Owed.** The daemon keeping an SSH edge state on every shard as it starts the edge (A-684, g299: `keep_here` with
+  `EdgeState::new` on the listener's shard and `EdgeState::arrivals` on the others); Subversion's tunnel moved to the
+  shard of the repository its greeting names (A-688); a test of an arrival that waits for a full shard's seat and of
+  one refused past the bound; main's live OpenSSH `git clone` over SSH and the other platforms' runs.
+
 ### A-683 — git's receive-pack on the SSH edge (2026-11-19, g302, UI goal 93; §4.17.2 "A push" items 1 to 7 and "Transports" item 2; A-651, A-654 parts 2 and 3, A-662)
 
 - **What was there.** A-654 part 2's driver (`git_push::ReceivePack`: `start`, `input`, `end`, `answer`, each one step
@@ -51547,9 +51610,10 @@ tests, new; `vcs_http.rs`'s `Exchange::reply_status` and module documentation).
   tests' harness (0041eb501, tree 16f4e16ff, kiln r313): the same filters 77 of 77, fmt clean. No integration target
   reaches either edge's receive-pack: the daemon does not start the SSH edge yet (A-684), and the HTTP site's push test
   is a lib test.
-- **Owed.** Moving a connection to the shard its repository's name routes to, as the HTTP edge moves one (with the
-  daemon's start of the SSH edge, A-684); main's live stock `git push` over SSH; every item A-654 part 2 owes (the
-  hooks, older bases, the policy's principals other than the owner at the append, push options, review requests).
+- **Owed.** A push over a connection A-651 part 4 moved to its repository's owner shard (it landed beside this piece,
+  and its own tests move connections running other commands): a two-shard daemon, as the HTTP site's push test runs;
+  main's live stock `git push` over SSH; every item A-654 part 2 owes (the hooks, older bases, the policy's principals
+  other than the owner at the append, push options, review requests).
 - **Applied in the same change to:** `crates/server/src/vcs_ssh/receive.rs` (new), `vcs_ssh/site.rs`
   (`ToolServices` with its shard lender, `ToolCommand`, the module docs' step 3), `vcs_ssh.rs` (the module and its owed
   list), `vcs_ssh/tests/receive.rs` (new), `vcs_ssh/tests/serve.rs` (its child), `vcs_ssh/tests/git.rs` (the services'
