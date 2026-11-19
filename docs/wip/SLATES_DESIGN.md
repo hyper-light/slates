@@ -12222,6 +12222,17 @@ engine: the verdict, rebase, position mapping, the register).
 > RFC 7748's X25519 exchange and RFC 8032's Ed25519 tests, and to whole connections with a client written from the RFCs
 > alone. User authentication and the session channel are piece 9's next parts.
 >
+> **Status (2026-11-19, A-633: piece 9's authentication and session channel built).** `slates-ssh`'s `Session` serves
+> a connection whole. Authentication is by public key: the `none` probe, a query answered `PK_OK` only for a key a
+> principal holds (through `KeyHolders`, the server's lookup over §4.13's principals), and a signature over the session
+> id checked through aws-lc-rs, for `ssh-ed25519` and for RSA keys under `rsa-sha2-512` and `rsa-sha2-256` (RFC 8332),
+> with partial success while a principal's policy wants more keys, the banner, a failure limit, and RFC 8308's
+> `server-sig-algs` sent after the first NEWKEYS. One session channel takes `env GIT_PROTOCOL` and one `exec` parsed as
+> git's two programs in git's quoting, `hg -R <repo> serve --stdio` in Mercurial's, or `svnserve -t`. Everything else
+> is refused by kind, the windows come from the caller's budget and the transport's cap, and `exit-status`, EOF and
+> close end the channel in order. The listener on the runtime, the host key's keeping and the commands' serving are
+> owed.
+>
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
 > inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
@@ -12332,11 +12343,13 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
    one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
-   [B: RFC 8709], with the RSA and ECDSA key forms users already hold as owed reading; ciphers `aes256-gcm@openssh.com`
+   [B: RFC 8709], and user keys in RSA under `rsa-sha2-512` and `rsa-sha2-256` [B: RFC 8332] (A-633), with the ECDSA
+   and FIDO key forms users also hold as owed reading; ciphers `aes256-gcm@openssh.com`
    and `chacha20-poly1305@openssh.com`, the forms OpenSSH clients speak ("Because of problems with the design of the
    algorithm negotiation in this RFC, OpenSSH (and other SSH implementations) use different rules" [B: OpenSSH
    `PROTOCOL` §1.6, §1.7]). The channel accepts one `exec` request whose command is exactly `git-upload-pack '<path>'`
-   or `git-receive-pack '<path>'`; the server parses it and never runs a command ("Normal precautions MUST be taken to
+   or `git-receive-pack '<path>'`, or, for §4.17.3 and §4.17.4, `hg -R <path> serve --stdio` and `svnserve -t`, each
+   read in its own client's quoting (A-633); the server parses it and never runs a command ("Normal precautions MUST be taken to
    prevent the execution of unauthorized commands" [B: RFC 4254 §6.5]). It accepts the `env` request for
    `GIT_PROTOCOL` alone ("It is recommended that implementations either maintain a list of allowable variable names"
    [B: RFC 4254 §6.4]), which is how a client asks for v2 over SSH ("the GIT_PROTOCOL environment variable must be set
@@ -12831,7 +12844,9 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
   server as a key's forced command (as Mercurial's own `contrib/hg-ssh` restricts a key to `hg -R <repo> serve
-  --stdio`) or by the client's `--remotecmd`; HTTP version 1 on the daemon's own HTTP edge, under TLS. HTTP version 2
+  --stdio`) or by the client's `--remotecmd`; or by slates' own SSH server (§4.17.2, A-633), which reads that exact
+  command in Mercurial's quoting and serves it in the daemon with no process; HTTP version 1 on the daemon's own HTTP
+  edge, under TLS. HTTP version 2
   (`/api/*`, the `hgrpc` frames) is not served: Mercurial documents it as experimental, and 7.2's server has no handler
   for it (no `X-HgUpgrade` path in `wireprotoserver.py` [C]).
 - **Commands.** Every command of 7.2's table, with its argument spec and its permission, `pull` or `push` [C:
@@ -13439,7 +13454,9 @@ for Subversion.)
   on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit`.
 - **svn+ssh.** sshd starts `svnserve -t` as the logged-in user; slates installs that command as one of its own (a CLI
   verb under the name `svnserve`), which speaks ra_svn on its standard input and output and relays to the daemon
-  through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism).
+  through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
+  slates' own SSH server (§4.17.2, A-633) the same `svnserve -t` is read from the `exec` request and served in the
+  daemon, the principal the one the client's key proved.
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
   COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
@@ -42418,3 +42435,69 @@ Applied in the same change to:
   and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
   server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
   checkout of a repository's green must pass over.
+
+### A-633 — The SSH server's user authentication and session channel: publickey with Ed25519 and RSA SHA-2 through a principals lookup, one session taking `env GIT_PROTOCOL` and one `exec` of git's, Mercurial's or Subversion's command, flow control from the caller's budget (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; §4.13; §4.17.3, §4.17.4; after A-594)
+Applied in the same change to:
+- §4.17.2's status and its SSH item (RSA user keys under RFC 8332; Mercurial's and Subversion's commands); §4.17.3's
+  transports and §4.17.4's svn+ssh (slates' own SSH server reads their commands); GAPS (the §4.17 entry);
+  `research/vcs-servers.md` §5.6 (new: the sources, pinned by hash);
+- `crates/ssh` (new: `userauth`, `channel`, `command`, `session`; `transport` sends EXT_INFO and gives each upper-layer
+  message its sequence number; `refusal` gains reason 14; their tests; `fixtures/userauth` with `make-fixtures.sh`).
+- **Authentication** (RFC 4252). `none` is answered with a failure naming `publickey` and is never counted. A query is
+  answered `SSH_MSG_USERAUTH_PK_OK` only for a key a principal holds. A signature over the session id and the request
+  (§7) is checked through aws-lc-rs, and only for a held key, so a client can make the server verify nothing it would
+  not accept. Keys: `ssh-ed25519`, and RSA under `rsa-sha2-512` and `rsa-sha2-256` over the `ssh-rsa` blob (RFC 8332
+  §3), within the 2048 to 8192 bits aws-lc-rs's verifiers take; a signature must name its request's algorithm (§3.2),
+  and one shorter than its modulus is padded with leading zeros, which §3 allows. `ssh-rsa` with SHA-1 is refused, as
+  OpenSSH 8.8 refused it by default. ECDSA and FIDO keys remain owed. The algorithms are announced in RFC 8308's
+  `server-sig-algs`, which the transport sends as the packet after its first NEWKEYS to a client that listed
+  `ext-info-c` (§2.4).
+- **Principals.** A key proves a principal only through `KeyHolders`, the server's lookup over §4.13's principals; the
+  crate keeps no keys. A principal whose policy wants several keys gets partial successes (§5.1) until that many
+  distinct keys of its have signed; a change of user name drops what was proven (§5).
+- **The failure limit** is the caller's. RFC 4252 §4 recommends 20 (`RECOMMENDED_FAILURE_LIMIT`), and past the limit the
+  server disconnects with reason 14, no more authentication methods. It is not learned here: a tail of the failures
+  that successful clients needed would never see the clients it cut off, so a learned limit needs a floor that lets a
+  client offer each key it holds. That is owed with the listener.
+- **The channel** (RFC 4254). One session at a time, on the design's "one session channel". `env` is taken for
+  `GIT_PROTOCOL` alone (§6.4), and one `exec` (§6.5) parsed by `command::parse` and raised to the caller, never run:
+  - git's `git-upload-pack '<path>'` and `git-receive-pack '<path>'`, the path read as git's own `sq_dequote` reads it
+    (`quote.c`, `connect.c` at `e1ec09b2`);
+  - Mercurial's `hg -R <path> serve --stdio`, with `--hidden`, the path bare or single-quoted as 7.2's `_serverquote`
+    writes it and the five words `contrib/hg-ssh` accepts; a shell metacharacter, a double quote or a stray backslash
+    is refused;
+  - Subversion's `svnserve -t`, the tunnel agent's fixed arguments (`libsvn_ra_svn/client.c` at `d434dc14`).
+  Every other request is answered `SSH_MSG_CHANNEL_FAILURE` when a reply is wanted, and every global request
+  `SSH_MSG_REQUEST_FAILURE`. Opens are refused as administratively prohibited for RFC 4254's own forwarding types, as
+  an unknown type (as §5.1 requires) for the rest, and as a resource shortage for a second session.
+- **Flow control, no fixed size.** The window offered is the caller's budget; the packet offered is the transport's
+  cap less the framing (`channel::max_data`), as §5.2 requires ("MUST NOT advertise a maximum packet size that would
+  result in transport packets larger than its transport layer is willing to receive"). A client sending past either
+  is refused. The window is given back once a packet's worth has been consumed, or sooner when what is left could not
+  carry a packet, so a small window never deadlocks. Sends stay within the client's window and packet and RFC 4253's
+  35000 bytes; `Writable` says when a held send may go again.
+- **Ending.** `exit-status`, then EOF, then close, in that order (§6.10). A client's close is answered with the server's
+  own unless it was already sent (§5.3).
+- **Sending order.** Every reply and every byte of data goes through one queue, bounded by the packet cap. It is flushed
+  as far as the transport takes it, so nothing is sent inside the server's own key exchange (RFC 4253 §7.1), and
+  reading stops while the queue is full.
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898). 105 of 105 at c088a300, with
+  `cargo fmt -p slates-ssh -- --check` clean.
+  - Red first at 3663c5af: 11 compile errors, each a missing layer.
+  - Two runs to green: a test helper sent its service request inside the first exchange, which strict mode rightly
+    refused; then a closed transport hid the client's disconnect event (fixed in `Session::receive`).
+  - Golden: an RSA 3072 key OpenSSH 10.2p1 made, read from its own blob, signing under both SHA-2 algorithms, with
+    OpenSSH's fingerprint; RFC 8032's keys as Ed25519 user keys; git's and Mercurial's quoting written from their
+    source, with proptests over any path.
+  - Whole sessions with the test client: EXT_INFO, a fetch from the probe to exit-status, EOF and close; every refusal
+    by kind; both windows; replies and data held through the server's own rekey and received under its new keys;
+    unknown numbers answered `SSH_MSG_UNIMPLEMENTED`.
+  - Red five ways on the Studio:
+    - the Ed25519 check skipped, its forgery test failed;
+    - the client's window not charged, the window test failed;
+    - sends allowed inside the server's rekey, the rekey test failed;
+    - partial success ignored, both partial tests failed;
+    - any escaped byte taken in a git path, the git refusal test failed.
+- **Owed.** The listener on slates-rt with the reaper and the connection-lifetime estimator (A-594's key time); the
+  host key's keeping; the key store over §4.13's principals; serving each command (§4.17.2-§4.17.4's pieces); ECDSA and
+  FIDO user keys; main's live interop with stock `ssh`, `git`, `hg` and `svn` clients.
