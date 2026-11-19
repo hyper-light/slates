@@ -18964,8 +18964,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     `docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
     **Left:** those bytes are counted by nothing until the range is filled or the backing goes (at most the ranges the
     dead daemon's fills had begun and not finished).
-  - **Open, the other sibling (from reading, owed a failing test, a Windows one):** on Windows a range is committed
-    before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
+  - **Fixed 2026-11-18 (A-530, goal 85, g079): on Windows a range was committed before its charge was asked, so a
+    `Budget` refusal left a committed range uncounted that Windows never gives back.** A range's fill now begins with its
+    charge (`dax_backing::begin_range`): refused, nothing is readied or cleared; a readying or clear the OS refuses after
+    it gives the charge back and refuses `Object`. The ordering is held on every host by
+    `a_range_is_charged_before_anything_is_made_for_it` (bridge-core's unit tests), red with the old order on the Mac
+    Studio. Record: `docs/bugs/2026-11-18-a-windows-dax-range-was-committed-before-its-budget-charge-was-asked.md`.
+    **Owed (main's):** the Windows run of the lib tests and a Windows Shards DAX map past the budget.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
     prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost
