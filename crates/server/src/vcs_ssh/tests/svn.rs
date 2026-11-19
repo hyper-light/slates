@@ -492,8 +492,12 @@ fn site<K>(keys: K, owner: Principal) -> (TunnelSite<K>, Lends) {
   (ToolSite::new(keys, held, services), lends)
 }
 
-/// The site the edge's tests serve a tunnel through: [`site`]'s.
-pub(in crate::vcs_ssh) fn tunnel_site<K>(keys: K, owner: Principal) -> impl SshSite + 'static
+/// The site the edge's tests serve a tunnel through: [`site`]'s, its key holders `keys`, which the edge sends with a
+/// connection it moves to another shard (A-651 part 4).
+pub(in crate::vcs_ssh) fn tunnel_site<K>(
+  keys: K,
+  owner: Principal,
+) -> impl SshSite<Keys = K> + 'static
 where
   K: KeyHolders<Principal = Principal> + Clone + 'static,
 {

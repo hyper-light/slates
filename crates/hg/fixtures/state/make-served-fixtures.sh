@@ -3,7 +3,8 @@
 # from its committed store, `.hg/requires` and `.hg/bookmarks`, so its nodes are the fixtures' own, opened with the
 # configuration it was made under (evolution on, publishing off), and read through 7.2's `served` filter, the one
 # `hg serve` answers a peer from (`wireprotov1server`). With stock Mercurial 7.2 from PyPI through uv (nothing installed
-# system-wide). Usage: make-served-fixtures.sh DIR (this script's directory).
+# system-wide). Usage: make-served-fixtures.sh DIR [REPO...] (DIR this script's directory), every repository
+# make-state-fixtures.sh makes when none is named.
 # For each repository R:
 #   R-served.txt            every changeset the filter serves, in revision order: `{node} {phase}`
 #   R-served-heads.txt      the served heads as `heads` answers them, in 7.2's order
@@ -57,7 +58,9 @@ unfiltered = repo.unfiltered()
 write('unserved', ['%s %s' % (text(unfiltered[r].hex()), 'hidden' if r in hidden else 'secret')
                    for r in unfiltered if r not in served])
 PY
-for repo in states states-store; do
+REPOS=(states states-store divergent)
+if [ $# -gt 1 ]; then shift; REPOS=("$@"); fi
+for repo in "${REPOS[@]}"; do
   mkdir -p "$WORK/$repo/.hg/store"
   while IFS= read -r file; do
     mkdir -p "$WORK/$repo/.hg/store/$(dirname "$file")"
