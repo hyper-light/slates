@@ -14702,6 +14702,22 @@ and export by landing).
 > slices); the write side (part 2); the daemon composing the site beside git's and handing it the stores (each
 > repository's index, green, lock table and authorization file, and a principal's Subversion user).
 >
+> **Status (2026-11-19, A-681, part 1, its second slice).** Built: the `log-report` over HTTP, so stock `svn log` and
+> `svn log -v` read a repository through the edge. The REPORT's body is read as A-609 reads it, the resource's node
+> must exist (`404` as `dav_method_report` answers), and the answer is A-613's log walk (`svn_repos_get_logs5`, held
+> to `svnserve`'s transcripts) with `mod_dav_svn`'s receivers in place of `svnserve`'s (`reports/log.c`): the header
+> written before the first changed path or entry, each item opened before its first changed path, `D:version-name`
+> `-1` closing a run of merged revisions, the principal's rules censoring paths, copy sources and revision properties
+> as for ra_svn. The edge's exchange steps the walk's first slices at the body's end, yielding between them, until it
+> has written or ended: a walk refused before its first byte is answered `dav_svn__convert_err`'s status with the
+> error in `D:error` (`404` for a missing path or revision), and one refused after it ends the connection. OPTIONS now
+> lists `log-revprops`. Held to the ra_svn walk over nine requests (every revision, merged revisions, oldest first with
+> a limit, strict history, two paths with a custom property, the locked rules' refusal and censoring, a missing path
+> and a revision past the youngest), each answer equal entry for entry, and to stock svn 1.15.0's `svn log` and
+> `svn log -v` through the edge over HTTPS. Owed: the other REPORTs, then the update-report for `svn checkout`; a
+> negative `S:limit` is refused (`svn_repos_get_logs5` would read it as two limits); revision properties are written in
+> the green's order where `mod_dav_svn` walks an APR hash.
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
@@ -15310,8 +15326,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
     (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
     report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
     `DAV:lockdiscovery` property. Its third, the site on the shared HTTP edge (A-681), has begun: the read side's
-    resources answered to OPTIONS, PROPFIND, GET and HEAD (part 1's first slice); its REPORTs, so `svn log` and `svn
-    checkout` reach a repository, then the commit, PROPPATCH and the lock verbs (part 2), follow.
+    resources answered to OPTIONS, PROPFIND, GET and HEAD (part 1's first slice) and the `log-report`, so `svn log`
+    reaches a repository (its second); the other REPORTs, so `svn checkout` does, then the commit, PROPPATCH and the
+    lock verbs (part 2), follow.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.

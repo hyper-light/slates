@@ -2129,7 +2129,7 @@ const STANDARD_THREE: &[&str] = &["svn:author", "svn:date", "svn:log"];
 /// The cases, each with whether it is read by the `locked` repository's anonymous rules: the root's shortcut over every
 /// revision, the youngest first, with every property; a file's history with its merged revisions; a branch oldest first with a limit,
 /// crossing its copy; the branch's history stopping at its copy, no property; two paths with a custom property named;
-/// under the rules, the root refused and the trunk censored; a missing path and a revision past the youngest refused.
+/// under the rules, the root refused and the trunk's whole history censored; a missing path and a revision past the youngest refused.
 const DAV_LOG_CASES: [(LogCase, bool); 9] = [
   (LogCase { paths: &[""], start: None, end: Some(0), changed: true, strict: false, limit: 0, merged: false, revprops: None }, false),
   (LogCase { paths: &["trunk/a.txt"], start: None, end: Some(1), changed: true, strict: false, limit: 0, merged: true, revprops: Some(STANDARD_THREE) }, false),
@@ -2137,7 +2137,7 @@ const DAV_LOG_CASES: [(LogCase, bool); 9] = [
   (LogCase { paths: &["branches/b1"], start: None, end: Some(0), changed: false, strict: true, limit: 0, merged: false, revprops: Some(&[]) }, false),
   (LogCase { paths: &["trunk/a.txt", "tags/t1"], start: Some(11), end: Some(2), changed: true, strict: false, limit: 0, merged: false, revprops: Some(&["svn:author", "x-ticket"]) }, false),
   (LogCase { paths: &[""], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, true),
-  (LogCase { paths: &["trunk"], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, true),
+  (LogCase { paths: &["trunk"], start: None, end: Some(0), changed: true, strict: false, limit: 0, merged: false, revprops: None }, true),
   (LogCase { paths: &["missing.txt"], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, false),
   (LogCase { paths: &["trunk"], start: Some(99), end: None, changed: false, strict: false, limit: 0, merged: false, revprops: None }, false),
 ];
