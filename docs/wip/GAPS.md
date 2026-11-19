@@ -1932,10 +1932,14 @@
 > acknowledgement settles it, 25,868 to 28,995 times a run, each a pause and a resend. Fixed on agents/perf-replies
 > (every result waits for room while its shard lives). BENCHMARKS, "Why main's two figures differ".
 
-> **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
-> shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
-> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds. Since
-> A-226's amendment it no longer costs other work a turn, only time to finish on a shard otherwise idle. Not changed.
+> **Fixed (2026-11-18, A-491): the give-back's slice was learned from wall time.** `learn_give_back_rate` divided by
+> the shard's clock, so on a loaded host a preempted step taught a small slice and a give-back took thousands of steps
+> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds, and
+> the recovery test's give-back case failed once under load on adacachy (main's r271). A step is now timed by its shard
+> thread's own CPU clock, steps a coarse clock (Windows) shows no CPU for folded into the next it shows
+> (`daemon::GiveBackRate`; `a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock`). **Owed (main's):**
+> `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` under load, and the give-back's step count at load against
+> the 2,572 to 3,042 above.
 
 > **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
 > The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran
@@ -2365,6 +2369,15 @@
 >   head_names`, `a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes`
 >   (`crates/server/src/daemon.rs`), red before. Bug record:
 >   `docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`.
+> - **Built in part (A-529, g250, 2026-11-19): a successor's confirmation now certifies its content.** A takeover's share
+>   is done only once every volume its round adopted is served from the successor's own placement: its head snapshot's
+>   placement names only the successor and the volume's current content candidates (`takeover::adopted_served`), the
+>   healer replacing an adopted volume's placement that names a member outside them rather than restoring it
+>   (`fleet.heal.adopted_replaced`). Tests: `a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement`
+>   (`crates/server/src/takeover.rs`, red with the gate removed) and the healer's decision test. Owed, in order: holders
+>   let a stale copy's content go on such a confirmation or its completion record (the regional layout bumped, so a
+>   mixed fleet cannot read an older build's confirmation as certified); an owner's settle certifies content the same
+>   way (A-508's holders then drop content too).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
@@ -3925,6 +3938,12 @@
 > delegation recalls, the idle seal and the huge-page re-arm. Owed beside it: a claim's pid is the client's word, so a
 > pid reused between a client's death and its watch is watched instead (Windows could carry the creation time, as the
 > daemon's header does, A-447); and the SDKs' heartbeat slot feeds nothing now.
+> **Since A-522 (piece 2)** the claim names its claimant's process by its pid and its start (the claim slot's
+> `AT_STARTED`, layout `SLB5`), so the watch is taken on that process alone and a pid reused before it reads exited at
+> once (the hole above, closed); and staging buffers and status captures are released at their own deadlines by the
+> shard's keeper on its timing wheel (`crate::deadlines`), off the tick. Still on the tick: leases, lapsed CLI
+> attachments, destroys, grants, the owed audit, departed hosts' attachments (A-222), held copies, the pressure hold,
+> NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
@@ -18973,8 +18992,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     `docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
     **Left:** those bytes are counted by nothing until the range is filled or the backing goes (at most the ranges the
     dead daemon's fills had begun and not finished).
-  - **Open, the other sibling (from reading, owed a failing test, a Windows one):** on Windows a range is committed
-    before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
+  - **Fixed 2026-11-18 (A-530, goal 85, g079): on Windows a range was committed before its charge was asked, so a
+    `Budget` refusal left a committed range uncounted that Windows never gives back.** A range's fill now begins with its
+    charge (`dax_backing::begin_range`): refused, nothing is readied or cleared; a readying or clear the OS refuses after
+    it gives the charge back and refuses `Object`. The ordering is held on every host by
+    `a_range_is_charged_before_anything_is_made_for_it` (bridge-core's unit tests), red with the old order on the Mac
+    Studio. Record: `docs/bugs/2026-11-18-a-windows-dax-range-was-committed-before-its-budget-charge-was-asked.md`.
+    **Owed (main's):** the Windows run of the lib tests and a Windows Shards DAX map past the budget.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
     prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost

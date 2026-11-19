@@ -4901,6 +4901,19 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-19, A-522: a claim names its process; staging and status captures keep their own deadlines).**
+> A claim on macOS and Windows carries its claimant's start beside its pid (the claim slot's `AT_STARTED`, the bootstrap
+> layout `SLB5`): on macOS the start time the kernel keeps for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`, in
+> microseconds), on Windows its creation time (`GetProcessTimes`). The daemon's hang-up watch is taken on that process
+> alone (`ExitWatch::on_started`): macOS registers its exit note and then reads the pid's start, so a pid another process
+> took before the watch reads exited at once and the dead client is retired; Windows opens the handle and checks the
+> creation time. Neither route has a socket at the claim to ask the kernel for its peer (`LOCAL_PEERTOKEN`,
+> `GetNamedPipeClientProcessId`); macOS's region is fetched by the Mach audit token, after the daemon seats and watches
+> the client. And the reap loop's tick no longer releases abandoned staging buffers and status captures: the shard's
+> keeper (`crate::deadlines`) sleeps on the timing wheel until the earliest of their deadlines, releases what is due,
+> and is woken only by a deadline set earlier than the one it sleeps for. Off the tick so far: dead clients (A-475),
+> staging buffers and status captures (A-522).
+
 > **Status (2026-11-18, A-475: a dead client is reclaimed at its hang-up).** The daemon no longer finds a dead client by
 > a poll. Each seated client has a watch, a task of its shard that awaits the client's hang-up through the shard's
 > driver: on Linux its control socket's end of stream (`EPOLLIN`, raised at the peer's close with `EPOLLRDHUP` and
@@ -19368,6 +19381,8 @@ Status: built 2026-11-06.
   6.93, 7.81 and 7.03 ms; a ping (one forwarded `versions`) 6.13, 7.74 and 7.66 ms. One request costs one round trip.
   The p99 is the link's in both forms (70 to 158 ms).
 ### A-226 — An idle shard gives back only the recovery memory written since its last give-back (accepted and built 2026-11-06; amends A-117; the supervisor's item (c), the macOS paced tail)
+> Amended 2026-11-18 by A-491: a give-back step's slice is learned from the shard thread's own CPU, not the wall
+> clock, steps a coarse thread clock shows no CPU for folded into the next it shows.
 Applied in the same change to:
 - `crates/vfs/src/checkpoint_log.rs` (`Journal`'s `committed_written`, `stale_written`, `log_written`,
   `UNKNOWN_EXTENT`, `Journal::checkpointed`, `Journal::given_back`, the bounded `Journal::dead_ranges`);
@@ -35367,3 +35382,139 @@ Applied in the same change to: §4.17.1 (a status block, the terms table, the cl
 identity, the hooks' first deadline, the worked example, the pieces list), §4.17.2 (large files), GAPS (the §4.17
 entry), `research/vcs-servers.md` §4, `crates/db/src/{repository,catalog,op,partition,error,lib}.rs`,
 `crates/db/tests/wire_order.{rs,txt}`, `crates/server/src/error.rs`.
+
+### A-530 — A DAX range's fill begins with its budget charge, before anything is made for it (2026-11-18, goal 85, g079; §4.6 the backed route, the fill budget; A-163, A-180, A-419)
+Applied in the same change to: GAPS (A-419's sibling line), `crates/bridge-core/src/dax_backing.rs` (`begin_range`
+over `RangeStart`, `StartingRange`; the ordering test), and the bug record
+`docs/bugs/2026-11-18-a-windows-dax-range-was-committed-before-its-budget-charge-was-asked.md`.
+- **What was there.** A range's fill began by readying the range for the VMM's map (`DaxObject::prepare_range`), then
+  clearing it where owed (A-419, A-526), then counting it against the fill budget, refused `Budget` at the bound.
+  Windows commits a range whole as it readies it (A-180) and never gives a section's committed page back, so a range
+  the budget refused stayed committed and counted by nothing: one more range for every ask refused at the bound, up to
+  the object's size, which is the machine's memory. Unix readies nothing, so only Windows held such ranges.
+- **The rule.** The charge comes first: the range is marked filled and counted, and a refusal stops the start `Budget`
+  with nothing readied or cleared. Then the range is readied, then cleared where owed; a readying or clear the OS
+  refuses gives the charge back and refuses `Object`. The order is one pure function over its steps (`begin_range`),
+  held by a test on every host.
+- **Why the undo does not leak on Windows.** A clear refused after a readying gives back the charge of a range that
+  stays committed only where the clear was owed by A-419, whose uncleared range stays counted; A-526's inherited ranges
+  are a Unix stream's alone, since Windows streams hold no resync.
+- **Tests.** `a_range_is_charged_before_anything_is_made_for_it` (`crates/bridge-core/src/dax_backing.rs`, the lib's
+  unit tests, every host): a refused charge stops the start before any readying; a readying or clear refused after it
+  gives the charge back. Red with the old order on the Mac Studio (`prepare`, `clear`, `charge` where `charge` alone
+  was owed); the module's tests 7 of 7 with it.
+
+
+### A-522 — A claim names its claimant's process by its pid and its start, so the hang-up watch is taken on that process alone; staging buffers and status captures are released at their own deadlines on the shard's timing wheel (2026-11-19, built for goal g255; the event-driven reaper's piece 2; §4.7 "Failure matrix"; A-447, A-468, A-475)
+
+- **What was there.** On macOS and Windows a claim named its claimant by its pid alone, the claimant's word in shared
+  memory. A client that died between its claim and its watch, its pid taken meanwhile by another process, left its
+  watch on that other process: its seat, attachments and id held for as long as the other process lived (A-475's owed
+  item). And the reap loop's tick released abandoned staging buffers and status captures once a liveness window,
+  asking every client's capture at every tick, whether any deadline was near or not.
+- **The claim's process.** Each claim slot now carries its claimant's start beside its pid (`AT_STARTED`, eight bytes
+  at offset 80, the bootstrap layout `SLB5`, which refuses `SLB4` either way): on macOS the start time the kernel keeps
+  for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec` and `pbi_start_tvusec`, in microseconds since
+  1970; the claim service's parent check reads the same record, `exit_watch::bsd_info`); on Windows its creation time
+  (`GetProcessTimes`, 100 ns intervals since 1601). Two processes that held one pid never share a start, since the
+  second starts after the first ended. The daemon takes its watch with `ExitWatch::on_started(pid, started)`:
+  - macOS registers `EVFILT_PROC` with `NOTE_EXIT` first and reads the pid's start after: the note is bound to the
+    process it was registered on (kqueue(2): "If a process can normally see another process, it can attach an event to
+    it"), so the claimant's exit is never missed between the two, and a start that does not match says the process the
+    note holds is not the claimant, which then reads exited at once;
+  - Windows opens the process for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` and compares the creation time
+    (`on_created`, A-447's judgment of the daemon), the open handle keeping the pid while it is held.
+
+  Rejected: the peer's audit token from a socket (`LOCAL_PEERTOKEN`, `<sys/un.h>`) or `GetNamedPipeClientProcessId`:
+  neither claim route has a socket or a pipe. The macOS region is fetched by a Mach message whose audit token the
+  claim service checks against the claim's pid, but the fetch comes after the daemon has seated and watched the client,
+  and from the instance's owner, the anchor when one holds it. A claimant's start is its own word, as its pid is: a
+  process that names another's pid and start fetches no region (macOS checks the fetcher's audit token) and only
+  strands its own seat, which the hostile claimant could already do by claiming.
+- **The deadlines (`crate::deadlines`).** One task a shard, the keeper, sleeps on the shard's timing wheel until the
+  earliest deadline among the staging buffers (their existing expiry index, `Staging::next_expiry`) and the status
+  captures (a new index of seats by their capture's deadline, `ShardState::capture_deadlines`), releases what is due
+  then, and sleeps again; a deadline set earlier than the one it sleeps for (a staging begin or put, a status capture
+  begun) wakes it (`deadlines::noted`), and a later one waits for it to re-arm. Each pass reads only the due entries.
+  A seat is entered once at most (`StatusPages::index` replaces its entry) and a seat that ends takes its entry with it
+  (`deadlines::forget_seat`, in `end_unproven` and the reaper's `finish`). The staging verbs still release what is due
+  at their own call. The shard's task bound counts the keeper (`LOOP_TASKS_PER_SHARD` 6 → 7).
+- **Left on the reap loop's tick:** leases, lapsed CLI attachments, destroys, grants, the owed audit, departed hosts'
+  attachments (A-222), the held copies' reclaim, the pressure hold, NFS purges, base hints with their delegation
+  recalls, the idle seal and the huge-page re-arm.
+- **Tests.** `crates/ipc/src/exit_watch.rs`: `a_watch_by_pid_and_start_takes_no_other_process_for_its_own` (a live
+  child watched by its pid and start is not exited until killed; by its pid and another start, exited at once).
+  `crates/ipc/src/rendezvous.rs`: `a_claim_names_its_process_by_its_pid_and_its_start` (the golden vector: the start
+  eight bytes little-endian at 80, read back into the accepted client) and the magic's golden, `SLB5`.
+  `crates/server/src/hangup.rs`: `a_client_whose_pid_another_process_took_is_ended_at_its_watchs_first_poll`.
+  `crates/server/src/deadlines.rs`: `an_abandoned_staging_buffer_is_released_at_its_expiry_without_a_tick` and
+  `an_abandoned_status_capture_is_released_at_its_deadline_without_a_tick` (a seat that ends takes its entry along).
+- **Evidence.** On the Mac Studio (kiln, d1323898, 2026-11-19 00:30–00:31 UTC, load 15–22, debug build): `cargo test
+  --locked -p slates-ipc --lib` (the exit watch's three tests, the claim's golden, the magic's golden and two claim
+  tests) 6 of 6; `cargo test --locked -p slates-server --lib -- hangup::tests reap::tests deadlines::tests
+  a_retired_clients_offers` 9 of 9: a staging buffer due in 100 ms released 105.6 ms after it began, a status capture
+  due in 100 ms released 101.2 ms after, where the tick took up to a second. Red-checked once on a mutated copy, the
+  macOS watch's start check removed and the keeper never woken by a deadline set: exactly the four tests they guard
+  failed (the exit watch's, the reused pid's, both deadlines'), the rest passed. The Windows arms (the claim's start,
+  `on_started` over `on_created`, the shared process opener that leaves `slates-ipc` two `unsafe` blocks fewer) and
+  the Linux build are filed for main.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line; A-475's owed pid item closed),
+`crates/ipc/src/exit_watch.rs`, `crates/ipc/src/mach_claim.rs`, `crates/ipc/src/rendezvous.rs`,
+`crates/server/src/deadlines.rs` (new), `crates/server/src/hangup.rs`, `crates/server/src/reap.rs`,
+`crates/server/src/daemon.rs`, `crates/server/src/state.rs`, `crates/server/src/staging.rs`,
+`crates/server/src/status_pages.rs`, `crates/server/src/verbs.rs`, `crates/server/src/config.rs`,
+`crates/server/src/lib.rs`, `crates/server/src/shards_route.rs` (rustfmt of A-475's merged call).
+
+### A-491 — An idle give-back step learns its slice from its shard thread's own CPU, not the wall clock (2026-11-18, g230, goal 85; A-226, CLAUDE.md "Bounded work everywhere")
+Applied in the same change to: A-226's entry (a note), GAPS (the give-back slice's entry closed),
+`docs/bugs/2026-11-18-the-give-back-slice-was-learned-from-the-wall-clock.md` (new), and
+`crates/server/src/daemon.rs` (`GiveBackRate`, `learn_give_back_rate`, `shard_thread_cpu_ns`, `spent_since`, and the
+steps `return_dead_recovery` and `purge_write_log`, each timed by a clock it is given) and `crates/server/src/state.rs`
+(`ShardState::give_back_rate` for `give_back_slice_bytes`).
+- **What was there.** Each idle give-back step (the recovery memory no restart reads, A-117 and A-226; the emptied
+  write log's pages) walked a slice learned from the step before: the bytes it walked over the time it took, scaled to
+  the step quantum. The time was the shard's clock, the host's monotonic wall clock, so a step the host descheduled
+  read as slow by every moment it waited and the next slice was cut by as much: at load about 100 a Mac's give-back of
+  18 to 21 ms of CPU took 2,572 to 3,042 steps (GAPS, 2026-11-08), and the recovery test's give-back case failed once
+  under load on adacachy (main's run r271) and passed on its rerun. The per-iteration budget holds a step to a quantum
+  of the shard's own CPU; the slice followed the host's scheduling instead.
+- **The rule.** A step is timed by the shard thread's own CPU clock (`slates_rt::registry::calling_thread_cpu`, the
+  clock the watchdog and the recovery's slices read), which load does not stretch: the slice is the bytes walked per
+  quantum of that CPU. A clock coarser than a step (Windows charges thread time a scheduler tick at a time) shows most
+  steps as no CPU and one as a whole tick, so the steps are folded until the clock shows some, and the slice is their
+  bytes over the CPU shown (`GiveBackRate::fold`). A step that walked nothing, or whose clock reads nothing, teaches
+  nothing. No wall clock is read.
+- **Test.** `a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock` (`daemon`'s unit tests: real
+  give-back steps on a shard whose recovery memory is all dead, timed by a controlled CPU clock: a quantum, half a
+  quantum, then a coarse clock's none, none and a quantum). Expect the slices a page, two pages, two, two, then the
+  three steps' six. Green on the Mac Studio (kiln r154, debug, 0.76 s: 16 KiB pages, a 3,889 ns quantum); red with the
+  steps timed by the wall clock again, which learned 21,239 bytes and then 82,598 from the steps' real wall time where
+  the CPU said 16,384, 32,768 and 98,304. The recovery test's give-back case is filed for main.
+
+### A-529 — A takeover's share is done only once the successor serves each volume it adopted from its own placement (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover", §4.10 "the healer"; the content release signal's first half; A-335, A-276, A-345)
+Applied in the same change to: GAPS (A-335's release entry), `crates/server/src/takeover.rs` (`share_done`,
+`adopted_served`, `served_from_placement`, `adopted_here`) and `crates/server/src/fleet.rs` (`heal_decision`'s adopted
+case, `fleet.heal.adopted_replaced`).
+- **What was there.** A successor confirmed its share once each object it learned was adopted and materialized here
+  (A-345). An adopted volume stays placed where the departed owner's head said (`verbs::materialize_taken_over`), and
+  the head the successor serves names those holders until the healer replaces the placement. So the confirmation said
+  nothing about content: a holder outside the successor's placement had to keep a stale copy's content for good, since
+  a head might still name it (A-335). The healer also left a named member outside the candidates named (A-276).
+- **The rule.** A share is done only when every volume its round adopted is served from this node's own placement:
+  its head snapshot's placement names only this node and the volume's current content candidates. The healer replaces
+  an adopted volume's placement that names a member outside them, where it would otherwise restore it, so the share
+  can finish. A confirmation now certifies that no head the successor serves names a holder outside its placement.
+  An object with no volume here (a catalog, a tombstone, a green), or a volume whose head names no content yet, has
+  nothing to serve.
+- **The cost.** A takeover completes later by the healer's replace of each adopted volume's content, so its retirement
+  stays kept that much longer. Main measures it: time to confirm, before and after.
+- **Tests.** `a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement` (a placement naming the
+  departed owner, one naming a member outside the candidates, and one naming this node and its candidates alone; the
+  share done only with the last) and the healer's decision test with its adopted case. Kiln on the Mac Studio,
+  2026-11-19, debug: `slates-server --lib` `takeover::`, the healer and the holder tests 29 of 29; red once on a
+  mutated copy with the share ignoring the adopted volumes' placement (`[true, true, true]`, every placement done).
+- **Owed.** Holders let a stale copy's content go on such a confirmation or its completion record, under a regional
+  layout bump so a mixed fleet never reads an older build's confirmation as certified. An owner's settle certifies
+  content the same way, and A-508's holders then drop content too. The replace could also run at once for an adopted
+  volume rather than at the healer's cadence.
