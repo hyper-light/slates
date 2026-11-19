@@ -492,7 +492,8 @@ enum Reply {
 /// from the channel [`MountThread::start`] was given and serves it on the owner shard ([`Request::serve`]).
 pub struct Request {
   op: Op<u64>,
-  reply: SyncSender<Reply>,
+  /// Where the reply goes, stamped with the instant it is sent so the waiting thread times its own wake (A-560).
+  reply: SyncSender<crate::reply::Stamped<Reply>>,
   hint: u64,
   /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
   /// dead daemon already applied may be found done.
@@ -994,7 +995,7 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
 /// A served request whose reply is still to be sent.
 pub struct Served {
   reply: Reply,
-  sender: SyncSender<Reply>,
+  sender: SyncSender<crate::reply::Stamped<Reply>>,
   barrier: bool,
   echo: bool,
   restored_read: bool,
@@ -1042,9 +1043,13 @@ impl Served {
     self.reply = Reply::Err(crate::status_unexpected_io_error());
   }
 
-  /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
+  /// Sends the reply to the waiting dispatcher thread, stamped with the instant it is sent (A-560). `false` when that
+  /// thread is gone (the mount is being torn down).
   pub fn send(self) -> bool {
-    self.sender.send(self.reply).is_ok()
+    self
+      .sender
+      .send(crate::reply::Stamped::now(self.reply))
+      .is_ok()
   }
 }
 
@@ -1766,7 +1771,10 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
 
 /// Puts `op` on the mount's channel and answers where its reply will come, or `None` when the mount is gone. Nothing
 /// wakes the mount's task: the caller does, or a later request's wake carries it there (FIFO).
-fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Reply>> {
+fn post(
+  requests: &SyncSender<Request>,
+  op: Op<u64>,
+) -> Option<Receiver<crate::reply::Stamped<Reply>>> {
   let (reply, answer) = sync_channel(1);
   requests
     .send(Request {
@@ -1780,7 +1788,7 @@ fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Reply>> 
 }
 
 /// A posted confirmation's answer, still to be taken ([`confirmed_open`]).
-pub(crate) struct Confirming(Receiver<Reply>);
+pub(crate) struct Confirming(Receiver<crate::reply::Stamped<Reply>>);
 
 /// Posts the confirmation that the driver accepted the open `context` names and wakes the mount's task, without waiting
 /// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
@@ -1805,7 +1813,7 @@ pub(crate) fn post_confirm(
 pub(crate) fn confirmed_open(confirming: &Confirming, wake: &Waker) -> Result<(), WinFspError> {
   let Confirming(answer) = confirming;
   let reply = match answer.try_recv() {
-    Ok(reply) => reply,
+    Ok(stamped) => stamped.reply,
     Err(TryRecvError::Empty) => {
       wake.wake_by_ref();
       crate::reply::await_reply(answer).map_err(|_| WinFspError::MountThread)?
@@ -3189,7 +3197,10 @@ impl MountThread {
   /// Starts the thread, which mounts the volume at `mount_point` (`S:`) — read-only when `read_only`, its names
   /// compared as `search` says (A-551: case-sensitively for an exact volume; a held drive keeps the search its record
   /// names, and [`Ready::search`] reports the one the drive declared) — with its requests sent on `requests` and `wake`
-  /// woken after each, and reports [`Outcome::Mounted`]. Refused only when no thread can start.
+  /// woken after each, and reports [`Outcome::Mounted`]. Refused only when no thread can start. Called on the shard that
+  /// serves the mount: its step quantum is the most the receive thread may spin for a reply (A-560), since a longer
+  /// spin takes more than a step of CPU from the shards; off any shard there is no quantum, and the thread parks at
+  /// once.
   pub fn start(
     mount_point: &str,
     (read_only, search): (bool, NameSearch),
@@ -3201,13 +3212,15 @@ impl MountThread {
     let (commands, command_rx) = sync_channel::<Command>(COMMAND_BOUND);
     let (outcome_tx, outcomes) = sync_channel::<Outcome>(OUTCOME_BOUND);
     let mount_point = mount_point.to_owned();
+    let spin_ceiling =
+      std::time::Duration::from_nanos(slates_rt::futures::step_budget_ns().unwrap_or(0));
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-winfsp".to_owned()),
       move || {
         run_mount(
           &mount_point,
           (read_only, search),
-          (requests, wake),
+          (requests, wake, spin_ceiling),
           &command_rx,
           &outcome_tx,
           open_bound,
@@ -3276,7 +3289,7 @@ impl Drop for MountThread {
 fn run_mount(
   mount_point: &str,
   (read_only, search): (bool, NameSearch),
-  (requests, wake): (SyncSender<Request>, Waker),
+  (requests, wake, spin_ceiling): (SyncSender<Request>, Waker, std::time::Duration),
   commands: &Receiver<Command>,
   outcomes: &SyncSender<Outcome>,
   open_bound: usize,
@@ -3395,7 +3408,7 @@ fn run_mount(
       match crate::dispatcher::Worker::start(
         mounted.file_system.addr(),
         section,
-        open_bound,
+        (open_bound, spin_ceiling),
         outcomes.clone(),
         wake.clone(),
         confirmations,

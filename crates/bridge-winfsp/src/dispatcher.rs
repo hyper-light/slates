@@ -203,10 +203,13 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+  /// Starts the receive thread. `bound` is the open bound, and `spin_ceiling` the most the thread may spin for a reply
+  /// (the step quantum of the shard that started the mount, A-560): the thread learns its window from its own wakes
+  /// under it ([`crate::reply::start`]).
   pub(crate) fn start(
     file_system: usize,
     section: OwnedHandle,
-    bound: usize,
+    (bound, spin_ceiling): (usize, std::time::Duration),
     outcomes: std::sync::mpsc::SyncSender<crate::host::Outcome>,
     wake: std::task::Waker,
     confirmations: SyncSender<crate::host::Request>,
@@ -216,20 +219,19 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        if let Err(error) = crate::reply::measure().and_then(|()| {
-          receive_loop(
-            file_system,
-            section,
-            bound,
-            Receive {
-              stopped,
-              confirmations: &confirmations,
-              wake: &wake,
-              outcomes: &outcomes,
-              private,
-            },
-          )
-        }) {
+        crate::reply::start(spin_ceiling);
+        if let Err(error) = receive_loop(
+          file_system,
+          section,
+          bound,
+          Receive {
+            stopped,
+            confirmations: &confirmations,
+            wake: &wake,
+            outcomes: &outcomes,
+            private,
+          },
+        ) {
           slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
             slates_machine::log_line!(

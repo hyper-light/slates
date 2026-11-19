@@ -31,8 +31,8 @@ use std::process::ExitCode;
 mod apparmor;
 mod args;
 mod format;
-// The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
-// `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
+// The handshake is the library's (`slates_api::container_engine`, A-520), which asks an engine only on Unix, where
+// its poll loop runs; this module prints its answer there, and Windows keeps its refusal (`run_oci_runtime`).
 #[cfg(unix)]
 mod oci_runtime;
 // The self-pipe `slates pmem` reads its signals from, Linux's alone.
@@ -198,9 +198,9 @@ fn run_oci_runtime(runtime: &str) -> Result<(), Failure> {
   oci_runtime::oci_runtime(runtime)
 }
 
-/// The handshake is Unix-only: it polls the engine's CLI through `rustix` and judges the answer with
-/// `slates-bridge-oci`, both `cfg(unix)` dependencies. Windows refuses it rather than pretending to check,
-/// because a bind source this verb has not judged is exactly what it exists to catch.
+/// The handshake is Unix-only: the library polls the engine's CLI there alone (`slates_api::container_engine`, A-520,
+/// which answers `EngineFault::Unsupported` elsewhere). Windows refuses it rather than pretending to check, because a
+/// bind source this verb has not judged is exactly what it exists to catch.
 #[cfg(not(unix))]
 fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
   Err(Failure::Failed(

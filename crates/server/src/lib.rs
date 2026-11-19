@@ -29,6 +29,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+mod carry;
 pub mod catalog;
 pub mod config;
 mod consensus;
@@ -114,6 +115,8 @@ mod delegation;
 mod learned_wait;
 // The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
 mod helper_runs;
+// The anchor's answers on the Windows hold channel, each exchange's wait learned as `learned_wait` learns one (A-552).
+mod anchor_answers;
 mod listing;
 mod lock_ledger;
 pub mod nfs;
@@ -141,6 +144,9 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+// A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
+// (A-548).
+mod reader_patience;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;
 mod recovery_slices;

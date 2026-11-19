@@ -17,7 +17,9 @@ use std::io::Read;
 use std::os::windows::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
-use slates_anchor::handles::{ENV_HANDLES, HandleMessage, WHAT_WINFSP_MOUNT, parse_env};
+use slates_anchor::handles::{
+  ENV_HANDLES, HandleMessage, HoldBounds, WHAT_WINFSP_MOUNT, parse_env,
+};
 use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
 use slates_bridge_core::{Attachments, Rights, View, VolumeBridge};
 use slates_db::catalog::{Principal, VolumeId};
@@ -33,6 +35,13 @@ use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+/// Shape: what the anchor holds in these fixtures: one WinFsp drive's handles and no Shards DAX section, as the
+/// anchor's own tests bound a mount-only hold (`held_windows`'s `attachments(1)`; A-448 split the one bound in two).
+const ONE_MOUNT: HoldBounds = HoldBounds {
+  attachments: 1,
+  sections: 0,
+};
 
 /// Format: the role selected by this fixture, the inherited channel's hex handle and its drive text.
 const ROLE: &str = "SLATES_WINFSP_REQUEST_ROLE";
@@ -210,7 +219,7 @@ fn a_read_taken_before_the_kill_is_settled_after_takeover() {
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(2),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };
@@ -284,7 +293,7 @@ fn a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(1),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };
@@ -1336,7 +1345,7 @@ fn a_close_served_before_the_kill_is_answered_done_after_takeover() {
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(2),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };
@@ -1422,7 +1431,7 @@ fn a_handle_open_across_the_kill_closes_through_the_successor() {
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(2),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };

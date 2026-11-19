@@ -13,6 +13,9 @@ slates-client = { workspace = true }
 slates-ipc = { workspace = true }
 # The loopback HTTP edge runs on a slates shard (AUD-29-23): its accept loop and connections are tasks.
 slates-rt = { workspace = true }
+# The HTTP edge learns how long an honest client takes to show its bearer with RFC 6298's estimator (A-523): the
+# transport's `RttEstimator`, the one every learned wait in slates keeps (the failover estimate's terms, the S3 base's).
+slates-transport = { workspace = true }
 serde_json = { workspace = true }
 # SHA-256 of each skill file for the Skills extension's manifest digests (SEP-2640), from the one crypto library.
 aws-lc-rs = { workspace = true }
