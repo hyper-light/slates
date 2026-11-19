@@ -112,12 +112,26 @@ cc = "1.4"
 # `AWS_LC_SYS_NO_JITTER_ENTROPY`), so AWS-LC seeds from the operating system's generator and a new process pays no
 # start-up latency for its first random bytes. Vetted primitives — the project never hand-rolls cryptography.
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "alloc"] }
-# SHA-1 with collision detection for git's object names (§4.17.2, A-600), as git's own sha1dc detects the SHAttered and
-# later attacks: RustCrypto's pure-Rust port of Stevens and Shumow's sha1collisiondetection (repository
-# RustCrypto/hashes), over RustCrypto's `sha1` and `digest`. Approved by main (2026-11-19) as RustCrypto's, pure Rust,
-# and refusing git's own t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`). No default features: neither
+# SHA-1 with collision detection for git's object names (§4.17.2, A-600) and Mercurial's nodes (§4.17.3, A-588), as git's
+# own sha1dc and Mercurial 7.2's sha1dc binding (`thirdparty/sha1dc/cext.c`) detect the SHAttered and later attacks:
+# RustCrypto's pure-Rust port of Stevens and Shumow's sha1collisiondetection (repository RustCrypto/hashes), over
+# RustCrypto's `sha1` and `digest`. Approved by main (2026-11-19) as RustCrypto's, pure Rust, and refusing git's own
+# t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`, `crates/hg/src/node.rs`). No default features: neither
 # `std` nor the OID tables are used.
 sha1-checked = { version = "0.10.0", default-features = false }
+# zlib's CRC32 (the IEEE polynomial, reflected), which git's pack index keeps of each packed object and `git
+# verify-pack` checks (§4.17.2, A-591): the crate flate2 itself computes zlib's CRC32 with, and flate2 is the
+# workspace's deflate API (A-607), so it costs no code beyond what flate2 brings (approved by main, 2026-11-19, on that
+# reason). slates' own CRC is CRC32C (`slates_wire::crc32c`), another polynomial. Default features: `std` lets it pick
+# ARMv8's CRC instructions or x86-64's carry-less multiply at run time, with a table for the rest, and slates-git keeps
+# no `unsafe` of its own.
+crc32fast = "1"
+# HMAC-MD5 for ra_svn's CRAM-MD5 (RFC 2195; §4.17.4 items 5 and 10, A-599): RustCrypto's pure-Rust `hmac` over its
+# `md-5`, approved by main (2026-11-19) for this mechanism alone. The vendored aws-lc-rs has MD5 (a local change, for S3)
+# but HMAC over the SHA family alone (`vendor/aws-lc-rs/src/hmac.rs`: `Algorithm`'s field is private, and its constants
+# are HMAC with SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512). No default features: neither needs `std`.
+hmac = { version = "0.12.1", default-features = false }
+md-5 = { version = "0.10.6", default-features = false }
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }
@@ -131,6 +145,17 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
+# The deflate engine for git packs, smart HTTP's gzip bodies and Mercurial's GZ streams and revlog chunks (A-607,
+# §4.17.2 piece 3 "chosen by measurement"): flate2's API over zlib-rs, pure Rust. Measured against miniz_oxide on the
+# Mac Studio M3 Ultra, 2026-11-19, over slates' own 4,742 files at e85c17f9f: at git's level 6, deflate 135.0 against
+# 79.4 MB/s and inflate 956.4 against 497.5 MB/s, best of 5 interleaved, output 0.255 against 0.257 of the input
+# (docs/wip/BENCHMARKS.md, "The deflate engine"). Crates name it `flate2.workspace = true`; no crate picks a backend.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# bzip2 for Mercurial's `BZ` bundles (A-598): the bzip2 crate on its default backend, libbz2-rs-sys, a pure-Rust port of
+# libbzip2 1.0.8. Read from crates.io's published packages, 2026-11-19: bzip2 0.6.1 and libbz2-rs-sys 0.2.6 are both
+# `build = false` with Rust sources only, and bzip2 takes libbz2-rs-sys without its default features (`rust-allocator`
+# alone), so neither C nor libc is built or linked. Approved by main once confirmed pure Rust.
+bzip2 = "0.6"
 # The derive macro's parser and emitter (the standard trio); build-time only.
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

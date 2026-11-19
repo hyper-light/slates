@@ -4391,6 +4391,9 @@ mod copy;
 #[cfg(test)]
 mod copy_tests;
 
+mod reanchor;
+pub use reanchor::{ReanchorRefused, Reanchored};
+
 #[cfg(test)]
 mod node_exclusive_tests;
 

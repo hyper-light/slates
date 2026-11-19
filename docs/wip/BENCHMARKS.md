@@ -14567,3 +14567,44 @@ and it was not chased (A-528).
 
 **What it leaves.** Without the replicas, the p99 at 1,000 clients is still 0.23 to 32.9 ms across these rounds: the
 contended rounds, not the replicas' target, are goal 87's next piece.
+
+## The deflate engine for the version-control servers: zlib-rs over miniz_oxide, both pure Rust (A-607; goal 93; 2026-11-19)
+
+§4.17.2 piece 3 names a deflate implementation "chosen by measurement": git's packs, smart HTTP's gzip request bodies
+and Mercurial's GZ streams and zlib revlog chunks all inflate and deflate through it. Both candidates sit behind
+flate2's one API, so the choice is a feature of the workspace's `flate2` entry and no server code depends on it.
+
+- **Machine:** Mac Studio, Apple M3 Ultra (32 cores), macOS, 2026-11-19 03:35 UTC; load average 3.40 at the start and
+  3.56 at the end (agents' builds on the same box).
+- **Data:** every file of slates' tree at e85c17f9f (`.git` and `target` skipped), each compressed and inflated as its
+  own zlib stream, the way git stores each object: 4,742 files, 132.1 MB.
+- **Command:** a scratch program outside the tree (`~/.cache/main-deflate-ab` on the Studio): one source, built once per
+  backend with `--features miniz` (flate2's `rust_backend`) and `--features zlibrs` (flate2's `zlib-rs`) into separate
+  target directories, `cargo build --release`; each run reuses one stream per direction with `reset()` and checks
+  every round trip (all passed). Runs alternate between the two binaries, five pairs at level 6, then five at level 1.
+- **zlib-ng was not measured:** its build needs cmake, which the Studio lacks. It is C, and the pure-Rust zlib-rs is
+  the one that entered.
+
+| level 6, run | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| zlib-rs deflate MB/s | 135.0 | 124.5 | 133.2 | 125.2 | 126.5 |
+| miniz_oxide deflate MB/s | (66.9)* | 79.4 | 76.4 | 77.7 | 76.5 |
+| zlib-rs inflate MB/s | 956.4 | 853.5 | 925.6 | 879.3 | 876.1 |
+| miniz_oxide inflate MB/s | (390.7)* | 475.8 | 462.6 | 482.4 | 497.5 |
+
+Output against input: zlib-rs 0.255, miniz_oxide 0.257.
+
+\* miniz_oxide's first level-6 run read 2,027 files of a checkout still being written, so it is shown, not compared.
+
+Best of five: zlib-rs deflates 1.70 times as fast (135.0 against 79.4 MB/s) and inflates 1.92 times as fast (956.4
+against 497.5 MB/s), with slightly smaller output. The level-1 runs met the same checkout still being written
+(1,449 to 1,976 files, 34.9 to 37.4 MB, each pair on nearly the same files). zlib-rs deflated at 310.8 to 316.8 against
+229.5 to 235.9 MB/s and inflated at 765.6 to 779.5 against 334.5 to 340.7 MB/s; miniz_oxide's level 1 compressed
+smaller, 0.401 against 0.435.
+
+Decision: zlib-rs, through flate2's `zlib-rs` feature in the workspace's `flate2` entry (A-607). Measured and rejected:
+miniz_oxide, slower in both directions at both levels.
+
+Consequence for tests: two deflate engines need not write the same bytes for one input. A golden test holds what the
+inflated stream means (its bytes and its object id), never a stock tool's compressed bytes.
+

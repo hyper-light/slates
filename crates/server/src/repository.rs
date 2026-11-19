@@ -19,6 +19,11 @@
 //! recovery can still branch from, `UnknownBase`; a fenced source `ContentUnavailable`; the partition's tables at their
 //! derived capacity `TableAtCapacity`.
 //!
+//! **The register (A-603).** Every change a verb makes of a repository is one entry of the repository's register at its
+//! next position (`slates_db::repository`): a repository's root joining and its default branch's binding, a branch's
+//! member joining and its name's binding, a bind, a retire, and every version of a member ([`version_record`]), so
+//! the register counts every change and its checks read one position.
+//!
 //! **Durability.** Each verb's records commit as one atom with its completion record (the verb's transaction), the
 //! engine installed only after them: a refused record leaves no engine ahead of its log, and a rolled-back one is undone
 //! by `verbs::reconcile_unpublished_effects`. A member is rebuilt at recovery the way it joined, in the order it joined
@@ -29,9 +34,9 @@
 //! its id.
 
 use slates_db::catalog::{
-  BaseRecord, BranchRecord, MemberOrigin, MemberRecord, NamePolicy as DbNamePolicy, PolicyRecord,
-  Principal, RepositoryId, RepositoryRecord, Role, SnapshotId as DbSnapshotId,
-  VolumeId as DbVolumeId, VolumeRecord, VolumeState,
+  BaseRecord, GreenVersion, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy,
+  PolicyRecord, Principal, RepositoryEntry, RepositoryId, RepositoryRecord, Role,
+  SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::op::Op;
 use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, VcsTool, VolumeId};
@@ -93,6 +98,56 @@ fn record(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
     .mutate(&mut state.segment, op, now)
     .map(|_| ())
     .map_err(|error| refusal_of_db(&error))
+}
+
+/// An entry of `repository`'s register at its next position, changing nothing yet (A-603): `NotFound` for no such
+/// repository.
+fn next_entry(state: &ShardState, repository: RepositoryId) -> Result<RepositoryEntry, Refusal> {
+  let position = state
+    .db
+    .partition()
+    .repositories()
+    .position(repository)
+    .ok_or(Refusal::NotFound)?;
+  Ok(RepositoryEntry {
+    repository,
+    position,
+    ..RepositoryEntry::default()
+  })
+}
+
+/// The record of `green`'s `version` and its chain entry: an entry of its repository's register when it is a member of
+/// a repository that stands, which every version of a repository's green is (§4.17.1 shared piece 2, A-603), else the
+/// green's own `GreenAdvanced`.
+pub(crate) fn version_record(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+  entry: Vec<u8>,
+) -> Op {
+  let repositories = state.db.partition().repositories();
+  let register = repositories
+    .member(green)
+    .map(|member| member.repository)
+    .and_then(|repository| Some((repository, repositories.position(repository)?)));
+  match register {
+    Some((repository, position)) => Op::RepositoryAdvanced {
+      entry: RepositoryEntry {
+        repository,
+        position,
+        versions: vec![GreenVersion {
+          green,
+          version,
+          entry,
+        }],
+        ..RepositoryEntry::default()
+      },
+    },
+    None => Op::GreenAdvanced {
+      green,
+      increment: entry,
+    },
+  }
 }
 
 /// The repository named `name` on this partition, when `principal` owns it: `NotFound` for none, `Forbidden` for
@@ -285,26 +340,18 @@ fn record_repository(
     }
     (None, None) => return Err(Refusal::NotFound),
   };
-  record(
-    state,
-    &Op::RepositoryGreenJoined {
-      record: MemberRecord {
-        repository,
-        green: root,
-        origin: MemberOrigin::Root,
-      },
-    },
-  )?;
-  record(
-    state,
-    &Op::RepositoryBranchAdded {
-      record: BranchRecord {
-        repository,
-        name: default_branch.to_owned(),
-        green: root,
-      },
-    },
-  )?;
+  // The root joins and the default branch binds it in one entry of the new register (A-603).
+  let mut entry = next_entry(state, repository)?;
+  entry.joined.push(MemberRecord {
+    repository,
+    green: root,
+    origin: MemberOrigin::Root,
+  });
+  entry.names.push(NameChange::Bind {
+    name: default_branch.to_owned(),
+    green: root,
+  });
+  record(state, &Op::RepositoryAdvanced { entry })?;
   Ok(root)
 }
 
@@ -442,30 +489,22 @@ fn record_branch(
     record: member_record(state, principal, (id, named), require_evidence),
   };
   admits(state, &created)?;
+  // The member joins and its name binds it in one entry of the repository's register (A-603).
+  let mut entry = next_entry(state, repository.id)?;
+  entry.joined.push(MemberRecord {
+    repository: repository.id,
+    green: id,
+    origin: MemberOrigin::Branch {
+      from: source,
+      version,
+    },
+  });
+  entry.names.push(NameChange::Bind {
+    name: name.to_owned(),
+    green: id,
+  });
   record(state, &created)?;
-  record(
-    state,
-    &Op::RepositoryGreenJoined {
-      record: MemberRecord {
-        repository: repository.id,
-        green: id,
-        origin: MemberOrigin::Branch {
-          from: source,
-          version,
-        },
-      },
-    },
-  )?;
-  record(
-    state,
-    &Op::RepositoryBranchAdded {
-      record: BranchRecord {
-        repository: repository.id,
-        name: name.to_owned(),
-        green: id,
-      },
-    },
-  )?;
+  record(state, &Op::RepositoryAdvanced { entry })?;
   Ok(id)
 }
 
@@ -480,19 +519,15 @@ pub(crate) fn bind_branch(
     Ok(record) => record,
     Err(reply) => return reply,
   };
-  let green = to_db_volume(green);
-  let member = state.db.partition().repositories().member(green).cloned();
-  if member.is_none_or(|member| member.repository != record.id) {
-    return refused(Refusal::NotFound);
-  }
-  let op = Op::RepositoryBranchAdded {
-    record: BranchRecord {
-      repository: record.id,
+  // One entry of the repository's register (A-603), whose guard binds a member of this lineage only.
+  let entry = next_entry(state, record.id).map(|mut entry| {
+    entry.names.push(NameChange::Bind {
       name: name.to_owned(),
-      green,
-    },
-  };
-  match self::record(state, &op) {
+      green: to_db_volume(green),
+    });
+    entry
+  });
+  match entry.and_then(|entry| self::record(state, &Op::RepositoryAdvanced { entry })) {
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
   }
@@ -508,11 +543,14 @@ pub(crate) fn retire_branch(
     Ok(record) => record,
     Err(reply) => return reply,
   };
-  let op = Op::RepositoryBranchRetired {
-    repository: record.id,
-    name: name.to_owned(),
-  };
-  match self::record(state, &op) {
+  // One entry of the repository's register (A-603).
+  let entry = next_entry(state, record.id).map(|mut entry| {
+    entry.names.push(NameChange::Retire {
+      name: name.to_owned(),
+    });
+    entry
+  });
+  match entry.and_then(|entry| self::record(state, &Op::RepositoryAdvanced { entry })) {
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
   }
@@ -812,6 +850,79 @@ mod tests {
       );
       assert_eq!(refusal(outside), Refusal::NotFound);
       assert_eq!(state.greens.busy_lends(), 0);
+    });
+  }
+
+  /// A-603 (§4.17.1 shared piece 2: every change of a repository is one entry of its register). Do: create a repository,
+  /// write its root twice, branch it at a version it folded and then at its head, retire the branch's name and bind it
+  /// again, write the branch; then write a green no repository holds, and send a bind the register refuses. Expect: the
+  /// create is one entry, and each verb and each member's version takes exactly one position more, its chain entry
+  /// recorded under the green; the refused branch, the lone green's version and the refused bind take none.
+  #[test]
+  fn every_verb_and_every_members_version_is_one_entry_of_the_register() {
+    crate::daemon::audit_on_shard(|state| {
+      let root = green_of(create(state, "tree", "main"));
+      let repo = repository(state, "tree");
+      let position = |state: &ShardState| state.db.partition().repositories().position(repo);
+      assert_eq!(position(state), Some(1), "the create is one entry");
+      write(state, root, b"v1", 1);
+      write(state, root, b"v2", 2);
+      assert_eq!(position(state), Some(3));
+      assert_eq!(state.db.partition().green_head(to_db_volume(root)), 2);
+      // No reader held version 1, so the root folded it: a branch there is refused before any record, and takes no
+      // position.
+      assert!(matches!(
+        refusal(branch(state, ("tree", "early", "main"), Some(1))),
+        Refusal::UnknownBase { .. }
+      ));
+      assert_eq!(position(state), Some(3));
+      let topic = green_of(branch(state, ("tree", "topic", "main"), None));
+      assert_eq!(position(state), Some(4));
+      let retired = ask(
+        state,
+        &owner(),
+        RequestBody::RetireBranch {
+          repository: "tree".to_owned(),
+          name: "topic".to_owned(),
+        },
+      );
+      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+      let bound = ask(
+        state,
+        &owner(),
+        RequestBody::BindBranch {
+          repository: "tree".to_owned(),
+          name: "topic".to_owned(),
+          green: topic,
+        },
+      );
+      assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
+      assert_eq!(position(state), Some(6));
+      write(state, topic, b"t1", 3);
+      assert_eq!(position(state), Some(7));
+      assert_eq!(state.db.partition().green_head(to_db_volume(topic)), 1);
+      let lone = green_of(ask(
+        state,
+        &owner(),
+        RequestBody::CreateGreen {
+          name: "lone".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ));
+      write(state, lone, b"l1", 4);
+      assert_eq!(state.db.partition().green_head(to_db_volume(lone)), 1);
+      let taken = ask(
+        state,
+        &owner(),
+        RequestBody::BindBranch {
+          repository: "tree".to_owned(),
+          name: "main".to_owned(),
+          green: topic,
+        },
+      );
+      assert!(matches!(refusal(taken), Refusal::AlreadyExists { .. }));
+      assert_eq!(position(state), Some(7));
     });
   }
 

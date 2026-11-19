@@ -40,8 +40,10 @@ pub enum Mapped {
 
 /// The content effect of one op on this path, as `(at, old_len, new_len)` in the op's version
 /// coordinates: `old_len` base bytes at `at` become `new_len` bytes. A namespace op (create,
-/// rename, mode, xattr) has no byte-coordinate effect and returns `None`.
-fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
+/// rename, mode, xattr) has no byte-coordinate effect and returns `None`. A review comment's step
+/// sums these to judge whether a delta accounts for its file's change of length
+/// (`crate::review::move_through`, A-596).
+pub(crate) fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
   match op.kind {
     OpKind::Overwrite => Some((op.at, op.len, op.len)),
     OpKind::Insert | OpKind::Extend => Some((op.at, 0, op.len)),

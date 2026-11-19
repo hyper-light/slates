@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype xmlns="DAV:"/><getcontentlength xmlns="DAV:"/><deadprop-count xmlns="http://subversion.tigris.org/xmlns/dav/"/><version-name xmlns="DAV:"/><creationdate xmlns="DAV:"/><creator-displayname xmlns="DAV:"/></prop></propfind>
