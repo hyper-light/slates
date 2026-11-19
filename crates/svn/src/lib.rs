@@ -8,8 +8,10 @@
 //! gives it, computed from the revisions' changed-path records ([`index`], A-553); the lock table with the check a
 //! commit meets, each guard returning the register entries it decided ([`lock`], A-602); the commit rule, the drive's
 //! out-of-date test and FSFS's merge at commit stated on that index, whether a work built on a base revision commits on
-//! the head or which conflict refuses it, its lock check the table's ([`commit`], A-592); and authorization, the authz
-//! file read as Subversion reads it and evaluated with its precedence for each principal ([`authz`], A-606).
+//! the head or which conflict refuses it, its lock check the table's ([`commit`], A-592); the HTTP side's bodies, the
+//! XML stock clients send over `http://` and `mod_dav_svn` answers, read within bounds and written byte for byte
+//! ([`dav`], A-609); and authorization, the authz file read as Subversion reads it and evaluated with its precedence
+//! for each principal ([`authz`], A-606).
 //!
 //! Nothing here performs I/O, reads a clock or draws randomness; every refusal is a typed value that names the
 //! Subversion error a client is answered with. The evidence is `docs/wip/research/vcs-servers-subversion.md`.
@@ -22,6 +24,7 @@
 
 pub mod authz;
 pub mod commit;
+pub mod dav;
 pub mod handshake;
 pub mod index;
 pub mod lock;

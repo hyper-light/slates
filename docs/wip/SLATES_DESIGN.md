@@ -12435,6 +12435,22 @@ signature verification).
 > each text from `hg debugdata`, each log from `hg debugindex --debug`, and what 7.2's own readers read; the command
 > in `make-object-fixtures.sh`, run twice, byte for byte alike) and against SHAttered's two prefixes. Still owed from
 > piece 3: the index's tables, and an existing store's import, whose zlib and zstd chunks A-607's engines now inflate.
+>
+> **Status (2026-11-19, A-598: piece 1's compressed streams built; piece 1 whole).** `slates-hg` makes a compressed
+> bundle plain (`compression::plain`) as 7.2's own relay of a bundle2 does (`_forwardchunks`): a bundle1's zlib
+> (`HG10GZ`) or bzip2 (`HG10` and the stream's own `BZ`) changegroup inflated behind `HG10UN`, and a bundle2's stream
+> inflated after its stream parameters, its `Compression` (`GZ`, `BZ` or `ZS`) dropped from them; an uncompressed
+> bundle comes back borrowed. The memory each stream's header sizes for its decoder (zlib's window, the tables of the
+> bzip2 block it names, libzstd's two buffers for the frame's window, held equal to libzstd's own count) and every byte
+> of room for inflated bytes are charged to the caller's admission before they are held, so a compression bomb, or a
+> window claimed past the admission, is refused by kind with nothing past it held. A plain bundle is compressed as 7.2
+> writes one (`compression::compress_bundle`), at the caller's level within each engine's range. The engines: flate2
+> over A-607's zlib-rs, bzip2 on its pure-Rust libbz2-rs-sys, the workspace's zstd. Proven against the five compressed
+> bundles stock 7.2 wrote of piece 1's repository (`crates/hg/fixtures/compressed`, the command in
+> `make-compressed-fixtures.sh`, checked by `SHA256SUMS`), each made plain to exactly the uncompressed bundle 7.2 wrote,
+> and against 7.2's server's zstd answer to a clone's `getbundle`; every cut is refused as cut short, a bit flipped at
+> every place is refused or judged, never a panic. A stream is inflated whole in one call, its work bounded by the
+> admission; inflating it in slices within the shard's step budget comes with push intake (piece 5).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12810,8 +12826,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, A-545, `crates/hg`): the
-   framings, bundle1, the deltas and the parts' payloads; owed: compressed streams (`GZ`, `BZ`, `ZS`, D-17).
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, A-545, A-598,
+   `crates/hg`): the framings, bundle1, the deltas, the parts' payloads, and the compressed streams (`GZ`, `BZ`, `ZS`).
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping. Built (A-569, `crates/hg`: `ssh`, `http`,
@@ -12914,6 +12930,14 @@ and export by landing).
 > the one the successful attempt proved; three hostile inputs no stock client sends are refused where `svnserve` reads
 > them through a C string or to 64 levels (item 10's text below). Owed with the rest of piece 7: the URL's canonical
 > form, the repository it names and the root URL `repos-info` carries, as `find_repos` derives them.
+>
+> **Status (2026-11-19, A-609).** Built: piece 13's first part, the HTTP side's bodies (`slates-svn`'s `dav`). It has
+> a bounded XML reader that refuses every DTD, so no entity is declared or expanded. It decodes OPTIONS, PROPFIND,
+> MERGE and ten REPORTs as `mod_dav_svn` reads them, and writes the answers byte for byte as `mod_dav_svn` writes them:
+> OPTIONS with the HTTPv2 headers, a multistatus, the MERGE answer, and every report's but the two editor drives. The
+> request bodies are stock svn 1.15.0's own, recorded against a responder on the Mac Studio. Owed (part 2): the
+> update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK, `list-report` and `file-revs-report`; main's run
+> captures against Apache with `mod_dav_svn`.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13367,7 +13391,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
    log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
-13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
+13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
+    (A-609); the editor drives and the write methods' bodies are its second.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -40554,6 +40579,166 @@ and its tests (new), `crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/prot
   all or none, a mismatch refusing the repository on that holder; a takeover adopts whole entries; and the repository
   record replicated with it (A-515's owed half). Until then each member's version ships on its green's own register, so
   in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
+
+### A-598 — Mercurial's compressed bundles: zlib, bzip2 and zstd streams made plain within the caller's admission, and plain bundles compressed as stock Mercurial 7.2 writes them (2026-11-19, g079 for UI goal 92 (kiln 51cef9f7); §4.17.3 piece 1; §4.9; D-17; A-514, A-569, A-607)
+Applied in the same change to: §4.17.3 (its status, and piece 1 built whole), `crates/hg` (`compression`, new;
+`bundle2`: `Compression`'s `GZ`, `BZ` and `ZS` read, a stream still compressed refused, `Compression` named twice
+refused, `sized` and `stream_params` open to the crate; `bundle1`'s documentation; `fixtures/compressed/` with
+`make-compressed-fixtures.sh` and `SHA256SUMS`; `bzip2`, `flate2` and `zstd` as its dependencies), `Cargo.toml`
+(`bzip2`, with what was read of it), `Cargo.lock` (bzip2, libbz2-rs-sys, flate2 and zlib-rs added, nothing else
+moved), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§16).
+- **What it does.** `compression::plain` gives a bundle as the plain bundle of its kind: an uncompressed one borrowed
+  as it is; a bundle1's changegroup inflated behind `HG10UN`, from `HG10GZ`'s zlib stream or from the bzip2 stream after
+  `HG10`, whose own magic `BZ` completes the header; a bundle2's stream inflated after its stream parameters, its
+  `Compression` dropped from them, exactly as 7.2 relays a bundle2 (`unbundle20._forwardchunks`). `Bundle2::decode` and
+  `bundle1::changegroup` read the plain bundle and refuse one still compressed by kind. `compression::compress_bundle`
+  writes a plain bundle compressed as 7.2 writes one (`Compression=<type>` first among a bundle2's stream parameters,
+  as `writebundle` sets it before any other; `HG10GZ`, or `HG10` and a bzip2 stream); `compression::inflate` and
+  `compression::compress` are one stream's, for the wire's `0.2` framing when it is served (piece 4).
+- **Decided: nothing held that the admission did not grant first.** Before a decoder is made, the memory its stream's
+  header sizes is charged: zlib's 32 KiB window (RFC 1950's largest, which flate2 asks of its backend whatever the
+  header says), the bzip2 block's tables (one 32-bit entry per byte of the block size its header digit names, the `tt`
+  of libbzip2 and libbz2-rs-sys; the bzip2 manual's "4 × block size"), or libzstd 1.5.7's input and output buffers for
+  the frame's window (`ZSTD_decompressStream`, `ZSTD_decodingBufferSize_internal`: a block, and the window and two
+  blocks with their copy slack, never past the content's size), read from the frame header by the RFC 8878 rules and
+  held to libzstd's own `ZSTD_sizeof_DCtx` by a test; libzstd is let accept no larger window (`ZSTD_d_windowLogMax`).
+  Then room for inflated bytes is charged before it is reserved: the compressed stream's own length first, then as
+  much again as is inflated so far, never past what is left. A stream needing more is refused `PastAdmission`, a
+  compression bomb refused by kind, the room it held exactly what was granted; a call's work is bounded with it.
+- **Decided: a zstd stream is one frame that names its content's size.** 7.2's reader reads one frame (python-zstandard's
+  `decompressobj` finishes at a frame's end and Mercurial reads that as the stream's end), so a second frame would be
+  lost; naming the size lets libzstd size the window to the content, so a small bundle costs its reader little, where
+  7.2's own writer names no size and asks every reader for a 2 MiB window.
+- **Decided: the level is the caller's.** Each engine's range is its own (zlib 0 to 9, bzip2 1 to 9, zstd from
+  `ZSTD_minCLevel` to `ZSTD_maxCLevel`, an uncompressed stream 0); a level outside it is refused by kind, never clamped,
+  and 7.2's zlib `-1` is the caller's to name as zlib's default, 6. The choice of engine and level is §4.17.3's learned
+  response compression (piece 4), not this codec's.
+- **From the sources.** Mercurial 7.2's `utils/compression.py` (the engines' bundle types, `supportedbundletypes`, the
+  stream readers: zlib's end found by feeding a copy one byte, bz2's by `EOFError`, zstd's by a `ZstdError` after its
+  one frame; `_TruncatedBZ2CompressedStreamReader` feeding `BZ` back), `bundle2.py` (`processcompression`,
+  `bundle20.setcompression` and `getchunks`, `unbundle20.iterparts` and `_forwardchunks`, `bundletypes`,
+  `writebundle`), `changegroup.py` (`cg1unpacker`), `exchange.py` (`readbundle`) and `bundlecaches.py`
+  (`_bundlespecv1compengines`), from `mercurial-7.2.tar.gz` (SHA-256 `a250227e…`); RFC 1950 and RFC 8878; libzstd
+  1.5.7's `zstd_decompress.c` (zstd-sys 2.1.0); libbz2-rs-sys 0.2.6's `decompress.rs`.
+- **Stricter than 7.2, on purpose.** 7.2 reads lazily and stops at the bundle's end, so it ignores bytes after a
+  compressed stream and a zlib trailer it never reached; slates inflates the whole stream and refuses a stream cut short
+  anywhere and bytes after its end. 7.2's set of bundle types holds `_truncatedBZ` and, for a bundle1, `ZS`, so its
+  readers take `Compression=_truncatedBZ` and `HG10ZS`, which no 7.2 writer makes; slates refuses both as unknown. A
+  bundle2 naming `Compression` twice, in any case, is refused (7.2 takes the last, so two readers could inflate one
+  stream two ways). A zstd stream must open with a standard frame, so libzstd's legacy formats are never reached.
+- **The engines.** zlib through flate2's own API on A-607's zlib-rs, naming no backend; bzip2 through the `bzip2` crate
+  0.6.1 on its default libbz2-rs-sys 0.2.6, both `build = false` with Rust sources only, libbz2-rs-sys without its
+  default features (no libc), approved by main once confirmed pure Rust; zstd through the workspace's `zstd` 0.13.3
+  (libzstd 1.5.7). bzip2's `Compression::new` panics outside 1 to 9 and libzstd's `DCtx::create` on a failed
+  allocation, so the codec calls `Compression::try_new` and `DCtx::try_create`, each failure a typed refusal.
+- **Golden vectors.** `crates/hg/fixtures/compressed`: the bundles stock Mercurial 7.2 (PyPI, through `uvx`, CPython
+  3.12) wrote of piece 1's repository as `gzip-v1`, `bzip2-v1`, and `gzip-v2`, `bzip2-v2` and `zstd-v2` with
+  changegroup `02`, phases and markers, each engine at 7.2's default level; made by `make-compressed-fixtures.sh` on the
+  Mac Studio (macOS 26.4, arm64), 2026-11-19, its header naming the exact command, the run comparing its uncompressed
+  twins with `fixtures/cg01.hg` and `cg02.hg` byte for byte; `SHA256SUMS` checked after the copy, 5 of 5. And A-569's
+  capture of 7.2's server answering a clone's `getbundle` with `zstd` (`fixtures/wire/http-clone.03.response-body`),
+  one frame of another path of 7.2's.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 174 of 174 in 1.59 s
+  (load 6.9), 16 of them this piece's; `cargo fmt -p slates-hg -- --check` clean. Golden: each compressed bundle made
+  plain to exactly the bundle 7.2 wrote uncompressed, and the uncompressed ones borrowed; 7.2's wire answer inflated
+  into a bundle2 that decodes; libzstd holding exactly the 2,490,432 bytes charged for 7.2's 2 MiB window; each plain
+  bundle compressed by every engine its kind takes, at each engine's lowest and highest level and 7.2's default,
+  framed as 7.2 frames it and made plain to itself (never compared with 7.2's compressed bytes: A-607). Hostile: every
+  proper prefix of each golden bundle refused as cut short; a bit flipped in every byte, every bit place met, refused
+  or, for zlib and bzip2, whose checksums cover what they inflate, inflated to the bundle 7.2 wrote; a byte after each
+  stream refused; unknown engines (`XZ`, `gz`, `_truncatedBZ`, none, `HG10ZS`, `HG10XX`) refused before anything is
+  inflated; 8 MiB of zeros from each engine refused within 1 MiB, the room held exactly 1 MiB; 2 GiB and 2 TiB zstd
+  windows and a 900,000-byte bzip2 block refused before a decoder is made; exactly a bundle's need making it plain with
+  nothing left, a byte less refused; levels outside each range, zstd for a bundle1 and bundles not plain refused with
+  nothing written; properties: arbitrary bundles round-tripping through every engine, arbitrary bytes after each
+  engine's header never panicking and never handed back as plain. Red: the same tests against the four entry points
+  stubbed (bundles passed through, nothing inflated or compressed), each arm in its own target directory: 14 of 16
+  failed; the two that passed exercise what the stubs left (the decoders refusing a stream still compressed; libzstd's
+  count). A first red and green pair shared one target directory and is discarded: cargo names a workspace member's
+  build by its path within the workspace, so the green clone ran the red clone's test binary (the stubs' 25 dead-code
+  warnings showed it). The first build's one error: proptest's `prop_assert!` makes its stringified condition a format
+  string, which a condition holding `{ .. }` breaks.
+- **Owed.** A stream is inflated whole in one call; inflating it in slices within the shard's step budget comes with
+  push intake (piece 5), with the inflater made resumable there. Serving the wire's `0.2` answers compressed, and
+  choosing the engine and level by the learned cost model, is piece 4's. Not read: a headerless bundle1 (7.2's
+  `headerlessfixup`, for old clients' `unbundle`) and stream-clone bundles (`HGS1`, piece 9).
+
+### A-609 — The HTTP side's bodies: a bounded XML reader with no DTD ever, the requests ra_serf sends decoded as mod_dav_svn reads them, and the answers written as it writes them (2026-11-19, g250, UI goal 93; §4.17.4 item 5 and piece 13's first part; A-500)
+Applied in the same change to:
+- §4.17.4's status and its pieces, and GAPS (the §4.17.4 entry);
+- `crates/svn` (`dav.rs`, `dav/xml.rs`, `dav/request.rs`, `dav/response.rs`, `dav/time.rs`, `dav/tests.rs` and
+  `dav/fixtures/*.xml`, all new; `lib.rs`);
+- `research/vcs-servers-subversion.md` (§1: the HTTP sources with their hashes; §3: "The bodies, the code").
+
+- **The reader.** A body is read whole, within the caller's bounds: its bytes, depth, name length, attributes and
+  elements, each refused past its bound (HTTP 413). Every refusal is typed and names the byte it stopped at. What it
+  refuses:
+  - bytes that are not UTF-8, or a declaration naming another encoding;
+  - a `DOCTYPE`, so no entity is ever declared or expanded, and a billion laughs is refused at its DTD's first byte;
+  - any entity but XML's five, a character reference XML 1.0 does not allow, and a processing instruction;
+  - an unbound prefix, a mismatched end tag, a duplicate attribute, and text after the root;
+  - a body cut anywhere.
+
+  It keeps what expat keeps: line breaks normalized, attribute whitespace normalized, CDATA as text, comments dropped.
+- **The requests.** OPTIONS, PROPFIND and MERGE (the transaction, its flags, its properties, and the lock-token list
+  paired as `version.c` pairs it), and ten REPORTs: `update-report`, `log-report`, `dated-rev-report`,
+  `get-locations`, `get-location-segments`, `get-locks-report`, `mergeinfo-report`, `get-deleted-rev-report`,
+  `inherited-props-report` and `replay-report`. Each report is read as its handler reads it:
+  - the `svn:` namespace is required;
+  - children in another namespace are skipped, and unknown `svn:` children are ignored;
+  - what the handler requires is required;
+  - paths are canonical;
+  - an unknown report is 501.
+
+  Stricter than `mod_dav_svn`, stated: a revision is decimal where `atol` reads garbage as 0, a date is
+  `svn_time_to_cstring`'s form, a path holds no `.` or `..` and is no URL, and only UTF-8 is read.
+- **The answers.** Each is written byte for byte as the source writes it: `DAV_XML_HEADER`, then `DEBUG_CR`, a line
+  feed in httpd 2.4.66; `apr_xml_quote_string`'s escapes with each call site's quotes flag; base64 in
+  `svn_base64_encode_string2`'s lines where `svn_xml_is_xml_safe` fails; and `svn_xml_fuzzy_escape` for a log
+  message. The quirks are kept: `<S:owner >`, and the empty line where a MERGE's post-commit error would stand. The
+  answers written:
+  - OPTIONS: its `DAV` lines, and the HTTPv2 headers only when the activity collection is asked for;
+  - `dated-rev-report` and `get-deleted-rev-report`;
+  - `get-locations`, `get-location-segments` and `get-locks-report`;
+  - `mergeinfo-report`, `inherited-props-report` and `log-report`;
+  - the MERGE answer;
+  - a multistatus, modeled on `mod_dav`'s writer with `mod_dav_svn`'s `lp1` and `lp2`.
+
+  Departure, stated: a custom revision property's name has its quotes escaped, where `mod_dav_svn` would break the
+  attribute.
+- **Golden vectors.** No `mod_dav_svn` runs on the Mac Studio: macOS's Apache has `mod_dav` only, and Homebrew's
+  Subversion ships no module. So stock svn 1.15.0 (Homebrew) was run there against a recorded responder: a canned
+  server that records each request and answers plausibly, so the client goes on. The run made 22 request bodies:
+  - OPTIONS, and the chunked probe's empty `<D:options/>`;
+  - four PROPFINDs;
+  - three log-reports;
+  - every other report but `get-deleted-rev-report`;
+  - four update-reports, from checkout, `svnrdump`, update and `status -u`;
+  - a MERGE.
+
+  `get-deleted-rev-report`'s body is ra_serf's own writer's (`get_deleted_rev.c`). The responder's answers are no
+  evidence; only the requests are. The response bytes come from the source code, since no live server answered.
+- **Tests and the run.** 24 tests:
+  - each captured body decoded;
+  - every proper prefix of every captured body refused, or the same reading where only trailing whitespace was cut;
+  - a billion laughs, an external entity and an unknown entity;
+  - every bound and every grammar refusal;
+  - RFC 4648's base64 vectors in svn's lines;
+  - dates written and read, and every 97th day from 1970 to 9999 round-tripped;
+  - each answer byte for byte, and read back by the reader.
+
+  `cargo test --locked -p slates-svn --lib` passed 98 of 98 on the Mac Studio (debug, 2026-11-19), and fmt was clean.
+  Red once, on a copy that read an unknown entity as `?`: the entity test failed.
+- **Owed.** Part 2 of piece 13:
+  - the update-report response (the editor drive, svndiff windows in base64 through the built codec);
+  - the replay editor drive;
+  - PROPPATCH, LOCK and UNLOCK bodies, and `list-report` and `file-revs-report`;
+  - the server that drives these.
+
+  Main's:
+  - a live capture against Apache with `mod_dav_svn` 1.14 or 1.15, comparing every fixture and every answer byte for
+    byte;
+  - clippy and `cargo xtask check` on `slates-svn`.
 
 ### A-606 — Subversion's authorization file, parsed as Subversion parses it and evaluated with its precedence, where its code departs from its own documentation the documentation followed (2026-11-19, g229, UI goal 92; §4.17.4 item 10 and piece 10; A-500)
 Applied in the same change to:
