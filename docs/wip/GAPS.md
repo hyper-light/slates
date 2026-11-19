@@ -865,19 +865,22 @@
 > its repository's shard, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the
 > shard lacks (until the site is handed A-662's stores, after which that path goes), the media type named as the reply
 > begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
-> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, each its own piece with its
-> failing test first (main's to start): the zlib bound an answer is charged before it is compressed is stock zlib's
-> `compressBound`, which the linked zlib-rs's level 1 outgrows on bytes that do not compress (65,536 of the bytes its
-> fixed codes write in nine bits came to 73,721 against 65,569; Windows x86_64, jupiter, kiln r92, 2026-11-19), so a
-> compressor choosing zlib above level 0 could hold an answer up to about an eighth of its stream past its charge (the
-> site's first value takes zlib at level 0, stored, within it); and a query's fields past the request's room are `400`
-> where a path past it is `414`.
+> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, its own piece with its failing
+> test first (main's to start): a query's fields past the request's room are `400` where a path past it is `414`.
 > **Built (A-675):** the daemon's import of a Mercurial repository's directory (`slates-server`'s
 > `vcs_store::hg_import`): started into a repository's empty store, advanced a turn at a time on its owner shard within
 > the shard's quantum, its index then in the empty index's place; at most one client region's bytes held, charged while
 > it runs; refused, abandoned or freed midway, everything given back; proven by the `states` repository imported a unit
 > a turn equal row for row to its import in one call (macOS arm64, Mac Studio: `vcs_store::` 18 of 18 with A-662's 13;
 > red first, the five new tests failing against stubs).
+> **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
+> charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
+> `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
+> outgrew their charge (65,536 that its fixed codes write in nine bits came to 73,721 against 65,569). zlib's arm is now
+> zlib-rs 0.6.8's `compress_bound`, n + ceil(n / 8) + 9, a byte more below 9 bytes and one more for none, which level 1
+> meets exactly at 4,095 and 4,096 bytes. Red first on main with the oracle alone
+> (`cargo test --locked -p slates-hg --lib compression`: 2 of 18 failed, both at zlib level 1, as jupiter's r92 found),
+> then `slates-hg --lib` 308 of 308 and fmt clean on macOS arm64 (Mac Studio, kiln r181); the other platforms owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
 > g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
