@@ -11656,6 +11656,15 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > the tree stood then (the head's graft fixed by what the change index names since, the fix recorded whole in the chain
 > entry, its room derived before the verdict and added to the entry's bound by the service). Owed: a checkpoint of a
 > green holding a copy, and a rebase that restates one (the A-626 part 2 entry).
+>
+> **Status (2026-11-19, A-626 part 3).** Built in the engine: a checkpoint of a green holding a copy (`crate::checkpoint`
+> version 4, `crates/merge/src/engine/copy_checkpoint.rs`): every copy record made at or before the checkpoint's version,
+> each copied tree's keys holding then what the copy above them gave them (set by a restore with no history, so each
+> reads by its record again), and the identity's running sum, moved to the version as a branch moves it, which the
+> restore takes (what it holds beyond the restored state's entries is kept for the recount). The anchor's layout is 12:
+> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Owed: a rebase that
+> restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since its version, where the
+> checkpoint lists it key by key (the A-626 part 3 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -13455,6 +13464,30 @@ signature verification).
 > is its thin facade. Proven by three stores imported a unit a turn equal row for row to one call, and an import
 > abandoned or refused midway holding nothing (Windows x86_64, jupiter: 278 of 278, red 2 failed; macOS owed).
 
+> **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
+> `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
+> are its heads before and its new changesets less every one a new changeset of the branch descends from, through any
+> branch (checked with stock 7.2); each new head is matched to a line it descends from by a maximum matching (an empty
+> line's head being the null node), so only a made line (a new head, or a new branch) or a retired one (merged into a
+> head another line took) touches the names log; its phase roots move as 7.2's `apply`, `advanceboundary`,
+> `updatephases` and `pushphase` move them; the `bookmarks` part applies as it is and a `bookmarks` pushkey is a
+> compare and swap on the hex the client saw; `reply:changegroup`'s `return` is `apply`'s. `push::held` reads what the
+> repository holds from its index, and `push::commit` keeps a push's revisions in a fork of the index. slates-server's
+> `repository::hg_push` lands it: the namespace holds `branch:<label>:<number>` for a line and `bookmark:<label>:` for a
+> bookmark, the label escaping `:`, `%`, controls and bytes not UTF-8, so the kinds and each branch's lines are
+> prefix-free ranges and a bookmark's name is checked exactly; each move, made line, retirement and bookmark change is
+> one of A-635's `BranchChange`s, its work built through A-618's builder against the version read; the client's race
+> checks are handed to the append as positions (lines' greens, names, the markers and phases logs), so they hold where
+> the entry commits, and the phase roots move in the same entry; a refusal for anything moved is `error:pushraced` in
+> 7.2's words; the fork replaces the index once the entry commits. Proven against stock 7.2's pushes
+> (`crates/hg/fixtures/push`): the fixtures' repository rebuilt from its texts in a new Mercurial repository, every node
+> 7.2's, then `push-plain`, `push-phase` and `push-bookmark` landed and answered byte for byte as 7.2 answered them,
+> `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
+> branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
+> histories (macOS arm64, Mac Studio: slates-hg's push tests 36 of 36, the server's 7 of 7; other platforms owed).
+> Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index and the
+> served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
 each bookmark is a green, and a push is a work whose verdict is the push's answer (§4.17.1). Phases, obsolescence
@@ -13868,8 +13901,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
    (A-641 part 2, `push::verify`, `push::tree`): the changegroup verified against the repository, and a move's work
-   through A-618's builder over laid-out flat manifests; owed: which lines and bookmarks a push moves, the landing on
-   each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
+   through A-618's builder over laid-out flat manifests. Built (A-657, part 3; `push::classify`, `push::held`,
+   `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
+   (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
+   each green's log with the phase roots in the same entry, the index kept; owed: the policy and the hooks (part 4).
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -13991,6 +14026,10 @@ and export by landing).
 > **Status (2026-11-19, A-626 part 2).** Built: a copy from a version its source changed after (`svn cp ^/trunk@N` with
 > the trunk changed since, as FSFS takes it), brought as the tree stood then, recorded whole in its chain entry with the
 > room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
+>
+> **Status (2026-11-19, A-626 part 3).** Built: a green holding copies is checkpointed (format version 4, the anchor's
+> layout 12), so a repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a
+> rebase restating a copy (part 4).
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -45997,8 +46036,8 @@ Applied in the same change to: §4.16 (a status block, the verdict's sentence on
     slates-server's `--lib` 614 passed, 3 ignored, and the same one of main's failed (3 of 3 with main `dc46c9f`'s
     `verbs.rs`).
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
-- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: its copies and the identity's sum
-  carried); a rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
+- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: built as A-626 part 3, its entry); a
+  rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
 
 ### A-644 part 1 — A protected branch's answers from the store, in git's words: how a move changes its ref, decided by generation numbers with no walk where they decide it, and the first merge commit and the first unsigned commit a move brings (2026-11-19, g230, UI goal 93; §4.17.2 "Protected branches, in git's terms", "A push" step 6 and "Pieces (git)" piece 11; after A-590, A-614, A-620 and A-642)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `research/vcs-servers.md` §5.9; `crates/git`
@@ -47963,6 +48002,177 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   the next piece, with `Streamed::counters()`; the red-checks of the marking and the other platforms' runs (main's); a
   delta search for an object past a window; the fragments' encoding sliced.
 
+### A-657 part 3 (A-641 part 3) — a Mercurial push landed on each green's own log: its new heads placed on lines and bookmarks by a maximum matching, its race checks made positions, its phase roots moved in the same entry, its names prefix-free (2026-11-19, g304, UI goal 93 (kiln 51cef9f7); §4.17.3 decisions 1 to 3 and 6, "Push" steps 3 to 7 and piece 5; A-635, A-642, A-645; after A-641 parts 1 and 2)
+
+- **What.** `crates/hg/src/push/classify.rs`: `classify(unbundle, (brought, held), view, (lines, marks), publishing,
+  admission) -> Result<Plan, Unclassified>`, the lines' moves and retirements, the lines made, the bookmarks' moves,
+  the draft roots' changes, the reply's parts and the changesets the hooks name; `Unclassified::refused` answers in
+  7.2's words. `push/held.rs`: `IndexHeld`, verification's `Held` over `HgIndex` and its `ContentStore`.
+  `push/commit.rs`: `fork_with`, a push's revisions appended to a fork of the index, all or none.
+  `verify::Verified::held_changesets` (7.2's `duprevs`). `crates/server/src/repository/hg_push.rs`: the namespace's
+  names (`line_name`, `branch_prefix`, `bookmark_name`, `line_of`), `prepare` (the checks judged, the changegroup
+  verified, the push placed, each `BranchChange` and its work built, the entry's checks and state) and `land` (the
+  fork, A-635's `RepositoryLogs::append`, the fork in the index's place or released, the reply).
+- **Read from 7.2's code and a run** (`research/mercurial-server.md` §24): `apply`'s phases and `return`,
+  `advanceboundary`, `updatephases`, `pushphase`, `pushbookmark`, `handlebookmark`, `headrevsdiff` from an empty
+  changelog, the external hook's environment and words; and with stock 7.2, a branch head dropped by a descendant on its
+  branch through another branch.
+- **Decided.** (1) The namespace: `branch:<label>:<number>` a line, `bookmark:<label>:` a bookmark, the label the
+  name's valid UTF-8 with `:`, `%`, control characters and bytes not UTF-8 written `%XX`; prefix-free by construction
+  (the tags differ and end in `:`, a label holds no `:`), so `branch:<B>:` is exactly B's lines and `bookmark:<M>:`
+  exactly one name; every name a stock client makes reads as itself (7.2 refuses `:` in a label); a line made takes its
+  branch's lowest free number; a Mercurial repository's first line is `branch:default:0`. (2) New heads matched to
+  lines by a maximum matching, so a push makes and retires as few names as it can and a line's move never touches the
+  names log. (3) The race checks as positions: `check:heads` the lines' names, every line's green and the markers log;
+  `check:updated-heads` each named head's line and its branch's names; `check:bookmarks` the bookmark's green and name
+  or its absence; `check:phases` the phases log; with every touched branch's names, every changed bookmark's name, and
+  the phases log for a push that moves roots. Stricter than 7.2: a phase moved anywhere since the read races, paid only
+  where a hook's run separates the read from the append. (4) A refusal for anything moved (a line's verdict meeting
+  another head, `Moved`, a name taken or retired, a check or state change that no longer holds) is `error:pushraced`
+  in 7.2's words; any other is `error:abort` in slates' words. (5) Stricter than 7.2: a node the `bookmarks` or
+  `phase-heads` part names that the repository does not hold is refused by kind; an `obsmarkers` part is refused until
+  piece 7. (6) A new line is made from a line its head descends from, else one holding its first parents' first held
+  changeset, else a line of that changeset's branch: the work replaces exactly what differs, so the base costs only the
+  work's size.
+- **Evidence** (macOS arm64, Mac Studio, kiln r47, 2026-11-19, debug, on the merged tree that lands, 5aa274153):
+  `cargo test --locked -p slates-hg --lib -- push::` 36 of 36 (the classifier's 11, the index fork's 2, parts 1 and
+  2's 23); `cargo test --locked -p slates-server --lib hg_push -- --test-threads=4` 7 of 7, its build warning-free;
+  `cargo fmt -p slates-hg -p slates-server -- --check` clean. The first build (r5) refused the server test's use of
+  slates-hg's crate-private hex helpers (now the server's `hex_of` and slates-hg's public `pushkey::hex_node`), and the
+  test build warned that `Prepared`'s admission and hook inputs were never read (removed: part 4 brings them with the
+  tests that observe them). No integration target reaches the landing until A-650's site serves `unbundle`. The reds
+  by mutation, clippy and the other platforms are main's.
+- **Owed.** Part 4: `vcs_policy::admit` before the append, with the right each change needs, and the hook driver at
+  `pretxnchangegroup` and `changegroup`. The server's home for each Mercurial repository's index and content store and
+  the served view over them (with A-650's site); the bundle read in slices; the pushkey compatibility hooks; markers
+  (piece 7); the fleet half of the append (A-636).
+- **Applied in the same change to:** §4.17.3's status (A-657) and piece 5's line; GAPS' §4.17.3 entry;
+  `research/mercurial-server.md` §24; `crates/hg/src/push/{mod,verify}.rs`, `crates/hg/src/import.rs` (`branch_of`
+  crate-visible); `crates/hg/src/push/{classify,classify_tests,held,commit,commit_tests}.rs` (new);
+  `crates/server/src/repository.rs`, `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs` (new);
+  `crates/server/Cargo.toml`, `Cargo.toml` and `Cargo.lock` (slates-server on slates-hg and slates-vcs).
+
+### A-626 part 3 — A checkpoint of a green holding a copy: version 4 carries the copies' records, their trees' keys and the identity's sum, and the anchor's layout is 12 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); §4.16 "The state's maps", "Commit" and A-238's checkpoint; §4.17.4 item 3 and piece 3; A-586, A-626 parts 1 and 2, A-202, A-238)
+Applied in the same change to: §4.16 (a status block under "The state's maps"), §4.17.4 (a status block), the A-626 part 2
+entry (its owed list), GAPS (the §4.17.4 entry; A-621's and A-646 part 2b's entries; "Formats the segment keeps changed
+without a layout bump", new, open), `crates/merge/src/checkpoint.rs` (version 4: `CopyRecord`, `Tables`, `Sum`,
+`SUM_BYTES`, the fields `copies`, `copied` and `sum`; a key or a record written twice refused `DuplicatePath`) and its
+tests (`src/checkpoint/tests.rs`, new), `crates/merge/src/engine/copy_checkpoint.rs` (new: `copied_at`,
+`leave_out_copied`, `copy_records_at`, `sum_at`, `restore_copied`, `take_sum`, the `place_*` setters),
+`crates/merge/src/engine.rs` (`checkpoint` without `copied_by`, `with_checkpoint` restoring the copies and the sum, the
+`restore_*` setters over `place_*`, `copies_before` and the recount), `crates/merge/src/engine/branch.rs`
+(`identity_moved_to`), `crates/merge/src/engine/copy.rs` (`every_key` for the engine; `brought_entry`, the record's
+kept fix, `record_bytes`, `release_kept_fixes`), the bug record
+`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`, `crates/merge/src/identity.rs`
+(`SUM_BYTES`, `add_sum`, `less`, `is_empty`, `to_bytes`, `from_bytes`), `crates/anchor/src/layout.rs`
+(`LAYOUT_VERSION` 12), and the tests (`engine/copy_tests.rs`: the checkpoint and restore test replacing the refusal's,
+the copy oracle restoring every history at every version; `tests/checkpoint.rs`, main's, updated by reading;
+`crates/anchor/tests/anchor.rs`: a segment of layout 11 refused at start).
+- **What was there.** `Green::checkpoint` answered `None` at or after any copy (`copied_by`), so the service kept such a
+  green's chain whole, counting `merge.checkpoint.unavailable`: a Subversion repository green that ever copied (every
+  branch and tag is a copy) never folded its chain. Two facts stood in the way. A copied tree's keys hold what the copy
+  gave them with no history of their own, read by the copy's record, so a checkpoint listing the keys whose histories
+  changed after the origin left the copied trees out; and the identity's set hash holds one entry a copy, standing for
+  its tree's entries at the source's version (A-586), which a green restored from the origin and the listed keys cannot
+  recount, since the histories that hold the source at that version are folded into the checkpoint.
+- **The format, version 4.** After the changed keys' tables: the copy records made at or before the checkpoint's
+  version (destination, version, source, source version), by destination then version; the copied tables, one a
+  dimension, each copied tree's keys that hold at the version what the copy above them gave them (no change of their own
+  after that copy and at or before the version), read there as every reader reads them, with the copy's version (a key
+  absent then is listed only where something stood at it at or before the version, which a restore must take away);
+  then the identity's running sum, LtHash16's 1,024 lanes little-endian, 2,048 bytes; then the head check. A key of a
+  copied tree that its own change set after the copy is a changed key, as any key is, and the changed tables leave the
+  copied keys out. A version 3 checkpoint is refused `BadVersion`, and a key or a record written twice `DuplicatePath`.
+- **The sum at a version below the head.** The running sum is brought to the head on a copy of it (the green is not
+  changed), then moved to the version by the keys changed since, as a branch at that version moves it
+  (`identity_moved_to`, the branch's own reverts): what a branch costs, the keys changed since the version.
+- **The restore.** The changed keys as before; the copied keys set with no history, so each reads by its record again;
+  the records kept, each charged with the change index as its commit charged it; then the carried sum taken as the
+  green's identity. What the sum holds beyond the restored state's own entries (the copies' entries less their trees')
+  is kept (`copies_before`), and the recount adds it for the copies made at or before the restore, whose trees it can no
+  longer read, so the identity still equals its recount.
+- **The anchor's layout, 12** (main's ruling): the segment keeps every checkpoint, so its format's change bumps the
+  layout, and a segment of an earlier layout is refused once, typed, at adoption, before anything is served. No reader
+  of version 3 exists, and no green is fenced mid-service for one. A-621 and A-646 part 2b changed formats the segment
+  keeps without a bump; this one covers them from now on (GAPS, filed with the guard owed: a structural test tying every
+  persisted format's version to the layout). A segment whose header says 11 is refused at start, typed
+  (`a_segment_from_before_version_4_checkpoints_is_refused_at_start`, as A-539's layout 10 test is), so a test holds
+  the bump: by reading, with the layout left at 11 the attach would succeed (that red is main's to run).
+- **Cost.** A checkpoint lists each copied tree key by key, files with their bytes, where the green holds the tree by
+  reference: the price of a checkpoint a restore reads alone. Owed, if a measurement shows it worth its rules: a restore
+  that grafts a tree whose source is unchanged since its version by reference.
+- **Tests** (`crates/merge/src/checkpoint/tests.rs`, `crates/merge/src/engine/copy_tests.rs`,
+  `crates/anchor/tests/anchor.rs`).
+  - Golden vectors: a checkpoint touching every table, a copy's record and copied keys, 2,497 bytes laid out field by
+    field, identity `13b881c8102bee2341e78a0d61ba6ffc1b5e90b31a082162f724c50c29251df3`. Both derived outside the crate:
+    the layout field by field, the identity by a BLAKE3 written in Python from the BLAKE3 paper with no library, which
+    reproduces the empty input's hash, the official test vectors at 1, 1023, 1024, 1025, 2048, 2049 and 3072 bytes, and
+    A-646's ops-document vector (218 bytes, `553a422f…6c0d92`).
+  - The determinism gate over the copies and the copied tables declared in reverse; hostile input: every prefix, a
+    version 3 header, a copied key and a copy's record each written twice, a byte appended.
+  - A green holding a copy, checkpointed at the copy's version and after an edit beneath it, restored and given the
+    versions after: it reads and hashes as the green, its identity its recount.
+  - The copy oracle: every generated history's green checkpointed at every version, the checkpoint encoded and decoded,
+    restored and given every later chain entry, hashing as the replay at every version it reaches, reading as the model
+    at every version from the checkpoint on, its identity its recount; a census of checkpoints carrying copies and of
+    ones listing copied keys, both met by A-672's fixed history whatever the seed (13 cases in all).
+  - A segment of layout 11, the layout before this part, written into a header and attached: refused at start, typed.
+- **Found by the oracle: what a copy brought is read from its graft, never below the floor.** The oracle's first run
+  restored greens at 2 and at 3 and replayed a copy made at 4 from version 1 (seed `cc ef9d3557…`, now a reviewed
+  seed). Their recounts read the source's history at 1, which a restored green does not hold. By reading, so did the
+  running identity for a key the copy brought that changes in its fold window or its own increment, and so did a sum
+  moved below the copy. A replica replaying such a copy hashed otherwise than its owner
+  (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). It is no artefact of
+  the oracle: the owner folds only as far as its retention budget needs, below the reachable floor it checkpoints at,
+  so a copy above its own fold floor may name a version below its last checkpoint, and recovery replays it.
+  - *Recording the entries a copy brought*: rejected. `svn copy ^/trunk ^/branches/x` is Subversion's most common
+    commit, and at A-645's scale it copies a 250 GB tree. A record holding every entry turns A-542's O(path length)
+    copy into O(the tree), in the format and in the checkpoint.
+  - *A floor rule* (a checkpoint waiting at the oldest source version a copy still needs): it does not meet the case.
+    The copies it fails on are made after the checkpoint, so no rule at the checkpoint holds them. And a copy at or
+    before the checkpoint needs nothing below it once restored: its keys read their current values from its record on,
+    the identity is past it, and the carried sum stands for what it brought.
+  - *No read below the floor* (taken). A copy grafts its source held at the version before it, with its fix (part 2).
+    Nothing reads what a copy brought unless the copy stands above the floor: the identity is brought past a copy before
+    the floor passes it, and a branch or a checkpoint is made at the floor or above. The version before such a copy
+    never lies below the floor or a restored green's checkpoint. The destination's own maps would answer a key the copy
+    gave and nothing changed since (its current value), and one changed later (its history at the copy's version). But
+    they cannot answer a key the copy's own version changed, or an inner copy of that version replaced, since that
+    value stood at no version: only the graft holds it. So every reader reads the graft (`Green::brought_entry`): the
+    source at the version before the copy, through the copy's fix. The fix, which the chain entry already carries whole,
+    is kept with the record while the copy stands above the fold floor and let go when the floor reaches it
+    (`Green::release_kept_fixes`). It is charged with the change index and secured before the verdict as the entry's
+    room is. A copy whose source was unchanged since its version keeps none: the common copy, from the head, stays
+    O(path length). The checkpoint's format is unchanged: a record carries no fix and no copied entry.
+  - Tests: a replica given a copy and then a change to a key it brought, its identity read once after both; one given
+    a copy whose own increment edits beneath it; each must hash as its owner and its identity equal its recount, and
+    the first replica's checkpoint below the copy must carry its owner's sum.
+- **Evidence** (debug, 2026-11-19, each run a fresh clone of the pushed branch: Windows x86_64 on jupiter with
+  `CARGO_BUILD_JOBS=4`, then the merged tree on macOS arm64, the Mac Studio, with `CARGO_BUILD_JOBS=2`; the Linux run
+  owed):
+  - Part 3 before the fix (7d08dd16a, over main 4644dcec3): `cargo test -p slates-merge --lib` 180 of 181, the copy
+    oracle failing at a restored green's recount (seed `cc ef9d3557…`); `cargo test -p slates-anchor --lib` 31 of 31,
+    main's baseline; `cargo fmt -p slates-merge -- --check` and `cargo fmt -p slates-anchor -- --check` clean.
+  - Red, the fix's tests over part 3 as it stood (d2a2b0afc, kiln r84): `cargo test -p slates-merge --lib copy_tests`,
+    22 passed and 3 failed, each at an identity: the two replica tests (`copy_tests.rs` 1270, "the replica's identity
+    at 5", and 1301) and the copy oracle on the seed, shrunk to a put, a directory, a put and a copy replacing its
+    destination from two versions back.
+  - Green (617ad96e0, r84): `cargo test -p slates-merge --lib` 182 of 183, every identity and model check passing and
+    the census meeting no nested replace (A-672's, landed before this part); the oracle run again alone, 1 of 1, its
+    census 77 accepted, 380 refused, 12 from the root, 36 from before the head, 26 into themselves, 19 from a changed
+    source, 17 changes beneath a copy, 35 replaced, 30 nested, 3 nested replacing, 26 moves, 265 checkpoints carrying
+    copies, 264 listing copied keys; `cargo test -p slates-anchor --lib` 31 of 31; both crates' fmt checks clean.
+  - The merged tree, over main 5c0a522f1 with A-672 landed (be0348459, the Mac Studio, kiln r40, load 15 on 32 cores),
+    each run focused on what this part changed. `cargo test --locked -p slates-merge --lib -- copy checkpoint
+    engine::branch engine::node_tests engine::reanchor engine::stack::tests`, every lib test reaching the checkpoint,
+    the restore, the recount, the fold or `identity_moved_to`: 73 passed, none failed, 112 filtered out. The copy
+    oracle's fixed history met all 13 census cases (6 checkpoints carrying copies, 5 listing copied keys), and the
+    whole run counted 97 accepted, 395 refused, 23 from the root, 55 from before the head, 34 into themselves, 19 from a
+    changed source, 45 changes beneath a copy, 36 replaced, 40 nested, 7 nested replacing, 28 moves, 337 checkpoints
+    carrying copies and 335 listing copied keys. `cargo test --locked -p slates-merge --test checkpoint checkpoint` 4 of
+    4 and `--test chain_replay checkpoint` 3 of 3; `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and
+    `--test anchor a_segment_` 5 of 5, the layout 11 refusal among them; both crates' fmt checks clean.
+
 ### A-662 — Each repository's store on its owner shard: one content store a shard and each repository's tool store with its derived values, made with its record, charged to the shard's budget, a push's objects held by its one entry and replayed by a recovery (2026-11-19, g258, UI goal 93 (kiln 51cef9f7); §4.17.1 "Durability and residency" and shared pieces 2, 3 and 7; §4.17.2 "The repository in git's terms"; A-581, A-588, A-553, A-614, A-635, A-642, A-645, A-647)
 
 - **What was there.** The tool stores were pure crates: A-614's git store over A-581's content store, A-588's Mercurial
@@ -48084,7 +48294,8 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   fragments encoded again off the answer's path (A-654); Mercurial's and Subversion's records and replay; the
   Subversion index charged by its bytes; a record naming a blob a work's post-state holds by reference; a repository
   destroy verb calling `free`; the `StoreLender` over this map (A-625 part 3); the fleet half (A-636).
-- **Applied in the same change to:** §4.17.1 (a status block; shared piece 3's line); GAPS (the §4.17 entry);
+- **Applied in the same change to:** §4.17.1 (a status block; shared piece 3's line); GAPS (the §4.17 entry, and
+  A-657's owed list: the Mercurial store's home built, its hand-off to `hg_push::Objects` owed);
   `crates/server/src/vcs_store.rs`, `vcs_store/record.rs` and `vcs_store/tests.rs` (new); `crates/server/src/lib.rs`,
   `state.rs`, `daemon.rs` (the field), `repository.rs` (`install_root` makes the store), `repository/push.rs`
   (`push_sealed`, the store's commit between the guard and the apply, the rebuild), `verbs.rs` (the recovery's call); `crates/db/src/catalog.rs` (`RepositoryEntry::objects`, `RegisterRecord::objects`),
