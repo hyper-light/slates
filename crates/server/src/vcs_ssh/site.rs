@@ -33,8 +33,7 @@ use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 use slates_vfs::clock::Clock;
 
 use super::git::UploadCommand;
-use crate::vcs_http::git::Repositories;
-use crate::vcs_http::git::StoreLender;
+use crate::vcs_http::git::{Located, Repositories, StoreLender};
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key no credential in the record has the id of (A-651 part 3).
@@ -128,6 +127,9 @@ pub(crate) trait SshSite {
   /// Who holds `key` (its blob `blob`) for `user`, when the connection's lookup could not say yet
   /// (`Holding::Unknown`): the record's answer, looked up where the record lives (A-651 part 3).
   async fn lookup(&mut self, user: &[u8], key: &UserKey, blob: &[u8]) -> Holding<Principal>;
+  /// Where the repository `command` names lives: here, or the runtime shard its connection moves to, so the `exec` is
+  /// dispatched on the shard that holds the repository (A-651 part 4). A command that names none is decided here.
+  fn locate(&self, command: &Asked) -> Located;
   /// Dispatches `command` for `principal`, with the `GIT_PROTOCOL` value sent before it.
   fn dispatch(
     &mut self,
@@ -510,6 +512,10 @@ where
         Holding::Nobody
       }
     }
+  }
+
+  fn locate(&self, _command: &Asked) -> Located {
+    Located::Here
   }
 
   fn dispatch(

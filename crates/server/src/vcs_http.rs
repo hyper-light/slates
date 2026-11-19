@@ -64,7 +64,7 @@ pub(crate) mod git;
 mod hg;
 pub(crate) mod waits;
 
-pub(crate) use daemon_edge::{bind, start};
+pub(crate) use daemon_edge::{ShardRepositories, bind, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;

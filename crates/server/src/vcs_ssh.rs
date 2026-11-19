@@ -148,6 +148,12 @@ pub(crate) struct Counts {
   pub(crate) commands_refused: u64,
   /// Commands run to their exit.
   pub(crate) commands_run: u64,
+  /// Connections this shard moved to their repository's shard.
+  pub(crate) moved: u64,
+  /// Connections that moved to this shard and took a seat here.
+  pub(crate) arrived: u64,
+  /// Connections that moved to this shard and were closed with every seat taken and the arrivals' bound reached.
+  pub(crate) arrivals_refused: u64,
 }
 
 /// A taken seat: its connection's task once spawned, whether its wait on its client is past its bound, and whether it is
@@ -179,8 +185,9 @@ enum Seating {
 pub(crate) struct EdgeState {
   /// The edge's bounds.
   bounds: Bounds,
-  /// The host key's seed: each connection's key is made from it.
-  host_seed: HostSeed,
+  /// The host key's seed: each connection's key is made from it. None on a shard that only seats connections that moved
+  /// there ([`EdgeState::arrivals`]), which makes no session.
+  host_seed: Option<HostSeed>,
   /// Each seat, free or taken: as many as the edge serves at once.
   seats: RefCell<Vec<Option<Taken>>>,
   /// The listener, when it waits for a seat.
@@ -194,11 +201,22 @@ pub(crate) struct EdgeState {
 }
 
 impl EdgeState {
-  /// An edge's state: `bounds`, and the seed of its Ed25519 host key.
+  /// An edge's state on its listener's shard: `bounds`, and the seed of its Ed25519 host key.
   pub(crate) fn new(bounds: Bounds, host_seed: [u8; ED25519_SEED_LEN]) -> EdgeState {
+    EdgeState::of(bounds, Some(HostSeed(host_seed)))
+  }
+
+  /// An edge's state on a shard that only seats connections that moved there (the module doc): `bounds`, and no host
+  /// key, since it makes no session.
+  pub(crate) fn arrivals(bounds: Bounds) -> EdgeState {
+    EdgeState::of(bounds, None)
+  }
+
+  /// An edge's state of `bounds` whose sessions' host key is made from `host_seed`, if it makes any.
+  fn of(bounds: Bounds, host_seed: Option<HostSeed>) -> EdgeState {
     EdgeState {
       bounds,
-      host_seed: HostSeed(host_seed),
+      host_seed,
       seats: RefCell::new(vec![None; bounds.connections]),
       waiting: RefCell::new(None),
       waits: RefCell::new(PhaseWaits::default()),
@@ -358,9 +376,10 @@ impl EdgeState {
     self.wake_listener();
   }
 
-  /// A session for a connection accepted at `now_ns` whose keys' lookup is `keys`; none when none can be made.
+  /// A session for a connection accepted at `now_ns` whose keys' lookup is `keys`; none when none can be made, or this
+  /// shard's edge holds no host key ([`EdgeState::arrivals`]).
   fn session<K: KeyHolders>(&self, keys: K, now_ns: u64) -> Option<Session<SystemEntropy, K>> {
-    let host_key = HostKey::ed25519_from_seed(&self.host_seed.0).ok()?;
+    let host_key = HostKey::ed25519_from_seed(&self.host_seed.as_ref()?.0).ok()?;
     let config = SessionConfig {
       transport: TransportConfig {
         packet_cap: PACKET_CAP,
@@ -425,6 +444,27 @@ impl Drop for Seat {
     // Off its shard (the runtime gone) no edge is left to give the seat back to.
     let _ = self.state.with(|state| state.give_back(slot));
   }
+}
+
+thread_local! {
+  /// This shard's edge state, once kept here ([`keep_here`]): where a connection that moves here is seated.
+  static HERE: Cell<Option<Kept<EdgeState>>> = const { Cell::new(None) };
+}
+
+/// Keeps `state` on this shard for its life as the shard's SSH edge (the module doc): the listener's shard keeps the
+/// one with the host key ([`EdgeState::new`]), every other shard one without ([`EdgeState::arrivals`]), so a connection
+/// that moves to a shard finds its seats there. Called once a shard, at the daemon's start; refused off a shard's
+/// thread.
+pub(crate) fn keep_here(state: EdgeState) -> Result<Kept<EdgeState>, RtError> {
+  let kept = slates_rt::registry::with_current(|context| context.keep(state))
+    .ok_or(RtError::NotOnShardThread)??;
+  HERE.with(|here| here.set(Some(kept)));
+  Ok(kept)
+}
+
+/// This shard's edge state, if one was kept here.
+pub(crate) fn here() -> Option<Kept<EdgeState>> {
+  HERE.with(Cell::get)
 }
 
 /// Waits, holding an accepted connection, until a seat is free for it (the module doc): at once below the bound; with
