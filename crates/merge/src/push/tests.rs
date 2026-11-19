@@ -558,7 +558,7 @@ fn a_push_reads_only_the_subtrees_whose_ids_changed() {
     (4, 1),
     "the store's own count"
   );
-  let ops: BTreeSet<(String, OpKind, u64, u64)> = kinds(&built.increment)
+  let ops: BTreeSet<(String, String, u64, u64)> = kinds(&built.increment)
     .into_iter()
     .map(|(path, kind, at, len)| {
       (
@@ -569,10 +569,10 @@ fn a_push_reads_only_the_subtrees_whose_ids_changed() {
       )
     })
     .collect();
-  let expected: BTreeSet<(String, OpKind, u64, u64)> = [
-    (String::new(), OpKind::SetXattr, 0, 20),
-    ("b/f".to_owned(), OpKind::Delete, 0, 12),
-    ("b/f".to_owned(), OpKind::Insert, 0, 7),
+  let expected: BTreeSet<(String, String, u64, u64)> = [
+    (String::new(), format!("{:?}", OpKind::SetXattr), 0, 20),
+    ("b/f".to_owned(), format!("{:?}", OpKind::Delete), 0, 12),
+    ("b/f".to_owned(), format!("{:?}", OpKind::Insert), 0, 7),
   ]
   .into_iter()
   .collect();
@@ -627,17 +627,18 @@ fn modes_links_and_removed_directories_are_the_operations_the_design_names() {
   assert_eq!((ops[0].0.as_str(), ops[0].1), ("link", OpKind::Symlink));
   files.remove("gone/a");
   files.remove("gone/deeper/b");
-  let removed: BTreeSet<(String, OpKind)> = step(&files, 5, &mut tree)
+  let removed: BTreeSet<(String, String)> = step(&files, 5, &mut tree)
     .into_iter()
-    .map(|(path, kind, _)| (path, kind))
+    .map(|(path, kind, _)| (path, format!("{kind:?}")))
     .collect();
-  let expected: BTreeSet<(String, OpKind)> = [
-    ("gone".to_owned(), OpKind::Rmdir),
-    ("gone/a".to_owned(), OpKind::Unlink),
-    ("gone/deeper".to_owned(), OpKind::Rmdir),
-    ("gone/deeper/b".to_owned(), OpKind::Unlink),
+  let expected: BTreeSet<(String, String)> = [
+    ("gone", OpKind::Rmdir),
+    ("gone/a", OpKind::Unlink),
+    ("gone/deeper", OpKind::Rmdir),
+    ("gone/deeper/b", OpKind::Unlink),
   ]
   .into_iter()
+  .map(|(path, kind)| (path.to_owned(), format!("{kind:?}")))
   .collect();
   assert_eq!(removed, expected);
 }
