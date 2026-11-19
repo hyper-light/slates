@@ -45469,7 +45469,9 @@ Applied in the same change to:
   the verb's), the sections uncharged (the charge's test), pre-lock taken for git's (the nine points' test and the
   snapshot's), two appended tags swapped (`wire_order`), a Subversion hook run in its view's root, pre-lock's output
   sent to the null device, its token read past a NUL, the record's sections dropped, and pre-lock's point read as
-  post-lock's (each its own test); the files put back, 49 of 49 again.
+  post-lock's (each its own test); the files put back, 49 of 49 again. On the tree merged with main (de9dc5cbf, A-642's
+  `Moved` taking `DatabaseRefusal` 10 first): db lib 142 of 142, ipc lib 74 of 74, both wire orders 2 of 2, server lib
+  621 of 622, the same `deadlines` test failing.
 - **Owed.** The read-only FSFS-layout view at REPOS for stock `svnlook` (A-645's derived data, after A-647, queued by
   main); the server's calls at commit, lock, unlock and revision-property change, refusing in Subversion's words a lock
   whose token the hook wrote past the cap; a dangling link told apart; no core dumps; the Windows driver. Main's:
