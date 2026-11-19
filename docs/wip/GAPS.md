@@ -22,9 +22,10 @@
 > the verbs that create repositories and their greens (a repository's greens in one lineage on their owner shard, a
 > branch made through the register with shared piece 2 and replayed by holders from the same record, a branch
 > recovered over its source at its version rather than over an origin); the record's replication in a fleet (with
-> piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (g292, A-542's second half) grafts
-> on these maps and needs a per-prefix appearance record under the one history rule. The integration suites, clippy
-> and `xtask` over the change are main's (run requests).
+> piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (A-542's second half) grafts on
+> these maps, recorded by a per-prefix appearance record under the one history rule: built as A-586 (g295,
+> 2026-11-19; its owed items in the §4.17.4 entry). The integration suites, clippy and `xtask` over the change are main's
+> (run requests).
 > **A-582 (2026-11-19, g251b; part 1):** git's piece 1 is built: `crates/git` (`slates-git`), pkt-lines (data, flush,
 > delimiter, response end; a reader that waits for a packet's last byte; a whole stream's decode charged to an
 > `Admission` first) and side-band-64k (bands 1 to 3, `sideband-all`), pure codecs with every length checked against
@@ -142,9 +143,16 @@
 > A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. A-542's second half, part 1
 > (2026-11-19): Copy's maps, every map of a green's state copying a path's tree by reference on A-534's radix tree,
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
-> Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
-> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
-> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
+> destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
+> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> made before a copy cutting it; held to a reference green that copies key by key (`cargo test -p slates-merge --lib`,
+> 44 of 44 on the Mac Studio, red six ways, see A-586). Owed from A-586: a checkpoint of a green holding a copy (its tree
+> listed, the identity's sum carried; `None` today, the chain kept whole), a rebase restating a copy (the deriver's
+> `VolumeOp::Copy`), a copy from a version its source changed after (refused today), Subversion's replace with history,
+> moves and second copies into a copied tree in one increment, the server's change-index consumers treating a copy's
+> destination as its tree, and a Merkle identity over the radix trees (weighed in A-586). Owed, in order: the commit
+> rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
