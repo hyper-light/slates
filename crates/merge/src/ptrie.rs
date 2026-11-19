@@ -30,6 +30,7 @@
 //! corruption no operation here makes) is answered as absent and counted in [`Nodes::missing`].
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 
 /// A node's place in its arena.
 type Slot = usize;
@@ -234,11 +235,15 @@ fn unique<V: Clone>(nodes: &mut Nodes<V>, slot: Slot, holders: &mut impl Holders
 #[derive(Debug)]
 pub struct Ptrie<V> {
   root: Option<Slot>,
+  marker: PhantomData<V>,
 }
 
 impl<V> Default for Ptrie<V> {
   fn default() -> Self {
-    Ptrie { root: None }
+    Ptrie {
+      root: None,
+      marker: PhantomData,
+    }
   }
 }
 
@@ -299,7 +304,10 @@ impl<V: Clone> Ptrie<V> {
     if let Some(root) = self.root {
       nodes.hold(root);
     }
-    Ptrie { root: self.root }
+    Ptrie {
+      root: self.root,
+      marker: PhantomData,
+    }
   }
 
   /// The root, made if the map has none.
