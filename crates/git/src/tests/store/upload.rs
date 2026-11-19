@@ -357,6 +357,42 @@ fn a_filter_sends_the_runs_objects_it_admits_and_the_want_always() {
   repository.release(&mut store).unwrap();
 }
 
+/// A-639 (§4.17.2 "Filters": "`blob:none` and `object:type` choose fragment classes"; `blob:limit` chooses objects by
+/// their rows). Do: answer a clone under `blob:limit=1000`, its objects one by one as the negotiation filtered them:
+/// every commit and tree, and the one small file. Expect: the base pack's part without blobs and the newest version's
+/// copied whole; the parts holding a large blob, partly wanted, left, and their one wanted object encoded afresh; read
+/// back, exactly the filtered closure, each once.
+#[test]
+fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let (repository, versions) = three_versions(format, &mut store, true);
+  let filter = Filter::BlobLimit(1000);
+  let wanted: BTreeSet<ObjectId> = versions
+    .iter()
+    .flatten()
+    .filter(|made| filter.admits(made.kind, u64::try_from(made.content.len()).unwrap(), 0))
+    .map(|made| made.id)
+    .collect();
+  let positions = wanted
+    .iter()
+    .map(|id| repository.object(&store, id).unwrap().position)
+    .collect();
+  let mut answer = Answer::objects(&Positions::of(positions));
+  answer.filter = Some(filter);
+  let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  let loose = counters.loose_whole + counters.loose_deltas;
+  assert_eq!(
+    (counters.parts_copied, counters.parts_by_entry, loose),
+    (2, 0, 1)
+  );
+  repository.release(&mut store).unwrap();
+}
+
 /// A-639 (the stream holds no borrow between turns; a base pack made again under it is refused, never mixed). Do:
 /// answer a clone of a ref whose base pack holds offset deltas to a client without `ofs-delta`, a unit a turn, and make
 /// the base pack again at a newer version as soon as the stream reads one of its parts entry by entry. Expect: a later

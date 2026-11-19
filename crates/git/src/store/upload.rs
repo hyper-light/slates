@@ -27,18 +27,20 @@
 //!
 //! **What the client can read.** A kept part is copied byte for byte, its offset deltas valid wherever it lands
 //! (§4.17.2: "A fragment's offset deltas stay valid when fragments are joined"), when every object it holds is to be
-//! sent, the client said `ofs-delta` or the part has no offset delta, and every base its reference deltas name is
-//! sent already or held by the client. The client holds a base when it asked a thin pack, the part is a run's, and
-//! the base lies outside the run's versions before this one: a base a version names is in the tree the version before
-//! it had, so outside the run it is in what the client's version reaches. Under a filter a base is held only when the
-//! filter would have sent it, so a client cloned under the same filter has it. Otherwise the part is read entry by
-//! entry: an entry kept whole is copied; an offset delta whose base this pack carries is copied with its distance
-//! measured again, or with its base named by id for a client without `ofs-delta`, and named by id where its base was
-//! sent before the part; a reference delta whose base is sent or held is copied; any other delta is sent whole from
-//! its object, so a client that did not ask for `thin-pack` is never sent a base it lacks ("A client MUST NOT request
-//! the 'thin-pack' capability if it cannot turn a thin pack into a self-contained pack" \[B:
-//! gitprotocol-capabilities\]). Sending the object whole rather than its base ahead of it sends nothing the client
-//! has, so the pack holds exactly the answer's objects.
+//! sent, the client said `ofs-delta` or the part has no offset delta, and the client reads every base its reference
+//! deltas name. A base is read when it is sent already. For a run's part it is also read when it comes later in this
+//! pack, as a reference delta may name any object of its pack \[B: gitformat-pack, "ref-delta"\] and no cycle can
+//! form, since every version of a run fast-forwarded the one before; and, for a client that asked a thin pack, when the
+//! pack does not carry it at all. Such a base lies in the tree the version before had, so outside the pack it is in
+//! what the client's version reaches; under a filter it is held only where the filter would have sent it, so a client
+//! cloned under the same filter has it. A part the cover took names bases sent before it alone: across a rewrite two
+//! versions may name each other's objects. Otherwise the part is read entry by entry: an entry kept whole is copied;
+//! an offset delta whose base this pack carries is copied with its distance measured again, or with its base named by
+//! id for a client without `ofs-delta`, and named by id where its base was sent before the part; a reference delta
+//! whose base the client reads is copied; any other delta is sent whole from its object, so a client that did not ask
+//! for `thin-pack` is never sent a base it lacks ("A client MUST NOT request the 'thin-pack' capability if it cannot
+//! turn a thin pack into a self-contained pack" \[B: gitprotocol-capabilities\]). Sending the object whole rather than
+//! its base ahead of it sends nothing the client has, so the pack holds exactly the answer's objects.
 //!
 //! **Slices.** [`Upload::advance`] does units of work until the owner's quantum is spent, at least one, and checks the
 //! owner's clock after each: a window of a kept part copied; a window of an object deflated (an object sent whole,
@@ -150,13 +152,11 @@ enum Stage {
   Gather { run: usize, version: u64, from: u64 },
   /// The header.
   Header,
-  /// Sending run `run`'s version `version`'s fragment of blobs or of the other kinds; `newer` holds the objects of
-  /// the run's versions before it, which no client of the run holds.
+  /// Sending run `run`'s version `version`'s fragment of blobs or of the other kinds.
   Runs {
     run: usize,
     version: u64,
     blobs: bool,
-    newer: Positions,
   },
   /// Choosing the greens whose kept parts may cover what is left.
   CoverFrom,
@@ -207,8 +207,8 @@ struct ByEntry {
   source: Source,
   /// The positions of its objects to send.
   keep: Positions,
-  /// For a run's part, the objects of the run's versions before it; `None` for a part the cover took.
-  newer: Option<Positions>,
+  /// Whether it is a run's part, whose bases outside the pack a thin client holds; the cover's parts' never are.
+  run: bool,
   /// The entry to judge next.
   next: usize,
   /// Where each of its entries sent begins in the pack, by the entry's index.
@@ -380,8 +380,7 @@ impl<A: Answered> Upload<A> {
         run,
         version,
         blobs,
-        newer,
-      } => self.send_run(cx, (run, version, blobs), newer),
+      } => self.send_run(cx, (run, version, blobs)),
       Stage::CoverFrom => Ok(self.cover_from(cx)),
       Stage::Cover { greens, at, part } => self.cover(cx, greens, at, part),
       Stage::Loose { from } => self.loose(cx, from, out),
@@ -488,7 +487,6 @@ impl<A: Answered> Upload<A> {
         run,
         version: versions.after.saturating_add(1),
         blobs: false,
-        newer: Positions::new(),
       },
       None => Stage::CoverFrom,
     }
@@ -499,7 +497,6 @@ impl<A: Answered> Upload<A> {
     &mut self,
     cx: &Context<'_>,
     (run, version, blobs): (usize, u64, bool),
-    newer: Positions,
   ) -> Result<Stage, StoreRefused> {
     let Some(versions) = self.answer.runs().get(run).copied() else {
       return Ok(Stage::CoverFrom);
@@ -515,37 +512,32 @@ impl<A: Answered> Upload<A> {
         version: at,
         blobs,
       };
-      self.take_part(source, kept, Some(&newer));
+      self.take_part(source, kept, true);
     }
-    if !blobs {
-      return Ok(Stage::Runs {
+    Ok(if blobs {
+      Stage::Runs {
+        run,
+        version: version.saturating_add(1),
+        blobs: false,
+      }
+    } else {
+      Stage::Runs {
         run,
         version,
         blobs: true,
-        newer,
-      });
-    }
-    let brought = cx
-      .repository
-      .brought(green, at)
-      .ok_or(StoreRefused::NoVersion { green, version })?;
-    Ok(Stage::Runs {
-      run,
-      version: version.saturating_add(1),
-      blobs: false,
-      newer: newer.union(brought),
+      }
     })
   }
 
   /// Sends what of a kept part is still wanted (module docs, **What the client can read**): copied whole, or entry by
-  /// entry. `newer`, for a run's part, holds the objects of the run's versions before it.
-  fn take_part(&mut self, source: Source, kept: &Kept, newer: Option<&Positions>) {
+  /// entry. `run` says the part is a run's.
+  fn take_part(&mut self, source: Source, kept: &Kept, run: bool) {
     let keep = kept.positions.intersection(&self.wanted);
     if keep.is_empty() {
       return;
     }
     let whole = keep.len() == kept.positions.len();
-    let readable = (self.answer.ofs_delta() || kept.offsets == 0) && self.bases_held(kept, newer);
+    let readable = (self.answer.ofs_delta() || kept.offsets == 0) && self.bases_read(kept, run);
     self.wanted = self.wanted.difference(&keep);
     self.sent = self.sent.union(&keep);
     if whole && readable {
@@ -563,23 +555,20 @@ impl<A: Answered> Upload<A> {
     self.by_entry = Some(ByEntry {
       source,
       keep,
-      newer: newer.cloned(),
+      run,
       next: 0,
       moved: vec![None; kept.placed.len()],
     });
   }
 
-  /// Whether every base the part's reference deltas name is sent already or, for a run's part with no filter to ask,
-  /// held by a thin client: outside the run's versions before it.
-  fn bases_held(&self, kept: &Kept, newer: Option<&Positions>) -> bool {
+  /// Whether the client reads every base the part's reference deltas name (module docs): each sent already; for a run's
+  /// part, or in the pack still to come, or, with no filter to ask, held by a thin client.
+  fn bases_read(&self, kept: &Kept, run: bool) -> bool {
     let missing = kept.references.difference(&self.sent);
     if missing.is_empty() {
       return true;
     }
-    match newer {
-      Some(newer) if self.answer.thin() && self.sends_all => missing.intersection(newer).is_empty(),
-      _ => false,
-    }
+    run && ((self.answer.thin() && self.sends_all) || missing.is_subset(&self.wanted))
   }
 
   /// One entry of a part read entry by entry: judged, and sent if wanted; the part's reading, or `None` once its last
@@ -663,8 +652,8 @@ impl<A: Answered> Upload<A> {
         let Some(position) = entry.base else {
           return Ok(None);
         };
-        let reads =
-          self.sent.contains(position) || self.held(cx, by_entry.newer.as_ref(), position)?;
+        let reads = self.sent.contains(position)
+          || (by_entry.run && (self.wanted.contains(position) || self.held(cx, position)?));
         Ok(reads.then_some(Representation::RefDelta { base }))
       }
     }
@@ -689,18 +678,10 @@ impl<A: Answered> Upload<A> {
     }
   }
 
-  /// Whether a thin client holds the object at `position` (module docs): a run's client, the object outside the run's
-  /// versions before this one, and one the filter sends.
-  fn held(
-    &self,
-    cx: &Context<'_>,
-    newer: Option<&Positions>,
-    position: u64,
-  ) -> Result<bool, StoreRefused> {
-    let Some(newer) = newer else {
-      return Ok(false);
-    };
-    if !self.answer.thin() || newer.contains(position) {
+  /// Whether a thin client holds the object at `position` a run's delta names and the pack does not carry (module docs):
+  /// it lies in what the client's version reaches, so it holds it where the filter would have sent it.
+  fn held(&self, cx: &Context<'_>, position: u64) -> Result<bool, StoreRefused> {
+    if !self.answer.thin() {
       return Ok(false);
     }
     if self.sends_all {
@@ -862,7 +843,7 @@ impl<A: Answered> Upload<A> {
       && !kept.positions.is_empty()
       && kept.positions.is_subset(&self.wanted)
     {
-      self.take_part(source, kept, None);
+      self.take_part(source, kept, false);
     }
     Ok(match after(cx.repository, green, part) {
       Some(part) => Stage::Cover { greens, at, part },
