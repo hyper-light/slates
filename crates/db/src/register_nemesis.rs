@@ -29,12 +29,18 @@
 //! - **ReadSafety**: at every committed position, every majority's highest-epoch entry is the committed value
 //!   (`FencedLedger.tla`'s rule, over the holders' state, an offline holder's included).
 //!
-//! Three mutations are kept as tests, so the checks are known to bite: a promise that raises no fence, a holder's
-//! restart that forgets it, and an owner that adopts on a minority's promises. Each breaks a history in some seed. The
-//! fence carries the load only across an owner's restart: a takeover installs a new generation, and a holder promises
-//! only under the generation it has installed, so it refuses the old owner by its authority before its fence is asked.
-//! Without owner restarts, neither fence mutation broke a seed (the Mac Studio, 2026-11-18, 48 seeds at `f = 1` and
-//! `f = 2`).
+//! Three mutations are kept as tests, so the checks are known to bite. Each broke histories (the Mac Studio, 2026-11-18,
+//! the first check each broken seed failed):
+//! - a promise that raises no fence: 39 of 48 seeds at `f = 1` and 44 of 48 at `f = 2` (StaleNeverCommits, Continuity);
+//! - a holder's restart that forgets its fence: 16 and 9 of 192 seeds (StaleNeverCommits, Continuity, Agreement);
+//! - an owner that adopts on a minority's promises: 23 and 7 of 48 seeds (Continuity, Agreement).
+//!
+//! ReadSafety, checked after the others in a step, broke first in none of those, so its own red check is a direct one
+//! over real holders' state: a majority whose newest entry at a committed position is another value.
+//!
+//! The fence carries the load only across an owner's restart. A takeover installs a new generation, and a holder
+//! promises only under the generation it has installed, so it refuses the old owner by its authority before its fence
+//! is asked. With takeovers alone, neither fence mutation broke a seed (48 seeds each at `f = 1` and `f = 2`).
 // Test harness: an unwrap or indexing here is a failed test.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -940,4 +946,61 @@ fn an_owner_that_promotes_on_a_minority_breaks_the_register_under_the_nemesis() 
       "f = {f}: no seed broke a check with owners that promote on a minority"
     );
   }
+}
+
+/// ReadSafety's check bites, its own red check: a position committed `v` at epoch 1 on two of three holders, and the third
+/// holding `w` at epoch 2, as a holder would if an owner of a higher epoch wrote the position without having adopted
+/// `v`. Do: ask the check, over the real holders' state. Expect: a ReadSafety violation, since a majority with the third
+/// holder reads `w`, its highest-epoch entry. The nemesis's mutations break other checks first, so this is where
+/// ReadSafety's own rule is shown to tell.
+#[test]
+fn the_read_safety_check_finds_a_majority_whose_newest_entry_is_another_value() {
+  let first = Authority {
+    generation: 1,
+    owner: OWNERS[0],
+  };
+  let second = Authority {
+    generation: 2,
+    owner: OWNERS[1],
+  };
+  let at_zero = |authority: Authority, epoch: u64, value: &[u8]| Record {
+    owner: authority.owner,
+    object: OBJECT,
+    sequence: 0,
+    epoch: HostEpoch(epoch),
+    generation: authority.generation,
+    value: value.to_vec(),
+  };
+  let mut holders = BTreeMap::new();
+  for id in [HostId(1), HostId(2)] {
+    let mut acceptor = Acceptor::new(id, first);
+    acceptor.accept(&at_zero(first, 1, b"v")).unwrap();
+    holders.insert(
+      id,
+      Holder {
+        acceptor,
+        online: true,
+      },
+    );
+  }
+  let mut third = Acceptor::new(HostId(3), second);
+  third.accept(&at_zero(second, 2, b"w")).unwrap();
+  holders.insert(
+    HostId(3),
+    Holder {
+      acceptor: third,
+      online: true,
+    },
+  );
+  let mut history = History::default();
+  history.committed_at.insert(0, b"v".to_vec());
+  history.read_safety(0, 0, &holders, 2);
+  assert!(
+    history
+      .violations
+      .iter()
+      .any(|said| said.contains("ReadSafety")),
+    "the check names the majority that reads w: {:?}",
+    history.violations
+  );
 }

@@ -117,6 +117,21 @@
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
 
+> **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
+> part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
+> were never checked over the implementation as history checks. `crates/db/src/register_nemesis.rs` (lib tests) runs the
+> real `Acceptor` and the owner's rules over a simulated network, under latency and reordering, loss, duplication,
+> one-way and two-way cuts, holders knocked offline and back from their persisted state, owners paused and resumed,
+> takeovers, and owner restarts under one generation. It checks Agreement (TotalOrder), Continuity (NoLoss for a
+> register), StaleNeverCommits and ReadSafety after every accept, commit and adoption. 48 seeds each at `f = 1` and
+> `f = 2` (1,500 steps a seed) break none, with every fault and the stale and late cases counted (the Mac Studio, 9 s
+> for all four tests). Three mutations kept as tests each break histories (a promise without its fence 39/48 and 44/48;
+> a restart that forgets the fence 16/192 and 9/192; promotion on a minority 23/48 and 7/48), and ReadSafety has a
+> direct red check. Found: the fence carries the load only across an owner's restart under one generation; a takeover's
+> generation refuses the stale owner first. **Owed:** the same nemesis over the live log (`slates_db::live`, whose
+> `crates/db/tests/live.rs` nemesis checks Agreement, NoLoss, StaleNeverCommits and Convergence but not ReadSafety), and
+> the real-process runs of `crates/cli/tests/live_chaos.rs` (main's).
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose

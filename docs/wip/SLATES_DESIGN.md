@@ -6313,6 +6313,20 @@ commit quorum. It drops its role on `StaleEpoch`. The historical `FencedRegister
 its modeled TotalOrder, Continuity, StaleNeverCommits and ReadSafety transitions; A-9 requires
 refinement and revalidation before those results can be applied to the corrected implementation.
 
+> **Status (2026-11-18, goal 81's chaos part, its network half, g229): the four invariants hold over the real holders
+> under a network nemesis.** `crates/db/src/register_nemesis.rs` runs the real holders (`Acceptor`) and the owner's
+> rules over a simulated network. Messages are held a drawn latency, so they reorder, and some are lost or delivered
+> twice. Pairs of hosts are cut one way or both and healed. Holders are knocked offline and come back from their
+> persisted state. Owners pause and resume, and the master hands out takeovers and owner restarts throughout. After
+> every accept, commit and adoption it checks Agreement (TotalOrder), Continuity (NoLoss for a register),
+> StaleNeverCommits and ReadSafety, by `FencedLedger.tla`'s per-position rule. No history of 48 seeds at `f = 1` and at
+> `f = 2` broke one. Three mutations kept as tests each break histories: a promise that raises no fence, a restart that
+> forgets it, and an owner that adopts on a minority's promises. ReadSafety's check has a direct red check of its own.
+> Found on the way: a takeover's new generation alone refuses a stale owner, since a holder promises only under the
+> generation it installed, so the fence carries the load only across an owner's restart under one generation (with
+> takeovers alone, neither fence mutation broke a seed). This is a simulation of the implementation, not the TLC
+> refinement A-9 names.
+
 > **Status (2026-11-18, A-398: a holder takes an installed configuration a copy a turn).** "Every holder raises its
 > fence for that host to the new epoch" was done at the install, in the turn that installed the version, over every copy
 > the holder keeps: each fence raised to its owner's committed epoch, each object a kept retirement names moved to its
