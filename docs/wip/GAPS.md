@@ -202,6 +202,17 @@
 > (piece 8's next part: listeners on a shard, TLS, authentication, `100 Continue`, the services' bodies streamed
 > through, the staged close); the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's DAV through it.
 > Clippy, `xtask` and the lint matrix over the change are main's (run requests).
+> **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
+> writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
+> repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
+> client's `want` (the first with its capabilities), `have`, `done`, `shallow`, `deepen`, `deepen-since`,
+> `deepen-not` and `filter`, the server's `NAK` and `ACK` plain, `continue`, `common` and `ready`, the shallow-update,
+> and `ERR` from either side. A capability git does not define is kept by name; a malformed id or line is refused by
+> kind and place. Golden vectors are fifteen exchanges and six advertisements stock git wrote under protocol.version 0
+> and 1 (`fixtures/v0`, `make-v0-fixtures.sh`, SHA-256 checked). `cargo test -p slates-git --lib` over main with it:
+> 203 of 203 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
+> Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
+> the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
@@ -303,11 +314,12 @@
 > transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real check on 4,096
 > generated histories a run; `cargo test -p slates-svn --lib` on the Mac Studio (see A-592). Owed from it: the drive
 > asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each command arrives, over a
-> transaction built a command at a time (piece 7). Found by it, owed to A-602's lock check: `LockTable::verdict`
-> verifies the locks a commit meets in the byte order of their paths, where FSFS checks the changed paths in
-> `svn_path_compare_paths` order (a path's children before its later siblings, `transaction.c` 3537-3539), so a commit
-> refused by locks at both `/t/a/b` and `/t/a-b` is answered at `/t/a-b` where `svnserve` answers `/t/a/b`; the
-> verdict's refusal is the lock check's, so it follows when that order does. A-602 (2026-11-19, g250): the lock table,
+> transaction built a command at a time (piece 7). Found by it and fixed by A-617 (2026-11-19, g268):
+> `LockTable::verdict` verified the locks a commit meets in the byte order of their paths, where FSFS checks the changed
+> paths in `svn_path_compare_paths` order and returns at the first that fails (`transaction.c` 3537-3539, 3578), so a
+> commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at `/t/a-b` where `svnserve` answers `/t/a/b`; it
+> now meets them in FSFS's order, and A-602's oracle accepts only the first failing path's locks (it had accepted any
+> lock in the commit). A-602 (2026-11-19, g250): the lock table,
 > the guards of `lock` (with stealing) and `unlock` (with breaking), and the verdict's lock check (with release or
 > keep), each returning the register entries it decided, applied unconditionally; its oracle FSFS's lock rules
 > transcribed, equal on generated histories; `cargo test -p slates-svn --lib` 74 of 74 on the Mac Studio (see A-602).

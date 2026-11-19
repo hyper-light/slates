@@ -437,6 +437,37 @@ fn the_lock_tables_check_answers_for_a_work_the_merge_accepts() {
   );
 }
 
+/// A-617 (§4.17.4 item 3.4; `transaction.c` `verify_locks` 3537-3539 sorts the changed paths with
+/// `svn_sort_compare_items_as_paths`, which is `path.c` `svn_path_compare_paths`, and returns at the first path whose
+/// check fails, 3578). Do: commit a work on the head that edits `/t/a-b` and `/t/a/b`, both locked by another
+/// principal, its lock check the lock table's. Expect: refused at `/t/a/b`, the first in Subversion's path order (a
+/// path's children before its later siblings), as FSFS's `verify_locks` transcribed answers, though byte order puts
+/// `/t/a-b` first.
+#[test]
+fn the_first_lock_in_subversions_path_order_answers() {
+  let index = repository(vec![vec![
+    add_dir("/t"),
+    add_dir("/t/a"),
+    add_file("/t/a/b", 1),
+    add_file("/t/a-b", 2),
+  ]]);
+  let table = table_of(&[lock_on("/t/a/b", OTHER, 1), lock_on("/t/a-b", OTHER, 2)]);
+  let commit = commit_by(Some(COMMITTER), &[]);
+  let changes = vec![edit("/t/a-b", 6), edit("/t/a/b", 5)];
+  let expected = LockRefusal::OwnerMismatch {
+    path: "/t/a/b".to_owned(),
+    owner: OTHER.to_owned(),
+  };
+  assert_eq!(
+    verify_locks(&changes, (&table, &commit), &mut Census::default()),
+    Answer::Locked(expected.clone())
+  );
+  assert_eq!(
+    judged_with_locks(&index, 1, changes, (&table, &commit)),
+    Err(CommitRefusal::Locked(expected))
+  );
+}
+
 /// A-592 (FSFS's merge refuses before its locks are verified: `merge_changes`, `tree.c` 2284, before `commit_body`'s
 /// `verify_locks`, `transaction.c` 3797). Do: after revision 2 edited `/a/b`, commit a work on revision 1 that edits it
 /// too, counting the lock check's calls. Expect: the conflict at `/a/b` answers, and the lock check is never asked.
@@ -783,22 +814,27 @@ fn verify_lock(lock: &Lock, commit: &CommitLocks) -> Result<(), LockRefusal> {
 }
 
 /// `lock.c` `svn_fs_fs__allow_locked_operation` (645-669), transcribed: the lock at `path`, or with `recurse` every
-/// lock at or beneath it, each verified. FSFS walks a subtree's lock digests in its hash's order; here in path order.
+/// lock at or beneath it, each verified. FSFS walks a subtree's lock digests in its hash's order, which no order of its
+/// own fixes; here, as the lock table chooses, in Subversion's path order, the path's own lock first.
 fn allow_locked_operation(
   table: &LockTable,
   path: &str,
   recurse: bool,
   commit: &CommitLocks,
 ) -> Result<(), LockRefusal> {
-  for lock in table.locks() {
-    let reached = if recurse {
-      svn_fspath_skip_ancestor(path, &lock.path)
-    } else {
-      lock.path == path
-    };
-    if reached {
-      verify_lock(lock, commit)?;
-    }
+  let mut reached: Vec<&Lock> = table
+    .locks()
+    .filter(|lock| {
+      if recurse {
+        svn_fspath_skip_ancestor(path, &lock.path)
+      } else {
+        lock.path == path
+      }
+    })
+    .collect();
+  reached.sort_by(|first, second| svn_path_compare_paths(&first.path, &second.path));
+  for lock in reached {
+    verify_lock(lock, commit)?;
   }
   Ok(())
 }
