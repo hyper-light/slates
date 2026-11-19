@@ -623,7 +623,11 @@ impl Layout {
         "exp-very-fragile-and-unsafe-plain-store-encoding",
       ),
       (self.file_index && self.fncache, "fileindex-v1", "fncache"),
-      (self.file_index && self.dotencode, "fileindex-v1", "dotencode"),
+      (
+        self.file_index && self.dotencode,
+        "fileindex-v1",
+        "dotencode",
+      ),
     ];
     match pairs.iter().find(|(both, _, _)| *both) {
       Some(&(_, first, second)) => Err(RequiresRefused::Incompatible { first, second }),
@@ -698,11 +702,23 @@ mod tests {
     };
     let plain = "exp-very-fragile-and-unsafe-plain-store-encoding";
     for (lines, expected) in [
-      (&["store", "fncache", "dotencode"][..], fncache(Encoding::Dot)),
+      (
+        &["store", "fncache", "dotencode"][..],
+        fncache(Encoding::Dot),
+      ),
       (&["store", "fncache", plain], fncache(Encoding::Plain)),
-      (&["store", "fncache", "generaldelta"], fncache(Encoding::Hybrid)),
-      (&["store", "fileindex-v1", "exp-revlogv2.2"], file_index(Encoding::Dot)),
-      (&["store", "fileindex-v1", plain], file_index(Encoding::Plain)),
+      (
+        &["store", "fncache", "generaldelta"],
+        fncache(Encoding::Hybrid),
+      ),
+      (
+        &["store", "fileindex-v1", "exp-revlogv2.2"],
+        file_index(Encoding::Dot),
+      ),
+      (
+        &["store", "fileindex-v1", plain],
+        file_index(Encoding::Plain),
+      ),
     ] {
       assert_eq!(shape(lines), Ok(expected), "{lines:?}");
     }
@@ -716,7 +732,10 @@ mod tests {
     let named = |requirement: &str| Box::from(requirement.as_bytes());
     let plain = "exp-very-fragile-and-unsafe-plain-store-encoding";
     let mut cases: Vec<(Vec<&str>, RequiresRefused)> = vec![
-      (vec!["store", "", "fncache"], RequiresRefused::Corrupt { line: 2 }),
+      (
+        vec!["store", "", "fncache"],
+        RequiresRefused::Corrupt { line: 2 },
+      ),
       (vec![".store"], RequiresRefused::Corrupt { line: 1 }),
       (
         vec!["store", "frobnicate"],
@@ -742,9 +761,18 @@ mod tests {
       (vec!["store", "revlogv1"], RequiresRefused::Unlisted),
       (vec!["store", "dotencode"], RequiresRefused::Unlisted),
     ];
-    for refused in ["treemanifest", "narrowhg-experimental", "lfs", "largefiles", "shared"] {
+    for refused in [
+      "treemanifest",
+      "narrowhg-experimental",
+      "lfs",
+      "largefiles",
+      "shared",
+    ] {
       let requirement = named(refused);
-      cases.push((vec!["store", refused], RequiresRefused::Unsupported { requirement }));
+      cases.push((
+        vec!["store", refused],
+        RequiresRefused::Unsupported { requirement },
+      ));
     }
     for (lines, expected) in cases {
       assert_eq!(shape(&lines), Err(expected), "{lines:?}");

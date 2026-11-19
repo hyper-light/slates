@@ -414,7 +414,11 @@ pub fn import<F: RepositoryFiles>(
 }
 
 /// Releases a refused import's index; the refusal, or the release's beside it.
-fn release<R>(index: HgIndex, store: &mut ContentStore, refused: ImportRefused<R>) -> ImportRefused<R> {
+fn release<R>(
+  index: HgIndex,
+  store: &mut ContentStore,
+  refused: ImportRefused<R>,
+) -> ImportRefused<R> {
   match index.release(store) {
     Ok(()) => refused,
     Err(release) => ImportRefused::Unreleased {
@@ -455,7 +459,10 @@ fn read_in_store<F: RepositoryFiles>(
   room: &mut Admission,
 ) -> Result<Option<Vec<u8>>, ImportRefused<F::Refused>> {
   let mut names: Vec<&[u8]> = vec![STORE];
-  for name in path.split(|byte| *byte == SLASH).filter(|name| !name.is_empty()) {
+  for name in path
+    .split(|byte| *byte == SLASH)
+    .filter(|name| !name.is_empty())
+  {
     if DOT_NAMES.contains(&name) || name.contains(&0) {
       return Err(ImportRefused::UnsafePath {
         path: in_store(path),
@@ -481,7 +488,8 @@ fn list_file_logs<F: RepositoryFiles>(
     Listing::Fncache => fncache_paths(files, room)?,
     Listing::FileIndex => file_index_paths(files, room)?,
   };
-  let unusable = |path: &&Vec<u8>| path.is_empty() || path.iter().any(|byte| FORBIDDEN.contains(byte));
+  let unusable =
+    |path: &&Vec<u8>| path.is_empty() || path.iter().any(|byte| FORBIDDEN.contains(byte));
   if let Some(path) = paths.iter().find(unusable) {
     return Err(ImportRefused::UnusablePath {
       path: Box::from(path.as_slice()),
@@ -651,7 +659,11 @@ struct Held(Vec<ContentId>);
 
 impl Held {
   /// Keeps `bytes` as content (an object of any length, cut into windows past one) and records the hold.
-  fn put<R>(&mut self, store: &mut ContentStore, bytes: &[u8]) -> Result<ContentId, ImportRefused<R>> {
+  fn put<R>(
+    &mut self,
+    store: &mut ContentStore,
+    bytes: &[u8],
+  ) -> Result<ContentId, ImportRefused<R>> {
     let identity = store.put_object(bytes)?;
     self.0.push(identity);
     Ok(identity)
@@ -783,8 +795,14 @@ impl<F: RepositoryFiles> Walk<'_, F> {
         [radix, &[ID_SEPARATOR], read.data_id, DOCKET_DATA].concat(),
       )
     };
-    let index = self.read_store_file(&index_name, room)?.1.unwrap_or_default();
-    let data = self.read_store_file(&data_name, room)?.1.unwrap_or_default();
+    let index = self
+      .read_store_file(&index_name, room)?
+      .1
+      .unwrap_or_default();
+    let data = self
+      .read_store_file(&data_name, room)?
+      .1
+      .unwrap_or_default();
     Ok(Files::Docketed {
       docket,
       index,
@@ -943,12 +961,20 @@ impl<F: RepositoryFiles> Walk<'_, F> {
   }
 
   /// Holds each changeset's manifest to the manifest log: the null node, or one it holds.
-  fn check_manifests(&self, index: &HgIndex, changesets: u32) -> Result<(), ImportRefused<F::Refused>> {
+  fn check_manifests(
+    &self,
+    index: &HgIndex,
+    changesets: u32,
+  ) -> Result<(), ImportRefused<F::Refused>> {
     for rev in 0..changesets {
       let row = index
         .changeset(self.store, rev)
         .ok_or(ImportRefused::Unindexed { rev })?;
-      if row.manifest != NULL_NODE && index.rev(self.store, Log::Manifest, &row.manifest).is_none() {
+      if row.manifest != NULL_NODE
+        && index
+          .rev(self.store, Log::Manifest, &row.manifest)
+          .is_none()
+      {
         return Err(ImportRefused::UnknownManifest {
           rev,
           node: row.manifest,
@@ -1018,7 +1044,11 @@ fn refuse_flags<R>(radix: &[u8], rev: u32, flags: u16) -> Result<(), ImportRefus
 }
 
 /// A revision's parents' nodes, from its revlog's entries.
-fn parents<R>(revlog: &Revlog<'_>, entry: &Entry, radix: &[u8]) -> Result<(Node, Node), ImportRefused<R>> {
+fn parents<R>(
+  revlog: &Revlog<'_>,
+  entry: &Entry,
+  radix: &[u8],
+) -> Result<(Node, Node), ImportRefused<R>> {
   let node = |rev: u32| -> Result<Node, ImportRefused<R>> {
     if rev == NONE {
       return Ok(NULL_NODE);
@@ -1033,7 +1063,10 @@ fn parents<R>(revlog: &Revlog<'_>, entry: &Entry, radix: &[u8]) -> Result<(Node,
 
 /// A changeset's branch and whether it closes it, as 7.2 reads its extras: the last `branch`, else `default`; any
 /// `close`.
-fn branch_of(read: &Changeset<'_>, room: &mut Admission) -> Result<(Vec<u8>, bool), changeset::Refusal> {
+fn branch_of(
+  read: &Changeset<'_>,
+  room: &mut Admission,
+) -> Result<(Vec<u8>, bool), changeset::Refusal> {
   let mut buffer = Vec::new();
   let extras = read.extras(room, &mut buffer)?;
   let branch = extras

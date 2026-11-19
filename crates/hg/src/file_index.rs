@@ -144,7 +144,8 @@ pub fn read_docket(bytes: &[u8]) -> Result<Docket<'_>, Refused> {
     return Err(Refused::Marker);
   }
   let sizes = "a file index docket's sizes";
-  let (list_size, meta_size, tree_size) = (cursor.u32(sizes)?, cursor.u32(sizes)?, cursor.u32(sizes)?);
+  let (list_size, meta_size, tree_size) =
+    (cursor.u32(sizes)?, cursor.u32(sizes)?, cursor.u32(sizes)?);
   let (list_id, meta_id, tree_id) = (id(&mut cursor)?, id(&mut cursor)?, id(&mut cursor)?);
   let tree = "a file index docket's tree fields";
   let (root, unused) = (cursor.u32(tree)?, cursor.u32(tree)?);
@@ -224,7 +225,8 @@ pub fn paths(
     docket.root,
     !tree.is_empty(),
   )?;
-  let (records, rest) = (if meta.is_empty() { &EMPTY_META } else { meta }).as_chunks::<META_RECORD>();
+  let (records, rest) =
+    (if meta.is_empty() { &EMPTY_META } else { meta }).as_chunks::<META_RECORD>();
   if !rest.is_empty() {
     return Err(Refused::Records {
       len: to_u64(meta.len()),
@@ -280,7 +282,11 @@ fn check_root(tree: &[u8], root: u32, written: bool) -> Result<(), Refused> {
 }
 
 /// The path a meta record names: in the list file's used bytes, not empty, and holding no forbidden byte.
-fn path_of<'a>(list: &'a [u8], record: &[u8; META_RECORD], token: u64) -> Result<&'a [u8], Refused> {
+fn path_of<'a>(
+  list: &'a [u8],
+  record: &[u8; META_RECORD],
+  token: u64,
+) -> Result<&'a [u8], Refused> {
   let [o0, o1, o2, o3, l0, l1, _, _] = *record;
   let start = usize::try_from(u32::from_be_bytes([o0, o1, o2, o3])).unwrap_or(usize::MAX);
   start
@@ -309,7 +315,10 @@ mod tests {
       bytes.extend_from_slice(&field.to_be_bytes());
     }
     let entries = usize::try_from(garbage.0).unwrap() * 12;
-    bytes.resize(bytes.len() + entries + usize::try_from(garbage.1).unwrap(), 0);
+    bytes.resize(
+      bytes.len() + entries + usize::try_from(garbage.1).unwrap(),
+      0,
+    );
     bytes
   }
 
@@ -320,7 +329,12 @@ mod tests {
 
   /// A tree file of one root whose single child is a leaf of token 1.
   fn tree() -> Vec<u8> {
-    [&[0, 0, 0, 0, 0, 1][..], b"a", &(0x8000_0001_u32).to_be_bytes()].concat()
+    [
+      &[0, 0, 0, 0, 0, 1][..],
+      b"a",
+      &(0x8000_0001_u32).to_be_bytes(),
+    ]
+    .concat()
   }
 
   /// The paths of a one-path index whose list file is `list` and whose record is `record`.
@@ -342,10 +356,20 @@ mod tests {
   /// path. Expect the docket's fields, its files' names (none for an unset id), and the path.
   #[test]
   fn a_docket_and_its_files_are_read_as_7_2_writes_them() {
-    let bytes = docket([4, 16, 11], [b"1a2b3c4d", b"00000000", b"5e6f7a8b"], 0, (2, 9));
+    let bytes = docket(
+      [4, 16, 11],
+      [b"1a2b3c4d", b"00000000", b"5e6f7a8b"],
+      0,
+      (2, 9),
+    );
     let docket = read_docket(&bytes).unwrap();
     assert_eq!(
-      (docket.list_size, docket.meta_size, docket.tree_size, docket.garbage),
+      (
+        docket.list_size,
+        docket.meta_size,
+        docket.tree_size,
+        docket.garbage
+      ),
       (4, 16, 11, 2)
     );
     assert_eq!(docket.list_file().unwrap(), b"fileindex-list.1a2b3c4d");
@@ -389,14 +413,22 @@ mod tests {
   /// root is not token 0, and whose written tree's root has no child. Expect each refused by kind.
   #[test]
   fn damaged_files_are_refused() {
-    let bytes = docket([4, 16, 11], [b"0000000a", b"0000000b", b"0000000c"], 0, (0, 0));
+    let bytes = docket(
+      [4, 16, 11],
+      [b"0000000a", b"0000000b", b"0000000c"],
+      0,
+      (0, 0),
+    );
     let docket = read_docket(&bytes).unwrap();
     let meta = [&[0; 8][..], &record(0, 3)].concat();
     let room = || Admission::new(1 << 20);
     let check = |list: &[u8], meta: &[u8], tree: &[u8], docket: &Docket<'_>| {
       paths(docket, list, meta, tree, &mut room())
     };
-    assert!(matches!(check(b"abc", &meta, &tree(), &docket), Err(Refused::Truncated(_))));
+    assert!(matches!(
+      check(b"abc", &meta, &tree(), &docket),
+      Err(Refused::Truncated(_))
+    ));
     let odd = Docket {
       meta_size: 15,
       ..docket
@@ -409,7 +441,10 @@ mod tests {
     rooted[3] = 1;
     assert_eq!(check(b"abc\0", &meta, &rooted, &docket), Err(Refused::Root));
     let lone = [0_u8; 11];
-    assert_eq!(check(b"abc\0", &meta, &lone, &docket), Err(Refused::Singleton));
+    assert_eq!(
+      check(b"abc\0", &meta, &lone, &docket),
+      Err(Refused::Singleton)
+    );
   }
 
   /// A-630 part 3: do read an index with no files at all, and one too large for its admission. Expect no path, and the
@@ -418,7 +453,10 @@ mod tests {
   fn an_empty_index_lists_nothing_and_the_admission_bounds_the_rest() {
     let bytes = docket([0; 3], [b"00000000"; 3], 0, (0, 0));
     let docket = read_docket(&bytes).unwrap();
-    assert_eq!(paths(&docket, &[], &[], &[], &mut Admission::new(0)), Ok(Vec::new()));
+    assert_eq!(
+      paths(&docket, &[], &[], &[], &mut Admission::new(0)),
+      Ok(Vec::new())
+    );
     let full = docket_bytes_for_one_path();
     let docket = read_docket(&full).unwrap();
     let meta = [&[0; 8][..], &record(0, 3)].concat();
@@ -432,6 +470,11 @@ mod tests {
 
   /// A docket for an index of one three-byte path.
   fn docket_bytes_for_one_path() -> Vec<u8> {
-    docket([4, 16, 11], [b"0000000a", b"0000000b", b"0000000c"], 0, (0, 0))
+    docket(
+      [4, 16, 11],
+      [b"0000000a", b"0000000b", b"0000000c"],
+      0,
+      (0, 0),
+    )
   }
 }

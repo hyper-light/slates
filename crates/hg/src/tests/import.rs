@@ -132,7 +132,13 @@ fn text_of(store: &ContentStore, row: &RevisionRow) -> Vec<u8> {
   let bytes = whole(store, &row.bytes);
   match row.block {
     None => bytes,
-    Some(block) => [filerev::MARKER, &whole(store, &block), filerev::MARKER, &bytes].concat(),
+    Some(block) => [
+      filerev::MARKER,
+      &whole(store, &block),
+      filerev::MARKER,
+      &bytes,
+    ]
+    .concat(),
   }
 }
 
@@ -147,10 +153,17 @@ fn check_changelog(imported: &Imported, store: &ContentStore) {
   };
   for (rev, text) in (0_u32..).zip(&texts) {
     let row = imported.index.changeset(store, rev).unwrap();
-    assert_eq!(store.object_bytes(&row.text, row.len).unwrap(), *text, "changeset {rev}");
+    assert_eq!(
+      store.object_bytes(&row.text, row.len).unwrap(),
+      *text,
+      "changeset {rev}"
+    );
     let computed = node::compute(&node_of(row.p1), &node_of(row.p2), text).unwrap();
     assert_eq!(computed, row.node, "changeset {rev}");
-    assert_eq!(changeset::decode(text).unwrap().manifest_node().unwrap(), row.manifest);
+    assert_eq!(
+      changeset::decode(text).unwrap().manifest_node().unwrap(),
+      row.manifest
+    );
   }
 }
 
@@ -191,7 +204,9 @@ fn check_asked(repository: &Repository) {
   let asked: BTreeSet<&Vec<u8>> = repository.asked.iter().collect();
   assert_eq!(asked.len(), repository.asked.len(), "a file asked twice");
   assert!(
-    asked.iter().all(|path| repository.files.contains_key(*path)),
+    asked
+      .iter()
+      .all(|path| repository.files.contains_key(*path)),
     "{:?}",
     repository.asked
   );
@@ -281,7 +296,10 @@ fn a_history_whose_logs_disagree_is_refused() {
   let mut no_manifests = repository("dot");
   no_manifests.files.remove(b"store/00manifest.i".as_slice());
   let refusal = refused(&mut no_manifests);
-  assert!(matches!(refusal, ImportRefused::UnknownManifest { rev: 0, .. }), "{refusal:?}");
+  assert!(
+    matches!(refusal, ImportRefused::UnknownManifest { rev: 0, .. }),
+    "{refusal:?}"
+  );
   let mut unlisted = repository("dot");
   let kept: Vec<u8> = lines(&unlisted.files[b"store/fncache".as_slice()])
     .filter(|line| *line != b"data/plain.txt.i")
@@ -291,7 +309,9 @@ fn a_history_whose_logs_disagree_is_refused() {
   let path = named("plain.txt");
   assert_eq!(refused(&mut unlisted), ImportRefused::Unlisted { path });
   let mut empty = repository("dot");
-  empty.files.insert(b"store/data/plain.txt.i".to_vec(), Vec::new());
+  empty
+    .files
+    .insert(b"store/data/plain.txt.i".to_vec(), Vec::new());
   let path = named("plain.txt");
   assert_eq!(refused(&mut empty), ImportRefused::EmptyLog { path });
 }
@@ -303,7 +323,12 @@ fn a_cut_index_is_refused_by_kind() {
   for (name, file, radix, what) in [
     ("dot", "store/00changelog.i", "00changelog", "an entry"),
     ("dot", "store/data/plain.txt.i", "data/plain.txt", "a chunk"),
-    ("v2", "store/00manifest-6b8ab34b.idx", "00manifest", "an index file"),
+    (
+      "v2",
+      "store/00manifest-6b8ab34b.idx",
+      "00manifest",
+      "an index file",
+    ),
   ] {
     let mut repository = repository(name);
     repository.files.get_mut(file.as_bytes()).unwrap().pop();
@@ -321,9 +346,27 @@ fn a_cut_index_is_refused_by_kind() {
 fn revisions_whose_texts_are_not_their_nodes_are_refused_by_kind() {
   let revlog = || named("data/plain.txt");
   for (flag, expected) in [
-    (1_u16 << 15, ImportRefused::Censored { revlog: revlog(), rev: 0 }),
-    (1 << 14, ImportRefused::Ellipsis { revlog: revlog(), rev: 0 }),
-    (1 << 13, ImportRefused::ExternallyStored { revlog: revlog(), rev: 0 }),
+    (
+      1_u16 << 15,
+      ImportRefused::Censored {
+        revlog: revlog(),
+        rev: 0,
+      },
+    ),
+    (
+      1 << 14,
+      ImportRefused::Ellipsis {
+        revlog: revlog(),
+        rev: 0,
+      },
+    ),
+    (
+      1 << 13,
+      ImportRefused::ExternallyStored {
+        revlog: revlog(),
+        rev: 0,
+      },
+    ),
     (
       1,
       ImportRefused::UnknownFlags {
@@ -334,7 +377,10 @@ fn revisions_whose_texts_are_not_their_nodes_are_refused_by_kind() {
     ),
   ] {
     let mut repository = repository("dot");
-    let index = repository.files.get_mut(b"store/data/plain.txt.i".as_slice()).unwrap();
+    let index = repository
+      .files
+      .get_mut(b"store/data/plain.txt.i".as_slice())
+      .unwrap();
     index[6..8].copy_from_slice(&flag.to_be_bytes());
     assert_eq!(refused(&mut repository), expected);
   }
@@ -361,9 +407,14 @@ fn requirements_are_refused_before_the_store_is_read() {
   let requirement = named("frobnicate");
   let expected = ImportRefused::Requirements(RequiresRefused::Unknown { requirement });
   assert_eq!(refused(&mut unknown), expected);
-  let only_requirements = |path: &Vec<u8>| path.as_slice() == b"requires" || path.as_slice() == b"store/requires";
+  let only_requirements =
+    |path: &Vec<u8>| path.as_slice() == b"requires" || path.as_slice() == b"store/requires";
   for repository in [tree, gone, unknown] {
-    assert!(repository.asked.iter().all(only_requirements), "{:?}", repository.asked);
+    assert!(
+      repository.asked.iter().all(only_requirements),
+      "{:?}",
+      repository.asked
+    );
   }
 }
 
@@ -389,13 +440,18 @@ fn least(imports: impl Fn(u64) -> bool) -> u64 {
 #[test]
 fn the_room_and_the_budget_bound_the_import_exactly() {
   for name in ["dot", "v2"] {
-    let room = least(|room| import(&mut repository(name), &mut store(), Admission::new(room)).is_ok());
+    let room =
+      least(|room| import(&mut repository(name), &mut store(), Admission::new(room)).is_ok());
     let mut store = store();
     let refusal = import(&mut repository(name), &mut store, Admission::new(room - 1)).unwrap_err();
-    assert!(matches!(refusal, ImportRefused::PastAdmission(_)), "{name}: {refusal:?}");
+    assert!(
+      matches!(refusal, ImportRefused::PastAdmission(_)),
+      "{name}: {refusal:?}"
+    );
     assert_eq!((store.len(), store.used()), (0, 0));
     let fits = |budget| ContentStore::new(budget, WINDOW).unwrap();
-    let budget = least(|budget| import(&mut repository(name), &mut fits(budget), self::room()).is_ok());
+    let budget =
+      least(|budget| import(&mut repository(name), &mut fits(budget), self::room()).is_ok());
     let mut small = fits(budget - 1);
     let refusal = import(&mut repository(name), &mut small, self::room()).unwrap_err();
     let by_budget = matches!(refusal, ImportRefused::Content(_) | ImportRefused::Index(_));
@@ -418,12 +474,19 @@ fn a_host_refusal_is_handed_back() {
 #[test]
 fn a_docket_id_climbing_out_of_the_store_is_refused_unasked() {
   let mut repository = repository("v2");
-  let docket = repository.files.get_mut(b"store/fileindex".as_slice()).unwrap();
+  let docket = repository
+    .files
+    .get_mut(b"store/fileindex".as_slice())
+    .unwrap();
   docket[24..32].copy_from_slice(b"../../ab");
   let path = named("store/fileindex-list.../../ab");
   assert_eq!(refused(&mut repository), ImportRefused::UnsafePath { path });
   let climbing = |path: &Vec<u8>| path.split(|byte| *byte == b'/').any(|name| name == b"..");
-  assert!(!repository.asked.iter().any(climbing), "{:?}", repository.asked);
+  assert!(
+    !repository.asked.iter().any(climbing),
+    "{:?}",
+    repository.asked
+  );
 }
 
 /// AC-HG.9, A-630 part 2: do import a store whose one-revision file log holds its revision twice, the second chunk
@@ -439,7 +502,9 @@ fn a_node_a_log_holds_twice_is_refused() {
   second[..8].copy_from_slice(&offset.to_be_bytes());
   second[16..20].copy_from_slice(&1_u32.to_be_bytes());
   let doubled = [original, second, chunk].concat();
-  repository.files.insert(b"store/data/au~78.txt.i".to_vec(), doubled);
+  repository
+    .files
+    .insert(b"store/data/au~78.txt.i".to_vec(), doubled);
   let expected = ImportRefused::Duplicate {
     revlog: named("data/aux.txt"),
     rev: 1,
@@ -459,15 +524,24 @@ fn fncache_entries_are_read_as_7_2_groups_them() {
         entry: named("meta/a/00manifest.i"),
       }),
     ),
-    ("data/.i", Some(ImportRefused::UnusablePath { path: named("") })),
+    (
+      "data/.i",
+      Some(ImportRefused::UnusablePath { path: named("") }),
+    ),
     ("data/leftover.txt", None),
   ] {
     let mut repository = repository("dot");
-    let fncache = repository.files.get_mut(b"store/fncache".as_slice()).unwrap();
+    let fncache = repository
+      .files
+      .get_mut(b"store/fncache".as_slice())
+      .unwrap();
     fncache.extend_from_slice(format!("{entry}\n").as_bytes());
     match expected {
       Some(expected) => assert_eq!(refused(&mut repository), expected, "{entry}"),
-      None => assert!(import(&mut repository, &mut store(), room()).is_ok(), "{entry}"),
+      None => assert!(
+        import(&mut repository, &mut store(), room()).is_ok(),
+        "{entry}"
+      ),
     }
   }
 }
