@@ -45,7 +45,22 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
-// Red (A-594): the tests below name the transport's modules, which are not built yet.
+pub mod entropy;
+pub mod hostkey;
+pub mod ident;
+pub mod kex;
+pub mod kexinit;
+pub mod keylife;
+pub mod packet;
+pub mod refusal;
+pub mod transport;
+pub mod wire;
+
+/// A count or a length as `u64`. Every `usize` fits on the targets slates ships (Appendix B.2), and one that did not
+/// would saturate, which every caller then refuses, rather than wrap.
+pub(crate) fn to_u64(value: usize) -> u64 {
+  u64::try_from(value).unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 #[path = "tests/support.rs"]

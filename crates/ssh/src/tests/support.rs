@@ -7,7 +7,10 @@ use crate::entropy::{Entropy, EntropyFailed};
 
 /// The bytes `text` spells in hex, whitespace ignored.
 pub(crate) fn hex(text: &str) -> Vec<u8> {
-  let digits: Vec<u8> = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
+  let digits: Vec<u8> = text
+    .bytes()
+    .filter(|byte| !byte.is_ascii_whitespace())
+    .collect();
   assert!(digits.len() % 2 == 0, "odd number of hex digits");
   digits
     .chunks(2)
@@ -58,7 +61,10 @@ pub(crate) struct Scripted {
 
 impl Scripted {
   pub(crate) fn new(script: &[u8]) -> Self {
-    Self { script: script.iter().copied().collect(), then: Seeded::new(7) }
+    Self {
+      script: script.iter().copied().collect(),
+      then: Seeded::new(7),
+    }
   }
 }
 
@@ -83,7 +89,10 @@ pub(crate) struct FailingAfter {
 
 impl FailingAfter {
   pub(crate) fn new(allowed: usize) -> Self {
-    Self { allowed, inner: Seeded::new(11) }
+    Self {
+      allowed,
+      inner: Seeded::new(11),
+    }
   }
 }
 

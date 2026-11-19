@@ -11,14 +11,19 @@ use crate::keylife::{RECOMMENDED_KEY_TIME_NS, UsageCap};
 use crate::packet::{Cipher, MAX_PACKET_EVERY_PEER_ACCEPTS, PacketRefusal, Sealer};
 use crate::refusal::{Direction, Refusal};
 use crate::support::{FailingAfter, Seeded, hex_array};
-use crate::transport::{Algorithms, ConfigRefusal, Event, SendRefusal, ServerTransport, TransportConfig};
+use crate::transport::{
+  Algorithms, ConfigRefusal, Event, SendRefusal, ServerTransport, TransportConfig,
+};
 
 const CHACHA: &str = "chacha20-poly1305@openssh.com";
 const GCM: &str = "aes256-gcm@openssh.com";
 
 /// RFC 8032 §7.1 test 1's key as the host key.
 fn host_key() -> HostKey {
-  HostKey::ed25519_from_seed(&hex_array("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")).unwrap()
+  HostKey::ed25519_from_seed(&hex_array(
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  ))
+  .unwrap()
 }
 
 fn config() -> TransportConfig {
@@ -43,7 +48,13 @@ struct Session {
 impl Session {
   fn new(config: TransportConfig, options: ClientOptions) -> Self {
     let server = ServerTransport::new(config, host_key(), Seeded::new(1), 0).unwrap();
-    Self { server, client: Client::new(options), events: Vec::new(), transcript: Vec::new(), now: 0 }
+    Self {
+      server,
+      client: Client::new(options),
+      events: Vec::new(),
+      transcript: Vec::new(),
+      now: 0,
+    }
   }
 
   /// Moves the server's output to the client; whether there was any.
@@ -68,7 +79,10 @@ impl Session {
         moved = true;
       }
       if !moved {
-        assert!(self.to_client(), "the server took nothing, raised nothing and wrote nothing");
+        assert!(
+          self.to_client(),
+          "the server took nothing, raised nothing and wrote nothing"
+        );
         stalls += 1;
         assert!(stalls < 10_000);
       }
@@ -101,7 +115,11 @@ impl Session {
 
   /// The last message the client opened.
   fn last_received(&self) -> &[u8] {
-    self.client.received.last().expect("the client received a message")
+    self
+      .client
+      .received
+      .last()
+      .expect("the client received a message")
   }
 }
 
@@ -120,7 +138,9 @@ fn disconnect_reason(payload: &[u8]) -> u32 {
 /// A clear packet of `payload`, as a client sends before the first NEWKEYS.
 fn clear_packet(payload: &[u8]) -> Vec<u8> {
   let mut out = Vec::new();
-  Sealer::clear().seal(payload, &mut Seeded::new(5), &mut out).unwrap();
+  Sealer::clear()
+    .seal(payload, &mut Seeded::new(5), &mut out)
+    .unwrap();
   out
 }
 
@@ -138,16 +158,33 @@ fn a_stock_client_connects_under_each_cipher_and_strictness() {
   ] {
     let mut session = Session::new(config(), ClientOptions::openssh_like(cipher_name, strict));
     session.pump().unwrap();
-    let session_id = session.client.session_id.expect("the client verified the exchange");
-    let algorithms = Algorithms { client_to_server: cipher, server_to_client: cipher };
+    let session_id = session
+      .client
+      .session_id
+      .expect("the client verified the exchange");
+    let algorithms = Algorithms {
+      client_to_server: cipher,
+      server_to_client: cipher,
+    };
     assert_eq!(
       session.events,
-      [Event::Established(crate::transport::Established { session_id, strict, client_ext_info: true, algorithms })]
+      [Event::Established(crate::transport::Established {
+        session_id,
+        strict,
+        client_ext_info: true,
+        algorithms
+      })]
     );
     assert_eq!(session.server.session_id(), Some(&session_id));
-    assert_eq!(session.client.host_key.as_deref(), Some(host_key().public_blob()));
+    assert_eq!(
+      session.client.host_key.as_deref(),
+      Some(host_key().public_blob())
+    );
     assert_eq!(session.client.strict, strict);
-    assert_eq!(session.server.client_identification(), Some(&b"SSH-2.0-OpenSSH_10.2"[..]));
+    assert_eq!(
+      session.server.client_identification(),
+      Some(&b"SSH-2.0-OpenSSH_10.2"[..])
+    );
     session.client.send(&service_request("ssh-userauth"));
     session.pump().unwrap();
     assert_eq!(session.events.last(), Some(&Event::ServiceAccepted));
@@ -156,7 +193,10 @@ fn a_stock_client_connects_under_each_cipher_and_strictness() {
     assert_eq!(session.last_received(), &accept[..]);
     session.client.send(&[50, 1, 2, 3]);
     session.pump().unwrap();
-    assert_eq!(session.events.last(), Some(&Event::Message(vec![50, 1, 2, 3])));
+    assert_eq!(
+      session.events.last(),
+      Some(&Event::Message(vec![50, 1, 2, 3]))
+    );
     session.server.send(&[52], session.now).unwrap();
     session.pump().unwrap();
     assert_eq!(session.last_received(), &[52]);
@@ -170,8 +210,16 @@ fn each_direction_runs_its_own_cipher() {
   let mut options = ClientOptions::openssh_like(GCM, true);
   options.ciphers_server_to_client = vec![CHACHA.to_string(), GCM.to_string()];
   let mut session = Session::serving(config(), options);
-  let Event::Established(established) = &session.events[0] else { panic!("first event {:?}", session.events[0]) };
-  assert_eq!(established.algorithms, Algorithms { client_to_server: Cipher::Aes256Gcm, server_to_client: Cipher::ChaCha20Poly1305 });
+  let Event::Established(established) = &session.events[0] else {
+    panic!("first event {:?}", session.events[0])
+  };
+  assert_eq!(
+    established.algorithms,
+    Algorithms {
+      client_to_server: Cipher::Aes256Gcm,
+      server_to_client: Cipher::ChaCha20Poly1305
+    }
+  );
   session.client.send(&[94, 9]);
   session.pump().unwrap();
   assert_eq!(session.events.last(), Some(&Event::Message(vec![94, 9])));
@@ -188,9 +236,15 @@ fn the_banner_comes_before_the_identification() {
   config.banner = vec!["slates: git, Mercurial and Subversion".to_string()];
   config.comments = Some("git".to_string());
   let session = Session::serving(config, ClientOptions::openssh_like(CHACHA, true));
-  assert_eq!(session.client.banner_lines, [b"slates: git, Mercurial and Subversion".to_vec()]);
+  assert_eq!(
+    session.client.banner_lines,
+    [b"slates: git, Mercurial and Subversion".to_vec()]
+  );
   let line = format!("SSH-2.0-{} git", software_version());
-  assert_eq!(session.client.server_identification.as_deref(), Some(line.as_bytes()));
+  assert_eq!(
+    session.client.server_identification.as_deref(),
+    Some(line.as_bytes())
+  );
 }
 
 /// A-594 hostile, Terrapin (the strict-kex draft §3.2: "MUST verify that the SSH_MSG_KEXINIT was the first message
@@ -243,14 +297,20 @@ fn exchange_messages_out_of_place_are_refused() {
   let init = session.client.take_output();
   let mut twice = init.clone();
   twice.extend_from_slice(&init);
-  assert_eq!(session.to_server(&twice), Err(Refusal::Unexpected { number: 30 }));
+  assert_eq!(
+    session.to_server(&twice),
+    Err(Refusal::Unexpected { number: 30 })
+  );
 
   let mut session = Session::new(config(), ClientOptions::openssh_like(GCM, false));
   let first = session.client.take_output();
   session.to_server(&first).unwrap();
   session.client.send(&[21]);
   let early = session.client.take_output();
-  assert_eq!(session.to_server(&early), Err(Refusal::Unexpected { number: 21 }));
+  assert_eq!(
+    session.to_server(&early),
+    Err(Refusal::Unexpected { number: 21 })
+  );
 }
 
 /// A-594 (RFC 4253 §10): do ask for `ssh-connection` before authentication, ask for `ssh-userauth` twice, and send an
@@ -303,7 +363,13 @@ fn a_client_disconnect_is_raised_and_closes() {
   put_string(&mut payload, b"");
   session.client.send(&payload);
   session.pump().unwrap();
-  assert_eq!(session.events.last(), Some(&Event::Disconnected { reason: 11, description: "bye".to_string() }));
+  assert_eq!(
+    session.events.last(),
+    Some(&Event::Disconnected {
+      reason: 11,
+      description: "bye".to_string()
+    })
+  );
   assert!(session.server.is_closed());
   assert_eq!(session.server.receive(&[0; 64], 0), Ok(0));
   assert_eq!(session.server.send(&[94], 0), Err(SendRefusal::Closed));
@@ -317,7 +383,12 @@ fn a_client_sharing_no_cipher_is_refused() {
   let mut options = ClientOptions::openssh_like(CHACHA, true);
   options.ciphers_client_to_server = vec!["aes128-ctr".to_string()];
   let mut session = Session::new(config(), options);
-  assert_eq!(session.pump(), Err(Refusal::KexInit(KexInitRefusal::NoCommonAlgorithm(List::CipherClientToServer))));
+  assert_eq!(
+    session.pump(),
+    Err(Refusal::KexInit(KexInitRefusal::NoCommonAlgorithm(
+      List::CipherClientToServer
+    )))
+  );
   session.to_client();
   assert_eq!(disconnect_reason(session.last_received()), 3);
 }
@@ -333,7 +404,10 @@ fn a_small_order_client_key_is_refused() {
   put_string(&mut init, &[0; 32]);
   session.client.send(&init);
   let bad = session.client.take_output();
-  assert_eq!(session.to_server(&bad), Err(Refusal::Kex(KexRefusal::SharedSecretRejected)));
+  assert_eq!(
+    session.to_server(&bad),
+    Err(Refusal::Kex(KexRefusal::SharedSecretRejected))
+  );
   session.to_client();
   assert_eq!(disconnect_reason(session.last_received()), 3);
 }
@@ -348,7 +422,10 @@ fn a_forged_packet_is_refused_with_mac_error() {
     let mut forged = session.client.take_output();
     let middle = forged.len() / 2;
     forged[middle] ^= 0x04;
-    assert_eq!(session.to_server(&forged), Err(Refusal::Packet(PacketRefusal::TagMismatch)));
+    assert_eq!(
+      session.to_server(&forged),
+      Err(Refusal::Packet(PacketRefusal::TagMismatch))
+    );
     session.to_client();
     assert_eq!(disconnect_reason(session.last_received()), 5);
   }
@@ -364,7 +441,12 @@ fn a_packet_past_the_cap_is_refused_from_its_length() {
     input.extend_from_slice(&head.to_be_bytes());
     let refusal = server.receive(&input, 0).unwrap_err();
     assert!(
-      matches!(refusal, Refusal::Packet(PacketRefusal::LengthPastCap { .. } | PacketRefusal::LengthUnaligned { .. })),
+      matches!(
+        refusal,
+        Refusal::Packet(
+          PacketRefusal::LengthPastCap { .. } | PacketRefusal::LengthUnaligned { .. }
+        )
+      ),
       "{refusal:?}"
     );
     assert!(server.is_closed());
@@ -380,13 +462,18 @@ fn bad_identifications_are_refused() {
   let before = server.pending_output().len();
   assert_eq!(
     server.receive(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", 0),
-    Err(Refusal::Identification(IdentificationRefusal::LineBeforeIdentification))
+    Err(Refusal::Identification(
+      IdentificationRefusal::LineBeforeIdentification
+    ))
   );
   assert!(server.pending_output().len() > before);
   let mut server = ServerTransport::new(config(), host_key(), Seeded::new(1), 0).unwrap();
   let mut endless = b"SSH-2.0-".to_vec();
   endless.extend_from_slice(&[b'x'; 400]);
-  assert_eq!(server.receive(&endless, 0), Err(Refusal::Identification(IdentificationRefusal::TooLong)));
+  assert_eq!(
+    server.receive(&endless, 0),
+    Err(Refusal::Identification(IdentificationRefusal::TooLong))
+  );
 }
 
 /// A-594 (RFC 4253 §9): do start a key exchange from the client once the service is accepted, then pass messages. Expect
@@ -399,14 +486,26 @@ fn a_client_rekey_keeps_the_session_id() {
     let session_id = *session.server.session_id().unwrap();
     session.client.start_rekey();
     session.pump().unwrap();
-    assert!(session.events.iter().any(|event| matches!(event, Event::Rekeyed(_))));
+    assert!(
+      session
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Rekeyed(_)))
+    );
     assert_eq!(session.client.server_newkeys, 2);
     assert_eq!(session.client.exchange_hashes.len(), 2);
-    assert_ne!(session.client.exchange_hashes[0], session.client.exchange_hashes[1]);
+    assert_ne!(
+      session.client.exchange_hashes[0],
+      session.client.exchange_hashes[1]
+    );
     assert_eq!(session.server.session_id(), Some(&session_id));
     let server_kexinit = session.client.server_kexinit.clone().unwrap();
     let read = KexInit::read(&server_kexinit).unwrap();
-    assert!(!read.list(List::Kex).contains("kex-strict-s-v00@openssh.com"));
+    assert!(
+      !read
+        .list(List::Kex)
+        .contains("kex-strict-s-v00@openssh.com")
+    );
     session.client.send(&[94, 1]);
     session.server.send(&[94, 2], 0).unwrap();
     session.pump().unwrap();
@@ -429,7 +528,10 @@ fn the_server_rekeys_when_the_key_time_runs_out() {
   session.server.poll_timers(1_000).unwrap();
   assert!(!session.server.pending_output().is_empty());
   assert_eq!(session.server.next_timer_ns(), None);
-  assert_eq!(session.server.send(&[94], 1_000), Err(SendRefusal::Rekeying));
+  assert_eq!(
+    session.server.send(&[94], 1_000),
+    Err(SendRefusal::Rekeying)
+  );
   session.pump().unwrap();
   assert!(matches!(session.events.last(), Some(Event::Rekeyed(_))));
   session.server.send(&[94], 1_000).unwrap();
@@ -457,7 +559,10 @@ fn the_key_time_is_never_shorter_than_the_last_exchange() {
 #[test]
 fn the_server_rekeys_at_half_its_keys_limit() {
   let mut config = config();
-  config.usage_cap = UsageCap { packets: Some(8), blocks: None };
+  config.usage_cap = UsageCap {
+    packets: Some(8),
+    blocks: None,
+  };
   let mut session = Session::serving(config, ClientOptions::openssh_like(GCM, true));
   assert_eq!(session.server.key_usage().sent.packets, 1);
   session.server.send(&[94, 1], 0).unwrap();
@@ -477,7 +582,10 @@ fn the_server_rekeys_at_half_its_keys_limit() {
 #[test]
 fn a_client_that_never_rekeys_exhausts_its_key() {
   let mut config = config();
-  config.usage_cap = UsageCap { packets: Some(8), blocks: None };
+  config.usage_cap = UsageCap {
+    packets: Some(8),
+    blocks: None,
+  };
   let mut options = ClientOptions::openssh_like(CHACHA, true);
   options.answer_kexinit = false;
   let mut session = Session::serving(config, options);
@@ -488,7 +596,12 @@ fn a_client_that_never_rekeys_exhausts_its_key() {
   }
   assert_eq!(session.server.key_usage().received.packets, 8);
   session.client.send(&[94, 8]);
-  assert_eq!(session.pump(), Err(Refusal::KeyExhausted { direction: Direction::ClientToServer }));
+  assert_eq!(
+    session.pump(),
+    Err(Refusal::KeyExhausted {
+      direction: Direction::ClientToServer
+    })
+  );
 }
 
 /// A-594: do pass the client's NEWKEYS and its service request in one read. Expect the server to stop after the NEWKEYS
@@ -506,8 +619,14 @@ fn input_waits_while_an_event_does() {
   let both = session.client.take_output();
   let used = session.server.receive(&both, 0).unwrap();
   assert!(used < both.len());
-  assert!(matches!(session.server.poll_event(), Some(Event::Established(_))));
-  assert_eq!(session.server.receive(&both[used..], 0), Ok(both.len() - used));
+  assert!(matches!(
+    session.server.poll_event(),
+    Some(Event::Established(_))
+  ));
+  assert_eq!(
+    session.server.receive(&both[used..], 0),
+    Ok(both.len() - used)
+  );
   assert_eq!(session.server.poll_event(), Some(Event::ServiceAccepted));
 }
 
@@ -526,7 +645,15 @@ fn input_waits_while_the_output_is_full() {
   assert_eq!(session.server.send(&[94], 0), Err(SendRefusal::OutputFull));
   session.to_server(&flood[used..]).unwrap();
   session.to_client();
-  assert_eq!(session.client.received.iter().filter(|payload| payload[0] == 3).count(), 1_200);
+  assert_eq!(
+    session
+      .client
+      .received
+      .iter()
+      .filter(|payload| payload[0] == 3)
+      .count(),
+    1_200
+  );
 }
 
 /// A-594 determinism: do run the same connection twice from the same seeds. Expect the server's bytes identical.
@@ -571,9 +698,15 @@ fn bad_configurations_are_refused() {
   small.packet_cap = MAX_PACKET_EVERY_PEER_ACCEPTS - 1;
   assert_eq!(
     ServerTransport::new(small, host_key(), Seeded::new(1), 0).unwrap_err(),
-    ConfigRefusal::PacketCapBelowStandard { cap: 34_999, floor: 35_000 }
+    ConfigRefusal::PacketCapBelowStandard {
+      cap: 34_999,
+      floor: 35_000
+    }
   );
-  assert_eq!(ServerTransport::new(config(), host_key(), FailingAfter::new(0), 0).unwrap_err(), ConfigRefusal::Entropy);
+  assert_eq!(
+    ServerTransport::new(config(), host_key(), FailingAfter::new(0), 0).unwrap_err(),
+    ConfigRefusal::Entropy
+  );
 }
 
 /// A-594: do send from the layers above before the service, a transport number, an empty message and one too large.
@@ -582,15 +715,24 @@ fn bad_configurations_are_refused() {
 fn sends_the_transport_cannot_take_are_refused() {
   let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
   session.pump().unwrap();
-  assert_eq!(session.server.send(&[94], 0), Err(SendRefusal::NotEstablished));
+  assert_eq!(
+    session.server.send(&[94], 0),
+    Err(SendRefusal::NotEstablished)
+  );
   for cipher in [CHACHA, GCM] {
     let mut session = Session::serving(config(), ClientOptions::openssh_like(cipher, true));
-    assert_eq!(session.server.send(&[5], 0), Err(SendRefusal::NotUpperLayer { number: 5 }));
+    assert_eq!(
+      session.server.send(&[5], 0),
+      Err(SendRefusal::NotUpperLayer { number: 5 })
+    );
     assert_eq!(session.server.send(&[], 0), Err(SendRefusal::Empty));
     let large = vec![94; MAX_PACKET_EVERY_PEER_ACCEPTS];
     assert_eq!(
       session.server.send(&large, 0),
-      Err(SendRefusal::TooLarge { payload: MAX_PACKET_EVERY_PEER_ACCEPTS as u64, ceiling: MAX_PACKET_EVERY_PEER_ACCEPTS as u64 })
+      Err(SendRefusal::TooLarge {
+        payload: MAX_PACKET_EVERY_PEER_ACCEPTS as u64,
+        ceiling: MAX_PACKET_EVERY_PEER_ACCEPTS as u64
+      })
     );
     session.server.send(&[94], 0).unwrap();
     session.pump().unwrap();

@@ -5,7 +5,9 @@
 //! completes an exchange with it, and whose packets it opens, agrees with the documents rather than with itself. It
 //! panics on anything it does not expect, which fails the test that drove it.
 
-use aws_lc_rs::aead::chacha20_poly1305_openssh::{OpeningKey as ChaChaOpen, SealingKey as ChaChaSeal};
+use aws_lc_rs::aead::chacha20_poly1305_openssh::{
+  OpeningKey as ChaChaOpen, SealingKey as ChaChaSeal,
+};
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement::{self, PrivateKey, UnparsedPublicKey as AgreementPublicKey, X25519};
 use aws_lc_rs::digest::{self, SHA256};
@@ -60,21 +62,29 @@ impl ClientOptions {
 
 /// RFC 7748 §6.1's Bob: the client's first ephemeral private key in the tests.
 pub(crate) const RFC7748_BOB_PRIVATE: [u8; 32] = [
-  0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b, 0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80, 0x0e, 0xe6, 0x6f, 0x3b, 0xb1, 0x29,
-  0x26, 0x18, 0xb6, 0xfd, 0x1c, 0x2f, 0x8b, 0x27, 0xff, 0x88, 0xe0, 0xeb,
+  0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b, 0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80, 0x0e, 0xe6,
+  0x6f, 0x3b, 0xb1, 0x29, 0x26, 0x18, 0xb6, 0xfd, 0x1c, 0x2f, 0x8b, 0x27, 0xff, 0x88, 0xe0, 0xeb,
 ];
 
 /// How the client seals one direction.
 enum Seal {
   Clear,
-  Gcm { key: LessSafeKey, fixed: [u8; 4], counter: u64 },
+  Gcm {
+    key: LessSafeKey,
+    fixed: [u8; 4],
+    counter: u64,
+  },
   ChaCha(ChaChaSeal),
 }
 
 /// How the client opens one direction.
 enum Open {
   Clear,
-  Gcm { key: LessSafeKey, fixed: [u8; 4], counter: u64 },
+  Gcm {
+    key: LessSafeKey,
+    fixed: [u8; 4],
+    counter: u64,
+  },
   ChaCha(ChaChaOpen),
 }
 
@@ -182,7 +192,10 @@ impl Client {
   fn read_lines(&mut self) {
     while let Some(end) = self.inbound.iter().position(|byte| *byte == b'\n') {
       let line: Vec<u8> = self.inbound.drain(..=end).collect();
-      assert!(line.ends_with(b"\r\n"), "every server line ends CR LF: {line:?}");
+      assert!(
+        line.ends_with(b"\r\n"),
+        "every server line ends CR LF: {line:?}"
+      );
       let line = line[..line.len() - 2].to_vec();
       if line.starts_with(b"SSH-") {
         self.server_identification = Some(line);
@@ -201,7 +214,12 @@ impl Client {
     let (length, tag_len, alignment, length_aligned) = match &self.open {
       Open::Clear => (u32::from_be_bytes(head) as usize, 0, 8, true),
       Open::Gcm { .. } => (u32::from_be_bytes(head) as usize, 16, 16, false),
-      Open::ChaCha(key) => (u32::from_be_bytes(key.decrypt_packet_length(self.receive_sequence, head)) as usize, 16, 8, false),
+      Open::ChaCha(key) => (
+        u32::from_be_bytes(key.decrypt_packet_length(self.receive_sequence, head)) as usize,
+        16,
+        8,
+        false,
+      ),
     };
     let aligned = if length_aligned { length + 4 } else { length };
     assert_eq!(aligned % alignment, 0, "the server's packet is aligned");
@@ -222,17 +240,25 @@ impl Client {
   fn open_packet(&mut self, packet: &mut [u8], length: usize) {
     match &mut self.open {
       Open::Clear => {}
-      Open::Gcm { key, fixed, counter } => {
+      Open::Gcm {
+        key,
+        fixed,
+        counter,
+      } => {
         let nonce = gcm_nonce(fixed, *counter);
         *counter = counter.wrapping_add(1);
         let head: [u8; 4] = packet[..4].try_into().unwrap();
         let (body, tag) = packet[4..].split_at_mut(length);
-        key.open_in_place_separate_tag(nonce, Aad::from(head), tag, body).expect("the server's GCM packet opens");
+        key
+          .open_in_place_separate_tag(nonce, Aad::from(head), tag, body)
+          .expect("the server's GCM packet opens");
       }
       Open::ChaCha(key) => {
         let (sealed, tag) = packet.split_at_mut(4 + length);
         let tag: &[u8; 16] = (&*tag).try_into().unwrap();
-        key.open_in_place(self.receive_sequence, sealed, tag).expect("the server's ChaCha20-Poly1305 packet opens");
+        key
+          .open_in_place(self.receive_sequence, sealed, tag)
+          .expect("the server's ChaCha20-Poly1305 packet opens");
       }
     }
   }
@@ -257,20 +283,29 @@ impl Client {
       self.send_kexinit();
     }
     let ours = self.lists();
-    let (Some(client_to_server), Some(server_to_client)) =
-      (first_shared(&ours[2], &server.lists[2]), first_shared(&ours[3], &server.lists[3]))
-    else {
+    let (Some(client_to_server), Some(server_to_client)) = (
+      first_shared(&ours[2], &server.lists[2]),
+      first_shared(&ours[3], &server.lists[3]),
+    ) else {
       return;
     };
     self.cipher_client_to_server = client_to_server;
     self.cipher_server_to_client = server_to_client;
     if self.exchanges == 1 {
-      let pairs = [("kex-strict-c-v00@openssh.com", "kex-strict-s-v00@openssh.com"), ("kex-strict-c", "kex-strict-s")];
+      let pairs = [
+        (
+          "kex-strict-c-v00@openssh.com",
+          "kex-strict-s-v00@openssh.com",
+        ),
+        ("kex-strict-c", "kex-strict-s"),
+      ];
       self.strict = pairs.iter().any(|(client, server_marker)| {
-        ours[0].iter().any(|name| name == client) && server.lists[0].iter().any(|name| name == server_marker)
+        ours[0].iter().any(|name| name == client)
+          && server.lists[0].iter().any(|name| name == server_marker)
       });
     }
-    let guess_right = ours[0].first() == server.lists[0].first() && ours[1].first() == server.lists[1].first();
+    let guess_right =
+      ours[0].first() == server.lists[0].first() && ours[1].first() == server.lists[1].first();
     let guess_stands = self.guessed && guess_right && self.options.guess.is_none();
     if !self.ecdh_sent || !guess_stands {
       self.send_ecdh_init();
@@ -284,10 +319,20 @@ impl Client {
     let server_public = read_string(payload, &mut at);
     let signature = read_string(payload, &mut at);
     assert_eq!(at, payload.len(), "the reply has no trailing bytes");
-    assert_eq!(server_public.len(), 32, "the server's X25519 key is 32 bytes");
+    assert_eq!(
+      server_public.len(),
+      32,
+      "the server's X25519 key is 32 bytes"
+    );
     let private = PrivateKey::from_private_key(&X25519, &self.private).unwrap();
     let client_public = private.compute_public_key().unwrap().as_ref().to_vec();
-    let shared = agreement::agree(&private, AgreementPublicKey::new(&X25519, &server_public), (), |x| Ok(x.to_vec())).unwrap();
+    let shared = agreement::agree(
+      &private,
+      AgreementPublicKey::new(&X25519, &server_public),
+      (),
+      |x| Ok(x.to_vec()),
+    )
+    .unwrap();
     let k = mpint(&shared);
     let mut hashed = Vec::new();
     let fields: [&[u8]; 7] = [
@@ -303,7 +348,10 @@ impl Client {
       put_string(&mut hashed, field);
     }
     hashed.extend_from_slice(&k);
-    let hash: [u8; 32] = digest::digest(&SHA256, &hashed).as_ref().try_into().unwrap();
+    let hash: [u8; 32] = digest::digest(&SHA256, &hashed)
+      .as_ref()
+      .try_into()
+      .unwrap();
     verify_host_signature(&host_key, &hash, &signature);
     let session_id = *self.session_id.get_or_insert(hash);
     self.exchange_hashes.push(hash);
@@ -311,15 +359,26 @@ impl Client {
     self.send(&[21]);
     let c2s = self.cipher_client_to_server.clone();
     let s2c = self.cipher_server_to_client.clone();
-    self.seal = seal_for(&c2s, &kdf(&k, &hash, b'C', &session_id, key_len(&c2s)), &kdf(&k, &hash, b'A', &session_id, iv_len(&c2s)));
-    self.next_open = Some(open_for(&s2c, &kdf(&k, &hash, b'D', &session_id, key_len(&s2c)), &kdf(&k, &hash, b'B', &session_id, iv_len(&s2c))));
+    self.seal = seal_for(
+      &c2s,
+      &kdf(&k, &hash, b'C', &session_id, key_len(&c2s)),
+      &kdf(&k, &hash, b'A', &session_id, iv_len(&c2s)),
+    );
+    self.next_open = Some(open_for(
+      &s2c,
+      &kdf(&k, &hash, b'D', &session_id, key_len(&s2c)),
+      &kdf(&k, &hash, b'B', &session_id, iv_len(&s2c)),
+    ));
     if self.strict {
       self.send_sequence = 0;
     }
   }
 
   fn on_server_newkeys(&mut self) {
-    self.open = self.next_open.take().expect("the server's NEWKEYS follows its reply");
+    self.open = self
+      .next_open
+      .take()
+      .expect("the server's NEWKEYS follows its reply");
     if self.strict {
       self.receive_sequence = 0;
     }
@@ -330,9 +389,17 @@ impl Client {
 
   /// The client's lists, in RFC 4253 §7.1's order (markers left out after the first exchange).
   fn lists(&self) -> Vec<Vec<String>> {
-    let markers = |name: &String| !(self.exchanges > 1 && (name.starts_with("kex-strict") || name.starts_with("ext-info")));
+    let markers = |name: &String| {
+      !(self.exchanges > 1 && (name.starts_with("kex-strict") || name.starts_with("ext-info")))
+    };
     vec![
-      self.options.kex.iter().filter(|name| markers(name)).cloned().collect(),
+      self
+        .options
+        .kex
+        .iter()
+        .filter(|name| markers(name))
+        .cloned()
+        .collect(),
       self.options.host_keys.clone(),
       self.options.ciphers_client_to_server.clone(),
       self.options.ciphers_server_to_client.clone(),
@@ -349,7 +416,12 @@ impl Client {
     self.exchanges += 1;
     self.in_exchange = true;
     self.ecdh_sent = false;
-    self.private = self.options.private_keys.get(self.exchanges - 1).copied().unwrap_or([self.exchanges as u8; 32]);
+    self.private = self
+      .options
+      .private_keys
+      .get(self.exchanges - 1)
+      .copied()
+      .unwrap_or([self.exchanges as u8; 32]);
     let mut payload = vec![20];
     let mut cookie = self.options.cookie;
     cookie[0] ^= self.exchanges as u8;
@@ -357,7 +429,9 @@ impl Client {
     for list in self.lists() {
       put_string(&mut payload, list.join(",").as_bytes());
     }
-    payload.push(u8::from(self.exchanges == 1 && self.options.first_kex_packet_follows));
+    payload.push(u8::from(
+      self.exchanges == 1 && self.options.first_kex_packet_follows,
+    ));
     payload.extend_from_slice(&0u32.to_be_bytes());
     self.kexinit = payload.clone();
     self.send(&payload);
@@ -391,10 +465,16 @@ impl Client {
     packet.extend(std::iter::repeat_n(0u8, padding));
     match &mut self.seal {
       Seal::Clear => {}
-      Seal::Gcm { key, fixed, counter } => {
+      Seal::Gcm {
+        key,
+        fixed,
+        counter,
+      } => {
         let nonce = gcm_nonce(fixed, *counter);
         *counter = counter.wrapping_add(1);
-        let tag = key.seal_in_place_separate_tag(nonce, Aad::from(length.to_be_bytes()), &mut packet[4..]).unwrap();
+        let tag = key
+          .seal_in_place_separate_tag(nonce, Aad::from(length.to_be_bytes()), &mut packet[4..])
+          .unwrap();
         packet.extend_from_slice(tag.as_ref());
       }
       Seal::ChaCha(key) => {
@@ -479,7 +559,10 @@ pub(crate) fn kdf(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], length: usi
 
 /// RFC 4251 §5's `mpint` of an unsigned big-endian magnitude, its length included.
 pub(crate) fn mpint(magnitude: &[u8]) -> Vec<u8> {
-  let first = magnitude.iter().position(|byte| *byte != 0).unwrap_or(magnitude.len());
+  let first = magnitude
+    .iter()
+    .position(|byte| *byte != 0)
+    .unwrap_or(magnitude.len());
   let mut body = Vec::new();
   if magnitude.get(first).is_some_and(|byte| byte & 0x80 != 0) {
     body.push(0);
@@ -508,10 +591,22 @@ fn parse_kexinit(payload: &[u8]) -> ServerLists {
   let lists = (0..10)
     .map(|_| {
       let list = read_string(payload, &mut at);
-      if list.is_empty() { Vec::new() } else { String::from_utf8(list).unwrap().split(',').map(str::to_string).collect() }
+      if list.is_empty() {
+        Vec::new()
+      } else {
+        String::from_utf8(list)
+          .unwrap()
+          .split(',')
+          .map(str::to_string)
+          .collect()
+      }
     })
     .collect();
-  assert_eq!(payload.len(), at + 5, "a KEXINIT ends with its boolean and reserved word");
+  assert_eq!(
+    payload.len(),
+    at + 5,
+    "a KEXINIT ends with its boolean and reserved word"
+  );
   ServerLists { lists }
 }
 

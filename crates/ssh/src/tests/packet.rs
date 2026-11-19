@@ -4,8 +4,8 @@ use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use proptest::prelude::*;
 
 use crate::packet::{
-  AES_BLOCK_LEN, CLEAR_ALIGNMENT, Cipher, LENGTH_LEN, MAX_PACKET_EVERY_PEER_ACCEPTS, MIN_PADDING, Opener, PacketRefusal,
-  SealRefusal, Sealer, TAG_LEN, Usage,
+  AES_BLOCK_LEN, CLEAR_ALIGNMENT, Cipher, LENGTH_LEN, MAX_PACKET_EVERY_PEER_ACCEPTS, MIN_PADDING,
+  Opener, PacketRefusal, SealRefusal, Sealer, TAG_LEN, Usage,
 };
 use crate::support::{Scripted, Seeded, hex};
 
@@ -47,13 +47,24 @@ fn chacha_seals_and_opens_the_drafts_worked_packet() {
   sealer.set_sequence(7);
   let mut padding = Scripted::new(&hex("4e43e804dc6c"));
   let mut out = Vec::new();
-  sealer.seal(&draft_payload(), &mut padding, &mut out).unwrap();
+  sealer
+    .seal(&draft_payload(), &mut padding, &mut out)
+    .unwrap();
   assert_eq!(out, hex(DRAFT_WIRE));
   assert_eq!(sealer.sequence(), 8);
-  assert_eq!(sealer.usage(), Usage { packets: 1, blocks: 0 });
+  assert_eq!(
+    sealer.usage(),
+    Usage {
+      packets: 1,
+      blocks: 0
+    }
+  );
   let mut opener = Opener::new(Cipher::ChaCha20Poly1305, &key, &[]).unwrap();
   opener.set_sequence(7);
-  assert_eq!(open_wire(&mut opener, &hex(DRAFT_WIRE), MAX_PACKET_EVERY_PEER_ACCEPTS), Ok(draft_payload()));
+  assert_eq!(
+    open_wire(&mut opener, &hex(DRAFT_WIRE), MAX_PACKET_EVERY_PEER_ACCEPTS),
+    Ok(draft_payload())
+  );
   assert_eq!(opener.sequence(), 8);
 }
 
@@ -69,15 +80,24 @@ fn chacha_refuses_a_forged_or_misplaced_packet() {
     forged[flip] ^= 0x01;
     let mut opener = Opener::new(Cipher::ChaCha20Poly1305, &key, &[]).unwrap();
     opener.set_sequence(7);
-    assert_eq!(open_wire(&mut opener, &forged, MAX_PACKET_EVERY_PEER_ACCEPTS), Err(PacketRefusal::TagMismatch));
+    assert_eq!(
+      open_wire(&mut opener, &forged, MAX_PACKET_EVERY_PEER_ACCEPTS),
+      Err(PacketRefusal::TagMismatch)
+    );
   }
   let mut opener = Opener::new(Cipher::ChaCha20Poly1305, &key, &[]).unwrap();
   opener.set_sequence(7);
   let head: [u8; 4] = wire[..4].try_into().unwrap();
-  assert_eq!(opener.frame(head, wire.len() - 1), Err(PacketRefusal::LengthPastCap { size: 92, cap: 91 }));
+  assert_eq!(
+    opener.frame(head, wire.len() - 1),
+    Err(PacketRefusal::LengthPastCap { size: 92, cap: 91 })
+  );
   let mut packet = wire.clone();
   opener.set_sequence(8);
-  assert!(opener.open(&mut packet).is_err(), "another sequence number decrypts another length or fails the tag");
+  assert!(
+    opener.open(&mut packet).is_err(),
+    "another sequence number decrypts another length or fails the tag"
+  );
 }
 
 /// A-594 oracle (RFC 5647 §7.1, §7.2): do seal three packets under AES-256-GCM with a derived IV, and seal the same
@@ -97,7 +117,11 @@ fn gcm_follows_rfc_5647s_nonce_and_additional_data() {
     let mut out = Vec::new();
     sealer.seal(payload, &mut entropy, &mut out).unwrap();
     let length = u32::from_be_bytes(out[..4].try_into().unwrap()) as usize;
-    assert_eq!(length % AES_BLOCK_LEN, 0, "the plaintext after the length is a multiple of 16");
+    assert_eq!(
+      length % AES_BLOCK_LEN,
+      0,
+      "the plaintext after the length is a multiple of 16"
+    );
     assert_eq!(out.len(), LENGTH_LEN + length + TAG_LEN);
     let padding = (length - 1 - payload.len()) as u8;
     let mut plain = vec![padding];
@@ -107,25 +131,42 @@ fn gcm_follows_rfc_5647s_nonce_and_additional_data() {
     plain.extend_from_slice(&padding_bytes);
     let mut nonce = [0u8; 12];
     nonce[..4].copy_from_slice(&iv[..4]);
-    nonce[4..].copy_from_slice(&0xffff_ffff_ffff_fffe_u64.wrapping_add(index as u64).to_be_bytes());
+    nonce[4..].copy_from_slice(
+      &0xffff_ffff_ffff_fffe_u64
+        .wrapping_add(index as u64)
+        .to_be_bytes(),
+    );
     let tag = by_hand
-      .seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from((length as u32).to_be_bytes()), &mut plain)
+      .seal_in_place_separate_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::from((length as u32).to_be_bytes()),
+        &mut plain,
+      )
       .unwrap();
     let mut expected = (length as u32).to_be_bytes().to_vec();
     expected.extend_from_slice(&plain);
     expected.extend_from_slice(tag.as_ref());
     assert_eq!(out, expected, "packet {index}");
-    assert_eq!(open_wire(&mut opener, &out, MAX_PACKET_EVERY_PEER_ACCEPTS), Ok(payload.to_vec()));
+    assert_eq!(
+      open_wire(&mut opener, &out, MAX_PACKET_EVERY_PEER_ACCEPTS),
+      Ok(payload.to_vec())
+    );
   }
   assert_eq!(sealer.usage().packets, 3);
   assert_eq!(sealer.usage(), opener.usage());
   let mut out = Vec::new();
-  Sealer::new(Cipher::Aes256Gcm, &key, &iv).unwrap().seal(b"\x5e", &mut Seeded::new(9), &mut out).unwrap();
+  Sealer::new(Cipher::Aes256Gcm, &key, &iv)
+    .unwrap()
+    .seal(b"\x5e", &mut Seeded::new(9), &mut out)
+    .unwrap();
   for flip in [out.len() - 1, LENGTH_LEN + 1] {
     let mut forged = out.clone();
     forged[flip] ^= 0x80;
     let mut fresh = Opener::new(Cipher::Aes256Gcm, &key, &iv).unwrap();
-    assert_eq!(open_wire(&mut fresh, &forged, MAX_PACKET_EVERY_PEER_ACCEPTS), Err(PacketRefusal::TagMismatch));
+    assert_eq!(
+      open_wire(&mut fresh, &forged, MAX_PACKET_EVERY_PEER_ACCEPTS),
+      Err(PacketRefusal::TagMismatch)
+    );
   }
 }
 
@@ -138,12 +179,23 @@ fn clear_packets_align_their_length_too() {
   for payload_len in [1usize, 2, 3, 10, 11, 12, 255] {
     let payload = vec![0x14; payload_len];
     let mut out = Vec::new();
-    sealer.seal(&payload, &mut Seeded::new(3), &mut out).unwrap();
+    sealer
+      .seal(&payload, &mut Seeded::new(3), &mut out)
+      .unwrap();
     assert_eq!(out.len() % CLEAR_ALIGNMENT, 0);
     assert!(out[4] as usize >= MIN_PADDING);
-    assert_eq!(open_wire(&mut opener, &out, MAX_PACKET_EVERY_PEER_ACCEPTS), Ok(payload));
+    assert_eq!(
+      open_wire(&mut opener, &out, MAX_PACKET_EVERY_PEER_ACCEPTS),
+      Ok(payload)
+    );
   }
-  assert_eq!(sealer.usage(), Usage { packets: 7, blocks: 0 });
+  assert_eq!(
+    sealer.usage(),
+    Usage {
+      packets: 7,
+      blocks: 0
+    }
+  );
 }
 
 /// A-594 hostile: do frame lengths a client could send in the clear: too short to hold a payload, unaligned, `u32::MAX`,
@@ -153,15 +205,30 @@ fn clear_packets_align_their_length_too() {
 fn bad_lengths_are_refused_from_the_first_four_bytes() {
   let opener = Opener::clear();
   let cap = MAX_PACKET_EVERY_PEER_ACCEPTS;
-  assert_eq!(opener.frame(4u32.to_be_bytes(), cap), Err(PacketRefusal::LengthTooShort { length: 4 }));
-  assert_eq!(opener.frame(13u32.to_be_bytes(), cap), Err(PacketRefusal::LengthUnaligned { length: 13, alignment: 8 }));
+  assert_eq!(
+    opener.frame(4u32.to_be_bytes(), cap),
+    Err(PacketRefusal::LengthTooShort { length: 4 })
+  );
+  assert_eq!(
+    opener.frame(13u32.to_be_bytes(), cap),
+    Err(PacketRefusal::LengthUnaligned {
+      length: 13,
+      alignment: 8
+    })
+  );
   assert_eq!(
     opener.frame(u32::MAX.to_be_bytes(), cap),
-    Err(PacketRefusal::LengthUnaligned { length: u32::MAX, alignment: 8 })
+    Err(PacketRefusal::LengthUnaligned {
+      length: u32::MAX,
+      alignment: 8
+    })
   );
   assert_eq!(
     opener.frame(0xffff_fffc_u32.to_be_bytes(), cap),
-    Err(PacketRefusal::LengthPastCap { size: 0x1_0000_0000, cap: cap as u64 })
+    Err(PacketRefusal::LengthPastCap {
+      size: 0x1_0000_0000,
+      cap: cap as u64
+    })
   );
   assert_eq!(opener.frame(12u32.to_be_bytes(), cap), Ok(16));
 }
@@ -174,13 +241,25 @@ fn bad_padding_is_refused() {
   let mut short = 12u32.to_be_bytes().to_vec();
   short.extend_from_slice(&[3, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0, 0, 0]);
   short.push(0);
-  assert_eq!(opener.open(&mut short), Err(PacketRefusal::PaddingTooShort { padding: 3 }));
+  assert_eq!(
+    opener.open(&mut short),
+    Err(PacketRefusal::PaddingTooShort { padding: 3 })
+  );
   let mut empty = 12u32.to_be_bytes().to_vec();
   empty.extend_from_slice(&[11; 12]);
-  assert_eq!(opener.open(&mut empty), Err(PacketRefusal::PaddingPastPacket { padding: 11, length: 12 }));
+  assert_eq!(
+    opener.open(&mut empty),
+    Err(PacketRefusal::PaddingPastPacket {
+      padding: 11,
+      length: 12
+    })
+  );
   let mut cut = 12u32.to_be_bytes().to_vec();
   cut.extend_from_slice(&[4; 8]);
-  assert_eq!(opener.open(&mut cut), Err(PacketRefusal::Incomplete { have: 12, need: 16 }));
+  assert_eq!(
+    opener.open(&mut cut),
+    Err(PacketRefusal::Incomplete { have: 12, need: 16 })
+  );
 }
 
 /// A-594: do seal a payload too large for RFC 4253 §6.1's 35000-byte packet, and a sequence number at `u32::MAX`. Expect
@@ -190,8 +269,15 @@ fn oversized_payloads_are_refused_and_sequence_numbers_wrap() {
   let mut sealer = Sealer::clear();
   let mut out = Vec::new();
   assert_eq!(
-    sealer.seal(&vec![0x5e; MAX_PACKET_EVERY_PEER_ACCEPTS], &mut Seeded::new(1), &mut out),
-    Err(SealRefusal::TooLarge { payload: MAX_PACKET_EVERY_PEER_ACCEPTS as u64, ceiling: MAX_PACKET_EVERY_PEER_ACCEPTS as u64 })
+    sealer.seal(
+      &vec![0x5e; MAX_PACKET_EVERY_PEER_ACCEPTS],
+      &mut Seeded::new(1),
+      &mut out
+    ),
+    Err(SealRefusal::TooLarge {
+      payload: MAX_PACKET_EVERY_PEER_ACCEPTS as u64,
+      ceiling: MAX_PACKET_EVERY_PEER_ACCEPTS as u64
+    })
   );
   assert!(out.is_empty());
   sealer.set_sequence(u32::MAX);

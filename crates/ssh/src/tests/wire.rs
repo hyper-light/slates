@@ -4,7 +4,9 @@
 use proptest::prelude::*;
 
 use crate::support::hex;
-use crate::wire::{MAX_NAME, Reader, WireRefusal, put_mpint_unsigned, put_name_list, put_string, put_uint32};
+use crate::wire::{
+  MAX_NAME, Reader, WireRefusal, put_mpint_unsigned, put_name_list, put_string, put_uint32,
+};
 
 /// A-594 golden (RFC 4251 §5's `mpint` examples): do write 0, 0x9a378f9b2e332a7 and 0x80 from their unsigned bytes, the
 /// first two with leading zero bytes. Expect RFC 4251's encodings: `00000000`, `00000008 09 a3 78 f9 b2 e3 32 a7` and
@@ -29,17 +31,35 @@ fn mpints_are_written_as_rfc_4251_writes_its_examples() {
 #[test]
 fn name_lists_read_their_names_in_order() {
   let mut payload = Vec::new();
-  put_name_list(&mut payload, &["curve25519-sha256", "kex-strict-c-v00@openssh.com", "ext-info-c"]).unwrap();
+  put_name_list(
+    &mut payload,
+    &[
+      "curve25519-sha256",
+      "kex-strict-c-v00@openssh.com",
+      "ext-info-c",
+    ],
+  )
+  .unwrap();
   put_string(&mut payload, b"").unwrap();
   let longest = "n".repeat(MAX_NAME);
   put_string(&mut payload, longest.as_bytes()).unwrap();
   let mut reader = Reader::new(&payload);
   let names: Vec<&[u8]> = reader.name_list().unwrap().names().collect();
-  assert_eq!(names, [&b"curve25519-sha256"[..], b"kex-strict-c-v00@openssh.com", b"ext-info-c"]);
+  assert_eq!(
+    names,
+    [
+      &b"curve25519-sha256"[..],
+      b"kex-strict-c-v00@openssh.com",
+      b"ext-info-c"
+    ]
+  );
   let empty = reader.name_list().unwrap();
   assert!(empty.is_empty());
   assert_eq!(empty.first(), None);
-  assert_eq!(reader.name_list().unwrap().first(), Some(longest.as_bytes()));
+  assert_eq!(
+    reader.name_list().unwrap().first(),
+    Some(longest.as_bytes())
+  );
   reader.finish().unwrap();
 }
 
@@ -48,13 +68,26 @@ fn name_lists_read_their_names_in_order() {
 #[test]
 fn name_lists_with_bad_names_are_refused() {
   let too_long = "n".repeat(MAX_NAME + 1);
-  let bad: [&[u8]; 8] = [b",a", b"a,,b", b"a,", too_long.as_bytes(), b"a b", b"a\x01", b"a\x7f", "é".as_bytes()];
+  let bad: [&[u8]; 8] = [
+    b",a",
+    b"a,,b",
+    b"a,",
+    too_long.as_bytes(),
+    b"a b",
+    b"a\x01",
+    b"a\x7f",
+    "é".as_bytes(),
+  ];
   for list in bad {
     let mut payload = vec![0xff];
     put_string(&mut payload, list).unwrap();
     let mut reader = Reader::new(&payload);
     reader.byte().unwrap();
-    assert_eq!(reader.name_list(), Err(WireRefusal::BadNameList { at: 5 }), "list {list:?}");
+    assert_eq!(
+      reader.name_list(),
+      Err(WireRefusal::BadNameList { at: 5 }),
+      "list {list:?}"
+    );
   }
 }
 
@@ -65,8 +98,14 @@ fn lengths_past_the_input_and_trailing_bytes_are_refused() {
   let mut payload = Vec::new();
   put_uint32(&mut payload, u32::MAX);
   payload.extend_from_slice(b"abc");
-  assert_eq!(Reader::new(&payload).string(), Err(WireRefusal::Truncated { at: 0 }));
-  assert_eq!(Reader::new(&[0, 0, 1]).uint32(), Err(WireRefusal::Truncated { at: 0 }));
+  assert_eq!(
+    Reader::new(&payload).string(),
+    Err(WireRefusal::Truncated { at: 0 })
+  );
+  assert_eq!(
+    Reader::new(&[0, 0, 1]).uint32(),
+    Err(WireRefusal::Truncated { at: 0 })
+  );
   let mut reader = Reader::new(&[7, 8]);
   assert_eq!(reader.byte(), Ok(7));
   assert_eq!(reader.finish(), Err(WireRefusal::TrailingBytes { at: 1 }));

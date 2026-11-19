@@ -59,6 +59,11 @@ fn host_keys_load_from_pkcs8() {
   let signature = key.sign(b"exchange hash").unwrap();
   let public = &key.public_blob()[19..];
   let raw = &signature[19..];
-  UnparsedPublicKey::new(&signature::ED25519, public).verify(b"exchange hash", raw).unwrap();
-  assert_eq!(HostKey::ed25519_from_pkcs8(b"not a document").unwrap_err(), HostKeyRejected);
+  UnparsedPublicKey::new(&signature::ED25519, public)
+    .verify(b"exchange hash", raw)
+    .unwrap();
+  assert_eq!(
+    HostKey::ed25519_from_pkcs8(b"not a document").unwrap_err(),
+    HostKeyRejected
+  );
 }

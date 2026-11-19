@@ -47,12 +47,29 @@ fn the_server_offers_its_methods_and_its_markers_first_only() {
   let first = server_kexinit(&[1; 16], true).unwrap();
   let read = KexInit::read(&first).unwrap();
   let names = |list: List| -> Vec<String> {
-    read.list(list).names().map(|name| String::from_utf8(name.to_vec()).unwrap()).collect()
+    read
+      .list(list)
+      .names()
+      .map(|name| String::from_utf8(name.to_vec()).unwrap())
+      .collect()
   };
-  assert_eq!(names(List::Kex), ["curve25519-sha256", "kex-strict-s-v00@openssh.com", "kex-strict-s"]);
+  assert_eq!(
+    names(List::Kex),
+    [
+      "curve25519-sha256",
+      "kex-strict-s-v00@openssh.com",
+      "kex-strict-s"
+    ]
+  );
   assert_eq!(names(List::HostKey), ["ssh-ed25519"]);
-  assert_eq!(names(List::CipherClientToServer), ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com"]);
-  assert_eq!(names(List::CipherServerToClient), ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com"]);
+  assert_eq!(
+    names(List::CipherClientToServer),
+    ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com"]
+  );
+  assert_eq!(
+    names(List::CipherServerToClient),
+    ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com"]
+  );
   assert_eq!(names(List::MacClientToServer), ["none"]);
   assert_eq!(names(List::CompressionServerToClient), ["none"]);
   assert!(names(List::LanguageClientToServer).is_empty());
@@ -69,12 +86,23 @@ fn the_server_offers_its_methods_and_its_markers_first_only() {
 /// with the server's (the AES-GCM draft §2: "MUST NOT cause connection failure").
 #[test]
 fn the_clients_first_choice_wins_per_direction() {
-  let mut lists = client("curve25519-sha256,ext-info-c", "aes128-ctr,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com");
-  let negotiated = negotiate(&KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(), true).unwrap();
+  let mut lists = client(
+    "curve25519-sha256,ext-info-c",
+    "aes128-ctr,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com",
+  );
+  let negotiated = negotiate(
+    &KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(),
+    true,
+  )
+  .unwrap();
   assert_eq!(negotiated.client_to_server, Cipher::Aes256Gcm);
   assert_eq!(negotiated.server_to_client, Cipher::Aes256Gcm);
   lists[3] = "chacha20-poly1305@openssh.com".to_string();
-  let negotiated = negotiate(&KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(), true).unwrap();
+  let negotiated = negotiate(
+    &KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(),
+    true,
+  )
+  .unwrap();
   assert_eq!(negotiated.client_to_server, Cipher::Aes256Gcm);
   assert_eq!(negotiated.server_to_client, Cipher::ChaCha20Poly1305);
   assert!(negotiated.client_ext_info);
@@ -89,10 +117,22 @@ fn markers_are_never_chosen_as_methods() {
     "kex-strict-s-v00@openssh.com,kex-strict-s,ext-info-c,kex-strict-c-v00@openssh.com,curve25519-sha256",
     "chacha20-poly1305@openssh.com",
   );
-  assert!(negotiate(&KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(), true).is_ok());
-  let markers_only = client("kex-strict-c-v00@openssh.com,ext-info-c,kex-strict-s-v00@openssh.com", "chacha20-poly1305@openssh.com");
+  assert!(
+    negotiate(
+      &KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(),
+      true
+    )
+    .is_ok()
+  );
+  let markers_only = client(
+    "kex-strict-c-v00@openssh.com,ext-info-c,kex-strict-s-v00@openssh.com",
+    "chacha20-poly1305@openssh.com",
+  );
   assert_eq!(
-    negotiate(&KexInit::read(&kexinit(as_strs(&markers_only), false)).unwrap(), true),
+    negotiate(
+      &KexInit::read(&kexinit(as_strs(&markers_only), false)).unwrap(),
+      true
+    ),
     Err(KexInitRefusal::NoCommonAlgorithm(List::Kex))
   );
 }
@@ -105,13 +145,27 @@ fn markers_are_never_chosen_as_methods() {
 fn strict_key_exchange_is_judged_by_the_client_marker_in_the_first_exchange() {
   let strict = |kex: &str, initial: bool| {
     let lists = client(kex, "chacha20-poly1305@openssh.com");
-    negotiate(&KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(), initial).unwrap().strict
+    negotiate(
+      &KexInit::read(&kexinit(as_strs(&lists), false)).unwrap(),
+      initial,
+    )
+    .unwrap()
+    .strict
   };
-  assert!(strict("curve25519-sha256,kex-strict-c-v00@openssh.com", true));
+  assert!(strict(
+    "curve25519-sha256,kex-strict-c-v00@openssh.com",
+    true
+  ));
   assert!(strict("curve25519-sha256,kex-strict-c", true));
   assert!(!strict("curve25519-sha256,ext-info-c", true));
-  assert!(!strict("curve25519-sha256,kex-strict-s-v00@openssh.com,kex-strict-s", true));
-  assert!(!strict("curve25519-sha256,kex-strict-c-v00@openssh.com", false));
+  assert!(!strict(
+    "curve25519-sha256,kex-strict-s-v00@openssh.com,kex-strict-s",
+    true
+  ));
+  assert!(!strict(
+    "curve25519-sha256,kex-strict-c-v00@openssh.com",
+    false
+  ));
 }
 
 /// A-594 hostile (RFC 4253 §7.1, "If there is no such algorithm, both sides MUST disconnect"): do negotiate a client
@@ -121,7 +175,11 @@ fn strict_key_exchange_is_judged_by_the_client_marker_in_the_first_exchange() {
 fn no_common_algorithm_is_refused_by_list() {
   let base = client("curve25519-sha256", "chacha20-poly1305@openssh.com");
   let cases: [(usize, &str, List); 6] = [
-    (0, "diffie-hellman-group14-sha256,sntrup761x25519-sha512@openssh.com", List::Kex),
+    (
+      0,
+      "diffie-hellman-group14-sha256,sntrup761x25519-sha512@openssh.com",
+      List::Kex,
+    ),
     (1, "rsa-sha2-512,ecdsa-sha2-nistp256", List::HostKey),
     (2, "aes128-ctr,aes256-cbc", List::CipherClientToServer),
     (3, "aes128-gcm@openssh.com", List::CipherServerToClient),
@@ -132,12 +190,21 @@ fn no_common_algorithm_is_refused_by_list() {
     let mut lists = base.clone();
     lists[index] = value.to_string();
     let read = KexInit::read(&kexinit(as_strs(&lists), false)).unwrap();
-    assert_eq!(negotiate(&read, true), Err(KexInitRefusal::NoCommonAlgorithm(list)), "{list:?}");
+    assert_eq!(
+      negotiate(&read, true),
+      Err(KexInitRefusal::NoCommonAlgorithm(list)),
+      "{list:?}"
+    );
   }
   let mut empty_cipher = base.clone();
   empty_cipher[2] = String::new();
   let read = KexInit::read(&kexinit(as_strs(&empty_cipher), false)).unwrap();
-  assert_eq!(negotiate(&read, true), Err(KexInitRefusal::NoCommonAlgorithm(List::CipherClientToServer)));
+  assert_eq!(
+    negotiate(&read, true),
+    Err(KexInitRefusal::NoCommonAlgorithm(
+      List::CipherClientToServer
+    ))
+  );
 }
 
 /// A-594 (RFC 4253 §7): do negotiate a guessing client whose preferred key exchange and host key are the server's, one
@@ -148,27 +215,55 @@ fn a_wrong_guess_is_skipped() {
   let skip = |kex: &str, host_keys: &str, guess: bool| {
     let mut lists = client(kex, "chacha20-poly1305@openssh.com");
     lists[1] = host_keys.to_string();
-    negotiate(&KexInit::read(&kexinit(as_strs(&lists), guess)).unwrap(), true).unwrap().skip_guessed_packet
+    negotiate(
+      &KexInit::read(&kexinit(as_strs(&lists), guess)).unwrap(),
+      true,
+    )
+    .unwrap()
+    .skip_guessed_packet
   };
   assert!(!skip("curve25519-sha256,ext-info-c", "ssh-ed25519", true));
-  assert!(skip("mlkem768x25519-sha256,curve25519-sha256", "ssh-ed25519", true));
+  assert!(skip(
+    "mlkem768x25519-sha256,curve25519-sha256",
+    "ssh-ed25519",
+    true
+  ));
   assert!(skip("curve25519-sha256", "rsa-sha2-512,ssh-ed25519", true));
-  assert!(!skip("mlkem768x25519-sha256,curve25519-sha256", "ssh-ed25519", false));
+  assert!(!skip(
+    "mlkem768x25519-sha256,curve25519-sha256",
+    "ssh-ed25519",
+    false
+  ));
 }
 
 /// A-594 hostile: do read KEXINITs cut short, with a bad name-list, with a byte left over, and with another message's
 /// number. Expect each refused by its kind.
 #[test]
 fn malformed_kexinits_are_refused() {
-  let good = kexinit(as_strs(&client("curve25519-sha256", "chacha20-poly1305@openssh.com")), false);
-  assert!(matches!(KexInit::read(&good[..good.len() - 1]), Err(KexInitRefusal::Malformed(WireRefusal::Truncated { .. }))));
+  let good = kexinit(
+    as_strs(&client(
+      "curve25519-sha256",
+      "chacha20-poly1305@openssh.com",
+    )),
+    false,
+  );
+  assert!(matches!(
+    KexInit::read(&good[..good.len() - 1]),
+    Err(KexInitRefusal::Malformed(WireRefusal::Truncated { .. }))
+  ));
   let mut trailing = good.clone();
   trailing.push(0);
-  assert!(matches!(KexInit::read(&trailing), Err(KexInitRefusal::Malformed(WireRefusal::TrailingBytes { .. }))));
+  assert!(matches!(
+    KexInit::read(&trailing),
+    Err(KexInitRefusal::Malformed(WireRefusal::TrailingBytes { .. }))
+  ));
   let mut bad_name = vec![20];
   bad_name.extend_from_slice(&[0; 16]);
   put_string(&mut bad_name, b"curve25519-sha256,,x");
-  assert!(matches!(KexInit::read(&bad_name), Err(KexInitRefusal::Malformed(WireRefusal::BadNameList { .. }))));
+  assert!(matches!(
+    KexInit::read(&bad_name),
+    Err(KexInitRefusal::Malformed(WireRefusal::BadNameList { .. }))
+  ));
   let mut other = good.clone();
   other[0] = 21;
   assert_eq!(KexInit::read(&other), Err(KexInitRefusal::NotKexInit));

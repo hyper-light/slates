@@ -5,7 +5,8 @@ use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, SHA256};
 
 use crate::client::{mpint, put_string};
 use crate::kex::{
-  ExchangeInputs, KexRefusal, curve25519_server, derive, ecdh_reply, exchange_hash, new_keys, read_ecdh_init,
+  ExchangeInputs, KexRefusal, curve25519_server, derive, ecdh_reply, exchange_hash, new_keys,
+  read_ecdh_init,
 };
 use crate::packet::Cipher;
 use crate::support::{hex, hex_array};
@@ -64,7 +65,11 @@ const SHA256_2048: KdfCase = KdfCase {
 /// its K, H and session id (the first H). Expect NIST's bytes, the SHA-1 case's keys through RFC 4253 §7.2's extension.
 #[test]
 fn key_derivation_matches_nists_vectors() {
-  let cases = [(&SHA1_FOR_LEGACY_USE_ONLY, &SHA1_1024), (&SHA256, &SHA256_1024), (&SHA256, &SHA256_2048)];
+  let cases = [
+    (&SHA1_FOR_LEGACY_USE_ONLY, &SHA1_1024),
+    (&SHA256, &SHA256_1024),
+    (&SHA256, &SHA256_2048),
+  ];
   for (algorithm, case) in cases {
     let (k, h) = (hex(case.k), hex(case.h));
     let expected = [
@@ -88,12 +93,19 @@ fn key_derivation_matches_nists_vectors() {
 /// whose first byte, 0x4a, needs no leading zero.
 #[test]
 fn the_server_half_matches_rfc_7748() {
-  let alice_private = hex_array::<32>("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+  let alice_private =
+    hex_array::<32>("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
   let bob_public = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
   let half = curve25519_server(&alice_private, &bob_public).unwrap();
-  assert_eq!(half.public.to_vec(), hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"));
+  assert_eq!(
+    half.public.to_vec(),
+    hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+  );
   let shared = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
-  assert_eq!(half.shared_secret.bytes(), &hex("00000020 4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")[..]);
+  assert_eq!(
+    half.shared_secret.bytes(),
+    &hex("00000020 4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")[..]
+  );
   assert_eq!(half.shared_secret.bytes(), &mpint(&shared)[..]);
 }
 
@@ -112,10 +124,20 @@ fn small_order_and_wrong_length_client_keys_are_refused() {
     "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
   ];
   for public in small_order {
-    assert_eq!(curve25519_server(&private, &hex(public)).unwrap_err(), KexRefusal::SharedSecretRejected, "{public}");
+    assert_eq!(
+      curve25519_server(&private, &hex(public)).unwrap_err(),
+      KexRefusal::SharedSecretRejected,
+      "{public}"
+    );
   }
-  assert_eq!(curve25519_server(&private, &[9; 31]).unwrap_err(), KexRefusal::PublicKeyLength { length: 31 });
-  assert_eq!(curve25519_server(&private, &[9; 33]).unwrap_err(), KexRefusal::PublicKeyLength { length: 33 });
+  assert_eq!(
+    curve25519_server(&private, &[9; 31]).unwrap_err(),
+    KexRefusal::PublicKeyLength { length: 31 }
+  );
+  assert_eq!(
+    curve25519_server(&private, &[9; 33]).unwrap_err(),
+    KexRefusal::PublicKeyLength { length: 33 }
+  );
 }
 
 /// A-594 (RFC 5656 §4): do hash an exchange's inputs, and hash by hand the same fields, each as a `string` but `K`,
@@ -150,7 +172,10 @@ fn the_exchange_hash_covers_each_field_in_order() {
     put_string(&mut by_hand, field);
   }
   by_hand.extend_from_slice(&k);
-  let expected: [u8; 32] = aws_lc_rs::digest::digest(&SHA256, &by_hand).as_ref().try_into().unwrap();
+  let expected: [u8; 32] = aws_lc_rs::digest::digest(&SHA256, &by_hand)
+    .as_ref()
+    .try_into()
+    .unwrap();
   assert_eq!(inputs(&fields), expected);
   for index in 0..fields.len() {
     let mut changed = fields.clone();
@@ -169,9 +194,18 @@ fn new_keys_have_each_ciphers_lengths() {
   assert!(keys.client_to_server.iv.bytes().is_empty());
   assert_eq!(keys.server_to_client.key.bytes().len(), 32);
   assert_eq!(keys.server_to_client.iv.bytes().len(), 12);
-  assert_eq!(keys.client_to_server.key.bytes(), &crate::client::kdf(&k, &h, b'C', &h, 64)[..]);
-  assert_eq!(keys.server_to_client.iv.bytes(), &crate::client::kdf(&k, &h, b'B', &h, 12)[..]);
-  assert_ne!(&keys.client_to_server.key.bytes()[..32], keys.server_to_client.key.bytes());
+  assert_eq!(
+    keys.client_to_server.key.bytes(),
+    &crate::client::kdf(&k, &h, b'C', &h, 64)[..]
+  );
+  assert_eq!(
+    keys.server_to_client.iv.bytes(),
+    &crate::client::kdf(&k, &h, b'B', &h, 12)[..]
+  );
+  assert_ne!(
+    &keys.client_to_server.key.bytes()[..32],
+    keys.server_to_client.key.bytes()
+  );
 }
 
 /// A-594 hostile: do read `SSH_MSG_KEX_ECDH_INIT` whole, cut short and with a byte left over, and write a reply. Expect
@@ -181,10 +215,16 @@ fn ecdh_messages_read_and_write() {
   let mut init = vec![30];
   put_string(&mut init, &[5; 32]);
   assert_eq!(read_ecdh_init(&init), Ok(&[5u8; 32][..]));
-  assert_eq!(read_ecdh_init(&init[..20]), Err(WireRefusal::Truncated { at: 1 }));
+  assert_eq!(
+    read_ecdh_init(&init[..20]),
+    Err(WireRefusal::Truncated { at: 1 })
+  );
   let mut trailing = init.clone();
   trailing.push(1);
-  assert_eq!(read_ecdh_init(&trailing), Err(WireRefusal::TrailingBytes { at: 37 }));
+  assert_eq!(
+    read_ecdh_init(&trailing),
+    Err(WireRefusal::TrailingBytes { at: 37 })
+  );
   let reply = ecdh_reply(b"key", b"public", b"signature").unwrap();
   let mut expected = vec![31];
   for field in [&b"key"[..], &b"public"[..], &b"signature"[..]] {
