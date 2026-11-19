@@ -1184,10 +1184,13 @@
 >   (a binding taken only from an answer that established one; the source's spelling) and `sim::tests` (the entry and
 >   its lifetime, every refusal with none holding room; Windows' refusal, on Windows' own build). By use, with a kernel
 >   mount: `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`,
->   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. Owed (A-520's next pieces): the
->   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
->   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
->   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. **Built 2026-11-19 (A-520's
+>   second piece, `CONTRACT` = 47):** the engine's profile and the pre-bind check are library calls the command line
+>   makes (`container_engine::engine_profile` under `slates oci-runtime`, `container::check_source` under
+>   `slates oci-check`), each held by unit tests on every host (the questions' order over an injected query; the check's
+>   judgment over an injected table and identity, and the host's own table). Owed: the judge's profiles for the engines
+>   measured since it was written (rootless podman, G-mount step 3, and podman's command line); and Windows, which
+>   has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
@@ -2485,8 +2488,15 @@
 >   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
 >   `NotRecovered` by name.
 
-> **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
-> predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
+> **Fixed (A-556, g250, 2026-11-19; was open since live-durability, 2026-11-09; A-272 ii adjacent): an object whose line
+> never passed through an unconfirmed predecessor read lost, then past tolerance, on a second failure inside that
+> predecessor's takeover window.** A round now waits on a carried retirement's cohort only for the objects that
+> retirement's round ranked along a line into the departed host (`RegionalConfiguration::readiness_cohorts`,
+> `falls_through`; `within_tolerance` judges the same): a carried cohort holds the only copy of a record only of an
+> object it owned and ranked to the departed host. The successors are still ranked over every recovery cohort, so a
+> fleet of mixed builds names the same ones. Test: `a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_
+> the_carrier` (`crates/db/src/register.rs`, red before: the carrier's own object read past tolerance). The text below
+> is the record of the finding. A host that retires before
 > confirming its share of an earlier retirement records it as `unconfirmed`, and `RegionalConfiguration::recovery_cohorts`
 > then recovers **every** object of the host jointly with the predecessor's cohort, not only the objects it was taking
 > over from it. In the store-destroyed flow (diag-live-durability-77, x86 run 1): old b destroyed, the owner killed
