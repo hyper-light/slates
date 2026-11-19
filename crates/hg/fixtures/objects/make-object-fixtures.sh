@@ -5,10 +5,15 @@
 # file whose bytes begin as the block does (an empty block before them), a named branch (an empty file list and the
 # `branch` extra), a date with a timezone, a description of several lines, a merge, a closed branch head (`close`), a
 # user beyond ASCII, and extras holding every byte 7.2 escapes (written through 7.2's own `repo.commit`). Then 7.2's own
-# storage API writes every revision of the changelog, the manifest log and each file log: its text (`revision`, the
-# file metadata included) as `<log>-<name>-<rev>.txt`, and `index.txt` a line per revision (`<log> <name> <rev> <node>
-# <p1> <p2> <file>`); `expected.txt` what 7.2 reads from each changeset, manifest entry and file revision, every value
-# hex-encoded.
+# debug commands write each log:
+#   index-changelog.txt, index-manifest.txt, index-file-<path>.txt   `hg debugindex --debug`: a header naming the
+#       columns, then every revision's number, rank, link, node, parents, full size, delta base and flags;
+#   changeset-<rev>.txt, manifest-<rev>.txt, file-<path>-<rev>.txt   `hg debugdata`: every revision's stored text, a
+#       file revision's metadata block included;
+#   expected.txt   what 7.2 reads from each changeset (`changectx`), each manifest entry and each file revision's copy
+#       (`filelog.renamed`), every value hex-encoded;
+#   log.txt        the graph.
+# Last it prints the SHA-1 7.2's `hashutil` uses (sha1dc's when its C extension is built) and every file's SHA-256.
 set -euo pipefail
 OUT=$(cd "$1" && pwd)
 export HGPLAIN=1 HGRCPATH= HGENCODING=utf-8 PYTHONHASHSEED=0 TZ=UTC LC_ALL=C
@@ -25,27 +30,15 @@ with repo.wlock(), repo.lock():
     repo.commit(text=b"escaped extras", user=b"Test <test@example.com>", date=b"0 0",
                 extra={b"note": b"a\nb\x00c\\d\re\x0012:tail", b"source": b"svn:1"})
 PY
-cat > "$WORK/dump.py" <<'PY'
+cat > "$WORK/expected.py" <<'PY'
 import os, sys
 from mercurial import hg, ui as uimod
 repo = hg.repository(uimod.ui.load(), sys.argv[1].encode()).unfiltered()
 out = sys.argv[2]
-index, expected = [], []
+expected = []
 def h(value):
     return value.hex() if value else "-"
-def dump(log, name, storage):
-    for rev in range(len(storage)):
-        node = storage.node(rev)
-        p1, p2 = storage.parents(node)
-        text = storage.revision(node) if log != "file" else storage._revlog.revision(node)
-        file_name = "%s-%s-%d.txt" % (log, name.replace("/", "_"), rev)
-        open(os.path.join(out, file_name), "wb").write(text)
-        index.append(" ".join([log, name, str(rev), node.hex(), p1.hex(), p2.hex(), file_name]))
-dump("changeset", "-", repo.changelog)
-dump("manifest", "-", repo.manifestlog.getstorage(b""))
 paths = sorted({f for rev in repo for f in repo[rev].files()})
-for path in paths:
-    dump("file", path.decode(), repo.file(path))
 for rev in repo:
     ctx = repo[rev]
     when, offset = ctx.date()
@@ -60,10 +53,21 @@ for path in paths:
     for rev in range(len(log)):
         renamed = log.renamed(log.node(rev))
         copy = "%s %s" % (renamed[0].hex(), renamed[1].hex()) if renamed else "- -"
-        expected.append(" ".join(["filerev", path.encode().hex() if isinstance(path, str) else path.hex(), str(rev), copy]))
-open(os.path.join(out, "index.txt"), "w").write("\n".join(index) + "\n")
+        expected.append(" ".join(["filerev", path.hex(), str(rev), copy]))
 open(os.path.join(out, "expected.txt"), "w").write("\n".join(expected) + "\n")
 PY
+# The rows of a `debugindex` listing: its lines after the header.
+rows() { tail -n +2 "$1" | wc -l | tr -d ' '; }
+# `debugdata` of every revision a listing holds: dump LISTING PREFIX ARGUMENT...
+dump() {
+  local listing=$1 prefix=$2 rev=0 count
+  shift 2
+  count=$(rows "$listing")
+  while [ "$rev" -lt "$count" ]; do
+    hg debugdata "$@" "$rev" > "$OUT/$prefix-$rev.txt"
+    rev=$((rev + 1))
+  done
+}
 cd "$WORK"
 hg version -q
 hg init repo
@@ -82,6 +86,18 @@ hg update -q stable; hg commit --close-branch -m 'close stable'
 hg update -q default; printf 'u\n' > u; hg add -q u; hg commit -u "$(printf 'T\303\251st <t@example.com>')" -m 'a user beyond ASCII'
 printf 'e\n' > e; hg add -q e
 py "$WORK/extras.py" "$WORK/repo"
-py "$WORK/dump.py" "$WORK/repo" "$OUT"
+hg debugindex --debug -c > "$OUT/index-changelog.txt"
+dump "$OUT/index-changelog.txt" changeset -c
+hg debugindex --debug -m > "$OUT/index-manifest.txt"
+dump "$OUT/index-manifest.txt" manifest -m
+hg manifest --all > "$WORK/paths"
+while IFS= read -r path; do
+  name=${path//\//_}
+  hg debugindex --debug "$path" > "$OUT/index-file-$name.txt"
+  dump "$OUT/index-file-$name.txt" "file-$name" "$path"
+done < "$WORK/paths"
+py "$WORK/expected.py" "$WORK/repo" "$OUT"
 hg log -G -T '{rev} {node|short} {branch} {desc|firstline}\n' > "$OUT/log.txt"
-ls "$OUT" | wc -l
+py -c 'from mercurial.utils import hashutil; print("hashutil.sha1 is", hashutil.sha1)'
+cd "$OUT"
+shasum -a 256 -- *
