@@ -6,6 +6,12 @@
 //! - **Agreement**: no position is ever durable with two values, whichever owner made it durable.
 //! - **NoLoss**: every takeover adopts a head whose state holds every durable entry, at its position, unchanged.
 //! - **StaleNeverCommits**: whatever a superseded owner still makes durable lies inside the head that superseded it.
+//! - **ReadSafety** (A-601; `FencedLedger.tla`'s rule, as `crates/db/src/register_nemesis.rs` judges the register):
+//!   every read phase one could make were the current owner lost, through whichever live holders it asks, adopts a head
+//!   whose state holds every durable write, at its position, unchanged, however far the other holders lag or whatever
+//!   superseded chain they hold. NoLoss judges the one read each takeover makes; this judges every read one could make,
+//!   after every step and every settling delivery. A violation is reported at the run's end, after the other checks, so
+//!   a history another check breaks is named by that check.
 //! - **Convergence**: once the network heals, every live holder holds exactly the owner's state, and every durable
 //!   write is in it.
 //!
@@ -265,6 +271,15 @@ struct Run {
   restarts: u64,
   /// Of those, the ones that fell between a publication's image and its entry's append.
   restarts_between: u64,
+  /// The steps taken, for a ReadSafety violation's message.
+  steps_taken: usize,
+  /// ReadSafety's first violation ([`Run::read_safety`]), reported by [`Run::settle`] after the run's other checks.
+  read_safety_broken: Option<String>,
+  /// The judgements ReadSafety made with a durable write to hold: its non-vacuity counter.
+  reads_judged: u64,
+  /// Of those, the ones where a host phase one would ask lacked a durable write (it lagged, or held a superseded
+  /// owner's chain) and every head a read could adopt held them all: the case the rule is about.
+  reads_past_a_stale_holder: u64,
 }
 
 impl Run {
@@ -334,6 +349,10 @@ impl Run {
       restart: None,
       restarts: 0,
       restarts_between: 0,
+      steps_taken: 0,
+      read_safety_broken: None,
+      reads_judged: 0,
+      reads_past_a_stale_holder: 0,
     }
   }
 
@@ -746,9 +765,20 @@ impl Run {
     let successor_holder = self.holders.remove(&successor).unwrap();
     // With `following`, the successor's holders are the set the takeover counted, less itself: what the durable
     // writes are held by. The configuration's candidates may be a set the old owner was still moving to, which holds
-    // none of them; the successor moves to it by a transition of its own.
+    // none of them; the successor moves to it by a transition of its own. Without it, they are the holders the
+    // superseded shipper committed, as the daemon's successor ships to the record's holders (`live_ship`'s
+    // `live_holders`), never a member that joined since: it holds none of the log, and named here it let a later phase
+    // one count `f + 1` holders none of which held a durable write (A-601's ReadSafety, 2026-11-19).
     let mut holders: Vec<HostId> = match self.following {
-      None => self.holders.keys().copied().collect(),
+      None => {
+        let committed = self.owners[old].shipper.holders().to_vec();
+        self
+          .holders
+          .keys()
+          .copied()
+          .filter(|host| committed.contains(host))
+          .collect()
+      }
       Some(Following::Joint) => self.owners[old].recorded.clone(),
       Some(Following::RecordAtOnce | Following::Fixed) => self.configuration.clone(),
     };
@@ -1113,7 +1143,139 @@ impl Run {
     }
   }
 
+  /// ReadSafety (A-601; `FencedLedger.tla`'s rule, §4.8 "Leases and reads"), judged now over every read phase one
+  /// could make were the current owner lost within the failures the run tolerates (`lost < f`, the nemesis's own
+  /// guard for a takeover; past it phase one waits for every surviving holder, `adopt_past_tolerance`). Phase one asks
+  /// the live candidates and adopts the greatest head among their reports once `f + 1` come from the holders it counts
+  /// ([`adopt`]), so a host's head can be adopted whenever `f + 1` counted holders, the host itself if it is one,
+  /// report no greater head (one with no copy reports nothing). Every such head's state must hold every durable write,
+  /// at its position, unchanged: a read adopting a stale chain would hand the successor, and every read it then
+  /// answers, a state older than a write already acknowledged. The first violation is kept with its step, and
+  /// [`Run::settle`] reports it after the run's other checks, so a history one of those breaks is still named by it.
+  fn read_safety(&mut self) {
+    if self.durable.is_empty() || self.read_safety_broken.is_some() || self.lost >= self.f {
+      return;
+    }
+    let (asked, counted) = self.phase_one_now();
+    let needed = usize::try_from(self.f + 1).unwrap();
+    if counted.len() < needed {
+      return;
+    }
+    self.reads_judged += 1;
+    // The durable writes are every position from 0 to the greatest durable one (`note_durable` records each).
+    let durable: Vec<u64> = self.durable.values().copied().collect();
+    let mut past_a_stale_holder = false;
+    for host in asked {
+      let lacking = self.first_lacking(host, &durable);
+      past_a_stale_holder |= lacking.is_some();
+      if let (Some(read), Some(position)) = (self.read_adopting(host, &counted, needed), lacking) {
+        self.read_safety_broken = Some(format!(
+          "ReadSafety: at step {}, phase one asking {read:?} adopts host {}'s head {:?}, which lacks durable \
+           position {position}",
+          self.steps_taken,
+          host.0,
+          self.reported_head(host)
+        ));
+        return;
+      }
+    }
+    if past_a_stale_holder {
+      self.reads_past_a_stale_holder += 1;
+    }
+  }
+
+  /// The holder set phase one would count toward `f + 1` were the current owner lost now (A-240), by the run's rules
+  /// ([`Run::phase_one_hosts`], [`Run::phase_one_asked`]): `None` under the mutation that counts any `f + 1`
+  /// candidates.
+  fn counted_set_now(&self) -> Option<Vec<HostId>> {
+    let owner = &self.owners[self.current];
+    match (self.following, self.counting) {
+      (None, Counting::Holders) => Some(owner.shipper.holders().to_vec()),
+      (None, Counting::AnyCandidate) => None,
+      (Some(Following::Joint), _) => Some(owner.recorded.clone()),
+      (Some(Following::RecordAtOnce | Following::Fixed), _) => Some(self.configuration.clone()),
+    }
+  }
+
+  /// The live hosts phase one would ask were the current owner lost now, every one of them reachable, and those of them
+  /// whose reports count toward `f + 1`.
+  fn phase_one_now(&self) -> (Vec<HostId>, Vec<HostId>) {
+    let owner = self.owners[self.current].host;
+    let counted_set = self.counted_set_now();
+    let named = |host: &HostId| {
+      self.following.is_none()
+        || self.configuration.contains(host)
+        || counted_set.as_ref().is_some_and(|set| set.contains(host))
+    };
+    let live = |host: &HostId| self.holders.get(host).is_some_and(|holder| holder.alive);
+    let asked: Vec<HostId> = self
+      .hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != owner && named(host) && live(host))
+      .collect();
+    let counted = asked
+      .iter()
+      .copied()
+      .filter(|host| counted_set.as_ref().is_none_or(|set| set.contains(host)))
+      .collect();
+    (asked, counted)
+  }
+
+  /// The head `host` would report to phase one now: `None` while it holds no copy.
+  fn reported_head(&self, host: HostId) -> Option<Head> {
+    self
+      .holders
+      .get(&host)
+      .and_then(|holder| holder.replica.as_ref())
+      .and_then(Replica::head)
+  }
+
+  /// A read through which phase one would adopt `host`'s head: `host` with `needed` of the `counted` holders whose
+  /// heads rank no higher (itself among them when it is one), or `None` when fewer than `needed` do. A head of equal
+  /// rank may be the one adopted, so it counts.
+  fn read_adopting(&self, host: HostId, counted: &[HostId], needed: usize) -> Option<Vec<HostId>> {
+    let rank = |host: HostId| self.reported_head(host).map(|head| head.rank());
+    let ceiling = rank(host);
+    let mut read: Vec<HostId> = counted
+      .iter()
+      .copied()
+      .filter(|other| rank(*other) <= ceiling)
+      .take(needed)
+      .collect();
+    if read.len() < needed {
+      return None;
+    }
+    if !read.contains(&host) {
+      read.push(host);
+    }
+    Some(read)
+  }
+
+  /// The first durable position `host`'s state lacks or holds another value at, or `None` when it holds every one.
+  fn first_lacking(&self, host: HostId, durable: &[u64]) -> Option<usize> {
+    let state = self
+      .holders
+      .get(&host)
+      .map(|holder| holder.state.as_slice())
+      .unwrap_or_default();
+    if state.get(..durable.len()) == Some(durable) {
+      return None;
+    }
+    (0..durable.len()).find(|position| state.get(*position) != durable.get(*position))
+  }
+
+  /// One step of the nemesis ([`Run::act`]), then ReadSafety judged over what it left.
   fn step(&mut self) {
+    self.act();
+    self.steps_taken += 1;
+    self.read_safety();
+  }
+
+  /// One step's choice, drawn from the run's seed: a write, a delivery, a loss or duplicate, a period, a cut or heal, a
+  /// superseded owner's step, a takeover, a holder learning the owner, a crash, a reconfiguration, a record, an
+  /// activation, or an owner's restart.
+  fn act(&mut self) {
     // An owner restart now and then (A-344), drawn only in runs that restart owners, so every other run replays as before.
     if self.restart.is_some() && self.rng.chance(RESTART_PER_MILLE) {
       self.restart_owner();
@@ -1187,6 +1349,7 @@ impl Run {
       self.record();
       self.activate();
       self.follow();
+      self.read_safety();
       if self.converged() {
         break;
       }
@@ -1205,6 +1368,11 @@ impl Run {
         Some(value),
         "NoLoss at the end: durable position {position}"
       );
+    }
+    // ReadSafety, judged after every step and every delivery here, is reported last, so a history another check breaks
+    // is named by that check.
+    if let Some(broken) = self.read_safety_broken.take() {
+      panic!("{broken}");
     }
   }
 
@@ -1300,8 +1468,12 @@ impl Run {
   }
 }
 
-fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
-  let mut totals = (0, 0, 0, 0, 0);
+/// What [`run_seeds`] counted over its seeds: takeovers, installs, stale refusals, durable positions, empty reports
+/// counted, ReadSafety's judgements, and those of them past a holder without a durable write.
+type NemesisCounts = (u64, u64, u64, u64, u64, u64, u64);
+
+fn run_seeds(f: u64, rule: EmptyReport) -> NemesisCounts {
+  let mut totals = (0, 0, 0, 0, 0, 0, 0);
   for seed in 0..SEEDS {
     let mut run = Run::new(f, seed, rule);
     for _ in 0..STEPS {
@@ -1313,25 +1485,106 @@ fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
     totals.2 += run.stale_refusals;
     totals.3 += u64::try_from(run.durable.len()).unwrap();
     totals.4 += run.empty_reports;
+    totals.5 += run.reads_judged;
+    totals.6 += run.reads_past_a_stale_holder;
   }
   totals
 }
 
 /// A-200, AC-8.3: under loss, duplication, reordering, partitions, holder crashes, owner loss with takeover and a
-/// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits and
-/// Convergence. The counters are the non-vacuity check: takeovers happened, installs caught holders up, superseded
-/// owners were refused by fences, and writes became durable.
+/// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits,
+/// ReadSafety (A-601) and Convergence. The counters are the non-vacuity check: takeovers happened, installs caught
+/// holders up, superseded owners were refused by fences, writes became durable, and ReadSafety judged reads, some of
+/// them past a holder that lacked a durable write.
 #[test]
 fn the_live_log_holds_the_register_invariants_under_the_nemesis() {
   for f in [1, 2] {
-    let (takeovers, installs, stale_refusals, durable, empty) =
+    let (takeovers, installs, stale_refusals, durable, empty, judged, past_stale) =
       run_seeds(f, EmptyReport::FenceAndCount);
     eprintln!(
       "f={f}: {SEEDS} seeds x {STEPS} steps: {takeovers} takeovers, {installs} installs, {stale_refusals} stale \
-       refusals, {durable} durable positions, {empty} empty reports counted"
+       refusals, {durable} durable positions, {empty} empty reports counted; ReadSafety judged {judged} times, \
+       {past_stale} of them past a holder without a durable write"
     );
     assert!(takeovers > 0 && installs > 0 && stale_refusals > 0 && durable > 0 && empty > 0);
+    assert!(
+      judged > 0 && past_stale > 0,
+      "ReadSafety judged {judged} times, {past_stale} past a stale holder"
+    );
   }
+}
+
+/// A-601, ReadSafety's own red check (`FencedLedger.tla`'s rule): a write durable at position 0 under the first owner
+/// (epoch 1) on one holder, and the other holder holding position 0 from a later owner (epoch 2) that wrote another
+/// value there, as a holder would if a takeover had adopted a head without the durable write. Do: judge the run's state
+/// at `f = 1`, where phase one counts both holders. Expect: a ReadSafety violation naming position 0, since phase one
+/// adopts the later owner's head, the greater. The nemesis's mutations break other checks first or alongside, so this
+/// is where the rule itself is shown to tell.
+#[test]
+fn the_read_safety_check_finds_a_read_that_adopts_a_head_without_a_durable_write() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  let later_owner = HostId(4);
+  let mut later = Shipper::new(
+    (later_owner, OBJECT, HostEpoch(2)),
+    Quorum { f: 1 },
+    &[HostId(3)],
+    None,
+    bounds_of(8, 16, 8),
+  );
+  let other = later.append(9_u64.to_le_bytes().to_vec()).unwrap();
+  hold(
+    &mut run,
+    HostId(3),
+    Replica::new(later_owner, OBJECT),
+    &other,
+  );
+  run.read_safety();
+  let broken = run.read_safety_broken.unwrap_or_default();
+  assert!(
+    broken.contains("ReadSafety") && broken.contains("lacks durable position 0"),
+    "the read adopting host 3's epoch-2 head is named: {broken:?}"
+  );
+}
+
+/// A-601, the rule's other side: a holder that lacks the durable write (here it holds no copy at all) is no violation
+/// while every read phase one could make adopts a head that holds it. Do: hold position 0's durable value on one of the
+/// `f = 1` run's two holders, the other holding nothing, and judge. Expect: no violation, and the judgement counted as
+/// one past a holder without the durable write, since a holder with no copy reports nothing and never ranks above one
+/// that holds the write.
+#[test]
+fn a_read_past_a_holder_without_a_durable_write_adopts_the_head_that_holds_it() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  run.read_safety();
+  assert_eq!(
+    (
+      run.read_safety_broken,
+      run.reads_judged,
+      run.reads_past_a_stale_holder
+    ),
+    (None, 1, 1)
+  );
+}
+
+/// Hands `host` the copy `replica` with `entry` accepted and its value applied, as a holder's delivery does.
+fn hold(run: &mut Run, host: HostId, mut replica: Replica, entry: &Entry) {
+  replica.accept(entry).unwrap();
+  let holder = run.holders.get_mut(&host).unwrap();
+  holder.state.push(u64::from_le_bytes(
+    entry.payload.as_slice().try_into().unwrap(),
+  ));
+  holder.replica = Some(replica);
 }
 
 /// A-200 phase one, the rule for a candidate that holds no copy (2026-11-05): its empty report counts toward `f + 1`

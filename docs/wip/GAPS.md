@@ -1173,9 +1173,15 @@
 > for all four tests). Three mutations kept as tests each break histories (a promise without its fence 39/48 and 44/48;
 > a restart that forgets the fence 16/192 and 9/192; promotion on a minority 23/48 and 7/48), and ReadSafety has a
 > direct red check. Found: the fence carries the load only across an owner's restart under one generation; a takeover's
-> generation refuses the stale owner first. **Owed:** the same nemesis over the live log (`slates_db::live`, whose
-> `crates/db/tests/live.rs` nemesis checks Agreement, NoLoss, StaleNeverCommits and Convergence but not ReadSafety), and
-> the real-process runs of `crates/cli/tests/live_chaos.rs` (main's).
+> generation refuses the stale owner first. **The live log's half: built (2026-11-19, A-601).**
+> `crates/db/tests/live.rs` now judges ReadSafety too, beside Agreement, NoLoss, StaleNeverCommits and Convergence:
+> every read phase one could make were the current owner lost adopts a state holding every durable write, judged after
+> every step and every settling delivery (the Mac Studio, kiln r176: 7,198 and 6,329 reads judged at `f = 1` and
+> `f = 2`, 3,721 and 3,035 of them past a holder without a durable write, none broken). Its first run found the model's
+> successor naming fresh members as holders without `following`, which the daemon's does not; the model now takes the
+> superseded shipper's committed holders. **Owed:** the real-process runs of `crates/cli/tests/live_chaos.rs`
+> (main's); and main's answer to whether a live-shipped volume can be taken over with no holders recorded, where the
+> daemon's successor falls back to the configuration's candidates (`live_ship`).
 
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
