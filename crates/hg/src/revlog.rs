@@ -263,12 +263,14 @@ impl From<PastAdmission> for Refused {
 
 /// A big-endian `u32` at `at`.
 fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+  // Format: four bytes, an index entry's lengths, base, link and parents (`>i`) and the index's header (`>I`).
   let field = bytes.get(at..)?.first_chunk::<4>()?;
   Some(u32::from_be_bytes(*field))
 }
 
 /// A big-endian `u64` at `at`.
 fn be64(bytes: &[u8], at: usize) -> Option<u64> {
+  // Format: eight bytes, an index entry's offset and flags (`>Q`) and a docket's sizes (`S_HEADER`'s `Q`s).
   let field = bytes.get(at..)?.first_chunk::<8>()?;
   Some(u64::from_be_bytes(*field))
 }
@@ -314,6 +316,8 @@ pub fn read_docket(bytes: &[u8]) -> Result<Docket<'_>, Refused> {
       sizes.saturating_add(at.saturating_mul(DOCKET_SIZE_BYTES)),
     )
   };
+  // Format: the docket's six sizes in order (`parse_docket_args`): the index's, its pending, the data's, its pending,
+  // the sidedata's, its pending; 0, 2 and 4 are the committed ones.
   let (index_end, data_end, sidedata_end) = (size(0), size(2), size(4));
   let default_header = fixed.last().copied();
   let mut rest = bytes.get(DOCKET_FIXED..).unwrap_or_default();
@@ -781,7 +785,12 @@ fn copy(stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
 /// A compressed chunk inflated by the crate's one inflater, the one compressed bundles use ([`compression::inflate`]):
 /// the decoder's memory and every byte of room charged to `admission` first, and a stream cut short, corrupt or
 /// followed by more bytes refused by kind.
-fn inflate(rev: u32, engine: Engine, stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
+fn inflate(
+  rev: u32,
+  engine: Engine,
+  stored: &[u8],
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refused> {
   let mut out = Vec::new();
   compression::inflate(engine, stored, admission, &mut out).map_err(|refusal| match refusal {
     StreamRefusal::PastAdmission { past, .. } => Refused::PastAdmission(past),

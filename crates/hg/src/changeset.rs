@@ -465,10 +465,11 @@ mod tests {
 
   const MANIFEST: &[u8] = b"38a51fca0cbc207c4af656034604724b2e089ff6";
 
-  /// What `encode` and `encoded_len` answer for `changeset`: the text written or the refusal, and the length given.
-  fn written(
-    changeset: &Changeset<'_>,
-  ) -> (Result<Vec<u8>, EncodeRefusal>, Result<u64, EncodeRefusal>) {
+  /// What `encode` and `encoded_len` answer: the text written or the refusal, and the length given.
+  type Written = (Result<Vec<u8>, EncodeRefusal>, Result<u64, EncodeRefusal>);
+
+  /// What `encode` and `encoded_len` answer for `changeset`.
+  fn written(changeset: &Changeset<'_>) -> Written {
     let mut out = Vec::new();
     let text = encode(changeset, &mut out).map(|()| out);
     (text, encoded_len(changeset))

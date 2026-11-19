@@ -87,7 +87,10 @@ fn branch_of(text: &[u8]) -> (Vec<u8>, bool) {
 
 /// The fixtures' history appended to an empty index, each log one group, as a push's changegroup brings them:
 /// the changelog, the manifest log, then each file's log. Answers the index, its store, and each log's numbers.
-fn appended() -> (HgIndex, ContentStore, BTreeMap<String, Vec<u32>>) {
+/// An index with its store, and the numbers each log's group was given, by log.
+type Appended = (HgIndex, ContentStore, BTreeMap<String, Vec<u32>>);
+
+fn appended() -> Appended {
   let mut store = store();
   let mut index = HgIndex::new();
   let mut numbers = BTreeMap::new();
@@ -167,6 +170,41 @@ fn appended() -> (HgIndex, ContentStore, BTreeMap<String, Vec<u32>>) {
   (index, store, numbers)
 }
 
+/// Holds the changelog's rows to 7.2's listing: numbers, parents, nodes, branches and closed heads.
+fn check_changelog(index: &HgIndex, store: &ContentStore, numbers: &[u32]) {
+  let changelog = listed("index-changelog.txt");
+  assert_eq!(numbers, changelog.iter().map(|row| row.rev).collect::<Vec<_>>());
+  assert_eq!(index.len(store, Log::Changelog), 11);
+  for row in &changelog {
+    let read = index.changeset(store, row.rev).unwrap();
+    let (branch, closed) = branch_of(file(&format!("changeset-{}.txt", row.rev)));
+    assert_eq!(
+      (read.node, read.p1, read.p2, read.branch, read.closed),
+      (row.node, row.p1_rev, row.p2_rev, branch.as_slice(), closed),
+      "changeset {}",
+      row.rev
+    );
+    assert_eq!(index.rev(store, Log::Changelog, &row.node), Some(row.rev));
+  }
+}
+
+/// Holds one manifest or file log's rows to 7.2's listing: numbers, parents, links and nodes both ways.
+fn check_log(index: &HgIndex, store: &ContentStore, log: Log<'_>, numbers: &[u32], listing: &str) {
+  let rows = listed(listing);
+  assert_eq!(numbers, rows.iter().map(|row| row.rev).collect::<Vec<_>>(), "{listing}");
+  assert_eq!(usize::try_from(index.len(store, log)).unwrap(), rows.len(), "{listing}");
+  for row in rows {
+    let read = index.revision(store, log, row.rev).unwrap();
+    assert_eq!(
+      (read.node, read.p1, read.p2, read.link),
+      (row.node, row.p1_rev, row.p2_rev, row.link),
+      "{listing} {}",
+      row.rev
+    );
+    assert_eq!(index.rev(store, log, &row.node), Some(row.rev));
+  }
+}
+
 /// A-588 part 2 (golden): do append the history 7.2 stored, each log as one group in 7.2's order. Expect every
 /// revision numbered as 7.2's `debugindex` numbered it, its parents' and its link's numbers 7.2's, its node found
 /// under its number and its number under its node, each log as long as 7.2's, the changesets' branches (`stable`
@@ -174,70 +212,17 @@ fn appended() -> (HgIndex, ContentStore, BTreeMap<String, Vec<u32>>) {
 #[test]
 fn the_history_7_2_stored_is_numbered_as_7_2_numbered_it() {
   let (index, store, numbers) = appended();
-  let changelog = listed("index-changelog.txt");
-  assert_eq!(
-    numbers["changelog"],
-    changelog.iter().map(|row| row.rev).collect::<Vec<_>>()
-  );
-  assert_eq!(index.len(&store, Log::Changelog), 11);
-  for row in &changelog {
-    let read = index.changeset(&store, row.rev).unwrap();
-    assert_eq!(
-      (read.node, read.p1, read.p2),
-      (row.node, row.p1_rev, row.p2_rev),
-      "changeset {}",
-      row.rev
-    );
-    assert_eq!(index.rev(&store, Log::Changelog, &row.node), Some(row.rev));
-    let (branch, closed) = branch_of(file(&format!("changeset-{}.txt", row.rev)));
-    assert_eq!((read.branch, read.closed), (branch.as_slice(), closed));
+  check_changelog(&index, &store, &numbers["changelog"]);
+  check_log(&index, &store, Log::Manifest, &numbers["manifest"], "index-manifest.txt");
+  for path in paths() {
+    let listing = format!("index-file-{path}.txt");
+    check_log(&index, &store, Log::File(path.as_bytes()), &numbers[&path], &listing);
   }
-  assert!(
-    changelog
-      .iter()
-      .any(|row| index.changeset(&store, row.rev).unwrap().closed)
-  );
-  let mut logs = vec![("manifest".to_string(), "index-manifest.txt".to_string())];
-  logs.extend(
-    paths()
-      .into_iter()
-      .map(|path| (path.clone(), format!("index-file-{path}.txt"))),
-  );
-  for (name, listing) in logs {
-    let log = if name == "manifest" {
-      Log::Manifest
-    } else {
-      Log::File(name.as_bytes())
-    };
-    let rows = listed(&listing);
-    assert_eq!(
-      numbers[&name],
-      rows.iter().map(|row| row.rev).collect::<Vec<_>>(),
-      "{name}"
-    );
-    assert_eq!(
-      usize::try_from(index.len(&store, log)).unwrap(),
-      rows.len(),
-      "{name}"
-    );
-    for row in rows {
-      let read = index.revision(&store, log, row.rev).unwrap();
-      assert_eq!(
-        (read.node, read.p1, read.p2, read.link),
-        (row.node, row.p1_rev, row.p2_rev, row.link),
-        "{name} {}",
-        row.rev
-      );
-      assert_eq!(index.rev(&store, log, &row.node), Some(row.rev));
-    }
-  }
+  assert!((0..11).any(|rev| index.changeset(&store, rev).unwrap().closed));
   let copy = index.revision(&store, Log::File(b"c"), 0).unwrap();
   assert!(copy.block.is_some());
   let meta = index.revision(&store, Log::File(b"meta"), 0).unwrap();
-  assert_eq!(
-    meta.block.map(|block| store.get(&block).map(<[u8]>::len)),
-    Some(Some(0))
-  );
+  assert_eq!(meta.block.map(|block| store.get(&block).map(<[u8]>::len)), Some(Some(0)));
 }
 
 /// A-588 part 2 (golden): do name every revision 7.2 stored by Mercurial's naming, a file revision's block given as
@@ -489,16 +474,61 @@ fn a_fork_shares_the_rows_and_keeps_its_own() {
   index.release(&mut store).unwrap();
 }
 
+/// A generated history's revision at `at`: its node.
+fn model_node(at: usize) -> Node {
+  [u8::try_from(at + 10).unwrap_or(u8::MAX); NODE_LEN]
+}
+
+/// A history's parents: each revision's parents are any other revision of the history, by its choices.
+type Parents = Vec<(Node, Node)>;
+
+/// What 7.2's `addgroup` does with `group` (positions of the history, in order) brought onto a log holding `held`, in a
+/// model: each revision's number and the log after the group, or the first missing parent's refusal.
+fn model_group(held: &[usize], group: &[usize], parents: &Parents) -> Result<(Vec<u32>, Vec<usize>), Refused> {
+  let mut expected = held.to_vec();
+  let mut numbers = Vec::new();
+  for at in group {
+    if let Some(rev) = expected.iter().position(|kept| kept == at) {
+      numbers.push(u32::try_from(rev).unwrap_or(NONE));
+      continue;
+    }
+    let (p1, p2) = parents.get(*at).copied().unwrap_or((NULL_NODE, NULL_NODE));
+    let known = |parent: &Node| *parent == NULL_NODE || expected.iter().any(|kept| model_node(*kept) == *parent);
+    if let Some(missing) = [p1, p2].into_iter().find(|parent| !known(parent)) {
+      return Err(Refused::MissingParent { node: missing });
+    }
+    expected.push(*at);
+    numbers.push(u32::try_from(expected.len() - 1).unwrap_or(NONE));
+  }
+  Ok((numbers, expected))
+}
+
+/// Holds every revision the model's log holds to the index: its node and its parents' numbers.
+fn check_model(index: &HgIndex, store: &ContentStore, log: Log<'_>, model: &[usize], parents: &Parents) {
+  let number = |parent: Node| {
+    if parent == NULL_NODE {
+      return NONE;
+    }
+    let held = model.iter().position(|kept| model_node(*kept) == parent).unwrap();
+    u32::try_from(held).unwrap()
+  };
+  for (rev, at) in model.iter().enumerate() {
+    let read = index.revision(store, log, u32::try_from(rev).unwrap()).unwrap();
+    let (p1, p2) = parents[*at];
+    assert_eq!((read.node, read.p1, read.p2), (model_node(*at), number(p1), number(p2)));
+  }
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
   /// A-588 part 2 (model): do append generated histories of a file's log (each revision's parents any other revision of
-  /// the history, so some name one that comes later or never; some revisions brought twice) in generated groups. Expect,
-  /// after every group, what a model of 7.2's `addgroup` gives: the same numbers or the same refusal, a refused group
-  /// leaving the log as it was, and every held node's parents numbered as the model numbers them.
+  /// the history, so some name one that comes later or never; some revisions brought twice) in generated groups.
+  /// Expect, after every group, what a model of 7.2's `addgroup` gives: the same numbers or the same refusal, a refused
+  /// group leaving the log as it was, and every held node's parents numbered as the model numbers them.
   #[test]
   fn appending_equals_7_2_s_addgroup(
-    parents in proptest::collection::vec(
+    choices in proptest::collection::vec(
       (any::<proptest::sample::Index>(), any::<proptest::sample::Index>(), 0_u8..3),
       1..24,
     ),
@@ -506,14 +536,12 @@ proptest! {
     repeats in proptest::collection::vec(any::<proptest::sample::Index>(), 0..4),
   ) {
     let (mut index, mut store, content) = with_one_changeset();
-    let link = [9; NODE_LEN];
     let log = Log::File(b"f");
-    let node = |at: usize| u8::try_from(at + 10).unwrap();
     let pick = |at: usize, choice: &proptest::sample::Index| {
-      let other = choice.index(parents.len());
-      (other != at).then(|| [node(other); NODE_LEN]).unwrap_or(NULL_NODE)
+      let other = choice.index(choices.len());
+      if other == at { NULL_NODE } else { model_node(other) }
     };
-    let parent_nodes: Vec<(Node, Node)> = parents
+    let parents: Parents = choices
       .iter()
       .enumerate()
       .map(|(at, (first, second, count))| {
@@ -522,7 +550,7 @@ proptest! {
         (p1, p2)
       })
       .collect();
-    let mut order: Vec<usize> = (0..parents.len()).collect();
+    let mut order: Vec<usize> = (0..choices.len()).collect();
     for repeat in &repeats {
       let at = repeat.index(order.len());
       order.insert(at, order[at]);
@@ -533,56 +561,26 @@ proptest! {
     bounds.dedup();
     let mut model: Vec<usize> = Vec::new();
     for window in bounds.windows(2) {
-      let group: Vec<usize> = order[window[0]..window[1]].to_vec();
+      let group = &order[window[0]..window[1]];
       let revisions: Vec<NewRevision> = group
         .iter()
         .map(|at| NewRevision {
-          p1: parent_nodes[*at].0,
-          p2: parent_nodes[*at].1,
-          ..revision(node(*at), None, None, link, content)
+          node: model_node(*at),
+          p1: parents[*at].0,
+          p2: parents[*at].1,
+          ..revision(0, None, None, [9; NODE_LEN], content)
         })
         .collect();
-      let mut expected = model.clone();
-      let mut numbers = Vec::new();
-      let mut refused = None;
-      for (at, revision) in group.iter().zip(&revisions) {
-        if let Some(rev) = expected.iter().position(|held| held == at) {
-          numbers.push(u32::try_from(rev).unwrap());
-          continue;
-        }
-        let known = |parent: Node| {
-          parent == NULL_NODE || expected.iter().any(|held| [node(*held); NODE_LEN] == parent)
-        };
-        let missing = [revision.p1, revision.p2].into_iter().find(|parent| !known(*parent));
-        if let Some(missing) = missing {
-          refused = Some(Refused::MissingParent { node: missing });
-          break;
-        }
-        expected.push(*at);
-        numbers.push(u32::try_from(expected.len() - 1).unwrap());
-      }
       let answer = index.append_revisions(&mut store, log, &revisions);
-      match refused {
-        Some(refusal) => prop_assert_eq!(answer, Err(refusal)),
-        None => {
+      match model_group(&model, group, &parents) {
+        Ok((numbers, after)) => {
           prop_assert_eq!(answer, Ok(numbers));
-          model = expected;
+          model = after;
         }
+        Err(refusal) => prop_assert_eq!(answer, Err(refusal)),
       }
-      prop_assert_eq!(usize::try_from(index.len(&store, log)).unwrap(), model.len());
+      prop_assert_eq!(index.len(&store, log), u32::try_from(model.len()).unwrap_or(NONE));
     }
-    for (rev, at) in model.iter().enumerate() {
-      let read = index.revision(&store, log, u32::try_from(rev).unwrap()).unwrap();
-      prop_assert_eq!(read.node, [node(*at); NODE_LEN]);
-      let number = |parent: Node| {
-        if parent == NULL_NODE {
-          return NONE;
-        }
-        let held = model.iter().position(|held| [node(*held); NODE_LEN] == parent).unwrap();
-        u32::try_from(held).unwrap()
-      };
-      let (p1, p2) = parent_nodes[*at];
-      prop_assert_eq!((read.p1, read.p2), (number(p1), number(p2)));
-    }
+    check_model(&index, &store, log, &model, &parents);
   }
 }
