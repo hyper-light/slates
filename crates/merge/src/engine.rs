@@ -196,6 +196,83 @@ pub enum Outcome {
   },
 }
 
+/// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
+/// its effects kept until [`Green::commit_judged`] commits them as the version after the head it was judged at. A push
+/// judges each of its greens' works so, and commits them only once every one of them accepted: git's atomic push ("Either
+/// all refs are updated or none") and every Mercurial push, with nothing applied before. It commits into the green that
+/// judged it, which its caller names: the engine has no name of its own.
+pub struct Judged {
+  /// The increment it judged.
+  id: [u8; 32],
+  /// The head it was judged at.
+  at: u64,
+  /// The accepted effects, applied at the commit.
+  effects: Vec<Effect>,
+  /// What the verdict resolved the increment to (`crate::chain_entry`).
+  applied: Vec<crate::chain_entry::Applied>,
+}
+
+impl Judged {
+  /// The increment it judged.
+  pub fn id(&self) -> [u8; 32] {
+    self.id
+  }
+
+  /// The head it was judged at: it commits as the version after it.
+  pub fn at(&self) -> u64 {
+    self.at
+  }
+
+  /// What the verdict resolved the increment to: what the durable chain records of its version (`crate::chain_entry`).
+  pub fn applied(&self) -> &[crate::chain_entry::Applied] {
+    &self.applied
+  }
+}
+
+impl core::fmt::Debug for Judged {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Judged")
+      .field("id", &self.id)
+      .field("at", &self.at)
+      .field("effects", &self.effects.len())
+      .finish()
+  }
+}
+
+/// A verdict held (A-635): what [`Green::judge`] reached, nothing of it applied.
+#[derive(Debug)]
+pub enum Judgment {
+  /// Accepted, and held until [`Green::commit_judged`].
+  Accepted(Judged),
+  /// Accepted before, as `version`: the same increment again, after a lost answer; nothing to commit.
+  AcceptedBefore {
+    /// The version it was accepted as.
+    version: u64,
+  },
+  /// The conflict windows, kept in the rejected-result cache as a submit's are.
+  Conflict {
+    /// The conflicting windows.
+    windows: Vec<ConflictWindow>,
+  },
+  /// The increment's base is below the version the green's chain was checkpointed at (as [`Outcome::BaseUnavailable`]).
+  BaseUnavailable {
+    /// The increment's base.
+    base: u64,
+    /// The oldest base the green still judges.
+    floor: u64,
+  },
+}
+
+/// A held verdict whose green moved before it was committed (A-635): refused, nothing applied; judged again, it meets
+/// what moved the green.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadMoved {
+  /// The head it was judged at.
+  pub judged_at: u64,
+  /// The green's head now.
+  pub head: u64,
+}
+
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
 /// a rebase; only the work moves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3697,41 +3774,78 @@ impl Green {
     &mut self,
     inc: &Increment,
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
+    match self.judge(inc) {
+      Judgment::Accepted(judged) => {
+        let (version, applied) = self.commit_held(judged);
+        (Outcome::Accepted { version }, Some(applied))
+      }
+      Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
+      Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
+      Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+    }
+  }
+
+  /// Judges an increment and holds the verdict (A-635): what a submit decides, nothing of it applied to the green but the
+  /// rejected-result cache's entry for a conflict, which a submit keeps too. An increment accepted before is answered
+  /// its version; a conflict the cache holds, its windows; a base below the checkpoint, unavailable; anything else is
+  /// decided against the head and held in a [`Judged`] for [`Green::commit_judged`].
+  pub fn judge(&mut self, inc: &Increment) -> Judgment {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return (Outcome::Accepted { version: *version }, None);
+      return Judgment::AcceptedBefore { version: *version };
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return (
-        Outcome::Conflict {
-          windows: windows.clone(),
-        },
-        None,
-      );
+      return Judgment::Conflict {
+        windows: windows.clone(),
+      };
     }
     if inc.base < self.deltas_from {
-      return (
-        Outcome::BaseUnavailable {
-          base: inc.base,
-          floor: self.deltas_from,
-        },
-        None,
-      );
+      return Judgment::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
     }
     let resolved = Green::resolve(inc);
     match self.decide(inc, &resolved) {
       Ok(effects) => {
         let applied = effects.iter().map(Effect::applied).collect();
-        // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
-        let version = self.head().saturating_add(1);
-        self.commit(effects, version);
-        self.accepted.insert(inc.id, version);
-        (Outcome::Accepted { version }, Some(applied))
+        Judgment::Accepted(Judged {
+          id: inc.id,
+          at: self.head(),
+          effects,
+          applied,
+        })
       }
       Err(windows) => {
         self.retain_rejected(inc.id, &windows);
-        (Outcome::Conflict { windows }, None)
+        Judgment::Conflict { windows }
       }
     }
+  }
+
+  /// Commits a held verdict as the version after the head it was judged at (A-635), with what the chain records of it:
+  /// refused [`HeadMoved`], nothing applied, once the green has moved since.
+  pub fn commit_judged(
+    &mut self,
+    judged: Judged,
+  ) -> Result<(u64, Vec<crate::chain_entry::Applied>), HeadMoved> {
+    let head = self.head();
+    if judged.at != head {
+      return Err(HeadMoved {
+        judged_at: judged.at,
+        head,
+      });
+    }
+    Ok(self.commit_held(judged))
+  }
+
+  /// Commits a verdict judged at the head: the version after it, and what the chain records of it.
+  fn commit_held(&mut self, judged: Judged) -> (u64, Vec<crate::chain_entry::Applied>) {
+    // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
+    let version = judged.at.saturating_add(1);
+    self.commit(judged.effects, version);
+    self.accepted.insert(judged.id, version);
+    (version, judged.applied)
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -4475,6 +4589,8 @@ mod copy_tests;
 mod reanchor;
 pub use reanchor::{ReanchorRefused, Reanchored};
 
+#[cfg(test)]
+mod judge_tests;
 #[cfg(test)]
 mod node_exclusive_tests;
 

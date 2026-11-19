@@ -1520,16 +1520,7 @@ impl Partition {
       ),
       // An entry of a repository's register (A-603): its rules, then its versions' chain entries and the state it adds
       // within the merge budget, less the state it removes.
-      Op::RepositoryAdvanced { entry } => {
-        self.repositories.check(
-          op,
-          self.caps.volumes,
-          |id| self.held(id),
-          |green| self.green_head(green),
-        )?;
-        let bytes = crate::repository::Repositories::entry_bytes(entry);
-        self.merge_bytes_fit(bytes.released, bytes.added)
-      }
+      Op::RepositoryAdvanced { entry } => self.check_entry(entry, &[]),
       // A repository's policy, set whole (A-622): `crate::repository`; its rules and hooks fit the merge byte budget,
       // the policy it replaces given back.
       Op::RepositoryPolicySet { repository, policy } => {
@@ -1807,6 +1798,60 @@ impl Partition {
       // A green adopted by its successor is recorded by its adoption (A-333): a new volume, checked as a creation is.
       Op::GreenAdopted { record, .. } => self.check_volume_created(record),
     }
+  }
+
+  /// The guard for recording `made`, new volumes, and then `entry` (A-635): judged whole before the first is recorded,
+  /// since what a transaction records before a refusal commits with it. Each made volume is checked as its creation is,
+  /// with the ids and names of those made before it and the volumes table's room for all of them; then the entry, each
+  /// made green counted one the partition holds, at no version yet. A push that makes new branches records them so.
+  pub fn check_creating(
+    &self,
+    made: &[crate::catalog::VolumeRecord],
+    entry: &crate::catalog::RepositoryEntry,
+  ) -> Result<(), DbError> {
+    for (index, record) in made.iter().enumerate() {
+      self.check_volume_created(record)?;
+      if made
+        .iter()
+        .take(index)
+        .any(|earlier| earlier.id == record.id || earlier.name == record.name)
+      {
+        return Err(DbError::AlreadyExists {
+          existing: record.id.bytes,
+        });
+      }
+    }
+    if self.volume_slots_used().saturating_add(made.len()) > self.caps.volumes {
+      return Err(DbError::Capacity { table: "volumes" });
+    }
+    self.check_entry(entry, made)
+  }
+
+  /// The guard for an entry of a repository's register (A-603): its rules, then its versions' chain entries and the
+  /// state it adds within the merge budget, less the state it removes. `made` are volumes recorded before it in its
+  /// transaction (A-635), each held as its record says, a green at no version yet.
+  fn check_entry(
+    &self,
+    entry: &crate::catalog::RepositoryEntry,
+    made: &[crate::catalog::VolumeRecord],
+  ) -> Result<(), DbError> {
+    let held = |id: VolumeId| match made.iter().find(|record| record.id == id) {
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
+      None => self.held(id),
+    };
+    let head = |green: VolumeId| {
+      if made.iter().any(|record| record.id == green) {
+        0
+      } else {
+        self.green_head(green)
+      }
+    };
+    self.repositories.check_entry(entry, held, head)?;
+    let bytes = crate::repository::Repositories::entry_bytes(entry);
+    self.merge_bytes_fit(bytes.released, bytes.added)
   }
 
   /// The check of a volume's creation, and of a green's by its adoption (A-333): the id and the name free here (a name

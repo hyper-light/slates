@@ -413,6 +413,17 @@ impl Repositories {
     entry::bytes(entry)
   }
 
+  /// The guard for an entry of a repository's register (A-603), `held` and `head` as [`Repositories::check`] takes
+  /// them: what a partition judging an entry beside volumes it is about to record asks (A-635).
+  pub fn check_entry(
+    &self,
+    entry: &crate::catalog::RepositoryEntry,
+    held: impl Fn(VolumeId) -> Held,
+    head: impl Fn(VolumeId) -> u64,
+  ) -> Result<(), DbError> {
+    entry::check(self, entry, held, head)
+  }
+
   /// The guard for a repository operation (`Partition::check`): refuses what the log must never record. `capacity`
   /// bounds the repositories; `held` says what the partition's catalog holds under a volume id; `head` is a green's
   /// head as its durable records hold it, which an entry's versions follow and its checks read (A-603).

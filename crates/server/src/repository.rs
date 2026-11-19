@@ -48,6 +48,11 @@ use crate::greens::ReleaseProgress;
 use crate::state::ShardState;
 use crate::verbs::{forbidden, refused, to_db_volume, to_wire_volume};
 
+// The push's callers, git's receive-pack and Mercurial's unbundle, land after it (A-620's second part; §4.17.3's push):
+// until one calls it, a daemon build calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod push;
+
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
   match tool {
