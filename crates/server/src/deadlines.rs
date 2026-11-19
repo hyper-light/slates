@@ -89,9 +89,32 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   ]
   .into_iter()
   .flatten()
-  .min();
+  .min()
+  // A deadline still past after its pass is one its job could not end (a record the catalog refused): it is tried again
+  // the shard's window on, never spun on. The red check of a retry the keeper never took found the spin: the watchdog
+  // ended the test daemon, its shard 3.5 s on its CPU without a step (A-536).
+  .map(|at| {
+    if at <= now {
+      count_stuck(state, now)
+    } else {
+      at
+    }
+  });
   state.deadline_armed = next;
   next.map(|at| at.saturating_sub(now))
+}
+
+/// Format: the counter of the keeper's passes that left a deadline past due (a job's record refused), each tried again a
+/// window later.
+const DEADLINE_STUCK: &str = "deadline.stuck";
+
+/// Counts a pass that left a deadline past due, and answers when it is tried again: the shard's window after `now`
+/// (A-455's window over the overrun this shard measured).
+fn count_stuck(state: &mut ShardState, now: u64) -> u64 {
+  state.count(DEADLINE_STUCK, 1);
+  now.saturating_add(crate::watchdog::watch_window_ns(
+    slates_rt::futures::scheduler_overrun_ns(),
+  ))
 }
 
 /// Closes every state borrow (`state::try_with_state`): a lease the borrow entered to lapse before the deadline the
