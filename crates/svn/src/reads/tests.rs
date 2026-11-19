@@ -438,7 +438,10 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
 /// The repository a recorded URL names and the session's base in it: the path past [`HOST`], its first name the
 /// repository's, the rest the base (`/` for none).
 fn repository_and_base(url: &[u8]) -> (String, String) {
-  let path = std::str::from_utf8(url).unwrap().strip_prefix(HOST).unwrap();
+  let path = std::str::from_utf8(url)
+    .unwrap()
+    .strip_prefix(HOST)
+    .unwrap();
   let (repository, rest) = path.split_once('/').unwrap_or((path, ""));
   (repository.to_owned(), format!("/{rest}"))
 }
@@ -1685,13 +1688,9 @@ fn a_copy_from_a_hidden_source_shows_no_source_and_the_author_and_date_alone() {
       .collect(),
   );
   let rules_text = b"[/]\n* = r\n\n[/branches]\n* =\n";
-  let rules = Authz::parse(
-    rules_text,
-    None,
-    crate::authz::Bounds::of(rules_text, None),
-  )
-  .unwrap()
-  .rules(b"repo", Principal::Anonymous);
+  let rules = Authz::parse(rules_text, None, crate::authz::Bounds::of(rules_text, None))
+    .unwrap()
+    .rules(b"repo", Principal::Anonymous);
   let session = Session {
     authz: Some(&rules),
     ..ROOT_SESSION

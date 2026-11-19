@@ -594,7 +594,8 @@ SCRIPTED_LOCKED = {
         command("get-latest-rev"),
     ],
     # The file's first location hidden: `svn_repos_get_file_revs2` asserts its mainline is not empty, and `svnserve`
-    # sets no malfunction handler, so the process aborts and the connection ends after the authentication request.
+    # sets no malfunction handler, so the process aborts and the connection ends with nothing written for the command:
+    # the authentication request is still in the unflushed buffer.
     "locked-file-revs-abort": [
         command("get-file-revs", b"branches/b1/a.txt", (0,), (11,)),
         command("get-latest-rev"),

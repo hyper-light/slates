@@ -31,8 +31,10 @@
 //!   `svn_repos_check_revision_access`); `get-locations`, `get-location-segments` and `log -g`'s history refuse a
 //!   hidden path 220001 "Unreadable path encountered; access denied" and end at a hidden copy source; `log` refuses a
 //!   hidden path or root 220001 "Item is not readable", ends a path's history at a hidden location and censors each
-//!   revision as `detect_changed` finds it; `get-file-revs` ends at a hidden location, and ends the connection where
-//!   `svnserve`'s assertion aborts its process. `get-latest-rev`, `get-dated-rev` and `get-deleted-rev` check nothing.
+//!   revision as `detect_changed` finds it; `get-file-revs` ends at a hidden location, and ends the connection with
+//!   nothing written for the command where `svnserve`'s assertion aborts its process (its authentication request still
+//!   in the unflushed buffer, as the recording shows). `get-latest-rev`, `get-dated-rev` and `get-deleted-rev` check
+//!   nothing.
 //!   Owed: a session that could authenticate, which `svnserve` asks to, mid-command, before it refuses.
 //! - **Property lists in name order.** `svnserve` writes a property list in its hash table's order, which APR seeds per
 //!   table (`apr_hash_make` since APR 1.5), so three recordings of one repository gave three orders; a client reads the

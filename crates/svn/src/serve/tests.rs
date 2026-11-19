@@ -285,7 +285,11 @@ fn assert_as_svnserve(
     "{name}: the drive"
   );
   let after = ours.len() - our_end;
-  assert_items(name, &ours[our_end..], &theirs[their_end..their_end + after]);
+  assert_items(
+    name,
+    &ours[our_end..],
+    &theirs[their_end..their_end + after],
+  );
 }
 
 /// A-656 (`serve.c`'s command loop against stock `svnserve` 1.15.0): replay every recorded session
@@ -321,12 +325,7 @@ fn every_recorded_session_is_answered_as_svnserve_answered_it() {
       }
       Ending::Waiting => ours.len(),
     };
-    assert_as_svnserve(
-      recorded.name,
-      &ours[..compared],
-      recorded.server,
-      &texts,
-    );
+    assert_as_svnserve(recorded.name, &ours[..compared], recorded.server, &texts);
   }
   assert_eq!(replayed, REPLAYED);
 }
@@ -837,7 +836,7 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   let fixture = fixture();
   let anonymous = FixtureGuards::anonymous();
   let check_secret = b"( check-path ( 6:secret ( ) ) ) ";
-  let log_r1 = b"( log ( ( 0: ) ( 1 ) ( 1 ) true false 0 false ) ) ";
+  let log_r1 = b"( log ( ( 0: ) ( 1 ) ( 1 ) true false 0 false all-revprops ( ) ) ) ";
   let a_directory = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
   let keyless = Repository {
     cram_md5: false,
@@ -850,7 +849,10 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   let (out, _) = send(&fixture, &anonymous, &mut connection, check_dir);
   assert_eq!(out, a_directory);
   let log = send_in_slices(&fixture, &anonymous, &mut connection, log_r1);
-  assert!(log.ends_with("done ( success ( ) ) ") && !log.contains("secret"), "{log}");
+  assert!(
+    log.ends_with("done ( success ( ) ) ") && !log.contains("secret"),
+    "{log}"
+  );
   let alices = FixtureGuards::default();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
   let (out, _) = send(&fixture, &alices, &mut connection, check_secret);

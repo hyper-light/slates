@@ -120,8 +120,8 @@ impl FileRevsRequest {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `get-file-revs ( path [ start ] [ end ] ? merged )` (`serve.c` `get_file_revs`): the authentication request, then
-  /// a [`Stream`] of the file's revisions.
+  /// `get-file-revs ( path [ start ] [ end ] ? merged )` (`serve.c` `get_file_revs`): a [`Stream`] of the file's
+  /// revisions, the authentication request written at its first step, once they are found.
   pub(super) fn file_revisions(
     &mut self,
     params: &[Value<'_>],
@@ -130,7 +130,6 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     let Some(request) = FileRevsRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
     let (version, compression) = if capabilities.accepts_svndiff2 {
       (Version::Two, Compression::Lz4)
     } else {
@@ -193,10 +192,17 @@ impl FileRevsStream {
     Ok(Progress::Done)
   }
 
-  /// One step: the revisions found, or the next sent, or the end once none is left.
+  /// One step: the revisions found, or the next sent, or the end once none is left. The first writes the
+  /// authentication request once the revisions are found, unless their walk aborted: `svnserve` writes the request into
+  /// its connection's buffer before it walks, and the process aborts before the buffer is flushed, so its client reads
+  /// nothing for the command (the `locked-file-revs-abort` recording).
   fn step<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), Stop> {
     let Some(pending) = self.pending.as_mut() else {
-      self.pending = Some(reads.file_revisions_to_send(&self.request)?);
+      let found = reads.file_revisions_to_send(&self.request);
+      if !matches!(found, Err(Stop::Aborted)) {
+        reads.trivial_auth()?;
+      }
+      self.pending = Some(found?);
       return Ok(());
     };
     let Some(next) = pending.pop_front() else {
@@ -628,7 +634,8 @@ enum Stop {
   /// A refusal: the answer ends with `done` and it.
   Refused(Failure),
   /// `SVN_ERR_ASSERT(mainline_path_revisions->nelts > 0)` failing: `svnserve` sets no malfunction handler, so
-  /// Subversion's default aborts its process and the connection ends without `done`; here it ends the same way.
+  /// Subversion's default aborts its process and the connection ends with nothing written for the command, its
+  /// authentication request lost in the unflushed buffer; here it ends the same way.
   Aborted,
   /// An item the writer refused.
   Unwritten(ItemError),

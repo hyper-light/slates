@@ -422,7 +422,9 @@ impl Established {
       let user = authz::Principal::named(user_of(principal));
       ReadRules {
         principal: principal.clone(),
-        rules: policy.authz.map(|(rules_file, name)| rules_file.rules(name, user)),
+        rules: policy
+          .authz
+          .map(|(rules_file, name)| rules_file.rules(name, user)),
       }
     });
     reads::Session {
