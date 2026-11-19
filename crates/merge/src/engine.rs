@@ -1512,8 +1512,9 @@ impl Green {
 
   /// The green's checkpoint at version `at` (§4.16; [`crate::checkpoint`]): every key whose value in effect at `at` was
   /// set after the origin by its own change, with that version and value, and every increment accepted at or before
-  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and the identity's
-  /// sum at `at` (A-626 part 3, `copy_checkpoint`). `None` when `at` is past the head or below the folded floor (its
+  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and, beside a copy's
+  /// record alone, the identity's sum at `at` (A-626 part 3 and its continuation (1), `copy_checkpoint`). `None` when
+  /// `at` is past the head or below the folded floor (its
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
@@ -1521,6 +1522,10 @@ impl Green {
       return None;
     }
     let (copied, listed) = self.copied_at(at);
+    let copies = self.copy_records_at(at);
+    // The sum stands for what the copies' entries hold beyond the restored state's own, so it travels beside a copy's
+    // record alone: without one, a restore's own entries are the identity (A-626 part 3, continued (1)).
+    let sum = (!copies.is_empty()).then(|| self.sum_at(at));
     let mut checkpoint = crate::checkpoint::Checkpoint {
       version: at,
       accepted: self
@@ -1552,9 +1557,9 @@ impl Green {
       hardlinks: changed_at(&self.hardlink_history, at),
       specials: changed_at(&self.special_history, at),
       xattrs: changed_at(&self.xattr_history, at),
-      copies: self.copy_records_at(at),
+      copies,
       copied,
-      sum: self.sum_at(at),
+      sum,
       head_check: None,
     };
     Green::leave_out_copied(&mut checkpoint, &listed);
@@ -1608,9 +1613,12 @@ impl Green {
     green.special_history_bytes = green.special_history_recounted();
     green.index_restored_changes();
     // The copied trees' keys and the copies' records after the change index, which counts the restored histories alone,
-    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3).
+    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3). A checkpoint
+    // with no copy's record carries none: the entries placed above are the identity (A-626 part 3, continued (1)).
     green.restore_copied(&checkpoint.copied, &checkpoint.copies);
-    green.take_sum(&checkpoint.sum);
+    if let Some(sum) = &checkpoint.sum {
+      green.take_sum(sum);
+    }
     self
   }
 

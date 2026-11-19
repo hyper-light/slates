@@ -1248,10 +1248,10 @@ fn replay_entry(
 /// checkpoint taken after its trunk changed and before a copy of the trunk from earlier replays the copy, then a change
 /// to a file the copy brought, its identity read only after both. Do: checkpoint [`trunk_changed_after_1`] at 3, copy
 /// the trunk at 1 to `b` as version 4 and overwrite `b/a` as 5; restore the checkpoint and replay 4 and 5, each entry
-/// encoded and decoded. Expect: the replica hashes as its owner at 5, its identity equals its recount, and its
-/// checkpoint at 3 carries its owner's sum there. Before, each read what the copy gave `b/a` from the trunk's history at
-/// 1, which the restored green does not hold: it read nothing there, so the replica hashed otherwise than its owner and
-/// its checkpoint carried another sum.
+/// encoded and decoded. Expect: the replica hashes as its owner at 5, its identity equals its recount, its identity
+/// moved to 3 is its owner's, and so is its checkpoint at 3 (which carries no sum since A-626 part 3, continued (1)).
+/// Before, each read what the copy gave `b/a` from the trunk's history at 1, which the restored green does not hold: it
+/// read nothing there, so the replica hashed otherwise than its owner and moved another sum to 3.
 #[test]
 fn a_replica_restored_after_a_copys_source_version_hashes_as_its_owner() {
   let mut green = trunk_changed_after_1();
@@ -1276,10 +1276,18 @@ fn a_replica_restored_after_a_copys_source_version_hashes_as_its_owner() {
     replica.head_identity(),
     replica.head_identity_from_scratch()
   );
-  let sum = |green: &Green| green.checkpoint(3).expect("a checkpoint at 3").sum;
+  // Below the copy, the identity moved to 3 is its owner's (`Green::sum_at`, what a branch there carries), and so is the
+  // whole checkpoint at 3, which carries no sum since no copy stands at or before it (A-626 part 3, continued (1)).
+  let moved = |green: &Green| green.sum_at(3);
   assert!(
-    sum(&replica) == sum(&green),
-    "the replica's checkpoint at 3 carries another sum"
+    moved(&replica) == moved(&green),
+    "the replica moves its identity to 3 otherwise than its owner"
+  );
+  let encoded = |green: &Green| green.checkpoint(3).map(|checkpoint| checkpoint.encode());
+  assert_eq!(
+    encoded(&replica),
+    encoded(&green),
+    "the replica's checkpoint at 3"
   );
 }
 
