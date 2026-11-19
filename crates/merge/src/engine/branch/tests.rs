@@ -116,7 +116,7 @@ impl Work {
   }
 
   fn name(&mut self, name: &str) -> u64 {
-    u64::from(self.doc.paths.intern(name))
+    self.doc.paths.intern(name)
   }
 }
 

@@ -369,7 +369,7 @@ pub enum Refused {
   NotAnswer,
   /// A capability that is no word: "Capability entry is not a word" (`SVN_ERR_RA_SVN_MALFORMED_DATA`).
   CapabilityNotWord,
-  /// A protocol version other than 2: "Unsupported ra_svn protocol version `n` (supported versions: [2])"
+  /// A protocol version other than 2: "Unsupported ra_svn protocol version `n` (supported versions: \[2\])"
   /// (`SVN_ERR_RA_SVN_BAD_VERSION`).
   UnsupportedVersion(u64),
   /// No `edit-pipeline` among the client's capabilities: "Missing edit-pipeline capability"
@@ -1002,13 +1002,16 @@ fn answer_items(value: Value<'_>) -> Result<AnswerItems<'_>, Refused> {
   })
 }
 
+/// The client's `ra-client` string and its first `client` string, each absent when the answer leaves it out.
+type ClientStrings<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
 /// The answer's optional tail, `? ra-client:string ( ? client:string )`: absent whole, or the string and the list after
 /// it, the list empty or a string first. `vparse_tuple` stops at the `?` only before the string, so a `ra-client` with
 /// no list after it is malformed (the hostile session `hostile-ra-client-without-client-list`).
 fn client_strings<'a>(
   ra_client: Option<Value<'a>>,
   client: Option<Value<'a>>,
-) -> Result<(Option<&'a [u8]>, Option<&'a [u8]>), Refused> {
+) -> Result<ClientStrings<'a>, Refused> {
   match (ra_client, client) {
     (None, _) => Ok((None, None)),
     (Some(Value::String(ra_client)), Some(Value::List(inner))) => match inner.into_iter().next() {
@@ -1060,10 +1063,7 @@ fn decode_digest(hex: &[u8]) -> Option<[u8; DIGEST_BYTES]> {
     return None;
   }
   let mut digest = [0; DIGEST_BYTES];
-  for (slot, pair) in digest.iter_mut().zip(hex.chunks_exact(2)) {
-    let [high, low] = pair else {
-      return None;
-    };
+  for (slot, [high, low]) in digest.iter_mut().zip(hex.as_chunks::<2>().0) {
     *slot = hex_value(*high)?.checked_shl(HEX_BITS)? | hex_value(*low)?;
   }
   Some(digest)
@@ -1072,6 +1072,7 @@ fn decode_digest(hex: &[u8]) -> Option<[u8; DIGEST_BYTES]> {
 /// The value of a lowercase hexadecimal digit (`cram.c`'s `hex_to_int` takes no uppercase).
 fn hex_value(digit: u8) -> Option<u8> {
   match digit {
+    // Format: the decimal digits.
     b'0'..=b'9' => digit.checked_sub(b'0'),
     b'a'..=b'f' => digit.checked_sub(b'a')?.checked_add(HEX_LETTER_BASE),
     _ => None,

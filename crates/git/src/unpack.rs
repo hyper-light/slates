@@ -2,8 +2,8 @@
 //! each entry inflated to exactly the size its header names, each delta resolved against its base through the applier,
 //! every object named, and the trailer checked.
 //!
-//! **Sources** (read 2026-11-19, git v2.50.1). The document [B]: `gitformat-pack.adoc`, a pack's header, entries and
-//! trailer (lines 35-68) and its deltas (95-175). The code [C], which git's receive-pack runs on every push and which
+//! **Sources** (read 2026-11-19, git v2.50.1). The document \[B\]: `gitformat-pack.adoc`, a pack's header, entries and
+//! trailer (lines 35-68) and its deltas (95-175). The code \[C\], which git's receive-pack runs on every push and which
 //! is followed where the document leaves room: `builtin/index-pack.c`,
 //! - `parse_pack_header`, the header;
 //! - `unpack_entry_data` (476-518), each entry inflated into a buffer of exactly its size, refused unless the stream
@@ -25,8 +25,9 @@
 //! the caller's index ([`Locate`], which A-591's [`Idx`] answers) or found among the pack's own objects by name. A
 //! delta whose base is not yet resolved waits. [`Reader::finish`] resolves the waiting deltas, each once its base is,
 //! in tables sorted by their base's entry and by their base's name, with an explicit stack in place of recursion, and
-//! answers every object in pack order. [`read_whole`] reads a pack held whole; [`check_index`] holds an index to the
-//! objects read from its pack, each id at its object's offset, which A-591 left to this piece.
+//! answers every object in pack order; [`Reader::finish_with`] reads a thin pack, taking the bases it names from
+//! outside it ([`Outside`], the receiver's repository, A-620). [`read_whole`] reads a pack held whole; [`check_index`]
+//! holds an index to the objects read from its pack, each id at its object's offset, which A-591 left to this piece.
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted, and every refusal is a typed variant naming where it stopped:
 //! - a stream that is no zlib stream, or whose data or Adler-32 is wrong (`Inflate`); one that inflates past its
@@ -72,6 +73,23 @@ pub struct NoIndex;
 
 impl Locate for NoIndex {
   fn offset_of(&self, _id: &ObjectId) -> Option<u64> {
+    None
+  }
+}
+
+/// Objects outside the pack that a thin pack's reference deltas may name: what the receiver's repository holds
+/// (§4.17.2 "A push", item 3: a delta resolved "against a base in the repository's index"; A-620).
+pub trait Outside {
+  /// The object named `id`, its type and content, if it is held outside the pack.
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])>;
+}
+
+/// Nothing outside the pack: every base must be one of its own objects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoObjects;
+
+impl Outside for NoObjects {
+  fn object(&self, _id: &ObjectId) -> Option<(Kind, &[u8])> {
     None
   }
 }
@@ -291,6 +309,18 @@ struct Resolved {
   chain: Option<Chain>,
 }
 
+/// An object a delta is applied to: one of the pack's, or one outside it.
+struct Source<'s> {
+  /// Its type.
+  kind: Kind,
+  /// Its name.
+  id: ObjectId,
+  /// Its content.
+  content: &'s [u8],
+  /// The deltas it lies under: none for an object stored whole, or held outside the pack.
+  depth: u64,
+}
+
 /// A delta waiting for its base.
 struct Waiting {
   /// The delta, inflated.
@@ -376,12 +406,23 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   }
 
   /// Ends the pack: refused unless its trailer has been read; then resolves the waiting deltas and answers every object
-  /// in pack order.
-  pub fn finish(mut self, admission: &mut Admission) -> Result<Unpacked, Refusal> {
+  /// in pack order. Every base must be one of the pack's own objects.
+  pub fn finish(self, admission: &mut Admission) -> Result<Unpacked, Refusal> {
+    self.finish_with(&NoObjects, admission)
+  }
+
+  /// Ends a pack that may be thin: as [`Reader::finish`], a reference delta whose base is none of the pack's objects
+  /// applied to the object of that name `outside` holds, as `index-pack --fix-thin` resolves it against the repository.
+  /// An object so made lies one delta deep; the base itself is not among the answer's objects.
+  pub fn finish_with<O: Outside + ?Sized>(
+    mut self,
+    outside: &O,
+    admission: &mut Admission,
+  ) -> Result<Unpacked, Refusal> {
     let Stage::Done(checksum) = self.stage else {
       return Err(Refusal::Truncated { at: self.at });
     };
-    self.resolve_waiting(admission)?;
+    self.resolve_waiting(outside, admission)?;
     let count = self.entries.len();
     charge_items::<Object>(admission, count)?;
     let mut objects = Vec::new();
@@ -608,21 +649,35 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         found: source.id,
       });
     }
-    let content = delta::apply(&source.content, delta, admission)
+    let depth = source.chain.map_or(0, |chain| chain.depth);
+    let source = Source {
+      kind: source.kind,
+      id: source.id,
+      content: &source.content,
+      depth,
+    };
+    self.apply_to_source(source, delta, at, admission).map(Some)
+  }
+
+  /// `delta`, the entry at `at`'s, applied to `source`: the object it makes, of the source's type, one delta deeper.
+  fn apply_to_source(
+    &self,
+    source: Source<'_>,
+    delta: &[u8],
+    at: u64,
+    admission: &mut Admission,
+  ) -> Result<Resolved, Refusal> {
+    let content = delta::apply(source.content, delta, admission)
       .map_err(|refusal| Refusal::Delta { at, refusal })?;
-    let depth = source
-      .chain
-      .map_or(0, |chain| chain.depth)
-      .saturating_add(1);
-    Ok(Some(Resolved {
+    Ok(Resolved {
       kind: source.kind,
       id: name_object(self.format, source.kind, &content, at)?,
       content,
       chain: Some(Chain {
         base: source.id,
-        depth,
+        depth: source.depth.saturating_add(1),
       }),
-    }))
+    })
   }
 
   /// The position of the entry that begins at `offset`, if one does.
@@ -655,9 +710,13 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   }
 
   /// Resolves the waiting deltas, each once its base is: their table sorted by base, then every entry's children found
-  /// in it by the entry's position and by its name, newly resolved ones on a stack. A delta still waiting after is
-  /// refused.
-  fn resolve_waiting(&mut self, admission: &mut Admission) -> Result<(), Refusal> {
+  /// in it by the entry's position and by its name, newly resolved ones on a stack; then those whose base no object of
+  /// the pack is, from `outside`. A delta still waiting after is refused.
+  fn resolve_waiting<O: Outside + ?Sized>(
+    &mut self,
+    outside: &O,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
     let count = self
       .entries
       .iter()
@@ -676,6 +735,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         self.resolve_children(child, &waiting, &mut stack, admission)?;
       }
     }
+    self.resolve_outside(&waiting, &mut stack, outside, admission)?;
     let first = self
       .entries
       .iter()
@@ -741,6 +801,60 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       }
     }
     Ok(())
+  }
+
+  /// Applies the deltas still waiting for a base named outside the pack: one table group at a time, the base taken from
+  /// `outside` when it holds it, each delta resolved then its own children as the pack's are.
+  fn resolve_outside<O: Outside + ?Sized>(
+    &mut self,
+    waiting: &[(Key, usize)],
+    stack: &mut Vec<usize>,
+    outside: &O,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    for (key, child) in waiting {
+      let Key::Id(id) = key else {
+        continue;
+      };
+      let Some((kind, content)) = outside.object(id) else {
+        continue;
+      };
+      let source = Source {
+        kind,
+        id: *id,
+        content,
+        depth: 0,
+      };
+      if self.resolve_child_on(source, *child, admission)? {
+        stack.push(*child);
+        while let Some(next) = stack.pop() {
+          self.resolve_children(next, waiting, stack, admission)?;
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Applies the delta at `child`, if still waiting, to `source`, an object outside the pack: whether it did.
+  fn resolve_child_on(
+    &mut self,
+    source: Source<'_>,
+    child: usize,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let Some(Record {
+      offset,
+      state: State::Waiting(waiting),
+      ..
+    }) = self.entries.get(child)
+    else {
+      return Ok(false);
+    };
+    let resolved = self.apply_to_source(source, &waiting.delta, *offset, admission)?;
+    if let Some(record) = self.entries.get_mut(child) {
+      record.state = State::Resolved(resolved);
+    }
+    Ok(true)
   }
 
   /// Applies the delta at `child`, if still waiting, to the object at `parent`: whether it did.

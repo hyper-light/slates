@@ -19,10 +19,15 @@ flate2 = { workspace = true }
 crc32fast = { workspace = true }
 # HTTP/1.1's request codec (A-595), which Mercurial's and Subversion's HTTP share: git's routes read its heads.
 slates-http = { workspace = true }
+# The object store git's rides on (§4.17.1 shared piece 3; git piece 5, A-614): content by identity, index tables.
+slates-vcs = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
+# The LFS tests' oracle (A-610): JSON compared by meaning with what the stock git-lfs client accepted, and the other leg
+# of the JSON validator's differential test. Tests only; the codecs read and write JSON themselves.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

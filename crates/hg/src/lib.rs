@@ -13,10 +13,11 @@
 //! for byte as Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), handles no part
 //! (piece 5), and serves no command (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by
 //! [`compression`] (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb
-//! refused by kind; and a plain bundle is compressed as 7.2 compresses one.
+//! refused by kind; and a plain bundle is compressed as 7.2 compresses one. [`serve`] holds read serving's logic
+//! (A-619): discovery's answers, `listkeys`, and which changesets a `getbundle` sends, over the served view's graph.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
-//! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
+//! `internals.bundle2`, `internals.bundles` and `internals.changegroups` \[B\], and its code \[C\], which is what clients
 //! run and is followed where the two disagree: `bundle2.py` (every size a signed 32-bit integer; a part type of
 //! `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter; the interrupt), `changegroup.py` (the delta headers
 //! of versions `01` to `05`; a chunk length of 1 to 4 refused as a negative one is; the tree-manifest list every
@@ -78,6 +79,7 @@ pub mod delta;
 pub mod filerev;
 pub mod heads;
 pub mod http;
+pub mod index;
 mod lines;
 pub mod manifest;
 pub mod node;
@@ -88,6 +90,7 @@ pub mod pushkey;
 mod quote;
 mod read;
 pub mod revlog;
+pub mod serve;
 pub mod ssh;
 pub mod wire;
 
@@ -135,3 +138,7 @@ mod object_tests;
 #[cfg(test)]
 #[path = "tests/revlogs.rs"]
 mod revlog_tests;
+
+#[cfg(test)]
+#[path = "tests/index.rs"]
+mod index_tests;

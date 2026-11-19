@@ -542,7 +542,7 @@ fn an_ipc_creation_with_an_invalid_path_reference_is_refused() {
     .iter_mut()
     .find(|op| op.kind == OpKind::Mknod)
     .unwrap()
-    .path = u16::MAX;
+    .path = u64::MAX;
   assert_eq!(
     Increment::decode(&bad_path.encode()),
     Err(DocDecodeError::BadPath)

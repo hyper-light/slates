@@ -66,10 +66,12 @@ const PYTHON_ESCAPES: [(u8, u8); 10] = [
   (b'\\', b'\\'),
   (b'\'', b'\''),
   (b'"', b'"'),
+  // Format: the escapes continue (the doc above).
   (b'a', 0x07),
   (b'b', 0x08),
   (b'f', 0x0c),
   (b'n', b'\n'),
+  // Format: the escapes continue (the doc above).
   (b'r', b'\r'),
   (b't', b'\t'),
   (b'v', 0x0b),
@@ -202,8 +204,12 @@ pub fn decode(text: &[u8]) -> Result<Changeset<'_>, Refusal> {
   Ok(changeset)
 }
 
+/// A date line's time, its timezone and, if present, the extras after them.
+type DateFields<'a> = (&'a [u8], &'a [u8], Option<&'a [u8]>);
+
 /// A date line's time, timezone and extras (`split(b' ', 2)`).
-fn split_date(date: &[u8]) -> Result<(&[u8], &[u8], Option<&[u8]>), Refusal> {
+fn split_date(date: &[u8]) -> Result<DateFields<'_>, Refusal> {
+  // Format: `split(b' ', 2)` leaves at most three fields.
   let mut fields = date.splitn(3, |byte| *byte == SPACE);
   let time = fields.next().unwrap_or_default();
   let timezone = fields.next().ok_or(Refusal::Shape {
@@ -221,6 +227,9 @@ fn is_decimal(time: &[u8]) -> bool {
   let digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
   digits(whole) && digits(fraction)
 }
+
+/// A changeset's extras in their written order: each key with its value, borrowed from the decoding buffer.
+type Extras<'b> = Vec<(&'b [u8], &'b [u8])>;
 
 impl<'a> Changeset<'a> {
   /// The manifest's node.
@@ -243,7 +252,7 @@ impl<'a> Changeset<'a> {
     &self,
     admission: &mut Admission,
     buffer: &'b mut Vec<u8>,
-  ) -> Result<Vec<(&'b [u8], &'b [u8])>, Refusal> {
+  ) -> Result<Extras<'b>, Refusal> {
     let raw = self.extras.unwrap_or_default();
     let items = || {
       raw
@@ -329,6 +338,7 @@ fn unescape_one<'a>(tail: &'a [u8], out: &mut impl Out) -> Option<&'a [u8]> {
     out.put(&[crate::quote::hex_pair(digits)?]);
     return after.get(HEX_DIGITS..);
   }
+  // Format: an octal escape's digits are 0 to 7.
   if letter.is_ascii_digit() && letter < b'8' {
     return Some(octal(tail, out));
   }
@@ -342,6 +352,7 @@ fn octal<'a>(digits: &'a [u8], out: &mut impl Out) -> &'a [u8] {
   let count = digits
     .iter()
     .take(OCTAL_DIGITS)
+    // Format: an octal escape's digits are 0 to 7.
     .take_while(|digit| (b'0'..b'8').contains(*digit))
     .count();
   let value = digits.iter().take(count).fold(0_u32, |total, digit| {
@@ -465,15 +476,22 @@ mod tests {
 
   const MANIFEST: &[u8] = b"38a51fca0cbc207c4af656034604724b2e089ff6";
 
-  /// The text `encode` writes for `changeset`, checked at the length `encoded_len` gave.
-  fn written(changeset: &Changeset<'_>) -> Result<Vec<u8>, EncodeRefusal> {
+  /// What `encode` and `encoded_len` answer: the text written or the refusal, and the length given.
+  type Written = (Result<Vec<u8>, EncodeRefusal>, Result<u64, EncodeRefusal>);
+
+  /// What `encode` and `encoded_len` answer for `changeset`.
+  fn written(changeset: &Changeset<'_>) -> Written {
     let mut out = Vec::new();
-    encode(changeset, &mut out)?;
-    assert_eq!(
-      encoded_len(changeset),
-      Ok(u64::try_from(out.len()).unwrap())
-    );
-    Ok(out)
+    let text = encode(changeset, &mut out).map(|()| out);
+    (text, encoded_len(changeset))
+  }
+
+  /// The text `encode` writes for `changeset`, held to the length `encoded_len` gave.
+  fn written_text(changeset: &Changeset<'_>) -> Vec<u8> {
+    let (text, len) = written(changeset);
+    let text = text.unwrap();
+    assert_eq!(len, Ok(u64::try_from(text.len()).unwrap()));
+    text
   }
 
   /// A-588: do read a changeset with files and one without, as 7.2 writes them, and one whose timezone is empty, as a
@@ -500,7 +518,7 @@ mod tests {
     let no_zone = decode(&silly).unwrap();
     assert_eq!((no_zone.timezone, no_zone.extras), (&b""[..], None));
     for (text, changeset) in [(&with_files, read), (&without, empty), (&silly, no_zone)] {
-      assert_eq!(written(&changeset).as_ref(), Ok(text));
+      assert_eq!(&written_text(&changeset), text);
     }
   }
 
@@ -742,7 +760,11 @@ mod tests {
     /// A-588: do write extras of any bytes and read them back. Expect the same extras, sorted by key.
     #[test]
     fn any_extras_read_back(
-      generated in proptest::collection::btree_map("[a-z]{1,6}", proptest::collection::vec(any::<u8>(), 0..12), 0..4),
+      generated in proptest::collection::btree_map(
+        "[a-z]{1,6}",
+        proptest::collection::vec(any::<u8>(), 0..12),
+        0..4,
+      ),
     ) {
       let pairs: Vec<(&[u8], &[u8])> =
         generated.iter().map(|(key, value)| (key.as_bytes(), value.as_slice())).collect();
@@ -761,7 +783,8 @@ mod tests {
       let manifest = crate::fixtures::hex(&generated.manifest);
       let mut extras_field = Vec::new();
       if let Some(extras) = &generated.extras {
-        let pairs: Vec<(&[u8], &[u8])> = extras.iter().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
+        let pairs: Vec<(&[u8], &[u8])> =
+          extras.iter().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
         encode_extras(&pairs, &mut extras_field).unwrap();
       }
       let joined = generated.files.join(&b'\n');
@@ -774,17 +797,21 @@ mod tests {
         files: &joined,
         description: &generated.description,
       };
-      let text = written(&changeset).unwrap();
+      let text = written_text(&changeset);
       prop_assert_eq!(decode(&text), Ok(changeset));
     }
 
     /// AC-HG.9, A-588: do read arbitrary bytes as a changeset and its extras. Expect a refusal, or a changeset written
     /// back to exactly the same bytes; never a panic.
     #[test]
-    fn arbitrary_bytes_read_back_or_are_refused(bytes in proptest::collection::vec(any::<u8>(), 0..96)) {
+    fn arbitrary_bytes_read_back_or_are_refused(
+      bytes in proptest::collection::vec(any::<u8>(), 0..96),
+    ) {
       let text = [MANIFEST, b"\n", &bytes].concat();
       if let Ok(read) = decode(&text) {
-        prop_assert_eq!(written(&read), Ok(text.clone()));
+        let (again, len) = written(&read);
+        prop_assert_eq!(again, Ok(text.clone()));
+        prop_assert_eq!(len, Ok(crate::read::to_u64(text.len())));
         let mut buffer = Vec::new();
         let _extras = read.extras(&mut room(), &mut buffer).map(|extras| extras.len());
       }

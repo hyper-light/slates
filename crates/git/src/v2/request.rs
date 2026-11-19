@@ -1,5 +1,5 @@
-//! The command request (A-582, part 2; gitprotocol-v2 "Command Request" [B]; `serve.c` `process_request`,
-//! `parse_command` and `receive_client_capability` [C]).
+//! The command request (A-582, part 2; gitprotocol-v2 "Command Request" \[B\]; `serve.c` `process_request`,
+//! `parse_command` and `receive_client_capability` \[C\]).
 //!
 //! ```text
 //! request = empty-request | command-request
