@@ -1,0 +1,18 @@
+[package]
+name = "slates-hg"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Mercurial's exchange formats (§4.17.3, A-514): bundle2, bundle1, changegroups and their deltas, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission."
+
+[dependencies]
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

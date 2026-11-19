@@ -159,12 +159,14 @@ where you must decide; a moved contract then fails your build at the place to up
 
 A host whose rules reach other products only through a trait with a simulator (Hex's) holds
 `slates_api::Volumes`: provision, snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM,
-mount, unmount and detach, each with the `Instance` verb's own signature. `Instance` implements it,
-and so does `SimVolumes::new(most)`, an in-memory stand-in for tests with no daemon: it answers the
-same outcomes and typed errors (names unique, clones pinning snapshots, works only over greens), holds
-at most `most` volumes and `most` attachments, serves no bytes (a stream it hands out is a real end
-nothing answers until detached) and mounts nothing (a mount is a record). The conformance suite in
-`crates/api/tests/api.rs` (`the_seam_conforms`) runs over both.
+mount, unmount, bind a mount into a container, and detach, each with the `Instance` verb's own
+signature. `Instance` implements it, and so does `SimVolumes::new(most)`, an in-memory stand-in for
+tests with no daemon: it answers the same outcomes and typed errors (names unique, clones pinning
+snapshots, works only over greens), holds at most `most` volumes and `most` attachments, serves no
+bytes (a stream it hands out is a real end nothing answers until detached), mounts nothing (a mount is
+a record) and binds only the mounts it recorded, judged as the daemon judges the kernel's table (a
+bind is a record too, ending with its mount). The conformance suite in `crates/api/tests/api.rs`
+(`the_seam_conforms`) runs over both.
 
 ## What is built (2026-11-18)
 
@@ -183,10 +185,21 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   Windows unmount could not ask for its mounts), `serve_shards(volume, intent, subtree)` (a stream end to
   hand `shards run --slates-fs-fd N`; its guest is offered DAX per file, each file of a 2 MiB range or
   more marked for its guest to map while the shard's fill budget has room), `serve_vhost_user(..)`
-  (Linux), `detach(attachment)`.
+  (Linux), `detach(attachment)`. `bind_into_container(volume, source, destination, intent)` (A-520) binds
+  a volume's mount into a container: the daemon checks in the kernel's mount table that `source` is
+  exactly this volume's mount, never touching the mount, records the binding (it ends at its `detach`
+  or with its mount), and answers a `ContainerBind`: the binding's attachment and the entry to hand the
+  container runtime as it is (`OciBinding`: `type: bind`, the non-recursive `bind`, `ro` or `rw` by the
+  intent, `private`, `nosuid`, `nodev`). Linux binds the FUSE mount (mount it `shared` for a rootful
+  engine: the engine and its containers reach it as users other than the one who mounted it, and the
+  binding's evidence says whether it was), macOS the loopback NFS mount, which Docker
+  Desktop's file sharing carries into its VM; Windows offers none (`Unsupported::Attachment`,
+  `HostPlatform`).
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`; on Windows that includes
-  `MountManager`, the one-time setting that lets WinFsp's driver make the drive). `slates_api::mount::unmount_busy(path)`
+  `MountManager`, the one-time setting that lets WinFsp's driver make the drive; on macOS and the BSDs,
+  `PrivateLoopback` where someone besides root can capture loopback traffic, since a mount's capability crosses it in
+  the clear). `slates_api::mount::unmount_busy(path)`
   lets go of a mount that a leftover process still uses, with no daemon and no privilege, and answers how
   (`LetGo`): `Detached` on Linux (`fusermount3 -u -z`: the holder reads on until it closes), `Forced` on macOS and
   the BSDs (`unmount(2)` with `MNT_FORCE`: the holder's next call fails; the loopback NFS mount is `hard`, so this is
@@ -312,3 +325,7 @@ the goal's clauses:
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
+3. The rest of the container handoff as library calls (A-520's next piece): the container engine's
+   profile, judged before a host mounts for it (the command line's `slates oci-runtime`), and the check
+   that a bind's source is still the mount verified, made just before the runtime binds it
+   (`slates oci-check`), so a host binds through the library alone.

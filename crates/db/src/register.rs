@@ -2689,6 +2689,12 @@ pub struct Retirement {
   /// an object it was taking over from one of them may not have been re-committed under it yet, so its own
   /// objects are recovered jointly with those hosts' cohorts ([`RegionalConfiguration::recovery_owners`]).
   pub unconfirmed: Vec<HostId>,
+  /// Whether its successors' confirmations certify their content (A-538): a successor confirms only once it serves
+  /// each volume it adopted from its own placement (A-529), so no head it serves names a holder outside that
+  /// placement, and such a holder lets a stale copy's content go. True for every retirement this build makes; false
+  /// for one read from a configuration an older build wrote (regional layout 5), whose confirmations may have come
+  /// before the content was placed again: their holders keep the content (A-335).
+  pub certified: bool,
 }
 
 /// Where a retired owner's object belongs ([`RegionalConfiguration::lineage`]).
@@ -2748,6 +2754,9 @@ pub struct CompletedTakeover {
   /// the takeover ran between the two, so these were members at each, and only they count towards an object's
   /// recovery quorum when the record is judged.
   pub held: Vec<HostId>,
+  /// Whether its confirmations certify their content (A-538, [`Retirement::certified`]), carried from the retirement it
+  /// was made from.
+  pub certified: bool,
 }
 
 impl CompletedTakeover {
@@ -3111,6 +3120,7 @@ impl RegionalConfiguration {
           survivors,
           confirmed: Vec::new(),
           unconfirmed,
+          certified: true,
         },
       );
     }
@@ -3596,6 +3606,17 @@ impl RegionalConfiguration {
       && self.within_tolerance(writer, object)
   }
 
+  /// Whether `departed`'s takeover's confirmations certify their content (A-538): its kept retirement or its completion
+  /// record was made by a build whose successors confirm only once they serve each adopted volume from their own
+  /// placement (A-529). False when the configuration keeps neither, and for a takeover read from an older layout.
+  pub fn certifies_content(&self, departed: HostId) -> bool {
+    match (self.retired.get(&departed), self.completed.get(&departed)) {
+      (Some(retirement), _) => retirement.certified,
+      (None, Some(record)) => record.certified,
+      (None, None) => false,
+    }
+  }
+
   /// Whether `holder`'s copy of `object`, which its live owner `owner` wrote, adds nothing the design counts on (A-508):
   /// `holder` is in none of `owner`'s neighbourhoods, so no takeover of `owner` would ask it (a round asks the members of
   /// the settled and current neighbourhoods, [`recovery_hosts`]), and `owner`'s settled cohort for the object is whole
@@ -3818,6 +3839,7 @@ impl RegionalConfiguration {
           confirmed: retirement.confirmed,
           recovery,
           held,
+          certified: retirement.certified,
         },
       );
     }
@@ -6340,6 +6362,7 @@ mod tests {
         confirmed: survivors.clone(),
         recovery: std::collections::BTreeMap::from([(departed, settled)]),
         held: survivors,
+        certified: true,
       }),
       "the completion record names every survivor, made at the last confirmation's version, with the neighbourhood the \
        takeover recovered through and the survivors still members (A-484)"
@@ -6621,6 +6644,31 @@ mod tests {
     assert!(
       !bootstrap.settled_away(owner, outside, object),
       "a settled cohort narrower than f + 1 settles nothing away"
+    );
+  }
+
+  /// A-538: a takeover this build makes certifies its successors' content, on its retirement and on its completion
+  /// record, and one read as uncertified does not. Do: take a member over in a five-member region and judge it; have
+  /// every survivor confirm and judge the record; then clear the record's mark, as a record read from an older layout
+  /// has it, and judge again, and judge a host never retired. Expect certified twice, then not, and not for the host.
+  #[test]
+  fn a_takeover_this_build_makes_certifies_its_content() {
+    let (mut regional, scatter) = wide_region();
+    let departed = HostId(1);
+    regional.take_over(departed, scatter);
+    let kept = regional.certifies_content(departed);
+    for survivor in regional.survivors_of(departed) {
+      regional.confirm(departed, survivor);
+    }
+    let recorded = regional.certifies_content(departed);
+    if let Some(record) = regional.completed.get_mut(&departed) {
+      record.certified = false;
+    }
+    let older = regional.certifies_content(departed);
+    assert_eq!(
+      (kept, recorded, older, regional.certifies_content(HostId(2))),
+      (true, true, false, false),
+      "certified on its retirement and its record, not once read as older, never for a host not retired"
     );
   }
 

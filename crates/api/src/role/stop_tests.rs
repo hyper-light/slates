@@ -51,9 +51,9 @@ const HELD_BYTES: &[u8] = b"written under a write attachment the sender holds as
 const FILE_MODE: u32 = 0o644;
 /// Shape: the sender's volume's bound: a mebibyte, room for its one file.
 const VOLUME_BOUND: u64 = 1 << 20;
-/// Shape: the bound the stop is held to here: the observation budget, the longest any one step of a stop waits (the
-/// replicas' give-back, A-457), which a stop whose sender stays meets in about 0.2 s (g267's runs) and kiln's
-/// fire-and-exit test missed by minutes.
+/// Shape: the bound the stop is held to here: the observation budget, the longest any one step of a stop waits, which a
+/// stop whose sender stays meets in about 0.2 s (g267's runs) and kiln's fire-and-exit test missed by minutes. (The
+/// replicas' give-back, A-457, the step it was first stated for, went with the replicas, A-528.)
 const STOP_WITHIN: Duration = Duration::from_nanos(OBSERVE_BUDGET_NS);
 
 /// The sender role: starts the anchor role as its child in a process group of its own, connects a client that creates a

@@ -47,7 +47,15 @@ verbs.rs`): on a shard, a recorded work listed twice with the first answer lost,
 twice with the first answer lost and the work marked between. It expects the second listing to name the work, the first
 install to make it and charge it, the second install to charge nothing and keep the marked work, and nothing owed after.
 
-## Still owed
+## Still owed (closed by A-533, 2026-11-19)
 
 A work whose asks go unanswered twice stays unbuilt until the next start, its verbs answering `NotFound` rather than
 `Unpublished`; a retry after admission is not built (GAPS).
+
+A-533: such a work's verbs answer `Unpublished` while its record stands (`work_home::unbuilt_refusal`), and that
+answer is never recorded as the request's completion (`verbs::not_started`), so a resend under the same id runs the
+verb once the work is rebuilt. As clients are let in, every shard asks its recorded works' green owners again
+(`daemon::ask_again_for_unbuilt_works`, `verbs::ask_owners_to_replay`) by a message the owner runs when it next runs,
+whose outcome comes back by a message of its own and is installed once: no timer, and nothing waits. Tests:
+`an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt` (red before: `NotFound`) and
+`an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it`.

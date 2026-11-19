@@ -112,7 +112,6 @@ pub(crate) struct SealedWork {
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
-#[derive(Debug)]
 pub(crate) enum RebaseAnswer {
   /// The work moves to `version`, holding `changed` with `journal`.
   Rebased {
@@ -595,6 +594,9 @@ pub(crate) fn gate(
   principal: &Principal,
   body: RequestBody,
 ) -> Gate {
+  if let Some(refusal) = unbuilt_refusal(state, &body) {
+    return Gate::Answer(crate::verbs::refused(refusal));
+  }
   if let RequestBody::CreateWork { green, name } = &body {
     return match create_need(state, crate::verbs::to_db_volume(*green), name) {
       Ok(None) => Gate::Run(body),
@@ -621,6 +623,31 @@ pub(crate) fn gate(
     return Gate::Run(body);
   }
   park(state, client_id, principal, body, Some(work), need)
+}
+
+/// Format: the refusal-ledger name of a verb of a work recorded unbuilt, answered `Unpublished` (A-533): the
+/// non-vacuity count of [`unbuilt_refusal`].
+const UNBUILT_UNPUBLISHED: &str = "merge.work_unbuilt_unpublished";
+
+/// A verb of a work this shard recovered and has not yet rebuilt through its green's owner (its record in `unbuilt`,
+/// A-247, A-513), answered `Unpublished`: the protocol's "not completed, retry under the same id", never recorded as
+/// the request's completion (`verbs::not_started`), so the resend runs the verb once the work is rebuilt (§4.16
+/// "Recovery": the work "is unserved (`Unpublished`) until it has"). Until A-533 it ran, and answered `NotFound`, as if
+/// the work were gone. Every verb naming the work is answered so, whatever shard holds its green.
+fn unbuilt_refusal(state: &mut ShardState, body: &RequestBody) -> Option<Refusal> {
+  let volume = crate::verbs::to_db_volume(body.volume()?);
+  if !state
+    .work_home
+    .unbuilt
+    .iter()
+    .any(|unbuilt| unbuilt.work == volume)
+  {
+    return None;
+  }
+  state.count(UNBUILT_UNPUBLISHED, 1);
+  Some(Refusal::Unpublished {
+    reason: "the work is rebuilt from its log once its green's owner answers".to_owned(),
+  })
 }
 
 /// A submit's reset must fit the work's log before anything is asked of the owner, as before the verdict when the two
@@ -1018,14 +1045,6 @@ fn start_ask(
     Need::Route => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
-  // What this shard's replica of the green holds is answered here, by the function the owner answers it by over the
-  // replica's engine, with no hop to the owner (A-465, A-273 step 5b); anything else is asked of the owner as before,
-  // why counted (`crate::green_replicas::serving`).
-  if let Some(answered) = answered_by_replica(state, green, version, &need)
-    && answer_here(state, queue, answered)
-  {
-    return true;
-  }
   let owner_partition =
     target.unwrap_or_else(|| crate::verbs::owner_of(crate::verbs::to_wire_volume(green)));
   let Some(owner) = crate::verbs::shard_of_partition(state, owner_partition) else {
@@ -1096,51 +1115,6 @@ fn start_ask(
       false
     }
   }
-}
-
-/// What this shard's replica of `green` answers of `need` (A-465, A-273 step 5b): a work's base read at `version`, its
-/// base version (`owner_files`, `owner_page`, `owner_sizes`), and its rebase (`owner_rebase`), each by the same function
-/// over the replica's engine, so the answer is the owner's for the same state. `None` when the replica does not hold
-/// the version asked (counted by why), or for any other need, which is the owner's.
-fn answered_by_replica(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  need: &Need,
-) -> Option<Answered> {
-  let asked = match need {
-    Need::Files(_) | Need::Page { .. } | Need::Sizes => version,
-    Need::Rebase { sealed } => sealed.base_version,
-    _ => return None,
-  };
-  let engine = crate::green_replicas::serving(state, green, asked)?;
-  let answered = match need {
-    Need::Files(paths) => Answered::Base(crate::verbs::base_files(Some(&*engine), version, paths)),
-    Need::Page { path, offset, want } => Answered::Base(crate::verbs::base_page(
-      Some(&*engine),
-      version,
-      path.clone(),
-      (*offset, *want),
-    )),
-    Need::Sizes => Answered::Base(crate::verbs::base_sizes(Some(&*engine), version)),
-    Need::Rebase { sealed } => Answered::Rebased(crate::verbs::rebase_on(Some(engine), sealed)),
-    _ => return None,
-  };
-  state.count(crate::green_replicas::SERVED, 1);
-  Some(answered)
-}
-
-/// Settles `answered`, the replica's answer to `queue`'s ask, on this shard once the verb that asked has parked, as an
-/// owner's answer is settled when it comes back: whether it was sent. One this shard's own channel refuses is asked of
-/// the owner instead.
-fn answer_here(state: &mut ShardState, queue: DbVolumeId, answered: Answered) -> bool {
-  let Some(here) = crate::verbs::shard_of_partition(state, state.partition) else {
-    return false;
-  };
-  crate::xshard::hand_reply_home(here, move || {
-    let _ = state::with_state_counted(|s| settle_outcome(s, queue, Outcome::Answered(answered)));
-  })
-  .is_ok()
 }
 
 /// What the owner answered for one ask of a batch.
