@@ -633,8 +633,8 @@ impl ClientEnd {
     self.room_parks
   }
 
-  /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
-  /// onto (nothing is dropped: a caller waits for room with [`Self::send_when_room`]). Rings the doorbell for this region's shard
+  /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps onto (nothing is dropped: a
+  /// caller waits for room with [`Self::send_when_room`]). Rings the doorbell for this region's shard
   /// when that shard has announced it is going idle — read after the doorbell protocol's fence ([`crate::doorbell`]), so
   /// a shard that missed this request on its re-check is always rung, and only that shard is woken (A-381).
   pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
@@ -1879,8 +1879,10 @@ mod departure {
       #[allow(clippy::disallowed_methods)]
       // the daemon leaves its ring full on purpose: the full ring is what is tested.
       std::thread::sleep(Duration::from_nanos(DRAINS_AFTER_NS));
+      // Read before the take: the slot frees inside it, so no write can come before this instant.
+      let freeing = Instant::now();
       let taken = daemon.try_take()?.map_or(0, |request| request.request);
-      Ok((taken, Instant::now()))
+      Ok((taken, freeing))
     });
     let asked = Instant::now();
     let roomed = rings
@@ -1888,7 +1890,7 @@ mod departure {
       .send_when_room(|end| end.send(&Slot::inline(filled + 1, b"room")?))
       .unwrap();
     let written = Instant::now();
-    let (taken, freed) = drainer.join().unwrap().unwrap();
+    let (taken, freeing) = drainer.join().unwrap().unwrap();
     drop(life);
     let parks = rings.client.room_parks();
     let wake = rings.client.wake_estimate_ns().max(1);
@@ -1898,7 +1900,10 @@ mod departure {
     );
     assert_eq!(roomed, Roomed::Sent);
     assert_eq!(taken, 1, "the daemon took the oldest request");
-    assert!(written >= freed, "written only once the daemon took a slot");
+    assert!(
+      written >= freeing,
+      "written only once the daemon began to take a slot"
+    );
     let took_ns = u64::try_from(took.as_nanos()).unwrap();
     let bound = u64::from((took_ns / wake).max(1).ilog2()) + 2;
     assert!(

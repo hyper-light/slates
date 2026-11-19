@@ -37461,3 +37461,39 @@ Applied in the same change to: §4.9 (the 2026-11-17 status), GAPS (the A-563 en
 wedged case left), `crates/server/src/verbs.rs` (`consensus_on_control`, `published_or_pending`, the test and its
 helpers), `crates/ipc/src/protocol.rs` (the doc of `Refusal::DurabilityPending`; the wire is unchanged), the bug record
 `docs/bugs/2026-11-19-a-consensus-operation-that-ran-was-answered-overloaded.md`.
+
+### A-571 — A full command ring is waited out by one rule on every client end, and the daemon tests' raw clients keep it: a connect is one claim, a hold's start waits on its observation (2026-11-19, UI goal 86 via g251b, part 1 of "The rest of class C": the `CREDIT_WAIT` copies; §4.7 "Failure matrix"; A-232, A-454, A-468, A-523)
+
+- **What was there.** Three daemon suites (`crates/server/tests/ack_release.rs`, `attach_forms.rs`, `shards.rs`) each
+  kept a raw client that retried a connect refused as unavailable, and a send refused for a full request ring, for five
+  seconds on the wall (`CREDIT_WAIT`), spinning a core all the while, and then failed the test, its daemon alive or
+  gone; `ack_release.rs` and `shards.rs` waited for a hold to begin under the same five seconds. A-454 left them owed
+  when it moved the fleet suite's two waits into its daemons' own time. The SDK's own wait for room had kept A-523's
+  rule since 2026-11-18, but privately (`slates_client`'s `RoomWait`), so a raw client could not keep it.
+- **One rule for a full ring** (`slates_ipc::room`, `ClientEnd::send_when_room`). The SDK's rule moves into the crate
+  that owns the ring, unchanged: spin for the client's wake estimate, then park, each pause twice the last and never
+  past the next look at the daemon's life, the looks on A-443's doubling; while the daemon lives the wait goes on, and a
+  look that finds it gone ends it, nothing written (`Roomed::DaemonGone`). `slates_client::Client::send` calls it and
+  reconnects on `DaemonGone` as before; each raw test client calls it and fails on `DaemonGone`. `ClientEnd::room_parks`
+  counts the parks (non-vacuity). The fleet suite keeps A-454's rule, room while the ring's shard steps and
+  `FROZEN_CAP` for a daemon it freezes on purpose, since a liveness rule waits on a frozen daemon for as long as it
+  lives.
+- **A connect is one claim**, as A-454 made the fleet suite's: each suite's daemon opens and publishes its rendezvous
+  before its start returns (`Listener::open`), or adopts the test's held one, and a claim waits while the rendezvous's
+  holder lives (A-468), so a refusal fails the test at once. The product's `Client::connect` claims once too.
+- **A hold's start waits on its observation.** The shard sets the hold's flag as it runs the observation; the test
+  waits for the flag or the observation's own end, its answer or its typed refusal past the daemon's observe budget,
+  and a hold that never began fails the test there.
+- **Owed** (GAPS; A-571's next part). `shards.rs`'s guest windows (`Guest::await_answer`: A-65 and A-228's rule, its
+  window and its CPU budget each `CREDIT_WAIT`), its condition polls (`wait_until`, `wait_for_count`), its attach's
+  answer and its stream reads still run on five seconds of the wall; `daemon.rs` keeps the same raw client, constant and
+  two waits; `common/client.rs`'s `START_WAIT` retries a connect five seconds while a daemon starts.
+- **Checks.** CHECKS-PENDING
+- **Tests.** `slates_ipc::endpoint`'s `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`
+  and `a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`; the schedule's walk
+  (`a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`) moved from `slates-client` to
+  `slates_ipc::room`. The three suites are main's to run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C: A-454's fleet sentence and A-523's ring
+slot sentence), `crates/ipc/src/{room,endpoint,lib}.rs`, `crates/client/src/client.rs` (`Client::send`; `RoomWait` and
+its test moved out), `crates/server/tests/{ack_release,attach_forms,shards}.rs`.
