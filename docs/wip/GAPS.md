@@ -162,9 +162,9 @@
 > takeovers adopting whole entries, the repository record replicated with it). Until then an entry of several greens is
 > atomic on its owner and not across a takeover.
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
-> piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and
-> 92; owner g291).** Built on §4.17.1: a named branch's
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
+> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
+> built (A-588) (2026-11-19; UI goals 91 and 92; owners g291, and g079 for A-598).** Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -198,10 +198,21 @@
 > collision attack refused by kind; proven by `cargo test -p slates-hg --lib`, 158 of 158 on the Mac Studio
 > (2026-11-19, debug, load 3.0), against every revision of one repository stock `hg` 7.2 stored, made twice byte for
 > byte alike (`crates/hg/fixtures/objects/make-object-fixtures.sh`: texts by `hg debugdata`, logs by `hg debugindex
-> --debug`, 7.2's own readings), and SHAttered's two prefixes. Owed, in order, after §4.17.1's seven pieces: (1, rest)
-> compressed streams (`GZ`, `BZ`, `ZS`; A-598, g079) on A-607's engines; (3, rest) the index's tables, then import of
-> a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd),
-> its tests holding inflated bytes; (4) read serving; (5) pushes; (6) the
+> --debug`, 7.2's own readings), and SHAttered's two prefixes. **Built (A-598):** compressed bundles: a bundle1's
+> `HG10GZ` and `HG10BZ` and a bundle2's `Compression` `GZ`, `BZ` and `ZS` made plain as 7.2's `_forwardchunks` makes
+> one (the stream inflated, `Compression` dropped), and plain bundles compressed as 7.2 writes them, at the caller's
+> level within each engine's range; zlib through flate2 on A-607's zlib-rs, bzip2 on the pure-Rust libbz2-rs-sys, the
+> workspace's zstd; each stream's decoder memory as its header sizes it (libzstd's held equal to its own count) and
+> every byte of inflated room charged to the admission before it is held, so a compression bomb is refused by kind;
+> proven by `cargo test --locked -p slates-hg --lib`, 174 of 174 on the Mac Studio (2026-11-19, debug, load 6.9), red
+> first against stubbed engines (14 of its 16 tests failed), against the five compressed bundles stock `hg` 7.2 wrote
+> (`crates/hg/fixtures/compressed/make-compressed-fixtures.sh`, `SHA256SUMS`), each made plain to exactly the bundle
+> 7.2 wrote uncompressed, and 7.2's server's zstd answer to a `getbundle`; every cut, a bit flipped at every place,
+> unknown engines and bytes after a stream refused by kind. Owed, in order, after §4.17.1's seven pieces: (3, rest) the
+> index's tables, then import of a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines
+> (flate2 over zlib-rs, and zstd), its tests holding inflated bytes; (4) read serving, the `0.2` answers compressed by
+> A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the shard's step
+> budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
 > changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
 > (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
 > and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run

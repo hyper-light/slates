@@ -151,6 +151,11 @@ zstd = "0.13"
 # 79.4 MB/s and inflate 956.4 against 497.5 MB/s, best of 5 interleaved, output 0.255 against 0.257 of the input
 # (docs/wip/BENCHMARKS.md, "The deflate engine"). Crates name it `flate2.workspace = true`; no crate picks a backend.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# bzip2 for Mercurial's `BZ` bundles (A-598): the bzip2 crate on its default backend, libbz2-rs-sys, a pure-Rust port of
+# libbzip2 1.0.8. Read from crates.io's published packages, 2026-11-19: bzip2 0.6.1 and libbz2-rs-sys 0.2.6 are both
+# `build = false` with Rust sources only, and bzip2 takes libbz2-rs-sys without its default features (`rust-allocator`
+# alone), so neither C nor libc is built or linked. Approved by main once confirmed pure Rust.
+bzip2 = "0.6"
 # The derive macro's parser and emitter (the standard trio); build-time only.
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

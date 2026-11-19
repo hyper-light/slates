@@ -27,7 +27,7 @@ pub const PROTOCOL_VERSION: &str = "2.0";
 /// The older servers' version RFC 4253 §5.1 makes identical to 2.0.
 pub const COMPATIBLE_VERSION: &str = "1.99";
 
-/// The longest identification line, CR and LF included (RFC 4253 §4.2).
+/// Format: the longest identification line, CR and LF included (RFC 4253 §4.2).
 pub const MAX_LINE: usize = 255;
 
 /// What every identification line starts with.
