@@ -664,7 +664,9 @@ fn first_missing(ceiling: u64, held: impl Fn(u64) -> bool) -> u64 {
   let (mut low, mut high) = (0_u64, 1_u64);
   while high < ceiling && held(high) {
     low = high;
-    high = high.checked_mul(2).map_or(ceiling, |doubled| doubled.min(ceiling));
+    high = high
+      .checked_mul(2)
+      .map_or(ceiling, |doubled| doubled.min(ceiling));
   }
   while high.saturating_sub(low) > 1 {
     let middle = low.saturating_add(high.saturating_sub(low) / 2);

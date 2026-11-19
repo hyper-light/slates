@@ -828,7 +828,9 @@ impl<F: RepositoryFiles> Walk<'_, F> {
       .keys()
       .fold(0_usize, |total, name| total.saturating_add(name.len()));
     self.room.charge(to_u64(names))?;
-    self.room.charge_items::<(Vec<u8>, Node)>(read.found.len())?;
+    self
+      .room
+      .charge_items::<(Vec<u8>, Node)>(read.found.len())?;
     imported.bookmarks = read.found.into_iter().collect();
     imported.dropped_bookmarks = read.dropped;
     imported.malformed_bookmarks = read.malformed;
@@ -1228,7 +1230,10 @@ fn read_bookmarks(bytes: &[u8], index: &HgIndex, store: &ContentStore) -> ReadBo
 fn strip(text: &[u8]) -> &[u8] {
   let kept = |byte: &u8| !PYTHON_WHITESPACE.contains(byte);
   let start = text.iter().position(kept).unwrap_or(text.len());
-  let end = text.iter().rposition(kept).map_or(start, |at| at.saturating_add(1));
+  let end = text
+    .iter()
+    .rposition(kept)
+    .map_or(start, |at| at.saturating_add(1));
   text.get(start..end).unwrap_or_default()
 }
 

@@ -738,3 +738,23 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **`batch`** splits `cmds` at `;`, each call at its first space, its arguments at `,` and `=`, unescapes them, runs the
   command (any in the table, its permission checked; a stream answer asserts) and joins the escaped answers with `;`.
   Measured: `heads ;known nodes=` answered `124` bytes, the three heads, `;`, and an empty `known`.
+
+## 23. Found while importing a repository's state with its history (A-649 part 2, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/state`)
+
+- **`phaseroots` is read strictly** (`phases._readroots`): each line is `line.split()` into exactly a phase and a node,
+  `int` and `bin` of each, and `roots[phase]` over `allphases`, so a line of another shape, a phase 7.2 does not define
+  or a node that is not hexadecimal aborts the command; a root whose node the changelog lacks is dropped with a debug
+  message ("removing unknown node … from … boundary"). An absent file means every changeset is public. Measured: the
+  history's file holds two roots, `1` for the first draft and `2` for the secret changeset, and the amended draft's
+  hidden predecessor is draft by descent, not by a root of its own.
+- **The bookmarks are read leniently** (`bookmarks.bmstore`): each line `strip`ped, an empty one passed over, `split(b'
+  ', 1)` into a node and a name, `bin` of the node; a line without the space, or digits `bin` refuses (odd, not
+  hexadecimal), is passed over with "malformed line in .hg/bookmarks", and a node the changelog lacks (a short one
+  among them) silently; a name given twice keeps its later node. The file is `.hg/bookmarks`, or the store's own under
+  `bookmarksinstore` (`format.bookmarks-in-store`), and a bookmark may name a secret changeset (measured: `secret-one`).
+- **The obsstore** (`obsolete.obsstore`) is read only when it holds bytes, so an empty file is no marker; it is in the
+  store's own format (here format 1, 7.2's default), markers in the order they were added. Measured: an amend's marker
+  (predecessor, successor, `ef1`, `operation` and `user` metadata) and a prune of a node never held (no successor).
+- **Mutable state and immutable rows.** The shared index never rewrites a row, while the phase roots and bookmarks move
+  with every push, so they are the register's (A-642), and the import hands them back typed; markers, never changed once
+  made, are the index's rows.

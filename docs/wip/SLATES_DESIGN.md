@@ -13108,6 +13108,19 @@ signature verification).
 > string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
 > requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
 > HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
+>
+> **Status (2026-11-19, A-649 parts 1 and 2: the index's keys tagged by kind; a store's state imported with its
+> history).** Every key of the index begins with its kind's tag (`L`, `N`, `O` for a push's object rows written by
+> `HgIndex::commit_objects`, `M` for markers), so no row of one kind meets another's whatever a path's length. The
+> import reads the state beside the history as 7.2 reads it: `phaseroots` (`phases._readroots`: a line it cannot read
+> refused, a root it does not hold dropped and counted), the bookmarks from `.hg/bookmarks` or, under
+> `bookmarksinstore`, the store (`bookmarks.bmstore`: a malformed line passed over and counted, an unheld node dropped,
+> a name given twice its later node), both returned typed for the register, which records the repository's mutable
+> state (a row of the index is never rewritten); and the obsstore, checked whole and kept as the index's marker rows in
+> its order, each alone in its format. Proven against one history 7.2 kept with a public root, drafts, an amended draft,
+> a secret changeset, three bookmarks and two markers, in `.hg` and in the store (`crates/hg/fixtures/state`, the
+> command in `make-state-fixtures.sh`): every changeset's phase computed from the imported roots as 7.2 lists it, every
+> bookmark and marker as 7.2 lists them, the markers written back to the obsstore's bytes.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13225,10 +13238,12 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
   that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
   and bytes as two contents of its row.
-- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, and an object row's `O` and the node
-  (`HgIndex::commit_objects`, a push's quarantine committed tagged), so no key of one kind equals one of another
-  whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long, as a node
-  is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on these rows.
+- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, an object row's `O` and the node
+  (`HgIndex::commit_objects`, a push's quarantine committed tagged), and a marker row's `M` and the marker's number
+  (the obsolescence markers in the order they arrived, each alone in its format), so no key of one kind equals one of
+  another whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long,
+  as a node is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on
+  these rows.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -13507,8 +13522,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
    encodings, the hashed long names) and its fncache. Built (A-630 parts 2 and 3, `crates/hg`: `import`,
    `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
-   read-only seam, its file index read. Owed with later pieces: the phase roots, bookmarks and markers (pieces 5 and
-   7), the import sliced and by ranges, and the server's adapter from §4.15's host seam.
+   read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
+   phase roots, bookmarks and markers imported with the history. Owed: the import sliced and by ranges, and the
+   server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -45066,3 +45082,40 @@ Applied in the same change to:
 
   Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
   removal of `TARGET`, which left `h` a link naming nothing.
+
+### A-649 part 2 — A Mercurial store's phases, bookmarks and obsolescence markers imported with its history, read as 7.2 reads them (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 decisions 2 to 4 and piece 3; A-630, A-545)
+Applied in the same change to: §4.17.3 (its status, the index's rows, piece 3), `crates/hg` (`import`: the state's
+three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/state/` and its
+`make-state-fixtures.sh`), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (its newest section).
+- **What it does.** After the logs the import reads the repository's state as 7.2 reads it. `store/phaseroots`
+  (`phases._readroots`): each line two fields between Python's whitespace, a phase 7.2 defines in decimal and a node's
+  forty hexadecimal digits, any other line refused (`PhaseRoots`, its number), as 7.2 aborts on it; a root whose node
+  the changelog does not hold dropped and counted, as 7.2 drops it; a public root passed over. The bookmarks,
+  `.hg/bookmarks` or, under `bookmarksinstore`, the store's (`bookmarks.bmstore`): each line stripped, an empty one passed
+  over, a node in hexadecimal, a space and the name; a line without the space or with digits that are not an even run
+  of hexadecimal passed over and counted, as 7.2 warns and passes over it; a node the changelog does not hold dropped
+  and counted; a name given twice its later node. `store/obsstore` (`obsolete.obsstore`): empty is none, anything else
+  checked whole by A-545's reader, every marker kept alone in the obsstore's format as a content, appended in its order
+  as the index's marker rows (`M` and the number, big-endian), numbered as a log is.
+- **Decision: where each is kept.** Markers are facts never changed once made, so they are rows of the index. The phase
+  roots and the bookmarks move with every push, and the shared index never rewrites a row, so they are the repository's
+  mutable state, which the register records (A-642's logs; bookmarks are greens, §4.17.3 decision 2): the import
+  returns them typed (`Imported::phase_roots`, sorted by phase and node; `Imported::bookmarks`, sorted by name) with
+  what it dropped and passed over, for the register's first entry. Until that entry exists an import is not served.
+- **Golden vectors.** `crates/hg/fixtures/state`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 06:49:34 to
+  06:49:44 UTC (load 8.8 to 9.9), by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the
+  branch at fdc52e9f1, exactly: `bash crates/hg/fixtures/state/make-state-fixtures.sh "$D/out"`. One history with
+  evolution on and publishing off (a root made public, a draft, a draft amended, a secret changeset, three bookmarks, a
+  prune of a node never held) in two repositories, bookmarks in `.hg` and in the store; each store whole, its
+  requirements, `.hg/bookmarks`, and 7.2's own listings (`hg log --hidden -T '{node} {phase}\n'`, `hg bookmarks`, `hg
+  debugobsolete`). 36 files and their `SHA256SUMS`, each checked equal after the copy.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-states-red` (18f0ba467, not for main:
+  the three readers and `HgIndex::marker` stubbed to read nothing), `cargo test --locked -p slates-hg --lib` 256 passed
+  and 5 failed, each new test by its assertion. Green: 261 of 261 at 8b395716b, the first build, in a target directory of
+  its own; rustfmt's layout from that run. Golden: every changeset's phase computed from the imported roots equal to
+  7.2's (public, draft, the amended one's hidden predecessor draft, secret), every bookmark and every marker as 7.2
+  lists them, the markers read back alone and written into one payload equal to the obsstore's bytes, the two
+  repositories' indexes equal row for row and each one's bookmarks read from where it keeps them alone. Hostile: six
+  `phaseroots` lines 7.2 cannot read, each refused by its line with nothing left held; an unheld root, a public root,
+  tabs and a carriage return, a root twice; nine bookmark lines of every kind; an obsstore cut by a byte, and an empty
+  one.
