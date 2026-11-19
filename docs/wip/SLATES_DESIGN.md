@@ -36887,7 +36887,12 @@ move-time carry gone, the move waiting for its head's record; `fleet.rs`, `verbs
   clone made, until its first snapshot.
 - **Tests.** `a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not` and the parked
   `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable` (`crates/server/src/verbs.rs`);
-  `a_clone_has_nothing_to_seal_until_its_first_snapshot` (`crates/server/src/fleet.rs`).
+  `a_clone_has_nothing_to_seal_until_its_first_snapshot` (`crates/server/src/fleet.rs`). Red first on the Mac Studio
+  (2026-11-19, `cargo test --locked -p slates-server --lib`): with the move flag ignored and the old `sealable_head`,
+  both failed (the walk named the origin's head, `SnapshotId { value: 0 }` at sequence 1, where nothing was due; the
+  moved clone held no mark); with the change, 72 of 72 over the lib's `a565`, the seal test, `a544`, `carry::`,
+  `moves::`, `catalog::`, `landing::`, `fleet::` and `live_ship::` tests; the parked bug test fails as filed (`None`
+  where the clone's position 0 is due).
 - **Owed.** A takeover's rebuild of a live-shipped captured clone after its owner's loss marks nothing: a mark there
   needs the log position its head was sealed at, so the rebuild can stop there for the mark and go on. The fleet's own
   test of a moved live clone landing on its new owner (filed for main). The bug's fix (filed).
