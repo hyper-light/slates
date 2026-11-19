@@ -12,7 +12,7 @@ use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::{HgIndex, Log};
 use slates_hg::phases::{Phase, PhaseHead};
 use slates_hg::push::held::IndexHeld;
-use slates_hg::push::reply::{Refused, Reply};
+use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Taken, Unbundle, read};
 use slates_hg::serve::{Repository, Rev};
 use slates_hg::{Admission, NULL_NODE, Node, delta, node};
@@ -603,6 +603,65 @@ fn a_push_names_its_transaction_as_7_2_does() {
     );
     assert_eq!(transaction_id(&NAME), transaction_id(&[7; 32]));
     assert_ne!(transaction_id(&NAME), transaction_id(&[8; 32]));
+  });
+}
+
+/// A reply part as a client reads it: its type, the part it answers (`in-reply-to`) and its payload.
+type ReplyPart = (Vec<u8>, Option<Vec<u8>>, Vec<u8>);
+
+/// A reply's parts as a client reads them.
+fn reply_parts(bytes: &[u8]) -> Vec<ReplyPart> {
+  let bundle = Bundle2::decode(bytes, &mut room()).unwrap();
+  bundle
+    .top_level()
+    .map(|(index, part)| {
+      let payload = bundle
+        .payload(index)
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+      let answers = part.param(b"in-reply-to").map(<[u8]>::to_vec);
+      (part.kind.to_vec(), answers, payload)
+    })
+    .collect()
+}
+
+/// A-657 part 4 (§4.17.3 "Hooks"; 7.2's `bundle2._processpart` writes what a part's handler printed, a
+/// `pretxnchangegroup` hook's words among it, as an `output` part right after that handler's reply, naming the part).
+/// Do: prepare stock `push-plain` on the rebuilt repository, hand it the words an admission hook printed as `run_hooks`
+/// hands them back (naming the push's changegroup part), and land it. Expect: its hooks are handed the push's one
+/// changeset as first and last; the reply is 7.2's `push-plain` reply with the hook's words as an `output` part in
+/// reply to the changegroup part, right after `reply:changegroup`.
+#[test]
+fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "words");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let unbundle = stock(fixture!("push-plain.hg"));
+    let (changegroup, _) = unbundle.changegroup().unwrap();
+    let mut prepared = hg.prepare(state, &unbundle, &view).unwrap();
+    assert_eq!(prepared.added, Some((made[3].node, made[3].node)));
+    let words = b"pretxnchangegroup.words: checked\n".to_vec();
+    let in_reply_to = prepared.changegroup;
+    prepared.with_output(vec![Replied::Output {
+      in_reply_to,
+      words: words.clone(),
+    }]);
+    let reply = hg.land(state, prepared).answer.unwrap();
+    let mut expected = reply_parts(fixture!("push-plain-reply.hg"));
+    let after = expected
+      .iter()
+      .position(|(kind, ..)| kind.as_slice() == b"reply:changegroup")
+      .unwrap();
+    let named = changegroup.to_string().into_bytes();
+    expected.insert(
+      after.saturating_add(1),
+      (b"output".to_vec(), Some(named), words),
+    );
+    assert_eq!(reply_parts(&encoded(&reply)), expected);
   });
 }
 
