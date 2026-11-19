@@ -765,6 +765,8 @@ const VALUES: &[&str] = &[
   "--tag",
   "--dax-window",
   "--executable",
+  "--principal",
+  "--expires",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
