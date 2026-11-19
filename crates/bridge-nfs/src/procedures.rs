@@ -3162,6 +3162,11 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     // RFC 8881 §10.2: the file is delegated to an NFSv4 client, whose recall was asked for; the change proceeds once
     // the delegation is returned or revoked, so the caller retries (A-79).
     VfsError::Delegated => Nfsstat3::Jukebox,
+    // RFC 1813 §2.6, `NFS3ERR_JUKEBOX`: "The server initiated the request, but was not able to complete it in a timely
+    // fashion": an S3 base's fetch of what the call reads is under way (A-555). The daemon parks the call on that fetch
+    // and serves it again when it lands; a call it could not park is answered this, and the client retries it. Until
+    // A-555 it fell to `NFS3ERR_SERVERFAULT`.
+    VfsError::BasePending(_) => Nfsstat3::Jukebox,
     _ => Nfsstat3::ServerFault,
   }
 }
@@ -3334,4 +3339,26 @@ fn other_state(
   };
   files.check_io(&stateid, handle, clientid, want, acting)?;
   Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_vfs::error::VfsError;
+  use slates_vfs::host::FetchId;
+
+  use super::nfsstat_of;
+  use crate::nfs::Nfsstat3;
+
+  /// A-555 (§4.15 "An S3 base"; RFC 1813 §2.6): do answer a procedure whose volume refused it because the overlay's base
+  /// is fetching what it reads. Expect `NFS3ERR_JUKEBOX`, "the server initiated the request, but was not able to
+  /// complete it in a timely fashion", which the client retries, as a delegated file's recall is answered: nothing
+  /// changed. The daemon parks the call on its fetch where it can; this is the answer for one it could not park. Before
+  /// A-555 it fell to `NFS3ERR_SERVERFAULT`, which a client takes for a failure.
+  #[test]
+  fn a_call_on_a_base_still_fetching_is_answered_jukebox_never_a_server_fault() {
+    assert_eq!(
+      nfsstat_of(&VfsError::BasePending(FetchId(7))),
+      Nfsstat3::Jukebox
+    );
+  }
 }

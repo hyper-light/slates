@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use slates_base::OsHost;
+use slates_base::{BaseHost, OsHost};
 use slates_db::Op;
 use slates_db::catalog::{
   AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer,
@@ -6240,7 +6240,7 @@ pub(crate) struct Credits {
 /// credits.
 pub(crate) struct Admitted {
   pub(crate) volume: Volume,
-  pub(crate) host: Option<OsHost>,
+  pub(crate) host: Option<BaseHost>,
   pub(crate) credits: Credits,
 }
 
@@ -6455,7 +6455,7 @@ pub(crate) fn publish_created_volume(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   volume: Volume,
-  host: Option<OsHost>,
+  host: Option<BaseHost>,
   credits: (
     Option<slates_mem::budget::Reservation>,
     Option<slates_mem::budget::VersionCredit>,
@@ -6888,12 +6888,13 @@ fn clone_base_host(
   state: &ShardState,
   origin: Handle<VolumeSlot>,
   record: &VolumeRecord,
-) -> Result<Option<OsHost>, Refusal> {
+) -> Result<Option<BaseHost>, Refusal> {
   let BaseRecord::Path { path } = &record.base else {
     return Ok(None);
   };
   let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
-  let Some(host) = slot.host.as_ref() else {
+  // A base the catalog records by its path is a host directory, read through a directory host.
+  let Some(host) = slot.host.as_ref().and_then(BaseHost::as_disk) else {
     return Err(Refusal::BaseUnavailable {
       path: path.clone(),
       errno: 0,
@@ -6901,7 +6902,7 @@ fn clone_base_host(
   };
   host
     .try_clone_dirs()
-    .map(Some)
+    .map(|host| Some(BaseHost::Disk(host)))
     .map_err(|error| base_open_refusal(path, error))
 }
 
@@ -6910,7 +6911,7 @@ fn open_base(
   state: &mut ShardState,
   path: &str,
   config: VolumeConfig,
-) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
+) -> Result<(Volume, Option<BaseHost>), Box<ReplyBody>> {
   let (mut host, root) = OsHost::open_root(std::path::Path::new(path))
     .map_err(|e| Box::new(refused(base_open_refusal(path, e))))?;
   let facts = host.facts(root).map_err(|_| {
@@ -6929,7 +6930,7 @@ fn open_base(
     },
   )
   .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?;
-  Ok((volume, Some(host)))
+  Ok((volume, Some(BaseHost::Disk(host))))
 }
 
 /// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
@@ -18037,7 +18038,7 @@ fn build_recovered_volume(
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
   size: SizeClass,
-) -> Result<(Volume, Option<OsHost>, u16), RecoveryCause> {
+) -> Result<(Volume, Option<BaseHost>, u16), RecoveryCause> {
   let image = image.ok_or(RecoveryCause::NoImage)?;
   let quota = quota_for(size);
   let journal = journal_floor_bytes(state);
@@ -18107,7 +18108,11 @@ fn build_recovered_volume(
       )),
     });
   }
-  Ok((volume, opened.map(|(host, _)| host), image.prefix))
+  Ok((
+    volume,
+    opened.map(|(host, _)| BaseHost::Disk(host)),
+    image.prefix,
+  ))
 }
 
 /// A recovered volume's resources that do not fit this process, named by `reason`.
