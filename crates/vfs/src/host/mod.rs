@@ -227,6 +227,13 @@ pub trait LandFs: HostFs {
   /// which its flush needs (A-472), and writes none of its data. It stays open for its batch's barrier
   /// ([`LandFs::begin_barrier`]), then is closed with [`HostFs::close_file`].
   fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// The existing directory `name` under `dir`, opened as [`LandFs::open_to_chmod`] opens a file, to have its mode and
+  /// Windows bits set and its batch's barrier sync it whole (a base directory's metadata entry, A-501): never through a
+  /// link, and refused `NotDirectory` for anything but a directory. Unix opens it to read (`O_DIRECTORY|O_NOFOLLOW`), as a
+  /// listing does; Windows asks its attributes and `FILE_ADD_FILE`, a directory's `FILE_WRITE_DATA`, which its flush
+  /// needs. A file handle, closed with [`HostFs::close_file`]: `set_mode`, `set_windows`, `fstat` and the barrier take it
+  /// as they take a file's.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Gives the file the Windows attribute bits the volume keeps for it (A-262, at Windows' values: hidden, system,

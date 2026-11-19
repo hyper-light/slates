@@ -1,13 +1,27 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping is designed, nothing is built (2026-11-18, A-497, D-28; UI goal 91;
-> owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches, pushes, stacked changes,
-> review requests, objects and history onto greens and works; §4.17.2 (git), §4.17.3 (Mercurial) and §4.17.4
-> (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces of §4.17.1 (the repository record
-> and green ids carrying its partition; one register entry for several greens; the object store and its index; works
-> from a client's push, with the head operation and the client-fidelity test; works over works and bases given as trees;
-> review records; policy and hooks), then each tool's pieces. No speed is claimed until main measures it by §4.17.1's
-> method.
+> **§4.17 version-control servers: the shared mapping and the git server are designed, nothing is built (2026-11-18,
+> A-497, D-28; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
+> §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
+> of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
+> object store and its index; works from a client's push, with the head operation and the client-fidelity test; works
+> over works and bases given as trees; review records; policy and hooks), then each tool's pieces (§4.17.2's fifteen for
+> git, starting with the pkt-line codec). No speed is claimed until main measures it by §4.17.1's and §4.17.2's method.
+
+> **§4.17.3 the Mercurial server: designed, nothing is built (2026-11-18, A-499; UI goal 91; owner g291).** Built on
+> §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move toward public, and a
+> public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock
+> push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a line's policy for
+> clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
+> (`research/mercurial-server.md`). Owed, in order, after §4.17.1's seven pieces: (1) the bundle2 and changegroup
+> codecs, with golden vectors made by stock `hg`; (2) the SSH and HTTP version 1 codecs; (3) the objects and the index,
+> and import of a repository directory; (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on
+> push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream clones, inline clone bundles, the
+> hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by
+> linelog; (13) main's runs: 7.2's own suite through a shim, the differential run against `hg serve`, a 6.x client, then
+> the measurements. Open: whether a 6.x client's changegroup `04` is the old sidedata layout (read from the document,
+> not from 6.x code; the older-client run checks it). No speed is claimed until main measures it.
 
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
@@ -981,6 +995,17 @@
 >   `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`. **Owed
 >   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back may
 >   lean on the same following (not shown: holders a new owner's own move round reaches take its authority there).
+> - **Closed by A-485 too: goal 85's bug 2, the move back to the creator (2026-11-18, A-487).**
+>   `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the quiet Mac Studio
+>   at main 3022c6894, the move back answering `Moving` and `MoveRefused { Unplaced }` in turn until its deadline. Its
+>   counters show A-485's cause, not a cause of its own: the third node refused every head and catalog record of the
+>   volume's new owner `Unauthorized` (8,006 = the owner's `fleet.ship.head.short` 4,000 + `catalog.short` 4,006) and
+>   2,663 of its content puts, the owner's handoff of the head off itself never finished (`fleet.heal.unfinished` 222),
+>   and no node counted `fleet.move.followed`: the move back must place the head on both other members, and the third
+>   kept the creator's authority. Its regression test:
+>   `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests: the move
+>   installed through the walk as the coordinator drives it, then the new owner's next record accepted and the creator's
+>   refused `Unauthorized`). **Owed (main's):** the volume-moved fleet test on the merged tree.
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
@@ -3876,7 +3901,13 @@
 >   way: an adopted move's seal was still taken again when its answer was lost to a stopped shard. Closed by A-488
 >   (2026-11-18, g225): the owner shard records the seal on the volume (`VolumeSlot::adopted_seal`), and
 >   `verbs::seal_adopted_head` answers a second ask the recorded seal
->   (`an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once`). **Class C, the rendezvous's
+>   (`an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once`). Its siblings, the asks whose effect
+>   runs on the target and whose answer a stopped shard loses after it: a direct map's send to its client, closed by
+>   A-505 (2026-11-19, g225: the client's shard records each map it sent until its reply arrives, a second ask is
+>   answered from the record, and a hand-off whose answers were all lost keeps its copy as handed;
+>   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); open: the Shards route's take
+>   of an offer, and recovery's `rebuild_remote_works` (its docs accept a non-answering shard's works left unbuilt).
+>   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
 >   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
@@ -3908,7 +3939,12 @@
 >   test daemons, an embedding) waited forever; every look asks the start stamp too, and Windows' wait takes the looks'
 >   timeout (`a_daemon_restarted_inside_its_own_process_ends_the_wait`;
 >   `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`); A-447's Windows
->   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
+>   claim had the same blind spot and now reads the start stamp it began under. A park a look ended was counted as no
+>   kind, neither a reply's wake nor an unanswered one, and the client suite's park accounting failed on macOS (32
+>   parks, 17 replies, 0 unanswered); since A-506 (2026-11-18, g251b) it is counted as its own kind
+>   (`ClientEnd::parks_ended_by_looks`) and teaches the wake estimate nothing
+>   (`a_park_a_liveness_look_ends_is_counted_as_its_own_kind_and_teaches_the_estimate_nothing`). `CLAIM_WAIT_NS` (a
+>   second, W restated
 >   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
 >   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
 >   left (twice it); and the pacing of an async connect's and a reconnect's polls (a tenth of it,
@@ -18928,7 +18964,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   shard is owed, from memory of ext4's and XFS's fsync paths, which commit only to the directory's own last change, to
   verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
   landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
-  the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
+  the same field between them is not seen; a `touch` alone and a base directory's mode change alone, which landed
+  nothing, **fixed by A-501 the same day** (`docs/bugs/2026-11-18-a-touch-alone-and-a-base-directorys-mode-alone-never-landed.md`:
+  a file's time a field of its metadata entry, judged and set through its handle as its mode is; a base directory's
+  metadata entry, `ChmodDir`, judged against the witness its first metadata change takes, landed after every removal
+  and deepest first, synced by its batch's barrier through its own handle; its unit tests ran on the Mac Studio, the
+  oracle's and the crash oracle's reruns and the Windows `--test os` suite filed for main; still owed with it: a base
+  directory both moved and changed in mode lands its move alone, its rename entry winning the diverged walk; a directory
+  whose owner or time alone the volume changed keeps its witness past every landing, since it makes no entry; the
+  presented list (`PlannedAction::Chmod`) names no time, so a `touch` alone shows as a chmod that changes nothing
+  visible, though the grant binds the time; and a directory mode that takes its owner's search away lands last, but a
+  landing resumed after a crash past it cannot open what lies beneath it and refuses);
   a captured clone's replacement overwrote an outsider's mode change where an overlay's refuses it (T-1.14), **fixed by
   A-466 the same day** (`docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`: its
   metadata judged field by field beside its bytes, the outsider's mode kept under the agent's bytes, a mode both changed
@@ -18952,7 +18998,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
   one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
   directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
-  until now); and
+  until now, which A-501 asked and left open: a made directory is no metadata entry and joins no batch, its `mkdirat`
+  and `fchmod` running in the directories' class, so syncing it whole is one more handle and sync per made directory,
+  staged as a metadata entry is, to measure before it lands); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

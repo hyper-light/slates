@@ -4056,7 +4056,7 @@ fn tally_of(manifest: &Manifest) -> slates_ipc::protocol::ActionTally {
       Action::Rmdir => &mut tally.rmdir,
       Action::Symlink { .. } => &mut tally.symlink,
       Action::Clear => &mut tally.clear,
-      Action::Chmod { .. } => &mut tally.chmod,
+      Action::Chmod { .. } | Action::ChmodDir { .. } => &mut tally.chmod,
     };
     *count = count.saturating_add(1);
   }

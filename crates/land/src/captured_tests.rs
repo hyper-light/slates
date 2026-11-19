@@ -495,3 +495,40 @@ fn a_captured_clones_replacement_already_on_the_disk_still_lands_its_mode() {
     "synced by its batch's barrier (A-472)"
   );
 }
+
+/// A-501 (a base directory's mode alone, in a captured clone). Do: in a captured clone, `chmod` the directory `/src` to
+/// 0700, nothing else changed beyond the clone's own edits, and land it against its capture. Expect the change since the
+/// capture to hold the directory, the landing `Done`, and the target's directory at 0700 under its own inode, synced.
+/// Before A-501 a captured clone's plan made nothing of a directory that both held.
+#[test]
+fn a_captured_clones_directory_mode_change_alone_lands() {
+  /// Shape: the directory made private to its owner.
+  const PRIVATE_DIR_MODE: u32 = 0o040_700;
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let src = clone.resolve(&store, "/src").unwrap().inode;
+  clone.chmod(&mut store, src, PRIVATE_DIR_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  let before = host.fingerprint("/target/src").unwrap();
+  let (presented, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  assert!(
+    presented
+      .manifest
+      .entries
+      .iter()
+      .any(|e| e.path.as_ref() == "/src"),
+    "{:?}",
+    presented.manifest.entries
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  let after = host.fingerprint("/target/src").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, PRIVATE_DIR_MODE & PERMISSIONS);
+  assert_eq!(after.ino, before.ino);
+  assert!(!host.holds_unsynced_metadata("/target/src"));
+}

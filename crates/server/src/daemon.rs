@@ -6224,6 +6224,7 @@ async fn control_loop(
                 read_ahead: None,
                 read_ahead_pending: 0,
                 remote_volumes: Vec::new(),
+                maps_sent: std::collections::BTreeSet::new(),
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {
