@@ -3219,7 +3219,6 @@ mod tests {
     );
   }
 
-<<<<<<< HEAD
   /// Format: FUSE's root node, the share's root (`FUSE_ROOT_ID`).
   const ROOT_NODE: u64 = 1;
   /// Format: the minor version the test's `INIT` names, a Linux 6.9 or later guest's kernel's (7.41).
@@ -3368,7 +3367,9 @@ mod tests {
       (field(attr + ATTR_UID_AT), field(attr + ATTR_GID_AT)),
       (1000, 1001),
       "the root shown owned by the run"
-=======
+    );
+  }
+
   /// Format: the epoch the test's successor fenced each volume's log at: past the audit daemon's own, as a successor's
   /// takeover is.
   const SUCCESSOR_EPOCH: u64 = 2;
@@ -3439,7 +3440,6 @@ mod tests {
       after,
       (false, false, 2),
       "both attachments' records are gone and both ends are counted"
->>>>>>> origin/main
     );
   }
 }
