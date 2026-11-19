@@ -25,8 +25,10 @@
 //! bound exists to limit; and a refusal closed with the client's bytes unread is a reset that can erase it (A-183). Each
 //! time the listener waits for a seat is counted ([`Counts::full`]).
 //!
-//! **Waits** ([`waits`]): each read and write on a connection runs within its phase's learned bound, none before the
-//! phase's first measurement, and only a connection whose credentials proved a principal teaches the bounds.
+//! **Waits** ([`waits`]): each read and write on a connection runs within its phase's learned bound, or before the phase
+//! has learned one within RFC 6298's first RTO from the connection's own measurement (its handshake's round trip, which
+//! the kernel timed before accept returned, read as the connection is accepted), so no wait is ever unbounded; only a
+//! connection whose credentials proved a principal teaches the bounds.
 //!
 //! **One connection's loop** asks the engine what it needs next and does it: writes its bytes, reads within the phase's
 //! wait, asks the site to decide a whole head (the answer says whether the credentials proved a principal), hands each run
@@ -50,7 +52,7 @@ use slates_http::reply::Status;
 use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase};
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::error::RtError;
-use slates_rt::futures::{detach, now_ns, spawn_child, within, yield_now};
+use slates_rt::futures::{detach, now_ns, scheduler_overrun_ns, spawn_child, within, yield_now};
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{SocketAddrV4, TcpListener, TcpStream};
 
@@ -74,6 +76,9 @@ const SPAWN_REFUSED: &str = "vcs_http.spawn";
 const NOT_DETACHED: &str = "vcs_http.detach";
 /// A connection no TLS session could be made for.
 const NO_SESSION: &str = "vcs_http.no_session";
+/// A connection whose round trip its kernel could not report: with no measurement of its own its first waits could not
+/// be bounded, so it is not served.
+const NO_ROUND_TRIP: &str = "vcs_http.no_round_trip";
 /// A connection ended because a wait ran past its learned bound.
 const CUT: &str = "vcs_http.cut";
 /// A connection whose socket failed.
@@ -86,16 +91,27 @@ pub(crate) struct Bounds {
   pub(crate) connections: usize,
   /// The bytes each request may hold.
   pub(crate) room: u64,
+  /// The shard's timer tick (`RuntimeConfig::timer_tick_ns`, the profile's `max(wake.mean, 100 × timer overhead)`): the
+  /// finest wait its timers keep, so the least clock granularity `G` its waits are floored by ([`waits`]).
+  pub(crate) tick_ns: u64,
 }
 
 impl Bounds {
-  /// Derived: an edge on a shard that seats `clients_per_shard` clients, each over a region of `region_bytes`: one
-  /// connection a seat, and each request one region's room (the module doc).
-  pub(crate) fn of_shard(clients_per_shard: usize, region_bytes: usize) -> Bounds {
+  /// Derived: an edge on a shard that seats `clients_per_shard` clients, each over a region of `region_bytes`, whose timer
+  /// ticks every `tick_ns`: one connection a seat, and each request one region's room (the module doc).
+  pub(crate) fn of_shard(clients_per_shard: usize, region_bytes: usize, tick_ns: u64) -> Bounds {
     Bounds {
       connections: clients_per_shard.max(1),
       room: u64::try_from(region_bytes).unwrap_or(u64::MAX),
+      tick_ns,
     }
+  }
+
+  /// The clock granularity `G` a wait starting now is floored by: the timer's tick, or the lateness the shard's scheduler
+  /// has shown when that is longer (`slates_rt::futures::scheduler_overrun_ns`, the floor the fleet's detector and the MCP
+  /// edge put under their windows).
+  fn granularity_ns(self) -> u64 {
+    self.tick_ns.max(scheduler_overrun_ns())
   }
 
   /// Derived: the listen backlog, the connections the kernel queues for the listener: as many as the edge serves at once
@@ -381,8 +397,15 @@ where
       crate::fleet::count_refusal(NO_SESSION);
       continue;
     };
+    let Ok(round_trip) = stream.round_trip() else {
+      let _ =
+        state.with(|state| state.count(|counts| counts.failed = counts.failed.saturating_add(1)));
+      crate::fleet::count_refusal(NO_ROUND_TRIP);
+      continue;
+    };
     let seat = Seat::take(state).ok_or(EdgeRefused::StateGone)?;
-    match spawn_child(drive(stream, connection, site(), seat)) {
+    let tracker = Tracker::new(round_trip);
+    match spawn_child(drive(stream, connection, site(), seat, tracker)) {
       Ok(task) => {
         if detach(task).is_err() {
           crate::fleet::count_refusal(NOT_DETACHED);
@@ -439,25 +462,19 @@ struct Socket {
 }
 
 impl Socket {
-  /// Reads within `deadline_ns` (none: until the client's bytes or its close): the count read, zero at its close.
-  async fn read(&mut self, deadline_ns: Option<u64>) -> Waited<usize> {
+  /// Reads before `deadline_ns` on the shard's clock: the count read, zero at the client's close.
+  async fn read(&mut self, deadline_ns: u64) -> Waited<usize> {
     let started_ns = now_ns();
     let read = self.stream.read(&mut self.buffer);
-    let outcome = match deadline_ns {
-      None => Ok(Some(read.await)),
-      Some(deadline_ns) => within(deadline_ns.saturating_sub(started_ns), read).await,
-    };
+    let outcome = within(deadline_ns.saturating_sub(started_ns), read).await;
     waited(outcome, started_ns)
   }
 
-  /// Writes `bytes` whole within `deadline_ns` (none: until the client takes them or the socket fails).
-  async fn write(&mut self, bytes: &[u8], deadline_ns: Option<u64>) -> Waited<()> {
+  /// Writes `bytes` whole before `deadline_ns` on the shard's clock.
+  async fn write(&mut self, bytes: &[u8], deadline_ns: u64) -> Waited<()> {
     let started_ns = now_ns();
     let write = self.stream.write_all(bytes);
-    let outcome = match deadline_ns {
-      None => Ok(Some(write.await)),
-      Some(deadline_ns) => within(deadline_ns.saturating_sub(started_ns), write).await,
-    };
+    let outcome = within(deadline_ns.saturating_sub(started_ns), write).await;
     waited(outcome, started_ns)
   }
 
@@ -522,10 +539,14 @@ impl<S: Site> Parts<S> {
 
   /// Where a wait in `phase` starting now ends ([`Tracker::deadline_ns`]): `Err` off the edge's shard, where no wait can
   /// be kept.
-  fn deadline_ns(&mut self, phase: Phase) -> Result<Option<u64>, ()> {
+  fn deadline_ns(&mut self, phase: Phase) -> Result<u64, ()> {
     let now = now_ns();
+    let granularity_ns = self
+      .state
+      .with(|state| state.bounds.granularity_ns())
+      .ok_or(())?;
     self
-      .learning(|tracker, waits| tracker.deadline_ns(phase, now, waits))
+      .learning(|tracker, waits| tracker.deadline_ns(phase, now, granularity_ns, waits))
       .ok_or(())
   }
 
@@ -579,9 +600,16 @@ impl<S: Site> Parts<S> {
         Err(why) => return Flow::End(why),
       },
     };
+    let receiving_ns = now_ns();
     connection.receive(self.socket.read_bytes(count));
+    let now = now_ns();
+    if phase == Phase::Handshake {
+      // The edge's own work on the handshake (its key exchange, its signature, its records), which the client's share
+      // of the handshake matches: added to the connection's first measurement while the handshake runs ([`waits`]).
+      self.tracker.worked(now.saturating_sub(receiving_ns));
+    }
     // The bytes may have ended a whole phase: the first byte of a request ends its idleness and begins its head.
-    let (after, now) = (connection.phase(), now_ns());
+    let after = connection.phase();
     let _ = self.learning(|tracker, waits| tracker.observe(after, now, waits));
     Flow::Go
   }
@@ -722,14 +750,20 @@ impl<S: Site> Parts<S> {
 }
 
 /// Serves one connection until it ends (the module doc's loop), its seat given back however it ends.
-async fn drive<S: Site>(stream: TcpStream, mut connection: Connection, site: S, seat: Seat) {
+async fn drive<S: Site>(
+  stream: TcpStream,
+  mut connection: Connection,
+  site: S,
+  seat: Seat,
+  tracker: Tracker,
+) {
   let mut parts = Parts {
     socket: Socket {
       stream,
       buffer: vec![0; READ_BYTES],
     },
     state: seat.state,
-    tracker: Tracker::default(),
+    tracker,
     site,
     secure: connection.secure(),
     service: None,

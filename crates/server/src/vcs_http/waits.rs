@@ -13,10 +13,17 @@
 //! and each write waiting for room its own wait: a body and a reply, whose whole length is a push's or a clone's size,
 //! never a wait's.
 //!
-//! **None before a first measurement.** A phase has no bound until one of its waits has completed: until then its waits
-//! end only when the client leaves or the edge's owner ends the edge, as a hook's first run is bounded by its client's
-//! connection alone (§4.17.1; `crate::vcs_hooks`). The connections an edge serves at once are its shard's seats
-//! (`super::Bounds`), so a client that holds a connection before any measurement holds one seat.
+//! **The connection's own first measurement, before a phase has learned** (main's ruling, 2026-11-19: a silent client
+//! never holds a seat unbounded). Until one of a phase's waits has completed, a wait in it is bounded by RFC 6298 §2.2's
+//! first RTO from the connection's own measurement `R`: `SRTT = R`, `RTTVAR = R/2`, so `R + max(G, 4·R/2)`
+//! ([`first_rto_ns`]). `R` is the TCP handshake's round trip as the kernel measured it at accept
+//! (`slates_rt::tcp::TcpStream::round_trip`). While a TLS handshake runs, the edge's own work on it so far is added: the
+//! client's share of a handshake is the same work (a key exchange, a signature checked), and a loopback round trip of
+//! microseconds would otherwise cut the first handshakes a laptop serves. Once the TLS handshake has ended, its whole
+//! duration from acceptance is `R`. `G` is the clock's measured granularity: the larger of the shard's timer tick, the
+//! lateness its scheduler has shown, and the resolution of the kernel's round-trip clock (a millisecond on macOS). So
+//! nothing a connection waits for is unbounded, and no number but the connection's own and the machine's is used.
+//! Until 2026-11-19 a phase had no bound before its first completed wait (A-625 part 2 as first landed).
 //!
 //! **Whose waits teach.** Only a connection whose credentials proved a principal (§4.13) teaches the bounds, as only a
 //! bearer holder's arrival teaches the MCP edge's (A-523): a connection's waits before its proof are kept, each phase's
@@ -29,11 +36,24 @@
 //! placed and asks for none).
 
 use slates_http_edge::connection::Phase;
+use slates_rt::tcp::RoundTrip;
 
 use crate::learned_wait::LearnedWait;
 
 /// The back-off's ceiling: none of the edge's own (the module doc); the type's largest value.
 const NO_CEILING_NS: u64 = u64::MAX;
+
+/// Format: RFC 6298 §2.2's `K`, the deviations an RTO adds to the smoothed round trip (`RTO = SRTT + max(G, K·RTTVAR)`).
+const RTO_DEVIATIONS: u64 = 4;
+/// Format: RFC 6298 §2.2's first deviation, a share of the first measurement: `RTTVAR <- R/2`.
+const FIRST_DEVIATION_DIVISOR: u64 = 2;
+
+/// Derived: RFC 6298 §2.2's first RTO from one measurement `round_trip_ns` (`SRTT = R`, `RTTVAR = R/2`), its deviation
+/// term floored by the clock's granularity `granularity_ns` (`G`): `R + max(G, 4·R/2)`.
+pub(crate) fn first_rto_ns(round_trip_ns: u64, granularity_ns: u64) -> u64 {
+  let _ = (round_trip_ns, granularity_ns, FIRST_DEVIATION_DIVISOR, RTO_DEVIATIONS);
+  u64::MAX
+}
 
 /// One value for each phase a connection waits on its client in: every [`Phase`] but `Closed`.
 #[derive(Debug, Default)]
@@ -165,13 +185,11 @@ struct Current {
   phase: Phase,
   /// When it began, on the shard's clock.
   since_ns: u64,
-  /// Where its wait ends: its start plus the phase's bound then; none before the phase's first sample.
-  deadline_ns: Option<u64>,
 }
 
-/// One connection's waits: the whole phase it is in, whether its credentials have proved a principal, and each phase's
-/// longest wait before they did (the module doc).
-#[derive(Debug, Default)]
+/// One connection's waits: its own first measurement, the whole phase it is in, whether its credentials have proved a
+/// principal, and each phase's longest wait before they did (the module doc).
+#[derive(Debug)]
 pub(crate) struct Tracker {
   /// Whether the connection's credentials proved a principal: from then on its waits teach the edge.
   proven: bool,
@@ -179,26 +197,58 @@ pub(crate) struct Tracker {
   unproven: PerPhase<Option<u64>>,
   /// The whole phase in progress.
   current: Option<Current>,
+  /// The connection's own first measurement `R` (the module doc): its TCP handshake's round trip, then its TLS
+  /// handshake's whole duration.
+  measured_ns: u64,
+  /// The resolution of the clock `measured_ns` was read from: the kernel's, until the shard's own clock timed the TLS
+  /// handshake (whose granularity the caller's `G` holds).
+  resolution_ns: u64,
+  /// The edge's own work on the connection's TLS handshake so far, added to `R` while the handshake runs.
+  worked_ns: u64,
 }
 
 impl Tracker {
-  /// Where a wait in `phase` starting at `now_ns` ends: a whole phase's deadline, set when the phase began (a whole phase
-  /// in progress that is not `phase` ends here, its wait completed); a silence's, the phase's bound from now. None before
-  /// the phase's first sample.
+  /// A connection's waits, its first measurement the TCP handshake's round trip as the kernel measured it at accept.
+  pub(crate) fn new(round_trip: RoundTrip) -> Tracker {
+    Tracker {
+      proven: false,
+      unproven: PerPhase::default(),
+      current: None,
+      measured_ns: round_trip.ns,
+      resolution_ns: round_trip.resolution_ns,
+      worked_ns: 0,
+    }
+  }
+
+  /// The edge spent `ns` of its own work on the connection's TLS handshake (its key exchange, its signature, its
+  /// records): added to `R` while the handshake runs.
+  pub(crate) fn worked(&mut self, ns: u64) {
+    self.worked_ns = self.worked_ns.saturating_add(ns);
+  }
+
+  /// Where a wait in `phase` starting at `now_ns` ends: a whole phase's bound from the phase's start (a whole phase in
+  /// progress that is not `phase` ends here, its wait completed), a silence's from now. The bound is the phase's learned
+  /// one, or before it has one RFC 6298's first RTO from the connection's own measurement, `granularity_ns` (the shard
+  /// clock's `G`) floored by the resolution of the clock that measured it ([`first_rto_ns`]).
   pub(crate) fn deadline_ns(
     &mut self,
     phase: Phase,
     now_ns: u64,
+    granularity_ns: u64,
     waits: &mut PhaseWaits,
-  ) -> Option<u64> {
+  ) -> u64 {
     self.observe(phase, now_ns, waits);
-    if whole(phase) {
-      self.current.and_then(|current| current.deadline_ns)
-    } else {
-      waits
-        .bound_ns(phase)
-        .map(|bound_ns| now_ns.saturating_add(bound_ns))
-    }
+    let since_ns = match self.current {
+      Some(current) if whole(phase) => current.since_ns,
+      _ => now_ns,
+    };
+    let bound_ns = waits.bound_ns(phase).unwrap_or_else(|| {
+      first_rto_ns(
+        self.measured_ns.saturating_add(self.worked_ns),
+        granularity_ns.max(self.resolution_ns),
+      )
+    });
+    since_ns.saturating_add(bound_ns)
   }
 
   /// The connection is in `phase` at `now_ns`: a whole phase in progress that is not `phase` ended there, its wait
@@ -212,22 +262,21 @@ impl Tracker {
       self.current = Some(Current {
         phase,
         since_ns: now_ns,
-        deadline_ns: waits
-          .bound_ns(phase)
-          .map(|bound_ns| now_ns.saturating_add(bound_ns)),
       });
     }
   }
 
   /// The whole phase in progress ended at `now_ns` as its client meant it to (the head whole, the client's close after a
-  /// drain): its wait completed.
+  /// drain): its wait completed. A TLS handshake's whole duration becomes the connection's first measurement.
   pub(crate) fn end(&mut self, now_ns: u64, waits: &mut PhaseWaits) {
     if let Some(current) = self.current.take() {
-      self.learn(
-        current.phase,
-        now_ns.saturating_sub(current.since_ns),
-        waits,
-      );
+      let waited_ns = now_ns.saturating_sub(current.since_ns);
+      if current.phase == Phase::Handshake {
+        self.measured_ns = waited_ns;
+        self.resolution_ns = 0;
+        self.worked_ns = 0;
+      }
+      self.learn(current.phase, waited_ns, waits);
     }
   }
 

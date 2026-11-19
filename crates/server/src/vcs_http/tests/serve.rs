@@ -21,6 +21,8 @@ use crate::daemon::LIVENESS_BUDGET_NS;
 const ROOM_BYTES: usize = 1 << 20;
 /// Shape: one seat: the edge of a shard that seats one client.
 const ONE_SEAT: usize = 1;
+/// Shape: the test runtime's timer tick, its `RuntimeConfig::timer_tick_ns` ([`runtime`]).
+const TIMER_TICK_NS: u64 = 100_000;
 /// Shape: how long a client waits for an answer before it gives up: four liveness windows, past every learned bound these
 /// tests reach.
 const PATIENCE_NS: u64 = 4 * LIVENESS_BUDGET_NS;
@@ -132,7 +134,7 @@ fn runtime() -> LocalRuntime {
     timers_per_shard: 32,
     ring_entries: 8,
     step_budget_ns: 1_000_000,
-    timer_tick_ns: 100_000,
+    timer_tick_ns: TIMER_TICK_NS,
     batch: 8,
     pin: false,
     cores: Vec::new(),
@@ -170,7 +172,7 @@ where
   R: Send + 'static,
 {
   let runtime = runtime();
-  let bounds = Bounds::of_shard(ONE_SEAT, ROOM_BYTES);
+  let bounds = Bounds::of_shard(ONE_SEAT, ROOM_BYTES, TIMER_TICK_NS);
   let (listener, address) = listener(bounds);
   let state = runtime
     .context()
@@ -323,13 +325,18 @@ fn a_kept_connection_is_answered_twice_and_its_proven_waits_teach_the_edge() {
   );
 }
 
-/// A-625 part 2 (the listener at its bound). Do: with one seat, connect a client that sends nothing, then a second that
-/// sends a proven POST and listens a moment; then close the first. Expect: the second unanswered while the first holds
-/// the seat, the listener's wait for a seat counted, and the second answered once the first has closed.
+/// A-625 part 2 (the listener at its bound). Do: with one seat, a first client sends a proven POST, reads its reply and
+/// keeps its connection open, idle within the bound its request taught the edge; a second client sends a proven POST and
+/// listens a moment; then the first closes. Expect: the second unanswered while the first holds the seat, the listener's
+/// wait for a seat counted, and the second answered once the first has closed.
 #[test]
 fn at_its_bound_the_listener_waits_for_a_seat_before_it_accepts() {
-  let ((early, answered), seen) = served(None, |address| {
-    let holder = connect(address);
+  let ((first, early, answered), seen) = served(None, |address| {
+    let mut holder = connect(address);
+    holder
+      .write_all(&post(b"first", true))
+      .expect("the first request");
+    let first = read_until(&mut holder, LAST_CHUNK);
     let mut waiting = connect(address);
     waiting
       .write_all(&post(b"next", true))
@@ -342,14 +349,38 @@ fn at_its_bound_the_listener_waits_for_a_seat_before_it_accepts() {
     waiting
       .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
       .expect("the read timeout");
-    (early, read_until(&mut waiting, LAST_CHUNK))
+    (first, early, read_until(&mut waiting, LAST_CHUNK))
   });
-  assert_eq!((early, answered), (false, echoed(b"next")));
+  assert_eq!(
+    (first, early, answered),
+    (echoed(b"first"), false, echoed(b"next"))
+  );
   assert!(
     seen.counts.full >= 1,
     "the listener waited for a seat: {seen:?}"
   );
   assert_eq!(seen.counts.accepted, 2);
+}
+
+/// A-625 part 2 (main's ruling: a silent client never holds a seat unbounded). Do: on an edge that has learned nothing,
+/// connect a client that sends nothing, and read until the connection ends. Expect: the edge lets it go within the first
+/// RTO of the connection's own round trip, well inside a liveness window (as first landed, A-625 part 2 held it until it
+/// left), the client reading the connection's clean end; the cut counted, and nothing learned or backed off by a client
+/// that proved no one.
+#[test]
+fn a_silent_client_is_let_go_within_its_bound() {
+  let ((ended, silent_for), seen) = served(None, |address| {
+    let mut stream = connect(address);
+    let silent_since = Instant::now();
+    let ended = matches!(stream.read(&mut [0u8; 1]), Ok(0));
+    (ended, silent_since.elapsed())
+  });
+  assert!(ended, "the edge let the silent client go");
+  assert!(
+    silent_for < Duration::from_nanos(LIVENESS_BUDGET_NS / 2),
+    "let go within its first RTO, not a learned window: {silent_for:?}"
+  );
+  assert_eq!((seen.counts.cut, seen.learned), (1, [(0, 0); 6]));
 }
 
 /// A-625 part 2 (the learned idle bound). Do: send a proven POST and read its reply, then stay silent with the connection
@@ -419,7 +450,7 @@ fn an_https_connection_is_served_and_its_handshake_teaches_the_edge() {
 #[test]
 fn ending_the_listener_cancels_and_joins_its_connections() {
   let runtime = runtime();
-  let bounds = Bounds::of_shard(ONE_SEAT, ROOM_BYTES);
+  let bounds = Bounds::of_shard(ONE_SEAT, ROOM_BYTES, TIMER_TICK_NS);
   let (listener, address) = listener(bounds);
   let state = runtime
     .context()
