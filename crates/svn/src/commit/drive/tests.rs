@@ -1,14 +1,15 @@
 //! The commit's drive (A-617, §4.17.4 items 3.2 to 3.4, piece 7's commit): stock Subversion 1.15.0's own commits
 //! (`crates/svn/fixtures/commit/`, recorded by its `make-fixtures.py`) replayed in their order through `begin`, the
-//! drive and a commit, every answer compared byte for byte with what `svnserve` wrote; and each refusal of a hostile
-//! drive in `svnserve`'s number and words, with the early-error rule.
+//! drive, its hooks (A-661) and the commit step (A-655), every answer compared byte for byte with what `svnserve`
+//! wrote; and each refusal of a hostile drive in `svnserve`'s number and words, with the early-error rule.
 use std::collections::BTreeMap;
-
-use aws_lc_rs::digest::{SHA256, digest};
 
 use super::*;
 use crate::authz;
+use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
+use crate::dump::Uuid;
 use crate::lock::{HeadView, LockRequest, LockTarget};
+use crate::migration::{Repository, Room};
 use crate::ra_svn::{Bounds, Parsed, Parser};
 
 /// One item of a stream and the bytes it took.
@@ -31,6 +32,19 @@ const DEPTH: usize = 8;
 
 /// The room a test drive and the test's index allow: past anything the recordings hold.
 const ROOM: usize = 1 << 30;
+
+/// The room the replay's repository holds its records within: past anything the recordings hold.
+/// Shape: [`ROOM`] index entries and as many bytes.
+const RECORDS_ROOM: Room = Room {
+  entries: ROOM,
+  bytes: 1 << 30,
+};
+
+/// The UUID the replay's repository is made with; no answer of a commit carries it.
+const UUID: &[u8] = b"00000000-0000-4000-8000-000000000655";
+
+/// The date the replay's repository is made at, its revision 0's.
+const CREATED: &[u8] = b"2026-11-19T00:00:00.000000Z";
 
 /// The commits, the lock and the race, in the order `make-fixtures.py` ran them (`sessions.txt`); the race is bob's
 /// commit `svnserve` took while alice's `conflict` drive was held at `close-edit`.
@@ -150,49 +164,6 @@ const RACE: Connection = (
 /// The file bob locks (`make-fixtures.py`'s `lock-bob` step, `svn lock -m bob's WORK/wc-bob/a.txt`).
 const LOCKED: &str = "/trunk/project/a.txt";
 
-/// A green over two maps, naming content by SHA-256 of a tagged encoding.
-#[derive(Default)]
-struct TestGreen {
-  texts: BTreeMap<ContentIdentity, Vec<u8>>,
-  lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
-}
-
-/// SHA-256 of `bytes`.
-fn sha256(bytes: &[u8]) -> ContentIdentity {
-  <[u8; 32]>::try_from(digest(&SHA256, bytes).as_ref()).unwrap()
-}
-
-impl Green for TestGreen {
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
-    self.texts.get(identity).map(Vec::as_slice)
-  }
-
-  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
-    let list = self.lists.get(identity)?;
-    Some(
-      list
-        .iter()
-        .map(|(name, value)| (name.as_slice(), value.as_slice()))
-        .collect(),
-    )
-  }
-
-  fn name_text(&self, text: &[u8]) -> ContentIdentity {
-    sha256(&[b"text\0".as_slice(), text].concat())
-  }
-
-  fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
-    let mut encoded = b"properties\0".to_vec();
-    for (name, value) in properties {
-      for part in [name, value] {
-        encoded.extend_from_slice(&u64::try_from(part.len()).unwrap().to_be_bytes());
-        encoded.extend_from_slice(part);
-      }
-    }
-    sha256(&encoded)
-  }
-}
-
 /// The head as the lock guard reads it.
 struct Head<'i>(&'i Index);
 
@@ -207,23 +178,49 @@ impl HeadView for Head<'_> {
   }
 }
 
-/// The repository the replay builds: the index, the green and the lock table.
+/// The repository the replay builds, whose records (the index, the texts and property lists, the revision
+/// properties and the locks) the drive reads as its index, green and lock table, and the commit step commits into;
+/// and the date `svnserve` gave each revision.
 struct Replay {
-  index: Index,
-  green: TestGreen,
-  locks: LockTable,
+  repository: Repository,
   transactions: u64,
+  dates: BTreeMap<u64, String>,
 }
 
 impl Replay {
   /// An empty repository: revision 0, its root alone.
   fn new() -> Self {
+    let uuid = Uuid::parse(UUID).unwrap();
     Self {
-      index: Index::new(),
-      green: TestGreen::default(),
-      locks: LockTable::new(),
+      repository: Repository::new(uuid, CREATED, RECORDS_ROOM).unwrap(),
       transactions: 0,
+      dates: BTreeMap::new(),
     }
+  }
+
+  /// The drive's step for `item` over the replay's records, every hook due passed at once.
+  fn command(&self, drive: &mut Drive, item: &Value<'_>, out: &mut Vec<u8>) -> Step {
+    let records = &self.repository;
+    let step = drive
+      .command(records.index(), records, records.locks(), item, out)
+      .unwrap();
+    match step {
+      Step::Hook(_) => self.resume(drive, Ok(()), out),
+      other => other,
+    }
+  }
+
+  /// The drive's step once its hook answered `answer`.
+  fn resume(
+    &self,
+    drive: &mut Drive,
+    answer: Result<(), Vec<(u32, String)>>,
+    out: &mut Vec<u8>,
+  ) -> Step {
+    let records = &self.repository;
+    drive
+      .resume(records.index(), records, records.locks(), answer, out)
+      .unwrap()
   }
 }
 
@@ -294,19 +291,20 @@ fn recorded_date(server: &[Read<'_>]) -> String {
   String::from_utf8(date.to_vec()).unwrap()
 }
 
-/// Commits an accepted work as the owner would and writes `svnserve`'s answer.
-fn commit_work(replay: &mut Replay, work: Work, user: &str, date: &str, out: &mut Vec<u8>) {
-  let revision = replay.index.append(work.record, ROOM).unwrap();
-  replay.green.texts.extend(work.texts);
-  replay.green.lists.extend(work.property_lists);
-  for entry in &work.lock_entries {
-    replay.locks.apply(entry).unwrap();
-  }
-  write_commit_info(revision, date, Some(user), None, out).unwrap();
+/// Commits an accepted work through the commit step at the instant `svnserve` dated it, and writes `svnserve`'s
+/// answer from what the revision records: its number, its date and its author.
+fn commit_work(replay: &mut Replay, work: Work, date: &str, out: &mut Vec<u8>) {
+  let now = crate::dav::request::svn_time(date).unwrap();
+  let revision = RevisionToCommit::of_work(work, now).unwrap();
+  let dated = revision.date().unwrap().to_owned();
+  let author = revision.author().map(str::to_owned);
+  let number = replay.repository.commit(revision).unwrap();
+  replay.dates.insert(number, date.to_owned());
+  write_commit_info(number, &dated, author.as_deref(), None, out).unwrap();
 }
 
-/// Replays one recorded commit connection and returns what slates wrote from `commit` on; `race` lands just before
-/// the drive's `close-edit`.
+/// Replays one recorded commit connection and returns what slates wrote from `commit` on, each hook passed as it
+/// comes due; `race` lands while the drive's `close-edit` waits for pre-commit, before its verdict.
 fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Connection>) -> Vec<u8> {
   let (name, user, client, server) = connection;
   let client = items(client);
@@ -324,7 +322,7 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
   let mut out = Vec::new();
   replay.transactions += 1;
   let start = Start {
-    transaction: format!("{}-{}", replay.index.youngest(), replay.transactions),
+    transaction: format!("{}-{}", replay.repository.youngest(), replay.transactions),
     now: AprTime(0),
     room: ROOM,
     authenticated_now: false,
@@ -335,21 +333,19 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
     panic!("{name}: {begun:?}")
   };
   for (item, _) in &client[at + 1..] {
-    if let Some(race) = race.filter(|_| is_command(item, "close-edit")) {
-      let answered = replay_commit(replay, race, None);
-      check_tail(race.0, race.3, &answered);
-    }
-    let step = drive
-      .command(&replay.index, &replay.green, &replay.locks, item, &mut out)
+    let records = &replay.repository;
+    let mut step = drive
+      .command(records.index(), records, records.locks(), item, &mut out)
       .unwrap();
+    if let Step::Hook(due) = step {
+      if let (Due::PreCommit { .. }, Some(race)) = (due, race) {
+        let answered = replay_commit(replay, race, None);
+        check_tail(race.0, race.3, &answered);
+      }
+      step = replay.resume(&mut drive, Ok(()), &mut out);
+    }
     if let Step::Accepted(work) = step {
-      commit_work(
-        replay,
-        *work,
-        user,
-        &recorded_date(&items(server)),
-        &mut out,
-      );
+      commit_work(replay, *work, &recorded_date(&items(server)), &mut out);
     }
   }
   out
@@ -399,14 +395,26 @@ fn take_lock(replay: &mut Replay, server: &[u8]) {
     )]),
     ..LockRequest::default()
   };
-  let decision = replay
-    .locks
-    .lock(&request, &Head(&replay.index), AprTime(0), ROOM, &mut draw)
+  let records = &replay.repository;
+  let decision = records
+    .locks()
+    .lock(
+      &request,
+      &Head(records.index()),
+      AprTime(0),
+      ROOM,
+      &mut draw,
+    )
     .unwrap();
-  for entry in &decision.entries {
-    replay.locks.apply(entry).unwrap();
-  }
-  let held = replay.locks.get_lock(LOCKED, AprTime(0)).unwrap();
+  replay
+    .repository
+    .apply_lock_entries(&decision.entries)
+    .unwrap();
+  let held = replay
+    .repository
+    .locks()
+    .get_lock(LOCKED, AprTime(0))
+    .unwrap();
   assert_eq!(
     held.token.as_str(),
     token,
@@ -449,17 +457,38 @@ fn replay_connection(replay: &mut Replay, connection: Connection) {
   check_tail(name, server, &answered);
 }
 
-/// A-617 (§4.17.4 items 3.2 to 3.4; `commit.c`, `editorp.c`, `serve.c` `commit`). Do: replay every recorded commit of
-/// stock svn 1.15.0 against stock svnserve 1.15.0 in its order, bob's lock taken with its recorded token and bob's
-/// race landing just before alice's `close-edit`, each accepted work committed to the index. Expect: every answer
-/// from `commit` on is the bytes `svnserve` wrote: thirteen commits answered with their revisions 1 to 13, the race's
-/// among them, the stale file and the stale root out of date (`E160028`), alice against bob's lock refused
-/// (`E160039`) at the call that meets it, and alice's raced commit a conflict at bob's file (`E160024`); the index's
-/// youngest is the recorded 13.
+/// The names of the revision properties `svnserve` recorded for every commit the recordings hold.
+/// Shape: `svn:author`, `svn:date` and `svn:log`, in name order; never the ephemeral `svn:txn-` ones the client sent.
+const RECORDED_PROPERTIES: [&[u8]; 3] = [b"svn:author", b"svn:date", b"svn:log"];
+
+/// Checks what `repository` records of `revision`: exactly [`RECORDED_PROPERTIES`], its date `date`.
+fn check_recorded(repository: &Repository, revision: u64, date: &str) {
+  let properties = repository.revision_properties(revision).unwrap();
+  let names: Vec<&[u8]> = properties.keys().map(Vec::as_slice).collect();
+  assert_eq!(names, RECORDED_PROPERTIES, "r{revision}");
+  let dated = properties.get(b"svn:date".as_slice()).map(Vec::as_slice);
+  assert_eq!(dated, Some(date.as_bytes()), "r{revision}");
+}
+
+/// A-617, A-655, A-661 (§4.17.4 items 3.2 to 3.5; `commit.c`, `editorp.c`, `serve.c` `commit`, `fs-wrap.c`
+/// `svn_repos_fs_commit_txn` 48-121, `transaction.c` `write_final_revprop` 3598-3630). Do: replay every recorded
+/// commit of stock svn 1.15.0 against stock svnserve 1.15.0 in its order, bob's lock taken with its recorded token,
+/// each hook passed as it comes due and bob's race landing while alice's `close-edit` waits for pre-commit, each
+/// accepted work committed through the commit step at the instant `svnserve` dated it. Expect: every answer from
+/// `commit` on is the bytes `svnserve` wrote: thirteen commits answered with their revisions 1 to 13, their dates and
+/// authors, the race's among them, the stale file and the stale root out of date (`E160028`), alice against bob's
+/// lock refused (`E160039`) at the call that meets it, and alice's raced commit a conflict at bob's file (`E160024`),
+/// met by the verdict after pre-commit; the youngest is 13; each revision records `svn:author`, `svn:log` and
+/// `svnserve`'s `svn:date` alone, the client's `svn:txn-` properties dropped; and bob's commit released his lock.
 #[test]
 fn stock_commits_are_answered_as_svnserve_answered_them() {
   let replay = replayed_until("");
-  assert_eq!(replay.index.youngest(), 13);
+  assert_eq!(replay.repository.youngest(), 13);
+  assert_eq!(replay.dates.len(), 13);
+  for (revision, date) in &replay.dates {
+    check_recorded(&replay.repository, *revision, date);
+  }
+  assert_eq!(replay.repository.locks().locks().count(), 0);
 }
 
 /// A hostile drive: the commands after the request, what the drive writes, and how its last item ends.
@@ -478,19 +507,23 @@ struct Hostile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Last {
   Taken,
+  Accepted,
   Refused,
   Dropped,
   Ended,
+  Hook,
   Close,
 }
 
 /// The step's kind.
 fn kind_of(step: &Step) -> Last {
   match step {
-    Step::Taken | Step::Accepted(_) => Last::Taken,
+    Step::Taken => Last::Taken,
+    Step::Accepted(_) => Last::Accepted,
     Step::Refused => Last::Refused,
     Step::Dropped => Last::Dropped,
     Step::Ended => Last::Ended,
+    Step::Hook(_) => Last::Hook,
     Step::Close => Last::Close,
   }
 }
@@ -627,11 +660,7 @@ fn check_hostile(replay: &Replay, case: &Hostile) {
   let mut out = Vec::new();
   let mut last = Last::Taken;
   for (item, _) in items(case.commands) {
-    last = kind_of(
-      &drive
-        .command(&replay.index, &replay.green, &replay.locks, &item, &mut out)
-        .unwrap(),
-    );
+    last = kind_of(&replay.command(&mut drive, &item, &mut out));
   }
   let failure = items(&out)
     .into_iter()
@@ -694,9 +723,7 @@ fn a_resulting_text_whose_md5_is_not_the_clients_is_refused() {
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
-    drive
-      .command(&replay.index, &replay.green, &replay.locks, &item, &mut out)
-      .unwrap();
+    replay.command(&mut drive, &item, &mut out);
   }
   let words = format!(
     "Checksum mismatch for resulting fulltext\n(/trunk/project/a.txt):\n   expected:  00000000000000000000000000000001\n     actual:  {actual}\n"
@@ -727,9 +754,7 @@ fn a_work_past_its_room_is_refused() {
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
-    drive
-      .command(&replay.index, &replay.green, &replay.locks, &item, &mut out)
-      .unwrap();
+    replay.command(&mut drive, &item, &mut out);
   }
   let failure = items(&out)
     .into_iter()
@@ -769,8 +794,7 @@ fn a_lock_in_the_way_refuses_the_call_that_meets_it() {
   let mut out = Vec::new();
   let mut last = Last::Taken;
   for (item, _) in items(commands) {
-    let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
-    last = kind_of(&step.unwrap());
+    last = kind_of(&replay.command(&mut drive, &item, &mut out));
   }
   let failure = items(&out)
     .into_iter()
@@ -800,7 +824,8 @@ fn accepted_rows(step: &Step) -> Vec<(String, Action)> {
 fn a_path_beneath_a_copy_reads_the_copys_source() {
   let replay = replayed_until("edit-large");
   let source = replay
-    .index
+    .repository
+    .index()
     .node("/trunk/project/sub/b.txt", 3)
     .unwrap()
     .unwrap();
@@ -828,8 +853,7 @@ fn a_path_beneath_a_copy_reads_the_copys_source() {
   let mut out = Vec::new();
   let mut rows = Vec::new();
   for (item, _) in items(commands.as_bytes()) {
-    let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
-    rows = accepted_rows(&step.unwrap());
+    rows = accepted_rows(&replay.command(&mut drive, &item, &mut out));
   }
   let expected = vec![
     ("/trunk/project/sub2".to_owned(), Action::Add),
@@ -1049,8 +1073,7 @@ fn check_case(replay: &Replay, case: &Check) {
   let mut out = Vec::new();
   let mut last = Last::Taken;
   for (item, _) in items(case.commands) {
-    let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
-    last = kind_of(&step.unwrap());
+    last = kind_of(&replay.command(&mut drive, &item, &mut out));
   }
   let failure = items(&out)
     .into_iter()
@@ -1179,4 +1202,338 @@ fn a_commit_alice_may_not_write_is_refused_authorization() {
   let (kind, failure, out) = begun(&locked, &token, false);
   assert_eq!((kind, failure), ("answered", refused));
   assert!(out.starts_with(b"( success ( ( ) 0: ) ) "));
+}
+
+/// A property change of the session's directory over the repository after `edit` (revision 3), then `close-edit`.
+const DIRECTORY_PROPERTY: &[u8] = b"( open-root ( ( 3 ) 2:d0 ) ) \
+( change-dir-prop ( 2:d0 6:colour ( 4:blue ) ) ) ( close-dir ( 2:d0 ) ) ( close-edit ( ) ) ";
+
+/// Alice's drive at `base_path` as transaction `3-1`, beginning with `revision_properties`.
+fn alice_setup(base_path: &str, revision_properties: Vec<(Vec<u8>, Vec<u8>)>) -> Setup {
+  Setup {
+    base_path: base_path.to_owned(),
+    repository_url: REPOSITORY.to_owned(),
+    filesystem: "fixture".to_owned(),
+    transaction: "3-1".to_owned(),
+    locks: CommitLocks {
+      user: Some("alice".to_owned()),
+      ..CommitLocks::default()
+    },
+    now: AprTime(0),
+    room: ROOM,
+    rules: None,
+    revision_properties,
+  }
+}
+
+/// The hooks a drive of `commands` over `replay` waited for, each passed as it came due, and how its last step ended.
+fn hooks_met(
+  replay: &Replay,
+  drive: &mut Drive,
+  commands: &[u8],
+  out: &mut Vec<u8>,
+) -> (Vec<Due>, Last) {
+  let mut dues = Vec::new();
+  let mut last = Last::Taken;
+  for (item, _) in items(commands) {
+    let records = &replay.repository;
+    let mut step = drive
+      .command(records.index(), records, records.locks(), &item, out)
+      .unwrap();
+    if let Step::Hook(due) = step {
+      dues.push(due);
+      step = replay.resume(drive, Ok(()), out);
+    }
+    last = kind_of(&step);
+  }
+  (dues, last)
+}
+
+/// A-661 (`commit.c` `open_root` 437-441 and `close_edit` 816; `fs-wrap.c` `svn_repos_fs_begin_txn_for_commit2`
+/// 151-178 and `svn_repos_fs_commit_txn` 69-71). Do: drive a property change of `/trunk/project` over the repository
+/// after `edit`, passing each hook as it comes due. Expect: `open-root` waits for start-commit and `close-edit` for
+/// pre-commit, each naming the transaction and writing nothing, and the drive goes on after each to its acceptance.
+#[test]
+fn start_commit_and_pre_commit_are_waited_for_where_svnserve_runs_them() {
+  let replay = replayed_until("edit-large");
+  let mut drive = Drive::new(alice_setup("/trunk/project", Vec::new()));
+  let mut out = Vec::new();
+  let met = hooks_met(&replay, &mut drive, DIRECTORY_PROPERTY, &mut out);
+  let transaction = "3-1".to_owned();
+  let dues = vec![
+    Due::StartCommit {
+      transaction: transaction.clone(),
+    },
+    Due::PreCommit { transaction },
+  ];
+  assert_eq!((met, out), ((dues, Last::Accepted), Vec::new()));
+}
+
+/// The errors a hook refused with, as the hook glue hands them over.
+fn hook_errors(hook: &str) -> Vec<(u32, String)> {
+  vec![
+    (
+      165_001,
+      format!("Commit blocked by {hook} hook (exit code 1) with output:\nno"),
+    ),
+    (165_001, "and a second error beneath it".to_owned()),
+  ]
+}
+
+/// The failure a drive wrote, every error of it, and how the drive ended: `commands` handed in, the hook at `refused`
+/// answering with [`hook_errors`] and every other hook passing, then `abort-edit`.
+fn refused_by_hook(replay: &Replay, refused: &str) -> (Option<Vec<(u64, String)>>, Vec<Last>) {
+  let mut drive = Drive::new(alice_setup("/trunk/project", Vec::new()));
+  let mut out = Vec::new();
+  let mut steps = Vec::new();
+  for (item, _) in items(DIRECTORY_PROPERTY)
+    .into_iter()
+    .chain(items(b"( abort-edit ( ) ) "))
+  {
+    let records = &replay.repository;
+    let mut step = drive
+      .command(records.index(), records, records.locks(), &item, &mut out)
+      .unwrap();
+    if let Step::Hook(due) = step {
+      let hook = match due {
+        Due::StartCommit { .. } => "start-commit",
+        Due::PreCommit { .. } => "pre-commit",
+      };
+      let answer = if hook == refused {
+        Err(hook_errors(hook))
+      } else {
+        Ok(())
+      };
+      step = replay.resume(&mut drive, answer, &mut out);
+    }
+    steps.push(kind_of(&step));
+  }
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
+  (failure, steps)
+}
+
+/// The errors `hook`'s refusal is written with.
+fn written(hook: &str) -> Option<Vec<(u64, String)>> {
+  let errors = hook_errors(hook).into_iter();
+  Some(
+    errors
+      .map(|(code, words)| (u64::from(code), words))
+      .collect(),
+  )
+}
+
+/// A-661 (`fs-wrap.c` 172-178 and 69-71; `editorp.c` 1149-1208). Do: drive the property change of `/trunk/project`
+/// with start-commit refusing, then again with start-commit passing and pre-commit refusing, `abort-edit` last each
+/// time. Expect: the refusal written as the failure of the command that waited, every error the hook gave in its
+/// order; each item after it dropped until `abort-edit` ends the drive; nothing accepted.
+#[test]
+fn a_hook_that_refuses_is_the_failure_of_the_command_that_waited() {
+  let replay = replayed_until("edit-large");
+  let (failure, steps) = refused_by_hook(&replay, "start-commit");
+  let after_start = vec![
+    Last::Refused,
+    Last::Dropped,
+    Last::Dropped,
+    Last::Dropped,
+    Last::Ended,
+  ];
+  assert_eq!((failure, steps), (written("start-commit"), after_start));
+  let (failure, steps) = refused_by_hook(&replay, "pre-commit");
+  let after_pre = vec![
+    Last::Taken,
+    Last::Taken,
+    Last::Taken,
+    Last::Refused,
+    Last::Ended,
+  ];
+  assert_eq!((failure, steps), (written("pre-commit"), after_pre));
+}
+
+/// A drive of `open-root` alone with `revision_properties`: the failure it wrote, if any, and its step.
+fn opened_with(
+  replay: &Replay,
+  revision_properties: &[(&[u8], &[u8])],
+) -> (Option<Vec<(u64, String)>>, Last) {
+  let owned = revision_properties
+    .iter()
+    .map(|(name, value)| (name.to_vec(), value.to_vec()))
+    .collect();
+  let mut drive = Drive::new(alice_setup("/trunk/project", owned));
+  let mut out = Vec::new();
+  let mut last = Last::Taken;
+  for (item, _) in items(b"( open-root ( ( 3 ) 2:d0 ) ) ") {
+    let records = &replay.repository;
+    let step = drive
+      .command(records.index(), records, records.locks(), &item, &mut out)
+      .unwrap();
+    last = kind_of(&step);
+  }
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
+  (failure, last)
+}
+
+/// A-655 (`fs-wrap.c` `svn_repos_fs_change_txn_props` 344-357, which `svn_repos_fs_begin_txn_for_commit2` calls at
+/// 160-164 before start-commit; `svn_repos__validate_prop` 202-263). Do: begin drives whose revision properties hold an
+/// `svn:log` with a carriage return, an `svn:date` that is no date, and a regular property with a carriage return.
+/// Expect: the first two refused at `open-root` with every error `svnserve` writes, no hook due; the third waits for
+/// start-commit.
+#[test]
+fn a_revision_property_svnserve_refuses_is_refused_at_open_root() {
+  let replay = replayed_until("edit-large");
+  let carriage = opened_with(&replay, &[(b"svn:log".as_slice(), b"a\r\n".as_slice())]);
+  let eol = vec![
+    (125_005, "Invalid property value".to_owned()),
+    (
+      125_017,
+      "Cannot accept non-LF line endings in 'svn:log' property".to_owned(),
+    ),
+  ];
+  assert_eq!(carriage, (Some(eol), Last::Refused));
+  let dated = opened_with(
+    &replay,
+    &[
+      (b"svn:date".as_slice(), b"bad".as_slice()),
+      (b"svn:log".as_slice(), b"ok".as_slice()),
+    ],
+  );
+  let bogus = vec![
+    (125_005, "Wrong or unexpected property value".to_owned()),
+    (125_003, "Bogus date".to_owned()),
+  ];
+  assert_eq!(dated, (Some(bogus), Last::Refused));
+  let regular = opened_with(&replay, &[(b"colour".as_slice(), b"a\r\n".as_slice())]);
+  assert_eq!(regular, (None, Last::Hook));
+}
+
+/// A-661 (`Drive::command`, `Drive::resume`). Do: hand a drive its next item while start-commit is due; and resume a
+/// drive no hook paused. Expect: each ends the drive, nothing written.
+#[test]
+fn an_item_while_a_hook_is_due_or_a_resume_with_none_ends_the_drive() {
+  let replay = replayed_until("edit-large");
+  let records = &replay.repository;
+  let mut drive = Drive::new(alice_setup("/trunk/project", Vec::new()));
+  let mut out = Vec::new();
+  let mut steps = Vec::new();
+  for (item, _) in items(DIRECTORY_PROPERTY).into_iter().take(2) {
+    let step = drive.command(records.index(), records, records.locks(), &item, &mut out);
+    steps.push(kind_of(&step.unwrap()));
+  }
+  let mut idle = Drive::new(alice_setup("/trunk/project", Vec::new()));
+  steps.push(kind_of(&replay.resume(&mut idle, Ok(()), &mut out)));
+  assert_eq!(
+    (steps, out),
+    (vec![Last::Hook, Last::Close, Last::Close], Vec::new())
+  );
+}
+
+/// The work a drive of `commands` at `base_path` over `replay` accepted, each hook passed.
+fn accepted_work(replay: &Replay, base_path: &str, commands: &[u8]) -> Work {
+  let mut drive = Drive::new(alice_setup(base_path, Vec::new()));
+  let mut out = Vec::new();
+  let mut accepted = None;
+  for (item, _) in items(commands) {
+    if let Step::Accepted(work) = replay.command(&mut drive, &item, &mut out) {
+      accepted = Some(*work);
+    }
+  }
+  accepted.unwrap()
+}
+
+/// A-655 (§4.17.4 item 3.5; `transaction.c` `commit_body` 3784-3786). Do: over the repository after `edit`, accept a
+/// property change of `/trunk/project` and one of `/trunk/project/sub`, both judged at revision 3; commit the second
+/// through the step, then the first as it was judged. Expect: the second is revision 4; the records refuse the first as
+/// FSFS's `commit_body` refuses a transaction whose base moved, "Transaction out of date" (`E160028`), holding revision
+/// 4 alone. The owner's step judges such a work again at the head by position before the records see it, as
+/// `svn_fs_fs__commit_txn` merges again (part 2b).
+#[test]
+fn a_revision_judged_at_a_moved_head_is_refused_by_the_records() {
+  let mut replay = replayed_until("edit-large");
+  let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
+  let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
+  let now = AprTime(1_795_073_195_123_456);
+  let second = RevisionToCommit::of_work(second, now).unwrap();
+  assert_eq!(replay.repository.commit(second), Ok(4));
+  let first = RevisionToCommit::of_work(first, now).unwrap();
+  let refusal = replay.repository.commit(first).unwrap_err();
+  let answered = (refusal.subversion_code(), refusal.message());
+  assert_eq!(answered, (160_028, "Transaction out of date".to_owned()));
+  assert_eq!(
+    refusal,
+    StepRefusal::OutOfDate {
+      head: 3,
+      youngest: 4
+    }
+  );
+  let changed: Vec<String> = replay
+    .repository
+    .index()
+    .changes(4)
+    .unwrap()
+    .iter()
+    .map(|row| row.path.clone())
+    .collect();
+  assert_eq!(
+    (replay.repository.youngest(), changed),
+    (4, vec!["/trunk/project/sub".to_owned()])
+  );
+}
+
+/// What a hook read of the transaction: its name, its base, its revision properties and the paths of its rows.
+type HookRead = (String, Revision, Vec<(Vec<u8>, Vec<u8>)>, Vec<String>);
+
+/// What pre-commit reads of a drive of `commands` with `begun` as its revision properties, every hook passed, and the
+/// revision properties of the work accepted.
+fn read_at_pre_commit(
+  replay: &Replay,
+  begun: Vec<(Vec<u8>, Vec<u8>)>,
+  commands: &[u8],
+) -> (Option<HookRead>, Option<Vec<(Vec<u8>, Vec<u8>)>>) {
+  let mut drive = Drive::new(alice_setup("/trunk/project", begun));
+  let mut out = Vec::new();
+  let (mut read, mut accepted) = (None, None);
+  for (item, _) in items(commands) {
+    let records = &replay.repository;
+    let mut step = drive
+      .command(records.index(), records, records.locks(), &item, &mut out)
+      .unwrap();
+    if let Step::Hook(due) = step {
+      if let Due::PreCommit { .. } = due {
+        let pending = drive.pending();
+        let rows: Vec<String> = pending.rows.keys().cloned().collect();
+        let properties = pending.revision_properties.to_vec();
+        read = Some((
+          pending.transaction.to_owned(),
+          pending.base,
+          properties,
+          rows,
+        ));
+      }
+      step = replay.resume(&mut drive, Ok(()), &mut out);
+    }
+    if let Step::Accepted(work) = step {
+      accepted = Some(work.revision_properties);
+    }
+  }
+  (read, accepted)
+}
+
+/// A-661 (`fs-wrap.c` `svn_repos_fs_commit_txn` 69-89: pre-commit reads the transaction, its ephemeral properties
+/// among its revision properties, and they are removed before the commit). Do: drive the property change of
+/// `/trunk/project`, begun with `svn:log` and `svn:txn-user-agent`, reading the transaction while pre-commit is due.
+/// Expect: pre-commit reads the transaction's name, its base 3, both properties and its one row; the accepted work
+/// keeps `svn:log` alone.
+#[test]
+fn pre_commit_reads_the_transaction_whose_work_drops_its_ephemeral_properties() {
+  let replay = replayed_until("edit-large");
+  let log = (b"svn:log".to_vec(), b"x".to_vec());
+  let agent = (b"svn:txn-user-agent".to_vec(), b"SVN/1.15.0".to_vec());
+  let begun = vec![log.clone(), agent.clone()];
+  let (read, accepted) = read_at_pre_commit(&replay, begun, DIRECTORY_PROPERTY);
+  let rows = vec!["/trunk/project".to_owned()];
+  let expected = ("3-1".to_owned(), 3, vec![log.clone(), agent], rows);
+  assert_eq!((read, accepted), (Some(expected), Some(vec![log])));
 }

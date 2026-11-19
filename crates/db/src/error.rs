@@ -131,8 +131,8 @@ pub enum DbError {
   /// (`crate::review`). Never entered in the log.
   Review(ReviewRefusal),
   /// A repository policy's setting named a version its policy has moved past, or a repository created already holding a
-  /// policy, which only its own setting gives (A-622). Read the policy again and set it from there. Never entered in the
-  /// log.
+  /// policy, which only its own setting gives (A-622); or a principal's tool identities' setting named a version they
+  /// have moved past (A-664). Read the record again and set it from there. Never entered in the log.
   PolicyChanged {
     /// The policy's version now.
     current: u64,
