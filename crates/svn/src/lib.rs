@@ -25,4 +25,5 @@ pub mod index;
 pub mod lock;
 pub mod mergeinfo;
 pub mod ra_svn;
+pub mod reads;
 pub mod svndiff;
