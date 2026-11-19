@@ -2,14 +2,17 @@
 //! stored five ways (`fixtures/store`'s dotencode and hybrid stores, the dotencode store under a pre-share-safe
 //! `.hg/requires`, and `fixtures/import`'s revlog version 2 store and version 1 file index store), each imported through
 //! the read seam with every text 7.2's `debugdata` and every node 7.2's, and the five indexes equal row for row; then
-//! damaged and hostile stores refused by kind with nothing left held.
+//! damaged and hostile stores refused by kind with nothing left held. And the state beside a history (A-649 part 2):
+//! `fixtures/state`'s phases, bookmarks and markers, held to 7.2's own listings of them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_vcs::{ContentId, ContentStore};
 
-use crate::fixtures::{import as import_fixtures, store as store_fixtures};
+use crate::fixtures::{import as import_fixtures, state as state_fixtures, store as store_fixtures};
 use crate::import::{FileRefused, ImportRefused, Imported, RepositoryFiles, import};
+use crate::obsmarkers;
+use crate::phases::{Phase, PhaseHead};
 use crate::index::{Log, NONE, RevisionRow};
 use crate::lines::lines;
 use crate::revlog;
@@ -68,30 +71,46 @@ impl RepositoryFiles for Repository {
   }
 }
 
-/// A fixture file of `fixtures/store` or of `fixtures/import`.
-fn fixture(from_store: bool, name: &str) -> &'static [u8] {
-  if from_store {
-    store_fixtures::file(name)
-  } else {
-    import_fixtures::file(name)
+/// Which fixtures hold a repository's files.
+#[derive(Clone, Copy)]
+enum Source {
+  /// `fixtures/store`.
+  Store,
+  /// `fixtures/import`.
+  Import,
+  /// `fixtures/state`.
+  State,
+}
+
+/// A fixture file, if its source holds one by that name.
+fn fixture(source: Source, name: &str) -> Option<&'static [u8]> {
+  match source {
+    Source::Store => store_fixtures::find(name),
+    Source::Import => import_fixtures::find(name),
+    Source::State => state_fixtures::find(name),
   }
 }
 
-/// The `.hg` of one of the five repositories: its `.hg/requires` from `fixtures/import`, its store from the fixtures
-/// that hold it (the pre-share-safe one's is the dotencode store without its own requirements).
+/// The `.hg` of one of the repositories: its `.hg/requires`, its store from the fixtures that hold it (the
+/// pre-share-safe one's is the dotencode store without its own requirements), and its `.hg/bookmarks` where it keeps one.
 fn repository(name: &str) -> Repository {
-  let mut files = BTreeMap::new();
-  let requires = import_fixtures::file(&format!("{name}-hg-requires.txt"));
-  files.insert(b"requires".to_vec(), requires.to_vec());
-  let (from_store, stored) = match name {
-    "legacy" => (true, "dot"),
-    "dot" | "hybrid" => (true, name),
-    _ => (false, name),
+  let (source, stored) = match name {
+    "legacy" => (Source::Store, "dot"),
+    "dot" | "hybrid" => (Source::Store, name),
+    "states" | "states-store" => (Source::State, name),
+    _ => (Source::Import, name),
   };
-  for line in lines(fixture(from_store, &format!("{stored}-files.txt"))) {
+  let requires_source = if matches!(source, Source::State) { Source::State } else { Source::Import };
+  let mut files = BTreeMap::new();
+  let requires = fixture(requires_source, &format!("{name}-hg-requires.txt")).unwrap();
+  files.insert(b"requires".to_vec(), requires.to_vec());
+  if let Some(bookmarks) = fixture(source, &format!("{name}-bookmarks")) {
+    files.insert(b"bookmarks".to_vec(), bookmarks.to_vec());
+  }
+  for line in lines(fixture(source, &format!("{stored}-files.txt")).unwrap()) {
     let file = core::str::from_utf8(line).unwrap();
     if name != "legacy" || file != "requires" {
-      let bytes = fixture(from_store, &format!("{stored}/{file}"));
+      let bytes = fixture(source, &format!("{stored}/{file}")).unwrap();
       files.insert(format!("store/{file}").into_bytes(), bytes.to_vec());
     }
   }
@@ -199,17 +218,17 @@ fn check_history(imported: &Imported, store: &ContentStore) {
   assert_eq!((Ok(counts.0), Ok(counts.1)), expected);
 }
 
-/// Holds what the import asked the host for: files the repository holds, each once.
+/// The files a repository may lack, which the import asks for and reads as empty: its state beside its history.
+const OPTIONAL: [&[u8]; 4] = [b"store/phaseroots", b"store/obsstore", b"bookmarks", b"store/bookmarks"];
+
+/// Holds what the import asked the host for: files the repository holds, or its optional state's, each once.
 fn check_asked(repository: &Repository) {
   let asked: BTreeSet<&Vec<u8>> = repository.asked.iter().collect();
   assert_eq!(asked.len(), repository.asked.len(), "a file asked twice");
-  assert!(
-    asked
-      .iter()
-      .all(|path| repository.files.contains_key(*path)),
-    "{:?}",
-    repository.asked
-  );
+  let known = |path: &&Vec<u8>| {
+    repository.files.contains_key(*path) || OPTIONAL.contains(&path.as_slice())
+  };
+  assert!(asked.iter().all(known), "{:?}", repository.asked);
 }
 
 /// An index's rows, each key with its body.
@@ -544,6 +563,165 @@ fn fncache_entries_are_read_as_7_2_groups_them() {
       ),
     }
   }
+}
+
+/// The lines of a fixture of `fixtures/state`, each cut at its first space.
+fn listing(name: &str) -> Vec<(String, String)> {
+  lines(state_fixtures::file(name))
+    .map(|line| {
+      let line = core::str::from_utf8(line).unwrap();
+      let (first, rest) = line.split_once(' ').unwrap();
+      (first.to_string(), rest.to_string())
+    })
+    .collect()
+}
+
+/// A node's lower-case hexadecimal.
+fn hex(node: &[u8]) -> String {
+  node.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Each changeset's phase computed from the imported roots, as 7.2 computes it: the greatest of its parents' and of a
+/// root's at itself, by node in hexadecimal.
+fn phases_of(imported: &Imported, store: &ContentStore) -> BTreeMap<String, Phase> {
+  let mut phases: Vec<Phase> = Vec::new();
+  let mut named = BTreeMap::new();
+  for rev in 0..imported.changesets {
+    let row = imported.index.changeset(store, rev).unwrap();
+    let rooted = imported.phase_roots.iter().filter(|root| root.node == row.node);
+    let parents = [row.p1, row.p2].into_iter().filter(|parent| *parent != NONE);
+    let inherited = parents.map(|parent| phases[usize::try_from(parent).unwrap()]);
+    let phase = rooted.map(|root| root.phase).chain(inherited).max().unwrap_or(Phase::Public);
+    phases.push(phase);
+    named.insert(hex(&row.node), phase);
+  }
+  named
+}
+
+/// Holds an import's state to 7.2's listings of `name`: every changeset's phase, every bookmark, every marker (its
+/// predecessor, each in the obsstore's order, and all of them written back to the obsstore's bytes).
+fn check_state(name: &str, imported: &Imported, store: &ContentStore) {
+  let phases = phases_of(imported, store);
+  let listed: BTreeMap<String, String> = listing(&format!("{name}-phases.txt")).into_iter().collect();
+  let computed: BTreeMap<String, String> =
+    phases.iter().map(|(node, phase)| (node.clone(), phase.name().to_string())).collect();
+  assert_eq!(computed, listed, "{name} phases");
+  let bookmarks: Vec<(String, String)> =
+    imported.bookmarks.iter().map(|(bookmark, node)| (String::from_utf8(bookmark.clone()).unwrap(), hex(node))).collect();
+  assert_eq!(bookmarks, listing(&format!("{name}-bookmarks.txt")), "{name} bookmarks");
+  check_markers(name, imported, store);
+}
+
+/// Holds an import's markers to 7.2's: each one's predecessor in the obsstore's order, and all of them, each read back
+/// alone, written into one payload equal to the obsstore's bytes.
+fn check_markers(name: &str, imported: &Imported, store: &ContentStore) {
+  let listed = listing(&format!("{name}-markers.txt"));
+  assert_eq!(usize::try_from(imported.markers).unwrap(), listed.len(), "{name} markers");
+  let mut written = Vec::new();
+  for (number, (predecessor, _)) in (0_u64..).zip(&listed) {
+    let alone = whole(store, &imported.index.marker(store, number).unwrap());
+    let read = obsmarkers::decode(&alone).unwrap();
+    let marker = read.iter().next().unwrap();
+    assert_eq!(&hex(marker.predecessor), predecessor, "{name} marker {number}");
+    written.extend_from_slice(if written.is_empty() { &alone } else { &alone[1..] });
+  }
+  let obsstore = state_fixtures::file(&format!("{name}/obsstore"));
+  assert_eq!(written, obsstore, "{name} obsstore");
+}
+
+/// A-649 part 2 (golden): do import the two repositories 7.2 kept one history's state in, bookmarks in `.hg` and in the
+/// store. Expect every changeset's phase computed from the imported roots as 7.2 lists it (public, draft, the amended
+/// one's predecessor draft, secret), every bookmark as 7.2 lists it, every marker 7.2 lists in its order and written
+/// back to the obsstore's bytes, nothing dropped or malformed, the two indexes equal row for row, and each repository's
+/// bookmarks read from where it keeps them alone.
+#[test]
+fn the_state_7_2_kept_beside_a_history_is_imported() {
+  let mut first: Option<Rows> = None;
+  for (name, kept, unasked) in [("states", "bookmarks", "store/bookmarks"), ("states-store", "store/bookmarks", "bookmarks")] {
+    let mut repository = repository(name);
+    let mut store = store();
+    let mut imported = import(&mut repository, &mut store, room()).unwrap();
+    check_state(name, &imported, &store);
+    let counts = (imported.dropped_phase_roots, imported.dropped_bookmarks, imported.malformed_bookmarks);
+    assert_eq!(counts, (0, 0, 0), "{name}");
+    let asked = |path: &str| repository.asked.iter().any(|asked| asked.as_slice() == path.as_bytes());
+    assert_eq!((asked(kept), asked(unasked)), (true, false), "{name}");
+    let rows = rows(&mut imported, &store);
+    assert_eq!(first.get_or_insert_with(|| rows.clone()), &rows, "{name}");
+  }
+}
+
+/// `repository` imported into a new store.
+fn imported(repository: &mut Repository) -> Imported {
+  import(repository, &mut store(), room()).unwrap()
+}
+
+/// The `states` repository with `file` holding `bytes`.
+fn states_with(file: &str, bytes: &[u8]) -> Repository {
+  let mut repository = repository("states");
+  repository.files.insert(file.as_bytes().to_vec(), bytes.to_vec());
+  repository
+}
+
+/// AC-HG.9, A-649 part 2 (7.2's `phases._readroots`): do import `phaseroots` lines of one field, of three, with a
+/// phase 7.2 does not define, a phase that is not a number, and a node of 39 digits. Expect each refused naming its line,
+/// with nothing left held.
+#[test]
+fn phase_roots_7_2_cannot_read_are_refused() {
+  let secret = "4ed94230db9650095697695adb1b40ef155eb141";
+  for (text, line) in [
+    (format!("2 {secret}\n1\n"), 2),
+    (format!("2 {secret} extra\n"), 1),
+    (format!("7 {secret}\n"), 1),
+    (format!("x {secret}\n"), 1),
+    (format!("\n2 {secret}\n"), 1),
+    (format!("2 {}\n", secret.get(1..).unwrap()), 1),
+  ] {
+    let refusal = refused(&mut states_with("store/phaseroots", text.as_bytes()));
+    assert_eq!(refusal, ImportRefused::PhaseRoots { line }, "{text:?}");
+  }
+}
+
+/// A-649 part 2 (7.2's `phases._readroots`): do import a `phaseroots` with a root whose node the changelog does not
+/// hold, a public root, tabs and a carriage return between and after the fields, and the secret root twice. Expect the
+/// unknown root dropped and counted, the public one passed over, the secret root kept once.
+#[test]
+fn phase_roots_whose_nodes_are_not_held_are_dropped_as_7_2_drops_them() {
+  let secret = "4ed94230db9650095697695adb1b40ef155eb141";
+  let text = format!("2\t{secret}\r\n0 {secret}\n1 {}\n2 {secret}\n", "a".repeat(40));
+  let imported = imported(&mut states_with("store/phaseroots", text.as_bytes()));
+  let roots: Vec<(Phase, String)> = imported.phase_roots.iter().map(|root| (root.phase, hex(&root.node))).collect();
+  assert_eq!((roots, imported.dropped_phase_roots), (vec![(Phase::Secret, secret.to_string())], 1));
+}
+
+/// A-649 part 2 (7.2's `bookmarks.bmstore`): do import a bookmarks file with an empty line, a line without a space,
+/// digits that are not hexadecimal, an odd count of digits, a node the changelog does not hold, a short node, a name
+/// given twice, a name with a space in it and a carriage return before a line's end. Expect the malformed lines passed
+/// over and counted, the unheld nodes dropped and counted, the later node kept for the name given twice, and the rest
+/// kept with their names as written, sorted by name.
+#[test]
+fn bookmark_lines_are_read_as_7_2_reads_them() {
+  let (one, two) = ("baa257697fd21c2c951df2f7ba0370ab6db8fa10", "b252f2a7c3d2e773bea91bf42aaa0acb39463176");
+  let text = format!(
+    "\n{one}\nzz{two} bad\n{} odd\n{} unheld\n{} short\n{one} again\n{two} again\n{one} a name\r\n",
+    two.get(1..).unwrap(),
+    "a".repeat(40),
+    two.get(..38).unwrap(),
+  );
+  let imported = imported(&mut states_with("bookmarks", text.as_bytes()));
+  let kept: Vec<(Vec<u8>, String)> = imported.bookmarks.iter().map(|(name, node)| (name.clone(), hex(node))).collect();
+  let expected = vec![(b"a name".to_vec(), one.to_string()), (b"again".to_vec(), two.to_string())];
+  assert_eq!((kept, imported.malformed_bookmarks, imported.dropped_bookmarks), (expected, 3, 2));
+}
+
+/// AC-HG.9, A-649 part 2: do import an obsstore cut by a byte, and an empty one. Expect the first refused by the
+/// markers' reader with nothing left held, and the second read as no marker, as 7.2 reads it.
+#[test]
+fn an_obsstore_is_read_whole_or_refused() {
+  let obsstore = state_fixtures::file("states/obsstore");
+  let refusal = refused(&mut states_with("store/obsstore", &obsstore[..obsstore.len() - 1]));
+  assert!(matches!(refusal, ImportRefused::Markers(_)), "{refusal:?}");
+  assert_eq!(imported(&mut states_with("store/obsstore", &[])).markers, 0);
 }
 
 proptest! {

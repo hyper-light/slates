@@ -32,6 +32,16 @@
 //! missing"), so a damaged fncache or file index cannot drop a file's history unseen; and every revision keeps its
 //! revlog's own number, since a node a log holds twice would be passed over and shift the numbers after it.
 //!
+//! **The repository's state beside its history** (A-649 part 2), read after the logs as 7.2 reads it: the phase roots
+//! (`phaseroots`, as `phases._readroots` reads it: a line it cannot read refused, as it aborts; a root whose node the
+//! changelog lacks dropped and counted, as it drops one; a public root passed over, since it changes nothing), the
+//! bookmarks (`.hg/bookmarks`, or the store's under `bookmarksinstore`, as `bookmarks.bmstore` reads them: a malformed
+//! line passed over and counted, as it warns and passes over, a node the changelog lacks dropped and counted, a name
+//! given twice its later node), and the obsolescence markers (`obsstore`, checked whole as `obsolete.obsstore` reads it,
+//! empty when empty). The phase roots and bookmarks are the repository's mutable state, which the register records
+//! (A-642's logs; a row of the index is never rewritten), so they come back typed in [`Imported`]; the markers are facts
+//! never changed, kept as the index's marker rows in the obsstore's order, each alone in the obsstore's format.
+//!
 //! **Refused by kind**, where 7.2 would read on: a censored revision (its text a tombstone), an ellipsis revision (a
 //! narrow clone's shortened history) and an externally stored one (lfs), whose texts do not hash to their nodes and
 //! whose pieces come later (§4.17.3 pieces 10 and 11); and, as 7.2 refuses them, revision flags 7.2 does not know
@@ -49,13 +59,17 @@
 //! rather than whole; a text rebuilt from the one before it where its chain passes through it, as 7.2's revision cache
 //! does, rather than from its chain's base; and the server's adapter from §4.15's host seam.
 
+use std::collections::BTreeMap;
+
 use slates_vcs::{ContentId, ContentRefused, ContentStore, IndexRefused};
 
 use crate::changeset::{self, Changeset};
 use crate::file_index;
 use crate::filerev;
 use crate::index::{self, HgIndex, Log, NewChangeset, NewRevision};
-use crate::node::CollisionAttack;
+use crate::node::{self, CollisionAttack};
+use crate::obsmarkers;
+use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
 use crate::revlog::{self, Entry, NONE, Revlog};
 use crate::store::{self, FncacheRefused, Layout, Listing, RequiresRefused, Shape};
@@ -151,6 +165,27 @@ const DEFAULT_BRANCH: &[u8] = b"default";
 /// Format: the extra a closing changeset holds.
 const CLOSE: &[u8] = b"close";
 
+/// Format: the store's phase roots (`phases.py`).
+const PHASEROOTS: &[u8] = b"phaseroots";
+
+/// Format: the bookmarks file, under `.hg` or, with `bookmarksinstore`, the store (`bookmarks.py`).
+const BOOKMARKS: &[u8] = b"bookmarks";
+
+/// Format: the store's obsolescence markers (`obsolete.py`).
+const OBSSTORE: &[u8] = b"obsstore";
+
+/// Format: the bytes Python's `bytes.split()` and `bytes.strip()` take for whitespace.
+const PYTHON_WHITESPACE: &[u8] = b" \t\n\r\x0b\x0c";
+
+/// Format: the end of a line, as a file's lines are read.
+const NEWLINE: u8 = b'\n';
+
+/// Format: what parts a bookmark's node from its name (`split(b' ', 1)`).
+const SPACE: u8 = b' ';
+
+/// Format: a phase's number is written in decimal.
+const DECIMAL_RADIX: u32 = 10;
+
 /// Why the host did not hand a file over.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileRefused<R> {
@@ -190,6 +225,19 @@ pub struct Imported {
   pub file_logs: u64,
   /// The file revisions, over every file log.
   pub file_revisions: u64,
+  /// The roots of the draft, secret, archived and internal phases, each a changeset the changelog holds, sorted by
+  /// phase and node: the repository's state, for the register to record.
+  pub phase_roots: Vec<PhaseHead>,
+  /// Phase roots dropped, as 7.2 drops them: their nodes are not the changelog's.
+  pub dropped_phase_roots: u64,
+  /// The bookmarks, each its name and a changeset the changelog holds, sorted by name: for the register's greens.
+  pub bookmarks: Vec<(Vec<u8>, Node)>,
+  /// Bookmarks dropped, as 7.2 drops them: their nodes are not the changelog's.
+  pub dropped_bookmarks: u64,
+  /// Bookmark lines passed over, as 7.2 passes them over with "malformed line in .hg/bookmarks".
+  pub malformed_bookmarks: u64,
+  /// The obsolescence markers, kept as the index's marker rows in the obsstore's order.
+  pub markers: u64,
 }
 
 /// Why an import was refused. Nothing it took is left held: its index is released and its holds given back.
@@ -265,6 +313,21 @@ pub enum ImportRefused<R> {
     rev: u32,
     /// The flags.
     flags: u16,
+  },
+  /// A `phaseroots` line 7.2 would not read: not two fields, a phase it does not define, or a node that is not forty
+  /// hexadecimal digits (it aborts on each).
+  PhaseRoots {
+    /// The line's number, from 1.
+    line: u64,
+  },
+  /// An obsstore 7.2 would not read.
+  Markers(obsmarkers::Refusal),
+  /// A marker that does not write alone in its obsstore's own format.
+  MarkerUnencodable {
+    /// The marker's place in the obsstore, from 0.
+    marker: u64,
+    /// The encoder's refusal.
+    refusal: obsmarkers::EncodeRefusal,
   },
   /// A changeset 7.2 would not read.
   Changeset {
@@ -728,7 +791,95 @@ impl<F: RepositoryFiles> Walk<'_, F> {
       imported.file_logs = imported.file_logs.saturating_add(1);
       imported.file_revisions = imported.file_revisions.saturating_add(u64::from(revisions));
     }
+    self.phase_roots(imported)?;
+    self.bookmarks(imported)?;
+    imported.markers = self.markers(&mut imported.index)?;
     Ok(())
+  }
+
+  /// The store's phase roots into `imported` (module docs).
+  fn phase_roots(&mut self, imported: &mut Imported) -> Result<(), ImportRefused<F::Refused>> {
+    let mut room = self.room;
+    let Some(bytes) = self.read_store_file(PHASEROOTS, &mut room)?.1 else {
+      return Ok(());
+    };
+    let (roots, dropped) = read_phase_roots(&bytes, &imported.index, self.store)?;
+    self.room.charge_items::<PhaseHead>(roots.len())?;
+    imported.phase_roots = roots;
+    imported.dropped_phase_roots = dropped;
+    Ok(())
+  }
+
+  /// The repository's bookmarks into `imported`: `.hg/bookmarks`, or the store's under `bookmarksinstore` (module
+  /// docs).
+  fn bookmarks(&mut self, imported: &mut Imported) -> Result<(), ImportRefused<F::Refused>> {
+    let mut room = self.room;
+    let read = if self.shape.bookmarks_in_store {
+      self.read_store_file(BOOKMARKS, &mut room)?.1
+    } else {
+      self.files.read(&[BOOKMARKS], &mut room)?
+    };
+    let Some(bytes) = read else {
+      return Ok(());
+    };
+    let read = read_bookmarks(&bytes, &imported.index, self.store);
+    let names = read
+      .found
+      .keys()
+      .fold(0_usize, |total, name| total.saturating_add(name.len()));
+    self.room.charge(to_u64(names))?;
+    self.room.charge_items::<(Vec<u8>, Node)>(read.found.len())?;
+    imported.bookmarks = read.found.into_iter().collect();
+    imported.dropped_bookmarks = read.dropped;
+    imported.malformed_bookmarks = read.malformed;
+    Ok(())
+  }
+
+  /// The store's obsolescence markers, checked whole, kept as the index's marker rows in the obsstore's order, each
+  /// alone in the obsstore's format; how many.
+  fn markers(&mut self, index: &mut HgIndex) -> Result<u64, ImportRefused<F::Refused>> {
+    let mut room = self.room;
+    let read = self.read_store_file(OBSSTORE, &mut room)?.1;
+    let Some(bytes) = read.filter(|bytes| !bytes.is_empty()) else {
+      return Ok(0);
+    };
+    let markers = obsmarkers::decode(&bytes).map_err(ImportRefused::Markers)?;
+    room.charge_items::<ContentId>(markers.len())?;
+    let mut held = Held::default();
+    let outcome = self
+      .keep_markers(&markers, &mut held, room)
+      .and_then(|kept| {
+        index
+          .append_markers(self.store, &kept)
+          .map_err(ImportRefused::from)
+      });
+    held
+      .give_back(self.store, outcome)
+      .map(|numbers| to_u64(numbers.len()))
+  }
+
+  /// Each marker kept alone in its obsstore's format, its encoding charged to a copy of `room` first.
+  fn keep_markers(
+    &mut self,
+    markers: &obsmarkers::Markers<'_>,
+    held: &mut Held,
+    room: Admission,
+  ) -> Result<Vec<ContentId>, ImportRefused<F::Refused>> {
+    let format = markers.format();
+    let mut kept = Vec::with_capacity(markers.len());
+    for (number, marker) in (0_u64..).zip(markers.iter()) {
+      let unencodable = |refusal| ImportRefused::MarkerUnencodable {
+        marker: number,
+        refusal,
+      };
+      let len = obsmarkers::encoded_len(format, &[marker]).map_err(unencodable)?;
+      let mut marker_room = room;
+      marker_room.charge(len)?;
+      let mut alone = Vec::new();
+      obsmarkers::encode(format, &[marker], &mut alone).map_err(unencodable)?;
+      kept.push(held.put(self.store, &alone)?);
+    }
+    Ok(kept)
   }
 
   /// Reads the store file `path` (unencoded), named as the store's encoding names it; with the name it was asked by.
@@ -983,6 +1134,102 @@ impl<F: RepositoryFiles> Walk<'_, F> {
     }
     Ok(())
   }
+}
+
+/// The phase roots of a `phaseroots` file (module docs); with how many were dropped.
+fn read_phase_roots<R>(
+  bytes: &[u8],
+  index: &HgIndex,
+  store: &ContentStore,
+) -> Result<(Vec<PhaseHead>, u64), ImportRefused<R>> {
+  let mut roots = Vec::new();
+  let mut dropped: u64 = 0;
+  for (line, text) in (1_u64..).zip(bytes.split_inclusive(|byte| *byte == NEWLINE)) {
+    let root = phase_root(text).ok_or(ImportRefused::PhaseRoots { line })?;
+    if root.phase == Phase::Public {
+      continue;
+    }
+    if index.rev(store, Log::Changelog, &root.node).is_none() {
+      dropped = dropped.saturating_add(1);
+      continue;
+    }
+    roots.push(root);
+  }
+  roots.sort_unstable_by_key(|root| (root.phase.number(), root.node));
+  roots.dedup();
+  Ok((roots, dropped))
+}
+
+/// One `phaseroots` line's root: two fields between Python's whitespace, a phase 7.2 defines in decimal digits and a
+/// node's forty hexadecimal digits.
+fn phase_root(text: &[u8]) -> Option<PhaseHead> {
+  let mut fields = text
+    .split(|byte| PYTHON_WHITESPACE.contains(byte))
+    .filter(|field| !field.is_empty());
+  let (Some(number), Some(hex), None) = (fields.next(), fields.next(), fields.next()) else {
+    return None;
+  };
+  Some(PhaseHead {
+    phase: Phase::from_number(decimal(number)?)?,
+    node: node::from_hex(hex)?,
+  })
+}
+
+/// Decimal digits' value, `None` for anything else or a value past an `i32`.
+fn decimal(field: &[u8]) -> Option<i32> {
+  let radix = i32::try_from(DECIMAL_RADIX).ok()?;
+  let value = field.iter().try_fold(0_i32, |value, digit| {
+    let digit = i32::try_from(char::from(*digit).to_digit(DECIMAL_RADIX)?).ok()?;
+    value.checked_mul(radix)?.checked_add(digit)
+  })?;
+  (!field.is_empty()).then_some(value)
+}
+
+/// What a bookmarks file holds.
+#[derive(Default)]
+struct ReadBookmarks {
+  /// Each name's node, the later line's for a name given twice.
+  found: BTreeMap<Vec<u8>, Node>,
+  /// Lines whose nodes the changelog does not hold.
+  dropped: u64,
+  /// Lines passed over as malformed.
+  malformed: u64,
+}
+
+/// The bookmarks a bookmarks file holds (module docs): each line stripped of Python's whitespace, an empty one passed
+/// over; a node in hexadecimal, a space and the name.
+fn read_bookmarks(bytes: &[u8], index: &HgIndex, store: &ContentStore) -> ReadBookmarks {
+  let mut read = ReadBookmarks::default();
+  for text in bytes.split_inclusive(|byte| *byte == NEWLINE) {
+    let line = strip(text);
+    if line.is_empty() {
+      continue;
+    }
+    let parted = line.iter().position(|byte| *byte == SPACE).and_then(|at| {
+      let hex = line.get(..at)?;
+      let hexadecimal = hex.len().is_multiple_of(2) && hex.iter().all(u8::is_ascii_hexdigit);
+      Some((hex, line.get(at.saturating_add(1)..)?)).filter(|_| hexadecimal)
+    });
+    let Some((hex, name)) = parted else {
+      read.malformed = read.malformed.saturating_add(1);
+      continue;
+    };
+    match node::from_hex(hex).filter(|node| index.rev(store, Log::Changelog, node).is_some()) {
+      Some(node) => {
+        read.found.insert(name.to_vec(), node);
+      }
+      None => read.dropped = read.dropped.saturating_add(1),
+    }
+  }
+  read
+}
+
+/// `text` without Python's whitespace at either end (`bytes.strip()`).
+fn strip(text: &[u8]) -> &[u8] {
+  let kept = |byte: &u8| !PYTHON_WHITESPACE.contains(byte);
+  let start = text.iter().position(kept).unwrap_or(text.len());
+  let end = text.iter().rposition(kept).map_or(start, |at| at.saturating_add(1));
+  text.get(start..end).unwrap_or_default()
 }
 
 /// One manifest or file log being read: where it goes in the index, its radix, and its revlog.
