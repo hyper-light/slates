@@ -1,0 +1,14 @@
+[/]
+* =
+
+[/trunk]
+* = r
+
+[/trunk/dir]
+* =
+
+[/trunk/dir/b.txt]
+* = r
+
+[/tags]
+* = r

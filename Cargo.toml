@@ -58,10 +58,12 @@ slates-http-edge = { path = "crates/http-edge", version = "0.1.0" }
 # git's wire, objects, store and smart HTTP routes (§4.17.2), which the daemon's git site serves (A-625 part 2).
 slates-git = { path = "crates/git", version = "0.1.0" }
 # SSH's transport, authentication and session channel as a sans-io core (§4.17.2 "Transports" 2; A-594, A-633, A-634),
-# which the daemon's SSH edge drives (A-651).
+# which the daemon's SSH edge drives (A-651); the daemon's credentials take an SSH key only when its user
+# authentication would (A-625 part 3).
 slates-ssh = { path = "crates/ssh", version = "0.1.0" }
-# Mercurial's exchange formats, objects, index and push (§4.17.3), whose pushes the daemon lands (A-657) and whose
-# repository stores it holds on each repository's owner shard (A-662, `slates_server::vcs_store`).
+# Mercurial's exchange formats, objects, index, push and import (§4.17.3), whose pushes the daemon lands (A-657), whose
+# repository stores it holds on each repository's owner shard (A-662, `slates_server::vcs_store`) and whose import the
+# daemon's base adapter answers (A-649 part 4).
 slates-hg = { path = "crates/hg", version = "0.1.0" }
 # Subversion's server (§4.17.4), whose repository stores the daemon holds on each repository's owner shard (A-662).
 slates-svn = { path = "crates/svn", version = "0.1.0" }

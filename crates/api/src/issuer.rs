@@ -15,16 +15,18 @@
 //! secret and the secret is held in this process only for the length of one proof.
 //!
 //! Moved here from the CLI on 2026-11-18 (A-278): `slates grant`, `enroll`, `revoke`, `run` and `recover` use it, as an
-//! embedding host's launcher does.
+//! embedding host's launcher does; `slates credential` enrolls and revokes version-control credentials with it (A-625
+//! part 3).
 
 use slates_anchor::AnchorSegment;
 use slates_anchor::layout::ISSUER_SECRET_BYTES;
 use slates_anchor::segment::{ENV_HANDOFF, ENV_LEN};
 use slates_ipc::delivery::Capability;
+use slates_ipc::protocol::{CredentialMaterial, Principal};
 use slates_machine::facts::{Facts, Identity};
 use slates_mem::Handoff;
 
-use crate::error::{Denied, Error, IssuerFault};
+use crate::error::{Denied, Error, IssuerFault, Unsupported};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::instance::Instance;
 use crate::launcher::LauncherSecret;
@@ -157,6 +159,75 @@ impl Issuer {
     instance
       .client
       .revoke(consumer, proof)
+      .map_err(|e| instance.error(e))
+  }
+
+  /// Enrolls the SSH key whose blob is `blob` for `principal` until `expires_ns` on the wall clock, if one is given
+  /// (§4.13, §4.17.2 "Access"; A-625 part 3); its id, OpenSSH's fingerprint of the blob. The daemon takes a key only
+  /// when SSH's user authentication would.
+  pub fn enroll_ssh_key(
+    &self,
+    instance: &mut Instance,
+    principal: Principal,
+    blob: Vec<u8>,
+    expires_ns: Option<u64>,
+  ) -> Result<[u8; 32], Error> {
+    self.enroll_credential(
+      instance,
+      principal,
+      CredentialMaterial::SshKey { blob },
+      expires_ns,
+    )
+  }
+
+  /// Mints an HTTP token for `principal`, good until `expires_ns` on the wall clock if one is given, and enrolls it by
+  /// its hash (A-625 part 3): the token's text, shown this once, and its id. The daemon is sent the hash alone, so the
+  /// token never crosses a channel; whoever holds the text presents it as Basic's password or as a bearer token.
+  pub fn enroll_token(
+    &self,
+    instance: &mut Instance,
+    principal: Principal,
+    expires_ns: Option<u64>,
+  ) -> Result<(String, [u8; 32]), Error> {
+    let mut random = [0u8; slates_server::credentials::TOKEN_RANDOM_BYTES];
+    slates_transport::handshake::secure_random(&mut random)
+      .map_err(|_| Error::Unsupported(Unsupported::SecureRandom))?;
+    let token = slates_server::credentials::token_text(&random);
+    let id = slates_server::credentials::token_id(token.as_bytes());
+    self.enroll_credential(
+      instance,
+      principal,
+      CredentialMaterial::HttpToken { id },
+      expires_ns,
+    )?;
+    Ok((token, id))
+  }
+
+  /// Enrolls `material` for `principal` until `expires_ns`, proven under the running daemon's secret; its id.
+  fn enroll_credential(
+    &self,
+    instance: &mut Instance,
+    principal: Principal,
+    material: CredentialMaterial,
+    expires_ns: Option<u64>,
+  ) -> Result<[u8; 32], Error> {
+    let secret = self.secret()?;
+    let proof =
+      slates_server::credentials::enroll_proof(&secret, &principal, &material, expires_ns);
+    instance
+      .client
+      .enroll_credential(principal, material, expires_ns, proof)
+      .map_err(|e| instance.error(e))
+  }
+
+  /// Revokes the version-control credential named `id` (§4.13; A-625 part 3): a later login or request presenting it
+  /// is refused.
+  pub fn revoke_credential(&self, instance: &mut Instance, id: [u8; 32]) -> Result<(), Error> {
+    let secret = self.secret()?;
+    let proof = slates_server::credentials::revoke_proof(&secret, &id);
+    instance
+      .client
+      .revoke_credential(id, proof)
       .map_err(|e| instance.error(e))
   }
 

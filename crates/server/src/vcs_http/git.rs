@@ -6,12 +6,16 @@
 //! **The order**, each refusal with its status and the three cache fields `http-backend` sends on every answer:
 //! 1. The route. A path, method, service or content type `http-backend` refuses is refused as it refuses it, whoever
 //!    asks: its syntax names no repository, so a client learns its mistake without credentials.
-//! 2. The credentials. None, another scheme, Basic in cleartext, or a credential that proves no principal is `401` with
-//!    the challenges the connection accepts (RFC 9110 §11.6.1: "A server generating a 401 (Unauthorized) response MUST
-//!    send a WWW-Authenticate header field containing at least one challenge"; Basic over TLS alone, RFC 7617 §4); a
-//!    repeated or malformed `Authorization` is `400`. Nothing about a repository is answered to a client that has proved
-//!    no one.
-//! 3. The repository. None of that name, or one of another tool, is `404` (§4.17.2: "No repository is `404`").
+//! 2. The credentials. None, another scheme, Basic in cleartext, or a credential that proves no principal (none held
+//!    under its hash, past its expiry, a revoked consumer's, an SSH key's) is `401` with the challenges the connection
+//!    accepts (RFC 9110 §11.6.1: "A server generating a 401 (Unauthorized) response MUST send a WWW-Authenticate header
+//!    field containing at least one challenge"; Basic over TLS alone, RFC 7617 §4); a repeated or malformed
+//!    `Authorization` is `400`; a credential record that did not answer is `503`. Nothing about a repository is answered
+//!    to a client that has proved no one. The proof is the credential record's (`crate::credentials`, A-625 part 3).
+//! 3. The repository. A name another shard's partition holds moves the connection there whole, its head undecided, and
+//!    the head is decided again where the repository lives ([`Answer::Move`]; main's ruling, 2026-11-19, as the NFS
+//!    export moves a mount's connection, §4.6), so its every step lends the store on its own shard. There, none of that
+//!    name, or one of another tool, is `404` (§4.17.2: "No repository is `404`").
 //! 4. The policy. A principal the repository's policy lets reach it for none of the service's rights is `403`
 //!    (gitprotocol-http: "If there is a repository at `$GIT_URL`, but access is not currently permitted, the server MUST
 //!    respond with the `403 Forbidden` HTTP status code"). upload-pack asks to read; receive-pack, its advertisement too,
@@ -22,6 +26,8 @@
 //!    9110 §15.6.4: "the server is currently unable to handle the request"). upload-pack is served from a repository's
 //!    store by [`upload`] (A-640 part 2, A-625 part 3), once the server lends stores (owed); receive-pack answers `503`
 //!    until its session's entry point lands (A-654). `Unserved` answers `503` to both.
+//!
+//! Every refusal of steps 2 to 5 is typed ([`Refused`]) and counted under its kind in the shard's status counters.
 //!
 //! A served request is `200` with the service's content type and the cache fields, in `http-backend`'s order
 //! (`slates_git::http::reply_fields`), its body the advertisement's `# service=` prelude for protocols v0 and v1
@@ -37,7 +43,7 @@ use slates_http::Admission;
 use slates_http::head::Head;
 use slates_http::reply::Status;
 use slates_http_edge::connection::Fields;
-use slates_http_edge::credential::{self, Credential};
+use slates_http_edge::credential::{self, Credential, CredentialRefused};
 
 use super::{Answer, Decided, Exchange, Failed, Site};
 use crate::vcs_policy::{self, Right};
@@ -46,17 +52,111 @@ mod upload;
 
 pub(crate) use upload::{StoreLender, UploadServices};
 
-/// What proves a request's credentials to a principal (§4.13): the token a Basic credential carries as its password, or a
-/// bearer token, looked up among the principals' keys. A credential that proves no one is `401`.
-pub(crate) trait Authenticator {
-  /// The principal `credential` proves, if any.
-  fn principal(&self, credential: &Credential) -> Option<Principal>;
+/// What a request's credential proved (§4.13; A-625 part 3): its principal, and the expiry an LFS action carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Proven {
+  /// The principal.
+  pub(crate) principal: Principal,
+  /// The credential's expiry on the wall clock (nanoseconds since the Unix epoch), for a bearer token that has one:
+  /// what an LFS action's `expires_at` carries (A-629). None for Basic, whose transfers authenticate as their batch did,
+  /// and for a token that never expires.
+  pub(crate) bearer_expires_ns: Option<u64>,
 }
 
-/// Where a repository is found by its name (§4.17.1: a name unique on the partition a stable hash of it chooses).
+/// Why a credential proved no one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unproven {
+  /// No credential is held under its hash.
+  Unknown,
+  /// It is past its expiry.
+  Expired,
+  /// It is an enrolled consumer's, and a human revoked the consumer (§4.13: "every later effect refuses").
+  Revoked,
+  /// Its hash names an SSH key, which proves no one over HTTP.
+  NotAToken,
+  /// The partition its hash routes to did not answer.
+  Unanswered,
+}
+
+/// What proves a request's credentials to a principal (§4.13): the token a Basic credential carries as its password, or a
+/// bearer token, looked up in the credential record (`crate::credentials`).
+pub(crate) trait Authenticator {
+  /// What `credential` proves.
+  async fn prove(&self, credential: &Credential) -> Result<Proven, Unproven>;
+}
+
+/// Where a repository's name lives (§4.17.1: a name is unique on the partition a stable hash of it chooses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Located {
+  /// On this shard.
+  Here,
+  /// On runtime shard `shard`, where the connection moves.
+  Elsewhere(u16),
+}
+
+/// Where a repository is found by its name.
 pub(crate) trait Repositories {
-  /// The repository named `name`, if one is.
+  /// Where the repository named `name` lives.
+  fn locate(&self, name: &str) -> Located;
+  /// The repository named `name` on this shard, if one is.
   fn find(&self, name: &str) -> Option<RepositoryRecord>;
+}
+
+/// Why git's site refused a request, by kind: each answered with its status and counted under its name (A-625 part 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+  /// No credentials, or a scheme other than Basic and Bearer: `401`.
+  NoCredentials,
+  /// Basic on a cleartext connection (RFC 7617 §4): `401`, its challenges offering Bearer alone.
+  CleartextBasic,
+  /// An `Authorization` field repeated or broken: `400`.
+  MalformedCredentials,
+  /// A credential that proved no one: `401`, or `503` when its record did not answer.
+  Unproven(Unproven),
+  /// No git repository of that name: `404`.
+  NoRepository,
+  /// The repository's policy lets the principal reach it for none of the service's rights: `403`.
+  Forbidden,
+  /// The repository's policy cannot be read: `500`.
+  Unreadable,
+  /// The service's server half, or the repository's store, is not here: `503`.
+  Unavailable,
+}
+
+impl Refused {
+  /// The status it is answered with.
+  pub(crate) fn status(self) -> Status {
+    match self {
+      Refused::NoCredentials
+      | Refused::CleartextBasic
+      | Refused::Unproven(
+        Unproven::Unknown | Unproven::Expired | Unproven::Revoked | Unproven::NotAToken,
+      ) => Status::UNAUTHORIZED,
+      Refused::MalformedCredentials => Status::BAD_REQUEST,
+      Refused::Unproven(Unproven::Unanswered) | Refused::Unavailable => Status::SERVICE_UNAVAILABLE,
+      Refused::NoRepository => Status::NOT_FOUND,
+      Refused::Forbidden => Status::FORBIDDEN,
+      Refused::Unreadable => Status::INTERNAL_SERVER_ERROR,
+    }
+  }
+
+  /// Format: the counter it is counted under in the shard's status report.
+  pub(crate) fn counter(self) -> &'static str {
+    match self {
+      Refused::NoCredentials => "vcs_http.git.no_credentials",
+      Refused::CleartextBasic => "vcs_http.git.cleartext_basic",
+      Refused::MalformedCredentials => "vcs_http.git.malformed_credentials",
+      Refused::Unproven(Unproven::Unknown) => "vcs_http.git.unknown_credential",
+      Refused::Unproven(Unproven::Expired) => "vcs_http.git.expired_credential",
+      Refused::Unproven(Unproven::Revoked) => "vcs_http.git.revoked_consumer",
+      Refused::Unproven(Unproven::NotAToken) => "vcs_http.git.not_a_token",
+      Refused::Unproven(Unproven::Unanswered) => "vcs_http.git.credentials_unanswered",
+      Refused::NoRepository => "vcs_http.git.no_repository",
+      Refused::Forbidden => "vcs_http.git.forbidden",
+      Refused::Unreadable => "vcs_http.git.policy_unreadable",
+      Refused::Unavailable => "vcs_http.git.unavailable",
+    }
+  }
 }
 
 /// What a decided request starts its service with.
@@ -190,16 +290,6 @@ impl Asked {
   }
 }
 
-/// What a request's credentials came to.
-enum Proof {
-  /// The principal they prove.
-  Principal(Principal),
-  /// None proved: `401` with the challenges.
-  Unauthorized,
-  /// The `Authorization` line itself refused, with this status (`400`).
-  Refused(Status),
-}
-
 /// git's site: the realm its challenges name, the room a route's decoded path is charged to, and the authenticator,
 /// repositories and services it decides with (the module doc).
 pub(crate) struct GitSite<A, R, S> {
@@ -233,8 +323,9 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     }
   }
 
-  /// The answer to `head`, on a connection that is TLS when `secure`, in the module doc's order.
-  pub(crate) fn answer(
+  /// The answer to `head`, on a connection that is TLS when `secure`, in the module doc's order: refused by kind, moved to
+  /// the shard its repository lives on, or served.
+  pub(crate) async fn answer(
     &mut self,
     head: &Head<'_>,
     secure: bool,
@@ -246,38 +337,63 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
         return refused_with(status, owned(&fields), false);
       }
     };
-    let principal = match self.proof(head, secure) {
-      Proof::Principal(principal) => principal,
-      Proof::Unauthorized => return self.unauthorized(secure),
-      Proof::Refused(status) => return refused_with(status, cache_fields(), false),
+    let proven = match self.proof(head, secure).await {
+      Ok(proven) => proven,
+      Err(refused) => return self.refuse(refused, secure, false),
     };
     let asked = Asked::of(route);
+    if let Located::Elsewhere(shard) = self.repositories.locate(&asked.repository) {
+      return Decided {
+        answer: Answer::Move { shard },
+        proven: true,
+      };
+    }
     let Some(repository) = self
       .repositories
       .find(&asked.repository)
       .filter(|repository| repository.tool == VcsTool::Git)
     else {
-      return refused_with(Status::NOT_FOUND, cache_fields(), true);
+      return self.refuse(Refused::NoRepository, secure, true);
     };
-    match vcs_policy::reaches(&repository, &principal, rights(asked.service)) {
-      Ok(true) => self.start(&asked, &repository, &principal),
-      Ok(false) => refused_with(Status::FORBIDDEN, cache_fields(), true),
+    match vcs_policy::reaches(&repository, &proven.principal, rights(asked.service)) {
+      Ok(true) => self.start(&asked, &repository, &proven.principal, secure),
+      Ok(false) => self.refuse(Refused::Forbidden, secure, true),
       // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
-      Err(_) => refused_with(Status::INTERNAL_SERVER_ERROR, cache_fields(), true),
+      Err(_) => self.refuse(Refused::Unreadable, secure, true),
     }
   }
 
-  /// What `head`'s credentials prove.
-  fn proof(&self, head: &Head<'_>, secure: bool) -> Proof {
-    match credential::credential(head, secure) {
-      Ok(Some(credential)) => self
-        .authenticator
-        .principal(&credential)
-        .map_or(Proof::Unauthorized, Proof::Principal),
-      Ok(None) => Proof::Unauthorized,
-      Err(refused) if refused.status() == Status::UNAUTHORIZED => Proof::Unauthorized,
-      Err(refused) => Proof::Refused(refused.status()),
+  /// What `head`'s credentials prove, or why they prove no one.
+  async fn proof(&self, head: &Head<'_>, secure: bool) -> Result<Proven, Refused> {
+    let credential = match credential::credential(head, secure) {
+      Ok(Some(credential)) => credential,
+      Ok(None) | Err(CredentialRefused::UnknownScheme) => return Err(Refused::NoCredentials),
+      Err(CredentialRefused::BasicInCleartext) => return Err(Refused::CleartextBasic),
+      Err(CredentialRefused::Repeated | CredentialRefused::Malformed) => {
+        return Err(Refused::MalformedCredentials);
+      }
+    };
+    self
+      .authenticator
+      .prove(&credential)
+      .await
+      .map_err(Refused::Unproven)
+  }
+
+  /// `refused`'s answer, counted under its kind: `401` with the challenges a connection that is TLS when `secure`
+  /// accepts, any other status with the cache fields. `proven` when the credentials proved a principal.
+  fn refuse(
+    &self,
+    refused: Refused,
+    secure: bool,
+    proven: bool,
+  ) -> Decided<GitExchange<S::Exchange>> {
+    crate::fleet::count_refusal(refused.counter());
+    let status = refused.status();
+    if status == Status::UNAUTHORIZED {
+      return self.unauthorized(secure);
     }
+    refused_with(status, cache_fields(), proven)
   }
 
   /// `401` with the challenges a connection that is TLS when `secure` accepts, then the cache fields.
@@ -295,12 +411,13 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
   }
 
   /// Starts the service `asked` names for `principal` on `repository`: served with its reply's fields and its exchange,
-  /// or `503` while it has not landed.
+  /// or `503` while it has not landed or the repository's store is not here.
   fn start(
     &mut self,
     asked: &Asked,
     repository: &RepositoryRecord,
     principal: &Principal,
+    secure: bool,
   ) -> Decided<GitExchange<S::Exchange>> {
     let start = Start {
       repository,
@@ -312,7 +429,7 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     let service = match self.services.start(&start) {
       Ok(service) => service,
       Err(ServiceRefused::Unavailable) => {
-        return refused_with(Status::SERVICE_UNAVAILABLE, cache_fields(), true);
+        return self.refuse(Refused::Unavailable, secure, true);
       }
     };
     let mut prelude = Vec::new();
@@ -339,7 +456,7 @@ impl<A: Authenticator, R: Repositories, S: GitServices> Site for GitSite<A, R, S
   type Exchange = GitExchange<S::Exchange>;
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    self.answer(head, secure)
+    self.answer(head, secure).await
   }
 }
 

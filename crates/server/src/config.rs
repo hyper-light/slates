@@ -476,8 +476,67 @@ pub struct DaemonConfig {
   /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter, so a reply may hand one
   /// out with no barrier of its own while a successor still starts past it ([`inode_reserve`]).
   pub inode_reserve: u64,
+  /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
+  /// none from [`DaemonConfig::derive`].
+  pub vcs_http: Option<VcsHttpConfig>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
+}
+
+/// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3): where it listens and the identity
+/// its HTTPS presents. Its connections, seats and request room are derived from each shard's budget, never configured
+/// (`crate::vcs_http::Bounds::of_shard`).
+#[derive(Clone, Debug)]
+pub struct VcsHttpConfig {
+  /// Where the edge listens. Without an identity it serves cleartext, which it does only on a loopback address (RFC 7617
+  /// §4, RFC 6750 §5.3).
+  pub address: slates_rt::tcp::SocketAddrV4,
+  /// The certificate chain and key its HTTPS presents: the node's own, the identity its RPC-with-TLS export presents
+  /// (§4.6, AUD-29-75), handed in by the command that read the operator's files (R1: the daemon reads none).
+  pub identity: Option<EdgeIdentity>,
+}
+
+/// An HTTPS identity as the operator's command hands it in: the certificate chain, leaf first, and the leaf's private
+/// key, each DER. Its `Debug` never shows the key.
+#[derive(Clone)]
+pub struct EdgeIdentity {
+  /// The chain, leaf first.
+  chain: Vec<Vec<u8>>,
+  /// The leaf's private key (PKCS#8, PKCS#1 or SEC1).
+  key: Vec<u8>,
+}
+
+impl EdgeIdentity {
+  /// The identity presenting `chain`, leaf first, with the leaf's private key `key`, each DER.
+  pub fn new(chain: Vec<Vec<u8>>, key: Vec<u8>) -> EdgeIdentity {
+    EdgeIdentity { chain, key }
+  }
+
+  /// The edge's serving identity, refused when the key is no key rustls reads or the chain and key make no server
+  /// configuration.
+  pub(crate) fn serving(
+    &self,
+  ) -> Result<slates_http_edge::tls::ServingIdentity, slates_http_edge::tls::TlsRefused> {
+    let chain = self
+      .chain
+      .iter()
+      .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+      .collect();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(self.key.clone()).map_err(|reason| {
+      slates_http_edge::tls::TlsRefused::Setup(rustls::Error::General(reason.to_owned()))
+    })?;
+    slates_http_edge::tls::ServingIdentity::new(chain, key)
+  }
+}
+
+impl std::fmt::Debug for EdgeIdentity {
+  /// The chain's length, never the key.
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("EdgeIdentity")
+      .field("certificates", &self.chain.len())
+      .finish_non_exhaustive()
+  }
 }
 
 /// The liveness window on this machine ([`liveness_window`]): the derived window and the floor the machine measured.
@@ -1134,6 +1193,7 @@ impl DaemonConfig {
       guest_credits,
       nfs_v4,
       inode_reserve,
+      vcs_http: None,
       derivations,
     }
     .with_control_shard_noted()

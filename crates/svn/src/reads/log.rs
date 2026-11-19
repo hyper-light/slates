@@ -40,8 +40,8 @@ mod merged;
 use super::history::History;
 use super::stream::{Progress, Stream};
 use super::{
-  AUTHOR_PROPERTY, DATE_PROPERTY, DONE, Failure, Outcome, ROOT, Reads, Repository, boolean,
-  c_string_of, full_path, kind_word, optional_revnum,
+  AUTHOR_PROPERTY, DATE_PROPERTY, DONE, Failure, Outcome, ROOT, Reads, Repository, RevisionAccess,
+  boolean, c_string_of, full_path, kind_word, optional_revnum,
 };
 use crate::index::{Action, ChangedPath, Revision};
 use crate::mergeinfo::Mergeinfo;
@@ -407,7 +407,8 @@ impl LogStream {
   }
 
   /// `svn_repos_get_logs5` before the walk: the range settled and checked, then the shortcut for no paths or the root
-  /// alone, else `do_logs` over the paths' histories.
+  /// alone (refused, "Item is not readable", where the session may not read the root), else `do_logs` over the paths'
+  /// histories.
   fn begin<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), Stop> {
     let head = reads.index.youngest();
     let settle = |revision: Option<i64>| -> Result<Revision, Failure> {
@@ -424,6 +425,9 @@ impl LogStream {
     let root_alone =
       paths.is_empty() || (paths.len() == 1 && paths.first().is_some_and(|path| path == ROOT));
     if root_alone && !self.request.merged {
+      if !reads.readable(ROOT) {
+        return Err(Failure::unreadable_item().into());
+      }
       let count = youngest.saturating_sub(oldest).saturating_add(1);
       let remaining = match self.request.limit {
         0 => count,
@@ -625,7 +629,9 @@ impl LogStream {
 
   /// `send_log` and `fill_log_entry`: the revision's changed paths when asked (never revision 0's), its revision
   /// properties as asked, then its entry; a merged revision only when a changed path lies outside the log's own history
-  /// (`interesting_merge`) and it was not sent before (`nested_merges`), its changed paths written either way.
+  /// (`interesting_merge`) and it was not sent before (`nested_merges`), its changed paths written either way. With
+  /// rules, `detect_changed`: a changed path the session may not read is left out, and a copy source it may not read
+  /// dropped from its change; then the revision properties shown are as many as the session may read of the revision.
   fn send<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
@@ -633,21 +639,14 @@ impl LogStream {
     sending: Sending,
   ) -> Result<(), Stop> {
     let judged = sending.handling && !self.history.is_empty();
-    let mut wanted = !judged;
-    if revision > 0 && (self.request.changed_paths || judged) {
-      let changes = reads
-        .index
-        .changes(revision)
-        .map_err(|refusal| Failure::of_index(&refusal))?;
-      for change in changes {
-        if self.request.changed_paths {
-          self.changed_path(reads, change)?;
-        }
-        wanted = wanted || outside_history(&self.history, revision, &change.path);
-      }
-    }
-    let properties = self.entry_properties(reads, revision);
-    if !wanted {
+    let (outside, access) =
+      if revision > 0 && (self.request.changed_paths || judged || reads.authz.is_some()) {
+        self.detect_changed(reads, revision, judged)?
+      } else {
+        (false, RevisionAccess::Full)
+      };
+    let properties = self.entry_properties(reads, revision, access);
+    if judged && !outside {
       return Ok(());
     }
     if sending.handling
@@ -663,6 +662,46 @@ impl LogStream {
     };
     self.entry(reads, revision, flags, properties)?;
     Ok(())
+  }
+
+  /// `detect_changed` with the receivers `send_log` gives it: each changed path the session may read written when
+  /// asked (its copy source too when the session may read that), and, when `judged`, whether one of them lies outside
+  /// the log's own history (`interesting_merge`). Answers that, and how much of the revision the session may read: all
+  /// of a revision that changed nothing.
+  fn detect_changed<R: Repository + ?Sized>(
+    &mut self,
+    reads: &mut Reads<'_, R>,
+    revision: Revision,
+    judged: bool,
+  ) -> Result<(bool, RevisionAccess), Stop> {
+    let changes = reads
+      .index
+      .changes(revision)
+      .map_err(|refusal| Failure::of_index(&refusal))?;
+    if changes.is_empty() {
+      return Ok((false, RevisionAccess::Full));
+    }
+    let (mut found_readable, mut found_unreadable, mut outside) = (false, false, false);
+    for change in changes {
+      if !reads.readable(&change.path) {
+        found_unreadable = true;
+        continue;
+      }
+      found_readable = true;
+      let source_readable = change
+        .copy_from
+        .as_ref()
+        .is_none_or(|source| reads.readable(&source.path));
+      found_unreadable |= !source_readable;
+      if self.request.changed_paths {
+        self.changed_path(reads, change, source_readable)?;
+      }
+      outside = outside || (judged && outside_history(&self.history, revision, &change.path));
+    }
+    Ok((
+      outside,
+      RevisionAccess::of(found_readable, found_unreadable),
+    ))
   }
 
   /// `handle_merged_revisions`' last entry, revision 0 marked `invalid-revnum`, closing an entry's children; nothing
@@ -683,11 +722,13 @@ impl LogStream {
     self.entry(reads, 0, flags, None)
   }
 
-  /// `path_change_receiver`: one changed path, the entry's two lists opened first.
+  /// `path_change_receiver`: one changed path, the entry's two lists opened first; its copy source written when the
+  /// session may read it.
   fn changed_path<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
     change: &ChangedPath,
+    source_readable: bool,
   ) -> Result<(), ItemError> {
     if !self.receiver.started {
       reads.out.extend_from_slice(LIST_OPEN);
@@ -703,6 +744,7 @@ impl LogStream {
     let copy = change
       .copy_from
       .iter()
+      .filter(|_| source_readable)
       .flat_map(|source| {
         [
           Value::String(source.path.as_bytes()),
@@ -726,13 +768,19 @@ impl LogStream {
     )
   }
 
-  /// `fill_log_entry`'s revision properties: none when none are wanted; every one; or, when the names asked match the
-  /// revision's own one for one, every one; else those named that the revision has.
+  /// `fill_log_entry`'s revision properties: none when none are wanted or the session may read none of the revision;
+  /// every one; or, when the names asked match the revision's own one for one, every one; else those named that the
+  /// revision has. Where the session may read the revision in part, the author and the date alone of those, the names
+  /// asked always matched one by one.
   fn entry_properties<'value, R: Repository + ?Sized>(
     &self,
     reads: &Reads<'value, R>,
     revision: Revision,
+    access: RevisionAccess,
   ) -> Option<Vec<(&'value [u8], &'value [u8])>> {
+    if access == RevisionAccess::Nothing {
+      return None;
+    }
     let wanted = match &self.request.revprops {
       Revprops::All => None,
       Revprops::Named(names) if names.is_empty() => return None,
@@ -743,9 +791,15 @@ impl LogStream {
       .revision_properties(revision)
       .unwrap_or_default();
     let Some(names) = wanted else {
-      return Some(all);
+      return Some(
+        all
+          .into_iter()
+          .filter(|(name, _)| access.shows(name))
+          .collect(),
+      );
     };
-    let matched = names.len() == all.len()
+    let matched = access == RevisionAccess::Full
+      && names.len() == all.len()
       && names
         .iter()
         .all(|name| all.iter().any(|(held, _)| *held == name.as_slice()));
@@ -753,7 +807,7 @@ impl LogStream {
       return Some(all);
     }
     let mut chosen: Vec<(&[u8], &[u8])> = Vec::new();
-    for name in names {
+    for name in names.iter().filter(|name| access.shows(name)) {
       if let Some(&(held, value)) = all.iter().find(|(held, _)| *held == name.as_slice())
         && !chosen.iter().any(|(kept, _)| *kept == held)
       {
@@ -836,7 +890,8 @@ impl LogStream {
 impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `get_path_histories`: each path's history opened at the range's youngest revision and taken to its first location,
   /// the path refused when absent there, or with `lenient` (`ignore_missing_locations`, a nested walk's) passed over
-  /// when it is absent, below a file or past the youngest; the youngest revision itself must be one.
+  /// when it is absent, below a file or past the youngest; the youngest revision itself must be one. A path the session
+  /// may not read is refused before its history is opened, "Item is not readable", lenient or not.
   fn path_histories(
     &self,
     paths: &[String],
@@ -848,6 +903,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     self.existing(i64::try_from(end).map_err(|_| Failure::corrupt())?)?;
     let mut histories = Vec::with_capacity(paths.len());
     for (position, path) in paths.iter().enumerate() {
+      if !self.readable(path) {
+        return Err(Failure::unreadable_item());
+      }
       match self.path_history(path, position, start, end, strict) {
         Ok(info) => histories.push(info),
         Err(failure) if lenient && missing(&failure) => {}
@@ -898,8 +956,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   }
 
   /// `get_history`: the path's next history location, from the history kept open or from one opened again at the last
-  /// location (one step past it, two after the first time); done when the history ends or passes the range's oldest
-  /// revision.
+  /// location (one step past it, two after the first time); done when the history ends, passes the range's oldest
+  /// revision, or reaches a location the session may not read.
   fn next_history(
     &self,
     info: &mut PathInfo,
@@ -928,7 +986,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     };
     info.path.clone_from(&location.path);
     info.history_rev = location.revision;
-    if location.revision < start {
+    if location.revision < start || !self.readable(&info.path) {
       info.done = true;
     }
     if info.kept {
