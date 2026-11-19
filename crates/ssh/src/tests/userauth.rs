@@ -24,12 +24,17 @@ const TEST3_SEED: &str = "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a
 /// The tests' key store: who holds which key blob for which user, and how many keys the principal wants.
 pub(crate) struct Holders {
   pub(crate) entries: Vec<(Vec<u8>, Vec<u8>, u32, u32)>,
+  /// Whether the holders cannot say yet of any key (A-651's deferred lookup).
+  pub(crate) unknown: bool,
 }
 
 impl KeyHolders for Holders {
   type Principal = u32;
 
   fn holding(&mut self, user: &[u8], _key: &UserKey, blob: &[u8]) -> Holding<u32> {
+    if self.unknown {
+      return Holding::Unknown;
+    }
     let found = self
       .entries
       .iter()
@@ -155,6 +160,7 @@ pub(crate) fn failure(partial: bool) -> Vec<u8> {
 fn holding(user: &[u8], blob: &[u8]) -> Holders {
   Holders {
     entries: vec![(user.to_vec(), blob.to_vec(), 7, 1)],
+    unknown: false,
   }
 }
 
@@ -168,6 +174,7 @@ fn replies(replies: Vec<Vec<u8>>) -> Answer<u32> {
   Answer {
     replies,
     authenticated: None,
+    wanted: None,
   }
 }
 
@@ -179,6 +186,7 @@ fn the_none_probe_names_publickey_and_counts_nothing() {
   let mut auth = Authenticator::<u32>::new(SESSION_ID, Some("slates: git over SSH".to_string()), 0);
   let mut store = Holders {
     entries: Vec::new(),
+    unknown: false,
   };
   let mut banner = vec![53];
   put_string(&mut banner, b"slates: git over SSH");
@@ -236,6 +244,7 @@ fn a_signature_over_the_session_proves_its_principal() {
       user: b"git".to_vec(),
       principal: 7,
     }),
+    wanted: None,
   };
   assert_eq!(auth.request(&proof, &mut store), Ok(success));
   assert_eq!(
@@ -382,6 +391,7 @@ fn partial_success_until_enough_distinct_keys_sign() {
       (b"ada".to_vec(), first.blob.clone(), 9, 2),
       (b"ada".to_vec(), second.blob.clone(), 9, 2),
     ],
+    unknown: false,
   };
   let mut auth = authenticator(0);
   let by = |key: &EdKey| {
@@ -413,6 +423,7 @@ fn a_new_user_name_drops_what_was_proven() {
   let (first, second) = (first_key(), second_key());
   let mut store = Holders {
     entries: Vec::new(),
+    unknown: false,
   };
   for user in [&b"alice"[..], b"bob"] {
     store
@@ -451,6 +462,7 @@ fn failures_past_the_limit_are_refused() {
   let mut auth = authenticator(2);
   let mut store = Holders {
     entries: Vec::new(),
+    unknown: false,
   };
   let unknown = query(b"git", "ssh-ed25519", &first_key().blob);
   let first = auth.request(&unknown, &mut store);
@@ -473,6 +485,7 @@ fn failures_past_the_limit_are_refused() {
 fn another_service_or_a_malformed_request_is_refused() {
   let mut store = Holders {
     entries: Vec::new(),
+    unknown: false,
   };
   let mut other_service = vec![50];
   put_string(&mut other_service, b"git");
@@ -546,4 +559,39 @@ fn key_blobs_are_checked_by_kind() {
       "{algorithm:?}"
     );
   }
+}
+
+/// A-651 (a key the holders must look up elsewhere). Do: under a failure limit of zero, query the first key and send its
+/// signature, with holders that cannot say yet. Expect: neither request answered nor counted, each naming its user and key
+/// as wanted, so the caller can look the key up and have the request asked again.
+#[test]
+fn a_key_the_holders_cannot_answer_for_yet_is_wanted_not_failed() {
+  let mut auth = authenticator(0);
+  let mut store = Holders {
+    entries: Vec::new(),
+    unknown: true,
+  };
+  let key = first_key();
+  let asked = auth.request(&query(b"git", "ssh-ed25519", &key.blob), &mut store);
+  let proof = signed(
+    b"git",
+    "ssh-ed25519",
+    &key.blob,
+    &ed_signature(&key, &SESSION_ID, b"git"),
+  );
+  let asked_signed = auth.request(&proof, &mut store);
+  let wanted = |answer: Result<Answer<u32>, AuthRefusal>| {
+    answer.map(|answer| {
+      (
+        answer.replies.len(),
+        answer.authenticated.is_some(),
+        answer.wanted.map(|wanted| (wanted.user, wanted.blob)),
+      )
+    })
+  };
+  let expected = Ok((0, false, Some((b"git".to_vec(), key.blob.clone()))));
+  assert_eq!(
+    (wanted(asked), wanted(asked_signed), auth.failures()),
+    (expected.clone(), expected, 0)
+  );
 }
