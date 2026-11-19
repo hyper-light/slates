@@ -175,6 +175,10 @@ mod hook_driver;
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). No caller
+// outside tests until the daemon imports a repository's directory (its piece).
+#[cfg_attr(not(test), allow(dead_code))]
+mod hg_base;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

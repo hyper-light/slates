@@ -606,9 +606,8 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); and the server's adapter from §4.15's host seam to `RepositoryFiles` (one name at a time; a store name that
-> is not UTF-8, which only the plain
-> encoding leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH
+> `verify`); and the daemon's import of a repository's directory through the server's adapter (A-649 part 4), a turn at
+> a time on the repository's owner shard. **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
 > stub), the three captured sessions served whole. **Built (A-649 part 1):** every key of the index tagged by its kind
@@ -634,6 +633,11 @@
 > **Built (A-649 part 3b):** the import in slices (`import::Import`, advanced a turn at a time under the owner's quantum
 > on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
 > nothing); red first, then green against three stores imported a unit a turn equal to one call.
+> **Built (A-649 part 4):** the server's adapter from §4.15's host seam to the import's (`slates-server`'s `hg_base`):
+> one name at a time under the repository's directory, an absent file `None`, the host's refusals carried through, a
+> name not UTF-8 refused by kind, a file read within its length when it was opened, at most a directory and two files
+> held whatever a path's depth, everything closed when the lend ends; red first, then green against two stores imported
+> through the simulated host equal to the same files read from memory.
 > Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full

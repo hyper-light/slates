@@ -66,7 +66,8 @@
 //!
 //! **Owed** (GAPS): the register's first entry recording the phase roots and bookmarks the import returns (until then
 //! an import is not served); a unit a host's pending read refused retried at the next turn rather than ending the
-//! import; the listing and the obsstore read in slices too; and the server's adapter from §4.15's host seam.
+//! import; and the listing and the obsstore read in slices too. The server's side of the seam is `slates-server`'s
+//! `hg_base` (A-649 part 4), over §4.15's host seam.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
