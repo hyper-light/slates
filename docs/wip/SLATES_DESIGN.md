@@ -44461,7 +44461,8 @@ Applied in the same change to:
   `--locked`, rustfmt clean, the one failure main's own `reads::tests::hostile_commands_are_answered_or_end_the_connection`
   (A-613: `list` with the parameters `5:trunk ( ) true` streams fewer than four items), which fails alone on origin/main
   a5dffc913 replayed from its seed `cc 8c15aaa60f4700e2c4cf9ad02498c39f24f70500057be3b37f4181c424a4d919`, reported to
-  main. Golden: `full.dump` and
+  main; 359 of 359 at b83497e7f, merged again with A-613's `get-deleted-rev` (that proptest's failing input not drawn),
+  rustfmt clean. Golden: `full.dump` and
   `part1.dump` imported and exported again byte for byte; `deltas.dump`, `part1.dump` then `part2.dump`, and the two as
   one stream, whole, a byte at a time and in pieces of 7 and 4,096, each importing to `full.dump`'s history and
   exporting as `full.dump`; every revision's changed paths equal, line for line, to `svnlook changed --copy-info` of the
