@@ -245,7 +245,7 @@ mod tests {
         data: b"moon",
       },
     ]);
-    assert_eq!(patched_len(13, &d), Ok(16));
+    assert_eq!(patched_len(13, &d), Ok(14));
     assert_eq!(apply(base, &d, &mut room()).unwrap(), b"goodbye, moon\n");
   }
 
