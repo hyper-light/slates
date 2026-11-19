@@ -13,6 +13,13 @@ svn-blame: svn blame svn://127.0.0.1:36913/repo/trunk/a.txt -> 0 ''
 svn-blame-g: svn blame -g svn://127.0.0.1:36913/repo/trunk/a.txt -> 0 ''
 svn-mergeinfo-eligible: svn mergeinfo --show-revs eligible svn://127.0.0.1:36913/repo/branches/b1 svn://127.0.0.1:36913/repo/trunk -> 0 ''
 svn-mergeinfo-merged: svn mergeinfo --show-revs merged svn://127.0.0.1:36913/repo/branches/b1 svn://127.0.0.1:36913/repo/trunk -> 0 ''
+locked-svn-ls: svn ls -v -R svn://127.0.0.1:36913/locked/trunk -> 0 ''
+locked-svn-log: svn log -v svn://127.0.0.1:36913/locked/trunk -> 0 ''
+locked-svn-log-g: svn log -g svn://127.0.0.1:36913/locked/trunk -> 1 'svn: E220001: Item is not readable'
+locked-svn-blame-g: svn blame -g svn://127.0.0.1:36913/locked/trunk/a.txt -> 0 ''
+locked-svn-cat: svn cat svn://127.0.0.1:36913/locked/trunk/dir/b.txt -> 0 ''
+locked-svn-cat-denied: svn cat svn://127.0.0.1:36913/locked/branches/b1/a.txt -> 1 'svn: E170001: Authorization failed'
+locked-svn-proplist: svn proplist -v --show-inherited-props svn://127.0.0.1:36913/locked/trunk/dir/b.txt -> 0 ''
 latest-and-dated: scripted, 7 commands
 revision-properties: scripted, 7 commands
 check-path: scripted, 8 commands
@@ -36,3 +43,7 @@ hostile-log-word: scripted, 2 commands
 hostile-log-path: scripted, 2 commands
 hostile-log-seven: scripted, 2 commands
 get-file-revs: scripted, 13 commands
+locked-reads: scripted, 29 commands
+locked-log: scripted, 8 commands
+locked-file-revs: scripted, 4 commands
+locked-file-revs-abort: scripted, 2 commands
