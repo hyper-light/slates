@@ -255,6 +255,7 @@ fn served<E>(decided: Decided<E>) -> (Fields, bool, E, bool) {
       fields,
       head_only,
       exchange,
+      ..
     } => (fields, head_only, exchange, decided.proven),
     Answer::Refuse { status, .. } => panic!("refused {status:?} where a service was expected"),
     Answer::Move { shard } => panic!("moved to shard {shard} where a service was expected"),

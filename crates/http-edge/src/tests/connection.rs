@@ -7,7 +7,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use slates_http::head::Head;
 use slates_http::reply::Status;
 
-use super::{Connection, Decision, Ended, Fields, Next, Phase};
+use super::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
 use crate::credential::{Credential, credential};
 use crate::tls::{ALPN_HTTP_1_1, HttpsSession, ServingIdentity};
 
@@ -98,6 +98,7 @@ fn serve(head: &Head<'_>) -> Decision {
       "application/x-git-upload-pack-advertisement",
     )]),
     head_only: head.method == b"HEAD",
+    status: StatusMode::Streamed,
   }
 }
 
@@ -643,6 +644,7 @@ fn served_with_late_fields(late: Fields, after_first: bool) -> String {
       Next::Decide => connection.decide(Decision::Serve {
         fields: fields(&[("Cache-Control", "no-cache")]),
         head_only: false,
+        status: StatusMode::Streamed,
       }),
       Next::Body(_) => connection.body_taken(),
       Next::BodyEnd => {}
@@ -689,5 +691,97 @@ fn a_service_names_its_reply_fields_as_its_reply_begins() {
       served_with_late_fields(media, true),
     ),
     (late, refused.to_owned(), decided)
+  );
+}
+
+/// Shape: the status a service names after reading the body, as Git LFS answers a lock it created (A-629).
+const CREATED: Status = Status {
+  code: 201,
+  reason: "Created",
+};
+
+/// Shape: a status no reply's content may follow (RFC 9110 §6.4.1).
+const NO_CONTENT: Status = Status {
+  code: 204,
+  reason: "No Content",
+};
+
+/// What a driver of [`served_after_body`] names: the route's status mode, the status its service names (none when it
+/// names none), and whether it names it after the reply's first run rather than as the reply begins.
+type Naming = (StatusMode, Option<Status>, bool);
+
+/// Drives one POST with a body through a connection whose decision serves it with `mode` and LFS's media type, and
+/// whose service answers one run, naming the status `naming` says; what the connection wrote.
+fn served_after_body((mode, named, after_first): Naming) -> String {
+  let mut connection = Connection::clear(ROOM);
+  let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
+  let mut named = named;
+  loop {
+    match connection.next() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Read if fed => connection.peer_closed(),
+      Next::Read => {
+        fed = true;
+        connection.receive(
+          b"POST /r.git/info/lfs/locks HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nlocks",
+        );
+      }
+      Next::Decide => connection.decide(Decision::Serve {
+        fields: fields(&[("Content-Type", "application/vnd.git-lfs+json")]),
+        head_only: false,
+        status: mode,
+      }),
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply if !after_first && named.is_some() => {
+        connection.reply_status(named.take().unwrap_or(Status::OK));
+      }
+      Next::Reply if runs == 0 => {
+        runs += 1;
+        connection.reply(b"answer");
+        if let Some(status) = named.take().filter(|_| after_first) {
+          connection.reply_status(status);
+        }
+      }
+      Next::Reply => connection.reply_end(),
+      Next::CloseWrite | Next::Drain | Next::Close => {
+        return String::from_utf8_lossy(&written).into_owned();
+      }
+    }
+  }
+}
+
+/// The head and body of a reply of `status` to [`served_after_body`]'s request, its one run chunked.
+fn after_body_reply(status: &str) -> String {
+  format!(
+    "HTTP/1.1 {status}\r\nContent-Type: application/vnd.git-lfs+json\r\nTransfer-Encoding: chunked\r\n\r\n\
+     6\r\nanswer\r\n0\r\n\r\n"
+  )
+}
+
+/// A-629 (main's ruling, 2026-11-19: a route's status is decided at its head or after its body). Do: serve a POST with a
+/// body on a route that decides its status after the body, its service naming `201` as its reply begins; naming none;
+/// naming `204`; then on a streamed route naming `201`; then on the first route naming `201` after its first run. Expect
+/// the first reply's head to carry `201`; the second `200`; the third and the fourth refused `500` in stages, nothing
+/// of a reply written; and the fifth's head `200`, the late status never written.
+#[test]
+fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names() {
+  let refused =
+    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  assert_eq!(
+    [
+      served_after_body((StatusMode::AfterBody, Some(CREATED), false)),
+      served_after_body((StatusMode::AfterBody, None, false)),
+      served_after_body((StatusMode::AfterBody, Some(NO_CONTENT), false)),
+      served_after_body((StatusMode::Streamed, Some(CREATED), false)),
+      served_after_body((StatusMode::AfterBody, Some(CREATED), true)),
+    ],
+    [
+      after_body_reply("201 Created"),
+      after_body_reply("200 OK"),
+      refused.to_owned(),
+      refused.to_owned(),
+      after_body_reply("200 OK"),
+    ]
   );
 }

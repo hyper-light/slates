@@ -6,7 +6,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use slates_http::head::Head;
 use slates_http::reply::Status;
-use slates_http_edge::connection::{Fields, Phase};
+use slates_http_edge::connection::{Fields, Phase, StatusMode};
 use slates_http_edge::tls::ServingIdentity;
 use slates_rt::control::Control;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
@@ -69,6 +69,7 @@ impl Site for Echoes {
       Answer::Serve {
         fields: Vec::new(),
         head_only: false,
+        status: StatusMode::Streamed,
         exchange: Echo::default(),
       }
     } else {

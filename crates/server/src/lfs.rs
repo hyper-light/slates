@@ -23,18 +23,22 @@
 //! `append` keeps its owner rule until the push's policy check lands (A-635: "until the policy of
 //! piece 7"), so today only the repository's owner takes and releases locks.
 //!
-//! **The objects** are a seam the caller hands in: the daemon holds no durable object store for a
-//! repository yet (A-581's use on the owner shard is owed), and a store that forgot its objects at
-//! a restart would lose them.
+//! **The objects** are the repository's LFS index beside its store on the owner shard (A-662's
+//! `VcsStores`, `GitStore::lfs`), their bytes in the shard's shared content store. An object
+//! request lends them; a lock request lends the locks log; none needs both, so each is lent alone
+//! ([`answer`]), the other answered by [`Unheld`], which refuses. They are held in memory: no
+//! durable object store is on the owner shard yet (A-581), so a restart forgets them.
 
 use slates_db::catalog::{
   Principal, RepositoryCheck, RepositoryId, RepositoryRecord, StateChange, StateLog,
 };
-use slates_git::lfs::Timestamp;
+use slates_git::lfs::objects::{Admitted, ObjectRefused};
 use slates_git::lfs::serve::{
-  Access, Answer, Context, Kind, LockRecord, Locks, LocksRefused, Need, Objects, Request, Routed,
-  Server, Taken, base_url,
+  Access, Answer, Context, Endpoint, Kind, LockRecord, Locks, LocksRefused, Need, Objects,
+  Request, Routed, Server, Stored, Taken, base_url,
 };
+use slates_git::lfs::{Oid, Timestamp};
+use slates_vcs::ContentRefused;
 use slates_http::reply::Status;
 use slates_ipc::protocol::Refusal;
 use slates_vfs::clock::Clock;
@@ -298,14 +302,56 @@ fn bare(status: Status) -> Answer {
   }
 }
 
+/// What an LFS request is lent when it is lent the other half of a repository (the module doc):
+/// nothing it holds, and a refusal of every change. An object request never asks its locks, nor a
+/// lock request its objects, so a refusal here is a server's mistake, answered `500`.
+pub(crate) struct Unheld;
+
+impl Objects for Unheld {
+  fn held(&self, _oid: &Oid) -> Option<u64> {
+    None
+  }
+
+  fn bytes(&self, _oid: &Oid) -> Option<Vec<u8>> {
+    None
+  }
+
+  fn admit(&mut self, _oid: &Oid, _bytes: &[u8]) -> Result<Admitted, ObjectRefused> {
+    Err(ObjectRefused::Store(ContentRefused::NotHeld))
+  }
+}
+
+impl Locks for Unheld {
+  fn take(&mut self, _path: &str, _owner: &str, _at: Timestamp) -> Result<Taken, LocksRefused> {
+    Err(LocksRefused::Failed)
+  }
+
+  fn find(&self, _id: &str) -> Option<LockRecord> {
+    None
+  }
+
+  fn listed_from(&self, _from: Option<&str>) -> Option<impl Iterator<Item = LockRecord> + '_> {
+    None::<std::iter::Empty<LockRecord>>
+  }
+
+  fn release(&mut self, _id: &str) -> Result<Option<LockRecord>, LocksRefused> {
+    Err(LocksRefused::Failed)
+  }
+}
+
+/// Whether `endpoint` is the locks API's, which the locks log answers; the others are objects'.
+fn locks_endpoint(endpoint: &Endpoint) -> bool {
+  matches!(
+    endpoint,
+    Endpoint::CreateLock | Endpoint::ListLocks | Endpoint::VerifyLocks | Endpoint::Unlock { .. }
+  )
+}
+
 /// Answers `call` on the owner shard of its repository (the module doc): `404` for no repository
-/// of that name here, `500` for a clock outside RFC 3339's years, else `slates_git`'s answer over
-/// the repository's policy, its locks log and `objects`.
-pub(crate) fn answer(
-  state: &mut ShardState,
-  objects: &mut impl Objects,
-  call: &LfsCall<'_>,
-) -> Answer {
+/// of that name here, `500` for a clock outside RFC 3339's years, `503` for an object request whose
+/// repository's store is not held here, else `slates_git`'s answer over the repository's policy and
+/// its locks log or its objects.
+pub(crate) fn answer(state: &mut ShardState, call: &LfsCall<'_>) -> Answer {
   let repositories = state.db.partition().repositories();
   let Some(record) = repositories.repository_named(&call.routed.repo).cloned() else {
     return bare(Status::NOT_FOUND);
@@ -328,26 +374,38 @@ pub(crate) fn answer(
     record: &record,
     principal: call.principal,
   };
-  let mut locks = LogLocks {
-    state,
-    repository: record.id,
-    principal: call.principal.cloned(),
-  };
-  let mut server = Server {
-    access: &access,
-    objects,
-    locks: &mut locks,
-  };
   let request = Request {
     endpoint: &call.routed.endpoint,
     query: call.query,
     body: call.body,
   };
-  server.answer(
-    &request,
-    &context,
-    &mut slates_git::Admission::new(call.room),
-  )
+  let mut admission = slates_git::Admission::new(call.room);
+  if locks_endpoint(&call.routed.endpoint) {
+    let mut locks = LogLocks {
+      state,
+      repository: record.id,
+      principal: call.principal.cloned(),
+    };
+    let mut server = Server {
+      access: &access,
+      objects: &mut Unheld,
+      locks: &mut locks,
+    };
+    return server.answer(&request, &context, &mut admission);
+  }
+  let Some((store, git)) = state.vcs_stores.git(record.id) else {
+    return bare(Status::SERVICE_UNAVAILABLE);
+  };
+  let mut objects = Stored {
+    store,
+    objects: &mut git.lfs,
+  };
+  let mut server = Server {
+    access: &access,
+    objects: &mut objects,
+    locks: &mut Unheld,
+  };
+  server.answer(&request, &context, &mut admission)
 }
 
 #[cfg(test)]
