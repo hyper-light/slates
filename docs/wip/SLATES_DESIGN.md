@@ -12485,6 +12485,15 @@ engine: the verdict, rebase, position mapping, the register).
 > lookup on their partitions), the services behind the seam, Mercurial's and Subversion's sites, the MCP edge onto this
 > engine, and the live `git clone` over HTTPS (main's).
 >
+> **Status (2026-11-19, A-625 part 3, first slice: upload-pack behind the edge).** git's site serves upload-pack
+> (A-640 part 2) from a repository's store: `vcs_http::git::UploadServices` starts it for a repository whose store a
+> `StoreLender` holds, answers `info/refs` with v2's advertisement and a `POST` with its request held whole, charged to
+> the request's room, and writes each answer one whole pkt-line's room a step through `slates_git::upload::Answer::write`,
+> the store lent afresh for each step (A-640 part 2's rule); a request upload-pack refuses is answered in git's words.
+> Owed: the server holding each repository's store on its owner shard and lending it (with A-653's pack source), the
+> daemon starting an edge (address, identity, an authenticator over §4.13's keys, the lookup across partitions),
+> receive-pack's session (A-654), then the live `git clone`.
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -46092,3 +46101,22 @@ shared with it; `getbundle`'s test store, sessions and whole-session replay open
   windows, the input held never past the window and every session finished.
 - **Owed.** The SSH edge's loop above (A-651); the session's answers sliced within the shard's step budget (a
   `getbundle` is made whole in one step, bounded by the request's room).
+
+### A-625 part 3, first slice — upload-pack behind the edge, the store lent a step at a time (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" item 1; after A-625 part 2, A-640 part 2)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/server` (`vcs_http::git::upload`,
+new; git's site's tests; the manifest's dev-dependency on `slates-vcs`) and the lock.
+- **What.** `UploadServices<L: StoreLender>` is git's services with upload-pack served: `start` refuses `503` for
+  receive-pack (its entry point, A-654, has not landed) and for a repository whose store the lender does not hold; the
+  `Upload` exchange holds a `POST`'s request whole (upload-pack reads a command request whole), charging its bytes to
+  the request's room (`413` past it), and at the body's end calls `slates_git::upload::serve` with `Asked::Request`, or
+  with `Asked::Advertise` for `info/refs`; each reply run is one `Answer::write` step of one whole pkt-line's room
+  (`pktline::MAX_LEN`, so a band-1 packet goes out whole), the store lent afresh by `StoreLender::lend` for each step.
+- **Why a lender.** A-640 part 2 lends `Served` for each step "so a shard's state is never held across a wait". The
+  store will live on the repository's owner shard, so the lender is the seam the server's piece implements: on that
+  shard, or by moving the connection there (A-645's owed cross-shard serving).
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_`, Mac Studio, debug, 2026-11-19, kiln): red at cb6deefe7
+  (3 of 3 failing: the stub refused upload-pack and, inverted, served receive-pack), green at 4b816d17a, 76 of 76, fmt
+  clean. Through git's site over an empty repository's store: v2's advertisement (`version 2` first, `ls-refs=unborn`),
+  `ls-refs` answered with the flush alone, a body that is no pkt-line answered `ERR`, receive-pack and an unheld store
+  `503`.
+- **Owed.** As the status says.
