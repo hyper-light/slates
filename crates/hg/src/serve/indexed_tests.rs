@@ -1,7 +1,8 @@
 //! Tests of the served view over an index (A-680 part 1). The golden: the two repositories stock 7.2 kept one history's
 //! state in (`fixtures/state`), each imported from its store and viewed at its imported phase roots and bookmarks, held
 //! to what stock 7.2's `served` filter serves of them (`fixtures/state/make-served-fixtures.sh`): the changesets, why
-//! each other one is left out, and the answers `heads`, `branchmap` and `listkeys` give. A clone over the view, every
+//! each other one is left out, and the answers `heads`, `branchmap` and `listkeys` give; and so `divergent`, a
+//! divergent bookmark as stock 7.2 makes one (A-690). A clone over the view, every
 //! text lent once and hashing to its node; texts longer than a window copied within the room. The model: 7.2's filter
 //! stated literally (whole ancestor sets for the phases, `_revealancestors` with its stack) on generated histories with
 //! phase roots of every phase, markers, prunes and bookmarks. And the refusals.
@@ -227,6 +228,46 @@ fn the_states_repositories_are_served_as_7_2_serves_them() {
     };
     assert_eq!(view.census(), census, "{name}");
   }
+}
+
+/// Bookmarks as `{name} {node}` lines, sorted, as the fixtures list them.
+fn bookmark_lines<'a>(marks: impl Iterator<Item = (&'a [u8], Node)>) -> Vec<String> {
+  let mut lines: Vec<String> = marks
+    .map(|(name, node)| format!("{} {}", String::from_utf8_lossy(name), hex(&node)))
+    .collect();
+  lines.sort();
+  lines
+}
+
+/// A-690 (golden): do serve `divergent`, which stock 7.2 made as a divergent bookmark is made (`feature` moved in a
+/// clone and here, the clone pulled back, so 7.2 keeps the clone's as `feature@1`; and `@` on the root), imported from
+/// its store and viewed at its imported phase roots and bookmarks. Expect the view to hold all three bookmarks, and to
+/// serve what stock 7.2's `served` filter serves of it (`make-served-fixtures.sh`): its three changesets, none left out,
+/// and `heads`, `branchmap` and `listkeys` of `bookmarks` and `phases` byte for byte, `bookmarks` holding `@` and
+/// `feature` alone (`listbinbookmarks` leaves out a name `isdivergent` holds, an `@` not as its last byte, and keeps `@`,
+/// whose `@` is its last byte); and the bookmarks a `getbundle`'s `bookmarks` part carries the same two.
+#[test]
+fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
+  let name = "divergent";
+  let (imported, store) = imported(name);
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  assert_eq!(
+    bookmark_lines(view.bookmarks()),
+    listed("divergent-bookmarks.txt")
+  );
+  check_served(name, &view, &imported, &store);
+  check_left_out(name, &view, &imported, &store);
+  check_answers(name, &view);
+  let carried = pull::bookmark_entries(&view, &mut room()).unwrap();
+  assert_eq!(
+    bookmark_lines(
+      carried
+        .iter()
+        .filter_map(|mark| Some((mark.name, mark.node?)))
+    ),
+    listed("divergent-served-bookmarks.txt")
+  );
+  assert_eq!(view.census(), Census::default());
 }
 
 /// The full texts of a group of a decoded changegroup, each held to its node.

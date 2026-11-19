@@ -605,10 +605,21 @@ fn push_planned(
     }
     None => false,
   };
+  let moved: Vec<(DbVolumeId, u64)> = entry
+    .versions
+    .iter()
+    .map(|version| (version.green, version.version))
+    .collect();
   let applied = apply_planned(state, (&steps, verdicts), (entry, made), held);
   if applied.is_err() && store_committed {
     // The store is ahead of a log that refused the entry: made again from the log (A-662).
     crate::vcs_store::rebuild(state, record.id);
+  }
+  if applied.is_ok() {
+    // Each green the entry moved keeps its version's map of paths to git's files (A-664 part 3, `vcs_store::paths`).
+    for (green, version) in moved {
+      crate::vcs_store::paths::advance(state, green, version);
+    }
   }
   applied
 }
