@@ -14,8 +14,13 @@
 //!   the key derivation of RFC 4253 §7.2 and `SSH_MSG_NEWKEYS`;
 //! - rekeying ([`keylife`]): by each cipher's own bounds (RFC 4344 §3) and by a key time the deployment learns.
 //!
-//! User authentication (RFC 4252) and channels (RFC 4254) are the next pieces; they read [`transport::Event::Message`]
-//! and send through [`transport::ServerTransport::send`].
+//! Above it (A-633), [`session::Session`] serves a connection whole:
+//! - user authentication by public key ([`userauth`]; RFC 4252, RFC 8332, RFC 8308's `server-sig-algs`), a key
+//!   proving a principal through the server's own lookup;
+//! - one session channel ([`channel`]; RFC 4254) taking `env GIT_PROTOCOL` and one `exec` of a command the
+//!   version-control servers answer ([`command`]: git's two programs, `hg -R <repo> serve --stdio`, `svnserve -t`),
+//!   with its window and packet size from the caller's budget and the transport's cap, and `exit-status`, EOF and close
+//!   sent in order.
 //!
 //! **Sources** (read 2026-11-19; research notes §5.5 pin each by hash). RFC 4250, 4251, 4253, 4344, 5647, 5656, 7748,
 //! 8032, 8308, 8709 and 8731 \[B\]; OpenSSH's `PROTOCOL` at `fa4b2a82` \[B\], which since moved its three transport
@@ -45,6 +50,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod channel;
+pub mod command;
 pub mod entropy;
 pub mod hostkey;
 pub mod ident;
@@ -53,7 +60,9 @@ pub mod kexinit;
 pub mod keylife;
 pub mod packet;
 pub mod refusal;
+pub mod session;
 pub mod transport;
+pub mod userauth;
 pub mod wire;
 
 /// A count or a length as `u64`. Every `usize` fits on the targets slates ships (Appendix B.2), and one that did not
@@ -101,8 +110,6 @@ mod keylife_tests;
 #[cfg(test)]
 #[path = "tests/transport.rs"]
 mod transport_tests;
-
-// Red (A-633): the tests below name the authentication and channel layers, which are not built yet.
 
 #[cfg(test)]
 #[path = "tests/command.rs"]
