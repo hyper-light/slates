@@ -205,11 +205,24 @@ fn request(old: ObjectId, new: ObjectId, name: &[u8], pack: &[u8]) -> Vec<u8> {
   out
 }
 
-/// A judge that applies every command.
+/// A judge that accepts every command and appends each.
 struct Applies;
 
 impl Judge for Applies {
-  fn judge(&mut self, _command: &Command, _pushed: &Pushed<'_>) -> Result<Vec<Reported>, Declined> {
+  type Accepted = ();
+
+  fn judge(&mut self, _command: &Command, _pushed: &Pushed<'_>) -> Result<(), Declined> {
+    Ok(())
+  }
+
+  fn append(&mut self, _command: &Command, (): ()) -> Result<Vec<Reported>, Declined> {
+    Ok(Vec::new())
+  }
+
+  fn append_atomic(
+    &mut self,
+    _accepted: Vec<(&Command, ())>,
+  ) -> Result<Vec<Vec<Reported>>, Declined> {
     Ok(Vec::new())
   }
 }
@@ -332,8 +345,15 @@ fn receive_pack_resolves_a_thin_pack_against_the_store() {
   let bytes = request(parent, commit_id, b"refs/heads/main", &pack);
   let view = IndexedObjects::new(&repository, &store, ROOM);
   let mut admission = Admission::new(ROOM);
-  let received =
-    receive::receive(&bytes, &ADVERTISED, &view, &mut Applies, &mut admission).unwrap();
+  let received = receive::receive(
+    &bytes,
+    &ADVERTISED,
+    &view,
+    &receive::NoneHidden,
+    &mut Applies,
+    &mut admission,
+  )
+  .unwrap();
   assert_eq!(received.outcomes, [receive::Outcome::Ok(Vec::new())]);
   let unpacked = received.unpacked.unwrap().unwrap();
   for (id, edit) in ids.iter().zip(&edits) {

@@ -32,16 +32,17 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`) and `get-file` (its own module, `file`). Owed with this piece: `list`, `log`
-//! with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by the
-//! authorization rules (A-606): today every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments` and `get-deleted-rev` (each its own
+//! module, `file`, `list`, `segments` and `deleted`). Owed with this piece: `log` with merged revisions,
+//! `get-file-revs`, and read access by the authorization rules (A-606): today every path is readable, as in an
+//! `anon-access = read` repository with no rules.
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
 //! Bounds: an answer holds what its command names, bounded by the index and the green (a property list, a revision's
 //! properties, a request's paths and their mergeinfo). A command whose answer grows with the repository writes its
 //! head and hands back a [`Stream`] that writes the rest a slice at a time, in the room the caller gives each slice
-//! (module `stream`): a file's text is never held whole.
+//! (module `stream`): a file's text is never held whole, nor a listing.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -168,7 +169,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 21] = [
+const ELSEWHERE: [&str; 18] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -178,7 +179,6 @@ const ELSEWHERE: [&str; 21] = [
   "status",
   "diff",
   "log",
-  "get-location-segments",
   "get-file-revs",
   "lock",
   "lock-many",
@@ -188,8 +188,6 @@ const ELSEWHERE: [&str; 21] = [
   "get-locks",
   "replay",
   "replay-range",
-  "get-deleted-rev",
-  "list",
 ];
 
 /// The separators of `svn_time_from_cstring`'s format, each after its field: year, month, day, hour, minute, second,
@@ -374,6 +372,9 @@ pub fn answer<R: Repository + ?Sized>(
     "get-dir" => reads.directory(params),
     "get-locations" => reads.locations(params),
     "get-file" => reads.file(params),
+    "list" => reads.list(params),
+    "get-location-segments" => reads.location_segments(params),
+    "get-deleted-rev" => reads.deleted_revision(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -1021,19 +1022,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     revision: i64,
   ) -> Result<Option<(i64, String, i64)>, Failure> {
     let revision = self.existing(revision)?;
-    let node = self
-      .node(path, revision)?
-      .ok_or_else(|| Failure::not_found(path, revision))?;
-    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
+    let Some((copied_in, copy_path)) = self.closest_copy(path, revision)? else {
       return Ok(None);
     };
-    let Some(copied) = self.node(path, copied_in)? else {
-      return Ok(None);
-    };
-    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
-    if copied.node_id() != node.node_id() || fresh {
-      return Ok(None);
-    }
     let Some((source, source_revision)) = self
       .node(&copy_path, copied_in)?
       .and_then(|root| root.copy_from())
@@ -1056,6 +1047,30 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       previous,
       i64::try_from(source_revision).unwrap_or(i64::MAX),
     )))
+  }
+
+  /// `svn_fs_closest_copy` (`tree.c` `fs_closest_copy`): the revision and path of the copy that made the node at `path`
+  /// in `revision` what it is: the youngest copy root on the path, unless the node there in that revision is another
+  /// line, or was made fresh in it beneath the copy; `None` without one. Refused when the path is absent.
+  fn closest_copy(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<(Revision, String)>, Failure> {
+    let node = self
+      .node(path, revision)?
+      .ok_or_else(|| Failure::not_found(path, revision))?;
+    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
+      return Ok(None);
+    };
+    let Some(copied) = self.node(path, copied_in)? else {
+      return Ok(None);
+    };
+    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
+    if copied.node_id() != node.node_id() || fresh {
+      return Ok(None);
+    }
+    Ok(Some((copied_in, copy_path)))
   }
 
   /// FSFS's `find_youngest_copyroot`: the youngest copy root of the path's node and its directories in `revision`, a
@@ -1707,7 +1722,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
   (year, month, day)
 }
 
+mod deleted;
 mod file;
+mod list;
+mod segments;
 mod stream;
 
 pub use stream::{Progress, Stream};

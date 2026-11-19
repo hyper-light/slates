@@ -3,7 +3,7 @@
 //! changesets a `getbundle` sends, with the phases and bookmarks beside them ([`pull`]), all over a [`Repository`]: the
 //! served view's changelog graph and names, which the index (A-588's tables, later) presents as a test's history does.
 //!
-//! **Sources** (2026-11-19; Mercurial 7.2's code [C], `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`).
+//! **Sources** (2026-11-19; Mercurial 7.2's code \[C\], `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`).
 //! `wireprotov1server.py` (`heads`, `known`, `between`, `branches`, `branchmap`, `listkeys`), `localrepo.py`
 //! (`heads`: `reversed(headrevs())`; `known`; `between`; `branches`), `branchmap.py` (a branch's heads in revision
 //! order, closed ones kept), `exchange.py` (`_computeoutgoing`, `_getbundlephasespart`, `_getbundlebookmarkpart`),
@@ -21,7 +21,9 @@
 //! the graph's fault rather than followed, so no repository can make a walk loop.
 
 pub mod discovery;
+pub mod getbundle;
 pub mod pull;
+pub mod session;
 
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, Node, PastAdmission, phases::Phase, pushkey};
@@ -62,7 +64,7 @@ pub trait Repository {
 }
 
 /// Why a request was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
   /// An item of a node list that is not 40 hexadecimal digits.
   NodeList {
@@ -83,6 +85,21 @@ pub enum Refusal {
   /// A name the answer's format cannot carry: a bookmark holding a tab or a line end, which 7.2 refuses to make.
   Unencodable {
     /// What could not be written.
+    what: &'static str,
+  },
+  /// A `getbundle` that names no bundle capability starting `HG2` (`bundle2requested`): a bundle1 client, which is not
+  /// served here.
+  NoBundle2,
+  /// Something asked that the client cannot read: no changegroup version, bookmarks, phases or marker format both
+  /// sides hold (7.2 aborts: "no common ... exchange method").
+  NoCommonExchange {
+    /// What is missing.
+    what: &'static str,
+  },
+  /// The store lacks what its graph names: a changeset's text, a manifest or file revision, or holds one no reader
+  /// takes.
+  Store {
+    /// What is missing or unreadable.
     what: &'static str,
   },
   /// The repository's graph broke its own rule at this revision: a parent not before its child, or a revision past

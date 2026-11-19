@@ -14,29 +14,29 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// One changeset of a test's history.
 #[derive(Clone, Debug)]
-struct Changeset {
-  node: Node,
-  parents: [Option<Rev>; 2],
-  branch: Vec<u8>,
-  closes: bool,
-  phase: Phase,
+pub(super) struct Changeset {
+  pub(super) node: Node,
+  pub(super) parents: [Option<Rev>; 2],
+  pub(super) branch: Vec<u8>,
+  pub(super) closes: bool,
+  pub(super) phase: Phase,
 }
 
 /// A served view held in memory: the repository every oracle reads.
 #[derive(Clone, Debug, Default)]
-struct History {
-  revs: Vec<Changeset>,
-  bookmarks: Vec<(Vec<u8>, Node)>,
-  publishing: bool,
-  by_node: HashMap<Node, Rev>,
+pub(super) struct History {
+  pub(super) revs: Vec<Changeset>,
+  pub(super) bookmarks: Vec<(Vec<u8>, Node)>,
+  pub(super) publishing: bool,
+  pub(super) by_node: HashMap<Node, Rev>,
 }
 
-fn at(rev: Rev) -> usize {
+pub(super) fn at(rev: Rev) -> usize {
   usize::try_from(rev).unwrap()
 }
 
 impl History {
-  fn push(&mut self, changeset: Changeset) -> Rev {
+  pub(super) fn push(&mut self, changeset: Changeset) -> Rev {
     let rev = Rev::try_from(self.revs.len()).unwrap();
     self.by_node.insert(changeset.node, rev);
     self.revs.push(changeset);
@@ -114,7 +114,7 @@ impl Repository for History {
 }
 
 /// A node no two revisions of a history share: splitmix64 of the revision's seed, so node order is not revision order.
-fn node_for(seed: u64) -> Node {
+pub(super) fn node_for(seed: u64) -> Node {
   let mut state = seed;
   let mut node = [0; 20];
   for chunk in node.chunks_mut(8) {
@@ -139,8 +139,8 @@ fn build(choices: &[(u32, u32, u8, bool, bool, bool)], seed: u64, publishing: bo
   };
   for (rev, (first, second, branch, closes, draft, mark)) in choices.iter().enumerate() {
     let rev = Rev::try_from(rev).unwrap();
-    let p1 = (rev > 0 && first % 7 != 0).then(|| rev - 1 - first % rev.min(4));
-    let p2 = (rev > 1 && second % 4 == 0)
+    let p1 = (rev > 0 && !first.is_multiple_of(7)).then(|| rev - 1 - first % rev.min(4));
+    let p2 = (rev > 1 && second.is_multiple_of(4))
       .then(|| second % rev)
       .filter(|parent| Some(*parent) != p1 && p1.is_some());
     let parents = [p1, p2];
@@ -173,7 +173,7 @@ fn build(choices: &[(u32, u32, u8, bool, bool, bool)], seed: u64, publishing: bo
   history
 }
 
-fn history() -> impl Strategy<Value = History> {
+pub(super) fn history() -> impl Strategy<Value = History> {
   (
     proptest::collection::vec(
       (
@@ -194,7 +194,7 @@ fn history() -> impl Strategy<Value = History> {
 
 // The naive oracles: whole sets, every child listed, nothing incremental.
 
-fn ancestors(history: &History, revs: &[Rev]) -> BTreeSet<Rev> {
+pub(super) fn ancestors(history: &History, revs: &[Rev]) -> BTreeSet<Rev> {
   let mut seen = BTreeSet::new();
   let mut stack: Vec<Rev> = revs.to_vec();
   while let Some(rev) = stack.pop() {
@@ -219,13 +219,13 @@ fn naive_missing(history: &History, heads: &[Rev], common: &[Rev]) -> Vec<Rev> {
     .collect()
 }
 
-fn hex(node: &Node) -> Vec<u8> {
+pub(super) fn hex(node: &Node) -> Vec<u8> {
   let mut out = Vec::new();
   pushkey::encode_hex(node, &mut out);
   out
 }
 
-fn joined(nodes: impl IntoIterator<Item = Node>) -> Vec<u8> {
+pub(super) fn joined(nodes: impl IntoIterator<Item = Node>) -> Vec<u8> {
   nodes
     .into_iter()
     .map(|node| hex(&node))
@@ -233,7 +233,7 @@ fn joined(nodes: impl IntoIterator<Item = Node>) -> Vec<u8> {
     .join(&b' ')
 }
 
-fn room() -> Admission {
+pub(super) fn room() -> Admission {
   Admission::new(u64::MAX)
 }
 
@@ -379,6 +379,35 @@ fn oracle_listkeys(history: &History, namespace: &[u8]) -> Vec<u8> {
     .join(&b'\n')
 }
 
+/// The served view's heads (a helper, so a property test's body holds no unwrap).
+fn heads_of(history: &History) -> Vec<Rev> {
+  head_revs(history, &mut room()).unwrap()
+}
+
+/// Every branch's heads.
+fn branch_heads_of(history: &History) -> Vec<Rev> {
+  branch_head_revs(history, &mut room()).unwrap()
+}
+
+/// A `getbundle`'s choice for these node lists.
+fn choose(history: &History, heads: &[u8], common: &[u8]) -> Outgoing {
+  pull::outgoing(history, heads, common, &mut room()).unwrap()
+}
+
+/// The phase heads a `getbundle` of `heads` sends.
+fn phase_heads_of(history: &History, heads: &[Rev]) -> Vec<PhaseHead> {
+  pull::phase_heads(history, heads, &mut room()).unwrap()
+}
+
+/// The bookmarks a `getbundle` sends, each a name and a node.
+fn marks_of(history: &History) -> Vec<(&[u8], Node)> {
+  pull::bookmark_entries(history, &mut room())
+    .unwrap()
+    .iter()
+    .map(|mark| (mark.name, mark.node.unwrap()))
+    .collect()
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
@@ -389,7 +418,7 @@ proptest! {
   #[test]
   fn heads_branchmap_and_listkeys_answer_as_the_oracle(history in history()) {
     prop_assert_eq!(answer(|room, out| discovery::heads(&history, room, out)), oracle_heads_answer(&history));
-    prop_assert_eq!(head_revs(&history, &mut room()).unwrap(), naive_heads(&history));
+    prop_assert_eq!(heads_of(&history), naive_heads(&history));
     let lines: Vec<Vec<u8>> = oracle_branchmap(&history)
       .into_iter()
       .map(|(branch, heads)| {
@@ -403,7 +432,7 @@ proptest! {
     prop_assert_eq!(answer(|room, out| discovery::branchmap(&history, room, out)), lines.join(&b'\n'));
     let mut flat: Vec<Rev> = oracle_branchmap(&history).into_values().flatten().collect();
     flat.sort_unstable();
-    prop_assert_eq!(branch_head_revs(&history, &mut room()).unwrap(), flat);
+    prop_assert_eq!(branch_heads_of(&history), flat);
     for namespace in [&b"namespaces"[..], b"bookmarks", b"phases", b"obsolete", b"unknown"] {
       prop_assert_eq!(answer(|room, out| pull::listkeys(&history, namespace, room, out)), oracle_listkeys(&history, namespace));
     }
@@ -461,16 +490,16 @@ proptest! {
       common_list.push(b' ');
     }
     common_list.extend(hex(&node_for(0xDEAD_BEEF)));
-    let chosen = pull::outgoing(&history, &joined(heads.iter().map(|rev| history.revs[at(*rev)].node)), &common_list, &mut room()).unwrap();
+    let chosen = choose(&history, &joined(heads.iter().map(|rev| history.revs[at(*rev)].node)), &common_list);
     let asked: Vec<Rev> = if heads.is_empty() { naive_heads(&history) } else { heads.iter().copied().collect::<BTreeSet<_>>().into_iter().collect() };
     prop_assert_eq!(&chosen.heads, &asked);
     prop_assert_eq!(&chosen.common, &common.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>());
     prop_assert_eq!(&chosen.missing, &naive_missing(&history, &asked, &common));
-    prop_assert_eq!(pull::phase_heads(&history, &chosen.heads, &mut room()).unwrap(), oracle_phase_heads(&history, &chosen.heads));
-    let marks = pull::bookmark_entries(&history, &mut room()).unwrap();
+    prop_assert_eq!(phase_heads_of(&history, &chosen.heads), oracle_phase_heads(&history, &chosen.heads));
+    let marks = marks_of(&history);
     let mut expected: Vec<(&[u8], Node)> = history.bookmarks().filter(|(_, node)| history.rev(node).is_some()).collect();
     expected.sort();
-    prop_assert_eq!(marks.iter().map(|mark| (mark.name, mark.node.unwrap())).collect::<Vec<_>>(), expected);
+    prop_assert_eq!(marks, expected);
   }
 
   /// AC-HG.9 (hostile input), A-619: do give `known`, `between`, `branches` and `getbundle` arbitrary arguments.
@@ -883,15 +912,12 @@ fn broken() -> History {
 }
 
 /// AC-HG.9 (hostile input), A-619: do give node lists with an item of 39 and 41 digits, a non-hexadecimal one and an
-/// empty one between two spaces; a `between` pair of one node and of three; unknown tops, nodes and heads; an
-/// admission too short for a list; and a repository whose graph names a parent after its child. Expect each refused by
-/// kind: the list's item, the pair, the unknown node, the admission, the graph's revision; an unknown common node is
-/// dropped, as 7.2 drops it, never refused.
+/// empty one between two spaces, and `between` pairs of one node and of three. Expect each refused by kind, naming the
+/// list's item or the pair.
 #[test]
-fn hostile_lists_unknown_nodes_and_broken_graphs_are_refused_by_kind() {
+fn malformed_lists_and_pairs_are_refused_by_kind() {
   let history = chain(6);
   let known_node = hex(&history.revs[5].node);
-  let unknown = hex(&node_for(1 << 40));
   let mut out = Vec::new();
   for (list, at) in [
     ([&known_node[..], b" ", &known_node[..39]].concat(), 1),
@@ -923,19 +949,30 @@ fn hostile_lists_unknown_nodes_and_broken_graphs_are_refused_by_kind() {
       Err(Refusal::Pair { at })
     );
   }
+}
+
+/// AC-HG.9 (hostile input), A-619: do give an unknown node as a `between` pair's top, as a `branches` node, as a
+/// `getbundle` head and as a common node. Expect the first three refused naming it, and the common node dropped, as
+/// 7.2 drops it, every head then sent whole.
+#[test]
+fn unknown_nodes_are_refused_except_common_ones() {
+  let history = chain(6);
   let unknown_node = node_for(1 << 40);
+  let unknown = hex(&unknown_node);
+  let refused = Err(Refusal::UnknownNode { node: unknown_node });
+  let mut out = Vec::new();
   let pair = [&unknown[..], b"-", &hex(&NULL_NODE)[..]].concat();
   assert_eq!(
     discovery::between(&history, &pair, &mut room(), &mut out),
-    Err(Refusal::UnknownNode { node: unknown_node })
+    refused
   );
   assert_eq!(
     discovery::branches(&history, &unknown, &mut room(), &mut out),
-    Err(Refusal::UnknownNode { node: unknown_node })
+    refused
   );
   assert_eq!(
-    pull::outgoing(&history, &unknown, b"", &mut room()),
-    Err(Refusal::UnknownNode { node: unknown_node })
+    pull::outgoing(&history, &unknown, b"", &mut room()).err(),
+    refused.err()
   );
   let dropped = pull::outgoing(&history, b"", &unknown, &mut room()).unwrap();
   assert_eq!(
@@ -946,7 +983,16 @@ fn hostile_lists_unknown_nodes_and_broken_graphs_are_refused_by_kind() {
       missing: (0..6).collect()
     }
   );
-  let long = vec![known_node.clone(); 100].join(&b' ');
+}
+
+/// AC-HG.9 (hostile input), A-619: do give `known` a list longer than its admission, and walk a repository whose graph
+/// names a parent after its child. Expect the list refused past the admission, and each walk refused naming the
+/// revision that broke the rule, none looping.
+#[test]
+fn a_short_admission_and_a_broken_graph_are_refused_by_kind() {
+  let history = chain(6);
+  let long = vec![hex(&history.revs[5].node); 100].join(&b' ');
+  let mut out = Vec::new();
   assert!(matches!(
     discovery::known(&history, &long, &mut Admission::new(100), &mut out),
     Err(Refusal::PastAdmission(_))
@@ -956,12 +1002,14 @@ fn hostile_lists_unknown_nodes_and_broken_graphs_are_refused_by_kind() {
     head_revs(&broken, &mut room()),
     Err(Refusal::Graph { rev: 2 })
   );
+  let node = hex(&broken.revs[2].node);
   assert_eq!(
-    discovery::branches(&broken, &hex(&broken.revs[2].node), &mut room(), &mut out),
+    discovery::branches(&broken, &node, &mut room(), &mut out),
     Err(Refusal::Graph { rev: 2 })
   );
+  let tip = hex(&broken.revs[3].node);
   assert_eq!(
-    pull::outgoing(&broken, &hex(&broken.revs[3].node), b"", &mut room()),
+    pull::outgoing(&broken, &tip, b"", &mut room()),
     Err(Refusal::Graph { rev: 2 })
   );
 }
@@ -973,12 +1021,13 @@ const PROBE_BOOKMARKS: &str = include_str!("../../fixtures/serve/bookmarks-probe
 const PROBE_CLIENT: &[u8] = include_bytes!("../../fixtures/serve/probe.client");
 const PROBE_SERVER: &[u8] = include_bytes!("../../fixtures/serve/probe.server");
 
-/// The repository the probe asked: each state line a node, its two parents, its phase, `1` where it closes its branch,
-/// then `|` and its branch; non-publishing, as the script's hgrc says.
-fn probed() -> History {
+/// The repository a capture asked (`make-serve-fixtures.sh`'s `dump`): each state line a node, its two parents, its
+/// phase, `1` where it closes its branch, then `|` and its branch; each bookmarks line a node and a name;
+/// non-publishing, as the script's hgrc says.
+pub(super) fn captured(state: &str, bookmarks: &str) -> History {
   let node = |hex: &str| pushkey::hex_node(hex.as_bytes()).unwrap().unwrap();
   let mut history = History::default();
-  for line in PROBE_STATE.lines() {
+  for line in state.lines() {
     let (fields, branch) = line.split_once('|').unwrap();
     let fields: Vec<&str> = fields.split(' ').collect();
     let parent = |hex: &str| (node(hex) != NULL_NODE).then(|| history.rev(&node(hex)).unwrap());
@@ -996,7 +1045,7 @@ fn probed() -> History {
       phase,
     });
   }
-  for line in PROBE_BOOKMARKS.lines() {
+  for line in bookmarks.lines() {
     let (hex, name) = line.split_once(' ').unwrap();
     history
       .bookmarks
@@ -1005,8 +1054,13 @@ fn probed() -> History {
   history
 }
 
+/// The repository the probe asked.
+fn probed() -> History {
+  captured(PROBE_STATE, PROBE_BOOKMARKS)
+}
+
 /// A line and the bytes after it.
-fn split_line(bytes: &[u8]) -> (&[u8], &[u8]) {
+pub(super) fn split_line(bytes: &[u8]) -> (&[u8], &[u8]) {
   let at = bytes.iter().position(|byte| *byte == b'\n').unwrap();
   (&bytes[..at], &bytes[at + 1..])
 }
