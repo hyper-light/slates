@@ -45,6 +45,7 @@ pub mod object_name;
 pub mod out;
 pub mod pktline;
 pub mod sideband;
+pub mod v2;
 
 pub use admission::{Admission, PastAdmission};
 
