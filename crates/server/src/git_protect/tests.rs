@@ -309,6 +309,7 @@ fn protecting() -> RepositoryRecord {
       version: 1,
       rules: rules.into_iter().map(deny).collect(),
       hooks: Vec::new(),
+      hooks_env: Vec::new(),
       signers: vec![key(TRUSTED_PUB).wire().to_vec()],
     },
   }
