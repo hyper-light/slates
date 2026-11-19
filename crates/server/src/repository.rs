@@ -109,6 +109,11 @@ fn free_name(state: &ShardState, repository: RepositoryId, name: &str) -> Result
 
 /// Records `op` in the verb's transaction; its refusal typed.
 fn record(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
+  // A change of the repository's own state logs is admitted only while the parts this shard owes their holders are
+  // within their bound (A-636 part 2b).
+  if crate::state_log::moves_state_logs(op) {
+    crate::state_log::admit(state)?;
+  }
   let now = state.clock.monotonic_ns();
   state
     .db
