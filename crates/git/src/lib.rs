@@ -58,6 +58,7 @@ pub mod refname;
 pub mod sideband;
 pub mod store;
 pub mod unpack;
+pub mod upload;
 pub mod v0;
 pub mod v2;
 
@@ -80,6 +81,10 @@ mod pack_fixtures;
 #[cfg(test)]
 #[path = "tests/v2_rest_fixtures.rs"]
 mod v2_rest_fixtures;
+
+#[cfg(test)]
+#[path = "tests/protected_fixtures.rs"]
+mod protected_fixtures;
 
 #[cfg(test)]
 #[path = "tests/served.rs"]

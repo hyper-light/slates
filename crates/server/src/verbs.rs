@@ -5078,7 +5078,13 @@ fn dispatch_inner(
       read,
       rules,
       hooks,
-    } => crate::repository::set_policy(state, principal, (&repository, read), (&rules, &hooks)),
+      hooks_env,
+    } => crate::repository::set_policy(
+      state,
+      principal,
+      (&repository, read),
+      (&rules, &hooks, &hooks_env),
+    ),
     RequestBody::Checkout {
       green,
       base,
@@ -9319,7 +9325,17 @@ fn judge_submission(
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
   let increment_bytes = inc.encode();
-  let bound = slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc);
+  // A copy from a version its source changed after records the source's values then in its entry (A-626 part 2): the
+  // green adds that room, derived from what its histories hold, never a fixed allowance.
+  let Some(room) = state
+    .greens
+    .get(&green_id)
+    .map(|engine| engine.copy_entry_room(&inc))
+  else {
+    return refused(Refusal::NotFound);
+  };
+  let bound =
+    slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc).saturating_add(room);
   let admission = Op::GreenAdvanced {
     green: green_id,
     increment: vec![0; bound],
