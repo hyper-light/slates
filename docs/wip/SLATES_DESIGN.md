@@ -13032,6 +13032,20 @@ engine: the verdict, rebase, position mapping, the register).
 > byte; `delta_of` is one search run to its end. Owed: its users, upload's objects past a window (part 2) and the
 > fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search).
 >
+> **Status (2026-11-19, A-653 continued (4): an object past a window searched under the request's admission).** The
+> stream no longer sends an object past a window whole without a trial: one no kept part covers is searched through
+> `store::Search` against the earlier ones past a window of its kind, the nearest first, as many as the learned window
+> tries, a window's bytes a unit, and the smallest delta shorter than the object is sent, its base named by its offset
+> back or by its id. What the search holds (the object, the largest candidate, the index and the delta, and the best
+> delta while another candidate is tried) is charged to the request's own admission before its first byte is read, as
+> a hold the admission takes back once the entry is sent (`Admission::hold`, `Admission::release`); where the
+> admission cannot hold it, the object is sent whole and the stream counts it (`loose_unsearched`). Every step of
+> upload-pack's answer is lent the request's admission (`Answer::write`, `PackSource::write`, `Upload::advance`). git
+> holds the same three for a trial and searches every object below its `core.bigFileThreshold`; slates takes no
+> constant of git's (R3). Owed: the fragment encoder's per-object unit (`Encoder::put` stepping its trials through a
+> search); a search across a window's edge, an object past a window trying earlier ones within one and the reverse, as
+> git's order by name and size would.
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -50705,3 +50719,77 @@ unchanged); `docs/cli.md`; `docs/library.md`.
   `vcs_http/daemon_edge.rs` (`DaemonSite`, the module doc); `vcs_http/git/upload.rs` and `vcs_http.rs` (their docs);
   `vcs_http/tests/daemon_edge.rs` (the push test, with g309's helpers); `vcs_http/tests/git.rs` (a test's doc);
   `git_push.rs` (its docs); `lib.rs` (the modules' notes); §4.17.2's status; GAPS (the A-654 entry).
+
+### A-653, continued (4) — An object past a window searched under the request's admission, the fall-back counted (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch" item 3; part 2 of "a delta search for an object past a window"; A-582's admission, A-653 continued (3)'s `store::Search`)
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`admission`: `Hold`,
+`Admission::hold`, `Admission::release`; `store::deltas`: `Search::held_most`, the delta reserved whole when the scan
+begins; `store::upload`: the loose stage's search, `UploadCounters::loose_unsearched`; `upload`: `Answer::write` and
+`PackSource::write` take the request's admission; their tests and test sources), `crates/server`
+(`vcs_http::git::upload` and `vcs_ssh::git` lend the request's admission to every write of the answer; their two test
+sources).
+
+- **Why.** A-639's stream sent an object past a window that no kept part covered whole, with no delta trial, since a
+  delta search held its source and target whole (A-653 continued (3)). Part 1 made the search a bounded amount a
+  step; this part puts the stream's objects past a window through it. Main's ruling (2026-11-19): the search's base,
+  target and the base's index charged to the request's own admission; an object sent whole only when that admission
+  cannot hold its search, and that fall-back counted; the admission given a release, a charge that answers a token
+  whose return gives its bytes back; `PackSource::write` and `Upload::advance` taking the request's admission, every
+  implementor adapted; git's rule cited from `pack-objects.c` at v2.50.1, never one of its constants (R3).
+- **git's rule, from its source** (`builtin/pack-objects.c` at tag v2.50.1, read whole). An object whose size passes
+  `core.bigFileThreshold` is marked `no_try_delta` (`get_object_details`, lines 2541-2544) and never searched
+  (`prepare_pack`, line 3326); every other object of a type git can read is tried against its window's candidates,
+  ordered by type, name hash and size (`type_size_sort`, lines 2568-2599). A trial holds the target's bytes, the
+  source's and the source's index, and counts each as its window's memory (`try_delta`, lines 2774, 2803 and 2813);
+  `pack.windowMemory`, unlimited by default (line 253), lets the oldest candidates go when that memory passes it, never
+  the nearest (`find_deltas`, lines 2913-2919). git also skips a trial its sizes rule out (`try_delta`, lines
+  2737-2755): a source shorter than the target by half the target or more, or over 32 times its length. slates keeps
+  git's three holdings as the charge and takes neither constant: the request's admission decides whether an object is
+  searched, and the learned window, which tries every candidate it holds, how many candidates are.
+- **The token.** `Admission::hold(bytes)` charges as `charge` does, refused with nothing taken past the room, and
+  answers a `Hold`; `Admission::release(hold)` gives its bytes back. A hold is neither `Clone` nor `Copy`, so it is
+  given back once at most; one dropped without a release stays charged, which errs toward the request's room. An
+  admission is `Copy`, so it gives back at most what its own holds still keep: a hold released into another copy never
+  raises that copy's room past what it was admitted. A decode's charges stay plain charges, kept for the request's life.
+- **The charge.** Before its first byte is read, a search of an object `t` bytes long against candidates whose largest
+  is `s` bytes charges `t + s`, the most its index and delta take (`Search::held_most(s, t)`), and, with more than one
+  candidate, a second delta's most for the best kept while another is tried. The index keeps at most an entry a whole
+  block of the source, charged at the most the standard library's `BTreeMap` nodes can cost (B = 6: a leaf of eleven
+  keys and values, an internal node of twelve links more, each rounded up to a power of two, every node but the root
+  holding five entries at least). The delta is reserved whole when the scan begins, at the most the scan can write: its
+  sizes, the target's bytes, an insert opcode for every 127 of them and one more, since a copy is written only for a
+  match longer than its own eight bytes and so pays for the opcode of the run of inserts it ends. A `Vec` made with a
+  capacity has that capacity, so the delta never grows past its charge.
+- **The search in units.** The object's bytes are read a window a unit, then each candidate's, the nearest first; each
+  step of the search over the two is a unit of a window's bytes. Each trial is timed by the owner's clock, its candidate's
+  reading with it, and taught to the window at its rank, as the fragments' encoder teaches its own; the smallest delta
+  shorter than the object wins. The entry's header is written once the delta is known, the delta deflated a window a
+  unit at its kind's learned level, and the hold given back after the last window; with no delta shorter, the hold is
+  given back and the object sent whole. An object past a window, sent whole or as a delta, is remembered by its id,
+  kind, length, content, offset and depth, never its bytes, as a later one's candidate while its chain has room, as many
+  of its kind as the window can try.
+- **The admission lent.** `Answer::write`, `PackSource::write` and `Upload::advance` take the request's admission. The
+  HTTP edge's exchange holds one admission for its request (the body, the plan and now every write); SSH's upload
+  command made an admission for `serve` and dropped it, and now keeps it for the answer's writes, made afresh for each
+  request.
+- **Tests**, failing first against today's behaviour (an object past a window sent whole with no trial, and a release
+  that gives nothing back: branch `agents/g083-loose-search-red`, never landed):
+  `an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission` (a never-encoded version of two
+  200-line texts past the tests' 1 KiB window, a line edited in each, answered within an admission of exactly the later
+  file's search and within one byte less, with `ofs-delta` and without, in one turn and a unit a turn: with the room the
+  later file a delta naming the earlier by its offset back or by its id, the same bytes over any turns and every byte
+  given back by the stream's end; one byte short, both whole, the fall-back counted once and nothing taken; each read
+  back to the version's objects, each once); `a_hold_and_its_release_leave_the_admission_as_it_was` and
+  `a_release_gives_back_no_more_than_was_held` (a hold and its release, a release capped at what the admission holds).
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1, load 6 to 12), over main 3612d1ef9 merged:
+  red (kiln r101, branch `agents/g083-loose-search-red` at dfe528437), `cargo test --locked -p slates-git --lib --
+  admission:: store:: upload::` 129 passed, 3 failed (the three tests above: the admission left 40 where 100, a release
+  into another copy 90 where 100, the later file whole where an offset delta), 4 ignored; green (kiln r102, at
+  2783b6bfe), the same filters 132 passed, 0 failed, 4 ignored; `cargo test --locked -p slates-server --lib --
+  vcs_http::git::tests vcs_ssh::git::tests --test-threads=4` 18 of 18, the HTTP and SSH upload-pack tests with the
+  request's admission lent to their writes; `cargo fmt -p slates-git -p slates-server -- --check` clean. No
+  integration target reaches the stream or its pack source.
+- **Owed.** The fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search); a search
+  across a window's edge (an object past a window trying earlier ones within one and the reverse, as git's order by
+  name and size would); the live clone over the HTTP edge with the store's production lender (A-625 part 3); the
+  red-checks and the other platforms' runs (main's).
