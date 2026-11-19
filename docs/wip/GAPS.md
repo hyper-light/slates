@@ -26,34 +26,42 @@
 > on these maps and needs a per-prefix appearance record under the one history rule. The integration suites, clippy
 > and `xtask` over the change are main's (run requests).
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
-> (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks
-> are greens; phases only move toward public, and a public changeset is never dropped or rewritten; markers are kept and
-> exchanged; topics are review requests; a stock push is judged whole-file and answered with Mercurial's own race abort,
-> and rebase on push is a line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code
-> and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2,
-> bundle1, changegroups `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input,
-> every structure counted and charged exactly to the caller's admission before it is built, no recursion; proven by
-> `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden
-> vectors stock `hg` 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle`
-> lists it, every text rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed,
-> four tests failed). **Built (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and
-> `check:bookmarks`, `check:heads` and `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies,
-> listkeys lines and namespace nodes), nothing allocated in decoding, every encoder's exact length given before it
-> writes; proven by `cargo test -p slates-hg --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against
-> golden vectors stock `hg` 7.2 made twice, byte for byte alike but the replies' cut
-> (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over SSH captured on the wire, the server's
-> replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask findings in the crate are folded in (the
-> no-panic root attribute among them); clippy and xtask are main's to rerun. Measured on stock 7.2 and recorded
-> (research §13): its C and pure marker readers disagree on a marker's size and on parent counts 0 and past 3. Owed, in
-> order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
-> (D-17); (2) the SSH and HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory;
-> (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8)
-> access and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow,
-> ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own
-> suite through a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a
-> 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
-> run checks it). No speed is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
+> piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
+> heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
+> dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
+> and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
+> markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built
+> (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups `01` to `05` and their deltas, every length
+> read as 7.2 reads it and checked against the input, every structure counted and charged exactly to the caller's
+> admission before it is built, no recursion; proven by `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio
+> (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg` 7.2 made
+> (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text rebuilds
+> from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed). **Built
+> (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and `check:bookmarks`, `check:heads` and
+> `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies, listkeys lines and namespace nodes),
+> nothing allocated in decoding, every encoder's exact length given before it writes; proven by `cargo test -p slates-hg
+> --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against golden vectors stock `hg` 7.2 made twice,
+> byte for byte alike but the replies' cut (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over
+> SSH captured on the wire, the server's replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask
+> findings in the crate are folded in (the no-panic root attribute among them); clippy and xtask are main's to rerun.
+> Measured on stock 7.2 and recorded (research §13): its C and pure marker readers disagree on a marker's size and on
+> parent counts 0 and past 3. **Built (A-569):** the wire protocol's version 1 framings: SSH's commands, arguments,
+> dictionary, chunked input, answers and error form; HTTP's arguments from the query, the `X-HgArg-<N>` headers and the
+> body's front behind `X-HgArgs-Post` in 7.2's precedence, `X-HgProto`, and the `0.1`, `0.2` and `hg-error` framings;
+> the capabilities line and the bundle2 capability blob; `batch`'s escapes and calls; every line bounded by the server's
+> own table and spec and the digits of the caller's room, every length and count by that room, every decoded byte
+> charged to the admission first; proven by `cargo test -p slates-hg --lib`, 126 of 126 on the Mac Studio (2026-11-19,
+> debug, load 21.7), against 103 captures stock `hg` 7.2 made over SSH and HTTP
+> (`crates/hg/fixtures/wire/make-wire-fixtures.sh`), every request and answer read and written again to its bytes. Owed,
+> in order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
+> (D-17); (3) the objects and the index, and import of a repository directory; (4) read serving; (5) pushes; (6) the
+> changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
+> (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
+> and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
+> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
+> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
+> main measures it.
 
 > **Open (g267, 2026-11-19, found settling A-565): a live clone is answered before any of it is durable.** A clone of a
 > live-shipped volume is live-shipped too, but the `Clone` verb's reply waits on its origin's log
@@ -1161,7 +1169,10 @@
 >   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
 >   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
 >   head has no record, and a move waits for its head's record); since A-565 a live-shipped one's move marks its
->   rebuild from the log too; owed of it, the fleet's own three-daemon tests of a move and a takeover (filed for main),
+>   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
+>   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
+>   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
+>   their first compile and run owed to main; owed of it, A-503's own move test (a clone moved b to c after a to b),
 >   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
@@ -5356,7 +5367,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; since 2026-11-17 the credit
 > is the whole state's bytes, not a fixed two entries, A-200 amended, the entry at the top of this ledger); a candidate's copy kept across its own
 > restart; real-process chaos
-> (partitions, injected latency, volume failure, client disconnect). The owner's `put_wal` is its `Local` records,
+> (partitions, injected latency, volume failure, client disconnect). The volume-failure and client-disconnect faults
+> are in the register's simulation since A-585 (g250, 2026-11-19, goal 81): `ledger::Cohort::lose_store` (a store lost
+> under a replica: the holder answers no read and accepts no record under its old id, as a fresh-id restart does), with
+> `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: a store-lost holder answering with nothing
+> completed a quorum that missed a committed record at `f = 2`) and `a_write_its_client_left_is_kept_or_dropped_whole`;
+> the real-process runs of both faults are main's (run-requests.md). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.

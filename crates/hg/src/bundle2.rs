@@ -23,6 +23,7 @@
 //! refused (the document says keys "MUST be unique"; 7.2 keeps the last); bytes after the stream's end are refused.
 
 use crate::out::{Measure, Out};
+use crate::quote::{self, PATH_SAFE};
 use crate::read::{Cursor, to_u64};
 use crate::{Admission, PastAdmission, Truncated};
 
@@ -43,13 +44,6 @@ pub const UNCOMPRESSED: &[u8] = b"UN";
 
 /// Format: the `Compression` values Mercurial defines besides `UN`: zlib, bzip2 and zstd (`supportedbundletypes`).
 pub const COMPRESSED: [&[u8]; 3] = [b"GZ", b"BZ", b"ZS"];
-
-/// Format: hexadecimal, the base of a URL escape's two digits (RFC 3986 §2.1, as Python's `quote_from_bytes` writes
-/// them, upper-case).
-const HEX_RADIX: u32 = 16;
-
-/// Format: the bytes Python's `quote_from_bytes(s, safe='/')` leaves unquoted besides letters and digits.
-const UNQUOTED: &[u8] = b"_.-~/";
 
 /// Format: the bytes a part type may hold besides letters and digits (`_parttypeforbidden`, `bundle2.py`).
 const PART_TYPE_EXTRA: &[u8] = b"_:-";
@@ -454,10 +448,10 @@ impl<'a> Bundle2<'a> {
       if position > 0 {
         block.push(b' ');
       }
-      quote(&param.name, &mut block);
+      quote::quote(&param.name, PATH_SAFE, &mut block);
       if let Some(value) = &param.value {
         block.push(b'=');
-        quote(value, &mut block);
+        quote::quote(value, PATH_SAFE, &mut block);
       }
     }
     put_length(out, block.len(), "stream parameters")?;
@@ -565,51 +559,11 @@ fn check_compression(value: Option<&[u8]>) -> Result<(), Refusal> {
   }
 }
 
-/// Python's `unquote_to_bytes`: each `%` and two hexadecimal digits is one byte; any other `%` is kept as it is.
+/// Python's `unquote_to_bytes` of one stream parameter's name or value ([`quote::unquote`]).
 fn unquote(quoted: &[u8]) -> Vec<u8> {
   let mut out = Vec::with_capacity(quoted.len());
-  let mut rest = quoted;
-  while let Some((&byte, tail)) = rest.split_first() {
-    let escaped = (byte == b'%')
-      .then(|| tail.get(..2).and_then(hex_pair))
-      .flatten();
-    match escaped {
-      Some(value) => {
-        out.push(value);
-        rest = tail.get(2..).unwrap_or_default();
-      }
-      None => {
-        out.push(byte);
-        rest = tail;
-      }
-    }
-  }
+  quote::unquote(quoted, &mut out);
   out
-}
-
-/// Two hexadecimal digits as the byte they name.
-fn hex_pair(pair: &[u8]) -> Option<u8> {
-  let mut value: u32 = 0;
-  for digit in pair {
-    let digit = char::from(*digit).to_digit(HEX_RADIX)?;
-    value = value.checked_mul(HEX_RADIX)?.checked_add(digit)?;
-  }
-  u8::try_from(value).ok()
-}
-
-/// Python's `quote_from_bytes(s, safe='/')`: letters, digits and `_.-~/` as they are, every other byte `%XX`.
-fn quote(raw: &[u8], out: &mut Vec<u8>) {
-  for &byte in raw {
-    if byte.is_ascii_alphanumeric() || UNQUOTED.contains(&byte) {
-      out.push(byte);
-    } else {
-      out.push(b'%');
-      for digit in [u32::from(byte) / HEX_RADIX, u32::from(byte) % HEX_RADIX] {
-        let character = char::from_digit(digit, HEX_RADIX).unwrap_or('0');
-        out.push(u8::try_from(character.to_ascii_uppercase()).unwrap_or(b'0'));
-      }
-    }
-  }
 }
 
 /// Whether `kind` is a part type 7.2 accepts: 1 to 255 bytes of `[a-zA-Z0-9_:-]` (`validateparttype`).

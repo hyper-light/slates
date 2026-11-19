@@ -12168,6 +12168,20 @@ signature verification).
 > obsstores; each payload decodes as 7.2's listings and logs say and encodes back to its bytes. The crate root now
 > carries the no-panic attribute (`arithmetic_side_effects` denied outside tests). Still owed from piece 1: compressed
 > streams, once the D-17 engines are wired.
+>
+> **Status (2026-11-19, A-569: piece 2, the protocol codecs, built).** `slates-hg` reads and writes the wire protocol's
+> version 1 framings as pure functions over bytes: SSH's command lines, arguments with their lengths, the dictionary
+> (`*`), `unbundle`'s chunked input, string answers, a push's answer and the out-of-band error form (`ssh`); HTTP's
+> arguments from the query, from the `X-HgArg-<N>` headers joined and from the body's front behind `X-HgArgs-Post`, in
+> 7.2's precedence and dictionary order, what a client reads (`X-HgProto`), and the `0.1`, `0.2` and `hg-error`
+> framings (`http`); the capabilities line and the bundle2 capability blob through both of its quotings
+> (`capabilities`); `batch`'s escapes and calls (`batch`); a command's argument spec (`wire`). Every line is bounded by
+> the server's own command table and spec and the digits of the caller's room, every length and count by that room,
+> and every decoded byte and vector counted and charged to the caller's admission before it is built; an SSH read says
+> how many bytes it still needs. Proven against 103 captures stock 7.2 made over SSH and HTTP
+> (`crates/hg/fixtures/wire`, the command in `make-wire-fixtures.sh`): a clone, a pull, a push, `debugwireargs` through
+> each way of carrying arguments, and a refused bundle1 client, every request and answer read and written again to its
+> bytes. Compression engines (D-17) and serving the commands (piece 4) are not this piece's.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12535,7 +12549,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    framings, bundle1, the deltas and the parts' payloads; owed: compressed streams (`GZ`, `BZ`, `ZS`, D-17).
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
-   string and the bundle2 capability blob, and `batch` escaping.
+   string and the bundle2 capability blob, and `batch` escaping. Built (A-569, `crates/hg`: `ssh`, `http`,
+   `capabilities`, `batch`, `wire`).
 3. The objects and the index: changeset texts, flat manifests and file metadata parsed and written, nodes checked, the
    index's tables, and an existing repository's store imported as a base.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
@@ -38649,6 +38664,121 @@ table).
   upcase_name_tests`: red with the table removed in a copy (no unit past ASCII upcased), 5 of 10 failed; green 10 of 10;
   the vfs lib 90 of 90 (one ignored); the bridge's `normalized::` 7 of 7 on the real table; the server's `image::` 2 of
   2. Windows (main's): the table check.
+
+### A-569 — Mercurial's wire protocol version 1, decoded and encoded as a pure core and held to what stock Mercurial 7.2 sent and answered over SSH and HTTP (2026-11-19, g291 for UI goal 91; §4.17.3 piece 2; §4.9; A-514, A-545, A-16)
+Applied in the same change to: §4.17.3 (its status and piece 2), `crates/hg` (`ssh`, `http`, `capabilities`, `batch`
+and `wire`, new; `quote`, `lines` and `decimal`, shared, with bundle2's stream parameters and pushkey's listkeys
+lines and reply numbers moved onto them, `pushkey::ReplyText::new` now infallible; `fixtures/wire/` and its
+`make-wire-fixtures.sh`), `.gitattributes` (the captures binary, so their CRLF heads stay as captured), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§14).
+- **What it does.** Reads and writes the framings both transports use. SSH: a command line; its arguments for its
+  spec, each `<name> <length>\n<value>` and the dictionary `* <count>\n` with its entries, in any order, each name
+  once; `unbundle`'s chunked input; a string answer `<length>\n<value>`; a push's answer (an empty string, then the
+  result); the out-of-band error (an empty line on stdout, the message and `\n-\n` on stderr); a request as 7.2's
+  client writes it (sorted by name, so the dictionary first). HTTP: the command (`cmd`); the form fields of the query,
+  of the `X-HgArg-<N>` headers joined (matched without case) and of the body's front behind `X-HgArgs-Post`; a spec's
+  arguments read in 7.2's precedence (the arguments' first value over the query's) and its dictionary in 7.2's
+  order; the body after the post arguments (`unbundle`'s input); what a client reads (`X-HgProto`: `0.1`, `0.2`, the
+  engines, `zlib,none` when it names none); the `0.2` header (the engine's name and its length), a push's bodies
+  without bundle2, and the form and header splitting 7.2's client writes. The capabilities line (`capabilities`,
+  `hello`) read in place and written; the bundle2 capability blob (`encodecaps`, `decodecaps`) through both of its
+  quotings. `batch`: the four escapes, the calls of `cmds`, the answers. Serving the commands (piece 4) and the
+  compression engines (D-17) are not this piece's.
+- **From the sources (`research/mercurial-server.md` §1 and §14).** 7.2's `wireprotoserver.py`
+  (`sshv1protocolhandler`, `_sshv1respondbytes`, `_sshv1respondstream`, `_sshv1respondooberror`,
+  `httpv1protocolhandler`, `decodevaluefromheaders`, `_httpresponsetype`, `genversion2`), `wireprotov1server.py`
+  (`batch`, the specs), `wireprototypes.py` (the batch escapes), `httppeer.py` (`makev1commandrequest`,
+  `encodevalueinheaders`), `sshpeer.py` (`_sendrequest`) and `bundle2.py` (`encodecaps`, `decodecaps`). Measured in
+  the captures: arguments arrive as the bytes the client meant over SSH and all three HTTP ways (`café` intact);
+  header names travel lower-case; a bundle2 push sends `heads` = `force` in hex; 7.2 refuses a bundle1 client with
+  `application/hg-error` over HTTP but with `abort:` on stderr and a closed session over SSH; `getbundle` is `0.2`
+  (`zstd` by default, `none` where offered alone) and chunked, string answers `0.1` with a length.
+- **Stricter than 7.2, on purpose.** A length or count is decimal digits alone (7.2's `int()` takes a sign, spaces
+  and `_`, and `read(-1)` reads to the end); an argument line is a name without whitespace, one space and the length
+  (7.2 splits at any whitespace); an argument sent twice is refused (7.2 keeps the last, then fails on the missing
+  one); an `X-HgArgs-Post` past the body is refused (7.2 reads what there is); a `batch` escape other than the four is
+  refused (7.2's `replace` chain leaves it), as are a call without its space and an argument without exactly one `=`
+  (7.2's `split` fails on them).
+- **Bounds, none a literal.** A command line by the longest command name the server serves; an argument line by its
+  spec's longest name and the digits of the caller's room; every length and count by that room (a dictionary's count
+  by the room over its smallest entry, four bytes); an SSH read takes what is buffered and says how many bytes it
+  needs, and charges nothing until it is whole. Every decoded byte (form fields, unquoted capabilities, unescaped
+  calls) and every vector is counted first and charged to the caller's admission, then built once; what a decode
+  joins or sorts on the way (the `X-HgArg` headers, the dictionary's first places) is charged beside it and freed. A
+  dictionary's names are deduplicated by a sort, not by comparing each with every other.
+- **Golden vectors.** `crates/hg/fixtures/wire`, made on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock
+  Mercurial 7.2 from PyPI through `uvx` (CPython 3.12.16), from a clone of the branch, exactly:
+  `crates/hg/fixtures/wire/make-wire-fixtures.sh "$OUT"` with `OUT` a new directory under `~/.cache`. SSH sessions
+  through an ssh stand-in recording both directions and stderr (a clone, a pull with discovery's `batch`, a push with
+  `unbundle`'s chunked input, `debugwireargs`, a refused bundle1 clone); HTTP exchanges through a recording proxy
+  before `hg serve` (a clone with `X-HgArg` headers and `0.2`, the same with `server.compressionengines=none`, a push,
+  `debugwireargs` in headers, behind `X-HgArgs-Post` and in the query, a refused bundle1 clone): 103 files, 30,469
+  bytes, each SHA-256 checked equal after the copy. The script's first run stopped at the push (`hg pull` left the
+  client on the old head, so its commit made a second head); it updates to the pulled tip now.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 126 of 126 in 1.0 s
+  (load 21.7), `cargo fmt -p slates-hg -- --check` clean. Red first, by stubs: with the public bodies of `ssh`, `http`,
+  `batch` and `capabilities` stubbed (branch `agents/g291-hg-wire-red`, d89d89d82; signatures kept, results empty or
+  refused), 37 of 126 failed, every test of those four modules and every golden wire test, but for the one property
+  that holds for any body (`ssh`'s arbitrary bytes never panicking); the 89 that passed are A-514's and A-545's and the
+  shared helpers'. Golden: every SSH request of the captures read with its spec and written again to its bytes, the
+  sessions read whole; the server's answers read and framed again into its bytes; the capabilities line and both
+  bundle2 blobs (the server's and the client's `bundlecaps`) read and written back; discovery's `batch` and its
+  answers; a pushed bundle read chunk by chunk and decoded; the reply stream and the next answer after it; HTTP
+  arguments alike in headers, body and query, and written again to the headers, body and query 7.2 sent; `X-HgProto`;
+  `0.1` answers, `0.2` answers naming `zstd` and `none` (that payload a bundle2 stream decoded whole); a pushed body
+  decoded; the `hg-error` refusal. Hostile: command and argument lines past their bounds, arguments the spec does not
+  name or sent twice, non-digit lengths, lengths and counts past the room (`u64::MAX` among them), cut requests at
+  every length asking for more, post lengths past the body, missing named arguments, admissions too small (nothing
+  charged), broken `0.2` headers, broken escapes and calls, arbitrary bytes (property tests).
+- **Owed.** Serving the commands, and which SSH refusals use the out-of-band form (piece 4); the compression engines
+  for `0.2` and bundle2 streams (D-17); `getbundle`'s argument types (node lists, booleans, lists), with read serving.
+
+### A-585 — A holder whose store is lost answers no read and accepts no record under its old id (2026-11-19, UI goal 81 (kiln dbe13f39, g250), part "Chaos across real processes", the failure half; §4.8 "Promotion and takeover"; D-26)
+Applied in the same change to: GAPS (the live-shipping entry's real-process chaos line) and `crates/db/src/ledger.rs`
+(`Cohort::lose_store`, `Holder::lost`; the takeover and the offer skip a lost holder).
+- **The fault.** A volume's store fails suddenly under a replica. The holder's records and its fence are gone.
+- **The rule it needs.** Such a holder answers no phase-one read and accepts no record under its old id. Its nothing
+  must never count toward a takeover's quorum as a promise. At `f = 2`, with a record committed on `f + 1` of the five
+  candidates, one of those holders losing its store and another host down leaves the record on one holder. A read of
+  the store-lost holder and the two that never held it would make a quorum that misses the record. The server meets
+  the rule by construction: each start takes a fresh member identity (`Daemon::member_identity`), so a host that
+  restarts without its store is a new member no cohort names until it is placed. The register's simulation now states
+  the rule and checks it.
+- **The invariants checked.** NoLoss and Continuity: the record is adopted. TotalOrder: the next record commits at the
+  next position. StaleNeverCommits: the superseded owner commits nothing more. Agreement: no position is held by a
+  quorum with two values. Also a client that disconnects mid-write: its write is kept whole or dropped whole by the
+  next owner, never split, and every committed write survives.
+- **Tests.** `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: the first takeover read three
+  empty logs and dropped the committed record) and `a_write_its_client_left_is_kept_or_dropped_whole`
+  (`crates/db/src/ledger.rs`). Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `ledger::` 3 of 3. Red once on a
+  mutated copy whose takeover read the store-lost holder: the takeover succeeded with an empty log (`Ok(0)`).
+- **Owed (main's).** The real-process runs of both faults: a replica's store destroyed under the live log, and a client
+  killed mid-write (run-requests.md).
+
+### A-583 — The fleet's own tests of a captured clone's landing after a takeover and after a live-shipped move (2026-11-19, g230, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover", §4.10 "Live shipping"; the tests A-544 and A-565 filed for main)
+Applied in the same change to: GAPS (g267's captured-clone status: the two tests written, their run owed),
+`crates/server/tests/fleet.rs` (the two tests and their helpers, beside A-291's captured-clone move test).
+- **What was owed.** A-544 and A-565 were proved by lib tests that built a successor's or a move target's state by hand
+  (`take_over_named`, `take_over_named_as`). Neither ran the fleet: no three daemons had seen a captured clone's record
+  ride its head to the survivors, nor a live-shipped clone's mark reach its move's target.
+- **The tests.** Both overlay one captured tree on a (a file the agent rewrites, one it removes, one it leaves alone),
+  capture its base, clone the capture, and let the agent rewrite, make and remove one file each. Each landing goes into
+  a directory holding the captured tree with an outsider's edit to the file the agent left alone. It is presented
+  through a client of the node that serves the clone, approved under that node's issuer secret as the human's surface
+  approves, and landed.
+  - `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` (A-544). Two clones: the first
+    snapshotted, the second never. Before a stops, the test waits until a has counted `fleet.carry.recorded`, both
+    survivors hold the first clone's head naming a's sealed manifest, and their catalog's capture record names the same
+    manifest. Both must also hold the second clone's catalog. Then a stops, as the takeover tests' owner does.
+    - The first clone's successor (the survivor rendezvous ranks first) must place its head and catalog and serve the
+      agent's tree. Its plan must be one replacement, one create and one removal, with no conflict. The landing must
+      write them and keep the outsider's file.
+    - The second clone's successor must serve an empty root and refuse the landing `Unsupported`, writing nothing.
+  - `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture` (A-565). The clone is live-shipped
+    and snapshotted. Once a counts its record, the clone is moved to b until done. b must serve the agent's tree, and
+    the landing on b must hold the same three changes and land them, the outsider's file kept.
+- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
+  helper, so no lib test came with them.
 
 ### A-555, second piece — The fetch driver: a volume's owner shard runs its S3 host's fetches, woken by the host when a fetch is wanted and ended with it (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base"; D-9, R6, R8; A-471, A-524, A-555)
 Applied in the same change to: `crates/base` (`s3::driver`, new: `HostCell`, `drive` and their tests; `s3::fetch::Store`
