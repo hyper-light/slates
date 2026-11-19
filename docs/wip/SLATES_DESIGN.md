@@ -13572,6 +13572,20 @@ signature verification).
 > read within its length when opened; a read answered three bytes a call read whole, and refused with the fetch where
 > a piece is still being fetched; the refusals and the bounds each by a test (macOS arm64, Mac Studio: 11 of 11; a
 > red run against a stub owed).
+>
+> **Status (2026-11-19, A-675: the daemon's import of a repository's directory).** `slates-server`'s
+> `vcs_store::hg_import` gives a Mercurial repository's store, made empty with its record, the history of a repository
+> directory on the host: the directory is read through `hg_base` and the import is advanced a turn at a time on the
+> repository's owner shard, each turn lent the host and the shard's content store within the shard's quantum on its
+> clock, with a yield between turns (`run`, a task of the shard). Done, its index takes the empty index's place, so the
+> store holds one index; refused, abandoned, or freed midway, it gives back everything it held. It holds at most one
+> client region's bytes between and within its turns, charged to the shard's budget while it runs, and one import a
+> repository runs at a time. Proven by the `states` repository imported a unit a turn equal row for row to its import in
+> one call, a refused import and a freed one giving back every byte charged, each refusal by kind, and the shard's own
+> task running an import to its end (macOS arm64, Mac Studio: `vcs_store::` 18 of 18, the five new tests among them; red
+> first, the five failing against stubs). Owed: the verb that asks for an import, and the import made durable (the
+> register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
+> served.
 
 > **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
 > `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
@@ -14028,9 +14042,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
    phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
    never whole, and texts rebuilt from the one before. Built (A-649 part 3b): the import in slices under the owner's
-   quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Owed: the
-   daemon's import of a repository's directory through it, a turn at a time on the repository's owner shard, the
-   imported index handed to the repository's Mercurial store in A-662's per-repository map (`vcs_store`'s `HgStore`).
+   quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Built (A-675,
+   `crates/server`: `vcs_store::hg_import`): the daemon's import of a repository's directory through it, a turn at a
+   time on the repository's owner shard, its index put in the place of the empty index A-662's map made the
+   repository's Mercurial store with. Owed: the verb that asks for an import, and the import made durable.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -49317,3 +49332,63 @@ docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison be
   commits after b13a6e05f change only manifest comments, the server's Mercurial site over HTTP and slates-svn's report
   editor, none of which slates-merge or slates-anchor builds from or the repository test reaches.
 - **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
+
+### A-675 — The daemon imports a Mercurial repository's directory into the repository's store, a turn at a time on its owner shard (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.3; A-649 parts 3b and 4; A-662)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/server` (`vcs_store::hg_import` and its tests,
+new; `vcs_store`: the map's imports and `free` giving an import back; `hg_base`'s test fixtures shared with them;
+`lib.rs`'s notes on both modules' callers), GAPS (the §4.17.3 entry).
+- **What it does.** A Mercurial repository's store is made with its record as an empty index (A-662's `HgStore`).
+  `hg_import::begin` takes a host and the repository's directory on it, read-only (§4.15), checks the store holds no
+  row and no import of it is under way, charges the import's room to the shard's budget, and reads the requirements
+  and the listing through `hg_base` (`Import::start`). `hg_import::turn` advances the import one turn: units of work
+  until the shard's quantum is spent on the shard's clock, at least one, lent the host (a fresh `HgBase` each turn) and
+  the shard's content store. `hg_import::run` is the shard's task for it: a yield, then a turn, until it ends. Done, the
+  import's index is put in the empty index's place, which is given back, so the store holds one index and nothing
+  keeps a second; what the import found beside the history (its counts, phase roots and bookmarks) is answered
+  (`Finished`) for the register's first entry to record. A store that holds a history by then keeps it, and the
+  import's index is given back (`NotEmpty`).
+- **Bounds.** An import holds at most its room between its turns as within them: the listing, the log it reads, a text
+  being rebuilt and the one before it. The room is one client region's bytes (`RegionGeometry::total_bytes`), what one
+  request of the version-control edge may hold (`vcs_http`'s `Bounds`), since one client asks for an import; it is
+  charged to the shard's budget as retention when the import starts and given back when it ends, so the charge covers
+  what the import may hold while it waits between turns. The texts it keeps go to the content store and are charged as
+  every store's are: each turn is lent every byte the shard could admit now, then the arena is grown from its pool by
+  what the turn kept and the charge trued up to what the content store holds. One import a repository runs at a time
+  (`Busy`), so the imports under way are bounded by the partition's repositories. Each holds its own host, which its
+  caller opened for the directory and which is closed when the import ends; a turn's adapter holds at most a directory
+  and two files of it, closed as the turn ends.
+- **Cancellation.** The import lives in the shard's map (`VcsStores`), keyed by its repository, and its task holds the
+  key alone, so a task dropped mid-import leaks nothing: the import waits in the map, holding what it held, until a
+  task runs it again or its repository is freed, which gives it back first (`vcs_store::free` calls
+  `hg_import::abandon`).
+- **Refusals, by kind** (`ImportFailed`): no Mercurial store of the repository here (`NoStore`), a store with a history
+  (`NotEmpty`), an import under way (`Busy`), the shard's budget unable to take the room (`Budget`, with what it could
+  admit), and the import's own refusal carried through (`Refused`: the store, its requirements, a file, or the host's
+  refusal, a fetch still pending on an S3 base among them). Each leaves the store as it was.
+- **Not taken (decided by the design, not measured).** A verb in this piece: §4.15 names no repository import, and the
+  import's durability decides its shape (the register's first entry, the recovery), so both are the next pieces'. The
+  adapter's handles held between turns beside the import, which the map now allows: left until a measurement shows
+  that a turn's reopening of its directory and files matters.
+- **Tests** (`crates/server/src/vcs_store/hg_import/tests.rs`; macOS arm64, Mac Studio, kiln r160, 2026-11-19, debug,
+  rustc 1.98.1, over main 54075b520):
+  - the oracle: the `states` repository 7.2 kept, laid out on the simulated host, imported into a repository's store on
+    its owner shard a unit a turn, equal row for row to its import in one call through the same adapter into a content
+    store with the shard's window, with every count, phase root and bookmark; more than one turn, each counted, and
+    the shard's charge settled to what the content store holds;
+  - the same repository with its manifest log cut in half, refused midway by the import's own refusal: the store's
+    index still empty, the content store holding what it held, the shard's retention charge what it was;
+  - `NoStore` for a git repository, `Busy` for a second import, `NotEmpty` for an imported store, each leaving the
+    store as it was;
+  - a repository freed midway giving its import back, counted abandoned, and with an imported one freed too, nothing
+    charged and the retention charge what it was before either import;
+  - the shard's own task (`run`) running an import to its end on a running daemon, equal row for row to the one call.
+
+  `cargo test --locked -p slates-server --lib vcs_store::` 18 of 18 (A-662's 13 and these 5; 687 filtered out) and
+  `--lib hg_base` 11 of 11, `cargo fmt --check -p slates-server` clean, no warning. Red first (69995faf9: `begin`
+  refusing `NoStore` and `turn` answering nothing at once): the five failed, each at its first `begin`. No integration
+  test reaches the import: nothing calls `begin` outside its tests until its verb. Main's: clippy, `xtask check`, the
+  doc gates and the other platforms.
+- **Owed.** The verb that asks for an import of a directory and answers when it ends; the import made durable: the
+  register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the directory
+  again or replays its record (until then an import is not served, and a restart leaves its store empty); a host's
+  pending fetch retried at the next turn rather than ending the import; the adapter's handles held between turns.
