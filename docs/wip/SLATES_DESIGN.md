@@ -11268,7 +11268,10 @@ is one more version, and the chain itself is never rewritten.
      it merges a transaction into the newest revision node by node and fails a file "whenever source, target, and
      ancestor are all distinct node revisions" [B: svn_fs.h `svn_fs_merge`], and it calls a path out of date when its
      base revision "is less than the last-changed-revision of the path" [B: svn_fs.h `svn_fs_lock_many`], which is the
-     negation of §4.16's fast path (`last_changed[path] <= base`).
+     negation of §4.16's fast path (`last_changed[path] <= base`). Subversion's exact rule is §4.17.4 item 3's, FSFS's
+     commit-time merge, and it is stricter than §4.16's verdict over whole-file operations: it accepts no identical
+     replacement, a directory whose properties changed meanwhile conflicts with any change beneath it, and a
+     directory's last change is its subtree's.
 6. **A base that is no version.** A review request or a merge may need a base that is a commit inside an earlier push,
    so not the head of any version. Such a base is given as a tree, and what the green changed since it is read as the
    whole-file differences between that tree and the head's, which is all that stock pushes ever declared. It costs
