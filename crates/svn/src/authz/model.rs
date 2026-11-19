@@ -621,7 +621,7 @@ fn holders_of(groups: &[ResolvedGroup]) -> Vec<Vec<usize>> {
 }
 
 /// For each group, whether expanding it never ends: it lies on a cycle of groups or names one that leads into a cycle.
-/// Groups whose members all end are peeled away until none is left to peel (module documentation of `authz`, item 5).
+/// Groups whose members all end are peeled away until none is left to peel (module documentation of `authz`, item 4).
 fn expands_forever(groups: &[ResolvedGroup]) -> Vec<bool> {
   let holders = holders_of(groups);
   let mut unfinished: Vec<usize> = groups.iter().map(|group| group.nested.len()).collect();

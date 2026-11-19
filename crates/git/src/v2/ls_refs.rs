@@ -23,12 +23,13 @@
 //! server writes one of each, and its client would make a second `peeled` a second `^{}` ref. An attribute of another
 //! kind is refused.
 
+use super::Refusal;
 use super::line::{self, Line, Packets, Part, SP};
-use super::{Refusal, refname};
 use crate::Admission;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::out::{Measure, Out};
 use crate::pktline::Packet;
+use crate::refname;
 
 /// Format: the argument asking for peeled tags [gitprotocol-v2 "ls-refs"].
 const PEEL: &[u8] = b"peel";

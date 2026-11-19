@@ -937,56 +937,77 @@ fn the_conf_authz_examples_uncommented_mean_what_they_say() {
   );
 }
 
-/// The book's examples (path-based authorization, svnbook 1.7), each with the outcome its prose states.
+/// What `user` may do at `at` in the book's `calc` repository.
+fn calc_access(authz: &Authz, user: &str, at: &str) -> Access {
+  authz.rules(b"calc", principal(Some(user))).access(path(at))
+}
+
+/// The book's first example (path-based authorization, svnbook 1.7): "harry has full read and write access ... sally
+/// has read-only access. Any other users are blocked".
 #[test]
-fn the_books_examples_have_the_outcomes_the_book_states() {
-  // "harry has full read and write access ... sally has read-only access. Any other users are blocked".
-  let first = parse("[calc:/branches/calc/bug-142]\nharry = rw\nsally = r\n");
-  let at = |authz: &Authz, user: &str, at: &str| {
-    authz.rules(b"calc", principal(Some(user))).access(path(at))
-  };
-  assert_eq!(at(&first, "harry", "/branches/calc/bug-142"), Access::Write);
+fn the_books_first_example_blocks_everyone_it_does_not_name() {
+  let authz = parse("[calc:/branches/calc/bug-142]\nharry = rw\nsally = r\n");
   assert_eq!(
-    at(&first, "sally", "/branches/calc/bug-142/src"),
+    calc_access(&authz, "harry", "/branches/calc/bug-142"),
+    Access::Write
+  );
+  assert_eq!(
+    calc_access(&authz, "sally", "/branches/calc/bug-142/src"),
     Access::Read
   );
-  assert_eq!(at(&first, "frank", "/branches/calc/bug-142"), Access::None);
-  // "Now Sally can write to the testing subdirectory of the branch, but can still only read other parts."
-  let second = parse(
+  assert_eq!(
+    calc_access(&authz, "frank", "/branches/calc/bug-142"),
+    Access::None
+  );
+}
+
+/// The book's second: "Now Sally can write to the testing subdirectory of the branch, but can still only read other
+/// parts."
+#[test]
+fn the_books_testing_subdirectory_lets_sally_write_there_alone() {
+  let authz = parse(
     "[calc:/branches/calc/bug-142]\nharry = rw\nsally = r\n\n# give sally write access only to the 'testing' subdir\n\
 [calc:/branches/calc/bug-142/testing]\nsally = rw\n",
   );
   assert_eq!(
-    at(&second, "sally", "/branches/calc/bug-142/testing/x"),
+    calc_access(&authz, "sally", "/branches/calc/bug-142/testing/x"),
     Access::Write
   );
   assert_eq!(
-    at(&second, "sally", "/branches/calc/bug-142/other"),
+    calc_access(&authz, "sally", "/branches/calc/bug-142/other"),
     Access::Read
   );
   assert_eq!(
-    at(&second, "harry", "/branches/calc/bug-142/testing"),
+    calc_access(&authz, "harry", "/branches/calc/bug-142/testing"),
     Access::Write
   );
-  // "Harry has read/write access to the entire bug-142 tree, but has absolutely no access at all to the secret
-  // subdirectory".
-  let third = parse(
+}
+
+/// The book's third: "Harry has read/write access to the entire bug-142 tree, but has absolutely no access at all to the
+/// secret subdirectory".
+#[test]
+fn the_books_denied_subdirectory_denies_harry_there_alone() {
+  let authz = parse(
     "[calc:/branches/calc/bug-142]\nharry = rw\nsally = r\n\n[calc:/branches/calc/bug-142/secret]\nharry =\n",
   );
   assert_eq!(
-    at(&third, "harry", "/branches/calc/bug-142/secret"),
+    calc_access(&authz, "harry", "/branches/calc/bug-142/secret"),
     Access::None
   );
   assert_eq!(
-    at(&third, "harry", "/branches/calc/bug-142/public"),
+    calc_access(&authz, "harry", "/branches/calc/bug-142/public"),
     Access::Write
   );
-  // "This makes all repositories world-readable to all users."
-  let fourth = parse("[/]\n* = r\n");
+}
+
+/// The book's root rule: "This makes all repositories world-readable to all users."
+#[test]
+fn the_books_root_rule_makes_every_repository_world_readable() {
+  let authz = parse("[/]\n* = r\n");
   for repository in [&b"calc"[..], b"paint", b""] {
     for user in [None, Some("anyone")] {
       assert_eq!(
-        authz_access(&fourth, repository, user, "/deep/path"),
+        authz_access(&authz, repository, user, "/deep/path"),
         Access::Read
       );
     }
@@ -1154,10 +1175,9 @@ fn the_1_10_notes_refuse_a_repeated_section_and_combine_repeated_entries() {
   }
 }
 
-/// The 1.10 release notes on wildcards: `*` one segment, `**` any number, `/*/**/*`, `/**/*/*` and `/*/*/**` one rule,
-/// a plain and a glob section for one path one rule, classic patterns with escapes, and write alone refused.
+/// The 1.10 release notes on wildcards: `*` is one segment, `**` any number of them.
 #[test]
-fn the_1_10_notes_on_wildcards() {
+fn the_1_10_notes_one_star_is_one_segment_and_two_are_any_number() {
   let one = parse("[:glob:/*/x]\n* = r\n");
   assert_eq!(authz_access(&one, b"", None, "/a/x"), Access::Read);
   assert_eq!(
@@ -1169,6 +1189,12 @@ fn the_1_10_notes_on_wildcards() {
   for at in ["/a/x", "/a/b/x", "/a/b/c/x"] {
     assert_eq!(authz_access(&many, b"", None, at), Access::Read, "{at}");
   }
+}
+
+/// The 1.10 release notes: `/*/**/*`, `/**/*/*` and `/*/*/**` are one rule, and so are a plain and a glob section for
+/// one path without wildcards: two of them in a file are refused.
+#[test]
+fn the_1_10_notes_equivalent_rules_collide() {
   for (first, second) in [
     ("/*/**/*", "/**/*/*"),
     ("/*/**/*", "/*/*/**"),
@@ -1184,6 +1210,12 @@ fn the_1_10_notes_on_wildcards() {
     refusal(b"[/path/without/wildcards]\n* = r\n[:glob:/path/without/wildcards]\n* = r\n"),
     in_rules(3, AuthzRefusal::RuleRepeated)
   );
+}
+
+/// The 1.10 release notes: classic patterns "work as expected, including escaping of special characters with a
+/// backslash"; and write alone is refused.
+#[test]
+fn the_1_10_notes_classic_patterns_escapes_and_no_write_alone() {
   let classic = parse("[:glob:/*foo*.bar]\n* = r\n[:glob:/x\\*y]\n* = rw\n");
   assert_eq!(
     authz_access(&classic, b"", None, "/afoob.bar"),
@@ -1470,7 +1502,7 @@ fn an_entry_for_an_empty_group_is_ignored_and_listed() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Where Subversion's code and its own documentation part (the module documentation, items 1 to 4).
+// Where Subversion's code and its own documentation part (the module documentation, items 1 to 3).
 
 /// Item 1: the root has no segments, so `[:glob:/*]` does not decide it ("`*` matches any single non-empty path
 /// segment", `authz.h`). Subversion 1.14.x's `lookup` walks `/` as one empty segment and answers r here.
@@ -1487,22 +1519,11 @@ fn divergence_1_the_root_has_no_segments_so_a_star_rule_does_not_decide_it() {
   );
 }
 
-/// Item 2: a recursive question at the root weighs every rule. Subversion 1.14.x's weighs only rules an empty segment
-/// matches and grants recursive read here, above the unreadable `/secret`.
-#[test]
-fn divergence_2_a_recursive_question_at_the_root_weighs_every_rule() {
-  let authz = parse("[/]\n* = rw\n[/secret]\n* =\n");
-  let rules = authz.rules(b"", principal(None));
-  assert_eq!(rules.access(path("/")), Access::Write);
-  assert_eq!(rules.access_beneath(path("/")), Access::None);
-  assert_eq!(rules.access_beneath(path("/public")), Access::Write);
-}
-
-/// Item 3: a suffix rule leaves the segment as it is for the rules beside it. Subversion 1.14.x's `lookup` reverses the
+/// Item 2: a suffix rule leaves the segment as it is for the rules beside it. Subversion 1.14.x's `lookup` reverses the
 /// segment in place, so the `/**/public` rule, held by the next node of the level, meets `cilbup`: it misses
 /// `/public` and matches `/cilbup`.
 #[test]
-fn divergence_3_a_suffix_rule_leaves_the_segment_for_the_rules_beside_it() {
+fn divergence_2_a_suffix_rule_leaves_the_segment_for_the_rules_beside_it() {
   let authz = parse("[/]\n* =\n[:glob:/*.secret]\n* =\n[:glob:/**/public]\n* = r\n");
   let rules = authz.rules(b"", principal(None));
   assert_eq!(rules.access(path("/public")), Access::Read);
@@ -1510,9 +1531,9 @@ fn divergence_3_a_suffix_rule_leaves_the_segment_for_the_rules_beside_it() {
   assert_eq!(rules.access(path("/a/public")), Access::Read);
 }
 
-/// Item 4: a path that starts with two slashes is refused. Subversion 1.14.x takes `[//secret]` for the root's rule.
+/// Item 3: a path that starts with two slashes is refused. Subversion 1.14.x takes `[//secret]` for the root's rule.
 #[test]
-fn divergence_4_two_slashes_at_the_start_of_a_rule_path_are_refused() {
+fn divergence_3_two_slashes_at_the_start_of_a_rule_path_are_refused() {
   assert_eq!(
     refusal(b"[//secret]\n* =\n"),
     in_rules(1, AuthzRefusal::RulePathEmptySegment)
@@ -1525,6 +1546,16 @@ fn divergence_4_two_slashes_at_the_start_of_a_rule_path_are_refused() {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The precedence, case by case.
+
+/// A recursive question at the root weighs every rule beneath it.
+#[test]
+fn a_recursive_question_at_the_root_weighs_every_rule() {
+  let authz = parse("[/]\n* = rw\n[/private]\n* =\n");
+  let rules = authz.rules(b"", principal(None));
+  assert_eq!(rules.access(path("/")), Access::Write);
+  assert_eq!(rules.access_beneath(path("/")), Access::None);
+  assert_eq!(rules.access_beneath(path("/public")), Access::Write);
+}
 
 /// The deepest level a rule matches decides, then the rule defined last; `**` matches zero segments too.
 #[test]
