@@ -87,6 +87,15 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
+> create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
+> `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
+> on `main`, Mercurial SHA-1 on `default`'s first line, Subversion's revisions bound to `root`); a format or branch the
+> tool cannot have is usage (exit 2), a name taken `AlreadyExists` (exit 1). Tests: the grammar's two and a real
+> anchor's CLI test (the A-685 entry has the runs). OWED: the other repository verbs on the command line (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`), the SDKs' and MCP's words, and the
+> server's own refusal of a format its tool does not name (it records the repository today and makes no git store for
+> `--tool git` in revisions; the CLI refuses it before asking).
 > **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
 > header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
 > `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
