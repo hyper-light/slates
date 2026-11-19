@@ -14,8 +14,10 @@ use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use super::copy::{appearance_bytes, in_tree, joined, relative};
 use super::{Green, Increment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
 use crate::chain_entry;
+use crate::checkpoint::{Checkpoint, Tables};
 use crate::increment::Base;
 use crate::ops_doc::{NODE_EXCLUSIVE, NodeOrigin, NodeRef, Op, OpKind, OpsDoc, REPLACE};
+use crate::origin::Origin;
 use crate::range::Range;
 use crate::review::OutdatedBy;
 use crate::verdict::MergeConflictClass;
@@ -574,16 +576,45 @@ fn a_branch_before_a_copy_holds_none_of_it_and_one_after_holds_it() {
   assert_eq!(lineage.walked(), walked, "a branch walked a map");
 }
 
-/// A-586 (owed: a checkpoint listing a copy's tree and carrying the identity's sum). Do: checkpoint a green at the
-/// version before its copy and at the copy's. Expect: the first taken, the second refused (`None`), which the service
-/// answers by keeping the chain whole.
+/// What a restored green and the green it was restored from answer alike at their head: the head, its base, the bytes
+/// of `b/a`, and the identity, which must also equal the restored green's recount.
+fn restored_reads(green: &mut Green) -> (u64, Base, Option<Vec<u8>>, [u8; 32], [u8; 32]) {
+  (
+    green.head(),
+    green.base_at(green.head()),
+    green.content("b/a").map(<[u8]>::to_vec),
+    green.head_identity(),
+    green.head_identity_from_scratch(),
+  )
+}
+
+/// A-626 part 3 (a checkpoint of a green holding a copy; A-586 had refused one). Do: copy `trunk` to `b`, edit `b/a`
+/// once after it, and checkpoint the green at the copy's version and at the edit's; restore each from the origin (none)
+/// and give it the versions after. Expect: each checkpoint carries the copy's record and lists the copied keys that hold
+/// what the copy gave them (at the copy's version, every key of the tree; at the edit's, every one but `b/a`, which its
+/// own change lists); each restored green reads, and hashes, as the green, its identity equal to its recount.
 #[test]
-fn a_green_is_not_checkpointed_from_its_first_copys_version() {
+fn a_green_holding_a_copy_is_checkpointed_and_restored() {
   let mut green = trunk();
-  accept(&mut green, Work::default().create("e", b"e"), 2);
-  accept(&mut green, Work::exclusive().copy("trunk", "b", 2), 3);
-  assert!(green.checkpoint(2).is_some());
-  assert!(green.checkpoint(3).is_none());
+  accept(&mut green, Work::exclusive().copy("trunk", "b", 1), 2);
+  accept(&mut green, Work::default().overwrite("b/a", 0, b"A"), 3);
+  for (at, copied_files) in [(2, 3), (3, 2)] {
+    let checkpoint = green.checkpoint(at).expect("a checkpoint");
+    assert_eq!(checkpoint.copies.len(), 1, "the copy's record at {at}");
+    assert_eq!(
+      checkpoint.copied.files.len(),
+      copied_files,
+      "the copied files at {at}"
+    );
+    let mut restored = Green::restore(Origin::default(), &checkpoint);
+    if at == 2 {
+      let work = Work::default().overwrite("b/a", 0, b"A").at(3, 2);
+      assert_eq!(restored.submit(&work), Outcome::Accepted { version: 3 });
+    }
+    let (read, expected) = (restored_reads(&mut restored), restored_reads(&mut green));
+    assert_eq!(read, expected, "restored at {at}");
+    assert_eq!(read.3, read.4, "the restored identity is its recount");
+  }
 }
 
 /// A-586 (owed: a rebase restating a copy). Do: rebase a work holding a copy. Expect: a type conflict naming its
@@ -1332,6 +1363,10 @@ struct Census {
   nested_replaced: usize,
   /// Moves accepted inside a copied tree (A-626).
   moved: usize,
+  /// Checkpoints taken at or after a copy, restored and replayed (A-626 part 3).
+  checkpointed_copies: usize,
+  /// Of those, ones listing copied keys a restore sets with no history.
+  copied_keys: usize,
 }
 
 impl Census {
@@ -1848,7 +1883,7 @@ impl Oracle {
     let head = self.green.head();
     prop_assert_eq!(head, self.model.head());
     for version in 0..=head {
-      self.check_version(version, head)?;
+      self.check_version(&self.green, version, head)?;
     }
     prop_assert_eq!(
       self.green.head_identity(),
@@ -1859,32 +1894,28 @@ impl Oracle {
     Ok(())
   }
 
-  /// [`Oracle::check`] at one version.
-  fn check_version(&self, version: u64, head: u64) -> Result<(), TestCaseError> {
+  /// [`Oracle::check`] of `green` (the green under test, or one restored from its checkpoint) at one version.
+  fn check_version(&self, green: &Green, version: u64, head: u64) -> Result<(), TestCaseError> {
     let state = self
       .model
       .state(version)
       .ok_or_else(|| TestCaseError::fail("a version the model lacks"))?;
     prop_assert_eq!(
-      sorted(self.green.base_at(version)),
+      sorted(green.base_at(version)),
       state.base(),
       "the base at {}",
       version
     );
     for (path, bytes) in &state.files {
       prop_assert_eq!(
-        self.green.content_at(path, version),
+        green.content_at(path, version),
         Some(bytes.clone()),
         "{} at {}",
         path,
         version
       );
     }
-    let named: BTreeSet<String> = self
-      .green
-      .changed_between(version, head)
-      .into_iter()
-      .collect();
+    let named: BTreeSet<String> = green.changed_between(version, head).into_iter().collect();
     prop_assert_eq!(
       named,
       self.model.named_between(version, head),
@@ -1907,6 +1938,68 @@ impl Oracle {
       identities.push(replica.head_identity());
     }
     Ok((replica, identities))
+  }
+
+  /// A-626 part 3: the green checkpointed at every version, each checkpoint encoded and decoded, restored from the
+  /// origin (none here) and given every later version's chain entry ([`Oracle::restored_from`]); the restored green must
+  /// read as the model at every version from the checkpoint on (each base, each file's bytes, the paths named since).
+  fn restore_at_every_version(&self, census: &mut Census) -> Result<(), TestCaseError> {
+    let (_, identities) = self.replay()?;
+    let head = self.green.head();
+    for at in 0..=head {
+      let checkpoint = self
+        .green
+        .checkpoint(at)
+        .ok_or_else(|| TestCaseError::fail(format!("no checkpoint at {at}")))?;
+      census.checkpointed_copies += usize::from(!checkpoint.copies.is_empty());
+      census.copied_keys += usize::from(lists_copied(&checkpoint.copied));
+      let decoded = Checkpoint::decode(&checkpoint.encode())
+        .map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
+      prop_assert_eq!(&decoded, &checkpoint, "the checkpoint at {} round trip", at);
+      let restored = self.restored_from(&decoded, &identities)?;
+      for version in at..=head {
+        self.check_version(&restored, version, head)?;
+      }
+    }
+    Ok(())
+  }
+
+  /// The green restored from `checkpoint` and given every chain entry after it, encoded and decoded: it must hash as the
+  /// replay (`identities`, by version) at its restore and at every version it reaches, and end with its identity equal
+  /// to its recount and its change index's bytes to theirs.
+  fn restored_from(
+    &self,
+    checkpoint: &Checkpoint,
+    identities: &[[u8; 32]],
+  ) -> Result<Green, TestCaseError> {
+    let mut restored = Green::restore(Origin::default(), checkpoint);
+    let at = usize::try_from(checkpoint.version).unwrap_or(usize::MAX);
+    let expected = |version: usize| identities.get(version).copied();
+    prop_assert_eq!(
+      Some(restored.head_identity()),
+      expected(at),
+      "restored at {}",
+      at
+    );
+    for (version, (increment, applied)) in self.entries.iter().enumerate().skip(at) {
+      let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
+      let decoded =
+        chain_entry::decode(&entry).map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
+      restored.apply_recorded(&decoded.increment, &decoded.applied);
+      prop_assert_eq!(
+        Some(restored.head_identity()),
+        expected(version + 1),
+        "restored at {} replayed to {}",
+        at,
+        version + 1
+      );
+    }
+    prop_assert_eq!(
+      restored.head_identity(),
+      restored.head_identity_from_scratch()
+    );
+    prop_assert_eq!(restored.changes_bytes(), restored.changes_recounted());
+    Ok(restored)
   }
 
   /// The replay must read as the green at every version and hash as it; then a branch of the green at every version
@@ -1949,13 +2042,26 @@ impl Oracle {
   }
 }
 
-/// Runs one history, checking after every step, then replays the green's chain and branches it at every version.
+/// Whether a checkpoint's copied tables list any key (A-626 part 3).
+fn lists_copied(tables: &Tables) -> bool {
+  !(tables.files.is_empty()
+    && tables.dirs.is_empty()
+    && tables.modes.is_empty()
+    && tables.xattrs.is_empty()
+    && tables.specials.is_empty()
+    && tables.symlinks.is_empty()
+    && tables.hardlinks.is_empty())
+}
+
+/// Runs one history, checking after every step, then restores it from a checkpoint at every version, replays its chain
+/// and branches it at every version.
 fn run(steps: &[Step], census: &mut Census) -> Result<(), TestCaseError> {
   let mut oracle = Oracle::default();
   for step in steps {
     oracle.apply(step, census)?;
     oracle.check()?;
   }
+  oracle.restore_at_every_version(census)?;
   oracle.replay_and_branch()
 }
 
@@ -1966,8 +2072,11 @@ fn run(steps: &[Step], census: &mut Census) -> Result<(), TestCaseError> {
 /// version's tree. Expect: the green decides every step as the model does; after every step it reads as the model at
 /// every version (each base, each file's bytes, the paths the change index names since), its identity equals its
 /// recount and its change index's bytes theirs, no map refused a copy its verdict passed, and a copy that replaces
-/// nothing walked no map; at the end its chain, replayed from its entries, reads and hashes as it does, and a branch at
-/// every version reads as the model and hashes as the replay, walking no map. The census shows each kind of copy met.
+/// nothing walked no map; at the end, restored from its checkpoint at every version (encoded and decoded) and given every
+/// later chain entry, it hashes as the replay at every version it reaches, reads as the model at every version from the
+/// checkpoint on, and its identity equals its recount (A-626 part 3); its chain, replayed from its entries, reads and
+/// hashes as it does, and a branch at every version reads as the model and hashes as the replay, walking no map. The
+/// census shows each kind of copy met, and checkpoints carrying copies and listing copied keys.
 #[test]
 fn every_copy_reads_as_its_model_over_every_history() {
   let census = RefCell::new(Census::default());
@@ -1997,6 +2106,8 @@ fn every_copy_reads_as_its_model_over_every_history() {
     census.nested,
     census.nested_replaced,
     census.moved,
+    census.checkpointed_copies,
+    census.copied_keys,
   ];
   assert!(
     met.iter().all(|&count| count > 0),
