@@ -57,7 +57,8 @@
 //! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
-//! `501` until then; the sites composed into one the daemon starts (git's alone today); the MCP edge onto this engine; the live `git clone` and `hg clone` over HTTPS (main's runs).
+//! `501` until then; the sites composed into one the daemon starts (git's alone today); the MCP edge onto this engine;
+//! the live `git clone` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;

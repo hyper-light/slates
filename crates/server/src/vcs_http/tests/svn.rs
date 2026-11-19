@@ -26,7 +26,7 @@ use slates_svn::mergeinfo::Contents;
 use slates_svn::reads::Repository;
 
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
-use super::{Lent, SvnExchange, SvnSite, SvnStores};
+use super::{Lent, NoSvnStores, SvnExchange, SvnSite, SvnStores};
 use crate::vcs_http::{Answer, Bounds, Decided, EdgeState, Exchange, Fields, serve};
 
 /// Shape: room enough for every request these tests send.
@@ -443,6 +443,28 @@ fn each_request_is_decided_in_the_module_docs_order() {
     .map(|(outcome, proven)| ((*outcome).to_owned(), *proven))
     .collect();
   assert_eq!(asked.to_vec(), expected);
+}
+
+/// A-681 (the module doc's step 6): do ask a site over the stores the daemon has today ([`NoSvnStores`]) for the
+/// owner's repository by OPTIONS, PROPFIND and GET, as the owner; expect each proven and refused `503`: no Subversion
+/// store is lent on any shard until the site is handed them.
+#[test]
+fn until_the_stores_land_every_request_a_principal_may_make_is_503() {
+  let mut site = SvnSite::new(REALM.to_owned(), ROOM, Tokens, Held, NoSvnStores);
+  let owner = basic("alice", OWNER_TOKEN);
+  let asked: Vec<(u16, bool)> = ["OPTIONS", "PROPFIND", "GET"]
+    .into_iter()
+    .map(|method| {
+      let bytes = request(method, "/repo/trunk/a.txt", &[owner.as_str()]);
+      let decided: Decided<SvnExchange<NoSvnStores>> = ready(site.answer(&head(&bytes), true));
+      let status = match decided.answer {
+        Answer::Refuse { status, .. } => status.code,
+        Answer::Move { .. } | Answer::Serve { .. } => 0,
+      };
+      (status, decided.proven)
+    })
+    .collect();
+  assert_eq!(asked, vec![(503, true); 3]);
 }
 
 /// What the owner's served `method target` with `depth` and `body` answers: its status, its fields and its reply's

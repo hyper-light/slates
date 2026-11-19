@@ -662,7 +662,8 @@ fn rfc1123(date: &str) -> Option<String> {
   let days = seconds / super::time::SECONDS_PER_DAY;
   let (year, month, day) = super::time::civil_from_days(days)?;
   let (hour, minute, second) = super::time::time_of_day(seconds % super::time::SECONDS_PER_DAY);
-  let weekday = DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY) % 7).ok()?)?;
+  let week = u64::try_from(DAY_NAMES.len()).ok()?;
+  let weekday = DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY) % week).ok()?)?;
   let month_name = MONTH_NAMES.get(usize::try_from(month.checked_sub(1)?).ok()?)?;
   Some(format!(
     "{weekday}, {day:02} {month_name} {year} {hour:02}:{minute:02}:{second:02} GMT"
