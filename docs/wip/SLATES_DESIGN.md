@@ -12191,8 +12191,8 @@ is one more version, and the chain itself is never rewritten.
 > of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
 > any tier computes, keeps and serves it with no coordination; computed eagerly as each version is recorded or lazily
 > when first read, by the type's own declaration, a unit a step under the shard's slices. Its first type is a version's
-> map of paths to contents (`derived/paths.rs`). Owed: the tool stores as types (A-614's D(k) first), and the server's
-> use (A-647's entry).
+> map of paths to contents (`derived/paths.rs`). A-614's D(k) and reached sets are one since A-647 part 2
+> (`crates/git/src/store/reach.rs`). Owed: A-553's and A-588's stores as types, and the server's use (A-647's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12522,6 +12522,13 @@ engine: the verdict, rebase, position mapping, the register).
 > chain's depth across fragments, bounded today by the versions a pack spans and reset by each rebuild; the encoding and
 > rebuild sliced under the shard's budget; one base pack shared by greens that reach alike (each green keeps its own
 > today).
+>
+> **Status (2026-11-19, A-647 part 2: D(k) as derived data, A-645).** A version's D(k) and its reached set are a type of
+> `slates-vcs`'s derived data (`store::ReachSets`, `crates/git/src/store/reach.rs`): a pure function of the version's
+> record and its parents' values, version `k - 1`'s and that of the version a remade set was taken from, which each
+> version now records (`Followed`). Its derivation is the admission's own walks over the committed index, and the owner
+> keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). The store's outputs
+> are unchanged.
 >
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
@@ -43986,10 +43993,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     bases and skip lists, copy detection, file search. Each type for a version is computed from its parents' values,
     eagerly or lazily, and stored immutable by identity, so any server or tier computes, caches and serves it without
     coordination. The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth.
-    (Part 1 built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type,
-    version) in an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down
-    a unit a step, and a version's map of paths to contents as its first type. Owed: A-614's D(k) as a type, part 2;
-    A-553's and A-588's stores after it.)
+    (Built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type, version) in
+    an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
+    step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
+    the store's outputs unchanged (part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -45914,3 +45921,53 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   `crates/vcs/src/content.rs` (`Form::Derived`, `put_derived`, `derived`, `DerivedNode`, `encode_derived`, the release
   cascade, `NotNameable`, `ContentCounters::derived`); `crates/vcs/src/lib.rs`; A-645's entry; §4.17.1 "Reads"; GAPS'
   §4.17 entry.
+
+### A-647 part 2 — A-614's D(k) and reached sets as a type of derived data, the store's outputs unchanged (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 1, A-614)
+
+- **The type** (`ReachSets`, `crates/git/src/store/reach.rs`, a child of the store's `repository.rs` as `graph.rs` is).
+  A ref's version (its green and its index `k`) has two sets of positions as its value: what its head reaches, and
+  D(k). They are what A-614's admission computes, by the same walks over the committed index: a fast-forward's D(k)
+  is the walk from the head that stops at version `k - 1`'s set, which grows by it; a rewrite's or a create's reached
+  set is the set it was remade from and the walk beyond it, and its D(k) the walk that stops at version `k - 1`'s set,
+  or with no head before it everything reached; a delete's both are empty. The repository is the type's history
+  (`Graph for Repository`, a version named by its green and `k`, big-endian): a version's parents are version `k - 1`
+  when it had a head, then the version its set was remade from. Typed refusals (`ReachRefused`): no such version,
+  parents' values that do not fit the record, a value that is not the type's, an object the index lacks, and the
+  store's own.
+- **One thing recorded, so the derivation reads only recorded history.** Which version a rewrite's or a create's set is
+  remade from is found among the greens' current heads when the move is admitted (A-614's base), a state no later
+  reader has. Each version now records it (`Followed`: grown, remade from a green at its version then, or emptied).
+  The values could not show whether it is used, since a head's reached set is the same whatever base a walk starts
+  from; the walk counters do (below).
+- **Kept with no second walk.** The admission's sets are the type's value: `Repository::reach_value` encodes a green's
+  newest version's sets as a derived node (no content named; the reached set's runs, then D(k)'s, each a count and
+  runs of a start and an end, eight bytes each, little-endian), which the owner keeps under (type, version) as it
+  commits; a tier lacking a value derives it with a fill, the same value by identity. The store's chains, D(k) and
+  reached sets are unchanged, and every existing test of `slates-git` passed with the record added (442 of 442 at
+  9b6c49357, beside the new hostile-values test; main's 3 ignored).
+- **Tests** (`crates/git/src/tests/store/reach.rs`; `cargo test --locked -p slates-git --lib`, the Mac Studio, 2026-11-19).
+  - Red first (9b6c49357, 07:11 UTC): with `derive` and `reach_value` refusing at once, the oracle, the rewrite test
+    and the refusals test failed; the hostile-values test, its reader not stubbed, passed.
+  - The oracle (`t_a647_every_versions_d_k_is_its_derived_value`, 64 cases a run) runs A-614's own generated
+    histories (its `op` and `apply`: commits on a head, on any earlier commit and as roots, refs moved to other refs'
+    heads, deletes, refused pushes, both object formats). After each step the moved green's newest value is kept from
+    the store's sets, and every version's value is read through the type: each is the store's D(k), at the newest
+    version its reached set, and the very value the store kept; each step derives exactly the versions it made (every
+    earlier value reused); a version's derivation walks and meets exactly what its admission did; a fill from nothing
+    reaches the same newest values; and the store is empty once all is released.
+  - Beside it: A-614's rewrite scenario names the rewrite's parents ref 1's version 2 and ref 2's version 0, and a lazy
+    read derives all five versions from nothing; every refusal by kind; hostile values (a count past the bytes,
+    runs out of order, touching, empty, a byte left over, a byte short, a value naming content) refused.
+  - Green (67b1da27a, 07:12 UTC): 446 of 446 with main's 3 ignored, in 20.98 s; `slates-vcs --lib` 46 of 46; `cargo
+    fmt` clean. With the walk check (1cafc67a9, 07:14 UTC) the four tests pass.
+  - Red five ways, a mutation at a time in the Studio's clone: a fast-forward walked with no stop set (the oracle); the
+    recorded base dropped (the oracle's walk check and the rewrite test, where values alone could not see it); leftover
+    parents' values taken (the refusals test); touching runs decoded (the hostile test); the kept value's D(k) emptied
+    (the oracle).
+- **Owed.** The store serving `brought` and `reached` from its values, its chains' sets dropped, once A-614's other
+  parts settle (a change of signature in a module four pieces were changing that day); A-553's node revisions and
+  A-588's manifests as types; the server's `Derivations` for each repository on its owner shard.
+- **Applied in the same change to:** `crates/git/src/store/reach.rs` (new), `store/repository.rs` (`Followed`, the base
+  `remade` names, the module), `store/positions.rs` (`run_pairs`, `from_runs`), `store/mod.rs` (the export and its
+  docs), `crates/git/src/tests/store/reach.rs` (new) and `tests/store/mod.rs`; §4.17.2's status; A-645's entry; §4.17.1
+  "Reads"' status; GAPS' §4.17 entry.
