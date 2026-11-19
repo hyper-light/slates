@@ -49,6 +49,7 @@ pub mod out;
 pub mod pack;
 pub mod pktline;
 pub mod sideband;
+pub mod store;
 pub mod v2;
 
 pub use admission::{Admission, PastAdmission};

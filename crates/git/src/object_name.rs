@@ -381,6 +381,13 @@ fn hex_value(digit: Option<u8>) -> Option<u8> {
     .and_then(|value| u8::try_from(value).ok())
 }
 
+/// The name's bytes, as the object store keys and compares names (A-614: `slates_vcs::Naming::Id`).
+impl AsRef<[u8]> for ObjectId {
+  fn as_ref(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
 impl core::fmt::Display for ObjectId {
   /// The name in lower-case hexadecimal, as git writes it.
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

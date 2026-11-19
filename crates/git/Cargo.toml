@@ -15,6 +15,8 @@ aws-lc-rs = { workspace = true }
 sha1-checked = { workspace = true }
 # zlib's CRC32, which a pack index keeps of each object (A-591; the workspace manifest says why this crate).
 crc32fast = { workspace = true }
+# The object store git's rides on (§4.17.1 shared piece 3; git piece 5, A-614): content by identity, index tables.
+slates-vcs = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
