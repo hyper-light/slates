@@ -105,14 +105,15 @@ pub enum DbError {
     /// The live members made from it.
     members: u64,
   },
-  /// An entry of a repository's register made for a position that is not the register's next, or naming a version of
-  /// a green that is not the one after its head (§4.17.1 shared piece 2, A-603): it was made against another state of
-  /// the register than the one it would follow. Never entered in the log.
-  OutOfOrder {
-    /// The position or version the entry named.
-    named: u64,
-    /// The one the register holds next.
-    expected: u64,
+  /// A green an entry moves or checks is not at the position the push read (§4.17.1 shared piece 2; A-603 rebuilt by
+  /// A-642): it moved since, so the entry is refused whole, naming the green. Never entered in the log.
+  Moved {
+    /// The green.
+    green: [u8; 16],
+    /// The position the push read.
+    read: u64,
+    /// The position the green is at.
+    at: u64,
   },
   /// An entry's check does not hold at the entry's register position (A-603): what it checks moved since it was read.
   /// Never entered in the log.
@@ -236,9 +237,10 @@ impl fmt::Display for DbError {
         "{members} live members of its lineage were made from this green"
       ),
       Self::Review(rule) => write!(f, "review: {rule}"),
-      Self::OutOfOrder { named, expected } => write!(
+      Self::Moved { green, read, at } => write!(
         f,
-        "a register entry naming {named} where the register holds {expected} next"
+        "green {:02x?} moved from {read}, read by the push, to {at}",
+        green.get(..4).unwrap_or_default()
       ),
       Self::CheckFailed { index } => {
         write!(

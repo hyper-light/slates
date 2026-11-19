@@ -60,6 +60,8 @@ LandingState 6 Done
 LandingState 7 Partial
 LandingState 8 Refused
 LandingState 9 Aborted
+LogName 0 Green
+LogName 1 State
 MemberOrigin 0 Root
 MemberOrigin 1 Branch
 NameChange 0 Bind
@@ -191,6 +193,7 @@ Principal 2 Certificate
 Principal 3 Consumer
 RepositoryCheck 0 Head
 RepositoryCheck 1 Names
+RepositoryCheck 2 Log
 Role 0 Plain
 Role 1 Work
 Role 2 Green
@@ -206,6 +209,12 @@ SizeClass 1 Dynamic
 StateChange 0 PhaseRootAdded
 StateChange 1 PhaseRootRemoved
 StateChange 2 MarkerAdded
+StateChange 3 LockTaken
+StateChange 4 LockReleased
+StateLog 0 Names
+StateLog 1 Phases
+StateLog 2 Markers
+StateLog 3 Locks
 VcsTool 0 Git
 VcsTool 1 Mercurial
 VcsTool 2 Subversion

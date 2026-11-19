@@ -1,6 +1,7 @@
-//! `list` (§4.17.4 "4. Reads": `list` reads the node rows; A-613 part 2): the dirents of a path and of what lies beneath
-//! it to a depth, as `svnserve`'s `list` and `svn_repos_list` write them (`serve.c`, `libsvn_repos/list.c`, Subversion
-//! 1.15.0), held to stock `svnserve`'s transcripts (`crates/svn/fixtures/reads`, sessions `list` and `hostile-list`):
+//! `list` (§4.17.4 "4. Reads": `list` reads the node rows; A-613 part 2): the dirents of a path and of what lies
+//! beneath it to a depth, as `svnserve`'s `list` and `svn_repos_list` write them (`serve.c`, `libsvn_repos/list.c`,
+//! Subversion 1.15.0), held to stock `svnserve`'s transcripts (`crates/svn/fixtures/reads`, sessions `list` and
+//! `hostile-list`):
 //! - The parameters are `c(?r)w?l?l`: the path, the revision (the youngest when absent), the depth word, then,
 //!   optionally, the dirent fields (each a word, any word but the six ignored; every field when the list is absent)
 //!   and the patterns (each a string, read to its first NUL). Another shape ends the connection.
@@ -13,18 +14,20 @@
 //!   directories left out at depth `files`, a file that matches no pattern left out, a directory that matches none
 //!   walked but not reported, recursion at depth `infinity` alone.
 //! - A dirent is `( path kind ( size ) ( has-props ) ( created-rev ) ( date ) ( author ) )`, its path absolute, each
-//!   list empty when its field is not asked, the kind `unknown` when it is not; with no field beyond the kind asked it is
-//!   `( path kind )` and nothing is read but the kind. Otherwise `fill_dirent` reads every field whichever are asked: a
-//!   directory's size is Subversion's invalid size written unsigned, the date the created revision's `svn:date` parsed
-//!   and written again (time 0's for a revision without one; a date that does not parse refuses the listing).
+//!   list empty when its field is not asked, the kind `unknown` when it is not; with no field beyond the kind asked it
+//!   is `( path kind )` and nothing is read but the kind. Otherwise `fill_dirent` reads every field whichever are
+//!   asked: a directory's size is Subversion's invalid size written unsigned, the date the created revision's
+//!   `svn:date` parsed and written again (time 0's for a revision without one; a date that does not parse refuses the
+//!   listing).
 //! - A name matches a pattern as `svn_utf__fuzzy_glob_match` matches it: folded, then APR's `apr_fnmatch` with no
-//!   flags. The fold is utf8proc's decomposition with case folding and marks stripped, composed again; over ASCII that is
-//!   the letters `A` to `Z` lowered and nothing else, which is what this port does. A name beyond ASCII is matched with
-//!   its ASCII letters lowered alone: utf8proc's case folding and mark stripping need Unicode's tables, owed (GAPS).
+//!   flags. The fold is utf8proc's decomposition with case folding and marks stripped, composed again; over ASCII that
+//!   is the letters `A` to `Z` lowered and nothing else, which is what this port does. A name beyond ASCII is matched
+//!   with its ASCII letters lowered alone: utf8proc's case folding and mark stripping need Unicode's tables, owed
+//!   (GAPS).
 //!
-//! The walk is a [`super::Stream`]: each slice ends once the bytes it wrote and the entries it visited reach the room the
-//! caller gives, so a slice's output and work are bounded by the room. What it keeps is one level of names per directory
-//! on the path from the listed one, as `svn_repos_list` keeps them.
+//! The walk is a [`super::Stream`]: each slice ends once the bytes it wrote and the entries it visited reach the room
+//! the caller gives, so a slice's output and work are bounded by the room. What it keeps is one level of names per
+//! directory on the path from the listed one, as `svn_repos_list` keeps them.
 
 use super::stream::{Progress, Stream};
 use super::{
@@ -191,8 +194,8 @@ fn patterns_of(items: &[Value<'_>]) -> Option<Vec<Vec<u8>>> {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `list ( path [ rev ] depth ? ( field ... ) ? ( pattern ... ) )` (`serve.c` `list`): the authentication request, the
-  /// revision opened, then a [`Stream`] of the walk.
+  /// `list ( path [ rev ] depth ? ( field ... ) ? ( pattern ... ) )` (`serve.c` `list`): the authentication request,
+  /// the revision opened, then a [`Stream`] of the walk.
   pub(super) fn list(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some(request) = ListRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
@@ -432,8 +435,8 @@ impl ListStream {
     Ok(())
   }
 
-  /// `fill_dirent`, when a field beyond the kind is asked: the size, whether there are properties, the created revision,
-  /// its date parsed (time 0's when it has none) and its author.
+  /// `fill_dirent`, when a field beyond the kind is asked: the size, whether there are properties, the created
+  /// revision, its date parsed (time 0's when it has none) and its author.
   fn dirent<R: Repository + ?Sized>(
     &self,
     reads: &Reads<'_, R>,

@@ -50,6 +50,7 @@
 
 pub mod drive;
 pub mod editor;
+pub mod exchange;
 #[cfg(test)]
 mod recorded;
 mod tuple;
@@ -675,6 +676,9 @@ pub enum Refused {
   ReportTooLarge,
   /// A call the reporter does not take where it stands: the caller's error, not the client's.
   OutOfTurn,
+  /// A drive's call out of the editor's order, or past the nodes open at once: slates' own mistake,
+  /// never the client's, refused rather than written.
+  Editor(editor::EditorRefused),
 }
 
 impl Refused {
@@ -684,7 +688,7 @@ impl Refused {
       Self::Item(error) => Some(error.subversion_code()),
       Self::Malformed => Some(SVN_ERR_RA_SVN_MALFORMED_DATA),
       Self::ReportTooLarge => Some(SVN_ERR_RA_SVN_REQUEST_SIZE),
-      Self::OutOfTurn => None,
+      Self::OutOfTurn | Self::Editor(_) => None,
     }
   }
 }
@@ -781,6 +785,9 @@ pub struct Context<'a> {
   pub room: usize,
   /// The most bytes one report command's item may take.
   pub item_bytes: usize,
+  /// The most nodes a drive holds open at once: the deepest path the repository holds, in names,
+  /// and its root (the caller's, from its index).
+  pub most_open: usize,
 }
 
 /// The reporter of one command (module documentation).

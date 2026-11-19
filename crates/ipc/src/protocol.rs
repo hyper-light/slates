@@ -4352,16 +4352,16 @@ pub enum DatabaseRefusal {
   /// A record's encoding was refused.
   Encoding,
   /// An entry of a repository's register made for a position other than the register's next, or naming a version of a
-  /// green other than the one after its head (§4.17.1 shared piece 2, A-603): made against another state of the
-  /// register. Appended.
+  /// green other than the one after its head (§4.17.1 shared piece 2, A-603). Superseded by [`DatabaseRefusal::Moved`]
+  /// with A-603's repository-wide position (A-642): kept on the wire, never sent. Appended.
   OutOfOrder {
     /// The position or version the entry named.
     named: u64,
     /// The one the register holds next.
     expected: u64,
   },
-  /// An entry's check does not hold at the entry's register position (A-603): what it checks moved since it was read,
-  /// as Mercurial's `check:heads` fails when a head moved. Appended.
+  /// An entry's check does not hold (A-603, A-642): what it checks changed since it was read (a name under a prefix, a
+  /// state log's position), as Mercurial's `check:heads` fails when a head was added. Appended.
   CheckFailed {
     /// The check's index among the entry's checks.
     index: u32,
@@ -4383,6 +4383,16 @@ pub enum DatabaseRefusal {
   PolicyHookMalformed {
     /// The hook's index among the policy's hooks.
     index: u32,
+  },
+  /// A green an entry moves or checks is not at the position the push read (§4.17.1 shared piece 2, A-642): it moved
+  /// since, so the entry is refused whole, naming the green. Appended.
+  Moved {
+    /// The green.
+    green: VolumeId,
+    /// The position the push read.
+    read: u64,
+    /// The position the green is at.
+    at: u64,
   },
   /// A repository policy's hooks-env section its repository cannot hold (A-648): in a repository that is not
   /// Subversion's, named by nothing or holding a NUL, or with a variable no hook's environment can carry (a name empty

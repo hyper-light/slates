@@ -502,6 +502,45 @@ pub enum Reply {
   Result(Service),
 }
 
+/// A reply's field as data: its name and its value, as `slates-http`'s reply writer takes them.
+pub type Field = (&'static [u8], &'static [u8]);
+
+/// The cache fields `http-backend` sends on every answer, in its order (`hdr_nocache`): what a site's own refusals
+/// (`401`, `403`, `404`, `503`) carry as well, since git's server answers every request with them.
+pub fn no_cache_fields() -> [Field; 3] {
+  NO_CACHE
+}
+
+/// The fields of a smart reply, as data, in `http-backend`'s order: its three cache fields, then the reply's content
+/// type. An edge that renders the reply's head itself (A-625) writes exactly what [`reply_head`] writes from them.
+pub fn reply_fields(reply: Reply) -> [Field; 4] {
+  let content_type = match reply {
+    Reply::Advertisement(service) => service.advertisement_type(),
+    Reply::Result(service) => service.result_type(),
+  };
+  let [expires, pragma, cache_control] = NO_CACHE;
+  [expires, pragma, cache_control, (CONTENT_TYPE, content_type)]
+}
+
+/// The status and fields of the reply to a refused route to a request of version `http`, as data: `Allow` with the
+/// route's methods first on a `405`, then `http-backend`'s cache fields. What [`refusal_reply`] writes, for an edge that
+/// renders the reply itself (A-625).
+pub fn refusal_parts(refused: RouteRefused, http: HttpVersion) -> (Status, Vec<Field>) {
+  let status = refused.status(http);
+  let mut fields = Vec::with_capacity(NO_CACHE.len().saturating_add(1));
+  if let RouteRefused::MethodNotAllowed(allowed) = refused
+    && status == Status::METHOD_NOT_ALLOWED
+  {
+    let methods = match allowed {
+      Allowed::GetHead => ALLOW_GET_HEAD,
+      Allowed::Post => ALLOW_POST,
+    };
+    fields.push((ALLOW, methods));
+  }
+  fields.extend(NO_CACHE);
+  (status, fields)
+}
+
 /// Writes a smart reply's head: `200`, the reply's content type, `http-backend`'s cache fields, and a chunked body to
 /// an HTTP/1.1 request (`Connection: close` too unless `keep_alive`), or one framed by the close to HTTP/1.0.
 pub fn reply_head(
@@ -510,17 +549,11 @@ pub fn reply_head(
   keep_alive: bool,
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
-  let content_type = match reply {
-    Reply::Advertisement(service) => service.advertisement_type(),
-    Reply::Result(service) => service.result_type(),
-  };
-  let [expires, pragma, cache_control] = NO_CACHE;
-  let fields = [expires, pragma, cache_control, (CONTENT_TYPE, content_type)];
   let body = match http {
     HttpVersion::Http11 => Body::Chunked,
     HttpVersion::Http10 => Body::UntilClose,
   };
-  reply::head(Status::OK, &fields, body, !keep_alive, out)
+  reply::head(Status::OK, &reply_fields(reply), body, !keep_alive, out)
 }
 
 /// Writes the reply to a refused route to a request of version `http`: its status, `http-backend`'s cache fields,
@@ -530,22 +563,8 @@ pub fn refusal_reply(
   http: HttpVersion,
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
-  let status = refused.status(http);
-  let [expires, pragma, cache_control] = NO_CACHE;
-  match refused {
-    RouteRefused::MethodNotAllowed(allowed) if status == Status::METHOD_NOT_ALLOWED => {
-      let methods = match allowed {
-        Allowed::GetHead => ALLOW_GET_HEAD,
-        Allowed::Post => ALLOW_POST,
-      };
-      reply::refusal(
-        status,
-        &[(ALLOW, methods), expires, pragma, cache_control],
-        out,
-      )
-    }
-    _ => reply::refusal(status, &NO_CACHE, out),
-  }
+  let (status, fields) = refusal_parts(refused, http);
+  reply::refusal(status, &fields, out)
 }
 
 /// Writes the start of an advertisement's body: for protocol v0 and v1 the pkt-line `# service=<service>` and a flush,

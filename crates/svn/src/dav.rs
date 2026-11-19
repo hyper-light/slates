@@ -34,9 +34,14 @@
 //! - **A path holds no `.` or `..` name, and is no URL**: `dav_svn__test_canonical` passes both, and a filesystem path
 //!   with either is refused later by `svn_fs__path_valid`; a URL is never what ra_serf sends in a body.
 //!
-//! The second part of piece 13 (A-627): `list-report` and `file-revs-report` read and answered ([`listing`]), and
-//! PROPPATCH, LOCK's `lockinfo`, `Timeout` and `Lock-Token` read ([`locking`]). The update-report's answer is
-//! [`drive`]. Owed: the replay answer and LOCK's answer (`util_lock.c`'s `activelock`).
+//! The second part of piece 13 (A-627): `list-report` and `file-revs-report` read and answered ([`listing`]); the two
+//! answers that are an editor drive, the update-report's and the replay report's, written by one [`drive::Drive`]
+//! from the one drive A-616's reporter yields (`report::drive::Call`), which ra_svn's editor writes too; and
+//! PROPPATCH read, LOCK and UNLOCK read into the lock table's guards (A-602) and answered, with the
+//! `DAV:lockdiscovery` property a PROPFIND reports ([`locking`]). The request heads and bodies are stock svn 1.15.0's
+//! own, recorded on the Mac Studio on 2026-11-19. Not written (GAPS): the update-report's resource walk, a pre-1.2
+//! client's; a LOCK's refresh, which a stock client never sends; and a generic DAV client's owner element, since every
+//! client is read as an svn client.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -134,6 +139,23 @@ pub enum DavRefusal {
     /// The room given.
     room: usize,
   },
+  /// An editor call the drive's order does not allow where it came (a close with nothing open, a file's call on a
+  /// directory, a second root): a fault of the drive's producer, refused before a byte of the call is written.
+  DriveOrder {
+    /// The call.
+    call: &'static str,
+  },
+  /// An answer whose drive was aborted: its partial bytes are never sent, so the server answers the drive's refusal
+  /// whole, as `mod_dav` answers an error met before it has sent a byte (`dav_method_report`).
+  Aborted,
+  /// A value the server handed a writer that its answer cannot carry as `mod_dav_svn` writes it (a root path a URL
+  /// cannot hold as it is, a header value with a line break).
+  Unwritable {
+    /// What the value is.
+    what: &'static str,
+    /// The value.
+    value: String,
+  },
 }
 
 /// HTTP 400, Bad Request: every refusal of a body's content.
@@ -158,7 +180,10 @@ impl DavRefusal {
     match self {
       Self::Xml(refusal) if refusal.past_a_bound() => HTTP_CONTENT_TOO_LARGE,
       Self::UnknownReport { .. } => HTTP_NOT_IMPLEMENTED,
-      Self::OutputRoom { .. } => HTTP_INTERNAL_SERVER_ERROR,
+      Self::OutputRoom { .. }
+      | Self::DriveOrder { .. }
+      | Self::Aborted
+      | Self::Unwritable { .. } => HTTP_INTERNAL_SERVER_ERROR,
       _ => HTTP_BAD_REQUEST,
     }
   }
