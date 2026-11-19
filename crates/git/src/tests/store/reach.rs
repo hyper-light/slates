@@ -3,6 +3,7 @@
 //! identity, the value the store kept from its admission as it committed; and (A-647 part 3) the store serves every
 //! version's two sets from that value alone.
 
+use std::collections::BTreeSet;
 use std::mem::size_of;
 
 use proptest::prelude::*;
@@ -11,11 +12,13 @@ use slates_vcs::{ContentId, ContentStore, Inserted};
 
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::objects::tree::Mode as FileMode;
-use crate::store::{ReachRefused, ReachSets, Repository, Sets};
+use crate::store::repository::reach::Shape;
+use crate::store::{Positions, ReachRefused, ReachSets, Repository, Sets};
 
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
-  Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store, tree, wide,
+  BUDGET, Made, Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store,
+  tree, wide,
 };
 
 /// A read's answer as the tests take it.
@@ -436,6 +439,196 @@ fn t_a647_p3_a_reached_set_past_one_window_is_kept_and_served() {
   assert!(
     newest.runs() * RUN_BYTES > WINDOW,
     "the runs alone pass one window"
+  );
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
+}
+
+/// Shape: a window as short as the server's store-level tests hold content in (A-662), so a ref's reached set passes
+/// many blocks and several levels of its tree within a few hundred pushes.
+const SHORT_WINDOW: usize = 1 << 8;
+
+/// Shape: the turns of each of the storage test's phases: enough that ref 1's newest reached set, kept as one sorted
+/// sequence of runs, passes the bound every one of its versions is held to.
+const TURNS: usize = 400;
+
+/// A commit of its own over `parents`, a blob of `text` and a tree naming it beneath it: its objects, and its id.
+fn commit_of(
+  format: ObjectFormat,
+  text: &str,
+  parents: &[ObjectId],
+  seconds: u64,
+) -> (Vec<Made>, ObjectId) {
+  let text = blob(format, text.as_bytes());
+  let files = tree(format, &[(FileMode::File, b"file", text.id)]);
+  let made = commit(format, files.id, parents, seconds);
+  let id = made.id;
+  (vec![made, files, text], id)
+}
+
+/// Pushes `objects` and moves `green` to `head`: what the commit's values added to the store.
+fn push_counted(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  objects: Vec<Made>,
+  (green, head): (u64, ObjectId),
+) -> u64 {
+  let before = repository.counters().value_bytes;
+  push_and_move(repository, store, objects, &[(green, Some(head))]).unwrap();
+  repository.counters().value_bytes - before
+}
+
+/// Root commits made on refs 2 and 3 by turns, so each of ref 2's is a run of its own: ref 2's, oldest first.
+fn roots_by_turns(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  format: ObjectFormat,
+) -> Vec<ObjectId> {
+  let mut roots = Vec::with_capacity(TURNS);
+  for at in 0..TURNS {
+    for green in [2, 3] {
+      let (objects, id) = commit_of(format, &format!("ref {green} root {at}\n"), &[], at as u64);
+      push_and_move(repository, store, objects, &[(green, Some(id))]).unwrap();
+      if green == 2 {
+        roots.push(id);
+      }
+    }
+  }
+  roots
+}
+
+/// Ref 1 made at a root of its own, pushed by turns with ref 3 (a commit over its head; a root of ref 3's), then merged
+/// with each of `roots`, newest first: what each of its versions added to the store for its value, in order.
+fn ref_one_by_turns_then_merges(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  format: ObjectFormat,
+  roots: &[ObjectId],
+) -> Vec<u64> {
+  let (objects, mut head) = commit_of(format, "ref 1's own root\n", &[], 0);
+  let mut added = vec![push_counted(repository, store, objects, (1, head))];
+  for at in 0..TURNS {
+    let (objects, made) = commit_of(format, &format!("ref 1 turn {at}\n"), &[head], at as u64);
+    head = made;
+    added.push(push_counted(repository, store, objects, (1, head)));
+    let (objects, root) = commit_of(format, &format!("ref 3 turn {at}\n"), &[], at as u64);
+    push_and_move(repository, store, objects, &[(3, Some(root))]).unwrap();
+  }
+  for (at, root) in roots.iter().enumerate().rev() {
+    let text = format!("merge {at}\n");
+    let (objects, made) = commit_of(format, &text, &[head, *root], at as u64);
+    head = made;
+    added.push(push_counted(repository, store, objects, (1, head)));
+  }
+  added
+}
+
+/// The blocks of `shape` the positions of `set` touch.
+fn blocks_touched(shape: Shape, set: &Positions) -> u64 {
+  let blocks: BTreeSet<u64> = set.iter().map(|position| position / shape.block).collect();
+  blocks.len() as u64
+}
+
+/// The nodes on a path from a set's tree's root down to a leaf: the root's level, the least whose range covers the
+/// set's last block, and one for the leaf; none for the empty set.
+fn path_nodes(shape: Shape, set: &Positions) -> u64 {
+  set.run_pairs().last().map_or(0, |&(_, end)| {
+    u64::from(shape.level_of((end - 1) / shape.block)) + 1
+  })
+}
+
+/// What a version may add for its value: a window for each node on the paths from its two trees' roots down to the
+/// blocks its D(k) touches, and one for its value's own node. Its reached set is the one before it grown by D(k), so
+/// that set's tree differs from the one before only on those paths; D(k)'s tree is those paths.
+fn bound(shape: Shape, sets: &Sets) -> u64 {
+  let paths = blocks_touched(shape, &sets.brought);
+  let nodes = paths * (path_nodes(shape, &sets.reached) + path_nodes(shape, &sets.brought));
+  (nodes + 1) * SHORT_WINDOW as u64
+}
+
+/// Ref 1's `versions` read back from their values, each held to what its push brought: D(k) new to the version
+/// before's reached set, a commit's three objects (a merge's six: the merged root's too), and its reached set the one
+/// before grown by D(k). Each version's bound, in order.
+fn bounds_of(
+  repository: &Repository,
+  store: &ContentStore,
+  shape: Shape,
+  versions: usize,
+) -> Vec<u64> {
+  let mut before = Positions::new();
+  let mut bounds = Vec::with_capacity(versions);
+  for version in 0..versions {
+    let sets = Sets {
+      reached: repository.reached(store, 1, version).unwrap(),
+      brought: repository.brought(store, 1, version).unwrap(),
+    };
+    let objects = if version > TURNS { 6 } else { 3 };
+    assert_eq!(sets.brought.len(), objects, "version {version}'s D(k)");
+    assert!(
+      sets.brought.intersection(&before).is_empty(),
+      "version {version} brought no object anew"
+    );
+    assert_eq!(
+      sets.reached,
+      before.union(&sets.brought),
+      "version {version}'s reached set"
+    );
+    bounds.push(bound(shape, &sets));
+    before = sets.reached;
+  }
+  bounds
+}
+
+/// A-647 part 4. Do: in a store of a 256-byte window, make 400 root commits on ref 2 and as many on ref 3 by turns, so
+/// each of ref 2's roots is a run of its own; make ref 1 at a root of its own and push it by turns with ref 3, a commit
+/// over its head each turn, so each of those versions brings a run past every run it reached; then merge ref 2's roots
+/// into ref 1, newest first, each merge a commit, a tree and a blob of its own, so each of those versions brings a run
+/// below every run ref 1 reached (the worst case for a set kept as one sorted sequence, which such a version writes
+/// again from that run on). Record what each of ref 1's versions added to the store for its value. Expect: every
+/// version adds at most a window for each node on the paths from its two trees' roots down to the blocks its D(k)
+/// touches and one for its value's node, a bound set by what it brought and its trees' depth, never by what the ref
+/// reaches; every version, not only the newest, still answers its D(k) (its push's objects) and its reached set (the
+/// one before grown by them); and ref 1's newest reached set, kept as one sorted sequence, passes every version's bound.
+#[test]
+#[allow(
+  clippy::print_stderr,
+  reason = "the census is the test's evidence, printed with every run"
+)]
+fn t_a647_p4_a_version_stores_what_it_adds_not_what_it_reaches() {
+  let format = ObjectFormat::Sha1;
+  let mut store = ContentStore::new(BUDGET, SHORT_WINDOW).unwrap();
+  let mut repository = Repository::new(format);
+  let roots = roots_by_turns(&mut repository, &mut store, format);
+  let added = ref_one_by_turns_then_merges(&mut repository, &mut store, format, &roots);
+  let shape = Shape::of(SHORT_WINDOW).unwrap();
+  let bounds = bounds_of(&repository, &store, shape, added.len());
+  let newest = repository.reached(&store, 1, added.len() - 1).unwrap();
+  let whole = (newest.runs() * RUN_BYTES) as u64;
+  let past: Vec<(usize, u64, u64)> = (0..added.len())
+    .filter(|&version| added[version] > bounds[version])
+    .map(|version| (version, added[version], bounds[version]))
+    .collect();
+  let (turns, merges) = added.split_at(TURNS + 1);
+  eprintln!(
+    "reach sets census: shape {shape:?}, versions {}, most added by a turn {} and by a merge {} bytes, most bound {}, \
+     added in all {}, newest set {} runs ({whole} bytes whole), versions past their bound {}",
+    added.len(),
+    turns.iter().max().unwrap(),
+    merges.iter().max().unwrap(),
+    bounds.iter().max().unwrap(),
+    added.iter().sum::<u64>(),
+    newest.runs(),
+    past.len()
+  );
+  assert_eq!(past.first(), None, "(version, added, bound)");
+  assert_eq!(
+    newest.runs(),
+    2 * TURNS + 1,
+    "each root a run, each turn's commit one, and the merges one"
+  );
+  assert!(
+    whole > *bounds.iter().max().unwrap(),
+    "kept whole, the newest set passes every version's bound"
   );
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());

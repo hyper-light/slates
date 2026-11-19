@@ -33,6 +33,7 @@
 
 use std::mem::size_of;
 
+use slates_vcs::content::encode_derived;
 use slates_vcs::derived::{DerivedType, Graph, Mode};
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
@@ -48,6 +49,67 @@ const WORD_BYTES: usize = size_of::<u64>();
 
 /// Format: the bytes of one run: its start and its end.
 const RUN_BYTES: usize = size_of::<(u64, u64)>();
+
+/// Format: the first byte of a leaf's payload: the runs of one block of positions.
+const LEAF: u8 = b'L';
+
+/// Format: the first byte of an inner node's payload: its level, then a bit for each child slot.
+const INNER: u8 = b'I';
+
+/// A set's tree's shape (module docs), derived from the store's window: the positions a leaf covers and the children an
+/// inner node names, each the most one window holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shape {
+  /// Positions a leaf covers: two for each run a leaf of one window holds, so a block of positions each apart fits.
+  pub(crate) block: u64,
+  /// Children an inner node names.
+  pub(crate) fanout: u64,
+}
+
+impl Shape {
+  /// The shape for a store of `window`; `None` for a window too short for a leaf of one run or an inner node of two
+  /// children.
+  pub(crate) fn of(window: usize) -> Option<Shape> {
+    let leaf = encode_derived(&[], &[LEAF])?.len();
+    let runs = window.checked_sub(leaf)?.checked_div(RUN_BYTES)?;
+    let block = u64::try_from(runs.checked_mul(2)?).ok()?;
+    let fanout = u64::try_from(fanout_for(window)?).ok()?;
+    (block >= 2 && fanout >= 2).then_some(Shape { block, fanout })
+  }
+
+  /// The least level whose node, from block 0, covers block `block`: the root's level of a set whose last block it is.
+  pub(crate) fn level_of(self, block: u64) -> u32 {
+    let (mut level, mut covered) = (0_u32, 1_u64);
+    while covered <= block {
+      covered = covered.saturating_mul(self.fanout);
+      level = level.saturating_add(1);
+    }
+    level
+  }
+}
+
+/// An inner node's payload's length for `fanout` children: its tag, its level, and a bit for each child slot.
+fn inner_payload_len(fanout: usize) -> Option<usize> {
+  fanout.div_ceil(8).checked_add(2)
+}
+
+/// The most children an inner node of one `window` names, by the store's own layout of a derived node.
+fn fanout_for(window: usize) -> Option<usize> {
+  let count = encode_derived(&[], &[])?.len();
+  let name = encode_derived(&[ContentId([0; 32])], &[])?
+    .len()
+    .checked_sub(count)?;
+  let bytes = |fanout: usize| {
+    count
+      .checked_add(name.checked_mul(fanout)?)?
+      .checked_add(inner_payload_len(fanout)?)
+  };
+  let mut fanout = window.checked_div(name)?;
+  while fanout > 0 && bytes(fanout).is_none_or(|len| len > window) {
+    fanout = fanout.saturating_sub(1);
+  }
+  Some(fanout)
+}
 
 /// Why the type refused to derive a version. Each leaves the store as it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
