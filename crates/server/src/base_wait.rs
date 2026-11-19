@@ -32,10 +32,10 @@
 //! to [`land`]; it ends when the host does.
 //!
 //! **Where it waits.** On the volume's owner shard, where the host, its fetches and the waits live: an NFS call parks in
-//! its connection's task, or in the owner's task of a call forwarded from another shard (`crate::nfs`). A FUSE request
-//! is answered the retry for now: parking it, holding the request off the device and dispatching it again when its
-//! fetch lands, is the Linux transport's own piece (GAPS). A volume over a host directory never waits: its host never
-//! answers pending.
+//! its connection's task, or in the owner's task of a call forwarded from another shard (`crate::nfs`); a FUSE request
+//! is kept off the device by its mount, a task of the shard waiting for its fetch, and dispatched again before the
+//! device is read once that fetch lands (`crate::fuse`'s `keep`, Linux), the kernel's other requests served meanwhile.
+//! A volume over a host directory never waits: its host never answers pending.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
@@ -166,6 +166,13 @@ impl BaseWaits {
     }
     waits.len()
   }
+}
+
+/// Whether the shard's waits are at their bound ([`bound`]): a request that meets a pending base now is answered the
+/// retry rather than kept (the FUSE transport asks before it keeps a request, A-555).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn full(s: &ShardState) -> bool {
+  s.base_waits.full(bound(s))
 }
 
 /// The most waits a shard parks: its client credit (`clients_per_shard × slots`), every request that can be in flight

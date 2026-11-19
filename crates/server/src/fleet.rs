@@ -11768,54 +11768,87 @@ mod discovery_wait_tests {
 
 #[cfg(test)]
 mod tests {
+  /// A volume named `<name>-origin` made for a principal on `state`'s shard, snapshotted, and that snapshot cloned as
+  /// `<name>-clone`: the clone, which has taken no snapshot of its own.
+  fn fresh_clone(state: &mut crate::state::ShardState, name: &str) -> slates_db::catalog::VolumeId {
+    use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
+    let owner = slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    let ReplyBody::Created { id: origin } = crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      RequestBody::Create {
+        name: format!("{name}-origin"),
+        size: SizeClass::Dynamic { max: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    ) else {
+      panic!("the origin was created")
+    };
+    let ReplyBody::Snapshotted { id: snapshot, .. } =
+      crate::verbs::dispatch(state, 1, &owner, RequestBody::Snapshot { volume: origin })
+    else {
+      panic!("the origin was snapshotted")
+    };
+    let ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      RequestBody::Clone {
+        volume: origin,
+        snapshot,
+        name: format!("{name}-clone"),
+      },
+    ) else {
+      panic!("the clone was made")
+    };
+    crate::verbs::to_db_volume(clone)
+  }
+
+  /// A-577. Do: on a shard, clone a volume's snapshot and ask the record plane what head it ships for the clone before the
+  /// clone takes a snapshot of its own. Expect the creation head at sequence 0, naming no content, as a new volume's: the
+  /// fleet knows the clone at once, so a live clone's log can answer its writers and a takeover finds it. Before, the
+  /// clone's record was a copy of its origin's, naming the origin's head at the origin's sequence, and nothing shipped for
+  /// the clone until its own first seal: at `f > 0` a live clone's log never answered.
+  #[test]
+  fn a_fresh_clone_ships_its_creation_head_at_once() {
+    let shipped = crate::daemon::audit_on_shard(|state| {
+      let id = fresh_clone(state, "shipped");
+      let record = state.db.partition().volume(id).cloned().unwrap();
+      let quorum = state.fleet.configuration().quorum;
+      super::head_value_of(state, &record, super::ObjectId(id.bytes), quorum)
+        .map(|(sequence, value)| (sequence, value.manifest))
+    });
+    assert_eq!(
+      shipped,
+      Some((0, None)),
+      "a fresh clone ships its creation head, naming no content"
+    );
+  }
+
   /// A-565's piece (the sibling A-544 saw). Do: on a shard, clone a volume's snapshot and ask the home seal walk what the
   /// clone has to seal before it takes a snapshot of its own, then after its first, recorded unplaced as at `f > 0` (a
-  /// laptop records a new snapshot placed on its owner at once, leaving nothing to seal). Expect nothing before (its
-  /// head is still its origin's, which its own tree cannot walk) and its own head after. Before, the walk named its
-  /// origin's head, and `start_seal` was refused for it, counted `fleet.seal`, every period until the clone's first
+  /// laptop records a new snapshot placed on its owner at once, leaving nothing to seal). Expect nothing before (its head
+  /// names no snapshot of its own: the creation head since A-577) and its own head after. Before A-565 the walk named
+  /// its origin's head, and `start_seal` was refused for it, counted `fleet.seal`, every period until the clone's first
   /// snapshot: for every clone made.
   #[test]
   fn a_clone_has_nothing_to_seal_until_its_first_snapshot() {
     let (before, after, own) = crate::daemon::audit_on_shard(|state| {
-      use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
+      use slates_ipc::protocol::{ReplyBody, RequestBody};
       let owner = slates_db::catalog::Principal::Uid {
         host: slates_db::HostId(0),
         uid: 1234,
       };
-      let ReplyBody::Created { id: origin } = crate::verbs::dispatch(
-        state,
-        1,
-        &owner,
-        RequestBody::Create {
-          name: "unsealed-origin".to_owned(),
-          size: SizeClass::Dynamic { max: 1 << 20 },
-          names: NamePolicy::Exact,
-          require_locked: false,
-          base: None,
-        },
-      ) else {
-        panic!("the origin was created")
-      };
-      let ReplyBody::Snapshotted { id: snapshot, .. } =
-        crate::verbs::dispatch(state, 1, &owner, RequestBody::Snapshot { volume: origin })
-      else {
-        panic!("the origin was snapshotted")
-      };
-      let ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
-        state,
-        1,
-        &owner,
-        RequestBody::Clone {
-          volume: origin,
-          snapshot,
-          name: "unsealed-clone".to_owned(),
-        },
-      ) else {
-        panic!("the clone was made")
-      };
-      let id = crate::verbs::to_db_volume(clone);
+      let id = fresh_clone(state, "unsealed");
       let object = super::ObjectId(id.bytes);
       let before = super::sealable_head(state, id, object);
+      let clone = crate::verbs::to_wire_volume(id);
       let ReplyBody::Snapshotted { .. } =
         crate::verbs::dispatch(state, 1, &owner, RequestBody::Snapshot { volume: clone })
       else {

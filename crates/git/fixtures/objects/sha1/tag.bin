@@ -1,0 +1,6 @@
+object bef5f60d7dcd616c065ee70ed811fc3f2be6ce9b
+type commit
+tag v1
+tagger test <test@example.com> 1112911993 +0000
+
+the tag both repositories hold

@@ -34,7 +34,8 @@
 //! its lease needs one healthy candidate's confirmation of two. The others judge what their subject owes: the destroys,
 //! that nothing destroyed is served again; the clients killed or cut off, that no reply is held and a green stays whole,
 //! its successor at exactly the head and files committed before (the green's own Continuity); and the kill at an
-//! acknowledgement, NoLoss at that instant, which a last look before the kill would move.
+//! acknowledgement, NoLoss at that instant, which a last look before the kill would move. A client killed mid-write with
+//! its owner lost after is judged as a takeover is, its write absent or whole at the next owner (A-585).
 //!
 //! SIGSTOP freezes a whole process and drops nothing, so the flows that lose, delay, duplicate or reorder datagrams, or
 //! cut a running node off in one direction or both, put the fault relay of `support/relay.rs` between the daemons
@@ -3140,6 +3141,155 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
       )]
     },
   );
+  drop(fleet);
+  verdict.judge();
+}
+
+/// Shape: the writes acknowledged before the mid-write client is killed.
+const BEFORE_THE_CUT: usize = 20;
+
+/// A-585 (goal 81, chaos across real processes: a client disconnecting mid-write, with its owner lost after): do stream
+/// acknowledged writes to a live volume, stop both candidates, start a client process writing one more file, kill it
+/// (SIGKILL) once its write has reached the owner and parked there waiting for its candidates (the owner's own
+/// `fleet.live.awaited` moved: the client's write has left it, an event of the client's write, never a sleep), then lose
+/// the owner's whole node and resume the candidates. Expect a survivor to serve the volume with every acknowledged write
+/// byte for byte and the killed client's write absent or whole, never torn (NoLoss); every copy that answers fenced at
+/// or above the successor's epoch (StaleNeverCommits); one identity at every sampled epoch and position (Agreement, the
+/// models' TotalOrder); the successor's first head past every position durable before (Continuity); and reads through
+/// every survivor that answer the acknowledged bytes or a refusal (ReadSafety).
+#[test]
+fn a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover() {
+  if !gated("client-killed-mid-write") {
+    return;
+  }
+  // Bare daemons, as in `destroy_across_the_loss`: both candidates stay stopped through the cut, and an anchor would
+  // end a stopped daemon once its beat lapsed and start one holding no copy of the log, a second fault past `f`.
+  let mut fleet = Fleet::start("cut-mid-write", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let instances = fleet.instances.clone();
+  let volume = fleet.create_volume(&owner, "cut-mid-write", true, Claim::Bounded);
+  let mut verdict = Verdict::new("a client killed mid-write, then its owner lost");
+  let began = Instant::now();
+  let stop_sampling = AtomicBool::new(false);
+  let holds = SamplerHolds::new(instances.len());
+  let never = AtomicBool::new(false);
+  let (outcomes, last_look, reached, samples) = std::thread::scope(|scope| {
+    let sampler = scope.spawn(|| {
+      Sampler {
+        instances: &instances,
+        volume: &volume,
+        began,
+        holds: &holds,
+      }
+      .run(&stop_sampling)
+    });
+    let stream = Stream {
+      instance: &owner,
+      volume: volume_id_of(&volume),
+      began,
+    };
+    let mut outcomes: Vec<Outcome> = stream.run(0..BEFORE_THE_CUT, &never);
+    let attachment = value_of(
+      &run_ready(&owner, &["attach", &volume, "--write"]),
+      "attachment",
+    );
+    let awaited_before = counter(&owner, "fleet.live.awaited");
+    for index in fleet.others(owner_index) {
+      fleet.stop(index);
+    }
+    let mut child = slates()
+      .arg("--instance")
+      .arg(&owner)
+      .args([
+        "write",
+        &volume,
+        &attachment,
+        &format!("/{}", chaos_path(BEFORE_THE_CUT)),
+      ])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .unwrap();
+    {
+      use std::io::Write;
+      let mut stdin = child.stdin.take().unwrap();
+      let _ = stdin.write_all(&chaos_body(BEFORE_THE_CUT));
+    }
+    // The client's write has left it once the owner holds it parked, waiting for its stopped candidates: the owner's own
+    // count of the writes it awaits moves. Killed then, the client is between "sent" and "answered".
+    let parked = Instant::now();
+    while counter(&owner, "fleet.live.awaited") <= awaited_before && parked.elapsed() < FLEET_WAIT {
+      pause();
+    }
+    let reached = counter(&owner, "fleet.live.awaited") > awaited_before;
+    let _ = child.kill();
+    let _ = child.wait();
+    outcomes.push(Outcome {
+      file: BEFORE_THE_CUT,
+      sent: Duration::ZERO,
+      took: Duration::ZERO,
+      refused: Some("its client was killed mid-write".to_owned()),
+    });
+    // The owner's last word before its loss, for Continuity: what it held durable then.
+    let last_look = live_states(&owner, &volume).unwrap_or_default();
+    fleet.kill_node(owner_index);
+    for index in fleet.others(owner_index) {
+      fleet.resume(index);
+    }
+    stop_sampling.store(true, Ordering::Release);
+    (outcomes, last_look, reached, sampler.join().unwrap())
+  });
+  verdict.check(
+    "the client's write reached the owner before the client was killed",
+    if reached {
+      Vec::new()
+    } else {
+      vec!["the owner never counted the write awaited within the fleet wait".to_owned()]
+    },
+  );
+  let survivors: Vec<&str> = fleet
+    .others(owner_index)
+    .into_iter()
+    .map(|index| instances[index].as_str())
+    .collect();
+  let served = wait_serving(&survivors, &volume, &outcomes);
+  verdict.note(format!("after the owner's loss: {served:?}"));
+  let (heads, disagreements) = agreement(&samples);
+  verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
+  verdict.check("Agreement", disagreements);
+  match served {
+    Some((successor, _)) => {
+      verdict.check(
+        "NoLoss (successor: every acknowledged write whole, the killed client's absent or whole)",
+        no_loss(successor, &volume, &outcomes),
+      );
+      let epoch = takeover_epoch(successor, &volume);
+      verdict.check(
+        "StaleNeverCommits (fences)",
+        fenced_at_or_above(&survivors, &volume, epoch),
+      );
+      judge_takeover(
+        &mut verdict,
+        &fleet,
+        (successor, &fleet.others(owner_index)),
+        (&volume, &outcomes),
+        samples.iter().map(|sample| &sample.state).chain(&last_look),
+        BEFORE_THE_CUT + 1..BEFORE_THE_CUT + 1 + FIRST_WRITE_FILES,
+      );
+    }
+    None => verdict.check(
+      "NoLoss (successor)",
+      vec![format!(
+        "no survivor served the volume within the fleet wait: {:?}",
+        survivors
+          .iter()
+          .map(|survivor| (*survivor, counters(survivor, "fleet.live.")))
+          .collect::<Vec<_>>()
+      )],
+    ),
+  }
   drop(fleet);
   verdict.judge();
 }

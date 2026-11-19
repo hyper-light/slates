@@ -544,10 +544,10 @@ mod tests {
   /// A-544. Do: on a shard, clone a captured base, ask whether the clone's head waits for a record and step its carry as
   /// the seal walk does, before the clone takes a snapshot of its own; then seal a head of the clone and step it until
   /// its record is in. Expect: before its first snapshot nothing held back and no carry refused, since the clone's head
-  /// is still its origin's, which its own tree cannot walk; after it, the record for its own head, and still no carry
-  /// refused. Before the fix the head waited for a record no carry would make, and a carry begun for it was refused,
-  /// counted `fleet.carry.refused` with a log line, for every captured clone made (on a kiln fleet runner, every
-  /// workspace).
+  /// names no snapshot of its own (the creation head since A-577; before, its origin's, which its tree cannot walk);
+  /// after it, the record for its own head, and still no carry refused. Before the fix the head waited for a record no
+  /// carry would make, and a carry begun for it was refused, counted `fleet.carry.refused` with a log line, for every
+  /// captured clone made (on a kiln fleet runner, every workspace).
   #[test]
   fn a544_a_fresh_captured_clone_carries_nothing_until_its_first_snapshot() {
     let daemon = crate::daemon::audit_daemon_of(1);
