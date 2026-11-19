@@ -178,6 +178,19 @@ pub enum VolumeOp {
     /// The existing file it links to.
     target: String,
   },
+  /// A path's tree at a committed version copied to another path by reference (A-586; A-626 part 4; Subversion's copy
+  /// with history): `from`'s tree as version `version` of the green held it, at `to`, replacing what `to` holds when
+  /// `replace` (A-626's `REPLACE`). What the work does in `to`'s tree after it composes against what it brings.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from.
+    version: u64,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
+  },
 }
 
 impl VolumeOp {
@@ -196,7 +209,9 @@ impl VolumeOp {
       | VolumeOp::Mkdir { path }
       | VolumeOp::Rmdir { path }
       | VolumeOp::SetMode { path, .. } => path.len(),
-      VolumeOp::Rename { from, to } => from.len().saturating_add(to.len()),
+      VolumeOp::Rename { from, to } | VolumeOp::Copy { from, to, .. } => {
+        from.len().saturating_add(to.len())
+      }
       VolumeOp::Symlink { path, target } | VolumeOp::Link { path, target } => {
         path.len().saturating_add(target.len())
       }
@@ -229,7 +244,8 @@ impl VolumeOp {
       | VolumeOp::SetXattr { .. }
       | VolumeOp::RemoveXattr { .. }
       | VolumeOp::Link { .. }
-      | VolumeOp::Mknod { .. } => None,
+      | VolumeOp::Mknod { .. }
+      | VolumeOp::Copy { .. } => None,
     }
   }
 
@@ -253,7 +269,7 @@ impl VolumeOp {
       | VolumeOp::Symlink { path, .. }
       | VolumeOp::SetXattr { path, .. }
       | VolumeOp::RemoveXattr { path, .. } => [Some(path), None],
-      VolumeOp::Rename { from, to } => [Some(from), Some(to)],
+      VolumeOp::Rename { from, to } | VolumeOp::Copy { from, to, .. } => [Some(from), Some(to)],
       VolumeOp::Link { path, target } => [Some(path), Some(target)],
     }
   }
@@ -292,7 +308,8 @@ impl VolumeOp {
       | VolumeOp::SetXattr { .. }
       | VolumeOp::RemoveXattr { .. }
       | VolumeOp::Link { .. }
-      | VolumeOp::Mknod { .. } => None,
+      | VolumeOp::Mknod { .. }
+      | VolumeOp::Copy { .. } => None,
     }
   }
 }
@@ -1219,6 +1236,7 @@ pub fn compose_volume_planned(
   journal: &[VolumeOp],
 ) -> Result<(OpsDoc, PostStatePlan), DeriveError> {
   let specials = crate::special::Composition::of(base, journal)?;
+  check_copies(journal)?;
   check_no_file_directory_collision(base, journal)?;
   let directories = compose_directories(base, journal)?;
   let sym_paths = symlink_paths(base, journal);
@@ -1227,7 +1245,10 @@ pub fn compose_volume_planned(
   let link_state = link_states(base, journal, &link_paths)?;
   let mut entities: Vec<Entity> = Vec::new();
   for op in journal {
-    if op.is_directory() || op.is_symlink() || op.is_link() || matches!(op, VolumeOp::Mknod { .. })
+    if op.is_directory()
+      || op.is_symlink()
+      || op.is_link()
+      || matches!(op, VolumeOp::Mknod { .. } | VolumeOp::Copy { .. })
     {
       continue;
     }
@@ -1279,7 +1300,70 @@ pub fn compose_volume_planned(
     &mut plan,
   );
   specials.emit(&mut doc);
+  emit_copies(&mut doc, journal);
   Ok((doc, plan))
+}
+
+/// Whether `path` lies in `root`'s tree: `root` itself or beneath it; every path, for the root (the empty path).
+fn within(path: &str, root: &str) -> bool {
+  root.is_empty()
+    || path == root
+    || path
+      .strip_prefix(root)
+      .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Refuses a journal that names a path in a copy's destination tree before the copy (A-626 part 4). The base a
+/// journal holding copies is composed against holds each copied tree where its copy puts it (`Green::base_for`), so an
+/// earlier operation there would be composed against what the copy brings, not what it changed: owed
+/// (`DeriveError::Unsupported`), as the deriver's other compositions over a reused name are.
+fn check_copies(journal: &[VolumeOp]) -> Result<(), DeriveError> {
+  for (index, op) in journal.iter().enumerate() {
+    let VolumeOp::Copy { to, .. } = op else {
+      continue;
+    };
+    let earlier = journal.get(..index).unwrap_or_default();
+    if let Some(name) = earlier
+      .iter()
+      .flat_map(VolumeOp::names)
+      .flatten()
+      .find(|name| within(name, to))
+    {
+      return Err(DeriveError::Unsupported(name.to_owned()));
+    }
+  }
+  Ok(())
+}
+
+/// Emits the journal's copies (A-626 part 4) by destination, so their order is not the journal's: each one `Copy`,
+/// its destination the op's path, its source the `src`, the source's version the `at`, and `REPLACE` where it replaces
+/// what its destination holds.
+fn emit_copies(doc: &mut OpsDoc, journal: &[VolumeOp]) {
+  let mut copies: Vec<(&str, &str, u64, bool)> = journal
+    .iter()
+    .filter_map(|op| match op {
+      VolumeOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      } => Some((to.as_str(), from.as_str(), *version, *replace)),
+      _ => None,
+    })
+    .collect();
+  copies.sort_unstable();
+  for (to, from, version, replace) in copies {
+    let path = doc.paths.intern(to);
+    let src = doc.paths.intern(from);
+    doc.ops.push(Op {
+      kind: OpKind::Copy,
+      flags: if replace { crate::ops_doc::REPLACE } else { 0 },
+      path,
+      at: version,
+      len: 0,
+      src,
+    });
+  }
 }
 
 /// A directory the increment declares: a create or a remove.
