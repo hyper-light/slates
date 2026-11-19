@@ -574,6 +574,36 @@ fn a_link_renamed_over_a_file_the_same_work_renamed_away_takes_its_place() -> Re
   Ok(())
 }
 
+/// A-643 (POSIX `rename`: when both names are links to one file it does nothing). Do: rename the
+/// hard link `HARDLINK` over the file it names, `TARGET`, by a work based at the head. Expect it
+/// accepted and nothing changed: `TARGET` still the file with its bytes, `HARDLINK` still the link
+/// naming it. Before, the link left its path and `TARGET` held its file and a link to itself.
+#[test]
+fn a_hard_link_renamed_over_the_file_it_names_changes_nothing() -> Result<(), String> {
+  let mut green = green();
+  accept(
+    &mut green,
+    Work::default().naming(OpKind::Rename, TARGET, HARDLINK),
+    1,
+  )?;
+  let found = (
+    kinds_at(&green, TARGET),
+    green.content(TARGET).map(<[u8]>::to_vec),
+    kinds_at(&green, HARDLINK),
+    green.hardlink(HARDLINK),
+  );
+  let expected = (
+    vec![Kind::File],
+    Some(b"<g>\n".to_vec()),
+    vec![Kind::Hardlink],
+    Some(TARGET),
+  );
+  if found != expected {
+    return Err(format!("{found:?}"));
+  }
+  Ok(())
+}
+
 /// A-643 (A-631's second sibling; §4.16 "The verdict": delete against modify). Do: remove the
 /// directory `DIR` and make it again after version 0, then submit a work based at 0 that removes
 /// it. Expect `DeleteModify`, the directory made again still standing; and the same removal
@@ -696,12 +726,13 @@ const ORIGINAL: [Kind; 5] = [
 /// Shape: the indices in `PATHS` of the nodes with a mode and attributes, the files and the
 /// directory.
 const WITH_METADATA: [usize; 3] = [0, 1, 4];
-/// Shape: the indices in `PATHS` of the files a new hard link names.
+/// Shape: the indices in `PATHS` of the files a new hard link names and a link is renamed over.
 const LINKABLE: [usize; 2] = [0, 1];
-/// Shape: the indices in `PATHS` of the links a work renames over `FILE`.
+/// Shape: the indices in `PATHS` of the links a work renames over a file.
 const RENAMEABLE: [usize; 2] = [2, 3];
-/// Shape: the index in `PATHS` of `FILE`, the file a link is renamed over.
-const OVER: usize = 0;
+/// Shape: the indices in `PATHS` of the hard link and of the file it names, `TARGET`: a rename of
+/// the one over the other changes nothing.
+const SAME_FILE: (usize, usize) = (3, 1);
 
 /// One generated event of A-643's oracle; an index names a path of `PATHS`, and `back` the
 /// versions behind the head a work is based.
@@ -717,8 +748,8 @@ enum Event {
   Remove(usize, u8),
   /// A work making a new hard link to the file at the path.
   Link(usize, u8),
-  /// A work renaming the link at the path over `FILE`.
-  RenameOver(usize, u8),
+  /// A work renaming the link at the first path over the file at the second.
+  RenameOver(usize, usize, u8),
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -729,7 +760,11 @@ fn event() -> impl Strategy<Value = Event> {
     4..5 => Event::Attribute(WITH_METADATA[which % WITH_METADATA.len()]),
     5..8 => Event::Remove(which, back),
     8..10 => Event::Link(LINKABLE[which % LINKABLE.len()], back),
-    _ => Event::RenameOver(RENAMEABLE[which % RENAMEABLE.len()], back),
+    _ => Event::RenameOver(
+      RENAMEABLE[which % RENAMEABLE.len()],
+      LINKABLE[(which / RENAMEABLE.len()) % LINKABLE.len()],
+      back,
+    ),
   })
 }
 
@@ -752,6 +787,8 @@ struct Answers {
   over_refused: u64,
   /// A link's rename over the file, accepted: the link replaced the file.
   over_accepted: u64,
+  /// The hard link's rename over the file it names, accepted: nothing changed.
+  over_unchanged: u64,
 }
 
 impl Answers {
@@ -767,7 +804,7 @@ impl Answers {
   }
 
   /// Every count, in the order the fields name them.
-  fn counts(&self) -> [u64; 8] {
+  fn counts(&self) -> [u64; 9] {
     [
       self.removal_refused,
       self.removal_accepted,
@@ -777,6 +814,7 @@ impl Answers {
       self.link_accepted,
       self.over_refused,
       self.over_accepted,
+      self.over_unchanged,
     ]
   }
 }
@@ -874,7 +912,7 @@ impl Whole {
       Event::Attribute(index) => self.metadata(index, true),
       Event::Remove(index, back) => self.remove(index, back, answers),
       Event::Link(index, back) => self.link(index, back, answers),
-      Event::RenameOver(index, back) => self.rename_over(index, back, answers),
+      Event::RenameOver(index, over, back) => self.rename_over((index, over), back, answers),
     }
   }
 
@@ -995,55 +1033,61 @@ impl Whole {
     Ok(())
   }
 
-  /// The class a rename of the link at `PATHS[index]` over `FILE`, based at `base`, is refused
-  /// by, or none when it is accepted: `merge_rename`'s rules in its order (the source gone or
-  /// removed after the base; a node other than a file at the destination; the destination's bytes
-  /// changed after the base).
-  fn over_answer(&self, index: usize, base: u64) -> Option<MergeConflictClass> {
+  /// The class a rename of the link at `PATHS[index]` over the file at `PATHS[over]`, based at
+  /// `base`, is refused by, or none when it is accepted: `merge_rename`'s rules in its order (the
+  /// source gone or removed after the base; a node other than a file at the destination; the
+  /// destination's bytes changed after the base).
+  fn over_answer(&self, (index, over): (usize, usize), base: u64) -> Option<MergeConflictClass> {
     if self.now(index) == Kind::Absent || self.removed[index] > base {
       return Some(MergeConflictClass::RenameRename);
     }
-    if !matches!(self.now(OVER), Kind::File | Kind::Absent) {
+    if !matches!(self.now(over), Kind::File | Kind::Absent) {
       return Some(MergeConflictClass::TypeChanged);
     }
-    (self.bytes_changed[OVER] > base).then_some(MergeConflictClass::RenameRename)
+    (self.bytes_changed[over] > base).then_some(MergeConflictClass::RenameRename)
   }
 
-  /// A work based `back` behind the head renaming the link at `PATHS[index]` over `FILE`, where
-  /// both stood at that base, the link and a file: refused as `over_answer` says, or accepted,
-  /// the link replacing the file (A-643).
+  /// A work based `back` behind the head renaming the link at `PATHS[index]` over the file at
+  /// `PATHS[over]`, where both stood at that base, the link and a file. The hard link over the file
+  /// it names changes nothing, accepted while the link stands (POSIX `rename`); any other is
+  /// refused as `over_answer` says, or accepted, the link replacing the file (A-643).
   fn rename_over(
     &mut self,
-    index: usize,
+    (index, over): (usize, usize),
     back: u8,
     answers: &mut Answers,
   ) -> Result<(), TestCaseError> {
     let base = self.base(back);
     let link = ORIGINAL[index];
-    if self.kind(base, index) != link || self.kind(base, OVER) != Kind::File {
+    if self.kind(base, index) != link || self.kind(base, over) != Kind::File {
       return Ok(());
     }
-    let expected = self.over_answer(index, base);
-    let answer = self.submit(
-      Work::default().naming(OpKind::Rename, FILE, PATHS[index]),
-      base,
-    );
+    let same_file = (index, over) == SAME_FILE && self.now(index) == link;
+    let expected = if same_file {
+      None
+    } else {
+      self.over_answer((index, over), base)
+    };
+    let (from, to) = (PATHS[index], PATHS[over]);
+    let answer = self.submit(Work::default().naming(OpKind::Rename, to, from), base);
     if let Some(class) = expected {
-      let classes = classes_on(&answer, FILE);
+      let classes = classes_on(&answer, to);
       prop_assert!(
         classes == Some(vec![class]),
-        "renaming {} over {FILE} from {base}: {answer:?}",
-        PATHS[index]
+        "renaming {from} over {to} from {base}: {answer:?}"
       );
       answers.over_refused += 1;
+      return Ok(());
+    }
+    prop_assert!(
+      matches!(answer, Outcome::Accepted { .. }),
+      "renaming {from} over {to} from {base}: {answer:?}"
+    );
+    if same_file {
+      answers.over_unchanged += 1;
     } else {
-      prop_assert!(
-        matches!(answer, Outcome::Accepted { .. }),
-        "renaming {} over {FILE} from {base}: {answer:?}",
-        PATHS[index]
-      );
-      self.removed_now(OVER);
-      self.made_now(OVER, link);
+      self.removed_now(over);
+      self.made_now(over, link);
       self.removed_now(index);
       answers.over_accepted += 1;
     }

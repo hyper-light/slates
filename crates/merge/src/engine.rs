@@ -2534,6 +2534,16 @@ impl Green {
     if from == dst {
       return Ok(());
     }
+    // A hard link renamed over the file it names is that file renamed onto itself: POSIX `rename`
+    // does nothing when both names are links to one file, and neither does the verdict, which
+    // would otherwise remove the file and leave the link naming itself (A-643).
+    if self
+      .hardlinks
+      .get(from)
+      .is_some_and(|target| target.as_str() == dst)
+    {
+      return Ok(());
+    }
     // The source must still name something — a file, a symlink or a hard link. A source an
     // intervening change renamed away or removed is a rename/rename conflict (checked first, so a
     // vanished source is named even when the destination is also occupied).
