@@ -12111,6 +12111,9 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   (`HostCounts::unkept`). A slot's base host is a `BaseHost` (a host directory or an S3 base). Proven: see A-555's
 >   evidence.
 > - **Owed.**
+>   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
+>     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
+>     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
 >   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
 >     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
 >     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of

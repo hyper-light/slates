@@ -10302,6 +10302,16 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > own virtio-fs device and the typed channel's verbs (answered `Unpublished`, retryable); and the volume over an S3 base
 > (the wire's create, the credential's hand-off, the fetch driver), with the rest of A-524's owed list.
 
+> **Status (2026-11-19, A-555's second piece: the fetch driver).** Built: `slates_base::s3::driver::drive`, the task of
+> the volume's owner shard that runs its host's fetches against the store one at a time and hands each answer back,
+> timed, so the requests parked on a fetch are woken when it lands. An idle driver waits on the host itself
+> (`S3Host::next_fetch_or_wait`), which wakes it the moment a miss wants a fetch; a host dropped wakes its driver, which
+> ends, so the driver lives exactly as long as its host and needs no other owner. It is the same code over any store
+> (`s3::fetch::Store`: the network client, or `SimS3` in a test) and any home of the host (`HostCell`: the shard's
+> volume slot in the daemon, `crates/server/src/base_wait.rs`'s `spawn_driver`, whose answers go to `base_wait::land`).
+> Owed: its start where a volume over an S3 base is made or recovered (the wire's create, A-555's next piece), and
+> fetches side by side within the requests that wait on them, which a measurement decides.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -38210,3 +38220,34 @@ oracle's tree a type alias.
   slates-server --lib -- base_wait error::` 6 of 6, `-p slates-base --lib -- s3` 55 of 55, `-p slates-vfs --lib --
   base::` 4 of 4, `-p slates-land --lib -- engine` 2 of 2, `-p slates-bridge-fuse --lib -- bridge::tests` 1 of 1,
   `-p slates-bridge-nfs --lib -- procedures::tests` 1 of 1, `cargo fmt --check` clean.
+
+### A-555, second piece — The fetch driver: a volume's owner shard runs its S3 host's fetches, woken by the host when a fetch is wanted and ended with it (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base"; D-9, R6, R8; A-471, A-524, A-555)
+Applied in the same change to: `crates/base` (`s3::driver`, new: `HostCell`, `drive` and their tests; `s3::fetch::Store`
+over the network client and `SimS3`; `s3::host`: `next_fetch_or_wait`, a wanted fetch waking the driver, and the host's
+drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); §4.15's status; GAPS (A-464's entry).
+
+- **Why.** A-555's first piece parks a request on the fetch it met and wakes it at `base_wait::land`; nothing called
+  `land`, so in a daemon no parked request would ever wake.
+- **Woken by the host, never polling.** The host is sans-io, so the driver waits on it: an idle driver's waker is kept by
+  the host and woken the moment a miss queues a fetch. A fetch starts with the request that needs it, and an idle volume
+  costs no wake.
+- **One fetch at a time.** The client keeps one connection and sends one request at a time (A-471), and the fetches
+  under way are bounded by the requests that wait on them (§4.15's bounds); a request parks on its own fetch whatever is
+  ahead of it in the queue. Fetches side by side are left to a measurement to decide, not assumed.
+- **It lives as long as its host.** The host wakes its driver as it is dropped (its volume destroyed, its base replaced),
+  and the driver, finding no host, ends; an answer that arrives after that is handed to nothing. So the driver's task is
+  detached with its end built in: no task outlives what it serves, and no owner needs to remember it (CLAUDE.md §2 item
+  9).
+- **One code path (R8).** `drive` is the same over the network client and `SimS3` (`Store`), and over the shard's slot
+  and a test's cell (`HostCell`).
+- **Rejected.** Polling the host on a timer: a wake per period on every idle S3 volume, and a fetch delayed by up to a
+  period. Waking the driver from the request's parking: a miss whose request is refused at the bound would leave its
+  fetch unasked.
+- **Owed.** The driver's start where a volume over an S3 base is made or recovered (the wire's create and the
+  credential's hand-off, A-555's next piece: the store client is built from the base's name and its credential), and
+  fetches side by side if a measurement asks for them.
+- **Evidence.** Mac Studio (debug, 2026-11-19, kiln r356): red first with the host not waking its driver, at a miss
+  (the miss woke nothing: 0 wakes where 1 was due) and at its drop (0 where 1 was due); then green: `cargo test --locked
+  -p slates-base --lib -- s3` 58 of 58 (the driver's three: an idle driver woken once by a miss and running its fetch, a
+  fetch the store holds open landing only once answered, a driver ending at its host's drop), `-p slates-server --lib --
+  base_wait` 4 of 4, `cargo fmt --check` clean.

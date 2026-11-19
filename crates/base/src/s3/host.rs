@@ -255,6 +255,9 @@ pub struct S3Host {
   tick: u64,
   cached_bytes: u64,
   wanted: VecDeque<Need>,
+  /// The fetch driver's waker while it waits for a fetch to be wanted ([`S3Host::next_fetch_or_wait`]): woken when
+  /// one is, and when the host is dropped, so the driver ends with its host.
+  driver: Option<std::task::Waker>,
   in_flight: BTreeMap<u64, Need>,
   next_ticket: u64,
   /// The name the next fetch takes.
@@ -272,6 +275,16 @@ pub struct S3Host {
   landing: BTreeSet<Cached>,
   round_trips: RttEstimator,
   counts: HostCounts,
+}
+
+impl Drop for S3Host {
+  /// A host dropped (its volume destroyed, or its base replaced) wakes a driver waiting on it, which finds it gone and
+  /// ends: the driver's task lives exactly as long as its host (A-555).
+  fn drop(&mut self) {
+    if let Some(driver) = self.driver.take() {
+      driver.wake();
+    }
+  }
 }
 
 impl std::fmt::Debug for S3Host {
@@ -315,6 +328,7 @@ impl S3Host {
       tick: 0,
       cached_bytes: 0,
       wanted: VecDeque::new(),
+      driver: None,
       in_flight: BTreeMap::new(),
       next_ticket: 1,
       next_fetch_id: 1,
@@ -384,6 +398,24 @@ impl S3Host {
     self.in_flight.insert(ticket, need);
     self.counts.fetches = self.counts.fetches.saturating_add(1);
     Some((ticket, fetch))
+  }
+
+  /// The next fetch a parked call waits for, as [`S3Host::next_fetch`]; when none is wanted, `waker` is kept and woken
+  /// once one is, or once the host is dropped (A-555): the shard's fetch driver waits so, and ends with its host.
+  pub fn next_fetch_or_wait(&mut self, waker: &std::task::Waker) -> Option<(u64, Fetch)> {
+    let next = self.next_fetch();
+    if next.is_none() {
+      self.driver = Some(waker.clone());
+    }
+    next
+  }
+
+  /// Wants `need` fetched: queued for the driver, which is woken if it waits.
+  fn want(&mut self, need: Need) {
+    self.wanted.push_back(need);
+    if let Some(driver) = self.driver.take() {
+      driver.wake();
+    }
   }
 
   /// The store's `answer` to the fetch handed out under `ticket`, which took `elapsed_ns` from asking to answer (a
@@ -528,7 +560,7 @@ impl S3Host {
       if let Some(listing) = self.listings.get_mut(path) {
         listing.reading = Some(Reading::new(fetch));
       }
-      self.wanted.push_back(Need::Listing(path.to_owned()));
+      self.want(Need::Listing(path.to_owned()));
     }
     if complete {
       if ask {
@@ -586,7 +618,7 @@ impl S3Host {
     match (page.truncated, page.next_token) {
       (true, Some(token)) => {
         reading.token = Some(token);
-        self.wanted.push_back(Need::Listing(path.to_owned()));
+        self.want(Need::Listing(path.to_owned()));
       }
       // A truncated page without its token cannot be continued: the store answered what no listing is.
       (true, None) => self.fail_listing(path, HostError::Unavailable(EIO)),
@@ -877,7 +909,7 @@ impl S3Host {
         .fetching
         .insert((run.key.clone(), run.etag.clone(), index), fetch);
     }
-    self.wanted.push_back(Need::Chunks(run));
+    self.want(Need::Chunks(run));
     Some(fetch)
   }
 
