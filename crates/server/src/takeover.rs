@@ -177,16 +177,17 @@ const TAKEOVER_RECLAIMED: &str = "fleet.takeover.reclaimed";
 
 /// The status count under which a holder records a copy it kept though its line ended at a completed takeover, or its
 /// successor confirmed with this holder outside its placement: the takeover never asked this holder (it was no survivor
-/// of it), and nothing shows the object recovered within tolerance (past it, or judged by a completion record, which
-/// keeps no neighbourhood), so its copy may be the only one of a record no round learned (A-309, A-341). Format: a
-/// refusal name in the daemon's status report.
+/// of it), and nothing shows the object recovered within tolerance in the first takeover since the copy was written,
+/// its writer's (past it, its share not yet done, or the writer unknown to this process), so its copy may be the only
+/// one of a record no round learned (A-309, A-341, A-484). Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_UNASKED: &str = "fleet.takeover.kept_unasked";
 
 /// The status count under which a holder records a copy the takeover never asked it for, let go as a stale one is
-/// ([`let_go_stale`]) because its successor confirmed with this holder outside its placement and the kept retirement
-/// shows the object's settled cohorts within tolerance (`RegionalConfiguration::within_tolerance`): the round heard a
-/// recovery quorum of each, and every record committed for the object is on `f + 1` of each, so it learned one at least
-/// as new as this copy (A-341). Format: a refusal name in the daemon's status report.
+/// ([`let_go_stale`]) because the first takeover since the copy was written, its writer's, recovered the object within
+/// tolerance with its share of it done ([`unasked_copy_stale`]), judged on that takeover's kept retirement or its
+/// completion record: the round heard a recovery quorum of each settled cohort, and every record committed for the
+/// object is on `f + 1` of each, so it learned one at least as new as this copy and adopted it (A-341, A-484). Format: a
+/// refusal name in the daemon's status report.
 const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 
 /// The status count under which a holder records a stale copy it kept because it still holds the copy's content
@@ -199,6 +200,19 @@ const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 /// the successor's placement receives none, so a release from the successor is owed (GAPS). Counted at each install it
 /// is judged at. Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_HOLDING_CONTENT: &str = "fleet.takeover.kept_holding_content";
+
+/// The status count under which a holder records a copy of a live owner's object it let go because it is in none of
+/// that owner's neighbourhoods and the owner's settled cohort for the object is whole and at least `f + 1` wide
+/// (`RegionalConfiguration::settled_away`, A-508): the copy's record, or a newer one, is on `f + 1` live hosts without it,
+/// and no takeover of the owner would ask this holder. A neighbourhood the owner settled away from kept such copies for
+/// good before. Format: a refusal name in the daemon's status report.
+const SETTLE_RELEASED: &str = "fleet.settle.released";
+
+/// The status count under which a holder records a copy of a live owner's object it keeps though it is in none of that
+/// owner's neighbourhoods, because the owner's settled cohort for the object is not whole (a member left it and the
+/// owner has not settled a new neighbourhood), is narrower than `f + 1` (a bootstrap's), or the object moved (A-508).
+/// Counted at each install that judges it. Format: a refusal name in the daemon's status report.
+const SETTLE_KEPT_OUTSIDE: &str = "fleet.settle.kept_outside";
 
 /// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
 /// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
@@ -475,7 +489,10 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///   share while this holder, asked in that round, is outside the successor's placement (the successor's adoption never
 ///   reaches it); a stale copy is dropped unless this holder still holds its content, which the successor may still
 ///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309), unless the
-///   kept retirement shows the object's settled cohorts within tolerance, when it goes the same way (A-341);
+///   first takeover since the copy was written, its writer's, recovered the object within tolerance, judged on that
+///   takeover's kept retirement or its completion record, when it goes the same way (A-341, A-484);
+/// - a copy of a live owner's object that the owner wrote, held outside all of the owner's neighbourhoods, goes the same
+///   way where the owner's settled cohort for it is whole and at least `f + 1` wide ([`settle_away`], A-508);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
 #[cfg(test)]
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
@@ -487,8 +504,24 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
 }
 
 /// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
-/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests.
+/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests. The copy
+/// is judged by its route ([`resolve_by_route`]), then follows its object's move, if the configuration moved it (A-291,
+/// [`crate::moves::follow_moved_object`]), whatever the route judged: a copy routed to its live old owner follows the
+/// move too (A-485).
 pub(crate) fn resolve_held_object(
+  state: &mut ShardState,
+  local: HostId,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+) {
+  resolve_by_route(state, local, regional, object);
+  crate::moves::follow_moved_object(state, regional, local, object);
+}
+
+/// [`resolve_held_object`]'s judgment of one held copy by its route: a copy routed to a live member is let go once its
+/// successor's confirmation shows it stale; one routed to a retired host moves to the successor its lineage ranks, or
+/// is kept, counted, or let go as its line ends.
+fn resolve_by_route(
   state: &mut ShardState,
   local: HostId,
   regional: &RegionalConfiguration,
@@ -505,7 +538,7 @@ pub(crate) fn resolve_held_object(
         let_go_stale(state, object);
       }
       Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
-      Confirmation::None => {}
+      Confirmation::None => settle_away(state, regional, object, owner, local),
     }
     return;
   }
@@ -534,13 +567,14 @@ pub(crate) fn resolve_held_object(
     Lineage::Settled { takeover } => {
       if regional.settled_for(takeover, local) {
         let_go_stale(state, object);
+      } else if unasked_copy_stale(state, regional, object) {
+        state.count(TAKEOVER_UNASKED_COVERED, 1);
+        let_go_stale(state, object);
       } else {
         state.count(TAKEOVER_KEPT_UNASKED, 1);
       }
     }
   }
-  // A copy the configuration moved to another member (A-291) follows its move.
-  crate::moves::follow_moved_objects(state);
 }
 
 /// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
@@ -565,10 +599,11 @@ fn let_go_stale(state: &mut ShardState, object: ObjectId) {
 /// was asked in that round (one of its survivors, A-309), so `owner` learned this copy and adopted the object, and this
 /// holder is outside `owner`'s placement of it, so the adoption never reaches this copy. A holder the round never asked
 /// (one an earlier neighbourhood of the retired host reached) keeps its copy: `owner` may have confirmed without ever
-/// learning the object (`crates/db/tests/lineage_model.rs` found it), unless the kept retirement shows the object's
-/// settled cohorts within tolerance, so the round learned a record at least as new (A-341; past tolerance, or judged by
-/// a completion record alone, the model found a history that let go the last copy of a record placed at `f + 1` after
-/// one failure). The confirmation is read from the kept retirement
+/// learning the object (`crates/db/tests/lineage_model.rs` found it), unless the first takeover since the copy was
+/// written, its writer's, recovered the object within tolerance, so a round learned a record at least as new and adopted
+/// it ([`unasked_copy_stale`]: A-341; past tolerance the model found a history that let go the last copy of a record
+/// placed at `f + 1` after one failure, and judged by a later takeover the last copy went, A-484). The confirmation is
+/// read from the kept retirement
 /// or, once the takeover completed, from its completion record (A-309): the last confirmation drops the retirement in
 /// the very version that records it, and judged by the kept retirement alone a holder outside the placement never saw
 /// that confirmation and kept its stale copy for good.
@@ -607,7 +642,7 @@ fn stale_after_confirmation(
       .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
   match (outside, asked) {
     (true, true) => Confirmation::Stale,
-    (true, false) if regional.within_tolerance(departed.owner, object) => Confirmation::Covered,
+    (true, false) if unasked_copy_stale(state, regional, object) => Confirmation::Covered,
     (true, false) => Confirmation::Unasked,
     (false, _) => Confirmation::None,
   }
@@ -617,15 +652,77 @@ fn stale_after_confirmation(
 enum Confirmation {
   /// The successor confirmed its share and this holder, outside its placement, was asked in that round: stale.
   Stale,
-  /// The successor confirmed and this holder is outside its placement, and the round never asked it, but the kept
-  /// retirement shows the object's settled cohorts within tolerance: stale too, counted [`TAKEOVER_UNASKED_COVERED`]
-  /// (A-341).
+  /// The successor confirmed and this holder is outside its placement, and the round never asked it, but its copy's
+  /// writer's takeover recovered the object within tolerance ([`unasked_copy_stale`]): stale too, counted
+  /// [`TAKEOVER_UNASKED_COVERED`] (A-341, A-484).
   Covered,
   /// The successor confirmed and this holder is outside its placement, but the round never asked it and nothing shows
-  /// the object recovered within tolerance: kept, counted [`TAKEOVER_KEPT_UNASKED`] (A-309).
+  /// the object recovered within tolerance in its copy's writer's takeover: kept, counted [`TAKEOVER_KEPT_UNASKED`]
+  /// (A-309).
   Unasked,
   /// No confirmation that judges the copy: none yet, or this holder is within the successor's placement.
   None,
+}
+
+/// Whether this holder's copy of `object` is stale though no round of the takeovers in its line asked this holder
+/// (A-341, A-484): the first takeover since the copy was written is its writer's (`Acceptor::written_by`), and that
+/// takeover recovered the object within tolerance with its share of it done, judged on its kept retirement or its
+/// completion record (`RegionalConfiguration::copy_stale`). Judged by the last takeover in the line instead, a copy whose
+/// writer's takeover was past tolerance and confirmed without learning the object went at a later takeover within
+/// tolerance, whose round could not have learned it either: possibly the object's last copy
+/// (`a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover`). A copy whose writer this
+/// process cannot know (its acceptor rebuilt from an image after an install moved its authority) is kept.
+fn unasked_copy_stale(
+  state: &ShardState,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+) -> bool {
+  state
+    .holder_records
+    .get(&object)
+    .and_then(|acceptor| acceptor.written_by())
+    .is_some_and(|writer| regional.copy_stale(writer, object))
+}
+
+/// Judges this holder's copy of `object`, routed to its live owner `owner`, when the owner wrote it
+/// (`Acceptor::written_by`) and this holder is in none of the owner's neighbourhoods (A-508): an owner whose
+/// neighbourhood settled away from this holder left the copy here, and nothing else would ever let it go. It goes as a
+/// stale copy goes ([`let_go_settled_away`]) where the owner's settled cohort for the object is whole and at least
+/// `f + 1` wide (`RegionalConfiguration::settled_away`), and is kept, counted [`SETTLE_KEPT_OUTSIDE`], where it is not. A
+/// copy another owner wrote is a takeover's to judge, and one whose writer this process cannot know is kept, as before.
+fn settle_away(
+  state: &mut ShardState,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+  owner: HostId,
+  local: HostId,
+) {
+  let written_by_owner = state
+    .holder_records
+    .get(&object)
+    .is_some_and(|acceptor| acceptor.written_by() == Some(owner));
+  if !written_by_owner || regional.holds_for(owner, local) {
+    return;
+  }
+  if regional.settled_away(owner, local, object) {
+    let_go_settled_away(state, object);
+  } else {
+    state.count(SETTLE_KEPT_OUTSIDE, 1);
+  }
+}
+
+/// Lets go a copy a live owner's neighbourhood settled away from (A-508) as a stale one goes ([`let_go_stale`]): kept
+/// whole, counted [`TAKEOVER_KEPT_HOLDING_CONTENT`], while its retention rule keeps content for it, since the owner's
+/// head may still name this holder for its content and the healer leaves such a named holder be (A-335, A-276's open
+/// item); dropped otherwise, counted [`SETTLE_RELEASED`].
+fn let_go_settled_away(state: &mut ShardState, object: ObjectId) {
+  crate::content_retention::retain_object(state, object);
+  if state.held_content.newest_placed(object).is_some() {
+    state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
+    return;
+  }
+  drop_copy(state, object);
+  state.count(SETTLE_RELEASED, 1);
 }
 
 /// Forgets `object`'s owner in this shard's routing and in every other shard's: the end [`track_owner_on_every_shard`]
@@ -657,7 +754,7 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
 /// reclaimed with its records, never kept for a head this holder no longer backs). A takeover's reclaim ([`reclaim`])
-/// and a planned move's (A-291, `crate::moves::follow_moved_objects`, once the move's new owner has sealed the volume
+/// and a planned move's (A-291, `crate::moves::follow_moved_object`, once the move's new owner has sealed the volume
 /// under its own placement, which leaves this holder out) both end a copy so.
 pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
@@ -2926,6 +3023,94 @@ mod tests {
     );
     install_council(state);
     others
+  }
+
+  /// Installs the audit node's council configuration and walks it onto its held copy of `object`, as an install's walk
+  /// reaches each copy (`fleet::install_on_copy`, A-398).
+  fn walk_install_onto(state: &mut ShardState, object: ObjectId) {
+    install_council(state);
+    let local = state.fleet.host();
+    let regional = state.council.configuration().clone();
+    let retired: std::collections::BTreeSet<HostId> = regional.retired.keys().copied().collect();
+    crate::fleet::install_on_copy(
+      state,
+      local,
+      (&regional, &retired),
+      regional.version,
+      object,
+    );
+  }
+
+  /// A-485 (A-291's move, §4.8 "Authority scope"; A-398's install walk): a holder's copy of a moved volume follows the
+  /// move when the install's walk reaches it, so the takeover of a target that dies before adopting it lists the copy
+  /// for the target's successor. Do: in A-340's region, hold a copy of another member's volume under that member's
+  /// authority; move the volume to a third member and walk the install onto the copy; retire the target and walk the
+  /// next install onto the copy. Expect the copy routed to the target after the move's install, and listed for the
+  /// target's successor in the target's takeover, as the successor's page asks (`copies_falling_to`). Before, the walk's
+  /// per-copy step followed a move only for a copy whose route named a retired host: a copy routed to its live old owner
+  /// kept that route and that authority, no takeover of the target listed it, every successor confirmed without it, and
+  /// the configuration handed the volume's line to a successor that never adopted it, while the old owner let its
+  /// frozen copy go (`a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`, every run since A-398).
+  #[test]
+  fn a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_targets_successor() {
+    let (owners, routed, listed) = crate::daemon::audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let others = whole_region(state);
+      let (owner, target) = (others[0], others[1]);
+      let volume = ObjectId::new(owner, 0);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(local, Authority { generation, owner });
+      acceptor
+        .accept(&Record {
+          owner,
+          object: volume,
+          sequence: 0,
+          epoch: HostEpoch(1),
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(volume, acceptor);
+      state.fleet.track_object_owner(volume, owner);
+      assert!(
+        state.council.propose(Reconfiguration::Move {
+          object: volume,
+          from: owner,
+          to: target,
+          cohort: vec![owner, local, target],
+        }),
+        "the move commits"
+      );
+      walk_install_onto(state, volume);
+      let routed = state.fleet.object_owner(volume);
+      assert!(
+        state.council.propose(Reconfiguration::TakeOver(target)),
+        "the target retires before it adopts"
+      );
+      walk_install_onto(state, volume);
+      let listed = state
+        .council
+        .configuration()
+        .successor(target, volume)
+        .map(|successor| {
+          (
+            successor,
+            copies_falling_to(state, target, successor, None).contains(&volume),
+          )
+        });
+      ((owner, target), routed, listed)
+    });
+    let (owner, target) = owners;
+    assert_eq!(
+      routed,
+      Some(target),
+      "the copy follows the move to its target (owner {owner:?})"
+    );
+    assert!(
+      matches!(listed, Some((_, true))),
+      "the target's takeover lists the copy for its successor: {listed:?}"
+    );
   }
 
   /// A round of the audit node's for `departed`'s takeover that has learned `object` and adopted nothing.

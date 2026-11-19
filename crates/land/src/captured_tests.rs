@@ -4,16 +4,11 @@
 //! scratch volume.
 
 use slates_mem::Handle;
-use slates_mem::arena::ChunkArena;
-use slates_mem::region::Region;
-use slates_vfs::clock::StepClock;
 use slates_vfs::dir::{Child, DirNode};
 use slates_vfs::host::HostFs;
 use slates_vfs::host::sim::SimHost;
 use slates_vfs::ids::SnapshotId;
-use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
-use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+use slates_vfs::volume::{Store, Volume};
 
 use crate::engine::{
   Audit, Beginning, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingState,
@@ -22,14 +17,9 @@ use crate::engine::{
 use crate::grant::{GrantScope, Grants, Leases, Surface, TargetIdentity, lease_key};
 use crate::manifest::{Action, Filter, Judged};
 use crate::source::Source;
+use crate::test_store::{config, store};
 use crate::verdict::{ConflictClass, Verdict};
 
-/// Shape: the test store's page.
-const PAGE: usize = 4096;
-/// Shape: pages of content the test store maps (4 MiB).
-const REGION_PAGES: usize = 1024;
-/// Shape: slots per slab in the test store.
-const CAP: usize = 1 << 14;
 /// Shape: a file's mode.
 const FILE_MODE: u32 = 0o100_644;
 /// Shape: a directory's mode.
@@ -44,36 +34,6 @@ const EXECUTABLE_MODE: u32 = 0o100_755;
 const PRIVATE_MODE: u32 = 0o100_600;
 /// Format: a mode's permission bits.
 const PERMISSIONS: u32 = 0o7777;
-
-fn store() -> Store {
-  let mut arena = ChunkArena::new(PAGE);
-  arena
-    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
-    .unwrap();
-  Store::new(
-    &StoreConfig {
-      page: PAGE,
-      cache_line: 64,
-      max_dirs: CAP,
-      max_inodes: CAP,
-      max_chunks: CAP,
-      max_dir_blocks: CAP,
-      dir_cutover: 4,
-    },
-    arena,
-    0,
-  )
-}
-
-fn config(prefix: u16) -> VolumeConfig {
-  VolumeConfig {
-    prefix,
-    names: NameEquivalence::Exact,
-    quota: Quota::Bounded { limit: 1 << 24 },
-    journal_bytes: 1 << 16,
-    clock: Box::new(StepClock::new(1_000, 1)),
-  }
-}
 
 fn dir(vol: &Volume, store: &Store, path: &str) -> Handle<DirNode> {
   match vol.resolve(store, path).unwrap().child {
@@ -417,6 +377,10 @@ fn a_captured_clones_mode_change_alone_lands() {
     host.bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])
   );
+  assert!(
+    !host.holds_unsynced_metadata("/target/src/keep.rs"),
+    "synced by its batch's barrier (A-472)"
+  );
 }
 
 /// The mode the target's file holds, its permission bits alone.
@@ -526,4 +490,45 @@ fn a_captured_clones_replacement_already_on_the_disk_still_lands_its_mode() {
     host.bytes("/target/src/edit.rs").as_deref(),
     Some(&b"the agent's body"[..])
   );
+  assert!(
+    !host.holds_unsynced_metadata("/target/src/edit.rs"),
+    "synced by its batch's barrier (A-472)"
+  );
+}
+
+/// A-501 (a base directory's mode alone, in a captured clone). Do: in a captured clone, `chmod` the directory `/src` to
+/// 0700, nothing else changed beyond the clone's own edits, and land it against its capture. Expect the change since the
+/// capture to hold the directory, the landing `Done`, and the target's directory at 0700 under its own inode, synced.
+/// Before A-501 a captured clone's plan made nothing of a directory that both held.
+#[test]
+fn a_captured_clones_directory_mode_change_alone_lands() {
+  /// Shape: the directory made private to its owner.
+  const PRIVATE_DIR_MODE: u32 = 0o040_700;
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let src = clone.resolve(&store, "/src").unwrap().inode;
+  clone.chmod(&mut store, src, PRIVATE_DIR_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  let before = host.fingerprint("/target/src").unwrap();
+  let (presented, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  assert!(
+    presented
+      .manifest
+      .entries
+      .iter()
+      .any(|e| e.path.as_ref() == "/src"),
+    "{:?}",
+    presented.manifest.entries
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  let after = host.fingerprint("/target/src").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, PRIVATE_DIR_MODE & PERMISSIONS);
+  assert_eq!(after.ino, before.ino);
+  assert!(!host.holds_unsynced_metadata("/target/src"));
 }

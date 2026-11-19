@@ -156,11 +156,13 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   Every node computes the same map from the same file. A name
   (`slates-0.slates.default.svc.cluster.local:7000` — the Kubernetes deployment of
   [deploy.md](deploy.md) names each node by its per-pod DNS name) is resolved by the daemon at every
-  fresh dial through the nameservers of this host's `/etc/resolv.conf`, so a peer that came back
-  under a new address (a rescheduled pod) is reached on the next re-dial; a name that does not
+  fresh dial through this host's nameservers: those of `/etc/resolv.conf` on Linux and macOS, and on
+  Windows the DNS servers of its network adapters that are up and have a gateway. So a peer that came
+  back under a new address (a rescheduled pod) is reached on the next re-dial; a name that does not
   resolve is counted under the `fleet.resolve` refusal in `status` and dialed again next period. A
-  named node binds its own two sockets on every interface. A manifest that names a node on a host
-  with no IPv4 nameserver in `/etc/resolv.conf` stops the boot naming the file. Both sockets are
+  named node binds its own two sockets on every interface. A manifest that names a node, or trusts an
+  enrollment root (a peer enrolled under it may announce a name), on a host with no IPv4 nameserver
+  stops the boot naming where it looked. Both sockets are
   taken up before the daemon starts: an address already in use stops the boot with
   `fleet serve: the probe serve socket could not be taken up at ADDRESS` (or `record`). Under
   `slates anchor --fleet`, the anchor binds the two ports once and keeps them across daemon restarts,

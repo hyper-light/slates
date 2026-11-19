@@ -247,8 +247,9 @@ pub enum DeployError {
   },
   /// The manifest lists no node at all.
   NoNodes,
-  /// A node is addressed by a DNS name, but no resolver configuration was given (the host has no usable
-  /// `/etc/resolv.conf`, or the caller passed none), so the name could never be dialed.
+  /// A node is addressed by a DNS name, but no resolver configuration was given (the host gave no IPv4 nameserver:
+  /// on Unix in `/etc/resolv.conf`, on Windows on no network adapter that is up with a gateway, A-490; or the caller
+  /// passed none), so the name could never be dialed.
   NoResolver {
     /// The first named node.
     node: String,

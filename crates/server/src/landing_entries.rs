@@ -65,7 +65,8 @@ fn planned(entry: &LandingEntry, conflict: Option<&LandConflict>) -> PlannedEntr
       target: target.to_string(),
     },
     Action::Clear => PlannedAction::Clear,
-    Action::Chmod { from, to } => PlannedAction::Chmod {
+    // A base directory's mode or bits alone (A-501) is a chmod of its path, as a file's is.
+    Action::Chmod { from, to } | Action::ChmodDir { from, to } => PlannedAction::Chmod {
       permissions_was: from.permissions,
       windows_was: from.windows,
       windows: to.windows,
