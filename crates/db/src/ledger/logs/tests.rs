@@ -428,7 +428,8 @@ fn a_takeover_that_cannot_fence_every_log_fences_none() {
     .append(&mut world.cohort, record(1, &[(a, 0, 1)]), &Reach::All)
     .unwrap();
   let successor = world.co_holders(&a).first().copied().unwrap();
-  let refused = LogsOwner::take_over(&mut world.cohort, successor, &only(&world.co_holders(&a)));
+  let reach = only(&world.co_holders(&a));
+  let refused = LogsOwner::take_over(&mut world.cohort, successor, &reach);
   let refusal = refused.map(|_| ()).unwrap_err();
   assert_eq!(
     (refusal.log, refusal.error),
