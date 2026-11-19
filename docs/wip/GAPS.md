@@ -226,6 +226,19 @@
 > slates-http-edge --lib` 31 of 31 on the Mac Studio, red first (29 of 31 on stubs). Owed (part 2): the daemon's
 > listener and tasks with each phase's wait learned and the bounds derived from the shard's budget; git's site (routes,
 > authentication to a principal, the policy's decision, the services); the live `git clone` over HTTPS (main's).
+> **A-625 part 2 (2026-11-19, g299; the edge on the daemon's runtime and git's site):** `crates/server` (`vcs_http`)
+> serves the engine on the runtime's TCP: a listener task whose connections are detached child tasks, cancelled and
+> joined with it; seats derived from the shard's client seats (`clients_per_shard`) and each request one client region's
+> room, the listener not accepting at the bound (the kernel's backlog the same bound); each phase's wait learned with
+> `LearnedWait`, the handshake, idleness, a head and the drain whole and a body's and a reply's silences one at a time,
+> no bound before a phase's first completed wait, only a connection whose credentials proved a principal teaching.
+> git's site: `http-backend`'s route, `401` with the connection's challenges, `404`, the policy's `403`
+> (`vcs_policy::reaches`), `503` while a service has not landed (both today). `slates-git` gives its reply fields as
+> data. `cargo test -p slates-server --lib vcs_` 46 of 46 and `-p slates-git --lib http` 18 of 18 on the Mac Studio, red
+> first on stubs (20 and 2 failing). Owed: the daemon starting an edge (address, identity, an authenticator over
+> §4.13's keys, the repositories' lookup on their partitions); upload-pack (A-615) and receive-pack's commit (A-620
+> part 2) behind `GitServices`; Mercurial's and Subversion's sites; the MCP edge onto this engine; the live `git clone`
+> over HTTPS (main's, once upload-pack serves).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
