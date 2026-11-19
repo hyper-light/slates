@@ -8,7 +8,12 @@
 //! the verdict judges it against exactly the green's deltas except its lowers' own. Disjoint changes commute (§4.16
 //! "Position mapping"), so after each work of a stack lands the green must hold what that replica holds, and a work must
 //! land exactly where the replica's lands. A bottom the green refuses is one some work in between meets, so the replica
-//! of the bottom refuses one of those. Every byte a generated work adds is fresh, so no two works ever make the same
+//! of the bottom refuses one of those. Where every work in between lands in the replica, that is all the oracle needs,
+//! and it requires it. Where one does not, the replica is no reference, and the stack goes unchecked from that level
+//! up (counted): the verdict depends on order there. Two works inserting at two points land one after the other, and a
+//! stack's work deleting the bytes between them lands after both; in the replica the delete lands first, the two
+//! points become one, and the second insert meets the first. Neither answer is wrong for its order, and the green's
+//! order is the one it was given. Every byte a generated work adds is fresh, so no two works ever make the same
 //! change (an identical change is judged by its own tests), and no work puts two operations at one offset, the one
 //! place where the verdict's mapping does not commute (the A-659 entry, owed). The census counts stacks by depth,
 //! uppers whose operations moved and those that did not, and every refusal.
@@ -227,6 +232,9 @@ struct Census {
   bottoms_refused: u64,
   /// Works that landed between a stack's base and its landing.
   between: u64,
+  /// Stacks whose replica refused a work between that the green landed (module docs): left unchecked from that level
+  /// up, as the verdict depends on order there.
+  collapsed: u64,
   /// Files a work over a tree edited where the head held the tree's bytes, applied.
   tree_applied: u64,
   /// Files a work over a tree edited where the head held other bytes, refused.
@@ -334,43 +342,52 @@ impl History {
       works: &works,
       between: &landed_between,
     };
+    let mut held = true;
     for (level, outcome) in landed.iter().enumerate() {
-      if !self.held_to_replica(&stack, (level, outcome), census)? {
-        break;
+      if held {
+        held = self.held_to_replica(&stack, (level, outcome), census)?;
+      }
+      // What the green committed, for the replicas of later steps: the bottom as given, an upper restated.
+      if let Landed::Accepted { restated, .. } = outcome {
+        let committed = if level == 0 {
+          Some(bottom.clone())
+        } else {
+          restated.clone()
+        };
+        prop_assert!(committed.is_some(), "level {} committed nothing", level);
+        self.log.extend(committed);
       }
     }
     Ok(())
   }
 
-  /// Holds the stack's work at `level` to its replica (module docs); whether the stack goes on above it.
+  /// Holds the stack's work at `level` to its replica (module docs); whether the replica holds the levels above it too.
   fn held_to_replica(
-    &mut self,
+    &self,
     stack: &Stack<'_>,
     (level, outcome): (usize, &Landed),
     census: &mut Census,
   ) -> Result<bool, TestCaseError> {
     let replica = self.replica(stack.prefix)?;
-    let (replica, replica_landed) = stack.replay(replica, level)?;
+    let (replica, between, landed) = stack.replay(replica, level)?;
     match outcome {
+      Landed::Accepted { .. } if !between => {
+        census.collapsed += 1;
+        Ok(false)
+      }
       Landed::Accepted {
         version, restated, ..
       } => {
         prop_assert!(
-          replica_landed,
+          landed,
           "the green landed level {} where its replica refused",
           level
         );
-        prop_assert_eq!(
+        let (green, held) = (
           files_at(&self.green, *version),
-          files_at(&replica, replica.head())
+          files_at(&replica, replica.head()),
         );
-        // What the green committed, for the replicas of later steps: the bottom as given, an upper restated.
-        let committed = match (level, restated) {
-          (0, _) => stack.works.first().cloned(),
-          (_, restated) => restated.clone(),
-        };
-        prop_assert!(committed.is_some(), "level {} committed nothing", level);
-        self.log.extend(committed);
+        prop_assert_eq!(green, held);
         census.depths[level] += 1;
         if let (Some(restated), Some(declared)) = (restated, stack.works.get(level)) {
           if restated.doc.ops == declared.doc.ops {
@@ -381,17 +398,25 @@ impl History {
         }
         Ok(true)
       }
+      Landed::Conflict { .. } if level == 0 => {
+        prop_assert!(
+          !between,
+          "the green refused the bottom where every work between landed over it"
+        );
+        census.bottoms_refused += 1;
+        Ok(false)
+      }
+      Landed::Conflict { .. } if !between => {
+        census.collapsed += 1;
+        Ok(false)
+      }
       Landed::Conflict { .. } => {
         prop_assert!(
-          !replica_landed,
+          !landed,
           "the green refused level {} where its replica landed",
           level
         );
-        if level == 0 {
-          census.bottoms_refused += 1;
-        } else {
-          census.uppers_refused += 1;
-        }
+        census.uppers_refused += 1;
         Ok(false)
       }
       other => {
@@ -431,31 +456,27 @@ struct Stack<'a> {
 }
 
 impl Stack<'_> {
-  /// The replica of the work at `level` (module docs), and whether that work landed there. For the bottom: the bottom,
-  /// then the works between, all of which land exactly when the bottom lands in the green. For an upper: the works below
-  /// it, the works between (each must land), then it.
-  fn replay(&self, mut green: Green, level: usize) -> Result<(Green, bool), TestCaseError> {
+  /// The replica of the work at `level` (module docs): the green, whether every work between landed there, and whether
+  /// the work at `level` did. For the bottom: the bottom, then the works between. For an upper: the works below it, the
+  /// works between, then it.
+  fn replay(&self, mut green: Green, level: usize) -> Result<(Green, bool, bool), TestCaseError> {
     let below = self.works.get(..level.max(1)).unwrap_or_default();
     for work in below {
       let outcome = green.submit(work);
       prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
     }
-    let mut between_landed = true;
+    let mut between = true;
     for work in self.between {
-      between_landed &= matches!(green.submit(work), Outcome::Accepted { .. });
+      between &= matches!(green.submit(work), Outcome::Accepted { .. });
     }
     if level == 0 {
-      return Ok((green, between_landed));
+      return Ok((green, between, true));
     }
-    prop_assert!(
-      between_landed,
-      "a work between was refused over landed lowers"
-    );
     let landed = match self.works.get(level) {
       Some(work) => matches!(green.submit(work), Outcome::Accepted { .. }),
       None => false,
     };
-    Ok((green, landed))
+    Ok((green, between, landed))
   }
 }
 
