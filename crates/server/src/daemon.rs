@@ -6661,6 +6661,77 @@ mod starved_share_tests {
   }
 }
 
+#[cfg(test)]
+mod laptop_failover_tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used)]
+  use super::{LIVENESS_BUDGET_NS, audit_daemon_of, observe_at, observe_first};
+
+  /// Shape: the lapse bound the test publishes as the daemon's anchor does: four liveness windows, as an anchor whose own
+  /// waits ran three windows late measures it, far from any delay the daemon held before.
+  const LAPSE_NS: u64 = 4 * LIVENESS_BUDGET_NS;
+  /// Shape: how long the test looks for every shard to read the delay: ten seconds, a hundred of the control shard's
+  /// beats, far past the beat that reads the bound and the fan that carries the delay.
+  const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+  /// Shape: the pause between the test's looks, half a beat.
+  const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+
+  /// A-574 (A-405's laptop detection, derived; R8). Do: start a two-shard daemon with no fleet (`f = 0`, a laptop's),
+  /// publish a lapse bound in its supervision block as its anchor does, and look at both shards' failover delay until
+  /// they agree. Expect each to be at least the liveness window, then the published lapse and the recovery prior, in
+  /// whole periods, and the control shard's detection term to be the watchdog's widest window (from the liveness window
+  /// to its ceiling) and then exactly the lapse, read from what was measured: the laptop's detection read on the control
+  /// shard's beat from what its watchdog and its anchor measure, and fanned to every shard. Before, a laptop's delay was
+  /// the liveness window and the recovery prior, set at boot and never read again.
+  #[test]
+  fn a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse() {
+    let daemon = audit_daemon_of(2);
+    daemon
+      .segment()
+      .supervision()
+      .unwrap()
+      .record_lapse_bound(LAPSE_NS);
+    let floor = crate::fleet::failover_in_periods(
+      LIVENESS_BUDGET_NS + LAPSE_NS + slates_db::replay::RECOVERY_BUDGET_NS,
+    );
+    let began = std::time::Instant::now();
+    let read = loop {
+      let control = observe_first(&daemon, |s| {
+        (s.failover_ns, s.failover.estimate().detection)
+      });
+      let other = observe_at(&daemon, 1, |s| s.failover_ns);
+      if control.0 >= floor && other == control.0 {
+        break Some(control);
+      }
+      if began.elapsed() > WAIT {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test reads on its own beat.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(LOOK);
+    };
+    daemon.stop();
+    let (failover_ns, detection) =
+      read.expect("every shard read a delay with the anchor's lapse in it");
+    let detection = detection.expect("its anchor detects it");
+    let window = detection
+      .ns
+      .checked_sub(LAPSE_NS)
+      .expect("the detection holds the lapse");
+    assert!(
+      (LIVENESS_BUDGET_NS..=crate::watchdog::WINDOW_CEILING_NS).contains(&window),
+      "the watchdog's widest window, then the lapse: {window} ns"
+    );
+    assert!(
+      detection.samples > 0,
+      "read from what was measured: {detection:?}"
+    );
+    println!(
+      "a laptop's failover delay {failover_ns} ns: the watchdog's widest window {window} ns, the anchor's lapse \
+       {LAPSE_NS} ns, then the recovery"
+    );
+  }
+}
+
 /// Format: nanoseconds per millisecond, for the late-beat log.
 const NS_PER_MS: u64 = 1_000_000;
 

@@ -202,6 +202,14 @@ pub fn confirmation(timing: &ElectionTiming, periods: &RunningDuration, heartbea
   }
 }
 
+/// The detection a node's anchor gives it where no peer's detector judges it.
+pub fn supervision(widest_window_ns: u64, _lapse_bound_ns: Option<u64>, _samples: u64) -> Term {
+  Term {
+    ns: widest_window_ns,
+    samples: 0,
+  }
+}
+
 /// The failover estimate (§4.8 "Derived constants"; A-363): each term with the measurements behind it, and their sum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FailoverEstimate {
@@ -266,6 +274,11 @@ impl Failover {
       samples: 0,
     });
     self
+  }
+
+  /// The detection this node's anchor gives it, read from the watchdog's widest window and the anchor's lapse bound.
+  pub fn supervise(&mut self, widest_window_ns: u64, lapse_bound_ns: Option<u64>) {
+    self.supervision = Some(supervision(widest_window_ns, lapse_bound_ns, 0));
   }
 
   /// A coordinator period began at `now_ns`: the time since the one before is a sample of the period's length. A clock
@@ -571,6 +584,89 @@ mod tests {
         ns: window,
         samples: 0,
       })
+    );
+  }
+
+  /// A-574 (A-405's laptop detection, derived; A-455, A-467). Do: read a node's supervision with its shards on a quiet
+  /// host (the watchdog's widest window the liveness window) and its anchor's lapse bound a window and a fifth, then
+  /// with a shard the host held two and a half windows, then with no anchor publishing a bound (a daemon run alone).
+  /// Expect the detection to be the widest window and then the anchor's lapse, in turn: the window and the bound; two
+  /// and a half windows and the bound; the window alone, its own watchdog ending it; each reading counted behind it.
+  /// Before, it was the liveness window whatever the watchdog and the anchor measured, a prior with nothing behind it.
+  #[test]
+  fn a_nodes_supervision_is_its_watchdogs_widest_window_then_its_anchors_lapse() {
+    let window = 10 * HEARTBEAT;
+    let lapse = window + window / 5;
+    let mut failover = Failover::new();
+    failover.supervise(window, Some(lapse));
+    assert_eq!(
+      failover.estimate().detection,
+      Some(Term {
+        ns: window + lapse,
+        samples: 1,
+      }),
+      "a quiet host: the window, then the anchor's lapse"
+    );
+    failover.supervise(5 * window / 2, Some(lapse));
+    assert_eq!(
+      failover.estimate().detection,
+      Some(Term {
+        ns: 5 * window / 2 + lapse,
+        samples: 2,
+      }),
+      "a held shard's wider window"
+    );
+    failover.supervise(window, None);
+    assert_eq!(
+      failover.estimate().detection,
+      Some(Term {
+        ns: window,
+        samples: 3,
+      }),
+      "no anchor: its own watchdog ends it at the verdict"
+    );
+  }
+
+  /// A-574 (R8: a laptop is the fleet at its degenerate inputs). Do: give one supervision reading to two estimators, a
+  /// laptop's (`f = 0`: no detector and no council, so no period refreshes its detection or confirmation) and a fleet
+  /// node's (refreshed each period with its detector's term, none before the detector's first period); compare their
+  /// estimates before and after the detector's term. Expect the laptop's delay to be its supervision and the recovery;
+  /// the fleet node's, before its detector's term, the same supervision with the council's confirmation and the same
+  /// recovery, and after it the detector's term in the supervision's place: one estimator and one sum, the laptop's
+  /// inputs degenerate, never a branch.
+  #[test]
+  fn a_laptop_and_a_fleet_node_derive_their_failover_delay_by_one_sum() {
+    let window = 10 * HEARTBEAT;
+    let lapse = window + window / 5;
+    let (mut laptop, mut fleet) = (Failover::new(), Failover::new());
+    laptop.supervise(window, Some(lapse));
+    fleet.supervise(window, Some(lapse));
+    let laptop_estimate = laptop.estimate();
+    let supervised = laptop_estimate.detection.expect("its anchor detects it");
+    assert_eq!(laptop_estimate.confirmation, None, "no council");
+    assert_eq!(
+      laptop_estimate.total_ns(),
+      supervised.ns + slates_db::replay::RECOVERY_BUDGET_NS
+    );
+    let before = fleet.refresh(None, &ElectionTiming::floor(), HEARTBEAT);
+    assert_eq!(before.detection, Some(supervised), "the same supervision");
+    let confirmation = before.confirmation.expect("a council confirms");
+    assert_eq!(
+      before.total_ns(),
+      supervised.ns + confirmation.ns + slates_db::replay::RECOVERY_BUDGET_NS
+    );
+    let detector = Some(Term {
+      ns: 900_000_000,
+      samples: 7,
+    });
+    let after = fleet.refresh(detector, &ElectionTiming::floor(), HEARTBEAT);
+    assert_eq!(
+      after.detection, detector,
+      "the detector's term once measured"
+    );
+    assert_eq!(
+      after.total_ns(),
+      900_000_000 + confirmation.ns + slates_db::replay::RECOVERY_BUDGET_NS
     );
   }
 
