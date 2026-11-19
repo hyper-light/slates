@@ -34,6 +34,11 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_subr/xml.c` (read 2026-11-19 for A-602) | `aeffb5c3effa073f` | C |
 | `subversion/libsvn_subr/ctype.c` (read 2026-11-19 for A-602) | `8c00533a27dc55f5` | C |
 | `subversion/include/svn_ctype.h` (read 2026-11-19 for A-602) | `2928f028e729a7b1` | B |
+| `subversion/libsvn_fs_fs/fs_fs.c` (read 2026-11-19 for A-592) | `b12b91eb0418577d` | C |
+| `subversion/libsvn_fs_fs/dag.c` (read 2026-11-19 for A-592) | `9efbb054b8818693` | C |
+| `subversion/libsvn_subr/path.c` (read 2026-11-19 for A-592) | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/sorts.c` (read 2026-11-19 for A-592) | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_subr/dirent_uri.c` (read 2026-11-19 for A-592) | `fe05687a2dedb22c` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -218,6 +223,23 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
   `E210001` unknown command, `E210004` malformed data, `E210009` request size, `E220001` unreadable, `E220002`
   partially readable, `E220004` unwritable, `E125005` bad property value. (Derivation script kept outside the tree;
   `grep -n 'SVN_ERRDEF' svn_error_codes.h` shows each offset.)
+- **The merge, then the locks** [C: `tree.c` `svn_fs_fs__commit_txn` 2194 on, `merge_changes` 2284; `transaction.c`
+  `commit_body` 3797; read 2026-11-19 for A-592]: FSFS merges the head into the transaction first, and only a merged
+  transaction reaches `commit_body`, whose `verify_locks` checks the locks; so a work that conflicts is answered with
+  the conflict whatever locks stand in its way. The drive checks locks too: `fs-wrap.c` 151-152 begins a commit's
+  transaction with `SVN_FS_TXN_CHECK_LOCKS`, which `tree.c` honours at each editor call (1614, 2497, 2554, 2645).
+- **Subversion's path order** [C: `sorts.c` `svn_sort_compare_items_as_paths` 69-79, which is `path.c`
+  `svn_path_compare_paths` 418-453]: "Children of paths are greater than their parents, but less than greater siblings
+  of their parents": a `/` sorts before every other byte, so `/a/b` comes before `/a-b`, which byte order puts first.
+  `svn_fspath__skip_ancestor` (`dirent_uri.c` 2664, through `svn_relpath_skip_ancestor` 1530-1551) is what
+  `verify_locks` skips a checked subtree's paths by.
+- **Property lists compare by content** [C: `fs_fs.c` `svn_fs_fs__prop_rep_equal` 1608-1665]: the same representation
+  is equal, committed representations with different MD5s differ, and otherwise both lists are read and compared, so
+  an empty list and no list are equal.
+- **A transaction root's created revision** [C: `dag.c` `svn_fs_fs__dag_get_revision`]: "In the special case that
+  this is an unmodified transaction root, we need to actually get the revision of the noderev's predecessor (the
+  revision root); see Issue #2608"; every other node the transaction made answers no revision, so the drive's
+  out-of-date test passes it unless the client named a revision past the transaction's base.
 
 ## 7. Properties, locks, mergeinfo, hooks, authorization
 
