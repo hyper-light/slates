@@ -203,6 +203,12 @@ impl Green {
     Ok((branch, reverted))
   }
 
+  /// `identity`, this green's sum at its head, moved to `version` as a branch at `version` moves it ([`Green::reverts`]):
+  /// what a checkpoint at `version` carries (A-626 part 3, `copy_checkpoint`).
+  pub(super) fn identity_moved_to(&self, version: u64, identity: &mut SetHash) {
+    self.reverts(version, identity);
+  }
+
   /// Every key whose value at `version` differs from what the new green holds once its cuts are made (the head's, or
   /// nothing in a cut tree), as the revert that sets it back, read for the paths the change index names in
   /// `(version, head]`; `identity` (this green's at its head) is moved to `version` by the keys whose value differs
