@@ -54,7 +54,7 @@ proptest! {
     work in raw(),
     base_pick in any::<u8>(),
   ) {
-    let (mut rebasing, mut accepting) = twins(&origin, &history);
+    let (rebasing, mut accepting) = twins(&origin, &history);
     let head = rebasing.head();
     let base = u64::from(base_pick) % (head + 1);
     let increment = increment_of(&work).with_id([0xA5; 32], base);

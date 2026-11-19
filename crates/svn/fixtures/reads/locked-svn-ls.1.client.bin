@@ -1,0 +1,2 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 34:svn://127.0.0.1:36913/locked/trunk 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( ANONYMOUS ( 45:YW5vbnltb3VzQEFkYXMtTWFjLVN0dWRpby5sb2NhbA==
+ ) ) ( get-latest-rev ( ) ) ( get-locks ( 0: ( infinity ) ) ) ( list ( 0: ( 11 ) infinity ( kind size created-rev time last-author ) ) ) 

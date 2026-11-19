@@ -7,6 +7,7 @@
 //! transcripts do not reach, case by case, and hostile commands, which never panic.
 
 use super::*;
+use crate::authz::{Authz, Principal};
 use crate::handshake::ClientCapabilities;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
 use crate::ra_svn::{Bounds, Parsed, Parser};
@@ -21,8 +22,16 @@ const TRANSACTION: &str = "0-1z";
 /// The recorded repository's UUID (`make-fixtures.py` `UUID`).
 const UUID: &str = "00000000-0000-4000-8000-00000000a613";
 
-/// The recorded repository's URL (`make-fixtures.py` `URL`): a session's base is the path past it.
-const URL: &str = "svn://127.0.0.1:36913/repo";
+/// The relay's address in every recorded URL (`make-fixtures.py` `PORT`): past it, a repository's name, then the
+/// session's base.
+const HOST: &str = "svn://127.0.0.1:36913/";
+
+/// The second recorded repository (`make-fixtures.py` `LOCKED`): the same history, read by an anonymous user under the
+/// authorization rules [`AUTHZ`].
+const LOCKED: &str = "locked";
+
+/// The rules the `locked` repository serves, as the recorder wrote them beside the transcripts.
+const AUTHZ: &str = include_str!("../../fixtures/reads/authz");
 
 /// The recorder's record of the repository the transcripts were made against.
 const REPOSITORY: &str = include_str!("../../fixtures/reads/repository.txt");
@@ -350,7 +359,8 @@ const PROPERTY_LISTS: [&str; 5] = [
 /// may be, one item.
 const SLICE_ROOM: usize = 1;
 
-/// A command's outcome with a streamed answer written whole, a slice of [`SLICE_ROOM`] at a time.
+/// A command's outcome with a streamed answer written whole, a slice of [`SLICE_ROOM`] at a time; [`Outcome::Close`]
+/// where the stream ends the connection.
 fn drained(
   outcome: Outcome,
   fixture: &Fixture,
@@ -360,12 +370,16 @@ fn drained(
   let Outcome::Streaming(mut stream) = outcome else {
     return outcome;
   };
-  while stream
-    .resume(&fixture.index, &fixture.green, session, out, SLICE_ROOM)
-    .unwrap()
-    == Progress::More
-  {}
-  Outcome::Answered
+  loop {
+    match stream
+      .resume(&fixture.index, &fixture.green, session, out, SLICE_ROOM)
+      .unwrap()
+    {
+      Progress::More => {}
+      Progress::Done => return Outcome::Answered,
+      Progress::Close => return Outcome::Close,
+    }
+  }
 }
 
 /// Replays a recorded session through the handler: each client command after the handshake answered, each answer
@@ -375,8 +389,10 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
   let fixture = Fixture::new();
   let answers = items(server);
   let commands = items(client);
-  let mut base = session_base(&commands[0]);
+  let (repository, mut base) = session_place(&commands[0]);
   let capabilities = session_capabilities(&commands[0]);
+  let rules = locked_rules();
+  let authz = (repository == LOCKED).then_some(&rules);
   let mut at = 4;
   let mut answered = 0;
   for command in commands.iter().skip(2) {
@@ -385,6 +401,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
       base: &base,
       uuid: UUID,
       capabilities,
+      authz,
     };
     let mut out = Vec::new();
     let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
@@ -404,7 +421,10 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
         }
         at += 2;
       }
-      Outcome::Close => return closed(name, word, at, answers.len(), answered),
+      Outcome::Close => {
+        at = same_answer(name, word, &items(&out), &answers, at);
+        return closed(name, word, at, answers.len(), answered);
+      }
     }
   }
   assert_eq!(
@@ -415,20 +435,36 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
   answered
 }
 
-/// The session's base: the path of the client's URL past the repository's (its greeting's third item).
-fn session_base(greeting: &Value<'_>) -> String {
+/// The repository a recorded URL names and the session's base in it: the path past [`HOST`], its first name the
+/// repository's, the rest the base (`/` for none).
+fn repository_and_base(url: &[u8]) -> (String, String) {
+  let path = std::str::from_utf8(url)
+    .unwrap()
+    .strip_prefix(HOST)
+    .unwrap();
+  let (repository, rest) = path.split_once('/').unwrap_or((path, ""));
+  (repository.to_owned(), format!("/{rest}"))
+}
+
+/// The session's repository and base: the client's URL (its greeting's third item) as [`repository_and_base`] reads
+/// it.
+fn session_place(greeting: &Value<'_>) -> (String, String) {
   let Value::List(parts) = greeting else {
     panic!("a greeting that is no list");
   };
   let Some(Value::String(url)) = parts.get(2) else {
     panic!("a greeting without its URL");
   };
-  let path = std::str::from_utf8(url).unwrap().strip_prefix(URL).unwrap();
-  if path.is_empty() {
-    "/".to_owned()
-  } else {
-    path.to_owned()
-  }
+  repository_and_base(url)
+}
+
+/// The rules the `locked` repository gives an anonymous reader, compiled as `svnserve` asks them (A-606): the
+/// repository's name, no user.
+fn locked_rules() -> PrincipalRules {
+  let rules = AUTHZ.as_bytes();
+  Authz::parse(rules, None, crate::authz::Bounds::of(rules, None))
+    .unwrap()
+    .rules(LOCKED.as_bytes(), Principal::Anonymous)
 }
 
 /// The session's base after a `reparent`, which another piece answers: the path of its URL past the repository's.
@@ -442,12 +478,7 @@ fn reparented(command: &Value<'_>) -> String {
   let Some(Value::String(url)) = params.first() else {
     panic!("a reparent without its URL");
   };
-  let path = std::str::from_utf8(url).unwrap().strip_prefix(URL).unwrap();
-  if path.is_empty() {
-    "/".to_owned()
-  } else {
-    path.to_owned()
-  }
+  repository_and_base(url).1
 }
 
 /// The capabilities the client's greeting announces (its second item, a list of words).
@@ -681,12 +712,48 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
   }
 }
 
-/// A-613: the recorder's `SHA256SUMS` names every transcript the tests read, and the recorder's record of the
-/// repository; the Studio run checks each sum with `shasum -a 256 -c`.
+/// A-613 part 2 (read access, A-606): stock `svn` 1.15.0's own sessions against the `locked` repository, read by an
+/// anonymous user under its rules (`ls -v -R`, `log -v` and `log -g` of `/trunk`, `blame -g` of `/trunk/a.txt`, `cat`
+/// of the readable `/trunk/dir/b.txt` and of the hidden `/branches/b1/a.txt`, `proplist -v --show-inherited-props` of
+/// `/trunk/dir/b.txt`), answered as `svnserve` answered them, `log -g` refused "Item is not readable" (220001) and the
+/// hidden file's `cat` "Authorization failed" (170001) among them; the locks `ls` asks for are the lock piece's.
+#[test]
+fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("locked-svn-ls"), 2),
+    (transcript!("locked-svn-log"), 4),
+    (transcript!("locked-svn-log-g"), 4),
+    (transcript!("locked-svn-blame-g"), 5),
+    (transcript!("locked-svn-cat"), 3),
+    (transcript!("locked-svn-cat-denied"), 2),
+    (transcript!("locked-svn-proplist"), 4),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(
+      replay(name, client, server, &["get-lock", "get-locks"]),
+      commands,
+      "{name}"
+    );
+  }
+}
+
+/// A-613: the recorder's `SHA256SUMS` names every transcript the tests read, the recorder's record of the repository
+/// and the `locked` repository's rules; the Studio run checks each sum with `shasum -a 256 -c`.
 #[test]
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "locked-reads",
+    "locked-log",
+    "locked-file-revs",
+    "locked-file-revs-abort",
+    "locked-svn-ls",
+    "locked-svn-log",
+    "locked-svn-log-g",
+    "locked-svn-blame-g",
+    "locked-svn-cat",
+    "locked-svn-cat-denied",
+    "locked-svn-proplist",
     "get-file-revs",
     "svn-blame",
     "svn-blame-g",
@@ -752,6 +819,7 @@ fn every_fixture_has_its_recorded_sum() {
     );
   }
   assert!(sums.lines().any(|line| line.ends_with("  repository.txt")));
+  assert!(sums.lines().any(|line| line.ends_with("  authz")));
 }
 
 /// One command's answer against the fixture's repository.
@@ -896,6 +964,7 @@ const ROOT_SESSION: Session<'static> = Session {
   base: "/",
   uuid: UUID,
   capabilities: STOCK_CAPABILITIES,
+  authz: None,
 };
 
 /// What stock `svn` 1.15.0 announces (recorded: every session's greeting): `svndiff1`, `accepts-svndiff2`,
@@ -1431,6 +1500,7 @@ const SVNDIFF0_SESSION: Session<'static> = Session {
     accepts_svndiff2: false,
     ..STOCK_CAPABILITIES
   },
+  authz: None,
 };
 
 /// A-613 part 2 (`get-file-revs` in svndiff 0, `svndiff.c`): a window of new data alone, the first revision's, is
@@ -1575,6 +1645,79 @@ fn a_mainline_revision_goes_before_a_merged_one_of_the_same_number() {
       (String::from("/c.txt"), 13, false),
       (String::from("/d.txt"), 13, true),
     ]
+  );
+}
+
+/// A-613 part 2 (read access, A-606): the scripted sessions against the `locked` repository, read by an anonymous user
+/// under its rules (the root and `/branches` hidden, `/trunk/dir` hidden save `dir/b.txt`), answered as `svnserve`
+/// answered them: revision properties as much as each revision is readable; `check-path`, `stat`, `get-dir`,
+/// `get-file` and `get-iprops` of a hidden path refused "Authorization failed" with nothing before it; hidden entries,
+/// ancestors and requested mergeinfo paths left out; locations and segments refused at a hidden peg path and ended at
+/// a hidden copy source; `list` passing a hidden directory by; `log` censored, refused at a hidden path or root, ended
+/// at a hidden location, and refused where a merge source is hidden; `get-file-revs` ended at a hidden location, and
+/// the connection ended where `svnserve` aborts.
+#[test]
+fn the_locked_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("locked-reads"), 29),
+    (transcript!("locked-log"), 8),
+    (transcript!("locked-file-revs"), 4),
+    (transcript!("locked-file-revs-abort"), 0),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
+  }
+}
+
+/// A-613 part 2 (read access, `svn_repos_check_revision_access` and `detect_changed`): a readable path copied from a
+/// hidden one keeps its change and loses its copy source, and the revision is readable in part, so its author and date
+/// alone show, in `rev-proplist`, `rev-prop` and `log`.
+#[test]
+fn a_copy_from_a_hidden_source_shows_no_source_and_the_author_and_date_alone() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/c.txt file add copy /branches/b1/a.txt 9 props "]);
+  let properties = [
+    ("svn:author", "carol"),
+    ("svn:date", "2026-01-12T12:00:00.000000Z"),
+    ("svn:log", "a copy of a hidden file"),
+  ];
+  fixture.green.revisions.push(
+    properties
+      .iter()
+      .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+      .collect(),
+  );
+  let rules_text = b"[/]\n* = r\n\n[/branches]\n* =\n";
+  let rules = Authz::parse(rules_text, None, crate::authz::Bounds::of(rules_text, None))
+    .unwrap()
+    .rules(b"repo", Principal::Anonymous);
+  let session = Session {
+    authz: Some(&rules),
+    ..ROOT_SESSION
+  };
+  let answer_of = |command: &[u8]| {
+    let value = items(command).remove(0);
+    let mut out = Vec::new();
+    let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+    assert!(matches!(
+      drained(outcome, &fixture, &session, &mut out),
+      Outcome::Answered
+    ));
+    String::from_utf8(out).unwrap()
+  };
+  assert_eq!(
+    answer_of(b"( rev-proplist ( 12 ) ) "),
+    "( success ( ( ) 0: ) ) ( success ( ( ( 10:svn:author 5:carol ) ( 8:svn:date 27:2026-01-12T12:00:00.000000Z ) ) \
+     ) ) "
+  );
+  assert_eq!(
+    answer_of(b"( rev-prop ( 12 7:svn:log ) ) "),
+    "( success ( ( ) 0: ) ) ( success ( ( ) ) ) "
+  );
+  assert_eq!(
+    answer_of(b"( log ( ( 11:trunk/c.txt ) ( 12 ) ( 12 ) true false 0 false all-revprops ( ) ) ) "),
+    "( success ( ( ) 0: ) ) ( ( ( 12:/trunk/c.txt A ( ) ( 4:file false false ) ) ) 12 ( 5:carol ) \
+     ( 27:2026-01-12T12:00:00.000000Z ) ( ) false false 0 ( ) false ) done ( success ( ) ) "
   );
 }
 

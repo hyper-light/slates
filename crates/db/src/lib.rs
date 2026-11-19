@@ -16,6 +16,7 @@
 //! other slot and the log intact.
 //!
 //! Modules: [`art`] (the adaptive radix tree of the indexes), [`catalog`] (the records),
+//! [`credentials`] (the version-control credentials a human enrolled, by the hash a client presents, A-625 part 3),
 //! [`op`] (the operations), [`partition`] (the state and its deterministic `apply`),
 //! [`record`] (the log record format over the segment's ring), [`register`] (the register
 //! primitives of §4.8 — the quorum, the fence, rendezvous placement, the configuration oracle),
@@ -37,6 +38,7 @@
 pub mod alias;
 pub mod art;
 pub mod catalog;
+pub mod credentials;
 pub mod error;
 pub mod ledger;
 pub mod live;

@@ -1913,6 +1913,7 @@ dependencies = [
  "slates-rt",
  "slates-seal",
  "slates-ssh",
+ "slates-svn",
  "slates-test-seeds",
  "slates-transport",
  "slates-vcs",

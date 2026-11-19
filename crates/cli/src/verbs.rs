@@ -351,6 +351,38 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       request.json,
     );
   }
+  // The version-control credentials (A-625 part 3) prove the human's authority as `enroll` does.
+  if let Verb::CredentialKey {
+    line,
+    principal,
+    expires_s,
+  } = &request.verb
+  {
+    return emit_credential_key(
+      Instance::from_client(&request.instance, client),
+      line,
+      (principal.as_ref(), *expires_s),
+      request.json,
+    );
+  }
+  if let Verb::CredentialToken {
+    principal,
+    expires_s,
+  } = &request.verb
+  {
+    return emit_credential_token(
+      Instance::from_client(&request.instance, client),
+      (principal.as_ref(), *expires_s),
+      request.json,
+    );
+  }
+  if let Verb::CredentialRevoke { id } = &request.verb {
+    return emit_credential_revoke(
+      Instance::from_client(&request.instance, client),
+      *id,
+      request.json,
+    );
+  }
   // `export` and `mount` attach for the host mount — the access-list-checked `attach` returns the mount capability the
   // loopback edge authorizes every request's file handle against (§4.13; AUD-01: a supplied uid and loopback
   // reachability are not authority, the capability is). `export` prints the capability's path for a mount elsewhere;
@@ -1541,7 +1573,10 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Recover { .. }
     | Verb::Grant { .. }
     | Verb::Enroll { .. }
-    | Verb::Revoke { .. } => {}
+    | Verb::Revoke { .. }
+    | Verb::CredentialKey { .. }
+    | Verb::CredentialToken { .. }
+    | Verb::CredentialRevoke { .. } => {}
   }
   Ok(())
 }
@@ -1601,12 +1636,23 @@ fn emit_share(
   rights: Rights,
   json: bool,
 ) -> Result<(), ClientError> {
-  // A principal with no host named is this daemon's own host's (A-237).
+  let principal = wire_principal(client, principal)?;
+  client.share(volume, principal, rights)?;
+  emit_ok("shared", json);
+  Ok(())
+}
+
+/// The principal `principal` names, as the wire names it: a host not named is this daemon's own (A-237), and a
+/// `consumer:N` without an account is under this process's.
+fn wire_principal(
+  client: &mut Client,
+  principal: &SharePrincipal,
+) -> Result<Principal, ClientError> {
   let here = match principal {
     SharePrincipal::Uid { host: Some(_), .. } | SharePrincipal::Consumer { host: Some(_), .. } => 0,
     _ => client.daemon_status()?.anchor,
   };
-  let principal = match principal {
+  Ok(match principal {
     SharePrincipal::Uid { uid, host } => Principal::Uid {
       host: host.unwrap_or(here),
       uid: *uid,
@@ -1620,9 +1666,105 @@ fn emit_share(
       account: account.unwrap_or_else(current_account),
       consumer: *consumer,
     },
+  })
+}
+
+/// The principal a credential proves and when it stops proving it (A-625 part 3): the principal named, else this
+/// process's own account on this daemon's host; `expires_s` seconds from now on the wall clock, if given.
+fn credential_terms(
+  instance: &mut Instance,
+  (principal, expires_s): (Option<&SharePrincipal>, Option<u64>),
+) -> Result<(Principal, Option<u64>), Failure> {
+  let own = SharePrincipal::Uid {
+    uid: current_account(),
+    host: None,
   };
-  client.share(volume, principal, rights)?;
-  emit_ok("shared", json);
+  let name = instance.name().to_owned();
+  let principal = wire_principal(instance.client(), principal.unwrap_or(&own))
+    .map_err(|error| failure_of(error, &name))?;
+  let expires_ns = expires_s.map(expiry_after).transpose()?;
+  Ok((principal, expires_ns))
+}
+
+/// The wall-clock instant `seconds` from now, in nanoseconds since the Unix epoch: when a credential enrolled now for
+/// that long stops proving its principal.
+fn expiry_after(seconds: u64) -> Result<u64, Failure> {
+  std::time::SystemTime::now()
+    .checked_add(std::time::Duration::from_secs(seconds))
+    .and_then(|instant| instant.duration_since(std::time::UNIX_EPOCH).ok())
+    .and_then(|since| u64::try_from(since.as_nanos()).ok())
+    .ok_or_else(|| Failure::Refused(format!("--expires {seconds} is past what the clock names")))
+}
+
+/// When a credential stops proving its principal, as the CLI prints it.
+fn expiry_text(expires_ns: Option<u64>) -> String {
+  expires_ns.map_or_else(
+    || "never".to_owned(),
+    |expires_ns| format!("{expires_ns} ns after the Unix epoch"),
+  )
+}
+
+/// `credential key LINE`: the human surface enrolls an SSH public key for a principal (§4.13, A-625 part 3), proving
+/// issuer authority as `enroll` does; the key's id is its fingerprint as `ssh-keygen -l` prints it.
+fn emit_credential_key(
+  mut instance: Instance,
+  line: &str,
+  terms: (Option<&SharePrincipal>, Option<u64>),
+  json: bool,
+) -> Result<(), Failure> {
+  let blob = slates_server::credentials::key_blob_of_line(line)
+    .map_err(|refusal| Failure::Refused(format!("credential key: {refusal}")))?;
+  let (principal, expires_ns) = credential_terms(&mut instance, terms)?;
+  let fingerprint = slates_server::credentials::key_fingerprint(&blob);
+  let name = instance.name().to_owned();
+  issuer()?
+    .enroll_ssh_key(&mut instance, principal, blob, expires_ns)
+    .map_err(|e| failure_of_api(e, &name))?;
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "id": fingerprint, "expires_ns": expires_ns })
+    );
+  } else {
+    slates_machine::out_line!("key: {fingerprint}");
+    slates_machine::out_line!("expires: {}", expiry_text(expires_ns));
+  }
+  Ok(())
+}
+
+/// `credential token`: the issuer mints an HTTP token for a principal and enrolls it by its hash (§4.13, A-625 part 3).
+/// The token is shown once, here; the daemon holds its hash alone, so it can never show it again.
+fn emit_credential_token(
+  mut instance: Instance,
+  terms: (Option<&SharePrincipal>, Option<u64>),
+  json: bool,
+) -> Result<(), Failure> {
+  let (principal, expires_ns) = credential_terms(&mut instance, terms)?;
+  let name = instance.name().to_owned();
+  let (token, id) = issuer()?
+    .enroll_token(&mut instance, principal, expires_ns)
+    .map_err(|e| failure_of_api(e, &name))?;
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "token": token, "id": hex32(&id), "expires_ns": expires_ns })
+    );
+  } else {
+    slates_machine::out_line!("token: {token}");
+    slates_machine::out_line!("id: {}", hex32(&id));
+    slates_machine::out_line!("expires: {}", expiry_text(expires_ns));
+  }
+  Ok(())
+}
+
+/// `credential revoke ID`: the human surface revokes a version-control credential (§4.13, A-625 part 3); a later login
+/// or request presenting it is refused.
+fn emit_credential_revoke(mut instance: Instance, id: [u8; 32], json: bool) -> Result<(), Failure> {
+  let name = instance.name().to_owned();
+  issuer()?
+    .revoke_credential(&mut instance, id)
+    .map_err(|e| failure_of_api(e, &name))?;
+  emit_ok("revoked", json);
   Ok(())
 }
 

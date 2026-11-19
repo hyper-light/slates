@@ -206,13 +206,22 @@ impl Push {
     self.deepest
   }
 
+  /// Hands the push a delta chain `depth` deep that its source carried, as a push's record names it (A-662,
+  /// `slates-server`'s `vcs_store`): a push replayed from a record holding no object (a later ref of a push without
+  /// `atomic`, whose first commit took every object, or a push whose objects another push committed first) carries
+  /// its pack's chain to the store's learned depth at its commit, as the live push did.
+  pub fn carried(&mut self, depth: u64) {
+    self.deepest = self.deepest.max(depth);
+  }
+
   /// Whether the push is sealed: every commit's generation number is known.
   pub fn is_sealed(&self) -> bool {
     self.sealed
   }
 
-  /// The kind, root content and length of the object held under `id`.
-  pub(crate) fn object(&self, id: &ObjectId) -> Option<(u8, slates_vcs::ContentId, u64)> {
+  /// The kind, root content and length of the object held under `id`: what a push's record names an object by, its
+  /// bytes read back from its root when the record is written (A-662, `slates-server`'s `vcs_store::record`).
+  pub fn object(&self, id: &ObjectId) -> Option<(u8, slates_vcs::ContentId, u64)> {
     self.quarantine.object(id.as_bytes())
   }
 
