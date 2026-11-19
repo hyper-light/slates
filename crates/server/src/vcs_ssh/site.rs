@@ -11,9 +11,11 @@
 //!    `usage.c` at `e1ec09b2`]; Mercurial: `abort: repository <path> not found`, 255 [C: Mercurial 7.2 `localrepo.py`,
 //!    `scmutil.py`'s `callcatch`, `dispatch.py`'s `sys.exit(status & 255)`]). No second spelling is tried. Before it,
 //!    a Mercurial path that starts `--` is refused as 7.2's dispatch refuses it before opening anything, naming the
-//!    arguments as `stringutil.pprint` writes them: `abort: potentially unsafe serve --stdio invocation: ['-R',
-//!    '<path>', 'serve', '--stdio']`, `'--hidden'` last when asked, 255 [C: 7.2 `dispatch.py` `_runcatchfunc`; recorded
-//!    from stock 7.2 on 2026-11-19 (A-679)].
+//!    arguments as `stringutil.pprint` writes them, each in single quotes with its bytes as Python's
+//!    `codecs.escape_encode` writes them: `abort: potentially unsafe serve --stdio invocation: ['-R', '<path>',
+//!    'serve', '--stdio']`, `'--hidden'` last when asked, 255; a path that starts with one `-` goes on to the
+//!    repository's lookup, as in 7.2 [C: 7.2 `dispatch.py` `_runcatchfunc`; recorded from stock 7.2 on 2026-11-19
+//!    (A-679): `--`, `--x`, quotes, tab, line ends, a backslash, DEL, a control byte and bytes past ASCII].
 //! 2. The policy: a principal the repository's policy lets reach it for none of the command's rights is refused
 //!    (`crate::vcs_policy::reaches`, A-597). upload-pack asks to read; receive-pack to submit, rewrite or delete;
 //!    Mercurial's `serve --stdio`, which pulls and pushes in one session, any of the four, each command then judged by
@@ -200,39 +202,86 @@ pub(crate) trait Services {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NotYet;
 
-/// The services the server runs today (A-651 part 2): git's upload-pack from the stores `lender` lends, each request
-/// admitted `room` bytes (`super::git`); receive-pack, Mercurial's `serve --stdio` and Subversion's tunnel not yet, as
-/// their stores (A-662) and entry points (A-654, A-656) have not landed. A repository whose store the lender does not hold
-/// is not served.
+/// The services the server runs today: git's upload-pack from the stores `lender` lends (`super::git`, A-651 part 2)
+/// and Mercurial's `serve --stdio` from the stores `hg` lends (`super::hg`, A-679), each request admitted `room` bytes;
+/// receive-pack and Subversion's tunnel not yet, as their entry points (A-654, A-656) have not landed. A repository
+/// whose store its tool's lender does not hold is not served.
 #[derive(Clone, Debug)]
-pub(crate) struct ToolServices<L> {
-  /// Where the stores are lent.
+pub(crate) struct ToolServices<L, H> {
+  /// Where git's stores are lent.
   lender: L,
+  /// Where Mercurial's stores are lent: the lender the HTTP site reads them from.
+  hg: H,
   /// The bytes each request may hold: the edge's room.
   room: u64,
 }
 
-impl<L> ToolServices<L> {
-  /// The services over `lender`'s stores, each request admitted `room` bytes.
-  pub(crate) fn new(lender: L, room: u64) -> Self {
-    Self { lender, room }
+impl<L, H> ToolServices<L, H> {
+  /// The services over `lender`'s git stores and `hg`'s Mercurial stores, each request admitted `room` bytes.
+  pub(crate) fn new(lender: L, hg: H, room: u64) -> Self {
+    Self { lender, hg, room }
   }
 }
 
-impl<L: StoreLender + Clone> Services for ToolServices<L> {
-  type Command = UploadCommand<L>;
+impl<L: StoreLender + Clone, H: HgStores + Clone> Services for ToolServices<L, H> {
+  type Command = ToolCommand<L, H>;
 
-  fn start(&mut self, start: &Start<'_>) -> Result<UploadCommand<L>, Unserved> {
+  fn start(&mut self, start: &Start<'_>) -> Result<ToolCommand<L, H>, Unserved> {
     match (start.service, start.repository) {
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
-        Ok(UploadCommand::new(
+        Ok(ToolCommand::Upload(UploadCommand::new(
           self.lender.clone(),
           repository.id,
           slates_git::http::version(start.git_protocol),
           self.room,
-        ))
+        )))
       }
       _ => Err(Unserved),
+    }
+  }
+}
+
+/// A command [`ToolServices`] started: one of the tools' sessions.
+pub(crate) enum ToolCommand<L: StoreLender, H> {
+  /// git's upload-pack.
+  Upload(UploadCommand<L>),
+  /// Mercurial's `serve --stdio`.
+  Mercurial(HgCommand<H>),
+}
+
+impl<L: StoreLender, H: HgStores> Command for ToolCommand<L, H> {
+  fn input(&mut self, run: &[u8]) -> Result<(), Refused> {
+    match self {
+      ToolCommand::Upload(command) => command.input(run),
+      ToolCommand::Mercurial(command) => command.input(run),
+    }
+  }
+
+  fn input_end(&mut self) {
+    match self {
+      ToolCommand::Upload(command) => command.input_end(),
+      ToolCommand::Mercurial(command) => command.input_end(),
+    }
+  }
+
+  async fn step(&mut self) -> Result<Stepped, Refused> {
+    match self {
+      ToolCommand::Upload(command) => command.step().await,
+      ToolCommand::Mercurial(command) => command.step().await,
+    }
+  }
+
+  fn output(&self) -> (&[u8], &[u8]) {
+    match self {
+      ToolCommand::Upload(command) => command.output(),
+      ToolCommand::Mercurial(command) => command.output(),
+    }
+  }
+
+  fn sent(&mut self, stderr: usize, stdout: usize) {
+    match self {
+      ToolCommand::Upload(command) => command.sent(stderr, stdout),
+      ToolCommand::Mercurial(command) => command.sent(stderr, stdout),
     }
   }
 }
@@ -352,6 +401,56 @@ fn repository_name(path: &[u8]) -> Option<&str> {
   Some(name.strip_prefix('/').unwrap_or(name))
 }
 
+/// The words a service the server cannot start ends with, in its tool's words (the module doc, step 3); a session whose
+/// store goes away mid-way ends in them too.
+pub(crate) fn not_served(service: Service) -> Refused {
+  Tool::of(service).refused(&format!("{} is not served yet", service.name()))
+}
+
+/// `bytes` as Python's `codecs.escape_encode` writes them, which 7.2's `stringutil.pprint` quotes (the module doc, step
+/// 1): a quote and a backslash each after a backslash; tab, line feed and carriage return as `\t`, `\n` and `\r`; any
+/// other byte below a space, and every byte from DEL up, as `\x` and two lowercase hexadecimal digits; the rest as
+/// themselves.
+fn python_escaped(bytes: &[u8]) -> String {
+  let mut text = String::with_capacity(bytes.len());
+  for &byte in bytes {
+    match byte {
+      b'\'' | b'\\' => {
+        text.push('\\');
+        text.push(char::from(byte));
+      }
+      b'\t' => text.push_str("\\t"),
+      b'\n' => text.push_str("\\n"),
+      b'\r' => text.push_str("\\r"),
+      b' '..=b'~' => text.push(char::from(byte)),
+      _ => text.push_str(&format!("\\x{byte:02x}")),
+    }
+  }
+  text
+}
+
+/// 7.2's refusal of a `serve --stdio` whose repository argument `path` starts `--`, before anything is opened (the
+/// module doc, step 1): the arguments it was run with listed as `stringutil.pprint` lists them, `'--hidden'` last when
+/// asked. None for any other command.
+fn unsafe_invocation(service: Service, path: &[u8]) -> Option<Refused> {
+  let Service::Mercurial { hidden } = service else {
+    return None;
+  };
+  if !path.starts_with(HG_UNSAFE_START) {
+    return None;
+  }
+  let ran: [&[u8]; 4] = [b"-R", path, b"serve", b"--stdio"];
+  let listed: Vec<String> = ran
+    .into_iter()
+    .chain(hidden.then_some(b"--hidden".as_slice()))
+    .map(|argument| format!("'{}'", python_escaped(argument)))
+    .collect();
+  Some(Tool::Mercurial.refused(&format!(
+    "potentially unsafe serve --stdio invocation: [{}]",
+    listed.join(", ")
+  )))
+}
+
 /// The production site: whose keys prove whom, where repositories are, and the services (the module doc).
 pub(crate) struct ToolSite<K, R, S> {
   /// The keys' lookup.
@@ -437,9 +536,7 @@ where
     };
     match self.services.start(&start) {
       Ok(command) => Dispatched::Run(command),
-      Err(Unserved) => Dispatched::Refuse(
-        Tool::of(service).refused(&format!("{} is not served yet", service.name())),
-      ),
+      Err(Unserved) => Dispatched::Refuse(not_served(service)),
     }
   }
 }

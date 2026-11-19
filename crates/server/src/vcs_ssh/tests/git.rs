@@ -17,6 +17,7 @@ use super::super::site::{
 };
 use super::UploadCommand;
 use crate::vcs_http::git::StoreLender;
+use crate::vcs_http::hg::NoStores;
 
 /// Shape: the content store's budget and window the test's empty repository is kept in.
 const STORE_BUDGET: u64 = 1 << 20;
@@ -292,11 +293,11 @@ fn record(id: RepositoryId) -> RepositoryRecord {
 }
 
 /// A-651 part 2 (the site's step 3). Do: start upload-pack for a repository whose store the lender holds, for one whose
-/// store it does not hold, and receive-pack and Mercurial's session for the held one. Expect: upload-pack started for the
-/// held store alone; every other start not served.
+/// store it does not hold, and receive-pack and Mercurial's session for the held one, no Mercurial store being lent
+/// ([`NoStores`]). Expect: upload-pack started for the held store alone; every other start not served.
 #[test]
 fn upload_pack_starts_only_over_a_store_the_lender_holds() {
-  let mut services = ToolServices::new(Lends::empty(), ROOM);
+  let mut services = ToolServices::new(Lends::empty(), NoStores, ROOM);
   let held = record(HELD);
   let unheld = record(RepositoryId { bytes: [1; 16] });
   let principal = held.owner.clone();

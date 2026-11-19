@@ -18,6 +18,11 @@ use super::waits::PHASES;
 use super::{Bounds, Counts, EdgeState, serve};
 use crate::daemon::LIVENESS_BUDGET_NS;
 
+/// Mercurial's `serve --stdio` behind the edge (A-679): its command's tests, and its sessions over the edge with these
+/// tests' client.
+#[path = "hg.rs"]
+mod hg;
+
 /// Shape: one seat: the edge of a shard that seats one client.
 const ONE_SEAT: usize = 1;
 /// Shape: two seats: a connection, and the one that needs the other's seat.
@@ -233,6 +238,17 @@ where
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
+  served_by(seats, || Site, client)
+}
+
+/// As [`served`], with sites `make` makes.
+fn served_by<S, M, C, R>(seats: usize, make: M, client: C) -> (R, Seen)
+where
+  S: SshSite + 'static,
+  M: FnMut() -> S + 'static,
+  C: FnOnce(SocketAddrV4) -> R + Send + 'static,
+  R: Send + 'static,
+{
   let runtime = runtime();
   let bounds = Bounds::of_shard(seats, ROOM_BYTES, TICK_NS);
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog())
@@ -244,7 +260,7 @@ where
     .expect("the edge's state kept on its shard");
   runtime
     .spawn(async move {
-      let _ = serve(listener, state, || Site).await;
+      let _ = serve(listener, state, make).await;
     })
     .expect("the listener's task");
   let shard = runtime.shard_id().0;
