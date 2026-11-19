@@ -2806,7 +2806,8 @@ mod tests {
   /// loopback without a fleet refused as a bad `--vcs-svn` naming loopback, since ra_svn is cleartext.
   #[test]
   fn the_grammar_parses_the_daemons_svn_listener() {
-    let loopback = |port| slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, port);
+    let loopback =
+      |port| slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, port);
     assert_eq!(
       parse(&args(
         "daemon --instance a --vcs-http 127.0.0.1:8080 --vcs-svn 127.0.0.1:3690"

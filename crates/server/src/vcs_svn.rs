@@ -364,7 +364,9 @@ pub(crate) fn start(
           crate::fleet::count_refusal(NOT_DETACHED);
         }
       }
-      Err(_) => crate::fleet::count_refusal(NOT_STARTED),
+      Err(_) => {
+        crate::fleet::count_refusal(NOT_STARTED);
+      }
     }
   })?;
   Ok(Some(port))
@@ -405,7 +407,9 @@ async fn serve(
         }
       }
       // The refused task's future, its seat with it, was dropped: the seat is given back.
-      Err(_) => crate::fleet::count_refusal(SPAWN_REFUSED),
+      Err(_) => {
+        crate::fleet::count_refusal(SPAWN_REFUSED);
+      }
     }
   }
 }
@@ -528,7 +532,10 @@ async fn read_more(
   let Some(buffer) = input.get_mut(start..) else {
     return false;
   };
-  let read = awaited(stream.read(buffer), deadline_ns, || seat.overdue(deadline_ns)).await;
+  let read = awaited(stream.read(buffer), deadline_ns, || {
+    seat.overdue(deadline_ns)
+  })
+  .await;
   let taken = match read {
     Ok((Ok(taken), _)) => taken,
     Ok((Err(_), _)) | Err(_) => 0,

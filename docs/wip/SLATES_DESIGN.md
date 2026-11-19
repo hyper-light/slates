@@ -14568,6 +14568,22 @@ and export by landing).
 > authentication for `lock-many` (the reporter's `lock-a` session), byte for byte; red seven ways. Owed: the lock
 > verbs; the read commands' authentication for one command with their authorization (A-606); the daemon's commit
 > once A-655 part 2b lands.
+>
+> **Status (2026-11-19, A-656 part 2, first slice: the svn:// listener).** Built: `slates anchor|daemon --vcs-svn
+> ADDRESS` (read by the roles' one version-control address reader, `slates_api::role::vcs_address`, beside
+> `--vcs-http`: loopback alone for a daemon that is no fleet node, since ra_svn has no TLS) starts the daemon's
+> svn:// listener on the control shard (`crates/server/src/vcs_svn.rs`), its port logged before the daemon's serving
+> line, the anchor passing the flag to its daemon. Each accepted connection is a seated child task running A-656's
+> connection over its socket: `svnserve`'s greeting byte for byte, the client's answer judged by A-599's handshake,
+> and its URL answered "No repository found" (210005), as `svnserve` answers under a root holding no repository, then
+> the connection's end. Its seats and its overdue rule are the HTTP edge's: as many connections as the shard seats
+> clients, a wait past the connection's first RTO (its own handshake round trip) marking it overdue, and the most
+> overdue reaped only when a seat is needed. Proven by a real anchor answering as stock `svnserve` 1.15.0's recorded
+> `no-repository` session, byte for byte (`an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener`); red first, the
+> flag unknown. Owed: the repositories' lookup (the rest of `find_repos`: the scheme, the URL's canonical form, a path
+> that climbs with `..`; a name located on its partition's shard, the connection moved there as the HTTP edge moves
+> one), the repository's sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait
+> learned (one mechanism for the HTTP, SSH and svn:// edges), and the SSH tunnel's entry point.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -50357,3 +50373,32 @@ at start).
   (`admit_right` visible to the crate), `repository.rs` (`branch_version` visible to the crate),
   `crates/git/src/upload/mod.rs` (`AGENT` public); §4.17.2's status; GAPS (the A-654 entry, and A-644 part 2's owed
   line).
+
+### A-656 part 2, first slice — The svn:// listener: `slates anchor|daemon --vcs-svn ADDRESS` (2026-11-19, g234; §4.17.4 piece 7)
+Applied in the same change to: §4.17.4's status; GAPS (the A-656 entry); `crates/api/src/role/mod.rs`
+(`ProcessOptions::vcs_svn`, `vcs_address` replacing `vcs_http_address` as the one reader of both flags, `Role::args`),
+`role/daemon.rs` (`DaemonConfig::vcs_svn`, the port line), `start.rs`, `lib.rs` (`CONTRACT` 53);
+`crates/cli/src/args.rs` (the roles' grammar and usage); `crates/server/src/vcs_svn.rs` (new), `config.rs`
+(`DaemonConfig::vcs_svn`), `daemon.rs` (`Daemon::vcs_svn_port`), `vcs_http.rs` (`awaited` visible to the crate);
+`crates/cli/tests/cli.rs`; `docs/cli.md`; the README's command table.
+
+- **Why.** The daemon had no svn:// listener: A-656 part 1 built the connection with no I/O, and nothing served it, so
+  a stock `svn` could not connect at all.
+- **The listener.** `--vcs-svn ADDRESS` is read as `--vcs-http` is, by one reader (`vcs_address`): an IPv4 address and
+  port, port 0 the system's pick, which the daemon logs (`slates daemon: the svn:// listener serves on IP:PORT`) before
+  it says it serves; an address off loopback is refused as usage for a daemon that is no fleet node, since ra_svn is
+  cleartext (CRAM-MD5 sends no password, every other byte crosses as written), and the daemon's start checks it again.
+  The listener runs on the control shard; each connection is a child task (spawned, detached, cancelled and joined with
+  the listener). Its bounds are the HTTP edge's (`Bounds::of_shard`: a seat for each client the shard seats, an item at
+  most a client region's bytes) and one read is `svnserve`'s own read buffer, `SVN_RA_SVN__READBUF_SIZE` (four 4,096-byte
+  pages, `libsvn_ra_svn/ra_svn.h` 65-67). A wait on a client past RFC 6298's first RTO of the connection's own handshake
+  round trip marks the connection overdue and goes on; with every seat taken the most overdue is reaped for a new one,
+  and none is cut while seats are free (the HTTP edge's rule, main's ruling of 2026-11-19).
+- **What a connection does.** A-656's `Connection`: the greeting, the client's answer judged by A-599's handshake, and
+  the URL answered "No repository found in '…'" (210005), `svnserve`'s answer under a root that holds no repository
+  (`serve.c` `find_repos`), then its end. Until the lookup's piece, the repository type the handshake's calls name is
+  an uninhabited one (`Unresolved`), so no sources can be handed to a connection.
+- **Tests.** @@RUN@@
+- **Owed.** The repositories' lookup (the rest of `find_repos`, a name located on its partition's shard, the
+  connection moved there), the repository's sources with every call, CRAM-MD5 keys over §4.13's principals, learned
+  waits (one mechanism for the three edges), the SSH tunnel's entry point; the Windows and Linux runs (main's).

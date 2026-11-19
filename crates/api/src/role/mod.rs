@@ -278,10 +278,7 @@ pub fn shard_count(text: &str) -> Result<u16, String> {
 /// shard count past the registry is ([`shard_count`]), rather than by a daemon that would start without the listener.
 /// A fleet node's HTTP edge presents the node's own identity, the one its RPC-with-TLS export presents, and its
 /// operator may publish either at any address. The roles here and the `slates` command read both flags with this.
-pub fn vcs_address(
-  text: &str,
-  fleet_node: bool,
-) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+pub fn vcs_address(text: &str, fleet_node: bool) -> Result<slates_rt::tcp::SocketAddrV4, String> {
   let address = text
     .parse::<slates_rt::tcp::SocketAddrV4>()
     .map_err(|error| {
