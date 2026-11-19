@@ -7,7 +7,6 @@ use crate::negotiation::{Acknowledgments, Answer, Graph, Request, Run, negotiate
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tree::Tree;
 use crate::served::{self, FIRST, MAIN, REFS, SECOND, SIDE, TAG, THIRD, id};
-use crate::unpack::{self, NoIndex};
 use crate::v2::fetch::{Event, decode_response};
 
 /// Everything `start` reaches through the graph.
@@ -31,8 +30,9 @@ fn reach(graph: &StoreGraph<'_>, start: u64) -> BTreeSet<u64> {
   seen
 }
 
-/// The names of the objects in the pack a stock git response carries.
-fn git_pack(response: &[u8]) -> BTreeSet<ObjectId> {
+/// The names of the objects in the pack a stock git response carries, its thin deltas' bases taken from the served
+/// repository.
+fn git_pack(response: &[u8], served: &served::Served) -> BTreeSet<ObjectId> {
   let events = decode_response(
     response,
     ObjectFormat::Sha1,
@@ -49,14 +49,7 @@ fn git_pack(response: &[u8]) -> BTreeSet<ObjectId> {
     .flatten()
     .copied()
     .collect();
-  let unpacked = unpack::read_whole(
-    &pack,
-    ObjectFormat::Sha1,
-    &NoIndex,
-    &mut Admission::new(u64::MAX),
-  )
-  .unwrap();
-  unpacked.objects.iter().map(|object| object.id).collect()
+  served::pack_names(&pack, &served.objects)
 }
 
 /// A-640 part 1: do read every object of the repository stock git served the golden vectors from through the graph.
@@ -215,7 +208,7 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
     .flat_map(|version| graph.brought(MAIN, version))
     .map(|node| graph.id(node))
     .collect();
-  assert_eq!(carried, git_pack(FETCH_HAVES_RESPONSE));
+  assert_eq!(carried, git_pack(FETCH_HAVES_RESPONSE, &served));
 
   let clone = Request {
     haves: &[],
@@ -228,6 +221,6 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
   };
   assert!(pack.runs.is_empty() && outcome.counters.walked > 0);
   let sent: BTreeSet<ObjectId> = pack.objects.iter().map(|node| graph.id(*node)).collect();
-  assert_eq!(sent, git_pack(FETCH_CLONE_RESPONSE));
+  assert_eq!(sent, git_pack(FETCH_CLONE_RESPONSE, &served));
   assert_eq!(graph.fault(), None);
 }

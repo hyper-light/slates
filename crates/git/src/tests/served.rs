@@ -10,9 +10,10 @@ use std::convert::Infallible;
 use slates_vcs::ContentStore;
 
 use crate::Admission;
+use crate::object_name::Kind;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::store::{Entries, Incoming, NamedRef, Push, Repository};
-use crate::unpack::{self, NoIndex, Object};
+use crate::unpack::{self, NoIndex, Object, Outside, Reader};
 
 /// The pack of all twelve objects, as `git pack-objects --delta-base-offset` wrote it.
 pub(crate) const OFS_PACK: &[u8] = include_bytes!("../../fixtures/ofs.pack");
@@ -129,4 +130,23 @@ pub(crate) fn served() -> Served {
     store,
     objects: unpacked.objects,
   }
+}
+
+/// The served repository's objects, as the bases a thin pack's deltas name (`index-pack --fix-thin`).
+pub(crate) struct Bases<'o>(pub(crate) &'o [Object]);
+
+impl Outside for Bases<'_> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    let object = self.0.iter().find(|object| object.id == *id)?;
+    Some((object.kind, &object.content))
+  }
+}
+
+/// The names of the objects in `pack`, thin or not, its bases taken from `objects`.
+pub(crate) fn pack_names(pack: &[u8], objects: &[Object]) -> std::collections::BTreeSet<ObjectId> {
+  let mut reader = Reader::new(ObjectFormat::Sha1, &NoIndex);
+  let mut admission = Admission::new(u64::MAX);
+  assert_eq!(reader.read(pack, &mut admission).unwrap(), pack.len());
+  let unpacked = reader.finish_with(&Bases(objects), &mut admission).unwrap();
+  unpacked.objects.iter().map(|object| object.id).collect()
 }
