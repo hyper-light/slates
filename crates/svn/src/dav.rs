@@ -35,11 +35,12 @@
 //!   with either is refused later by `svn_fs__path_valid`; a URL is never what ra_serf sends in a body.
 //!
 //! The second part of piece 13 (A-627): `list-report` and `file-revs-report` read and answered ([`listing`]), and
-//! PROPPATCH, LOCK's `lockinfo`, `Timeout` and `Lock-Token` read ([`locking`]). Owed: the update-report and replay
-//! answers (the editor drives, svndiff windows in base64) and LOCK's answer (`util_lock.c`'s `activelock`).
+//! PROPPATCH, LOCK's `lockinfo`, `Timeout` and `Lock-Token` read ([`locking`]). The update-report's answer is
+//! [`drive`]. Owed: the replay answer and LOCK's answer (`util_lock.c`'s `activelock`).
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+pub mod drive;
 pub mod listing;
 pub mod locking;
 pub mod request;

@@ -1724,6 +1724,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-http-edge"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "proptest",
+ "rcgen",
+ "rustls",
+ "slates-http",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-image"
 version = "0.1.0"
 dependencies = [

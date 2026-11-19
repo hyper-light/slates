@@ -12249,6 +12249,17 @@ engine: the verdict, rebase, position mapping, the register).
 > input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
 > streamed through, the staged close).
 >
+> **Status (2026-11-19, A-625 part 1: the edge's engine built).** `crates/http-edge` (`slates-http-edge`) holds one
+> connection's request loop as a state machine over bytes, shared by the three tools' HTTP: HTTPS through rustls over
+> aws-lc-rs (TLS 1.3 and 1.2, ALPN `http/1.1`, no client certificate, no resumption; one configuration per connection,
+> D-8 exception 2), Basic credentials over TLS alone and Bearer, `100 Continue` to a waiting client, keep-alive and
+> pipelining, bodies streamed to the service as slices of the input or inflated runs (never a whole push held), replies
+> chunked to HTTP/1.1 and framed by the close to HTTP/1.0, and typed refusals: a refusal leaving no body unread keeps
+> the connection, any other ends it in stages (the reply, `close_notify`, a half-close, the client's bytes drained;
+> A-183). Owed (part 2): the daemon's listener and connection tasks on the runtime's TCP, each phase's wait learned,
+> the connections and the request room derived from the shard's budget, and git's site (routes, authentication to a
+> principal, the policy's decision, the services).
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -12281,6 +12292,26 @@ engine: the verdict, rebase, position mapping, the register).
 > their transient sets charged; the versions' records kept as content. A green's maps made from a commit that is no
 > version's head (A-534's owed item) is receive-pack's create, piece 6.
 >
+> **Status (2026-11-19, A-614 part 2: piece 5's pack fragments and base pack).** `crates/git` (`store`) encodes each
+> version's D(k), once and off the answer's path, as two fragments kept as content: commits, trees and tags, then blobs.
+> Each entry is written as `pack-objects` writes one through A-582's writers, deflated by zlib through flate2 over
+> zlib-rs (A-607), with the CRC32 of the whole entry kept. An object may be a delta against an earlier entry of its
+> fragment, named by offset, or against the object its path held in the previous version, named by id: that object,
+> found by walking the two root trees together into the subtrees that differ, is tried first. The delta search is git's
+> shape (`diff-delta.c`), with the source indexed in blocks a copy instruction long, matches extended greedily, and copies
+> at most 64 KiB. Every tunable is learned from the deployment's own objects (`store::learn`). The window is one rank past
+> the deepest whose measured savings paid for its measured time at the owner's exchange (§4.11's value of a byte over
+> its value of CPU); it starts at the nearest candidate and grows a rank a fragment while further ranks pay. The zlib
+> level per kind is the level whose saved bytes most outweigh its time, every level sampled on one object of each kind a
+> fragment. The depth is the deepest chain the deployment's own clients' packs carried, at most git's 4095. The base
+> pack's rebuild point is rent or buy: clones' measured time on the fragments after it, against the last rebuild's
+> measured time, the first clone building the first. The base pack is every object the head reaches, self-contained
+> (offset deltas only); a clone is the base pack and the fragments after it, and a pack is assembled through A-591's
+> writer (header, entries, trailer). Owed: the fetch's choice of fragments within fast-forward runs (piece 7); a REF
+> chain's depth across fragments, bounded today by the versions a pack spans and reset by each rebuild; the encoding and
+> rebuild sliced under the shard's budget; one base pack shared by greens that reach alike (each green keeps its own
+> today).
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -12307,6 +12338,17 @@ engine: the verdict, rebase, position mapping, the register).
 > none under `atomic`. The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
 > band-2 lines. Proven byte for byte against nine pushes stock git 2.50.1 made to stock `git receive-pack`. Part 2 makes
 > each ref's update a work the engine judges, every ref recorded as one register entry.
+>
+> **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
+> answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
+> `ACK` for each have the store holds) and `ready` (each want reaches a have the client holds, or one of its parents,
+> searched by generation number); one round on a version head, the run of versions M+1 to N whenever those all
+> fast-forwarded; the walk otherwise, in generation order, sending the commits the wants reach and the haves do not, and
+> their trees less the edge commits' trees, as git's `pack-objects` sends without bitmaps; `deepen`, `deepen-relative`,
+> `deepen-since` and `deepen-not` with their `shallow` and `unshallow` lines; the filters `blob:none`, `blob:limit`,
+> `tree:<depth>`, `object:type` and `combine:` (`sparse:oid` read and refused, owed); and `include-tag`. Proven against
+> an oracle computing each answer from full reachability over generated histories. Building the pack from the runs and
+> the objects is piece 7's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12577,8 +12619,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
    trailer; hostile input. (The deflate implementation, chosen by measurement: zlib-rs through flate2's API, A-607.)
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack
-   (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 the
-   fragments and the base pack; part 3 the commit rows' changed-path Bloom filters).
+   (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 built:
+   the fragments and the base pack, their window, depth, zlib level and rebuild point learned; part 3 the commit rows'
+   changed-path Bloom filters).
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
@@ -12710,6 +12753,18 @@ signature verification).
 > (`crates/hg/fixtures/serve`): eight answers byte for byte. Owed of piece 4: the changegroup the choice names (its
 > manifests and files, held deltas or full texts), the bundle2 a `getbundle` answers, then `slates hg serve --stdio`'s
 > loop and HTTP version 1; the heads the index keeps will replace the walks over the whole view.
+>
+> **Status (2026-11-19, A-630 part 1: a store's names and its fncache built).** `slates-hg`'s `store` names the revlog
+> of each tracked path as an existing repository's `.hg/store` names it: 7.2's `encodedir`, its filename encoding
+> (capitals as `_x`, reserved bytes as `~xx`), Windows' reserved names and a last (with `dotencode`, a first) period or
+> space escaped, and a path longer than 120 bytes hashed under `dh/` with its directories' prefixes, a filler and its
+> SHA-1 (collision-detecting, as 7.2's `hashutil`); both of 7.2's encodings (`dotencode`'s `_pathencode` and the
+> hybrid one); the `fncache` read (`decodedir`, a final newline and no empty line required) and the requirements'
+> layout. Proven against two stores stock 7.2 wrote of one history (`crates/hg/fixtures/store`, the command in
+> `make-store-fixtures.sh`): every fncache entry encoded to exactly the data revlogs stored, three of them hashed, a
+> case collision, every reserved name and byte. Owed: the import itself (each revlog through `revlog` into `index`,
+> through §4.15's read seam; its golden vectors, every revision's `debugdata`, are in the same fixtures) and version
+> 2's file index.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13100,7 +13155,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `manifest`, `filerev`, `node`): the objects and their nodes. Built (A-611, `crates/hg`: `revlog`): the import's
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
    holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
-   Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
+   Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
+   encodings, the hashed long names) and its fncache. Owed: the import into the index, and version 2's file index.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
    phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
@@ -13234,9 +13290,12 @@ and export by landing).
 > Held to transcripts of stock `svnserve` 1.15.0 answering stock `svn` 1.15.0 and scripted clients
 > (`crates/svn/fixtures/reads`, recorded by its `make-fixtures.py` through a relay, each file's SHA-256 in
 > `SHA256SUMS`), property lists compared as sets: `svnserve` writes them in APR's per-table seeded hash order, three
-> recordings gave three orders, and slates writes them in name order. Owed: `get-file`, `get-dir`, `list`, `log` with
-> merged revisions, `get-locations`, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then
-> `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
+> recordings gave three orders, and slates writes them in name order. Its second part's first slice (2026-11-19):
+> `get-dir` (the node's and the entry properties, the dirent fields asked for, the ancestors' properties) and
+> `get-locations` (`svn_repos_trace_node_locations` over the index: the closest copy by FSFS's youngest copy root, its
+> source, the same line at the same path), with `svn info` of a file and `svn proplist --show-inherited-props` replayed
+> whole. Owed: `get-file`, `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+> `get-deleted-rev`, then `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -13704,8 +13763,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
-    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH and LOCK's request are built (A-627), and the
-    update-report and replay editor drives and LOCK's answer are owed.
+    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
+    built (A-627), and the replay drive, LOCK's answer and LOCK and UNLOCK onto the lock table are owed.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -41719,6 +41778,94 @@ Part 1 applied in the same change to: `crates/git` (`refname.rs` and `tests/refn
 `v2/refname.rs`, removed; `objects/tag.rs`, `v2/fetch.rs` and `v2/ls_refs.rs` on the shared module; the `mod` line in
 `lib.rs`), GAPS (the §4.17 entry).
 
+**Part 2: upload-pack v2's negotiation** (`crates/git/src/negotiation`; §4.17.2 "A fetch" items 2 and 3, "Pieces (git)"
+piece 7). Sources, read 2026-11-19 at git v2.50.1: `upload-pack.c` (`parse_want`, `got_oid`, `do_got_oid`,
+`ok_to_give_up`, `send_acks`, `process_shallow`, `deepen`, `deepen_by_rev_list`, `send_shallow`, `send_unshallow`,
+`get_reachable_list`, `create_pack_file`), `commit-reach.c` (`can_all_from_reach_with_flag`), `shallow.c`
+(`get_shallow_commits`, `get_shallow_commits_by_rev_list`), `list-objects-filter.c`, `list-objects-filter-options.c`,
+`list-objects.c` and `builtin/pack-objects.c` (`add_tag_chain`) [C]; `gitprotocol-v2` and `rev-list-options` [B].
+
+- **The trait** (`Graph`). What the negotiation reads of a repository, A-614's store implementing it and the tests a
+  graph over generated histories: an object's handle, name and kind; a commit's row (generation number, committer date,
+  root tree) and parents; a tree's held entries; a blob's size; a tag's target; every ref's object; the annotated tags
+  under `refs/tags/`; the greens a commit heads with their current version; the versions a commit headed; whether a
+  version fast-forwarded the one before; and D(k). Neither crate names the other's modules.
+- **Acknowledgments.** An `ACK` for each have the store holds, once, in the order sent: the document's rule, where git
+  also leaves out a have it had marked as an earlier have's parent. `NAK` for none; after `done`, no section.
+- **`ready`**, never under `wait-for-done`: there is a common have, and each want, peeled through its tags, reaches a
+  common commit or one of its parents (git's `THEY_HAVE`); a want that is no commit holds nothing back. git prunes that
+  search at the oldest have's commit date, which a parent dated before its child defeats; here the search stops below
+  the least generation among those commits, which nothing below can reach, so it is exact, remembering across wants what
+  each commit reaches.
+- **One round on a version head** (§4.17.2: "the objects to send are D(M+1) to D(N), and the answer is `ready` in the
+  first round"). A want that heads a green at version N, with a common have that headed it at version M, is answered by
+  the run M+1 to N, the latest M, the shortest run among greens, with no walk and no search. It is taken only where the
+  union is exact: every version M+1 to N fast-forwarded (D(k) is what version k reaches and k-1 does not, so over
+  fast-forwards the union telescopes to what N reaches and M does not; a rewrite between would add what it dropped,
+  and since such a rewrite lies between every earlier M and N too, only the latest M is tried), the client is not
+  shallow and asks no deepening, and the filter, if any, decides each object by its row (`blob:none`, `blob:limit`,
+  `object:type`, `combine:` of those), so the pack can apply it to the run's fragments.
+- **The walk**: one queue in decreasing generation order, the walked wants painting `WANT` and the common haves (peeled
+  to commits), the commits a cut makes whole and the wants a run answers painting `HAVE`; each commit taken passes its
+  paint to its parents, a graft (a shallow commit) to none; the walk stops when no queued commit is painted `WANT`
+  alone. The commits sent are those painted `WANT` alone. The trees and blobs sent are those of their trees less those
+  of the edge commits' trees (each parent of a sent commit that is not sent) and of the haves that are no commits, as
+  git's `pack-objects` sends without bitmaps (`mark_edges_uninteresting`); whatever the client lacks is in it, and
+  nothing the wants do not reach. A smaller exact set from reached-set bitmaps is the store's to give.
+- **Shallow.** `deepen <n>`: each commit's least depth from the wants, 1 at a want, found breadth first where git's
+  depth-first walk keeps the least; the commits at depth `n` shallow, a root among them as git marks it.
+  `deepen-relative`: from the client's shallow commits the refs reach, to depth `n + 1`. `INFINITE_DEPTH` (what
+  `--unshallow` sends): every client shallow commit made whole. `deepen-since` and `deepen-not`: the commits `rev-list`
+  selects, those the wants reach not reached from a commit older than the time (`--max-age` marks it uninteresting with
+  its parents) nor from the `deepen-not` objects, found by the same walk with old commits painted `HAVE` as they are
+  taken; a selected commit with a parent not selected is shallow, and selecting none is refused as git refuses it. A
+  shallow commit the client holds is not sent again; a client shallow commit the cut makes whole is `unshallow`, its
+  parents wanted and itself had; every shallow commit, the client's and the new, is a graft. A shallow client asking no
+  deepening gets an empty shallow-info section, as git sends one. A shallow line naming an object the store does not
+  hold is left out and one naming no commit is refused, as git does.
+- **Filters** (`negotiation::filter`): `blob:none`; `blob:limit=<n>` with `k`, `m`, `g`, sending blobs smaller than
+  `n`; `tree:<depth>`, the root tree at depth 0, sending trees and blobs whose least depth is under it, a tree met again
+  shallower opened again; `object:type=<type>`; `combine:`, its sub-specs percent-decoded and refused, as git refuses
+  them, when they hold a reserved byte. Commits and tags are sent but under `object:type`; the wants and their tags'
+  chains whatever the filter, as git sends what a client named. Refused by kind: an unknown spec, a number that is not
+  canonical decimal with a unit (git's `git_parse_ulong` also reads `0x`, octal and a sign, which no client writes), an
+  unknown type, an empty combination, a nested one (git reads it; its own client writes every filter into one
+  `combine:`), `sparse:path=` (dropped by git), and `sparse:oid=` (read, not served: owed).
+- **`include-tag`**: each annotated tag under `refs/tags/` whose chain ends at an object the pack carries, its runs'
+  objects included, sent with every tag of its chain, as `add_tag_chain` adds them.
+- **Bounds.** Every walk is iterative; every entry it keeps (a commit's paint, a queued commit, a tree opened, an object
+  chosen, a search frame) is charged to the caller's admission before it is kept, at its own size, so a negotiation past
+  it is refused, typed. Nothing else bounds a walk: no count is fixed here.
+- **Tests** (`cargo test -p slates-git --lib negotiation`: 11). An oracle computes each answer from full reachability by
+  the rules above, never by the module's walks, over generated histories (merges, skewed dates, tags of tags, greens
+  whose versions run along a head's first-parent ancestry with a rewrite now and then, haves on version heads and
+  elsewhere, shallow clients, every deepening and filter, unheld wants and haves); 4,096 cases a run, the answers equal
+  refusals included, the one-round count equal, and no commit walked or searched where every want was answered in one
+  round. A census of what the cases met fails the test if any of 21 outcomes went unmet (every answer, the one-round
+  path alone and beside a walk, shallow and unshallow lines and the empty section, each filter, `include-tag`, each
+  refusal): the first generator met the one-round path 0 to 2 times in 1,024 cases, and was rebuilt until it met it 28
+  to 50 times. A second property holds, over 1,024 cases with no filter or shallow client, that a pack carries
+  everything the wants reach that the common haves do not and nothing the wants do not reach, and that each run carries
+  exactly what its head reaches and its have's version head does not. Deterministic cases: a client three versions
+  behind answered in one round with nothing walked; a rewrite between taking the walk; `wait-for-done` and `done`; a
+  clone at depth 1 (git's `fetch-shallow` fixture's shape); a tree met again shallower under `tree:4`; the admission
+  refused; and the filter specs, refusals and rules.
+- **Checks** (Mac Studio, `cargo test -p slates-git --lib`, 2026-11-19): 216 of 216, three runs in a row on one tree,
+  `cargo fmt --check` clean. Failing first: with `negotiate` stubbed to answer nothing, the 7 negotiation tests that
+  call it failed. Red six ways, one guard at a time in the Studio's clone: `ready` without the haves' parents failed the
+  oracle; the one-round path without its fast-forward check failed 3 tests; the edge commits' trees not left out failed
+  the oracle; grafts followed failed 2; the depth cut one too deep failed 2; and a tree never opened again shallower
+  failed the test written for it, after the oracle had missed it once the generator favoured the one-round path.
+- **Next** (GAPS): `sparse:oid` (git's gitignore matcher over a blob's patterns, and a revision's name resolved); the
+  server's mapping of a v2 `fetch` request onto `negotiation::Request` (`want-ref` and `deepen-not` resolved through
+  the refs); the pack itself, from the runs' fragments with the filter applied by row and from the chosen objects
+  (thin packs, offset deltas), piece 7's next part; `object-info`; the walks in cooperative slices under the shard's
+  budget; and A-614's store implementing `Graph`.
+
+Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`negotiation`, new:
+`mod.rs`, `filter.rs`, `ready.rs`, `one_round.rs`, `paint.rs`, `shallow.rs`, `objects.rs` and their tests; the `mod`
+line in `lib.rs`).
+
 ### A-593 — Subversion's dump format: formats 2 and 3 read as the stream arrives within the caller's admission and written byte for byte as `svnadmin dump` writes them (2026-11-19, g264, UI goal 92; §4.17.4 "Pieces that follow" piece 6, its first part; A-500, A-553)
 Applied in the same change to:
 - §4.17.4 (a status block; piece 6 marks its codec built) and GAPS (the §4.17.4 entry);
@@ -42000,11 +42147,20 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   hostile commands, never a panic. Red-checked six ways (a directory's size 0, `get-iprops` taking the youngest, an
   authentication request before an unknown command's refusal, a huge revision read as malformed, mergeinfo keys left
   absolute, dates before 1970 accepted): each failed its tests.
-- **Owed** (the next parts): `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`,
-  `get-location-segments`, `get-file-revs`, `get-deleted-rev`, each with its transcripts (two stock sessions recorded
-  here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
-  revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
-  anonymous read makes when the session could authenticate.
+- **Part 2, its first slice** (2026-11-19): `get-dir` and `get-locations`, recorded in three more scripted sessions
+  (every dirent field, a field subset, inherited properties, a file refused "Can't get entries of non-directory"
+  160016, an absent path; a copy crossed, revisions after the peg kept while the line reaches back to the same path,
+  a tag, a deleted file refused for the revision after its deletion, an absent path and a bad peg refused after
+  `done`, a revision list holding a string ending the connection), and the two stock sessions recorded earlier
+  (`svn info` of a file at an older revision, `svn proplist --show-inherited-props`) replayed whole with the
+  session's base taken from the client's URL. Found by the recording: `get-dir` writes a directory's size 0 (`stat`
+  writes 2^64 - 1), the stored date as it is and time 0's date for an entry without one; both commands' entries come
+  in hash order, compared as sets. The session value gains the repository's UUID (`svn:entry:uuid`). Studio:
+  `cargo test -p slates-svn --lib reads` all passing, fixtures' sums checked.
+- **Owed** (the next slices): `get-file`, `list`, `log` with merged revisions, `get-location-segments`,
+  `get-file-revs`, `get-deleted-rev`, each with its transcripts; then `svn mergeinfo --show-revs`'s eligible and
+  merged revisions from the segments and the log; read access by A-606's rules, and the authentication request a
+  denied anonymous read makes when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
@@ -42430,6 +42586,146 @@ Applied in the same change to:
   and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
   server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
   checkout of a repository's green must pass over.
+
+### A-627, continued — The update-report's answer: the editor drive in send-all mode, written as update.c writes it (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part)
+Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), and `crates/svn` (`dav/drive.rs` and its
+tests, new; `dav/listing.rs`'s flat base64 shared; `dav.rs`).
+
+- **Built.** `dav::Drive` takes the editor's calls and writes each as `reports/update.c`'s format strings do in
+  send-all mode, the mode stock ra_serf asks for when bulk updates are allowed:
+  - the header with `send-all` and `inline-props`, and the target revision;
+  - the anchor's `S:open-directory`, and `S:open-*` and `S:add-*` (`bc-url`, `sha1-checksum`, copy source), each with
+    the checked-in href `send_vsn_url` writes;
+  - `S:delete-entry` and `S:absent-*`;
+  - `S:set-prop` (escaped as `svn_xml_escape_cdata_string`, or base64 with line breaks) and `S:remove-prop`;
+  - `S:txdelta` with an optional `base-checksum`, the svndiff through the crate's encoder in base64 with no line breaks;
+  - a file's MD5 in `S:prop` before its close, and every close.
+
+  What to send is the server's: the delta between the client's reported state and the target over the index (piece 7's
+  reporter).
+- **Tests and the run.** Three tests: a drive of every call byte for byte, read back as well-formed XML, and the header
+  with neither mode and a copy's source. `cargo test --locked -p slates-svn --lib` passed 286 of 286 on the Mac Studio
+  (2026-11-19), and fmt was clean. Red once, on a copy that dropped the line feed after a base64 property's tag: the
+  drive test failed.
+- **Owed.** The replay drive (`replay.c`), LOCK's answer, and LOCK and UNLOCK onto the A-602 guards.
+
+### A-625 part 1 — the HTTP edge's engine: one connection's request loop as a state machine over bytes, HTTPS, credentials, 100-continue, keep-alive, streamed bodies, typed refusals and the staged close (2026-11-19, g076b, UI goal 93; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's next part)
+Applied in the same change to:
+- §4.17.2's status; GAPS (the §4.17 entry);
+- `crates/http-edge` (`slates-http-edge`, new: `connection`, `tls`, `credential`, their tests);
+- `crates/http` (`reply::bare`; `Status::INTERNAL_SERVER_ERROR` and `SERVICE_UNAVAILABLE`; two of A-595's tests rewritten
+  for main's clippy findings: `read_in` returns a typed `Failed` rather than asserting in a fn returning `Result`, and
+  the advertisement's head test compares one whole `Head`, cognitive complexity 14 of 10);
+- the workspace manifest, lock and unsafe budget (`slates-http-edge = 0`).
+- **Why a crate apart from the daemon.** The engine holds no socket, clock or thread, so every rule it keeps is a
+  `--lib` test over bytes, TLS included (a rustls client in memory); the daemon's listener (part 2) moves bytes and
+  waits. It knows no tool: a site answers each head with a decision.
+- **The loop.** `Connection::next` asks for what the connection needs: write first whenever it has bytes, then read, a
+  decision on a whole head, each run of the body (handed out as a slice of the input, or one inflated run, and taken
+  before more is read), the body's end, the reply, or the end. The reply's head is rendered at the decision from its
+  fields and sent with the reply's first bytes; fields a reply cannot carry turn the decision into a 500.
+- **TLS.** `ServingIdentity` holds the operator's chain and key, checked when made; each connection gets its own rustls
+  configuration (TLS 1.3 and 1.2, ALPN `http/1.1` alone, no client certificate, no tickets, no session cache), its `Arc`
+  owned by that connection (D-8 exception 2). `HttpsSession` hands rustls plaintext in the pieces it takes and moves the
+  sealed records out between them, the network export's lesson.
+- **Credentials.** Basic (RFC 7617) decoded strictly and refused in cleartext; Bearer (RFC 6750) a `b64token`; a
+  repeated or malformed line 400, another scheme 401; the challenges offer Basic over TLS alone, each naming a quoted
+  realm; secrets compared to their end. A credential's debug form never shows its secret.
+- **Refusals.** The head's, the body's framing and coding (400, 413, 501 and the rest), the credentials', the site's and
+  a failing service's, each with its status. A refusal whose request leaves no body unread keeps the connection (a 401
+  to a client's first request is the common case); any other ends in stages: the reply with `Connection: close`,
+  `close_notify`, a half-close, then the client's bytes drained (A-183). A service that fails after its reply began
+  aborts it short of the last chunk.
+- **Tests** (`cargo test -p slates-http-edge --lib` and `-p slates-http --lib`, Mac Studio, debug, 2026-11-19): red first,
+  29 of 31 failing on stubs; green at b656845e1, 31 of 31 and 52 of 52, `cargo fmt --check` clean.
+- **Owed (part 2).** The daemon's listener on the runtime's TCP, one connection a task, each phase's wait learned (the
+  handshake, a head's arrival, idleness between requests, a stalled body, the drain), the connections served at once
+  and the request room derived from the shard's budget, refusals counted; git's site: `slates-git`'s routes, the
+  authenticator from a credential to a principal of §4.13, the policy's decision (§4.17.1, A-597, A-622), and
+  upload-pack and receive-pack as services (A-620, A-624); the live run with a stock `git clone` over HTTPS (main's).
+
+### A-630 part 1 — A Mercurial store's names and its fncache, as stock 7.2 names and lists them (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, the import; A-588, A-611)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`store`, new; `node::sha1`;
+`fixtures/store/` and its `make-store-fixtures.sh`), `.gitattributes` (the store fixtures kept as stored), GAPS (the
+§4.17.3 entry).
+- **What it does.** `store::encode_path` gives the store name of a revlog path as 7.2's `store.py` does: `encodedir`,
+  `_encodefname`, `_auxencode`, and `_hashencode` past 120 bytes, in both of 7.2's encodings (`_pathencode` for a
+  `dotencode` store, which also hashes a raw path past 120; `_hybridencode` without). `encode_dir` and `decode_dir`
+  rename `.i`, `.d` and `.hg` directories and back; `read_fncache` reads the fncache (`decodedir`, every line an entry,
+  a final newline and no empty line, as `fncache._load` and `_checkentries` require), charged to an admission;
+  `read_layout` reads the requirements a store walk needs (`store`, `fncache`, `dotencode`, `exp-revlogv2.2`,
+  `fileindex-v1`).
+- **From the sources.** 7.2's `store.py` (read from Homebrew's 7.2): `_encodedir`, `decodedir`, `_reserved` (0 to 31,
+  126 to 255, `\:*?"<>|`), `_buildencodefun`, `_buildlowerencodefun`, `_auxencode`, `_hashencode`
+  (`_maxstorepathlen` 120, `_dirprefixlen` 8, `_maxshortdirslen` 68), `_hybridencode`, `_pathencode`, `fncache`; its
+  doctests are this module's unit vectors.
+- **Golden vectors.** `crates/hg/fixtures/store`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 05:14 UTC,
+  by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the branch at b16ddf6, exactly: `bash
+  crates/hg/fixtures/store/make-store-fixtures.sh "$D/out"`. One history in a `dotencode` store and a hybrid one, its
+  names taking every branch of the encoding (capitals and underscores, `FOO` removed then `foo`, `aux.txt`, `con`,
+  `com1`, `lpt9.x`, `prn.d`, `:?*"<>|\~` and `é`, a leading and a trailing period and space, `x.i/`, `y.d/` and `z.hg/`,
+  a path long raw, one long once encoded, and a deep one hashed with seven directory prefixes, one rewritten to end in
+  `_`): each store whole, its file list, its requirements, its paths, and every revision's `debugdata`; 94 files, each
+  SHA-256 checked equal after the copy. The stores differ only where `dotencode` does (the leading period and space).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 195 of 195 at its second
+  build (the first's one error a borrowed temporary, E0716), 6 of them this part's; rustfmt's layout taken from that
+  run; 203 of 203 with rustfmt clean on the tree merged with main (A-619's read serving among them) at b412d90. Golden: in each store every fncache entry encoded to exactly the data revlogs 7.2 stored (the sets equal, each a
+  fixture), every tracked path's revlog in the fncache, three hashed names and the case collision among them. Unit:
+  7.2's doctests of `_encodedir`, `decodedir`, `_buildencodefun`, `encodefilename` and `_auxencode`; long paths hashed
+  in both encodings. Hostile: an fncache without its newline, with an empty line, or past its admission.
+- **Owed of A-630.** The import (each revlog the fncache names read through `revlog` and appended to `index`, links by
+  changelog number, through §4.15's read seam; golden: every changeset's node and every file's bytes equal to the
+  fixtures' `debugdata`), then version 2's file index (`store_utils/file_index.py`).
+
+### A-614 part 2 — Pack fragments per D(k) and the base pack, the delta window, depth and zlib level and the rebuild point learned from the deployment's own objects (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4, piece 5; §4.11's cost model; A-582, A-591, A-607, A-608)
+
+Applied in the same change to: §4.17.2 (a status block; piece 5's line), GAPS (the §4.17 entry), `crates/git` (`store`:
+`learn`, `deltas`, `fragment`, the repository's fragment and base-pack records and methods; `Incoming::depth`).
+
+- **Fragments.** `Repository::encode_fragments` encodes a version's D(k), after its commit, as two fragments kept as
+  content (commits, trees and tags; then blobs, so a fetch that wants no blobs is a concatenation too). Each entry is
+  written through `entry::write`, deflated through flate2, and its CRC32 kept (`Placed`). A fragment is written as if it
+  began right after a pack's header, and an offset delta keeps only the distance back to its base, so its bytes are valid
+  wherever a pack places them. `pack` and `clone_pack` assemble packs through `pack::Writer`.
+- **Bases.** The object a path held in the previous version, found by walking the two root trees together into the
+  subtrees that differ, is tried first, as a REF delta; then the earlier entries of the same kind, nearest first, as OFS
+  deltas. The smallest delta shorter than the object wins. A REF delta's base lies outside its fragment, so it begins a
+  chain, as a client completing a thin pack stores the base whole.
+- **The delta search** (`deltas::delta_of`): git's shape, `diff-delta.c`. The source is indexed in blocks a copy
+  instruction long (eight bytes: a shorter match saves nothing as a copy), the target is scanned with a rolling hash,
+  matches are extended greedily, and copies are at most git's 64 KiB.
+- **Learned, never fixed** (`learn`): the window, the zlib level per kind, the depth, and the rebuild point. git fixes
+  the first two by constants it calls "magic values" (window 10, depth 50; `technical/pack-heuristics`).
+  - The window is one rank past the deepest whose measured savings paid for its time at the owner's exchange. It starts
+    at the nearest candidate; every candidate would make an import's first fragment cost a delta search for every pair.
+  - The level is the one whose saved bytes most outweigh its time, every level sampled on one object of each kind each
+    fragment.
+  - The depth is the deepest chain the deployment's clients' packs carried (their `pack.depth`), at most git's 4095;
+    zero before any push carried a delta.
+  - The rebuild point is rent or buy over clones' measured time and the last rebuild's.
+- **The base pack** is every object the head reaches, self-contained (OFS only); `clone_pack` is it and the fragments
+  after it.
+- **Tests** (`cargo test --locked -p slates-git --lib store::`, 21 of 21 and 2 ignored, the whole crate 278 of 278, and
+  `-p slates-vcs --lib` 30 of 30, the Mac Studio, 2026-11-19, at 6dbde92ad; `cargo fmt --check` clean):
+  - The oracle now encodes every committed version and reads each ref's whole pack back through A-608's reader against
+    its D(k)s, in both formats.
+  - `a_delta_turns_its_source_into_its_target_and_none_saves_nothing` and `every_delta_applies_back_to_its_target`
+    (generated).
+  - `the_learned_rules_follow_what_was_measured`.
+  - `a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_version`.
+  - `similar_files_in_one_version_are_offset_deltas_within_the_learned_depth`.
+  - `a_fragments_entries_keep_their_offsets_and_crcs`.
+  - `a_clone_is_its_base_pack_and_the_fragments_after_it`.
+  - Main's two runs, ignored: `a_sample_pack_for_verify_pack` and `double_hashing_costs`.
+- **Red-checks** (the Studio, each mutation once on a copy, the tree clean after): no delta ever found (3 red), the named
+  base never tried (1), a chain past the learned depth (1, after the test was made to need it), an offset delta's base a
+  byte off (3), a CRC32 a byte short (1), the window never growing (1), the worst level chosen (1), a rebuild due without
+  rent (2), named bases backwards (1, after the edit's own entry was pinned), a base pack of the last D(k) alone (1), a
+  pack's count one off (5).
+- **Owed.** The fetch's choice of fragments within fast-forward runs (piece 7). A REF chain's depth across fragments,
+  bounded today by the versions a pack spans and reset by each rebuild. The encoding and the rebuild sliced under the
+  shard's budget. One base pack shared by greens that reach alike. Main's runs are filed: `git verify-pack` over the
+  sample pack, the double hashing, clippy, `xtask` and the docs.
 
 ### A-616 — ra_svn's reporter, part 1: the commands that begin a report and the report, kept and refused as `svnserve` keeps and refuses them (2026-11-19, g234, UI goal 93; §4.17.4 "4. Reads", the reporter, and piece 7's third part; after A-599)
 Applied in the same change to:
