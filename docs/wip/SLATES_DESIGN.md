@@ -13323,6 +13323,17 @@ signature verification).
 > requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
 > HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
 >
+> **Status (2026-11-19, A-667: each branch's heads by 7.2's rule).** `serve::discovery::branch_head_revs` takes a
+> revision for its branch's head when no later revision on its branch descends from it, through any branches (7.2's
+> `branchmap.py`: "A branchhead is a revision such that no descendant is on the same branch"), closed heads kept, for
+> `branchmap` and `check:updated-heads`; before, a child on the branch was asked for, and A-619's oracle stated the
+> same, so `default` 0, `stable` 1, `default` 2 answered `default`'s heads 0 and 2 where 7.2 answers 2. A branch is
+> walked only where its candidates have children on other branches and a parent from another branch lies above them
+> (7.2's `uncertain`). Apart from 7.2 on purpose: a merge whose parent on its branch is an ancestor of its other
+> parent, where 7.2's shortcut keeps a head by its cache's history (measured both ways against stock 7.2;
+> `docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`). Owed: an obsolete changeset the
+> served view shows is never a head in 7.2; the view carries no obsolescence yet.
+>
 > **Status (2026-11-19, A-641 part 2: a push's changegroup verified, and a line's move a work).** `push::verify`
 > checks a push's changegroup against what the repository holds, through a `Held` trait (each log's texts by node),
 > as 7.2's `revlog.addgroup` and `server.validate` do: each group taken in order, a node its log holds passed over (so
@@ -46992,6 +47003,42 @@ Applied in the same change to:
   (`IdentitiesSet`), `partition.rs` (the map, its check, apply and snapshot), `error.rs` (`PolicyChanged`'s words),
   `crates/db/src/tests/identities.rs` (new), `crates/db/tests/wire_order.txt`; §4.17.1 "A push is a work"'s status;
   GAPS' §4.17 entry.
+
+### A-667 — Each branch's heads by 7.2's rule: no later revision on the branch descends from a head (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); found by g304 against stock 7.2; §4.17.3 "Pull and clone" item 1, "Push" step 4; A-619, A-641)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::discovery::branch_head_revs`,
+`serve::RevSet::remove`, `serve::tests`' and `push::tests`' oracles, `serve/discovery_tests.rs`), GAPS (a fixed entry),
+`docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`.
+- **What was wrong.** A revision was its branch's head when no child of it was on its branch. 7.2's rule
+  (`branchmap.py` lines 422-424) ends every revision a later revision on its branch descends from, through any
+  branches: for `default` 0, `stable` 1 on 0, `default` 2 on 1, `hg heads default` answers 2, and `branchmap` and
+  `check:updated-heads` here answered 0 and 2. A-619's oracle and A-641's push-check oracle stated the implementation's
+  rule, so both certified it.
+- **The decision.** The rule, computed as 7.2 computes it where 7.2 is exact: a revision continued on its branch is no
+  head, one with no child at all is a head, and a branch whose other candidates have children is walked from its
+  highest parent from another branch at or above its lowest such candidate down to that candidate (7.2's `uncertain`
+  and `cl.ancestors(uncertain, floorrev)`). Closed heads are kept (`branchheads(closed=True)`, which the wire's
+  `branchmap` and `all_nodes_are_heads` read).
+- **Apart from 7.2, on purpose.** 7.2's shortcut for one known head and one parent on the branch (lines 478-483) never
+  looks at the other parent, so a merge whose parent on its branch is an ancestor of its other parent can leave a head
+  the rule ends; whether it does depends on how 7.2's cache was updated. Measured with Homebrew's 7.2 (2026-11-19):
+  `default` 0, `default` 1, `other` 2 on 1, `default` 3 on 2 and 0 answers 3 and 1 either way; `default` 0, `other` 1,
+  `default` 2, `other` 3, `default` 4 on 3 and 0 answers 4 and 2 with the cache kept commit by commit and 4 alone with
+  it computed whole. The rule is the one answer a server can give.
+- **Siblings.** `check:updated-heads` read the same function and is fixed with it; `check:heads` reads topological
+  heads, as 7.2 does; `reject_new_heads` (open topological heads on the branch) and the push's head count (topological
+  heads added and removed) have no caller yet and are owed with the landing; the push classifier is not built.
+- **Tests (Windows x86_64, jupiter, 2026-11-19, kiln, debug, rustc 1.98.1; the Mac Studio was offline).** Red: branch
+  `agents/g300-a667-branch-heads-red` (5c88fd3e9, the tests alone, against the old rule), `cargo test --locked -p
+  slates-hg --lib` 276 passed and 6 failed, the five new tests and A-619's corrected oracle, each answering the old
+  rule's extra heads. First green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone, which stated the old
+  rule too and is corrected. Green: 284 of 284 at 87690ec64 (main's 278 and A-667's six), in a target directory of its
+  own; rustfmt's layout from those runs. Merged with main b79ece5d5, whose slates-merge builds as a dependency only with
+  its `test-model` gate on `history_touches` removed (c370dddbe; reported to main), removed in the clone alone: 284 of
+  284 at 7e4388e32. The tests: g304's history, the two measured histories, a closed head kept and
+  ending a head through it, a generated oracle over histories moving between two branches with merges of any earlier
+  revisions, and its non-vacuity from fixed seeds. Owed: the same run on macOS.
+- **Owed.** An obsolete changeset the served view shows is never a head in 7.2 (lines 351-358) and its ancestors are
+  ended through it (lines 469-476); the served view carries no obsolescence yet.
 
 ### A-636 part 1 — A repository's logs over the fenced ledger: each log replicated on its own, every record committed whole and applied at the holders' joins, a takeover fencing every log or none and keeping each record whole or dropping it, replicas reading by a vector of positions (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half; §4.8 "Promotion and takeover"; with A-642 and A-635)
 
