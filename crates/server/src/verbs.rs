@@ -10201,6 +10201,12 @@ pub(crate) fn admit_clone(
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
   let allowed = volume_core.set_inode_allowance(clone_allowance);
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  // And its namespace dimension (§4.2), as a create's admission and a restart's set it: a create's share, but never
+  // below the entries the clone holds, which are its snapshot's (A-549). It reserves nothing, so it is set from the
+  // clone's own count. Before A-572 a clone carried no entry allowance until a restart set one.
+  let entries = entry_allowance(size).max(volume_core.entry_usage().0);
+  let entries_allowed = volume_core.set_entry_allowance(entries);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, entries_allowed);
   // A dynamic clone's slots become its version hold, returned with it at teardown, never a reserved credit (A-342).
   let version_credit = match version_credit {
     Some(credit) if dynamic => {
