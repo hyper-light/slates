@@ -105,7 +105,9 @@ pub(crate) fn exported(
   attachment: u64,
   token: Option<[u8; 16]>,
 ) -> Result<Exported, Error> {
-  let token = token.ok_or(Error::Protocol(ProtocolFault::UnexpectedReply { verb: VERB }))?;
+  let token = token.ok_or(Error::Protocol(ProtocolFault::UnexpectedReply {
+    verb: VERB,
+  }))?;
   Ok(Exported {
     attachment,
     path: crate::mount::export_path(name, (attachment, token)),
@@ -142,7 +144,9 @@ mod tests {
     );
     assert_eq!(
       exported("work", ATTACHMENT, None),
-      Err(Error::Protocol(ProtocolFault::UnexpectedReply { verb: VERB }))
+      Err(Error::Protocol(ProtocolFault::UnexpectedReply {
+        verb: VERB
+      }))
     );
   }
 }

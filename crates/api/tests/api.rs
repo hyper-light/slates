@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use slates_api::{
   ArchiveFault, AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind,
-  Error, Exhausted, Existing, ExportOptions, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch,
-  LandOutcome, LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval,
-  MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget, PathFault, PolicyReason,
-  PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source,
-  TrustedSigner, Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  Error, Exhausted, Existing, ExportOptions, Filter, Instance, Intent, Invalid, IssuerFault,
+  KindMismatch, LandOutcome, LandingApproval, LandingConflict, LandingStage, LandingState,
+  MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget, PathFault,
+  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId,
+  Source, TrustedSigner, Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
   WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
