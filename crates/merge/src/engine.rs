@@ -635,6 +635,10 @@ pub struct Green {
   /// index's (`changes_bytes`), and a green holding one is not checkpointed (`Green::checkpoint`), so the chain bounds
   /// them.
   copies: BTreeMap<String, Vec<copy::Appearance>>,
+  /// What the identity's sum held beyond the state's own entries when the green was restored from a checkpoint
+  /// (A-626 part 3): the entries of the copies made at or before the checkpoint, less their trees' entries, which the
+  /// recount adds since their sources at their versions are no longer held. `None` where nothing was beyond.
+  copies_before: Option<crate::identity::SetHash>,
   /// Copies whose maps brought a tree: the non-vacuity count of the copy's path.
   copies_grafted: u64,
   /// Copies a map refused at commit after the verdict judged them possible: zero in every correct use.
@@ -1369,13 +1373,16 @@ impl Green {
   }
 
   /// The green's checkpoint at version `at` (§4.16; [`crate::checkpoint`]): every key whose value in effect at `at` was
-  /// set after the origin, with that version and value, and every increment accepted at or before `at`. `None` when
-  /// `at` is past the head or below the folded floor (its values are no longer reconstructible). With the origin it
-  /// restores ([`Green::restore`]) a green that answers as this one does for every version from `at` on.
+  /// set after the origin by its own change, with that version and value, and every increment accepted at or before
+  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and the identity's
+  /// sum at `at` (A-626 part 3, `copy_checkpoint`). `None` when `at` is past the head or below the folded floor (its
+  /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
+  /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
-    if at > self.head() || at < self.folded_below || at < self.deltas_from || self.copied_by(at) {
+    if at > self.head() || at < self.folded_below || at < self.deltas_from {
       return None;
     }
+    let (copied, listed) = self.copied_at(at);
     let mut checkpoint = crate::checkpoint::Checkpoint {
       version: at,
       accepted: self
@@ -1407,22 +1414,14 @@ impl Green {
       hardlinks: changed_at(&self.hardlink_history, at),
       specials: changed_at(&self.special_history, at),
       xattrs: changed_at(&self.xattr_history, at),
+      copies: self.copy_records_at(at),
+      copied,
+      sum: self.sum_at(at),
       head_check: None,
     };
+    Green::leave_out_copied(&mut checkpoint, &listed);
     checkpoint.canonicalize();
     Some(checkpoint)
-  }
-
-  /// Whether a copy was made at or before `at` (A-586): a checkpoint there would have to list its tree key by key and
-  /// carry the identity's sum (a copy's entry stands for its tree's, which a restore from the origin and the keys cannot
-  /// recompute), owed; until then such a green keeps its chain whole (`None` from [`Green::checkpoint`], which the service
-  /// counts and answers by keeping every version).
-  fn copied_by(&self, at: u64) -> bool {
-    self
-      .copies
-      .values()
-      .flatten()
-      .any(|record| record.version <= at)
   }
 
   /// A green restored from its `origin` and a `checkpoint` of it (§4.16, §4.8 recovery): the origin's state with every
@@ -1470,17 +1469,15 @@ impl Green {
     green.identity_version = checkpoint.version;
     green.special_history_bytes = green.special_history_recounted();
     green.index_restored_changes();
+    // The copied trees' keys and the copies' records after the change index, which counts the restored histories alone,
+    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3).
+    green.restore_copied(&checkpoint.copied, &checkpoint.copies);
+    green.take_sum(&checkpoint.sum);
     self
   }
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
-    if let Some(old) = self.content.remove(&changed.key) {
-      self.identity.remove(&file_entry(&changed.key, &old));
-    }
-    if let Some(bytes) = &changed.value {
-      self.identity.add(&file_entry(&changed.key, bytes));
-      self.content.insert(&changed.key, bytes.clone());
-    }
+    self.place_file(&changed.key, changed.value.as_deref());
     self.last_changed.insert(changed.key.clone(), changed.at);
     self.clear_content_history(&changed.key);
     let value = changed
@@ -1491,13 +1488,7 @@ impl Green {
   }
 
   fn restore_dir(&mut self, changed: &crate::checkpoint::Changed<String, ()>) {
-    if self.dirs.remove(&changed.key).is_some() {
-      self.identity.remove(&dir_entry(&changed.key));
-    }
-    if changed.value.is_some() {
-      self.identity.add(&dir_entry(&changed.key));
-      self.dirs.insert(&changed.key, ());
-    }
+    self.place_dir(&changed.key, changed.value.is_some());
     self.dir_history.insert(
       changed.key.clone(),
       vec![(changed.at, changed.value.is_some())],
@@ -1505,13 +1496,7 @@ impl Green {
   }
 
   fn restore_mode(&mut self, changed: &crate::checkpoint::Changed<String, u32>) {
-    if let Some(old) = self.modes.remove(&changed.key) {
-      self.identity.remove(&mode_entry(&changed.key, old));
-    }
-    if let Some(mode) = changed.value {
-      self.identity.add(&mode_entry(&changed.key, mode));
-      self.modes.insert(&changed.key, mode);
-    }
+    self.place_mode(&changed.key, changed.value);
     self.mode_changed.insert(changed.key.clone(), changed.at);
     self
       .mode_history
@@ -1519,35 +1504,12 @@ impl Green {
   }
 
   fn restore_link(&mut self, tag: &[u8], changed: &crate::checkpoint::Changed<String, String>) {
-    let (map, changed_map, history) = if tag == IDENTITY_TAG_SYMLINK {
-      (
-        &mut self.symlinks,
-        &mut self.symlink_changed,
-        &mut self.symlink_history,
-      )
+    self.place_link(tag, &changed.key, changed.value.as_deref());
+    let (changed_map, history) = if tag == IDENTITY_TAG_SYMLINK {
+      (&mut self.symlink_changed, &mut self.symlink_history)
     } else {
-      (
-        &mut self.hardlinks,
-        &mut self.hardlink_changed,
-        &mut self.hardlink_history,
-      )
+      (&mut self.hardlink_changed, &mut self.hardlink_history)
     };
-    let old = map.remove(&changed.key);
-    if let Some(old) = &old {
-      self.identity.remove(&link_entry(tag, &changed.key, old));
-    }
-    if let Some(target) = &changed.value {
-      self.identity.add(&link_entry(tag, &changed.key, target));
-      map.insert(&changed.key, target.clone());
-    }
-    if tag != IDENTITY_TAG_SYMLINK {
-      relink(
-        &mut self.links_to,
-        &changed.key,
-        old.as_deref(),
-        changed.value.as_deref(),
-      );
-    }
     changed_map.insert(changed.key.clone(), changed.at);
     history.insert(
       changed.key.clone(),
@@ -1556,13 +1518,7 @@ impl Green {
   }
 
   fn restore_special(&mut self, changed: &crate::checkpoint::Changed<String, SpecialNode>) {
-    if let Some(old) = self.specials.remove(&changed.key) {
-      self.identity.remove(&special_entry(&changed.key, &old));
-    }
-    if let Some(node) = changed.value {
-      self.identity.add(&special_entry(&changed.key, &node));
-      self.specials.insert(&changed.key, node);
-    }
+    self.place_special(&changed.key, changed.value);
     self.special_changed.insert(changed.key.clone(), changed.at);
     self
       .special_history
@@ -1571,13 +1527,7 @@ impl Green {
 
   fn restore_xattr(&mut self, changed: &crate::checkpoint::Changed<(String, String), Vec<u8>>) {
     let (path, name) = &changed.key;
-    if let Some(old) = self.xattrs.remove(path, name) {
-      self.identity.remove(&xattr_entry(path, name, &old));
-    }
-    if let Some(value) = &changed.value {
-      self.identity.add(&xattr_entry(path, name, value));
-      self.xattrs.insert(path, name, value.clone());
-    }
+    self.place_xattr(path, name, changed.value.as_deref());
     self.xattr_changed.insert(changed.key.clone(), changed.at);
     self.xattr_history.insert(
       changed.key.clone(),
@@ -1805,14 +1755,22 @@ impl Green {
     let mut set = crate::identity::SetHash::default();
     self.add_state_entries(&mut set);
     // Each copy's entry in, and the entries of the tree it copied out: the running sum adds the one and never the
-    // others (A-586). The recount reads each source at its version, so it holds while the histories reach that far.
+    // others (A-586). The recount reads each source at its version, so it holds while the histories reach that far: for
+    // a copy made at or before the checkpoint the green was restored from, they do not, and the checkpoint's sum gave
+    // what those copies stand for (`copies_before`, A-626 part 3).
     for (dst, records) in &self.copies {
-      for record in records {
+      for record in records
+        .iter()
+        .filter(|record| record.version > self.deltas_from)
+      {
         set.add(&copy_entry(dst, &record.source, record.source_version));
         for entry in self.copied_tree_entries(dst, record) {
           set.remove(&entry);
         }
       }
+    }
+    if let Some(before) = &self.copies_before {
+      set.add_sum(before);
     }
     set.identity()
   }
@@ -5249,6 +5207,8 @@ mod branch;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 mod copy;
+
+mod copy_checkpoint;
 
 #[cfg(test)]
 mod copy_tests;

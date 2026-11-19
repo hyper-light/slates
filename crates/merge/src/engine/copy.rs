@@ -1678,7 +1678,7 @@ impl Green {
   }
 
   /// Every key of every dimension the green holds or held in `root`'s tree, current or recorded.
-  fn every_key(&self, root: &str) -> Vec<IdentityKey> {
+  pub(super) fn every_key(&self, root: &str) -> Vec<IdentityKey> {
     let inside = |path: &String| in_tree(path, root);
     let mut keys: Vec<IdentityKey> = Vec::new();
     let files = union_keys(self.content.keys(), self.content_history.keys().cloned());
