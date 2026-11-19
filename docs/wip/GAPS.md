@@ -544,7 +544,11 @@
 > Basic with the token as the password on the loopback cleartext edge as over TLS (`--vcs-http` serves cleartext on
 > loopback alone, where Bearer was already taken), and every `401` offers Basic's challenge first and Bearer's after
 > it, TLS included: stock Mercurial 7.2 reads the first challenge alone and crashed on a Bearer first, and stock git
-> and Subversion send Basic alone, so a lone anchor's cleartext edge took none of their credentials. EVIDENCE_PENDING
+> and Subversion send Basic alone, so a lone anchor's cleartext edge took none of their credentials. macOS arm64 (Mac
+> Studio, kiln r295 red over main b94ae6e90: 2, 8 and 1 failing, stock hg 7.2 in its crash report; r325 green over
+> main 770ae8826): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 46 of 46 (stock hg
+> 7.2 against the edge serving the hg site: `abort: HTTP Error 503`, the site reached), `slates-cli --test cli
+> vcs_http` 2 of 2, fmt clean.
 > Owed: the daemon serving the hg site beside git's (its site is git's alone, so stock hg against a running anchor
 > meets git's `404`; A-680 part 2 and the sites' composition), then g083's stock-hg anchor tests un-ignored; stock
 > svn over the loopback edge (A-681); the Windows and Linux runs (main's).

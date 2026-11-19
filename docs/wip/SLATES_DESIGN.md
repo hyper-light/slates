@@ -51202,7 +51202,20 @@ lent with the request's room and `file_node` gone, the changegroup lending each 
   Basic's password in the URL ends `abort: HTTP Error 503: Service Unavailable`, the site reached; it skips loudly
   without stock hg 7.2, `SLATES_TEST_HG`). `slates-cli`: `an_anchors_vcs_http_flag_starts_its_daemons_edge` (a real
   anchor's cleartext edge answers Basic's challenge, then Bearer's).
-- **Evidence** EVIDENCE_PENDING
+- **Evidence** (macOS arm64, Mac Studio, debug, `CARGO_BUILD_JOBS=2`, 2026-11-19; stock Mercurial 7.2 through `uvx
+  --quiet --python 3.12 --from mercurial==7.2 hg`, Python 3.12.16; the Windows x86_64 and Linux runs owed). Red first,
+  the tests over main b94ae6e90's code (kiln r295 at 7b8ac8402): `cargo test --locked -p slates-http-edge --lib
+  credential` 9 passed and the 2 new failed; `-p slates-server --lib -- vcs_http:: --test-threads=4` 38 passed and the
+  8 new or changed failed, stock hg ending in its crash report (`** unknown exception encountered`, exit 1, its
+  traceback through `urllib/request.py` line 1247, hg's `url.py` line 418 and line 1129's `ValueError`), the cleartext
+  daemon answering Basic `401` with Bearer's challenge alone; `-p slates-cli --test cli vcs_http` 1 passed and the
+  anchor's edge test failed on Bearer alone. Green over main 770ae8826 (kiln r325 at 4d2493b2f, and the http-edge
+  filter again at 59229e97a once the TLS connection test read its credential without a connection argument): 10 of 10
+  (`slates-http-edge`, that test among them), 46 of 46 (`slates-server`'s `vcs_http`: git's, Mercurial's, the daemon
+  edge's and the edge's tests; stock hg 7.2 ran, no skip, and ended `abort: HTTP Error 503: Service Unavailable`), 2 of 2
+  with g083's ignored HTTP test listed (`slates-cli`); `cargo fmt --all -- --check` clean; no warning in this piece's
+  lines (a non-test build of `slates-server` warns 21 times, LFS's unreached call and an unused `UploadServices`
+  import, alike in the red run over main's tree).
 - **Not changed, on purpose.** The daemon's site is git's alone (`DaemonSite`), so stock hg against a running anchor
   still meets git's route (`404`) until the sites are composed; g083's two stock-hg tests over the anchor's HTTP edge
   stay ignored on A-680 (and A-685), A-686 dropped from their reasons.
