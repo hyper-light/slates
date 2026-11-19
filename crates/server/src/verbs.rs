@@ -20908,8 +20908,10 @@ mod tests {
 
   /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
   /// adopts; and another whose catalog carries only the record it was born with (no head of it was ever placed with its
-  /// record). Expect: the first judged against its capture on the successor, the carried paths as its owner recorded
-  /// them; the second refused by kind, never landed as a volume with no capture.
+  /// record), and step its carry as the seal walk does. Expect: the first judged against its capture on the successor,
+  /// the carried paths as its owner recorded them, and free to move on with them; the second refused by kind, never
+  /// landed as a volume with no capture, its carry refused (no mark to carry from, counted) and a move of it waiting
+  /// until it is refused `Unplaced`, as A-503's move of a capture it could not carry waited.
   #[test]
   fn a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind() {
     crate::daemon::audit_on_shard(|state| {
@@ -20946,6 +20948,10 @@ mod tests {
         }
         other => panic!("the successor holds no capture to land against: {other:?}"),
       }
+      assert!(
+        crate::carry::carries_its_head(state, id),
+        "a successor that marked its adopted head moves the clone on with its record"
+      );
       let born = slates_db::catalog::VolumeId { bytes: [0x92; 16] };
       let catalog = crate::catalog::CatalogValue {
         carried: Some(crate::carry::creation_record()),
@@ -20958,6 +20964,16 @@ mod tests {
           Err(Refusal::Unsupported { .. })
         ),
         "a captured clone with no record for its head is refused by kind, never landed as a volume with no capture"
+      );
+      crate::carry::step(state, born);
+      assert_eq!(
+        state.refusals.get(crate::carry::CARRY_REFUSED),
+        Some(&1),
+        "a successor with no mark cannot carry the capture for its head, and counts it"
+      );
+      assert!(
+        !crate::carry::carries_its_head(state, born),
+        "a move of a clone whose head carries no record waits to be refused"
       );
     });
   }

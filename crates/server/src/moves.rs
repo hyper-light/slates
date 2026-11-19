@@ -63,9 +63,12 @@
 //! **What a captured clone's move carries (A-503, A-544).** A clone of a captured base lands against its capture
 //! (A-291's landing), which stays with the node that made the clone. Every head of such a clone is placed with the
 //! record of what its capture held where the two differ (`crate::carry`), so the head a move hands over comes with its
-//! record in the volume's catalog, which the report waits for as it waits for every catalog change. The new owner adopts
-//! it with the volume (`verbs::finish_making` records it, the snapshot it materialized the moved head as its mark) and
-//! keeps the mark through its seal ([`seal_adopted`]); its own heads carry again from the mark, and the mark is no
+//! record in the volume's catalog, which the report waits for as it waits for every catalog change. The move waits too
+//! until the head it hands over carries its record here (`carry::carries_its_head`, [`ready_to_hand_over`]): a carry
+//! still walking, or refused, holds it back until it is refused `Unplaced`, as A-503's own walk did, so a move never
+//! makes a clone that lands against its capture here into one its new owner refuses to land. The new owner adopts the
+//! record with the volume (`verbs::finish_making` records it, the snapshot it materialized the moved head as its mark)
+//! and keeps the mark through its seal ([`seal_adopted`]); its own heads carry again from the mark, and the mark is no
 //! snapshot that holds a move back.
 //!
 //! **R8.** At one node there is no other member, so every move is refused `MoveRefusal::Target`.
@@ -366,6 +369,11 @@ fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
 /// `f = 1` a target that died at the switch left the content in the frozen copy alone, and its takeover's successor
 /// waited on it until it gave the volume up (`a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`).
 fn ready_to_hand_over(state: &mut ShardState, id: DbVolumeId, quorum: Quorum) -> bool {
+  // A captured clone hands over a head that carries its capture's record (A-544), so its new owner lands it against the
+  // capture as this node does; a carry still walking, or refused, holds the move back until it is refused `Unplaced`.
+  if !crate::carry::carries_its_head(state, id) {
+    return false;
+  }
   // The head is the volume's: a frozen volume takes no write and no snapshot, and the healer passes it by, so only its
   // handoff advances it.
   let Some(epoch) = state.db.partition().volume(id).map(|record| record.epoch) else {

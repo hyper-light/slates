@@ -3299,6 +3299,8 @@ fn seal_walk_slice(
   };
   if remaining.is_none() && track == Track::Home {
     heal_one_placed_snapshot(state, local, slicing.created_unix);
+    // The walk visits only the volumes this shard serves, so the carry of one it let go is forgotten here (A-544).
+    crate::carry::forget_gone(state);
   }
   (work, remaining)
 }
