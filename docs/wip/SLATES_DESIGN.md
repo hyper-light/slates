@@ -32430,6 +32430,29 @@ and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api
   staging buffers and status pages (moved there from the sweep; the deadline wheel's), leases, lapsed CLI attachments,
   destroys, grants, the owed audit, departed hosts' attachments, the held copies' reclaim, the pressure hold, NFS
   purges, base hints and delegation recalls, the idle seal and the huge-page re-arm.
-- **Owed.** The claim's pid is the client's own word on Windows and is not bound to its process's creation, so a client
-  that died before its admission could leave a watch on a reused pid; the claim could carry its creation time as the
-  daemon's header does (A-447). The SDKs' heartbeat slot no longer feeds liveness and could stop being sent.
+- **Tests.** `crates/server/src/hangup.rs`: `a_client_killed_with_sigkill_is_seen_at_the_next_event_turn` (the watch
+  answers at the one poll the kill's event woke), `a_client_dead_before_its_watch_registered_is_caught_at_the_registration`
+  (at its first poll, by the test after the registration) and `a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind`
+  (a cancelled watch never answers, no completion of its wait reaches the shard, and on Linux the peer reads the daemon's
+  close once the seat's end is gone too). `crates/server/src/reap.rs`:
+  `a_client_killed_with_sigkill_is_retired_at_its_hang_up_not_a_budget_later` (a proven client's seat given back on a
+  one-shard daemon, `client.reaped_by_hangup` moved by one with the reaped health signal). `slates-rt`'s
+  `handle_wait` has two Windows tests (a wait answering at a child's kill, and at once for a child already gone).
+- **Evidence.** On the Mac Studio (kiln, d1323898, 2026-11-19 00:09–00:10 UTC, load 8.6–12.3, debug build): `cargo test
+  --locked -p slates-server --lib -- hangup::tests reap::tests` 5 of 5; the hang-up seen 0.372 ms after the kill, at the
+  watch's second poll, and the seat given back 9.4 ms after it, where the sweep took one to two seconds. Red-checked
+  once on a mutated copy, the test once after macOS's registration removed and the reaper left unwoken by a report:
+  exactly the two tests they guard failed (the dead-before-registration watch did not answer at its first poll; the
+  seat was not given back within a liveness budget), the other three passed. The Linux and Windows arms compile only
+  there; they and the integration suites are filed for main's build (run-requests.md).
+- **Owed.** A claim's pid is the client's own word (macOS and Windows), so a client that died between its claim and
+  its watch, its pid reused meanwhile, leaves the watch on another process; Windows could carry the client's creation
+  time in its claim as the daemon's header carries its own (A-447), and macOS the audit token's pid version. The SDKs'
+  heartbeat slot no longer feeds liveness and could stop being sent.
+
+Applied in the same change to: §4.7 (a status block, the failure matrix), GAPS (R3's class D, the reaper series; the
+dead-client reclaim's record), `crates/server/src/hangup.rs` (new), `crates/server/src/reap.rs`,
+`crates/server/src/daemon.rs` (the admission's watch, the reaper's start, the reap loop's tick),
+`crates/server/src/state.rs`, `crates/server/src/verbs.rs`, `crates/server/src/config.rs`,
+`crates/server/src/lib.rs`, `crates/server/src/peer.rs` (removed), `crates/rt/src/handle_wait.rs` (new),
+`crates/rt/src/iocp.rs`, `crates/rt/src/lib.rs`, `unsafe-budget.toml`.
