@@ -5,8 +5,8 @@
 //! check holds what a stream inflates to, never the compressed bytes: two engines may compress one input two ways.
 
 use super::{
-  BZIP2_BLOCK_UNIT, EncodeRefusal, Engine, Refusal, StreamRefusal, ZLIB_WINDOW, Zstd, ZstdFrame,
-  bzip2_held, compress, compress_bundle, inflate, plain, run,
+  BZIP2_BLOCK_UNIT, ENGINES, EncodeRefusal, Engine, Refusal, StreamRefusal, ZLIB_WINDOW, Zstd,
+  ZstdFrame, bound, bzip2_held, compress, compress_bundle, inflate, plain, run,
 };
 use crate::bundle2::{self, Bundle2, StreamParam};
 use crate::read::to_u64;
@@ -510,6 +510,68 @@ fn noted(note: &[u8], rest: &[u8]) -> Vec<u8> {
   out
 }
 
+/// The levels `bound` is checked at for `engine`: every level of zlib's; the ends of bzip2's, whose level only sizes its
+/// blocks, so every level writes one block alike below its smallest (100 kB); and zstd's fastest, its default and its
+/// strongest (its range is too wide to walk: libzstd's fastest is -131072).
+fn checked_levels(engine: Engine) -> Vec<i32> {
+  let levels = engine.levels();
+  match engine {
+    Engine::Zlib | Engine::Uncompressed => levels.collect(),
+    Engine::Bzip2 => vec![*levels.start(), *levels.end()],
+    Engine::Zstd => vec![*levels.start(), 3, *levels.end()],
+  }
+}
+
+/// Every engine and level at which `plain` compresses past [`bound`]: the engine, the level, the stream's length and the
+/// bound.
+fn past_the_bound(plain: &[u8]) -> Vec<(Engine, i32, usize, u64)> {
+  let mut past = Vec::new();
+  for engine in ENGINES {
+    for level in checked_levels(engine) {
+      let mut out = Vec::new();
+      compress(engine, level, plain, &mut out).unwrap();
+      let most = bound(engine, to_u64(plain.len()));
+      if to_u64(out.len()) > most {
+        past.push((engine, level, out.len(), most));
+      }
+    }
+  }
+  past
+}
+
+/// `length` bytes that make zlib's level 1 write its longest codes: each from 144 to 255, the literals its fixed codes
+/// write in nine bits (RFC 1951 §3.2.6), drawn by xorshift64* (Vigna 2016) from a fixed seed, so nothing repeats for a
+/// match to shorten.
+fn nine_bit_literals(length: usize) -> Vec<u8> {
+  let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+  let mut bytes = Vec::with_capacity(length);
+  while bytes.len() < length {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    let drawn = state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
+    bytes.extend(drawn.iter().map(|byte| 144 + byte % 112));
+  }
+  bytes.truncate(length);
+  bytes
+}
+
+/// A-650 part 1: do compress, with every engine at every level the bound is checked at, runs of bytes that zlib's level
+/// 1 writes nine bits each, at lengths about its rounding (empty, below and at a byte of codes, its short-input bytes)
+/// and past a 4 KiB and a 64 KiB run. Expect none past `bound`: zlib-rs's own, which counts those nine bits; stock
+/// zlib's, which counts stored blocks alone, is outgrown at level 1.
+#[test]
+fn the_longest_codes_stay_within_every_engines_bound() {
+  let past: Vec<(usize, (Engine, i32, usize, u64))> = [0, 1, 7, 8, 9, 64, 4_095, 4_096, 65_536]
+    .into_iter()
+    .flat_map(|length| {
+      let past = past_the_bound(&nine_bit_literals(length));
+      past.into_iter().map(move |over| (length, over))
+    })
+    .collect();
+  assert_eq!(past, Vec::new());
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
@@ -566,5 +628,15 @@ proptest! {
         }
       }
     }
+  }
+
+  /// A-650 part 1: do compress arbitrary bytes with every engine at every level the bound is checked at. Expect no
+  /// stream longer than `bound` says for the bytes' length, the room an HTTP answer charges before it compresses.
+  #[test]
+  fn arbitrary_bytes_stay_within_every_engines_bound(
+    bytes in proptest::collection::vec(any::<u8>(), 0..1024),
+  ) {
+    let past = past_the_bound(&bytes);
+    prop_assert!(past.is_empty(), "past the bound: {past:?}");
   }
 }

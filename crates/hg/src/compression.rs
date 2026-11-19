@@ -333,12 +333,18 @@ pub enum EncodeRefusal {
   },
 }
 
-/// Format: the shifts of zlib's `compressBound`, `len + (len >> 12) + (len >> 14) + (len >> 25) + 13` (zlib's
-/// `compress.c`), the most a zlib stream of `len` bytes takes at any level.
-const ZLIB_BOUND_SHIFTS: [u32; 3] = [12, 14, 25];
+/// Format: the divisor of the growth zlib-rs bounds a stream by, a byte in eight: its level 1 (`deflate_quick`, as
+/// zlib-ng's) writes every literal in fixed codes, nine bits at most for eight (zlib-rs 0.6.8 `deflate_quick_overhead`,
+/// zlib-ng's `DEFLATE_QUICK_OVERHEAD`).
+const ZLIB_QUICK_DIVISOR: u64 = 8;
 
-/// Format: the constant of zlib's `compressBound`: its header, its Adler-32 and its last block's framing.
-const ZLIB_BOUND_EXTRA: u64 = 13;
+/// Format: the bytes zlib-rs's `compress_bound` adds to every stream: a block's header, end and padding bits in whole
+/// bytes (`DEFLATE_BLOCK_OVERHEAD`, 3) and the zlib wrapper's header and Adler-32 (`ZLIB_WRAPLEN`, 6).
+const ZLIB_BOUND_EXTRA: u64 = 9;
+
+/// Format: the length below which zlib-rs's `compress_bound` adds a byte ("one extra byte for lengths less than 9");
+/// it adds one more for an empty input ("always at least one byte for any input").
+const ZLIB_SHORT_INPUT: u64 = 9;
 
 /// Format: bzip2's bound, an output "1% larger than the uncompressed data, plus six hundred extra bytes" (the bzip2
 /// manual's `BZ2_bzBuffToBuffCompress`): the divisor of that one percent.
@@ -347,19 +353,20 @@ const BZIP2_BOUND_DIVISOR: u64 = 100;
 /// Format: bzip2's bound's six hundred extra bytes (as [`BZIP2_BOUND_DIVISOR`]).
 const BZIP2_BOUND_EXTRA: u64 = 600;
 
-/// The most bytes [`compress`] writes for `length` plain bytes with `engine`, by each library's own documented bound:
-/// zlib's `compressBound`, bzip2's one percent and six hundred bytes, libzstd's `ZSTD_compressBound`, and the length
-/// itself uncompressed. A caller charges it to its admission before it compresses, so the compressed bytes are never
-/// held past the room.
+/// The most bytes [`compress`] writes for `length` plain bytes with `engine`, at any of its levels, by each library's own
+/// documented bound: zlib-rs's `compress_bound` (zlib-ng's `compressBound`), bzip2's one percent and six hundred bytes,
+/// libzstd's `ZSTD_compressBound`, and the length itself uncompressed. A caller charges it to its admission before it
+/// compresses, so the compressed bytes are never held past the room. Stock zlib's `compressBound` (`len + (len >> 12) +
+/// (len >> 14) + (len >> 25) + 13`) is no bound for the backend the workspace links: it counts stored blocks, which
+/// zlib-rs's level 1 never falls back to, so its fixed codes outgrow it on bytes that do not compress (A-650).
 pub fn bound(engine: Engine, length: u64) -> u64 {
   match engine {
     Engine::Uncompressed => length,
-    Engine::Zlib => ZLIB_BOUND_SHIFTS
-      .iter()
-      .fold(length, |total, shift| {
-        total.saturating_add(length.checked_shr(*shift).unwrap_or(0))
-      })
-      .saturating_add(ZLIB_BOUND_EXTRA),
+    Engine::Zlib => length
+      .saturating_add(length.div_ceil(ZLIB_QUICK_DIVISOR))
+      .saturating_add(ZLIB_BOUND_EXTRA)
+      .saturating_add(u64::from(length == 0))
+      .saturating_add(u64::from(length < ZLIB_SHORT_INPUT)),
     Engine::Bzip2 => length
       .saturating_add(length.div_ceil(BZIP2_BOUND_DIVISOR))
       .saturating_add(BZIP2_BOUND_EXTRA),

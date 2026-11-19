@@ -248,76 +248,101 @@ fn stranger_may(right: PolicyRight) -> PolicyRule {
 /// `GET`, `unbundle` by `POST` from a stranger who may only read, and a repository whose store this shard does not
 /// hold; then, with no rule, the stranger's `heads`. Expect `405`, `400`, `401`, `404` twice, `503`, `405`, `403` and
 /// `503`, and the owner's `heads` at `/hg/` served; then the stranger `403` and the owner's `heads` at `/hg` served.
+/// Every case is judged before any is compared, so a failing run names each that differs.
 #[test]
 fn each_step_of_hgwebs_order_refuses_with_its_status() {
-  let mut site = site(vec![stranger_may(PolicyRight::Read)]);
-  let mut strict = self::site(Vec::new());
-  let cases: [(&str, &str, &[&str], Option<Status>); 10] = [
+  let mut open = site(vec![stranger_may(PolicyRight::Read)]);
+  let mut strict = site(Vec::new());
+  let cases: [(&str, &str, &str, &[&str], Option<Status>); 12] = [
     (
+      "open",
       "PUT",
       "/hg?cmd=heads",
       &[OWNER_BEARER],
       Some(Status::METHOD_NOT_ALLOWED),
     ),
     (
+      "open",
       "GET",
       "/hg%2Fx?cmd=heads",
       &[OWNER_BEARER],
       Some(Status::BAD_REQUEST),
     ),
-    ("GET", "/hg?cmd=heads", &[], Some(Status::UNAUTHORIZED)),
     (
+      "open",
+      "GET",
+      "/hg?cmd=heads",
+      &[],
+      Some(Status::UNAUTHORIZED),
+    ),
+    (
+      "open",
       "GET",
       "/nothing?cmd=heads",
       &[OWNER_BEARER],
       Some(Status::NOT_FOUND),
     ),
     (
+      "open",
       "GET",
       "/r.git?cmd=heads",
       &[OWNER_BEARER],
       Some(Status::NOT_FOUND),
     ),
     (
+      "open",
       "GET",
       "/hg",
       &[OWNER_BEARER],
       Some(Status::SERVICE_UNAVAILABLE),
     ),
     (
+      "open",
       "GET",
       "/hg?cmd=unbundle",
       &[OWNER_BEARER],
       Some(Status::METHOD_NOT_ALLOWED),
     ),
     (
+      "open",
       "POST",
       "/hg?cmd=unbundle",
       &[STRANGER_BEARER],
       Some(Status::FORBIDDEN),
     ),
     (
+      "open",
       "GET",
       "/bare?cmd=heads",
       &[OWNER_BEARER],
       Some(Status::SERVICE_UNAVAILABLE),
     ),
-    ("GET", "/hg/?cmd=heads", &[OWNER_BEARER], None),
-  ];
-  for (method, target, fields, expected) in cases {
-    assert_eq!(
-      refused_status(&mut site, method, target, fields),
-      expected,
-      "{method} {target}"
-    );
-  }
-  assert_eq!(
+    ("open", "GET", "/hg/?cmd=heads", &[OWNER_BEARER], None),
     (
-      refused_status(&mut strict, "GET", "/hg?cmd=heads", &[STRANGER_BEARER]),
-      refused_status(&mut strict, "GET", "/hg?cmd=heads", &[OWNER_BEARER]),
+      "strict",
+      "GET",
+      "/hg?cmd=heads",
+      &[STRANGER_BEARER],
+      Some(Status::FORBIDDEN),
     ),
-    (Some(Status::FORBIDDEN), None)
-  );
+    ("strict", "GET", "/hg?cmd=heads", &[OWNER_BEARER], None),
+  ];
+  let (judged, expected): (Vec<_>, Vec<_>) = cases
+    .into_iter()
+    .map(|(which, method, target, fields, expected)| {
+      let site = if which == "strict" {
+        &mut strict
+      } else {
+        &mut open
+      };
+      let status = refused_status(site, method, target, fields);
+      (
+        (which, method, target, fields, status),
+        (which, method, target, fields, expected),
+      )
+    })
+    .unzip();
+  assert_eq!(judged, expected);
 }
 
 /// AC-HG.9, A-650 part 1: do send a wire command by `PUT`, the owner's `unbundle` by `GET`, and `heads` with no
@@ -348,6 +373,64 @@ fn refusals_name_what_the_client_may_do_instead() {
       (allow("POST"), true),
       (challenge, false)
     )
+  );
+}
+
+/// Shape: a request's room in [`requests_past_their_room_and_a_damaged_policy_are_refused`].
+const SMALL_ROOM: u64 = 256;
+/// Shape: a run of bytes past [`SMALL_ROOM`].
+const PAST_SMALL_ROOM: usize = 300;
+
+/// AC-HG.9, A-650 part 1: do send the owner's `heads`, to a site admitting each request 256 bytes, by a path past
+/// them, by a query whose fields are past them, and with an argument header past them; then the owner's `heads` of a
+/// Mercurial repository whose policy holds a rule only git reads (a damaged record). Expect `414` for the path and
+/// the query alike, `431` for the header, and `500` for the damaged policy, which is never judged without its rule.
+#[test]
+fn requests_past_their_room_and_a_damaged_policy_are_refused() {
+  let mut small = HgSite::new(
+    REALM.to_owned(),
+    SMALL_ROOM,
+    Tokens,
+    Held { rules: Vec::new() },
+    OneStore,
+  );
+  let long = "x".repeat(PAST_SMALL_ROOM);
+  let argument = format!("X-HgArg-1: pad={long}");
+  let git_rule = PolicyRule {
+    names: PolicyNames::Refs,
+    pattern: "refs/heads/*".to_owned(),
+    ..stranger_may(PolicyRight::Read)
+  };
+  let mut damaged = site(vec![git_rule]);
+  let judged = [
+    refused_status(
+      &mut small,
+      "GET",
+      &format!("/{long}?cmd=heads"),
+      &[OWNER_BEARER],
+    ),
+    refused_status(
+      &mut small,
+      "GET",
+      &format!("/hg?cmd=heads&pad={long}"),
+      &[OWNER_BEARER],
+    ),
+    refused_status(
+      &mut small,
+      "GET",
+      "/hg?cmd=heads",
+      &[OWNER_BEARER, argument.as_str()],
+    ),
+    refused_status(&mut damaged, "GET", "/hg?cmd=heads", &[OWNER_BEARER]),
+  ];
+  assert_eq!(
+    judged,
+    [
+      Some(Status::URI_TOO_LONG),
+      Some(Status::URI_TOO_LONG),
+      Some(Status::FIELDS_TOO_LARGE),
+      Some(Status::INTERNAL_SERVER_ERROR),
+    ]
   );
 }
 

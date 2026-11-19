@@ -13421,7 +13421,9 @@ signature verification).
 > 7.2's media types: a string in `application/mercurial-0.1`, an error in `application/hg-error`, a stream in
 > `application/mercurial-0.2` in an engine the client reads (an abort part uncompressed, as 7.2 sends it), else in
 > `0.1` in zlib. The engine and level are the caller's (`Compressor`), and each answer is charged at its engine's
-> documented bound before it is made. `getbundle` judges the bundle capabilities before what is missing, in 7.2's
+> documented bound before it is made, zlib's as the linked zlib-rs states it (its level 1 writes fixed codes and
+> outgrows stock zlib's `compressBound` on bytes that do not compress). `getbundle` judges the bundle capabilities
+> before what is missing, in 7.2's
 > order, so a bundle1 client is never sent a bundle2 abort. The daemon's site (`vcs_http::hg`) routes a repository's
 > URL as hgweb does, proves credentials as git's site does, judges the policy in hgweb's order (read for every
 > request; a push also `POST` and a right to submit, rewrite or delete), and names the answer's media type as the
@@ -47377,13 +47379,19 @@ the bundle capabilities first; `fixtures/serve-http` and its script, kept as cap
   at its fastest level; zlib level 0 to a `0.1` client). `httpheader` is the edge's line bound, 8000 (a client's count
   holds the line end the edge's leaves out). A principal whose credentials hold and whom the policy refuses is `403`,
   where hgweb answers `401`. hgweb's pages are `503` until piece 12; a repository whose store the shard lacks is `503`
-  until A-662, and that path goes when it lands. A body past the request's room is `413`.
+  until A-662, and that path goes when it lands. A path, or a query's fields, past the request's room is `414`, as
+  git's routes answer a target past theirs; `X-Hg` fields past it are `431`; a body past it is `413`; a policy holding a
+  rule the repository's tool cannot read (a damaged record) is `500`, never judged without the rule.
 - **Found, and fixed here, failing tests first.** A-569's `Fields::command` read a query's first `cmd`, where hgweb's
   `multidict` answers the last, which 7.2 serves (`hgweb/request.py`). A-619's `getbundle` computed what is missing
   before it judged the bundle capabilities, so a bundle1 client naming a head the view lacks was answered with a
   bundle2 abort it cannot read; 7.2 refuses bundle1 first (`wireprotov1server.getbundle`), and so does this now, over
-  SSH and HTTP alike. And a trap: `.gitattributes`' `* text=auto eol=lf` normalized the captures' CRLF heads on their
-  first commit; `crates/hg/fixtures/serve-http/** -text` keeps them as captured, as A-569's are kept.
+  SSH and HTTP alike. The room an answer is charged before it is compressed was zlib's stock `compressBound`, which
+  the linked backend outgrows: zlib-rs's level 1 (zlib-ng's `deflate_quick`) writes fixed codes, nine bits for the
+  bytes 144 to 255, and never falls back to stored blocks; `compression::bound` is now zlib-rs's own `compress_bound`, and
+  an oracle holds every engine's streams within it (research §24). And a trap: `.gitattributes`' `* text=auto
+  eol=lf` normalized the captures' CRLF heads on their first commit; `crates/hg/fixtures/serve-http/** -text` keeps
+  them as captured, as A-569's are kept.
 - **Tests.** {{RUN-AMENDMENT}}
 - **Owed.** The stores the site reads (A-662, g258), and with them the `503` path's removal; the learned response
   compression; the answers sliced within the shard's step budget (a `getbundle` is made whole in one step, bounded by

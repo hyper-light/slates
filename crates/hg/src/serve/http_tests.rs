@@ -350,6 +350,16 @@ fn requests_mercurial_refuses_are_refused_in_its_own_words() {
 /// A `getbundle` request of the cloned store from a client sending `proto` as what it reads, its bundle capabilities
 /// `caps` (a bundle2 blob, unquoted).
 fn getbundle_of(proto: Option<&[u8]>, blob: &[u8], chooser: &mut impl Compressor) -> Answered {
+  getbundle_in(proto, blob, chooser, ROOM)
+}
+
+/// [`getbundle_of`]'s request, admitted `room`.
+fn getbundle_in(
+  proto: Option<&[u8]>,
+  blob: &[u8],
+  chooser: &mut impl Compressor,
+  room: u64,
+) -> Answered {
   let mut quoted = b"HG20,bundle2=".to_vec();
   capabilities::encode_bundle2_value(blob, &mut quoted);
   let mut arguments = Vec::new();
@@ -370,8 +380,78 @@ fn getbundle_of(proto: Option<&[u8]>, blob: &[u8], chooser: &mut impl Compressor
     &request,
     HEADER_LINE,
     chooser,
-    &mut Admission::new(ROOM),
+    &mut Admission::new(room),
   )
+}
+
+/// The least room at which `served` holds, searched up to [`ROOM`]; `None` where it does not hold there. `served` must
+/// hold at every room past one it holds at, as an admission's charges do.
+fn least_room(mut served: impl FnMut(u64) -> bool) -> Option<u64> {
+  if served(0) {
+    return Some(0);
+  }
+  if !served(ROOM) {
+    return None;
+  }
+  let (mut refused, mut held) = (0_u64, ROOM);
+  while held - refused > 1 {
+    let middle = refused + (held - refused) / 2;
+    if served(middle) {
+      held = middle;
+    } else {
+      refused = middle;
+    }
+  }
+  Some(held)
+}
+
+/// AC-HG.9, A-650 part 1: do answer a clone's `getbundle` to a `0.2` client in `none` at the least room that serves it
+/// so, then in zlib, bzip2 and zstd at that room and at the request's whole room. Expect each compressing engine refused
+/// past the admission at the least room, before it compresses, since its bound (past the stream's length) is charged
+/// first; and each served with the whole room.
+#[test]
+fn a_stream_is_charged_its_engines_bound_before_it_is_compressed() {
+  let v2: &[u8] = b"0.1 0.2 comp=zstd,zlib,bzip2,none";
+  let fastest = |engine: Engine| {
+    Fixed(Compression {
+      engine,
+      level: *engine.levels().start(),
+    })
+  };
+  let least = least_room(|room| {
+    let plain = getbundle_in(
+      Some(v2),
+      CLIENT_BLOB,
+      &mut fastest(Engine::Uncompressed),
+      room,
+    );
+    plain.refused.is_none()
+  })
+  .unwrap();
+  let judged: Vec<(Engine, bool, bool)> = [Engine::Zlib, Engine::Bzip2, Engine::Zstd]
+    .into_iter()
+    .map(|engine| {
+      let short = getbundle_in(Some(v2), CLIENT_BLOB, &mut fastest(engine), least);
+      let whole = getbundle_in(Some(v2), CLIENT_BLOB, &mut fastest(engine), ROOM);
+      let past = matches!(
+        short.refused,
+        Some(Refused::Serve(super::super::Refusal::PastAdmission(_)))
+      );
+      (
+        engine,
+        past && short.media_type == MEDIA_TYPE_ERROR,
+        whole.refused.is_none(),
+      )
+    })
+    .collect();
+  assert_eq!(
+    judged,
+    vec![
+      (Engine::Zlib, true, true),
+      (Engine::Bzip2, true, true),
+      (Engine::Zstd, true, true)
+    ]
+  );
 }
 
 /// Format: the bundle2 capabilities a 7.2 client sends that a `getbundle` answer here reads.
