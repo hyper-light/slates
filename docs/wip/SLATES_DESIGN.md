@@ -3119,8 +3119,9 @@ therefore one implementation shared by both versions.
     the next drop.
     - **Amended 2026-10-10: a purge is owed durably.** The obligation is journaled in the same transaction as the drop
       that makes it (`ClientChange::PurgeOwed`, `Op::NfsPurgeOwed`). It is settled only once every owner acknowledged
-      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and each shard's reap loop sends a
-      round (`nfs::purge_owed_here`) besides a compound's own.
+      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and the shard's reaper sends a round
+      (`nfs::purge_owed_here`) besides a compound's own: at once at a start that owes purges, and a retry window after
+      any access that leaves the table owing (A-570; until then the reap loop's tick sent one once a window).
     - Before, the obligation lived only in memory. A daemon death between a client's durable clear and every owner's
       acknowledgement left its opens, locks and delegations at the owners, with no shard left knowing the client and so
       no lease to expire them (`a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it`;
@@ -4948,7 +4949,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 > task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
 > them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
 > dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536),
-> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold (A-570); NFS purges are next.
+> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold and NFS purges (A-570): the NFSv4
+> table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands the reaper a round at once
+> at a start that owes purges and a retry window after any access that leaves it owing. Base hints are next.
 
 > **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
 > named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
@@ -37356,6 +37359,18 @@ Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' 
 - **Filed for main's build.** The Linux and Windows arms (`memory_pressure.rs`'s two platform modules and
   `pressure::report_or_asked`'s Windows arm) were written on macOS and never compiled by g255.
 
+- **The NFS purge (job 2).** What a shard's NFSv4 table owes its owners (a dropped client's state, a destroyed
+  session's records, journaled since 2026-10-10) goes out at its own deadline, no longer at the tick: each access to
+  the table closes by noting whether it owes anything (`nfs::note_purges`, in `nfs_state::record_clients`), which arms
+  a round a retry window on while it does and clears the deadline once it does not; a start whose partition owes purges
+  arms one at once (`nfs::arm_purges_at_start`). The keeper hands the round to the reaper (`nfs::owe_purge_round`),
+  which awaits the owners. A client's own compound still sends its purges inline. The tick sent what was owed at its
+  looks, whatever the phase: a purge refused just before a look went again at once, one refused just after a look
+  waited a whole window, and every shard woke for it. Test: `crates/server/src/nfs.rs`
+  `a_refused_purge_goes_again_a_window_after_its_round` (a one-shard daemon past the tick's first look, its owners
+  refusing purges: a dropped client's purge refused, then sent again no sooner than a window after that round and
+  within half a window more).
+
 Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper series' line), `unsafe-budget.toml`,
 `xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
-`crates/server/src/{pressure,daemon,state,config,lib}.rs`.
+`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.

@@ -4106,8 +4106,10 @@
 > **Since A-570 (piece 5)** the pressure hold is sampled at its start and at the kernel's own memory-pressure reports
 > (macOS's dispatch source, Linux's pressure-stall trigger with its silence past a window as the stall's end, Windows'
 > memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
-> polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. Still on
-> the tick: NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
+> polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. NFSv4
+> purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
+> leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
+> re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
