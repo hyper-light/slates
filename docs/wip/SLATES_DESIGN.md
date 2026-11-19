@@ -44701,7 +44701,7 @@ mod drive`, its doc sentence), `crates/svn/src/commit/drive.rs` and `crates/svn/
   alone (the verdict refuses the same bytes at `close-edit`, so the replay cannot tell them apart); the read through a
   copy, the copy test alone (no recorded commit opens a path beneath a copy). Green (99674c480, 06:20 UTC, load 7.1):
   `cargo test --locked -p slates-svn --lib` 321 of 321 in 9.27 s, `cargo fmt -p slates-svn -- --check` clean. On the
-  tree merged with main (5d5a94bde, 06:28 UTC): 338 of 338 in 8.80 s, rustfmt clean. Clippy, `xtask check` and the doc
+  tree merged with main (c715685db, 06:34 UTC): 365 of 365 in 8.12 s, rustfmt clean. Clippy, `xtask check` and the doc
   gate are main's (the run-request queue).
 - **Owed.** `svn_repos__validate_prop`, the authorization checks (A-606), `svn_repos__validate_new_path`, authenticating
   for write before `commit`, the owner's commit step and the connection task (A-617's next part).
