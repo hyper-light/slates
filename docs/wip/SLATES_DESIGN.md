@@ -2864,16 +2864,23 @@ kernel, and its successor's journal starts empty. The successor knows where such
   write in the write log (A-63);
 - a kernel holds state older than a change only for an inode it looked up before the change, and the change's
   publication recorded that reference (A-61);
-- a logged write is in no publication, so the write-log replay notes the inodes it wrote.
+- a logged write is in no publication, so the write-log replay notes the inodes it wrote;
+- but a lookup made after the last publication is in no image, and such a kernel can hold what the successor never had
+  or holds otherwise: bytes a mutation showed before the publication the death lost, and the pages of a base file an
+  outsider wrote while no daemon ran (A-573). The successor cannot tell which inodes those are.
 
 So a restored mount's rounds open with a takeover round. First comes `FUSE_NOTIFY_INC_EPOCH`, to a kernel that offered
 FUSE 7.44 or later: every cached name is looked up again at its next use, which reaches the names no inode set can.
-Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode its owner's restored references and
-the replay name. A directory's invalidation also drops its cached listing, which kernels before Linux 7.2 keep past an
-epoch bump. The set is as large as what the kernel had looked up, so the round is sent in slices of half the shard's
-live step quantum, walked in inode order from where the last slice ended. The mount turns at once while a slice is owed
-and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44 cannot drop a
-renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
+Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode of the head, each costing the kernel
+nothing for an inode it never cached; a mount of a pinned view, whose version takes no head change, is sent its owner's
+restored references and the replay's inodes. A directory's invalidation also drops its cached listing, which kernels
+before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so the round is sent in slices of half the
+shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
+while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
+cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
+after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
+opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
+(GAPS).
 
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
@@ -10052,7 +10059,10 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind; a move waits
 > until the head it hands over carries its record, so a refused carry holds the move back until it is refused
 > `Unplaced`, as before. A clone never sealed before its owner's loss reaches its successor as an empty tree, the
-> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost).
+> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost). **A live-shipped one
+> moves with its mark too (A-565):** its new owner rebuilds it from its live log, which the move made durable at
+> exactly the head it hands over, so the rebuild is that head and is marked as a seal's is; a takeover after an
+> owner's loss still marks nothing it rebuilt from a log, which may have run past the seal its head names.
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -37110,7 +37120,7 @@ and:
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance.
   - A resize leaves the entry allowance at the size the volume was made with.
-  - Recovery counts a whiteout as a live entry (found by reading).
+  - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
 Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
@@ -37750,6 +37760,117 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
   `host.rs` and the server's `winfsp.rs`, and the drive tests
   `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
   `an_exact_drive_keeps_two_spellings_two_files` (`crates/cli/tests/winfsp_semantics.rs`).
+
+### A-573 — A takeover names every inode of the head to a mount of the head: what a kernel looked up after the last publication never outlives a death (2026-11-19, g232; UI goal 85, B10; §4.6 "A mount taken over by a restarted daemon"; A-61, A-63, A-151, A-158)
+Applied in the same change to: §4.6 (the takeover paragraph), GAPS (A-158's siblings "an effect served before its
+publication" and "an outsider's change beneath a base during a takeover's gap"), the bug record
+`docs/bugs/2026-11-19-a-takeover-left-cached-what-a-kernel-looked-up-after-the-last-publication.md`,
+`crates/vfs/src/{trie,volume,base}.rs`, `crates/bridge-core/src/{volume_bridge,lib}.rs`.
+- **What was there.** A-158's takeover round invalidated the root and every inode the mount's owner's restored
+  references and the write-log replay named, on the premise that a kernel holds state older than a change only for an
+  inode it looked up before the change, which the change's publication recorded (A-61). A lookup made after the last
+  publication is in no image, and two kinds of kernel state fell outside the premise: bytes a mutation showed before
+  the publication the death lost (a dirty read), and the pages of a base file an outsider wrote in place while no daemon
+  ran, whose names and attributes revalidate but whose pages a FUSE mount, which asks no `FUSE_AUTO_INVAL_DATA`, keeps.
+  Both stayed cached for as long as the kernel kept them.
+- **The rule, by kind.** The successor cannot tell which inodes a kernel looked up after the last publication, so a
+  mount of the head is sent every inode of the head (`Volume::visit_head_inodes`), each `FUSE_NOTIFY_INVAL_INODE`
+  costing the kernel nothing for an inode it never cached; every reference a current view takes and every inode the
+  replay writes is one of them. A mount of a pinned view keeps A-158's set: its version takes no head change, so no
+  mutation the death lost ever showed through it. A number the dead daemon issued after its last publication (another
+  path's unpublished create a listing showed, a base directory first loaded after the publication) is in no image and
+  no head: the successor refuses it (`NotFound`) and never serves it.
+- **The walk.** The inode table is a radix trie over the number's counter; `trie::visit_after` walks it in that order
+  from past any number, entering only the nodes on that number's path and the subtrees past it, so the round's slices
+  each cost what they send. The table's order is the counter's, which keeps a clone's own and its origin's inodes in one
+  order, where the numbers' full values would interleave two prefixes.
+- **Tests.** `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover` (a: a file published,
+  looked up and written after the publication, the daemon dead; the successor holds the published bytes, no restored
+  reference names the file, and the head's walk does) and
+  `a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit` (b: a base file
+  loaded and published, looked up after, written in place by an outsider while no daemon ran; the successor reads the
+  edit, and the head's walk names the file), both in `crates/vfs/src/base.rs`;
+  `a_walk_after_any_number_gives_the_inodes_past_it_in_order_and_slices_join_whole` (`trie.rs`). On the Mac Studio
+  (debug, 2026-11-19, load 2 to 11): `slates-vfs --lib` the two 2 of 2 and `trie::` 6 of 6, `slates-bridge-core --lib`
+  40 of 40; red with the old rule put back (the mount's restored references and the replay): both failed at the walk's
+  assertion, their premises holding under both rules.
+- **Owed.** The numbers issued after the last publication: a descriptor opened before the death keeps their cached
+  pages, since no walk can name them until each publication records the volume's live counter beside its reserved
+  ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
+  between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
+  kill-in-window tests) are Linux's, main's to run.
+
+### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
+
+- **What was there.** A move's new owner materializes a live-shipped volume from its live log, as a takeover's
+  successor does (`fleet::make_in_turns`), and A-503's adoption marked only a head materialized from a placed seal
+  (`verbs::finish_making`: never `from_live_log`), since a log rebuilt after an owner's loss may have run past the seal
+  its head names. So a live-shipped captured clone, moved, held no mark on its new owner, and its landing there was
+  refused by kind.
+- **The rule.** A move's rebuild from the log is the head the move hands over: its old owner froze the volume (no write,
+  no snapshot), took the head of its live tree (`verbs::head_for_move`) and reported the move only once the log was
+  durable at its head (`moves::ready_to_report`), so the log's tree is that head. The new owner learns that the
+  materialization is a move's from its adoption, which the control shard keeps until the move is reported adopted
+  (`ShardState::move_adoptions`; `fleet::MakeTaken::moved`, `verbs::TakenOver::moved`), and marks the materialized
+  snapshot when the head's identity is the carried one, as from a seal. A takeover after an owner's loss still marks
+  nothing it rebuilt from a log. Identities cannot decide that instead: the rebuild lays its archive out by the image's
+  extents (`live_ship::archive_of`), the seal by its chunker, so one tree has two identities.
+- **What a clone never sealed loses (settled for main).** A-544 states that a captured clone never sealed before its
+  owner's loss reaches its successor as an empty tree. Whether that loses an acknowledged write depends on the promise
+  the volume was made with:
+  - *Not live-shipped* (every kiln fleet workspace: kiln never turns live shipping on). A write is acknowledged once it
+    is published on its owner (D-18); across an owner's loss the design keeps only the newest placed seal, and the
+    volume's status reports the rest as its loss window: with no seal placed, its whole age (`verbs::at_risk_ns`). The
+    empty tree is inside the window the client was told of, so nothing acknowledged beyond the promise is lost.
+  - *Live-shipped* (a clone of a live origin inherits the flag). A write is acknowledged only once it is durable on `f`
+    candidates (A-200): a clone's first write publishes its whole image, inherited tree included, at its log's first
+    position and answers once that position is durable, so no write is lost. **The `Clone` verb itself is not held:** its
+    reply waits on the origin's log (`verbs::replicated_waits` takes the verb's own volume), which the clone did not
+    change, so the clone is answered while nothing of it is held anywhere else, and the status reports its window as zero.
+    At `f = 1` an owner lost before the clone's first write is durable leaves a successor with no log of it and no seal,
+    serving it empty: an acknowledged clone lost, a durability bug against the live-durability promise (goal 84). Filed as
+    its own bug, `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, with its failing test
+    parked (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `#[ignore]` until the fix).
+- **A clone seals nothing until its first snapshot (A-544's sibling, fixed here).** The home seal walk takes a head that
+  is none of the volume's own snapshots as nothing to seal (`fleet::sealable_head`): a fresh clone's head is its
+  origin's (`verbs::publish_clone_as` copies the origin's record), and recovery may reset a lost head to none
+  (`verbs::reconcile_lost`). Before, `start_seal` was refused for it and counted `fleet.seal` every period, for every
+  clone made, until its first snapshot.
+- **Tests.** `a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not` and the parked
+  `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable` (`crates/server/src/verbs.rs`);
+  `a_clone_has_nothing_to_seal_until_its_first_snapshot` (`crates/server/src/fleet.rs`). Red first on the Mac Studio
+  (2026-11-19, `cargo test --locked -p slates-server --lib`): with the move flag ignored and the old `sealable_head`,
+  both failed (the walk named the origin's head, `SnapshotId { value: 0 }` at sequence 1, where nothing was due; the
+  moved clone held no mark); with the change, 72 of 72 over the lib's `a565`, the seal test, `a544`, `carry::`,
+  `moves::`, `catalog::`, `landing::`, `fleet::` and `live_ship::` tests; the parked bug test fails as filed (`None`
+  where the clone's position 0 is due).
+- **Owed.** A takeover's rebuild of a live-shipped captured clone after its owner's loss marks nothing: a mark there
+  needs the log position its head was sealed at, so the rebuild can stop there for the mark and go on. The fleet's own
+  test of a moved live clone landing on its new owner (filed for main). The bug's fix (filed).
+
+Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267; the bug's entry), the bug record,
+`crates/server` (`verbs.rs`, `fleet.rs`, `live_ship.rs`: `owe_first_whole`, a test's live log).
+
+### A-572 — A volume's entry count and allowance hold the namespace rule at a restart, a clone's admission and a resize (2026-11-19, goal 85, g234; A-549's sweep; §4.2's namespace dimension, §4.5 whiteouts, §4.8 recovery)
+Applied in the same changes to: A-549's entry and its bug record (the siblings marked fixed); GAPS, §8c; the bug record
+`docs/bugs/2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`; and, part by part, the files named below. One
+commit a part, in order of harm.
+
+- **Part 1, a restart counted whiteouts as live entries.**
+  - **What was there.** The live count never holds a whiteout. `dir_remove` takes one off as it turns a base name into
+    a whiteout, and `DirNode::live_len` skips them. But `rebuild_entries` places each image entry that names no child
+    as `Child::Whiteout` through `dir_insert`, and `dir_place` counted every placement. So every restart counted an
+    overlay's whiteouts in its head and in a clone head's own directories, and floored its entry allowance at that
+    count.
+  - **The rule.** A placement counts as a live entry, and is admitted against the allowance, only when it names a
+    child (`Volume::dir_place`, `dir_insert`). The live path never places a whiteout (it turns a name into one in place),
+    so only a recovery's count changes. The rule sits at the one counting site, not in recovery alone, so no later
+    placement of a whiteout can count one.
+  - **Tests.** `a_restart_counts_no_whiteout_as_a_live_entry` (`crates/vfs/src/base.rs`). It builds an overlay with
+    three whiteouts and a file and a directory of its own. Its count before a restart, after it, and the recount of its
+    image (the names its directories carry that name a child) must all be equal.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (3 counted live, 6 after the
+    restart); green with the rule; `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored.
 
 ### A-553 — The Subversion index: every node-revision with the identities FSFS gives it, computed from each revision's changed-path rows and held to a naive filesystem (2026-11-19, g292 for UI goal 91; §4.17.4 item 2 and piece 4; A-500, A-531, A-542)
 Applied in the same change to: §4.17.4 (a status block; item 2's copy-identity rules made FSFS's, every revision's
