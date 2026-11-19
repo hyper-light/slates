@@ -13456,8 +13456,9 @@ signature verification).
 > 7.2's, then `push-plain`, `push-phase` and `push-bookmark` landed and answered byte for byte as 7.2 answered them,
 > `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
 > branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
-> histories. Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index
-> and the served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+> histories (macOS arm64, Mac Studio: slates-hg's push tests 36 of 36, the server's 7 of 7; other platforms owed).
+> Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index and the
+> served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -48001,8 +48002,14 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   piece 7. (6) A new line is made from a line its head descends from, else one holding its first parents' first held
   changeset, else a line of that changeset's branch: the work replaces exactly what differs, so the base costs only the
   work's size.
-- **Evidence.** Pending the Mac Studio's runs (offline 2026-11-19 from the start of this part): `cargo test -p
-  slates-hg --lib` and `cargo test -p slates-server --lib hg_push`, red first against stubs.
+- **Evidence** (macOS arm64, Mac Studio, kiln r47, 2026-11-19, debug, on the merged tree that lands, 5aa274153):
+  `cargo test --locked -p slates-hg --lib -- push::` 36 of 36 (the classifier's 11, the index fork's 2, parts 1 and
+  2's 23); `cargo test --locked -p slates-server --lib hg_push -- --test-threads=4` 7 of 7, its build warning-free;
+  `cargo fmt -p slates-hg -p slates-server -- --check` clean. The first build (r5) refused the server test's use of
+  slates-hg's crate-private hex helpers (now the server's `hex_of` and slates-hg's public `pushkey::hex_node`), and the
+  test build warned that `Prepared`'s admission and hook inputs were never read (removed: part 4 brings them with the
+  tests that observe them). No integration target reaches the landing until A-650's site serves `unbundle`. The reds
+  by mutation, clippy and the other platforms are main's.
 - **Owed.** Part 4: `vcs_policy::admit` before the append, with the right each change needs, and the hook driver at
   `pretxnchangegroup` and `changegroup`. The server's home for each Mercurial repository's index and content store and
   the served view over them (with A-650's site); the bundle read in slices; the pushkey compatibility hooks; markers

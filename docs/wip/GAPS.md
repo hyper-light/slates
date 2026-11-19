@@ -756,7 +756,8 @@
 > `advanceboundary`, its race checks handed to A-635's append as positions, a refusal for anything moved answered as
 > 7.2's race; the names `branch:<label>:<number>` and `bookmark:<label>:`, prefix-free; what the repository holds read
 > from its index, and its revisions kept in a fork of the index; held to stock 7.2's pushes on the fixtures' repository
-> rebuilt from its texts (every node 7.2's; replies byte for byte), pending the Mac Studio's runs.
+> rebuilt from its texts (every node 7.2's; replies byte for byte): slates-hg's push tests 36 of 36 and the server's 7
+> of 7 on macOS arm64 (Mac Studio, kiln r47, 2026-11-19); the other platforms owed to main.
 > Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
