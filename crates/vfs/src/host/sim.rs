@@ -184,6 +184,9 @@ pub enum SimVerb {
   Rmdir,
   /// `open_to_chmod` and `open_dir_to_chmod`, by the object's path: a metadata entry's open the host refuses (A-539).
   OpenToChmod,
+  /// `symlink`, by the link's path: a link the host refuses to make (A-568: a Windows account without the link
+  /// privilege).
+  Symlink,
 }
 
 /// A barrier the simulated host took (A-132): running it changes nothing — the host applies its durability when the
@@ -1536,6 +1539,7 @@ impl LandFs for SimHost {
       return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let path = format!("/{}", parts.join("/"));
+    self.fault(SimVerb::Symlink, &path)?;
     SimHost::symlink(self, &path, target);
     if let Some(n) = self.node_mut(&parts) {
       n.windows = windows;
