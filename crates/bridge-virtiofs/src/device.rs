@@ -373,6 +373,17 @@ enum DaxServed {
   },
 }
 
+/// What the device's `dispatch` did with a chain's request: wrote a reply of this many bytes, or (Unix) took a
+/// SETUPMAPPING and holds the chain while its window's backing is filled and its pieces mapped. The held case exists
+/// only where maps do, so no other platform names a variant it lacks (0754e4853 named `DaxMapHeld` on Windows).
+enum Dispatched {
+  /// A reply of this many bytes was written.
+  Written(usize),
+  /// A SETUPMAPPING is held for its window's fill and map (§4.6).
+  #[cfg(unix)]
+  MapHeld,
+}
+
 /// What `serve_chain` did: a reply of this many bytes was scattered, or the chain is held unanswered.
 enum ChainOutcome {
   /// A reply was scattered into the guest's buffers; the used element's length.
@@ -1353,7 +1364,7 @@ impl Device {
     chain: &DescriptorChain,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
-  ) -> Option<usize> {
+  ) -> Dispatched {
     #[cfg(unix)]
     {
       match serve_dax(
@@ -1364,13 +1375,13 @@ impl Device {
         &mut self.backed,
         &mut self.reply,
       ) {
-        DaxServed::NotHandled => Some(self.writeback.serve(
+        DaxServed::NotHandled => Dispatched::Written(self.writeback.serve(
           &self.request,
           bridge,
           cx,
           &mut self.reply,
         )),
-        DaxServed::Replied(n) => Some(n),
+        DaxServed::Replied(n) => Dispatched::Written(n),
         DaxServed::MapHeld {
           unique,
           window,
@@ -1387,7 +1398,7 @@ impl Device {
             mapped: Vec::new(),
             refused: false,
           });
-          None
+          Dispatched::MapHeld
         }
       }
     }
@@ -1395,7 +1406,7 @@ impl Device {
     {
       // Only a held map names its queue and chain, and maps are Unix's (§4.6).
       let _held_on = (queue, chain);
-      Some(
+      Dispatched::Written(
         self
           .writeback
           .serve(&self.request, bridge, cx, &mut self.reply),
@@ -1480,10 +1491,11 @@ impl Device {
     let mut written = if room_short {
       0
     } else {
-      let Some(written) = self.dispatch(queue, chain, bridge, cx) else {
-        return Ok(ChainOutcome::DaxMapHeld);
-      };
-      written
+      match self.dispatch(queue, chain, bridge, cx) {
+        Dispatched::Written(written) => written,
+        #[cfg(unix)]
+        Dispatched::MapHeld => return Ok(ChainOutcome::DaxMapHeld),
+      }
     };
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's
     // fsync or close fails rather than claim its stores durable (A-163's rule; a RELEASE's answer the kernel ignores,

@@ -27,7 +27,9 @@ const WRITE_BITS: u32 = 0o222;
 /// ("The file handle must have the GENERIC_WRITE access right"), and NTFS refuses it to a read-only file (MS-FSA
 /// 2.1.5.1.2.1).
 const WRITE_DATA: u32 = 0x0000_0002;
-/// Format: `FILE_APPEND_DATA` (winnt.h): the other right MS-FSA 2.1.5.1.2.1 refuses a read-only file.
+/// Format: `FILE_APPEND_DATA` (winnt.h): the other right MS-FSA 2.1.5.1.2.1 refuses a read-only file. Only the tests
+/// read it, to show neither right is asked of one: the rule asks it nowhere, which is the point.
+#[cfg(test)]
 const APPEND_DATA: u32 = 0x0000_0004;
 /// Format: `FILE_READ_ATTRIBUTES` (winnt.h): what a file's fingerprint and its attribute word are read with.
 const READ_ATTRIBUTES: u32 = 0x0000_0080;
