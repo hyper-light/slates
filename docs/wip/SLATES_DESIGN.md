@@ -37349,3 +37349,16 @@ the link-making token, the module's docs; `src/chmod_tests.rs`; `tests/os.rs`), 
   Windows tests take the writer as their probe: the link landed, or its entry failed alone by
   `ERROR_PRIVILEGE_NOT_HELD` with the rest written and nothing left at its name, the branch printed; A-451's test is
   split into its setup and two assertions.
+- **Tests, red first** (the Mac Studio, kiln, 2026-11-19, debug). Red (run r259, 02:31 UTC, load 8.4): at the
+  tests-first commit (8e122983b) `slates-land --lib -- a_link_the_host_refuses a_privilege_the_process_lacks` 2 of 2
+  failed: the Windows writer's rule read `ERROR_PRIVILEGE_NOT_HELD` as `Unavailable(Win32(1314))` where
+  `Unprivileged(Win32(1314))` was wanted, and the landing ended at the link, so the file beside it was never written
+  (`None` where `Written` was wanted). Green (run r288, 02:35 to 02:38 UTC, load 41.2 to 31.8) at the change
+  (121cc896c): `slates-land --lib` 50 passed (1 ignored, the manifest vectors' writer), `slates-vfs --lib -- host::
+  base` 14, `slates-server --lib -- landing:: error::` 16; `cargo fmt --check` clean. r259's own green half is not
+  counted: both trees were cloned into one target directory before the red build, and cargo, which hashes a workspace
+  member by its relative path, judged the second tree fresh and ran the red binary (its panics named the red file's
+  lines); r288 built a tree cloned after.
+- **Owed** (GAPS): on Linux a link on a file system that holds none (`symlink(2)`'s `EPERM`, FAT) still ends a landing.
+  Filed for main: the Windows land suites (`--test os`: the two link tests, the writer's open under the token), the
+  xwin check, and clippy (A-451's test was 15 of 10 cognitive complexity on Windows).
