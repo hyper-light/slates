@@ -275,6 +275,21 @@
 > slates-http-edge --lib` 31 of 31 on the Mac Studio, red first (29 of 31 on stubs). Owed (part 2): the daemon's
 > listener and tasks with each phase's wait learned and the bounds derived from the shard's budget; git's site (routes,
 > authentication to a principal, the policy's decision, the services); the live `git clone` over HTTPS (main's).
+> **A-625 part 2 (2026-11-19, g299; the edge on the daemon's runtime and git's site):** `crates/server` (`vcs_http`)
+> serves the engine on the runtime's TCP: a listener task whose connections are detached child tasks, cancelled and
+> joined with it; seats derived from the shard's client seats (`clients_per_shard`) and each request one client region's
+> room, the listener not accepting at the bound (the kernel's backlog the same bound); each phase's wait learned with
+> `LearnedWait`, the handshake, idleness, a head and the drain whole and a body's and a reply's silences one at a time,
+> no bound before a phase's first completed wait, only a connection whose credentials proved a principal teaching.
+> git's site: `http-backend`'s route, `401` with the connection's challenges, `404`, the policy's `403`
+> (`vcs_policy::reaches`), `503` while a service has not landed (both today). `slates-git` gives its reply fields as
+> data. `cargo test -p slates-server --lib vcs_` 46 of 46 and `-p slates-git --lib http` 18 of 18 on the Mac Studio, red
+> first on stubs (20 and 2 failing). Owed: the daemon starting an edge (address, identity, an authenticator over
+> §4.13's keys, the repositories' lookup on their partitions); upload-pack (A-615, A-640) and receive-pack's commit
+> (A-620 part 2) behind `GitServices`; serving across shards at A-645's scale (a connection moved to its repository's
+> owner shard once its head names it, or a listener on each shard); a bearer credential's expiry handed with its
+> principal for LFS's actions (A-629 part 2); Mercurial's and Subversion's sites; the MCP edge onto this engine; the
+> live `git clone` over HTTPS (main's, once upload-pack serves).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -589,8 +604,9 @@
 > Studio, red-checked six ways (see A-613); its second part's first slice, `get-dir` and `get-locations`, the two stock
 > sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
 > the caller's room, red-checked six ways, the fixtures recorded again for every command still owed; its third slice
-> (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways. Owed from it: `log` with merged revisions,
-> `get-location-segments`, `get-file-revs`, `get-deleted-rev`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways; its fourth slice (g297),
+> `get-location-segments`, red-checked five ways. Owed from it: `log` with merged revisions, `get-file-revs`,
+> `get-deleted-rev`; `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the

@@ -12356,6 +12356,27 @@ engine: the verdict, rebase, position mapping, the register).
 > the connections and the request room derived from the shard's budget, and git's site (routes, authentication to a
 > principal, the policy's decision, the services).
 >
+> **Status (2026-11-19, A-625 part 2: the edge on the daemon's runtime, and git's site).** `crates/server` (`vcs_http`)
+> serves the engine on the runtime's TCP. The listener is a task whose connections are its child tasks: each is detached
+> so it gives its slot back as it ends, and is cancelled and joined when the listener ends, so none outlives it. The
+> bounds come from the shard's budget: as many connections at once as the shard seats clients (`clients_per_shard`,
+> AC-2.6), each request the bytes of one client region, so together they hold at most the client share of the shard's
+> reserve. At the bound the listener stops accepting until a connection ends, and the kernel's backlog is the same
+> bound: over HTTPS a refusal could be answered only after a handshake, which costs the task and buffers the bound
+> limits. Each phase's wait on a client is learned with `LearnedWait` (RFC 6298, Karn's rule, the back-off). The
+> handshake, idleness, a head and the drain are waited for whole, so a client trickling bytes is held to the phase's
+> learned length; a body's and a reply's silences are waited for one at a time, since their length is the push's or the
+> clone's size. A phase has no bound until one of its waits has completed, and only a connection whose credentials
+> proved a principal teaches the bounds: its waits before the proof are folded in at the proof, each phase's longest,
+> and a stranger's cut backs nothing off. git's site routes as `http-backend` routes (A-595), then answers `401` with the
+> challenges the connection accepts, `404` for no git repository of that name, `403` when the repository's policy lets
+> the principal reach it for none of the service's rights (`vcs_policy::reaches`, A-597, A-622), and `503` while the
+> service's server half has not landed, which today is both (upload-pack, A-615; receive-pack's commit, A-620 part 2).
+> `slates-git` gives a smart reply's and a refused route's fields as data and writes its replies from them. Owed: the
+> daemon starting an edge (its address, the operator's identity, an authenticator over §4.13's keys, the repositories'
+> lookup on their partitions), the services behind the seam, Mercurial's and Subversion's sites, the MCP edge onto this
+> engine, and the live `git clone` over HTTPS (main's).
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -12712,7 +12733,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Cache shares (fragments, kept compressed objects, commit rows, index tables) | shares of the shard's memory budget (§4.2) that equalize each cache's marginal misses saved per byte, from miss-ratio curves sampled online | the shard's budget | equal shares until the first curves exist (no literal: an equal split of a measured budget) |
 | Push bytes in flight and pushes per shard | the shard's memory budget over the measured inflate and hash rate | the shard's budget, typed refusal | the first push's own size |
 | Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
-| Reaping a stalled client | silence past the tail of the gaps seen for that phase of the exchange, with the estimate's own error added (A-363's form) | the shard's connection budget | the round trip measured at connect |
+| Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal | the shard's connection seats: a stalled client holds one seat | none: until a phase's first completed wait, its waits end only when the client leaves, as a hook's first run is bounded by its client alone (§4.17.1) |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges (§4.17.1's rule, A-581: the git store's index is `slates-vcs`'s, A-614) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, the largest due `j`); a table is one window of the content plane and the tail seals once its rows no longer fit one | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
 | SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
@@ -13519,9 +13540,11 @@ and export by landing).
 > resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Its third slice (2026-11-19, g297):
 > `list`, `svn_repos_list`'s walk streamed a slice at a time (each slice bounded by the bytes it writes and the entries
 > it visits), its patterns matched by APR's `apr_fnmatch` after Subversion's fold, exact over ASCII names; `svn ls -v
-> -R` replayed whole. Owed: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`;
-> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
-> (A-606).
+> -R` replayed whole. Its fourth slice (2026-11-19, g297): `get-location-segments`, `svn_repos_node_location_segments`'
+> loop a turn a step (the closest copy or the node's origin, each segment cropped to the range, the gap to the copy's
+> source), `serve.c`'s range refusals after `done`. Owed: `log` with merged revisions, `get-file-revs`,
+> `get-deleted-rev`; the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
+> authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -42509,8 +42532,22 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   reverse, names not folded, the kind `none` when not asked, `exclude` walked, dates never read, directories kept at
   `files`, recursion at every depth: each failed named tests; the eighth, an empty pattern list walked, answers the
   same bytes and failed once the test of its one slice was added).
-- **Owed** (the next slices): `log` with merged revisions, `get-location-segments`, `get-file-revs`,
-  `get-deleted-rev`, each replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
+- **Part 2, its fourth slice** (2026-11-19, g297): `get-location-segments` (`reads/segments.rs`). The parameters
+  `c(?r)(?r)(?r)` (path, peg, start, end); after the authentication request a missing or negative peg or start is the
+  youngest and a missing or negative end 0; an end younger than the start and a start younger than the peg are refused
+  after `done` (160006, `serve.c`'s own words), and a peg past the youngest ("No such revision N"). The walk is
+  `svn_repos_node_location_segments`' loop: a turn takes the closest copy of the path in the current revision
+  (`svn_repos__prev_location`, the index's youngest copy root as `get-locations` takes it), its segment from the copy's
+  revision, or from the node's origin (the revision its node identity was born in, `svn_fs_node_origin_rev`), to the
+  current revision; sends it where it meets the range, cropped; sends the gap down to the copy's source likewise, its
+  path absent; and moves to the source. A segment's path has no leading separator (the root's is empty). One turn is
+  one step of a `Stream`; `segment_turn` is shared with `log`'s history as mergeinfo. Tests (the Mac Studio, `cargo
+  test -p slates-svn --lib`, 2026-11-19): 331 of 331, rustfmt's layout taken; the session (16 commands: copies,
+  a replacement, gaps, the root, a cropped range, both range refusals, an absent path, a peg past the youngest, a
+  negative peg) replayed whole; the parameters and the streaming. Red-checked five ways (no gaps, no cropping, the
+  origin ignored, the two refusals swapped, no `done` before a range refusal): each failed the session's replay.
+- **Owed** (the next slices): `log` with merged revisions, `get-file-revs`, `get-deleted-rev`, each replayed against
+  the transcripts already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
   when the session could authenticate.
@@ -44085,6 +44122,72 @@ Applied in the same change to:
   `svnserve`'s "broken symlink" (recorded); no core dumps; the server's calls at commit, lock, unlock and
   revision-property change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ. Main's:
   clippy, `xtask` and the lint matrix over the two modules.
+
+### A-625 part 2 — the HTTP edge on the daemon's runtime: the listener and its connection tasks, each phase's wait learned, the bounds derived from the shard's budget, and git's site (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1, "Access" and "Pieces (git)" piece 8; after A-625 part 1, A-595, A-597, A-622)
+Applied in the same change to:
+- §4.17.2's status and its tunables table ("Reaping a stalled client": what a wait is per phase, whose waits teach, and no
+  first value before a measurement, where the row had named the round trip measured at connect); GAPS (the §4.17 entry);
+- `crates/server` (`vcs_http`, new: the listener, `waits`, `git`, their tests; `vcs_policy::reaches`; its manifest
+  depends on `slates-http`, `slates-http-edge` and `slates-git`);
+- `crates/git` (`http::reply_fields`, `refusal_parts`, `no_cache_fields`: the fields as data, `reply_head` and
+  `refusal_reply` written from them);
+- the workspace manifest (`slates-git`'s entry) and lock.
+- **The listener.** `vcs_http::serve` takes a listener and the edge's state kept on its shard (`EdgeState`: the bounds,
+  the identity, the seats, every phase's learned waits, the counts). It waits for a free seat, accepts, makes the
+  connection's engine (TLS over the operator's identity, or cleartext, which a listener off loopback refuses:
+  `CleartextOffLoopback`, RFC 7617 §4 and RFC 6750 §5.3), and spawns the connection as a detached child task. The
+  runtime cancels and joins a task's children when it ends, so ending the listener ends every connection with it; a
+  connection's seat is a guard given back however its task ends (a cancellation, a refused spawn).
+- **Bounds, derived.** An HTTP connection is a client of its shard, as the MCP edge counts one: the edge serves
+  `clients_per_shard` connections at once, each request admitted one client region's bytes (`RegionGeometry::
+  total_bytes`), so the connections' requests hold at most the client share of the reserve the seats were derived from;
+  a connection reads one TLS record whole at a time (RFC 8446 §5.2) beside it. At the bound the listener does not
+  accept: the alternative, accepting to answer `503`, needs a handshake on an HTTPS edge (a task and buffers past the
+  bound) and loses the answer to a reset when the client's bytes go unread (A-183). The kernel's listen backlog is the
+  same bound, and the listener's waits for a seat are counted.
+- **Waits** (`vcs_http::waits`). A phase whose bytes the request's own room bounds is waited for whole: the handshake
+  (acceptance to its end), idleness (the end of an exchange to the next request's first byte), a head (its first byte to
+  its decision) and the drain (the half-close to the client's close). A body's and a reply's silences, whose total is a
+  push's or a clone's size, are waited for one read or write at a time. Each phase learns through `LearnedWait` and has
+  no bound before its first completed wait, as a hook's first run is bounded by its client alone (§4.17.1). Only a
+  connection whose credentials proved a principal teaches: its waits before the proof are kept as each phase's longest
+  and folded in at the proof, and a stranger's cut backs nothing off, as only a bearer holder's arrival teaches the MCP
+  edge (A-523). An end the client caused (its close mid-wait) teaches nothing (Karn's rule). The back-off has no ceiling
+  of the edge's own (RFC 6298 §2.5 permits one and asks for none). So a client that holds a connection before any of
+  its phase's waits has completed holds one seat until it leaves, and the seats bound how many such clients there are.
+- **One connection's loop.** The engine's `Next` is done step by step: its bytes written and read within the phase's
+  wait, a whole head decided by the site (whose answer says whether the credentials proved a principal), each body run
+  handed to the service and its end, each reply run passed on, the half-close and the drain of a staged close; the task
+  yields after each body run, each reply run and each drained read, so a large push or clone never holds the shard.
+  A staged refusal is counted as it is decided, before the client can read the connection's end.
+- **git's site** (`vcs_http::git`). The route first, as `http-backend` refuses it whoever asks; then the credentials
+  (none, another scheme, Basic in cleartext or one that proves no principal: `401` with the connection's challenges; a
+  repeated or malformed `Authorization`: `400`); then the repository by its exact name (`404` for none, or another
+  tool's); then the policy's gate (`403`: no rule lets the principal reach it for the service's rights, read for
+  upload-pack, submit, rewrite or delete for receive-pack, its advertisement too); then the service (`503` while its
+  server half has not landed: `Unserved` today). A served advertisement's body is the `# service=` prelude for v0 and v1,
+  then the service's bytes. The authenticator (a credential to a principal) and the repositories' lookup are traits the
+  daemon's piece implements.
+- **The gate** (`vcs_policy::reaches`): the owner always; another principal when some rule allows it one of the rights
+  asked on some name; a policy its tool cannot read refused `Unreadable`. Which refs the principal then sees or changes
+  is each ref's verdict, the service's (`admit` for a push).
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_` and `-p slates-git --lib http`, Mac Studio, debug,
+  2026-11-19, kiln): red first at abf86570b, the 20 new server tests and 2 new git tests failing on stubs; green at
+  ff4b5012d, 46 of 46 and 18 of 18, `cargo fmt --check` clean. Over real loopback sockets on a one-shard runtime: a
+  kept connection answered twice with exactly the samples the rules give (idleness 2, heads 2, reply writes 2, nothing
+  else); one seat holding a second client off until the first closes; a proven connection cut at its learned idle bound
+  (about a second: the first idleness's tail plus the liveness window); a refused body drained after a half-close, the
+  client reading a clean end; HTTPS through a rustls client, its handshake one sample at the proof; the listener's
+  cancellation ending its connection and freeing every seat. Pure: each phase unbounded before its first wait, the
+  back-off, the proof's fold, a whole phase's deadline fixed at its start against a silence's from each wait; git's site
+  in its order with each status and field; the gate.
+- **Owed.** The daemon starting an edge (its listen address, the operator's certificate and key, an authenticator over
+  §4.13's principals and keys, a repositories' lookup that reaches each repository's partition); the services behind
+  `GitServices` (A-615's and A-640's upload-pack, A-620 part 2's commit); serving across shards at A-645's scale (one
+  shard's seats bound this edge: a connection moves to its repository's owner shard once its head names the repository,
+  as the NFS export moves a mount's connection, or each shard listens); the authenticator handing a bearer credential's
+  expiry with its principal, which LFS's actions carry (A-629 part 2); Mercurial's (§4.17.3) and Subversion's (§4.17.4)
+  sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run, once upload-pack serves).
 
 ### A-641 part 1 — a push's bundle read as 7.2's handlers read it, its race checks judged in 7.2's words and order, and its reply written as 7.2's server writes it (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 1, 4 and 7 and piece 5; A-514, A-545, A-569, A-619; the landing follows A-642)
 
