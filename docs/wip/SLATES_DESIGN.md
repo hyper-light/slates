@@ -13812,9 +13812,12 @@ copy and commits the result as any commit. The server never merges file contents
 
 *9. Hooks* (§4.17.1's hook rule; A-623). The server's nine hook points as stock `svnserve` 1.15 runs them, and nothing
 of Subversion's client side: slates offers the server alone, and a hook that reads its transaction runs the stock
-`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). Each hook runs through §4.17.1's
-driver over a read-only attachment of the work or the revision, and gets `hooks.c`'s arguments, standard input and
-environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
+`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). REPOS names a read-only
+FSFS-layout view of the repository, derived from the index (A-645's derived data), so that stock `svnlook` reads the
+transaction and the revisions there, as git's hooks get a read-only bare repository (git piece 10; main's decision,
+2026-11-19; owed after A-647's derived-data mechanism). Each hook runs through §4.17.1's driver, configured in the
+repository's policy at one of the nine points the record names (A-648), and gets `hooks.c`'s arguments, standard input
+and environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
 - start-commit: the repository's directory (REPOS, its configured directory), the user, the client's capabilities
   joined by `:`, the transaction.
 - pre-commit: REPOS and the transaction. On standard input, when the commit presented lock tokens, `LOCK-TOKENS:`, a
@@ -13831,8 +13834,11 @@ environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates
 
 Every argument is a C string that ends at its first NUL. A hook's environment is its own hooks-env section, else the
 default section, else nothing, and never the server's; a section named twice is one, and a section with no variables is
-none. Its directory is `/` and a hook with no input of its own reads the null device, as under `svnserve -d`; standard
-input is a pipe, never Subversion's temporary file (R1).
+none. The sections are the repository policy's (A-648), set by its owner with the rules and the hooks: in place of the
+file `svnserve.conf`'s `hooks-env` names, which a repository with no disk has not. Its directory is `/` and a hook with
+no input of its own reads the null device, as under `svnserve -d`; standard input is a pipe, never Subversion's
+temporary file (R1). pre-lock's standard output, read up to its first NUL, is the token the lock is made with, judged as
+a client's token is; empty, the server makes the token.
 
 What the client is told is `svnserve`'s own words, byte for byte (`check_hook_result`, `fs-wrap.c`, `serve.c`). A
 refusing pre-hook is `E165001` "Commit blocked by pre-commit hook (exit code 2)" (start-commit and pre-commit "Commit",
@@ -13904,6 +13910,22 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > trailing newline, recorded); a dangling link told apart (`svnserve`'s "Failed to run '…' hook; broken symlink",
 > recorded); no core dumps (`apr_exit_why_e` 6); the server's calls at commit, lock, unlock and revision-property
 > change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ.
+>
+> **Status (2026-11-19, A-648: the record's points, the hooks-env and the driver's gaps).** The repository record names
+> Subversion's nine points (`slates_db`'s and the protocol's `HookPointName`, tags 8 to 13 appended, both wire orders
+> published) and holds a Subversion repository's hooks-env in its policy (`RepositoryPolicy::hooks_env` and
+> `SetRepositoryPolicy`'s, appended): the guard refuses a section no hook's environment can carry (unnamed, a NUL, a
+> variable named by nothing or holding `=` or a NUL, a value holding a NUL) and any section in a git or Mercurial
+> repository (`PolicyHooksEnvMalformed`, `DatabaseRefusal` 10, by index), and charges its sections' bytes as it charges
+> rules and hooks. The driver runs a Subversion hook in `/` (`HookPoint::directory`), hands pre-lock's standard output
+> back (`Ended::standard_output`: a second pipe, read as the words are, to the run's cap) as the lock's token
+> (`svn_lock_token`: up to the first NUL, the server's own when empty, none past the cap), and a Subversion hook's
+> environment is the record's (`SvnHooksEnv::of`; the record's point is the runner's by `HookPoint::of`). On the Mac
+> Studio: `slates-db` and `slates-ipc` lib whole, both wire orders, and `slates-server` lib 597 of 598, the one failure
+> (a `deadlines` test) failing alike on main; red eleven ways.
+> Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
+> revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
+> a dangling link told apart; no core dumps; the Windows driver.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -44056,3 +44078,49 @@ Applied in the same change to:
   `svnserve`'s "broken symlink" (recorded); no core dumps; the server's calls at commit, lock, unlock and
   revision-property change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ. Main's:
   clippy, `xtask` and the lint matrix over the two modules.
+
+### A-648 — Subversion's hook points in the record and the driver's gaps: the six other points, a repository's hooks-env, hooks run in /, pre-lock's output as the token (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-623 and A-622)
+Applied in the same change to:
+- §4.17.4 item 9 (REPOS a read-only FSFS-layout view, main's decision; the hooks-env the policy's; pre-lock's output
+  the token) and a status;
+- GAPS (the §4.17 entry);
+- `crates/db` (`catalog.rs`: `HookPointName`'s six appended points, `HooksEnvSection` and `HooksEnvVariable`, new, and
+  `RepositoryPolicy::hooks_env`, appended; `error.rs`: `PolicyHooksEnvMalformed`; `repository/policy.rs`: the guard and
+  the charge; `repository.rs`'s tests; `tests/wire_order.txt`, the six tags published);
+- `crates/ipc` (`protocol.rs`: the same points, types and field, `SetRepositoryPolicy::hooks_env` appended,
+  `DatabaseRefusal::PolicyHooksEnvMalformed`, tag 10; `tests/wire_order.txt`);
+- `crates/server` (`repository.rs`: the verb's hooks-env and points; `verbs.rs`; `error.rs`; `vcs_policy.rs`'s test
+  record; `vcs_hooks.rs`: `HookPoint::directory` and `HookPoint::of`, `SvnHooksEnv::of`, `svn_lock_token`;
+  `hook_driver.rs`: the directory, pre-lock's output, `Ended`).
+
+- **The record.** `HookPointName` names Subversion's nine points, the six A-623 added appended as tags 8 to 13 in the
+  database's enum and the protocol's, each published by its wire order's file. A Subversion repository's policy holds
+  its hooks-env, set with its rules and hooks by `SetRepositoryPolicy`: sections, each named for a hook or `default`,
+  of variables, each a name and bytes, in place of the file `svnserve.conf`'s `hooks-env` names, which a repository
+  with no disk has not. A section is held as the file's would be read (A-623's `SvnHooksEnv`: one named twice is one,
+  one with no variables is none), and its bytes are charged to the partition's merge budget as rules and hooks are.
+- **The guard.** It refuses, by section index, a section in a git or Mercurial repository (their hooks inherit the
+  server's environment), one named by nothing or holding a NUL, and one with a variable no hook's environment can carry:
+  a name empty or holding `=` or a NUL, a value holding a NUL. Typed on the wire as `PolicyHooksEnvMalformed`.
+- **The driver.** A Subversion hook runs in `/`, as `svnserve -d` runs it (`HookPoint::directory`; git's and
+  Mercurial's still run in their view's root). pre-lock's standard output is a second pipe, read as the words are, to
+  the run's cap, and handed back with the outcome (`Ended::standard_output`); `svn_lock_token` reads it as `svnserve`
+  does, a C string up to its first NUL, the server's own token when that is empty, and none when the cap cut it before
+  any NUL. A Subversion hook's environment is built from the record (`SvnHooksEnv::of`), and a record's point is the
+  runner's by `HookPoint::of`.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19, a fresh clone of 135d358c0; `cargo fmt` clean over the
+  three crates): `cargo test --locked -p slates-db --lib` 140 of 140; `-p slates-ipc --lib` 74 of 74, two ignored;
+  `-p slates-db --test wire_order` and `-p slates-ipc --test wire_order` 2 of 2 each, the appended tags published by
+  hand and held by them; `-p slates-server --lib` 597 of 598. The failure,
+  `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` (`deadlines.rs`
+  830, the capture never let go within its window), is not this change's: it fails 5 of 5 alone here and 3 of 3 on a
+  clean clone of main at 3239c88. Red eleven ways, each guard broken in a copy failing the tests that hold it and
+  nothing else: the hooks-env unchecked, `=` allowed in a name, a section held by any tool (each the guard's test and
+  the verb's), the sections uncharged (the charge's test), pre-lock taken for git's (the nine points' test and the
+  snapshot's), two appended tags swapped (`wire_order`), a Subversion hook run in its view's root, pre-lock's output
+  sent to the null device, its token read past a NUL, the record's sections dropped, and pre-lock's point read as
+  post-lock's (each its own test); the files put back, 49 of 49 again.
+- **Owed.** The read-only FSFS-layout view at REPOS for stock `svnlook` (A-645's derived data, after A-647, queued by
+  main); the server's calls at commit, lock, unlock and revision-property change, refusing in Subversion's words a lock
+  whose token the hook wrote past the cap; a dangling link told apart; no core dumps; the Windows driver. Main's:
+  clippy, `xtask` and the lint matrix over the change.

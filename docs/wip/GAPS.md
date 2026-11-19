@@ -241,6 +241,16 @@
 > deadline, client), its exit read without reaping so the group's kill stays its own, its child always reaped. Server
 > lib tests 42 of 42 on the Mac Studio with the test binary re-invoked as the hook, red three ways. Owed: the Windows
 > driver (a job object), the Linux launcher's namespace (§4.6), the push pieces' calls, the hook times' table.
+> **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
+> (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
+> hooks-env in its policy (refused by section, `DatabaseRefusal` 10, when no hook's environment can carry it or the
+> repository is not Subversion's; charged as rules and hooks are); the driver runs a Subversion hook in `/`, hands
+> pre-lock's standard output back as the lock's token (`svn_lock_token`), and builds the environment from the record.
+> On the Mac Studio: db lib 140 of 140, ipc lib 74 of 74, both `wire_order` tests, server lib 597 of 598 (the
+> failure a `deadlines` test that fails alike on main 3239c88: run request); red eleven ways. Owed: the read-only
+> FSFS-layout view at REPOS for stock `svnlook` (after A-647, queued by main); the
+> server's calls; a dangling link told apart; no core dumps; the Windows driver. Main's: clippy, `xtask` and the lint
+> matrix over the change.
 > **A-623 (2026-11-19, g229; §4.17.4 item 9, Subversion's hook points):** `vcs_hooks` holds Subversion's nine points
 > with each hook's arguments, standard input and environment as stock `svnserve` 1.15 hands them, and `svn_told`,
 > `svnserve`'s own words for every outcome; slates ships no `svnlook` (Ada's scope: a hook runs the stock one). Held to
