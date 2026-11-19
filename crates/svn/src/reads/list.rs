@@ -194,13 +194,15 @@ fn patterns_of(items: &[Value<'_>]) -> Option<Vec<Vec<u8>>> {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `list ( path [ rev ] depth ? ( field ... ) ? ( pattern ... ) )` (`serve.c` `list`): the authentication request,
-  /// the revision opened, then a [`Stream`] of the walk.
+  /// `list ( path [ rev ] depth ? ( field ... ) ? ( pattern ... ) )` (`serve.c` `list`): the read access checked
+  /// (`must_have_access`), the revision opened, then a [`Stream`] of the walk.
   pub(super) fn list(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some(request) = ListRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if !self.must_read(&request.path)? {
+      return Ok(Outcome::Answered);
+    }
     match self.at_or_youngest(request.revision) {
       Ok(revision) => Ok(Outcome::Streaming(Stream::list(ListStream::new(
         request, revision,
@@ -352,8 +354,9 @@ impl ListStream {
     )
   }
 
-  /// `do_list`'s next entry: its dirent when it matches, then its own entries at depth `infinity`; the deepest
-  /// directory left when its entries are done, and the walk's end when the last is.
+  /// `do_list`'s next entry: passed over, its own entries too, when the session may not read it; else its dirent when
+  /// it matches, then its own entries at depth `infinity`. The deepest directory is left when its entries are done,
+  /// and the walk ends when the last is.
   fn visit<R: Repository + ?Sized>(
     &self,
     mut levels: Vec<Level>,
@@ -366,6 +369,9 @@ impl ListStream {
         Ok(Walk::Levels(levels))
       };
     };
+    if !reads.readable(&path) {
+      return Ok(Walk::Levels(levels));
+    }
     if entry.matches {
       let node = reads
         .node(&path, self.revision)?

@@ -59,6 +59,11 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   audit [--since N] [--json]
   enroll [--account UID] [--json]                  enroll a consumer; its capability is shown once
   revoke CONSUMER [--json]                         revoke a consumer's enrollment
+  credential key LINE [--principal PRINCIPAL] [--expires SECONDS] [--json]
+            enroll an SSH public key (its .pub line) for git over SSH; PRINCIPAL is you unless given
+  credential token [--principal PRINCIPAL] [--expires SECONDS] [--json]
+            mint a token for git over HTTPS (Basic's password or a bearer token); shown once
+  credential revoke ID [--json]                    revoke a credential by its id (a key's SHA256:... or hex)
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
@@ -499,6 +504,29 @@ pub(crate) enum Verb {
     /// The consumer.
     consumer: u64,
   },
+  /// Enroll an SSH public key for a principal (`credential key LINE`, A-625 part 3): the human surface's verb, proven
+  /// under the anchor's issuer secret (§4.13); the key's id is its OpenSSH fingerprint.
+  CredentialKey {
+    /// The key's `.pub` line, as `ssh-keygen` writes it.
+    line: String,
+    /// The principal it proves, or the caller's own account when none is given.
+    principal: Option<SharePrincipal>,
+    /// How many seconds from now it proves the principal; for good when none is given.
+    expires_s: Option<u64>,
+  },
+  /// Mint an HTTP token for a principal and enroll it by its hash (`credential token`, A-625 part 3): the human
+  /// surface's verb; the token is shown once.
+  CredentialToken {
+    /// The principal it proves, or the caller's own account when none is given.
+    principal: Option<SharePrincipal>,
+    /// How many seconds from now it proves the principal; for good when none is given.
+    expires_s: Option<u64>,
+  },
+  /// Revoke a version-control credential by its id (`credential revoke ID`, A-625 part 3): the human surface's verb.
+  CredentialRevoke {
+    /// The credential's id.
+    id: [u8; 32],
+  },
   /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
   Share {
     /// The volume.
@@ -737,6 +765,8 @@ const VALUES: &[&str] = &[
   "--tag",
   "--dax-window",
   "--executable",
+  "--principal",
+  "--expires",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -1378,6 +1408,82 @@ fn share_principal(text: &str) -> Result<SharePrincipal, ParseError> {
   }
 }
 
+/// A credential's id as a human names it (A-625 part 3): an SSH key's fingerprint as `ssh-keygen -l` prints it
+/// (`SHA256:` and the hash in base64 without padding), or 64 hexadecimal characters as `credential` prints a token's.
+fn credential_id(text: &str) -> Result<[u8; MANIFEST_BYTES], ParseError> {
+  let bad = || ParseError::BadValue {
+    what: "ID",
+    reason: format!("{text} (SHA256:... as ssh-keygen -l prints it, or 64 hexadecimal characters)"),
+  };
+  let Some(encoded) = text.strip_prefix("SHA256:") else {
+    return manifest_hash(text).map_err(|_| bad());
+  };
+  let mut padded = encoded.to_owned();
+  while !padded.len().is_multiple_of(BASE64_GROUP) {
+    padded.push('=');
+  }
+  let bytes = slates_server::signed_work::base64_decode(&padded).map_err(|_| bad())?;
+  <[u8; MANIFEST_BYTES]>::try_from(bytes.as_slice()).map_err(|_| bad())
+}
+
+/// Format: the characters of one base64 group (RFC 4648 §4), to which an unpadded fingerprint is padded.
+const BASE64_GROUP: usize = 4;
+
+/// The flags a credential's enrollment takes: `--principal PRINCIPAL` and `--expires SECONDS`.
+fn credential_flags(taken: &Taken) -> Result<(Option<SharePrincipal>, Option<u64>), ParseError> {
+  taken.only(&Spec {
+    values: &["--principal", "--expires"],
+    switches: &[],
+  })?;
+  let principal = taken
+    .value("--principal")
+    .map(share_principal)
+    .transpose()?;
+  let expires_s = taken.value("--expires").map(number).transpose()?;
+  Ok((principal, expires_s))
+}
+
+/// The verbs of the version-control credentials (A-625 part 3): `credential key`, `credential token`, `credential
+/// revoke`.
+fn parse_credential(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["credential", "key", line] => {
+      let (principal, expires_s) = credential_flags(taken)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialKey {
+          line: (*line).to_owned(),
+          principal,
+          expires_s,
+        },
+      )))
+    }
+    ["credential", "token"] => {
+      let (principal, expires_s) = credential_flags(taken)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialToken {
+          principal,
+          expires_s,
+        },
+      )))
+    }
+    ["credential", "revoke", id] => {
+      taken.only(&NONE)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialRevoke {
+          id: credential_id(id)?,
+        },
+      )))
+    }
+    ["credential", ..] => Err(ParseError::Missing(
+      "credential key LINE | credential token | credential revoke ID",
+    )),
+    _ => Ok(None),
+  }
+}
+
 /// The verbs of the enrollment surface (§4.13): `enroll`, `revoke`, `share`.
 fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
   match words {
@@ -1628,6 +1734,9 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     Some("pmem") => return parse_pmem(&taken, arguments),
     _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
     _ => {}
+  }
+  if let Some(command) = parse_credential(&taken, &words)? {
+    return Ok(command);
   }
   if let Some(command) = parse_enrollment(&taken, &words)? {
     return Ok(command);
@@ -2843,6 +2952,63 @@ mod tests {
       })
     ));
     assert_eq!(parse(&args("revoke")), Err(ParseError::Missing("CONSUMER")));
+  }
+
+  /// A-625 part 3. Do: parse `credential key` with a whole `.pub` line as its one word and an expiry; `credential token`
+  /// for a consumer; `credential revoke` by the fingerprint `ssh-keygen -l` printed for slates-ssh's RSA fixture, then by
+  /// the same id in hex; a fingerprint cut short; a bare `credential`. Expect: each verb with what was given (the key's
+  /// line whole, no principal, the expiry; the consumer; one id both ways); `BadValue` naming ID; `Missing` naming the
+  /// three forms.
+  #[test]
+  fn the_grammar_parses_the_credential_verbs() {
+    let line =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me@host";
+    let words: Vec<String> = ["credential", "key", line, "--expires", "3600"]
+      .iter()
+      .map(|word| (*word).to_owned())
+      .collect();
+    let Command::Client(request) = parse(&words).unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::CredentialKey {
+        line: line.to_owned(),
+        principal: None,
+        expires_s: Some(3600),
+      }
+    );
+    assert_eq!(
+      client_verb("credential token --principal consumer:7 --json"),
+      Verb::CredentialToken {
+        principal: Some(SharePrincipal::Consumer {
+          account: None,
+          consumer: 7,
+          host: None,
+        }),
+        expires_s: None,
+      }
+    );
+    let Verb::CredentialRevoke { id } =
+      client_verb("credential revoke SHA256:Wymbjagh5qjwNh2R9f44I8A1HSB7TrTf6LdcnH26LQ8")
+    else {
+      panic!("revoke");
+    };
+    let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+      client_verb(&format!("credential revoke {hex}")),
+      Verb::CredentialRevoke { id }
+    );
+    assert!(matches!(
+      parse(&args("credential revoke SHA256:Wymbjagh5qjw")),
+      Err(ParseError::BadValue { what: "ID", .. })
+    ));
+    assert_eq!(
+      parse(&args("credential")),
+      Err(ParseError::Missing(
+        "credential key LINE | credential token | credential revoke ID"
+      ))
+    );
   }
 
   /// A-237: a share names another host's account by the anchor that host's `slates status` prints (`@ANCHOR`), and
