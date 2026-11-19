@@ -191,9 +191,9 @@ fn give_back(store: &mut ContentStore, contents: &[ContentId]) -> Result<(), Ind
 }
 
 /// Gives back the holds `rows` take of their contents, going on past a refusal and answering the first.
-fn release_rows<'a>(
+fn release_rows(
   store: &mut ContentStore,
-  rows: impl Iterator<Item = RowRef<'a>>,
+  rows: impl Iterator<Item = RowRef<'_>>,
 ) -> Result<(), IndexRefused> {
   let mut first = Ok(());
   for row in rows {
@@ -205,9 +205,9 @@ fn release_rows<'a>(
 }
 
 /// Takes the holds `rows` take of their contents.
-fn hold_rows<'a>(
+fn hold_rows(
   store: &mut ContentStore,
-  rows: impl Iterator<Item = RowRef<'a>>,
+  rows: impl Iterator<Item = RowRef<'_>>,
 ) -> Result<(), IndexRefused> {
   for row in rows {
     for content in row.contents() {
@@ -227,9 +227,7 @@ fn release_table(store: &mut ContentStore, layer: &Layer) -> Result<(), IndexRef
 }
 
 /// The tail's rows, in key order.
-fn tail_rows<'a>(
-  tail: &'a BTreeMap<Box<[u8]>, Box<[u8]>>,
-) -> impl Iterator<Item = RowRef<'a>> + 'a {
+fn tail_rows(tail: &BTreeMap<Box<[u8]>, Box<[u8]>>) -> impl Iterator<Item = RowRef<'_>> {
   tail.iter().filter_map(|(key, body)| RowRef::new(key, body))
 }
 

@@ -125,7 +125,7 @@ fn the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositori
   git_push.commit(&mut git_repository, &mut store).unwrap();
   hg_push.commit(&mut hg_repository, &mut store).unwrap();
   let content = ContentId::of(bytes);
-  let len = bytes.len() as u64;
+  let len = u64::try_from(bytes.len()).unwrap();
   let git_row = git_repository.get(&store, &git_id).unwrap();
   assert_eq!(object_row(&git_row), Some((3, len, content)));
   let hg_row = hg_repository.get(&store, &hg_id).unwrap();
@@ -425,7 +425,7 @@ fn an_arrival_an_insert_or_a_fold_past_the_budget_changes_nothing() {
   ));
   assert!(push.is_empty() && store.is_empty());
   let mut index = Index::new();
-  let one_row = (1 + 1 + TAIL_SLOT_BYTES) as u64;
+  let one_row = u64::try_from(1 + 1 + TAIL_SLOT_BYTES).unwrap();
   store.set_budget(one_row);
   assert!(matches!(
     index.insert(&mut store, row(b"ab", &[], b"")),
@@ -618,7 +618,7 @@ struct Real {
 fn object_body(kind: u8, bytes: &[u8]) -> Vec<u8> {
   encode_body(
     &[ContentId::of(bytes)],
-    &object_payload(kind, bytes.len() as u64),
+    &object_payload(kind, u64::try_from(bytes.len()).unwrap()),
   )
   .unwrap()
 }
@@ -687,11 +687,12 @@ fn commit(real: &mut Real, model: &mut Model, push: usize, index: usize) {
   let identical = rows
     .iter()
     .filter(|(id, _)| model_index.contains_key(id))
-    .count() as u64;
+    .count();
+  let identical = u64::try_from(identical).unwrap();
   assert_eq!(
     result,
     Ok(Batch {
-      new: rows.len() as u64 - identical,
+      new: u64::try_from(rows.len()).unwrap() - identical,
       identical
     })
   );
@@ -734,6 +735,44 @@ fn fork(real: &mut Real, model: &mut Model, index: usize) {
   }
 }
 
+fn get(real: &Real, model: &Model, index: usize, key: u8) {
+  if let (Some(real_index), Some(model_index)) = (&real.indexes[index], &model.indexes[index]) {
+    let found = real_index
+      .get(&real.store, &[key])
+      .map(|row| row.body().to_vec());
+    assert_eq!(found.as_ref(), model_index.get([key].as_slice()));
+  }
+}
+
+fn fold(real: &mut Real, index: usize, merge: bool) {
+  if let Some(real_index) = real.indexes[index].as_mut() {
+    if merge {
+      real_index.compact(&mut real.store).unwrap();
+    } else {
+      real_index.fold(&mut real.store).unwrap();
+    }
+  }
+}
+
+fn release(real: &mut Real, model: &mut Model, index: usize) {
+  if let Some(released) = real.indexes[index].take() {
+    released.release(&mut real.store).unwrap();
+    model.indexes[index] = None;
+  }
+}
+
+fn recreate(real: &mut Real, model: &mut Model, index: usize) {
+  if real.indexes[index].is_none() {
+    real.indexes[index] = Some(Index::new());
+    model.indexes[index] = Some(BTreeMap::new());
+  }
+}
+
+fn abandon(real: &mut Real, model: &mut Model, push: usize) {
+  real.pushes[push].abandon(&mut real.store).unwrap();
+  model.pushes[push].clear();
+}
+
 fn apply(real: &mut Real, model: &mut Model, step: &Step) {
   match *step {
     Step::Admit {
@@ -744,47 +783,19 @@ fn apply(real: &mut Real, model: &mut Model, step: &Step) {
       lie,
     } => admit(real, model, push, tool, blob, kind, lie),
     Step::Commit { push, index } => commit(real, model, push, index),
-    Step::Abandon { push } => {
-      real.pushes[push].abandon(&mut real.store).unwrap();
-      model.pushes[push].clear();
-    }
+    Step::Abandon { push } => abandon(real, model, push),
     Step::Insert {
       index,
       key,
       blob,
       payload,
     } => insert(real, model, index, key, blob, payload),
-    Step::Get { index, key } => {
-      if let (Some(real_index), Some(model_index)) = (&real.indexes[index], &model.indexes[index]) {
-        let found = real_index
-          .get(&real.store, &[key])
-          .map(|row| row.body().to_vec());
-        assert_eq!(found.as_ref(), model_index.get([key].as_slice()));
-      }
-    }
-    Step::Fold { index } => {
-      if let Some(real_index) = real.indexes[index].as_mut() {
-        real_index.fold(&mut real.store).unwrap();
-      }
-    }
-    Step::Compact { index } => {
-      if let Some(real_index) = real.indexes[index].as_mut() {
-        real_index.compact(&mut real.store).unwrap();
-      }
-    }
+    Step::Get { index, key } => get(real, model, index, key),
+    Step::Fold { index } => fold(real, index, false),
+    Step::Compact { index } => fold(real, index, true),
     Step::Fork { index } => fork(real, model, index),
-    Step::Release { index } => {
-      if let Some(released) = real.indexes[index].take() {
-        released.release(&mut real.store).unwrap();
-        model.indexes[index] = None;
-      }
-    }
-    Step::Recreate { index } => {
-      if real.indexes[index].is_none() {
-        real.indexes[index] = Some(Index::new());
-        model.indexes[index] = Some(BTreeMap::new());
-      }
-    }
+    Step::Release { index } => release(real, model, index),
+    Step::Recreate { index } => recreate(real, model, index),
   }
 }
 
@@ -797,7 +808,7 @@ fn check(real: &Real, model: &Model) {
     if let (Some(real_index), Some(model_index)) = (real_index, model_index) {
       let rows: BTreeMap<Vec<u8>, Vec<u8>> = read(real_index, &real.store).into_iter().collect();
       assert_eq!(&rows, model_index);
-      assert_eq!(real_index.rows(), model_index.len() as u64);
+      assert_eq!(real_index.rows(), u64::try_from(model_index.len()).unwrap());
       for (key, body) in model_index {
         assert_eq!(
           real_index

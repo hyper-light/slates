@@ -1,8 +1,8 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record and greens
-> made at another green's version are built (2026-11-18, A-497, D-28, A-515; 2026-11-19, A-534; UI goal 91; owners g261
-> git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
+> made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
+> A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).** §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
 > of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
@@ -45,6 +45,19 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
+> BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget;
+> tables of sorted rows that are content, each row naming the contents it holds, opened from any bytes with every fault
+> refused by kind; each repository's index a tail over tables, a fork holding each table once more (no table written,
+> no row copied), a compaction merging only the layers its own index holds, due by a learned rent-or-buy rule over the
+> probes it would save (one rule for every tool, which §4.17.3's and §4.17.4's fold rows now read); and a push's
+> quarantine, every object checked by its tool's naming before a byte is stored, committed as one checked step or
+> abandoned with nothing left. An oracle holds the whole store to plain maps over generated histories, and ten mutations
+> each turned tests red (`cargo test -p slates-vcs --lib`, 19 of 19, Mac Studio; see A-581). Owed: the greens' file
+> blocks held in this store (piece 4); a compaction, a release and an abandon sliced under the shard's budget; the store
+> and each index on the owner shard, timed by its clock, with each tool's naming (each server's object pieces; the
+> Subversion index's rows move into these tables there); content-defined chunking of the large-file class (D-6); pruning
+> what no branch reaches; wire-form caches; content placed by identity in a fleet.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
