@@ -11866,8 +11866,9 @@ engine: the verdict, rebase, position mapping, the register).
 
 #### 4.17.2 The git server
 
-> **Status (2026-11-18, A-497's second part).** Designed; nothing is built. It builds on §4.17.1 and redefines none of
-> its terms. Reading notes: `research/vcs-servers.md` §5.
+> **Status (2026-11-18, A-497's second part).** Designed; piece 1 built 2026-11-19 (A-582, its first part): pkt-lines
+> and side-band-64k as pure codecs in `crates/git`, with golden vectors stock git 2.50.1 wrote on its own wire. It builds
+> on §4.17.1 and redefines none of its terms. Reading notes: `research/vcs-servers.md` §5.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -38820,6 +38821,78 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
   -p slates-base --lib -- s3` 58 of 58 (the driver's three: an idle driver woken once by a miss and running its fetch, a
   fetch the store holds open landing only once answered, a driver ending at its host's drop), `-p slates-server --lib --
   base_wait` 4 of 4, `cargo fmt --check` clean.
+
+### A-582 — git's wire codecs, part 1: pkt-lines and side-band-64k as pure codecs, with golden vectors from stock git's own wire (2026-11-19, UI goal 91 via g251b; §4.17.2 "The wire" and piece 1; D-28)
+
+- **What.** A new crate, `crates/git` (`slates-git`), laid out as `slates-hg` is (A-514): pure functions over bytes, an
+  `Admission` charged before anything is allocated, an `Out` that can measure an encode before making it, and typed
+  refusals naming where they stopped. Part 1 holds the framing every later piece speaks.
+  - **pkt-lines** (`pktline`; gitprotocol-common "pkt-line Format", gitprotocol-v2 "Packet-Line Framing"; git's
+    `pkt-line.c`). `read` reads one packet from the bytes a stream has delivered, `None` until its last byte arrives, so
+    a server reads a request as it comes; `decode` checks a whole stream and counts its packets, charges the list to
+    the admission, then builds it. A length past 65520 (git's `LARGE_PACKET_MAX`) is `TooLong`; `0003` is
+    `ShorterThanHeader`; a digit outside `0-9a-fA-F` is `NotHex` at its own place, even before the four digits have all
+    arrived; `0004` is a data packet with no data, as git reads it. `write` writes lower-case digits, as git's
+    `set_packet_header` does.
+  - **side-band-64k** (`sideband`; gitprotocol-capabilities "side-band, side-band-64k", gitprotocol-v2 "packfile
+    section" and `sideband-all`; git's `sideband.c`). `demux` reads a data packet's band, refusing a packet with no band
+    byte and any byte but 1, 2 and 3 (git's "bad band"); `write` splits bytes into packets of at most 65515 after the
+    band byte, none for no bytes, and `written_len` says what that takes beforehand.
+- **Golden vectors** (`crates/git/fixtures/make-fixtures.sh`, run on the Mac Studio 2026-11-19 with git 2.50.1 (Apple
+  Git-155), through kiln; the files copied byte for byte, each checked against the SHA-256 printed there; a second run
+  made the same bytes but for the progress answer, whose text git throttles by time). One repository (three commits, a
+  subdirectory, an annotated tag, a second branch); protocol v2's advertisement, plain and with `sideband-all` and
+  `packfile-uris` allowed; an `ls-refs` request and answer; and `fetch` requests, written byte for byte by the script,
+  with `git upload-pack --stateless-rpc`'s answers: a clone, a have without `done` (acknowledgments ending `ready`),
+  `deepen 1` (shallow-info), `want-ref` (wanted-refs), progress left on (band 2), and `packfile-uris` under
+  `sideband-all`. Stock git sends URIs only in a response multiplexed throughout: the first capture asked without
+  `sideband-all` and got the whole pack, as git's own t5702 implies by setting `GIT_TEST_SIDEBAND_ALL`. Packs with offset
+  and with reference deltas, their `.idx` from `git index-pack` and `git verify-pack -v`'s listing of each are captured
+  for the parts that follow.
+- **Tests.** The document's own examples; every stream stock git wrote or read decoded and encoded back to its bytes;
+  every cut of every stream whole or `Truncated`, and a reader waiting exactly there; every bit flip of every byte
+  refused by kind or read as its length says; lengths at and past the caps; the admission refused one packet short and
+  spent exactly; a reader fed a byte at a time finding each packet as its last byte arrives; measures equal to writes;
+  each fetch answer's packfile section demultiplexed to one pack (`PACK`, version 2) and its progress; every data
+  packet of the `sideband-all` answer on band 1; bands written and read back in as few packets as the cap allows; and a
+  property test of arbitrary packets up to the cap.
+- **Checks.** On the Mac Studio (debug, 2026-11-19, load 21 to 27): `cargo test -p slates-git --lib` 14 of 14 and
+  `cargo fmt --check` clean. Red with a length past 65520 read as a packet (`fff1` came back not yet whole, where
+  `TooLong { at: 7, len: 65521 }` was due) and with any band byte read as band 1 (`Ok((Data, [120]))` for byte 0).
+- **Next** (GAPS; A-582's parts, in order): protocol v2's messages; pack entry headers with `OBJ_OFS_DELTA` and
+  `OBJ_REF_DELTA` and the delta instructions with an applier; idx v2; the pack stream with a deflate engine chosen by
+  measurement (§4.17.2 piece 3).
+
+Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
+`.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
+
+### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
+Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
+`crates/server/tests/fleet.rs` (the test and its helpers beside A-583's; `assert_the_agents_changes_landed_alone` now
+takes the target it expects).
+- **What was owed.** A-503 moved a captured clone once in its lib tests, by hand. No fleet had moved one and moved it
+  on, so nothing showed the second owner holds the capture's record, nor that an old owner never serves a stale copy.
+- **The test.** `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`. Three
+  daemons at `f = 1`. Setup on a:
+  - The clone is made over A-583's captured tree, and the agent's three changes are made in it.
+  - It is snapshotted and shared with b's and c's accounts.
+  - a's catalog record's access list is read.
+  - The clone moves to b once a counts `fleet.carry.recorded`.
+
+  After each move (a to b, then b to c, through the owner's client):
+  - The new owner serves the tree whole without `/removed`. Its catalog record carries the access list a held, and its
+    status names the volume.
+  - It takes a write that changes a file's bytes (`/changed` on b, `/made` on c) and serves it.
+  - Every previous owner is asked for that file at once and again once the old owner has let its copy go. Each answer
+    must be the new bytes (forwarded) or a refusal by kind, never the bytes its own copy held.
+  - The counters must show the move: the old owner's `fleet.move.begun` and `fleet.move.released`, the new owner's
+    `fleet.move.adopted` once and `fleet.move.adoption_reported`.
+
+  Last, c lands the clone into the captured tree with an outsider's edit to `/kept`. Its plan must be the agent's
+  changes since the capture alone, and the landing must write `/changed` as b left it and `/made` as c did, the
+  outsider's file kept.
+- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
+  helper.
 
 ### A-555, third piece — A FUSE request that meets a pending base is kept off the device and dispatched again when its fetch lands (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base", §4.6 "Linux (own /dev/fuse driver)"; A-555; Linux-only, written and filed for main's build)
 Applied in the same change to: `crates/bridge-fuse` (`channel`: `dispatch_kept` beside `dispatch_ready`, both through

@@ -25,6 +25,16 @@
 > piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (g292, A-542's second half) grafts
 > on these maps and needs a per-prefix appearance record under the one history rule. The integration suites, clippy
 > and `xtask` over the change are main's (run requests).
+> **A-582 (2026-11-19, g251b; part 1):** git's piece 1 is built: `crates/git` (`slates-git`), pkt-lines (data, flush,
+> delimiter, response end; a reader that waits for a packet's last byte; a whole stream's decode charged to an
+> `Admission` first) and side-band-64k (bands 1 to 3, `sideband-all`), pure codecs with every length checked against
+> git's 65520 and the bytes left, golden vectors stock git 2.50.1 wrote and read on its own wire
+> (`crates/git/fixtures/make-fixtures.sh`), and every cut, every bit flip and the lengths past the caps refused by kind
+> (`cargo test -p slates-git --lib`, 14 of 14). Owed in A-582's next parts, in order: protocol v2's messages (the
+> capability advertisement, `ls-refs`, `fetch` and its sections: acknowledgments, shallow-info, wanted-refs,
+> packfile-uris, packfile); a pack entry's header with `OBJ_OFS_DELTA` and `OBJ_REF_DELTA` and the delta instructions
+> with an applier; idx v2; and the pack stream, which needs a deflate engine chosen by measurement (§4.17.2 piece 3).
+> The captured packs and indexes for those parts are in the fixtures already.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
@@ -1172,8 +1182,9 @@
 >   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
 >   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
 >   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
->   their first compile and run owed to main; owed of it, A-503's own move test (a clone moved b to c after a to b),
->   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
+>   their first compile and run owed to main, as is A-503's own move test (A-589:
+>   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
+>   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
 >   (3) a kind

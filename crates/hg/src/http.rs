@@ -397,10 +397,8 @@ impl<'b> Fields<'b> {
     let mut earliest = vec![false; total];
     let mut previous: Option<&[u8]> = None;
     for (name, at) in sorted {
-      if previous != Some(name) {
-        if let Some(mark) = earliest.get_mut(at) {
-          *mark = true;
-        }
+      if let Some(mark) = earliest.get_mut(at) {
+        *mark = previous != Some(name);
       }
       previous = Some(name);
     }
