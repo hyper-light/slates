@@ -1104,6 +1104,14 @@
 >   a busy unmount of a path where nothing is mounted is refused with the program's status, on each OS. By use, with a
 >   kernel mount: `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, run with `SLATES_TEST_MOUNT=1`,
 >   filed for main's run);
+> - **an unmount with no program and no `PATH`, fixed 2026-11-18 (A-507, `CONTRACT` = 42; g264's kiln runner, whose
+>   `PATH` lacked `/sbin`):** `mount::unmount` and `unmount_busy` ran `umount`/`umount -f` by name, so that runner could
+>   take no mount down. macOS and the BSDs now call `unmount(2)` (`MNT_FORCE` for the busy one), and every Unix host
+>   judges an unmount by the kernel's mount table: nothing mounted at the path is `NotMounted` before any call,
+>   `EBUSY` is `MountFault::Busy`, and the table still listing the mount after a call that said done is
+>   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
+>   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
+>   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
@@ -3981,7 +3989,14 @@
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
 >   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own; and macOS's `MOUNT_CALL_DEADLINE` (part 3). The reconnect since A-468
+>   borrows the reply deadline for its own. macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
+>   part): the mount's MOUNT call for the root handle (`slates_bridge_nfs::client::exchange`) bounded each of its
+>   connect, send and receive by one liveness budget, so a live daemon that answered later failed the mount; it now
+>   waits while its connection lives, as the hard NFS mount it makes does (Apple's `mount_nfs(8)`), a daemon gone
+>   ending it at once (`connect(2)`'s `ECONNREFUSED`; the close `recv(2)` reads as 0, since a process's exit frees its
+>   descriptors, `close(2)`) and a stuck one ended by its watchdog or anchor
+>   (`a_mount_call_answered_past_the_old_deadline_is_served`, `a_mount_call_whose_daemon_goes_unanswered_ends_at_once`,
+>   `a_mount_call_to_a_port_nothing_listens_on_is_refused_at_once`). The reconnect since A-468
 >   (2026-11-18, g251b; C-b's second part): a client whose daemon was gone reconnected for the reconnect budget
 >   (`Deadlines::reconnect_ns`, the recovery budget and a liveness window, two seconds), and a claim under a live anchor
 >   waited at most that budget, so a restart slower than it failed the anchor's clients and a daemon nothing would

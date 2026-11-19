@@ -3007,6 +3007,12 @@ tests and the abstract states must agree.
 service for the export's root handle over its own loopback socket and passes it to `mount(2)` in
 Apple's XDR arguments (`NFS_MATTR_FH`). The mount's source is `slates:/<name>`. The capability
 therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every local user can read.
+- **The MOUNT call waits while its connection lives** (A-517), as the hard mount it makes waits (Apple's
+  `mount_nfs(8)`: an unresponsive server's calls "will hang uninterruptibly until the server comes back", and `intr`
+  lets a termination signal end them). No daemon on the port refuses the connect (`connect(2)`, `ECONNREFUSED`); a
+  daemon that goes closes its sockets with its process (`close(2)`), which the read meets as the peer's close
+  (`recv(2)`); a stuck one is ended by its watchdog or its anchor (A-232). Until A-517 each of the call's connect, send
+  and receive was bounded by one liveness budget, so a live daemon that answered later failed the mount.
 - **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself. The daemon ends
   the attachment of a host mount of that volume only once the kernel's mount table
   (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point. Since A-493 it watches the table
@@ -9061,6 +9067,13 @@ it builds against the contract and adds to it rather than around it.
 > not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, A-369), by the driver's own rule over the
 > value it reads at every mount. Until then such a machine was told it could mount, and each mount was refused
 > `MountManagerNotAllowed` after the host had made the volume it was for (kiln's bare-metal starts).
+> **`CONTRACT` = 42 (A-507):** an unmount runs no program on macOS and the BSDs and is judged by the kernel's mount
+> table. `mount::unmount` and `mount::unmount_busy` call `unmount(2)` there (`MNT_FORCE` for the busy one); until then
+> they ran `umount` found on the `PATH`, so a kiln runner whose `PATH` lacked `/sbin` could not unmount, and kiln kept
+> the volume (g264). A path the table lists no mount at is `MountFault::NotMounted` before any call; `EBUSY` is
+> `MountFault::Busy`; a call that said done while the table still lists the mount is `MountFault::StillMounted`; a
+> table that could not be read is `MountFault::MountTable`. Linux keeps `fusermount3 -u`, the setuid helper its FUSE
+> mount is made through (`umount2(2)` needs `CAP_SYS_ADMIN`), under the same table judgment.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -34523,6 +34536,69 @@ dead-client reclaim's record), `crates/server/src/hangup.rs` (new), `crates/serv
 `crates/server/src/state.rs`, `crates/server/src/verbs.rs`, `crates/server/src/config.rs`,
 `crates/server/src/lib.rs`, `crates/server/src/peer.rs` (removed), `crates/rt/src/handle_wait.rs` (new),
 `crates/rt/src/iocp.rs`, `crates/rt/src/lib.rs`, `unsafe-budget.toml`.
+
+### A-517 — The macOS mount's MOUNT call waits while its connection lives, as the hard mount it makes does: no fixed deadline (2026-11-18, UI goal 86 via g251b; R3's class C, C-b's third part; §4.6 "Mounting without exposing the capability"; A-34, A-232)
+
+- **What was there.** `slates mount` on macOS asks the daemon's MOUNT service for the export's root handle over its own
+  loopback socket (`slates_bridge_nfs::client::fetch_root_handle`, A-34), and each of that call's connect, send and
+  receive was bounded by `MOUNT_CALL_DEADLINE` (`crates/api/src/mount.rs`): one liveness budget, a second. A daemon
+  alive and slower to answer (a busy machine, a long start) failed the mount.
+- **The evidence (Apple's documentation, the man pages macOS 26.4 ships).** The mount this call precedes is hard
+  (`NFS_MFLAG_SOFT` cleared, `NFS_MFLAG_INTR` set), and `mount_nfs(8)` states that rule: "If the server becomes
+  unresponsive while an NFS file system is mounted, any new or outstanding file operations on that file system will
+  hang uninterruptibly until the server comes back (or that NFS file system is forcibly unmounted)"; `intr` makes
+  "file system calls that are delayed due to an unresponsive server ... fail with EINTR when a termination signal is
+  posted for the process". The call's own socket ends at once wherever no daemon can answer: `connect(2)` fails
+  `ECONNREFUSED` when "the target is not listening for connections"; a daemon's exit frees its descriptors
+  (`close(2)`: "When a process exits, all associated file descriptors are freed"), and a read then returns 0, "the peer
+  has closed its half side of the connection", or `ECONNRESET` (`recv(2)`). A daemon alive but stuck is ended by its
+  own watchdog or killed by its anchor (A-232, §4.14), which is that close.
+- **The rule.** `exchange(port, call)` and `fetch_root_handle(port, caller, path)` take no deadline: a blocking
+  connect, send and receive on the loopback socket, waiting while the connection lives. `MOUNT_CALL_DEADLINE` is gone;
+  the examples and the forged-`UMNT` CLI test call the same functions without one.
+- **Tests (`slates-bridge-nfs --lib`, `client::tests`).** `a_mount_call_answered_past_the_old_deadline_is_served` (a
+  stand-in daemon answers 1.5 s after the call: served), written first and red on the old code: "Err(Io(Os { code:
+  35, kind: WouldBlock ... })) after 1.002248833s", the receive timeout `recv(2)` reports as `EAGAIN`;
+  `a_mount_call_whose_daemon_goes_unanswered_ends_at_once` (the stand-in reads the call and closes: ended before the
+  old deadline) and `a_mount_call_to_a_port_nothing_listens_on_is_refused_at_once` (`ConnectionRefused`), which hold
+  the rule's other half and pass before and after.
+
+### A-507 — An unmount runs no program on macOS and the BSDs and is believed only when the kernel's mount table agrees (2026-11-18, UI goal 85 via g071, found by g264 on a kiln runner; §4.6; `CONTRACT` = 42)
+- **The bug.** `mount::unmount` and `mount::unmount_busy` ran `umount` and `umount -f` found on the `PATH`. A kiln
+  runner's `PATH` held only `/usr/bin` and `/bin`, so `/sbin/umount` was never found: no mount could be taken down, and
+  kiln (which then destroyed the volume anyway) now keeps it instead (g264's 6e1d95f32).
+- **The rule.** macOS and the BSDs call `unmount(2)` itself, `MNT_FORCE` for the busy one ("forcibly unmounted even if
+  files are still active", `man 2 unmount`): no program, no `PATH`, and no privilege, since only "the caller is not the
+  super-user, and the mount() was not done by the user" is refused `EPERM`. Linux keeps `fusermount3 -u` (`-z` for the
+  busy one), the setuid helper its FUSE mount is made through: `umount2(2)` "requires appropriate privilege (Linux: the
+  `CAP_SYS_ADMIN` capability)" (man7.org, umount(2)), so an unprivileged caller's own call is refused `EPERM`.
+- **Judged by the table.** Before the call the mount at the path is found in the kernel's table
+  (`slates_bridge_oci::mount_table`: `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on Linux, neither touching
+  a mount), the last listed there, since a later mount shadows an earlier one; none there is `NotMounted` and no call is
+  made. After it, the unmount is done only once that mount's identity is gone from the table: still listed, it is the
+  call's refusal, or `StillMounted` when the call said done. The path's entry is named without touching the mount (the
+  parent's real path with its name), since a lookup on a `hard` NFS mount whose daemon has gone waits forever.
+- **Typed refusals.** `unmount(2)`'s error numbers as its man page gives them: `EBUSY` ("a process is holding a
+  reference to a file located on the filesystem") is `Busy`, naming `unmount_busy` as the way to let go; `EINVAL`
+  ("the requested directory is not in the mount table") is `NotMounted`; `ENOENT` and `ENOTDIR` are `MountPoint`; any
+  other is `Unmount` with its number. A path no call can name (a NUL byte) is `MountPoint`, never a panic.
+- **Tests.** `crates/api/src/mount.rs`: `an_unmount_is_asked_as_the_os_takes_it`,
+  `the_kernels_unmount_refusals_are_typed`, `an_unmount_is_believed_only_when_the_table_agrees`, and
+  `an_unmount_of_a_path_where_nothing_is_mounted_is_refused_not_mounted` (the host's own table, no call made);
+  `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, a kernel mount) takes `Busy` on macOS.
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug).** Red once, on a copy where `EBUSY` mapped to the untyped
+  `Unmount` and no request let go: `the_kernels_unmount_refusals_are_typed` and `an_unmount_is_asked_as_the_os_takes_it`
+  failed. Green at 43166ce14: `cargo test -p slates-api --lib -- mount:: contract_history`, 12 of 12, the host's own
+  table included. The Linux half (`ask_unmount` over `fusermount3`) compiles only on Linux: its build, clippy, `xtask`
+  and the macOS bare-metal run with a `PATH` lacking `/sbin` are main's (filed).
+- **Owed.** Naming the processes that hold a busy mount (libproc's `proc_listpidspath` on macOS, `/proc` on Linux);
+  Linux's busy `fusermount3 -u` stays `Unmount` with its exit, since the helper reports no error number.
+
+Applied in the same change to: §4.6's contract log (`CONTRACT` = 42), GAPS (the library's mount entry), `docs/bugs/`
+(a record), `docs/library.md`, `crates/api/src/mount.rs`, `crates/api/src/error.rs` (`MountFault::Busy`,
+`StillMounted`, `MountTable`; `Unmount` and `NotMounted` restated), `crates/api/src/lib.rs` (`CONTRACT` = 42),
+`crates/api/Cargo.toml` and `Cargo.lock` (`slates-bridge-oci` on Unix), `crates/api/tests/api.rs`, and
+`crates/cli/src/verbs.rs` (a doc line).
 
 ### A-509 — A kept FUSE mount of a volume recovery could not rebuild is served on, refusing every request `EIO`, until its user releases it (2026-11-18, goal 85, g079; §4.6 "Linux", §4.8 `NotRecovered`; A-61, A-102, A-304)
 Applied in the same change to: §4.6 "Linux" (a status under AUD-29-64's), GAPS (the not-recovered entry's open line),

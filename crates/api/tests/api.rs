@@ -2861,10 +2861,11 @@ fn a_busy_mount_is_let_go_of_the_oss_way() {
     .mount(volume, &point.path, &MountOptions::default())
     .unwrap();
   let held = std::fs::File::open(Path::new(&mounted.path).join("held.txt")).unwrap();
+  // `Busy` from `unmount(2)`'s `EBUSY` on macOS and the BSDs (A-507); `fusermount3 -u`'s exit on Linux.
   assert!(
     matches!(
       slates_api::mount::unmount(&mounted.path),
-      Err(slates_api::MountFault::Unmount { .. })
+      Err(slates_api::MountFault::Busy { .. } | slates_api::MountFault::Unmount { .. })
     ),
     "a mount a process holds is busy"
   );
