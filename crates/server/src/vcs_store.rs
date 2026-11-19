@@ -129,6 +129,9 @@ pub(crate) struct GitStore {
   /// to git's files, kept in `derivations` as each version commits. Declared with the content store's window when the
   /// store is made ([`made`]); `None` for a store made without one.
   pub(crate) paths: Option<paths::GreenPaths>,
+  /// Each green's map of its head, by the green's key (A-664 part 3, [`paths`]): one a member green that committed a
+  /// version, its root held once by the store, replaced as each version commits and made again by a recovery.
+  pub(crate) heads: BTreeMap<u64, paths::Head>,
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
   versions: BTreeMap<u64, Vec<u64>>,
@@ -145,6 +148,7 @@ impl GitStore {
       derivations: Derivations::new(),
       reach: ReachSets::declare(Mode::Eager),
       paths: None,
+      heads: BTreeMap::new(),
       versions: BTreeMap::new(),
       charged: 0,
     }
@@ -388,7 +392,10 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
     RepositoryStore::Git(store) => {
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
-      store.repository.release(content).is_ok() && values && versions
+      let maps = store.heads.values().fold(true, |whole, head| {
+        content.release(&head.root).is_ok() && whole
+      });
+      store.repository.release(content).is_ok() && values && versions && maps
     }
     RepositoryStore::Mercurial(store) => {
       let values = store.derivations.release(content).is_ok();
@@ -1015,6 +1022,18 @@ pub(crate) async fn recover(
       index = index.saturating_add(1);
       slices.unit_done().await;
     }
+    // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
+    let greens: Vec<DbVolumeId> = state
+      .db
+      .partition()
+      .repositories()
+      .members_of(record.id)
+      .map(|member| member.green)
+      .collect();
+    for green in greens {
+      paths::remake_green(state, green);
+      slices.unit_done().await;
+    }
   }
 }
 
@@ -1033,5 +1052,7 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
     }
     index = index.saturating_add(1);
   }
+  // Each green's map of its head, made again as the live store holds it (A-664 part 3).
+  paths::remake(state, id);
   state.count(REBUILT, 1);
 }

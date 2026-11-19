@@ -13,7 +13,7 @@ use slates_ipc::protocol::{
 use slates_vcs::derived::paths::{Entry, PathMap};
 use slates_vcs::{ContentId, ContentStore, Mode};
 
-use super::{BUILT, DERIVED, GreenAt, GreenPaths, GreenStep, REFUSED};
+use super::{BUILT, DERIVED, GreenPaths, REFUSED, REMADE};
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
@@ -117,7 +117,7 @@ fn version(state: &mut ShardState, green: VolumeId, serial: u32, ops: Vec<Op>) -
   version
 }
 
-/// The map kept for `green`'s `version`: its root and its files.
+/// The map the store holds for `green`, when it is of `version`: its root and its files.
 fn kept(
   state: &ShardState,
   repository: RepositoryId,
@@ -126,16 +126,10 @@ fn kept(
 ) -> Option<(ContentId, BTreeMap<Vec<u8>, Entry>)> {
   let (content, git) = state.vcs_stores.git_ref(repository)?;
   let paths = git.paths.as_ref()?;
-  let at = GreenAt {
-    green: crate::vcs_store::green_key(to_db_volume(green)),
-    version,
-  };
-  let root = git
-    .derivations
-    .value(content, paths, &GreenStep::named(at), at)
-    .ok()??;
-  let files = paths.files(content, root).ok()?;
-  Some((root, files))
+  let key = crate::vcs_store::green_key(to_db_volume(green));
+  let head = git.heads.get(&key).filter(|head| head.version == version)?;
+  let files = paths.files(content, head.root).ok()?;
+  Some((head.root, files))
 }
 
 /// The model's files as the map names them: each class's byte and the identity of its bytes as an object.
@@ -289,8 +283,8 @@ fn links(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model
 }
 
 /// The fixed history's last five versions (each checked against the model): a file renamed; a symbolic link removed; a
-/// directory renamed, which the change names by the directory alone; a splice into the moved file; its execute bit
-/// taken away.
+/// file moved into a directory made with it and its old directory removed, a change naming directories; a splice into
+/// the moved file; its execute bit taken away.
 fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
   let green = at.1;
   let rename = |from: &str, to: &str| {
@@ -309,7 +303,16 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
   let seventh = version(state, green, 7, vec![Op::Declare(unlink)]);
   take(model, "s");
   assert_kept(state, at, seventh, model);
-  let eighth = version(state, green, 8, vec![rename("/d", "/x")]);
+  let moved = vec![
+    Op::Declare(WorkOp::Mkdir {
+      path: "/x".to_owned(),
+    }),
+    rename("/d/a", "/x/a"),
+    Op::Declare(WorkOp::Rmdir {
+      path: "/d".to_owned(),
+    }),
+  ];
+  let eighth = version(state, green, 8, moved);
   let (class, bytes) = take(model, "d/a");
   set(model, "x/a", class, &bytes);
   assert_kept(state, at, eighth, model);
@@ -327,11 +330,11 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
 
 /// A-664 part 3 (its first piece; A-647's owed map: "the green's state as the path map these types read"). Do: on a git
 /// repository's root green, submit ten versions: files made in a directory, one overwritten, one made executable, a
-/// symbolic link and a hard link, a named pipe and an attribute, a file renamed, the link removed, the directory
-/// renamed, a splice, the execute bit taken away. Expect: after each, the version's map holds exactly the files git
+/// symbolic link and a hard link, a named pipe and an attribute, a file renamed, the link removed, a file moved to a
+/// new directory and the old one removed, a splice, the execute bit taken away. Expect: after each, the version's map holds exactly the files git
 /// would (classes `100644`, `100755`, `120000`; a hard link its primary's bytes; no pipe), and its root is the root of
-/// that map built from scratch in another store; the first version and the directory's rename built whole, the other
-/// eight derived from their parents' maps (the non-vacuity count of the incremental path), none refused.
+/// that map built from scratch in another store; the first version and the move between directories built whole, the
+/// other eight derived from the map before (the non-vacuity count of the incremental path), none refused.
 #[test]
 fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
   let counts = crate::daemon::audit_on_shard(|state| {
@@ -374,26 +377,30 @@ fn t_a664_p3_a_plain_greens_versions_keep_no_map() {
   assert_eq!(counts, (0, 0, 0));
 }
 
-/// A-664 part 3 (its first piece; A-662: a store made again from the log keeps no derived value). Do: submit two
+/// A-664 part 3 (its first piece; A-662: a store made again from the log equals the live store whole). Do: submit two
 /// versions to a git repository's green, make its store again from the log as a recovery does, then submit a third.
-/// Expect: the second version's map gone with the store; the third built whole from the head and equal to its model,
-/// so three versions made two builds and one derivation.
+/// Expect: the store made again holds the green's map of its head again, built from the head and equal to its model;
+/// the third version's map derived from it; so one build as a version committed, one remade, two derived.
 #[test]
-fn t_a664_p3_after_the_store_is_made_again_the_next_map_is_built_whole() {
-  let (gone, counts) = crate::daemon::audit_on_shard(|state| {
+fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
+  let counts = crate::daemon::audit_on_shard(|state| {
     let at = git_repository(state, "again");
     let mut model = Model::new();
     version(state, at.1, 1, vec![create("/f", b"one")]);
     let second = version(state, at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]);
     crate::vcs_store::rebuild(state, at.0);
-    let gone = kept(state, at.0, at.1, second).is_none();
-    let third = version(state, at.1, 3, vec![create("/g", b"three")]);
     set(&mut model, "f", FileClass::File, b"two");
+    assert_kept(state, at, second, &model);
+    let third = version(state, at.1, 3, vec![create("/g", b"three")]);
     set(&mut model, "g", FileClass::File, b"three");
     assert_kept(state, at, third, &model);
-    (gone, (count(state, BUILT), count(state, DERIVED)))
+    (
+      count(state, BUILT),
+      count(state, REMADE),
+      count(state, DERIVED),
+    )
   });
-  assert_eq!((gone, counts), (true, (2, 1)));
+  assert_eq!(counts, (1, 1, 2));
 }
 
 /// A-664 part 3 (its first piece: a branch's first version has no parent's map of its own green). Do: submit a file to

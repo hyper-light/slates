@@ -1489,7 +1489,7 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
   });
 }
 
-/// The files of the map kept for the version `version` of `green`, a green of `repository` (A-664 part 3).
+/// The files of the map the store holds for `green`, a green of `repository`, when it is of `version` (A-664 part 3).
 fn kept_files(
   state: &ShardState,
   repository: RepositoryId,
@@ -1498,13 +1498,11 @@ fn kept_files(
 ) -> Option<BTreeMap<Vec<u8>, slates_vcs::derived::paths::Entry>> {
   let (content, git) = state.vcs_stores.git_ref(repository)?;
   let paths = git.paths.as_ref()?;
-  let at = super::paths::GreenAt {
-    green: green_key(green),
-    version,
-  };
-  let named = super::paths::GreenStep::named(at);
-  let root = git.derivations.value(content, paths, &named, at).ok()??;
-  paths.files(content, root).ok()
+  let head = git
+    .heads
+    .get(&green_key(green))
+    .filter(|head| head.version == version)?;
+  paths.files(content, head.root).ok()
 }
 
 /// A-664 part 3 (its first piece: a push's version keeps its map of paths to git's files, as a submit's does). Do: push
