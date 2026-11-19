@@ -610,7 +610,7 @@ fn ancestor_at(
       .filter(|_| step.depth > depth)
       .ok_or(malformed(step.root))?;
     let jumped = skew_jump_depth(step.depth);
-    let (link, lands) = if jumped < depth {
+    let (link, lands) = if jumped < depth || depth < u64::MAX {
       (step.parent, below)
     } else {
       (step.jump, jumped)
@@ -723,7 +723,7 @@ fn skip_lowest(walk: &mut Walk<'_>, mut at: usize, floor: u64) -> Result<usize, 
       skew_jump_depth(step.depth),
       step.generation,
     )?;
-    if walk.node(jumped)?.made.generation >= floor {
+    if walk.node(jumped)?.made.generation >= floor && jump == parent {
       at = jumped;
       continue;
     }
