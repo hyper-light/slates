@@ -76,9 +76,9 @@
 > --lib`: 54 of 54 on the Mac Studio, the 32 new failing first against stubs. This is A-582's owed "idx v2". Owed: the
 > pack reader (piece 3: entries, inflation, deltas, the streamed trailer, ids checked against objects); a sliced decode
 > and check for a large pack, with the import of a repository on disk (piece 15), which also remakes version 1 indexes;
-> a vector that reaches the checksums' collision refusal (no published collision begins with `PACK` or `\377tOc`);
-> `pack::HEADER_LEN` and g258's `entry::PACK_HEADER_LEN` made one (whichever lands second). Clippy, `xtask` and the
-> lint matrix over the change are main's (run requests).
+> a vector that reaches the checksums' collision refusal (no published collision begins with `PACK` or `\377tOc`).
+> A pack header's length is one number, A-582 part 3's `entry::PACK_HEADER_LEN`, which `pack` uses. Clippy, `xtask` and
+> the lint matrix over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's

@@ -39523,7 +39523,9 @@ Applied in the same change to:
   count has arrived. `check` holds a whole pack in memory: it must be at least a header and a trailer long, and its
   trailer must be the checksum of every byte before it, verified before any of them is read; then its header is read.
   `Writer` writes git's header at version 2 and the trailer computed as the objects pass, so a fetch's pack needs no
-  second pass (§4.17.2 "A fetch", item 3).
+  second pass (§4.17.2 "A fetch", item 3). The header's length is one number for the pack and its entries, A-582 part
+  3's `entry::PACK_HEADER_LEN`: part 3 landed first, so `pack` and `pack::idx` use its constant, as main asked
+  (2026-11-19).
 - **The index** [B: `gitformat-pack.adoc`, "Version 2 pack-*.idx files"; C: `pack-write.c`'s `write_idx_file` and
   `need_large_offset`, `packfile.c`'s `load_idx` and `nth_packed_object_offset`, `pack-check.c`'s `verify_packfile`].
   `Idx::decode` verifies the index's own checksum first, then the magic `\377tOc` and version 2, then the layout:
@@ -39533,7 +39535,8 @@ Applied in the same change to:
   - the ids strictly ascend, a duplicate refused apart from a step down;
   - each fanout count is the number of ids whose first byte is at most its byte;
   - every large offset names an entry of the table, and no offset lies inside a pack's header.
-  It then answers by position and by id in place, building nothing: the fanout narrows a lookup, then a binary search.
+  It then answers by position and by id in place, building nothing: the fanout narrows a lookup, then a binary search,
+  and `offset_of` gives the lookup from id to offset that the pack reader resolves a reference delta's base by (A-608).
   `Idx::check_pack` holds an index to its pack as `git verify-pack` does short of inflating. It checks one hash, one
   count and one trailer, in `open_packed_git_1`'s order. It orders the objects by offset in a table charged to the
   caller's admission first, and refuses an offset at or past the trailer, two objects at one offset, or bytes after the
@@ -39558,8 +39561,8 @@ Applied in the same change to:
 - **The CRC32 and its crate.** Each index entry keeps zlib's CRC32 (the IEEE polynomial, reflected; `index-pack.c`
   takes zlib's `crc32()` over each entry's bytes as they are used), and slates had
   only CRC32C (`slates_wire::crc32c`). Main approved `crc32fast` (2026-11-19) for one reason: it is the crate flate2
-  itself computes zlib's CRC32 with, and flate2 enters the workspace anyway (A-595's gzip bodies, piece 3's objects), so
-  it brings no code the tree would not hold. Its `std` feature picks ARMv8's CRC instructions or x86-64's carry-less
+  itself computes zlib's CRC32 with, and flate2 is the workspace's deflate API (A-607), so it brings no code the tree
+  would not hold once a crate takes flate2. Its `std` feature picks ARMv8's CRC instructions or x86-64's carry-less
   multiply at run time, with a table for the rest, and slates-git keeps no `unsafe` of its own.
 - **Golden vectors.** The packs, indexes and `git verify-pack -v` listings A-582's `make-fixtures.sh` captured
   (`ofs` and `ref`, SHA-1, with offset and with reference deltas), and `make-index-fixtures.sh`'s, run with git 2.50.1
@@ -39592,6 +39595,4 @@ Applied in the same change to:
 - **Owed.** The pack reader (piece 3): entries, inflation and deltas, the trailer checked as a stream arrives, and an
   index's ids checked against its pack's objects. `Idx::decode` and `Idx::check_pack` run whole, hashing and CRC-ing
   every byte in one call, so a caller on a shard gives them what its slice admits; a sliced form comes with the import
-  of a repository on disk (piece 15), which also remakes a version 1 index from its pack. `pack::HEADER_LEN` and g258's
-  draft `entry::PACK_HEADER_LEN` (A-582 part 3) are one number: whichever lands second points at the other's (main,
-  2026-11-19).
+  of a repository on disk (piece 15), which also remakes a version 1 index from its pack.

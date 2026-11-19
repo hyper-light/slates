@@ -1,7 +1,8 @@
 //! A-591: a pack's header and trailer, held to the packs stock git 2.50.1 wrote (`fixtures/make-fixtures.sh` and
 //! `fixtures/make-index-fixtures.sh`, run on the Mac Studio on 2026-11-19) and to hostile bytes.
 
-use super::{HEADER_LEN, Header, Refusal, SIGNATURE, Version, Writer, check, read_header};
+use super::{Header, Refusal, SIGNATURE, Version, Writer, check, read_header};
+use crate::entry::PACK_HEADER_LEN;
 use crate::object_name::{Hasher, ObjectFormat, ObjectId};
 use crate::out::{Measure, Out};
 
@@ -28,6 +29,11 @@ const OBJECTS: u32 = 12;
 const EMPTY_PACK_HEADER: [u8; 12] = *b"PACK\x00\x00\x00\x02\x00\x00\x00\x00";
 /// That empty pack's trailer, as `xxd` showed it.
 const EMPTY_PACK_TRAILER: &str = "029d08823bd8a8eab510ad6ac75c823cfd3ed31e";
+
+/// A pack header's length, A-582's [`PACK_HEADER_LEN`], as an index into bytes.
+pub(crate) fn header_len() -> usize {
+  usize::try_from(PACK_HEADER_LEN).unwrap()
+}
 
 /// The checksum `format` takes of `bytes`.
 pub(crate) fn checksum(format: ObjectFormat, bytes: &[u8]) -> ObjectId {
@@ -67,7 +73,7 @@ fn each_pack_git_wrote_is_checked_and_its_header_read() {
       checksum(format, &bytes[..trailer_at]),
       "{name}"
     );
-    assert_eq!(pack.objects(), &bytes[HEADER_LEN..trailer_at], "{name}");
+    assert_eq!(pack.objects(), &bytes[header_len()..trailer_at], "{name}");
     assert_eq!(pack.bytes(), bytes, "{name}");
     assert_eq!(pack.format(), format, "{name}");
   }
@@ -100,9 +106,9 @@ fn a_pack_of_no_objects_is_the_one_git_writes() {
   let trailer = Writer::new(ObjectFormat::Sha1, 0, &mut out)
     .finish()
     .unwrap();
-  assert_eq!(&out[..HEADER_LEN], &EMPTY_PACK_HEADER[..]);
+  assert_eq!(&out[..header_len()], &EMPTY_PACK_HEADER[..]);
   assert_eq!(trailer.to_string(), EMPTY_PACK_TRAILER);
-  assert_eq!(&out[HEADER_LEN..], trailer.as_bytes());
+  assert_eq!(&out[header_len()..], trailer.as_bytes());
   let pack = check(&out, ObjectFormat::Sha1).unwrap();
   assert_eq!(pack.header().objects, 0);
   assert!(pack.objects().is_empty());
@@ -112,14 +118,14 @@ fn a_pack_of_no_objects_is_the_one_git_writes() {
 /// twelfth byte has arrived, then the header, whatever follows.
 #[test]
 fn a_header_is_read_as_its_bytes_arrive() {
-  for len in 0..HEADER_LEN {
+  for len in 0..header_len() {
     assert_eq!(read_header(&OFS_PACK[..len]), Ok(None), "{len} bytes");
   }
   let header = Header {
     version: Version::Two,
     objects: OBJECTS,
   };
-  assert_eq!(read_header(&OFS_PACK[..HEADER_LEN]), Ok(Some(header)));
+  assert_eq!(read_header(&OFS_PACK[..header_len()]), Ok(Some(header)));
   assert_eq!(read_header(OFS_PACK), Ok(Some(header)));
 }
 
@@ -128,7 +134,7 @@ fn a_header_is_read_as_its_bytes_arrive() {
 #[test]
 fn a_wrong_signature_byte_is_refused_as_soon_as_it_arrives() {
   for at in 0..SIGNATURE.len() {
-    let mut bytes = OFS_PACK[..HEADER_LEN].to_vec();
+    let mut bytes = OFS_PACK[..header_len()].to_vec();
     bytes[at] ^= 0x20;
     let refusal = Err(Refusal::Signature { at: at as u64 });
     assert_eq!(read_header(&bytes[..=at]), refusal, "byte {at}");
@@ -193,8 +199,8 @@ fn a_flipped_bit_anywhere_in_a_pack_is_refused_by_its_trailer() {
 #[test]
 fn a_pack_shorter_than_its_header_and_trailer_is_refused() {
   for (name, bytes, format) in PACKS {
-    let needed = (HEADER_LEN + format.raw_len()) as u64;
-    for len in 0..HEADER_LEN + format.raw_len() {
+    let needed = PACK_HEADER_LEN + format.raw_len() as u64;
+    for len in 0..header_len() + format.raw_len() {
       assert_eq!(
         check(&bytes[..len], format),
         Err(Refusal::Truncated {

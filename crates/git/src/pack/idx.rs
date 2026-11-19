@@ -49,7 +49,8 @@
 //! allocates nothing; [`Idx::check_pack`] orders the objects by offset in a table it charges to the caller's
 //! [`Admission`] before it is built; [`write`] sorts the caller's entries in place and allocates nothing.
 
-use super::{Checksummed, HEADER_LEN, Pack, checksum_of};
+use super::{Checksummed, Pack, checksum_of};
+use crate::entry::PACK_HEADER_LEN;
 use crate::object_name::{CollisionAttack, ObjectFormat, ObjectId};
 use crate::out::Out;
 use crate::{Admission, PastAdmission, to_u64};
@@ -457,7 +458,7 @@ impl<'a> Idx<'a> {
         });
       }
       let offset = self.offset(position).unwrap_or_default();
-      if offset < to_u64(HEADER_LEN) {
+      if offset < PACK_HEADER_LEN {
         return Err(Refusal::OffsetInHeader {
           position: to_u64(position),
           offset,
@@ -547,6 +548,12 @@ impl<'a> Idx<'a> {
     None
   }
 
+  /// Where in the pack the object named `id` begins, or `None` when the index does not hold it: [`Idx::find`], then
+  /// [`Idx::offset`]. The lookup from id to offset a pack reader resolves a reference delta's base by (A-608).
+  pub fn offset_of(&self, id: &ObjectId) -> Option<u64> {
+    self.offset(self.find(id)?)
+  }
+
   /// The copy of its pack's trailer.
   pub fn pack_checksum(&self) -> ObjectId {
     self.pack_checksum
@@ -608,9 +615,9 @@ impl<'a> Idx<'a> {
   fn check_spans(&self, pack: &Pack<'_>, by_offset: &[(u64, usize)]) -> Result<(), Mismatch> {
     let end = to_u64(pack.trailer_at());
     let first = by_offset.first().map_or(end, |(offset, _)| *offset);
-    if first != to_u64(HEADER_LEN) {
+    if first != PACK_HEADER_LEN {
       return Err(Mismatch::Unindexed {
-        at: to_u64(HEADER_LEN),
+        at: PACK_HEADER_LEN,
       });
     }
     let mut objects = by_offset.iter().peekable();
@@ -709,7 +716,7 @@ fn check_entries(
   }
   if let Some(position) = entries
     .iter()
-    .position(|entry| entry.offset < to_u64(HEADER_LEN))
+    .position(|entry| entry.offset < PACK_HEADER_LEN)
   {
     return Err(WriteRefusal::OffsetInHeader {
       position: to_u64(position),

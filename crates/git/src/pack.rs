@@ -32,6 +32,7 @@
 
 pub mod idx;
 
+use crate::entry::PACK_HEADER_LEN;
 use crate::object_name::{CollisionAttack, Hasher, ObjectFormat, ObjectId};
 use crate::out::Out;
 use crate::to_u64;
@@ -54,12 +55,10 @@ const WORD: usize = core::mem::size_of::<u32>();
 /// Derived: where the version begins, after the signature.
 const VERSION_AT: usize = SIGNATURE.len();
 
-/// Derived: where the count begins, after the version.
+/// Derived: where the count begins, after the version. The header ends with the count, at A-582's
+/// [`PACK_HEADER_LEN`], one number for the pack's header and for its entries' bases: the first object begins there, so
+/// no object of a pack begins before it.
 const COUNT_AT: usize = VERSION_AT.saturating_add(WORD);
-
-/// Derived: the header's length, the signature, the version and the count. The first object begins here, so no object
-/// of a pack begins before it.
-pub const HEADER_LEN: usize = COUNT_AT.saturating_add(WORD);
 
 /// A pack's version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,9 +144,9 @@ impl<'a> Pack<'a> {
 
   /// Its objects, back to back: every byte between the header and the trailer.
   pub fn objects(&self) -> &'a [u8] {
-    self
-      .bytes
-      .get(HEADER_LEN..self.trailer_at())
+    usize::try_from(PACK_HEADER_LEN)
+      .ok()
+      .and_then(|start| self.bytes.get(start..self.trailer_at()))
       .unwrap_or_default()
   }
 }
@@ -192,13 +191,13 @@ pub fn read_header(bytes: &[u8]) -> Result<Option<Header>, Refusal> {
 /// checksum of the bytes before it, verified before any of them is read, then its header.
 pub fn check(bytes: &[u8], format: ObjectFormat) -> Result<Pack<'_>, Refusal> {
   let truncated = Refusal::Truncated {
-    needed: to_u64(HEADER_LEN.saturating_add(format.raw_len())),
+    needed: PACK_HEADER_LEN.saturating_add(to_u64(format.raw_len())),
     left: to_u64(bytes.len()),
   };
   let trailer_at = bytes
     .len()
     .checked_sub(format.raw_len())
-    .filter(|at| *at >= HEADER_LEN)
+    .filter(|at| to_u64(*at) >= PACK_HEADER_LEN)
     .ok_or(truncated)?;
   let (guarded, trailer) = bytes.split_at_checked(trailer_at).ok_or(truncated)?;
   let checksum = checksum_of(format, guarded).map_err(Refusal::Collision)?;

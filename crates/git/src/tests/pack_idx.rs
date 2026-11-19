@@ -7,10 +7,11 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use super::{Entry, Idx, MAGIC, Mismatch, Refusal, WriteRefusal, write, write_above, written_len};
+use crate::entry::PACK_HEADER_LEN;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::out::{Measure, Out};
 use crate::pack::tests::{OFS_PACK, REF_PACK, SHA256_PACK, checksum, resign};
-use crate::pack::{HEADER_LEN, Writer, check};
+use crate::pack::{Writer, check};
 use crate::{Admission, PastAdmission};
 
 /// `ofs.pack`'s index, as `git pack-objects` wrote it.
@@ -174,8 +175,8 @@ fn room(count: usize) -> u64 {
 }
 
 /// A-591: do decode each index git wrote and hold it to its pack. Expect git's twelve ids in order, each found at the
-/// offset git listed and spanning the bytes git listed (the 8-byte table read for `ofs-large.idx`), the pack's trailer
-/// copied, the pack held, and the exact room charged.
+/// offset git listed, by position and by id, and spanning the bytes git listed (the 8-byte table read for
+/// `ofs-large.idx`), the pack's trailer copied, the pack held, and the exact room charged.
 #[test]
 fn each_index_git_wrote_reads_as_git_listed_it() {
   for golden in GOLDEN {
@@ -204,6 +205,7 @@ fn each_index_git_wrote_reads_as_git_listed_it() {
         (object.id, object.offset),
         "{name}"
       );
+      assert_eq!(idx.offset_of(&object.id), Some(object.offset), "{name}");
       let next = offsets
         .iter()
         .copied()
@@ -622,7 +624,7 @@ fn shared_offsets_and_bytes_before_the_first_object_are_refused() {
   let pack = check(OFS_PACK, format).unwrap();
   let idx = Idx::decode(OFS_IDX, format).unwrap();
   let first = (0..OBJECTS)
-    .find(|position| idx.offset(*position) == Some(HEADER_LEN as u64))
+    .find(|position| idx.offset(*position) == Some(PACK_HEADER_LEN))
     .unwrap();
   let shared_offset = idx.offset(4).unwrap();
   let shared = changed(OFS_IDX, format, |bytes| {
@@ -776,11 +778,7 @@ type Generated = (Vec<u8>, u32, u64);
 fn model(format: ObjectFormat, objects: &[Generated]) -> BTreeMap<Vec<u8>, (u32, u64)> {
   let mut model = BTreeMap::new();
   for (index, (id, crc32, offset)) in objects.iter().enumerate() {
-    let offset = if index == 0 {
-      HEADER_LEN as u64
-    } else {
-      *offset
-    };
+    let offset = if index == 0 { PACK_HEADER_LEN } else { *offset };
     model
       .entry(id[..format.raw_len()].to_vec())
       .or_insert((*crc32, offset));
@@ -797,7 +795,7 @@ fn synthetic_pack(
   let mut pack = Vec::new();
   let mut writer = Writer::new(format, blobs.len() as u32, &mut pack);
   let mut entries = Vec::new();
-  let mut offset = HEADER_LEN as u64;
+  let mut offset = PACK_HEADER_LEN;
   for (id, blob) in blobs {
     writer.put(blob);
     entries.push(Entry {
@@ -815,13 +813,13 @@ proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
   /// A-591, model: do write the index of up to 64 generated objects in either hash, handed over in any order, and
-  /// decode it. Expect the model's entries in id order, every id found at its place and an id the model lacks not
-  /// found, the same bytes whatever the order handed over, and the length `written_len` foretold.
+  /// decode it. Expect the model's entries in id order, every id found at its place and its offset, an id the model
+  /// lacks not found, the same bytes whatever the order handed over, and the length `written_len` foretold.
   #[test]
   fn any_entries_written_decode_to_the_model(
     sha256 in any::<bool>(),
     objects in proptest::collection::vec(
-      (proptest::collection::vec(any::<u8>(), 32), any::<u32>(), HEADER_LEN as u64..=u64::MAX),
+      (proptest::collection::vec(any::<u8>(), 32), any::<u32>(), PACK_HEADER_LEN..=u64::MAX),
       0..64,
     ),
     absent in proptest::collection::vec(any::<u8>(), 32),
@@ -851,10 +849,12 @@ proptest! {
     prop_assert_eq!(idx.pack_checksum(), pack_checksum);
     for (position, entry) in expected.iter().enumerate() {
       prop_assert_eq!(idx.find(&entry.id), Some(position));
+      prop_assert_eq!(idx.offset_of(&entry.id), Some(entry.offset));
     }
     let absent = ObjectId::from_bytes(format, &absent[..format.raw_len()]).unwrap();
     if !model.contains_key(absent.as_bytes()) {
       prop_assert_eq!(idx.find(&absent), None);
+      prop_assert_eq!(idx.offset_of(&absent), None);
     }
   }
 
