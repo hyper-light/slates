@@ -715,9 +715,11 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 4 since A-291's planned move, which gave each moved-object
-/// exception the member a move took it from and the cohort its records sit in (a flag, then, when it is set, the host
-/// and the cohort's hosts), after its owner and version. Layout 3 (A-380) appended the council's recorded voters
+/// Format: the regional configuration's layout version: 5 since A-484, which gave each completion record the settled
+/// neighbourhoods its takeover recovered through (a count, then each owner and its settled form) and the hosts that
+/// stayed members through it, after its version and before its confirmed hosts. Layout 4 (A-291's planned move) gave
+/// each moved-object exception the member a move took it from and the cohort its records sit in (a flag, then, when it
+/// is set, the host and the cohort's hosts), after its owner and version. Layout 3 (A-380) appended the council's recorded voters
 /// (`voters`, a host set) after the moved-object exceptions. Layout 2 (A-309) put the completion records (`completed`)
 /// where layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence
 /// byte, then its settled form, after its unconfirmed hosts). Layout 1 was the first versioned layout. A decoder
@@ -727,7 +729,7 @@ const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
 /// (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was dropped and no retirement is
 /// kept, and A-291's when no object is moved, which only the version tells apart.
 /// Format: the regional layout's version, raised with each change of its fields' meaning (4 since A-291).
-const REGIONAL_LAYOUT: u32 = 4;
+const REGIONAL_LAYOUT: u32 = 5;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
@@ -818,15 +820,7 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_bytes(&mut out, &adoption.head);
     put_bytes(&mut out, &adoption.catalog);
   }
-  put_u32(
-    &mut out,
-    u32::try_from(config.completed.len()).unwrap_or(u32::MAX),
-  );
-  for (host, record) in &config.completed {
-    put_u64(&mut out, host.0);
-    put_u64(&mut out, record.version);
-    encode_hosts(&mut out, &record.confirmed);
-  }
+  encode_completed(&mut out, &config.completed);
   put_u32(
     &mut out,
     u32::try_from(config.moved.len()).unwrap_or(u32::MAX),
@@ -845,6 +839,31 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
   }
   encode_hosts(&mut out, &config.voters);
   out
+}
+
+/// Encodes the completion records: their count, then each host, its version, its recovery neighbourhoods (a count, then
+/// each owner and its settled form), its held hosts and its confirmed hosts (A-309, A-484).
+fn encode_completed(
+  out: &mut Vec<u8>,
+  completed: &std::collections::BTreeMap<HostId, CompletedTakeover>,
+) {
+  put_u32(out, u32::try_from(completed.len()).unwrap_or(u32::MAX));
+  for (host, record) in completed {
+    put_u64(out, host.0);
+    put_u64(out, record.version);
+    // The neighbourhoods the takeover recovered through and the hosts that stayed members through it (A-484), before
+    // the confirmed hosts.
+    put_u32(
+      out,
+      u32::try_from(record.recovery.len()).unwrap_or(u32::MAX),
+    );
+    for (owner, settled) in &record.recovery {
+      put_u64(out, owner.0);
+      encode_settled(out, settled);
+    }
+    encode_hosts(out, &record.held);
+    encode_hosts(out, &record.confirmed);
+  }
 }
 
 /// Decodes the moved-object exceptions (count, then each `(object, owner, version, from)`, `from` a flag and, when the
@@ -880,7 +899,8 @@ fn decode_moved(
   Ok((moved, rest))
 }
 
-/// Decodes the completion records (count, then each `(host, version, confirmed hosts)`), bounding every count (A-309).
+/// Decodes the completion records (count, then each `(host, version, recovery, held hosts, confirmed hosts)`, the
+/// recovery a count of `(owner, settled)`), bounding every count (A-309, A-484).
 fn decode_completed(
   bytes: &[u8],
 ) -> Result<(std::collections::BTreeMap<HostId, CompletedTakeover>, &[u8]), RaftWireError> {
@@ -889,8 +909,18 @@ fn decode_completed(
   for _ in 0..count {
     let (host, tail) = take_u64(rest)?;
     let (version, tail) = take_u64(tail)?;
+    let (recovery, tail) = decode_settled_map(tail)?;
+    let (held, tail) = decode_hosts(tail)?;
     let (confirmed, tail) = decode_hosts(tail)?;
-    completed.insert(HostId(host), CompletedTakeover { version, confirmed });
+    completed.insert(
+      HostId(host),
+      CompletedTakeover {
+        version,
+        confirmed,
+        recovery,
+        held,
+      },
+    );
     rest = tail;
   }
   Ok((completed, rest))
@@ -2025,6 +2055,60 @@ mod tests {
     }
   }
 
+  /// A-484: a completion record whose count of recovery neighbourhoods lies — more than the bytes back — is refused
+  /// before allocating, and the record's new fields round-trip. Do: complete a takeover in a three-member region, encode,
+  /// check the record keeps one neighbourhood and its held hosts and decodes whole, then raise the neighbourhoods' count
+  /// to the largest a count can be. Expect `LengthMismatch`.
+  #[test]
+  fn a_lying_completion_record_recovery_count_is_refused() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    config.take_over(A, 3);
+    for survivor in config.survivors_of(A) {
+      config.confirm(A, survivor);
+    }
+    let record = config.completed.get(&A).cloned().unwrap();
+    let settled = record.recovery.get(&A).cloned().unwrap();
+    assert_eq!(
+      record.recovery.len(),
+      1,
+      "one recovery owner: the retired host"
+    );
+    assert!(!record.held.is_empty(), "its survivors are held");
+    assert!(settled.domains.is_empty() && config.moved.is_empty() && config.voters.is_empty());
+    expect_round_trip(
+      &config,
+      "round-trip is identity with a record's recovery and held hosts",
+    );
+    let bytes = encode_regional_configuration(&config);
+    // From the end: the recorded voters' and moved objects' counts, then the record's confirmed and held hosts (each a
+    // count then its ids), then its one neighbourhood (an owner, a generation, its hosts as a count and ids, and an empty
+    // domain map's count), after the count of neighbourhoods.
+    let after =
+      4 * size_of::<u32>() + (record.confirmed.len() + record.held.len()) * size_of::<u64>();
+    let neighbourhood =
+      2 * size_of::<u64>() + 2 * size_of::<u32>() + settled.hosts.len() * size_of::<u64>();
+    let count_at = bytes.len() - after - neighbourhood - size_of::<u32>();
+    assert_eq!(
+      bytes.get(count_at..count_at + size_of::<u32>()),
+      Some(1u32.to_le_bytes().as_slice()),
+      "the neighbourhoods' count is where the layout puts it"
+    );
+    let mut lying = bytes.clone();
+    lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&lying),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
+    );
+  }
+
   /// A configuration whose moved-object count lies — more exceptions than the bytes back — is refused before
   /// allocating, and one cut short inside an exception is refused as truncated.
   #[test]
@@ -2177,10 +2261,10 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x04\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x05\x00\x00\x00".as_slice()),
         Some(b"RTCF\x02\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 4 since A-291, which gave each moved object its member left and cohort (3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 5 since A-484, which gave each completion record its recovery neighbourhoods and the hosts held through it (4 since A-291, 3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));
