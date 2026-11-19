@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
-use super::{AppendRefused, Answer, Cut, LogRecord, LogsCohort, LogsOwner, ReadRefused};
+use super::{Answer, AppendRefused, Cut, LogRecord, LogsCohort, LogsOwner, ReadRefused};
 use crate::catalog::{LogName, LogSpan, RepositoryId, StateLog, VolumeId, spans_split_by};
 use crate::ledger::{Reach, TakeoverError};
 use crate::register::{HostId, ObjectId, Quorum, candidates_for};
@@ -192,8 +192,15 @@ fn each_log_commits_on_its_own_holders_and_a_push_waits_on_no_other_log() {
   );
   let announced = owner.announce(&mut world.cohort, &Reach::All);
   let expected = cut(&[(a, 2), (b, 1), (world.names, 0)]);
-  assert_eq!(announced, expected, "every push committed once B's holders are back");
-  assert_eq!(world.cohort.committed_cut(), expected, "the owner's cut is the oracle's");
+  assert_eq!(
+    announced, expected,
+    "every push committed once B's holders are back"
+  );
+  assert_eq!(
+    world.cohort.committed_cut(),
+    expected,
+    "the owner's cut is the oracle's"
+  );
 }
 
 /// A-636 and A-642 (an atomic record committed whole, applied at its join on every holder): do append a record over
@@ -208,14 +215,22 @@ fn an_atomic_record_commits_whole_and_every_holder_applies_it_at_its_join() {
   let mut owner = LogsOwner::bootstrap(&world.cohort);
   let reach = world.only(&a);
   let atomic = owner
-    .append(&mut world.cohort, record(1, &[(a, 0, 1), (b, 0, 1)]), &reach)
+    .append(
+      &mut world.cohort,
+      record(1, &[(a, 0, 1), (b, 0, 1)]),
+      &reach,
+    )
     .unwrap();
   owner.announce(&mut world.cohort, &reach);
   let after = owner
     .append(&mut world.cohort, record(2, &[(a, 1, 2)]), &reach)
     .unwrap();
   owner.announce(&mut world.cohort, &reach);
-  assert_eq!((atomic.whole, after.whole), (false, false), "B lacks the record");
+  assert_eq!(
+    (atomic.whole, after.whole),
+    (false, false),
+    "B lacks the record"
+  );
   assert_nothing_applied(&world);
   owner.announce(&mut world.cohort, &Reach::All);
   assert_applied_by_every_holder(&world, a, 2);
@@ -229,7 +244,11 @@ fn an_atomic_record_commits_whole_and_every_holder_applies_it_at_its_join() {
 
 /// No holder of A or B applied any position yet.
 fn assert_nothing_applied(world: &Apart) {
-  for host in world.holders(&world.a).into_iter().chain(world.holders(&world.b)) {
+  for host in world
+    .holders(&world.a)
+    .into_iter()
+    .chain(world.holders(&world.b))
+  {
     let applied = world.cohort.applied(host);
     assert!(
       applied.values().all(|position| *position == 0),
@@ -255,7 +274,9 @@ fn applied_everywhere() -> (Apart, LogsOwner) {
   let (a, b) = (world.a, world.b);
   let mut owner = LogsOwner::bootstrap(&world.cohort);
   for spans in [vec![(a, 0, 1), (b, 0, 1)], vec![(a, 1, 2)]] {
-    let number = u64::try_from(owner.log(&a).len()).unwrap().saturating_add(1);
+    let number = u64::try_from(owner.log(&a).len())
+      .unwrap()
+      .saturating_add(1);
     let appended = owner
       .append(&mut world.cohort, record(number, &spans), &Reach::All)
       .unwrap();
@@ -330,7 +351,11 @@ fn a_takeover_drops_a_record_no_read_holds_whole_and_what_follows_it() {
     .unwrap();
   let reach = world.only(&a);
   first
-    .append(&mut world.cohort, record(2, &[(a, 1, 2), (b, 0, 1)]), &reach)
+    .append(
+      &mut world.cohort,
+      record(2, &[(a, 1, 2), (b, 0, 1)]),
+      &reach,
+    )
     .unwrap();
   first
     .append(&mut world.cohort, record(3, &[(a, 2, 3)]), &reach)
@@ -349,9 +374,16 @@ fn a_takeover_drops_a_record_no_read_holds_whole_and_what_follows_it() {
     .append(&mut world.cohort, record(4, &[(a, 1, 2)]), &gone)
     .unwrap();
   taken.owner.announce(&mut world.cohort, &gone);
-  assert!(next.whole, "the new owner's push takes the dropped record's position");
+  assert!(
+    next.whole,
+    "the new owner's push takes the dropped record's position"
+  );
   let history = world.cohort.committed_history();
-  assert_eq!(history.get(&a), Some(&vec![identity(1), identity(4)]), "NoLoss on A");
+  assert_eq!(
+    history.get(&a),
+    Some(&vec![identity(1), identity(4)]),
+    "NoLoss on A"
+  );
   assert_eq!(history.get(&b), Some(&vec![]), "nothing of the record on B");
 }
 
@@ -367,9 +399,17 @@ fn a_takeover_keeps_a_record_every_read_holds_and_finishes_it() {
   let mut first = LogsOwner::bootstrap(&world.cohort);
   let reach = world.only(&a);
   first
-    .append(&mut world.cohort, record(1, &[(a, 0, 1), (b, 0, 1)]), &reach)
+    .append(
+      &mut world.cohort,
+      record(1, &[(a, 0, 1), (b, 0, 1)]),
+      &reach,
+    )
     .unwrap();
-  assert_eq!(world.cohort.committed_cut().get(&b), Some(&0), "B has not committed it");
+  assert_eq!(
+    world.cohort.committed_cut().get(&b),
+    Some(&0),
+    "B has not committed it"
+  );
   let successor = world.co_holders(&b).first().copied().unwrap();
   let mut taken = LogsOwner::take_over(&mut world.cohort, successor, &Reach::All).unwrap();
   assert_eq!(taken.dropped, Vec::<[u8; 32]>::new(), "kept whole");
@@ -380,7 +420,11 @@ fn a_takeover_keeps_a_record_every_read_holds_and_finishes_it() {
     "committed whole, on both logs"
   );
   let stale = first
-    .append(&mut world.cohort, record(2, &[(a, 1, 2), (b, 1, 2)]), &Reach::All)
+    .append(
+      &mut world.cohort,
+      record(2, &[(a, 1, 2), (b, 1, 2)]),
+      &Reach::All,
+    )
     .unwrap();
   assert!(!stale.whole, "the superseded owner commits nothing");
 }
@@ -395,7 +439,11 @@ fn a_superseded_owner_commits_nothing_on_any_log() {
   let (a, b, names) = (world.a, world.b, world.names);
   let mut first = LogsOwner::bootstrap(&world.cohort);
   first
-    .append(&mut world.cohort, record(1, &[(a, 0, 1), (b, 0, 1)]), &Reach::All)
+    .append(
+      &mut world.cohort,
+      record(1, &[(a, 0, 1), (b, 0, 1)]),
+      &Reach::All,
+    )
     .unwrap();
   let successor = world.co_holders(&a).first().copied().unwrap();
   let taken = LogsOwner::take_over(&mut world.cohort, successor, &Reach::All).unwrap();
@@ -404,15 +452,26 @@ fn a_superseded_owner_commits_nothing_on_any_log() {
     record(3, &[(names, 0, 2)]),
   ]
   .map(|stale| first.append(&mut world.cohort, stale, &Reach::All).unwrap());
-  assert!(stale.iter().all(|appended| !appended.whole), "nothing whole");
+  assert!(
+    stale.iter().all(|appended| !appended.whole),
+    "nothing whole"
+  );
   let mut owner = taken.owner;
   let fresh = owner
-    .append(&mut world.cohort, record(4, &[(a, 1, 2), (b, 1, 2)]), &Reach::All)
+    .append(
+      &mut world.cohort,
+      record(4, &[(a, 1, 2), (b, 1, 2)]),
+      &Reach::All,
+    )
     .unwrap();
   assert!(fresh.whole, "the new owner commits at the same positions");
   let history = world.cohort.committed_history();
   let committed: BTreeSet<[u8; 32]> = history.values().flatten().copied().collect();
-  assert_eq!(committed, [identity(1), identity(4)].into(), "no superseded record committed");
+  assert_eq!(
+    committed,
+    [identity(1), identity(4)].into(),
+    "no superseded record committed"
+  );
 }
 
 /// A-636 (a takeover that cannot fence every log fences none): do commit a push to green A; take the repository over
@@ -629,8 +688,15 @@ enum Step {
 fn step() -> impl Strategy<Value = Step> {
   // Shape: twenty-four kinds, weighted by the arms below.
   let kinds = 0..24u8;
-  (kinds, any::<u8>(), any::<u8>(), any::<u8>(), any::<u16>(), any::<bool>()).prop_map(
-    |(kind, first, second, third, mask, flag)| match kind {
+  (
+    kinds,
+    any::<u8>(),
+    any::<u8>(),
+    any::<u8>(),
+    any::<u16>(),
+    any::<bool>(),
+  )
+    .prop_map(|(kind, first, second, third, mask, flag)| match kind {
       // Shape: appends, eight in twenty-four, one in eight misread.
       0..=7 => Step::Append {
         logs: first,
@@ -653,8 +719,7 @@ fn step() -> impl Strategy<Value = Step> {
         back: third,
         ahead: flag && third.is_multiple_of(8),
       },
-    },
-  )
+    })
 }
 
 /// The logs a step picks from `logs`: one log when its top bit is clear (a push to one green or one state log), else
@@ -674,7 +739,10 @@ fn chosen(logs: u8, all: &[LogName]) -> Vec<LogName> {
   }
   picked.sort_unstable();
   picked.dedup();
-  picked.into_iter().filter_map(|index| all.get(index).copied()).collect()
+  picked
+    .into_iter()
+    .filter_map(|index| all.get(index).copied())
+    .collect()
 }
 
 /// One generated history's world: the repository's holders, its owner and the owners it superseded, the reach, and
@@ -798,7 +866,10 @@ impl World {
     }
     let pending_elsewhere = self.waiting_beside(&logs);
     let spans = record.spans.clone();
-    match self.owner.append(&mut self.cohort, record.clone(), &self.reach) {
+    match self
+      .owner
+      .append(&mut self.cohort, record.clone(), &self.reach)
+    {
       Ok(appended) => {
         self.records.insert(record.identity, spans);
         self.count_append(logs.len(), appended.whole, pending_elsewhere);
@@ -885,7 +956,9 @@ impl World {
       .collect();
     let census = &mut self.census;
     census.takeovers = census.takeovers.saturating_add(1);
-    census.dropped_whole = census.dropped_whole.saturating_add(count(taken.dropped.len()));
+    census.dropped_whole = census
+      .dropped_whole
+      .saturating_add(count(taken.dropped.len()));
     census.kept_unfinished = census.kept_unfinished.saturating_add(count(kept.len()));
     let superseded = std::mem::replace(&mut self.owner, taken.owner);
     self.stale.push(superseded);
@@ -935,17 +1008,26 @@ impl World {
       Err(ReadRefused::Split { identity }) => {
         census.reads_split = census.reads_split.saturating_add(1);
         let spans = self.records.get(&identity).cloned().unwrap_or_default();
-        prop_assert!(spans_split_by(&spans, |log| vector.get(log).copied()), "split, wrongly");
+        prop_assert!(
+          spans_split_by(&spans, |log| vector.get(log).copied()),
+          "split, wrongly"
+        );
         Ok(())
       }
       Err(ReadRefused::NotApplied { log, asked, .. }) => {
         census.reads_not_applied = census.reads_not_applied.saturating_add(1);
-        prop_assert!(asked > applied.get(&log).copied().unwrap_or(0), "not applied, wrongly");
+        prop_assert!(
+          asked > applied.get(&log).copied().unwrap_or(0),
+          "not applied, wrongly"
+        );
         Ok(())
       }
       Err(ReadRefused::NotHeld { log }) => {
         census.reads_not_held = census.reads_not_held.saturating_add(1);
-        prop_assert!(!self.cohort.candidates(&log).contains(&host), "not held, wrongly");
+        prop_assert!(
+          !self.cohort.candidates(&log).contains(&host),
+          "not held, wrongly"
+        );
         Ok(())
       }
     }
@@ -955,23 +1037,37 @@ impl World {
   fn judge_answer(&self, vector: &Cut, answer: &Answer) -> Result<(), TestCaseError> {
     for (log, identities) in answer {
       let history = self.history.get(log).map_or(&[][..], Vec::as_slice);
-      prop_assert!(history.starts_with(identities), "a replica answered past the history");
+      prop_assert!(
+        history.starts_with(identities),
+        "a replica answered past the history"
+      );
     }
     let at = |log: &LogName| vector.get(log).copied();
     for identity in answer.values().flatten() {
       let spans = self.records.get(identity).cloned().unwrap_or_default();
-      prop_assert!(!spans_split_by(&spans, at), "a replica answered a split cut");
+      prop_assert!(
+        !spans_split_by(&spans, at),
+        "a replica answered a split cut"
+      );
     }
     Ok(())
   }
 
   /// The checks after every step: Agreement, NoLoss, and every holder's applied cut whole, committed and monotone.
   fn check(&mut self) -> Result<(), TestCaseError> {
-    prop_assert_eq!(self.cohort.diverges(), None, "two values held by quorums at a position");
+    prop_assert_eq!(
+      self.cohort.diverges(),
+      None,
+      "two values held by quorums at a position"
+    );
     let now = self.cohort.committed_history();
     for (log, before) in &self.history {
       let after = now.get(log).map_or(&[][..], Vec::as_slice);
-      prop_assert!(after.starts_with(before), "NoLoss: {:?} lost a committed record", log);
+      prop_assert!(
+        after.starts_with(before),
+        "NoLoss: {:?} lost a committed record",
+        log
+      );
     }
     self.count_committed(&now);
     self.history = now;
@@ -1015,7 +1111,10 @@ impl World {
       .map_err(|refusal| TestCaseError::fail(format!("{host:?} applied {refusal:?}")))?;
     self.judge_answer(&applied, &answer)?;
     for identity in answer.values().flatten() {
-      let several = self.records.get(identity).is_some_and(|spans| spans.len() > 1);
+      let several = self
+        .records
+        .get(identity)
+        .is_some_and(|spans| spans.len() > 1);
       if several && self.joined.insert((host, *identity)) {
         self.census.applied_at_join = self.census.applied_at_join.saturating_add(1);
       }

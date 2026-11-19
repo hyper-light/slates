@@ -179,7 +179,11 @@ impl LogsCohort {
 
   /// The candidates of `log`, owner first; none for a log the repository does not keep.
   pub fn candidates(&self, log: &LogName) -> &[HostId] {
-    self.logs.get(log).map(Cohort::candidates).unwrap_or_default()
+    self
+      .logs
+      .get(log)
+      .map(Cohort::candidates)
+      .unwrap_or_default()
   }
 
   /// What `host` applied, a log at a time; nothing for a host that applied nothing.
@@ -249,7 +253,10 @@ impl LogsCohort {
           asked: *asked,
         });
       }
-      let prefix = held.iter().take(as_index(*asked)).map(|record| record.identity);
+      let prefix = held
+        .iter()
+        .take(as_index(*asked))
+        .map(|record| record.identity);
       answer.insert(*name, prefix.collect());
     }
     let at = |log: &LogName| vector.get(log).copied();
@@ -556,7 +563,10 @@ fn lowered_to(
   {
     return None;
   }
-  let from = spans.iter().find(|span| span.log == *log).map(|span| span.from);
+  let from = spans
+    .iter()
+    .find(|span| span.log == *log)
+    .map(|span| span.from);
   Some(from.unwrap_or(position).min(position))
 }
 
