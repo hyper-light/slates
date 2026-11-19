@@ -3156,6 +3156,9 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::StaleHandle => HostAnswer::StaleHandle,
     // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
+    // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
+    // a refusal no errno names.
+    HostError::Pending => HostAnswer::Errno { errno: 0 },
   }
 }
 

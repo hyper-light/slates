@@ -16,13 +16,27 @@
 //! - [`tls`]: rustls' client over aws-lc-rs, driven sans-io beneath the framing.
 //! - [`client`]: `HeadObject`, ranged `GetObject` bound by `If-Match` or a version id, and `ListObjectsV2` pages,
 //!   signed, sent over the runtime's TCP, every answer typed (A-471).
+//! - [`time`]: the calendar the signing timestamp is written in and S3's `LastModified` read in.
 //!
-//! The `HostFs` implementation with its simulated oracle is part 3 (GAPS A-464).
+//! The base itself (A-524, part 3):
+//! - [`name`]: an S3 base as the library names it (endpoint, region, bucket, prefix, addressing), refused by its kind
+//!   when no request could read it, and its identity, the device of its fingerprints.
+//! - [`host`]: the read-only host seam answered from the base's objects, sans-io: a miss parked as a pending answer
+//!   naming its fetch, a directory its delimited listing, a file bound to its object by its ETag and version, ranges in
+//!   the volume's chunks within a budgeted cache, every window learned from the path's round trips.
+//! - [`fetch`]: what the host asks of its store and the store's answer, run through the network client.
+//! - [`sim`]: `SimS3`, the simulated store that is the host's oracle: versioned objects, an outsider's puts and
+//!   deletes, truncated listings and the typed refusals, as S3 answers them.
 
 pub mod client;
+pub mod fetch;
+pub mod host;
 pub mod http;
 pub mod keys;
 pub mod list;
+pub mod name;
 pub mod sigv4;
+pub mod sim;
+pub mod time;
 pub mod tls;
 pub mod wait;

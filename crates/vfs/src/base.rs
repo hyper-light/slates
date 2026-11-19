@@ -544,6 +544,9 @@ pub(crate) fn unavailable_errno(error: HostError) -> i32 {
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       GONE_DIRECTORY_ERRNO
     }
+    // A fetch under way is no errno: the directory is unavailable for no reason the host's errno names, as a base
+    // unavailable with no host at all is (`BaseUnavailable(0)`). Recovery over an S3 base is A-524's owed integration.
+    HostError::Pending => 0,
   }
 }
 
@@ -858,6 +861,7 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
+    HostError::Pending => VfsError::BasePending,
   }
 }
 

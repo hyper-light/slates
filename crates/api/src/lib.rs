@@ -234,10 +234,25 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`MountFault::NotMounted`] before any call, and the new refusals are [`MountFault::Busy`] (`EBUSY`: a process holds
 /// a file on the mount), [`MountFault::StillMounted`] (the call said done and the table disagrees) and
 /// [`MountFault::MountTable`] (the table could not be read) (the same day).
+/// 43: an S3 base as the library names it ([`S3Base`], [`S3Style`], [`S3Scheme`]) and the credential handed for it
+/// ([`S3Credentials`], whose `Debug` shows its access key id alone): the store's endpoint, the bucket's region, the
+/// bucket, the prefix and the addressing, each refused by its kind where no request could read it ([`NameRefused`]:
+/// [`EndpointFault`], [`BucketFault`], [`PrefixFault`]) (Mantle's CP-T10.5, A-524; 2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 42;
+pub const CONTRACT: u32 = 43;
 
+/// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
+pub use slates_base::s3::client::Style as S3Style;
+/// An S3 base as the library names it (§4.15 "An S3 base", A-524; Mantle's CP-T10.5): the store's endpoint, the
+/// bucket's region, the bucket, the prefix and the addressing, each checked when it is made, and its identity, the
+/// device every entry of the base reports.
+pub use slates_base::s3::name::{
+  BucketFault, EndpointFault, NameRefused, PrefixFault, S3Base, Scheme as S3Scheme,
+};
+/// The credential an S3 base is read with, as Mantle hands it: held in RAM alone, its `Debug` showing its access key id
+/// alone (§4.15 "Credentials").
+pub use slates_base::s3::sigv4::Credentials as S3Credentials;
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
 /// A snapshot exported as its archive ([`Instance::export_archive`], A-441), and a volume made from one
@@ -300,6 +315,50 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/library.md")]
 pub struct Guide;
+
+#[cfg(test)]
+mod s3_naming {
+  /// A-524 (§4.15 "An S3 base"; Mantle's CP-T10.5): do name an S3 base through the library as Mantle would, the same
+  /// objects again in another region, a base whose bucket S3 would not name, and a credential. Expect the first named
+  /// with its prefix and its virtual-hosted `Host` header, the same objects the same identity, the bad bucket refused
+  /// by its kind, and the credential's secret never in its `Debug`.
+  #[test]
+  fn the_library_names_an_s3_base_and_refuses_one_no_request_could_read() {
+    let endpoint = "https://s3.us-east-1.amazonaws.com";
+    let base = super::S3Base::new(
+      endpoint,
+      "us-east-1",
+      "kiln-bytes",
+      "projects/x/",
+      super::S3Style::VirtualHosted,
+    )
+    .expect("Mantle's base is named");
+    assert_eq!(base.prefix(), "projects/x/");
+    assert_eq!(base.host_header(), "kiln-bytes.s3.us-east-1.amazonaws.com");
+    let elsewhere = super::S3Base::new(
+      endpoint,
+      "eu-west-1",
+      "kiln-bytes",
+      "projects/x/",
+      super::S3Style::Path,
+    )
+    .expect("the same objects named again");
+    assert_eq!(base.identity(), elsewhere.identity());
+    assert_eq!(
+      super::S3Base::new(
+        endpoint,
+        "us-east-1",
+        "Kiln_Bytes",
+        "",
+        super::S3Style::Path
+      ),
+      Err(super::NameRefused::Bucket(super::BucketFault::Character))
+    );
+    let credentials =
+      super::S3Credentials::new("AKIAIOSFODNN7EXAMPLE", "a-secret-never-shown", None);
+    assert!(!format!("{credentials:?}").contains("a-secret-never-shown"));
+  }
+}
 
 #[cfg(test)]
 mod contract_history {
