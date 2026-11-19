@@ -19,10 +19,23 @@
 //! - **Release copy**: the map was let go; the anchor closes its copy.
 //!
 //! The anchor applies them to [`Held`], each kind under its own bound with a typed refusal past it, and hands what it
-//! holds to every daemon it spawns ([`ENV_DEVICES`], [`ENV_CONNECTIONS`], [`ENV_COPIES`]; [`Held::env_value`],
-//! [`Held::connections_env_value`], [`Held::copies_env_value`], read back by [`parse_env`], [`parse_connections_env`]
-//! and [`parse_copies_env`]), each descriptor inherited as the NFS listener's is. The channel keeps each message whole and in order, and the anchor drains it
+//! holds to every daemon it spawns in one table ([`Table`]: [`Held::devices_part`], [`Held::connections_part`],
+//! [`Held::copies_part`], read back by [`parse_devices`], [`parse_connections`] and [`parse_copies`]), each descriptor
+//! inherited as the NFS listener's is. The channel keeps each message whole and in order, and the anchor drains it
 //! before any restart, so a release from the dead daemon is never applied after its successor started.
+//!
+//! **The table rides a sealed object, never the environment** (A-462, A-460's Unix half). Linux refuses an `execve`
+//! whose single argument or environment string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` ("the limit per string is 32
+//! pages": `execve(2)`; `include/uapi/linux/binfmts.h`), 131,072 bytes on 4 KiB pages, failing `E2BIG`; macOS bounds the
+//! arguments and the environment together at `ARG_MAX`, 1,048,576 bytes (`getconf ARG_MAX` and `kern.argmax` on the Mac
+//! Studio, macOS 26.4, 2026-11-18). A held device takes up to [`DEVICE_TEXT_CAP`] characters, so the old variables
+//! passed Linux's limit at about 800 devices with full sessions, while the bounds admit `shards × 4096`. The table's
+//! text ([`encode_table`]) is written into an object of its own length, sealed and read-only as a DAX peer's copy is
+//! (`slates_mem::PeerObject` made `PeerAccess::Read`: a memfd sealed against writes, shrinking, growing and new seals on
+//! Linux; an unlinked shared-memory object handed by a descriptor opened read alone on macOS), whose descriptor the
+//! spawn inherits; [`ENV_HELD`] names only that descriptor and the table's length ([`encode_pointer`], at most
+//! [`POINTER_TEXT_CAP`] characters), which the daemon checks against its bounds' capacity ([`table_cap`]) before it reads
+//! a byte ([`TableObject`], [`read_table`]).
 //!
 //! Every message is a fixed [`MESSAGE_BYTES`]-byte body, checked by kind, length and descriptor count before
 //! anything is kept: the channel crosses a process boundary, so its bytes are external input.
@@ -35,27 +48,20 @@
 
 use std::collections::BTreeMap;
 use std::io::{IoSlice, IoSliceMut};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 
 use rustix::net::{
   AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
   SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
 };
 
-/// Format: the environment variable carrying the device channel's daemon end and every held device to a
-/// spawned daemon: `CHANNEL_FD` then, for each device, `;ATTACHMENT_HEX:FD:SESSION_HEX` (`-` for a device
-/// whose session has not arrived). The descriptors are inherited across the spawn.
-pub const ENV_DEVICES: &str = "SLATES_ANCHOR_DEVICES";
-
-/// Format: the environment variable carrying every held NFS connection to a spawned daemon: `ID_HEX:FD` for each,
-/// joined by `;` (empty when none is held). The descriptors are inherited across the spawn; the channel itself rides
-/// in [`ENV_DEVICES`].
-pub const ENV_CONNECTIONS: &str = "SLATES_ANCHOR_CONNECTIONS";
-
-/// Format: the environment variable carrying every held writable copy to a spawned daemon (A-197): `ID_HEX:FD:RECORD_HEX`
-/// for each, joined by `;` (empty when none is held). The descriptors are inherited across the spawn; the channel itself
-/// rides in [`ENV_DEVICES`].
-pub const ENV_COPIES: &str = "SLATES_ANCHOR_COPIES";
+/// Format: the environment variable pointing a spawned daemon at its handoff table (A-462): `FD:LEN_HEX`, the inherited
+/// descriptor of the sealed, read-only object holding the table's text ([`encode_table`]) and the text's length in
+/// bytes ([`encode_pointer`]). The table's three parts are the devices part, `CHANNEL_FD` then, for each device,
+/// `;ATTACHMENT_HEX:FD:SESSION_HEX` (`-` for a device whose session has not arrived); the connections part, `ID_HEX:FD`
+/// for each, joined by `;`; and the copies part (A-197), `ID_HEX:FD:RECORD_HEX` for each, joined by `;`. Every
+/// descriptor they name is inherited across the spawn.
+pub const ENV_HELD: &str = "SLATES_ANCHOR_HELD";
 
 /// Format: the most session bytes a message carries. The FUSE session is two bytes
 /// (`slates_bridge_fuse::session::SESSION_BYTES`); the channel carries them opaque, with room for that
@@ -588,8 +594,9 @@ impl Held {
     self.copies.remove(&copy);
   }
 
-  /// The [`ENV_COPIES`] value handing every held copy to a daemon.
-  pub fn copies_env_value(&self) -> String {
+  /// The handoff table's copies part (A-197; [`Table::copies`]): `ID_HEX:FD:RECORD_HEX` for each held copy, joined by
+  /// `;`, empty when none is held.
+  pub fn copies_part(&self) -> String {
     self
       .copies
       .iter()
@@ -627,8 +634,9 @@ impl Held {
     self.connections.remove(&connection);
   }
 
-  /// The [`ENV_CONNECTIONS`] value handing every held connection to a daemon.
-  pub fn connections_env_value(&self) -> String {
+  /// The handoff table's connections part ([`Table::connections`]): `ID_HEX:FD` for each held connection, joined by
+  /// `;`, empty when none is held.
+  pub fn connections_part(&self) -> String {
     self
       .connections
       .iter()
@@ -660,8 +668,9 @@ impl Held {
       .map(|(attachment, held)| (*attachment, held))
   }
 
-  /// The [`ENV_DEVICES`] value handing `channel` (the daemon's end) and every held device to a daemon.
-  pub fn env_value(&self, channel: BorrowedFd<'_>) -> String {
+  /// The handoff table's devices part ([`Table::devices`]): `channel` (the daemon's end), then
+  /// `;ATTACHMENT_HEX:FD:SESSION_HEX` for each held device (`-` for a session not yet sent).
+  pub fn devices_part(&self, channel: BorrowedFd<'_>) -> String {
     let mut value = channel.as_raw_fd().to_string();
     for (attachment, held) in &self.held {
       let session = held.session.as_deref().map_or_else(|| "-".to_owned(), hex);
@@ -700,7 +709,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     .collect()
 }
 
-/// One device handed over in the environment: its attachment, its inherited descriptor number, and its session.
+/// One device handed over in the table: its attachment, its inherited descriptor number, and its session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InheritedDevice {
   /// The attachment.
@@ -711,7 +720,7 @@ pub struct InheritedDevice {
   pub session: Option<Vec<u8>>,
 }
 
-/// What [`ENV_DEVICES`] handed a daemon.
+/// What the table's devices part handed a daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inherited {
   /// The channel's daemon end.
@@ -720,9 +729,9 @@ pub struct Inherited {
   pub devices: Vec<InheritedDevice>,
 }
 
-/// Parses an [`ENV_DEVICES`] value. Every descriptor number must be non-negative and distinct, and every
-/// attachment named once, so no number is adopted twice.
-pub fn parse_env(value: &str) -> Result<Inherited, HoldRefusal> {
+/// Parses the table's devices part ([`Held::devices_part`]). Every descriptor number must be non-negative and distinct,
+/// and every attachment named once, so no number is adopted twice.
+pub fn parse_devices(value: &str) -> Result<Inherited, HoldRefusal> {
   let mut parts = value.split(';');
   let channel = parts
     .next()
@@ -765,7 +774,7 @@ pub fn parse_env(value: &str) -> Result<Inherited, HoldRefusal> {
   Ok(Inherited { channel, devices })
 }
 
-/// One connection handed over in the environment: its id and its inherited descriptor number.
+/// One connection handed over in the table: its id and its inherited descriptor number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InheritedConnection {
   /// The connection's id.
@@ -774,10 +783,10 @@ pub struct InheritedConnection {
   pub fd: RawFd,
 }
 
-/// Reads an [`ENV_CONNECTIONS`] value back: each `ID_HEX:FD`. A value that does not parse, or names one id or one
-/// descriptor twice, is refused whole, so the daemon adopts no descriptor number it cannot account for (two owners of
-/// one number would close it twice).
-pub fn parse_connections_env(value: &str) -> Result<Vec<InheritedConnection>, HoldRefusal> {
+/// Reads the table's connections part back ([`Held::connections_part`]): each `ID_HEX:FD`. A part that does not parse,
+/// or names one id or one descriptor twice, is refused whole, so the daemon adopts no descriptor number it cannot account
+/// for (two owners of one number would close it twice).
+pub fn parse_connections(value: &str) -> Result<Vec<InheritedConnection>, HoldRefusal> {
   let connections = parse_connection_entries(value)?;
   let ids: std::collections::BTreeSet<u64> = connections.iter().map(|c| c.connection).collect();
   let fds: std::collections::BTreeSet<RawFd> = connections.iter().map(|c| c.fd).collect();
@@ -787,7 +796,7 @@ pub fn parse_connections_env(value: &str) -> Result<Vec<InheritedConnection>, Ho
   Ok(connections)
 }
 
-/// Each `ID_HEX:FD` entry of an [`ENV_CONNECTIONS`] value, parsed.
+/// Each `ID_HEX:FD` entry of the table's connections part, parsed.
 fn parse_connection_entries(value: &str) -> Result<Vec<InheritedConnection>, HoldRefusal> {
   value
     .split(';')
@@ -808,7 +817,7 @@ fn parse_connection_entries(value: &str) -> Result<Vec<InheritedConnection>, Hol
     .collect()
 }
 
-/// One writable copy handed over in the environment: its id, its inherited descriptor number and its record.
+/// One writable copy handed over in the table: its id, its inherited descriptor number and its record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InheritedCopy {
   /// The copy's id.
@@ -819,10 +828,10 @@ pub struct InheritedCopy {
   pub record: Vec<u8>,
 }
 
-/// Reads an [`ENV_COPIES`] value back: each `ID_HEX:FD:RECORD_HEX`, the record at least one byte and at most
-/// [`SESSION_CAP`]. A value that does not parse, or names one id or one descriptor twice, is refused whole, so the
-/// daemon adopts no descriptor number it cannot account for.
-pub fn parse_copies_env(value: &str) -> Result<Vec<InheritedCopy>, HoldRefusal> {
+/// Reads the table's copies part back ([`Held::copies_part`]): each `ID_HEX:FD:RECORD_HEX`, the record at least one byte
+/// and at most [`SESSION_CAP`]. A part that does not parse, or names one id or one descriptor twice, is refused whole, so
+/// the daemon adopts no descriptor number it cannot account for.
+pub fn parse_copies(value: &str) -> Result<Vec<InheritedCopy>, HoldRefusal> {
   let copies = value
     .split(';')
     .filter(|entry| !entry.is_empty())
@@ -852,6 +861,249 @@ pub fn parse_copies_env(value: &str) -> Result<Vec<InheritedCopy>, HoldRefusal> 
     return Err(malformed("a copy id or descriptor named twice"));
   }
   Ok(copies)
+}
+
+/// The handoff table's three parts (A-462), as the anchor writes them: the devices part ([`Held::devices_part`], the
+/// channel's descriptor first), the connections part ([`Held::connections_part`]) and the copies part
+/// ([`Held::copies_part`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Table {
+  /// The channel's descriptor and every held device.
+  pub devices: String,
+  /// Every held connection.
+  pub connections: String,
+  /// Every held copy.
+  pub copies: String,
+}
+
+/// The bounds a handoff table is read against (A-462): the devices, connections and copies the anchor may hold for its
+/// daemon, which the daemon derives as the anchor does (its `held_device_bound`, `held_connection_bound` and
+/// `held_copy_bound`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableBounds {
+  /// The devices.
+  pub devices: usize,
+  /// The connections.
+  pub connections: usize,
+  /// The copies.
+  pub copies: usize,
+}
+
+/// Format: the most characters a descriptor number takes in the table: an `i32`'s decimal digits.
+const FD_DIGITS: usize = 10;
+/// Format: the most characters an id takes in the table: a `u64`'s hexadecimal digits.
+const ID_DIGITS: usize = 16;
+/// Format: the CRC32C that closes the table, in hexadecimal.
+const CHECKSUM_DIGITS: usize = 8;
+/// Derived: the most characters one held device takes in the devices part, `;ATTACHMENT_HEX:FD:SESSION_HEX`: its three
+/// fields at their most and their three separators.
+pub const DEVICE_TEXT_CAP: usize = 3 + ID_DIGITS + FD_DIGITS + SESSION_CAP * HEX_DIGITS_PER_BYTE;
+/// Derived: the most characters one held connection takes in the connections part, `ID_HEX:FD;`.
+const CONNECTION_TEXT_CAP: usize = 2 + ID_DIGITS + FD_DIGITS;
+/// Derived: the most characters one held copy takes in the copies part, `ID_HEX:FD:RECORD_HEX;`.
+const COPY_TEXT_CAP: usize = 3 + ID_DIGITS + FD_DIGITS + SESSION_CAP * HEX_DIGITS_PER_BYTE;
+/// Derived: the characters the table adds to its parts: the channel's number, the two line breaks between the parts and
+/// the checksum with its `#`.
+const TABLE_FRAME_TEXT: usize = FD_DIGITS + 2 + 1 + CHECKSUM_DIGITS;
+/// Format: the most characters [`ENV_HELD`] takes ([`encode_pointer`]): a descriptor number, a colon and a `u64` length
+/// in hexadecimal, whatever the table holds.
+pub const POINTER_TEXT_CAP: usize = FD_DIGITS + 1 + ID_DIGITS;
+
+/// Derived: the most bytes a handoff table read against `bounds` takes ([`encode_table`]): each device, connection and
+/// copy the bounds admit at its most, and the frame. None where it overflows.
+pub fn table_cap(bounds: TableBounds) -> Option<usize> {
+  let devices = bounds.devices.checked_mul(DEVICE_TEXT_CAP)?;
+  let connections = bounds.connections.checked_mul(CONNECTION_TEXT_CAP)?;
+  let copies = bounds.copies.checked_mul(COPY_TEXT_CAP)?;
+  devices
+    .checked_add(connections)?
+    .checked_add(copies)?
+    .checked_add(TABLE_FRAME_TEXT)
+}
+
+/// The handoff table's text (A-462): its three parts, a line each, then `#` and the CRC32C of what precedes it in
+/// hexadecimal. A part holds hexadecimal, decimal, `;`, `:` and `-` alone, so neither a line break nor `#` is ever one's.
+pub fn encode_table(table: &Table) -> String {
+  let text = format!("{}\n{}\n{}", table.devices, table.connections, table.copies);
+  let checksum = slates_wire::crc32c::crc32c(text.as_bytes());
+  format!("{text}#{checksum:08x}")
+}
+
+/// Reads a handoff table's text back into its parts: refused `Malformed` unless its checksum holds over the rest and the
+/// rest is exactly three lines. Each part is then read by its own parser ([`parse_devices`], [`parse_connections`],
+/// [`parse_copies`]).
+pub fn decode_table(text: &str) -> Result<Table, HoldRefusal> {
+  let (body, checksum) = text
+    .rsplit_once('#')
+    .ok_or(malformed("a handoff table without its checksum"))?;
+  if checksum.len() != CHECKSUM_DIGITS
+    || !lower_hex(checksum)
+    || u32::from_str_radix(checksum, HEX).ok() != Some(slates_wire::crc32c::crc32c(body.as_bytes()))
+  {
+    return Err(malformed("a handoff table whose checksum does not hold"));
+  }
+  let mut lines = body.split('\n');
+  let (Some(devices), Some(connections), Some(copies), None) =
+    (lines.next(), lines.next(), lines.next(), lines.next())
+  else {
+    return Err(malformed("a handoff table is three lines"));
+  };
+  Ok(Table {
+    devices: devices.to_owned(),
+    connections: connections.to_owned(),
+    copies: copies.to_owned(),
+  })
+}
+
+/// The [`ENV_HELD`] value pointing a spawned daemon at its table (A-462): the object's descriptor `fd` in the daemon, in
+/// decimal, and the table's length `len` in bytes, in hexadecimal: `FD:LEN_HEX`.
+pub fn encode_pointer(fd: RawFd, len: usize) -> String {
+  format!("{fd}:{len:x}")
+}
+
+/// Parses an [`ENV_HELD`] value: the table's descriptor and its length. Refused `Malformed` unless it is exactly the shape
+/// [`encode_pointer`] writes (decimal digits, a colon, lowercase hexadecimal; no sign), a descriptor number from zero,
+/// and a length from one byte to the most a table read against `bounds` takes ([`table_cap`]), all before a byte is read.
+pub fn parse_pointer(value: &str, bounds: TableBounds) -> Result<(RawFd, usize), HoldRefusal> {
+  if value.len() > POINTER_TEXT_CAP {
+    return Err(malformed("a handoff pointer past POINTER_TEXT_CAP"));
+  }
+  let (fd, len) = value
+    .split_once(':')
+    .ok_or(malformed("a handoff pointer is FD:LEN"))?;
+  let fd = Some(fd)
+    .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    .and_then(|digits| digits.parse::<RawFd>().ok())
+    .ok_or(malformed("the handoff table's descriptor"))?;
+  let len = Some(len)
+    .filter(|digits| digits.len() <= ID_DIGITS && lower_hex(digits))
+    .and_then(|digits| usize::from_str_radix(digits, HEX).ok())
+    .filter(|len| *len > 0)
+    .ok_or(malformed("the handoff table's length"))?;
+  let cap = table_cap(bounds).ok_or(malformed("the handoff table's capacity"))?;
+  if len > cap {
+    return Err(malformed("a handoff table past its bounds' capacity"));
+  }
+  Ok((fd, len))
+}
+
+/// Whether `text` is lowercase hexadecimal digits alone, the only form the table and its pointer are written in: so each
+/// has one encoding, with no sign and no capitals.
+fn lower_hex(text: &str) -> bool {
+  !text.is_empty()
+    && text
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Refuses a table whose parts name its own descriptor `table` again (the channel, a device, a connection or a copy):
+/// one inherited number has one owner, and the daemon owns the table's from the moment it reads it.
+pub fn check_table_owner(
+  table: RawFd,
+  devices: &Inherited,
+  connections: &[InheritedConnection],
+  copies: &[InheritedCopy],
+) -> Result<(), HoldRefusal> {
+  let named = devices.channel == table
+    || devices.devices.iter().any(|device| device.fd == table)
+    || connections.iter().any(|connection| connection.fd == table)
+    || copies.iter().any(|copy| copy.fd == table);
+  if named {
+    return Err(malformed("the handoff table's descriptor has two owners"));
+  }
+  Ok(())
+}
+
+/// Format: the name a handoff table's object is made under: shown as `memfd:<name>` in `/proc` on Linux; macOS's object
+/// takes a random name, gone at once.
+const TABLE_OBJECT_NAME: &str = "slates-anchor-held";
+
+/// The handoff table written into a sealed, read-only object of its own length (A-462): a `slates_mem::PeerObject` made
+/// `PeerAccess::Read`, the object a DAX peer is handed. On Linux a memfd sealed against later writes, shrinking, growing
+/// and new seals (`F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`), the anchor's own view, taken before
+/// the seals, the only writer; on macOS an unlinked shared-memory object whose handed descriptor was opened read alone.
+/// The anchor keeps it until its spawn holds its own copy of [`TableObject::descriptor`].
+#[derive(Debug)]
+pub struct TableObject {
+  object: slates_mem::PeerObject,
+  len: usize,
+}
+
+impl TableObject {
+  /// The object holding `table`'s text ([`encode_table`]). Refused `Os` where the OS refuses the object or its write.
+  pub fn new(table: &Table) -> Result<TableObject, HoldRefusal> {
+    let text = encode_table(table);
+    let len =
+      u64::try_from(text.len()).map_err(|_| malformed("a handoff table past an address"))?;
+    let mut object =
+      slates_mem::PeerObject::create(TABLE_OBJECT_NAME, len, slates_mem::PeerAccess::Read)
+        .map_err(|error| mem_refused("the handoff table's object", &error))?;
+    object
+      .store(0, text.as_bytes())
+      .map_err(|error| mem_refused("the handoff table's write", &error))?;
+    Ok(TableObject {
+      object,
+      len: text.len(),
+    })
+  }
+
+  /// The descriptor a spawn inherits, read alone: the caller clears close-on-exec for the spawn.
+  #[must_use]
+  pub fn descriptor(&self) -> BorrowedFd<'_> {
+    self.object.descriptor()
+  }
+
+  /// The table's length in bytes.
+  #[must_use]
+  pub fn len(&self) -> usize {
+    self.len
+  }
+
+  /// Never: a table holds its frame at least. Here for the convention beside [`TableObject::len`].
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// The [`ENV_HELD`] value naming [`TableObject::descriptor`] at its own number, as a spawned process inherits it.
+  #[must_use]
+  pub fn pointer(&self) -> String {
+    encode_pointer(self.descriptor().as_raw_fd(), self.len)
+  }
+}
+
+/// The [`ENV_HELD`] value handing `table` to a daemon of this very process, as a test playing the anchor does: a copy of
+/// the table's descriptor, close-on-exec, left for that daemon to own, and its pointer. Refused as [`TableObject::new`]
+/// is, and `Os` where the copy is refused.
+pub fn hand_in_process(table: &Table) -> Result<String, HoldRefusal> {
+  let object = TableObject::new(table)?;
+  let copy = rustix::io::fcntl_dupfd_cloexec(object.descriptor(), 0)
+    .map_err(os("fcntl(F_DUPFD_CLOEXEC)"))?;
+  Ok(encode_pointer(copy.into_raw_fd(), object.len()))
+}
+
+/// The handoff table the anchor handed this process (A-462): `len` bytes of the object `fd`, mapped read alone and read
+/// once, the object closed after. Refused `Os` where the object will not map or holds fewer bytes, and `Malformed` for
+/// bytes that are not text; the caller then reads it with [`decode_table`].
+pub fn read_table(fd: OwnedFd, len: usize) -> Result<String, HoldRefusal> {
+  let view_len = u64::try_from(len).map_err(|_| malformed("a handoff table past an address"))?;
+  let view = slates_mem::PeerView::map(fd, view_len)
+    .map_err(|error| mem_refused("the handoff table's view", &error))?;
+  let mut bytes = vec![0u8; len];
+  view
+    .load(0, &mut bytes)
+    .map_err(|error| mem_refused("the handoff table's read", &error))?;
+  String::from_utf8(bytes).map_err(|_| malformed("a handoff table that is not text"))
+}
+
+/// A memory refusal as a [`HoldRefusal`]: the OS's errno where it gave one, as `Os`; any other, malformed.
+fn mem_refused(call: &'static str, error: &slates_mem::MemError) -> HoldRefusal {
+  match error {
+    slates_mem::MemError::OsRefused {
+      code: Some(code), ..
+    } => HoldRefusal::Os { call, code: *code },
+    _ => malformed(call),
+  }
 }
 
 #[cfg(test)]
@@ -1077,7 +1329,7 @@ mod tests {
         device: second,
       })
       .unwrap();
-    let parsed = parse_env(&held.env_value(daemon.as_fd())).unwrap();
+    let parsed = parse_devices(&held.devices_part(daemon.as_fd())).unwrap();
     assert_eq!(parsed.channel, daemon.as_raw_fd());
     assert_eq!(
       parsed.devices,
@@ -1115,13 +1367,13 @@ mod tests {
       "3;1:4:zz",
     ] {
       assert!(
-        matches!(parse_env(value), Err(HoldRefusal::Malformed { .. })),
+        matches!(parse_devices(value), Err(HoldRefusal::Malformed { .. })),
         "{value:?} must be refused"
       );
     }
     let long_session = "00".repeat(SESSION_CAP + 1);
     assert!(
-      parse_env(&format!("3;1:4:{long_session}")).is_err(),
+      parse_devices(&format!("3;1:4:{long_session}")).is_err(),
       "a session past the cap"
     );
   }
@@ -1266,7 +1518,7 @@ mod tests {
       })
       .unwrap();
     assert_eq!(
-      parse_connections_env(&held.connections_env_value()).unwrap(),
+      parse_connections(&held.connections_part()).unwrap(),
       [
         InheritedConnection {
           connection: 0xA1,
@@ -1278,7 +1530,7 @@ mod tests {
         },
       ]
     );
-    assert_eq!(parse_connections_env("").unwrap(), []);
+    assert_eq!(parse_connections("").unwrap(), []);
   }
 
   /// A-197. Do: send a copy hold (a pipe's write end, with a record) and its release over a fresh channel; receive
@@ -1412,7 +1664,7 @@ mod tests {
       })
       .unwrap();
     assert_eq!(
-      parse_copies_env(&held.copies_env_value()).unwrap(),
+      parse_copies(&held.copies_part()).unwrap(),
       [
         InheritedCopy {
           copy: 0xA1,
@@ -1426,7 +1678,7 @@ mod tests {
         },
       ]
     );
-    assert_eq!(parse_copies_env("").unwrap(), []);
+    assert_eq!(parse_copies("").unwrap(), []);
   }
 
   /// A-197, hostile input. Do: parse malformed copies environment values. Expect: each refused whole.
@@ -1448,7 +1700,7 @@ mod tests {
       too_long.as_str(),
     ] {
       assert!(
-        matches!(parse_copies_env(value), Err(HoldRefusal::Malformed { .. })),
+        matches!(parse_copies(value), Err(HoldRefusal::Malformed { .. })),
         "{value:?} must be refused"
       );
     }
@@ -1461,12 +1713,256 @@ mod tests {
       "x", "1", "1:", ":4", "zz:4", "1:-4", "1:four", "1:4;1:5", "1:4;2:4", "1:4:5",
     ] {
       assert!(
-        matches!(
-          parse_connections_env(value),
-          Err(HoldRefusal::Malformed { .. })
-        ),
+        matches!(parse_connections(value), Err(HoldRefusal::Malformed { .. })),
         "{value:?} must be refused"
       );
     }
+  }
+
+  /// Format: Linux's limit on one string an `execve` passes, `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` on 4 KiB pages ("the limit
+  /// per string is 32 pages": `execve(2)`; `include/uapi/linux/binfmts.h`), past which the exec fails `E2BIG`.
+  const EXEC_STRING_LIMIT: usize = 32 * 4096;
+  /// Shape: the devices of the full table below, each with a session of the whole cap: past the limit above on their own.
+  const FULL_DEVICES: u32 = 1_000;
+  /// Shape: the connections and copies of the full table below.
+  const FULL_OTHERS: u32 = 256;
+  /// Format: the descriptor numbers the full table names: the channel's, then the devices', connections' and copies'
+  /// from here on, all distinct.
+  const FIRST_NUMBER: RawFd = 3;
+
+  /// A table full past `execve`'s string limit: [`FULL_DEVICES`] devices with sessions of [`SESSION_CAP`] bytes and
+  /// [`FULL_OTHERS`] connections and copies, every descriptor number distinct; and bounds that admit it.
+  fn full_table() -> (Table, TableBounds) {
+    let mut number = FIRST_NUMBER;
+    let mut next = || {
+      number += 1;
+      number
+    };
+    let mut devices = FIRST_NUMBER.to_string();
+    for attachment in 0..FULL_DEVICES {
+      let session = hex(&[u8::try_from(attachment % 251).unwrap(); SESSION_CAP]);
+      devices.push_str(&format!(
+        ";{:x}:{}:{session}",
+        u64::from(attachment) << 32,
+        next()
+      ));
+    }
+    let connections: Vec<String> = (0..FULL_OTHERS)
+      .map(|connection| format!("{connection:x}:{}", next()))
+      .collect();
+    let copies: Vec<String> = (0..FULL_OTHERS)
+      .map(|copy| {
+        format!(
+          "{:x}:{}:{}",
+          (1u64 << 63) | u64::from(copy),
+          next(),
+          hex(&[0xD4; 24])
+        )
+      })
+      .collect();
+    let table = Table {
+      devices,
+      connections: connections.join(";"),
+      copies: copies.join(";"),
+    };
+    let bounds = TableBounds {
+      devices: usize::try_from(FULL_DEVICES).unwrap(),
+      connections: usize::try_from(FULL_OTHERS).unwrap(),
+      copies: usize::try_from(FULL_OTHERS).unwrap(),
+    };
+    (table, bounds)
+  }
+
+  /// A-462. Do: encode a table past the 131,072 bytes Linux lets one exec string hold, point at it, and read the pointer and
+  /// the table back, each part through its parser; then write it into the handoff's sealed object and read it back
+  /// through the object's own descriptor; then point at a table of the most bytes the bounds allow, and one more. Expect
+  /// the table past the limit and its pointer within [`POINTER_TEXT_CAP`]; every device, connection and copy back whole,
+  /// the table's descriptor named by none of them; the object's bytes the table's, and the object refusing a write and a
+  /// resize through the descriptor a daemon is handed; the cap's length taken and one past it refused before a byte is
+  /// read.
+  #[test]
+  fn a_table_past_execs_string_limit_round_trips_through_the_codec_and_the_handoff() {
+    let (table, bounds) = full_table();
+    let text = encode_table(&table);
+    assert!(
+      text.len() > EXEC_STRING_LIMIT,
+      "a full table of {} bytes",
+      text.len()
+    );
+    the_codec_reads_the_table_back_whole(&table, &text, bounds);
+    the_object_holds_the_table_and_refuses_a_change(&table, &text);
+    the_pointer_is_held_to_its_bounds_capacity(bounds);
+  }
+
+  /// `text`, `table`'s encoding, pointed at and read back through the codec: the pointer within [`POINTER_TEXT_CAP`] and
+  /// far inside the exec limit, the table equal, and each part whole by its own parser, the table's descriptor named by
+  /// none of them.
+  fn the_codec_reads_the_table_back_whole(table: &Table, text: &str, bounds: TableBounds) {
+    let pointer = encode_pointer(9_999, text.len());
+    assert!(pointer.len() <= POINTER_TEXT_CAP && pointer.len() < EXEC_STRING_LIMIT);
+    let (fd, len) = parse_pointer(&pointer, bounds).unwrap();
+    assert_eq!((fd, len), (9_999, text.len()));
+    let back = decode_table(text.get(..len).unwrap()).unwrap();
+    assert_eq!(&back, table);
+    the_parts_come_back_whole(&back, fd);
+  }
+
+  /// Every part of `back` parses whole: the channel and every device with its session at the cap, every connection and
+  /// every copy; and none of them names `table_fd`.
+  fn the_parts_come_back_whole(back: &Table, table_fd: RawFd) {
+    let devices = parse_devices(&back.devices).unwrap();
+    let connections = parse_connections(&back.connections).unwrap();
+    let copies = parse_copies(&back.copies).unwrap();
+    let full_sessions = devices
+      .devices
+      .iter()
+      .filter(|device| {
+        device
+          .session
+          .as_deref()
+          .is_some_and(|session| session.len() == SESSION_CAP)
+      })
+      .count();
+    assert_eq!(
+      (devices.channel, full_sessions),
+      (FIRST_NUMBER, usize::try_from(FULL_DEVICES).unwrap())
+    );
+    assert_eq!(
+      (connections.len(), copies.len()),
+      (
+        usize::try_from(FULL_OTHERS).unwrap(),
+        usize::try_from(FULL_OTHERS).unwrap()
+      )
+    );
+    check_table_owner(table_fd, &devices, &connections, &copies).unwrap();
+  }
+
+  /// `table` written into the handoff's sealed object: its bytes `text`'s, read back through a copy of the descriptor a
+  /// daemon is handed, and that descriptor refused a write and a resize.
+  fn the_object_holds_the_table_and_refuses_a_change(table: &Table, text: &str) {
+    let object = TableObject::new(table).unwrap();
+    assert_eq!(object.len(), text.len());
+    let read = read_table(
+      object.descriptor().try_clone_to_owned().unwrap(),
+      object.len(),
+    )
+    .unwrap();
+    assert_eq!(read, text);
+    assert!(
+      rustix::io::write(object.descriptor(), b"x").is_err(),
+      "a daemon's descriptor writes nothing"
+    );
+    // The memory object a daemon is handed, not a host file (R1): its size must not move.
+    #[allow(clippy::disallowed_methods)]
+    let resized =
+      rustix::fs::ftruncate(object.descriptor(), u64::try_from(text.len()).unwrap() + 1);
+    assert!(resized.is_err(), "a daemon's descriptor resizes nothing");
+  }
+
+  /// A pointer of the most bytes a table read against `bounds` takes is taken, and one of a byte more refused before a
+  /// byte is read.
+  fn the_pointer_is_held_to_its_bounds_capacity(bounds: TableBounds) {
+    let cap = table_cap(bounds).unwrap();
+    assert_eq!(
+      parse_pointer(&encode_pointer(7, cap), bounds).unwrap(),
+      (7, cap)
+    );
+    assert!(matches!(
+      parse_pointer(&encode_pointer(7, cap + 1), bounds),
+      Err(HoldRefusal::Malformed { .. })
+    ));
+  }
+
+  /// A-462, hostile input. Do: parse pointers of no text, no colon, empty fields, a sign, a negative descriptor, a zero or
+  /// capital length, a third field and one past [`POINTER_TEXT_CAP`]; and tables with no checksum, a wrong one, a
+  /// capital one, two lines and four. Expect each refused as malformed, nothing read.
+  #[test]
+  fn hostile_handoff_pointers_and_tables_are_refused() {
+    let bounds = TableBounds {
+      devices: 8,
+      connections: 8,
+      copies: 8,
+    };
+    let past = "1".repeat(POINTER_TEXT_CAP + 1);
+    for pointer in [
+      "",
+      "3",
+      ":10",
+      "3:",
+      "+3:10",
+      "-3:10",
+      "3:+10",
+      "3:0",
+      "3:1A",
+      "3:10:1",
+      "3;10",
+      past.as_str(),
+    ] {
+      assert!(
+        matches!(
+          parse_pointer(pointer, bounds),
+          Err(HoldRefusal::Malformed { .. })
+        ),
+        "pointer {pointer:?}"
+      );
+    }
+    let good = encode_table(&Table {
+      devices: "3".to_owned(),
+      connections: String::new(),
+      copies: String::new(),
+    });
+    assert!(decode_table(&good).is_ok());
+    let (body, checksum) = good.rsplit_once('#').unwrap();
+    let flipped = format!(
+      "{body}#{:08x}",
+      u32::from_str_radix(checksum, 16).unwrap() ^ 1
+    );
+    let capital = format!("{body}#{}", checksum.to_uppercase());
+    let with = |text: &str| {
+      format!(
+        "{text}#{:08x}",
+        slates_wire::crc32c::crc32c(text.as_bytes())
+      )
+    };
+    // A checksum of digits alone has no capitals to write: the form itself is checked beside it.
+    assert!(!lower_hex("1A") && !lower_hex("+1") && !lower_hex("") && lower_hex("1a"));
+    for table in [
+      body.to_owned(),
+      flipped,
+      capital,
+      with("3\n"),
+      with("3\n\n\n"),
+    ] {
+      if table == good {
+        continue;
+      }
+      assert!(
+        matches!(decode_table(&table), Err(HoldRefusal::Malformed { .. })),
+        "table {table:?}"
+      );
+    }
+  }
+
+  /// A-462. Do: check a table whose channel, one device, one connection or one copy is the table's own descriptor, and
+  /// one naming it nowhere. Expect the first four refused, the descriptor having two owners, and the last taken.
+  #[test]
+  fn a_tables_own_descriptor_is_never_named_again() {
+    let (table, _) = full_table();
+    let devices = parse_devices(&table.devices).unwrap();
+    let connections = parse_connections(&table.connections).unwrap();
+    let copies = parse_copies(&table.copies).unwrap();
+    let named = [
+      devices.channel,
+      devices.devices.first().unwrap().fd,
+      connections.first().unwrap().fd,
+      copies.first().unwrap().fd,
+    ];
+    for fd in named {
+      assert!(
+        check_table_owner(fd, &devices, &connections, &copies).is_err(),
+        "{fd}"
+      );
+    }
+    assert!(check_table_owner(1, &devices, &connections, &copies).is_ok());
   }
 }

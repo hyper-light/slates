@@ -1,6 +1,6 @@
 //! A writable direct map's copy (A-197) outlives its daemon with the store its client made after a logged write (§4.6;
 //! A-389), with this test as the anchor. The test makes the anchor's hold channel and hands it to each daemon as the
-//! anchor does, the held copy to the second (`SLATES_ANCHOR_DEVICES`, `SLATES_ANCHOR_COPIES`), which a daemon adopts
+//! anchor does, the held copy to the second (the handoff table `SLATES_ANCHOR_HELD` names, A-462), which a daemon adopts
 //! once per process into a process-wide cell: hence a binary of its own with one test. A daemon's death is a fenced
 //! stop, which ends no record and releases no hold, as a killed process does. Linux alone: the anchor holds a writable
 //! copy there alone (A-197).
@@ -234,13 +234,17 @@ fn a_clients_store_after_a_logged_write_outlives_that_writes_replay() {
   // SAFETY: this binary holds this one test; the variable is set before any daemon starts.
   unsafe {
     std::env::set_var(
-      held::ENV_DEVICES,
-      daemon_end
-        .as_fd()
-        .try_clone_to_owned()
-        .unwrap()
-        .into_raw_fd()
-        .to_string(),
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices: daemon_end
+          .as_fd()
+          .try_clone_to_owned()
+          .unwrap()
+          .into_raw_fd()
+          .to_string(),
+        ..held::Table::default()
+      })
+      .unwrap(),
     );
   }
   let profile = common::machine_profile();
@@ -308,8 +312,15 @@ fn a_clients_store_after_a_logged_write_outlives_that_writes_replay() {
   // SAFETY: this binary holds this one test; it sets the variables only between daemons, each of which reads them once
   // at its start, and no other thread of this process reads the environment meanwhile.
   unsafe {
-    std::env::set_var(held::ENV_DEVICES, devices);
-    std::env::set_var(held::ENV_COPIES, copies);
+    std::env::set_var(
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices,
+        connections: String::new(),
+        copies,
+      })
+      .unwrap(),
+    );
   }
   let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
   assert_eq!(

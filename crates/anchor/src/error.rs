@@ -71,6 +71,10 @@ pub enum AnchorError {
   NotRunning,
   /// A Windows hold failed before the attachment could be committed or handed to a successor.
   Hold(crate::handles::HandleRefusal),
+  /// The handoff table for a daemon about to start could not be made (A-462): it is not started without what the anchor
+  /// holds, which its start would otherwise take for nothing held.
+  #[cfg(unix)]
+  Handoff(crate::held::HoldRefusal),
 }
 
 impl fmt::Display for AnchorError {
@@ -115,6 +119,8 @@ impl fmt::Display for AnchorError {
       }
       Self::NotRunning => f.write_str("no daemon is running"),
       Self::Hold(error) => write!(f, "anchor hold: {error}"),
+      #[cfg(unix)]
+      Self::Handoff(error) => write!(f, "the handoff table: {error}"),
     }
   }
 }

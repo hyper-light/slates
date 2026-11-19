@@ -854,46 +854,62 @@ fn full_role() {
   let channel = Channel::adopt(unsafe {
     OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
   });
-  let record = |id: u64| vec![u8::try_from(id).unwrap(); RECORD_CAP];
   if segment
     .read_published(RegionKind::Profile)
     .unwrap()
     .is_some()
   {
-    assert_eq!(
-      entries.len(),
-      FULL_MOUNTS,
-      "every held entry reached the successor"
-    );
-    for (entry, id) in entries.iter().zip(1u64..) {
-      assert_eq!((entry.id, entry.values.len()), (id, 1));
-      assert_eq!(entry.record, record(id));
-      let inherited = handle_from_value(*entry.values.first().unwrap()).unwrap();
-      assert!(signalled(inherited), "entry {id}'s event is live");
-    }
+    every_full_entry_arrived_live(&entries);
     segment.publish(RegionKind::Profile, b"checked").unwrap();
   } else {
-    let mut events = Vec::new();
-    for id in 1..=u64::try_from(FULL_MOUNTS).unwrap() {
-      let live = event(None);
-      // SAFETY: a live event owned in this process until the hold is acknowledged.
-      assert_ne!(unsafe { SetEvent(live.as_raw_handle()) }, 0);
-      let hold = HandleMessage::Hold {
-        id,
-        what: WHAT_WINFSP_MOUNT,
-        values: vec![handle_value(live.as_raw_handle())],
-        record: record(id),
-      };
-      channel.send(&hold, WAIT_MS).unwrap();
-      assert_eq!(
-        channel.recv(WAIT_MS).unwrap(),
-        Some(HandleMessage::Held { id })
-      );
-      events.push(live);
-    }
+    hold_full_mounts(&channel);
     segment.publish(RegionKind::Profile, b"committed").unwrap();
   }
   std::process::exit(ROLE_EXIT);
+}
+
+/// The record the full child holds mount `id` under: a record of the whole cap.
+fn full_record(id: u64) -> Vec<u8> {
+  vec![u8::try_from(id).unwrap(); RECORD_CAP]
+}
+
+/// The full child's first process: holds [`FULL_MOUNTS`] live events through `channel`, each with its [`full_record`],
+/// each answered `Held` before the next; the events stay open until the process exits.
+fn hold_full_mounts(channel: &Channel) {
+  let mut events = Vec::new();
+  for id in 1..=u64::try_from(FULL_MOUNTS).unwrap() {
+    let live = event(None);
+    // SAFETY: a live event owned in this process until the hold is acknowledged.
+    assert_ne!(unsafe { SetEvent(live.as_raw_handle()) }, 0);
+    let hold = HandleMessage::Hold {
+      id,
+      what: WHAT_WINFSP_MOUNT,
+      values: vec![handle_value(live.as_raw_handle())],
+      record: full_record(id),
+    };
+    channel.send(&hold, WAIT_MS).unwrap();
+    assert_eq!(
+      channel.recv(WAIT_MS).unwrap(),
+      Some(HandleMessage::Held { id })
+    );
+    events.push(live);
+  }
+}
+
+/// The full child's successor: every one of the [`FULL_MOUNTS`] entries arrived, in order, with its record and one live
+/// event.
+fn every_full_entry_arrived_live(entries: &[HandedEntry]) {
+  assert_eq!(
+    entries.len(),
+    FULL_MOUNTS,
+    "every held entry reached the successor"
+  );
+  for (entry, id) in entries.iter().zip(1u64..) {
+    assert_eq!((entry.id, entry.values.len()), (id, 1));
+    assert_eq!(entry.record, full_record(id));
+    let inherited = handle_from_value(*entry.values.first().unwrap()).unwrap();
+    assert!(signalled(inherited), "entry {id}'s event is live");
+  }
 }
 
 /// The garbling supervised child: its first process writes short and corrupted hold messages between two real holds.

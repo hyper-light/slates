@@ -804,6 +804,19 @@ impl LandFs for OsLand {
     self.host.open_file(dir, name)
   }
 
+  /// The directory opened as the host opens one (`O_DIRECTORY|O_NOFOLLOW`, its name checked and never on one of this
+  /// daemon's own mounts, A-227) and held as a file handle (A-501): `fchmod`, `fstat` and the barrier's `fsync` take any
+  /// descriptor, and `fsync` of a directory's descriptor writes its inode, its mode among it.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = self.host.open_dir(dir, name)?;
+    let held = self.host.dir_fd(opened).and_then(|fd| {
+      fd.try_clone_to_owned()
+        .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+    });
+    self.host.close_dir(opened);
+    self.host.adopt_file(held?)
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     rustix::fs::fchmod(self.file(file)?, mode_bits(mode)).map_err(refusal)
   }

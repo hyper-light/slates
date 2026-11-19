@@ -75,6 +75,13 @@ enum Since {
   },
   /// A file the head deleted since: a whiteout at `name` in directory `dir`.
   Deleted { dir: InodeNo, name: Box<str> },
+  /// A directory the head still holds whose mode or Windows bits it changed since (A-501), inode `no` at `name` in
+  /// directory `dir`.
+  ChangedDir {
+    no: InodeNo,
+    dir: InodeNo,
+    name: Box<str>,
+  },
   /// Anything else.
   Other,
 }
@@ -982,6 +989,12 @@ impl Volume {
               found.push(Diverged {
                 path: path.clone(),
                 kind,
+              });
+            } else if witnessed(child.inode) {
+              // A base directory whose metadata alone the volume changed (A-501).
+              found.push(Diverged {
+                path: path.clone(),
+                kind: Divergence::Witnessed,
               });
             }
             deeper.push((path, h));
@@ -2641,6 +2654,9 @@ impl Overlay<'_> {
         .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
       return Ok(());
     }
+    if let Body::Directory(dir) = self.vol.inode(store, no)?.body {
+      return self.witness_directory(store, no, dir);
+    }
     let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));
     if !is_base {
       return Ok(());
@@ -2713,6 +2729,39 @@ impl Overlay<'_> {
     self
       .vol
       .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
+    Ok(())
+  }
+
+  /// A base directory's witness, taken before its metadata changes (A-501): its fingerprint on the disk now, through the
+  /// handle its listing holds; it has no bytes to hash. A landing judges the mode or bits it sets against it, as a file's
+  /// metadata entry is judged (A-458). Its home is its parent and its name, as a file's is: a status re-checks it there
+  /// ([`Overlay::check_drift`]) and a recovery keeps it with its parent's listing. A directory the volume made, moved or
+  /// replaced holds no base of its own (its entry lands it whole), and the root is the target itself, no entry of it, so
+  /// neither is witnessed.
+  fn witness_directory(
+    &mut self,
+    store: &Store,
+    no: InodeNo,
+    dir: Handle<DirNode>,
+  ) -> Result<(), VfsError> {
+    let node = store.dirs.get(self.vol.head_dir(store, dir)?)?;
+    let Some(parent) = node.parent else {
+      return Ok(());
+    };
+    if node.base != BaseDirState::Merged || node.origin.is_some() {
+      return Ok(());
+    }
+    let home = (parent, node.name.clone());
+    let host_dir = self.listing_dir(no)?;
+    let fingerprint = self.host.fingerprint_dir(host_dir).map_err(host_refusal)?;
+    let witness = Witness {
+      fingerprint,
+      identity: [0; 32],
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy: false,
+    };
+    let at = self.vol.witness_clock();
+    self.plane()?.record_witness(no, witness, Some(home), at);
     Ok(())
   }
 
@@ -3222,6 +3271,9 @@ impl Overlay<'_> {
     let Some(witness) = self.vol.base.as_ref().and_then(|b| b.witness(no)) else {
       return Ok(());
     };
+    if matches!(self.vol.inode(store, no)?.body, Body::Directory(_)) {
+      return self.check_directory_drift(store, no, &witness);
+    }
     let lost = matches!(&self.vol.inode(store, no)?.body, Body::Base(b) if b.lost);
     if lost {
       return Err(VfsError::BaseDrift);
@@ -3277,6 +3329,48 @@ impl Overlay<'_> {
     Ok(())
   }
 
+  /// [`Overlay::check_drift`] of a witnessed base directory (A-501): the directory its home names now, judged by what its
+  /// witness is for, its identity and its own metadata (mode, owner, Windows bits): gone is `Deleted`, another object
+  /// `Replaced` or `TypeChanged`, another mode `Modified`. Its times and size move with every entry made or removed in
+  /// it, which the volume follows (its listing is merged), so they are no drift of its own.
+  fn check_directory_drift(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    witness: &Witness,
+  ) -> Result<(), VfsError> {
+    let at_path = match self.home_of(store, no) {
+      Ok((dir, name)) => match self.host.open_dir(dir, &name) {
+        Ok(opened) => {
+          let fp = self.host.fingerprint_dir(opened);
+          self.host.close_dir(opened);
+          Some(fp.map_err(host_refusal)?)
+        }
+        Err(HostError::NotFound) => None,
+        Err(HostError::NotFile | HostError::NotDirectory) => {
+          self.record_drift(store, no, DriftKind::TypeChanged);
+          return Ok(());
+        }
+        Err(e) => return Err(host_refusal(e)),
+      },
+      Err(_) => None,
+    };
+    let was = witness.fingerprint;
+    match at_path {
+      None => self.record_drift(store, no, DriftKind::Deleted),
+      Some(fp) if (fp.dev, fp.ino) != (was.dev, was.ino) => {
+        self.record_drift(store, no, DriftKind::Replaced);
+      }
+      Some(fp)
+        if (fp.mode, fp.uid, fp.gid, fp.windows) != (was.mode, was.uid, was.gid, was.windows) =>
+      {
+        self.record_drift(store, no, DriftKind::Modified);
+      }
+      Some(_) => {}
+    }
+    Ok(())
+  }
+
   /// The BLAKE3 of an open file's bytes.
   fn identity_of(&mut self, file: HostFile, size: u64) -> Result<[u8; 32], VfsError> {
     let bytes = self.read_whole(file, size)?;
@@ -3293,7 +3387,7 @@ impl Overlay<'_> {
       changed
     });
     if fresh {
-      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      let path = self.witnessed_path(store, no).unwrap_or_default();
       self
         .vol
         .record(&mut store.metadata, Op::Drift, path, Some(no), 0);
@@ -3439,9 +3533,17 @@ impl Overlay<'_> {
   /// An inode's path, or `inode N` where none names it, as `status` names it.
   fn path_or_inode(&self, store: &Store, no: InodeNo) -> String {
     self
+      .witnessed_path(store, no)
+      .unwrap_or_else(|| format!("inode {}", no.0))
+  }
+
+  /// The path of a witnessed entry in the head: a file's or a link's through its home, a base directory's through its own
+  /// name and parent chain (A-501), which no home names.
+  fn witnessed_path(&self, store: &Store, no: InodeNo) -> Option<String> {
+    self
       .vol
       .path_of_inode(store, no)
-      .unwrap_or_else(|| format!("inode {}", no.0))
+      .or_else(|| self.vol.path_of_dir(store, no))
   }
 
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
@@ -3458,13 +3560,7 @@ impl Overlay<'_> {
       match self.check_drift(store, no) {
         // Drift found is recorded by the check itself and listed below.
         Ok(()) | Err(VfsError::BaseDrift) => {}
-        Err(refusal) => unverified.push((
-          self
-            .vol
-            .path_of_inode(store, no)
-            .unwrap_or_else(|| format!("inode {}", no.0)),
-          refusal,
-        )),
+        Err(refusal) => unverified.push((self.path_or_inode(store, no), refusal)),
       }
     }
     unverified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3472,15 +3568,7 @@ impl Overlay<'_> {
     let mut drift: Vec<(String, DriftKind)> = plane
       .drift
       .iter()
-      .map(|(no, kind)| {
-        (
-          self
-            .vol
-            .path_of_inode(store, *no)
-            .unwrap_or_else(|| format!("inode {}", no.0)),
-          *kind,
-        )
-      })
+      .map(|(no, kind)| (self.path_or_inode(store, *no), *kind))
       .collect();
     drift.sort();
     Ok(BaseStatus {
@@ -3735,6 +3823,10 @@ impl Overlay<'_> {
         }
         Ok(())
       }
+      Since::ChangedDir { no, dir, name } => {
+        self.forget_landed(store, &landed.path)?;
+        self.rebase_directory(no, dir, &name, landed.written)
+      }
       Since::Other => Ok(()),
     }
   }
@@ -3804,7 +3896,20 @@ impl Overlay<'_> {
       (Some(Child::Dir(x)), Some(Child::Dir(y)))
         if store.dirs.get(x)?.inode == store.dirs.get(y)?.inode =>
       {
-        Since::Unchanged
+        let no = store.dirs.get(y)?.inode;
+        let (then, now) = (
+          self.vol.inode_in(store, id, no)?,
+          self.vol.inode(store, no)?,
+        );
+        if (then.attrs.mode, then.windows) == (now.attrs.mode, now.windows) {
+          Since::Unchanged
+        } else {
+          Since::ChangedDir {
+            no,
+            dir: dir_no,
+            name: name.into(),
+          }
+        }
       }
       (Some(Child::File(_)), Some(Child::File(no))) => Since::ChangedFile {
         no,
@@ -3817,6 +3922,37 @@ impl Overlay<'_> {
       },
       _ => Since::Other,
     })
+  }
+
+  /// A head directory whose mode or Windows bits changed since the landed snapshot, rebased onto what landed (A-501): once
+  /// the landed path left the overlay, its witness becomes the directory as the landing left it (`written`, its
+  /// fingerprint after the landing set it; else the disk's, through its listing), so the head's later change lands next
+  /// as a metadata entry from what landed. Forgotten with the landed entry, it would never land.
+  fn rebase_directory(
+    &mut self,
+    no: InodeNo,
+    dir: InodeNo,
+    name: &str,
+    written: Option<Witness>,
+  ) -> Result<(), VfsError> {
+    let fingerprint = match written {
+      Some(written) => written.fingerprint,
+      None => {
+        let listed = self.listing_dir(no)?;
+        self.host.fingerprint_dir(listed).map_err(host_refusal)?
+      }
+    };
+    let witness = Witness {
+      fingerprint,
+      identity: [0; 32],
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy: false,
+    };
+    let at = self.vol.witness_clock();
+    self
+      .plane()?
+      .record_witness(no, witness, Some((dir, name.into())), at);
+    Ok(())
   }
 
   /// A head file changed since the landed snapshot, rebased onto what landed: its witness becomes the
@@ -3892,6 +4028,8 @@ impl Overlay<'_> {
         if let Some(plane) = self.vol.base.as_mut() {
           plane.forget_redirect(no, at);
           plane.forget_whiteout(dir_no, name, at);
+          // A landed metadata entry's witness (A-501): the directory follows the disk again.
+          plane.forget_witness(no, at);
           // The directory is on the disk now: its listing is read from there.
           if !plane.listings.contains_key(&no)
             && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
@@ -4085,6 +4223,10 @@ impl Overlay<'_> {
     }
     let mut done = Vec::new();
     for no in targets {
+      if matches!(self.vol.inode(store, no)?.body, Body::Directory(_)) {
+        done.push(self.rewitness_directory(store, no)?);
+        continue;
+      }
       if let Some(f) = self.plane()?.descriptors.remove(&no) {
         self.host.close_file(f);
       }
@@ -4136,6 +4278,29 @@ impl Overlay<'_> {
       done.push(path);
     }
     Ok(done)
+  }
+
+  /// [`Overlay::rewitness`] of a base directory whose metadata the volume changed (A-501): its witness becomes the
+  /// directory its home names now, and its drift record clears; the volume's own mode and bits are left as they are, as a
+  /// file's content is. Answers its path.
+  fn rewitness_directory(&mut self, store: &mut Store, no: InodeNo) -> Result<String, VfsError> {
+    let (dir, name) = self.home_of(store, no)?;
+    let opened = self.host.open_dir(dir, &name).map_err(host_refusal)?;
+    let fingerprint = self.host.fingerprint_dir(opened);
+    self.host.close_dir(opened);
+    let witness = Witness {
+      fingerprint: fingerprint.map_err(host_refusal)?,
+      identity: [0; 32],
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy: false,
+    };
+    let at = self.vol.witness_clock();
+    let plane = self.plane()?;
+    plane.record_witness(no, witness, None, at);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
+    Ok(self.vol.path_of_dir(store, no).unwrap_or_default())
   }
 
   /// `pin`: read the named subtrees (the whole base when none are named) into the store and

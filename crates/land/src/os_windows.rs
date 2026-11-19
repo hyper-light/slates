@@ -1273,20 +1273,53 @@ impl LandFs for OsLand {
     self.host.adopt_file(opened)
   }
 
+  /// The directory opened to have its attributes set and its batch's barrier flush it (A-501): `CHMOD_ACCESS`, whose
+  /// `FILE_WRITE_DATA` is a directory's `FILE_ADD_FILE`, the access `NtFlushBuffersFile` asks of a directory too; as a
+  /// directory (`FILE_DIRECTORY_FILE`) and never through a link: opened with `FILE_OPEN_REPARSE_POINT`, a reparse point is
+  /// refused `NotDirectory`, closed again.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = nt_create(
+      self.dir(dir)?,
+      name,
+      CHMOD_ACCESS,
+      nt::FILE_OPEN,
+      nt::FILE_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      0,
+    )?;
+    if attributes(opened.as_handle())?
+      & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+      != 0
+    {
+      return Err(HostError::NotDirectory);
+    }
+    self.host.adopt_file(opened)
+  }
+
   /// The one bit a mode decides on Windows, `READONLY`, with every other bit the temporary holds kept
-  /// (`crate::windows_bits::mode_word`).
+  /// (`crate::windows_bits::mode_word`). A directory's read-only is among its Windows bits (A-451), and Windows keeps no
+  /// POSIX mode, so a directory's mode decides nothing here (A-501), as at its `mkdir`.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     let handle = self.file(file)?;
-    let wanted = crate::windows_bits::mode_word(attributes(handle)?, mode);
-    set_attributes(handle, wanted)
+    let held = attributes(handle)?;
+    if held & FILE_ATTRIBUTE_DIRECTORY != 0 {
+      return Ok(());
+    }
+    set_attributes(handle, crate::windows_bits::mode_word(held, mode))
   }
 
   /// The volume's Windows bits on the temporary (A-451, `give_bits`): every bit the volume keeps, set or cleared and
   /// read back, the read-only state its mode gave it kept. The rename that places it sets `ARCHIVE` again (NTFS's own
   /// rule for a renamed file, measured by A-185), so a landed file is `ARCHIVE` whatever the volume held: the truth that
-  /// it changed, which a backup reads.
+  /// it changed, which a backup reads. A base directory's metadata entry (A-501) gives a directory's bits, its read-only
+  /// among them.
   fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError> {
-    give_bits(self.file(file)?, windows, crate::windows_bits::Made::File)
+    let handle = self.file(file)?;
+    let made = if attributes(handle)? & FILE_ATTRIBUTE_DIRECTORY != 0 {
+      crate::windows_bits::Made::Dir
+    } else {
+      crate::windows_bits::Made::File
+    };
+    give_bits(handle, windows, made)
   }
 
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {

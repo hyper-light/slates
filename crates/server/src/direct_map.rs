@@ -475,12 +475,84 @@ async fn answer_after(
 /// does (`crate::xshard::send_back`).
 fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
+    let _ended = crate::state::with_state_counted(|s| replied(s, route, &reply));
     crate::state::deliver(route.client_index, route.request, reply, true);
     return;
   }
   crate::xshard::send_reply_home(route.shard, move || {
+    let _ended = crate::state::with_state_counted(|s| replied(s, route, &reply));
     crate::state::deliver(route.client_index, route.request, reply, true);
   });
+}
+
+/// What the client's shard did with a copy's descriptor (Linux, A-188): sent over the client's control socket, refused
+/// unconfined by the hand-off's own judge, or not sent. Held here with the rules over it, so they are tested on every
+/// host (A-505).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivered {
+  /// Sent over the client's control socket.
+  Sent,
+  /// Refused unconfined by the hand-off's own judge (`slates_ipc::rendezvous::Control::send_mapping`).
+  Unconfined,
+  /// Not sent: the client is gone or retiring, has no control socket, or the socket refused.
+  Refused,
+}
+
+/// On the client's shard: sends map `mapping_id` at most once (A-505). `sent` is the client's record of the maps this
+/// shard sent it whose replies have not reached it (`ClientSlot::maps_sent`): a map in it is answered `Sent` and not
+/// sent again, and one that `send` sends is recorded. The copy's shard asks again when it lost the answer to its first
+/// ask, and a shard that stopped for a window runs that first ask once it resumes, before the second: without the
+/// record the second sent the client another descriptor of the same copy.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn send_once(
+  sent: &mut std::collections::BTreeSet<u64>,
+  mapping_id: u64,
+  send: impl FnOnce() -> Delivered,
+) -> Delivered {
+  if sent.contains(&mapping_id) {
+    return Delivered::Sent;
+  }
+  let delivered = send();
+  if delivered == Delivered::Sent {
+    sent.insert(mapping_id);
+  }
+  delivered
+}
+
+/// Whether a hand-off keeps its copy as handed, the client's to let go (A-505): when an ask answered `Sent`, and when
+/// every ask's answer was lost (`None`). A send whose answer was lost may have run, and a copy given back then left the
+/// descriptor the client received holding the copy's pages outside every budget until the client happened to drain its
+/// control socket. Kept as handed, the copy is the client's to release; a client that received no descriptor gives it
+/// back itself when its receive gives up at its reply deadline (A-174).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn kept_as_handed(answer: Option<Delivered>) -> bool {
+  matches!(answer, Some(Delivered::Sent) | None)
+}
+
+/// Ends the record of a map sent to its client once its reply reaches the client's shard (A-505): `Mapped` names the map,
+/// and every ask about it ran before this reply, which the same channel carries after them, so no ask can need the
+/// record again. Any other reply ends none.
+fn forget_replied(sent: &mut std::collections::BTreeSet<u64>, reply: &ReplyBody) {
+  if let ReplyBody::Mapped { mapping_id, .. } = reply {
+    sent.remove(mapping_id);
+  }
+}
+
+/// On the client's shard, as `route`'s reply is delivered there: [`forget_replied`] on the record of the client the reply
+/// is for (the slot at its index, if it still holds that client).
+fn replied(state: &mut ShardState, route: ReplyRoute, reply: &ReplyBody) {
+  let client = RequestId::from_word(route.request).client;
+  let Some(generation) = state.clients.generation_at(route.client_index) else {
+    return;
+  };
+  if let Ok(slot) = state
+    .clients
+    .get_mut(Handle::from_raw(route.client_index, generation))
+    && slot.client_id == client
+  {
+    forget_replied(&mut slot.maps_sent, reply);
+  }
 }
 
 /// Writes back every writable map the dead client `client_id` holds on this shard (§4.6, A-186, A-188), before its reap
@@ -839,6 +911,9 @@ mod served {
   #[cfg(target_os = "linux")]
   use std::os::fd::OwnedFd;
 
+  #[cfg(target_os = "linux")]
+  use super::Delivered;
+
   use crate::error::refusal_of_vfs;
   use crate::merge_service::{canonical_path, find_record};
   use crate::state::{ShardState, VolumeSlot};
@@ -854,6 +929,11 @@ mod served {
   /// Counter: a descriptor the hand-off judged unconfined (`IpcError::UnconfinedDescriptor`): a copy that is not
   /// sealed or not the size it claims, which must never happen. Its client reads by copy.
   const UNCONFINED: &str = "dax.local_map_unconfined";
+  /// Counter: a direct map kept as handed though no answer came back from its client's shard (Linux, A-505): the send
+  /// may have run, so the copy is the client's to let go, and a client that received no descriptor gives it back at its
+  /// reply deadline. The lost-answer path's non-vacuity counter.
+  #[cfg(target_os = "linux")]
+  const HANDED_UNANSWERED: &str = "dax.local_map_handed_unanswered";
 
   /// Counter: a `MapRead` refused because its client holds its share of the direct maps already (`MapShareExhausted`).
   const SHARE_REFUSED: &str = "dax.local_map_share_refused";
@@ -1261,8 +1341,9 @@ mod served {
       Some((state.shard, home, descriptor, mapping))
     }
 
-    /// The reply a hand-off came to (Linux): `Mapped` once the client's shard sent the copy, the copy then the client's
-    /// alone to let go; `MapUnavailable` (counted) where it did not, or the call did not reach that shard.
+    /// The reply a hand-off came to (Linux): `Mapped` once the client's shard sent the copy, and when no ask's answer
+    /// came back, since the send may have run (A-505, [`super::kept_as_handed`]), the copy then the client's alone to
+    /// let go; `MapUnavailable` (counted) where the client's shard answered that it did not send it.
     #[cfg(target_os = "linux")]
     fn handed(
       &mut self,
@@ -1270,28 +1351,25 @@ mod served {
       delivered: Option<Delivered>,
       mapping: slates_ipc::rendezvous::Mapping,
     ) -> ReplyBody {
-      match delivered {
-        Some(Delivered::Sent) => {
-          // Held in the table since the copy was made: the fill lets go of it no more.
-          self.backing = None;
-          state.count(HANDED, 1);
-          ReplyBody::Mapped {
-            mapping_id: mapping.mapping_id,
-            region_off: 0,
-            file_len: mapping.file_len,
-            block_len: mapping.block_len,
-          }
+      if super::kept_as_handed(delivered) {
+        // Held in the table since the copy was made: the fill lets go of it no more.
+        self.backing = None;
+        state.count(HANDED, 1);
+        if delivered.is_none() {
+          state.count(HANDED_UNANSWERED, 1);
         }
-        Some(Delivered::Unconfined) => {
-          state.count(UNCONFINED, 1);
-          state.count(FELL_BACK, 1);
-          refused(Refusal::MapUnavailable)
-        }
-        Some(Delivered::Refused) | None => {
-          state.count(FELL_BACK, 1);
-          refused(Refusal::MapUnavailable)
-        }
+        return ReplyBody::Mapped {
+          mapping_id: mapping.mapping_id,
+          region_off: 0,
+          file_len: mapping.file_len,
+          block_len: mapping.block_len,
+        };
       }
+      if delivered == Some(Delivered::Unconfined) {
+        state.count(UNCONFINED, 1);
+      }
+      state.count(FELL_BACK, 1);
+      refused(Refusal::MapUnavailable)
     }
 
     /// Offers the filled copy's descriptor on the socket route (macOS), judged first to authorize the copy alone in the
@@ -1414,19 +1492,9 @@ mod served {
     }
   }
 
-  /// What the client's shard did with a copy's descriptor (Linux, A-188).
-  #[cfg(target_os = "linux")]
-  enum Delivered {
-    /// Sent over the client's control socket.
-    Sent,
-    /// Refused unconfined by the hand-off's own judge (`slates_ipc::rendezvous::Control::send_mapping`).
-    Unconfined,
-    /// Not sent: the client is gone or retiring, has no control socket, or the socket refused.
-    Refused,
-  }
-
   /// On the client's shard: sends client `client_id` the copy's `descriptor` with `mapping` over its control socket, the
   /// delivery sealed under the client's own channel (A-187), which is why it is sent here and not from the copy's shard.
+  /// Sent once (A-505): a map the client's record holds as sent is answered `Sent` and not sent again.
   #[cfg(target_os = "linux")]
   fn send_to_client(
     state: &mut ShardState,
@@ -1435,20 +1503,30 @@ mod served {
     mapping: slates_ipc::rendezvous::Mapping,
   ) -> Delivered {
     use std::os::fd::AsFd;
-    let control = state
+    let Some(handle) = state
       .clients
       .iter()
-      .map(|(_, client)| client)
-      .find(|client| client.client_id == client_id && !client.retiring)
-      .and_then(|client| client.control.as_ref());
-    let Some(control) = control else {
+      .find(|(_, client)| client.client_id == client_id && !client.retiring)
+      .map(|(handle, _)| handle)
+    else {
       return Delivered::Refused;
     };
-    match control.send_mapping(descriptor.as_fd(), mapping) {
-      Ok(()) => Delivered::Sent,
-      Err(slates_ipc::error::IpcError::UnconfinedDescriptor { .. }) => Delivered::Unconfined,
-      Err(_) => Delivered::Refused,
-    }
+    let Ok(crate::state::ClientSlot {
+      control, maps_sent, ..
+    }) = state.clients.get_mut(handle)
+    else {
+      return Delivered::Refused;
+    };
+    let Some(control) = control.as_ref() else {
+      return Delivered::Refused;
+    };
+    super::send_once(maps_sent, mapping.mapping_id, || {
+      match control.send_mapping(descriptor.as_fd(), mapping) {
+        Ok(()) => Delivered::Sent,
+        Err(slates_ipc::error::IpcError::UnconfinedDescriptor { .. }) => Delivered::Unconfined,
+        Err(_) => Delivered::Refused,
+      }
+    })
   }
 
   /// Hands the filled copy to its client over the client's control socket (Linux), from the shard that serves the
@@ -1475,14 +1553,32 @@ mod served {
         crate::held_copy::hold(s, mapping.mapping_id, record, descriptor.as_fd());
       });
     }
-    // Waited for in the client's shard's own time (R3 class A): a starved shard's hand-off is heard, not given up.
-    let delivered = crate::xshard::call_in_shard_time(
+    // Waited for in the client's shard's own time (R3 class A): a starved shard's hand-off is heard, not given up. An
+    // answer lost to a shard that stopped for a window, or ran one of CPU without answering, is asked for again (A-505):
+    // the second ask runs behind the first on that shard's channel, so it is answered from the client's record of what
+    // the first sent, never sent again. A descriptor of the same copy for the second ask is taken before the first moves
+    // its own away; without one (the process at its descriptor limit) no second ask is made, and the hand-off is judged
+    // as when both answers are lost.
+    let again = descriptor.try_clone().ok();
+    let first = crate::xshard::call_in_shard_time(
       here,
       home,
       move |s| send_to_client(s, client_id, &descriptor, mapping),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
+    let delivered = match (first, again) {
+      (None, Some(descriptor)) => {
+        crate::xshard::call_in_shard_time(
+          here,
+          home,
+          move |s| send_to_client(s, client_id, &descriptor, mapping),
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await
+      }
+      (answered, _) => answered,
+    };
     crate::state::with_state(|s| fill.handed(s, delivered, mapping))
       .unwrap_or_else(|| refused(Refusal::MapUnavailable))
   }
@@ -1683,6 +1779,61 @@ fn recorded_form(reply: &ReplyBody) -> ReplyBody {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-505 (A-488's sibling, goal 85). Do: on a client's record of the maps sent to it, ask to send map 7 whose send
+  /// succeeds and whose answer is then lost, as a client's shard that stopped for a window answers it; ask again, as the
+  /// copy's shard does; judge the hand-off from the answers it got; then ask to send map 8 whose send is refused, and
+  /// deliver map 7's reply. Expect: map 7 sent once, the second ask answered `Sent`; the copy kept as handed when an ask
+  /// answered `Sent` and when every answer was lost, given back when one answered `Refused` or `Unconfined`; the refused
+  /// map 8 not recorded, so a later ask may send it; and map 7's record ended by its reply. Before, every ask sent the
+  /// map, and a hand-off whose answer was lost gave its copy back while its client held the descriptor sent to it.
+  #[test]
+  fn a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed() {
+    let mut sent = std::collections::BTreeSet::new();
+    let mut sends = 0u32;
+    let mut send = |outcome: Delivered| {
+      sends = sends.saturating_add(1);
+      outcome
+    };
+    let first = send_once(&mut sent, 7, || send(Delivered::Sent));
+    assert_eq!(first, Delivered::Sent);
+    // The first answer is lost on its way back; the copy's shard asks again.
+    let again = send_once(&mut sent, 7, || send(Delivered::Sent));
+    assert_eq!(again, Delivered::Sent, "the second ask is answered as sent");
+    let refused = send_once(&mut sent, 8, || send(Delivered::Refused));
+    assert_eq!(refused, Delivered::Refused);
+    assert_eq!(
+      sends, 2,
+      "map 7 was sent once and map 8 tried once: a second ask sent the same copy again"
+    );
+    assert!(
+      kept_as_handed(Some(again)),
+      "an answered send keeps the copy as handed"
+    );
+    assert!(
+      kept_as_handed(None),
+      "with every answer lost the send may have run, and a copy given back leaves its descriptor with the client"
+    );
+    assert!(!kept_as_handed(Some(Delivered::Refused)));
+    assert!(!kept_as_handed(Some(Delivered::Unconfined)));
+    assert_eq!(
+      sent.iter().copied().collect::<Vec<u64>>(),
+      vec![7],
+      "a refused send is not recorded"
+    );
+    forget_replied(&mut sent, &ReplyBody::MapReleased);
+    assert_eq!(sent.len(), 1, "a reply that names no map ends no record");
+    forget_replied(
+      &mut sent,
+      &ReplyBody::Mapped {
+        mapping_id: 7,
+        region_off: 0,
+        file_len: 1,
+        block_len: 4096,
+      },
+    );
+    assert!(sent.is_empty(), "map 7's reply ended its record");
+  }
 
   /// AC-A-175: a Windows hand-off's completion is recorded without its handle, so a reply replayed after a restart
   /// names none. Do: take the record's form of a hand-off naming handle 0x1234, of a Linux map, of a macOS offer and of

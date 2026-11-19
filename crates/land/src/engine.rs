@@ -58,7 +58,7 @@ use crate::manifest::{
 pub use crate::source::Source;
 use crate::verdict::{
   ConflictClass, DiskState, MetaVerdict, Verdict, content_verdict, landed_meta, meta_verdict,
-  verdict,
+  verdict, with_modified,
 };
 
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
@@ -1439,12 +1439,13 @@ impl<H: LandFs> Landing<'_, H> {
       .then(|| file_pages(entry.overlay.map_or(0, |overlay| overlay.size), store))
   }
 
-  /// Whether `entry` is a metadata entry its verdict applies (A-472): a mode or bits change alone (`Chmod`), or a
-  /// captured clone's replacement whose bytes the disk already holds (A-466), set in place and synced by its batch's
-  /// barrier.
+  /// Whether `entry` is a metadata entry its verdict applies (A-472): a file's mode, bits or time changed alone
+  /// (`Chmod`), a base directory's mode or bits (`ChmodDir`, A-501), or a captured clone's replacement whose bytes the
+  /// disk already holds (A-466), set in place and synced by its batch's barrier.
   fn stages_meta(&self, entry: &LandingEntry, report: &EntryReport) -> bool {
     matches!(report.verdict, Some(Verdict::Apply))
-      && (matches!(entry.action, Action::Chmod { .. }) || self.sets_meta_alone(entry))
+      && (matches!(entry.action, Action::Chmod { .. } | Action::ChmodDir { .. })
+        || self.sets_meta_alone(entry))
   }
 
   /// The barrier of the staged batch taken (§4.15 step 8, A-130, A-132): every staged file is to be durable before any
@@ -1745,9 +1746,9 @@ impl<H: LandFs> Landing<'_, H> {
           Err(e) => return Err(e.into()),
         }
       }
-      // A file is staged for its batch's barrier by `write_one` (A-130), and a metadata entry too (A-472): never written
-      // here.
-      Action::Create | Action::Replace | Action::Chmod { .. } => {
+      // A file is staged for its batch's barrier by `write_one` (A-130), and a metadata entry too (A-472, A-501): never
+      // written here.
+      Action::Create | Action::Replace | Action::Chmod { .. } | Action::ChmodDir { .. } => {
         return Err(WriteFailure::Volume(VfsError::Invalid));
       }
       Action::Delete => {
@@ -2340,7 +2341,7 @@ impl<H: LandFs> Landing<'_, H> {
     progress: &mut WriteProgress,
   ) -> EntryStep {
     let (dir_path, name) = split(&entry.path);
-    let set = metadata_of(entry).and_then(|(from, to)| self.set_meta(dir_path, name, from, to));
+    let set = metadata_of(entry).and_then(|change| self.set_meta(dir_path, name, change));
     match set {
       Ok(MetaSet::Staged(file)) => {
         progress.staged_pages = progress.staged_pages.saturating_add(file_pages(0, store));
@@ -2360,46 +2361,64 @@ impl<H: LandFs> Landing<'_, H> {
   }
 
   /// A metadata entry's fields set (A-458): the file opened through its own handle, never through a link
-  /// ([`LandFs::open_to_chmod`]), and judged again by that handle's `fstat`, field by field ([`meta_verdict`]), so what
-  /// is set lands on the object judged and a field an outsider changed since the validation is never overwritten
-  /// (`TargetInUse`). Then each field to set is set through the handle (`set_mode`, `set_windows`); no byte is
-  /// written, and the handle stays open for the batch's barrier. A check and a set are two calls on one handle: an
-  /// outsider's change to the same field between them is the one it cannot see, as POSIX and Windows offer no
-  /// compare-and-set of a mode. A file the landing may not open so (its owner may not read it; on Windows it is read-only,
-  /// and its flush needs a handle that may write, A-472) fails its entry alone.
+  /// ([`LandFs::open_to_chmod`]; a directory's, [`LandFs::open_dir_to_chmod`], A-501), and judged again by that handle's
+  /// `fstat`, field by field ([`meta_verdict`], a file's time beside its mode, [`with_modified`]), so what is set lands
+  /// on the object judged and a field an outsider changed since the validation is never overwritten (`TargetInUse`).
+  /// Then each field to set is set through the handle (`set_mtime`, `set_windows`, `set_mode`); no byte is written, and
+  /// the handle stays open for the batch's barrier. A check and a set are two calls on one handle: an outsider's change
+  /// to the same field between them is the one it cannot see, as POSIX and Windows offer no compare-and-set of a mode.
+  /// A file the landing may not open so (its owner may not read it; on Windows it is read-only, and its flush needs a
+  /// handle that may write, A-472) fails its entry alone; a directory's name that holds another kind now is a type
+  /// change.
   fn set_meta(
     &mut self,
     dir_path: &str,
     name: &str,
-    from: FileMeta,
-    to: FileMeta,
+    change: MetaChange,
   ) -> Result<MetaSet, WriteFailure> {
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
-    let file = match self.host.open_to_chmod(dir, name) {
+    let opened = if change.directory {
+      self.host.open_dir_to_chmod(dir, name)
+    } else {
+      self.host.open_to_chmod(dir, name)
+    };
+    let file = match opened {
       Ok(file) => file,
       Err(HostError::NotFound) => {
         return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TargetInUse)));
       }
+      Err(HostError::NotDirectory | HostError::NotFile) if change.directory => {
+        return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TypeChanged)));
+      }
       Err(HostError::Unavailable(errno)) => return Ok(MetaSet::Done(Outcome::Failed { errno })),
       Err(e) => return Err(e.into()),
     };
-    let set = self.set_meta_through(file, from, to);
+    let set = self.set_meta_through(file, change);
     if !matches!(set, Ok(MetaSet::Staged(_))) {
       self.host.close_file(file);
     }
     set
   }
 
-  /// [`Landing::set_meta`] through its open file.
+  /// [`Landing::set_meta`] through its open file. The time is set first, so a mode set after it never stands between
+  /// the handle and its time.
   fn set_meta_through(
     &mut self,
     file: HostFile,
-    from: FileMeta,
-    to: FileMeta,
+    change: MetaChange,
   ) -> Result<MetaSet, WriteFailure> {
     let found = self.host.fstat(file)?;
-    let (permissions, windows) = match meta_verdict(from, FileMeta::of_fingerprint(&found), to) {
+    let disk = if change.directory {
+      FileMeta::of_dir_fingerprint(&found)
+    } else {
+      FileMeta::of_fingerprint(&found)
+    };
+    let mut meta = meta_verdict(change.from, disk, change.to);
+    if let Some((witnessed, volume)) = change.modified {
+      meta = with_modified(meta, witnessed, found.mtime_ns, volume);
+    }
+    let (permissions, windows, modified) = match meta {
       MetaVerdict::Conflict => {
         return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TargetInUse)));
       }
@@ -2407,15 +2426,19 @@ impl<H: LandFs> Landing<'_, H> {
       MetaVerdict::Set {
         permissions,
         windows,
-      } => (permissions, windows),
+        modified,
+      } => (permissions, windows, modified),
     };
-    if let Some(permissions) = permissions {
-      // The file's own type bits, beside the volume's permission bits.
-      let mode = (found.mode & !FileMeta::PERMISSIONS) | permissions;
-      self.host.set_mode(file, mode)?;
+    if let Some(mtime_ns) = modified {
+      self.host.set_mtime(file, mtime_ns)?;
     }
     if let Some(windows) = windows {
       self.host.set_windows(file, windows)?;
+    }
+    if let Some(permissions) = permissions {
+      // The object's own type bits, beside the volume's permission bits.
+      let mode = (found.mode & !FileMeta::PERMISSIONS) | permissions;
+      self.host.set_mode(file, mode)?;
     }
     Ok(MetaSet::Staged(file))
   }
@@ -3139,7 +3162,10 @@ fn owned_paths(manifest: &Manifest) -> Ours {
       .filter(|e| match e.action {
         Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear => made,
         Action::Delete | Action::Rmdir => !made,
-        Action::Replace | Action::Rename { .. } | Action::Chmod { .. } => false,
+        Action::Replace
+        | Action::Rename { .. }
+        | Action::Chmod { .. }
+        | Action::ChmodDir { .. } => false,
       })
       .map(|e| e.path.to_string())
       .collect()
@@ -3202,12 +3228,51 @@ fn grant_ended(grant: Option<&GrantRecord>, now_ns: u64) -> bool {
   grant.is_some_and(|g| g.expires_ns <= now_ns)
 }
 
-/// What a metadata entry sets (A-458, A-466): a `Chmod`'s base and target, or a captured clone's replacement whose bytes
-/// the disk already holds, its metadata's ([`replaced_meta`]); anything else is no metadata entry, a malformed one.
-fn metadata_of(entry: &LandingEntry) -> Result<(FileMeta, FileMeta), WriteFailure> {
+/// What a metadata entry changes (A-458, A-466, A-501): its fields as the base held them and as the volume holds them,
+/// whether it is a directory's, and a file's modification time where its entry judges one.
+#[derive(Clone, Copy, Debug)]
+struct MetaChange {
+  /// The fields as the base held them.
+  from: FileMeta,
+  /// The fields as the volume holds them.
+  to: FileMeta,
+  /// A base directory's entry (`ChmodDir`): opened as a directory and judged by a directory's fields.
+  directory: bool,
+  /// A file's modification time as its witness found it and as the volume holds it (an overlay's `Chmod`, A-501); none
+  /// for an entry judged by content, whose capture read another folder, and for a directory, whose time moves with every
+  /// entry made or removed in it.
+  modified: Option<(i64, i64)>,
+}
+
+/// What a metadata entry sets (A-458, A-466, A-501): a `Chmod`'s base and target (and an overlay's file time), a
+/// `ChmodDir`'s, or a captured clone's replacement whose bytes the disk already holds, its metadata's
+/// ([`replaced_meta`]); anything else is no metadata entry, a malformed one.
+fn metadata_of(entry: &LandingEntry) -> Result<MetaChange, WriteFailure> {
   match &entry.action {
-    Action::Chmod { from, to } => Ok((*from, *to)),
-    Action::Replace => replaced_meta(entry),
+    Action::Chmod { from, to } => Ok(MetaChange {
+      from: *from,
+      to: *to,
+      directory: false,
+      modified: match entry.judged {
+        Judged::Witness => entry
+          .witnessed
+          .zip(entry.overlay)
+          .map(|(witness, overlay)| (witness.fingerprint.mtime_ns, overlay.mtime_ns)),
+        Judged::Content => None,
+      },
+    }),
+    Action::ChmodDir { from, to } => Ok(MetaChange {
+      from: *from,
+      to: *to,
+      directory: true,
+      modified: None,
+    }),
+    Action::Replace => replaced_meta(entry).map(|(from, to)| MetaChange {
+      from,
+      to,
+      directory: false,
+      modified: None,
+    }),
     _ => Err(WriteFailure::Volume(VfsError::Invalid)),
   }
 }
@@ -3525,13 +3590,14 @@ impl Beginning {
 
   /// [`Beginning::new`] for a clone of a captured base (§4.15 `capture_base`, A-291's landing): its manifest is the
   /// change of `request.source` since the capture `base` (a snapshot's tree in the same store, pinned while the clone
-  /// lives), every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the
-  /// volume as it was.
+  /// lives; or, for a clone a move brought here, what the move carried of the capture and the clone's mark, A-503),
+  /// every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the volume
+  /// as it was.
   pub fn against_capture(
     vol: &Volume,
     target: &LandingTarget,
     request: &LandingRequest,
-    base: slates_vfs::captured::FrozenTree,
+    base: impl Into<slates_vfs::captured::CaptureBase>,
   ) -> Result<Beginning, LandingRefusal> {
     let began = Instant::now();
     let walk = crate::manifest::PlanWalk::against_capture(vol, request.source, base)
