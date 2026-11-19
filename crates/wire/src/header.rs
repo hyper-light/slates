@@ -12,7 +12,10 @@ pub const MAGIC: u32 = 0x5354_4C53;
 /// Format: the protocol major this build speaks; a mismatch is refused outright. Major 2 (A-237): a principal carries
 /// the host whose account it is, so a share names (host, account) and no host's uid is taken for another's; no
 /// append-only change can say that of the principals already on the wire, so a major-1 peer is refused, never decoded.
-pub const MAJOR: u16 = 2;
+/// Major 3 (A-539): a host's refusal code is typed by its numbering, an errno field carrying an errno alone and a Win32
+/// error code its own appended variant; a major-2 Windows peer put Win32 codes in errno fields, which no append-only
+/// change can say of them, so a major-2 peer is refused, never decoded.
+pub const MAJOR: u16 = 3;
 /// Format: the protocol minor this build speaks; minors add kinds and fields, append-only.
 pub const MINOR: u16 = 0;
 

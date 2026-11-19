@@ -3163,15 +3163,14 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::NotFile => HostAnswer::NotFile,
     HostError::StaleHandle => HostAnswer::StaleHandle,
     // The code in the variant of its numbering (A-539); a path on a mount this daemon serves carries the platform's
-    // deadlock-avoided errno (A-227).
-    HostError::Exists(_)
-    | HostError::NoSpace(_)
-    | HostError::Unsupported(_)
-    | HostError::Unavailable(_)
-    | HostError::OwnMount(_) => match error.code() {
-      Some(slates_vfs::host::OsCode::Win32(code)) => HostAnswer::Win32 { code },
-      Some(slates_vfs::host::OsCode::Errno(errno)) => HostAnswer::Errno { errno },
-      None => HostAnswer::Errno { errno: 0 },
+    // deadlock-avoided code (A-227).
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code)
+    | HostError::OwnMount(code) => match code {
+      slates_vfs::host::OsCode::Win32(code) => HostAnswer::Win32 { code },
+      slates_vfs::host::OsCode::Errno(errno) => HostAnswer::Errno { errno },
     },
     // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
     // a refusal no errno names.
@@ -4711,6 +4710,20 @@ mod landed_reply_tests {
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::Unavailable(errno)),
+      TargetRefusal::Host { errno: BOTH_ERRNO }
+    );
+    // A path on this daemon's own mount carries the platform's deadlock-avoided code in its own numbering (A-227):
+    // Windows' `ERROR_POSSIBLE_DEADLOCK` rode in an errno's place before A-539.
+    assert_eq!(
+      super::answer_of(HostError::OwnMount(win32)),
+      HostAnswer::Win32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::OwnMount(win32)),
+      TargetRefusal::HostWin32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::OwnMount(errno)),
       TargetRefusal::Host { errno: BOTH_ERRNO }
     );
     assert_eq!(

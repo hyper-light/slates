@@ -7047,6 +7047,11 @@ window is the process-restart window (zero, thanks to the anchor). Same code, ze
 
 ### 4.9 Wire protocol (D-15)
 
+> **Status (2026-11-19, A-539: wire major 3).** A host's refusal code is typed by its numbering (§4.15 step 6): an errno
+> field carries an errno alone, and a Win32 error code rides in a variant appended beside it. A major-2 Windows peer put
+> Win32 codes in errno fields, which no append-only change can say of them, so the major is 3 and a major-2 peer is
+> refused before its body is read (`crates/wire/src/header.rs`, as A-237 took major 2).
+
 > **Status (2026-11-07, A-241: a client proves its id).** A client's id names its seat: its retained completion records,
 > its attachments, every verb after. The rendezvous carries only the id a client wants, which a stranger can name, and
 > a request carries its id in its slot word. So now:
@@ -9158,6 +9163,11 @@ it builds against the contract and adds to it rather than around it.
 > not in its shape, or a host that asks no engine); `container::check_source` and `ContainerBind::check_source`
 > judge whether a bind's source is still the mount verified, the table first and then the identity the kernel never
 > reuses, refusing `SourceFault`. `slates-bridge-oci` is linked on every platform, its judge's types the contract's.
+> **`CONTRACT` = 48 (A-539):** a host's refusal code carries its numbering. `HostFault::Base` names an `OsCode`, an
+> errno or a Win32 error code (none where the host named none), where it held a bare number that on Windows was a Win32
+> code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
+> `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
+> put in the OS's words only in its own numbering.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -10322,12 +10332,20 @@ entry either old or new, never torn).
    no rename that replaces its destination. The seam names the kinds the engine tells apart (A-539): a name that exists
    (`HostError::Exists`), no room (`NoSpace`), a verb the filesystem lacks (`Unsupported`); each writer reads its own
    platform's numbers into them (Linux's `EDQUOT` 122 and macOS's 69, a Linux exchange's `EINVAL` and macOS's
-   `ENOTSUP`, Windows' `ERROR_ALREADY_EXISTS`), so the engine compares no number. Every refusal carries its code typed by
-   its numbering (`OsCode`: an errno or a Win32 error code, A-527) to the end: the landing report's failed entry and
-   crash, the volume's `BaseUnavailable`, and the wire, where each errno variant carries an errno alone and a Win32
-   variant appended beside it carries a Win32 code (`HostAnswer::Win32`, `LandingDegradation::CrashedWin32`,
-   `TargetRefusal::HostWin32`, `Refusal::BaseUnavailableWin32`; D-15's append-only rule), pinned by golden vectors
-   (`crates/ipc/src/os_code_vectors.rs`); the library contract's `HostFault::Base` names an `OsCode`.
+   `ENOTSUP`, Windows' `ERROR_ALREADY_EXISTS`), so the engine compares no number. Where it tells none of them apart it
+   reads every kind alike, as it read every errno before: a metadata entry's open refused by any kind fails that entry
+   alone, and a refused `rmdir` is the target in use (a removal), a kept directory (an exchange back) or not this
+   landing's (an aside). Every refusal carries its code typed by its numbering (`OsCode`: an errno or a Win32 error code,
+   A-527) to the end: the landing report's failed entry (none for a fetch under way) and crash, the volume's
+   `BaseUnavailable`, a path on this daemon's own mount (`EDEADLK`, Windows' `ERROR_POSSIBLE_DEADLOCK`), a base path past
+   the longest recorded (`ENAMETOOLONG`, Windows' `ERROR_FILENAME_EXCED_RANGE`), and the wire, where each errno variant
+   carries an errno alone and a Win32 variant appended beside it carries a Win32 code (`HostAnswer::Win32`,
+   `LandingDegradation::CrashedWin32`, `TargetRefusal::HostWin32`, `Refusal::BaseUnavailableWin32`), pinned by golden
+   vectors (`crates/ipc/src/os_code_vectors.rs`); the library contract's `HostFault::Base` names an `OsCode` (contract
+   48). An errno field so changed what it may hold, which no append-only change can say of what an older peer or record
+   holds, so the change takes a new wire major (3: a major-2 peer is refused, never decoded; D-15, as A-237's took 2)
+   and a new anchor layout (11: a segment whose completion records keep replies a layout-10 daemon wrote is refused,
+   never misread); a ring body's schema hash moves with its appended variants on its own (§4.9 "Framing").
 7. *Batches inside the landing (A-130).* A file is staged — written, given its mode and mtime, and
    written out — and waits, open at its hidden name, for its batch's barrier; then the batch's files
    are placed. A batch holds at most one copy window of pages (`chunk_bytes`), each file counted as at
@@ -36619,3 +36637,62 @@ and `crates/cli/Cargo.toml` with `Cargo.lock` (the command line no longer links 
 - **Owed.** The judge's profiles for the engines slates has run since it was written (rootless podman, G-mount step 3,
   and podman's command line, both refused today), and Windows, which binds nothing (G-mount step 4) until a route into
   Docker Desktop's VM is measured (kiln's W9).
+
+### A-539 — A host's refusal code carries its numbering end to end, and the landing reads kinds, never numbers (2026-11-19, g085, UI goal 88; §4.15 step 6, §4.9, §4.12; A-527's owed half; A-185, A-227, A-237, A-519)
+Applied in the same change to: §4.15 step 6 (the rule), §4.9 (status: wire major 3), §4.12's contract log (`CONTRACT`
+= 48), GAPS (A-185's owed numbering: built, with what it leaves), `docs/library.md` (the host faults' row),
+`crates/vfs` (`src/host/mod.rs`: `OsCode`, the named kinds `HostError::Exists`, `NoSpace`, `Unsupported`,
+`Unavailable(OsCode)`, `OwnMount(OsCode)`, `HostError::code`; `src/host/sim.rs`: the simulated host gives the kinds and
+can refuse `rmdir` and a metadata open; `src/error.rs`: `VfsError::BaseUnavailable(Option<OsCode>)`; `src/base.rs` and
+`src/base_recovery.rs`: a recovered directory's code typed, the gone directory's per platform; `src/volume.rs`;
+`tests/base.rs`), `crates/base` (`src/unix.rs`, `src/windows.rs`, `src/own_mounts.rs`: the deadlock avoided typed per
+platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.rs`: the Unix writer's rule;
+`src/os_windows.rs` and `src/windows_codes.rs`: the Windows writer's; `src/engine.rs`: `Outcome::Failed` and
+`Degradation::Crashed` by `OsCode`, `named_code`; `src/test_store.rs`, `src/chmod_tests.rs`, `src/captured_tests.rs`,
+`tests/durability.rs`), `crates/server` (`src/error.rs`: `target_of_host`, `base_unavailable`; `src/landing.rs`:
+`answer_of`, `degradation_of`; `src/verbs.rs`: the over-long base's code per platform; `src/daemon.rs`), `crates/ipc`
+(`src/protocol.rs`: the four appended variants; `tests/wire_order.txt`; `src/os_code_vectors.rs` and its `.txt`, new),
+`crates/wire` (`src/header.rs`: `MAJOR` = 3), `crates/anchor` (`src/layout.rs`: `LAYOUT_VERSION` = 11;
+`tests/anchor.rs`), `crates/api` (`src/error.rs`: `OsCode`, `HostFault::Base { code }`; `src/lib.rs`: `CONTRACT` =
+48), `crates/mcp` and `crates/sdk-node` (a Win32 code as `win32` beside `errno`), and the bridges (`bridge-core`,
+`bridge-fuse`: the volume's refusal as its errno, where it is one).
+- **What was there.** A-527 typed the land seam's own refusal (`HostError::Win32` beside `Unavailable(errno)`), and
+  past the seam one number field still held either numbering: the landing report's `Failed { errno }` and crash, the
+  volume's `BaseUnavailable`, and the wire's `TargetRefusal::Host`, `HostAnswer::Errno`, `LandingDegradation::Crashed`
+  and `Refusal::BaseUnavailable`, which on Windows carried Win32 codes (5 is `EIO` as an errno and
+  `ERROR_ACCESS_DENIED` as a Win32 code). The engine told refusals apart by an errno's number, with Linux's and macOS's
+  side by side (`EDQUOT` 122 and 69, `ENOTSUP` 95 and 45), and the Windows writer gave a Win32 code of such a kind
+  the errno of that kind. Two more fields carried a Windows number where an errno goes: a path on the daemon's own
+  mount (`ERROR_POSSIBLE_DEADLOCK`, 1131) and a base path past the longest recorded (the MSVC runtime's `ENAMETOOLONG`,
+  38, which no Windows call answers).
+- **The rule.** The seam names the kinds the landing tells apart (`Exists`, `NoSpace`, `Unsupported`), each writer
+  reading its own platform's numbers into them, so the engine compares no number. Where it tells none of them apart it
+  reads every kind alike, as it read every errno before: a metadata entry's open refused by any kind fails that entry
+  alone (A-519, A-527), and a refused `rmdir` is the target in use, a kept directory or not this landing's (A-291,
+  AUD-29-04). Every code is typed by its numbering (`OsCode`) to the end: the report, the volume, the daemon's own-mount
+  and over-long refusals, and the wire, where an errno variant carries an errno alone and a Win32 variant appended
+  beside it a Win32 code. The library names an `OsCode` in `HostFault::Base` and puts it in the OS's words only in its
+  own numbering.
+- **Layouts.** An errno field changed what it may hold, which no appended variant can say of what an older peer sent or
+  an older segment keeps. So the wire's major is 3 (a major-2 peer is refused before its body is read, D-15, as A-237
+  took 2), and the anchor's layout is 11 (a completion record keeps its reply's bytes, read back with no schema word, so
+  a layout-10 segment is refused at start, never misread). A ring body's schema hash covers every variant of every enum
+  in it (`slates-wire-derive`), so the ring needed nothing more: a body of the older form is refused "schema mismatch".
+  No shim reads the old form anywhere.
+- **Tests, red first** (the Mac Studio, kiln, 2026-11-19, debug, run r59, 01:40 to 01:44 UTC, load 11.9 to 25.4).
+  At the first piece's tests-first commit (033ecb3d0): `slates-land --lib -- windows_codes os::tests` 2 of 2 failed
+  (`ERROR_FILE_EXISTS` read `Unavailable(17)` where `Exists(Win32(80))` was wanted; `refusal(EEXIST)` `Unavailable(17)`
+  where `Exists(Errno(17))`), `slates-ipc --lib -- os_code_vectors` failed its vectors (none published, 12 written),
+  and `slates-server --lib -- a_win32_code_reaches_the_wire` read `Errno { errno: 5 }` where `Win32 { code: 5 }` was
+  wanted. At this change's tests-first commit (92362f024): `slates-land --lib -- whatever_the_kind` 2 of 2 failed on
+  their first refusal, `Exists(Errno(17))` (the metadata entry's landing `Aborted` with `Crashed`; the removal
+  `Failed` where `Conflict(TargetInUse)` was wanted), and `slates-wire --lib -- header` read a major-2 header through to
+  its unknown class. The golden vectors (`crates/ipc/src/os_code_vectors.txt`) agree, 8 of 8, byte for byte with an
+  encoder written apart from the crate's, from the codec's rules (a `u32` discriminant by declaration index, a `u32`
+  length prefix, little-endian fields) and the wire order's indices.
+- **Owed** (GAPS): `TargetRefusal::MountRefused` carries a WinFsp mount's Win32 code in its `errno` field on Windows; an
+  `OsCode` says an errno but not whose, and a fleet mixing Linux and macOS would put a forwarded errno in the reader's
+  words; the client's own OS faults name a bare number in its own numbering. Filed for main: the Windows land and base
+  suites and the xwin check (the Windows writer's rule, the deadlock and over-long codes), the anchor's cross-process
+  test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
+  `Outcome::Failed { code: Option<OsCode> }`, and clippy.

@@ -251,23 +251,27 @@ fn await_learned() -> Result<(), HostError> {
   Ok(())
 }
 
-/// The refusal of a path on this daemon's own mount, with the errno the platform names it by: a deadlock avoided.
+/// The refusal of a path on this daemon's own mount, with the code the platform names it by, typed by its numbering
+/// (A-539): a deadlock avoided.
 pub fn refusal() -> HostError {
-  HostError::OwnMount(deadlock_errno())
+  HostError::OwnMount(deadlock_code())
 }
 
+/// `EDEADLK`, an errno.
 #[cfg(unix)]
-fn deadlock_errno() -> i32 {
-  rustix::io::Errno::DEADLK.raw_os_error()
+fn deadlock_code() -> slates_vfs::host::OsCode {
+  slates_vfs::host::OsCode::Errno(rustix::io::Errno::DEADLK.raw_os_error())
 }
 
-/// Format: Windows' `ERROR_POSSIBLE_DEADLOCK` (winerror.h), its name for the same refusal.
+/// Format: Windows' `ERROR_POSSIBLE_DEADLOCK` (winerror.h), its name for the same refusal: a Win32 error code, which
+/// before A-539 rode where an errno does.
 #[cfg(not(unix))]
-const ERROR_POSSIBLE_DEADLOCK: i32 = 1131;
+const ERROR_POSSIBLE_DEADLOCK: u32 = 1131;
 
+/// `ERROR_POSSIBLE_DEADLOCK`, a Win32 error code.
 #[cfg(not(unix))]
-fn deadlock_errno() -> i32 {
-  ERROR_POSSIBLE_DEADLOCK
+fn deadlock_code() -> slates_vfs::host::OsCode {
+  slates_vfs::host::OsCode::Win32(ERROR_POSSIBLE_DEADLOCK)
 }
 
 /// Format: the bytes of a tag, drawn from the system's random source.

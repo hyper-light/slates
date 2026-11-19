@@ -14235,10 +14235,10 @@ fn refused_before_dispatch(
   match body {
     RequestBody::Create {
       base: Some(path), ..
-    } if path.len() > longest_recordable_base() => Some(Refusal::BaseUnavailable {
-      path: path.clone(),
-      errno: PATH_TOO_LONG_ERRNO,
-    }),
+    } if path.len() > longest_recordable_base() => Some(crate::error::base_unavailable(
+      path.clone(),
+      Some(PATH_TOO_LONG),
+    )),
     _ => None,
   }
 }
@@ -14255,13 +14255,16 @@ const PLATFORM_PATH_BYTES: usize = 4_095;
 #[cfg(windows)]
 const PLATFORM_PATH_BYTES: usize = 32_767 * 3;
 
-/// Format: the errno a base path past [`longest_recordable_base`] is refused with: `ENAMETOOLONG`, the host's own answer
-/// to a path past its maximum (the MSVC runtime's value on Windows, `<errno.h>`).
+/// Format: the code a base path past [`longest_recordable_base`] is refused with, the host's own answer to a path past
+/// its maximum, typed by its numbering (A-539): `ENAMETOOLONG`, an errno.
 #[cfg(unix)]
-const PATH_TOO_LONG_ERRNO: i32 = rustix::io::Errno::NAMETOOLONG.raw_os_error();
-/// Format: see the Unix arm.
+const PATH_TOO_LONG: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Errno(rustix::io::Errno::NAMETOOLONG.raw_os_error());
+/// Format: see the Unix arm; Windows' own answer, `ERROR_FILENAME_EXCED_RANGE`, a Win32 error code. Before A-539 it was
+/// the MSVC runtime's `ENAMETOOLONG` (38, `<errno.h>`), a number no Windows call answers, in an errno's place.
 #[cfg(windows)]
-const PATH_TOO_LONG_ERRNO: i32 = 38;
+const PATH_TOO_LONG: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Win32(windows_sys::Win32::Foundation::ERROR_FILENAME_EXCED_RANGE);
 
 /// Format: the longest reason a recovery cause records ([`RecoveryCause`]'s `reason`), in bytes. A reason is the
 /// daemon's own text, never a caller's: a fixed phrase and a typed error's display (a host refusal and its errno, a

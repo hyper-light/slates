@@ -1692,10 +1692,8 @@ impl<H: LandFs> Landing<'_, H> {
         }
       }
       // An entry below the target on a mount this daemon serves (A-227): refused before any open, that entry alone.
-      Err(WriteFailure::Host(HostError::OwnMount(errno))) => Written {
-        outcome: Outcome::Failed {
-          code: Some(OsCode::Errno(errno)),
-        },
+      Err(WriteFailure::Host(HostError::OwnMount(code))) => Written {
+        outcome: Outcome::Failed { code: Some(code) },
         window_ns: None,
       },
       Err(WriteFailure::Host(HostError::NotFound | HostError::NotDirectory)) => Written {
@@ -2393,10 +2391,14 @@ impl<H: LandFs> Landing<'_, H> {
       Err(HostError::NotDirectory | HostError::NotFile) if change.directory => {
         return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TypeChanged)));
       }
-      Err(HostError::Unavailable(code)) => {
-        return Ok(MetaSet::Done(Outcome::Failed { code: Some(code) }));
+      // Refused by any kind the host names a code for, this entry fails alone (A-519, A-527): the landing tells none of
+      // them apart here (A-539).
+      Err(e) => {
+        return match named_code(e) {
+          Some(code) => Ok(MetaSet::Done(Outcome::Failed { code: Some(code) })),
+          None => Err(e.into()),
+        };
       }
-      Err(e) => return Err(e.into()),
     };
     let set = self.set_meta_through(file, change);
     if !matches!(set, Ok(MetaSet::Staged(_))) {
@@ -2529,7 +2531,9 @@ impl<H: LandFs> Landing<'_, H> {
     match self.host.rmdir(dir, name) {
       Ok(()) => Ok(Outcome::Written),
       Err(HostError::NotFound) => Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
-      Err(HostError::Unavailable(_)) => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      // Not empty (`ENOTEMPTY`, or POSIX's other answer `EEXIST`), in use, or refused by any other kind the host names
+      // a code for (A-539): the outsider's, kept.
+      Err(e) if named_code(e).is_some() => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
       Err(e) => Err(e.into()),
     }
   }
@@ -2608,7 +2612,7 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(there) if there.dev == made.dev && there.ino == made.ino => {
         match self.host.rmdir(dir, fresh) {
           Ok(()) => {}
-          Err(HostError::Unavailable(_)) => self.keep(dir, split(path).0, fresh, path)?,
+          Err(e) if named_code(e).is_some() => self.keep(dir, split(path).0, fresh, path)?,
           Err(e) => return Err(e.into()),
         }
       }
@@ -3088,8 +3092,8 @@ impl<H: LandFs> Landing<'_, H> {
       }
       HostKind::Dir => match self.host.rmdir(dir, aside) {
         Ok(()) => Ok(true),
-        // Not empty: never this landing's.
-        Err(HostError::Unavailable(_)) => Ok(false),
+        // Not empty, or refused by any kind the host names a code for (A-539): never this landing's.
+        Err(e) if named_code(e).is_some() => Ok(false),
         Err(e) => Err(e),
       },
       _ => Ok(false),
@@ -3317,6 +3321,25 @@ fn batch_pages(store: &Store) -> u64 {
     .checked_div(store.content.page().max(1))
     .unwrap_or(0);
   u64::try_from(pages).unwrap_or(u64::MAX).max(1)
+}
+
+/// The code of a refusal the host named a code for, of any kind (A-539): a name that exists, no room, a verb the
+/// filesystem lacks, or anything else it could not serve. A metadata entry's open and a refused `rmdir` read these alike,
+/// as they read every errno before the seam named the kinds; a path on this daemon's own mount (A-227), a fetch under
+/// way (A-524) and the typed refusals are read on their own.
+fn named_code(error: HostError) -> Option<OsCode> {
+  match error {
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code) => Some(code),
+    HostError::NotFound
+    | HostError::NotDirectory
+    | HostError::NotFile
+    | HostError::StaleHandle
+    | HostError::OwnMount(_)
+    | HostError::Pending => None,
+  }
 }
 
 /// The staged temporary a file with `overlay`'s bytes may be cloned from (A-445): the first of the batch's staged files

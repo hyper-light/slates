@@ -147,9 +147,10 @@ pub enum HostError {
   /// Anything else the host cannot serve, by the code it named, typed by its numbering (A-527, A-539).
   Unavailable(OsCode),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
-  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
-  /// deadlock avoided by.
-  OwnMount(i32),
+  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The code the platform names a
+  /// deadlock avoided by, typed by its numbering (A-539): `EDEADLK`, or Windows' `ERROR_POSSIBLE_DEADLOCK`, a Win32 code
+  /// that before A-539 rode in an errno's place.
+  OwnMount(OsCode),
   /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
   /// nothing changed, and the same call is answered once the fetch lands. The caller parks the request and runs it
   /// again then; a host that reads a local disk never answers it.
@@ -167,7 +168,7 @@ impl std::fmt::Display for HostError {
       Self::NoSpace(code) => write!(f, "no room ({code})"),
       Self::Unsupported(code) => write!(f, "not supported here ({code})"),
       Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
-      Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
+      Self::OwnMount(code) => write!(f, "on a mount this daemon serves ({code})"),
       Self::Pending => f.write_str("the host's fetch is pending"),
     }
   }
@@ -176,16 +177,15 @@ impl std::fmt::Display for HostError {
 impl std::error::Error for HostError {}
 
 impl HostError {
-  /// The code a refusal names, typed by its numbering: every kind but the typed ones the host names no number for (not
-  /// found, not a directory, not a file, a stale handle) and a fetch under way (A-524); a mount of this daemon's names
-  /// the errno its platform names a deadlock avoided by.
+  /// The code a refusal names, typed by its numbering (A-539): every kind but the typed ones the host names no number
+  /// for (not found, not a directory, not a file, a stale handle) and a fetch under way (A-524).
   pub fn code(&self) -> Option<OsCode> {
     match self {
       Self::Exists(code)
       | Self::NoSpace(code)
       | Self::Unsupported(code)
-      | Self::Unavailable(code) => Some(*code),
-      Self::OwnMount(errno) => Some(OsCode::Errno(*errno)),
+      | Self::Unavailable(code)
+      | Self::OwnMount(code) => Some(*code),
       Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle | Self::Pending => {
         None
       }
