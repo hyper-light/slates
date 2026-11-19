@@ -231,7 +231,12 @@ fn a_change_makes_a_new_node_revision_of_every_directory_above_it_and_none_besid
   let mut index = trunk();
   let before = at(&index, "/trunk/lib", 1).id();
   commit(&mut index, vec![edit("/trunk/lib/a.c", 3)]);
-  assert_created_in(&index, &["/", "/trunk", "/trunk/lib", "/trunk/lib/a.c"], 2, 2);
+  assert_created_in(
+    &index,
+    &["/", "/trunk", "/trunk/lib", "/trunk/lib/a.c"],
+    2,
+    2,
+  );
   assert_created_in(&index, &["/branches", "/trunk/README"], 2, 1);
   let lib = at(&index, "/trunk/lib", 2);
   assert_eq!(
