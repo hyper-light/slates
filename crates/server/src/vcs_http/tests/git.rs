@@ -99,6 +99,7 @@ impl Repositories for Held {
         version: 1,
         rules,
         hooks: Vec::new(),
+        hooks_env: Vec::new(),
       },
     })
   }
