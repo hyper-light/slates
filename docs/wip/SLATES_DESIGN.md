@@ -12141,6 +12141,15 @@ is one more version, and the chain itself is never rewritten.
 > its first submit and carried by every submit with its message (`Authorship`); a repository's green refuses a submit
 > without either, `MessageRequired` or `IdentityRequired`, before any work is built (A-664 part 1). Owed: the commit
 > recorded with the version and admitted (part 3), Mercurial's and Subversion's.
+>
+> **Status (2026-11-19, A-664 part 3, first piece: the green's state as the path map).** Each member green of a git
+> repository keeps the map of paths to git's files of its head (`crates/server/src/vcs_store/paths.rs`), the map item
+> 3's derived trees read: made as each version commits on the owner, a submit's and a push's alike; derived from the one
+> before over the change index and the hard links naming each changed file; built whole where no map of the version
+> before is kept or a copy names a tree by its destination alone; given back as the green leaves its lineage; made again
+> from the head by a recovery, so the store after a recovery equals the store before (A-662). Owed: the commit derived
+> from these maps, recorded with the version and admitted to the git store (part 3's commit), Mercurial's and
+> Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12851,6 +12860,12 @@ engine: the verdict, rebase, position mapping, the register).
 > principal's identities and the submit's message (part 1), and the made commit recorded with the version and admitted
 > to the git store (part 3, over A-662).
 >
+> **Status (2026-11-19, A-664 part 3, first piece: the path map `Trees` reads).** Built: each git green's head kept by
+> its repository's store as A-647's path map of `FileClass` entries over the shard's content store
+> (`vcs_store::paths`, §4.17.1's status), a file's content its bytes as an object, so a version's tree is derived from
+> the change between two kept maps. Part 1 is built too (A-664 part 1). Owed: the trees and the commit made from these
+> maps, admitted with the green's head moved and recorded with the version.
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -13484,8 +13499,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
-    A-664: part 2 built, a version's trees and commit as derived types; part 1, the principal's identities and
-    `MessageRequired` and `IdentityRequired` at submit, and part 3, the made commit recorded and admitted, owed.)
+    A-664: part 2 built, a version's trees and commit as derived types; part 1 built, the principal's identities and
+    `MessageRequired` and `IdentityRequired` at submit; part 3's first piece built, each green's map of paths to git's
+    files kept at its head (`vcs_store::paths`); the made commit recorded and admitted, owed.)
 14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
 15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
     landing.
@@ -51477,3 +51493,107 @@ tests, new; `vcs_http.rs`'s `Exchange::reply_status` and module documentation).
   (unreachable over HTTP by `SVNParentPath`'s first-segment rule without a longest-prefix search across partitions); a
   browser's `?p=` and `?r=` and a directory's HTML listing; Basic on the cleartext loopback edge (A-686); main's runs
   (clippy, `xtask`, the other platforms, red-checks).
+
+### A-664 part 3, first piece — Each git green's map of paths to git's files, kept at its head as each version commits: derived from the one before over the change index and the links it leaves out, built whole where no map of the version before is kept or a copy names a tree alone, given back as the green leaves its lineage, made again by a recovery (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.17.1 "A version" and "A push is a work" item 3; §4.17.2 "The repository in git's terms" item 5 and piece 13; A-647's owed map; A-662; A-586; after A-664 part 2)
+
+- **What it keeps** (`crates/server/src/vcs_store/paths.rs`). For each member green of a git repository, the map of
+  paths to git's files of its head: A-647's path map (`slates_vcs::derived::paths::PathMap`) whose entries are
+  `slates_git::derived::FileClass`'s, a file's content its bytes as an object in the shard's content store (A-662). A
+  regular file is `100644`, or `100755` when its owner may execute it (git keeps a regular file's owner execute bit
+  alone \[C: git `read-cache.c` `ce_mode_from_stat` and `cache.h` `create_ce_mode`, v2.50.1\]); a symbolic link
+  `120000`, its content its target; a submodule's link `160000`, its content the commit's id (A-637); a hard link a
+  file with its file's bytes and class; a named pipe, a socket or a device nothing git holds, so no file of the map.
+  One map a green (`GitStore::heads`, by the green's key, the version it is of beside its root), its root held once by
+  the store and replaced as each version commits; what two greens' heads share is held once (path copying, A-647).
+- **The head's alone, and why.** A green's next map is derived from its head's and nothing else reads an earlier one;
+  and A-662's rule is that a store made again from the log equals the live one whole, every content with its holders,
+  while an earlier version's map cannot be made again from a log a checkpoint folds. The piece's first cut kept every
+  version's map under its version (`Derivations`), which no recovery could make again; the head's is made again from
+  the green itself.
+- **When, and from what.** As each version commits on the owner: a submit's in `verbs::judge_submission` once
+  `record_accepted` has appended its record, a push's in `repository::push::push_sealed` once its register entry is
+  applied (each green the entry moved). The change is read from the green, never from a client: the paths
+  `Green::changed_between` names (the change index, A-264), and the hard links naming each (`Green::links_naming`,
+  new): the index names a change to a regular file at the file alone (a special node's links are named with it), while
+  each link reads the file's bytes and mode, so without them an overwrite of a linked file left the link's entry at the
+  old bytes (the fixed history's sixth version, red first). Each named path is set to its file at the head, or removed
+  where the map before holds a file and the head none. A directory needs nothing of its own: the map keeps a directory
+  while a file stands beneath it (A-647), and the index names each file a version makes, moves or removes, so a step
+  costs the change's paths and their directories in the map, never the green's tree.
+- **Whole, where it must be.** The map is built from the whole head where the store keeps no map of the green's version
+  before (a green's first version, a branch's first, the first after a refused step), or where a copy was made at or
+  above a named path in the span (`Green::copied_after`, new, over the engine's `replaced_after`): the index names a
+  copy at its destination alone, standing for the tree it brought (A-586). The first cut built whole wherever a named
+  path was a directory at the head, so a version that made a directory, or set a directory's mode, hashed every file
+  of the green again; a directory's files are named one by one, and only a copy's are not. No client verb makes a copy
+  yet (A-626 part 4), so `copied_after` is held by the engine's test alone and its use here is owed a test through a
+  work.
+- **Its life.** Given back as the green leaves its lineage (`vcs_store::paths::forget`, from
+  `repository::retire_member`, which reads the green's repository from its lineage before the retire ends it: a
+  destroy, a fence, a refused push's branch made in memory), since a store made again holds no map for a green that is
+  no member: the first cut kept a destroyed branch's map until its repository went. Made again from the head by a
+  recovery (`vcs_store::recover`, a green a unit, after the repository's records replay) and by `vcs_store::rebuild`;
+  freed with the repository (`vcs_store::release`).
+- **Budget and refusals.** A step's contents and nodes are lent the room the shard's budget could admit now and trued
+  up after, as A-662 charges a push. A refused step (that room, a path the map refuses, the content store's own) keeps
+  nothing new and holds nothing new, and is counted (`vcs_paths.refused`); the version's record is durable already, and
+  the green's next map is built whole. Counters: `vcs_paths.derived` (the incremental path's non-vacuity count),
+  `vcs_paths.built`, `vcs_paths.remade`, `vcs_paths.refused`.
+- **The engine's readers** (`slates-merge`, `Green`): `symlinks`, `hardlinks` and `specials`, which with `files` read
+  every name of the head that is no directory; `links_naming`; `copied_after`.
+- **Tests.** `crates/server/src/vcs_store/paths/tests.rs`, each map held, identity for identity, to the map its model
+  builds from scratch in another store with the shard's window (A-647: one map, one root, on every store): an
+  eleven-version fixed history on a git repository's root green (files made in a directory, one overwritten, one made
+  executable, a symbolic link and a hard link, a named pipe and an attribute, the hard link's file overwritten, a file
+  renamed, the symbolic link removed, an executable file moved to a new directory and the old one removed, a splice,
+  the execute bit taken away), one built and ten derived, none refused; a plain green keeps no map; a store made again
+  holds each green's map again, the next version derived from it; a branch's first version built whole, its second
+  derived; a destroyed branch takes its map with it, the store then equal to one made again from the log, every
+  content with its holders and the bytes it uses. `crates/server/src/vcs_store/tests.rs`: a push's version through
+  A-635's append keeps its map, built whole. `crates/merge/src/engine/node_tests.rs`: the links naming a file follow
+  it through a rename, and the index names a change to the file alone; `copy_tests.rs`: `copied_after` holds for a
+  copy's destination and a path beneath it after the version before the copy, never after the copy's own, never for its
+  source or a path beside it.
+- **Found, and left to its own piece** (reported to main). The green keeps a mode at its path (A-618), and a rename
+  carries a file's bytes and not its mode: `chmod +x d/a` in one version and `mv d/a x/a` in a later one land `x/a`
+  with no mode, the moved file's mode dropped with its old path, so the tree git reads holds it `100644`, where POSIX
+  `rename` and `git mv` keep it `0755` (the piece's first run, at bad1af546: the move read class 0 where the model said
+  1). The map reads the green as it is; the fixed history states the moved file's mode in the work that moves it.
+- **Runs** (macOS arm64, the Mac Studio, 2026-11-19, rustc 1.98.1, debug, `CARGO_BUILD_JOBS=2`). Red first (kiln r124,
+  dfe4617a8 with `paths.rs` and `repository.rs` put back as they stood before this change's fixes, at d752f0d1b, the
+  first cut merged with main 3612d1ef9): `cargo test --locked -p slates-server --lib vcs_store::paths::` 3 passed and 2
+  failed, the fixed history at version 6 (the link `h` still its file's old bytes, `keep` the new) and the destroyed
+  branch's map still kept (`(true, true)` against `(true, false)`). Before it, the first cut's own runs (at bad1af546):
+  with `advance` doing nothing, 4 of its 5 tests failed and the plain green's passed; with it, the fixed history failed
+  at the move (the finding above). Green (kiln r147, dfe4617a8 over main 3612d1ef9, slates-server compiled afresh):
+  `cargo test --locked -p slates-server --lib -- vcs_store:: repository:: verbs::tests vcs_http::tests::git identities`
+  120 passed, 2 ignored (measurements, not gates), none failed, among them the six tests above, A-662's and every
+  repository test (main's failure at 3329211e0, `each_verb_moves_the_names_log_and_each_members_version_its_own_log`,
+  passes on main now); that filter named none of the git edge's tests, so `-- vcs_http::git::tests` ran apart, 12 of 12;
+  `cargo test --locked -p slates-merge --lib -- engine::node_tests::
+  engine::copy_tests::a_copy_is_named_for_every_path_of_its_tree_after_the_version_before_it` 18 of 18; the integration
+  tests through the submit's step, filtered as A-664 part 1's were: `-p slates-client --test edit_and_submit` 2 of 2,
+  `-p slates-server --test daemon` 7 of 7, `--test works_off_owner` 5 of 5 and `--test fleet` 14 of 14 (178.4 s); `cargo
+  fmt -p slates-server -p slates-merge -- --check` clean. The same set on the tree as it lands, the server's filter
+  widened to the git edges whose pushes reach the map's step through `push_sealed` (A-654 part 3): the piece squashed
+  over main b94ae6e90 (kiln r242, 22:21-22:31Z), then merged with main 9f349d66b (kiln r289, 22:39-22:49Z), where
+  `rebuild` replays through main's `make_from_log` (A-655 part 2b) and makes the maps again after it: `cargo test
+  --locked -p slates-server --lib -- vcs_store:: repository:: verbs::tests vcs_http:: identities git_push::
+  --test-threads=4` 169 and then 175 passed, 2 ignored, none failed, the piece's six among them; slates-merge's 18 of
+  18; edit_and_submit 2 of 2, daemon 7 of 7, works_off_owner 5 of 5 and fleet 14 of 14 (181.8 s, 193.2 s); fmt clean.
+  Main's commits after 9f349d66b change this piece's files by visibility and one accessor alone (A-665 part 2's hooks).
+  No integration target makes a git repository, so none of them keeps a map; the unit tests above do. The Windows x86_64
+  and Linux runs, clippy, xtask and the doc gate are main's.
+- **Owed.** Part 3's commit: the trees and the commit derived from these maps' changes (A-664 part 2's types),
+  admitted to the git store with the green's head moved and recorded with the version; a submit refused before its
+  verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
+  (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
+  source's head is the version it was made at; the holders' maps (A-636's fleet half); a copy made through a work
+  driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
+  by the same rule.
+- **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
+  `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
+  `vcs_store/tests.rs`; `crates/server/src/verbs.rs` (the submit's step); `crates/server/src/repository/push.rs` (the
+  push's step); `crates/server/src/repository.rs` (`retire_member`, the module's docs); `crates/merge/src/engine.rs`
+  (the five readers), `engine/node_tests.rs` and `engine/copy_tests.rs`; §4.17.1's and §4.17.2's statuses and piece
+  13; GAPS (A-664's entry).
