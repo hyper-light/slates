@@ -339,8 +339,9 @@ def main():
         stock("update-mixed-revisions", ["update", wc("wc-c")])
         # status -u: a working copy at r2 with a local edit; no text deltas.
         stock("checkout-r2", ["checkout", "-r2", trunk, wc("wc-d")])
-        with open(wc("wc-d/a.txt"), "ab") as edited:
-            edited.write(b"a local edit\n")
+        if only is None:
+            with open(wc("wc-d/a.txt"), "ab") as edited:
+                edited.write(b"a local edit\n")
         stock("status-u", ["status", "-u", wc("wc-d")])
         # A diff of two revisions of one URL.
         stock("diff-r1-r6", ["diff", "-r", "1:6", trunk])
@@ -356,7 +357,8 @@ def main():
         stock("checkout-for-lock", ["checkout", trunk, wc("wc-g")])
         stock("lock-a", ["lock", "--username", "alice", "--password", "secret", "-m", "held", wc("wc-g/a.txt")])
         stock("update-with-lock", ["update", wc("wc-g")])
-        run(["svnadmin", "rmlocks", repository, "/trunk/a.txt"], env=env, capture_output=True)
+        if only is None:
+            run(["svnadmin", "rmlocks", repository, "/trunk/a.txt"], env=env, capture_output=True)
         stock("update-with-broken-lock", ["update", wc("wc-g")])
         # Hand-made reports. Each is a list of steps: bytes to send, or bytes to wait for in what svnserve wrote, so a
         # client answers the drive only once the drive has ended (svnserve looks for input before every editor command
