@@ -75,12 +75,15 @@ pub enum Applied {
   Spliced(String, Vec<Op>),
   /// Create the file from these declared ops over nothing.
   Created(String, Vec<Op>),
-  /// Set `dst` to what `from` holds at this version.
+  /// Set `dst` to what `from` holds at this version, with `ops` spliced into those bytes (A-547).
   Copied {
     /// The file written.
     dst: String,
     /// The file it takes its bytes from.
     from: String,
+    /// The edits the work made to `dst` after the rename, in the coordinates of the bytes it takes: the work's own ops
+    /// mapped through what changed `from` since the work's base. Empty for a rename alone, which encodes as before.
+    ops: Vec<Op>,
   },
   /// Remove the file.
   RemoveContent(String),
@@ -184,6 +187,9 @@ mod tag {
   pub(super) const REMOVE_XATTR: u8 = 15;
   /// Format: the tag of a file spliced by exactly the ops it declared.
   pub(super) const SPLICED_AS_DECLARED: u8 = 16;
+  /// Format: the tag of a file taking another's bytes with edits spliced into them (A-547): a rename's destination the
+  /// work edited after the rename. A rename alone keeps [`COPIED`].
+  pub(super) const COPIED_SPLICED: u8 = 17;
 }
 
 /// The largest an entry for `increment` can encode to, whatever its verdict resolves it to: what the service charges
@@ -458,7 +464,13 @@ fn put_applied(out: &mut Vec<u8>, increment: &Increment, applied: &Applied) {
       put_tagged_paths(out, tag::CREATED, &[path]);
       put_ops(out, ops);
     }
-    Applied::Copied { dst, from } => put_tagged_paths(out, tag::COPIED, &[dst, from]),
+    Applied::Copied { dst, from, ops } if ops.is_empty() => {
+      put_tagged_paths(out, tag::COPIED, &[dst, from]);
+    }
+    Applied::Copied { dst, from, ops } => {
+      put_tagged_paths(out, tag::COPIED_SPLICED, &[dst, from]);
+      put_ops(out, ops);
+    }
     Applied::RemoveContent(path) => put_tagged_paths(out, tag::REMOVE_CONTENT, &[path]),
     Applied::MakeDir(path) => put_tagged_paths(out, tag::MAKE_DIR, &[path]),
     Applied::RemoveDir(path) => put_tagged_paths(out, tag::REMOVE_DIR, &[path]),
@@ -501,7 +513,20 @@ fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applie
     tag::COPIED => {
       let dst = take_str(reader)?;
       let from = take_str(reader)?;
-      Applied::Copied { dst, from }
+      Applied::Copied {
+        dst,
+        from,
+        ops: Vec::new(),
+      }
+    }
+    tag::COPIED_SPLICED => {
+      let dst = take_str(reader)?;
+      let from = take_str(reader)?;
+      Applied::Copied {
+        dst,
+        from,
+        ops: take_ops(reader)?,
+      }
     }
     tag::REMOVE_CONTENT => Applied::RemoveContent(take_str(reader)?),
     tag::MAKE_DIR => Applied::MakeDir(take_str(reader)?),

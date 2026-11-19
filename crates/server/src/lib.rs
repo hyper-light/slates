@@ -75,6 +75,9 @@ mod green_adopt;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+// The judgment a held NFS connection's adoption takes on Linux (A-550): pure, so every host's tests hold it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod held_send;
 pub mod histogram;
 mod image;
 pub mod landing;

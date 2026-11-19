@@ -4923,6 +4923,18 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
+> (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
+> term, and to the next CLI attachment's lapse, which the partition now keeps in an index of terms (derived from the
+> records and made again at a restore), so no attachment is walked to find the lapsed. Whatever path records a lease or
+> a term (a take, a renewal, a replay), the partition notes the earliest it entered and each state borrow closes by
+> handing that to the keeper (`deadlines::after_borrow`). Destroys are stepped by the serve loop once woken: a takeover's
+> relinquish now wakes it, as a destroy and a move's release already did, and a refused completion record is tried
+> again at its own deadline, the shard's window on. A deadline still past after the keeper's pass (a job that could not
+> end it) is tried again a window on, never spun on (`deadlines::armed_for`, counted `deadline.stuck`). Off the tick so
+> far: dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536);
+> grants and the owed audit are next.
+
 > **Status (2026-11-19, A-522: a claim names its process; staging and status captures keep their own deadlines).**
 > A claim on macOS and Windows carries its claimant's start beside its pid (the claim slot's `AT_STARTED`, the bootstrap
 > layout `SLB5`): on macOS the start time the kernel keeps for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`, in
@@ -11017,7 +11029,10 @@ same ops document on every platform (its identity is the test). Paths under the 
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
 derivation is refused `JournalIncomplete` (naming the sequence it needed and the oldest the journal
-holds), never composed from what is left (`Volume::records_since`; 2026-11-05).
+holds), never composed from what is left (`Volume::records_since`; 2026-11-05). A rename's destination the work edited
+after the rename carries those edits on the move: the verdict maps them through the source's deltas onto the bytes the
+rename moves, an edit meeting one of them an overlap conflict, and the chain entry records them with the copy, so
+replay and a rebase restate them after the `Rename` (A-547).
 
 **Position mapping.** Through the canonical deltas in (base, head], one direction, per path: an
 intervening size-changing operation at position p with delta d shifts the increment's ranges
@@ -36426,6 +36441,97 @@ fetches); `crates/vfs` (`HostError::Pending`, `VfsError::BasePending` and its er
   unavailable store the handle answered `EIO`, not stale; with the store's version not bound the replaced object's
   second chunk was asked unbound; with a stale listing never listed again the new key never showed (1 entry where 2 were
   due) and the oracle's look missed a put file.
+
+
+### A-536 — Leases, CLI attachments and destroys leave the reap loop's tick, each kept at its own deadline or woken by its own event (2026-11-19, built for goal g255; the event-driven reaper's piece 3, jobs 1–3 of 5; §4.7; D-16, A-230, A-475, A-522)
+
+- **What was there.** The reap loop's tick, once a liveness window, released lapsed write leases (`verbs::expire_leases`,
+  the partition's lease wheel popped), ended lapsed CLI attachments (`verbs::expire_lapsed_attachments`, a walk of every
+  attachment record), and stepped destroys (`verbs::step_destroys`), which besides the serve loop's own rounds was the
+  only thing that started a takeover's relinquished teardown and retried a destroy whose completion record the catalog
+  refused.
+- **Leases (job 1).** The keeper (`crate::deadlines`, A-522) sleeps to the lease wheel's next deadline as well
+  (`Partition::next_lease_expiry`, the wheel's tick at or after the earliest expiry, so a pass then finds it due) and
+  runs `expire_leases` in its pass (a lease a live write attachment keeps is renewed, A-414). A lease is recorded by many
+  paths (a take, the keeper's own renewal, a replay), so the partition notes the earliest it entered
+  (`Partition::take_noted_lease`), and every state borrow closes by handing that note to the keeper
+  (`deadlines::after_borrow`, in `state::try_with_state`), which wakes it only for a deadline before the one it sleeps
+  for. The serve round's own lease pass stays (a wheel pop, nothing scanned).
+- **CLI attachments (job 2).** The partition keeps its termed attachments in an index by their lapse
+  (`termed_by_expiry`: one entry a termed attachment, kept at the add, the renewal and every removal, derived from the
+  records and made again at a restore), so `expire_lapsed_attachments` reads the lapsed alone (`Partition::lapsed_terms`)
+  where it walked every attachment; the keeper sleeps to the next lapse (`next_term_lapse`), noted as leases are
+  (`take_noted_term`).
+- **Destroys (job 3).** The serve loop steps destroys in its rounds once woken: a takeover's relinquish
+  (`verbs::relinquish_superseded`) now wakes it, as a destroy and a move's release already did. A completion record the
+  catalog refused is tried again at its own deadline, the shard's window on (`verbs::retry_destroy_at_window`,
+  `ShardState::destroy_retry_at`), when the keeper wakes the serve loop to step it.
+- **Never a spin.** Job 3's red check (the keeper never taking a retry it had armed for) found the keeper spinning: a
+  deadline still past after its pass re-armed a zero span, `within` answered at once, and the watchdog ended the test
+  daemon, its shard 3.5 s on its CPU without a step. So a deadline still past after a pass (a job that could not end it,
+  a record refused) is tried again the shard's window on (`deadlines::armed_for`) and counted `deadline.stuck`.
+- **Tests.** `crates/server/src/deadlines.rs`: `a_lapsed_write_lease_is_released_at_its_term_without_a_tick`,
+  `a_lapsed_cli_attachment_ends_at_its_term_without_a_tick`, `a_refused_destroys_retry_is_kept_at_its_deadline_without_a_tick`,
+  `a_deadline_still_past_after_its_pass_is_tried_again_a_window_on`; `crates/server/src/verbs.rs`:
+  `a_relinquished_volume_is_torn_down_without_a_tick`. Each failed first against its job's mutation (one red run each).
+- **Evidence.** On the Mac Studio (kiln, d1323898, 2026-11-19 00:38–00:54 UTC, load 15–34, debug build), each job's run
+  green then red: a lease due in 100 ms released 105–110 ms after it was recorded, a CLI attachment with a 100 ms term
+  ended 113.7–114.5 ms after it was made, a relinquished volume torn down 40.9 ms after the relinquish, a destroy's
+  retry due in 100 ms kept at 101.9 ms; the last run 15 of 15 (`deadlines::tests`, the two lease tests, the relinquish,
+  `hangup::tests`, `reap::tests`), `slates-db --lib` 109 of 109. Each red run failed exactly its guarded tests.
+- **Left on the tick for piece 4:** grants past their term, the owed audit's resend; and after them departed hosts'
+  attachments, held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the idle seal and
+  the huge-page re-arm.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/db/src/partition.rs`,
+`crates/server/src/deadlines.rs`, `crates/server/src/state.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`.
+
+### A-547 — An edit after a rename is merged with the renamed bytes, and the chain entry's copy carries it (2026-11-19, goal 85 via g225; §4.16 "Composition at seal", "Position mapping"; A-202)
+
+- **What was there.** A work that renames `a` over `b` and then writes `b` declares a `Rename` and content ops on `b`
+  in the coordinates of `a`'s bytes at its base. The verdict copied `a`'s head bytes to `b` and skipped `b`'s ops, as
+  "handled with that effect", which never used them: the submit was accepted and the edit lost (GAPS, found by perf
+  2026-11-09). The chain entry's `Copied { dst, from }` had no ops to replay, and replay maps all of an entry's effects
+  before committing any, so a second `Spliced` effect could not carry them.
+- **The rule.** The verdict maps the destination's ops through what changed the source since the work's base
+  (`Green::edits_after_rename`, the same position mapping a path's own edits take) and splices them into the bytes the
+  rename moves; an edit that meets an intervening change to the source is an overlap conflict on the destination. The
+  effect carries them (`ContentSource::Copied(from, ops)`), the chain entry records them (`Applied::Copied`'s `ops`,
+  tag `COPIED_SPLICED`; a rename alone still encodes as `COPIED`, so existing entries read as before), replay splices
+  them into the copy, and a rebase restates them after the `Rename` (`rebased_from`).
+- **Test.** `an_edit_after_a_rename_over_a_file_is_merged_with_the_renamed_bytes` (`crates/merge/src/engine.rs`: the
+  submit keeps `b` = `0123456789XY` with `a` gone, and the version's entry, encoded, decoded and replayed, does too).
+  The server's parked `an_edit_after_a_rename_over_a_file_is_merged_with_it` (`crates/server/tests/green_post_state.rs`)
+  is no longer ignored; it and the merge suites are filed for main.
+- **Owed.** The rebase oracle's generator (`journal_of` in `green_post_state.rs`) still leaves this case out.
+
+Applied in the same change to: §4.16 "Composition at seal", GAPS (the 2026-11-09 entry, fixed), the bug record
+`docs/bugs/2026-11-19-an-edit-after-a-rename-was-accepted-and-lost.md`, `crates/merge/src/{engine,chain_entry}.rs`,
+`crates/server/tests/green_post_state.rs`.
+
+### A-550 — A held NFS connection is served on after its daemon only on a record's boundary: the judgment, part 1 of A-113's Linux half (2026-11-18, goal 85, g079; §4.6 the loopback listener; A-113, A-128)
+Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part 2 owed), `crates/server/src/held_send.rs`
+(new: `SendLedger`, `Resume`, `resume` and the unit test), `crates/server/src/lib.rs`, and the bug record
+`docs/bugs/2026-11-18-linux-nfs-loopback-connections-were-dropped-at-every-daemon-restart.md`.
+- **What was there.** A-113 holds each loopback NFS connection in the anchor across a restart, so a restart is a slow
+  reply and never a dropped connection, on macOS only: its sends are all or nothing (`SO_SNDLOWAT`). Linux copies what
+  fits, so a send can end mid-record, and a successor resuming such a stream would hand the client the next reply's
+  bytes as the rest of the torn one. So every Linux daemon restart dropped every NFS client's connection, and each
+  client reconnected.
+- **The rule (judgment).** At adoption the successor compares the bytes the kernel says the connection's writer handed
+  it with the ledger the dead daemon wrote before its last send: the bytes of whole replies before it (`committed`) and
+  that send's length (`in_flight`). Exactly `committed` (nothing of the send) or exactly `committed + in_flight` (all of
+  it) leaves the stream on a record's boundary, and the connection is served on: a request still queued is answered
+  afresh, a whole reply sent twice is dropped by its client (RFC 5531). Any other count, the sum's overflow included,
+  is a torn stream: the connection ends and its client reconnects, as every one did before.
+- **Owed (part 2, Linux-only).** The ledger in anchor-owned RAM, written before each send and advanced after it, each
+  record checksummed; the kernel's count (`tcpi_bytes_acked` plus `SIOCOUTQ`); Linux connections held once both are
+  there; and the kill run.
+- **Tests.** `a_held_connection_is_served_on_only_on_a_records_boundary` (`crates/server/src/held_send.rs`, every
+  host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
+  in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
+  judgment.
 
 ### A-544 — A captured clone taken over after its owner's loss lands against its capture: every head it places carries its capture's record (2026-11-18, g267, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover"; A-291, A-424, A-503)
 

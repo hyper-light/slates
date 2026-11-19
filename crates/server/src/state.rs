@@ -523,7 +523,7 @@ pub struct ShardState {
   /// yield (`crate::readmission`).
   pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
   /// The slots of stale copies this shard relinquished to a takeover that named this node again (A-362,
-  /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the reaper (`verbs::step_destroys`)
+  /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the serve loop (`verbs::step_destroys`)
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
   /// cap: a relinquished copy was a volume this shard held, and each leaves once its teardown is done.
   pub(crate) relinquished: Vec<VolumeSlot>,
@@ -700,6 +700,9 @@ pub struct ShardState {
   pub(crate) deadline_task: Option<slates_rt::TaskId>,
   /// The deadline the keeper sleeps until, `None` while none is set (`crate::deadlines::noted` reads it).
   pub(crate) deadline_armed: Option<u64>,
+  /// When a destroy whose completion record the catalog refused is tried again (A-536): the shard's window after the
+  /// refusal, kept by the deadline keeper, which wakes the serve loop then to step it (`verbs::step_destroys`).
+  pub(crate) destroy_retry_at: Option<u64>,
   /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
   /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
   pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
@@ -1454,6 +1457,8 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
       return Err(StateAccess::Fenced);
     }
     let result = f(state);
+    // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).
+    crate::deadlines::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
   })
