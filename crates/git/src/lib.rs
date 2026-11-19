@@ -41,8 +41,11 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod admission;
+pub mod delta;
+pub mod entry;
 pub mod object_name;
 pub mod out;
+pub mod pack;
 pub mod pktline;
 pub mod sideband;
 
@@ -57,3 +60,7 @@ pub(crate) fn to_u64(value: usize) -> u64 {
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 mod fixtures;
+
+#[cfg(test)]
+#[path = "tests/pack_fixtures.rs"]
+mod pack_fixtures;

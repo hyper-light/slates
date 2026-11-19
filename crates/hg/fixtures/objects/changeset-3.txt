@@ -1,0 +1,6 @@
+38a51fca0cbc207c4af656034604724b2e089ff6
+Test <test@example.com>
+0 0
+meta
+
+a file that begins as the block does

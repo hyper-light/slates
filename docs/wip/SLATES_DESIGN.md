@@ -11953,6 +11953,28 @@ engine: the verdict, rebase, position mapping, the register).
 > detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
+>
+> **Status (2026-11-19, A-582 part 3: piece 2 built whole, with a pack entry's header and git's delta).** `crates/git`
+> reads and writes a pack entry's header (`entry`): the type and the size, which git reads to 60 bits; an OFS_DELTA's
+> offset back to its base, refused at zero and wherever it would put the base before the pack's first entry; and a
+> REF_DELTA's base name in the pack's object format. The size is charged to the caller's admission once the header is
+> whole. It reads, writes and applies git's delta (`delta`): the source's and the target's sizes, then copy and insert
+> instructions. Each is refused by kind where git refuses it: a copy outside the source, a source of another size, the
+> reserved byte zero, an instruction cut short, a target made too long or too short. The whole delta is checked before
+> its target is charged and made. Proven on the offset-delta and reference-delta packs stock git 2.50.1 wrote: every
+> entry's header reads as `git verify-pack -v` lists it and writes back to git's bytes, and each delta, applied to its
+> base, makes the object git named.
+>
+> **Status (2026-11-19, A-591: the pack index and a pack's header and trailer built).** `crates/git` (`pack`,
+> `pack::idx`) reads a pack's header as a stream delivers it: `PACK` is refused at its first wrong byte, versions 2 and
+> 3 are read, and the count follows. It checks a whole pack's trailer before any byte it guards, and writes a pack's
+> header at version 2 and its trailer as the bytes stream out. It decodes the index, version 2, in place once the
+> index's own checksum holds: the fanout never goes down and agrees with the ids, the ids strictly ascend, the 8-byte
+> table is whole and every large offset names one of its entries, and no offset lies inside a pack's header. It holds an
+> index to its pack as `git verify-pack` does, short of inflating (one count, one trailer, the objects back to back,
+> each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
+> `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
+> packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12216,7 +12238,7 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 2. The object codecs: the object header and identity (collision-detecting SHA-1 and SHA-256), a pack entry's header,
    and delta instructions with an applier; golden vectors from packs stock git wrote, recorded with the commands.
 3. The pack reader: streaming, bounded, inflating, resolving deltas against the pack and the index, checking the
-   trailer; hostile input. (A deflate implementation enters the workspace here, chosen by measurement.)
+   trailer; hostile input. (The deflate implementation, chosen by measurement: zlib-rs through flate2's API, A-607.)
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack.
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
@@ -12277,6 +12299,19 @@ signature verification).
 > (`crates/hg/fixtures/wire`, the command in `make-wire-fixtures.sh`): a clone, a pull, a push, `debugwireargs` through
 > each way of carrying arguments, and a refused bundle1 client, every request and answer read and written again to its
 > bytes. Compression engines (D-17) and serving the commands (piece 4) are not this piece's.
+>
+> **Status (2026-11-19, A-588: piece 3's objects and nodes built).** `slates-hg` reads and writes a repository's three
+> kinds of object byte for byte as 7.2 stores them, each reader and its writer accepting exactly the same objects: a
+> changeset's text (`changeset`: its fields in place, its extras unescaped as 7.2's `decodeextra` reads them and
+> escaped as `encodeextra` writes them), a flat manifest (`manifest`: sorted lines of a path, a lower-case node and an
+> `x` or `l` flag, refused where 7.2's C reader refuses), and a file revision (`filerev`: its metadata block apart from
+> its bytes, the copy 7.2's `renamed` reads, and the parents in the order 7.2 stores them). It computes each node
+> (`node`) as 7.2 does: the SHA-1 of the lower parent, the higher and the text, with sha1collisiondetection on, since
+> 7.2's `hashutil.sha1` is sha1dc's wherever its C extension is built, so a known collision attack is refused
+> (`CollisionAttack`). Proven against every revision of one repository stock 7.2 stored (`crates/hg/fixtures/objects`:
+> each text from `hg debugdata`, each log from `hg debugindex --debug`, and what 7.2's own readers read; the command
+> in `make-object-fixtures.sh`, run twice, byte for byte alike) and against SHAttered's two prefixes. Still owed from
+> piece 3: the index's tables, and an existing store's import, whose zlib and zstd chunks A-607's engines now inflate.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12379,7 +12414,15 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   does), then the file's bytes. The row keeps them apart, so the bytes are the same content as the file in every tree
   (§4.17.1 "Objects", item 1) and only the block is kept beside them.
 - Each node is checked on arrival as Mercurial computes it: the SHA-1 of the two parents in ascending order and then
-  the text [B: `internals.revlogs` "Hash Computation"].
+  the text [B: `internals.revlogs` "Hash Computation"], with sha1collisiondetection on, as 7.2's `hashutil.sha1` is
+  sha1dc's wherever its C extension is built, set to detect and never to mend [C: `utils/hashutil.py`,
+  `thirdparty/sha1dc/cext.c`]. A revision whose hashing shows a known collision attack is refused (`CollisionAttack`),
+  as 7.2 raises "sha1 collision attack detected" on it.
+- A file revision's parents are kept in the order 7.2 stores them: with a metadata block and one null parent, the null
+  one first; without a block, second (7.2's fix-up for issue6528, applied to every incoming file revision [C:
+  `revlogutils/rewrite.py` `_has_bad_parents`]). Its copy is read as 7.2's `renamed` reads it, only from a revision
+  whose first parent is null and whose block names both `copy` and `copyrev` [C: `filelog.py`]. Reordering parents
+  never changes a node, which hashes them in order of value.
 - The tail is folded into a new table when the lookups it served since the last fold cost more than a fold (the table
   of learned tunables).
 
@@ -12547,7 +12590,8 @@ limit, so slates answers with one `dump0` key, and a client splits its own pushe
 
 **Failure matrix (Mercurial's, beside §4.17.1's).** A push whose answer was lost after its commit: the client's repeat
 is answered accepted with nothing new (above). A hostile or damaged bundle: refused by kind before any effect, nothing
-indexed. A revision whose node does not hash: `ObjectIdMismatch`. A marker obsoleting a public changeset: refused. A
+indexed. A revision whose node does not hash: `ObjectIdMismatch`; one whose hashing shows a known SHA-1 collision
+attack: `CollisionAttack`. A marker obsoleting a public changeset: refused. A
 client gone during a stream clone: the held view is unaffected, and the next request starts again. An owner restart:
 the index, the phase roots and the markers replay with the greens from the register (§4.16); the revlog view, the
 linelogs and the delta cache are held artefacts, made again on demand.
@@ -12556,9 +12600,11 @@ linelogs and the delta cache are held artefacts, made again on demand.
 `Corrupt`, `UnknownMandatory` for a part or a parameter, `PastAdmission`); `UnknownDeltaBase { node }`;
 `MissingObject { node }` (a parent, a link, a manifest's file revision); `PathRefused { path, rule }`;
 `PhaseRefused { phase }`; `ObsoletesPublic { node }`; `NewHead { branch }`; `RewriteRefused { node }` (a rewrite that
-would drop a public changeset, or a draft no marker obsoletes). Each is answered in Mercurial's words: the race abort,
-`error:abort` with message and hint, `error:pushkey` (and `reply:pushkey` 0) for a bookmark or phase that did not move,
-`<hook> hook exited with status <n>` for a refusing hook [C: `hook.py`, `utils/procutil.py`], and hgweb's statuses.
+would drop a public changeset, or a draft no marker obsoletes); `CollisionAttack { node }` (a revision in which SHA-1's
+collision detection finds a known attack, which 7.2's own hashing raises on). Each is answered in Mercurial's words:
+the race abort, `error:abort` with message and hint, `error:pushkey` (and `reply:pushkey` 0) for a bookmark or phase
+that did not move, `<hook> hook exited with status <n>` for a refusing hook [C: `hook.py`, `utils/procutil.py`], and
+hgweb's statuses.
 
 **Worked example.** Repository `linux` (Mercurial, publishing) has line `default` at version 412, whose head is
 changeset h412. Alice and Bob have pulled it. Alice pushes a1, which edits `kernel/fork.c`, with `check:updated-heads`
@@ -12647,7 +12693,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    string and the bundle2 capability blob, and `batch` escaping. Built (A-569, `crates/hg`: `ssh`, `http`,
    `capabilities`, `batch`, `wire`).
 3. The objects and the index: changeset texts, flat manifests and file metadata parsed and written, nodes checked, the
-   index's tables, and an existing repository's store imported as a base.
+   index's tables, and an existing repository's store imported as a base. Built (A-588, `crates/hg`: `changeset`,
+   `manifest`, `filerev`, `node`): the objects and their nodes. Owed: the index's tables, then the import, whose zlib
+   and zstd revlog chunks A-607's engines inflate (flate2 over zlib-rs, and zstd), its tests holding inflated bytes.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
@@ -12697,6 +12745,27 @@ and export by landing).
 > FSFS's operations to whole trees, equals it on generated histories, and equals itself replayed in random drive
 > orders. Owed with the object store (§4.17.1 shared piece 3): the rows held as content tables with a mutable tail, and
 > the learned fold (item 12); with the server (piece 7): one large revision applied in slices under the shard's budget.
+>
+> **Status (2026-11-19, A-602).** Built: locks (`slates-svn`'s `lock`, piece 8; items 7 and 3.4). The lock table has
+> three guards: `lock` (with stealing), `unlock` (with breaking) and the verdict's check (with release or keep). Each
+> returns the register entries it decided and its answers, and `apply` applies an entry unconditionally, so a holder's
+> replay never reads a clock or draws a token. Its oracle transcribes FSFS's lock rules (`lock.c`, `fs-loader.c`,
+> `fs-wrap.c`, `transaction.c`, `serve.c`) and equals it on generated histories. Owed: the verbs on the wire with the
+> ra_svn server (piece 7), the lock hooks (piece 11), DAV's LOCK and UNLOCK (piece 13), the entries' encoding in the
+> repository's register, the head view over the index, and the room derived from the shard's (item 12).
+>
+> **Status (2026-11-19, A-605).** Built: mergeinfo (`slates-svn`'s `mergeinfo`, piece 9, item 8): the `svn:mergeinfo`
+> value read as `svn_mergeinfo_parse` reads it (every refusal by Subversion's own message, answered `E200020`; at commit
+> a NUL inside the value refused first, as `verify_mergeinfo` does) and written as `svn_mergeinfo_to_string` writes it;
+> the range-list algebra transcribed from `mergeinfo.c` (union, intersection, removal, difference, equality, each with
+> `consider_inheritance`), since Subversion's walk is not exact per revision when inheritance is compared and the stock
+> client computes with it; inheritance and elision; and `get-mergeinfo`'s answers over the index (explicit, inherited,
+> nearest-ancestor; descendants found by the index's counts, a crawl the server pulls a slice at a time; a value that
+> does not parse answering none, issue #3896). Held to `mergeinfo-test.c`'s vectors, to the per-revision model wherever
+> Subversion's algebra is exact, and to a naive filesystem on generated histories. Owed: `svn mergeinfo --show-revs`'s
+> eligible and merged revisions, composed from this algebra with piece 7's location segments and log
+> (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`, `filter_log_entry_with_rangelist`); the property's UTF-8 and
+> CR checks at commit, which are piece 7's property validation (`svn_repos__validate_prop`).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12827,10 +12896,13 @@ for Subversion.)
    identical change and which knows neither rule 3 nor rule 4 nor a directory's subtree-wide last change; this section
    states the exact rule, and §4.17.1 needs only to point here.
 4. **Locks at the verdict.** Before it accepts, the merge task reads the lock table for every node the work changes,
-   deletes or moves away, and every file beneath a deleted or replaced directory: a lock held by another principal is
-   `E160039`, a lock whose token the commit did not present is `E160037`. An accept releases the presented locks unless
-   the client asked to keep them. The check and the release are in the verdict's one step on the owner, so no lock
-   changes between them.
+   deletes or moves away. A modified path meets its own lock. A path the work adds, deletes or replaces meets every
+   lock at or beneath it, as FSFS's `verify_locks` checks: a lock kept through its file's deletion can stand beneath a
+   path added later. A lock held by another principal is `E160039`, checked first. A lock whose token the commit did
+   not present is `E160037`, wherever in the commit the token was presented. A commit with no principal that meets a
+   lock is `E160034`. An accept releases every presented lock whose token and owner match, paths it did not change
+   among them, unless the client asked to keep them. The check and the release are in the verdict's one step on the
+   owner, so no lock changes between them (A-602).
 5. **What the version records.** The revision's changed-path rows as the drive declared them (add; delete; replace, a
    delete and an add of one path in one drive; modify; text changed when `apply-textdelta` came; properties changed;
    mergeinfo changed; the copy source), the transaction's name, and the initial revision properties: `svn:author` the
@@ -12923,6 +12995,21 @@ follow the locking specification (notes §7): only a file is locked; a current r
 be out of date (`E160042`); pre-lock, post-lock, pre-unlock and post-unlock run around each. A lock is data the verdict
 reads, not a lock in the sense of §2 bans 1 and 10: nothing ever waits on it and no coordination call is made; a commit
 that meets another principal's lock is refused at once. `svn:needs-lock` is a property whose meaning is the client's.
+
+Stated with A-602, beyond Subversion's own rules:
+- **An expiry, once judged, is recorded.** FSFS removes an expired lock it meets under its write lock. Here the guard
+  that meets one records its removal: a lock request replaces it, an unlock answers `E160041` and removes it, and an
+  accepted commit removes every expired lock its check met. So the judgment stands on every holder whatever its
+  clock says.
+- **A refused commit records nothing.** FSFS removes the expired locks its walk met before the refusing one, in a hash
+  table's order, which leaves which it removed unspecified. Here none is removed, and the next use judges each again.
+- **The table's room is the owner's**, derived from its shard's room (item 12). A lock request whose paths could take
+  the table past it first lets go of every expired lock. A new lock past the room is then refused `E160000`, which is
+  the closest error Subversion has.
+- **A comment or a token is the whole string the client sent.** C stops at a NUL; here a comment holding one is
+  `E130004` and a token `E160037`.
+- **Release in the verdict's step.** `svnserve` releases a commit's locks after the commit; here release is in the
+  verdict's step (item 3.4).
 
 *8. Mergeinfo and merges.* `svn:mergeinfo` is a property whose value must parse (notes §7). `get-mergeinfo` answers it
 explicit (the node's own), inherited (the nearest ancestor's, each source path extended by the relative path, its
@@ -13044,13 +13131,15 @@ base checksum that differs: `E200014`, the work released. A malformed item or sv
 refused, naming the hook. A lock in the way: refused as item 3.4 says. A holder whose recomputed index differs: as
 §4.16, fatal and loud.
 
-*Refusals*, each in Subversion's words and number (derived from `svn_error_codes.h`, notes §6): out of date at the
-drive `E160028`; conflict at the verdict `E160024`; no such revision `E160006`; no such transaction `E160007`; a lock
-held by another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a
-lock `E160042`; a revision property's old value differs `E160049`; hook refused `E165001`; revision properties not
-enabled `E165006`; post-commit failed `E165007`; not authorized `E170001`; unreadable `E220001`, unwritable `E220004`;
-checksum `E200014`; property value `E125005`; mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`;
-request too large `E210009`; svndiff `E185000` to `E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
+*Refusals*, each in Subversion's words and number (derived from `svn_error_codes.h`, notes §6): out of date at the drive
+`E160028`; conflict at the verdict `E160024`; no such revision `E160006`; no such transaction `E160007`; a lock held by
+another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a lock
+`E160042`, an expired lock `E160041`, no principal `E160034`, a directory to lock `E160017`, a path to lock the head
+lacks `E160013`, a lock comment XML cannot carry `E130004`, a negative expiry `E200004`; a revision property's old value
+differs `E160049`; hook refused `E165001`; revision properties not enabled `E165006`; post-commit failed `E165007`; not
+authorized `E170001`; unreadable `E220001`, unwritable `E220004`; checksum `E200014`; property value `E125005`;
+mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`; request too large `E210009`; svndiff `E185000` to
+`E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
 
 *Worked example.* Repository `kernel` is at revision 1,200. Carol's working copy mixes revisions: `/trunk` at 1,190 and
 `/trunk/kernel/sched/core.c` at 1,195. She commits an edit of `core.c`: the work's base B is 1,200, and `core.c`'s
@@ -13095,7 +13184,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
    checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
-8. Locks. 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
+   oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
+   log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
@@ -39019,6 +39110,79 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
 Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
 `.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
 
+**Part 3: a pack entry's header and git's delta, with an applier (2026-11-19, g258, UI goal 92; §4.17.2 "Pieces (git)"
+piece 2's rest, after A-600).**
+
+- **A pack entry's header** (`entry`). Sources: `gitformat-pack` (v2.50.1) lines 51-93 and 235-262 [B]; git's
+  `unpack_object_header_buffer` and `get_delta_base` (`packfile.c`), `unpack_raw_entry` (`builtin/index-pack.c`),
+  `encode_in_pack_object_header` (`pack-write.c`) and the offset writer of `builtin/pack-objects.c` [C]. `read` reads
+  one header from the bytes a pack stream has delivered, given where the entry begins, `None` until its last byte; it
+  charges the size to the caller's admission once the header is whole. `write` writes one as `pack-objects` does, each
+  number in the fewest bytes, and `written_len` measures it. A REF_DELTA's base is A-600's `ObjectId` in the pack's
+  format, and the four object types' numbers are A-600's. Each refusal is typed and names the entry's place:
+  - type 0 or 5, from the first byte;
+  - a size past 60 bits, refused before the byte that would pass it. `packfile.c` reads no group past shift 57, while
+    index-pack's own loop has no such check and shifts past the word. The stricter rule is kept: no pack git writes
+    breaks it, since a size past 60 bits is an object of an exbibyte;
+  - an offset past 64 bits;
+  - an offset of zero (`BaseNotBefore`), and one that puts the base inside the pack's 12-byte header or before the pack
+    (`BaseBeforePack`). git refuses a base at or before byte zero, and would find no entry inside the header.
+- **git's delta** (`delta`). Sources: `gitformat-pack` lines 95-175 [B]; `patch_delta` (`patch-delta.c`), `delta.h` and
+  `create_delta` (`diff-delta.c`) [C]. `sizes` and `Instructions` (each instruction with its place) read a delta.
+  `apply` checks the whole delta against the source, charges the target's size to the admission, then makes it in
+  memory reserved once (`try_reserve_exact`, so no allocation can panic); `apply_to` makes it into any `Out` and writes
+  nothing for a refused delta. `write_sizes`, `write_copy` and `write_insert` write as `create_delta` does. Each refusal
+  is typed, the first rule broken in the delta's order:
+  - under git's four bytes (`TooShort`);
+  - a size or an instruction cut short (`Truncated`). git's `get_delta_hdr_size` stops a size at the delta's end even
+    when its last byte says another follows; the document ends a size only at a byte whose top bit is clear;
+  - a size past 64 bits (`SizeTooLong`). git dies on a group that loses bits and leaves a group at a shift of 64 or more
+    undefined; here any such group is refused, zero or not;
+  - the reserved byte zero (`Reserved`), a source of another size (`SourceSize`), a copy outside the source
+    (`CopyOutsideSource`), and a target made too long (`PastTarget`) or too short (`ShortOfTarget`).
+
+  A copy whose size bytes say zero copies 0x10000 bytes. No bound is a literal: the input, the source, the target's
+  declared size and the caller's admission bound everything.
+- **Golden vectors.** The packs A-582 part 1 captured: `ofs.pack` and `ref.pack`, written by stock git 2.50.1's
+  `pack-objects` with offset deltas and with reference deltas, and `git verify-pack -v`'s listing of each. Both carry
+  the same two deltas: `671f3c00` from `adab45a6`, and `41debd46` from `671f3c00`, a chain of two. The crate has no
+  inflater until piece 3, so `make-delta-fixtures.sh` inflated the two deltas once, with Python 3.9.6's zlib 1.2.12, on
+  the Mac Studio on 2026-11-19; their SHA-256s were matched byte for byte where they were committed. The tests trust
+  neither the script nor its files: each delta's Adler-32 must equal the trailer its zlib stream ends with in both packs
+  (RFC 1950 §2.2). The three versions of the file `text` are rebuilt by `make-fixtures.sh`'s own recipe and named
+  through A-600's `name_of`.
+- **Tests** (`cargo test -p slates-git --lib`, 22 new). For the entry header:
+  - every entry of both packs, read at its listed offset, has the listed type and size and its base by offset or by
+    id, writes back to git's bytes, and its compressed data begins on a zlib header;
+  - every cut is not yet whole and charges nothing; every bit flip is read within its bytes or refused by kind at the
+    entry's place;
+  - an offset delta read as if it began at each place from 0 to 600 is refused until its base would reach byte 12;
+  - the 60-bit and 64-bit edges; types 0 and 5 from one byte; the admission; the writer's refusals; and a round-trip
+    property.
+
+  For the delta:
+  - each captured delta is tied to both packs by its Adler-32 and has its base's and its object's sizes;
+  - applied along git's chain, each makes the file git named, charged exactly its size;
+  - each reads as the instructions git chose, decoded by hand (`671f3c00` is three copies; `41debd46` is a copy, the
+    insert `100` and two copies), and writes back to git's bytes;
+  - every cut and every bit flip is refused by kind with nothing written, or applied whole;
+  - each rule is a refusal of its own kind; a zero size copies 0x10000; the admission; the writers at each operand
+    byte's edge; a model oracle (any copies and inserts over any source); and any bytes after a true source size.
+- **Checks.** On the Mac Studio (kiln, debug, 2026-11-19). The first run (load 2.0) passed 42 of 43. The failure was
+  the test's own: its reserved-byte delta was three bytes long, so it was refused `TooShort` before the byte was read.
+  With that fixed, the second run (load 2.9 to 7.5) passed 44 of 44, and `cargo fmt --check` was clean. Red five ways:
+  - the 60-bit bound removed: a size past it read as not yet whole, where `SizeTooLong` was due;
+  - the pack-header bound removed: the delta read at place 576 named base 0, where `BaseBeforePack` was due;
+  - the reserved byte read as an empty insert: `ShortOfTarget`, where `Reserved` was due;
+  - the target not charged: `hello world` made under an admission of 10 bytes, where `PastAdmission` was due;
+  - one byte of a captured delta changed: its Adler-32 896992619 against the pack's 897058156.
+- **Owed** (A-582's next parts, others'): protocol v2's messages; idx v2 and the pack header (A-591); the pack stream
+  with a deflate engine chosen by measurement (§4.17.2 piece 3), which reads these headers and applies these deltas.
+
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`entry.rs` and `delta.rs`, new;
+their tests and `tests/pack_fixtures.rs`; `lib.rs`'s module lines); `crates/git/fixtures` (`make-delta-fixtures.sh` and
+`deltas/`, new); `.gitattributes` (the deltas, binary).
+
 ### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
 Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
 `crates/server/tests/fleet.rs` (the test and its helpers beside A-583's; `assert_the_agents_changes_landed_alone` now
@@ -39317,6 +39481,303 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-602 — Subversion's locks: the lock table, its verbs' guards and the verdict's check, guarded then applied and held to FSFS's lock rules (2026-11-19, g250, UI goal 92 (kiln 51cef9f7); §4.17.4 item 7, item 3.4 and piece 8; A-500)
+Applied in the same change to:
+- §4.17.4's status, item 3.4, item 7, its refusals and its pieces, and GAPS (the §4.17.4 entry);
+- `crates/svn` (`lock.rs` and `lock/tests.rs`, new; `lib.rs`; `index.rs`, whose canonical-path check the lock table
+  shares);
+- `research/vcs-servers-subversion.md` (§1: six more files with their hashes; §7: "Locks, the code").
+
+- **What is built.** `slates-svn`'s `lock` holds a repository's lock table and three guards:
+  - `lock` makes locks: `lock` and `lock-many` over `svn://`, or a LOCK over HTTP, with stealing;
+  - `unlock` removes them, with breaking;
+  - `verdict` is the check a commit meets (item 3.4).
+
+  Each guard reads the table, the head and the instant the owner's clock gave. The head is a `HeadView`, which the
+  server answers from the index. Each guard returns the register entries it decided with its answers. `apply` applies
+  an entry unconditionally, as `crates/db/src/partition.rs` applies its records. So a holder's replay never reads a
+  clock or draws a token. The owner reads its clock through the codebase's seam (`Clock::wall_ns`, made an `AprTime`
+  by `AprTime::from_wall_ns`). It draws a token's sixteen bytes from its random source, and `LockToken::drawn` makes
+  them `opaquelocktoken:` and a version 4 UUID.
+- **The rules, from FSFS's code** (Subversion 1.14.x at `d434dc14`; notes §7, "Locks, the code"):
+  - A lock request needs a principal (`E160034`), a comment XML can carry (`E130004`) and an expiry that is not
+    negative (`E200004`). Zero is none.
+  - Then each path on its own:
+    - A supplied token must be `opaquelocktoken:` and printable ASCII (`E160037`). A supplied token comes from a DAV
+      refresh or a pre-lock hook.
+    - Only a file is locked (`E160017`).
+    - A path the head lacks is `E160013`, or `E160042` when the client named its revision.
+    - That revision past the head is `E160006`, and before the file's last change is `E160042`.
+    - A path locked already is `E160035`, whoever asks, unless the request steals the lock.
+  - A token is drawn only for a lock made, in path order.
+  - An unlock needs a principal, even to break a lock (`E160034`). No lock is `E160040`. Unless the request breaks it,
+    the wrong token is `E160040` and another principal's lock is `E160039`.
+  - An expired lock is no lock to every rule. A read does not show it.
+  - At the verdict:
+    - Each lock met must be the committer's, checked first (`E160039`).
+    - Its token must be among those presented, under any path (`E160037`).
+    - An accepted commit releases every presented lock whose token and owner match, unless it keeps them.
+- **What slates states on top** (item 7):
+  - An expiry the owner judges is recorded, so it stands on every holder.
+  - A refused commit records nothing.
+  - The table holds at most its room. Past it, a lock request first lets go of every expired lock, then refuses
+    `E160000`.
+  - A NUL in a comment or a token is refused.
+  - Release is in the verdict's step.
+- **The oracle.** `the_lock_table_equals_fsfs_lock_rules_on_generated_histories` transcribes FSFS's functions
+  (`check_lock`, `lock_body`, `check_unlock`, `unlock_body`, `get_lock`, `walk_locks`, `verify_lock`,
+  `verify_locks`, `svn_fs_lock_many`, `unlock_paths`, `get_locks_filter_func`) into a model. The model changes its map
+  of locks in place, as FSFS changes its digest files. The table, guarded then applied, must equal it after every step
+  of 256 generated histories in five ways:
+  - the same answers;
+  - the same tokens, drawn in the same order;
+  - every lock held, expired ones too;
+  - every `get-lock` and `get-locks`;
+  - a commit refused for a lock the model could have refused it for, or accepted by both. FSFS meets a directory's
+    locks in a hash table's order, so it reports whichever it meets first.
+
+  The census of the first run (Mac Studio, 2026-11-19) met all of these:
+  - all 15 refusals a guard makes;
+  - 469 tokens drawn and 80 supplied;
+  - 45 steals and 8 breaks;
+  - 17 releases and 20 commits that kept their locks;
+  - 60 expired locks met by commits and 35 requests that let go of expired locks;
+  - 460 commits refused.
+- **Tests and the run.** Twenty case tests, each citing the function it holds the table to.
+  `cargo test --locked -p slates-svn --lib` passed 74 of 74 on the Mac Studio (debug, 2026-11-19), and
+  `cargo fmt -p slates-svn -- --check` was clean. Red once, on a copy with the verdict's owner check skipped: three case
+  tests and the oracle failed, `E160037` where `E160039` was due.
+- **The commit rule (A-592, g268)** calls `verdict` with the work's changed paths and their actions as arguments.
+  Nothing here reads its module.
+- **Owed.** The verbs on the wire with the ra_svn server (piece 7): `lock`, `lock-many`, `unlock`, `unlock-many`,
+  `get-lock`, `get-locks`, and `commit`'s `lock-tokens` and `keep-locks`. Also owed:
+  - the four lock hooks, a pre-lock hook's token among them (piece 11);
+  - DAV's LOCK and UNLOCK with `Timeout` (piece 13);
+  - the entries' encoding in the repository's register;
+  - the `HeadView` over the index;
+  - the room derived from the shard's (item 12).
+
+  Main's: clippy and `cargo xtask check` on `slates-svn`.
+
+### A-607 — the deflate engine for the version-control servers: zlib-rs through flate2, chosen by measurement (2026-11-19, main, UI goal 93 (kiln 51cef9f7); §4.17.2 piece 3; §4.17.3 piece 1's GZ streams and piece 3's zlib revlog chunks)
+
+- **What.** One deflate engine for every zlib stream the servers read or write: git's pack entries and loose objects,
+  smart HTTP's gzip request bodies, Mercurial's GZ bundles and zlib revlog chunks. It is flate2's API over zlib-rs (pure
+  Rust), named once in the workspace's `[workspace.dependencies]`; a crate takes it as `flate2.workspace = true` and
+  never picks a backend.
+- **Why, measured.** Against miniz_oxide (also pure Rust) on the Mac Studio M3 Ultra, 2026-11-19, over slates' own
+  4,742 files at e85c17f9f, each its own zlib stream as git stores objects, five interleaved pairs: at git's level 6,
+  deflate 135.0 against 79.4 MB/s and inflate 956.4 against 497.5 MB/s (best of five), output 0.255 against 0.257 of
+  the input; at level 1 both directions faster too. The table, every run and the command are in docs/wip/BENCHMARKS.md
+  ("The deflate engine for the version-control servers"). Measured and rejected: miniz_oxide. Not measured: zlib-ng (C;
+  its build needs cmake).
+- **Consequence for tests.** Two deflate engines need not write the same compressed bytes for one input, so a golden
+  test holds an inflated stream's meaning (its bytes, its object id), never a stock tool's compressed bytes.
+- **Applied in the same change to:** Cargo.toml (`flate2` in `[workspace.dependencies]`, with the measurement),
+  docs/wip/BENCHMARKS.md, §4.17.2 piece 3.
+
+### A-591 — git's pack index, version 2, and a pack's header and trailer, read and written as git 2.50.1 does (2026-11-19, g293, UI goal 92; §4.17.2 "Pieces (git)" pieces 2 and 3, "The repository in git's terms" item 4; after A-600)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`pack.rs` and `pack/idx.rs`, new; their tests `tests/pack.rs` and `tests/pack_idx.rs`; the golden
+  vectors `fixtures/ofs-large.idx`, `sha256.pack`, `sha256.idx` and their `verify-pack` listings, with
+  `make-index-fixtures.sh`; `lib.rs`'s `mod` line; `Cargo.toml`);
+- the workspace manifest and lock (`crc32fast` 1.5.5, whose one dependency, `cfg-if`, was there already; nothing else
+  re-resolved).
+- **A pack's header and trailer** [B: `gitformat-pack.adoc`; C: `pack.h`, `index-pack.c`'s `parse_pack_header`,
+  `packfile.c`'s `open_packed_git_1`; git v2.50.1, each string cited here checked against its source on 2026-11-19].
+  `read_header` reads the twelve bytes as a stream delivers them: a signature byte other than `PACK`'s is refused as
+  soon as it arrives, a version other than 2 and 3 as soon as its four bytes have, and the answer is `None` until the
+  count has arrived. `check` holds a whole pack in memory: it must be at least a header and a trailer long, and its
+  trailer must be the checksum of every byte before it, verified before any of them is read; then its header is read.
+  `Writer` writes git's header at version 2 and the trailer computed as the objects pass, so a fetch's pack needs no
+  second pass (§4.17.2 "A fetch", item 3). The header's length is one number for the pack and its entries, A-582 part
+  3's `entry::PACK_HEADER_LEN`: part 3 landed first, so `pack` and `pack::idx` use its constant, as main asked
+  (2026-11-19).
+- **The index** [B: `gitformat-pack.adoc`, "Version 2 pack-*.idx files"; C: `pack-write.c`'s `write_idx_file` and
+  `need_large_offset`, `packfile.c`'s `load_idx` and `nth_packed_object_offset`, `pack-check.c`'s `verify_packfile`].
+  `Idx::decode` verifies the index's own checksum first, then the magic `\377tOc` and version 2, then the layout:
+  - the fanout never goes down (git's "non-monotonic index");
+  - the file is exactly as long as its count and its 8-byte table make it, the table whole entries and at most one
+    fewer than the objects (git's "wrong index v2 file size");
+  - the ids strictly ascend, a duplicate refused apart from a step down;
+  - each fanout count is the number of ids whose first byte is at most its byte;
+  - every large offset names an entry of the table, and no offset lies inside a pack's header.
+  It then answers by position and by id in place, building nothing: the fanout narrows a lookup, then a binary search,
+  and `offset_of` gives the lookup from id to offset that the pack reader resolves a reference delta's base by (A-608).
+  `Idx::check_pack` holds an index to its pack as `git verify-pack` does short of inflating. It checks one hash, one
+  count and one trailer, in `open_packed_git_1`'s order. It orders the objects by offset in a table charged to the
+  caller's admission first, and refuses an offset at or past the trailer, two objects at one offset, or bytes after the
+  header no object covers. Each object's CRC32 is taken over its span, from its offset to the next object's, the last
+  to the trailer, as `verify_packfile` takes it. `write` writes an index as `write_idx_file` does: the entries sorted by
+  id in place, every check made before the first byte, an offset past 2^31 - 1 in the 8-byte table, and that table's
+  entries numbered in id order.
+- **Stricter than git, where git trusts files it wrote.** A server reads indexes it did not write (an imported
+  repository's, piece 15), so each of these is refused by kind, though git's reader passes it:
+  - a large offset naming a slot past its table (git's `check_pack_index_ptr` keeps only the read inside the file);
+  - a fanout that disagrees with the ids;
+  - an 8-byte table that is not whole entries;
+  - an offset inside a pack's header;
+  - a duplicate id, as git refuses one only when strict.
+  The writer refuses whatever the reader refuses, so it never writes an index slates would not read. Version 1, which
+  has no magic, is refused as `Magic`; slates writes version 2 only.
+- **Checksums** run through `object_name::Hasher` (A-600), so a SHA-1 checksum runs git's collision detection as an
+  object name does, and a checksum whose input carries a known attack's disturbance is refused by kind (`Collision`).
+  git 2.50.1 hashes its own files' checksums with `unsafe_hash_algo` (`csum-file.c`), which `hash.h` makes the
+  collision-detecting SHA-1 unless a build names a separate fast one, so a default build of git refuses such a checksum
+  too. No published collision begins with a pack's or an index's first bytes, so no golden vector reaches that refusal.
+- **The CRC32 and its crate.** Each index entry keeps zlib's CRC32 (the IEEE polynomial, reflected; `index-pack.c`
+  takes zlib's `crc32()` over each entry's bytes as they are used), and slates had
+  only CRC32C (`slates_wire::crc32c`). Main approved `crc32fast` (2026-11-19) for one reason: it is the crate flate2
+  itself computes zlib's CRC32 with, and flate2 is the workspace's deflate API (A-607), so it brings no code the tree
+  would not hold once a crate takes flate2. Its `std` feature picks ARMv8's CRC instructions or x86-64's carry-less
+  multiply at run time, with a table for the rest, and slates-git keeps no `unsafe` of its own.
+- **Golden vectors.** The packs, indexes and `git verify-pack -v` listings A-582's `make-fixtures.sh` captured
+  (`ofs` and `ref`, SHA-1, with offset and with reference deltas), and `make-index-fixtures.sh`'s, run with git 2.50.1
+  (Apple Git-155) on 2026-11-19:
+  - `ofs-large.idx`, `ofs.pack`'s index made by `git index-pack --index-version=2,0x200`, git's own switch (its
+    t5302 uses `--index-version=2,0x40000`) that puts the eight objects past 0x200 in the 8-byte table, since no small
+    pack has an offset past 2^31 - 1;
+  - `sha256.pack`, `sha256.idx` and their listing, the same history in a SHA-256 repository.
+  The same day each index was made again by hand with the same git on another Mac, byte for byte, and both listings
+  came out again exactly. The empty pack's bytes are `git pack-objects --stdout < /dev/null`'s (trailer `029d0882…`).
+- **Tests** (`cargo test -p slates-git --lib`, Mac Studio M3 Ultra, 2026-11-19 03:52Z, debug, load 20.6 at the start:
+  54 of 54, the 32 new among them; `cargo fmt --check` clean). Red first: on the Studio's clone alone, never committed,
+  the eight entry points were stubbed to answers that build nothing, and 32 of 32 new tests failed. The tests:
+  - each index reads as git listed it, every object found at git's offset and spanning git's size-in-pack, the 8-byte
+    table read for `ofs-large.idx`, the pack held and the exact room charged;
+  - each index is written back byte for byte, `ofs-large.idx` at git's forced limit, from entries handed over in
+    reverse; each pack is written back byte for byte, and the empty pack is git's;
+  - every single-bit flip of a SHA-1 and a SHA-256 pack and index is refused by its checksum, before its header is read;
+  - the brief's hostile set, each re-signed so only the change is judged: a fanout that goes down, a count past the
+    file, offsets past the pack (at the trailer, at 2^31 - 1, at 2^40 through the table), a large index one past its
+    table and into a table of none, and a bit flipped in each checksum (the pack's trailer, the index's own, and its
+    copy of the pack's: refused by the index's checksum, and once re-signed refused against the pack);
+  - and the rest by kind: truncation at every length short of the smallest file, another magic and version, a table of
+    the wrong size, unsorted and duplicated ids, a miscounting fanout, offsets in the header, a pack not the index's
+    (another pack, the other hash, another count), a wrong CRC32, shared offsets, bytes before the first object, a check
+    past its admission, and the writer's refusals;
+  - two proptests: a model (a map from id to CRC32 and offset) that any entries written in any order decode to, every id
+    found and an absent one not; and an oracle pack of opaque objects whose index, made from their spans, holds, and
+    with one CRC32 changed is refused naming that object.
+- **Owed.** The pack reader (piece 3): entries, inflation and deltas, the trailer checked as a stream arrives, and an
+  index's ids checked against its pack's objects. `Idx::decode` and `Idx::check_pack` run whole, hashing and CRC-ing
+  every byte in one call, so a caller on a shard gives them what its slice admits; a sliced form comes with the import
+  of a repository on disk (piece 15), which also remakes a version 1 index from its pack.
+
+### A-588 — Mercurial's objects and nodes: changesets, flat manifests and file revisions read and written byte for byte as stock Mercurial 7.2 stores them, each node computed with SHA-1's collision detection as 7.2 computes it (2026-11-19, g291 for UI goal 92 (kiln 51cef9f7); §4.17.3 piece 3; §4.9; A-514, A-600, A-607)
+Applied in the same change to: §4.17.3 (its status, the index's node and parents lines, the failure matrix, the
+refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node`, new; `fixtures/objects/` and its
+`make-object-fixtures.sh`; `fixtures/sha1dc/`, SHAttered's two prefixes; `sha1-checked` as its dependency), `Cargo.toml`
+(`sha1-checked`'s comment names Mercurial's nodes), `.gitattributes` (the objects' fixtures kept as stored), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§15).
+- **What it does.** `changeset`: a changeset's text read in place as 7.2's `changelogrevision` cuts it (the manifest's
+  node in hexadecimal, the user, the date line's time, timezone and extras, the files, the description); its extras
+  unescaped into the caller's buffer as `decodeextra` reads them (7.2's `\0` fix-up, then Python's `escape_decode`),
+  their bytes and items charged to the admission first, and written as `encodeextra` writes them (sorted by key,
+  escaped, joined by NUL). `manifest`: a flat manifest's lines (a path, a NUL, forty lower-case digits, an `x` or `l`
+  flag) checked whole, read in place and written back. `filerev`: a file revision's text split into its metadata block
+  and its bytes; the block's entries; the copy 7.2's `renamed` reads; the parents in the order 7.2 stores them; a split
+  written back to its bytes; and `pack`, a new text as `filelog.add` writes one. `node`: a node computed and checked,
+  and a node's hexadecimal read and written. Every reader and its writer accept exactly the same objects, so whatever
+  is read writes back to its bytes and whatever is written reads back as itself.
+- **Decided: SHA-1 with collision detection, not aws-lc-rs (main approved, 2026-11-19).** The piece's brief named
+  aws-lc-rs, then the workspace's one cryptographic library. Stock 7.2 hashes every node through sha1dc instead:
+  `utils/hashutil.py` takes `sha1 = sha1dc.sha1` and falls back to `hashlib.sha1` only when the C extension does not
+  import, and the PyPI 7.2 printed `hashutil.sha1 is <class 'sha1dc.sha1'>` in both fixture runs. Its binding detects
+  and refuses: `SHA1DCSetSafeHash(&(self->ctx), 0)` ("We don't want "safe" sha1s ... We just want to detect
+  collisions") and, in `finalize`, `PyErr_SetString(PyExc_OverflowError, "sha1 collision attack detected")`
+  (`mercurial/thirdparty/sha1dc/cext.c`, lines 36 and 83-84 of `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`). So
+  aws-lc-rs would accept revisions 7.2 refuses. Nodes go through `sha1-checked`, configured as A-600 configures it for
+  git (detection on, the safe hash off), and an attack is refused as `CollisionAttack`, named by its plain SHA-1.
+- **From the sources (`research/mercurial-server.md` §15).** 7.2's `changelog.py` (`changelogrevision`, `readfiles`,
+  `add`, `encodeextra`, `decodeextra`, `_string_escape`, `_string_unescape`), `cext/manifest.c` (`find_lines`),
+  `utils/storageutil.py` (`hashrevisionsha1`, `parsemeta`, `packmeta`), `filelog.py` (`add`, `has_meta`, `renamed`),
+  `revlogutils/rewrite.py` (`_has_bad_parents`), `utils/hashutil.py` and `thirdparty/sha1dc/cext.c`. A copy is read
+  only from a revision whose first parent is null and whose block names both `copy` and `copyrev` ("In rare cases due
+  to old bugs, one can occur without the other"), half a pair being no copy; 7.2 reorders a file revision's parents on
+  the way in (issue6528's fix-up) and changegroup `04` flags a block (`REVIDX_HASMETA`) and swaps them the other way;
+  7.2's own `_string_unescape`, run on the tests' escapes, reads `\777` as `0xFF` and keeps `\q`, and `decodeextra`
+  keeps the later of a key given twice.
+- **Stricter than 7.2, on purpose.** An empty changeset text (7.2's null changeset); an empty user, which 7.2's writer
+  refuses, since its line is the first blank one `readfiles` finds and 7.2's two readers then disagree on the files; a
+  manifest field that is not forty hexadecimal digits; a time that is not a decimal number (7.2 takes any `float()`
+  when asked); a manifest's upper-case digits and its tree flag `t`, and its other errors when the text is read rather
+  than when an entry is; a `copyrev` that is not forty digits. A writer refuses what its reader would read back as
+  something else: a key holding `:` or given twice, a field holding its line's end, a block holding its closing marker.
+- **Golden vectors.** `crates/hg/fixtures/objects`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 03:52 and
+  03:54 UTC, by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the branch at ea134bdf6,
+  exactly: `bash crates/hg/fixtures/objects/make-object-fixtures.sh "$D/out"` with `D` a new directory under
+  `~/.cache`. One repository of eleven changesets (flags `x` and `l`, a copy, a file beginning as the block does, a
+  named branch, a timezone of -3600, a description of several lines, a merge, a closed head, a user beyond ASCII,
+  extras holding every escaped byte): each log's `hg debugindex --debug`, every revision's `hg debugdata`, and 7.2's own
+  readings, 42 files, the two runs byte for byte alike, each SHA-256 checked equal after the copy; the 30 texts are the
+  bytes the storage API's `revision()` gave the script's first version. `crates/hg/fixtures/sha1dc`: SHAttered's two
+  320-byte prefixes, the bytes of A-600's cuts (SHA-256 `cac8644d…` and `842a2c7d…`), sharing the plain SHA-1
+  `f92d74e3…`.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 158 of 158 in 0.97 s (load
+  3.0), 32 of them this piece's; `cargo fmt -p slates-hg` left nothing to change. The first build's one error was a
+  property test borrowing a temporary (E0716). Golden: every node of the 30 revisions computed from the parents
+  `debugindex` lists and the text `debugdata` wrote, each text as long as 7.2's index says, no flag set; every
+  changeset's fields and extras as 7.2's `changectx` reads them, each written back to its bytes; every manifest's
+  entries as 7.2 reads them, each file node held by its path's log, each written back; every file revision's copy as
+  `renamed` reads it, its split and its packed text equal to the stored one, and 7.2's parents' order a fixed point on
+  7.2's own store. The hasher: SHAttered's two prefixes refused as one attack named by their shared plain SHA-1, their
+  first 192 bytes hashed without a refusal. Hostile and properties: cut and malformed changesets, an empty user, a
+  non-decimal time, extras 7.2 cannot read, an admission too small (nothing charged), fields that would read back as
+  others, a manifest with any byte changed or cut, blocks unclosed or holding a line without `: `, generated objects
+  written and read back, arbitrary bytes never panicking and anything read written back byte for byte. Red: not run
+  (one run, §8); the first draft's own tests asserted what these replace (a lone `copy` refused; no collision
+  detection), so they could not pass on it.
+- **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
+  zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-605 — Mergeinfo: the `svn:mergeinfo` value read and written as Subversion reads and writes it, its range-list algebra transcribed, inheritance and elision, and `get-mergeinfo` over the index (2026-11-19, g262, UI goal 92; §4.17.4 item 8 and piece 9; A-500, A-553)
+Applied in the same change to: §4.17.4 (a status block; piece 9 marked built), GAPS (the §4.17.4 entry),
+`docs/wip/research/vcs-servers-subversion.md` (§11, new), `crates/svn/src/mergeinfo.rs` and
+`crates/svn/src/mergeinfo/tests.rs` (new), `crates/svn/src/lib.rs` (its `mod` line).
+- **What was there.** Item 8 said a value must parse and named `get-mergeinfo`'s three modes and the descendants found
+  by the per-directory counts. Nothing read, wrote or answered mergeinfo; the index (A-553) kept FSFS's `minfo-here` and
+  `minfo-cnt` with no reader.
+- **The decision.** Every rule is Subversion's own, read in its code at `1.14.x` `d434dc14` (notes §11, each file's
+  sha256 there). The value is read as `svn_mergeinfo_parse` reads it, as a C string, a line's last colon dividing, the
+  path canonical, revisions digits alone up to 2^31 - 1, ranges sorted and combined, a key named twice merged; every
+  refusal is a kind named by Subversion's message, answered `E200020`; a commit's check refuses a NUL first
+  (`verify_mergeinfo`). It is written as `svn_mergeinfo_to_string` writes it, paths in `svn_path_compare_paths` order.
+  The range-list algebra is transcribed, not restated: with `consider_inheritance` Subversion's walk is not exact per
+  revision (`1-10` and `3-4*,5-6` share nothing; removing `3-4*,5-6` from `1-10` removes nothing), and the stock client
+  computes `svn mergeinfo --show-revs` with it, so a server's answer equal to the client's needs it as it is; a named
+  test holds that walk. Inheritance is `svn_mergeinfo_inheritable2` then `svn_fs__append_to_merged_froms`; elision is
+  `should_elide_mergeinfo`. The queries answer as FSFS does: a path's nearest node holding mergeinfo (from its parent
+  for nearest-ancestor, none at the root; the path alone for explicit), a value that does not parse answering none and
+  ending the search (issue #3896), a row claiming mergeinfo its list lacks refused as corrupt, the descendants entered
+  only where `minfo-cnt` says mergeinfo lies beneath. The index names each node's property list and the green holds the
+  lists and the directories, read through one seam (`Contents`); the descendants are an iterator that lists at most one
+  directory a step, so the server pulls them a slice at a time under the shard's budget.
+- **Tests** (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19, on the tree merged with main 553d3d155): 111
+  of 111, 37 of them this module's, in 1.40 s. Subversion's own vectors from `mergeinfo-test.c`: 25 valid values, 26
+  broken ones each by its kind, 68 range-list merges, 15 removals and 16 differences each with and without inheritance,
+  the intersections, the merges of whole mergeinfo, the to-string cases, issues 4686's and 4840's merges, and the
+  62 × 63 single-range loop, with the per-revision check Subversion's own test leaves to do. Property tests over the
+  per-revision model Subversion's random tests use (`rl_array_t`): unions exact; inheritable lists intersected and
+  removed as sets; without inheritance a positional walk whose touching pieces join; with inheritance within the
+  per-revision bounds. Hostile values (the grammar's alphabet and any byte; every cut and bit flip of a valid value):
+  each refused, typed, or read canonically, none panicking; 100,000-range and 100,000-line values read whole. The
+  queries case by case, with their refusals (`E160013`, `E160005`, `E160006`, `E160004` twice). The oracle: a naive
+  filesystem keeping every revision's whole tree equals the index-backed queries on 256 generated histories of
+  additions, copies, deletions and property changes, every crawl listing only directories with mergeinfo beneath, its
+  census (inherited answers, unparsed values, found descendants, listings, pruned directories) all moving.
+- **Red-checked eight ways** (a mutant each on the Studio; the tests that failed): the revision limit lifted (1); the
+  union taking the smaller cover (6); an inherited value keeping its `*` ranges (4, the oracle among them); the descent
+  rule without "one, not its own" (4); issue #3896's search going on (2); a joined range non-inheritable unless both
+  pieces are (1: the without-inheritance property, which no vector of Subversion's catches); a comma ending the value
+  accepted (2); paths in byte order (2). `cargo fmt -p slates-svn --check` clean.
+- **Owed.** `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from this algebra with piece 7's
+  location segments and log (`svn_client__mergeinfo_log`'s range lists and `filter_log_entry_with_rangelist`'s judgment
+  of each log entry by its changed paths); `log`'s `include-merged-revisions` (`log.c` `fs_mergeinfo_changed`,
+  `get_combined_mergeinfo_changes`) with piece 7's log; the property's UTF-8 and CR checks with piece 7's property
+  validation (`svn_repos__validate_prop`).
 
 ### A-603 — A repository's register: one entry commits several greens' versions, members, names and the repository's own state as one step, its checks read at its position (2026-11-19, g261 for UI goal 92; §4.17.1 items 2 and 3 and shared piece 2; §4.17.3 decisions 3, 4 and 6; §4.16 "Commit"; D-28; after A-515, A-575)
 Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
