@@ -276,7 +276,11 @@ fn a_path_beneath_a_copy_is_its_sources_node_revision_until_it_changes_there() {
   );
   let (branch_id, _, branch_copy) = identities(&index, "/branches/b1", 2);
   commit(&mut index, vec![edit("/branches/b1/lib/a.c", 4)]);
-  assert_a_new_node_revision_on_the_branch(&index, (source_id, source_line), (branch_id, branch_copy));
+  assert_a_new_node_revision_on_the_branch(
+    &index,
+    (source_id, source_line),
+    (branch_id, branch_copy),
+  );
   assert_eq!(
     index
       .relation(("/branches/b1/lib/a.c", 3), ("/trunk/lib/a.c", 1))

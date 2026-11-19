@@ -807,7 +807,7 @@ mod tests {
   /// tall under the narrow window.
   fn six_windows() -> Vec<u8> {
     let mut bytes = Vec::new();
-    for fill in [b'a', b'b', b'a', b'c', b'd'] {
+    for fill in *b"abacd" {
       bytes.extend(std::iter::repeat_n(fill, NARROW));
     }
     bytes.extend_from_slice(b"tail");
