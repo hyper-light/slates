@@ -719,6 +719,27 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   `interesting_merge` calls the client's changed-path receiver before it judges, and `send_log` checks
   `nested_merges` after `fill_log_entry`, so a merged revision passed over has had its changed paths written, which
   join the next entry's (not recorded: the recorded `-g -v` logs pass none over with changed paths).
+- **`get-file-revs`** [C: `serve.c` `get_file_revs`, `file_rev_handler`, `svndiff_handler`, `svndiff_close_handler`;
+  `rev_hunt.c` `svn_repos_get_file_revs2`, `find_interesting_revisions`, `get_merged_mergeinfo`,
+  `find_merged_revisions`, `compare_path_revisions`, `send_path_revision`, `get_file_revs_backwards`; `marshal.c`
+  `svn_ra_svn__svndiff_version`; `svndiff.c` `window_handler`, `send_simple_insertion_window`, `encode_window`;
+  `fs-loader.c` `svn_fs_contents_different`; `dag.c` `svn_fs_fs__dag_things_different`; at 1.15.0,
+  `libsvn_fs_fs/fs_fs.c` `fc2b7fc8bd7a409b` (`svn_fs_fs__file_text_rep_equal`, `svn_fs_fs__prop_rep_equal`) and
+  `libsvn_fs_fs/cached_data.c` `b8cb7bcca34e04eb` (`svn_fs_fs__get_file_delta_stream`); recorded]: `c(?r)(?r)?B`, each
+  revision the youngest when missing or negative; a start after the end walks newest first and refuses merged revisions,
+  200007 with `svn_strerror`'s message, since the error is made without one. Every revision is found before the first is
+  sent. `compare_path_revisions` sorts the merged revisions newest first (its comment says increasing) with `qsort`,
+  which keeps no order among equals, over a list gathered in the merged mergeinfo's seeded hash order, so two merged
+  files changed in one revision have no order to match. `svn_fs_contents_different` and `svn_fs_props_different` are
+  strict: FSFS compares texts and property lists by content, counting no text and a zero-length text both empty and
+  equal, then MD5 and SHA-1. The svndiff version is `svn_ra_svn__svndiff_version`'s: 0 at compression level 0, else 2
+  for `accepts-svndiff2`, 1 (zlib) for `svndiff1`, 0 otherwise. Each stream write is one string: `window_handler` writes
+  the header alone, then each window's integers and its instruction and new-data sections when not empty (an svndiff 2
+  section is never empty: it starts with its original length); in svndiff 0 a window of one new-data instruction goes to
+  `send_simple_insertion_window`, which writes the header if it is not out, the integers and the instruction as one
+  write, then the new data. The report editor writes its svndiff 0 windows' header as its own chunk; no recording holds
+  that case. FSFS sends a stored delta as it is when its base is the source's representation and otherwise makes one
+  with `svn_txdelta2`; both are `compute_window` over 100 KiB pieces, so the deltifier's windows are the same.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and

@@ -14012,9 +14012,13 @@ and export by landing).
 > revisions, `svn_repos_get_logs5` and `do_logs` over FSFS's node history on the index, a stream a revision a step,
 > merged revisions refused until built; and the crate's one walk of copy roots (A-616's) asked by every read command.
 > The sixth slice whole (2026-11-19, g297): `log`'s merged revisions as `svn_repos_get_logs5` finds them, nested walks
-> of each merge's runs, the stock `svn log -g` and `svn mergeinfo --show-revs` replayed whole. Owed: `get-file-revs`;
-> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
-> (A-606).
+> of each merge's runs, the stock `svn log -g` and `svn mergeinfo --show-revs` replayed whole. Its seventh slice
+> (2026-11-19, g297): `get-file-revs`, `svn_repos_get_file_revs2`'s walk of the file's history across copies (merged
+> revisions found by `find_merged_revisions`' rounds and interleaved; a start after the end walked newest first), each
+> revision's property changes and its text's delta from the previous text in Subversion's own windows (A-652's
+> deltifier), a string for each write `svndiff.c` makes, a revision a step; the scripted session's 13 commands and the
+> stock `svn blame` and `svn blame -g` replayed whole. Owed: the svndiff 0 session's recording; the fold of a name
+> beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -14164,7 +14168,8 @@ and export by landing).
 > `serve::Connection`): A-599's handshake, then every command answered as `serve.c`'s command loop answers it: A-613's
 > reads and their streams, `reparent` (170000 for a URL outside the repository), A-616's report exchange, and every
 > other command of `svnserve`'s set refused as one it does not know (210001, `Turn::Unserved`) until its piece lands
-> (commit, A-655; the lock verbs; `get-file-revs`, `replay`, `change-rev-prop`); `update`'s target checked for read
+> (commit, A-655; the lock verbs; `replay`, `change-rev-prop`; `get-file-revs` since A-613's seventh slice, which
+> answers it among the reads); `update`'s target checked for read
 > access on the session's path. One connection serves `svn://` and `svnserve -t`: a tunnel's user comes in through the
 > repository its caller names (`EXTERNAL`). Held to every recorded report session replayed from its first byte against
 > stock `svnserve` 1.15.0's (40 sessions; property lists and listings as sets; the one listing where A-613's `get-dir`
@@ -43267,10 +43272,39 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   Red-checked thirteen ways (no children, reverse merges unmarked, merged revisions sent again, no `interesting_merge`
   test, the request's paths for the histories' next, no issue #4022 check, segments unshifted, runs walked from the
   first, the first source removed): each failed named tests.
-- **Owed** (the next slices): `get-file-revs`, replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
-  (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
-  general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
-  when the session could authenticate.
+- **Part 2, its seventh slice** (2026-11-19, g297): `get-file-revs` (`reads/file_revs.rs`). The parameters
+  `c(?r)(?r)?B`, each revision the youngest when missing or negative, then the authentication request. Start not after
+  end: `find_interesting_revisions` walks the file's history from the end back across copies (`svn_fs_history_prev2` on
+  the index, `reads/history.rs`) to the first location at or before the start, the path a file in the end revision or
+  refused, "'P' is not a file in revision N" (160017); with merged revisions, each location's merged mergeinfo
+  (`get_merged_mergeinfo`: a changed path at or above it with `svn:mergeinfo` modified, then the inherited mergeinfo
+  against the revision before's, added and deleted together) and `find_merged_revisions`' rounds over each range's file,
+  a location already found ending a walk; the mainline and the merged revisions sent oldest first, interleaved. Start
+  after end: the history walked newest first and sent as found (`get_file_revs_backwards`); merged revisions refused,
+  200007 with `svn_strerror`'s words. Each revision as `send_path_revision` sends it: its revision properties, its
+  property changes from the previous revision's (`svn_prop_diffs`), and its text's delta from the previous text when
+  `svn_fs_contents_different` finds them different (strict: FSFS's `svn_fs_fs__file_text_rep_equal` counts no text and a
+  zero-length text both empty and equal, then compares MD5 and SHA-1), always for the first and, with merged revisions,
+  when the path changes (issue #4544's hack). The windows are A-652's deltifier's, which FSFS both stores and computes
+  (`svn_fs_fs__get_file_delta_stream` sends a stored delta when its base is the source's text); svndiff 2 to a client
+  that accepts it, else 0 (never 1, zlib, the report editor's rule); a string for each stream write `svndiff.c` makes,
+  `send_simple_insertion_window`'s one string of header, integers and instruction in svndiff 0 among them. The answer
+  streams a revision a step, the revisions all found in its first step, as Subversion finds them before sending; a
+  revision's two texts are held whole while its delta is made (reading the green's pieces a window at a time is owed,
+  item 11). Merged revisions of one number from two files have no order to match: `svnserve` gathers them in its seeded
+  hash order and sorts them with `qsort`. Tests (2026-11-19, Windows x86_64, jupiter: `cargo test -p slates-svn --lib`
+  444 of 444, fmt clean): the scripted `get-file-revs` session's 13 commands, `svn blame` and `svn blame -g` answered as
+  `svnserve` answered them; a text made empty from none; svndiff 0's strings, derived from `svndiff.c`. The replay
+  compares a `get-file-revs` answer with each delta's strings folded into one entry, so it moves on by the items
+  written, not the entries compared: the first build moved by the entries, left 12 of `svnserve`'s items an answer for
+  the next command, and failed both replays until fixed. Owed: the macOS run; the session to record,
+  `get-file-revs-svndiff0`, whose client announces neither `svndiff1` nor `accepts-svndiff2`, to hold svndiff 0 to
+  `svnserve` byte for byte (the Mac Studio, which has stock `svnserve`, offline); a test of a file property taken away
+  and one of a mainline and a merged revision of one number, which no recorded revision reaches (written, not yet run);
+  red-checks.
+- **Owed** (the next slices): `list`'s fold of a name beyond ASCII (utf8proc's NFD with case folding and marks stripped,
+  composed again, which needs Unicode's case-folding and general-category tables); read access by A-606's rules, and the
+  authentication request a denied anonymous read makes when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
