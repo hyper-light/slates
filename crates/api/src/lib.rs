@@ -17,7 +17,9 @@
 //!   overlay's drift as typed entries.
 //! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
 //!   a descriptor a VMM takes; and a host mount bound into a container ([`container`], A-520), the entry the host's OCI
-//!   runtime performs, verified in the kernel's mount table.
+//!   runtime performs, verified in the kernel's mount table, the container engine's profile judged first
+//!   ([`container_engine`]) and the bind's source checked again just before the runtime binds it
+//!   ([`container::check_source`]).
 //! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
 //!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
 //!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
@@ -68,6 +70,7 @@
 
 pub mod asynchronous;
 pub mod container;
+pub mod container_engine;
 pub mod error;
 pub mod exec;
 pub mod grant;
@@ -87,11 +90,13 @@ pub mod start;
 pub mod volume;
 
 pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
-pub use container::ContainerBind;
+pub use container::{ContainerBind, SourceFault};
+pub use container_engine::{EngineFault, EngineProfile};
 pub use error::{
-  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
-  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, OsCode, PathFault,
-  ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
+  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HoldersUnread, HostFault, Invalid,
+  IssuerFault, KindMismatch, Missing, MountFault, MountHolders, MountMissing, MoveTarget, Note,
+  OsCode, PathFault, ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported,
+  Unsupported, Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
@@ -246,14 +251,44 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// attachment and the entry the host's OCI runtime performs ([`OciBinding`], with its [`HostMountEvidence`]), refused
 /// typed as the daemon refuses the form (`Invalid::ChosenPath`, `Unsupported::Attachment`, `Denied::Rights`); the
 /// simulator answers it from the mounts it recorded (kiln's container engine, kiln goal 01a1f124; the same day).
-/// 45: a host's refusal code carries its numbering (A-539): [`HostFault::Base`] names an [`OsCode`], an errno or a
+/// 45: a busy unmount names its holders and is typed on Linux too (A-537): [`MountFault::Busy`] carries
+/// [`MountHolders`], the processes the kernel's own tables show holding the mount (on Linux each process's
+/// descriptors, working and root directories, by device, without touching the mount), with [`HoldersUnread`] saying
+/// why none were read (macOS: every libproc answer stats the file, which a `hard` NFS mount whose daemon has gone waits
+/// on without bound); and on Linux a plain `fusermount3 -u` refused while the kernel's table still lists the mount is
+/// [`MountFault::Busy`], where it was [`MountFault::Unmount`] with the helper's exit (the same day).
+/// 46: an S3 base as the library names it ([`S3Base`], [`S3Style`], [`S3Scheme`]) and the credential handed for it
+/// ([`S3Credentials`], whose `Debug` shows its access key id alone): the store's endpoint, the bucket's region, the
+/// bucket, the prefix and the addressing, each refused by its kind where no request could read it ([`NameRefused`]:
+/// [`EndpointFault`], [`BucketFault`], [`PrefixFault`]) (Mantle's CP-T10.5, A-524; 2026-11-19).
+/// 47: the rest of the container handoff as library calls (A-520; until then the command line's `slates oci-runtime` and
+/// `slates oci-check` alone): [`container_engine::engine_profile`] asks the runtime's engine for its profile and judges
+/// it, answering an [`EngineProfile`] (the endpoint, the profile, and the [`container_engine::TestedProfile`] it holds)
+/// or an [`EngineFault`] (the judge's [`container_engine::ProfileRefusal`] before any profile, or `Untested` with the
+/// profile it refused; an engine unreachable; an answer too large or not in its shape; or a host that asks no engine);
+/// [`container::check_source`] and
+/// [`ContainerBind::check_source`] judge whether a bind's source is still the mount verified, by the kernel's table
+/// and the identity it never reuses, refusing [`SourceFault`]; `slates-bridge-oci` is linked on every platform, its
+/// types the contract's (kiln's container engine, kiln goal 01a1f124; 2026-11-19).
+/// 48: a host's refusal code carries its numbering (A-539): [`HostFault::Base`] names an [`OsCode`], an errno or a
 /// Win32 error code (none where the host named none), where it held a bare number; the wire's
 /// `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
-/// `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone (the same day).
+/// `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 45;
+pub const CONTRACT: u32 = 48;
 
+/// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
+pub use slates_base::s3::client::Style as S3Style;
+/// An S3 base as the library names it (§4.15 "An S3 base", A-524; Mantle's CP-T10.5): the store's endpoint, the
+/// bucket's region, the bucket, the prefix and the addressing, each checked when it is made, and its identity, the
+/// device every entry of the base reports.
+pub use slates_base::s3::name::{
+  BucketFault, EndpointFault, NameRefused, PrefixFault, S3Base, Scheme as S3Scheme,
+};
+/// The credential an S3 base is read with, as Mantle hands it: held in RAM alone, its `Debug` showing its access key id
+/// alone (§4.15 "Credentials").
+pub use slates_base::s3::sigv4::Credentials as S3Credentials;
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
 /// A snapshot exported as its archive ([`Instance::export_archive`], A-441), and a volume made from one
@@ -317,6 +352,50 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/library.md")]
 pub struct Guide;
+
+#[cfg(test)]
+mod s3_naming {
+  /// A-524 (§4.15 "An S3 base"; Mantle's CP-T10.5): do name an S3 base through the library as Mantle would, the same
+  /// objects again in another region, a base whose bucket S3 would not name, and a credential. Expect the first named
+  /// with its prefix and its virtual-hosted `Host` header, the same objects the same identity, the bad bucket refused
+  /// by its kind, and the credential's secret never in its `Debug`.
+  #[test]
+  fn the_library_names_an_s3_base_and_refuses_one_no_request_could_read() {
+    let endpoint = "https://s3.us-east-1.amazonaws.com";
+    let base = super::S3Base::new(
+      endpoint,
+      "us-east-1",
+      "kiln-bytes",
+      "projects/x/",
+      super::S3Style::VirtualHosted,
+    )
+    .expect("Mantle's base is named");
+    assert_eq!(base.prefix(), "projects/x/");
+    assert_eq!(base.host_header(), "kiln-bytes.s3.us-east-1.amazonaws.com");
+    let elsewhere = super::S3Base::new(
+      endpoint,
+      "eu-west-1",
+      "kiln-bytes",
+      "projects/x/",
+      super::S3Style::Path,
+    )
+    .expect("the same objects named again");
+    assert_eq!(base.identity(), elsewhere.identity());
+    assert_eq!(
+      super::S3Base::new(
+        endpoint,
+        "us-east-1",
+        "Kiln_Bytes",
+        "",
+        super::S3Style::Path
+      ),
+      Err(super::NameRefused::Bucket(super::BucketFault::Character))
+    );
+    let credentials =
+      super::S3Credentials::new("AKIAIOSFODNN7EXAMPLE", "a-secret-never-shown", None);
+    assert!(!format!("{credentials:?}").contains("a-secret-never-shown"));
+  }
+}
 
 #[cfg(test)]
 mod contract_history {

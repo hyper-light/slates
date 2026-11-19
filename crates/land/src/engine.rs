@@ -136,8 +136,8 @@ pub enum Outcome {
   AcceptedIdentical,
   /// The host refused the write with this code, typed by its numbering (A-539); the temporary was removed.
   Failed {
-    /// The code the host named.
-    code: OsCode,
+    /// The code the host named; none where it named none (a fetch under way, A-524).
+    code: Option<OsCode>,
   },
   /// A compare-and-swap lost before any write reached the name.
   Conflict(ConflictClass),
@@ -1677,7 +1677,7 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(w) => w,
       // No room fails its entry alone, and the landing goes on (A-539: the seam names it, whatever the platform numbers).
       Err(WriteFailure::Host(HostError::NoSpace(code))) => Written {
-        outcome: Outcome::Failed { code },
+        outcome: Outcome::Failed { code: Some(code) },
         window_ns: None,
       },
       // Any other refusal the host names a code for — a name in use or a verb missing where the landing expected
@@ -1687,14 +1687,14 @@ impl<H: LandFs> Landing<'_, H> {
       )) => {
         self.crashed = Some(code);
         Written {
-          outcome: Outcome::Failed { code },
+          outcome: Outcome::Failed { code: Some(code) },
           window_ns: None,
         }
       }
       // An entry below the target on a mount this daemon serves (A-227): refused before any open, that entry alone.
       Err(WriteFailure::Host(HostError::OwnMount(errno))) => Written {
         outcome: Outcome::Failed {
-          code: OsCode::Errno(errno),
+          code: Some(OsCode::Errno(errno)),
         },
         window_ns: None,
       },
@@ -1704,6 +1704,12 @@ impl<H: LandFs> Landing<'_, H> {
       },
       Err(WriteFailure::Host(HostError::NotFile | HostError::StaleHandle)) => Written {
         outcome: Outcome::Conflict(ConflictClass::TypeChanged),
+        window_ns: None,
+      },
+      // A landing's target is a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to,
+      // that entry fails alone, with no code to name.
+      Err(WriteFailure::Host(HostError::Pending)) => Written {
+        outcome: Outcome::Failed { code: None },
         window_ns: None,
       },
       Err(WriteFailure::Volume(e)) => Written {
@@ -2387,7 +2393,9 @@ impl<H: LandFs> Landing<'_, H> {
       Err(HostError::NotDirectory | HostError::NotFile) if change.directory => {
         return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TypeChanged)));
       }
-      Err(HostError::Unavailable(code)) => return Ok(MetaSet::Done(Outcome::Failed { code })),
+      Err(HostError::Unavailable(code)) => {
+        return Ok(MetaSet::Done(Outcome::Failed { code: Some(code) }));
+      }
       Err(e) => return Err(e.into()),
     };
     let set = self.set_meta_through(file, change);

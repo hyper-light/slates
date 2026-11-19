@@ -287,7 +287,7 @@ fn a_full_disk_mid_write_and_a_temporary_left_behind_are_reported_and_the_resume
   assert_eq!(
     outcome_of(&report, "/a/x"),
     Some(&Outcome::Failed {
-      code: OsCode::Errno(ENOSPC)
+      code: Some(OsCode::Errno(ENOSPC))
     }),
     "{report:?}"
   );
@@ -419,7 +419,7 @@ fn assert_the_batch_failed_unseen(history: &mut History, report: &LandingReport)
     assert_eq!(
       outcome_of(report, path),
       Some(&Outcome::Failed {
-      code: OsCode::Errno(ENOSPC)
+      code: Some(OsCode::Errno(ENOSPC))
     }),
       "{report:?}"
     );

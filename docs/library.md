@@ -195,6 +195,12 @@ bind is a record too, ending with its mount). The conformance suite in `crates/a
   binding's evidence says whether it was), macOS the loopback NFS mount, which Docker
   Desktop's file sharing carries into its VM; Windows offers none (`Unsupported::Attachment`,
   `HostPlatform`).
+  Before it, `container_engine::engine_profile(runtime)` asks the container engine for its profile and
+  judges it (`EngineProfile`: the endpoint, the profile and the test it holds, with how a container's
+  ids reach the volume and how hard links behave through it; else `EngineFault`, `Untested` naming the
+  engine it refused); just before the runtime binds, `ContainerBind::check_source()` (or
+  `container::check_source(source, identity)`) checks the source is still the mount verified, by the
+  kernel's table and the mount id it never reuses (`SourceFault`: `Missing`, `Replaced`, ...).
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`; on Windows that includes
   `MountManager`, the one-time setting that lets WinFsp's driver make the drive; on macOS and the BSDs,
@@ -205,8 +211,12 @@ bind is a record too, ending with its mount). The conformance suite in `crates/a
   the BSDs (`unmount(2)` with `MNT_FORCE`: the holder's next call fails; the loopback NFS mount is `hard`, so this is
   the way off it once its daemon has gone). `mount::unmount(path)` and `unmount_busy` run no program on macOS and the
   BSDs, so no `PATH` is needed (A-507), and both are judged by the kernel's mount table: a path with nothing mounted
-  is `MountFault::NotMounted` before any call, a held mount's plain unmount is `MountFault::Busy` on macOS, and an
-  unmount the table still lists is `MountFault::StillMounted`.
+  is `MountFault::NotMounted` before any call, a held mount's plain unmount is `MountFault::Busy` (on Linux too since
+  A-537: a plain `fusermount3 -u` refused while the table still lists the mount), and an unmount the table still lists
+  is `MountFault::StillMounted`. A `Busy` names its holders (`MountHolders`): on Linux the processes whose descriptors,
+  working or root directories are on the mount, read from `/proc` without touching it, and how many could not be read;
+  on macOS none are read (`HoldersUnread::NoReader`), since every libproc answer stats the file, which a `hard` NFS
+  mount whose daemon has gone waits on without bound.
 - Landing: `land(&request, signature)` under the caller's mode; `plan_landing(&request)` presents
   without writing, for a reviewer, and states what a signer signs; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at
@@ -325,7 +335,5 @@ the goal's clauses:
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
-3. The rest of the container handoff as library calls (A-520's next piece): the container engine's
-   profile, judged before a host mounts for it (the command line's `slates oci-runtime`), and the check
-   that a bind's source is still the mount verified, made just before the runtime binds it
-   (`slates oci-check`), so a host binds through the library alone.
+3. The container engine profiles slates has run since its judge was written (rootless podman, and
+   podman's command line), which the judge still refuses.

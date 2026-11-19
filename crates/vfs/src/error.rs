@@ -108,6 +108,9 @@ pub enum VfsError {
   /// the change succeeds once the delegation is returned or revoked (the caller retries: `NFS3ERR_JUKEBOX`,
   /// `NFS4ERR_DELAY`, `EAGAIN`).
   Delegated,
+  /// The overlay's base is fetching what the operation reads (an S3 base's miss, `HostError::Pending`, A-524): nothing
+  /// changed, and the operation succeeds once the fetch lands, when the caller runs it again.
+  BasePending,
   /// A sealed chunk's segment did not open (A-99): its bytes or its tag changed in RAM, or the key it names is gone.
   /// Nothing is returned for it, never bytes that did not authenticate.
   Integrity,
@@ -183,7 +186,9 @@ impl VfsError {
       | Self::RecoveryVersion { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
-      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",
+      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated | Self::BasePending => {
+        "EAGAIN"
+      }
       Self::DigestCacheFull => "ENOSPC",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",

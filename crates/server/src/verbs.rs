@@ -2867,7 +2867,7 @@ fn run_forwarded(
 }
 
 /// Applies the channel-local status cursor discipline before dispatching ordinary verbs.
-fn status_on_channel(
+pub(crate) fn status_on_channel(
   state: &mut ShardState,
   client: Handle<ClientSlot>,
   request: u64,
@@ -2886,15 +2886,8 @@ fn status_on_channel(
   }
   slot.status_pages.clear(&mut state.store.metadata);
   if matches!(body, RequestBody::DaemonStatus) {
-    let expires = state
-      .clock
-      .monotonic_ns()
-      .saturating_add(state.config.failover_slo_ns);
-    slot
-      .status_pages
-      .begin(request, expires, &mut state.store.metadata);
-    // The capture's deadline is the shard's keeper's to keep (A-522).
-    crate::deadlines::capture_set(state, client, expires);
+    // No deadline yet: the capture's counts from the capture, once its scatter has made it (A-525, [`send_reply`]).
+    slot.status_pages.begin(request, &mut state.store.metadata);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -11242,8 +11235,8 @@ fn guest_over_the_ring(
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
 /// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363, A-414).
 /// Another principal's lease is refused `LeaseHeld` while it is unexpired, and past its term too while its holder still
-/// holds a live write attachment of the volume ([`lease_kept_until`]): the reaper renews such a lease at its lapse
-/// ([`expire_leases`]), and a take between the lapse and that pass must not hand it to a second writer.
+/// holds a live write attachment of the volume ([`lease_kept_until`]): the shard's deadline keeper renews such a lease at
+/// its lapse ([`expire_leases`], A-536), and a take between the lapse and that pass must not hand it to a second writer.
 fn take_write_lease(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -11549,14 +11542,13 @@ pub(crate) fn use_attachment(
 /// The attachments ended.
 pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
+  // The lapsed alone, from the partition's index of terms (A-536), never a walk of every attachment.
   let lapsed: Vec<AttachmentRecord> = state
     .db
     .partition()
-    .attachments()
-    .filter(
-      |record| matches!(record.consumer, Consumer::Termed { expires_ns } if expires_ns <= now),
-    )
-    .cloned()
+    .lapsed_terms(now)
+    .into_iter()
+    .filter_map(|id| state.db.partition().attachment(id).cloned())
     .collect();
   let mut ended = 0usize;
   for record in lapsed {
@@ -12054,10 +12046,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
       {
         // Not recorded: the volume keeps its slot and credits, counted by the refusal's name, and is
-        // recorded again at the reaper's next cadence (`reap_loop` steps destroys), not in a busy round
-        // — before 2026-09-29 the refusal was discarded and the tables let go of a volume the catalog
-        // still held.
+        // recorded again at its retry deadline, the shard's window on (A-536: the deadline keeper wakes the serve
+        // loop then), not in a busy round — before 2026-09-29 the refusal was discarded and the tables let go of a
+        // volume the catalog still held; until A-536 the reap loop's tick tried again each window, refused or not.
         state.count(refusal_name(&refusal_of_db(&e)), 1);
+        retry_destroy_at_window(state, now);
         continue;
       }
       any = true;
@@ -12075,6 +12068,17 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     }
   }
   any || releasing
+}
+
+/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
+/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
+/// change, and kept by the deadline keeper, never a tick (A-536).
+fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
+  let at = now.saturating_add(crate::watchdog::watch_window_ns(
+    slates_rt::futures::scheduler_overrun_ns(),
+  ));
+  state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
+  crate::deadlines::noted(state, at);
 }
 
 /// One cooperative slice of each volume released to the member a move named (A-291, `crate::moves`): its record left
@@ -13225,6 +13229,11 @@ fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), B
       state.count(refusal_name(&refusal_of_vfs(&e)), 1);
     }
     state.relinquished.push(slot);
+    // The serve round steps its teardown (`step_destroys`); woken, it keeps running until the slices are done (A-536:
+    // before, the reap loop's tick started it).
+    if let Some(task) = state.server_task {
+      slates_rt::registry::wake(task.0);
+    }
   }
   crate::live_ship::forget(state, id);
   state.yielded.remove(&id);
@@ -15348,7 +15357,7 @@ fn remember_forwarded_ring(
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
 /// is kept and retried; never dropped).
-fn send_reply(
+pub(crate) fn send_reply(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
@@ -15368,22 +15377,40 @@ fn send_reply(
   if client.retiring || client.client_id != RequestId::from_word(request).client {
     return true;
   }
+  let mut held_until = None;
   if matches!(reply, ReplyBody::DaemonStatus { .. }) {
     let capacity = slates_ipc::status::snapshot_capacity(client.end.region());
     let page = slates_ipc::status::page_capacity(client.end.region());
     let now = state.clock.monotonic_ns();
+    // Held the failover delay from the capture (A-525): the bound the daemon holds every other thing a client leaves
+    // waiting for its next request to (a staging buffer, A-414), counted from when the report was made, so a scatter a
+    // starved daemon took long to gather takes nothing from its client's time to page it.
+    let deadline = now.saturating_add(state.failover_ns);
     // Replace the deferred reply itself: a full ring retries these exact page bytes,
     // including the final page whose retained snapshot has already been released.
     *reply = client
       .status_pages
-      .capture(request, reply, capacity, &mut state.store.metadata)
+      .capture(
+        request,
+        reply,
+        (capacity, deadline),
+        &mut state.store.metadata,
+      )
       .and_then(|()| {
         client
           .status_pages
           .page(request, 0, page, now, &mut state.store.metadata)
       })
       .unwrap_or_else(refused);
+    held_until = client.status_pages.deadline();
   }
+  // A capture its first page left held is the shard's keeper's to let go at its deadline (A-522).
+  if let Some(at) = held_until {
+    crate::deadlines::capture_set(state, handle, at);
+  }
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return true;
+  };
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
@@ -22372,6 +22399,40 @@ mod tests {
         "the ended attachment let the lease go"
       );
     });
+  }
+
+  /// A-536 (destroys off the tick). Do: on a one-shard daemon, create a volume and relinquish it as a takeover that
+  /// superseded it does, from outside a serve round; look until its slot's teardown is done. Expect: done within half a
+  /// liveness window, by the serve loop, woken by the relinquish. Before, nothing woke it, and the reap loop's tick
+  /// started the teardown up to a window later.
+  #[test]
+  fn a_relinquished_volume_is_torn_down_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = std::time::Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let (owner, _) = lease_principals();
+      let id = plain_volume(state, &owner, "relinquished");
+      super::relinquish_superseded(state, super::to_db_volume(id)).unwrap();
+      assert!(
+        !state.relinquished.is_empty(),
+        "the relinquished slot is queued for its teardown"
+      );
+    });
+    let within = std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 2);
+    let done = loop {
+      if crate::daemon::observe_first(&daemon, |state| state.relinquished.is_empty()) {
+        break Some(begun.elapsed());
+      }
+      if begun.elapsed() > within {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its drivers.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    daemon.stop();
+    let done = done.expect("the relinquished slot was torn down within half a liveness window");
+    println!("a relinquished volume torn down {done:?} after the relinquish");
   }
 
   /// D-16, A-414. Do: attach a volume for write in the CLI's form and for reading in the library's form, both as its

@@ -523,25 +523,40 @@ pub struct BasePlane {
 }
 
 /// A base directory a recovery could not reacquire ([`BasePlane::unavailable`]): its recorded source and fingerprint,
-/// kept for the next image, and the errno its untouched entries are refused with.
+/// kept for the next image, and the code its untouched entries are refused with, typed by its numbering (A-539; none
+/// where the host named none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnavailableDir {
   pub(crate) source: Vec<String>,
   pub(crate) fingerprint: Fingerprint,
-  pub(crate) code: crate::host::OsCode,
+  pub(crate) code: Option<crate::host::OsCode>,
 }
 
-/// Format: the errno a base directory that is no longer the recorded one is refused with, `ENOENT` (2 on Linux and
-/// macOS, and Windows' `ERROR_FILE_NOT_FOUND`): the directory the image recorded is not there, whether removed or
+/// Format: the code a base directory that is no longer the recorded one is refused with, in this platform's numbering:
+/// `ENOENT` (`<errno.h>`, 2 on Linux and macOS): the directory the image recorded is not there, whether removed or
 /// replaced by another at the path (§4.8, A-153).
-pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
+#[cfg(not(windows))]
+pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Errno(2);
+/// Format: see the other arm; Windows' `ERROR_FILE_NOT_FOUND` (winerror.h, 2), a Win32 error code (A-539).
+#[cfg(windows)]
+pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Win32(2);
 
-/// The code a base directory recovery could not reopen is refused with: the host's own, typed by its numbering (A-539),
-/// or [`GONE_DIRECTORY_ERRNO`] in this platform's numbering when the host says only that it is not there as a directory.
-pub(crate) fn unavailable_code(error: HostError) -> crate::host::OsCode {
-  error
-    .code()
-    .unwrap_or(crate::host::OsCode::native(GONE_DIRECTORY_ERRNO))
+/// The code a base directory recovery could not reopen is refused with, typed by its numbering (A-539): the host's own;
+/// [`GONE_DIRECTORY`] when the host says only that it is not there as a directory; none for a fetch under way, which no
+/// code names, as a base unavailable with no host at all names none (recovery over an S3 base is A-524's owed
+/// integration).
+pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> {
+  match error {
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code) => Some(code),
+    HostError::OwnMount(errno) => Some(crate::host::OsCode::Errno(errno)),
+    HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
+      Some(GONE_DIRECTORY)
+    }
+    HostError::Pending => None,
+  }
 }
 
 impl BasePlane {
@@ -855,11 +870,12 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
     // The code as the host named it, typed by its numbering (A-539).
-    HostError::Exists(_)
-    | HostError::NoSpace(_)
-    | HostError::Unsupported(_)
-    | HostError::Unavailable(_)
-    | HostError::OwnMount(_) => VfsError::BaseUnavailable(e.code()),
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code) => VfsError::BaseUnavailable(Some(code)),
+    HostError::OwnMount(errno) => VfsError::BaseUnavailable(Some(crate::host::OsCode::Errno(errno))),
+    HostError::Pending => VfsError::BasePending,
   }
 }
 
@@ -1271,7 +1287,7 @@ impl Overlay<'_> {
         return Ok(Some(names));
       }
       if let Some(gone) = plane.unavailable.get(&no) {
-        return Err(VfsError::BaseUnavailable(Some(gone.code)));
+        return Err(VfsError::BaseUnavailable(gone.code));
       }
       let Some(listing) = plane.listings.get(&no) else {
         return Ok(None);
@@ -1309,7 +1325,7 @@ impl Overlay<'_> {
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     if let Some(gone) = plane.unavailable.get(&dir_no) {
-      return Err(VfsError::BaseUnavailable(Some(gone.code)));
+      return Err(VfsError::BaseUnavailable(gone.code));
     }
     let listing = plane
       .listings
@@ -1894,7 +1910,7 @@ impl Overlay<'_> {
   fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
     let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     if let Some(gone) = plane.unavailable.get(&dir_no) {
-      return Err(VfsError::BaseUnavailable(Some(gone.code)));
+      return Err(VfsError::BaseUnavailable(gone.code));
     }
     plane
       .listings

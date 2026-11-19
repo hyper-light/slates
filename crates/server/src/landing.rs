@@ -3173,6 +3173,9 @@ fn answer_of(error: HostError) -> HostAnswer {
       Some(slates_vfs::host::OsCode::Errno(errno)) => HostAnswer::Errno { errno },
       None => HostAnswer::Errno { errno: 0 },
     },
+    // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
+    // a refusal no errno names.
+    HostError::Pending => HostAnswer::Errno { errno: 0 },
   }
 }
 

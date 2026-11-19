@@ -150,6 +150,10 @@ pub enum HostError {
   /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
   /// deadlock avoided by.
   OwnMount(i32),
+  /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
+  /// nothing changed, and the same call is answered once the fetch lands. The caller parks the request and runs it
+  /// again then; a host that reads a local disk never answers it.
+  Pending,
 }
 
 impl std::fmt::Display for HostError {
@@ -164,6 +168,7 @@ impl std::fmt::Display for HostError {
       Self::Unsupported(code) => write!(f, "not supported here ({code})"),
       Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
+      Self::Pending => f.write_str("the host's fetch is pending"),
     }
   }
 }
@@ -172,13 +177,13 @@ impl std::error::Error for HostError {}
 
 impl HostError {
   /// The code a refusal names, typed by its numbering: every kind but the typed ones the host names no number for (not
-  /// found, not a directory, not a file, a stale handle); a mount of this daemon's names the errno its platform names a
-  /// deadlock avoided by.
+  /// found, not a directory, not a file, a stale handle) and a fetch under way (A-524); a mount of this daemon's names
+  /// the errno its platform names a deadlock avoided by.
   pub fn code(&self) -> Option<OsCode> {
     match self {
       Self::Exists(code) | Self::NoSpace(code) | Self::Unsupported(code) | Self::Unavailable(code) => Some(*code),
       Self::OwnMount(errno) => Some(OsCode::Errno(*errno)),
-      Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle => None,
+      Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle | Self::Pending => None,
     }
   }
 }

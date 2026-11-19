@@ -258,8 +258,19 @@ pub struct Partition {
   leases_by_holder: Art<VolumeId>,
   lease_expiry: Wheel,
   lease_timers: BTreeMap<VolumeId, slates_rt::timer::TimerId>,
+  /// The earliest lease expiry entered in the wheel since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_lease`]): what tells the keeper a lease was set to lapse before the deadline it sleeps for
+  /// (A-536), whichever path recorded it (a take, a renewal, a replay).
+  lease_noted: Option<u64>,
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
+  /// The termed attachments (a CLI's, A-230) by when their term lapses, each `(expires_ns, id)`: derived from the
+  /// records, made again at a restore, one entry a termed attachment, so the lapsed are found without a walk of the
+  /// table (A-536).
+  termed_by_expiry: BTreeSet<(u64, u64)>,
+  /// The earliest term entered in [`Partition::termed_by_expiry`] since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_term`]), as `lease_noted` is for leases (A-536).
+  term_noted: Option<u64>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
   /// The completions a green's successor adopted from the green's merge records (A-255), each with the work whose submit
   /// it completes (A-288), by key `(origin, client, sequence)`: held while the client's window retains the completion,
@@ -402,6 +413,9 @@ impl Partition {
       leases_by_holder: Art::new(),
       lease_expiry: Wheel::new(caps.tick_ns, caps.timers, now_ns),
       lease_timers: BTreeMap::new(),
+      lease_noted: None,
+      termed_by_expiry: BTreeSet::new(),
+      term_noted: None,
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
@@ -964,8 +978,53 @@ impl Partition {
       .attachment_index
       .remove(&id.to_be_bytes())
       .ok_or(DbError::NotFound)?;
-    self.attachments.remove(handle)?;
+    let record = self.attachments.remove(handle)?;
+    self.unindex_term(&record);
     Ok(())
+  }
+
+  /// Enters a termed attachment's lapse in [`Partition::termed_by_expiry`] and notes it for the keeper (A-536); any
+  /// other kind holds no term.
+  fn index_term(&mut self, record: &AttachmentRecord) {
+    if let Consumer::Termed { expires_ns } = record.consumer {
+      self.termed_by_expiry.insert((expires_ns, record.id));
+      self.term_noted = Some(
+        self
+          .term_noted
+          .map_or(expires_ns, |noted| noted.min(expires_ns)),
+      );
+    }
+  }
+
+  /// Takes a termed attachment's lapse out of [`Partition::termed_by_expiry`].
+  fn unindex_term(&mut self, record: &AttachmentRecord) {
+    if let Consumer::Termed { expires_ns } = record.consumer {
+      self.termed_by_expiry.remove(&(expires_ns, record.id));
+    }
+  }
+
+  /// The termed attachments whose term lapsed by `now_ns`, read from their index alone (A-536): the caller ends each.
+  pub fn lapsed_terms(&self, now_ns: u64) -> Vec<u64> {
+    self
+      .termed_by_expiry
+      .iter()
+      .take_while(|(expires_ns, _)| *expires_ns <= now_ns)
+      .map(|(_, id)| *id)
+      .collect()
+  }
+
+  /// When the next termed attachment lapses, the deadline the shard's keeper sleeps until for them (A-536).
+  pub fn next_term_lapse(&self) -> Option<u64> {
+    self
+      .termed_by_expiry
+      .first()
+      .map(|(expires_ns, _)| *expires_ns)
+  }
+
+  /// The earliest term entered since the last call, taken: the keeper wakes for it when it sleeps for a later deadline
+  /// (A-536).
+  pub fn take_noted_term(&mut self) -> Option<u64> {
+    self.term_noted.take()
   }
 
   /// The highest attachment id the partition holds, or `None` when it holds none (a walk of the table,
@@ -1945,6 +2004,7 @@ impl Partition {
       Op::AttachmentAdded { record } => {
         let h = self.attachments.insert(record.clone())?;
         self.attachment_index.insert(&record.id.to_be_bytes(), h);
+        self.index_term(record);
         Ok(())
       }
       Op::ClientIdReserved { client } => {
@@ -1976,9 +2036,17 @@ impl Partition {
           .get(&id.to_be_bytes())
           .ok_or(DbError::NotFound)?;
         let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
-        record.consumer = Consumer::Termed {
-          expires_ns: *expires_ns,
-        };
+        let lapsed_at = std::mem::replace(
+          &mut record.consumer,
+          Consumer::Termed {
+            expires_ns: *expires_ns,
+          },
+        );
+        let renewed = record.clone();
+        if let Consumer::Termed { expires_ns: before } = lapsed_at {
+          self.termed_by_expiry.remove(&(before, *id));
+        }
+        self.index_term(&renewed);
         Ok(())
       }
       Op::AttachmentExpired { id } => {
@@ -2404,7 +2472,24 @@ impl Partition {
         table: "lease timers",
       })?;
     self.lease_timers.insert(volume, timer);
+    // Noted as the wheel will report it, its tick at or after the expiry (`next_lease_expiry`), so the keeper's own arming
+    // for it reads as no earlier deadline.
+    let tick = self.lease_expiry.tick_ns().max(1);
+    let due = lease.expires_ns.div_ceil(tick).saturating_mul(tick);
+    self.lease_noted = Some(self.lease_noted.map_or(due, |noted| noted.min(due)));
     Ok(())
+  }
+
+  /// The earliest lease expiry entered since the last call, taken: the shard's keeper wakes for it when it sleeps for a
+  /// later deadline (A-536).
+  pub fn take_noted_lease(&mut self) -> Option<u64> {
+    self.lease_noted.take()
+  }
+
+  /// When the next lease lapses on the wheel, the deadline the shard's keeper sleeps until for leases (A-536): the
+  /// wheel's tick at or after the earliest expiry, so a pass at that moment finds the lease due.
+  pub fn next_lease_expiry(&mut self) -> Option<u64> {
+    self.lease_expiry.next_deadline_ns()
   }
 
   /// The volumes whose leases expired by `now_ns` (the caller records `LeaseReleased` for
@@ -2734,6 +2819,7 @@ impl Partition {
     for a in &snapshot.attachments {
       let h = p.attachments.insert(a.clone())?;
       p.attachment_index.insert(&a.id.to_be_bytes(), h);
+      p.index_term(a);
     }
     p.restore_completions(&snapshot.completions);
     for g in &snapshot.grants {

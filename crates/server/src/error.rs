@@ -149,6 +149,10 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::Delegated => Refusal::Unpublished {
       reason: "the file is delegated to an NFSv4 client; its recall is under way".to_owned(),
     },
+    // Retryable under the same id: an S3 base's fetch of what the request reads is under way (A-524).
+    VfsError::BasePending => Refusal::Unpublished {
+      reason: "the overlay's base is fetching what the request reads".to_owned(),
+    },
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
       feature: format!("archiving a tree deeper than {limit} path components"),
     },
@@ -279,13 +283,14 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     H::NotFile => TargetRefusal::NotFile,
     H::StaleHandle => TargetRefusal::Stale,
     // The code in the variant of its numbering (A-539): an errno in `Host`, a Win32 code in `HostWin32`.
-    H::Exists(_) | H::NoSpace(_) | H::Unsupported(_) | H::Unavailable(_) | H::OwnMount(_) => {
-      match e.code() {
-        Some(slates_vfs::host::OsCode::Win32(code)) => TargetRefusal::HostWin32 { code },
-        Some(slates_vfs::host::OsCode::Errno(errno)) => TargetRefusal::Host { errno },
-        None => TargetRefusal::Host { errno: 0 },
-      }
-    }
+    H::Exists(code) | H::NoSpace(code) | H::Unsupported(code) | H::Unavailable(code) => match code {
+      slates_vfs::host::OsCode::Win32(code) => TargetRefusal::HostWin32 { code: *code },
+      slates_vfs::host::OsCode::Errno(errno) => TargetRefusal::Host { errno: *errno },
+    },
+    H::OwnMount(errno) => TargetRefusal::Host { errno: *errno },
+    // A target is a directory host's, which never answers a pending fetch (an S3 base's, A-524); were one to, it is a
+    // refusal no code names.
+    H::Pending => TargetRefusal::Host { errno: 0 },
   }
 }
 
