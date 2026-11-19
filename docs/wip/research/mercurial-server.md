@@ -622,7 +622,56 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **An abort on a bundle2 request is answered as a bundle2 stream** holding one `error:abort` part (the message
   mandatory, the hint advisory), not as an SSH error: owed to the stdio loop.
 
-## 20. Found while building piece 3's import of an existing store and its file index (A-630 parts 2 and 3, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/import`)
+## 20. Found while building piece 5's first part, a push's bundle, race checks and reply (A-641 part 1, 2026-11-19; 7.2's code [C] in the wheel uv installs on the Mac Studio, CPython 3.12; captures of stock `hg` 7.2 over SSH, `fixtures/push`)
+
+- **Files read**, with their SHA-256 there: `bundle2_part_handlers.py` (`7aabb77e10cd6160…`), `bundle2.py`
+  (`90ddd2bf3fbdb781…`), `exchange.py` (`ecf56e2d9f26d017…`), `wireprotov1server.py` (`b47340cf38d24c13…`); and from the
+  same wheel, not hashed: `changegroup.py`, `branchmap.py`, `error.py`, `hook.py`, `hgext/hooklib/reject_new_heads.py`.
+- **A part's handler** (`bundle2.py` `_gethandler`, its two raises at 539 and 546): routed by the type in lower case; a type no handler takes,
+  or a mandatory parameter outside the handler's declared names (`part.mandatorykeys - handler.params`, sorted), raises
+  `BundleUnknownFeatureError(parttype=part.type, params=...)` and is re-raised only for a mandatory part. The server
+  answers it with `error:unsupportedcontent` carrying `parttype` and the names joined by NUL, both mandatory
+  (`wireprotov1server.py` 808-814). Captured: an unknown `TEST:UNKNOWN` part answered `parttype: test:unknown`; an
+  unknown mandatory `slates-unknown` on `CHANGEGROUP` answered `parttype: changegroup, params: slates-unknown`.
+- **The race checks' words** (`bundle2_part_handlers.py` 244-352): `check:heads` and `check:updated-heads` "remote
+  repository changed while pushing - please try again"; `check:bookmarks` the same then ` (bookmark "%s" move from %s
+  to %s)` (the node the client saw, then the server's), `(bookmark "%s" is missing, expected %s)` or `(bookmark "%s" set
+  on %s, expected missing)`; `check:phases` ` (%s is %s expected %s)` (the node, its phase now, the phase expected),
+  every node as `short` (twelve hexadecimal digits). `check:heads` compares sorted lists (`sorted(heads) !=
+  sorted(op.repo.heads())`), and an empty repository's `heads()` is `[nullid]`; `check:updated-heads` asks
+  `branchmap().all_nodes_are_heads` (`branchmap.py` 888-894: every node among every branch's heads, closed ones too, and
+  `[nullid]` alone only when the repository is empty). `check:phases` reads the payload into a mapping keyed in
+  `allphases` order, so its nodes are judged public first whatever the payload's order. All four were captured: the
+  three races answered `error:pushraced` with exactly these words (`push-race`, `push-race-bookmark`,
+  `push-race-phase`).
+- **What a 7.2 client sends** (the captures' listings): `replycaps` first, then `check:bookmarks` (when it moves a
+  bookmark), `check:phases` (the remote's public heads and draft roots as the client saw them, `_pushb2checkphases`,
+  `exchange.py` 950-972), `check:updated-heads` (`checkheads=related`, 7.2's default) or `check:heads` (a strict
+  server), `changegroup` version `03`, then `bookmarks` or `phase-heads`. A forced push sends no check at all
+  (`_pushb2ctxcheckheads` 896-922 and the bookmark and phase checks skip under `force`).
+- **The reply** (`bundle2_part_handlers.py` 79-147, 424-452, 538-562; `exchange.py` `unbundle`, from 2818): parts are numbered from
+  0 as added; `reply:changegroup` is advisory with advisory `in-reply-to` (the changegroup part's id: 3, or 4 after a
+  bookmark check) and `return`; `reply:pushkey` and `reply:obsmarkers` are mandatory with advisory parameters; an
+  `output` part (advisory) follows a part whose handler printed, and one more comes last for the transaction's hooks,
+  but only where output is captured: always over HTTP (`url.startswith(b'remote:http')`), over SSH only under
+  `experimental.bundle2-output-capture`, so the captures over SSH hold none. A bookmark or a phase pushed alone is
+  answered by a stream with no part. A refused push is answered by a new stream (salvaged `output`, then one error
+  part), so a reply part made before the refusal is never sent.
+- **`reply:changegroup`'s `return`** (`changegroup.py` 879-890, 969-974): the heads added less those removed less the
+  added heads that close their branch, plus one, or minus one where negative: "never return 0".
+- **`unbundle`'s `heads` argument** (`exchange.py` 2799-2816): `force`, the list equal to `repo.heads()` in its order
+  (newest first), or `hashed` and the SHA-1 of the heads sorted and joined; judged before the payload is read ("while
+  preparing changes") and again as the bundle applies ("while uploading changes"). A bundle2 push sends `force`.
+- **A new head refused by 7.2's own hook** (`hgext/hooklib/reject_new_heads.py`, run as `pretxnclose`): `error:abort`
+  with "Changes on branch 'default' resulted in multiple heads" and no hint. Its `%r` is bytes formatting's `%a`, the
+  repr of a `pycompat.bytestr` (bytes' repr without its `b`); measured for ten names under CPython 3.12 (quotes, both
+  quotes, tab, NUL, bytes from 0x7f, a backslash, line ends, UTF-8), held by the test.
+- **The fixture script's first run** recorded none of the three races: the other clients pushed through the recording
+  stand-in without naming a capture, the stand-in failed on the missing name, and the script took their exit status
+  255 for a refused push, so each replay found the server unmoved and was accepted (`reply:changegroup` 1). The
+  stand-in now records only a named capture, and only a recorded push may be refused.
+
+## 21. Found while building piece 3's import of an existing store and its file index (A-630 parts 2 and 3, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/import`)
 
 - **Which requirements 7.2 knows.** `repo/requirements.py`'s `BASE_SUPPORTED` (23), the `exp-compression-<engine>`
   names of every engine with a revlog header (`zlib`, `zstd`, and `none`, whose chunks keep a NUL) with
