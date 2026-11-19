@@ -604,7 +604,8 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
 /// A-635 (the gates every merge passes, and the entry's own refusals). Do: push a move with a check of another
 /// branch's head that no longer holds; with a phase root and a marker beside it; to a green whose write policy forbids
 /// merges, and then asks for an approval of each; as a principal who does not own the repository; and to a repository
-/// that is not there. Expect: the failed check refuses the entry, naming the check, nothing applied; the state moves
+/// that is not there. Expect: the failed check refuses the entry `Moved`, naming the green, the position read and the
+/// one it is at (A-642), nothing applied; the state moves
 /// with the push in its one entry; the forbidding policy refuses `PolicyForbids`, the asking one names the work an
 /// approver would approve; the stranger is refused `Forbidden` and the unknown repository `NotFound`.
 #[test]
@@ -653,7 +654,11 @@ fn assert_a_failed_check_refuses_the_entry(
   assert_eq!(
     push(state, &owner(), repo, changes, parts),
     Err(PushRefused::Entry(Refusal::Database {
-      refusal: slates_ipc::protocol::DatabaseRefusal::CheckFailed { index: 0 }
+      refusal: slates_ipc::protocol::DatabaseRefusal::Moved {
+        green: crate::verbs::to_wire_volume(topic),
+        read: 5,
+        at: 0,
+      }
     }))
   );
   assert_eq!(kept(state, repo, &greens), before);
