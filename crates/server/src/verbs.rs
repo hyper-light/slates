@@ -22213,8 +22213,22 @@ mod tests {
     });
     assert!(all_sent, "each scatter sent its part to the fenced shard");
     let mut end = slates_ipc::ClientEnd::new(region);
+    let answers = answers_by_sequence(&mut end, 3);
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    (fenced, answers, unserved)
+  }
+
+  /// The next `count` answers the seated client's ring holds, by request sequence, each waited for within the
+  /// observation budget; fewer when one does not come.
+  fn answers_by_sequence(
+    end: &mut slates_ipc::ClientEnd,
+    count: usize,
+  ) -> std::collections::BTreeMap<u32, ReplyBody> {
     let mut answers = std::collections::BTreeMap::new();
-    while answers.len() < 3 {
+    while answers.len() < count {
       match end.wait(Some(crate::daemon::OBSERVE_BUDGET_NS)) {
         Ok(reply) => {
           let body: ReplyBody =
@@ -22230,11 +22244,7 @@ mod tests {
         }
       }
     }
-    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
-      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
-    });
-    daemon.stop();
-    (fenced, answers, unserved)
+    answers
   }
 
   /// A-557 (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`'s sibling; §4.8 "Lookup": an
@@ -22264,6 +22274,140 @@ mod tests {
       unserved,
       Some(3),
       "each scatter's part came home unserved, counted where it was asked"
+    );
+  }
+
+  /// The two read scatters the resend test sends, by request sequence: a listing (1) and the caller's grants (2).
+  fn read_scatters() -> [(u32, super::RequestBody); 2] {
+    [
+      (1, super::RequestBody::List { after: None }),
+      (2, super::RequestBody::Grants { after: None }),
+    ]
+  }
+
+  /// Serves `body` from the client seated at `seat` under `sequence`, as the shard serves a request its ring hands over
+  /// (`serve`): its answer when it was answered at once, `None` when it went out to be answered later (a scatter).
+  fn served_as_from_the_ring(
+    state: &mut crate::state::ShardState,
+    seat: u32,
+    (sequence, body): &(u32, super::RequestBody),
+  ) -> Option<ReplyBody> {
+    use slates_vfs::clock::Clock as _;
+    let generation = state.clients.generation_at(seat).unwrap();
+    let handle = slates_mem::Handle::from_raw(seat, generation);
+    let word = slates_wire::request::RequestId {
+      client: ASKING,
+      sequence: *sequence,
+    }
+    .word();
+    let slot = slates_ipc::protocol::pack(
+      state.clients.get_mut(handle).unwrap().end.region_mut(),
+      slates_ipc::protocol::Direction::Request,
+      u64::from(*sequence),
+      word,
+      body,
+    )
+    .unwrap();
+    let request = super::Request {
+      request: slot.request,
+      kind: slot.kind,
+      payload: slot.payload,
+    };
+    let now = state.clock.monotonic_ns();
+    match super::serve(state, handle, &request, now) {
+      super::Served::Reply(reply) => Some(reply),
+      super::Served::Forwarded => None,
+    }
+  }
+
+  /// What the resend test saw ([`resent_past_a_fenced_shard`]), each by request sequence.
+  struct Resent {
+    /// The fenced control shard.
+    fenced: Option<u16>,
+    /// Each scatter's first answer.
+    first: std::collections::BTreeMap<u32, ReplyBody>,
+    /// A resend answered at once, as from the request's completion record, with that answer.
+    at_once: std::collections::BTreeMap<u32, ReplyBody>,
+    /// A resend's answer that came back later, its scatter run again.
+    again: std::collections::BTreeMap<u32, ReplyBody>,
+    /// The asking shard's count of parts that came home unserved.
+    unserved: Option<u64>,
+  }
+
+  /// On a two-shard daemon whose control shard is fenced, a client seated on the other shard sends each read scatter
+  /// ([`read_scatters`]), reads both answers, then sends each again under its own id, as a client resends a request
+  /// refused `Overloaded` (`slates_client::Client::begin_again`).
+  fn resent_past_a_fenced_shard() -> Resent {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, seat, region, sent_at_once) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let sent_at_once = read_scatters()
+        .iter()
+        .filter_map(|asked| served_as_from_the_ring(state, seat, asked))
+        .count();
+      (state.shards.first().copied(), seat, region, sent_at_once)
+    });
+    assert_eq!(sent_at_once, 0, "each scatter went out to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answers_by_sequence(&mut end, read_scatters().len());
+    let at_once: std::collections::BTreeMap<u32, ReplyBody> =
+      crate::daemon::observe_at(&daemon, 1, move |state| {
+        read_scatters()
+          .iter()
+          .filter_map(|asked| {
+            served_as_from_the_ring(state, seat, asked).map(|reply| (asked.0, reply))
+          })
+          .collect()
+      });
+    let owed = read_scatters().len().saturating_sub(at_once.len());
+    let again = answers_by_sequence(&mut end, owed);
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    Resent {
+      fenced,
+      first,
+      at_once,
+      again,
+      unserved,
+    }
+  }
+
+  /// A-563 (A-557's sibling; §4.9 "Status (2026-11-17, an `Overloaded` verb is never its own completion)": `Overloaded`
+  /// says the request was not started, so a resend under its id runs it). Do: on a two-shard daemon whose control shard
+  /// is fenced, list the volumes and ask for the grants from a client seated on the other shard, each served as its
+  /// ring hands it over; once both are answered, send each again under its own id. Expect: each answered `Overloaded`
+  /// naming the fenced shard both times, and each resend run again (its part sent and counted unserved a second time),
+  /// never answered from a record. Before, the deferred reply's path recorded the refusal as the request's completion,
+  /// so every resend under the id met it for good.
+  #[test]
+  fn a_resend_of_a_read_scatter_refused_overloaded_runs_it_again() {
+    let seen = resent_past_a_fenced_shard();
+    let fenced = seen.fenced.expect("the daemon has a control shard");
+    let refused_for_the_fence = |answer: Option<&ReplyBody>| {
+      matches!(
+        answer,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Overloaded { shard }
+        }) if *shard == fenced
+      )
+    };
+    for (verb, sequence) in [("list", 1u32), ("grants", 2)] {
+      let (first, at_once, again) = (
+        seen.first.get(&sequence),
+        seen.at_once.get(&sequence),
+        seen.again.get(&sequence),
+      );
+      assert!(refused_for_the_fence(first), "{verb}'s first answer: {first:?}");
+      assert_eq!(at_once, None, "{verb}'s resend was answered from a record");
+      assert!(refused_for_the_fence(again), "{verb}'s resend: {again:?}");
+    }
+    assert_eq!(
+      seen.unserved,
+      Some(4),
+      "each send and each resend ran its scatter"
     );
   }
 
