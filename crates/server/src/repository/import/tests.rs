@@ -92,9 +92,10 @@ fn the_states_repository(_: &str) -> Result<Opened, HostError> {
   Ok((Box::new(host), directory))
 }
 
-/// An opener a refusal must never reach.
-fn never_opened(path: &str) -> Result<Opened, HostError> {
-  panic!("{path} opened")
+/// An opener a refusal must never reach: reached, it answers a stale handle, which no open of a path gives, so the
+/// verb's reply is the host's refusal no test expects and the test's comparison fails there.
+fn never_opened(_: &str) -> Result<Opened, HostError> {
+  Err(HostError::StaleHandle)
 }
 
 /// Asks the shard to import `PATH` into `name` as `principal`, the directory opened by `open`: the reply, and whether

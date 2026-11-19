@@ -175,10 +175,11 @@ fn hold(state: &mut ShardState, id: RepositoryId, answer: Answer) -> ReplyBody {
 
 /// The shard's task for repository `id`'s import: runs it to its end, then answers the held request. The reply is sent
 /// once the shard's state is let go, since its delivery takes the state itself (`state::deliver`), and a nested lend of
-/// it is refused.
+/// it is refused. A lend refused in a way that loses the answer is counted as the shard's lost step
+/// (`state::with_state_counted`), never dropped unseen.
 async fn answer_at_end(id: RepositoryId) {
   let outcome = hg_import::run(id).await;
-  let answered = crate::state::with_state(|state| answer(state, id, outcome)).flatten();
+  let answered = crate::state::with_state_counted(|state| answer(state, id, outcome)).flatten();
   if let Some((route, reply, here)) = answered {
     crate::told::deliver_to(route, reply, here);
   }
