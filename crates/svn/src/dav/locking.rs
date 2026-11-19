@@ -146,6 +146,14 @@ const NOT_FOUND_CODES: [u32; 2] = [160_013, 160_006];
 /// Format: `svn_error_codes.h`, the filesystem category's start (160,000) plus 39 and plus 35.
 const LOCKED_CODES: [u32; 2] = [160_039, 160_035];
 
+/// `SVN_ERR_UNSUPPORTED_FEATURE`, which `dav_svn__convert_err` answers 501.
+/// Format: `svn_error_codes.h`, the miscellaneous category's start (200,000) plus 7.
+const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
+
+/// `SVN_ERR_FS_PROP_BASEVALUE_MISMATCH`, which `dav_svn__convert_err` answers 412.
+/// Format: `svn_error_codes.h`, the filesystem category's start (160,000) plus 49.
+const SVN_ERR_FS_PROP_BASEVALUE_MISMATCH: u32 = 160_049;
+
 /// What `dav_svn__sanitize_error` puts in place of a lock request's error it does not name.
 /// Format: `lock.c` `append_locks` 841.
 const LOCK_FAILED: &str = "Failed to create new lock.";
@@ -827,9 +835,19 @@ fn unlock_refused(request: &UnlockRequest, refusal: &LockRefusal, filesystem: &s
       let message = format!(
         "User '{user}' is trying to use a lock owned by '{owner}' in filesystem '{filesystem}'"
       );
-      error_answer(convert_status(code), true, code, &message)
+      error_answer(
+        convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+        true,
+        code,
+        &message,
+      )
     }
-    _ => error_answer(convert_status(code), false, code, UNLOCK_FAILED),
+    _ => error_answer(
+      convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+      false,
+      code,
+      UNLOCK_FAILED,
+    ),
   }
 }
 
@@ -845,7 +863,12 @@ fn lock_refused(refusal: &LockRefusal, filesystem: &str) -> HttpAnswer {
   let code = refusal.subversion_code();
   let message =
     lock_error_message(refusal, filesystem).unwrap_or_else(|| String::from(LOCK_FAILED));
-  error_answer(convert_status(code), true, code, &message)
+  error_answer(
+    convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+    true,
+    code,
+    &message,
+  )
 }
 
 /// FSFS's message for a refusal `append_locks` passes on with its own text (`SVN_ERR_IS_LOCK_ERROR`, no such lock):
@@ -889,14 +912,19 @@ fn malformed_token_message(token: &str) -> String {
   format!("Lock token '{token}' is not ASCII or is a control character at byte {at}")
 }
 
-/// The status `dav_svn__convert_err` gives a Subversion error (`util.c` 140-157), the lock verbs' 500 otherwise.
-fn convert_status(code: u32) -> u16 {
+/// The status `dav_svn__convert_err` gives a Subversion error (`util.c` 140-157): its own for the codes it maps, else
+/// `status`, the one its caller suggests (the lock verbs' 500, a log-report's 400).
+pub(crate) fn convert_status(code: u32, status: u16) -> u16 {
   if NOT_FOUND_CODES.contains(&code) {
     HTTP_NOT_FOUND
+  } else if code == SVN_ERR_UNSUPPORTED_FEATURE {
+    HTTP_NOT_IMPLEMENTED
   } else if LOCKED_CODES.contains(&code) {
     HTTP_LOCKED
+  } else if code == SVN_ERR_FS_PROP_BASEVALUE_MISMATCH {
+    HTTP_PRECONDITION_FAILED
   } else {
-    HTTP_INTERNAL_SERVER_ERROR
+    status
   }
 }
 
