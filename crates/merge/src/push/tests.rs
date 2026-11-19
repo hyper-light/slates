@@ -1035,6 +1035,59 @@ fn a_submodule_link_lands_as_a_special_node_holding_its_commit() {
   assert_eq!(green.special("vendor/lib"), None);
 }
 
+/// A push from version 1 over `base_tree` of the link `vendor/lib` at `commit`, named `name` and moving no head.
+fn moved_link(
+  store: &mut Store,
+  green: &Green,
+  base_tree: ObjectKey,
+  commit: ObjectKey,
+  name: u8,
+) -> Built {
+  let tree = put(store, &files_of(&[("vendor/lib", Node::Submodule(commit))]));
+  let push = Push {
+    name: [name; 32],
+    base_version: 1,
+    base_tree: Some(base_tree),
+    tree,
+    head: None,
+  };
+  build(&push, green, store, u64::MAX).unwrap()
+}
+
+/// A-637 (the engine: a link's commit is what it holds, as a symbolic link's target is). Do: land a submodule's link;
+/// then submit, each from that version and moving no head, a push moving it to a second commit, one moving it to a
+/// third, and one moving it to the second as the first did. Expect: the first accepted; the second a `CreateCreate`
+/// conflict at the link, another push having moved it since its base; the third accepted, the link at the second.
+#[test]
+fn a_link_two_pushes_move_from_one_base_conflicts_unless_they_agree() {
+  let mut store = Store::default();
+  let mut green = Green::new();
+  let commits: Vec<ObjectKey> = (0..3_u8).map(|n| key(b"commit", &[n])).collect();
+  let linked = files_of(&[("vendor/lib", Node::Submodule(commits[0]))]);
+  let (_, outcome, base_tree) = land(&mut store, &mut green, None, &linked, &head(1));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  let first = moved_link(&mut store, &green, base_tree, commits[1], 1);
+  assert_eq!(
+    green.submit(&first.increment),
+    Outcome::Accepted { version: 2 }
+  );
+  let other = moved_link(&mut store, &green, base_tree, commits[2], 2);
+  let Outcome::Conflict { windows } = green.submit(&other.increment) else {
+    panic!("a link two pushes moved apart must conflict");
+  };
+  let at: Vec<(&str, MergeConflictClass)> = windows
+    .iter()
+    .map(|window| (window.path.as_str(), window.class))
+    .collect();
+  assert_eq!(at, [("vendor/lib", MergeConflictClass::CreateCreate)]);
+  let agreeing = moved_link(&mut store, &green, base_tree, commits[1], 3);
+  assert!(matches!(
+    green.submit(&agreeing.increment),
+    Outcome::Accepted { .. }
+  ));
+  assert_eq!(green.special("vendor/lib"), Some(gitlink(commits[1])));
+}
+
 /// A-618 and A-637 (GAPS §8f: the deriver's composition of a path that changes kind is owed). Do: over a landed tree,
 /// push a file becoming a directory, a directory becoming a link, a link becoming a file, a file becoming a submodule's
 /// link, and a submodule's link becoming a directory. Expect: `KindChanged` naming each path; the green unchanged.

@@ -84,6 +84,19 @@ const KIND_CHAR_DEVICE: u8 = 3;
 /// Format: the kind byte of a submodule's link (A-637).
 const KIND_GITLINK: u8 = 4;
 
+impl SpecialKind {
+  /// Whether `self` and `other` are one type of node, so that a change from one to the other is the node's change
+  /// rather than a type change: a submodule's link to any commit is a submodule's link, since its commit is what it
+  /// holds, as a symbolic link's target is (A-637); every other kind is its whole value, a device's number included, so
+  /// a renumbered device is another node (A-294).
+  pub fn same_type(self, other: SpecialKind) -> bool {
+    match (self, other) {
+      (SpecialKind::Gitlink { .. }, SpecialKind::Gitlink { .. }) => true,
+      _ => self == other,
+    }
+  }
+}
+
 impl SpecialNode {
   /// The length of [`SpecialNode::encode`]'s bytes: [`DEVICE_ENCODED_BYTES`] for a device node, [`ENCODED_BYTES`]
   /// for a FIFO or socket name.

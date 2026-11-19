@@ -3017,7 +3017,9 @@ impl Green {
   }
 
   /// An IPC creation compares the complete captured metadata, without ever comparing stream
-  /// bytes. A different kind is a type conflict; a differing concurrent creation conflicts.
+  /// bytes. A different kind is a type conflict; a differing concurrent creation conflicts. A submodule's link moved to
+  /// another commit is the same kind with another commit ([`SpecialKind::same_type`](crate::special::SpecialKind::same_type), A-637): accepted, or a
+  /// `CreateCreate` conflict when another work moved it since the base.
   fn merge_special(
     &self,
     path: &str,
@@ -3032,7 +3034,7 @@ impl Green {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if let Some(current) = self.specials.get(path) {
-      if current.kind != node.kind {
+      if !current.kind.same_type(node.kind) {
         return Err(Green::window(path, MergeConflictClass::TypeChanged));
       }
       if current == &node {
