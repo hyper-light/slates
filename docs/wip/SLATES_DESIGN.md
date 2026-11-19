@@ -12945,6 +12945,27 @@ path the server sends (absent entries, log's access levels, `get-file`, `get-dir
 (write on the path and its parent; recursive write to delete or replace a directory; recursive read of a copy source).
 A principal with read on the whole repository and no rule beneath meets one comparison and no per-path check.
 
+> **Status (2026-11-19, A-606).** Built: authorization (`slates-svn`'s `authz`, piece 10). The rules file, and a
+> separate groups file, are read as `svn_config__parse_stream` reads them and their sections, groups, aliases and
+> entries taken as `authz_parse.c` takes them; groups are resolved without being expanded. Each principal's rules in a
+> repository are compiled into Subversion's tree of path segments and walked with its precedence: the deepest matching
+> level, then the rule defined last; a later `**` eclipsing the rules beneath it; 1.14.1's choice between a global and
+> a repository rule for one path. Answers are read, write or none at a path, beneath it (`svn_authz_recursive`) and
+> anywhere (`svn_authz__get_global_rights`). A principal whose rules all give one access is answered by one
+> comparison, counted. Every refusal is typed, with its line and its Subversion error. Held to Subversion's own authz
+> tests (`authz-test.c` with `authz.rules` and `authz.groups`, and the authz tests of `repos-test.c`), APR's
+> `apr_fnmatch` table, the documentation's files, and a naive oracle over generated rule sets. Where 1.14.x's code
+> departs from its own documentation, the documentation is followed and each case is a named test:
+> - the root has no segments (`lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there);
+> - a recursive question at the root weighs every rule (Subversion weighs only those an empty segment matches, so it
+>   grants recursive read at a root above a denied `/secret`);
+> - a suffix pattern leaves the segment as it was for the other rules of its level (`lookup` reverses it in place);
+> - `[//x]` is refused (Subversion takes it for the root).
+>
+> Owed: the server's questions (piece 7: every path sent, every path a commit changes); the file read from the
+> repository (`authz-db` as a `^/` URL) and compiled per file identity; `svnserve`'s `force-username-case`; and
+> `mod_authz_svn`'s questions with HTTP (piece 13).
+
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
 the large-file class by content-defined chunking, so a copy or a branch of a large file costs a reference. Locks and
@@ -13066,7 +13087,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
    checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
-8. Locks. 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+8. Locks. 9. Mergeinfo queries. 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks
+and `svnlook`. 12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 

@@ -854,3 +854,132 @@ proptest! {
     agrees(&model)?;
   }
 }
+
+/// A hand-built rule set that uses every construct: a groups file, nested groups, an alias as a member and as an
+/// entry, inverted entries, every piece kind, a global and a repository rule for the root, a later `**` over an
+/// earlier rule, an entry for an empty group, and every style at once.
+fn rich_model() -> Model {
+  let entry = |inverted: bool, who: Who, access: Access| Entry {
+    inverted,
+    who,
+    access,
+  };
+  let section =
+    |repository: &'static str, glob: bool, pieces: Vec<Piece>, entries: Vec<Entry>| Section {
+      repository,
+      glob,
+      pieces,
+      entries,
+    };
+  Model {
+    aliases: vec![1, 2],
+    groups: vec![
+      vec![Member::User(0), Member::Alias(0)],
+      vec![Member::Group(0), Member::User(3)],
+      Vec::new(),
+    ],
+    sections: vec![
+      section(
+        "",
+        false,
+        vec![],
+        vec![entry(false, Who::Everyone, Access::Read)],
+      ),
+      section(
+        "R1",
+        false,
+        vec![],
+        vec![entry(false, Who::Group(1), Access::Write)],
+      ),
+      section(
+        "",
+        false,
+        vec![Piece::Name("a"), Piece::Name("b")],
+        vec![entry(false, Who::User(1), Access::Write)],
+      ),
+      section(
+        "",
+        true,
+        vec![Piece::Name("a"), Piece::Many],
+        vec![
+          entry(true, Who::Group(0), Access::None),
+          entry(false, Who::Alias(1), Access::Write),
+        ],
+      ),
+      section(
+        "R2",
+        true,
+        vec![Piece::Prefix, Piece::Suffix],
+        vec![
+          entry(true, Who::User(2), Access::Read),
+          entry(false, Who::Authenticated, Access::None),
+        ],
+      ),
+      section(
+        "",
+        true,
+        vec![Piece::One, Piece::Pattern("*a*")],
+        vec![
+          entry(false, Who::Anonymous, Access::Write),
+          entry(false, Who::Group(2), Access::Write),
+        ],
+      ),
+    ],
+    groups_file: true,
+    style: Style {
+      separator: " : ",
+      crlf: true,
+      byte_order_mark: true,
+      continuation: true,
+      comments: true,
+    },
+  }
+}
+
+/// The oracle's comparison is not vacuous: over the rich set, the module agrees with it, its answers take every
+/// access, a recursive answer falls below a path's own, and some principal's rules are walked rather than uniform.
+#[test]
+fn the_oracle_compares_varied_answers_over_a_rich_rule_set() {
+  let model = rich_model();
+  agrees(&model).expect("the module agrees with the oracle");
+  let mut seen = [false; 3];
+  let mut beneath_lower = false;
+  for repository in REPOSITORIES {
+    for user in [
+      None,
+      Some("u0"),
+      Some("u1"),
+      Some("u2"),
+      Some("u3"),
+      Some("u4"),
+    ] {
+      let kept = model.kept(repository, user);
+      for path in paths() {
+        let access = oracle_access(&kept, &path);
+        seen[access as usize] = true;
+        beneath_lower |= oracle_beneath(&kept, &path) < access;
+      }
+    }
+  }
+  assert_eq!(seen, [true; 3], "every access answered");
+  assert!(beneath_lower, "a recursive answer below a path's own");
+  let (rules, groups) = model.render();
+  let authz = Authz::parse(
+    rules.as_bytes(),
+    groups.as_deref().map(str::as_bytes),
+    Bounds::of(rules.as_bytes(), groups.as_deref().map(str::as_bytes)),
+  )
+  .expect("parses");
+  let walked = REPOSITORIES.iter().any(|repository| {
+    [None, Some("u0"), Some("u2")].iter().any(|user| {
+      authz
+        .rules(
+          repository.as_bytes(),
+          Principal::named(user.map(str::as_bytes)),
+        )
+        .uniform()
+        .is_none()
+    })
+  });
+  assert!(walked, "some principal's rules are walked");
+}

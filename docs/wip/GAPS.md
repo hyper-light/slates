@@ -130,7 +130,18 @@
 > history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem
 > applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
 > Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
-> shared piece 3), and a large revision applied in slices (with the server).
+> shared piece 3), and a large revision applied in slices (with the server). A-606 (2026-11-19, g229, UI goal 92):
+> authorization, built (`slates-svn`'s `authz`): the rules and groups files read as Subversion reads them, every
+> refusal typed with its line; each principal's rules compiled per repository and walked with Subversion's precedence
+> (deepest level, then last rule; a later `**` eclipsing; issue 4762's global-or-repository choice); answers at a path,
+> beneath it and anywhere. Held to Subversion's own authz tests, APR's `apr_fnmatch` table, the documentation's files
+> and a naive oracle (`cargo test -p slates-svn --lib authz` on the Mac Studio, see A-606). Four places where 1.14.x's
+> code departs from its own documentation follow the documentation, each a named test (the root as one empty segment;
+> a recursive question at the root that skips literal rules and so grants recursive read above a denied subtree; a
+> suffix match reversing the segment for its level's other rules; `[//x]` taken for the root). Owed from it: the
+> server's questions (piece 7), the file read from the repository and kept per file identity, `force-username-case`,
+> `mod_authz_svn`'s questions (piece 13); main's: clippy and `xtask` over the module, and the four departures
+> confirmed against stock Subversion (run request).
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
@@ -145,7 +156,7 @@
 > Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
 > `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
 > commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
-> mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
+> mergeinfo; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
 

@@ -1272,6 +1272,15 @@ fn names_are_bytes_case_and_spaces_included() {
   );
 }
 
+/// A bracket expression cannot be written in a section header: the header ends at its first `]`
+/// (`parse_section_name`), so `[:glob:/[ab]]` is the glob section `/[ab`, a literal, and the `]` after it is ignored.
+#[test]
+fn a_section_header_ends_at_its_first_closing_bracket() {
+  let authz = parse("[:glob:/[ab]]\n* = r\n");
+  assert_eq!(authz_access(&authz, b"", None, "/[ab"), Access::Read);
+  assert_eq!(authz_access(&authz, b"", None, "/a"), Access::None);
+}
+
 /// A carriage return that opens a line or follows `[` is dropped, as `parser_getc` drops it.
 #[test]
 fn carriage_returns_at_a_lines_start_and_after_the_bracket_are_dropped() {
