@@ -34741,5 +34741,7 @@ steps `return_dead_recovery` and `purge_write_log`, each timed by a clock it is 
 - **Test.** `a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock` (`daemon`'s unit tests: real
   give-back steps on a shard whose recovery memory is all dead, timed by a controlled CPU clock: a quantum, half a
   quantum, then a coarse clock's none, none and a quantum). Expect the slices a page, two pages, two, two, then the
-  three steps' six. The recovery test's give-back case is filed for main.
+  three steps' six. Green on the Mac Studio (kiln r154, debug, 0.76 s: 16 KiB pages, a 3,889 ns quantum); red with the
+  steps timed by the wall clock again, which learned 21,239 bytes and then 82,598 from the steps' real wall time where
+  the CPU said 16,384, 32,768 and 98,304. The recovery test's give-back case is filed for main.
 
