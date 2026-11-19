@@ -19,10 +19,22 @@
 //!
 //! Bounds: repositories by the partition's volume capacity, with a typed `Capacity` refusal at it; branches by the
 //! greens, since each binds a distinct green of the partition and the greens are bounded by that same capacity.
+//!
+//! **Lineages (A-575).** A repository's greens share the nodes of their maps in one lineage on its partition
+//! (`slates_merge::engine::Lineage`), and each green's membership is a record here: the lineage's first green its root,
+//! every other made at a version of a member before it. A recovery rebuilds a lineage's members in the order they
+//! joined, each the way it joined, so the rules keep that order rebuildable: one root a lineage; a member made from a
+//! member of the same lineage that joined before it; a green that live members were made from cannot be destroyed
+//! while they live ([`Repositories::branched_from`]); and the oldest version a live member was made at is the floor its
+//! source's durable checkpoint may not pass ([`Repositories::branch_floor`]), so that version is still there to branch
+//! from. A membership leaves with its green, and outlives its repository's record, since a destroyed repository leaves
+//! its greens.
 
 use std::collections::BTreeMap;
 
-use crate::catalog::{BranchRecord, RepositoryId, RepositoryRecord, VolumeId};
+use crate::catalog::{
+  BranchRecord, MemberOrigin, MemberRecord, RepositoryId, RepositoryRecord, VolumeId,
+};
 use crate::error::DbError;
 use crate::op::Op;
 
@@ -48,6 +60,10 @@ pub struct Repositories {
   branches: BTreeMap<(RepositoryId, String), VolumeId>,
   /// Derived: each bound green to the name that binds it.
   bound: BTreeMap<VolumeId, (RepositoryId, String)>,
+  /// Every lineage member, by green (A-575).
+  members: BTreeMap<VolumeId, MemberRecord>,
+  /// Each lineage's members in the order they joined, the order a recovery rebuilds them in (A-575).
+  lineages: BTreeMap<RepositoryId, Vec<VolumeId>>,
 }
 
 /// Refuses an empty name or one holding a NUL byte (§4.17.1, A-515).
@@ -128,6 +144,61 @@ impl Repositories {
       .map(|(repository, name)| (*repository, name.as_str()))
   }
 
+  /// `green`'s membership of a lineage, when it is a member (A-575).
+  pub fn member(&self, green: VolumeId) -> Option<&MemberRecord> {
+    self.members.get(&green)
+  }
+
+  /// A lineage's members, in the order they joined: the order a recovery rebuilds them in, each member's source before
+  /// it.
+  pub fn members_of(&self, repository: RepositoryId) -> impl Iterator<Item = &MemberRecord> + '_ {
+    self
+      .lineages
+      .get(&repository)
+      .into_iter()
+      .flatten()
+      .filter_map(|green| self.members.get(green))
+  }
+
+  /// Every lineage that has a member, in id order.
+  pub fn lineages(&self) -> impl Iterator<Item = RepositoryId> + '_ {
+    self.lineages.keys().copied()
+  }
+
+  /// Every membership, lineage by lineage in id order and each lineage's in the order it joined: what a snapshot
+  /// carries.
+  pub fn memberships(&self) -> impl Iterator<Item = MemberRecord> + '_ {
+    self
+      .lineages
+      .keys()
+      .flat_map(|repository| self.members_of(*repository))
+      .cloned()
+  }
+
+  /// The live members made from `green`: while there are any, `green` cannot be destroyed (A-575).
+  pub fn branched_from(&self, green: VolumeId) -> u64 {
+    let made = self.branches_of(green).count();
+    u64::try_from(made).unwrap_or(u64::MAX)
+  }
+
+  /// The oldest version of `green` a live member was made at: the floor `green`'s durable checkpoint may not pass, so
+  /// a recovery can branch it at that version again (A-575). `None` when no live member was made from it.
+  pub fn branch_floor(&self, green: VolumeId) -> Option<u64> {
+    self.branches_of(green).min()
+  }
+
+  /// The versions of `green` its lineage's live members were made at, one a member.
+  fn branches_of(&self, green: VolumeId) -> impl Iterator<Item = u64> + '_ {
+    let repository = self.members.get(&green).map(|member| member.repository);
+    repository
+      .into_iter()
+      .flat_map(move |repository| self.members_of(repository))
+      .filter_map(move |member| match member.origin {
+        MemberOrigin::Branch { from, version } if from == green => Some(version),
+        _ => None,
+      })
+  }
+
   /// The guard for a repository operation (`Partition::check`): refuses what the log must never record. `capacity`
   /// bounds the repositories; `held` says what the partition's catalog holds under a volume id.
   pub fn check(
@@ -151,7 +222,50 @@ impl Repositories {
         .repository(*repository)
         .map(|_| ())
         .ok_or(DbError::NotFound),
+      Op::RepositoryGreenJoined { record } => self.check_joined(record, held),
       _ => Ok(()),
+    }
+  }
+
+  /// A green joins the lineage of a repository that exists, on that repository's partition, once; the lineage's first
+  /// member is its root and every other was made from a member of the same lineage (A-575).
+  fn check_joined(&self, record: &MemberRecord, held: impl Fn(VolumeId) -> Held) -> Result<(), DbError> {
+    let repository = self
+      .repository(record.repository)
+      .ok_or(DbError::NotFound)?;
+    match held(record.green) {
+      Held::Absent => return Err(DbError::NotFound),
+      Held::NotGreen => return Err(DbError::NotGreen),
+      Held::Green => {}
+    }
+    if record.green.partition() != repository.id.partition() {
+      return Err(DbError::NotFound);
+    }
+    if self.members.contains_key(&record.green) {
+      return Err(DbError::AlreadyExists {
+        existing: record.green.bytes,
+      });
+    }
+    match record.origin {
+      // One root a lineage: every other member is made from one of its members, so the lineage is one arena's.
+      MemberOrigin::Root => match self
+        .lineages
+        .get(&record.repository)
+        .and_then(|order| order.first())
+      {
+        Some(root) => Err(DbError::AlreadyExists {
+          existing: root.bytes,
+        }),
+        None => Ok(()),
+      },
+      MemberOrigin::Branch { from, .. } => {
+        let joined = self.members.get(&from).map(|member| member.repository);
+        if joined == Some(record.repository) {
+          Ok(())
+        } else {
+          Err(DbError::NotFound)
+        }
+      }
     }
   }
 
@@ -240,6 +354,10 @@ impl Repositories {
         record.default_branch = branch.clone();
         Ok(())
       }
+      Op::RepositoryGreenJoined { record } => {
+        self.join(record);
+        Ok(())
+      }
       Op::RepositoryDestroyed { repository } => {
         let record = self.records.remove(repository).ok_or(DbError::NotFound)?;
         self.by_name.remove(&record.name);
@@ -270,18 +388,39 @@ impl Repositories {
       .insert(record.green, (record.repository, record.name.clone()));
   }
 
-  /// A destroyed green leaves the namespace that bound it (§4.17.1: deleting a branch's green deletes the branch).
+  /// Adds a member at the end of its lineage's order.
+  fn join(&mut self, record: &MemberRecord) {
+    self
+      .lineages
+      .entry(record.repository)
+      .or_default()
+      .push(record.green);
+    self.members.insert(record.green, record.clone());
+  }
+
+  /// A destroyed green leaves the namespace that bound it (§4.17.1: deleting a branch's green deletes the branch), and
+  /// its lineage (A-575).
   pub fn green_removed(&mut self, green: VolumeId) {
     if let Some(key) = self.bound.remove(&green) {
       self.branches.remove(&key);
     }
+    if let Some(member) = self.members.remove(&green)
+      && let Some(order) = self.lineages.get_mut(&member.repository)
+    {
+      order.retain(|joined| *joined != green);
+      if order.is_empty() {
+        self.lineages.remove(&member.repository);
+      }
+    }
   }
 
   /// The repositories a snapshot carries, rebuilt with their derived indexes. A binding naming no carried repository,
-  /// or a second binding of one green, is a corrupt snapshot, refused rather than half restored.
+  /// a second binding of one green, a member joining twice or before the member it was made from, is a corrupt
+  /// snapshot, refused rather than half restored.
   pub fn restore(
     records: &[RepositoryRecord],
     bindings: &[BranchRecord],
+    members: &[MemberRecord],
   ) -> Result<Repositories, DbError> {
     let mut repositories = Repositories::new();
     for record in records {
@@ -298,6 +437,22 @@ impl Repositories {
         });
       }
       repositories.bind(binding);
+    }
+    for member in members {
+      let source_joined = match member.origin {
+        MemberOrigin::Root => true,
+        MemberOrigin::Branch { from, .. } => repositories
+          .members
+          .get(&from)
+          .is_some_and(|source| source.repository == member.repository),
+      };
+      if repositories.members.contains_key(&member.green) || !source_joined {
+        return Err(DbError::Corrupt {
+          seq: 0,
+          reason: "a snapshot's lineage member joins twice, or before the member it was made from",
+        });
+      }
+      repositories.join(member);
     }
     Ok(repositories)
   }
@@ -416,12 +571,24 @@ mod tests {
     partition.apply(op)
   }
 
-  /// What a partition answers about repositories, compared whole across a snapshot.
-  fn answers(partition: &Partition) -> (Vec<RepositoryRecord>, Vec<BranchRecord>) {
+  /// What a partition answers about repositories and their lineages, compared whole across a snapshot.
+  type Answers = (
+    Vec<RepositoryRecord>,
+    Vec<BranchRecord>,
+    Vec<MemberRecord>,
+    Vec<Option<u64>>,
+  );
+
+  /// What a partition answers about repositories, their lineages and each test green's branch floor.
+  fn answers(partition: &Partition) -> Answers {
     let repositories = partition.repositories();
     (
       repositories.repositories().cloned().collect(),
       repositories.bindings().collect(),
+      repositories.memberships().collect(),
+      (0..GREENS)
+        .map(|green| repositories.branch_floor(volume_id(HOME, green)))
+        .collect(),
     )
   }
 
@@ -587,15 +754,119 @@ mod tests {
     );
   }
 
-  /// One step of a generated history over a repository namespace.
+  /// A green joining `repo`'s lineage as its root, or made from `from` at `version`.
+  fn joined(repo: RepositoryId, green: VolumeId, origin: MemberOrigin) -> Op {
+    Op::RepositoryGreenJoined {
+      record: MemberRecord {
+        repository: repo,
+        green,
+        origin,
+      },
+    }
+  }
+
+  /// A-575 (§4.17.1 item 4). Do: make greens on the repository's partition, a plain volume and a foreign green; join a
+  /// root, branch two members from it and one from a branch, and try each wrong join; destroy greens in either order;
+  /// rebuild from a snapshot, and from one listing a member before the member it was made from. Expect: a second root
+  /// and a member joining twice are `AlreadyExists`; a branch of a non-member or another lineage's member, an unknown
+  /// repository and the foreign green `NotFound`; the plain volume `NotGreen`; a green members were made from refuses
+  /// its destroy `BranchedFrom` until they go, and its branch floor is the oldest version they were made at; the
+  /// snapshot rebuilds the members in the order they joined; the disordered snapshot is refused `Corrupt`.
+  #[test]
+  fn a_lineage_takes_one_root_and_branches_of_its_own_members() {
+    let mut partition = Partition::new(caps(), 0);
+    let [root, first, second, deep] = [1, 2, 3, 4].map(|serial| volume_id(HOME, serial));
+    let plain = volume_id(HOME, 5);
+    let foreign = volume_id(ELSEWHERE, 6);
+    for (id, green) in [(root, true), (first, true), (second, true), (deep, true), (plain, false), (foreign, true)] {
+      run(&mut partition, &Op::VolumeCreated { record: volume(id, green) }).unwrap();
+    }
+    let record = repository(9, "linux");
+    let repo = record.id;
+    run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
+    let branch = |from: VolumeId, version: u64| MemberOrigin::Branch { from, version };
+    run(&mut partition, &joined(repo, root, MemberOrigin::Root)).unwrap();
+    run(&mut partition, &joined(repo, first, branch(root, 7))).unwrap();
+    run(&mut partition, &joined(repo, second, branch(root, 3))).unwrap();
+    run(&mut partition, &joined(repo, deep, branch(first, 1))).unwrap();
+    let refused = |partition: &mut Partition, op: &Op| run(partition, op).unwrap_err();
+    assert!(matches!(refused(&mut partition, &joined(repo, plain, MemberOrigin::Root)), DbError::NotGreen));
+    assert!(matches!(refused(&mut partition, &joined(repo, root, branch(first, 0))), DbError::AlreadyExists { .. }));
+    assert!(matches!(refused(&mut partition, &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)), DbError::NotFound));
+    assert!(matches!(refused(&mut partition, &joined(repo, foreign, MemberOrigin::Root)), DbError::NotFound));
+    let other = repository(10, "other");
+    let other_repo = other.id;
+    run(&mut partition, &Op::RepositoryCreated { record: other }).unwrap();
+    let spare = volume_id(HOME, 7);
+    run(&mut partition, &Op::VolumeCreated { record: volume(spare, true) }).unwrap();
+    assert!(matches!(refused(&mut partition, &joined(other_repo, spare, branch(root, 0))), DbError::NotFound));
+    run(&mut partition, &joined(other_repo, spare, MemberOrigin::Root)).unwrap();
+    let late = volume_id(HOME, 11);
+    run(&mut partition, &Op::VolumeCreated { record: volume(late, true) }).unwrap();
+    assert!(matches!(refused(&mut partition, &joined(other_repo, late, MemberOrigin::Root)), DbError::AlreadyExists { .. }));
+    assert_eq!(partition.repositories().branch_floor(root), Some(3));
+    assert_eq!(partition.repositories().branch_floor(first), Some(1));
+    assert_eq!(partition.repositories().branch_floor(second), None);
+    let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    assert_eq!(answers(&rebuilt), answers(&partition));
+    let order: Vec<VolumeId> = partition.repositories().members_of(repo).map(|member| member.green).collect();
+    assert_eq!(order, vec![root, first, second, deep]);
+    assert_eq!(refused(&mut partition, &Op::VolumeDestroyed { id: root }), DbError::BranchedFrom { members: 2 });
+    assert_eq!(refused(&mut partition, &Op::VolumeDestroyed { id: first }), DbError::BranchedFrom { members: 1 });
+    run(&mut partition, &Op::VolumeDestroyed { id: deep }).unwrap();
+    run(&mut partition, &Op::VolumeDestroyed { id: first }).unwrap();
+    assert_eq!(partition.repositories().branch_floor(root), Some(3));
+    run(&mut partition, &Op::VolumeDestroyed { id: second }).unwrap();
+    assert_eq!(partition.repositories().branch_floor(root), None);
+    run(&mut partition, &Op::VolumeDestroyed { id: root }).unwrap();
+    assert_eq!(partition.repositories().members_of(repo).count(), 0);
+    let mut disordered = partition.to_snapshot(0);
+    disordered.repository_members = vec![
+      MemberRecord { repository: repo, green: first, origin: branch(root, 1) },
+      MemberRecord { repository: repo, green: root, origin: MemberOrigin::Root },
+    ];
+    assert!(matches!(
+      Partition::from_snapshot(&disordered, caps(), 0),
+      Err(DbError::Corrupt { .. })
+    ));
+  }
+
+  /// One step of a generated history over a repository namespace and its lineage.
   #[derive(Clone, Debug)]
   enum Step {
-    Create { serial: u8, name: u8 },
-    Bind { serial: u8, name: u8, green: u8 },
-    Retire { serial: u8, name: u8 },
-    Default { serial: u8, name: Option<u8> },
-    Destroy { serial: u8 },
-    DestroyGreen { green: u8 },
+    Create {
+      serial: u8,
+      name: u8,
+    },
+    Bind {
+      serial: u8,
+      name: u8,
+      green: u8,
+    },
+    Retire {
+      serial: u8,
+      name: u8,
+    },
+    Default {
+      serial: u8,
+      name: Option<u8>,
+    },
+    Destroy {
+      serial: u8,
+    },
+    DestroyGreen {
+      green: u8,
+    },
+    JoinRoot {
+      serial: u8,
+      green: u8,
+    },
+    JoinBranch {
+      serial: u8,
+      green: u8,
+      from: u8,
+      version: u8,
+    },
   }
 
   /// Shape: few repositories, names and greens, so histories collide on each rule often.
@@ -618,6 +889,15 @@ mod tests {
         .prop_map(|(serial, name)| Step::Default { serial, name }),
       (0..SERIALS).prop_map(|serial| Step::Destroy { serial }),
       (0..GREENS).prop_map(|green| Step::DestroyGreen { green }),
+      (0..SERIALS, 0..GREENS).prop_map(|(serial, green)| Step::JoinRoot { serial, green }),
+      (0..SERIALS, 0..GREENS, 0..GREENS, any::<u8>()).prop_map(|(serial, green, from, version)| {
+        Step::JoinBranch {
+          serial,
+          green,
+          from,
+          version,
+        }
+      }),
     ]
   }
 
@@ -630,6 +910,9 @@ mod tests {
     names: BTreeMap<(u8, String), u8>,
     /// The greens alive.
     greens: BTreeSet<u8>,
+    /// Each lineage's members in the order they joined, by repository serial: each green serial with the member it was
+    /// made from and the version, `None` for the root (A-575).
+    lineages: BTreeMap<u8, Vec<(u8, Option<(u8, u8)>)>>,
   }
 
   /// What the model answers: the refusal's kind, so the comparison is of rules, not of the existing ids named.
@@ -638,6 +921,7 @@ mod tests {
     Ok,
     NotFound,
     AlreadyExists,
+    BranchedFrom,
   }
 
   fn answer_of(result: &Result<(), DbError>) -> Answer {
@@ -645,6 +929,7 @@ mod tests {
       Ok(()) => Answer::Ok,
       Err(DbError::NotFound) => Answer::NotFound,
       Err(DbError::AlreadyExists { .. }) => Answer::AlreadyExists,
+      Err(DbError::BranchedFrom { .. }) => Answer::BranchedFrom,
       Err(other) => panic!("a refusal the model has no rule for: {other:?}"),
     }
   }
@@ -703,14 +988,59 @@ mod tests {
           self.names.retain(|(owner, _), _| *owner != serial);
           Answer::Ok
         }
-        Step::DestroyGreen { green } => {
-          if !self.greens.remove(&green) {
-            return Answer::NotFound;
-          }
-          self.names.retain(|_, bound| *bound != green);
-          Answer::Ok
-        }
+        Step::DestroyGreen { green } => self.destroy_green(green),
+        Step::JoinRoot { serial, green } => self.join(serial, green, None),
+        Step::JoinBranch {
+          serial,
+          green,
+          from,
+          version,
+        } => self.join(serial, green, Some((from, version))),
       }
+    }
+
+    /// A green's destroy: refused while a live member was made from it; its name and its membership leave with it.
+    fn destroy_green(&mut self, green: u8) -> Answer {
+      if !self.greens.contains(&green) {
+        return Answer::NotFound;
+      }
+      let made_from = self
+        .lineages
+        .values()
+        .flatten()
+        .any(|(_, origin)| origin.is_some_and(|(from, _)| from == green));
+      if made_from {
+        return Answer::BranchedFrom;
+      }
+      self.greens.remove(&green);
+      self.names.retain(|_, bound| *bound != green);
+      for members in self.lineages.values_mut() {
+        members.retain(|(member, _)| *member != green);
+      }
+      self.lineages.retain(|_, members| !members.is_empty());
+      Answer::Ok
+    }
+
+    /// A green joining a repository's lineage, the rules in the guard's order (A-575).
+    fn join(&mut self, serial: u8, green: u8, origin: Option<(u8, u8)>) -> Answer {
+      if !self.repositories.contains_key(&serial) || !self.greens.contains(&green) {
+        return Answer::NotFound;
+      }
+      if self.lineages.values().flatten().any(|(member, _)| *member == green) {
+        return Answer::AlreadyExists;
+      }
+      let members = self.lineages.get(&serial);
+      match origin {
+        None if members.is_some_and(|members| !members.is_empty()) => return Answer::AlreadyExists,
+        Some((from, _))
+          if !members.is_some_and(|members| members.iter().any(|(member, _)| *member == from)) =>
+        {
+          return Answer::NotFound;
+        }
+        _ => {}
+      }
+      self.lineages.entry(serial).or_default().push((green, origin));
+      Answer::Ok
     }
   }
 
@@ -745,11 +1075,33 @@ mod tests {
       Step::DestroyGreen { green } => Op::VolumeDestroyed {
         id: volume_id(HOME, green),
       },
+      Step::JoinRoot { serial, green } => Op::RepositoryGreenJoined {
+        record: MemberRecord {
+          repository: repository_id(HOME, serial),
+          green: volume_id(HOME, green),
+          origin: MemberOrigin::Root,
+        },
+      },
+      Step::JoinBranch {
+        serial,
+        green,
+        from,
+        version,
+      } => Op::RepositoryGreenJoined {
+        record: MemberRecord {
+          repository: repository_id(HOME, serial),
+          green: volume_id(HOME, green),
+          origin: MemberOrigin::Branch {
+            from: volume_id(HOME, from),
+            version: u64::from(version),
+          },
+        },
+      },
     }
   }
 
   /// The model's state in the partition's terms, to compare whole.
-  fn expected(model: &Model) -> (Vec<RepositoryRecord>, Vec<BranchRecord>) {
+  fn expected(model: &Model) -> Answers {
     let records = model
       .repositories
       .iter()
@@ -768,16 +1120,48 @@ mod tests {
         green: volume_id(HOME, *green),
       })
       .collect();
-    (records, bindings)
+    let members = model
+      .lineages
+      .iter()
+      .flat_map(|(serial, members)| {
+        members.iter().map(|(green, origin)| MemberRecord {
+          repository: repository_id(HOME, *serial),
+          green: volume_id(HOME, *green),
+          origin: match origin {
+            None => MemberOrigin::Root,
+            Some((from, version)) => MemberOrigin::Branch {
+              from: volume_id(HOME, *from),
+              version: u64::from(*version),
+            },
+          },
+        })
+      })
+      .collect();
+    let floors = (0..GREENS)
+      .map(|green| {
+        model
+          .lineages
+          .values()
+          .flatten()
+          .filter_map(|(_, origin)| match origin {
+            Some((from, version)) if *from == green => Some(u64::from(*version)),
+            _ => None,
+          })
+          .min()
+      })
+      .collect();
+    (records, bindings, members, floors)
   }
 
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(400), ..ProptestConfig::default() }))]
 
-    /// A-515 (§4.17.1). Do: run a generated history of repository creates, binds, retires, default changes, repository
-    /// destroys and green destroys on a partition holding a few greens. Expect: after every step the partition's
-    /// answer (accepted, or which refusal) and its whole state equal the design's rules kept over plain maps, and a
-    /// partition rebuilt from its snapshot answers the same.
+    /// A-515, A-575 (§4.17.1). Do: run a generated history of repository creates, binds, retires, default changes,
+    /// repository destroys, green destroys, and greens joining lineages as roots or as branches of members at a
+    /// version, on a partition holding a few greens. Expect: after every step the partition's answer (accepted, or
+    /// which refusal) and its whole state (records, names, every lineage's members in the order they joined, each
+    /// green's branch floor) equal the design's rules kept over plain maps, and a partition rebuilt from its snapshot
+    /// answers the same.
     #[test]
     fn the_namespace_equals_the_rules_over_every_history(
       steps in proptest::collection::vec(step(), 0..120),

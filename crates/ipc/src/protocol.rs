@@ -1144,6 +1144,75 @@ pub enum RequestBody {
     /// Whether unlocked memory refuses, as a create's.
     require_locked: bool,
   },
+  /// Create repository `name` (§4.17.1 "The repository and its greens"; A-575) on the partition its name hashes to: its
+  /// record and its lineage's root green, bound to `default_branch`. The root is `green`, an unbound green of that
+  /// partition that joins as it stands, or a new empty green. Answered `GreenCreated` with the root. Appended.
+  CreateRepository {
+    /// The repository's name, unique everywhere.
+    name: String,
+    /// The tool it serves.
+    tool: VcsTool,
+    /// How it names its objects.
+    format: ObjectFormat,
+    /// The branch its root is bound to, and the one a client gets when it names none.
+    default_branch: String,
+    /// The green that becomes its root, when not a new empty one.
+    green: Option<VolumeId>,
+  },
+  /// Make branch `name` of repository `repository` at `version` of branch `from` (its head when `None`), sharing every
+  /// node of `from`'s state, so what it costs is what changed after `version` (§4.17.1 item 4, A-575). Answered
+  /// `GreenCreated` with the new green. Appended.
+  CreateBranch {
+    /// The repository.
+    repository: String,
+    /// The new branch's name.
+    name: String,
+    /// The branch it is made from.
+    from: String,
+    /// The version of `from` it is made at; its head when `None`.
+    version: Option<u64>,
+  },
+  /// Bind branch `name` of repository `repository` to `green`, a member of the repository's lineage no name binds:
+  /// what restores a retired branch (§4.17.1 item 5; A-575). Answered `Acknowledged`. Appended.
+  BindBranch {
+    /// The repository.
+    repository: String,
+    /// The branch's name.
+    name: String,
+    /// The green.
+    green: VolumeId,
+  },
+  /// Retire branch `name` of repository `repository`: the name leaves the namespace and its green stays a member of
+  /// the lineage, so binding the name to it again restores the branch (§4.17.1 item 5; A-575). Answered
+  /// `Acknowledged`. Appended.
+  RetireBranch {
+    /// The repository.
+    repository: String,
+    /// The branch's name.
+    name: String,
+  },
+}
+
+/// The tool a repository serves (§4.17; A-575), as `CreateRepository` names it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VcsTool {
+  /// git.
+  Git,
+  /// Mercurial.
+  Mercurial,
+  /// Subversion.
+  Subversion,
+}
+
+/// How a repository names its objects (§4.17.1 item 1; A-575), as `CreateRepository` names it: fixed at creation.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectFormat {
+  /// SHA-1 names: git's default and Mercurial's node ids.
+  Sha1,
+  /// SHA-256 names: git's `object-format=sha256`.
+  Sha256,
+  /// Revision numbers: Subversion's.
+  Revisions,
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1919,6 +1988,11 @@ impl RequestBody {
       | RequestBody::CaptureBase { volume }
       | RequestBody::ArchiveExport { volume, .. } => Some(*volume),
       RequestBody::ArchiveImport { archive, .. } => Some(*archive),
+      // A repository's verbs are served on the partition its name hashes to, as a create by name is (A-575).
+      RequestBody::CreateRepository { .. }
+      | RequestBody::CreateBranch { .. }
+      | RequestBody::BindBranch { .. }
+      | RequestBody::RetireBranch { .. } => None,
     }
   }
 
@@ -1929,6 +2003,8 @@ impl RequestBody {
       self,
       RequestBody::Create { .. }
         | RequestBody::CreateGreen { .. }
+        | RequestBody::CreateRepository { .. }
+        | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }

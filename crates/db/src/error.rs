@@ -99,6 +99,12 @@ pub enum DbError {
   NotGreen,
   /// A repository's or a branch's name is empty or holds a NUL byte (§4.17.1, A-515).
   InvalidName,
+  /// A green that live members of its lineage were made from cannot be destroyed while they live: each would lose the
+  /// version it was made at, which its rebuild branches from again (§4.17.1 item 4, A-575). Never entered in the log.
+  BranchedFrom {
+    /// The live members made from it.
+    members: u64,
+  },
 }
 
 impl fmt::Display for DbError {
@@ -143,6 +149,10 @@ impl fmt::Display for DbError {
       Self::Memory(e) => write!(f, "memory: {e}"),
       Self::NotGreen => f.write_str("not a green volume"),
       Self::InvalidName => f.write_str("an empty name, or one holding a NUL byte"),
+      Self::BranchedFrom { members } => write!(
+        f,
+        "{members} live members of its lineage were made from this green"
+      ),
     }
   }
 }

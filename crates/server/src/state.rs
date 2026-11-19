@@ -14,7 +14,6 @@ use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::Slab;
 use slates_mem::SparseObject;
-use slates_merge::engine::Green;
 use slates_merge::increment::VolumeOp;
 use slates_vfs::volume::{Store, Volume};
 
@@ -754,8 +753,9 @@ pub struct ShardState {
   /// bounded by the clients' credit, refused typed beyond it.
   pub pending_forwards: std::collections::VecDeque<PendingForward>,
   /// Green volumes' merge engines (§4.16): the in-memory chain and per-path state a green owns,
-  /// keyed by its id. A green is not a store-backed VFS tree; its merged content lives here.
-  pub greens: BTreeMap<VolumeId, Green>,
+  /// keyed by its id. A green is not a store-backed VFS tree; its merged content lives here. A repository's greens are
+  /// members of its lineage, sharing the nodes of their maps (A-575, `crate::greens`).
+  pub greens: crate::greens::Greens,
   /// Greens whose recovered history did not reproduce what was acknowledged (AUD-29-18), each with why:
   /// no engine is installed and every verb naming one is refused typed, while its durable origin and chain
   /// stay untouched as the evidence a reviewed recovery works from. Bounded by the partition's greens.

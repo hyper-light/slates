@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use super::super::{Green, Increment, Outcome};
-use super::{Lineage, LineageGreen, LineageRefused};
+use super::{Lent, Lineage, LineageGreen, LineageRefused};
 use crate::checkpoint::Checkpoint;
 use crate::increment::Base;
 use crate::ops_doc::{Op, OpKind, OpsDoc};
@@ -41,6 +41,13 @@ fn copy_at(green: &Green, version: u64) -> Origin {
     specials: base.specials,
     xattrs: base.xattrs,
   }
+}
+
+/// Retires `handle` and gives every hold back, a node a step, as a shard's slices do.
+fn retire_whole(lineage: &mut Lineage, handle: LineageGreen) {
+  let mut release = lineage.retire(handle).unwrap();
+  while lineage.release_step(&mut release).unwrap() {}
+  assert!(release.is_done());
 }
 
 /// The oldest version `green` reconstructs.
@@ -585,7 +592,7 @@ proptest! {
           }
           let count = greens.len();
           let twin = greens.remove(green % count);
-          lineage.retire(twin.handle).unwrap();
+          retire_whole(&mut lineage, twin.handle);
           prop_assert_eq!(lineage.with(twin.handle, |_| ()), Err(LineageRefused::Stale));
         }
       }
@@ -602,7 +609,7 @@ proptest! {
       prop_assert_eq!(lineage.missing(), 0);
     }
     for twin in greens {
-      lineage.retire(twin.handle).unwrap();
+      retire_whole(&mut lineage, twin.handle);
     }
     prop_assert_eq!(lineage.live_nodes(), 0, "a lineage with every green retired holds nodes");
     prop_assert_eq!(lineage.arenas.blocks.live(), 0, "a lineage with every green retired holds blocks");
@@ -831,9 +838,12 @@ fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_it
   assert_eq!(lineage.reverted(), 0);
   let branch = lineage.branch(root, 2).unwrap();
   assert_eq!(lineage.reverted(), 1, "the file changed at version 3");
-  lineage.retire(branch).unwrap();
+  retire_whole(&mut lineage, branch);
   assert_eq!(lineage.branch(branch, 0), Err(LineageRefused::Stale));
-  assert_eq!(lineage.retire(branch), Err(LineageRefused::Stale));
+  assert!(matches!(
+    lineage.retire(branch),
+    Err(LineageRefused::Stale)
+  ));
   let again = lineage.branch(root, 3).unwrap();
   assert_ne!(again, branch, "a reused seat is a new handle");
   assert_eq!(lineage.with(branch, |_| ()), Err(LineageRefused::Stale));
@@ -960,4 +970,182 @@ fn a_branch_sets_back_every_dimension() {
       "the branch at {version}"
     );
   }
+}
+
+/// The increment `n` overwriting the first byte of `path` with `X`, at `green`'s head.
+fn first_byte(green: &Green, path: &str, n: u32) -> Increment {
+  let mut work = Work::default();
+  let src = work.stash(b"X");
+  work.op(OpKind::Overwrite, path, 0, 1, src);
+  let mut id = [0u8; 32];
+  id[..4].copy_from_slice(&n.to_le_bytes());
+  Increment {
+    id,
+    base: green.head(),
+    doc: work.doc,
+    post_state: work.post,
+    evidence: Vec::new(),
+  }
+}
+
+/// A-575. Do: take a lineage's root engine out, then lend, branch, retire and put back the other member, and put the
+/// root back; then retire the other and take the root out again before its release runs. Expect: the engine taken out
+/// reads its files; while it is out every other lend, branch, retire and release step is refused `Busy` (the arenas
+/// are in its engine) and a put-back naming another member is refused `Stale`; once it is back each runs, and the root
+/// reads the same after the other's release.
+#[test]
+fn a_member_taken_out_holds_the_arenas_and_every_other_lend_waits_for_it() {
+  let mut origin = Origin::default();
+  origin.files.push(("a".to_owned(), b"0123".to_vec()));
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  let other = lineage.branch(root, 0).unwrap();
+  let out = lineage.take(root).unwrap();
+  assert_eq!(out.content("a"), Some(b"0123".as_slice()));
+  assert_eq!(
+    lineage.with(other, |green| green.head()),
+    Err(LineageRefused::Busy)
+  );
+  assert!(matches!(
+    Lent::new(&mut lineage, other),
+    Err(LineageRefused::Busy)
+  ));
+  assert_eq!(lineage.branch(other, 0), Err(LineageRefused::Busy));
+  assert!(matches!(lineage.retire(other), Err(LineageRefused::Busy)));
+  assert_eq!(
+    lineage.put_back(other, Green::new()),
+    Err(LineageRefused::Stale)
+  );
+  lineage.put_back(root, out).unwrap();
+  let read = |lineage: &mut Lineage, member: LineageGreen| {
+    lineage
+      .with(member, |green| green.content("a").map(<[u8]>::to_vec))
+      .unwrap()
+  };
+  assert_eq!(read(&mut lineage, other), Some(b"0123".to_vec()));
+  let mut release = lineage.retire(other).unwrap();
+  let out = lineage.take(root).unwrap();
+  assert_eq!(
+    lineage.release_step(&mut release),
+    Err(LineageRefused::Busy)
+  );
+  lineage.put_back(root, out).unwrap();
+  while lineage.release_step(&mut release).unwrap() {}
+  assert_eq!(read(&mut lineage, root), Some(b"0123".to_vec()));
+  assert_eq!(lineage.len(), 1);
+}
+
+/// A-575 (§4.16, a retire sliced under the shard's budget). Do: branch a green of a thousand files at its head, change
+/// a hundred of them in the branch, then retire the branch and give its holds back a step at a time. Expect: no step
+/// frees more than one node; once the steps end the lineage holds exactly the nodes the root held alone before the
+/// branch; and the root reads every file as it did.
+#[test]
+fn a_retired_branch_gives_back_a_node_a_step_and_frees_only_what_it_alone_held() {
+  let mut origin = Origin::default();
+  for n in 0..1_000u32 {
+    origin.files.push((
+      format!("dir{}/file{n}", n % 10),
+      format!("bytes of {n}").into_bytes(),
+    ));
+  }
+  let mut alone = Green::with_origin(origin.clone());
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  let held_alone = lineage.live_nodes();
+  let branch = lineage.branch(root, 0).unwrap();
+  for n in (0..1_000u32).step_by(10) {
+    let path = format!("dir{}/file{n}", n % 10);
+    let inc = lineage
+      .with(branch, |green| first_byte(green, &path, n))
+      .unwrap();
+    assert!(matches!(
+      lineage.with(branch, |green| green.submit(&inc)).unwrap(),
+      Outcome::Accepted { .. }
+    ));
+  }
+  assert!(
+    lineage.live_nodes() > held_alone,
+    "the branch's writes copied no node"
+  );
+  let mut release = lineage.retire(branch).unwrap();
+  let mut steps = 0u64;
+  loop {
+    let before = lineage.live_nodes();
+    let more = lineage.release_step(&mut release).unwrap();
+    assert!(
+      before - lineage.live_nodes() <= 1,
+      "a step freed more than one node"
+    );
+    if !more {
+      break;
+    }
+    steps += 1;
+  }
+  assert!(steps > 0, "the release took no step");
+  assert_eq!(
+    lineage.live_nodes(),
+    held_alone,
+    "the release freed other than what the branch alone held"
+  );
+  let files: Vec<(String, Vec<u8>)> = lineage
+    .with(root, |green| {
+      green
+        .files()
+        .map(|(path, bytes)| (path, bytes.to_vec()))
+        .collect()
+    })
+    .unwrap();
+  let expected: Vec<(String, Vec<u8>)> = alone
+    .files()
+    .map(|(path, bytes)| (path, bytes.to_vec()))
+    .collect();
+  assert_eq!(files, expected);
+  assert_eq!(
+    lineage.with(root, Green::head_identity).unwrap(),
+    alone.head_identity()
+  );
+}
+
+/// A-575 (a repository's member made empty, §4.17.1). Do: add an empty member to a lineage and create a file in it.
+/// Expect: it holds nothing at version 0 and its file at version 1, and the lineage's root is untouched.
+#[test]
+fn an_empty_member_joins_with_nothing_and_holds_what_it_writes() {
+  let mut origin = Origin::default();
+  origin.files.push(("a".to_owned(), b"root".to_vec()));
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  let empty = lineage.create();
+  assert_eq!(
+    lineage
+      .with(empty, |green| (green.head(), green.files().count()))
+      .unwrap(),
+    (0, 0)
+  );
+  let mut work = Work::default();
+  work.op(OpKind::Create, "b", 0, 0, u64::MAX);
+  let src = work.stash(b"new");
+  work.op(OpKind::Insert, "b", 0, 3, src);
+  let inc = Increment {
+    id: [9; 32],
+    base: 0,
+    doc: work.doc,
+    post_state: work.post,
+    evidence: Vec::new(),
+  };
+  assert_eq!(
+    lineage.with(empty, |green| green.submit(&inc)).unwrap(),
+    Outcome::Accepted { version: 1 }
+  );
+  assert_eq!(
+    lineage
+      .with(empty, |green| green.content("b").map(<[u8]>::to_vec))
+      .unwrap(),
+    Some(b"new".to_vec())
+  );
+  assert_eq!(
+    lineage
+      .with(root, |green| (
+        green.content("b").map(<[u8]>::to_vec),
+        green.content("a").map(<[u8]>::to_vec)
+      ))
+      .unwrap(),
+    (None, Some(b"root".to_vec()))
+  );
 }

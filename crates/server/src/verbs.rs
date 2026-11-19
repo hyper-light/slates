@@ -2528,6 +2528,13 @@ pub fn serve(
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    // A repository and every green of its lineage live on the partition its name hashes to (§4.17.1, A-575).
+    RequestBody::CreateRepository { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    RequestBody::CreateBranch { repository, .. }
+    | RequestBody::BindBranch { repository, .. }
+    | RequestBody::RetireBranch { repository, .. } => {
+      Some(owner_of_name(repository, state.shards.len()))
+    }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
     // and answered there with no hop, and its name is held at the partition it hashes to, by an alias when that is
     // another (A-236).
@@ -4551,6 +4558,8 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
     body,
     RequestBody::Create { .. }
       | RequestBody::CreateGreen { .. }
+      | RequestBody::CreateRepository { .. }
+      | RequestBody::CreateBranch { .. }
       | RequestBody::CreateWork { .. }
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
@@ -4988,6 +4997,32 @@ fn dispatch_inner(
       size,
       require_locked,
     } => crate::image::import_verb(state, principal, archive, name, (size, require_locked)),
+    RequestBody::CreateRepository {
+      name,
+      tool,
+      format,
+      default_branch,
+      green,
+    } => crate::repository::create_repository(
+      state,
+      principal,
+      (&name, tool, format, &default_branch),
+      green,
+    ),
+    RequestBody::CreateBranch {
+      repository,
+      name,
+      from,
+      version,
+    } => crate::repository::create_branch(state, principal, (&repository, &name, &from), version),
+    RequestBody::BindBranch {
+      repository,
+      name,
+      green,
+    } => crate::repository::bind_branch(state, principal, (&repository, &name), green),
+    RequestBody::RetireBranch { repository, name } => {
+      crate::repository::retire_branch(state, principal, (&repository, &name))
+    }
     RequestBody::Checkout {
       green,
       base,
@@ -14420,7 +14455,7 @@ fn longest_listable_name() -> usize {
 /// page leaves a summary's name ([`longest_listable_name`], A-263) and what a status leaves its name beside its other
 /// fields at their widest ([`longest_statused_name`], A-267). A create refuses a longer name `InvalidName` before
 /// anything is made. Read once: it is a function of the wire's shapes and the reply chunk alone.
-fn longest_name() -> usize {
+pub(crate) fn longest_name() -> usize {
   static LONGEST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
   *LONGEST.get_or_init(|| longest_listable_name().min(longest_statused_name()))
 }

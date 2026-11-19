@@ -4579,7 +4579,7 @@ async fn init_shard(
     status_scatters: std::collections::BTreeMap::new(),
     last_work_ns: now,
     pending_forwards: std::collections::VecDeque::new(),
-    greens: std::collections::BTreeMap::new(),
+    greens: crate::greens::Greens::default(),
     works: std::collections::BTreeMap::new(),
     merge: crate::merge_service::MergeShardState::default(),
     ack_scatters: std::collections::BTreeMap::new(),

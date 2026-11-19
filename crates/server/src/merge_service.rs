@@ -160,7 +160,7 @@ pub(crate) fn rejected_cache_budget(state: &ShardState) -> usize {
 /// none: the floor the engine's histories are folded to (§4.16 "delta retention before folding").
 /// Never past the head.
 pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
-  let head = state.greens.get(&green).map_or(0, Green::head);
+  let head = state.greens.get(&green).map_or(0, |engine| engine.head());
   let pins = state
     .merge
     .attachments
@@ -169,7 +169,14 @@ pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
     .map(|pin| pin.version);
   // Every work's base is held in the partition wherever the work lives (A-247).
   let oldest_work = state.db.partition().oldest_work_floor(green);
-  pins.chain(oldest_work).min().unwrap_or(head).min(head)
+  // A live branch of the green's lineage made at a version keeps it, so a recovery branches it there again (A-575).
+  let oldest_branch = state.db.partition().repositories().branch_floor(green);
+  pins
+    .chain(oldest_work)
+    .chain(oldest_branch)
+    .min()
+    .unwrap_or(head)
+    .min(head)
 }
 
 /// The version a green's durable chain may be checkpointed at (W3; §4.16): the reachable floor, kept below the
@@ -251,7 +258,7 @@ pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, d
     return;
   }
   // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
-  let Some(checkpoint) = state.greens.get_mut(&green).and_then(|engine| {
+  let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
     let mut checkpoint = engine.checkpoint(floor)?;
     checkpoint.head_check = Some((engine.head(), engine.head_identity()));
     Some(checkpoint)
@@ -285,16 +292,19 @@ pub(crate) const CHECKPOINT_UNAVAILABLE: &str = "merge.checkpoint.unavailable";
 /// whole.
 pub(crate) const CHECKPOINT_REFUSED: &str = "merge.checkpoint.refused";
 
-/// A work's base (`crate::work_files`): its green on this shard, when it still exists, at the work's base version.
-pub(crate) fn work_base<'a>(
-  state: &'a ShardState,
+/// Runs `read` over a work's base (`crate::work_files`): its green on this shard, lent for the call when it still
+/// exists (`crate::greens`), at the work's base version.
+pub(crate) fn with_work_base<R>(
+  state: &ShardState,
   work: &crate::state::WorkState,
-) -> crate::work_files::Base<'a> {
-  crate::work_files::Base {
-    green: state.greens.get(&work.green),
+  read: impl FnOnce(crate::work_files::Base<'_>) -> R,
+) -> R {
+  let lent = state.greens.get(&work.green);
+  read(crate::work_files::Base {
+    green: lent.as_deref(),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
-  }
+  })
 }
 
 /// The refusal for a file of a work whose green is gone: its base cannot be read (§4.16 failure matrix,
@@ -329,13 +339,15 @@ pub(crate) fn settle_green_retention_leaving(
 ) -> Result<(), u64> {
   let floor = reachable_floor(state, green);
   let budget = rejected_cache_budget(state);
-  let Some(engine) = state.greens.get_mut(&green) else {
-    return Ok(());
+  let wanted = {
+    let Some(mut engine) = state.greens.get_mut(&green) else {
+      return Ok(());
+    };
+    // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
+    // cache is bounded by: one merge byte bound per green) with `room` to spare, never past a live reader's version.
+    engine.fold_history_to_budget(floor, budget.saturating_sub(room));
+    u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX)
   };
-  // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
-  // cache is bounded by: one merge byte bound per green) with `room` to spare, never past a live reader's version.
-  engine.fold_history_to_budget(floor, budget.saturating_sub(room));
-  let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
     // Capacity is claimed as it is needed (A-98), and a green's works, which claim it by their charges, live on other
@@ -953,10 +965,9 @@ pub(crate) fn attach_green(
       Ok(consumer) => consumer,
       Err(refusal) => return refused(refusal),
     };
-  let Some(engine) = state.greens.get(&record.id) else {
+  let Some(version) = state.greens.get(&record.id).map(|engine| engine.head()) else {
     return refused(Refusal::NotFound);
   };
-  let version = engine.head();
   // A green pins a version and is read-only (§4.16, D-27): its attachment carries read only, and the
   // mount capability token that lets the consumer mount that pinned view over NFS read-only (§4.13;
   // AUD-01). Refused, never a weak token, if the platform's secure random is unavailable.
@@ -1069,6 +1080,7 @@ pub(crate) fn advance(
     (target, pin.version)
   };
   let invalidated = engine.changed_between(from, to);
+  drop(engine);
   state.merge.attachments.insert(
     attachment,
     PinnedAttachment {
@@ -1127,7 +1139,7 @@ pub(crate) fn read_window(
     Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
     Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.files.page(work_base(state, w), key, (offset, want)) {
+        Some(w) => match with_work_base(state, w, |base| w.files.page(base, key, (offset, want))) {
           Ok(Some((bytes, total))) => ReplyBody::ReadPage {
             bytes,
             total,
@@ -1162,7 +1174,7 @@ fn read_green_range(
   let Some(engine) = state.greens.get(&green) else {
     return refused(Refusal::NotFound);
   };
-  let version = match green_version(state, engine, green, at) {
+  let version = match green_version(state, &engine, green, at) {
     Ok(version) => version,
     Err(refusal) => return refused(refusal),
   };
@@ -1367,9 +1379,7 @@ pub(crate) fn status_merge_volume(
     }),
     MergeRole::Work { .. } => state.works.get(&id).map_or((0, 0), |work| {
       (
-        work
-          .files
-          .sizes(work_base(state, work))
+        with_work_base(state, work, |base| work.files.sizes(base))
           .iter()
           .map(|(_, len)| *len)
           .sum(),
@@ -2087,7 +2097,7 @@ pub(crate) fn enqueue_record(
       state
         .greens
         .get_mut(&green)
-        .map(Green::head_identity)
+        .map(|mut engine| engine.head_identity())
         .unwrap_or_default()
     },
   );
@@ -2187,7 +2197,10 @@ fn enqueue_record_with(
     .map(crate::signed_work::shipped);
   // Where the engine has folded the green's histories (A-385): its holders fold their replicas there once they hold
   // this version, so no replica keeps more of the green's history than its owner.
-  let folded_below = state.greens.get(&green).map_or(0, Green::folded_below);
+  let folded_below = state
+    .greens
+    .get(&green)
+    .map_or(0, |engine| engine.folded_below());
   // The newest version known committed (A-404): never this one, which waits for its placement.
   let committed = checkpoint_floor(state, green).min(version.saturating_sub(1));
   let mut value = MergeRecordValue {
@@ -2355,7 +2368,7 @@ pub(crate) fn await_placed_green(
       feature: "mirror placement of a green".to_owned(),
     }));
   }
-  let head = state.greens.get(&id).map_or(0, Green::head);
+  let head = state.greens.get(&id).map_or(0, |engine| engine.head());
   let placed = state
     .merge
     .placed
