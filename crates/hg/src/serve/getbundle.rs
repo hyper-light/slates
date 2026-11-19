@@ -29,6 +29,12 @@
 //! base, which every reader takes (`mdiff.trivialdiffheader`); held deltas and computed ones are the learned delta
 //! choice's (§4.17.3's tunables).
 //!
+//! **Texts lent** (A-680). The store lends each text in place where it holds it in one piece and copies it otherwise,
+//! the copy charged to the request's admission before it is made ([`Store`]). Each missing changeset's text is lent
+//! once and kept in its entry, whose list of paths the files are read from; each manifest is lent once, checked whole,
+//! and each path a changeset lists is found in its text by halving ([`manifest::find`]), so no manifest is read again
+//! for a path.
+//!
 //! **Relevant markers** (`obsstore.relevantmarkers`): those naming one of the nodes as a successor, prunes naming one
 //! as predecessor or parent, and then, again and again, those of each found marker's predecessor; sorted as
 //! `obsutil.sortedmarkers` sorts 7.2's marker tuples: by predecessor, successors, flags, metadata, date and parents,
@@ -43,30 +49,46 @@ use crate::changegroup::{Changegroup, Group, Revision, Version};
 use crate::obsmarkers::{self, Format, Marker};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
-use crate::{Admission, NULL_NODE, Node, bookmarks, changeset, delta, phases, pushkey, quote};
+use crate::{
+  Admission, NULL_NODE, Node, PastAdmission, bookmarks, changeset, delta, manifest, phases,
+  pushkey, quote,
+};
 use core::cmp::Ordering;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The served view with what its changesets name: their texts, and the manifest and file logs' revisions.
+/// The served view with what its changesets name: their texts, and the manifest and file logs' revisions (A-619 part
+/// 2). A text is lent (A-680): in place where the store holds it in one piece, else copied, the copy's bytes charged to
+/// the request's room before it is made, so nothing a store copies is held past the request's admission.
 pub trait Store: Repository {
-  /// A changeset's text, `None` past the view.
-  fn changeset_text(&self, rev: Rev) -> Option<&[u8]>;
+  /// A changeset's text; `None` past the view, or where the store does not hold it whole.
+  fn changeset_text(
+    &self,
+    rev: Rev,
+    room: &mut Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, PastAdmission>;
 
-  /// The manifest revision of `node`.
-  fn manifest(&self, node: &Node) -> Option<Logged<'_>>;
+  /// The manifest revision of `node`; `None` where the store does not hold it whole.
+  fn manifest(
+    &self,
+    node: &Node,
+    room: &mut Admission,
+  ) -> Result<Option<Logged<'_>>, PastAdmission>;
 
-  /// The revision of the file at `path` whose node is `node`.
-  fn file(&self, path: &[u8], node: &Node) -> Option<Logged<'_>>;
-
-  /// The node the manifest `manifest` names for `path`, `None` where it names none.
-  fn file_node(&self, manifest: &Node, path: &[u8]) -> Option<Node>;
+  /// The revision of the file at `path` whose node is `node`; `None` where the store does not hold it whole.
+  fn file(
+    &self,
+    path: &[u8],
+    node: &Node,
+    room: &mut Admission,
+  ) -> Result<Option<Logged<'_>>, PastAdmission>;
 
   /// The repository's obsolescence markers, in any order.
   fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
 }
 
 /// A manifest or file revision as its log keeps it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Logged<'a> {
   /// Its position in its log: what orders a group.
   pub position: u64,
@@ -76,8 +98,8 @@ pub struct Logged<'a> {
   pub link: Node,
   /// Its revision flags.
   pub flags: u16,
-  /// Its text.
-  pub text: &'a [u8],
+  /// Its text, lent.
+  pub text: Cow<'a, [u8]>,
 }
 
 /// What a `getbundle` asks, its arguments as the wire carried them (`wireprotov1server.getbundle`): `heads` and
@@ -409,11 +431,13 @@ struct Entry<'s> {
   link: Node,
   /// Its flags.
   flags: u16,
-  /// Its full text.
-  text: &'s [u8],
+  /// Its full text, lent by the store.
+  text: Cow<'s, [u8]>,
 }
 
-/// The changegroup of `outgoing` in `version`, encoded.
+/// The changegroup of `outgoing` in `version`, encoded. Each missing changeset's text is lent once and each manifest's
+/// once (A-680): the changesets' entries hold their texts, which the paths they list are read from, and each path's
+/// file node is found in the text of the manifest's entry ([`manifest::find`]).
 pub fn changegroup(
   store: &impl Store,
   outgoing: &Outgoing,
@@ -422,7 +446,7 @@ pub fn changegroup(
 ) -> Result<Vec<u8>, Refusal> {
   let held = common_ancestors(store, &outgoing.common, admission)?;
   let changelog = changelog_entries(store, &outgoing.missing, admission)?;
-  let (manifests, files) = named_revisions(store, &outgoing.missing, &held, admission)?;
+  let (manifests, files) = named_revisions(store, &changelog, &held, admission)?;
   let mut groups: Vec<(&[u8], Vec<Entry<'_>>)> = Vec::with_capacity(files.len());
   groups.extend(files);
   encode_changegroup(version, &changelog, &manifests, &groups, admission)
@@ -451,7 +475,21 @@ fn common_ancestors(
   Ok(held)
 }
 
-/// The missing changesets' entries, oldest first, each linked to itself.
+/// The refusal of a store that lacks a changeset's text, or holds one no reader takes.
+fn no_changeset_text() -> Refusal {
+  Refusal::Store {
+    what: "a changeset's text",
+  }
+}
+
+/// The refusal of a store that lacks a manifest revision, or holds one no reader takes.
+fn no_manifest() -> Refusal {
+  Refusal::Store {
+    what: "a manifest revision",
+  }
+}
+
+/// The missing changesets' entries, oldest first, each linked to itself and holding its text, lent once.
 fn changelog_entries<'s>(
   store: &'s impl Store,
   missing: &[Rev],
@@ -464,27 +502,23 @@ fn changelog_entries<'s>(
     let parent =
       |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
     let [first, second] = parents_of(store, *rev)?;
+    let text = store
+      .changeset_text(*rev, admission)?
+      .ok_or_else(no_changeset_text)?;
     entries.push(Entry {
       node,
       parents: [parent(first)?, parent(second)?],
       link: node,
       flags: 0,
-      text: store.changeset_text(*rev).ok_or(Refusal::Store {
-        what: "a changeset's text",
-      })?,
+      text,
     });
   }
   Ok(entries)
 }
 
-/// A changeset's manifest node and the paths it touches.
-fn read_changeset(store: &impl Store, rev: Rev) -> Result<(Node, &[u8]), Refusal> {
-  let text = store.changeset_text(rev).ok_or(Refusal::Store {
-    what: "a changeset's text",
-  })?;
-  let changeset = changeset::decode(text).map_err(|_| Refusal::Store {
-    what: "a changeset's text",
-  })?;
+/// A changeset's manifest node and the paths it touches, read from its text.
+fn read_changeset(text: &[u8]) -> Result<(Node, &[u8]), Refusal> {
+  let changeset = changeset::decode(text).map_err(|_| no_changeset_text())?;
   let manifest = pushkey::hex_node(changeset.manifest)
     .ok()
     .flatten()
@@ -494,49 +528,65 @@ fn read_changeset(store: &impl Store, rev: Rev) -> Result<(Node, &[u8]), Refusal
   Ok((manifest, changeset.files))
 }
 
-/// The manifests a changegroup carries and its file groups by path.
-type Named<'s> = (Vec<Entry<'s>>, BTreeMap<&'s [u8], Vec<Entry<'s>>>);
+/// The manifests a changegroup carries and its file groups by path, each path read from a changeset's text.
+type Named<'t, 's> = (Vec<Entry<'s>>, BTreeMap<&'t [u8], Vec<Entry<'s>>>);
+
+/// A revision found for a group, with its position in its log: what orders the group.
+type Placed<'s> = (u64, Entry<'s>);
 
 /// Every manifest the missing changesets name and, by path, the file revisions their manifests name at the paths they
 /// list: each linked to the first missing changeset that names it, the file revisions whose own link the client holds
-/// left out, each group in its log's order.
-fn named_revisions<'s>(
+/// left out, each group in its log's order. Each manifest is lent once and checked whole before its paths are looked up
+/// in it by halving.
+fn named_revisions<'t, 's>(
   store: &'s impl Store,
-  missing: &[Rev],
+  changelog: &'t [Entry<'s>],
   held: &RevSet,
   admission: &mut Admission,
-) -> Result<Named<'s>, Refusal> {
-  let mut manifests: Vec<(u64, Entry<'s>)> = Vec::new();
-  let mut seen_manifests = BTreeSet::new();
-  let mut files: BTreeMap<&'s [u8], Vec<(u64, Entry<'s>)>> = BTreeMap::new();
+) -> Result<Named<'t, 's>, Refusal> {
+  let mut manifests: Vec<Placed<'s>> = Vec::new();
+  let mut seen_manifests: BTreeMap<Node, usize> = BTreeMap::new();
+  let mut files: BTreeMap<&'t [u8], Vec<Placed<'s>>> = BTreeMap::new();
   let mut seen_files = BTreeSet::new();
-  for rev in missing {
-    let link = node_of(store, *rev)?;
-    let (manifest, touched) = read_changeset(store, *rev)?;
-    if seen_manifests.insert(manifest) {
-      let logged = store.manifest(&manifest).ok_or(Refusal::Store {
-        what: "a manifest revision",
-      })?;
-      admission.charge_items::<(u64, Entry<'_>, Node)>(1)?;
-      manifests.push((logged.position, entry(manifest, link, logged)));
-    }
+  for changeset in changelog {
+    let link = changeset.node;
+    let (manifest, touched) = read_changeset(&changeset.text)?;
+    let at = match seen_manifests.get(&manifest) {
+      Some(at) => *at,
+      None => {
+        let logged = store
+          .manifest(&manifest, admission)?
+          .ok_or_else(no_manifest)?;
+        manifest::decode(&logged.text).map_err(|_| no_manifest())?;
+        admission.charge_items::<(Placed<'_>, Node, usize)>(1)?;
+        manifests.push((logged.position, entry(manifest, link, logged)));
+        let at = manifests.len().saturating_sub(1);
+        seen_manifests.insert(manifest, at);
+        at
+      }
+    };
+    let Some((_, kept)) = manifests.get(at) else {
+      return Err(no_manifest());
+    };
     for path in touched
       .split(|byte| *byte == NEWLINE)
       .filter(|path| !path.is_empty())
     {
-      let Some(node) = store.file_node(&manifest, path) else {
+      let Some(found) = manifest::find(&kept.text, path) else {
         continue;
       };
-      if seen_files.insert((path, node)) {
-        let logged = store.file(path, &node).ok_or(Refusal::Store {
-          what: "a file revision",
-        })?;
-        admission.charge_items::<(u64, Entry<'_>, &[u8], Node)>(1)?;
+      if seen_files.insert((path, found.node)) {
+        let logged = store
+          .file(path, &found.node, admission)?
+          .ok_or(Refusal::Store {
+            what: "a file revision",
+          })?;
+        admission.charge_items::<(Placed<'_>, &[u8], Node)>(1)?;
         if !client_holds(store, held, &logged) {
           files
             .entry(path)
             .or_default()
-            .push((logged.position, entry(node, link, logged)));
+            .push((logged.position, entry(found.node, link, logged)));
         }
       }
     }
@@ -601,7 +651,7 @@ fn encode_changegroup(
   let mut deltas = Vec::with_capacity(len);
   let mut ends = Vec::with_capacity(count);
   for entry in all() {
-    delta::encode_full_text(entry.text, &mut deltas).map_err(|_| unencodable("a full text"))?;
+    delta::encode_full_text(&entry.text, &mut deltas).map_err(|_| unencodable("a full text"))?;
     ends.push(deltas.len());
   }
   let starts = core::iter::once(0).chain(ends.iter().copied());
