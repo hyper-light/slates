@@ -9151,6 +9151,10 @@ it builds against the contract and adds to it rather than around it.
 > `AT_STATX_DONT_SYNC` and compared by device), with `HoldersUnread` saying why none were read (macOS: every libproc
 > answer stats the file). On Linux a plain `fusermount3 -u` refused while the table still lists the mount is
 > `MountFault::Busy`, where it was `MountFault::Unmount` with the helper's exit.
+> **`CONTRACT` = 46 (A-524):** an S3 base is named by the library: `S3Base`, the endpoint (`https`, or plain `http`
+> to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys' rules, and the addressing,
+> each refused by its kind (§4.15's S3 base). A base whose fetch is outstanding answers `Pending` through the host
+> seam, and the wire's `Unpublished` until the server parks it (A-555).
 > **`CONTRACT` = 47 (A-520, second piece):** the container handoff's other two steps are library calls, which the
 > command line now makes: `container_engine::engine_profile(runtime)` asks the runtime's engine for its profile,
 > bounded as the command line asked it, and judges it, answering an `EngineProfile` or an `EngineFault` (the judge's
@@ -10105,7 +10109,7 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > - `sim`: `SimS3`, the oracle: versioned and unversioned buckets, an outsider's puts and deletes, delimited listings
 >   paged with opaque tokens (a forged one refused `400`), reads bound by `If-Match` or a version answering `412`,
 >   `404 NoSuchKey` or `NoSuchVersion`, `416`, and a refused or expired credential, each as S3's reference states it.
-> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 43): the endpoint
+> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 46): the endpoint
 >   (`https`, or plain `http` to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys'
 >   rules, and the addressing (a dotted bucket refused virtual-hosted over HTTPS), each refused by its kind; its
 >   identity, a digest of the endpoint's host and port, the bucket and the prefix, is the device of every fingerprint.
