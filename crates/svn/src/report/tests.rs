@@ -350,7 +350,7 @@ fn a_stock_updates_report_is_kept_as_svnserve_keeps_it() {
   files.paths = vec![secret()];
   assert_finished(recorded!("update-depth-files.1"), files);
   let mut mixed = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
-  mixed.paths = vec![path("a.txt", Some(2), Depth::Infinity, false), secret()];
+  mixed.paths = vec![secret(), path("a.txt", Some(2), Depth::Infinity, false)];
   assert_finished(recorded!("update-mixed-revisions.1"), mixed);
 }
 
@@ -380,12 +380,13 @@ fn a_stock_reports_deletions_locks_and_links_are_kept() {
   assert_finished(recorded!("update-with-not-present.1"), not_present);
   let (_, replay, _) = replay_recorded(recorded!("update-with-lock.1"));
   let Ending::Finished(report) = replay.ending else { panic!("{:?}", replay.ending) };
-  let token = report.paths[0].lock_token.clone().unwrap();
+  let reported = report.paths.iter().find(|info| info.path == "a.txt").unwrap();
+  let token = reported.lock_token.clone().unwrap();
   assert!(token.starts_with(b"opaquelocktoken:"), "{token:?}");
   let mut locked = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
   let mut held = path("a.txt", Some(6), Depth::Infinity, false);
   held.lock_token = Some(token);
-  locked.paths = vec![held, secret()];
+  locked.paths = vec![secret(), held];
   assert_finished(recorded!("update-with-lock.1"), locked);
   let mut linked = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
   let mut switched = path("dir", Some(6), Depth::Infinity, false);
@@ -696,8 +697,13 @@ fn a_reports_first_refusal_is_the_one_answered() {
   .concat();
   let replay = replay(&trunk_context(&session, 1 << 16), update_head(), &report, &[]);
   assert_eq!(replay.ending, Ending::Failed(ReportFailure::UnsupportedDepth));
-  let failure = b"( failure ( ( 165002 35:Unsupported report depth 'unknown' 0: 0 ) ) ) ";
-  assert_eq!(replay.written, [TRIVIAL_AUTH, TRIVIAL_AUTH, failure.as_slice()].concat());
+  let failure = [
+    b"( failure ( ( 165002 ".as_slice(),
+    &string(b"Unsupported report depth 'unknown'"),
+    b"0: 0 ) ) ) ",
+  ]
+  .concat();
+  assert_eq!(replay.written, [TRIVIAL_AUTH, TRIVIAL_AUTH, &failure].concat());
 }
 
 /// A-616 (a link at depth `exclude`, `svn_repos_link_path3`; a second report of a target beneath
