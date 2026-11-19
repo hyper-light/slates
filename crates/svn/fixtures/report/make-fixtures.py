@@ -238,17 +238,10 @@ def item_string(data):
     return b"%d:%s " % (len(data), data)
 
 
-# A stock 1.15 client's capabilities.
-STOCK_CAPABILITIES = b"edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops"
-# A client that announces neither svndiff1 nor accepts-svndiff2, to which svnserve sends svndiff version 0
-# (`svn_ra_svn__svndiff_version`), as to a client older than 1.4.
-SVNDIFF0_CAPABILITIES = b"edit-pipeline absent-entries depth mergeinfo log-revprops"
-
-
-# A client's answer to the greeting, a stock 1.15 client's without SASL's client string unless CAPABILITIES say
-# otherwise, and its anonymous authentication.
-def opening(url, capabilities=STOCK_CAPABILITIES):
-    return (b"( 2 ( " + capabilities + b" ) " + item_string(url) + b"10:SVN/1.15.0 ( ) ) ( ANONYMOUS ( 0: ) ) ")
+# A stock 1.15 client's answer to the greeting without SASL's client string, and its anonymous authentication.
+def opening(url):
+    return (b"( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) "
+            + item_string(url) + b"10:SVN/1.15.0 ( ) ) ( ANONYMOUS ( 0: ) ) ")
 
 
 SET_ROOT = b"( set-path ( 0: 6 false ( ) infinity ) ) "
@@ -404,20 +397,12 @@ def main():
             ("hostile-checkout-copy-sources",
              [b"( update ( ( 4 ) 0: true infinity true false ) ) " + b"( set-path ( 0: 4 true ( ) infinity ) ) "
               + FINISH, close_edit, EDIT_DONE]),
-            # svndiff version 0, to a client that accepts neither 1 nor 2 (the A-616 sibling bug of 2026-11-19): a
-            # checkout of /trunk at r6, every text new data (`send_simple_insertion_window`, big.txt four windows),
-            # and an update from r5, dir/b.txt's and big.txt's windows copying from their bases (`window_handler`).
-            ("svndiff0-checkout",
-             [UPDATE_HEAD + b"( set-path ( 0: 6 true ( ) infinity ) ) " + FINISH, close_edit, EDIT_DONE]),
-            ("svndiff0-update",
-             [UPDATE_HEAD + b"( set-path ( 0: 5 false ( ) infinity ) ) " + FINISH, close_edit, EDIT_DONE]),
         ]
         for name, steps in hostile:
             if only is not None and name not in only:
                 continue
             prefix = os.path.join(out, name + ".1")
-            capabilities = SVNDIFF0_CAPABILITIES if name.startswith("svndiff0-") else STOCK_CAPABILITIES
-            sent = bytearray(opening(b"svn://127.0.0.1/repo/trunk", capabilities))
+            sent = bytearray(opening(b"svn://127.0.0.1/repo/trunk"))
             received = bytearray()
             with socket.create_connection(("127.0.0.1", port), timeout=STEP_SECONDS) as connection:
                 connection.sendall(bytes(sent))

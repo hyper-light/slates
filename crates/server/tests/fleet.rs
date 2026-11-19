@@ -20600,10 +20600,7 @@ fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
   });
   assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
   let submitted = client.try_call(
-    &RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    },
+    &RequestBody::submit(work, Vec::new()),
     u64::try_from(RECORD_HOLD_WINDOW.as_nanos()).unwrap_or(u64::MAX),
   );
   assert!(
@@ -20684,10 +20681,7 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
   });
   let mut client = common::client::connect(daemon_b.instance());
   let edited = client.edit(work, "f", 0, 0, b"hello");
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let word = client.begin(&submit).map(|id| id.word());
   let first = word
     .as_ref()
@@ -20815,10 +20809,7 @@ fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_b
     .unwrap();
   let mut pipelined = common::client::connect(&instance_a);
   let submit = pipelined
-    .begin(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    })
+    .begin(&RequestBody::submit(work, Vec::new()))
     .unwrap();
   let both = [&daemon_a, &daemon_b];
   assert!(
@@ -20980,10 +20971,7 @@ fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound(
   });
   let mut client = common::client::connect(daemon_b.instance());
   let edited = client.edit(work, "f", 0, 0, b"hello");
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let word = client.begin(&submit).map(|id| id.word());
   let first = word
     .as_ref()
@@ -23325,10 +23313,7 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
     delete_len: 0,
     bytes: b"hello".to_vec(),
   });
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   let placed = daemon_a.merge_record_placed(green, 1);
   let counters = daemon_a.fleet_refusals().map(|counters| {
     counters
@@ -23426,10 +23411,7 @@ fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
       });
       client
         .try_call(
-          &RequestBody::Submit {
-            work,
-            evidence: Vec::new(),
-          },
+          &RequestBody::submit(work, Vec::new()),
           u64::try_from(formation_deadline().as_nanos()).unwrap_or(u64::MAX),
         )
         .ok()
@@ -23553,10 +23535,7 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
   // The fixture's whole formation wait: a commit that is going to place has long placed by then.
   let submitted = client
     .try_call(
-      &RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
+      &RequestBody::submit(work, Vec::new()),
       u64::try_from(formation_deadline().as_nanos()).unwrap_or(u64::MAX),
     )
     .ok();
@@ -24253,13 +24232,7 @@ fn a_holder_restarted_over_its_segment_recomputes_the_greens_next_version() {
     bytes: b"again".to_vec(),
   });
   let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX);
-  let submitted = client.try_call(
-    &RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    },
-    deadline_ns,
-  );
+  let submitted = client.try_call(&RequestBody::submit(work, Vec::new()), deadline_ns);
   let refs: Vec<&Daemon> = daemons.iter().collect();
   let placed = poll_until(&refs, PLACEMENT_DEADLINE, || {
     daemons[0].merge_record_placed(green, 2)
@@ -24408,13 +24381,7 @@ fn a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder() {
   let run = usize::try_from(REPEATED_RUN_CHUNKS * slates_archive::format::MAX_CHUNK_BYTES).unwrap();
   let edits = append_in_pages(&mut client, work, "repeated", &vec![REPEATED_RUN_BYTE; run]);
   let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
-  let submitted = client.try_call(
-    &RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    },
-    deadline_ns,
-  );
+  let submitted = client.try_call(&RequestBody::submit(work, Vec::new()), deadline_ns);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let holders_at_one = poll_until(&observed, PLACEMENT_DEADLINE, || {
     let held: Vec<_> = daemons
@@ -24759,10 +24726,7 @@ fn submit_version_on(node: &Daemon, green: VolumeId, version: u64) -> ReplyBody 
   }
   client
     .try_call(
-      &RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
+      &RequestBody::submit(work, Vec::new()),
       u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
     )
     .unwrap_or_else(|e| refused_placeholder(&e))
@@ -24804,10 +24768,7 @@ fn work_with_an_unsubmitted_edit(
 fn submit_on(node: &Daemon, work: VolumeId) -> ReplyBody {
   Client::connect(node.instance())
     .try_call(
-      &RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
+      &RequestBody::submit(work, Vec::new()),
       u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
     )
     .unwrap_or_else(|e| refused_placeholder(&e))
@@ -25004,10 +24965,7 @@ fn timed_submit(
     bytes: b"hello".to_vec(),
   });
   let started = Instant::now();
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   (edited, submitted, started.elapsed())
 }
 
@@ -25306,10 +25264,7 @@ fn rewrite_and_submit(
       delete_len,
       bytes: tag.bytes().cycle().take(page).collect(),
     });
-    let submitted = client.call(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    });
+    let submitted = client.call(&RequestBody::submit(work, Vec::new()));
     answers.push((version, edited, submitted));
   }
   answers
@@ -25489,10 +25444,7 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
   // The submit appends version 1 and waits for its record, which the holders withhold: no answer comes.
   let unanswered = client
     .try_call(
-      &RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
+      &RequestBody::submit(work, Vec::new()),
       LIVENESS_BUDGET_NS.saturating_mul(2),
     )
     .is_err();
@@ -25773,10 +25725,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     .collect();
   // The submit, sent by a library client that keeps its id across a restart, appends version 1 and waits for its record,
   // which the holders withhold: no answer comes.
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let mut resender = common::client::connect(daemons[0].instance());
   let word = resender.begin(&submit).map(|id| id.word());
   let first = word
@@ -25876,10 +25825,7 @@ fn timed_submits(
       bytes: b"hello".to_vec(),
     });
     let started = Instant::now();
-    let submitted = client.call(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    });
+    let submitted = client.call(&RequestBody::submit(work, Vec::new()));
     answers.push((index, edited, submitted, started.elapsed()));
   }
   answers
@@ -25930,13 +25876,7 @@ fn edited_work_to_submit(client: &mut Client) -> (VolumeId, RequestBody) {
     }),
     ReplyBody::Edited
   ));
-  (
-    green,
-    RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    },
-  )
+  (green, RequestBody::submit(work, Vec::new()))
 }
 
 /// What the commit gate showed: with the inputs withheld, with the acknowledgements withheld, and once
@@ -27065,10 +27005,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
   let (green, work) = green_with_work(&mut owner_client, "resent-over-two-takeovers", &daemons);
   let mut client = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   if routed {
     edit_work(&mut client, work, 0, "hello");
   }
@@ -27245,10 +27182,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   let mut owner_client = Client::connect(daemons[0].instance());
   let (green, work) = green_with_work(&mut owner_client, "placed-work", &daemons);
   edit_work(&mut owner_client, work, 0, "hello");
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let first = owner_client.call(&submit);
   let snapshot = owner_client.call(&RequestBody::Snapshot { volume: work });
   let shipped = owner_client.call(&RequestBody::LiveShip {
@@ -27679,10 +27613,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
   let (green, work) = green_with_work(&mut owner_client, "resent-over-takeover", &daemons);
   let mut client = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let edited = routed.then(|| {
     client.call(&RequestBody::Edit {
       work,
@@ -27806,10 +27737,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
   let (green, work) = green_with_work(&mut owner_client, "route-ends", &daemons);
   let mut client = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   if routed {
     edit_work(&mut client, work, 0, "hello");
   }
@@ -27830,10 +27758,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       delete_len: 0,
       bytes: b"own".to_vec(),
     });
-    let submitted = owner_client.call(&RequestBody::Submit {
-      work: own_work,
-      evidence: Vec::new(),
-    });
+    let submitted = owner_client.call(&RequestBody::submit(own_work, Vec::new()));
     (edited, submitted)
   });
   let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 2);
@@ -28811,10 +28736,7 @@ fn commit_version(client: &mut Client, work: VolumeId, (at, bytes): (u64, &str),
   let started = Instant::now();
   let submitted = client
     .try_call(
-      &RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
+      &RequestBody::submit(work, Vec::new()),
       u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
     )
     .expect("the acceptance resolves once the version commits at the quorum");
@@ -28956,10 +28878,7 @@ fn submit_next_on_successor(
     return false;
   }
   edit_work(&mut client, work, 12, "?");
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let submitted = client
     .try_call(
       &submit,
@@ -31843,10 +31762,7 @@ fn a_greens_successor_is_found_by_a_survivor_after_its_owner_died() {
     delete_len: 0,
     bytes: b"hello".to_vec(),
   });
-  let submitted = owner_client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = owner_client.call(&RequestBody::submit(work, Vec::new()));
   drop(owner_client);
   let object = ObjectId(green.bytes);
   let successor_host =
@@ -31952,10 +31868,7 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
       bytes: b"hello".to_vec(),
     })
   });
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let mut resender = common::client::connect(daemons[1].instance());
   // The answer is never read: it is lost with the owner.
   let word = resender.begin(&submit).map(|id| id.word());
@@ -32089,10 +32002,7 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
   });
   let mut submitter = common::client::connect(daemons[0].instance());
   let word = submitter
-    .begin(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    })
+    .begin(&RequestBody::submit(work, Vec::new()))
     .map(|id| id.word());
   let placed_while_withheld =
     poll_for_periods(&fleet, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
@@ -32221,10 +32131,7 @@ fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_v
     delete_len: 0,
     bytes: b"hello".to_vec(),
   });
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let mut submitter = common::client::connect(daemons[0].instance());
   let word = submitter.begin(&submit).map(|id| id.word());
   let placed_while_withheld =
@@ -32355,10 +32262,7 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
       bytes: b"hello".to_vec(),
     })
   });
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let mut victim = common::client::connect(daemons[1].instance());
   let word = victim.begin(&submit).map(|id| id.word());
   let first = word
@@ -32578,10 +32482,7 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
   if routed {
     edit_work(&mut client, work, 0, "hello");
   }
-  let submit = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let submit = RequestBody::submit(work, Vec::new());
   let mut resender = common::client::connect(daemons[3].instance());
   let word = resender.begin(&submit).map(|id| id.word());
   let first = word

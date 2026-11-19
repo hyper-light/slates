@@ -1150,7 +1150,7 @@ fn mark(kept: &Kept, keep: &Positions, bits: &mut [u64], from: u64, handles: usi
 }
 
 /// The handles a window holds, `size_of::<u64>()` bytes each: what one unit reads of a list of positions.
-fn handles(store: &ContentStore) -> usize {
+pub(super) fn handles(store: &ContentStore) -> usize {
   store
     .window()
     .checked_div(size_of::<u64>())

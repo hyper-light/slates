@@ -63,3 +63,11 @@ Every other writer of an svndiff stream was read for the same shape on 2026-11-1
 where the boundaries between writes never show. The commit's editor (`commit/edit.rs`, `commit/drive.rs`) writes no
 deltas; it gathers a client's chunks and decodes every whole part of what it holds (`textdelta_chunk`, and the
 reading of a delta's pending bytes), so an old client's header sent with its first window in one chunk is read alike.
+
+## Follow-up (A-616 continued (7), 2026-11-19)
+
+The recording this record left owed is settled another way. The editor's chunks and `get-file-revs`' delta strings are
+now written by one writer (`DeltaWrites`, `crates/svn/src/report/editor.rs`), and stock `svnserve` 1.15.0's own
+svndiff 0 writes, recorded by g297 as the reads fixtures' `get-file-revs-svndiff0` session, hold both callers byte for
+byte. The two report sessions added above to `crates/svn/fixtures/report/make-fixtures.py`, never recorded, were taken
+out.

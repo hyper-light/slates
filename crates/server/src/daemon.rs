@@ -255,6 +255,9 @@ pub struct Daemon {
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
   /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
   nfs_port: Option<u16>,
+  /// The port the version-control servers' HTTP edge listens on, when the configuration asked for one and it started
+  /// (A-625 part 3).
+  vcs_http_port: Option<u16>,
   /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
   start_beats: u64,
 }
@@ -1099,6 +1102,9 @@ impl Daemon {
     )?;
     #[cfg(target_os = "macos")]
     start_shards_route(&runtime, control, &config)?;
+    // The version-control servers' HTTP edge, when the operator asked for one (§4.17.2 "Transports" item 1, A-625 part 3):
+    // its listener on the control shard beside the NFS transport, every shard keeping its seats.
+    let vcs_http_port = crate::vcs_http::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
@@ -1108,6 +1114,7 @@ impl Daemon {
       config,
       shards,
       nfs_port,
+      vcs_http_port,
       start_beats: start_beat.beats,
     })
   }
@@ -1116,6 +1123,12 @@ impl Daemon {
   /// `nfs://localhost:PORT` to reach this daemon's volumes (those on its accepting shard, R8).
   pub fn nfs_port(&self) -> Option<u16> {
     self.nfs_port
+  }
+
+  /// The port the version-control servers' HTTP edge listens on (§4.17.2 "Transports" item 1, A-625 part 3), when the
+  /// configuration asked for one and it started.
+  pub fn vcs_http_port(&self) -> Option<u16> {
+    self.vcs_http_port
   }
 
   /// How many times this daemon's start beat before its watchdog took the beat over (§2.6 boot step 2, A-312): at least
@@ -6371,6 +6384,7 @@ async fn control_loop(
                 control,
                 revoked: false,
                 consumer_policy: None,
+                identities: None,
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,
