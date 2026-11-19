@@ -799,4 +799,11 @@ fn a_hostile_chain_entry_is_refused_typed() {
     Err(DocDecodeError::BadVersion),
     "an entry of version 3, before the signature's verdict rode it"
   );
+  // Nor one of the version before A-621, whose ops named their paths in 16 bits.
+  earlier[4..8].copy_from_slice(&4u32.to_le_bytes());
+  assert_eq!(
+    chain_entry::decode(&earlier),
+    Err(DocDecodeError::BadVersion),
+    "an entry of version 4, before an op's path index was 64 bits"
+  );
 }

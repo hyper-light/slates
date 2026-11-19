@@ -98,11 +98,23 @@ impl Hasher {
 /// The node 7.2 computes for `text` with parents `p1` and `p2` (`hashrevisionsha1`): the SHA-1 of the lower parent,
 /// then the higher, then the text; refused where the detection finds an attack.
 pub fn compute(p1: &Node, p2: &Node, text: &[u8]) -> Result<Node, CollisionAttack> {
+  compute_prefixed(p1, p2, &[], text)
+}
+
+/// The node of the text `prefix` then `bytes`, hashed in place: a file revision's metadata block between its markers,
+/// then the file's bytes, which are content of their own (§4.17.3, the index), so its text is never put together.
+pub fn compute_prefixed(
+  p1: &Node,
+  p2: &Node,
+  prefix: &[u8],
+  bytes: &[u8],
+) -> Result<Node, CollisionAttack> {
   let (low, high) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
   let mut hasher = Hasher::new();
   hasher.update(low);
   hasher.update(high);
-  hasher.update(text);
+  hasher.update(prefix);
+  hasher.update(bytes);
   hasher.finish()
 }
 

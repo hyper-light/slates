@@ -200,6 +200,11 @@
 > after a snapshot. Lib tests on the Mac Studio: db `repository::` 15 of 15, server `repository::` 5 of 5, ipc's lib,
 > both wire-order tests; red first on a mutated copy. Owed: the push paths' check (part 2) and the hook driver (part 3);
 > the verb's client and CLI forms.
+> **A-622 part 2 (2026-11-19, g255; the push's check point):** `vcs_policy::admit(record, principal, asked)` judges
+> each change a push asks for (a name and the right its change needs) by the record's policy compiled for its tool, the
+> first refused the push's typed `PushRefusal` (denied by rule n, not listed, not permitted, another tool's name, an
+> unreadable rule); unruled changes are the owner's alone. Server lib `vcs_policy::` on the Mac Studio, red first.
+> Owed: the git, Mercurial and Subversion push pieces calling it, each with its tool's words; the hook driver (part 3).
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the
@@ -276,7 +281,8 @@
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588) and its revlog reader (A-611) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598).** Built
+> built (A-588), its revlog reader (A-611) and its index's tables (A-588 part 2) (2026-11-19; UI goals 91 to 93; owners
+> g291, and g079 for A-598).** Built
 > on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -327,17 +333,21 @@
 > through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`, 182 of
 > 182 on the Mac Studio (2026-11-19, merged with A-598), against 158 files stock `hg` 7.2 stored in five repositories
 > (zstd, zlib, split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
-> (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). Owed, in order, after §4.17.1's seven pieces: (3, rest) the
-> index's tables on A-581's `slates-vcs`, then the import's walk of a store (the fncache, the path encodings, a version
-> 2 store's file index) and censored, ellipsis and externally stored revisions; (4) read serving, the `0.2` answers
-> compressed by A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the
-> shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
-> changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
-> (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
-> and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
-> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
-> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
-> main measures it.
+> (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). **Built (A-588 part 2):** the index's tables: a repository's
+> logs as rows of one A-581 `slates-vcs` index (log rows by log and number, node rows by node and log), groups numbered
+> as 7.2's `addgroup` numbers them and refused whole on a missing parent or link, Mercurial's node rule as the shared
+> store's `Naming`; the revlog reader's chunks now inflated by A-598's `compression::inflate`, the crate's one inflater;
+> proven by `cargo test -p slates-hg --lib` on the Mac Studio against A-588's fixtures' numbers and a model of
+> `addgroup` (see the amendment). Owed, in order, after §4.17.1's seven pieces: (3, rest) the import's walk of a store
+> (the fncache, the path encodings, a version 2 store's file index) and censored, ellipsis and externally stored
+> revisions; (4) read serving, the `0.2` answers compressed by A-598's engines at the learned level; (5) pushes, a
+> compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
+> bounded by the admission); (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access
+> and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and
+> remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through
+> a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's
+> changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks
+> it). No speed is claimed until main measures it.
 
 > **Fixed (g267, 2026-11-19, A-577; found settling A-565): a live clone was answered before any of it was durable.** A
 > clone of a live-shipped volume is live-shipped too, but its `Clone` reply waited on its origin's log, and its record,
@@ -2091,6 +2101,47 @@
 > a shorter truncate conflicts; the same truncate identical). Red on the Mac Studio with the fix reversed (kiln r613:
 > the file `<1>\n` each time), green with it (43 of 43). A-596's oracle bases truncating works behind the head again.
 > Bug record: `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+
+> **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
+> A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
+> past the 65,535th, so the 65,536th and every later name of one work aliased one path; the deriver's index lookup,
+> the verdict's reading of a rename's source and an attribute's name, and the server's laying-in of an attribute's
+> value (which skipped it) narrowed the same way, and interning scanned every name, O(n²). Now an index is 64 bits in
+> memory and on the wire: the ops document's version 2, with u64 path and op counts and 34-byte op records, and the
+> chain entry's version 5. Interning looks a name up in an ordered map, and decode refuses a table naming a path twice
+> (`DuplicatePath`); versions 1 and 4 are refused `BadVersion`. A work names as many paths as its caller's admission
+> allows: a kernel tree's first push (about 97,000 files) is one work, and g225's interim refusal of a work past
+> 65,535 names (A-618, `TooManyNames`) can go. Tests (`crates/merge/src/ops_doc/tests.rs`, moved there from
+> `tests/ops_doc.rs`; `chain_entry`'s): 65,537 distinct names each their own through canonicalization, encode and
+> decode; the comparison counter (doubling the names less than triples the comparisons, where a scan quadruples them);
+> the determinism gate at that size (built twice, names declared in opposite orders, same bytes); the golden vectors
+> re-derived for version 2 (`11ede55e…d370763b`) by an independent encoder and BLAKE3 that reproduce version 1's; the
+> chain entry keeping an op's index past 16 bits. Green on the Mac Studio (kiln r692: `slates-merge --lib` 60 of 60,
+> `slates-server --lib` green and merge-origin tests 31 of 31, fmt clean). Red with the old scan and 16-bit index
+> restored inside the new types (r705: all four failed; doubling the names took 2,149,245,934 comparisons against
+> 537,633,163). Owed to main: the merge crate's integration tests updated by reading (`tests/increment.rs`,
+> `tests/special.rs`, `tests/chain_replay.rs`) and the server's suites. Bug record:
+> `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+
+> **A metadata change to a file replaced after a work's base, and a rename of a replaced symlink or hard link: found
+> open (2026-11-19, A-612's sweep, reading only; §4.16 "The verdict": "delete against modify in either direction",
+> "rename against rename").** A-612 refuses a work's content edit or rename of a file replaced after its base
+> (`Green::file_removed`), but two siblings were seen by reading and not changed. (1) A work's `SetMode`,
+> `SetXattr` or `RemoveXattr` on a path whose file was replaced after its base is judged only by that dimension's own
+> last change (`mode_changed`, `xattr_changed`), so it may land on the file that took the old one's place. (2) A rename
+> whose source is a symlink or a hard link that was removed and made again (or renamed onto) after the work's base
+> moves the new one, since `file_removed` records regular files. Owed: a failing test of each, then the same rule:
+> refused `DeleteModify` (metadata) and `RenameRename` (a link's rename) when the path's node was replaced after the
+> base, recorded for every kind a path can name.
+
+> **A chain entry's encoding scans every op of the increment for each splice: found open (2026-11-19, A-621's reading,
+> g267; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` records a splice "as declared" when its ops
+> are the increment's for that path, which `declared_ops` finds by filtering every op of the increment by its path's
+> name; `take_applied` does the same on decode. A version that splices many existing files pays O(splices × ops):
+> about 50,000 splices of a 100,000-op increment is 5 × 10⁹ path lookups and string compares, on the owner's commit
+> path and every holder's replay. A first push is untouched: its files are created (`Created`, ops recorded whole).
+> Owed: group the increment's content ops by path once per entry (one pass), a failing cost test first (a counter of
+> ops visited, against the splices times the ops).
 
 > **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
 > "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
