@@ -14,11 +14,13 @@
 //! kind here. Format 1's total size: the C reader (`fm1readmarker`) steps from marker to marker by it and reads each
 //! marker's fields only within it, so trailing bytes inside a marker are skipped unseen, while the pure reader
 //! (`_fm1purereadmarkers`) ignores it and walks by the counts; a marker whose size is not exactly its fields is
-//! refused, so both readers would see the same markers. A parent count other than 0, 1, 2 or 3 (the C reader reads it as
-//! no parent data, the pure one reads that many parents). A format 0 metadata entry with no `:` (7.2's
-//! `split(b':', 1)` fails on one). A format 0 marker flagged SHA-256 (7.2 reads 20-byte nodes under it; its writer
-//! refuses one: "cannot handle sha256 with old obsstore format"). A format 1 date is kept as its float's bits, so a
-//! marker encodes back to exactly its bytes.
+//! refused, so both readers would see the same markers. A parent count other than 0, 1, 2 or 3 (the C reader reads it
+//! as no parent data, the pure one reads that many parents). A count of 0, which 7.2 writes for a marker that records
+//! no parents, is kept: it is read here as the pure reader reads it, parents recorded and none, where the C reader
+//! reads no parent data (each measured on 7.2, `research/mercurial-server.md` §13). A format 0 metadata entry with no
+//! `:` (7.2's `split(b':', 1)` fails on one). A format 0 marker flagged SHA-256 (7.2 reads 20-byte nodes under it; its
+//! writer refuses one: "cannot handle sha256 with old obsstore format"). A format 1 date is kept as its float's bits,
+//! so a marker encodes back to exactly its bytes.
 //!
 //! Nothing is allocated in decoding: the payload is checked whole, then its markers are read in place, so the payload
 //! is the only cap. An encode is checked whole before a byte is written, and its exact length is known before it is
