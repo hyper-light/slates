@@ -651,7 +651,10 @@ fn valid_mime_type(value: &str) -> bool {
         && !byte.is_ascii_whitespace()
         && !MIME_SPECIALS.contains(byte))
   });
-  media_ok && !bytes.iter().any(|byte| byte.is_ascii_control() && *byte != b'\t')
+  media_ok
+    && !bytes
+      .iter()
+      .any(|byte| byte.is_ascii_control() && *byte != b'\t')
 }
 
 /// A date as stored (`svn_time_to_cstring`'s form) in RFC 1123's form, `getlastmodified`'s and `Last-Modified`'s
@@ -744,7 +747,11 @@ impl Described {
 
   /// Declares `prefix` for `uri` among the other namespaces, once.
   fn declare(&mut self, prefix: &str, uri: &str) {
-    if !self.namespaces.iter().any(|(declared, _)| declared == prefix) {
+    if !self
+      .namespaces
+      .iter()
+      .any(|(declared, _)| declared == prefix)
+    {
       self.namespaces.push((prefix.to_owned(), uri.to_owned()));
     }
   }
@@ -931,13 +938,17 @@ fn all_properties<R: ?Sized>(
   described.declare_live("lp1", DAV);
   described.declare_live("lp2", SVN_DAV);
   for (name, value) in &subject.properties {
-    described.found.push_str(&dead_property(name, value, names_only));
+    described
+      .found
+      .push_str(&dead_property(name, value, names_only));
     described.any_found = true;
   }
   for (group, name) in ALL_LIVE {
     if let Some(value) = live_value(served, subject, lock, group, name) {
       let written = if names_only { String::new() } else { value };
-      described.found.push_str(&live_element(group, name, &written));
+      described
+        .found
+        .push_str(&live_element(group, name, &written));
       described.any_found = true;
     }
   }
@@ -964,7 +975,10 @@ fn dead_property(name: &[u8], value: &[u8], names_only: bool) -> String {
   if names_only || value.is_empty() {
     return format!("<{prefix}:{local}/>\n");
   }
-  match std::str::from_utf8(value).ok().filter(|_| is_xml_safe(value)) {
+  match std::str::from_utf8(value)
+    .ok()
+    .filter(|_| is_xml_safe(value))
+  {
     Some(text) => format!(
       "<{prefix}:{local}>{}</{prefix}:{local}>\n",
       quote(text, false).replace('\r', "&#13;")
@@ -990,14 +1004,18 @@ fn named_property<R: ?Sized>(
     if let Some((prefix, uri)) = declared_as(group) {
       described.declare_live(prefix, uri);
     }
-    described.found.push_str(&live_element(group, &name.name, &value));
+    described
+      .found
+      .push_str(&live_element(group, &name.name, &value));
     described.any_found = true;
     return;
   }
   if let Some(value) = own_named(subject, name) {
     described.declare_dead();
     let full = full_name(name).unwrap_or_default();
-    described.found.push_str(&dead_property(full.as_bytes(), value, false));
+    described
+      .found
+      .push_str(&dead_property(full.as_bytes(), value, false));
     described.any_found = true;
     return;
   }
@@ -1073,7 +1091,11 @@ fn core_value(subject: &Subject<'_>, lock: &str, name: &str) -> Option<String> {
 }
 
 /// A provider's property in `DAV:` (`liveprops.c`; `resourcetype` `mod_dav`'s standard provider's).
-fn dav_value<R: ?Sized>(served: &Served<'_, R>, subject: &Subject<'_>, name: &str) -> Option<String> {
+fn dav_value<R: ?Sized>(
+  served: &Served<'_, R>,
+  subject: &Subject<'_>,
+  name: &str,
+) -> Option<String> {
   match name {
     "resourcetype" => Some(String::from(if subject.collection {
       "<D:collection/>"
@@ -1087,7 +1109,10 @@ fn dav_value<R: ?Sized>(served: &Served<'_, R>, subject: &Subject<'_>, name: &st
       .live_media_type()
       .map(|media| quote(&media, false).into_owned()),
     "getetag" => Some(subject.etag()),
-    "creationdate" => subject.date.as_deref().map(|date| quote(date, true).into_owned()),
+    "creationdate" => subject
+      .date
+      .as_deref()
+      .map(|date| quote(date, true).into_owned()),
     "getlastmodified" => subject.date.as_deref().and_then(rfc1123),
     _ => dav_version_value(served, subject, name),
   }
@@ -1137,11 +1162,19 @@ fn author_value(author: &[u8]) -> String {
 }
 
 /// `mod_dav_svn`'s own properties (`liveprops.c`).
-fn svn_value<R: ?Sized>(served: &Served<'_, R>, subject: &Subject<'_>, name: &str) -> Option<String> {
+fn svn_value<R: ?Sized>(
+  served: &Served<'_, R>,
+  subject: &Subject<'_>,
+  name: &str,
+) -> Option<String> {
   let file_text = (!subject.collection).then_some(subject.text).flatten();
   match name {
     "baseline-relative-path" => Some(
-      quote(subject.place.path.strip_prefix('/').unwrap_or_default(), true).into_owned(),
+      quote(
+        subject.place.path.strip_prefix('/').unwrap_or_default(),
+        true,
+      )
+      .into_owned(),
     ),
     "md5-checksum" if !subject.collection => {
       Some(file_text.map_or_else(|| hex(&EMPTY_MD5), |text| hex(&text.md5)))
@@ -1182,11 +1215,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The multistatus of `responses` (`dav_begin_multistatus`, `dav_send_one_response`), `207` with `headers` after its
 /// content type.
-fn multistatus(
-  responses: &[Described],
-  headers: Headers,
-  room: usize,
-) -> HttpAnswer {
+fn multistatus(responses: &[Described], headers: Headers, room: usize) -> HttpAnswer {
   let mut body = Body::new(room);
   match write_multistatus(responses, &mut body) {
     Ok(()) => {

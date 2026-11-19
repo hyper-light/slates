@@ -62,7 +62,8 @@ const DATE: &str = "2026-11-19T00:00:01.000000Z";
 /// Shape: the instant locks are judged at.
 const NOW: AprTime = AprTime(1_800_000_000_000_000);
 /// Shape: the PROPFIND `svn ls` sends at depth 1 where no `list` capability is listed (A-609's fixture).
-const PROPFIND_KIND: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop>\
+const PROPFIND_KIND: &[u8] =
+  b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop>\
 <resourcetype xmlns=\"DAV:\"/></prop></propfind>";
 
 /// The principal with uid `uid` on host 0.
@@ -132,7 +133,10 @@ impl Repositories for Held {
 }
 
 /// A digest of `bytes` as a fixed array.
-fn digest_of<const N: usize>(algorithm: &'static aws_lc_rs::digest::Algorithm, bytes: &[u8]) -> [u8; N] {
+fn digest_of<const N: usize>(
+  algorithm: &'static aws_lc_rs::digest::Algorithm,
+  bytes: &[u8],
+) -> [u8; N] {
   digest(algorithm, bytes).as_ref().try_into().unwrap()
 }
 
@@ -147,7 +151,12 @@ fn text_of(bytes: &[u8]) -> Text {
 }
 
 /// An addition's changed-path row.
-fn added(path: &str, kind: NodeKind, text: Option<Text>, properties: Option<ContentIdentity>) -> ChangedPath {
+fn added(
+  path: &str,
+  kind: NodeKind,
+  text: Option<Text>,
+  properties: Option<ContentIdentity>,
+) -> ChangedPath {
   ChangedPath {
     path: path.to_owned(),
     action: Action::Add,
@@ -191,12 +200,24 @@ impl Repo {
       transaction: "0-1".to_owned(),
       changes: vec![
         added("/trunk", NodeKind::Directory, None, None),
-        added("/trunk/a.txt", NodeKind::File, Some(text_of(A_TEXT)), Some(list_identity)),
+        added(
+          "/trunk/a.txt",
+          NodeKind::File,
+          Some(text_of(A_TEXT)),
+          Some(list_identity),
+        ),
         added("/trunk/secret", NodeKind::Directory, None, None),
-        added("/trunk/secret/s.txt", NodeKind::File, Some(text_of(secret)), None),
+        added(
+          "/trunk/secret/s.txt",
+          NodeKind::File,
+          Some(text_of(secret)),
+          None,
+        ),
       ],
     };
-    index.append(record, usize::try_from(ROOM).unwrap()).unwrap();
+    index
+      .append(record, usize::try_from(ROOM).unwrap())
+      .unwrap();
     let tree = |paths: &[(&str, bool)]| {
       paths
         .iter()
@@ -393,7 +414,12 @@ fn ready<F: Future>(future: F) -> F::Output {
 
 /// How the site decided `method target` with `fields`, on a TLS connection: moved to a shard, refused with a status,
 /// or served; and whether the credentials proved a principal.
-fn decided(site: &mut SvnSite<Tokens, Held, Stores>, method: &str, target: &str, fields: &[&str]) -> (String, bool) {
+fn decided(
+  site: &mut SvnSite<Tokens, Held, Stores>,
+  method: &str,
+  target: &str,
+  fields: &[&str],
+) -> (String, bool) {
   let bytes = request(method, target, fields);
   let decided: Decided<SvnExchange<Stores>> = ready(site.answer(&head(&bytes), true));
   let outcome = match decided.answer {
@@ -469,7 +495,12 @@ fn until_the_stores_land_every_request_a_principal_may_make_is_503() {
 
 /// What the owner's served `method target` with `depth` and `body` answers: its status, its fields and its reply's
 /// bytes, and how many reply runs it took.
-fn exchanged(method: &str, target: &str, depth: Option<&str>, body: &[u8]) -> (u16, Fields, Vec<u8>, usize) {
+fn exchanged(
+  method: &str,
+  target: &str,
+  depth: Option<&str>,
+  body: &[u8],
+) -> (u16, Fields, Vec<u8>, usize) {
   let mut site = site();
   let owner = basic("alice", OWNER_TOKEN);
   let depth = depth.map(|depth| format!("Depth: {depth}"));
@@ -497,8 +528,12 @@ fn exchanged(method: &str, target: &str, depth: Option<&str>, body: &[u8]) -> (u
 /// reply begins, with its content type, listing the trunk and `a.txt` and leaving `secret` out; and the GET `403`.
 #[test]
 fn the_exchange_answers_from_the_lent_store_by_the_principals_rules() {
-  let (status, fields, reply, _) =
-    exchanged("PROPFIND", "/repo/!svn/rvr/1/trunk", Some("1"), PROPFIND_KIND);
+  let (status, fields, reply, _) = exchanged(
+    "PROPFIND",
+    "/repo/!svn/rvr/1/trunk",
+    Some("1"),
+    PROPFIND_KIND,
+  );
   let body = String::from_utf8(reply).unwrap();
   let hrefs: Vec<&str> = body
     .split("<D:href>")
@@ -510,7 +545,10 @@ fn the_exchange_answers_from_the_lent_store_by_the_principals_rules() {
     (status, fields, hrefs, hidden),
     (
       207,
-      vec![(b"Content-Type".to_vec(), b"text/xml; charset=\"utf-8\"".to_vec())],
+      vec![(
+        b"Content-Type".to_vec(),
+        b"text/xml; charset=\"utf-8\"".to_vec()
+      )],
       vec!["/repo/!svn/rvr/1/trunk/", "/repo/!svn/rvr/1/trunk/a.txt"],
       403
     )
@@ -650,7 +688,9 @@ fn svn_present() -> bool {
 #[test]
 fn stock_svn_reads_a_repository_through_the_site_over_https() {
   if !svn_present() {
-    eprintln!("SKIPPED stock_svn_reads_a_repository_through_the_site_over_https: no `svn` on this host");
+    eprintln!(
+      "SKIPPED stock_svn_reads_a_repository_through_the_site_over_https: no `svn` on this host"
+    );
     return;
   }
   let runtime = runtime();
@@ -690,11 +730,22 @@ fn stock_svn_reads_a_repository_through_the_site_over_https() {
   };
   assert_eq!(
     (
-      read(&info, &["Node Kind: file", "Revision: 1", UUID, "Last Changed Author: alice"]),
+      read(
+        &info,
+        &[
+          "Node Kind: file",
+          "Revision: 1",
+          UUID,
+          "Last Changed Author: alice"
+        ]
+      ),
       cat.clone(),
       ls.clone(),
       read(&proplist, &["svn:eol-style", "native"]),
-      (hidden.0, hidden.1.contains("403") || hidden.1.contains("orbidden")),
+      (
+        hidden.0,
+        hidden.1.contains("403") || hidden.1.contains("orbidden")
+      ),
     ),
     (
       true,

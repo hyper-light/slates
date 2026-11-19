@@ -34,7 +34,8 @@ const PROPFIND_KIND: &[u8] = include_bytes!("../fixtures/propfind-resourcetype.x
 /// Shape: the PROPFIND `svn info` sends for a URL's lock.
 const PROPFIND_LOCKS: &[u8] = include_bytes!("../fixtures/propfind-lockdiscovery.xml");
 /// Shape: a PROPFIND of the two properties a checked-in version is read by.
-const PROPFIND_VERSION: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop>\
+const PROPFIND_VERSION: &[u8] =
+  b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop>\
 <checked-in/><version-name/></prop></propfind>";
 
 /// The fixtures' repository, with a lock table.
@@ -183,7 +184,11 @@ fn svn_infos_propfind_of_a_file_is_answered_byte_for_byte() {
       header(&answer.headers, "Content-Type"),
       text_of(&answer)
     ),
-    (207, vec!["text/xml; charset=\"utf-8\""], expected.to_owned())
+    (
+      207,
+      vec!["text/xml; charset=\"utf-8\""],
+      expected.to_owned()
+    )
   );
 }
 
@@ -202,7 +207,10 @@ fn a_property_a_directory_does_not_define_is_listed_not_found() {
 <lp1:creator-displayname>bob</lp1:creator-displayname>\n</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n\
 </D:propstat>\n<D:propstat>\n<D:prop>\n<g0:getcontentlength/>\n</D:prop>\n\
 <D:status>HTTP/1.1 404 Not Found</D:status>\n</D:propstat>\n</D:response>\n</D:multistatus>\n";
-  assert_eq!((answer.status, text_of(&answer)), (207, expected.to_owned()));
+  assert_eq!(
+    (answer.status, text_of(&answer)),
+    (207, expected.to_owned())
+  );
 }
 
 /// A-681 (`dav_get_allprops`, `deadprops.c`, `liveprops.c`): do PROPFIND `allprop` of a file with a property, as
@@ -343,7 +351,12 @@ fn streamed(fixture: &Fixture, answer: Answer) -> (Headers, Vec<u8>) {
 fn a_get_streams_a_files_text_with_set_headers_fields() {
   let fixture = Fixture::new();
   let rules = rules_of(None);
-  let get = |path: &str| streamed(&fixture, fixture.ask(Some(&rules), "GET", (path, None), b""));
+  let get = |path: &str| {
+    streamed(
+      &fixture,
+      fixture.ask(Some(&rules), "GET", (path, None), b""),
+    )
+  };
   let (revision_root, text) = get("/!svn/rvr/6/trunk/script.sh");
   let (public, public_text) = get("/trunk/script.sh");
   let (typed, _) = get("/!svn/rvr/1/trunk/dir/c.bin");
@@ -354,7 +367,10 @@ fn a_get_streams_a_files_text_with_set_headers_fields() {
   ];
   let public_headers = vec![
     ("Cache-Control", String::from("max-age=0")),
-    ("Last-Modified", String::from("Thu, 01 Jan 2026 00:00:01 GMT")),
+    (
+      "Last-Modified",
+      String::from("Thu, 01 Jan 2026 00:00:01 GMT"),
+    ),
     ("ETag", String::from("\"1//trunk/script.sh\"")),
     ("Content-Type", String::from("text/plain")),
   ];
@@ -407,7 +423,9 @@ fn every_refusal_has_its_status() {
     .collect();
   assert_eq!(
     statuses,
-    [403, 404, 404, 500, 500, 501, 501, 403, 403, 400, 400, 501, 501]
+    [
+      403, 404, 404, 500, 500, 501, 501, 403, 403, 400, 400, 501, 501
+    ]
   );
 }
 
@@ -489,8 +507,5 @@ fn a_mime_type_is_judged_as_subversion_judges_it() {
   .iter()
   .map(|value| valid_mime_type(value))
   .collect();
-  assert_eq!(
-    judged,
-    [true, true, true, false, true, false, false, false]
-  );
+  assert_eq!(judged, [true, true, true, false, true, false, false, false]);
 }

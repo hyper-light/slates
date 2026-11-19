@@ -410,7 +410,12 @@ pub(crate) struct SvnExchange<S> {
 impl<S> SvnExchange<S> {
   /// The exchange for `asked` on `repository`, its route, method and depth copied and charged to `room`; none past it
   /// or for a `Depth` that is no text.
-  fn new(stores: S, repository: &RepositoryRecord, asked: Asked<'_, '_>, room: u64) -> Option<Self> {
+  fn new(
+    stores: S,
+    repository: &RepositoryRecord,
+    asked: Asked<'_, '_>,
+    room: u64,
+  ) -> Option<Self> {
     let mut admission = Admission::new(room);
     let method = String::from_utf8(asked.head.method.to_vec()).ok()?;
     let depth = match asked.head.field(DEPTH) {
