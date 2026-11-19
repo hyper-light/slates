@@ -784,7 +784,11 @@ fn a_file_without_a_text_has_the_md5_of_no_bytes() {
   let (_, out, _) = streamed(&fixture, &fixture.green, command, 1);
   assert_eq!(
     String::from_utf8(out).unwrap(),
-    "( success ( ( ) 0: ) ) ( success ( ( 32:d41d8cd98f00b204e9800998ecf8427e ) 12 ( ) ) ) 0: ( success ( ) ) "
+    concat!(
+      "( success ( ( ) 0: ) ) ",
+      "( success ( ( 32:d41d8cd98f00b204e9800998ecf8427e ) 12 ( ) ) ) ",
+      "0: ( success ( ) ) "
+    )
   );
 }
 
