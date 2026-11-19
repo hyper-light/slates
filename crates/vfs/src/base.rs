@@ -4836,4 +4836,98 @@ mod tests {
       "the replacement landed during {raced} digests, {reached} of them between the listing's check and the open"
     );
   }
+
+  /// Shape: the journal a restarted overlay keeps, as [`overlay`] makes one.
+  const JOURNAL: usize = 1 << 16;
+  /// Format: a file's and a directory's mode.
+  const FILE_MODE: u32 = 0o644;
+  const DIR_MODE: u32 = 0o755;
+
+  /// The live entries a restart counts in `image` (§4.2's namespace dimension): the names its directories carry that
+  /// name a child. A whiteout names none.
+  fn named_entries(image: &crate::recover::VolumeImage) -> u64 {
+    image
+      .inodes
+      .iter()
+      .map(|inode| match &inode.body {
+        crate::recover::BodyImage::Directory { entries, .. } => {
+          entries.iter().filter(|entry| entry.child.is_some()).count()
+        }
+        _ => 0,
+      })
+      .map(|named| u64::try_from(named).unwrap())
+      .sum()
+  }
+
+  /// A-572 (A-549's sweep). Do: over a base holding `/top` and three files in `/src`, remove `/top` and two of the files
+  /// through the overlay, which leaves three whiteouts, and make a file and a directory of the overlay's own; image the
+  /// overlay and restart it. Expect its live-entry count before the restart, after it, and the recount of its image (the
+  /// names its directories carry that name a child) all equal. Before A-572 the restart counted each whiteout as an
+  /// entry, three past the live count, and the floor a restart sets the entry allowance at rose by as many.
+  #[test]
+  fn a_restart_counts_no_whiteout_as_a_live_entry() {
+    let mut host = SimHost::new();
+    host.replace_file("/top", OPENED);
+    host.mkdir("/src");
+    for name in ["a", "b", "c"] {
+      host.replace_file(&format!("/src/{name}"), OPENED);
+    }
+    host.advance_ns(STEP_NS);
+    let mut before = store();
+    let mut vol = overlay(&mut host, &mut before);
+    let root = vol.root();
+    let crate::dir::Child::Dir(src) = vol
+      .with_host(&mut host)
+      .resolve(&mut before, "/src")
+      .unwrap()
+      .child
+    else {
+      panic!("/src is a directory");
+    };
+    vol
+      .with_host(&mut host)
+      .unlink(&mut before, root, "top")
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .unlink(&mut before, src, "a")
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .unlink(&mut before, src, "b")
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .create_file(&mut before, root, "mine", FILE_MODE)
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .mkdir(&mut before, src, "made", DIR_MODE)
+      .unwrap();
+    let image = vol.to_image(&before, Some(&mut host)).unwrap();
+    let live = vol.entry_usage().0;
+    assert_eq!(
+      live,
+      named_entries(&image),
+      "the live count is the named entries of the overlay's image"
+    );
+    host.close_files();
+    let host_root = host.root();
+    let mut after = store();
+    let claims = crate::recover::Claims::prepare(&mut after, [&image]).unwrap();
+    let recovered = Volume::from_image(
+      &mut after,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      Some((&mut host, host_root)),
+    )
+    .unwrap();
+    assert_eq!(
+      recovered.entry_usage().0,
+      live,
+      "the restart counts the entries the live overlay counted, no whiteout among them"
+    );
+  }
 }
