@@ -23568,71 +23568,6 @@ mod clone_admission_tests {
       "the clone holds a version slot for each inode it holds"
     );
   }
-}
-
-#[cfg(test)]
-mod materialization_wait_tests {
-  use super::await_materialization;
-  use crate::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
-  use slates_db::register::ObjectId;
-
-  /// Shape: the volume whose materialization the held verb waits for; any id works, nothing reads its catalog.
-  const PENDING: ObjectId = ObjectId([7; 16]);
-  /// Shape: how long the test thread waits before it looks: past the bound the wait had until A-548 (one liveness
-  /// window) by half a window.
-  const PAST_THE_OLD_BOUND_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2;
-
-  /// A-548 (R3's class C; §4.8 "Promotion and takeover"): a verb held for its volume's materialization waits for the
-  /// materialization's end, however long it takes, and is let go at that end. Do: on an audit daemon's shard, mark a
-  /// volume pending materialization and spawn a task that waits as such a verb does; wait past the old bound (one
-  /// liveness window) and half a window more; then end the materialization (its pending entry removed, as a made, a
-  /// given-up or a tombstoned volume's is). Expect: the task still waiting past the old bound, and done once the
-  /// materialization ended. Before, the wait looked at the heartbeat and gave up at one window, so its verb was refused
-  /// while the materialization still ran, and its client sent round to retry.
-  #[test]
-  // The test thread waits past the old bound; no runtime wheel serves this thread (D-9 allows a test).
-  #[allow(clippy::disallowed_methods)]
-  fn a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound() {
-    let daemon = crate::daemon::audit_daemon();
-    let (done, done_seen) = std::sync::mpsc::channel();
-    crate::daemon::observe_first(&daemon, move |state| {
-      state.pending_materializations.insert(
-        PENDING,
-        crate::state::PendingVolume::adopted(
-          crate::head::HeadValue {
-            manifest: None,
-            content_holders: Vec::new(),
-            sealing: None,
-          },
-          None,
-          Vec::new(),
-        ),
-      );
-      let held = slates_rt::futures::spawn(async move {
-        await_materialization(PENDING).await;
-        let _ = done.send(());
-      })
-      .unwrap();
-      slates_rt::futures::detach(held).unwrap();
-    });
-    std::thread::sleep(std::time::Duration::from_nanos(PAST_THE_OLD_BOUND_NS));
-    let waited_past_the_old_bound = done_seen.try_recv().is_err();
-    crate::daemon::observe_first(&daemon, |state| {
-      state.pending_materializations.remove(&PENDING);
-    });
-    let let_go_at_the_end = done_seen
-      .recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
-      .is_ok();
-    daemon.stop();
-    assert!(
-      waited_past_the_old_bound,
-      "the held verb was let go while its materialization was still pending"
-    );
-    assert!(
-      let_go_at_the_end,
-      "the held verb is let go once its materialization ends"
-    );
-  }
 
   /// Links `count` more names `prefix-n` to the file `target` in `volume`'s root.
   pub(super) fn link_names(
@@ -23710,7 +23645,10 @@ mod materialization_wait_tests {
       (share, floored, few, refused)
     });
     let (walked, count, allowance) = floored;
-    assert_eq!(count, walked, "the floored clone counts the entries its namespace holds");
+    assert_eq!(
+      count, walked,
+      "the floored clone counts the entries its namespace holds"
+    );
     assert_eq!(
       walked,
       share + PAST_FAIR,
@@ -23721,8 +23659,79 @@ mod materialization_wait_tests {
       "the floored clone's entry allowance is the entries its snapshot holds, above the share"
     );
     let (walked, count, allowance) = few;
-    assert_eq!(count, walked, "the small clone counts the entries its namespace holds");
-    assert_eq!(allowance, share, "the small clone's entry allowance is a create's share");
+    assert_eq!(
+      count, walked,
+      "the small clone counts the entries its namespace holds"
+    );
+    assert_eq!(
+      allowance, share,
+      "the small clone's entry allowance is a create's share"
+    );
     assert_eq!(refused, 0, "no allowance was refused");
+  }
+}
+
+#[cfg(test)]
+mod materialization_wait_tests {
+  use super::await_materialization;
+  use crate::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+  use slates_db::register::ObjectId;
+
+  /// Shape: the volume whose materialization the held verb waits for; any id works, nothing reads its catalog.
+  const PENDING: ObjectId = ObjectId([7; 16]);
+  /// Shape: how long the test thread waits before it looks: past the bound the wait had until A-548 (one liveness
+  /// window) by half a window.
+  const PAST_THE_OLD_BOUND_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2;
+
+  /// A-548 (R3's class C; §4.8 "Promotion and takeover"): a verb held for its volume's materialization waits for the
+  /// materialization's end, however long it takes, and is let go at that end. Do: on an audit daemon's shard, mark a
+  /// volume pending materialization and spawn a task that waits as such a verb does; wait past the old bound (one
+  /// liveness window) and half a window more; then end the materialization (its pending entry removed, as a made, a
+  /// given-up or a tombstoned volume's is). Expect: the task still waiting past the old bound, and done once the
+  /// materialization ended. Before, the wait looked at the heartbeat and gave up at one window, so its verb was refused
+  /// while the materialization still ran, and its client sent round to retry.
+  #[test]
+  // The test thread waits past the old bound; no runtime wheel serves this thread (D-9 allows a test).
+  #[allow(clippy::disallowed_methods)]
+  fn a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound() {
+    let daemon = crate::daemon::audit_daemon();
+    let (done, done_seen) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      state.pending_materializations.insert(
+        PENDING,
+        crate::state::PendingVolume::adopted(
+          crate::head::HeadValue {
+            manifest: None,
+            content_holders: Vec::new(),
+            sealing: None,
+          },
+          None,
+          Vec::new(),
+        ),
+      );
+      let held = slates_rt::futures::spawn(async move {
+        await_materialization(PENDING).await;
+        let _ = done.send(());
+      })
+      .unwrap();
+      slates_rt::futures::detach(held).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_nanos(PAST_THE_OLD_BOUND_NS));
+    let waited_past_the_old_bound = done_seen.try_recv().is_err();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.pending_materializations.remove(&PENDING);
+    });
+    let let_go_at_the_end = done_seen
+      .recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .is_ok();
+    daemon.stop();
+    assert!(
+      waited_past_the_old_bound,
+      "the held verb was let go while its materialization was still pending"
+    );
+    assert!(
+      let_go_at_the_end,
+      "the held verb is let go once its materialization ends"
+    );
   }
 }
