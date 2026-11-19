@@ -45,7 +45,7 @@ fn refusal(e: rustix::io::Errno) -> HostError {
     rustix::io::Errno::NOENT => HostError::NotFound,
     rustix::io::Errno::NOTDIR => HostError::NotDirectory,
     rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR => HostError::NotFile,
-    other => HostError::Unavailable(other.raw_os_error()),
+    other => HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error())),
   }
 }
 
@@ -232,7 +232,11 @@ impl OsHost {
       .map(|(&handle, (fd, mount))| {
         fd.try_clone()
           .map(|fd| (handle, (fd, *mount)))
-          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+          .map_err(|error| {
+            HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+              error.raw_os_error().unwrap_or(0),
+            ))
+          })
       })
       .collect::<Result<BTreeMap<_, _>, HostError>>()?;
     Ok(Self {
@@ -248,9 +252,11 @@ impl OsHost {
   /// nanosecond, a `u64` lasts 584 years.)
   fn allocate(&mut self) -> Result<u64, HostError> {
     let h = self.next;
-    self.next = h.checked_add(1).ok_or(HostError::Unavailable(
-      rustix::io::Errno::MFILE.raw_os_error(),
-    ))?;
+    self.next = h
+      .checked_add(1)
+      .ok_or(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+        rustix::io::Errno::MFILE.raw_os_error(),
+      )))?;
     Ok(h)
   }
 
@@ -434,10 +440,11 @@ impl HostFs for OsHost {
     let fd = self.dir(dir)?;
     check_crossing(fd.as_fd(), self.dir_mount(dir)?, name)?;
     let target = rustix::fs::readlinkat(fd, name, Vec::new()).map_err(refusal)?;
-    target
-      .to_str()
-      .map(|s| s.into())
-      .map_err(|_| HostError::Unavailable(rustix::io::Errno::ILSEQ.raw_os_error()))
+    target.to_str().map(|s| s.into()).map_err(|_| {
+      HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+        rustix::io::Errno::ILSEQ.raw_os_error(),
+      ))
+    })
   }
 
   fn close_file(&mut self, file: HostFile) {

@@ -175,6 +175,10 @@ fn source_for(pool: &[u8], len: usize) -> Vec<u8> {
 }
 
 /// Decodes `stream` as a caller fed it in the pieces `cuts` makes, holding only what the decoder has not consumed.
+#[allow(
+  clippy::panic_in_result_fn,
+  reason = "a test helper: its assert checks the decoder's NeedMore rule mid-stream, which the decoder's own error type has no variant for; the Result carries the decoder's refusals to the property test"
+)]
 fn decode_in_pieces(stream: &[u8], cuts: &[usize]) -> Result<Vec<Window>, SvndiffError> {
   let mut decoder = Decoder::new();
   let mut held: Vec<u8> = Vec::new();

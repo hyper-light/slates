@@ -977,6 +977,39 @@ fn a_segment_from_before_host_scoped_principals_is_refused_at_start_saying_to_re
   );
 }
 
+/// A-539 (a recorded reply's host code typed by its numbering). Do: write layout 10, the layout before A-539, into a
+/// segment's header and attach it. Expect: refused at start, never read. A completion record keeps its reply's bytes,
+/// and a Windows daemon of layout 10 put a Win32 error code in a reply's errno field (`Refusal::BaseUnavailable`,
+/// `TargetRefusal::Host`, `HostAnswer::Errno`, `LandingDegradation::Crashed`), which a reader of today would take for
+/// an errno. Before A-539 layout 10 was the current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_typed_host_codes_is_refused_at_start() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: the layout before A-539's typed host codes.
+  const BEFORE_TYPED_CODES: u32 = 10;
+  let name = format!("slates-anchor-untyped-codes-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &BEFORE_TYPED_CODES.to_le_bytes())
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "a segment whose replies may hold untyped host codes is refused at start: {result:?}"
+  );
+}
+
 /// Shape: how long the graceful stopping child keeps beating after it acknowledges a stop before it exits —
 /// its "drain", long enough that an anchor which did not wait for it would be seen not to.
 const DRAIN_MS: u64 = 100;

@@ -61,3 +61,5 @@ scatter entry forever, unbounded growth under repeated refusals.
 
 - In the same three read scatters, a refused part is settled as an empty part. A listing, grants or status can then be
   answered as if complete without that shard's volumes, grants or report. Not changed here; reported.
+  Fixed 2026-11-19 by A-557: a part whose shard's state refused it comes home unserved, and the scatter answers
+  `Overloaded { shard }` for it (`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`).

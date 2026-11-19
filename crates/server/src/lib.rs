@@ -29,6 +29,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+mod carry;
 pub mod catalog;
 pub mod config;
 mod consensus;

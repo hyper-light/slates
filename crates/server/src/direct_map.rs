@@ -1831,24 +1831,42 @@ mod tests {
   #[test]
   fn a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed() {
     let mut sent = std::collections::BTreeSet::new();
+    let again = send_map_7_twice_and_map_8_refused(&mut sent);
+    assert_hand_off_judged_from_its_answers(again);
+    assert_eq!(
+      sent.iter().copied().collect::<Vec<u64>>(),
+      vec![7],
+      "a refused send is not recorded"
+    );
+    assert_replies_end_their_records(&mut sent);
+  }
+
+  /// A-505's sends: map 7 asked twice, its first answer lost on its way back so the copy's shard asks again, then map 8
+  /// whose send is refused. Returns the second ask's answer.
+  fn send_map_7_twice_and_map_8_refused(sent: &mut std::collections::BTreeSet<u64>) -> Delivered {
     let mut sends = 0u32;
     let mut send = |outcome: Delivered| {
       sends = sends.saturating_add(1);
       outcome
     };
-    let first = send_once(&mut sent, 7, || send(Delivered::Sent));
+    let first = send_once(sent, 7, || send(Delivered::Sent));
     assert_eq!(first, Delivered::Sent);
-    // The first answer is lost on its way back; the copy's shard asks again.
-    let again = send_once(&mut sent, 7, || send(Delivered::Sent));
+    let again = send_once(sent, 7, || send(Delivered::Sent));
     assert_eq!(again, Delivered::Sent, "the second ask is answered as sent");
-    let refused = send_once(&mut sent, 8, || send(Delivered::Refused));
+    let refused = send_once(sent, 8, || send(Delivered::Refused));
     assert_eq!(refused, Delivered::Refused);
     assert_eq!(
       sends, 2,
       "map 7 was sent once and map 8 tried once: a second ask sent the same copy again"
     );
+    again
+  }
+
+  /// A-505's judge: a copy is kept as handed when an ask answered `Sent` and when every answer was lost, and given back
+  /// when one answered `Refused` or `Unconfined`.
+  fn assert_hand_off_judged_from_its_answers(answered: Delivered) {
     assert!(
-      kept_as_handed(Some(again)),
+      kept_as_handed(Some(answered)),
       "an answered send keeps the copy as handed"
     );
     assert!(
@@ -1857,15 +1875,14 @@ mod tests {
     );
     assert!(!kept_as_handed(Some(Delivered::Refused)));
     assert!(!kept_as_handed(Some(Delivered::Unconfined)));
-    assert_eq!(
-      sent.iter().copied().collect::<Vec<u64>>(),
-      vec![7],
-      "a refused send is not recorded"
-    );
-    forget_replied(&mut sent, &ReplyBody::MapReleased);
+  }
+
+  /// A-505's record ends at its map's reply alone: a reply that names no map ends none, and map 7's `Mapped` ends its own.
+  fn assert_replies_end_their_records(sent: &mut std::collections::BTreeSet<u64>) {
+    forget_replied(sent, &ReplyBody::MapReleased);
     assert_eq!(sent.len(), 1, "a reply that names no map ends no record");
     forget_replied(
-      &mut sent,
+      sent,
       &ReplyBody::Mapped {
         mapping_id: 7,
         region_off: 0,

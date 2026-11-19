@@ -584,6 +584,10 @@ fn words() -> impl Strategy<Value = String> {
 }
 
 /// Items of every kind, nested.
+#[allow(
+  clippy::disallowed_types,
+  reason = "D-8's test-harness exception: proptest's `prop_oneof!` and `prop_recursive` build their union from `Arc`s, inside the macro; nothing in slates shares by `Arc`"
+)]
 fn items() -> impl Strategy<Value = Owned> {
   let leaf = prop_oneof![
     words().prop_map(Owned::Word),

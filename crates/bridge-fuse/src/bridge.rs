@@ -688,7 +688,8 @@ pub fn errno(e: VfsError) -> i32 {
     VfsError::NoAttribute => ENODATA,
     VfsError::Invalid | VfsError::InvalidName => EINVAL,
     VfsError::NameTooLong => ENAMETOOLONG,
-    VfsError::BaseUnavailable(code) => code,
+    // The host's errno where it named one (A-539); none, or a Win32 code no FUSE kernel reads, is `EIO`.
+    VfsError::BaseUnavailable(Some(slates_vfs::host::OsCode::Errno(errno))) if errno > 0 => errno,
     // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
     VfsError::Memory(slates_mem::MemError::SlabFull { .. }) => EMFILE,
     VfsError::PublishNeeded => EAGAIN,

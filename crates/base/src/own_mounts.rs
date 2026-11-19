@@ -282,32 +282,36 @@ fn await_learned() -> Result<(), HostError> {
       .checked_sub(still_since.elapsed())
       .filter(|left| !left.is_zero())
     else {
-      return Err(HostError::Unavailable(
+      return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::AGAIN.raw_os_error(),
-      ));
+      )));
     };
     std::thread::park_timeout(left.min(std::time::Duration::from_nanos(gate.look_ns)));
   }
   Ok(())
 }
 
-/// The refusal of a path on this daemon's own mount, with the errno the platform names it by: a deadlock avoided.
+/// The refusal of a path on this daemon's own mount, with the code the platform names it by, typed by its numbering
+/// (A-539): a deadlock avoided.
 pub fn refusal() -> HostError {
-  HostError::OwnMount(deadlock_errno())
+  HostError::OwnMount(deadlock_code())
 }
 
+/// `EDEADLK`, an errno.
 #[cfg(unix)]
-fn deadlock_errno() -> i32 {
-  rustix::io::Errno::DEADLK.raw_os_error()
+fn deadlock_code() -> slates_vfs::host::OsCode {
+  slates_vfs::host::OsCode::Errno(rustix::io::Errno::DEADLK.raw_os_error())
 }
 
-/// Format: Windows' `ERROR_POSSIBLE_DEADLOCK` (winerror.h), its name for the same refusal.
+/// Format: Windows' `ERROR_POSSIBLE_DEADLOCK` (winerror.h), its name for the same refusal: a Win32 error code, which
+/// before A-539 rode where an errno does.
 #[cfg(not(unix))]
-const ERROR_POSSIBLE_DEADLOCK: i32 = 1131;
+const ERROR_POSSIBLE_DEADLOCK: u32 = 1131;
 
+/// `ERROR_POSSIBLE_DEADLOCK`, a Win32 error code.
 #[cfg(not(unix))]
-fn deadlock_errno() -> i32 {
-  ERROR_POSSIBLE_DEADLOCK
+fn deadlock_code() -> slates_vfs::host::OsCode {
+  slates_vfs::host::OsCode::Win32(ERROR_POSSIBLE_DEADLOCK)
 }
 
 /// Format: the bytes of a tag, drawn from the system's random source.
@@ -321,12 +325,14 @@ fn fresh_tag() -> Result<u64, HostError> {
     rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
     rustix::fs::Mode::empty(),
   )
-  .map_err(|e| HostError::Unavailable(e.raw_os_error()))?;
+  .map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
   let mut bytes = [0u8; TAG_BYTES];
-  let read =
-    rustix::io::read(&source, &mut bytes).map_err(|e| HostError::Unavailable(e.raw_os_error()))?;
+  let read = rustix::io::read(&source, &mut bytes)
+    .map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
   if read != TAG_BYTES {
-    return Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()));
+    return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+      rustix::io::Errno::IO.raw_os_error(),
+    )));
   }
   Ok(u64::from_le_bytes(bytes))
 }
@@ -403,7 +409,7 @@ mod linux {
     match e {
       rustix::io::Errno::NOENT => HostError::NotFound,
       rustix::io::Errno::NOTDIR => HostError::NotDirectory,
-      other => HostError::Unavailable(other.raw_os_error()),
+      other => HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error())),
     }
   }
 
@@ -424,9 +430,9 @@ mod linux {
       .lines()
       .find_map(|line| line.strip_prefix("mnt_id:"))
       .and_then(|id| id.trim().parse::<u64>().ok())
-      .ok_or(HostError::Unavailable(
+      .ok_or(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::NOSYS.raw_os_error(),
-      ))
+      )))
   }
 
   /// Whether mount `id` is this daemon's: recorded, or (not yet recorded) named by its tag in the kernel's table.
@@ -635,9 +641,9 @@ mod linux {
     followed: usize,
   ) -> Result<OwnedFd, HostError> {
     if followed > MAX_SYMLINKS {
-      return Err(HostError::Unavailable(
+      return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::LOOP.raw_os_error(),
-      ));
+      )));
     }
     let target = rustix::fs::readlinkat(link, c"", Vec::new()).map_err(unavailable)?;
     let target = Path::new(OsStr::from_bytes(target.as_bytes()));
@@ -711,7 +717,7 @@ mod macos {
     match e {
       rustix::io::Errno::NOENT => HostError::NotFound,
       rustix::io::Errno::NOTDIR => HostError::NotDirectory,
-      other => HostError::Unavailable(other.raw_os_error()),
+      other => HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error())),
     }
   }
 
@@ -811,9 +817,9 @@ mod macos {
       if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
         followed = followed.saturating_add(1);
         if followed > MAX_SYMLINKS {
-          return Err(HostError::Unavailable(
+          return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
             rustix::io::Errno::LOOP.raw_os_error(),
-          ));
+          )));
         }
         let target =
           rustix::fs::readlinkat(&at, name.as_os_str(), Vec::new()).map_err(unavailable)?;
@@ -1004,9 +1010,9 @@ mod tests {
     drop(never);
     assert_eq!(
       answer,
-      Err(HostError::Unavailable(
+      Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::AGAIN.raw_os_error()
-      )),
+      ))),
       "a still window gives the check up"
     );
     assert!(took >= GATE_WINDOW, "after a window: {took:?}");

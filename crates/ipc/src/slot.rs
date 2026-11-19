@@ -2,9 +2,19 @@
 //!
 //! Format, one slot, 64 bytes: the sequence word (8), the kind (2), the payload length (2),
 //! the request id word (8: client in the high half, sequence in the low half, as
-//! `slates_wire::RequestId`), the payload (40), padding (4). One cache line, so a request or
-//! a reply is one line transfer between cores (§2.2 of the design). A payload that does not
-//! fit names a range of the client's bulk region instead (`SlotKind::Bulk`).
+//! `slates_wire::RequestId`), the payload (40), the producer's stamp (4). One cache line, so a
+//! request or a reply is one line transfer between cores (§2.2 of the design). A payload that
+//! does not fit names a range of the client's bulk region instead (`SlotKind::Bulk`).
+//!
+//! **The stamp (A-559).** The producer stamps each slot as it writes it: the low 32 bits of the
+//! host's monotonic clock (`slates_machine::clock::monotonic_ns`, the clock the daemon stamps its
+//! spans in), with the lowest bit set, so a slot no producer stamped reads zero ([`stamp_now`]).
+//! The client's requests and the daemon's replies are stamped alike, so whoever takes a slot
+//! knows when it landed, not only when it was taken; [`landed_ns`] widens a stamp back to the
+//! clock's full reading from any reading taken within 2³² ns (about 4.3 s) after it. A harness
+//! splits a latency by the two: everything before its request landed and after its reply did is
+//! its own time (`slates_machine::attribution`). Before A-559 the four bytes were padding, so a
+//! producer of that layout writes zero, which reads as no stamp.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,9 +36,17 @@ const AT_REQUEST: usize = 12;
 const AT_PAYLOAD: usize = 20;
 /// Format: the payload bytes a slot carries.
 pub const PAYLOAD_BYTES: usize = 40;
-/// Format: a slot's body after its sequence word — kind, length, request word and payload — copied in
-/// and out whole (AUD-29-09: the sequence word is atomic, the body plain, and they never meet).
-const BODY_BYTES: usize = AT_PAYLOAD + PAYLOAD_BYTES - AT_KIND;
+/// Format: the producer's stamp's offset, right after the payload (A-559).
+const AT_STAMP: usize = AT_PAYLOAD + PAYLOAD_BYTES;
+/// Format: the stamp's width.
+const STAMP_BYTES: usize = size_of::<u32>();
+/// Format: a slot's body after its sequence word — kind, length, request word, payload and stamp — copied
+/// in and out whole (AUD-29-09: the sequence word is atomic, the body plain, and they never meet).
+const BODY_BYTES: usize = AT_STAMP + STAMP_BYTES - AT_KIND;
+/// Format: the bits of a monotonic reading a stamp keeps, its low 32.
+const STAMP_BITS: u64 = 0xFFFF_FFFF;
+/// Format: the bit every stamp sets, so a zero stamp is a slot no producer stamped.
+const STAMPED: u32 = 1;
 /// Format: the ring's words before its slots: the producer's tail hint and the consumer's head
 /// hint, each on its own cache line (the slots' sequences carry the protocol; the hints let
 /// the other side see depth without scanning).
@@ -93,6 +111,9 @@ pub struct Slot {
   pub request: u64,
   /// The payload.
   pub payload: Vec<u8>,
+  /// The producer's stamp, as [`Ring::peek`] read it (module docs, "The stamp"): zero for a slot no producer stamped.
+  /// A slot to be pushed carries zero; [`Ring::push`] writes the stamp it is given.
+  pub stamp: u32,
 }
 
 impl Slot {
@@ -108,19 +129,44 @@ impl Slot {
       kind: SlotKind::Inline,
       request,
       payload: payload.to_vec(),
+      stamp: 0,
     })
   }
 }
 
-/// A slot's body as the producer writes it: kind, length, request word, payload zero-padded to its field.
-fn encode_body(slot: &Slot) -> [u8; BODY_BYTES] {
+/// The stamp a producer writes into the slot it pushes now (module docs, "The stamp"): the low 32 bits of the host's
+/// monotonic clock, with the lowest bit set.
+pub fn stamp_now() -> u32 {
+  u32::try_from(slates_machine::clock::monotonic_ns() & STAMP_BITS)
+    .map_or(u32::MAX, |low| low | STAMPED)
+}
+
+/// When a slot stamped `stamp` landed, on the host's monotonic clock, given `by_ns`, a reading of that clock taken at
+/// or after the landing and less than 2³² ns after it (module docs, "The stamp"): the latest instant at or before `by_ns`
+/// whose low 32 bits are the stamp's, to within the one nanosecond the stamp's set bit may add. `None` for a slot no
+/// producer stamped, or a landing that would precede the clock's start.
+pub fn landed_ns(stamp: u32, by_ns: u64) -> Option<u64> {
+  if stamp == 0 {
+    return None;
+  }
+  // Both compared without the set bit, which the stamp may have added: a reading taken in the very nanosecond of the
+  // landing then widens to it rather than to a whole wrap before.
+  let low = u32::try_from(by_ns & STAMP_BITS).ok()? & !STAMPED;
+  let back = u64::from(low.wrapping_sub(stamp & !STAMPED));
+  by_ns.checked_sub(back)
+}
+
+/// A slot's body as the producer writes it: kind, length, request word, payload zero-padded to its field, and the
+/// producer's `stamp`.
+fn encode_body(slot: &Slot, stamp: u32) -> [u8; BODY_BYTES] {
   let mut body = [0u8; BODY_BYTES];
   let len = u16::try_from(slot.payload.len()).unwrap_or(u16::MAX);
-  let fields: [(usize, &[u8]); 4] = [
+  let fields: [(usize, &[u8]); 5] = [
     (AT_KIND, &slot.kind.word().to_le_bytes()),
     (AT_LEN, &len.to_le_bytes()),
     (AT_REQUEST, &slot.request.to_le_bytes()),
     (AT_PAYLOAD, &slot.payload),
+    (AT_STAMP, &stamp.to_le_bytes()),
   ];
   for (at, bytes) in fields {
     let start = at.saturating_sub(AT_KIND);
@@ -159,10 +205,13 @@ fn decode_body(body: &[u8; BODY_BYTES]) -> Result<Slot, IpcError> {
   }
   let mut request = [0u8; size_of::<u64>()];
   request.copy_from_slice(field(AT_REQUEST, size_of::<u64>()).ok_or_else(past)?);
+  let mut stamp = [0u8; STAMP_BYTES];
+  stamp.copy_from_slice(field(AT_STAMP, STAMP_BYTES).ok_or_else(past)?);
   Ok(Slot {
     kind,
     request: u64::from_le_bytes(request),
     payload: field(AT_PAYLOAD, len).ok_or_else(past)?.to_vec(),
+    stamp: u32::from_le_bytes(stamp),
   })
 }
 
@@ -310,9 +359,15 @@ impl Ring {
     Ok(self.seq(object, index)?.load(Ordering::Acquire) == index)
   }
 
-  /// The producer writes `slot` at `index` and releases it; refuses `RingFull` when the
-  /// consumer has not released the slot.
-  pub fn push(&self, object: &mut SharedObject, index: u64, slot: &Slot) -> Result<(), IpcError> {
+  /// The producer writes `slot` at `index`, stamped `stamp` ([`stamp_now`] as it writes; module docs, "The stamp"), and
+  /// releases it; refuses `RingFull` when the consumer has not released the slot.
+  pub fn push(
+    &self,
+    object: &mut SharedObject,
+    index: u64,
+    slot: &Slot,
+    stamp: u32,
+  ) -> Result<(), IpcError> {
     if slot.payload.len() > PAYLOAD_BYTES {
       return Err(IpcError::PayloadTooLarge {
         offered: slot.payload.len(),
@@ -323,7 +378,7 @@ impl Ring {
       return Err(IpcError::RingFull);
     }
     let body = self.ids(object)?.body;
-    object.write_span(body, self.position(index), &encode_body(slot))?;
+    object.write_span(body, self.position(index), &encode_body(slot, stamp))?;
     self
       .seq(object, index)?
       .store(index.wrapping_add(1), Ordering::Release);
@@ -383,5 +438,79 @@ impl Ring {
     let tail = self.tail_hint(object)?.load(Ordering::Acquire);
     let head = self.head_hint(object)?.load(Ordering::Acquire);
     Ok(tail.wrapping_sub(head))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The stamp a producer writing at `at` wrote ([`stamp_now`]'s rule over a chosen reading).
+  fn stamp_at(at: u64) -> u32 {
+    u32::try_from(at & STAMP_BITS).unwrap() | STAMPED
+  }
+
+  /// A-559 (the stamp). Do: widen the stamps of landings at even and odd readings, early and late in a wrap of the low 32
+  /// bits, from readings taken in the same nanosecond, 300 µs, 29 ms and a nanosecond short of a whole wrap after.
+  /// Expect: each widens back to its landing, within the one nanosecond the stamp's set bit may add.
+  #[test]
+  fn a_stamp_widens_back_to_its_landing_from_any_reading_within_a_wrap() {
+    let wrap = STAMP_BITS + 1;
+    for landed in [
+      7 * wrap + 1_000,
+      7 * wrap + 1_001,
+      9 * wrap + wrap - 2,
+      9 * wrap + wrap - 1,
+    ] {
+      for after in [0, 1, 300_000, 29_000_000, wrap - 2] {
+        let widened = landed_ns(stamp_at(landed), landed + after).unwrap();
+        assert!(
+          widened.abs_diff(landed) <= 1,
+          "landed {landed}, read {after} ns after: widened to {widened}"
+        );
+      }
+    }
+  }
+
+  /// A-559. Do: widen a zero stamp, the reading of a slot no producer stamped (a producer of the layout before A-559,
+  /// whose padding was zero), and a stamp whose landing would be before the clock started. Expect: no landing for
+  /// either.
+  #[test]
+  fn an_unstamped_slot_or_a_landing_before_the_clock_widens_to_none() {
+    assert_eq!(landed_ns(0, 5_000_000_000), None);
+    assert_eq!(landed_ns(stamp_at(100), 5), None);
+  }
+
+  /// A-559. Do: write a reply's body with a stamp and read it back, and read back a body written with a zero stamp.
+  /// Expect: the stamp and every other field come back as written.
+  #[test]
+  fn a_slot_carries_its_producers_stamp_from_the_writing_to_the_reading() {
+    let slot = Slot::inline(0x0001_0002_0000_0003, b"answered").unwrap();
+    let stamp = stamp_at(123_456_789);
+    let read = decode_body(&encode_body(&slot, stamp)).unwrap();
+    assert_eq!(
+      read,
+      Slot {
+        stamp,
+        ..slot.clone()
+      }
+    );
+    let unstamped = decode_body(&encode_body(&slot, 0)).unwrap();
+    assert_eq!(unstamped.stamp, 0);
+  }
+
+  /// A-559. Do: take a stamp now, between two readings of the host's monotonic clock. Expect: it is marked stamped and
+  /// widens to an instant between the two readings, within the set bit's nanosecond.
+  #[test]
+  fn a_stamp_taken_now_lands_between_the_readings_around_it() {
+    let before = slates_machine::clock::monotonic_ns();
+    let stamp = stamp_now();
+    let after = slates_machine::clock::monotonic_ns();
+    assert_eq!(stamp & STAMPED, STAMPED);
+    let landed = landed_ns(stamp, after).unwrap();
+    assert!(
+      landed + 1 >= before && landed <= after + 1,
+      "stamped {landed}, between {before} and {after}"
+    );
   }
 }

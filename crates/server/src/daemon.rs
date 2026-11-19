@@ -793,13 +793,8 @@ impl Daemon {
     // This daemon's own mounts (A-227), recorded as each is made, so no daemon thread opens a path on one; room for one
     // a live attachment the shards can hold, the bound the anchor's device holds take.
     slates_base::own_mounts::install(config.held_device_bound()).map_err(|error| {
-      ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(match error {
-        slates_vfs::host::HostError::Unavailable(code)
-        | slates_vfs::host::HostError::OwnMount(code) => code,
-        // A Win32 code as its own number (A-527).
-        slates_vfs::host::HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
-        _ => 0,
-      }))
+      // The code as the host named it, typed by its numbering (A-539).
+      ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(error.code()))
     })?;
     let identity = profile.facts.identity.clone();
     let supervision = source.supervision();
@@ -4633,7 +4628,7 @@ async fn init_shard(
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     moves_out: std::collections::BTreeMap::new(),
-    move_carries: std::collections::BTreeMap::new(),
+    carries: std::collections::BTreeMap::new(),
     move_adoptions: std::collections::BTreeMap::new(),
     move_records: std::collections::BTreeMap::new(),
     moves_forgotten: std::collections::BTreeSet::new(),
