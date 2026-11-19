@@ -13563,6 +13563,7 @@ pub(crate) fn finish_making(
   region: Vec<u64>,
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
+  let from_live_log = taken.takeover.from_live_log;
   let Some(making) = state.making_volumes.remove(&id) else {
     return Err(Box::new(refused(Refusal::NotFound)));
   };
@@ -13676,6 +13677,23 @@ pub(crate) fn finish_making(
   ];
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
+      return Err(Box::new(refused(refusal_of_db(&e))));
+    }
+  }
+  // What a move carried of the volume's capture comes with its catalog (A-503): the snapshot just sealed is its mark
+  // when it holds the head the capture was carried against (a move's adoption, or a takeover before the new owner wrote,
+  // since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt from a
+  // live log, whose tree may have run past the seal it names, so its landings are refused rather than judged from a
+  // tree that is not the moved one.
+  if let Some(carried) = catalog.carried.clone() {
+    let moved_head = head.manifest == Some(carried.head) && !from_live_log;
+    let mark = moved_head.then_some(to_db_snapshot(snapshot));
+    let op = Op::CaptureAdopted {
+      volume: id,
+      carried,
+      mark,
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
@@ -20289,6 +20307,7 @@ mod tests {
       write: None,
       write_version: 0,
       signers: Vec::new(),
+      carried: None,
     }
   }
 

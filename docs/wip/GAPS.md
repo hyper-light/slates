@@ -953,8 +953,8 @@
 >   two Mac runners is filed for main.
 > - **Kiln's workspaces as captured clones (A-463, kiln K5, 2026-11-18):** on a runner the server's `[slates_fleet]`
 >   lists, each workspace is an O(1) clone of its folder's captured base (one capture shared while the folder is as
->   captured, a base gone with its last clone), so it moves; its review and landing are A-424's; a workspace that moved
->   is landed nowhere until stage 2. Machines outside the fleet keep overlays. Held by kiln's real-instance test
+>   captured, a base gone with its last clone), so it moves; its review and landing are A-424's, and once moved A-503's
+>   (its move carries its capture). Machines outside the fleet keep overlays. Held by kiln's real-instance test
 >   (`captured_tests.rs`); the live move of a captured clone and the bare-metal run on its mount are filed for main.
 > - **Owed, in order:** the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
@@ -1033,10 +1033,11 @@
 >   over the simulated host (`crates/land/src/captured_tests.rs`). **Owed, in order:** (1) the advance: a second
 >   landing is judged against the capture again, so an outsider's later edit of a file the agent landed and did not
 >   touch since is a `ModifyModify` conflict (a refusal, never a loss) until the clone keeps what it landed as its base
->   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2, a moved clone: its capture stays on
->   the node that made it and the moved clone keeps no lineage, so it still lands as a scratch volume (every entry a
->   create, no removal carried) until the move carries its base (the plan: the old owner computes, at the move, the
->   captured identity of every path the clone changed, and the new owner keeps the moved head as the mark); (3) a kind
+>   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2 is built (A-503): a move carries
+>   the captured state of every path its clone changed in the volume's catalog, and the new owner keeps the moved head as
+>   its mark, so a moved clone lands against its capture; owed of it, the fleet's own three-daemon test (filed for main)
+>   and a captured clone taken over after its owner's loss, which carries nothing and still lands as a scratch volume;
+>   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
 >   captured clone into a real directory (run request filed). Kiln's W6 may land captured clones once (1) is built, or
@@ -11567,7 +11568,7 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; parts 2 and 3 owed)
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; part 3 owed)
 
 > - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
 >   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
@@ -11580,17 +11581,26 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   debug, kiln r389): `cargo test --locked -p slates-base --lib -- s3`, 14 of 14 (the four golden vectors, twenty
 >   hostile pages, a page cut anywhere and arbitrary bytes, every unnamable key); red once each (`$` unreserved, `<!`
 >   passed over, `..` a name).
+> - **Built (part 2, A-471).** The network client in `crates/base/src/s3` (`client`, `http`, `tls`, `wait`):
+>   `HeadObject`, ranged `GetObject` bound by `If-Match` or a version id, and `ListObjectsV2` pages, signed, over the
+>   runtime's TCP and rustls over aws-lc-rs, every length capped before it is held, every wait learned from the path's
+>   round trips within the caller's liveness window and ceiling, every answer typed. Proven (Mac Studio, debug, kiln
+>   r447): `cargo test --locked -p slates-base --lib -- s3`, 30 of 30 (the client's seven against an in-process fake
+>   store on loopback, over TLS and in the clear; the framing's five, twenty-three hostile answers among them; the
+>   waits' three); red once each (a `412` untyped, `If-Match` not sent, no back-off, a length past its cap let
+>   through); `cargo xwin check -p slates-base` (Windows x86_64) clean.
 > - **Owed.**
->   - Part 2: the network client over the shard's runtime (rt TCP, rustls over aws-lc-rs with the platform's roots,
->     HTTP/1.1 with bounded heads and bodies, S3 error documents, the retry within `LIVENESS_BUDGET_NS`, the
->     read-ahead from the measured bandwidth-delay product), run against a local S3-compatible store.
+>   - Part 2's remainder: the platform's trust roots (a source of roots to choose: compiled-in or the operating
+>     system's store), name resolution (the caller resolves the endpoint today), the read-ahead from the measured
+>     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
+>     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
 >   - Part 3: the `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and
 >     the N=1 differential, the library's way to name an S3 base and hand its credential, the anchor's hold of the
 >     credential across a restart.
->   - The listing page cap assumes a continuation token no longer than an encoded key (S3 states no length): measured
->     in part 2.
->   - The cross-target lint of `slates-base` with its new `aws-lc-rs` dependency (Windows through `cargo xwin`, the
->     Linux targets): main's.
+>   - The listing page and request caps assume a continuation token no longer than an encoded key (S3 states no
+>     length): the client counts the longest a listing names (`Counts::longest_token`); the live run reads it.
+>   - The cross-target lint of `slates-base` with its new `aws-lc-rs`, `rustls`, `slates-rt` and `slates-transport`
+>     dependencies (Windows through `cargo xwin clippy`, the Linux targets): main's.
 
 ### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
 

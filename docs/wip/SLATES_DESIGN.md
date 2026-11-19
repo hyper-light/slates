@@ -8182,7 +8182,10 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > move ends itself: `Moved`, or `MoveUnplaced` once it thaws), every refusal reported by its kind and the agent left where
 > it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out). Its
 > workspaces on the fleet's runners are clones of the folder's captured base (A-463), plain volumes the move takes; one
-> capture serves the agents started over an unchanged folder, and a base goes with its last clone.
+> capture serves the agents started over an unchanged folder, and a base goes with its last clone. A moved captured
+> clone lands on its new owner against its capture (A-503): its move carries the captured state of every path it
+> changed in its catalog, and the new owner keeps the moved head as its mark (§4.15's status); the mark is no snapshot
+> that holds a later move back.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -9822,9 +9825,21 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > the agent never touched is in no manifest, so it is never a conflict and never overwritten. The landing leaves the
 > clone a scratch volume (no base is taken from the target), so it still moves. Owed: a later landing judged against
 > what the last one landed rather than the capture (an outsider's edit of a file the agent landed and did not touch
-> again is a conflict until then); a moved captured clone, whose capture stays behind, still lands as a scratch volume
-> (stage 2); a name whose kind changed lands as a removal and a making that the class order meets as `TypeChanged`;
-> a symlink pointed elsewhere does not land over the old one, as an overlay's does not (GAPS, g267).
+> again is a conflict until then); a name whose kind changed lands as a removal and a making that the class order meets
+> as `TypeChanged`; a symlink pointed elsewhere does not land over the old one, as an overlay's does not (GAPS, g267).
+> **A captured clone that moved lands against its capture too (A-503, stage 2, 2026-11-18):** the capture stays with
+> the node that made the clone, so the move carries the part of it the clone changed: before the move is reported, the
+> old owner walks the capture against the head it hands over (`slates_vfs::captured::CarryWalk`, in a task of the
+> volume's shard a slice at a time) and records in the volume's catalog the captured state of every path where the two
+> differ (each file's BLAKE3, size, mode and Windows bits, each link's target, each directory, each name the capture did
+> not hold) with the head's archive identity (`Op::CaptureCarried`, `CatalogValue::carried`). The rest of the capture is
+> that head. The new owner adopts the record with the catalog and keeps the snapshot it materialized the head as, its
+> **mark**, through its seal (`Op::CaptureAdopted`; the mark only when the materialized head's identity is the carried
+> one and it was not rebuilt from a live log). Its landing is then judged against `CaptureBase::Carried`: the candidates
+> are where the source parts from the mark and every carried path, and what the capture held at a path is the carried
+> state, else the mark's, which is the stage-1 judgement exactly. A move from the new owner carries again from its mark
+> and its record. A carried record whose mark this node does not hold (a takeover that rebuilt a later head) is refused
+> typed, never landed as a scratch volume.
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -9941,6 +9956,30 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > the retry and the measured read-ahead) with its real-store run against a local S3-compatible store; part 3, the
 > `HostFs` implementation, its parked misses and `SimS3`, its oracle, and the library's way to name an S3 base and hand
 > its credential.
+
+> **Status (2026-11-18, A-471 part 2: the network client).** Built in `crates/base/src/s3` on the runtime's own TCP and
+> timers, rustls over aws-lc-rs, and slates' own HTTP/1.1:
+> - `client`: `HeadObject`, ranged `GetObject` bound by `If-Match` (or a version id) and `ListObjectsV2` pages, each
+>   signed by `sigv4`, one request at a time on a kept-alive connection. Every answer is typed: `412` on a bound read
+>   is `Changed`; `404` `Missing`; `403` `Denied` with S3's code; `400 ExpiredToken` `CredentialExpired`; `416`
+>   `RangeNotSatisfiable`; a range or a head other than asked a `Mismatch`, never data; `503 SlowDown`, `503` and `500`
+>   retried, then `SlowDown` or `Unavailable` past the ceiling.
+> - `http`: a request's head refused past its cap or with a line break in any field (an ETag decoded from a hostile
+>   listing could carry one); a response read as its bytes arrive, its head past its cap refused, its body by length or
+>   chunks refused past what the request asked or an error document may hold, before the excess is held; both framings
+>   at once (the smuggling shape), another coding, no framing, interim statuses and the invalid ones below them (RFC
+>   9110 §15), folded or malformed fields refused.
+> - `wait`: each request's bound is the path's measured round trips (RFC 9002's estimator, to the response's head)
+>   plus the caller's liveness window, doubled per request that ran out (Karn's rule, RFC 6298 §5.5) to the caller's
+>   ceiling; a retry S3 asks for pauses with full jitter up to the tail doubled per retry, within the ceiling (AWS's
+>   advice for `SlowDown`).
+> - `tls`: the server's certificate verified against the authorities the endpoint names; plain HTTP refused off
+>   loopback.
+>
+> Owed: the platform's trust roots for an endpoint on the public internet (part 3 chooses their source: compiled-in
+> roots or the operating system's store); name resolution (the caller resolves the endpoint's address; the runtime has
+> no resolver); a live run against a real S3-compatible store, which also reads the longest continuation token a
+> listing names (`Counts::longest_token`) against the caps' assumption that none is longer than an encoded key.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -34299,6 +34338,109 @@ counter `image.archive_import_stage_past_bound`, `BadLayout` classed `Malformed`
   a stream refused at its header (fed to the refusal, not to its end); that seed is kept
   (`crates/archive/src/archive.proptest-regressions`). The tests' red-checks, the archive and api suites and the lints
   are filed for main (run-requests.md, 2026-11-19).
+
+### A-471 — The S3 base's network client: signed requests over the runtime's TCP and rustls, every length capped and every wait learned (2026-11-18, goal g268; Mantle's CP-T10.5 part 2; §4.15 "An S3 base"; §4.9 hostile input; D-9, R3, R6; RFC 9112, RFC 9002, RFC 6298; A-442, A-464)
+Applied in the same change to: `crates/base/src/s3` (`client`, `http`, `tls` and `wait`, each with its tests;
+`sigv4::amz_timestamp` and `sigv4::canonical_query` made public; `ResponseReader::has_head`); `crates/base/Cargo.toml`
+(`rustls`, `slates-rt` and `slates-transport` dependencies, `rcgen` for the tests); §4.15's status; GAPS (A-464's
+entry, part 2 built). And, for what main's workspace clippy and `cargo xtask check` found in this goal's earlier
+landings (r413): the streamed archive's and streamed export's oracles generate their bytes from plain tuples
+(`crates/archive/src/stream.rs`, `crates/vfs/src/export.rs`; `prop_oneof!` holds its arms in an `Arc`, R2); the
+archive export and import tests of `crates/api/tests/api.rs` judge through helpers (cognitive complexity); A-464's
+`list.rs` names its radix and escape length and marks its entry overhead, and its test cuts the page by `get`; and the
+archive job's identity suffix is read by its type's width (`crates/server/src/image.rs`).
+
+- **Why.** Part 1 signed and parsed; nothing sent a request. Part 3's base host needs a client that reads objects
+  bounded by their identity and lists directories, over slates' own runtime, every length and every wait bounded.
+- **The shape.** One client per endpoint and credential: one request at a time on a kept-alive connection, opened on
+  first use and again after a failure or `Connection: close`. A request is the method, the key's path encoded once
+  and the canonical query (the same strings `sigv4` signs, so what is sent is what was signed), the signed fields
+  (`host`, `x-amz-content-sha256`, `x-amz-date`, a temporary credential's session token, the range and `If-Match`)
+  and the `Authorization` header. TLS is rustls' client driven sans-io, as the network export drives its server.
+- **Caps (R3).** A request's head: its line (a key's longest encoding as path and as listing prefix, a continuation
+  token assumed as long) and S3's documented 8 KB request header. A response's head: the stored headers a PUT may set
+  (held to that 8 KB) and S3's own lines, 12 KiB. A body: a range's length, a listing page's cap (A-464), or an error
+  document's: `SignatureDoesNotMatch` echoes the canonical request (at most a request's head) and its bytes at three
+  characters a byte, four request heads, and the rest of the document is under S3's own response lines, which are
+  added. The bytes held before framing: a head's cap and one read, the read one TLS 1.2 record's ciphertext at its
+  largest. Every status a base meets is named by RFC 9110's name (`http::PRECONDITION_FAILED` and its kin).
+- **Waits (R3, A-442).** RFC 9002's estimator over the round trips to each response's head (the transport's
+  `RttEstimator`, the law A-442's learned wait folds), the bound its tail plus the caller's liveness window, doubled per
+  request that ran out (no sample: Karn's rule) to the caller's ceiling, ended by the next answer. A retry S3 asks for
+  (`503 SlowDown`, `503`, `500`) pauses uniformly up to the tail doubled per retry in a row, within the ceiling. Both
+  bounds are the caller's (`client::Limits`): part 3 states the ceiling as the liveness budget the bounds above name
+  (`LIVENESS_BUDGET_NS`), past which a read is refused `BaseUnavailable`.
+- **Typed answers.** From S3's error responses (fetched 2026-11-18): `412 PreconditionFailed`, `404 NoSuchKey` and
+  `NoSuchBucket`, `403 AccessDenied` and its kin, `400 ExpiredToken`, `416 InvalidRange`, `500 InternalError`,
+  `503 SlowDown` and `ServiceUnavailable`, each its kind; a `HEAD`'s answers carry no body, so their kinds come from the
+  status alone.
+- **Rejected.** A body ending at the connection's close (RFC 9112 allows one for a response): it cannot be told from
+  one cut short, and S3 always frames its bodies. Both framings at once, which §6.3 lets a recipient treat as an error:
+  it is the shape request smuggling takes.
+- **The token's length.** S3 calls continuation tokens obfuscated and states no length, and both caps assume a token
+  no longer than an encoded key (3,072 bytes). The client keeps the longest token a listing named
+  (`Counts::longest_token`); part 3's live run lists a prefix of more than a thousand keys, so every page but the last
+  is truncated and names one, and records the longest against the assumption. A longer one fails the run, not a
+  volume: its next request is refused `RequestTooLarge` before it is sent.
+- **Owed.** The platform's trust roots (a dependency decision for part 3); name resolution (the caller's); a live run
+  against a real S3-compatible store; the cross-target lint (main's).
+- **Evidence.** Mac Studio (debug, kiln r447, 2026-11-18): `cargo test --locked -p slates-base --lib -- s3`, 30 of
+  30 in 7.1 s. The client's seven run against an in-process fake store on loopback that answers recorded bytes: a
+  ranged read over TLS whose signature, recomputed from the request's own fields by the signing page's rules, matches
+  the one it carries; a listing, its continuation, a head and a chunked range on one kept-alive connection; seven
+  refusals each typed and none retried; `SlowDown` retried twice and then past the ceiling; a silent store timed out,
+  reconnected, and then past the ceiling; a certificate the endpoint does not name refused; plain HTTP off loopback
+  and an empty range refused. With them the framing's five (twenty-three hostile answers by kind, arbitrary bytes and
+  answers cut anywhere), the waits' three, the calendar's one and A-464's fourteen. Red once each (2026-11-18): with
+  the `412` arm gone the refusals came back `Unexpected { status: 412 }`; with `If-Match` not sent the request carried
+  none; with no back-off the bound stayed 53 ms where 106 ms was due; with a length let through to twice its cap the
+  answer waited for a body instead of `BodyTooLong`. `cargo xwin check -p slates-base` for `x86_64-pc-windows-msvc`
+  clean; `cargo xtask check` names no literal of this change's files (its fourteen are other crates').
+
+### A-503 — A captured clone that moved lands against its capture: its move carries the paths it changed, and its new owner keeps the moved head as the mark (2026-11-18, g267, kiln goal 95101ef3; §4.15 `capture_base` and "Plan", §4.10 "Ownership follows the writer"; A-291, A-424, A-450, A-463)
+
+- **What was there.** A-424 judged a captured clone's landing against its capture, a snapshot in the same store as the
+  clone (its origin's). A move (A-291) hands the new owner the clone's head alone, and the clone keeps no lineage there,
+  so on the new owner it landed as a scratch volume: every entry a create, no removal carried, every file the agent or
+  an outsider changed a conflict. Kiln therefore refused a moved workspace's landing (A-463).
+- **The rule.** What a captured clone's landing needs of its capture is, at every path, what the capture held there.
+  At the paths the clone had not changed when it moved, the head it hands over holds exactly that. So the move carries
+  only the rest: the captured state of every path where the capture and that head differ, found as A-424 finds a
+  landing's candidates and judged path by path (`slates_vfs::captured::CarryWalk`: a file's BLAKE3, size, mode and
+  Windows bits, a link's target, a directory, a name the capture did not hold), bounded by what the clone changed,
+  never by the tree. The old owner walks it in a task of the volume's shard, a slice a turn, once the move has frozen
+  the volume, and records it with the head's archive identity in the volume's catalog register
+  (`Op::CaptureCarried`, which raises the catalog's sequence; `CatalogValue::carried`, appended), so the report, which
+  waits for the catalog at its current sequence to be placed, waits for it too. The new owner adopts it with the
+  catalog (`Op::CaptureAdopted`, its sequence unchanged) and records as its **mark** the snapshot it materialized the
+  head as, when that head's identity is the carried one and it was not rebuilt from a live log, and keeps the mark
+  through its seal (the adopted snapshot it otherwise drops). Its landing is judged against
+  `CaptureBase::Carried { mark, carried }`: the candidates are where the source parts from the mark (both trees of the
+  moved volume's own store) and every carried path; what the capture held at a path is the carried state, else the
+  mark's. That is A-424's judgement exactly, so the entries, their witnesses and the grants that bind them are the same
+  as on the first owner. A later move carries again from the mark and the record, drops the earlier mark once the new
+  record is in, and the mark is exempt from the `Snapshots` refusal. A record whose mark this node does not hold (a
+  takeover that rebuilt a later head, or the mark's snapshot destroyed) is refused `Unsupported`, never landed as a
+  scratch volume; carried bytes that do not parse (a path not absolute, or not made of plain names, or out of order)
+  are refused too. A carry that cannot be walked holds its move back until it is refused `Unplaced`, counted
+  `fleet.move.capture_uncarried`.
+- **Tests.** `a_moved_clones_carried_capture_and_mark_hold_what_its_capture_held_at_every_path` and
+  `a_carried_capture_from_another_node_is_refused_unless_well_formed` (`crates/vfs/src/captured.rs`: the moved volume
+  made again with no node shared, the same later changes in it and in the clone, the carried state equal to the
+  capture's at every path of every tree); `a_moved_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`
+  and `a_moved_clone_plans_what_its_clone_plans_on_its_first_runner` (`crates/land/src/captured_tests.rs`: the moved
+  volume's plan equal to the clone's own against its capture, entry by entry, and unequal to the scratch plan it had
+  before; its landing writes the agent's changes from before and after the move and passes an outsider's edit); and
+  `a_carried_capture_is_kept_with_its_volume_and_its_mark_goes_with_its_snapshot` (`crates/db/src/replay.rs`).
+- **Owed.** The fleet's own test (three daemons: a captured clone moved, changed, presented and landed on its new owner,
+  and moved on again), filed for main. A captured clone taken over after its owner's loss carries nothing (no move
+  walked its capture), so its successor still lands it as a scratch volume: carrying the capture at each seal, or
+  refusing such a landing, is owed. A live-shipped clone's move carries a record its new owner holds no mark for.
+
+Applied in the same change to: §4.15's status (A-424's paragraph), §4.10's status (the consumer's paragraph), GAPS (g267),
+`crates/vfs` (`captured.rs`), `crates/land` (`manifest.rs`, `engine.rs`), `crates/db` (`catalog.rs`, `op.rs`,
+`partition.rs`), `crates/server` (`catalog.rs`, `landing.rs`, `moves.rs`, `verbs.rs`, `fleet.rs`, `mirror.rs`,
+`state.rs`, `daemon.rs`).
 
 ### A-475 — A dead client is reclaimed at its hang-up: its control socket's end of stream or its process's exit, awaited through the shard's driver, never a silence-and-peer poll (2026-11-18, built for goal g255; the event-driven reaper's piece 1; §4.7 "Failure matrix"; A-28, A-149, A-432, A-455, A-470)
 

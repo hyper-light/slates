@@ -58,6 +58,16 @@
 //! the new owner's round counts the rest of the cohort. If it dies before, the switch never happens and the volume is
 //! recovered by its takeover as any of its volumes is.
 //!
+//! **What a captured clone's move carries (A-503).** A clone of a captured base lands against its capture (A-291's
+//! landing), which stays with the node that made the clone. So before such a move is reported, the old owner walks
+//! the capture against the head it hands over in its own task, a slice at a time ([`begin_carry`], `CarryWalk`), and
+//! records what it carried in the volume's catalog (`Op::CaptureCarried`): the captured state of every path where the
+//! two differ, with the head's identity. The catalog ships at its raised sequence before the report, as every catalog
+//! change does, so the new owner adopts it with the volume (`verbs::finish_making` records it, the snapshot it
+//! materialized the moved head as its mark) and keeps the mark through its seal ([`seal_adopted`]). A move from there
+//! carries again from the mark and what it holds, and the mark is no snapshot that holds a move back. A carry that
+//! cannot finish holds its move back until it is refused `Unplaced` (counted [`MOVE_CAPTURE_UNCARRIED`]).
+//!
 //! **R8.** At one node there is no other member, so every move is refused `MoveRefusal::Target`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,6 +98,15 @@ pub(crate) const MOVE_STREAM: u64 = 29;
 
 /// Counter: moves a shard began (the volume frozen with its head handed over).
 const MOVE_BEGUN: &str = "fleet.move.begun";
+/// Counter: captured clones' moves whose capture was carried and recorded in the volume's catalog (A-503).
+const MOVE_CAPTURE_CARRIED: &str = "fleet.move.capture_carried";
+/// Counter: captured clones' moves whose capture could not be carried (its walk refused, or its task not started), each
+/// held back until it is refused `Unplaced` (A-503).
+const MOVE_CAPTURE_UNCARRIED: &str = "fleet.move.capture_uncarried";
+/// Counter: carries the database refused to record, asked again the next period (A-503).
+const MOVE_CAPTURE_UNRECORDED: &str = "fleet.move.capture_unrecorded";
+/// Counter: a carried capture's earlier mark the move could not drop (a clone pins it), kept (A-503).
+const MOVE_MARK_KEPT: &str = "fleet.move.mark_kept";
 /// Counter: handoffs a move began: its head placed again on `f + 1` hosts other than this owner and republished
 /// ([`ready_to_hand_over`]).
 const MOVE_HANDOFF_BEGUN: &str = "fleet.move.handoff_begun";
@@ -170,6 +189,20 @@ pub(crate) struct MoveOut {
 /// shard's volumes.
 pub(crate) type MovesOut = BTreeMap<DbVolumeId, MoveOut>;
 
+/// Where a captured clone's move stands in carrying its capture (A-503, [`begin_carry`]).
+#[derive(Debug)]
+pub(crate) enum MoveCarry {
+  /// Its task walks the capture against the head the move hands over.
+  Running,
+  /// Walked: what the catalog will carry, recorded once the head has its identity ([`capture_carried`]).
+  Carried(slates_vfs::captured::CarriedCapture),
+  /// Refused: the move is held back until it is refused `Unplaced`.
+  Refused,
+}
+
+/// The carries of a shard's moves, by volume id. Bounded by its moves; an entry leaves once recorded, or with its move.
+pub(crate) type MoveCarries = BTreeMap<DbVolumeId, MoveCarry>;
+
 /// Whether `volume` is frozen for a move on this shard: every verb but its status and the move itself is answered
 /// `Overloaded` (retryable) while it is, and forwarded to its new owner from the switch on.
 pub(crate) fn frozen(state: &ShardState, volume: VolumeId) -> bool {
@@ -210,6 +243,7 @@ pub(crate) fn move_verb(
   if let Some(out) = state.moves_out.get(&id).copied() {
     if let Some(reason) = out.refused {
       state.moves_out.remove(&id);
+      state.move_carries.remove(&id);
       return refused(reason);
     }
     if out.to != to {
@@ -237,7 +271,155 @@ pub(crate) fn move_verb(
     },
   );
   state.count(MOVE_BEGUN, 1);
+  begin_carry(state, id);
   ReplyBody::Moving { to: to.0 }
+}
+
+/// Begins carrying volume `id`'s capture for its move (A-503): when it is a captured clone (its capture here, or what an
+/// earlier move carried of it and its mark: `crate::landing::capture_of`), a task of this shard walks that capture
+/// against the head the move hands over, a slice at a time ([`carry_slices`]); nothing for any other volume. A capture
+/// that cannot be read, or a task that cannot start, holds the move back until it is refused `Unplaced`, counted.
+fn begin_carry(state: &mut ShardState, id: DbVolumeId) {
+  state.move_carries.remove(&id);
+  let base = match crate::landing::capture_of(state, id) {
+    Ok(Some(base)) => base,
+    Ok(None) => return,
+    Err(_) => {
+      uncarried(state, id);
+      return;
+    }
+  };
+  let head = state.db.partition().volume(id).map(|record| record.head);
+  let walk = head.and_then(|head| {
+    let slot = state
+      .by_id
+      .get(&id)
+      .and_then(|handle| state.volumes.get(*handle).ok())?;
+    let tree = slot
+      .volume
+      .frozen_tree(crate::verbs::core_snapshot(
+        slates_ipc::protocol::SnapshotId { value: head.value },
+      ))
+      .ok()?;
+    Some((
+      slates_vfs::captured::CarryWalk::new(base, tree),
+      slot.volume.policy(),
+    ))
+  });
+  let Some((walk, policy)) = walk else {
+    uncarried(state, id);
+    return;
+  };
+  state.move_carries.insert(id, MoveCarry::Running);
+  let spawned =
+    slates_rt::futures::spawn(carry_slices(id, walk, policy)).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    uncarried(state, id);
+  }
+}
+
+/// Records that volume `id`'s capture could not be carried: its move waits until it is refused `Unplaced`.
+fn uncarried(state: &mut ShardState, id: DbVolumeId) {
+  state.move_carries.insert(id, MoveCarry::Refused);
+  state.count(MOVE_CAPTURE_UNCARRIED, 1);
+  slates_machine::log_line!(
+    "slates daemon: the capture of a moved volume {} could not be carried; its move waits to be refused",
+    crate::verbs::hex_of(&id.bytes)
+  );
+}
+
+/// The task carrying volume `id`'s capture ([`begin_carry`]): `walk` stepped a slice a turn of this shard
+/// (`crate::image::sliced`), yielding between slices, until it ends or the move it carries for does (thawed, refused or
+/// released: the entry it reports to is gone or no longer running). Owned by that entry: it ends with it.
+async fn carry_slices(
+  id: DbVolumeId,
+  mut walk: slates_vfs::captured::CarryWalk,
+  policy: slates_vfs::names::NameEquivalence,
+) {
+  loop {
+    let more = state::with_state(|s| {
+      let moving = s
+        .moves_out
+        .get(&id)
+        .is_some_and(|out| out.refused.is_none());
+      if !moving || !matches!(s.move_carries.get(&id), Some(MoveCarry::Running)) {
+        if !moving {
+          s.move_carries.remove(&id);
+        }
+        return false;
+      }
+      match crate::image::sliced(s, |s| {
+        walk
+          .unit(&s.store, policy)
+          .map_err(|error| crate::error::refusal_of_vfs(&error))
+      }) {
+        Ok(None) => true,
+        Ok(Some(carried)) => {
+          s.move_carries.insert(id, MoveCarry::Carried(carried));
+          false
+        }
+        Err(_) => {
+          uncarried(s, id);
+          false
+        }
+      }
+    });
+    if more != Some(true) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Whether the move of `id` carries what it must of its clone's capture (A-503): nothing to carry, or carried and
+/// recorded in the volume's catalog for the head it hands over (`Op::CaptureCarried`, which raises the catalog's sequence,
+/// so the report then waits for the catalog to be placed with it). A carry still walking, refused, or waiting for the
+/// head's identity (its seal) holds the move back. Recording it drops the volume's earlier mark, kept as long as a move
+/// might thaw back to it.
+fn capture_carried(state: &mut ShardState, id: DbVolumeId) -> bool {
+  match state.move_carries.get(&id) {
+    None => return true,
+    Some(MoveCarry::Running | MoveCarry::Refused) => return false,
+    Some(MoveCarry::Carried(_)) => {}
+  }
+  let partition = state.db.partition();
+  let Some(head) = partition.volume(id).map(|record| record.head) else {
+    return false;
+  };
+  let Some(identity) = partition
+    .snapshot(id, head)
+    .and_then(|snapshot| snapshot.identity)
+  else {
+    return false;
+  };
+  let earlier = partition
+    .carried(id)
+    .and_then(|(_, mark)| mark)
+    .filter(|mark| *mark != head);
+  let Some(MoveCarry::Carried(carried)) = state.move_carries.remove(&id) else {
+    return false;
+  };
+  let op = Op::CaptureCarried {
+    volume: id,
+    carried: slates_db::catalog::CarriedRecord {
+      head: identity,
+      entries: slates_wire::Wire::to_bytes(&carried),
+    },
+    mark: Some(head),
+  };
+  let now = state.clock.monotonic_ns();
+  if state.db.mutate(&mut state.segment, &op, now).is_err() {
+    state.count(MOVE_CAPTURE_UNRECORDED, 1);
+    state.move_carries.insert(id, MoveCarry::Carried(carried));
+    return false;
+  }
+  state.count(MOVE_CAPTURE_CARRIED, 1);
+  if let Some(earlier) = earlier
+    && crate::verbs::drop_snapshot(state, id, earlier).is_err()
+  {
+    state.count(MOVE_MARK_KEPT, 1);
+  }
+  true
 }
 
 /// The refusal a move gives for `reason`.
@@ -280,10 +462,12 @@ fn unmovable(
   {
     return Some(MoveRefusal::Lineage);
   }
+  // A carried capture's mark is the volume's own (A-503): its move carries again from it and lets it go with the copy.
+  let mark = partition.carried(record.id).and_then(|(_, mark)| mark);
   if partition
     .snapshots_of(record.id)
     .iter()
-    .any(|snapshot| snapshot.id != record.head)
+    .any(|snapshot| snapshot.id != record.head && Some(snapshot.id) != mark)
   {
     return Some(MoveRefusal::Snapshots);
   }
@@ -350,6 +534,10 @@ fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
 /// `f = 1` a target that died at the switch left the content in the frozen copy alone, and its takeover's successor
 /// waited on it until it gave the volume up (`a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`).
 fn ready_to_hand_over(state: &mut ShardState, id: DbVolumeId, quorum: Quorum) -> bool {
+  // A captured clone carries its capture first (A-503), and its catalog then ships with it.
+  if !capture_carried(state, id) {
+    return false;
+  }
   // The head is the volume's: a frozen volume takes no write and no snapshot, and the healer passes it by, so only its
   // handoff advances it.
   let Some(epoch) = state.db.partition().volume(id).map(|record| record.epoch) else {
@@ -630,11 +818,9 @@ fn refuse_unreported(state: &mut ShardState, object: ObjectId, reason: MoveRefus
 
 /// Ends the move of `object` whose target left the region before the switch: the volume is this node's again.
 fn thaw(state: &mut ShardState, object: ObjectId) {
-  if state
-    .moves_out
-    .remove(&DbVolumeId { bytes: object.0 })
-    .is_some()
-  {
+  let id = DbVolumeId { bytes: object.0 };
+  state.move_carries.remove(&id);
+  if state.moves_out.remove(&id).is_some() {
     state.count(MOVE_THAWED, 1);
   }
 }
@@ -1110,13 +1296,14 @@ pub(crate) fn seal_adopted(
   if !(placed(key, epoch) && placed(key.catalog(), catalog_version)) {
     return Sealing::Sealed(superseded, epoch);
   }
-  let still_held = state
-    .db
-    .partition()
+  let partition = state.db.partition();
+  let still_held = partition
     .snapshots_of(id)
     .iter()
     .any(|snapshot| snapshot.id == superseded);
-  if still_held && crate::verbs::drop_snapshot(state, id, superseded).is_err() {
+  // The adopted head is a carried capture's mark (A-503): its landings are judged from it, so it stays.
+  let mark = partition.carried(id).and_then(|(_, mark)| mark) == Some(superseded);
+  if still_held && !mark && crate::verbs::drop_snapshot(state, id, superseded).is_err() {
     state.count(MOVE_DROP_REFUSED, 1);
   }
   Sealing::Placed

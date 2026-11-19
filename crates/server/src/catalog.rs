@@ -81,11 +81,18 @@ pub struct CatalogValue {
   /// The keys trusted to sign the volume's work (A-321), in SSH wire form, in the order the launcher set them: a
   /// successor judges signed work under the same signers. Appended.
   pub signers: Vec<Vec<u8>>,
+  /// What a captured clone's move carried of its capture (A-503): the member it moves to judges its landings against the
+  /// capture from it and the head it adopts. `None` for any volume no move carried a capture for. Appended.
+  pub carried: Option<slates_db::catalog::CarriedRecord>,
 }
 
 impl CatalogValue {
-  /// The catalog of the volume `record` describes.
-  pub fn of(record: &VolumeRecord) -> CatalogValue {
+  /// The catalog of the volume `record` describes, with what its move carried of its capture (`carried`, the
+  /// partition's record of it).
+  pub fn of(
+    record: &VolumeRecord,
+    carried: Option<&slates_db::catalog::CarriedRecord>,
+  ) -> CatalogValue {
     CatalogValue {
       name: record.name.clone(),
       size: record.policy.size,
@@ -102,6 +109,7 @@ impl CatalogValue {
       write: record.policy.write,
       write_version: record.policy.write_version,
       signers: record.policy.signers.clone(),
+      carried: carried.cloned(),
     }
   }
 
@@ -154,6 +162,10 @@ mod tests {
       }),
       write_version: 2,
       signers: vec![vec![7; 51]],
+      carried: Some(slates_db::catalog::CarriedRecord {
+        head: [5; 32],
+        entries: vec![1, 2, 3],
+      }),
     }
   }
 
