@@ -131,7 +131,9 @@ pub mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
-pub mod peer;
+// A client's hang-up, the event its death is seen at (A-475): its control socket's end of stream (Linux) or its
+// process's exit (macOS, Windows), awaited through the shard's driver.
+mod hangup;
 mod reap;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;

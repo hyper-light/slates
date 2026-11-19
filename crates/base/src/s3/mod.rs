@@ -9,9 +9,20 @@
 //!   page, each key that names no POSIX path (an empty or a dot component, a NUL, a name or key too long, a file a
 //!   directory shadows) refused by its kind, so no key leaves the base or aliases another.
 //!
-//! The network client that sends what [`sigv4`] signs over the shard's own runtime (TCP and TLS, rustls over
-//! aws-lc-rs) is part 2, and the `HostFs` implementation with its simulated oracle is part 3 (GAPS A-464).
+//! - [`http`]: HTTP/1.1 framing, a request's head written and a response read as its bytes arrive, every length checked
+//!   against its cap before it is held, chunked and length bodies alike, every hostile shape refused by its kind.
+//! - [`wait`]: how long a request waits and how long it pauses before trying again, learned from the path's round trips
+//!   within the bounds the caller states, as A-442's learned wait.
+//! - [`tls`]: rustls' client over aws-lc-rs, driven sans-io beneath the framing.
+//! - [`client`]: `HeadObject`, ranged `GetObject` bound by `If-Match` or a version id, and `ListObjectsV2` pages,
+//!   signed, sent over the runtime's TCP, every answer typed (A-471).
+//!
+//! The `HostFs` implementation with its simulated oracle is part 3 (GAPS A-464).
 
+pub mod client;
+pub mod http;
 pub mod keys;
 pub mod list;
 pub mod sigv4;
+pub mod tls;
+pub mod wait;

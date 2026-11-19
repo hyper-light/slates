@@ -67,11 +67,12 @@ const MAPPINGS_PER_COPY: u64 = 3;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// Shape: tasks a client may need across shards at once: its request forwarded to the owner
 /// and the reply carried back (a synchronous client has one request in flight; an
-/// asynchronous one is bounded by its ring's credit, which the ring's slots cap).
-const TASKS_PER_CLIENT: usize = 2;
-/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the control loop
-/// and the heartbeat, plus a spare for a shutdown message.
-const LOOP_TASKS_PER_SHARD: usize = 5;
+/// asynchronous one is bounded by its ring's credit, which the ring's slots cap), and the watch
+/// on its hang-up for its whole seat (A-475, `crate::reap::watch`).
+const TASKS_PER_CLIENT: usize = 3;
+/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the client reaper
+/// (A-475), the control loop and the heartbeat, plus a spare for a shutdown message.
+const LOOP_TASKS_PER_SHARD: usize = 6;
 /// Shape: the fleet's perpetual tasks per peer on the control shard: the probe loop and the record
 /// link (`fleet::probe_peer`, `fleet::establish_record_link`).
 const FLEET_LOOPS_PER_PEER: usize = 2;

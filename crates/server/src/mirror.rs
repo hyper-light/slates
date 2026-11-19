@@ -298,7 +298,11 @@ fn owed(state: &mut ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
       catalog: record(
         object.catalog(),
         volume.catalog_version,
-        crate::catalog::CatalogValue::of(volume).to_record_bytes(),
+        crate::catalog::CatalogValue::of(
+          volume,
+          state.db.partition().carried(id).map(|(carried, _)| carried),
+        )
+        .to_record_bytes(),
       )
       .encode(),
     };

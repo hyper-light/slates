@@ -228,9 +228,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 41: a landing carries a file whose mode or Windows attribute bits alone changed (A-458): [`PlannedAction::Chmod`]
 /// names such an entry with the mode and bits it had, and [`ActionTally::chmod`] counts them; until then such a change
 /// was planned as a replacement the verdict passed by, and it never landed (the same day).
+/// 42: an unmount runs no program on macOS and the BSDs and is judged by the kernel's mount table (A-507):
+/// `mount::unmount` and `mount::unmount_busy` call `unmount(2)` there (until then `umount`, found on the `PATH`, so
+/// a host whose `PATH` lacked `/sbin` could not unmount; g264's kiln runner); a path the table lists no mount at is
+/// [`MountFault::NotMounted`] before any call, and the new refusals are [`MountFault::Busy`] (`EBUSY`: a process holds
+/// a file on the mount), [`MountFault::StillMounted`] (the call said done and the table disagrees) and
+/// [`MountFault::MountTable`] (the table could not be read) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 41;
+pub const CONTRACT: u32 = 42;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
