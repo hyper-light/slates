@@ -10,8 +10,7 @@
 //! turn, and every cut of every report.
 
 use super::recorded::{
-  ROOT_URL, Recorded, YOUNGEST, command, context, items, recorded, report_command, session,
-  value_of,
+  ROOT_URL, Recorded, YOUNGEST, context, items, recorded, report_command, session, value_of,
 };
 use super::*;
 use crate::handshake::Session;
