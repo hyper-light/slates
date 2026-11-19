@@ -192,8 +192,12 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   the BSDs (`unmount(2)` with `MNT_FORCE`: the holder's next call fails; the loopback NFS mount is `hard`, so this is
   the way off it once its daemon has gone). `mount::unmount(path)` and `unmount_busy` run no program on macOS and the
   BSDs, so no `PATH` is needed (A-507), and both are judged by the kernel's mount table: a path with nothing mounted
-  is `MountFault::NotMounted` before any call, a held mount's plain unmount is `MountFault::Busy` on macOS, and an
-  unmount the table still lists is `MountFault::StillMounted`.
+  is `MountFault::NotMounted` before any call, a held mount's plain unmount is `MountFault::Busy` (on Linux too since
+  A-537: a plain `fusermount3 -u` refused while the table still lists the mount), and an unmount the table still lists
+  is `MountFault::StillMounted`. A `Busy` names its holders (`MountHolders`): on Linux the processes whose descriptors,
+  working or root directories are on the mount, read from `/proc` without touching it, and how many could not be read;
+  on macOS none are read (`HoldersUnread::NoReader`), since every libproc answer stats the file, which a `hard` NFS
+  mount whose daemon has gone waits on without bound.
 - Landing: `land(&request, signature)` under the caller's mode; `plan_landing(&request)` presents
   without writing, for a reviewer, and states what a signer signs; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at

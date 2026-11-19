@@ -86,9 +86,10 @@ pub mod volume;
 
 pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
 pub use error::{
-  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
-  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
-  RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
+  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HoldersUnread, HostFault, Invalid,
+  IssuerFault, KindMismatch, Missing, MountFault, MountHolders, MountMissing, MoveTarget, Note,
+  PathFault, ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported,
+  Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
@@ -234,9 +235,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`MountFault::NotMounted`] before any call, and the new refusals are [`MountFault::Busy`] (`EBUSY`: a process holds
 /// a file on the mount), [`MountFault::StillMounted`] (the call said done and the table disagrees) and
 /// [`MountFault::MountTable`] (the table could not be read) (the same day).
+/// 43: a busy unmount names its holders and is typed on Linux too (A-537): [`MountFault::Busy`] carries
+/// [`MountHolders`], the processes the kernel's own tables show holding the mount (on Linux each process's
+/// descriptors, working and root directories, by device, without touching the mount), with [`HoldersUnread`] saying
+/// why none were read (macOS: every libproc answer stats the file, which a `hard` NFS mount whose daemon has gone waits
+/// on without bound); and on Linux a plain `fusermount3 -u` refused while the kernel's table still lists the mount is
+/// [`MountFault::Busy`], where it was [`MountFault::Unmount`] with the helper's exit (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 42;
+pub const CONTRACT: u32 = 43;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

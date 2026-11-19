@@ -1224,12 +1224,15 @@ pub enum MountFault {
     /// The OS error number: the unmount call's (macOS and the BSDs), or starting the helper's (Linux).
     errno: Option<i32>,
   },
-  /// The mount is busy and stays (`EBUSY`, A-507): a process holds a reference to a file on it, an open file or a
-  /// working directory there (`unmount(2)`). End that process, or let go of the mount anyway with
-  /// [`crate::mount::unmount_busy`].
+  /// The mount is busy and stays (A-507): a process holds a reference to a file on it, an open file or a working
+  /// directory there. macOS and the BSDs say so by `unmount(2)`'s `EBUSY`; on Linux `fusermount3` reports no error
+  /// number, so a plain unmount it refused while the kernel's table still lists the mount is this (A-537). End the
+  /// holders, or let go of the mount anyway with [`crate::mount::unmount_busy`].
   Busy {
     /// The mount point.
     path: String,
+    /// The processes the kernel's own tables show holding it, read on this refusal alone (A-537).
+    holders: MountHolders,
   },
   /// The unmount answered done, but the kernel's mount table still lists the mount (A-507): an unmount is believed
   /// only when the table agrees.
@@ -1253,6 +1256,71 @@ pub enum MountFault {
     /// Each volume whose status was refused, and the refusal.
     unreported: Vec<Unreported>,
   },
+}
+
+/// The processes the kernel's own tables show holding a busy mount ([`MountFault::Busy`], A-537), read on the refusal's
+/// cold path without touching the mount, bounded by what the kernel states it lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MountHolders {
+  /// The processes holding a file, a working directory or a root on the mount, by process id, ascending, each once.
+  pub pids: Vec<u32>,
+  /// The processes listed whose tables this caller may not read (another user's, on Linux): any may hold it too.
+  pub unreadable: u32,
+  /// Why none were read, when none were.
+  pub unread: Option<HoldersUnread>,
+}
+
+/// Why a busy mount's holders were not read ([`MountHolders::unread`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoldersUnread {
+  /// This platform has no reader that leaves the mount alone. On macOS every libproc answer that reports a file stats
+  /// it (xnu's `fill_vnodeinfo` runs `vn_stat`), and the slates mount is a `hard` NFS mount, on which a stat waits
+  /// without bound once its daemon has gone.
+  NoReader {
+    /// The platform.
+    platform: &'static str,
+  },
+  /// The kernel refused its process tables.
+  Refused {
+    /// The OS error number, when the kernel gave one.
+    errno: Option<i32>,
+  },
+  /// A listing went past the bound the kernel states for it (on Linux `pid_max` processes, `nr_open` descriptors a
+  /// process).
+  PastBound {
+    /// The bound.
+    cap: usize,
+  },
+}
+
+impl fmt::Display for MountHolders {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match (&self.unread, self.pids.as_slice()) {
+      (Some(unread), _) => write!(f, "its holders were not read ({unread})"),
+      (None, []) => write!(f, "no process this caller may read holds a file there"),
+      (None, pids) => write!(f, "held by process(es) {pids:?}"),
+    }?;
+    if self.unreadable > 0 {
+      write!(f, ", and {} process(es) could not be read", self.unreadable)?;
+    }
+    Ok(())
+  }
+}
+
+impl fmt::Display for HoldersUnread {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::NoReader { platform } => {
+        write!(f, "{platform} has no reader that leaves the mount alone")
+      }
+      Self::Refused { errno } => write!(
+        f,
+        "the kernel refused its process tables: {}",
+        errno_text(*errno)
+      ),
+      Self::PastBound { cap } => write!(f, "a listing passed the kernel's bound of {cap}"),
+    }
+  }
 }
 
 /// A volume that could not report its mounts: named in [`MountFault::NotMounted`] when no other volume reported the
@@ -1373,10 +1441,10 @@ impl fmt::Display for MountFault {
         ),
         (None, errno) => write!(f, "unmounting {path} was refused: {}", errno_text(*errno)),
       },
-      Self::Busy { path } => write!(
+      Self::Busy { path, holders } => write!(
         f,
-        "{path} is busy: a process holds a file open on it or its working directory there; end it, or let go of \
-         the mount anyway (`slates_api::mount::unmount_busy`)"
+        "{path} is busy: {holders}; end the holders, or let go of the mount anyway \
+         (`slates_api::mount::unmount_busy`)"
       ),
       Self::StillMounted { path } => write!(
         f,

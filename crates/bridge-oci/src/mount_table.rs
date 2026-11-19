@@ -325,7 +325,7 @@ const MOUNT_ID_FIELD: usize = 0;
 /// Format: see [`MOUNT_ID_FIELD`].
 const DEVICE_FIELD: usize = 2;
 /// Format: the shift that packs a device's major number above its minor in [`MountIdentity::device`].
-const MAJOR_SHIFT: u32 = 32;
+pub(crate) const MAJOR_SHIFT: u32 = 32;
 
 /// The identity a `mountinfo` line names: its mount ID and its `major:minor`; `None` when either is not a
 /// number.
