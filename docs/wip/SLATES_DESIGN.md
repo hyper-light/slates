@@ -13048,6 +13048,20 @@ engine: the verdict, rebase, position mapping, the register).
 > byte; `delta_of` is one search run to its end. Owed: its users, upload's objects past a window (part 2) and the
 > fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search).
 >
+> **Status (2026-11-19, A-653 continued (4): an object past a window searched under the request's admission).** The
+> stream no longer sends an object past a window whole without a trial: one no kept part covers is searched through
+> `store::Search` against the earlier ones past a window of its kind, the nearest first, as many as the learned window
+> tries, a window's bytes a unit, and the smallest delta shorter than the object is sent, its base named by its offset
+> back or by its id. What the search holds (the object, the largest candidate, the index and the delta, and the best
+> delta while another candidate is tried) is charged to the request's own admission before its first byte is read, as
+> a hold the admission takes back once the entry is sent (`Admission::hold`, `Admission::release`); where the
+> admission cannot hold it, the object is sent whole and the stream counts it (`loose_unsearched`). Every step of
+> upload-pack's answer is lent the request's admission (`Answer::write`, `PackSource::write`, `Upload::advance`). git
+> holds the same three for a trial and searches every object below its `core.bigFileThreshold`; slates takes no
+> constant of git's (R3). Owed: the fragment encoder's per-object unit (`Encoder::put` stepping its trials through a
+> search); a search across a window's edge, an object past a window trying earlier ones within one and the reverse, as
+> git's order by name and size would.
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -13750,6 +13764,18 @@ signature verification).
 > first, the five failing against stubs). Owed: the verb that asks for an import, and the import made durable (the
 > register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
 > served.
+>
+> **Status (2026-11-19, A-678: the import verb).** A client asks the daemon to import a Mercurial repository's directory
+> with `ImportRepository { repository, path }`, served on the partition the repository's name hashes to and for its
+> owner alone: the directory is opened as a base is (read-only, never through a link), A-675's import started, and the
+> request's reply held in the shard's map beside the import, so the request is answered when the import ends, its
+> completion recorded first: `RepositoryImported` with what it took, or `ImportRefused` with its fault by kind
+> (`NotMercurial`, `NotEmpty`, `UnderWay`, `Unawaited`, `Format`, `Damaged` with a path, `PastRoom` with the room,
+> `Pending`, `Abandoned`), beside `NotFound`, `Forbidden`, `BaseUnavailable` and `BudgetExceeded`. A resend of the
+> request while its import runs takes the held route over. Proven on macOS arm64 (Mac Studio, kiln r110) by the verb's
+> four tests (red first, the four failing against stubs), `vcs_store::` 18 of 18, `wire_order` 2 of 2 with the variants
+> published, and the API's typing of the refusal. Owed: the import made durable; until then a request that reached the
+> owner from another node is refused `Unawaited`.
 
 > **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
 > `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
@@ -14228,7 +14254,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Built (A-675,
    `crates/server`: `vcs_store::hg_import`): the daemon's import of a repository's directory through it, a turn at a
    time on the repository's owner shard, its index put in the place of the empty index A-662's map made the
-   repository's Mercurial store with. Owed: the verb that asks for an import, and the import made durable.
+   repository's Mercurial store with. Built (A-678, `crates/server`: `repository::import`; `crates/ipc`:
+   `ImportRepository`): the verb that asks for an import, answered when it ends. Owed: the import made durable.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -50721,6 +50748,131 @@ unchanged); `docs/cli.md`; `docs/library.md`.
   `vcs_http/daemon_edge.rs` (`DaemonSite`, the module doc); `vcs_http/git/upload.rs` and `vcs_http.rs` (their docs);
   `vcs_http/tests/daemon_edge.rs` (the push test, with g309's helpers); `vcs_http/tests/git.rs` (a test's doc);
   `git_push.rs` (its docs); `lib.rs` (the modules' notes); §4.17.2's status; GAPS (the A-654 entry).
+
+### A-678 — The import verb: a client asks the daemon to import a Mercurial repository's directory, answered when the import ends (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.12; A-675)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/ipc` (`RequestBody::ImportRepository`,
+`ReplyBody::RepositoryImported`, `Refusal::ImportRefused`, `ImportFault`; `tests/wire_order.rs` and `wire_order.txt`),
+`crates/api` (`Invalid::Import`, `ImportFault` re-exported, a test typing the refusal), `crates/server`
+(`repository::import` and its tests, new; `verbs`: the verb's route and dispatch, its refusal's counter name,
+`base_open_refusal` shared; `vcs_store`: the held answers; `told::deliver_to` shared), GAPS (the §4.17.3 entry).
+- **The verb.** `ImportRepository { repository, path }` is served on the partition the repository's name hashes to, as
+  every repository verb is, and for its owner alone (`NotFound`, `Forbidden`). A repository of another tool is refused
+  `NotMercurial` before anything opens. The directory is opened as a base is (§4.15: `OsHost::open_root`, read-only,
+  `O_NOFOLLOW`), refused as a base is (`BaseUnavailable`, `OwnMount`), and A-675's import is started; its refusals at
+  the start are answered at once.
+- **Answered when it ends.** A started import runs a turn at a time on the owner shard, in a task of the shard. The
+  request's reply is held meanwhile: its origin, id and route, kept in the shard's map beside the import, one an import;
+  the running verb is marked deferred (`acceptance_deferred`, as a submit's acceptance is), so its transaction records
+  no completion. When the import ends the task records the request's completion with its reply in one durable step,
+  then sends the reply where the route names, outside its lend of the shard's state (`told::deliver_to`, whose delivery
+  takes the state itself). A resend of the request while its import runs takes the route over, so the end answers the
+  client where it is now; any other request for the repository is refused `UnderWay`.
+- **Refusals, by kind** (`ImportFault`, appended as `ArchiveFault` was): `NotMercurial`, `NotEmpty`, `UnderWay`,
+  `Unawaited`, `Format` (a requirement the import does not take, or a censored, ellipsis, externally stored or
+  unknown-flagged revision), `Damaged { path }` (a file missing, not of its format or at odds with the rest, its path
+  under `.hg` where the import's refusal names one), `PastRoom { room }`, `Pending` (a fetch still pending on an S3
+  base: ask again once it lands) and `Abandoned`; beside them `BudgetExceeded` with the room the budget had,
+  `BaseUnavailable` naming the directory for the host's own refusal, and `ContentUnavailable` for a store not held.
+  The API reads them as `Invalid::Import(ImportFault)`.
+- **Not taken (decided by the design, not measured).** An answer at once with a separate status verb: two verbs where
+  one answers, and a status kept per repository after its import ended. A request forwarded from another node waits
+  on its exchange, which cannot be held here: it is refused `Unawaited` until the import is durable and a resend can be
+  answered from its record.
+- **Tests** (`crates/server/src/repository/import/tests.rs`, and `an_import_refusal_is_typed_invalid_by_its_fault` in
+  `crates/api/src/error.rs`; macOS arm64, Mac Studio, kiln r110, 2026-11-19, debug, rustc 1.98.1, over main 0577ab0bd):
+  - refused by kind before anything is opened: a repository nobody made `NotFound`, another principal `Forbidden`, a
+    git repository `NotMercurial`, no request running (directly and through the shard's dispatch) and no route
+    `Unawaited`, a directory the host does not find `BaseUnavailable` naming it; none deferred;
+  - a started import of the `states` repository holds its reply (deferred, counted), a resend of its request takes the
+    route over without opening the directory again (counted rejoined), and another request is refused `UnderWay`;
+  - on a running daemon, the shard's task answers the held request when the import ends: counted answered once, its
+    reply sent (counted undeliverable, no client being there), the request let go, the store holding the history;
+  - each way an import fails or ends mapped to its refusal, and a finished import to `RepositoryImported`;
+  - the API types the refusal as an invalid request naming its fault, never retried.
+
+  `cargo test --locked -p slates-server --lib repository::import` 4 of 4 (751 filtered out), `--lib vcs_store::` 18 of
+  18, `-p slates-ipc --test wire_order every_` 2 of 2 over the tags the `--ignored` writer published (`ImportFault` 0 to
+  8, `Refusal` 78, `ReplyBody` 77, `RequestBody` 90), `-p slates-api --lib error` 12 of 12, `cargo fmt --check` clean on
+  the three crates; the same counts over main 3612d1ef9 (kiln r93). Red first (kiln r31, at 20821ad20: `import_with`
+  answering `NotFound` and `refusal_of` `ContentUnavailable` at once): the four failed, as recorded then; r31's log was
+  collected before this landing. No integration test reaches the verb. Main's: clippy, `xtask check`, the doc gates and
+  the other platforms.
+- **Owed.** The import made durable (the register's first entry and a recovery), with a forwarded request answered from
+  its record; the CLI's and the SDKs' words for the verb.
+
+### A-653, continued (4) — An object past a window searched under the request's admission, the fall-back counted (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch" item 3; part 2 of "a delta search for an object past a window"; A-582's admission, A-653 continued (3)'s `store::Search`)
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`admission`: `Hold`,
+`Admission::hold`, `Admission::release`; `store::deltas`: `Search::held_most`, the delta reserved whole when the scan
+begins; `store::upload`: the loose stage's search, `UploadCounters::loose_unsearched`; `upload`: `Answer::write` and
+`PackSource::write` take the request's admission; their tests and test sources), `crates/server`
+(`vcs_http::git::upload` and `vcs_ssh::git` lend the request's admission to every write of the answer; their two test
+sources).
+
+- **Why.** A-639's stream sent an object past a window that no kept part covered whole, with no delta trial, since a
+  delta search held its source and target whole (A-653 continued (3)). Part 1 made the search a bounded amount a
+  step; this part puts the stream's objects past a window through it. Main's ruling (2026-11-19): the search's base,
+  target and the base's index charged to the request's own admission; an object sent whole only when that admission
+  cannot hold its search, and that fall-back counted; the admission given a release, a charge that answers a token
+  whose return gives its bytes back; `PackSource::write` and `Upload::advance` taking the request's admission, every
+  implementor adapted; git's rule cited from `pack-objects.c` at v2.50.1, never one of its constants (R3).
+- **git's rule, from its source** (`builtin/pack-objects.c` at tag v2.50.1, read whole). An object whose size passes
+  `core.bigFileThreshold` is marked `no_try_delta` (`get_object_details`, lines 2541-2544) and never searched
+  (`prepare_pack`, line 3326); every other object of a type git can read is tried against its window's candidates,
+  ordered by type, name hash and size (`type_size_sort`, lines 2568-2599). A trial holds the target's bytes, the
+  source's and the source's index, and counts each as its window's memory (`try_delta`, lines 2774, 2803 and 2813);
+  `pack.windowMemory`, unlimited by default (line 253), lets the oldest candidates go when that memory passes it, never
+  the nearest (`find_deltas`, lines 2913-2919). git also skips a trial its sizes rule out (`try_delta`, lines
+  2737-2755): a source shorter than the target by half the target or more, or over 32 times its length. slates keeps
+  git's three holdings as the charge and takes neither constant: the request's admission decides whether an object is
+  searched, and the learned window, which tries every candidate it holds, how many candidates are.
+- **The token.** `Admission::hold(bytes)` charges as `charge` does, refused with nothing taken past the room, and
+  answers a `Hold`; `Admission::release(hold)` gives its bytes back. A hold is neither `Clone` nor `Copy`, so it is
+  given back once at most; one dropped without a release stays charged, which errs toward the request's room. An
+  admission is `Copy`, so it gives back at most what its own holds still keep: a hold released into another copy never
+  raises that copy's room past what it was admitted. A decode's charges stay plain charges, kept for the request's life.
+- **The charge.** Before its first byte is read, a search of an object `t` bytes long against candidates whose largest
+  is `s` bytes charges `t + s`, the most its index and delta take (`Search::held_most(s, t)`), and, with more than one
+  candidate, a second delta's most for the best kept while another is tried. The index keeps at most an entry a whole
+  block of the source, charged at the most the standard library's `BTreeMap` nodes can cost (B = 6: a leaf of eleven
+  keys and values, an internal node of twelve links more, each rounded up to a power of two, every node but the root
+  holding five entries at least). The delta is reserved whole when the scan begins, at the most the scan can write: its
+  sizes, the target's bytes, an insert opcode for every 127 of them and one more, since a copy is written only for a
+  match longer than its own eight bytes and so pays for the opcode of the run of inserts it ends. A `Vec` made with a
+  capacity has that capacity, so the delta never grows past its charge.
+- **The search in units.** The object's bytes are read a window a unit, then each candidate's, the nearest first; each
+  step of the search over the two is a unit of a window's bytes. Each trial is timed by the owner's clock, its candidate's
+  reading with it, and taught to the window at its rank, as the fragments' encoder teaches its own; the smallest delta
+  shorter than the object wins. The entry's header is written once the delta is known, the delta deflated a window a
+  unit at its kind's learned level, and the hold given back after the last window; with no delta shorter, the hold is
+  given back and the object sent whole. An object past a window, sent whole or as a delta, is remembered by its id,
+  kind, length, content, offset and depth, never its bytes, as a later one's candidate while its chain has room, as many
+  of its kind as the window can try.
+- **The admission lent.** `Answer::write`, `PackSource::write` and `Upload::advance` take the request's admission. The
+  HTTP edge's exchange holds one admission for its request (the body, the plan and now every write); SSH's upload
+  command made an admission for `serve` and dropped it, and now keeps it for the answer's writes, made afresh for each
+  request.
+- **Tests**, failing first against today's behaviour (an object past a window sent whole with no trial, and a release
+  that gives nothing back: branch `agents/g083-loose-search-red`, never landed):
+  `an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission` (a never-encoded version of two
+  200-line texts past the tests' 1 KiB window, a line edited in each, answered within an admission of exactly the later
+  file's search and within one byte less, with `ofs-delta` and without, in one turn and a unit a turn: with the room the
+  later file a delta naming the earlier by its offset back or by its id, the same bytes over any turns and every byte
+  given back by the stream's end; one byte short, both whole, the fall-back counted once and nothing taken; each read
+  back to the version's objects, each once); `a_hold_and_its_release_leave_the_admission_as_it_was` and
+  `a_release_gives_back_no_more_than_was_held` (a hold and its release, a release capped at what the admission holds).
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1, load 6 to 12), over main 3612d1ef9 merged:
+  red (kiln r101, branch `agents/g083-loose-search-red` at dfe528437), `cargo test --locked -p slates-git --lib --
+  admission:: store:: upload::` 129 passed, 3 failed (the three tests above: the admission left 40 where 100, a release
+  into another copy 90 where 100, the later file whole where an offset delta), 4 ignored; green (kiln r102, at
+  2783b6bfe), the same filters 132 passed, 0 failed, 4 ignored; `cargo test --locked -p slates-server --lib --
+  vcs_http::git::tests vcs_ssh::git::tests --test-threads=4` 18 of 18, the HTTP and SSH upload-pack tests with the
+  request's admission lent to their writes; `cargo fmt -p slates-git -p slates-server -- --check` clean. No
+  integration target reaches the stream or its pack source.
+- **Owed.** The fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search); a search
+  across a window's edge (an object past a window trying earlier ones within one and the reverse, as git's order by
+  name and size would); the live clone over the HTTP edge with the store's production lender (A-625 part 3); the
+  red-checks and the other platforms' runs (main's).
 
 ### A-629 part 2c — Git LFS on the shared HTTP edge: its routes on git's site through the edge's authentication, its status decided after its body, the locks API served by the daemon (2026-11-19, g230, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Transports" item 1; after A-629 part 2b-ii, A-625 part 3 and A-650 part 1)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/http-edge` (`connection.rs`:

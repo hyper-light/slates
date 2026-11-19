@@ -170,12 +170,13 @@ fn an_answer_past_its_admission_is_refused() {
   let served = serving(&fixture, &REFS, MAIN_REF);
   for room in [0u64, 64, 512, 4096] {
     let mut source = WholeObjects::new(&fixture.objects);
+    let mut admission = Admission::new(room);
     let mut answer = serve(
       &served,
       Version::V2,
       Asked::Request(FETCH_CLONE_REQUEST),
       &mut source,
-      &mut Admission::new(room),
+      &mut admission,
     );
     assert!(
       matches!(
@@ -187,7 +188,7 @@ fn an_answer_past_its_admission_is_refused() {
     );
     let mut bytes = Vec::new();
     assert_eq!(
-      answer.write(&served, &mut source, &mut bytes, usize::MAX),
+      answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),
       Written::End
     );
     assert!(
@@ -243,6 +244,7 @@ impl PackSource for Failing<'_> {
     &mut self,
     served: &Served<'_>,
     pack: &mut WholePack,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
@@ -250,7 +252,7 @@ impl PackSource for Failing<'_> {
       return Err(self.refusal);
     }
     let room = room.min(self.before - pack.1);
-    self.whole.write(served, pack, out, room)
+    self.whole.write(served, pack, admission, out, room)
   }
 }
 
@@ -267,15 +269,16 @@ fn a_pack_that_fails_midway_ends_with_gits_band_three_words() {
     before: 20,
     refusal: past,
   };
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     &served,
     Version::V2,
     Asked::Request(FETCH_CLONE_REQUEST),
     &mut source,
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   let mut bytes = Vec::new();
-  while answer.write(&served, &mut source, &mut bytes, 7) == Written::More {}
+  while answer.write(&served, &mut source, &mut admission, &mut bytes, 7) == Written::More {}
   assert_eq!(answer.refusal(), Some(&Refusal::Pack(past)));
   assert!(bytes.ends_with(&on_band_three(ABORT)));
   let events = decode_response(
@@ -333,6 +336,7 @@ impl PackSource for Pausing<'_> {
     &mut self,
     served: &Served<'_>,
     pack: &mut WholePack,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
@@ -340,7 +344,7 @@ impl PackSource for Pausing<'_> {
     if self.pause {
       return Ok(true);
     }
-    self.whole.write(served, pack, out, room)
+    self.whole.write(served, pack, admission, out, room)
   }
 }
 
@@ -357,18 +361,19 @@ fn a_source_that_works_without_writing_ends_the_step_and_is_asked_again() {
     whole: WholeObjects::new(&fixture.objects),
     pause: false,
   };
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     &served,
     Version::V2,
     Asked::Request(FETCH_CLONE_REQUEST),
     &mut source,
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   let mut bytes = Vec::new();
   let mut empty = 0;
   loop {
     let before = bytes.len();
-    let written = answer.write(&served, &mut source, &mut bytes, 1);
+    let written = answer.write(&served, &mut source, &mut admission, &mut bytes, 1);
     if written == Written::End {
       break;
     }
@@ -398,16 +403,17 @@ fn every_cut_and_flip_of_a_request_is_refused_or_answered_whole() {
   let (mut refused, mut answered) = (0, 0);
   for request in &requests {
     let mut source = WholeObjects::new(&fixture.objects);
+    let mut admission = Admission::new(1 << 20);
     let mut answer = serve(
       &served,
       Version::V2,
       Asked::Request(request),
       &mut source,
-      &mut Admission::new(1 << 20),
+      &mut admission,
     );
     let mut bytes = Vec::new();
     assert_eq!(
-      answer.write(&served, &mut source, &mut bytes, usize::MAX),
+      answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),
       Written::End
     );
     match answer.refusal() {
