@@ -750,18 +750,25 @@
 > on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
 > nothing); red first (2 failed), then 278 of 278 on Windows x86_64 (jupiter) against three stores imported a unit a
 > turn equal to one call; the macOS run owed.
+> **Built (A-657 = A-641 part 3):** a push landed on each green's own log: its new heads
+> placed on lines by a maximum matching (only a made or retired line touches the names log), its bookmarks applied as
+> 7.2 applies them and its pushkeys compared and swapped, its phase roots moved in the same entry as 7.2's
+> `advanceboundary`, its race checks handed to A-635's append as positions, a refusal for anything moved answered as
+> 7.2's race; the names `branch:<label>:<number>` and `bookmark:<label>:`, prefix-free; what the repository holds read
+> from its index, and its revisions kept in a fork of the index; held to stock 7.2's pushes on the fixtures' repository
+> rebuilt from its texts (every node 7.2's; replies byte for byte): slates-hg's push tests 36 of 36 and the server's 7
+> of 7 on macOS arm64 (Mac Studio, kiln r47, 2026-11-19); the other platforms owed to main.
 > Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
-> (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
-> refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens the
-> checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
-> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
-> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
-> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
-> it whole);
+> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
+> `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
+> content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
+> 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
+> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
+> the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one
+> position for every phase) measured under concurrent pushes before it is kept;
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -976,8 +983,25 @@
 > (2026-11-19, g295): a copy from a version its source changed after built, the head's graft fixed by what the change
 > index names since, the fix recorded whole in the chain entry (record kind 19) with its room derived before the
 > verdict and added to the entry's bound by the service (`cargo test -p slates-merge --lib` 118 of 118 on the Mac
-> Studio, red seven ways, see A-626 part 2). Owed from A-626: a checkpoint of a green holding a copy (part 3), a rebase
-> restating a copy (part 4); the replaced tree held by reference rather than removed key by
+> Studio, red seven ways, see A-626 part 2). A-626 part 3 (2026-11-19, g307): a checkpoint of a green holding a copy
+> built, version 4 (the copies' records, the copied trees' keys holding what their copy gave them, set by a restore with
+> no history, and the identity's running sum, which the restore takes), the anchor's layout 12 refusing every older
+> segment at adoption, so no version 3 checkpoint is ever read; the service's `merge.checkpoint.unavailable` now counts
+> only a floor folded past (see A-626 part 3). Its oracle found a replica hashing otherwise than its owner: a copy made
+> after the replica's checkpoint from a version before it was read through the source's history there, which a
+> restored green does not hold. Fixed in the same part without a format change: what a copy brought is read from its
+> graft, the source at the version before the copy through the copy's fix, kept with its record until the fold floor
+> reaches it (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). Red over
+> part 3 as it stood: 3 of 25 copy tests failing, each at an identity; green `cargo test -p slates-merge --lib` 182 of
+> 183 (its one failure the copy oracle's census, met by none of 128 generated histories, which A-672's fixed history,
+> landed before this part, now meets) and `cargo test -p slates-anchor --lib` 31 of 31, on Windows x86_64 (jupiter);
+> over main 5c0a522f1 on macOS arm64 (Mac Studio, kiln r40) the focused runs green: slates-merge lib 73 of 73 filtered
+> to the copy, checkpoint, branch, node, reanchor and stack tests, the fixed history meeting all 13 census cases,
+> `--test checkpoint` 4 of 4, `--test chain_replay` 3 of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 5 of 5
+> (a segment of layout 11 refused at start, new); Linux owed. Owed from A-626: a rebase restating a copy (part 4); a
+> restore that grafts
+> a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
+> if measured worth it; the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
 > Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the ra_svn server's commands (its
 > greeting and authentication built, A-599; its reporter's commands and report, A-616 part 1, and its drive's calls,
@@ -2693,7 +2717,31 @@
 > restored inside the new types (r705: all four failed; doubling the names took 2,149,245,934 comparisons against
 > 537,633,163). Owed to main: the merge crate's integration tests updated by reading (`tests/increment.rs`,
 > `tests/special.rs`, `tests/chain_replay.rs`) and the server's suites. Bug record:
-> `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+> `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`. Its format change made no anchor layout
+> bump (filed below, "Formats the segment keeps changed without a layout bump"); since the layout 12 of A-626 part 3
+> (2026-11-19), every segment a build before it wrote is refused at adoption.
+
+> **Formats the segment keeps changed without a layout bump: found open (2026-11-19, g307 by reading, on main's ruling for
+> A-626 part 3; `crates/anchor/src/layout.rs`, `crates/db/src/op.rs` `Op::GreenAdvanced`).** The partition's op log and
+> snapshots live in the anchor segment and hold every green's chain entries (`Op::GreenAdvanced`, the chain entry's bytes
+> with the increment's ops document inside) and checkpoints (`Op::GreenCheckpointed`). The ops document's version 2 and
+> the chain entry's version 5 (A-621), and the ops document's version 3 (A-646 part 2b), changed those formats with the
+> segment's `LAYOUT_VERSION` left at 11. A daemon of either change adopting a segment an older one wrote would meet each
+> older entry as `BadVersion` mid-service, the green fenced, where a bump refuses the segment once, typed, at adoption,
+> before anything is served. The layout 12 of A-626 part 3 covers both from now on: every segment written before it is
+> refused at adoption. Owed: the guard, a structural test tying every format version the segment keeps (the ops
+> document, the chain entry, the checkpoint, the origin, the work log, every record a partition persists) to
+> `LAYOUT_VERSION`, so a format change without a bump fails the build.
+
+> **The identity's recount is no oracle on a green folded past a copy: found open (2026-11-19, A-626 part 3, g307, by
+> reading; `Green::head_identity_from_scratch`, `Green::copied_tree_entries`).** The recount takes out what each copy
+> made after the green's restore brought, reading the copy's source at the version before it (since part 3, through
+> the copy's fix). A green built from its origin counts every copy, so once its histories are folded past a copy
+> (`fold_history_before`, which also lets the copy's kept fix go), the recount reads below the floor for it. Only the
+> recount is affected: the running identity and every sum moved below the head read what a copy brought only for a copy
+> above the floor. No test folds a green holding a copy and then recounts it. Owed: a recount for such a green that
+> reads no history below the floor and costs no fold a walk of a copied tree (a restore's `copies_before` comes from the
+> checkpoint's sum; a fold has no independent sum to take), and a test that folds past a copy and recounts.
 
 > **A metadata change to a node replaced after a work's base, and a rename of a replaced symlink or hard link: fixed
 > (2026-11-19, A-631, g267; found by A-612's sweep; §4.16 "The verdict": "delete against modify in either direction",
@@ -2845,6 +2893,8 @@
 >    node at its target at the work's base or the one the work makes, its golden vectors re-derived independently
 >    (218 bytes, `553a422f…6c0d92`) and the determinism gate holding with nodes (red on r1104, 12 failed; green 134
 >    of 134; merged with main on r1111, 141 of 141). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+>    Version 3 made no anchor layout bump ("Formats the segment keeps changed without a layout bump", filed with
+>    A-621's entry); since A-626 part 3's layout 12, every segment a build before it wrote is refused at adoption.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
 >    (`links_to`), two lookups where it scanned every attribute change and every hard link; a counter test shows 2
 >    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links

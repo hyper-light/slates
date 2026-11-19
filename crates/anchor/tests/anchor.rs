@@ -1010,6 +1010,39 @@ fn a_segment_from_before_typed_host_codes_is_refused_at_start() {
   );
 }
 
+/// A-626 part 3 (a green's checkpoint holding copies, version 4). Do: write layout 11, the layout before A-626 part 3,
+/// into a segment's header and attach it. Expect: refused at start, never read. The segment keeps every green's
+/// checkpoints, and a daemon of layout 11 wrote them in version 3, which a reader of today refuses `BadVersion`
+/// mid-service, its green fenced; the layout refuses the whole segment once, typed, before anything is served. Before
+/// A-626 part 3 layout 11 was the current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_version_4_checkpoints_is_refused_at_start() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: the layout before A-626 part 3's version 4 checkpoints.
+  const BEFORE_COPY_CHECKPOINTS: u32 = 11;
+  let name = format!("slates-anchor-v3-checkpoints-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &BEFORE_COPY_CHECKPOINTS.to_le_bytes())
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "a segment whose checkpoints are version 3 is refused at start: {result:?}"
+  );
+}
+
 /// Shape: how long the graceful stopping child keeps beating after it acknowledges a stop before it exits —
 /// its "drain", long enough that an anchor which did not wait for it would be seen not to.
 const DRAIN_MS: u64 = 100;
