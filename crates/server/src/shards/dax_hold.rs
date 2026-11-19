@@ -571,7 +571,7 @@ pub(crate) fn adopt_inherited(state: &mut ShardState) -> usize {
     .map(|dax| (Encoded::from_word(dax.copy).slot(), Held::Dax(dax)))
     .collect();
   #[cfg(target_os = "linux")]
-  let deadline = crate::held_copy::claim_deadline(state);
+  let taken_back = crate::held_copy::taken_back_ns(state);
   #[cfg(target_os = "linux")]
   order.extend(
     std::mem::take(&mut state.inherited_copies)
@@ -595,7 +595,7 @@ pub(crate) fn adopt_inherited(state: &mut ShardState) -> usize {
         taken
       }
       #[cfg(target_os = "linux")]
-      Held::Map(map) => crate::held_copy::adopt_or_release(state, map, deadline),
+      Held::Map(map) => crate::held_copy::adopt_or_release(state, map, taken_back),
     };
     if taken {
       adopted = adopted.saturating_add(1);

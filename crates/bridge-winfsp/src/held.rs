@@ -1,15 +1,20 @@
 //! A-198's held mount: its checked handoff record, and the lifetime of the volume and its drive. The record names the
-//! exact WinFsp volume, drive and read-only posture. The drive is a Mount Manager drive WinFsp's driver makes for the
-//! volume (A-369; WinFsp v2.1 `src/sys/volume.c` `FspVolumeUseMountmgr`), which the machine allows once, as WinFsp
-//! itself is installed once; no launcher or privileged process runs. The anchor duplicates the control and ledger
-//! handles, and the volume keeps its drive: normal teardown ends both once the anchor acknowledged releasing its
-//! copies. Until A-369 the drive was defined in the caller's DOS namespace (`DefineDosDeviceW`) and its temporary
+//! exact WinFsp volume, drive, read-only posture and name search (A-551). The drive is a Mount Manager drive WinFsp's
+//! driver makes for the volume (A-369; WinFsp v2.1 `src/sys/volume.c` `FspVolumeUseMountmgr`), which the machine allows
+//! once, as WinFsp itself is installed once; no launcher or privileged process runs. The anchor duplicates the control
+//! and ledger handles, and the volume keeps its drive: normal teardown ends both once the anchor acknowledged releasing
+//! its copies. Until A-369 the drive was defined in the caller's DOS namespace (`DefineDosDeviceW`) and its temporary
 //! symbolic link was held beside them; Windows resolves no file's final path on such a drive.
 
 /// Format: `FSP_FSCTL_VOLUME_NAME_SIZEMAX / sizeof(WCHAR)`, from WinFsp v2.1 fsctl.h.
 pub const VOLUME_UNITS: usize = 64 + 192;
-/// Format: a drive's letter and colon, the whole volume-name field, then one read-only flag byte.
+/// Format: a drive's letter and colon, the whole volume-name field, then one flag byte.
 pub const RECORD_BYTES: usize = (VOLUME_UNITS + 2) * size_of::<u16>() + size_of::<u8>();
+/// Format: bit 0 of the record's flag byte: the drive is read-only.
+const READ_ONLY: u8 = 1 << 0;
+/// Format: bit 1 of the record's flag byte: the drive declared no `CaseSensitiveSearch` (A-551). Clear in a record made
+/// before A-551, when every drive declared it, so such a record reads as what its drive was told.
+const CASE_INSENSITIVE: u8 = 1 << 1;
 
 /// Why a held mount's record cannot be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,7 +25,7 @@ pub enum Refusal {
   Volume,
   /// The drive is not an ASCII letter and colon.
   Drive,
-  /// The read-only flag is not a boolean.
+  /// The flag byte holds a bit no flag defines.
   Flags,
 }
 
@@ -33,6 +38,10 @@ pub struct Record {
   pub drive: [u16; 2],
   /// The posture used to construct WinFsp's matching dispatcher object.
   pub read_only: bool,
+  /// Whether the drive declared no `CaseSensitiveSearch` (A-551). WinFsp's driver fixed it when it made the volume, so
+  /// a successor names opens as the drive compares names, whatever the volume's names call for now: a drive mounted
+  /// before A-551 declared it whatever its volume's names, and keeps it until it is mounted again.
+  pub case_insensitive: bool,
 }
 
 impl Record {
@@ -43,7 +52,13 @@ impl Record {
     for unit in self.volume.iter().chain(self.drive.iter()) {
       encoded.extend_from_slice(&unit.to_le_bytes());
     }
-    encoded.push(u8::from(self.read_only));
+    let read_only = if self.read_only { READ_ONLY } else { 0 };
+    let case_insensitive = if self.case_insensitive {
+      CASE_INSENSITIVE
+    } else {
+      0
+    };
+    encoded.push(read_only | case_insensitive);
     Ok(encoded)
   }
 
@@ -56,16 +71,18 @@ impl Record {
       volume: [0; VOLUME_UNITS],
       drive: [0; 2],
       read_only: false,
+      case_insensitive: false,
     };
     let units = record.volume.iter_mut().chain(record.drive.iter_mut());
     for (unit, bytes) in units.zip(encoded.as_chunks::<{ size_of::<u16>() }>().0) {
       *unit = u16::from_le_bytes(*bytes);
     }
-    record.read_only = match encoded.last() {
-      Some(0) => false,
-      Some(1) => true,
-      _ => return Err(Refusal::Flags),
-    };
+    let flags = *encoded.last().ok_or(Refusal::Length)?;
+    if flags & !(READ_ONLY | CASE_INSENSITIVE) != 0 {
+      return Err(Refusal::Flags);
+    }
+    record.read_only = flags & READ_ONLY != 0;
+    record.case_insensitive = flags & CASE_INSENSITIVE != 0;
     record.check()?;
     Ok(record)
   }
@@ -239,6 +256,7 @@ mod tests {
       volume,
       drive: [u16::from(b'S'), u16::from(b':')],
       read_only: true,
+      case_insensitive: true,
     }
   }
 
@@ -249,6 +267,30 @@ mod tests {
     let restored = Record::decode(&expected.encode().unwrap()).unwrap();
     assert_eq!(restored, expected);
     assert_eq!(restored.drive_text().unwrap(), "S:");
+  }
+
+  /// A-551. Do: hand through the hold format a record of a drive that declared no `CaseSensitiveSearch` and one that
+  /// did, then read a record as a daemon before A-551 wrote it, its flag byte the read-only bit alone. Expect: each
+  /// posture kept, and the old record read as a drive that compares names with case, which every drive then declared.
+  #[test]
+  fn the_mount_record_keeps_how_its_drive_compares_names() {
+    for case_insensitive in [true, false] {
+      let expected = Record {
+        case_insensitive,
+        ..mount()
+      };
+      assert_eq!(
+        Record::decode(&expected.encode().unwrap()).unwrap(),
+        expected
+      );
+    }
+    let mut before = mount().encode().unwrap();
+    for read_only in [0u8, 1] {
+      *before.last_mut().unwrap() = read_only;
+      let restored = Record::decode(&before).unwrap();
+      assert!(!restored.case_insensitive);
+      assert_eq!(restored.read_only, read_only == 1);
+    }
   }
 
   /// A-198. Do: truncate or extend a record, supply invalid UTF-16, change its drive or flags. Expect: each refused.
@@ -262,7 +304,7 @@ mod tests {
     extended.push(0);
     assert_eq!(Record::decode(&extended), Err(Refusal::Length));
     let mut flags = encoded;
-    *flags.last_mut().unwrap() = 2;
+    *flags.last_mut().unwrap() = 4;
     assert_eq!(Record::decode(&flags), Err(Refusal::Flags));
     let mut invalid = mount();
     invalid.volume[1] = 0xd800;

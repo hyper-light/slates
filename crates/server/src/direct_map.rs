@@ -842,10 +842,34 @@ pub(crate) struct DirectMapState {
   /// shard's copies (`direct_maps_per_shard`).
   pub(crate) held: BTreeMap<u32, ClientMaps>,
   /// The maps this shard took back from its anchor after a takeover that their holders have not claimed yet, by map id:
-  /// the holder's client id and the deadline past which the map is reclaimed (A-197; `crate::held_copy`). Bounded by
-  /// the copies the anchor handed back, at most its held-copy bound.
+  /// the holder's client id and when the map was taken back, whose claim is owed for the failover delay from then
+  /// ([`claim_overdue`]; A-197, A-552; `crate::held_copy`). Bounded by the copies the anchor handed back, at most its
+  /// held-copy bound.
   #[cfg(target_os = "linux")]
   pub(crate) unclaimed: BTreeMap<u64, (u32, u64)>,
+}
+
+/// Derived: whether a map this shard took back from its anchor at `taken_back_ns` (A-197) is past its holder's claim at
+/// `now_ns`, with the shard holding the failover delay at `failover_ns` now (A-552). The map keeps its holder's write
+/// attachment, and with it the holder's write lease on the volume (D-16), which since A-414 a silent holder keeps for
+/// the failover delay (`F = D + E + R`, A-363, fanned to every shard); a holder that has not named its map in a sync or
+/// a release that long after the takeover gave it back is held to the same term, so a dead holder's lease keeps no
+/// other writer out longer than a silent one's would. Judged at each look by the delay the shard holds then, so it
+/// follows the fleet's measurement rather than the one taken at the takeover. Until A-552 the claim was owed for the
+/// client's old reconnect budget, the recovery budget and a window, which no client keeps any more: since A-468 a client
+/// reconnects while its anchor lives, by no clock. Cfg-free, so the rule is tested on every host; its only caller is
+/// Linux's (`crate::held_copy`).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn claim_overdue(taken_back_ns: u64, now_ns: u64, failover_ns: u64) -> bool {
+  now_ns >= claim_due_ns(taken_back_ns, failover_ns)
+}
+
+/// Derived: when the claim of a map taken back at `taken_back_ns` falls due, by the failover delay `failover_ns` the
+/// shard holds now ([`claim_overdue`]'s rule): the instant the shard's deadline keeper sleeps to for the earliest one
+/// (A-554, `crate::held_copy::next_claim_deadline`).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn claim_due_ns(taken_back_ns: u64, failover_ns: u64) -> u64 {
+  taken_back_ns.saturating_add(failover_ns)
 }
 
 /// A retry of a map still being filled joins it: the verb does not run again, and the reply goes where this attempt
@@ -1779,6 +1803,31 @@ fn recorded_form(reply: &ReplyBody) -> ReplyBody {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-552 (R3's class D: `held_copy`'s reconnect budget; A-197, A-414, A-468). Do: judge a map taken back at a shard's
+  /// start while its shard holds the failover delay at three liveness windows, two and a half windows on and three and a
+  /// half; then once the delay is fanned down to two windows, two and a half windows on. Expect: still owed its claim at
+  /// two and a half windows and overdue at three and a half; overdue at two and a half once the delay is two. Before, a
+  /// map was overdue at the client's old reconnect budget (the recovery budget and a window) whatever term its holder's
+  /// write lease runs for, though its client reconnects by no clock since A-468.
+  #[test]
+  fn a_taken_back_maps_claim_is_owed_for_the_failover_delay_its_shard_holds_now() {
+    let window = crate::daemon::LIVENESS_BUDGET_NS;
+    let taken_back = window;
+    let (owed_at, past_at) = (taken_back + 5 * window / 2, taken_back + 7 * window / 2);
+    assert!(
+      !claim_overdue(taken_back, owed_at, 3 * window),
+      "owed within the failover delay"
+    );
+    assert!(
+      claim_overdue(taken_back, past_at, 3 * window),
+      "overdue past it"
+    );
+    assert!(
+      claim_overdue(taken_back, owed_at, 2 * window),
+      "judged by the delay the shard holds now"
+    );
+  }
 
   /// A-505 (A-488's sibling, goal 85). Do: on a client's record of the maps sent to it, ask to send map 7 whose send
   /// succeeds and whose answer is then lost, as a client's shard that stopped for a window answers it; ask again, as the

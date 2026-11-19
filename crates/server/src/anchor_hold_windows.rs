@@ -3,7 +3,8 @@
 //! ends (A-427), each held with its stream's session as its record, which a `Record` replaces as the session moves
 //! (A-423); and those streams' DAX sections (A-448), each held with its attachment and file as its record, the
 //! counterpart of A-365's held copies. One IOCP pipe lives on the control shard; exchanges borrow it by
-//! move, and a bounded deadline covers both waiting for its owner and the request/acknowledgement pair. NFS socket
+//! move, and one deadline covers both waiting for its owner and the request/acknowledgement pair: learned from the
+//! anchor's answers this daemon waited on (A-552, `crate::anchor_answers`), backed off to the failover delay. NFS socket
 //! holds are still owed; those paired Unix API calls continue to report that no connection hold is available on Windows.
 //!
 //! **The channel outlives a missed deadline.** A deadline that passes ends an exchange, not the pipe: the pipe goes back
@@ -22,14 +23,59 @@ use slates_rt::tcp::{OwnedStream, TcpStream};
 use std::cell::{Cell, RefCell};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The shard owning the single request/acknowledgement stream. Set once at the daemon's start.
 static OWNER: OnceLock<u16> = OnceLock::new();
 thread_local! {
   /// One exchange at a time. Taking the pipe grants ownership across awaits without a lock or shared mutable borrow.
   static PIPE: RefCell<Option<PipeEnd>> = const { RefCell::new(None) };
-  /// An exchange owns the pipe while this is true. Waiting exchanges yield under the shared recovery deadline.
+  /// An exchange owns the pipe while this is true. Waiting exchanges yield under their own exchange's deadline.
   static EXCHANGING: Cell<bool> = const { Cell::new(false) };
+  /// The anchor's answers the exchanges waited on (A-552), kept where every exchange runs: on the shard owning the pipe.
+  static ANSWERS: RefCell<crate::anchor_answers::AnchorAnswers> =
+    RefCell::new(crate::anchor_answers::AnchorAnswers::default());
+}
+
+/// The bound the next exchange waits for the anchor's answer within ([`ANSWERS`]' bound), published by the owner shard
+/// after each exchange, so the asking shard waits for the owner by the same span the owner waits for the anchor (A-552).
+/// [`UNPUBLISHED`] until the first exchange ends. A word on a cold path (a mount's hold or release, a Shards stream's
+/// resync end or section), relaxed.
+static ANSWER_BOUND_NS: AtomicU64 = AtomicU64::new(UNPUBLISHED);
+/// Format: [`ANSWER_BOUND_NS`] before any bound is published: every bound is at least a liveness window, never zero.
+const UNPUBLISHED: u64 = 0;
+
+/// The bound the next exchange waits for the anchor's answer within: the one the owner shard published last, or before
+/// any, the estimator's own, a liveness window plus nothing measured (no exchange has backed it off, so the ceiling
+/// does not bear on it).
+fn answer_bound_ns() -> u64 {
+  match ANSWER_BOUND_NS.load(Ordering::Relaxed) {
+    UNPUBLISHED => crate::anchor_answers::AnchorAnswers::default().bound_ns(u64::MAX),
+    published => published,
+  }
+}
+
+/// Folds one exchange's outcome into the owner shard's estimate and publishes the next bound (A-552): an answer, the
+/// anchor's refusal included, after `took_ns` is a sample; an exchange given up at its bound is unanswered, which backs
+/// the next bound off, no further than the failover delay this shard holds; any other refusal (no channel, the pipe or
+/// the driver refused, a message that would not decode) says nothing of how long the anchor takes, and changes nothing.
+fn learn(answered: &Result<(), HoldRefusal>, took_ns: u64) {
+  let Some(failover_ns) = crate::state::with_state(|s| s.failover_ns) else {
+    return;
+  };
+  let _ = ANSWERS.try_with(|answers| {
+    let Ok(mut answers) = answers.try_borrow_mut() else {
+      return;
+    };
+    match answered {
+      Ok(()) | Err(HoldRefusal::Protocol(handles::HandleRefusal::Refused { .. })) => {
+        answers.answered(took_ns);
+      }
+      Err(HoldRefusal::Deadline) => answers.unanswered(),
+      Err(_) => {}
+    }
+    ANSWER_BOUND_NS.store(answers.bound_ns(failover_ns), Ordering::Relaxed);
+  });
 }
 
 /// Owns a single exchange through cancellation. However the exchange ends, answered, refused or dropped at its deadline,
@@ -338,16 +384,13 @@ pub(crate) fn install(channel: Option<OwnedHandle>, owner: u16) -> Result<(), Ho
   })
 }
 
-/// Derived: how long a mount waits for the anchor to take its hold: the recovery budget a restart is bounded by, plus
-/// the liveness budget, which covers the anchor's own wait between looks at the channel (at most half of it,
-/// `lapse_wait` in `crates/cli/src/anchor.rs`). The same span a client gives a restarting daemon (`Deadlines::derive`).
-const HOLD_BUDGET_NS: u64 =
-  slates_db::replay::RECOVERY_BUDGET_NS.saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
-/// Derived: one attempt at a release: the liveness budget, twice the anchor's longest wait between looks at the channel,
-/// so a live anchor answers the first attempt. Two attempts make [`RELEASE_BOUND_NS`].
-const RELEASE_ATTEMPT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
-/// Derived: how long a detach retries the release before it answers a refusal: the same span as [`HOLD_BUDGET_NS`].
-pub(crate) const RELEASE_BOUND_NS: u64 = HOLD_BUDGET_NS;
+/// Derived: how long a detach retries the release before it answers its client a refusal: the bound the anchor's
+/// answers are waited for within (A-552, [`answer_bound_ns`]), so the client hears once the anchor is late past its own
+/// measured pace and a liveness window. The release goes on being asked after that (`crate::winfsp`), and the anchor's
+/// answer ends the mount then. Until A-552 it was the recovery budget and a window.
+pub(crate) fn release_bound_ns() -> u64 {
+  answer_bound_ns()
+}
 
 /// Holds a mount before its attachment commits. Exactly one bounded exchange owns the channel at a time.
 pub(crate) async fn hold_mount(
@@ -355,15 +398,12 @@ pub(crate) async fn hold_mount(
   values: Vec<u64>,
   record: Vec<u8>,
 ) -> Result<(), HoldRefusal> {
-  exchange(
-    HandleMessage::Hold {
-      id,
-      what: WHAT_WINFSP_MOUNT,
-      values,
-      record,
-    },
-    HOLD_BUDGET_NS,
-  )
+  exchange(HandleMessage::Hold {
+    id,
+    what: WHAT_WINFSP_MOUNT,
+    values,
+    record,
+  })
   .await
 }
 
@@ -371,80 +411,83 @@ pub(crate) async fn hold_mount(
 /// second finds nothing and is answered the same), so the caller repeats it until it is answered; a refusal is returned
 /// for the caller to count.
 pub(crate) async fn release_mount(id: u64) -> Result<(), HoldRefusal> {
-  exchange(HandleMessage::Release { id }, RELEASE_ATTEMPT_NS).await
+  exchange(HandleMessage::Release { id }).await
 }
 
 /// Holds a Shards stream's resync end, `value` in this daemon's table, as entry `id` (its attachment), with `record`
 /// its session (A-427): answered once the anchor has duplicated the end out of this process, within the same budget a
 /// mount's hold has.
 pub(crate) async fn hold_resync(id: u64, value: u64, record: Vec<u8>) -> Result<(), HoldRefusal> {
-  exchange(
-    HandleMessage::Hold {
-      id,
-      what: WHAT_SHARDS_RESYNC,
-      values: vec![value],
-      record,
-    },
-    HOLD_BUDGET_NS,
-  )
+  exchange(HandleMessage::Hold {
+    id,
+    what: WHAT_SHARDS_RESYNC,
+    values: vec![value],
+    record,
+  })
   .await
 }
 
 /// Replaces held entry `id`'s record with `record`, a Shards stream's session as it moved (A-423, A-427): answered once
 /// the anchor keeps it, within a hold's budget; refused when the anchor holds no such entry.
 pub(crate) async fn record_resync(id: u64, record: Vec<u8>) -> Result<(), HoldRefusal> {
-  exchange(HandleMessage::Record { id, record }, HOLD_BUDGET_NS).await
+  exchange(HandleMessage::Record { id, record }).await
 }
 
 /// Lets a Shards stream's resync end go (A-427): one attempt, as a mount's release; idempotent at the anchor, so a
 /// release of an end it never took is answered the same.
 pub(crate) async fn release_resync(id: u64) -> Result<(), HoldRefusal> {
-  exchange(HandleMessage::Release { id }, RELEASE_ATTEMPT_NS).await
+  exchange(HandleMessage::Release { id }).await
 }
 
 /// Holds a Shards stream's DAX section, `value` in this daemon's table, as entry `id` (its backing, named apart from every
 /// attachment), with `record` its attachment and file (A-448): answered once the anchor has duplicated the section out
 /// of this process, within the same budget a mount's hold has.
 pub(crate) async fn hold_section(id: u64, value: u64, record: Vec<u8>) -> Result<(), HoldRefusal> {
-  exchange(
-    HandleMessage::Hold {
-      id,
-      what: WHAT_SHARDS_DAX,
-      values: vec![value],
-      record,
-    },
-    HOLD_BUDGET_NS,
-  )
+  exchange(HandleMessage::Hold {
+    id,
+    what: WHAT_SHARDS_DAX,
+    values: vec![value],
+    record,
+  })
   .await
 }
 
 /// Lets a Shards stream's DAX section go (A-448): one attempt, as a mount's release; idempotent at the anchor, so a
 /// release of a section it never took is answered the same.
 pub(crate) async fn release_section(id: u64) -> Result<(), HoldRefusal> {
-  exchange(HandleMessage::Release { id }, RELEASE_ATTEMPT_NS).await
+  exchange(HandleMessage::Release { id }).await
 }
 
-/// One exchange with the anchor over the channel `OWNER`'s shard holds: the anchor's part within `budget_ns` on the wall,
-/// once the owner shard runs it; the owner shard waited for in its own time (A-440; R3's class A), since a hold the
-/// anchor takes is a side effect its caller must learn of: waited `budget_ns` on the wall, a busy owner shard ran the
-/// exchange after the caller had been answered `Deadline`, and the anchor held what its caller took for unheld.
-async fn exchange(message: HandleMessage, budget_ns: u64) -> Result<(), HoldRefusal> {
+/// One exchange with the anchor over the channel `OWNER`'s shard holds: the anchor's part within the learned bound
+/// ([`answer_bound_ns`], read once as the exchange begins) on the wall, once the owner shard runs it; the owner shard
+/// waited for in its own time by the same bound (A-440; R3's class A), since a hold the anchor takes is a side effect its
+/// caller must learn of: waited on the wall, a busy owner shard ran the exchange after the caller had been answered
+/// `Deadline`, and the anchor held what its caller took for unheld. The owner folds the outcome into its estimate
+/// ([`learn`], A-552).
+async fn exchange(message: HandleMessage) -> Result<(), HoldRefusal> {
   let owner = *OWNER.get().ok_or(HoldRefusal::NoChannel)?;
   let origin = crate::state::with_state(|s| s.shard).ok_or(HoldRefusal::Unavailable)?;
+  let budget_ns = answer_bound_ns();
   crate::xshard::task_in_shard_time(
     origin,
     owner,
     move || async move {
-      // Waiting and transacting share one derived bound. The lease gives the channel back however this ends, and a
+      // Waiting and transacting share one learned bound. The lease gives the channel back however this ends, and a
       // later exchange's read passes over whatever this one left unread.
-      futures::within(budget_ns, async move {
+      let began = futures::now_ns();
+      let answered = match futures::within(budget_ns, async move {
         let lease = acquire().await?;
         let pipe = lease.pipe.as_ref().ok_or(HoldRefusal::Unavailable)?;
         transact(pipe, message).await
       })
       .await
-      .map_err(HoldRefusal::Runtime)?
-      .ok_or(HoldRefusal::Deadline)?
+      {
+        Ok(Some(answered)) => answered,
+        Ok(None) => Err(HoldRefusal::Deadline),
+        Err(error) => Err(HoldRefusal::Runtime(error)),
+      };
+      learn(&answered, futures::now_ns().saturating_sub(began));
+      answered
     },
     budget_ns,
   )
@@ -608,8 +651,10 @@ mod tests {
 
     let (first, took) = answers.recv_timeout(STAND_IN_WAIT).unwrap();
     assert_eq!(first.unwrap_err(), HoldRefusal::Deadline.to_string());
+    // The first exchange's bound: the estimator's own, before any answer was measured (A-552).
+    let first_bound = crate::anchor_answers::AnchorAnswers::default().bound_ns(u64::MAX);
     assert!(
-      (RELEASE_ATTEMPT_NS..RELEASE_ATTEMPT_NS.saturating_mul(4)).contains(&took),
+      (first_bound..first_bound.saturating_mul(4)).contains(&took),
       "the deadline passed after {took} ns"
     );
     assert_eq!(

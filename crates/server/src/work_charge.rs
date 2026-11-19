@@ -302,7 +302,7 @@ mod tests {
         let seen: BTreeMap<String, Vec<u8>> = files
           .files(base)
           .into_iter()
-          .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+          .map(|(path, bytes)| (path, bytes.to_vec()))
           .collect();
         prop_assert_eq!(&seen, &model, "after {:?}", step);
         for path in PATHS {

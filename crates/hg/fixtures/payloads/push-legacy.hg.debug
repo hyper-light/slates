@@ -1,0 +1,9 @@
+Stream params: {}
+replycaps -- {} (mandatory: True)
+check:bookmarks -- {} (mandatory: True)
+check:phases -- {} (mandatory: True)
+pushkey -- {key: 976eb9d7cd11eb8a63d94860fb7186069eef4a10, namespace: phases, new: 0, old: 1} (mandatory: True)
+obsmarkers -- {} (mandatory: True)
+    version: 1 (92 bytes)
+    86d599a1904caf7869263a4d824bcb40473ed8fc 976eb9d7cd11eb8a63d94860fb7186069eef4a10 0 (Thu Jan 01 00:00:00 1970 +0000) {'ef1': '9', 'operation': 'amend', 'user': 'test'}
+pushkey -- {key: other, namespace: bookmarks, new: 976eb9d7cd11eb8a63d94860fb7186069eef4a10, old: } (mandatory: True)

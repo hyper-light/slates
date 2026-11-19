@@ -73,6 +73,9 @@ pub struct Reply {
   pub kind: SlotKind,
   /// The payload.
   pub payload: Vec<u8>,
+  /// The daemon's stamp as it wrote the reply into the ring (`crate::slot`, "The stamp"; A-559): zero for a reply no
+  /// daemon stamped. [`crate::slot::landed_ns`] widens it to when the reply landed.
+  pub stamp: u32,
 }
 
 /// What a wait for the next reply while the daemon lives ended with ([`ClientEnd::wait_while_daemon_lives`]).
@@ -97,6 +100,9 @@ pub struct ClientEnd {
   spin_override_ns: Option<u64>,
   next_request: u64,
   next_reply: u64,
+  /// The stamp this end wrote into the last request it pushed (`crate::slot`, "The stamp"; A-559): when that request
+  /// landed in the command ring, for a caller that splits its latency ([`Self::request_stamp`]); zero before any.
+  request_stamp: u32,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
   parks: u64,
   /// Replies taken.
@@ -184,6 +190,7 @@ impl ClientEnd {
       spin_override_ns: None,
       next_request: 0,
       next_reply: 0,
+      request_stamp: 0,
       parks: 0,
       replies: 0,
       unanswered_wakes: 0,
@@ -522,6 +529,12 @@ impl ClientEnd {
     self.wake.mean_ns()
   }
 
+  /// The stamp this end wrote into the last request it pushed: when that request landed in the command ring
+  /// (`crate::slot`, "The stamp"; A-559), widened by [`crate::slot::landed_ns`]; zero before any request.
+  pub fn request_stamp(&self) -> u32 {
+    self.request_stamp
+  }
+
   /// Parks whose measured wake fed the estimate.
   pub fn wake_samples(&self) -> u64 {
     self.wake_samples
@@ -579,7 +592,9 @@ impl ClientEnd {
   /// a shard that missed this request on its re-check is always rung, and only that shard is woken (A-381).
   pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
     let cmd = self.region.cmd();
-    cmd.push(self.region.object_mut(), self.next_request, slot)?;
+    let stamp = crate::slot::stamp_now();
+    cmd.push(self.region.object_mut(), self.next_request, slot, stamp)?;
+    self.request_stamp = stamp;
     self.next_request = self.next_request.wrapping_add(1);
     let announced = self.region.daemon_parked()?;
     let parked =
@@ -609,6 +624,7 @@ impl ClientEnd {
       request: slot.request,
       kind: slot.kind,
       payload: slot.payload,
+      stamp: slot.stamp,
     }))
   }
 
@@ -1239,7 +1255,12 @@ impl DaemonEnd {
   /// Writes a reply and wakes the client if it parked.
   pub fn reply(&mut self, slot: &Slot) -> Result<(), IpcError> {
     let cpl = self.region.cpl();
-    cpl.push(self.region.object_mut(), self.next_reply, slot)?;
+    cpl.push(
+      self.region.object_mut(),
+      self.next_reply,
+      slot,
+      crate::slot::stamp_now(),
+    )?;
     self.next_reply = self.next_reply.wrapping_add(1);
     let word = self.region.wake_word()?;
     word.fetch_add(1, Ordering::AcqRel);
