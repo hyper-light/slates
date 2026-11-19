@@ -555,7 +555,7 @@ fn push_planned(
   let mut entry = entry(record.id, (&steps, &verdicts), parts);
   if let Some((sealed, moves)) = sealed.as_mut() {
     let resolved = resolve(state, (&steps, &entry), moves)?;
-    if let Err(refused) = sealed.admit(&mut state.vcs_stores, resolved) {
+    if let Err(refused) = sealed.admit((&mut state.store, &mut state.vcs_stores), resolved) {
       return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
         state, &refused,
       )));

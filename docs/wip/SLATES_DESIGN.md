@@ -48039,8 +48039,10 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   not compile, having been written while no machine could build it. Its first build (Mac Studio, 2026-11-19) found
   two more. (5) `GitPush::read` lent A-618's work builder A-638's view over a settled store, whose budget is what it
   holds, and the view lists a tree within the store's room (`ContentStore::room`), so every work's root tree was refused
-  `PastRoom { asked: 56, room: 0 }`: the five tests that build a work through the shard failed at it. A read is now
-  lent room as every step is (`lend`) and gives it back after, holding nothing. (6) The store-level tests held content
+  `PastRoom { asked: 56, room: 0 }`; past it, `SealedPush::admit` met the same: A-614's admission walks trees and peels
+  tags within that room and answers a refused parse `Malformed`, so every append was refused `ContentUnavailable`. The
+  five tests that push through the shard failed at each in turn. Both steps are now lent the room the shard could admit
+  (`lent_to_read`) and, reading the stores only, give it back after, holding nothing. (6) The store-level tests held content
   in 64-byte windows, below the store's longest row (an object row's key, root and fields with its table's frame,
   `RowPastWindow`), so the oracle and the fixed history were refused at their first push; their window is A-614's
   view tests' 256 bytes, and their blobs run to three windows.

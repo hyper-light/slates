@@ -439,6 +439,23 @@ fn within_budget<T>(
   answer
 }
 
+/// Runs `read` over the stores, read only, with the room [`lend`] gives: what a step that parses objects needs, since
+/// A-614's store lists a tree, a tag or a commit within the content store's room (`ContentStore::room`), as A-638's view
+/// does, and a settled store has none, its budget being what it holds. Read only, the stores hold after it what they
+/// held before, so the room lent is given back and nothing is charged.
+fn lent_to_read<T>(
+  (store, stores): (&mut Store, &mut VcsStores),
+  read: impl FnOnce(&VcsStores) -> T,
+) -> T {
+  lend(store, stores, 0);
+  let answer = read(stores);
+  let charged = stores.charged;
+  if let Some(content) = stores.content.as_mut() {
+    content.set_budget(charged);
+  }
+  answer
+}
+
 /// A git push in its quarantine (§4.17.2 "A push" item 3): each object admitted to the repository's store as it comes
 /// and noted for the push's record, which an append writes as it commits ([`SealedPush::record`]).
 #[derive(Debug)]
@@ -488,14 +505,19 @@ impl SealedPush {
   }
 
   /// Admits `moves` (each a green's key, its version once the entry moves it, and its new head) in place of any
-  /// admitted before, against the store as it is now: what one append commits. Refused, the push keeps what it holds.
+  /// admitted before, against the store as it is now: what one append commits. The admission walks the push's trees
+  /// and tags within the room lent for it ([`lent_to_read`]). Refused, the push keeps what it holds.
   pub(crate) fn admit(
     &mut self,
-    stores: &mut VcsStores,
+    stores: (&mut Store, &mut VcsStores),
     moves: Vec<RecordedMove>,
   ) -> Result<(), GitRefused> {
-    let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
-    self.moves = admit_moves(content, store, &self.push, &moves)?;
+    let (repository, push) = (self.repository, &self.push);
+    let admitted = lent_to_read(stores, |stores| {
+      let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
+      admit_moves(content, store, push, &moves)
+    })?;
+    self.moves = admitted;
     self.keyed = moves;
     Ok(())
   }
@@ -573,24 +595,21 @@ impl GitPush {
   }
 
   /// Runs `read` over the repository's objects and this push's, the index first (A-638's view), as a ref's work is
-  /// built from them (A-618), with the room [`lend`] gives lent for the step: the view lists a tree within the content
-  /// store's room (`ContentStore::room`), and a settled store has none, since its budget is what it holds. A read holds
-  /// nothing after it, so the room lent is given back and nothing is charged. None when no git store of the repository
-  /// is held here.
+  /// built from them (A-618), within the room lent for it: the view lists a tree within the content store's room
+  /// ([`lent_to_read`]). None when no git store of the repository is held here.
   pub(crate) fn read<R>(
     &self,
-    (store, stores): (&mut Store, &mut VcsStores),
+    stores: (&mut Store, &mut VcsStores),
     read: impl FnOnce(&PushedObjects<'_>) -> R,
   ) -> Option<R> {
-    lend(store, stores, 0);
-    let answer = stores
-      .git_ref(self.repository)
-      .map(|(content, git)| read(&PushedObjects::new(&git.repository, content, &self.push)));
-    let charged = stores.charged;
-    if let Some(content) = stores.content.as_mut() {
-      content.set_budget(charged);
-    }
-    answer
+    lent_to_read(stores, |stores| {
+      let (content, git) = stores.git_ref(self.repository)?;
+      Some(read(&PushedObjects::new(
+        &git.repository,
+        content,
+        &self.push,
+      )))
+    })
   }
 }
 
