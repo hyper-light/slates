@@ -562,14 +562,26 @@ fn a_path_mercurials_audit_refuses_is_refused() {
     assert_eq!(fault(path), Some(PathFault::IllegalComponent), "{path:?}");
   }
   assert_eq!(fault(b"a/"), Some(PathFault::EndsInSeparator));
-  let nested = |base: &[u8]| Some(PathFault::NestedRepository { base: base.to_vec() });
+  let nested = |base: &[u8]| {
+    Some(PathFault::NestedRepository {
+      base: base.to_vec(),
+    })
+  };
   assert_eq!(fault(b"a/.hg/b"), nested(b"a"));
   assert_eq!(fault("x/y/.H\u{feff}G./z".as_bytes()), nested(b"x/y"));
   let unheld: [&[u8]; 5] = [b"a//b", b"./a", b"a/./b", b"a\0b", b"\xff"];
   for path in unheld {
     assert_eq!(fault(path), Some(PathFault::NotHeld), "{path:?}");
   }
-  for path in [".hgignore", "a/.hgtags", "x~1/y", "HG~a", "hg~", "src/deep/mod.rs", "c"] {
+  for path in [
+    ".hgignore",
+    "a/.hgtags",
+    "x~1/y",
+    "HG~a",
+    "hg~",
+    "src/deep/mod.rs",
+    "c",
+  ] {
     assert_eq!(verify::audit(path.as_bytes()), Ok(()), "{path}");
   }
   let (mut hidden, _) = Made3::one(&NULL_NODE, &[("a", b"x\n", "")]);

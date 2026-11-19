@@ -640,13 +640,24 @@ fn audited(path: &[u8]) -> Result<(), PathFault> {
     && first.first().is_some_and(u8::is_ascii_alphabetic)
     && first.get(1) == Some(&DRIVE);
   let top_reserved = first.is_empty() || DOT_HG.contains(&lower_clean(first).as_slice());
-  if drive || top_reserved || parts.contains(&b"..".as_slice()) || parts.iter().any(|part| short_name(part)) {
+  if drive
+    || top_reserved
+    || parts.contains(&b"..".as_slice())
+    || parts.iter().any(|part| short_name(part))
+  {
     return Err(PathFault::IllegalComponent);
   }
   let lowered: Vec<Vec<u8>> = parts.iter().map(|part| lower_clean(part)).collect();
   for reserved in DOT_HG {
-    if let Some(at) = lowered.iter().skip(1).position(|part| part.as_slice() == reserved) {
-      let base = parts.get(..at.saturating_add(1)).unwrap_or_default().join(&SLASH);
+    if let Some(at) = lowered
+      .iter()
+      .skip(1)
+      .position(|part| part.as_slice() == reserved)
+    {
+      let base = parts
+        .get(..at.saturating_add(1))
+        .unwrap_or_default()
+        .join(&SLASH);
       return Err(PathFault::NestedRepository { base });
     }
   }
@@ -670,7 +681,9 @@ fn short_name(part: &[u8]) -> bool {
   );
   !number.is_empty()
     && number.iter().all(u8::is_ascii_digit)
-    && SHORT_STEMS.iter().any(|known| stem.eq_ignore_ascii_case(known))
+    && SHORT_STEMS
+      .iter()
+      .any(|known| stem.eq_ignore_ascii_case(known))
 }
 
 /// `part` lower-cased as Python lower-cases bytes (ASCII alone), with the code points HFS+ ignores removed
