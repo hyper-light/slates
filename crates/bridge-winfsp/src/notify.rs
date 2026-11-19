@@ -30,8 +30,11 @@
 //! buffer holds only a name relative to the record before it, which this module never sends.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use slates_bridge_core::{CachedBytes, Invalidation};
+
+use crate::normalized::{NORMALIZED_UNITS_MAX, NameSearch, SEPARATOR};
 
 /// Format: `FILE_NOTIFY_CHANGE_FILE_NAME` (winnt.h): a name was added, removed or renamed.
 pub const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
@@ -80,25 +83,49 @@ pub struct OpenNames {
   /// The same names in order, each with its handle, so the opens at or beneath a path are found without walking the
   /// rest (A-212).
   by_name: BTreeSet<(String, u64)>,
+  /// How WinFsp's driver compares this drive's names (A-551).
+  search: NameSearch,
+  /// On a drive that searches without case, each name of at most [`NORMALIZED_UNITS_MAX`] units by the units the driver
+  /// compares it by ([`NameSearch::key`]), with the handles open by it: how an open finds the spelling Windows already
+  /// holds a prefix of its path by ([`OpenNames::spelled_at`], `crate::normalized`). A longer name is one the driver
+  /// upper-cased itself, whose spelling is no open's to take. Empty on a drive that searches with case. Bounded as the
+  /// handles are.
+  by_key: BTreeMap<Vec<u16>, BTreeSet<u64>>,
 }
 
 impl OpenNames {
-  /// An empty table: a mount Windows holds nothing of yet.
+  /// An empty table of a drive that searches with case: a mount Windows holds nothing of yet.
   pub fn new() -> OpenNames {
     OpenNames::default()
+  }
+
+  /// An empty table of a drive whose names WinFsp's driver compares by `search` (A-551).
+  pub fn searching(search: NameSearch) -> OpenNames {
+    OpenNames {
+      search,
+      ..OpenNames::default()
+    }
+  }
+
+  /// How WinFsp's driver compares this drive's names.
+  pub fn search(&self) -> NameSearch {
+    self.search
   }
 
   /// Handle `handle` was opened on inode `ino` by `path`.
   pub fn opened(&mut self, handle: u64, ino: u64, path: &str) {
     if let Some((_, old)) = self.by_handle.insert(handle, (ino, path.to_owned())) {
+      unkey(&mut self.by_key, self.search, &old, handle);
       self.by_name.remove(&(old, handle));
     }
+    key(&mut self.by_key, self.search, path, handle);
     self.by_name.insert((path.to_owned(), handle));
   }
 
   /// Handle `handle` was closed: Windows no longer holds its node through it.
   pub fn closed(&mut self, handle: u64) {
     if let Some((_, old)) = self.by_handle.remove(&handle) {
+      unkey(&mut self.by_key, self.search, &old, handle);
       self.by_name.remove(&(old, handle));
     }
   }
@@ -109,12 +136,42 @@ impl OpenNames {
     for (handle, (_, path)) in &mut self.by_handle {
       if let Some(rest) = beneath(path, from) {
         let moved = format!("{to}{rest}");
-        self
-          .by_name
-          .remove(&(std::mem::replace(path, moved.clone()), *handle));
+        let old = std::mem::replace(path, moved.clone());
+        unkey(&mut self.by_key, self.search, &old, *handle);
+        key(&mut self.by_key, self.search, &moved, *handle);
+        self.by_name.remove(&(old, *handle));
         self.by_name.insert((moved, *handle));
       }
     }
+  }
+
+  /// On a drive that searches without case, the spelling Windows holds the path whose driver units are `key` by: the
+  /// first `key.len()` units of a name open at that path or beneath it (A-551, `crate::normalized`). `None` when
+  /// Windows holds no such name, and on a drive that searches with case.
+  pub fn spelled_at(&self, key: &[u16]) -> Option<String> {
+    let handle = self.held_at_or_beneath(key)?;
+    let (_, name) = self.by_handle.get(&handle)?;
+    let units: Vec<u16> = name.encode_utf16().take(key.len()).collect();
+    if units.len() != key.len() {
+      return None;
+    }
+    String::from_utf16(&units).ok()
+  }
+
+  /// A handle open by a name whose driver units are `key`, or begin with `key` and a separator. The names beneath a
+  /// path sort together from its units and a separator, so the first indexed name from there is beneath it if any is.
+  fn held_at_or_beneath(&self, key: &[u16]) -> Option<u64> {
+    if let Some(handles) = self.by_key.get(key) {
+      return handles.first().copied();
+    }
+    let mut beneath = key.to_vec();
+    beneath.push(SEPARATOR);
+    self
+      .by_key
+      .range::<[u16], _>((Bound::Included(beneath.as_slice()), Bound::Unbounded))
+      .next()
+      .filter(|(units, _)| units.starts_with(&beneath))
+      .and_then(|(_, handles)| handles.first().copied())
   }
 
   /// Whether every name Windows holds beneath `from` stays within [`MAX_PATH_UNITS`] once `from` becomes `to`. Such a name
@@ -206,6 +263,45 @@ impl OpenNames {
     names.sort_unstable();
     names.dedup();
     names
+  }
+}
+
+/// The driver units [`OpenNames`] indexes `name` by: none on a drive that searches with case, and none for a name past
+/// what an open's reply can name (A-551).
+fn indexed(search: NameSearch, name: &str) -> Option<Vec<u16>> {
+  if search.case_sensitive() {
+    return None;
+  }
+  let units = search.key(name);
+  (units.len() <= NORMALIZED_UNITS_MAX).then_some(units)
+}
+
+/// Indexes `name` as open by `handle` ([`indexed`]).
+fn key(
+  by_key: &mut BTreeMap<Vec<u16>, BTreeSet<u64>>,
+  search: NameSearch,
+  name: &str,
+  handle: u64,
+) {
+  if let Some(units) = indexed(search, name) {
+    by_key.entry(units).or_default().insert(handle);
+  }
+}
+
+/// Forgets `name` as open by `handle`, and the name with its last handle.
+fn unkey(
+  by_key: &mut BTreeMap<Vec<u16>, BTreeSet<u64>>,
+  search: NameSearch,
+  name: &str,
+  handle: u64,
+) {
+  if let Some(units) = indexed(search, name)
+    && let Some(handles) = by_key.get_mut(&units)
+  {
+    handles.remove(&handle);
+    if handles.is_empty() {
+      by_key.remove(&units);
+    }
   }
 }
 
@@ -659,5 +755,57 @@ mod tests {
     names.closed(5);
     assert_eq!(names.first_beneath("\\dir.txt"), None);
     assert_eq!(names.first_beneath("\\dir2"), Some((6, 6)));
+  }
+
+  /// ASCII's upcase, as Windows' table maps it.
+  fn ascii_upcase(unit: u16) -> u16 {
+    if (0x61..=0x7A).contains(&unit) {
+      unit - 0x20
+    } else {
+      unit
+    }
+  }
+
+  /// A-551. Do: on a drive that searches without case, hold `\Src\a.txt` by two handles, then ask the spelling Windows
+  /// holds `\SRC`, `\SRC\A.TXT` and `\SRCS` by; close one handle, then the other; hold it again and rename `\Src` to
+  /// `\Lib` through the mount, then move it as the durable rename does (an open recorded again under its new name).
+  /// Expect: `\Src` and `\Src\a.txt` while either handle holds it and nothing after the last close; nothing for
+  /// `\SRCS`, whose units only begin as `\SRC`'s do; after the rename the new spelling and nothing under the old; and
+  /// on a drive that searches with case, nothing ever.
+  #[test]
+  fn the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames() {
+    let mut names = OpenNames::searching(NameSearch::CaseInsensitive {
+      upcase: ascii_upcase,
+    });
+    let key = |path: &str| -> Vec<u16> { path.encode_utf16().map(ascii_upcase).collect() };
+    names.opened(1, 7, "\\Src\\a.txt");
+    names.opened(2, 7, "\\Src\\a.txt");
+    assert_eq!(names.spelled_at(&key("\\SRC")).as_deref(), Some("\\Src"));
+    assert_eq!(
+      names.spelled_at(&key("\\SRC\\A.TXT")).as_deref(),
+      Some("\\Src\\a.txt")
+    );
+    assert_eq!(names.spelled_at(&key("\\SRCS")), None);
+    names.closed(1);
+    assert_eq!(names.spelled_at(&key("\\SRC")).as_deref(), Some("\\Src"));
+    names.closed(2);
+    assert_eq!(names.spelled_at(&key("\\SRC")), None);
+    names.opened(3, 7, "\\Src\\a.txt");
+    names.renamed("\\Src", "\\Lib");
+    assert_eq!(
+      names.spelled_at(&key("\\LIB\\A.TXT")).as_deref(),
+      Some("\\Lib\\a.txt")
+    );
+    assert_eq!(names.spelled_at(&key("\\SRC")), None);
+    names.opened(3, 7, "\\Bin\\a.txt");
+    assert_eq!(names.spelled_at(&key("\\LIB")), None);
+    assert_eq!(names.spelled_at(&key("\\BIN")).as_deref(), Some("\\Bin"));
+    let mut exact = OpenNames::new();
+    exact.opened(1, 7, "\\Src\\a.txt");
+    assert_eq!(exact.spelled_at(&key("\\SRC")), None);
+    assert_eq!(
+      exact.spelled_at(&"\\Src".encode_utf16().collect::<Vec<_>>()),
+      None
+    );
   }
 }

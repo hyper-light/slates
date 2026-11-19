@@ -2343,6 +2343,19 @@ fail the call), so this is the protocol's limit, not a slates defect (A-269). Un
 an open for writing and answered each change `NotPermitted`
 (`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
 
+**A folding volume's drive is case-insensitive to Windows (A-543, A-551; from WinFsp v2.1's source).** A WinFsp drive
+declares `CaseSensitiveSearch` for an exact volume only. Over a folding volume WinFsp's driver keys its open files by
+name compared without case, as the system's upcase table compares them, so every spelling of a file is one file node:
+one share access (an open that shares nothing under one spelling refuses another, `ERROR_SHARING_VIOLATION`, as on
+NTFS) and one cache. Each open answers its node's name as its normalized name (`FSP_FSCTL_OPEN_FILE_INFO`): each
+prefix as Windows already holds it, else as the volume stores it (A-543's `stored_path`) where the driver takes that for
+the asked spelling, else as asked (`crates/bridge-winfsp/src/normalized.rs`). The open's ledger record and its open
+names keep that name byte for byte, since the driver renames a node and the nodes beneath it by it and a notification
+must name it (`winfsp.h` 1285-1299). `GetFinalPathNameByHandleW` shows the made spelling. Three cases stay out of reach
+and are in GAPS: names the volume folds alike and Windows' table does not (normalization, the Kelvin sign) remain a node
+per spelling; a path past 1,024 units is upper-cased by the driver itself; and names the table folds alike and the
+volume keeps apart (`ς` and `σ`) share one node.
+
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
 
@@ -2860,16 +2873,23 @@ kernel, and its successor's journal starts empty. The successor knows where such
   write in the write log (A-63);
 - a kernel holds state older than a change only for an inode it looked up before the change, and the change's
   publication recorded that reference (A-61);
-- a logged write is in no publication, so the write-log replay notes the inodes it wrote.
+- a logged write is in no publication, so the write-log replay notes the inodes it wrote;
+- but a lookup made after the last publication is in no image, and such a kernel can hold what the successor never had
+  or holds otherwise: bytes a mutation showed before the publication the death lost, and the pages of a base file an
+  outsider wrote while no daemon ran (A-573). The successor cannot tell which inodes those are.
 
 So a restored mount's rounds open with a takeover round. First comes `FUSE_NOTIFY_INC_EPOCH`, to a kernel that offered
 FUSE 7.44 or later: every cached name is looked up again at its next use, which reaches the names no inode set can.
-Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode its owner's restored references and
-the replay name. A directory's invalidation also drops its cached listing, which kernels before Linux 7.2 keep past an
-epoch bump. The set is as large as what the kernel had looked up, so the round is sent in slices of half the shard's
-live step quantum, walked in inode order from where the last slice ended. The mount turns at once while a slice is owed
-and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44 cannot drop a
-renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
+Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode of the head, each costing the kernel
+nothing for an inode it never cached; a mount of a pinned view, whose version takes no head change, is sent its owner's
+restored references and the replay's inodes. A directory's invalidation also drops its cached listing, which kernels
+before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so the round is sent in slices of half the
+shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
+while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
+cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
+after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
+opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
+(GAPS).
 
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
@@ -10053,7 +10073,10 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind; a move waits
 > until the head it hands over carries its record, so a refused carry holds the move back until it is refused
 > `Unplaced`, as before. A clone never sealed before its owner's loss reaches its successor as an empty tree, the
-> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost).
+> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost). **A live-shipped one
+> moves with its mark too (A-565):** its new owner rebuilds it from its live log, which the move made durable at
+> exactly the head it hands over, so the rebuild is that head and is marked as a seal's is; a takeover after an
+> owner's loss still marks nothing it rebuilt from a log, which may have run past the seal its head names.
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -37669,6 +37692,154 @@ paths), `crates/merge/src/engine/branch.rs` and `branch/tests.rs` (new: `Lineage
   a green at a commit that is no version's head (piece 3's trees); and §4.17.4's `Copy` (g292, A-542's second half),
   which grafts with `subtree` and `graft` on these maps and needs a per-prefix appearance record under the one history
   rule (a grafted key has no history, and must not read as present before the copy).
+
+### A-551 — A folding volume's WinFsp drive compares names without case, and each open answers its node's name (2026-11-19, goal 85, g258; §4.4 name policy, §4.6 "Windows"; B2's Windows half after A-543; T-4.6)
+Applied in the same change to: §4.6 ("A folding volume's drive is case-insensitive to Windows"), GAPS (the
+folding-drive entry: part 2 built, the Windows build owed, three cases out of reach), the bug record
+`docs/bugs/2026-11-18-a-winfsp-drive-declared-a-folding-volume-case-sensitive.md`, `crates/bridge-winfsp/src/`
+(`normalized.rs` new; `notify.rs`, `held.rs`, `inflight.rs`, `ffi.rs`, `host.rs`, `dispatcher.rs`, `lib.rs`),
+`crates/bridge-winfsp/tests/support/host.rs`, `crates/server/src/winfsp.rs`, `crates/cli/tests/winfsp_semantics.rs`,
+`unsafe-budget.toml` (bridge-winfsp 156 to 159).
+- **What was there.** Every WinFsp drive declared `CaseSensitiveSearch`, so on a folding volume each spelling of a file
+  was a file node of its own in WinFsp's driver: an open that shares nothing under one spelling did not refuse another,
+  where NTFS answers `ERROR_SHARING_VIOLATION`, and Windows kept a cache per spelling over one file. A-543 gave the
+  portable half, the path an open names as the volume stores it.
+- **What the driver does (WinFsp v2.1, read 2026-11-19).** Without `CaseSensitiveSearch` it keys open files by name
+  compared without case, unit by unit through the system's upcase table (`src/sys/util.c` 1543-1552), and an open of a
+  name equal so to an open node's joins that node (`src/sys/device.c` 743-760, `src/sys/file.c` 662-666). A new node
+  takes the normalized name the open answers, which must equal the asked name so, or the open is refused
+  `STATUS_OBJECT_NAME_INVALID`; with none it takes the asked name upper-cased (`src/sys/create.c` 1035-1069). The DLL
+  passes a normalized name of at most 1,024 units (`src/dll/fsop.c` 466). A rename moves a node and every node beneath
+  it, found by the same comparison, to the new name with each one's own rest (`src/sys/file.c` 1573-1640); the new name
+  is the target directory's node name and the last component as typed (`src/sys/fileinfo.c` 1814-1862). A notification
+  must name a node by its normalized name (`inc/winfsp/winfsp.h` 1285-1299).
+- **The rule.** A drive declares `CaseSensitiveSearch` for an exact volume only; the held record keeps the posture, so a
+  successor serves a drive as it was mounted (a record from before A-551 reads as case-sensitive, as its drive was).
+  On a folding drive each open answers its node's name: each prefix as Windows already holds it, through a name open at
+  it or beneath it; past that, each component as the volume stores it where the driver takes that for the asked one,
+  else as asked; past 1,024 units, the driver's own upper-cased name, unanswered. The ledger record and the open names
+  keep that name byte for byte, the match the driver renames by and the name a notification needs. A rule that took the
+  stored path alone would have left records behind the driver's: after another path respelled a held directory, a
+  sibling's open would name the new spelling while the driver joined the old node, and a rename would move the node and
+  not the record.
+- **Rejected.** Recording each open as WinFsp upper-cases it, which keeps every record equal to the driver's by
+  construction: `GetFinalPathNameByHandleW` would then show upper case to Rust's `canonicalize`, Python's `realpath`
+  and git, which ask it for a file's path (A-369), and a notification of an entry under a held directory would carry
+  the upper-cased directory to watchers. Answering every open with its stored path, as A-543's record planned: refused by the driver
+  for any spelling that differs by more than case, and out of step with a node Windows already holds.
+- **Also fixed.** WinFsp v2.1's DLL counts an open's normalized name twice when it places the open's security descriptor
+  after it (`src/dll/fsop.c` 468, then 413), and leaves the alignment between them unwritten, so a Create's size reached
+  bytes of the receive packet's earlier response. `finish_response` clears both spans, keeping A-215's rule that no
+  byte of an earlier response is sent.
+- **Cost.** On a folding drive, one look-up a component per open (the stored path), and one indexed look-up a component
+  of the open names until Windows holds none (`OpenNames::spelled_at`), keyed by the upcased units; nothing on an exact
+  drive.
+- **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are a
+  node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell otherwise
+  leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.
+- **Tests.** Every host: `normalized::tests` (seven: each spelling names one node by its made spelling; a case-sensitive
+  drive answers nothing; a stored spelling answered only where the driver takes it; the spelling Windows holds a path or
+  a prefix by; past 1,024 units the driver's upper-cased name; a lost surrogate unanswered; final sigma takes the open
+  node's name), `notify::tests::the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`,
+  `inflight::tests::a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response` and
+  `held::tests::the_mount_record_keeps_how_its_drive_compares_names`. On the Mac Studio (d1323898, debug, load average
+  20.6 to 25.7, 2026-11-19 02:02 UTC), `cargo test -p slates-bridge-winfsp --lib -- normalized:: notify:: inflight::
+  held::`: red with today's rules restored in a copy (each open named as asked, no index, no clear, no posture bit), 9
+  of 43 failed (5 `normalized`, 2 `held`, 1 `inflight`, 1 `notify`; the two `normalized` tests that passed hold today's
+  answer where it stays right); green 43 of 43; the crate's whole lib suite 96 of 96. Windows (main's): the build of
+  `host.rs` and the server's `winfsp.rs`, and the drive tests
+  `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
+  `an_exact_drive_keeps_two_spellings_two_files` (`crates/cli/tests/winfsp_semantics.rs`).
+
+### A-573 — A takeover names every inode of the head to a mount of the head: what a kernel looked up after the last publication never outlives a death (2026-11-19, g232; UI goal 85, B10; §4.6 "A mount taken over by a restarted daemon"; A-61, A-63, A-151, A-158)
+Applied in the same change to: §4.6 (the takeover paragraph), GAPS (A-158's siblings "an effect served before its
+publication" and "an outsider's change beneath a base during a takeover's gap"), the bug record
+`docs/bugs/2026-11-19-a-takeover-left-cached-what-a-kernel-looked-up-after-the-last-publication.md`,
+`crates/vfs/src/{trie,volume,base}.rs`, `crates/bridge-core/src/{volume_bridge,lib}.rs`.
+- **What was there.** A-158's takeover round invalidated the root and every inode the mount's owner's restored
+  references and the write-log replay named, on the premise that a kernel holds state older than a change only for an
+  inode it looked up before the change, which the change's publication recorded (A-61). A lookup made after the last
+  publication is in no image, and two kinds of kernel state fell outside the premise: bytes a mutation showed before
+  the publication the death lost (a dirty read), and the pages of a base file an outsider wrote in place while no daemon
+  ran, whose names and attributes revalidate but whose pages a FUSE mount, which asks no `FUSE_AUTO_INVAL_DATA`, keeps.
+  Both stayed cached for as long as the kernel kept them.
+- **The rule, by kind.** The successor cannot tell which inodes a kernel looked up after the last publication, so a
+  mount of the head is sent every inode of the head (`Volume::visit_head_inodes`), each `FUSE_NOTIFY_INVAL_INODE`
+  costing the kernel nothing for an inode it never cached; every reference a current view takes and every inode the
+  replay writes is one of them. A mount of a pinned view keeps A-158's set: its version takes no head change, so no
+  mutation the death lost ever showed through it. A number the dead daemon issued after its last publication (another
+  path's unpublished create a listing showed, a base directory first loaded after the publication) is in no image and
+  no head: the successor refuses it (`NotFound`) and never serves it.
+- **The walk.** The inode table is a radix trie over the number's counter; `trie::visit_after` walks it in that order
+  from past any number, entering only the nodes on that number's path and the subtrees past it, so the round's slices
+  each cost what they send. The table's order is the counter's, which keeps a clone's own and its origin's inodes in one
+  order, where the numbers' full values would interleave two prefixes.
+- **Tests.** `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover` (a: a file published,
+  looked up and written after the publication, the daemon dead; the successor holds the published bytes, no restored
+  reference names the file, and the head's walk does) and
+  `a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit` (b: a base file
+  loaded and published, looked up after, written in place by an outsider while no daemon ran; the successor reads the
+  edit, and the head's walk names the file), both in `crates/vfs/src/base.rs`;
+  `a_walk_after_any_number_gives_the_inodes_past_it_in_order_and_slices_join_whole` (`trie.rs`). On the Mac Studio
+  (debug, 2026-11-19, load 2 to 11): `slates-vfs --lib` the two 2 of 2 and `trie::` 6 of 6, `slates-bridge-core --lib`
+  40 of 40; red with the old rule put back (the mount's restored references and the replay): both failed at the walk's
+  assertion, their premises holding under both rules.
+- **Owed.** The numbers issued after the last publication: a descriptor opened before the death keeps their cached
+  pages, since no walk can name them until each publication records the volume's live counter beside its reserved
+  ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
+  between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
+  kill-in-window tests) are Linux's, main's to run.
+
+### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
+
+- **What was there.** A move's new owner materializes a live-shipped volume from its live log, as a takeover's
+  successor does (`fleet::make_in_turns`), and A-503's adoption marked only a head materialized from a placed seal
+  (`verbs::finish_making`: never `from_live_log`), since a log rebuilt after an owner's loss may have run past the seal
+  its head names. So a live-shipped captured clone, moved, held no mark on its new owner, and its landing there was
+  refused by kind.
+- **The rule.** A move's rebuild from the log is the head the move hands over: its old owner froze the volume (no write,
+  no snapshot), took the head of its live tree (`verbs::head_for_move`) and reported the move only once the log was
+  durable at its head (`moves::ready_to_report`), so the log's tree is that head. The new owner learns that the
+  materialization is a move's from its adoption, which the control shard keeps until the move is reported adopted
+  (`ShardState::move_adoptions`; `fleet::MakeTaken::moved`, `verbs::TakenOver::moved`), and marks the materialized
+  snapshot when the head's identity is the carried one, as from a seal. A takeover after an owner's loss still marks
+  nothing it rebuilt from a log. Identities cannot decide that instead: the rebuild lays its archive out by the image's
+  extents (`live_ship::archive_of`), the seal by its chunker, so one tree has two identities.
+- **What a clone never sealed loses (settled for main).** A-544 states that a captured clone never sealed before its
+  owner's loss reaches its successor as an empty tree. Whether that loses an acknowledged write depends on the promise
+  the volume was made with:
+  - *Not live-shipped* (every kiln fleet workspace: kiln never turns live shipping on). A write is acknowledged once it
+    is published on its owner (D-18); across an owner's loss the design keeps only the newest placed seal, and the
+    volume's status reports the rest as its loss window: with no seal placed, its whole age (`verbs::at_risk_ns`). The
+    empty tree is inside the window the client was told of, so nothing acknowledged beyond the promise is lost.
+  - *Live-shipped* (a clone of a live origin inherits the flag). A write is acknowledged only once it is durable on `f`
+    candidates (A-200): a clone's first write publishes its whole image, inherited tree included, at its log's first
+    position and answers once that position is durable, so no write is lost. **The `Clone` verb itself is not held:** its
+    reply waits on the origin's log (`verbs::replicated_waits` takes the verb's own volume), which the clone did not
+    change, so the clone is answered while nothing of it is held anywhere else, and the status reports its window as zero.
+    At `f = 1` an owner lost before the clone's first write is durable leaves a successor with no log of it and no seal,
+    serving it empty: an acknowledged clone lost, a durability bug against the live-durability promise (goal 84). Filed as
+    its own bug, `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, with its failing test
+    parked (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `#[ignore]` until the fix).
+- **A clone seals nothing until its first snapshot (A-544's sibling, fixed here).** The home seal walk takes a head that
+  is none of the volume's own snapshots as nothing to seal (`fleet::sealable_head`): a fresh clone's head is its
+  origin's (`verbs::publish_clone_as` copies the origin's record), and recovery may reset a lost head to none
+  (`verbs::reconcile_lost`). Before, `start_seal` was refused for it and counted `fleet.seal` every period, for every
+  clone made, until its first snapshot.
+- **Tests.** `a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not` and the parked
+  `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable` (`crates/server/src/verbs.rs`);
+  `a_clone_has_nothing_to_seal_until_its_first_snapshot` (`crates/server/src/fleet.rs`). Red first on the Mac Studio
+  (2026-11-19, `cargo test --locked -p slates-server --lib`): with the move flag ignored and the old `sealable_head`,
+  both failed (the walk named the origin's head, `SnapshotId { value: 0 }` at sequence 1, where nothing was due; the
+  moved clone held no mark); with the change, 72 of 72 over the lib's `a565`, the seal test, `a544`, `carry::`,
+  `moves::`, `catalog::`, `landing::`, `fleet::` and `live_ship::` tests; the parked bug test fails as filed (`None`
+  where the clone's position 0 is due).
+- **Owed.** A takeover's rebuild of a live-shipped captured clone after its owner's loss marks nothing: a mark there
+  needs the log position its head was sealed at, so the rebuild can stop there for the mark and go on. The fleet's own
+  test of a moved live clone landing on its new owner (filed for main). The bug's fix (filed).
+
+Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267; the bug's entry), the bug record,
+`crates/server` (`verbs.rs`, `fleet.rs`, `live_ship.rs`: `owe_first_whole`, a test's live log).
 
 ### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
 Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's

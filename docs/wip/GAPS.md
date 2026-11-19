@@ -55,6 +55,19 @@
 > 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
 > run checks it). No speed is claimed until main measures it.
 
+> **Open (g267, 2026-11-19, found settling A-565): a live clone is answered before any of it is durable.** A clone of a
+> live-shipped volume is live-shipped too, but the `Clone` verb's reply waits on its origin's log
+> (`verbs::replicated_waits` takes the verb's own volume), which the clone did not change, so the clone is answered while
+> nothing of it is held anywhere else, and its status reports a zero loss window. At `f = 1` an owner lost before the
+> clone's first write is durable leaves a successor with no log of it (`live_ship::fetch`: `Ok(None)`) and no seal (a
+> fresh clone's head is its origin's), serving it empty: an acknowledged clone lost, against A-200's promise. Writes are
+> not lost (a live clone's first write ships its whole image, inherited tree included, and waits for it). Not affected:
+> kiln's fleet workspaces (never live-shipped; their status reports their whole age at risk until a seal is placed).
+> **Owed:** the clone's reply held for its first whole entry, `durable_target` naming it from the clone's making, and the
+> loss report zero only once the log holds a durable whole entry; the failing test is written and parked
+> (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `crates/server/src/verbs.rs`). Record:
+> `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`.
+
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
 > `SIGTERM` and returned, and the instance was seen serving about two minutes later. Waiting for the stop (r443, r457)
@@ -1122,10 +1135,11 @@
 >   the captured state of every path its clone changed in the volume's catalog, and the new owner keeps the moved head as
 >   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
 >   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
->   head has no record, and a move waits for its head's record); owed of it, the fleet's own three-daemon tests of a
->   move and a takeover (filed for main), a live-shipped clone's record for a head its log rebuilt, and a clone whose
->   owner dies before its first snapshot is placed, which its successor serves as an empty tree (sealed at its making,
->   or its catalog naming its capture, A-544);
+>   head has no record, and a move waits for its head's record); since A-565 a live-shipped one's move marks its
+>   rebuild from the log too; owed of it, the fleet's own three-daemon tests of a move and a takeover (filed for main),
+>   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
+>   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
+>   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
 >   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
@@ -1465,31 +1479,51 @@
 >   - the 60-round race three times with Defender's real-time protection off, against three times with it on;
 >   - the same race on WinFsp's own driver, with an outside writer in place of the link.
 
-> **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
-> A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
-> every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`
-> (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's driver keys its open files by name and compares
-> case-sensitively when that bit is set (`src/sys/device.c` 676 and 750, `src/sys/create.c` 316-318). So a file opened
-> as `A.TXT` and as `a.txt` on a folding volume gets two of the driver's file nodes: two share-access records (an
-> exclusive open does not exclude the other spelling, where NTFS answers a sharing violation) and two caches over one
-> file. T-4.6 ("case-insensitive lookup on a case-fold volume; expect one entry and `EEXIST` on a folded duplicate")
-> has no test through the drive. The fix: declare `CaseSensitiveSearch` for an exact volume only, and answer each open
-> of a folding volume with its normalized name (each component as stored), which WinFsp otherwise upper-cases
-> (`create.c` 1036-1043), failing test first (an exclusive open under one spelling, then the other: NTFS's
-> `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the Windows workloads cell,
-> which runs on a folding volume to match NTFS (A-300), does not meet it.
+> **The WinFsp drive declared a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for A-300;
+> built 2026-11-19 in two parts, A-543 and A-551; the Windows half compiled and run by main, owed).** The mount set
+> `CaseSensitiveSearch` (and `CasePreservedNames`) for every volume (`crates/bridge-winfsp/src/host.rs`, the mount's
+> `params.flags`), while a volume made with `--fold` (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's
+> driver keys its open files by name and compares case-sensitively when that bit is set (`src/sys/device.c` 676 and 750,
+> `src/sys/create.c` 316-318). So a file opened as `A.TXT` and as `a.txt` on a folding volume got two of the driver's
+> file nodes: two share-access records (an exclusive open does not exclude the other spelling, where NTFS answers a
+> sharing violation) and two caches over one file. T-4.6 ("case-insensitive lookup on a case-fold volume; expect one
+> entry and `EEXIST` on a folded duplicate") had no test through the drive. The fix: declare `CaseSensitiveSearch` for
+> an exact volume only, and answer each open of a folding volume with its normalized name (each component as stored),
+> which WinFsp otherwise upper-cases (`create.c` 1036-1043), failing test first (an exclusive open under one spelling,
+> then the other: NTFS's `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the
+> Windows workloads cell, which runs on a folding volume to match NTFS (A-300), does not meet it.
 > - **Built, part 1 of 2 (2026-11-18, A-543, goal 85, g079): the path an open names as the volume stores it.**
 >   `slates_bridge_core::stored_path` walks a `\`-separated path from the root and names each component as its
 >   directory stores it (`Bridge::stored_entry`, over `Volume::stored_name_no`): on a folding volume every spelling of a
 >   file answers the spelling it was made with, on an exact one the path as asked. Held by
 >   `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (bridge-core's unit tests, every
 >   host), red with the open named as asked on the Mac Studio.
-> - **Owed, part 2 (Windows-only, main's to write and compile, run-requests.md):** the drive declares
->   `CaseSensitiveSearch` only for an exact volume (`Mounted::new`'s `params.flags`, given the volume's name policy by
->   `crates/server/src/winfsp.rs`); an open or create on a folding volume answers its `stored_path` as WinFsp's
->   normalized name (`FSP_FSCTL_OPEN_FILE_INFO`'s `NormalizedName`, copied when it fits `NormalizedNameSize`, else
->   none), and the open's ledger and `OpenNames` record that path, the name the driver's file node takes; then the drive
->   test above.
+> - **Built, part 2 of 2 (2026-11-19, A-551, goal 85, g258): the drive's half.** The drive declares
+>   `CaseSensitiveSearch` for an exact volume only (`Mounted::new`, given the volume's policy by
+>   `crates/server/src/winfsp.rs` `name_search`); the held record keeps the posture, so a successor serves a drive as it
+>   was mounted, and a record made before A-551 reads as case-sensitive, as every drive then was. Each open and create
+>   on a folding drive answers its node's name as WinFsp's normalized name (`FSP_FSCTL_OPEN_FILE_INFO`, `finish_open`):
+>   each prefix as Windows already holds it, else the stored spelling where the driver takes it for the asked one (the
+>   system's upcase table, ntdll's `RtlUpcaseUnicodeChar`), else as asked (`crates/bridge-winfsp/src/normalized.rs`);
+>   the open's ledger record and `OpenNames` keep that name byte for byte, as the driver renames and notifications need
+>   it (`winfsp.h` 1285-1299). The receive worker clears what WinFsp's DLL counts past a Create's name and descriptor:
+>   v2.1 counts the name twice when it places the descriptor (`fsop.c` 468 then 413), which would have sent the
+>   packet's earlier bytes. Pure rules held by unit tests on every host (`normalized::tests`, `notify::tests`'s
+>   `the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`, `inflight::tests`'s
+>   `a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response`, `held::tests`'s
+>   `the_mount_record_keeps_how_its_drive_compares_names`).
+> - **Owed (main, filed in run-requests.md):** the Windows build of A-551 (`host.rs`, the server's `winfsp.rs`) and the
+>   drive tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` (red before: `a.txt` opened beside
+>   an unshared `A.TXT`, final path `a.txt`) and `an_exact_drive_keeps_two_spellings_two_files`
+>   (`crates/cli/tests/winfsp_semantics.rs`), with the rest of the WinFsp suites.
+> - **Out of reach, stated (A-551):** names the volume folds alike and Windows' upcase table does not (a decomposed `é`
+>   against a precomposed one, the Kelvin sign against `K`) stay a file node per spelling, since the driver refuses a
+>   normalized name that differs by more than its table's case; a path past 1,024 units is upper-cased by the driver
+>   (the DLL drops a longer normalized name), so a rename of a directory above it that the records spell otherwise
+>   leaves that record behind; and names the table folds alike and the volume keeps apart (final sigma `ς` against `σ`)
+>   are two files to the volume and one node to the driver, so the second's open while the first is open shares the
+>   first's node and cache. The last would need the volume to refuse such a name beside its twin on a drive's volume,
+>   or the drive to refuse the second open; neither is built.
 
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
@@ -18014,15 +18048,26 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   same. The precise fix marks as stale, in adopted files' states, the ranges the last publications and the replayed
   writes changed. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not
   reproduced.
-- **An effect served before its publication (open, from A-158).** A mutation is applied, then published before its
-  reply. A mount that reads the new bytes in between, followed by the daemon dying before the publication, holds bytes
-  the successor never had. If its kernel looked the inode up after the last publication, no restored reference names it,
-  and the takeover round leaves it cached. The change was never acknowledged, so this is a dirty read surviving a crash,
-  not a lost acknowledgement. Not reproduced.
-- **An outsider's change beneath a base during a takeover's gap (open, from A-158).** A base file the kernel looked up
-  after the last publication is in no restored reference, and the successor's watcher did not run while no daemon did.
-  Its names and attributes revalidate within the base's timestamp granularity, but its cached pages stay. Not
-  reproduced.
+- **An effect served before its publication (from A-158) — fixed 2026-11-19 (A-573, B10 (a)) for every inode the
+  successor holds.** A mutation is applied, then published before its reply. A mount that reads the new bytes in
+  between, followed by the daemon dying before the publication, holds bytes the successor never had. If its kernel
+  looked the inode up after the last publication, no restored reference names it, and the takeover round left it
+  cached. The change was never acknowledged, so this is a dirty read surviving a crash, not a lost acknowledgement. Not
+  reproduced. Now a mount of the head is sent every inode of the head (`Volume::visit_head_inodes`;
+  `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover`, red with the old set). **Still
+  open:** a number the dead daemon issued after its last publication (an unpublished create a listing showed) is in no
+  image and no head; the successor refuses it (`NotFound`), never serving it, but a descriptor opened before the death
+  keeps its cached pages until each publication records the volume's live counter beside its reserved ceiling (the
+  image and the delta, both encodings, the publication oracle), so the round can name the numbers between the two.
+- **An outsider's change beneath a base during a takeover's gap (from A-158) — fixed 2026-11-19 (A-573, B10 (b)) for
+  every base file the successor holds.** A base file the kernel looked up after the last publication is in no restored
+  reference, and the successor's watcher did not run while no daemon did. Its names and attributes revalidate within
+  the base's timestamp granularity, but its cached pages stayed (a FUSE mount asks no `FUSE_AUTO_INVAL_DATA`). Not
+  reproduced. Now every inode of the head is named, base files loaded before the last publication among them
+  (`a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit`, red with the
+  old set). **Still open:** a base directory first loaded after the last publication gave its files numbers no image
+  holds, so they are the numbers above: refused, never served, their pages kept by a descriptor opened before the
+  death until publications record the live counter.
 - **Kernels before FUSE 7.44 keep renamed-away names across a takeover (open, from A-158).** They take no
   `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
   mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but
