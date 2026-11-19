@@ -774,24 +774,6 @@ impl<S> Work<'_, '_, S> {
       }
     }
     let first = given.parents.first().copied();
-    // A-666 part 3's mutation (a branch not for main): every file the first parent holds that the change leaves is
-    // blamed again by a diff with the first parent's, the same blame made again, as a type that re-blames the whole
-    // tree each version would.
-    if let Some(tree) = first {
-      for (path, entry) in self.maps.files(self.store, tree)? {
-        if change.contains_key(&path) {
-          continue;
-        }
-        self.counters.judged = self.counters.judged.saturating_add(1);
-        let content = read_node(self.store, entry.content)?.content;
-        let made = self.make((path.as_slice(), content), &[entry.content], &given.name)?;
-        let blame = Entry {
-          class: BLAME_CLASS,
-          content: made,
-        };
-        edits.insert(path, Some(blame));
-      }
-    }
     Ok(self.maps.apply(self.store, first, &edits)?)
   }
 
@@ -906,9 +888,7 @@ impl<S> Work<'_, '_, S> {
       }
       self.charge(diff_bytes(old.len(), file.len()))?;
       for (from, to) in matched(old, file).ok_or(BlameRefused::Exhausted)? {
-        if let (Some(slot), Some(line)) = (lines.get_mut(to), attribution.get(from))
-          && slot.is_none()
-        {
+        if let (Some(slot), Some(line)) = (lines.get_mut(to), attribution.get(from)) {
           *slot = Some(*line);
         }
       }
