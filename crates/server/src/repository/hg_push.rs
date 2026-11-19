@@ -413,6 +413,8 @@ pub(crate) struct Prepared {
   pub(crate) asked: Vec<Ask>,
   /// Its changegroup part's id, which a hook's `output` part names.
   pub(crate) changegroup: Option<u32>,
+  /// Its transaction's id, which every hook of it reads (`HG_TXNID`; [`transaction_id`]).
+  pub(crate) transaction: String,
 }
 
 /// One name a push changes as its admission asks about it (A-622 part 2's `admit`): its namespace and label, the right
@@ -505,8 +507,28 @@ pub(crate) fn prepare<V: Repository, H: Held>(
     added: plan.added,
     asked: asked(&plan, &read),
     changegroup: unbundle.changegroup().map(|(id, _)| id),
+    transaction: transaction_id(&terms.1),
     verified,
   })
+}
+
+/// Format: the BLAKE3 context a push's Mercurial transaction id is derived from its name in.
+const TRANSACTION_CONTEXT: &str = "slates 2026-11-19 a Mercurial push's transaction id";
+/// Format: what 7.2's transaction id begins with, before the hexadecimal of a SHA-1's digest (`localrepo.transaction`).
+const TRANSACTION_TAG: &str = "TXN:";
+
+/// The push's transaction id (`HG_TXNID`), the same for every hook of the push and another for every other push: `TXN:`
+/// and forty hexadecimal digits, as 7.2 writes the SHA-1 of its transaction's start, here a BLAKE3 key derived from
+/// the push's name, whose first twenty bytes a node's hexadecimal writes.
+pub(crate) fn transaction_id(name: &[u8; 32]) -> String {
+  let mut hasher = blake3::Hasher::new_derive_key(TRANSACTION_CONTEXT);
+  hasher.update(name);
+  let digest = hasher.finalize();
+  let mut hex = TRANSACTION_TAG.as_bytes().to_vec();
+  if let Some(node) = digest.as_bytes().first_chunk::<{ core::mem::size_of::<Node>() }>() {
+    slates_hg::node::write_hex(node, &mut hex);
+  }
+  String::from_utf8(hex).unwrap_or_default()
 }
 
 /// Slates' words for a changegroup verification refused, 7.2's where it has them.
@@ -854,12 +876,17 @@ pub(crate) struct Hook {
   pub(crate) input: HookInput,
 }
 
+/// What a push's hooks name of it: the first and last changesets it adds (none when it adds none), and its
+/// transaction's id ([`Prepared`]'s).
+#[cfg(unix)]
+pub(crate) type Added<'a> = (Option<(Node, Node)>, &'a str);
+
 /// The hooks `policy` configures at `point`, in the order it gives them, each started with what `input` makes for its
 /// name; none when the push added no changeset (7.2 runs its changegroup hooks only then).
 #[cfg(unix)]
 fn configured(
   policy: &RepositoryPolicy,
-  (point, added): (HookPointName, Option<(Node, Node)>),
+  (point, (added, transaction)): (HookPointName, Added<'_>),
   url: &str,
   input: impl Fn(&str, &vcs_hooks::Changegroup) -> HookInput,
 ) -> Vec<Hook> {
@@ -870,6 +897,7 @@ fn configured(
     first: hex_text(&first),
     last: hex_text(&last),
     url: url.to_owned(),
+    transaction: transaction.to_owned(),
   };
   policy
     .hooks
@@ -884,11 +912,12 @@ fn configured(
 }
 
 /// The `pretxnchangegroup` hooks a prepared push runs before its verdict (§4.17.3 "Hooks": admission), over its pending
-/// view, `HG_NODE` and `HG_NODE_LAST` the first and last changesets it adds, `HG_URL` the transport's `url`.
+/// view, `HG_NODE` and `HG_NODE_LAST` the first and last changesets it adds, `HG_TXNID` its transaction, `HG_URL` the
+/// transport's `url`.
 #[cfg(unix)]
 pub(crate) fn admission_hooks(
   policy: &RepositoryPolicy,
-  added: Option<(Node, Node)>,
+  added: Added<'_>,
   (view, url): (PendingView, &str),
 ) -> Vec<Hook> {
   configured(policy, (HookPointName::HgPretxnchangegroup, added), url, |name, changes| {
@@ -896,11 +925,12 @@ pub(crate) fn admission_hooks(
   })
 }
 
-/// The `changegroup` hooks a landed push runs after its commit (§4.17.3 "Hooks": observing), over the committed view.
+/// The `changegroup` hooks a landed push runs after its commit (§4.17.3 "Hooks": observing), over the committed view,
+/// in the admission hooks' transaction.
 #[cfg(unix)]
 pub(crate) fn observing_hooks(
   policy: &RepositoryPolicy,
-  added: Option<(Node, Node)>,
+  added: Added<'_>,
   (view, url): (CommittedView, &str),
 ) -> Vec<Hook> {
   configured(policy, (HookPointName::HgChangegroup, added), url, |name, changes| {

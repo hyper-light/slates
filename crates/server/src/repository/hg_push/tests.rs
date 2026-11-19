@@ -22,7 +22,7 @@ use slates_vcs::ContentStore;
 
 use super::{
   BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, branch_prefix, land, line_name, line_of,
-  prepare,
+  prepare, transaction_id,
 };
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
@@ -514,6 +514,25 @@ fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert!(hg.holds(&made[3].node));
 }
 
+/// A-657 part 4 (`HG_TXNID`; 7.2's `localrepo.transaction`). Do: prepare stock `push-plain` on the rebuilt repository,
+/// and take the transaction ids of the push's name and of another. Expect: the prepared push's id is its name's, `TXN:`
+/// and forty lower-case hexadecimal digits; the same name gives the same id, another name another.
+#[test]
+fn a_push_names_its_transaction_as_7_2_does() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "transaction");
+    rebuild(state, &mut hg, (&[1], 1));
+    let view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
+    let prepared = hg.prepare(state, &stock(fixture!("push-plain.hg")), &view).unwrap();
+    assert_eq!(prepared.transaction, transaction_id(&NAME));
+    let digits = prepared.transaction.strip_prefix("TXN:").unwrap();
+    assert_eq!(digits.len(), 40);
+    assert!(digits.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f')));
+    assert_eq!(transaction_id(&NAME), transaction_id(&[7; 32]));
+    assert_ne!(transaction_id(&NAME), transaction_id(&[8; 32]));
+  });
+}
+
 /// A-657, A-642 (a race found where the entry appends). Do: on the rebuilt repository, prepare stock `push-plain`
 /// (its check that `second` is a head holds), then land another client's push moving `default` (`other`), then land
 /// the prepared push. Expect: the other push lands; the prepared one is refused as 7.2's race, byte for byte its
@@ -759,7 +778,10 @@ mod hooks {
   use slates_hg::push::reply::{Refused, Replied};
   use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 
-  use super::super::{Hook, HooksRan, admission_hooks, observing_hooks, run_hooks};
+  use super::super::{
+    Hook, HooksRan, admission_hooks, observing_hooks, run_hooks, transaction_id,
+  };
+  use super::NAME;
   use crate::vcs_hooks::{CommittedView, EnvValue, PendingView};
 
   /// Format: the variable that makes the test binary, re-invoked, a hook of the role it names (hook_driver's tests').
@@ -852,8 +874,9 @@ mod hooks {
   /// 0101… to 0202… and of one adding none, then run them, the first accepting, the second refusing with status 3, the
   /// third accepting. Expect: the three admission hooks in their order with `HG_NODE` and `HG_NODE_LAST` the first and
   /// last changesets, `HG_PENDING` the view and `HG_URL` the transport's; none for a push adding nothing; the one
-  /// observing hook; the run stops at the second, answering `pretxnchangegroup.second hook exited with status 3`, both
-  /// hooks' words salvaged as `output` parts naming the changegroup part, two lessons learned, the third never run.
+  /// observing hook; every hook of the push in its one transaction (`HG_TXNID`); the run stops at the second,
+  /// answering `pretxnchangegroup.second hook exited with status 3`, both hooks' words salvaged as `output` parts
+  /// naming the changegroup part, two lessons learned, the third never run.
   #[test]
   fn admission_hooks_run_in_order_and_the_first_refusal_answers_in_7_2s_words() {
     let policy = policy(&[
@@ -863,11 +886,15 @@ mod hooks {
       (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.third"),
     ]);
     let added = Some(([1; 20], [2; 20]));
+    let transaction = transaction_id(&NAME);
     let url = "remote:ssh:127.0.0.1";
-    let hooks = admission_hooks(&policy, added, (PendingView(7), url));
+    let hooks = admission_hooks(&policy, (added, &transaction), (PendingView(7), url));
     assert_inputs(&hooks, url);
-    assert!(admission_hooks(&policy, None, (PendingView(7), url)).is_empty());
-    assert_eq!(observing_hooks(&policy, added, (CommittedView(7), url)).len(), 1);
+    assert!(admission_hooks(&policy, (None, &transaction), (PendingView(7), url)).is_empty());
+    let observing = observing_hooks(&policy, (added, &transaction), (CommittedView(7), url));
+    assert_eq!(observing.len(), 1);
+    let in_transaction = Some(EnvValue::Bytes(transaction.as_bytes().to_vec()));
+    assert!(hooks.iter().chain(&observing).all(|hook| env(hook, "HG_TXNID") == in_transaction));
     let roles = ["accept", "refuse", "accept"];
     let ran = drive(hooks.into_iter().zip(roles).map(|(hook, role)| playing(hook, role)).collect());
     assert_ran(&ran);
