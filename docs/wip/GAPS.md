@@ -586,14 +586,18 @@
 > store's parts, every version encoded and a base pack made, each object once; `Streamed::counters`. A-653
 > continued (2): a version's fragments and a base pack encoded a unit at a time under the owner's quantum
 > (`store::Encoding`: a pair of trees walked, a window's worth of rows read, or one object encoded, a unit), the same
-> bytes over any turns; closes A-639's "the fragments' encoding sliced". Owed: the live clone over the HTTP edge
-> (A-625 part 3's store per repository), and with it the owner driving encodings by turns; a delta search past a
-> window, of which part 1 is built (A-653 continued (3): `store::Search`, git's delta search a bounded amount a step,
-> byte for byte the one pass's, `delta_of` one search run to its end) and part 2 owed (the stream's objects past a
-> window searched through it, their buffers and index charged to the request's admission, sent whole only where it
-> cannot hold them, that case counted; git's rule read from `pack-objects.c` at v2.50.1 first); within an encoding,
-> one object (its delta trials until `Encoder::put` steps them through a `Search`), a pair of trees and a part's put
-> each still a unit whole; the red-checks and the other platforms' runs (main's).
+> bytes over any turns; closes A-639's "the fragments' encoding sliced". A-653 continued (3) and (4): a delta search
+> past a window, `store::Search` (git's delta search a bounded amount a step, byte for byte the one pass's, `delta_of`
+> one search run to its end), and the stream's objects past a window no part covers searched through it, what the
+> search holds (the object, the largest candidate, the index and the delta) charged to the request's own admission as
+> a hold given back once the entry is sent (`Admission::hold`, `Admission::release`), the object sent whole only where
+> the admission cannot hold it, that case counted (`loose_unsearched`); git's rule cited from `pack-objects.c` at
+> v2.50.1, none of its constants taken; closes A-639's "a delta search for an object past a window". Owed: the live
+> clone over the HTTP edge (A-625 part 3's store per repository), and with it the owner driving encodings by turns;
+> within an encoding, one object (its delta trials until `Encoder::put` steps them through a `Search`), a pair of trees
+> and a part's put each still a unit whole; a search across a window's edge (an object past a window trying earlier
+> ones within one, and the reverse, as git's order by name and size would); the red-checks and the other platforms'
+> runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
@@ -874,7 +878,7 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); the verb that asks for a directory's import (A-675 built the import itself); and the import made durable:
+> `verify`); and the import made durable (A-675 built the import, A-678 the verb that asks for one):
 > the register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the
 > directory again or replays its record (until then an import is not served, and a restart leaves its store empty).
 > **Built (A-619 part 3):**
@@ -936,6 +940,11 @@
 > it runs; refused, abandoned or freed midway, everything given back; proven by the `states` repository imported a unit
 > a turn equal row for row to its import in one call (macOS arm64, Mac Studio: `vcs_store::` 18 of 18 with A-662's 13;
 > red first, the five new tests failing against stubs).
+> **Built (A-678):** the import verb (`ImportRepository`, `slates-server`'s `repository::import`): for the repository's
+> owner, the directory opened as a base is, A-675's import started and the request answered when it ends, its completion
+> recorded first; a resend takes the held route over; every refusal by kind (`ImportFault`, the API's
+> `Invalid::Import`); proven on macOS arm64 (Mac Studio, kiln r110): the verb's 4 tests (red first), `vcs_store::` 18 of
+> 18, `wire_order` 2 of 2, `slates-api`'s `error` tests 12 of 12 with the refusal's typing.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress

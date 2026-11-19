@@ -134,6 +134,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Self {
       lender,
       repository,
+      admission,
       answer,
       ..
     } = self;
@@ -142,7 +143,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     };
     let written = lender
       .lend(*repository, |served, packs| {
-        answer.write(served, packs, out, MAX_LEN)
+        answer.write(served, packs, admission, out, MAX_LEN)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     Ok(written == Written::More)
