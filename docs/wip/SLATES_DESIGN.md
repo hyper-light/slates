@@ -37209,4 +37209,7 @@ and `pending_changes` through them), and the bug record
   rest fresh. Failing first on the Mac Studio (debug, r138, 2026-11-19): the rule moved unchanged into
   `coherence::taken_over` left them fresh (`Some([])`, the write then at bytes 16..48). The fix's first run (r258) then
   failed on the test's own premise: a write past the end of an empty file is recorded as an extension from its old end,
-  0..48, so the test now writes bytes 0..32 and expects exactly them stale.
+  0..48, so the test now writes bytes 0..32 and expects exactly them stale. Green on the Mac Studio (r284):
+  `cargo test --locked -p slates-bridge-fuse --lib coherence` 14 of 14 and the library whole 36 of 36; rustfmt changes
+  nothing. The Linux channel's glue is not compiled on macOS: its build, its unit tests and the takeover tests are
+  main's (Linux).
