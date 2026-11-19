@@ -809,6 +809,20 @@ server's directory are the ones its reviewed expected-failure list starts from.
   request"; `push_ssl` without HTTPS: `403` "ssl required"; `deny_push`, then `allow-push`: `401` "push not
   authorized". The status line carries the message (`statusmessage`). slates keeps the order and answers a principal
   its policy refuses `403`, since its credentials were proved.
+- **The room a compressed answer is charged** (`compression::bound`, charged before the answer is compressed). Each
+  engine's own documented worst case: libbzip2's "1% larger than the uncompressed data, plus six hundred extra bytes"
+  (`BZ2_bzBuffToBuffCompress`; libbz2-rs-sys is its port), libzstd's `ZSTD_compressBound`, and for zlib the bound of
+  the backend the workspace links (A-607): zlib-rs 0.6.8's `compress_bound`, zlib-ng's `compressBound`, `len +
+  ceil(len / 8) + 3 + 6`, a byte more below 9 bytes and one more for none. Stock zlib's `compressBound` (`len + (len >>
+  12) + (len >> 14) + (len >> 25) + 13`, `compress.c`) is no bound there: it counts stored blocks, which stock zlib
+  falls back to on bytes that do not compress, while zlib-rs's level 1 is zlib-ng's `deflate_quick`
+  (`src/deflate/algorithm/quick.rs`), which writes every literal in fixed codes, nine bits for the literals 144 to 255
+  (RFC 1951 §3.2.6), and never falls back. Measured (Windows x86_64, jupiter, kiln r92, 2026-11-19: the oracle
+  `the_longest_codes_stay_within_every_engines_bound` run with stock zlib's bound in zlib-rs's place): level 1 wrote 64
+  of those bytes in 80 (stock zlib's bound 77), 4,096 in 4,617 (its bound 4,110) and 65,536 in 73,721, 8,152 bytes
+  (12.4%) past its 65,569; every other zlib level stayed within it. zlib-rs's bound for the same lengths is 81, 4,617
+  and 73,737, and level 1 met it exactly at 4,095 and 4,096 bytes: the bound is the worst case itself, with nothing to
+  spare.
 - **Measured** (`fixtures/serve-http`, `make-http-fixtures.sh`, the repository of `fixtures/serve` made the same way;
   its states, bookmarks and incoming output equal byte for byte). The clone: `capabilities` (582 bytes:
   `batch branchmap bundle2=… changegroupsubset compression=zstd,zlib getbundle httpheader=1024
