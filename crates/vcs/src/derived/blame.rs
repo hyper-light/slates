@@ -342,7 +342,7 @@ fn blame_at(
       class: BLAME_CLASS,
       content,
     })) => Ok((Some(content), reads)),
-    Some(At::File(_)) => Ok((None, reads)),
+    Some(At::File(_)) => Err(BlameRefused::Malformed { node: tree }),
   }
 }
 
@@ -391,7 +391,7 @@ fn decode_spans(bytes: &[u8], lines: u64) -> Option<Vec<Span>> {
       path: path.to_vec(),
       origin: u32::from_le_bytes(*origin),
     };
-    let empty = span.lines == 0 || span.version.is_empty() || span.path.is_empty();
+    let empty = span.version.is_empty() || span.path.is_empty();
     if empty || spans.last().is_some_and(|last| joins(last, &span)) {
       return None;
     }
