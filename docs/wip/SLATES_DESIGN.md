@@ -10342,6 +10342,16 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > own virtio-fs device and the typed channel's verbs (answered `Unpublished`, retryable); and the volume over an S3 base
 > (the wire's create, the credential's hand-off, the fetch driver), with the rest of A-524's owed list.
 
+> **Status (2026-11-19, A-555's second piece: the fetch driver).** Built: `slates_base::s3::driver::drive`, the task of
+> the volume's owner shard that runs its host's fetches against the store one at a time and hands each answer back,
+> timed, so the requests parked on a fetch are woken when it lands. An idle driver waits on the host itself
+> (`S3Host::next_fetch_or_wait`), which wakes it the moment a miss wants a fetch; a host dropped wakes its driver, which
+> ends, so the driver lives exactly as long as its host and needs no other owner. It is the same code over any store
+> (`s3::fetch::Store`: the network client, or `SimS3` in a test) and any home of the host (`HostCell`: the shard's
+> volume slot in the daemon, `crates/server/src/base_wait.rs`'s `spawn_driver`, whose answers go to `base_wait::land`).
+> Owed: its start where a volume over an S3 base is made or recovered (the wire's create, A-555's next piece), and
+> fetches side by side within the requests that wait on them, which a measurement decides.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -38722,3 +38732,81 @@ lines and reply numbers moved onto them, `pushkey::ReplyText::new` now infallibl
   charged), broken `0.2` headers, broken escapes and calls, arbitrary bytes (property tests).
 - **Owed.** Serving the commands, and which SSH refusals use the out-of-band form (piece 4); the compression engines
   for `0.2` and bundle2 streams (D-17); `getbundle`'s argument types (node lists, booleans, lists), with read serving.
+
+### A-585 — A holder whose store is lost answers no read and accepts no record under its old id (2026-11-19, UI goal 81 (kiln dbe13f39, g250), part "Chaos across real processes", the failure half; §4.8 "Promotion and takeover"; D-26)
+Applied in the same change to: GAPS (the live-shipping entry's real-process chaos line) and `crates/db/src/ledger.rs`
+(`Cohort::lose_store`, `Holder::lost`; the takeover and the offer skip a lost holder).
+- **The fault.** A volume's store fails suddenly under a replica. The holder's records and its fence are gone.
+- **The rule it needs.** Such a holder answers no phase-one read and accepts no record under its old id. Its nothing
+  must never count toward a takeover's quorum as a promise. At `f = 2`, with a record committed on `f + 1` of the five
+  candidates, one of those holders losing its store and another host down leaves the record on one holder. A read of
+  the store-lost holder and the two that never held it would make a quorum that misses the record. The server meets
+  the rule by construction: each start takes a fresh member identity (`Daemon::member_identity`), so a host that
+  restarts without its store is a new member no cohort names until it is placed. The register's simulation now states
+  the rule and checks it.
+- **The invariants checked.** NoLoss and Continuity: the record is adopted. TotalOrder: the next record commits at the
+  next position. StaleNeverCommits: the superseded owner commits nothing more. Agreement: no position is held by a
+  quorum with two values. Also a client that disconnects mid-write: its write is kept whole or dropped whole by the
+  next owner, never split, and every committed write survives.
+- **Tests.** `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: the first takeover read three
+  empty logs and dropped the committed record) and `a_write_its_client_left_is_kept_or_dropped_whole`
+  (`crates/db/src/ledger.rs`). Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `ledger::` 3 of 3. Red once on a
+  mutated copy whose takeover read the store-lost holder: the takeover succeeded with an empty log (`Ok(0)`).
+- **Owed (main's).** The real-process runs of both faults: a replica's store destroyed under the live log, and a client
+  killed mid-write (run-requests.md).
+
+### A-583 — The fleet's own tests of a captured clone's landing after a takeover and after a live-shipped move (2026-11-19, g230, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover", §4.10 "Live shipping"; the tests A-544 and A-565 filed for main)
+Applied in the same change to: GAPS (g267's captured-clone status: the two tests written, their run owed),
+`crates/server/tests/fleet.rs` (the two tests and their helpers, beside A-291's captured-clone move test).
+- **What was owed.** A-544 and A-565 were proved by lib tests that built a successor's or a move target's state by hand
+  (`take_over_named`, `take_over_named_as`). Neither ran the fleet: no three daemons had seen a captured clone's record
+  ride its head to the survivors, nor a live-shipped clone's mark reach its move's target.
+- **The tests.** Both overlay one captured tree on a (a file the agent rewrites, one it removes, one it leaves alone),
+  capture its base, clone the capture, and let the agent rewrite, make and remove one file each. Each landing goes into
+  a directory holding the captured tree with an outsider's edit to the file the agent left alone. It is presented
+  through a client of the node that serves the clone, approved under that node's issuer secret as the human's surface
+  approves, and landed.
+  - `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` (A-544). Two clones: the first
+    snapshotted, the second never. Before a stops, the test waits until a has counted `fleet.carry.recorded`, both
+    survivors hold the first clone's head naming a's sealed manifest, and their catalog's capture record names the same
+    manifest. Both must also hold the second clone's catalog. Then a stops, as the takeover tests' owner does.
+    - The first clone's successor (the survivor rendezvous ranks first) must place its head and catalog and serve the
+      agent's tree. Its plan must be one replacement, one create and one removal, with no conflict. The landing must
+      write them and keep the outsider's file.
+    - The second clone's successor must serve an empty root and refuse the landing `Unsupported`, writing nothing.
+  - `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture` (A-565). The clone is live-shipped
+    and snapshotted. Once a counts its record, the clone is moved to b until done. b must serve the agent's tree, and
+    the landing on b must hold the same three changes and land them, the outsider's file kept.
+- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
+  helper, so no lib test came with them.
+
+### A-555, second piece — The fetch driver: a volume's owner shard runs its S3 host's fetches, woken by the host when a fetch is wanted and ended with it (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base"; D-9, R6, R8; A-471, A-524, A-555)
+Applied in the same change to: `crates/base` (`s3::driver`, new: `HostCell`, `drive` and their tests; `s3::fetch::Store`
+over the network client and `SimS3`; `s3::host`: `next_fetch_or_wait`, a wanted fetch waking the driver, and the host's
+drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); §4.15's status; GAPS (A-464's entry).
+
+- **Why.** A-555's first piece parks a request on the fetch it met and wakes it at `base_wait::land`; nothing called
+  `land`, so in a daemon no parked request would ever wake.
+- **Woken by the host, never polling.** The host is sans-io, so the driver waits on it: an idle driver's waker is kept by
+  the host and woken the moment a miss queues a fetch. A fetch starts with the request that needs it, and an idle volume
+  costs no wake.
+- **One fetch at a time.** The client keeps one connection and sends one request at a time (A-471), and the fetches
+  under way are bounded by the requests that wait on them (§4.15's bounds); a request parks on its own fetch whatever is
+  ahead of it in the queue. Fetches side by side are left to a measurement to decide, not assumed.
+- **It lives as long as its host.** The host wakes its driver as it is dropped (its volume destroyed, its base replaced),
+  and the driver, finding no host, ends; an answer that arrives after that is handed to nothing. So the driver's task is
+  detached with its end built in: no task outlives what it serves, and no owner needs to remember it (CLAUDE.md §2 item
+  9).
+- **One code path (R8).** `drive` is the same over the network client and `SimS3` (`Store`), and over the shard's slot
+  and a test's cell (`HostCell`).
+- **Rejected.** Polling the host on a timer: a wake per period on every idle S3 volume, and a fetch delayed by up to a
+  period. Waking the driver from the request's parking: a miss whose request is refused at the bound would leave its
+  fetch unasked.
+- **Owed.** The driver's start where a volume over an S3 base is made or recovered (the wire's create and the
+  credential's hand-off, A-555's next piece: the store client is built from the base's name and its credential), and
+  fetches side by side if a measurement asks for them.
+- **Evidence.** Mac Studio (debug, 2026-11-19, kiln r356): red first with the host not waking its driver, at a miss
+  (the miss woke nothing: 0 wakes where 1 was due) and at its drop (0 where 1 was due); then green: `cargo test --locked
+  -p slates-base --lib -- s3` 58 of 58 (the driver's three: an idle driver woken once by a miss and running its fetch, a
+  fetch the store holds open landing only once answered, a driver ending at its host's drop), `-p slates-server --lib --
+  base_wait` 4 of 4, `cargo fmt --check` clean.

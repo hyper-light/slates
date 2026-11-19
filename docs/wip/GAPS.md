@@ -1169,7 +1169,10 @@
 >   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
 >   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
 >   head has no record, and a move waits for its head's record); since A-565 a live-shipped one's move marks its
->   rebuild from the log too; owed of it, the fleet's own three-daemon tests of a move and a takeover (filed for main),
+>   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
+>   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
+>   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
+>   their first compile and run owed to main; owed of it, A-503's own move test (a clone moved b to c after a to b),
 >   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
@@ -5364,7 +5367,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; since 2026-11-17 the credit
 > is the whole state's bytes, not a fixed two entries, A-200 amended, the entry at the top of this ledger); a candidate's copy kept across its own
 > restart; real-process chaos
-> (partitions, injected latency, volume failure, client disconnect). The owner's `put_wal` is its `Local` records,
+> (partitions, injected latency, volume failure, client disconnect). The volume-failure and client-disconnect faults
+> are in the register's simulation since A-585 (g250, 2026-11-19, goal 81): `ledger::Cohort::lose_store` (a store lost
+> under a replica: the holder answers no read and accepts no record under its old id, as a fresh-id restart does), with
+> `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: a store-lost holder answering with nothing
+> completed a quorum that missed a committed record at `f = 2`) and `a_write_its_client_left_is_kept_or_dropped_whole`;
+> the real-process runs of both faults are main's (run-requests.md). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.
@@ -12176,6 +12184,9 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   (`HostCounts::unkept`). A slot's base host is a `BaseHost` (a host directory or an S3 base). Proven: see A-555's
 >   evidence.
 > - **Owed.**
+>   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
+>     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
+>     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
 >   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
 >     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
 >     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
