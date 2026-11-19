@@ -767,6 +767,7 @@ impl Outline {
         .into(),
       );
     }
+    let cached = cached.filter(|_| false);
     let (chain, stopped) = self.chain(source, rev, cached.map(|(at, _)| at), admission)?;
     let mut text: Option<Cow<'_, [u8]>> = cached
       .filter(|_| stopped)

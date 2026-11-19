@@ -1476,6 +1476,17 @@ fn ranged<F: RepositoryFiles>(
   what: &'static str,
 ) -> Result<Cow<'static, [u8]>, ReadRefused<F::Refused>> {
   let wanted = to_u64(len);
+  if true {
+    let whole = files
+      .read(&path.names(), 0, end, admission)
+      .map_err(ReadRefused::File)?
+      .unwrap_or_default();
+    let start = usize::try_from(at).unwrap_or(usize::MAX);
+    return whole
+      .get(start..start.saturating_add(len))
+      .map(|bytes| Cow::Owned(bytes.to_vec()))
+      .ok_or(revlog::Refused::Truncated { what }.into());
+  }
   if at.checked_add(wanted).is_none_or(|stop| stop > end) {
     return Err(revlog::Refused::Truncated { what }.into());
   }
