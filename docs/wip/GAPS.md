@@ -9,6 +9,20 @@
 > review records; policy and hooks), then each tool's pieces. No speed is claimed until main measures it by §4.17.1's
 > method.
 
+> **§4.17.3 the Mercurial server: designed, nothing is built (2026-11-18, A-499; UI goal 91; owner g291).** Built on
+> §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move toward public, and a
+> public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock
+> push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a line's policy for
+> clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
+> (`research/mercurial-server.md`). Owed, in order, after §4.17.1's seven pieces: (1) the bundle2 and changegroup
+> codecs, with golden vectors made by stock `hg`; (2) the SSH and HTTP version 1 codecs; (3) the objects and the index,
+> and import of a repository directory; (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on
+> push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream clones, inline clone bundles, the
+> hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by
+> linelog; (13) main's runs: 7.2's own suite through a shim, the differential run against `hg serve`, a 6.x client, then
+> the measurements. Open: whether a 6.x client's changegroup `04` is the old sidedata layout (read from the document,
+> not from 6.x code; the older-client run checks it). No speed is claimed until main measures it.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose

@@ -11243,6 +11243,399 @@ Each server's pieces follow these, in its own section.
 commit), §4.13 (principals and capabilities), §4.15 (import from a host directory; export by landing), §4.16 (the
 engine: the verdict, rebase, position mapping, the register).
 
+#### 4.17.3 Mercurial (A-499)
+
+> **Status (2026-11-18, A-499).** Designed; nothing is built. Built on §4.17.1 without redefining it, from Mercurial
+> 7.2's own documents and code and hg-evolve 12.0.0 (the topic and evolve extensions). The reading notes, every source
+> named to its file, are `research/mercurial-server.md`. The pieces are listed at the end, after the shared ones.
+
+**Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
+protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
+each bookmark is a green, and a push is a work whose verdict is the push's answer (§4.17.1). Phases, obsolescence
+markers and topics, which git has no counterpart for, are decided here.
+
+**What Mercurial adds to the shared mapping (the decisions).**
+1. **A named branch with several heads.** Mercurial calls a changeset a branch head when no child of it is on the same
+   named branch, and one named branch may have several (`branchmap` answers "a space-delimited list of hex nodes of
+   heads on that branch" [B: `internals.wireprotocol`]). Each branch head is the head of a green of its own, a *line*;
+   the named branch is the set of its lines, and `branchmap` lists their heads. A push whose changesets descend from a
+   line's head moves that line. A push that starts another head on a named branch (a client's `--force`) makes a line,
+   a namespace entry of the repository's register (§4.17.1, "The repository and its greens", item 3), where the policy
+   allows new heads; a protected line never does. A merge of two lines of one named branch moves the first and retires
+   the second in one entry. A new named branch (`--new-branch`) is a line made at its first parent's version (item 4
+   there). A closing changeset (`close=1`) is one more version, and its line stays, closed, as `branchmap` reports
+   closed heads.
+2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. A bookmark moves only
+   when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
+   value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
+   `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.
+   Mercurial's tags are not names a push moves: they are the `.hgtags` file of the tree (with its `hgtagsfnodes`
+   cache), so they are content of versions, never greens.
+3. **Phases.** Public, draft and secret are attributes of changesets, kept as Mercurial keeps them, as phase roots
+   ("no changeset can be in a lower phase than its ancestors", and phases move "only ... towards the public phase" [B:
+   `phases.txt`]). Every change of them is an entry of the repository's register, alone or with the push that makes it.
+   On a publishing repository (Mercurial's default) every changeset a push brings is public when its version commits;
+   on a non-publishing one it stays draft until a `phase-heads` part, a `phases` pushkey or a publishing push moves it.
+   Public is immutable here as in Mercurial: a version whose head does not descend from the line's previous head (a
+   rewrite, §4.17.1 "A version") is admitted only when every changeset it drops from the line's history is draft and
+   obsoleted by a marker the repository holds or the push brings. A public changeset is never dropped, rewritten or
+   lowered. A secret changeset never reaches the server ("Changesets in secret phase are not exchanged" [B:
+   `phases.txt`]): a push naming one, or one of the local phases archived (32) and internal (96) [C: `phases.py`], is
+   refused.
+4. **Obsolescence markers.** The repository keeps the markers it receives (formats 0 and 1 [C: `obsolete.py`]) and
+   exchanges them by the `obsmarkers` part and the `obsolete` pushkey namespace. A marker whose predecessor is public is
+   refused (the state Mercurial calls phase-divergence [B: `evolution.txt`]); one whose predecessor is a draft is what
+   decision 3's rewrite rule admits. Two pushes that rewrite one draft two ways (content-divergence) are both kept, as
+   Mercurial keeps them, and the reply's output says so; the clients resolve it. Markers whose predecessors the server
+   never held are kept, since markers "can be exchanged without any of the precursor changesets" [B: `evolution.txt`].
+   An obsolete changeset leaves the served view at once; its objects stay until the repository's budget needs the room,
+   oldest first, counted, and a request for one that is gone is answered as for any changeset outside the served view.
+5. **Topics are review requests.** A topic (hg-evolve's `topic` and `topic-namespace` extras, named
+   `branch//namespace/topic` [C: `hgext3rd/topic`]) is a review request in §4.17.1's sense: a chain of works held for
+   review over the line its named branch names, one work per draft changeset of the topic, in order (a stacked change),
+   with its review record. A push whose first parent is a topic's head extends its chain; a push that rewrites it
+   (amend, evolve) replaces the chain from the first changed work, its markers naming old and new. Publishing a topic
+   (`hg push --publish`, a publishing line, or hg-evolve's `topic.publish-bare-branch` for changesets with no topic)
+   or merging the request on the server submits the chain. A bookmark the policy marks for review, by name pattern, is
+   a review request the same way. Topic heads are answered from the works (`_exttopics_heads`, `tns_heads` and the
+   topic-aware `branchmap` [C: `topic/server.py`]); a repository may serve topic changesets to topic-aware clients
+   only (hg-evolve's `topic.server-gate-topic-changesets`), as a policy.
+6. **The head and the base.** §4.17.1's `slates.vcs.head` holds the changeset's 20-byte node. A push's base, on each
+   line it moves, is the head the client saw there: `check:updated-heads` names exactly those heads ("only a subset of
+   heads in the repository" [B: `internals.bundle2`]). `check:heads` and `unbundle`'s `heads` argument (a list,
+   `force`, or `hashed` and the SHA-1 of the sorted heads [C: `exchange.check_heads`]) ask more, every head unchanged,
+   which is how older clients and the strict push mode check: the owner checks them in the push's own register step,
+   at the position its entry commits at.
+7. **Changesets the server makes.** Where §4.17.1 has the server make the tool's objects (an agent's work through the
+   SDK or a mount, a merged review request, a server-side rebase), it writes them as Mercurial's own commit does [C:
+   `mercurial/commit.py` `_filecommit`]: each changed file's revision with its parents taken from the new changeset's
+   parents' manifests and its copy metadata pointed at the copy source's node there, the manifest of the version's
+   tree, then the changeset text. The changeset's fields:
+   - an agent's work: the user is the principal's Mercurial identity (`Name <address>`, from its §4.13 record), the date
+     is the merge record's time in UTC, the description is the submit's message (a Mercurial-served line refuses a
+     submit without one), the extras are `branch` (unless `default`) and the topic's, and the first parent is the
+     line's head;
+   - a rebase: the user, date, description and extras of the changeset it replaces, plus `rebase_source` naming that
+     changeset, as Mercurial's rebase writes it [C: `hgext/rebase.py`], and a marker from the old one to the new
+     (format 1, the merge record's time, the merging principal as its user);
+   - a merged review request whose policy's merge method is `merge`: a merge changeset whose first parent is the line's
+     head and second the request's top, its description the policy's merge message.
+   Every field comes from the merge record or the work and never from a holder's clock, so every holder computes the
+   same nodes (§4.16 "Apply on holders").
+8. **Rebase on push.** A line whose policy says *rebase on push* takes a stock push as a work the server turns into
+   objects (§4.17.1, "A push is a work", item 3: no head operation). When the push's first parent is an older version
+   of the line, its changesets are mapped onto the head at whole-file granularity; if every path is accepted or
+   identical, the server writes the rebased changesets (decision 7) and returns them with their markers in the reply
+   bundle. It does this only for a client whose bundle2 capabilities name both `pushback` (with it "the server can send
+   a bundle2 response containing the rewritten changeset data and the client will apply it" [B: `internals.bundle2`])
+   and `obsmarkers`: a client that cannot apply markers ignores them [C: `bundle2_part_handlers.py`] and would keep its
+   old changesets beside the new ones. Any other client is answered as Mercurial answers a stale push (Push, step 7). A
+   stack holding a merge changeset is never rebased by the server.
+
+**The repository's index (§4.17.1 "Objects", item 3).** Mercurial reads history by revision number, so the index keeps
+a revlog's shape, as immutable content tables with a mutable tail:
+```rust
+struct HgChangelogRow { node: [u8; 20], p1: u32, p2: u32 /* revs, u32::MAX for none */, manifest: [u8; 20],
+                        text: Blake3, len: u64, branch: u32 /* an interned name */, flags: u16 /* closed */ }
+struct HgRevisionRow { node: [u8; 20], p1: u32, p2: u32 /* ordinals in this log */, link: u32 /* changelog rev */,
+                       flags: u16 /* censored, ellipsis, externally stored, copy information */,
+                       meta: Option<Blake3> /* the metadata block */, bytes: Blake3, len: u64 }
+struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tables<HgRevisionRow>>,
+                 files: Art<PathKey, Tables<HgRevisionRow>>, by_node: Tables<([u8; 20], LogId, u32)>,
+                 phase_roots: PhaseRoots, markers: Tables<MarkerRow>, heads: Art<BranchId, SmallVec<u32>> }
+```
+- A changeset's revision number is its position in the changelog table, in the order the server took them, so it is
+  topological as a revlog's is (references "*always* refer to a previous entry" [B: `internals.revlogs`]).
+- A file revision's text is its metadata block, when it has one (copy information, or bytes that begin as the block
+  does), then the file's bytes. The row keeps them apart, so the bytes are the same content as the file in every tree
+  (§4.17.1 "Objects", item 1) and only the block is kept beside them.
+- Each node is checked on arrival as Mercurial computes it: the SHA-1 of the two parents in ascending order and then
+  the text [B: `internals.revlogs` "Hash Computation"].
+- The tail is folded into a new table when the lookups it served since the last fold cost more than a fold (the table
+  of learned tunables).
+
+**The wire surface.**
+- **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
+  server as a key's forced command (as Mercurial's own `contrib/hg-ssh` restricts a key to `hg -R <repo> serve
+  --stdio`) or by the client's `--remotecmd`; HTTP version 1 on the daemon's own HTTP edge, under TLS. HTTP version 2
+  (`/api/*`, the `hgrpc` frames) is not served: Mercurial documents it as experimental, and 7.2's server has no handler
+  for it (no `X-HgUpgrade` path in `wireprotoserver.py` [C]).
+- **Commands.** Every command of 7.2's table, with its argument spec and its permission, `pull` or `push` [C:
+  `wireprotov1server.py`]: `batch`, `between`, `branchmap`, `branches`, `capabilities`, `changegroup` and
+  `changegroupsubset` (legacy), `clonebundles`, `clonebundles_manifest`, `get_cached_bundle_inline`, `getbundle`,
+  `heads`, `hello`, `listkeys`, `lookup`, `known`, `protocaps`, `pushkey`, `stream_out` and `unbundle`; `debugwireargs`
+  for the interop suite; the shipped extensions' `narrow_widen`, `x_rfl_getfile`, `x_rfl_getfiles`,
+  `x_rfl_getflogheads`, `putlfile`, `getlfile`, `statlfile` and `lheads`; and hg-evolve's `_exttopics_heads` and
+  `tns_heads`. An unknown command is answered as 7.2 answers it (over SSH, an empty string).
+- **Capabilities.** The ones 7.2 sends [C: `_capabilities`, `addcapabilities`, `exchanges/bundle_caps.py`], with
+  slates' values: `streamreqs` names the revlog view's requirements (below); `compression` lists the engines slates
+  offers; `httpheader` is the head size the HTTP edge admits, a stated bound and not a tuning; `checkheads=related`
+  always, since the verdict is per line; `pushback` where a line rebases on push; `obsmarkers=V0,V1`; `exp-narrow-1` and
+  `exp-ellipses-2` where narrow serving is on.
+- **Changegroup versions.** 7.2's code and its own documentation disagree on version `04`: the document calls it the
+  sidedata format, the code made `04` a 130-byte delta-information header and moved sidedata to `05`, and a 6.x client
+  with experimental sidedata listed `04` meaning the old layout (`research/mercurial-server.md` §3.3). So the server
+  takes `01` to `03` in pushes and advertises only those. It sends the highest version the client listed among `01` to
+  `03`, and `04` only to a client whose bundle2 capabilities also name `delta-compression`, which only 7.x clients
+  send, so its deltas travel in the compression they are held in [C: `changegroup.py` `WireDeltaCompression`].
+- **Responses.** The media type and compression the client offered (`X-HgProto`, `comp=`), chosen by the learned cost
+  model below; streams framed as 7.2 frames them; errors in Mercurial's forms: `error:abort` with a message and a hint,
+  `error:pushraced`, `error:pushkey`, `application/hg-error` and hgweb's statuses (401, 403, 405) over HTTP, and over
+  SSH the message on stderr ending `\n-\n`.
+
+**Pull and clone.**
+1. Discovery (`heads`, `known`, `branchmap`, `lookup`, `listkeys`, and the legacy `between` and `branches`) reads the
+   index in RAM at one register position (§4.17.1 "Reads"): one consistent cut of every line, bookmark and phase.
+2. `getbundle` with `common` and `heads`: the missing changesets are the ancestors of `heads` that are not ancestors of
+   `common`, in the served view (no secret and no hidden changeset), walked over revision numbers as Mercurial's own
+   outgoing computation walks them [C: `exchange._computeoutgoing`].
+3. The parts go in 7.2's order [C: `exchange.getbundle2partsorder`]: `stream2` when asked, `changegroup`, `bookmarks`,
+   `listkeys`, `obsmarkers`, `phase-heads`, `hgtagsfnodes`, and `cache:rev-branch-cache` for the legacy clients that
+   ask for it.
+4. Each revision travels as a delta against a base the client holds or receives earlier, or as a full text. A held
+   delta whose base qualifies is sent as held (in its stored compression to a client that accepts
+   `delta-compression`); any other is computed once and held by the identity of what it encodes (§4.17.1 "Objects",
+   item 2). A delta is an encoding for the wire: no verdict ever reads one.
+5. A clone of heads the server has served before is one held artefact (the bundle for that head set's identity, or the
+   stream of that view), sent from RAM; inline clone bundles (`get_cached_bundle_inline`, `clonebundles_manifest`)
+   advertise it while it is held. Whether an artefact stays is learned (the table below).
+
+**Push.** Each step names what it refuses; nothing takes effect before step 6.
+1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
+   does) is read in slices within the shard's budget per step, every length checked against the request's admission
+   (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires
+   ("A consumer should abort if it encounters a mandatory part it doesn't know how to process" [B:
+   `internals.bundle2`]). The objects are the work's: §4.17.1's quarantine.
+2. **Verification.** Every delta's base is held or comes earlier in the bundle, and the delta applies within it; every
+   node is the hash of its parents and text; every link names a changeset of the bundle; every file node a new
+   manifest names is in the bundle or the index (what 7.2 checks only under `server.validate`, here always); every
+   path passes Mercurial's own audit (no `.hg` at the top, no `..`, no drive root [C: `pathutil.pathauditor`]) and the
+   policy's rules, such as names that differ only by case where the policy refuses them.
+3. **Classification.** Each new changeset's line, topic or bookmark (decisions 1, 2 and 5) and its phase (decision 3),
+   and so the works: one per line or request the push moves, its base the head the client saw there, its operations
+   the whole-file differences between that version's tree and the new head's (§4.17.1, "A push is a work", item 2),
+   its head operation the new node.
+4. **Race checks.** `check:heads`, `check:updated-heads`, `check:phases`, `check:bookmarks` and `unbundle`'s `heads`
+   name what the client saw; a head that is no version's head is answered as a moved one, before any work is built
+   (§4.17.1, "A push is a work", item 1).
+5. **Admission.** Access (below), then the admission hooks (below). A refusal names its rule or its hook.
+6. **Verdicts and commit.** The works are submitted together, and one register entry commits every line's and
+   bookmark's version, the namespace entries (a new line, a retired one), the phase roots and the markers, or none of
+   them (§4.17.1, "The repository and its greens", item 2). The changesets become the versions' objects; a refused work
+   releases what it held.
+7. **Reply.** Accept and identical answer `reply:changegroup` with the change in heads as 7.2 counts it ("``1`` means
+   the number of heads remained the same. Values ``2`` and larger indicate the number of added heads minus 1" [B:
+   `internals.wireprotocol`]), with `reply:pushkey`, `reply:obsmarkers`, `output` parts carrying hook output, and with
+   pushback the rebased changesets and their markers. A head conflict answers Mercurial's race abort ("remote
+   repository changed while pushing - please try again" [C: `bundle2_part_handlers.py`]; over bundle1, "repository
+   changed while uploading changes - please try again" [C: `exchange.check_heads`]). A path conflict of a rebase on
+   push answers `error:abort` naming each path and the head to rebase onto.
+8. **After the commit.** The observing hooks run (below), and never change the answer.
+
+The answer is given after the commit, so it is durable when given (§4.17.1). A push repeated after a lost answer brings
+changesets the index holds: they are verified and dropped, since revisions are keyed by node, and its head operations
+are identical, so it is answered as accepted with nothing new.
+
+**Hooks: Mercurial's points on §4.17.1's three.**
+- **Admission**, before the verdict: `prechangegroup`, `pretxnchangegroup` (once per push, `HG_NODE` the first new
+  changeset and `HG_NODE_LAST` the last), `pretxnclose`, `pretxnclose-bookmark` (once per bookmark),
+  `pretxnclose-phase` (once per changeset whose phase changes) and `prepushkey`; on reads, `preoutgoing` and
+  `prelistkeys` [B: `config.txt` "hooks"]. A hook runs with Mercurial's `HG_*` environment over a read-only attachment
+  of the work's post-state rendered as a Mercurial repository (the revlog view, below), with `HG_PENDING` naming it as
+  7.2 names a repository whose transaction is pending to its own hooks [C: `hook.py`, `txnutil.py`], so a hook's own
+  `hg` commands read the pushed changesets.
+- **Observing**, after the commit: `changegroup`, `incoming` (once per changeset), `txnclose`, `txnclose-bookmark`,
+  `txnclose-phase`, `pushkey`, `outgoing` and `listkeys`, run from the repository's own queue, bounded by its budget,
+  each failure counted; none changes an answer, as in Mercurial, where these run after the transaction.
+- **Built in**, with no program run: the hooks Mercurial ships in `hgext/hooklib` (`reject_new_heads`,
+  `reject_merge_commits`, `enforce_draft_commits`, `changeset_published`, `changeset_obsoleted`) and the `acl`
+  extension are policies judged at admission.
+- `pushvars` parts become the push's hooks' `USERVAR_*` variables, as in Mercurial [B: `internals.bundle2`].
+
+**Access.** §4.17.1's principal and capabilities decide, and Mercurial's own rules are kept in their order, so an
+existing repository's configuration keeps its meaning:
+- the repository: `deny_read`, `allow_read` and `allow-pull` for reads; for a push, a `POST`, TLS unless the policy
+  says otherwise (`push_ssl`), then `deny_push` and `allow-push`, with hgweb's statuses [C: `hgweb/common.py`
+  `checkauthz`];
+- lines and paths, in acl's order: deny, then allow, by branch; deny, then allow, by path pattern; and by bookmark, with
+  groups, judged by the authenticated principal and never by the committer ("not the committer of the original
+  changeset (since the latter is merely informative)" [C: `hgext/acl.py`]);
+- narrow: `[narrowacl]`'s includes and excludes per principal, forced on every narrow request and widening, and a
+  widening that would drop a required exclude refused, naming the principal [C: `narrowwirepeer.narrow_widen`];
+- a read right never reaches hidden or secret changesets: the served view excludes them, and no read right grants
+  7.2's hidden access, which is an administrator's mode.
+
+**Narrow, shallow and large files.**
+- **Narrow clones.** `getbundle` with `narrow` and its patterns, and `narrow_widen`. The patterns compile to §4.16's
+  filter (an increment's excluded subtrees), and file segments are filtered. A push from a narrow clone carries file
+  revisions inside its patterns only, and every manifest entry outside them must equal its first parent's, checked at
+  verification.
+- **Shallow history.** narrow's `depth`, with ellipsis revisions (flag 16384, changegroup `03` or later,
+  `exp-ellipses-2`) where the policy turns it on, as 7.2 gates it behind `narrow.serveellipses`; and remotefilelog's
+  `x_rfl_getfile`, `x_rfl_getfiles` and `x_rfl_getflogheads`, held to 7.2's behaviour, since that extension promises
+  "NO BACKWARDS COMPATIBILITY GUARANTEES" [C: `hgext/remotefilelog`].
+- **Large files.** largefiles' `putlfile` (its SHA-1 checked before anything is kept, as 7.2 checks it), `getlfile`,
+  `statlfile`, `lheads` and `largefiles=serve`; lfs's batch API (`/.git/info/lfs/objects/batch`) and basic transfers on
+  the HTTP edge, with `lfs` and `lfs-serve` [C: `hgext/lfs/wireprotolfsserver.py`]. Both are content objects of the
+  repository; the LFS store is git's (§4.17.2), since lfs speaks git's protocol.
+
+**Stream clones: the revlog view.** A stream clone sends a store's files, so the server renders the repository as
+Mercurial's store in RAM: revlog version 1 with `generaldelta` and `sparserevlog`, under `store`, `fncache` and
+`dotencode`, with the phase roots, the bookmarks and the markers' file, appended as versions commit. `stream_out`
+(version 1) and the `stream2` part (version 2: per file a source byte, the name's length and the size as varints, the
+name, then the bytes [C: `streamclone._emit2`]) send it, and `streamreqs` names exactly its requirements. Its deltas
+follow the pinned client's own writer (`revlogutils/deltas.py`), so a stream clone leaves the client the store a pull
+would have built, and `hg verify` on the clone is the check: the rule is the client's, not a slates tunable. A stream
+is offered only when it holds nothing the principal may not read. The same rendering is the read-only repository the
+admission hooks see and what an export lands (§4.15).
+
+**hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
+`branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
+`hgweb.txt`]), served from the index and the greens. `annotate` reads a linelog per file per line, extended at each
+version: a linelog is a weave over a linear history [B: `internals.linelog`], which a line's chain of versions is, and
+it is what Mercurial's own `fastannotate` keeps in order to answer faster than core annotate's walk of the file's
+history [C: `hgext/fastannotate`]. A linelog is a held artefact (the table below). The changesets inside one push are
+annotated from their file revisions, at that push's own cost.
+
+**Learned tunables** (§4.17.1's rule: the estimator, its inputs, when it updates, its bounds and its first value).
+
+| Tunable (7.2's fixed rule) | Estimator | Inputs | Updates | Bounds | First value |
+|---|---|---|---|---|---|
+| Response compression, engine and level (`server.compressionengines`' order; `zliblevel` -1, `zstdlevel` 3) | the engine and level with the least predicted send time: compression time plus compressed bytes over the delivery rate | the connection's delivery rate (bytes the peer acknowledged per second, from the runtime's send path); this repository's compression speed and ratio per engine and level, measured on its own chunks (D-17's cost model) | each slice sent | the engines the client named (`zlib,none` when it named none); a slice's compression within the shard's budget per step | each named engine at its fastest level on the first slice, measured there; the second slice chooses |
+| Delta, full text, and the delta's base (the client's configuration; 7.2 reuses stored deltas) | a held delta whose base qualifies costs nothing; otherwise a delta against the first parent when the bytes it saves over the delivery rate exceed its predicted compute time, else the full text | delivery rate; this repository's delta compute time and delta size, regressed on the text's length per log kind | each delta computed | the delta cache's share of the repository's budget (§4.2) | held deltas and full texts until the response's first computed delta is measured |
+| `stream-preferred` (`server.preferuncompressed`, off; "slower than about 6 Mbps" [B: `config.txt` `server.uncompressed`]) | advertised to a principal when the view's bytes over its predicted rate are less than a changegroup's generation time plus its compressed bytes over that rate | the principal's delivery rates on its earlier exchanges; the view's size; this repository's measured generation rate and compressed size of a full changegroup (no generation time for a held one) | each exchange and each clone | only when the stream holds nothing the principal may not read | not advertised to a principal with no sample; its first exchange measures its rate |
+| Write slice (7.2's chunk iterators) | the connection's bandwidth-delay product: delivery rate times smoothed round trip | the runtime's TCP measurements of the connection | each send window | the shard's budget per step; the connection's memory share (§4.2) | what one step of encoding produces |
+| Held artefacts: full-clone bundles, the delta cache, linelogs, the revlog view's pages (7.2: `pullbundles.manifest` and clone bundles an administrator makes) | value per byte, the request rate times the cost to make it again over its bytes; the lowest goes first when the budget needs room | requests per artefact; the time it took to make, measured when made; its bytes | each request and each making | the repository's RAM share (§4.2, A-16) | made at its first request, which measures its cost; kept until the budget needs the room |
+| Push verification, slice and fan-out | a slice is what one step verifies at the measured cost per byte; fan out to the owner node's other shards when the predicted remaining time exceeds a measured cross-shard hop | this repository's verification throughput (hashing, applying deltas); the hop cost the runtime measures | each slice | the request's admission (A-16), checked before decoding | one revision, measured |
+| Index tail fold | fold when the lookups the tail served since the last fold cost more than a fold | lookup time served from the tail; the last fold's time | each lookup and each fold | the repository's budget | the first fold when the tail's lookups cost more than building the tail did |
+| Hidden changesets kept (7.2 keeps them for good) | kept until the budget needs room, oldest first | the repository's budget | each admission | the repository's budget | kept |
+| Hook deadlines | §4.17.1's: learned from each hook's own runs | | | | |
+
+Not tunables: `httpheader` (the head size the edge admits, a stated bound); the revlog view's delta rules (the client's
+own writer); and the `obsolete` pushkey namespace's dumps, which 7.2 splits at `_maxpayload = 5300`, "arbitrary picked
+to fit into 8K limit from HTTP server" [C: `obsolete.py`]. A `listkeys` answer travels in a body, which has no such
+limit, so slates answers with one `dump0` key, and a client splits its own pushed dumps.
+
+**Failure matrix (Mercurial's, beside §4.17.1's).** A push whose answer was lost after its commit: the client's repeat
+is answered accepted with nothing new (above). A hostile or damaged bundle: refused by kind before any effect, nothing
+indexed. A revision whose node does not hash: `ObjectIdMismatch`. A marker obsoleting a public changeset: refused. A
+client gone during a stream clone: the held view is unaffected, and the next request starts again. An owner restart:
+the index, the phase roots and the markers replay with the greens from the register (§4.16); the revlog view, the
+linelogs and the delta cache are held artefacts, made again on demand.
+
+**Refusals (Mercurial's, beside §4.17.1's and §4.16's).** `BundleRefused { fault }` (`ForeignMagic`, `Truncated`,
+`Corrupt`, `UnknownMandatory` for a part or a parameter, `PastAdmission`); `UnknownDeltaBase { node }`;
+`MissingObject { node }` (a parent, a link, a manifest's file revision); `PathRefused { path, rule }`;
+`PhaseRefused { phase }`; `ObsoletesPublic { node }`; `NewHead { branch }`; `RewriteRefused { node }` (a rewrite that
+would drop a public changeset, or a draft no marker obsoletes). Each is answered in Mercurial's words: the race abort,
+`error:abort` with message and hint, `error:pushkey` (and `reply:pushkey` 0) for a bookmark or phase that did not move,
+`<hook> hook exited with status <n>` for a refusing hook [C: `hook.py`, `utils/procutil.py`], and hgweb's statuses.
+
+**Worked example.** Repository `linux` (Mercurial, publishing) has line `default` at version 412, whose head is
+changeset h412. Alice and Bob have pulled it. Alice pushes a1, which edits `kernel/fork.c`, with `check:updated-heads`
+naming h412: one whole-file replacement and the head set to a1. The fast path accepts, version 413 commits with a1
+public, and Alice reads `reply:changegroup` 1 (still one head). Bob commits b1, editing `mm/mmap.c`, on h412 and pushes
+without pulling: his client learns the remote head a1, finds that b1 would be a second head of `default`, and stops
+before sending ("push creates new remote head", a check Mercurial makes on the client [C: `discovery.checkheads`]). He
+pulls, rebases on his machine, and pushes b1' naming a1: version 414. Line `next` has the policy *rebase on push*, and
+Carol's client has pushback and markers on: her c1, made on `next`'s version 30, edits `fs/open.c`, while version 31,
+another push, edited `fs/read_write.c`. The server maps c1 onto version 31 (no path in common), writes c1' with c1's
+user, date and description and `rebase_source` naming c1, commits version 32 with the marker c1 → c1', and hands both to
+Carol's client in the reply. Dan's d1, also made on version 30, edits `fs/read_write.c`: a whole-file conflict with
+version 31, answered `error:abort` naming `fs/read_write.c` and the head to rebase onto; nothing is kept. On a
+non-publishing repository, Erin's topic `fix-oom` holds three draft changesets as a chain of three works over
+`default`. After review it is merged by the method `rebase`; `default` moved since its base, none of its paths moved, so
+the server writes three rebased changesets and three markers in one entry, public, and Erin's client hides the old ones
+at its next pull.
+
+**Laptop degenerate.** §4.17.1's: one node, f = 0, every arrow in-process. `slates hg serve --stdio` reaches the local
+daemon through the rendezvous, and HTTP is served on loopback. The code is the fleet's (R8).
+
+**Ten times faster: Mercurial's runs (§4.17.1's method; main's to make).**
+- Competitors: `hg serve` (7.2, hgweb's own HTTP server); hgweb under a WSGI server, as 7.2 ships it for production
+  (`contrib/hgweb.wsgi`); `hg serve --stdio` behind OpenSSH for the SSH transport; and Heptapod (GitLab with Mercurial),
+  where it can be run, as the industrial host.
+- Dataset: the Linux kernel's history converted from git, once, its command, duration and result recorded:
+  `git clone --bare https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux.git`, then
+  `hg --config extensions.convert= convert --rev "$(git -C linux.git rev-parse v7.4-rc1)" linux.git linux-hg`
+  (Mercurial's defaults, `convert.git.similarity` 50). A bounded conversion for quicker rounds, the history after v7.3
+  from a clone made with `--shallow-exclude=v7.3`, if `hg convert` accepts a shallow clone (to be checked). And the
+  v7.4-rc1 tree (6628e7d4), the load tests' tree, committed as one changeset, for clones bound by files and bytes rather
+  than history.
+- Operations, from a stock 7.2 client over HTTP and over SSH: clone (whole, `--stream`, and narrow to `kernel/`); pull
+  after 1, 10 and 100 upstream changesets, and a pull with nothing new (discovery alone); push of 1 changeset and of
+  100; 1, 8 and 64 concurrent pushers to one line and to as many lines; a server-side merge (a topic's chain merged by
+  `rebase`); `log` and `annotate` of one path through hgweb (`/json-log`, `/json-annotate/<rev>/kernel/fork.c`).
+- Measures and the claim: §4.17.1's. Where the difference is expected to come from, each a hypothesis until measured:
+  no disk and no sync on the push path; verification spread over cores; held deltas sent in their stored compression;
+  held clone artefacts sent from RAM at the link's rate; annotate from a linelog instead of a walk of the file's
+  history; discovery answered from indexes in RAM; no Python on the server.
+
+**The interop proof (main's runs).**
+- **Mercurial's own suite.** 7.2's `tests/run-tests.py` with `--with-hg` naming a shim that runs the real `hg` for every
+  command except `serve`. For `serve` (`-p … -d --pid-file`, and `--stdio` as the suite's `dummyssh` starts it) the shim
+  serves the test's repository from slates: imported from its directory as a base (a read, §4.15), with every commit
+  landed back into that directory through the revlog view under the harness's write policy (A-285), since the tests
+  then read the server's directory with local `hg` commands. The tests are the ones `research/mercurial-server.md` §9
+  names, with a reviewed expected-failure list, each line with its reason, that only shrinks (Part 6).
+- **The differential run.** Each scenario (clone, pull, push and its races, bookmarks, phases, markers, topics, narrow,
+  largefiles, lfs, refusing hooks and access) by a stock client against `hg serve` over a copy of the repository and
+  against slates, the results compared whole: the client's repository afterwards (`hg log --hidden -T` with each
+  changeset's node, phase, branch, bookmarks and topic; `hg debugobsolete`; `hg verify`) and the client's output.
+- **Older clients.** The differential run again with a 6.x client, the oldest a deployment names, for changegroup
+  `04`'s two layouts and for bundle1.
+
+**Acceptance criteria.** Each is a test by use; the ids are this subsection's.
+- AC-HG.1 (T-HG.1): every differential scenario is identical with stock 7.2, over SSH and over HTTP.
+- AC-HG.2 (T-HG.2): every changeset, manifest and file revision the server sends hashes to its node, and a pushed one
+  that does not is refused before any effect.
+- AC-HG.3 (T-HG.3): an accepted stock push leaves exactly its bytes and its nodes (§4.17.1's client-fidelity rule), and
+  one that moved a line the client did not see is answered with the race abort; the oracle is a serial model of lines,
+  bookmarks, phases and markers.
+- AC-HG.4 (T-HG.4): phases only move toward public, a public changeset is never dropped or rewritten, a secret one never
+  arrives, and the server's column of Mercurial's 49-case phase table holds [C: `phases.py`].
+- AC-HG.5 (T-HG.5): a push that moves several lines, bookmarks and phases commits all of it or none, with a crash
+  injected at every step (as `t_1_15_crash_at_every_write_instruction_then_resume`).
+- AC-HG.6 (T-HG.6): a rebase on push and a merged request write the same nodes on every holder, and a client that asked
+  for pushback holds them after its push.
+- AC-HG.7 (T-HG.7): the repository's rules, acl's order and the narrow ACL refuse exactly what 7.2 refuses.
+- AC-HG.8 (T-HG.8): every learned tunable's choice moves with its inputs, each with a counter proving its path ran.
+- AC-HG.9 (T-HG.9): every parser of a client's bytes (bundle2, changegroups, SSH framing, HTTP arguments, markers, phase
+  and bookmark entries, pushkey values) refuses truncated, oversized, bit-flipped and foreign input by kind and never
+  panics (property tests).
+- AC-HG.10 (T-HG.10): the differential scenarios answer alike at f = 0 and at a simulated f = 1 (R8).
+- AC-HG.11 (T-HG.11): every operation of the runs above is measured against `hg serve`, and is called ten times faster
+  only where measured so (main's runs, `BENCHMARKS.md`).
+
+**Pieces that follow (Mercurial's, after §4.17.1's).** Each is one piece with its own tests; main assigns the numbers.
+1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
+   interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
+   parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties.
+2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
+   HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
+   string and the bundle2 capability blob, and `batch` escaping.
+3. The objects and the index: changeset texts, flat manifests and file metadata parsed and written, nodes checked, the
+   index's tables, and an existing repository's store imported as a base.
+4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
+5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
+   register entry and the reply.
+6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
+   pushback (decision 8).
+7. Markers and their exchange; topics as review requests.
+8. Access and hooks: the repository's rules, acl's, the narrow ACL, the admission and observing hooks, the built-in
+   ones.
+9. The revlog view: stream clones, inline clone bundles, the hooks' read-only repository.
+10. Narrow, ellipsis and remotefilelog.
+11. largefiles and lfs, lfs on git's store.
+12. hgweb's read URLs, and annotate by linelog.
+13. Main's runs: the shim and the suite, the differential run, the older clients, then the measurements.
+
+**Integration points.** §4.17.1 (the mapping this builds on), §4.16 (the verdict and rebase; a rewrite as a work's
+rebase), §4.8 (the register entry that carries phases and markers), §4.11 (one copy of each file's bytes), §4.12 (the
+CLI's `slates hg serve`), §4.13 (principals and their Mercurial identities), §4.15 (import of a repository directory,
+and export by landing).
+
 ---
 
 ## Part 5 — Phased implementation plan
@@ -33009,3 +33402,42 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
 
 Applied in the same change to: Part 0 (§0.1's reading order), Part 3 (D-28), §4.17 (new), GAPS (a §4.17 entry at the
 top), `research/vcs-servers.md` (new).
+
+### A-499 — The Mercurial server over greens and works (2026-11-18, g291 for UI goal 91; new §4.17.3; D-28, §4.17.1, §4.16)
+- **What it adds.** §4.17.3, built on §4.17.1 without redefining it: the decisions that are Mercurial's alone (a named
+  branch's heads as lines, each a green; bookmarks as greens moved by compare and swap; tags as content; phases as
+  attributes that only move toward public, with public never dropped or rewritten and secret never received;
+  obsolescence markers kept and exchanged, refused on a public predecessor; topics as review requests, chains of works;
+  the head and the base read from Mercurial's own check parts; the changesets the server makes and every field of
+  them; rebase on push with pushback, for clients that can apply it); the index in a revlog's shape; the wire surface
+  (SSH and HTTP version 1, every command and capability 7.2 serves, the changegroup versions, errors in Mercurial's
+  words); pull and push step by step; hooks on §4.17.1's three points; access in Mercurial's own orders; narrow,
+  shallow and large files; the revlog view for stream clones and hooks; hgweb and annotate by linelog; the learned
+  tunables in §4.17.1's form; failures and refusals; a worked example; Mercurial's runs for the tenfold claim and the
+  interop proof; AC-HG.1 to AC-HG.11; and thirteen pieces, in order, after §4.17.1's seven.
+- **From the sources.** Mercurial 7.2's documents and code (its Homebrew installation, read only) and hg-evolve
+  12.0.0 (its PyPI source distribution, read and deleted), read 2026-11-18, each fact cited to its file in
+  `research/mercurial-server.md`. Where Mercurial's document and its code disagree, both are cited and the code is
+  followed: `internals.changegroups` describes changegroup `04` as the sidedata format, while 7.2's code made `04` a
+  130-byte delta-information header and moved sidedata to `05` (that note's §3.3).
+- **Rejected.**
+  - A version per public changeset: §4.17.1 makes a version one value of a branch, one push, with the changesets in
+    between as its objects; a version per changeset would also have cost the engine a step per changeset of an import.
+  - Phases as roles, public in greens and every draft in a work: a non-publishing repository's drafts move its heads,
+    as in Mercurial, so drafts may sit on a line; only topics and review bookmarks are works.
+  - Rebasing every stale push on the server: a client without pushback and markers would keep its old changesets beside
+    the server's new ones. A stock client gets Mercurial's own race abort, and rebase on push is a line's policy for
+    clients that can apply what it returns.
+  - HTTP version 2 (`/api/*`, `hgrpc`): Mercurial documents it as experimental, and 7.2's own server does not serve it.
+  - Changegroup `04` to any client that lists it: the version's layout changed between releases.
+  - Keeping hidden changesets for good, as 7.2 does: RAM is bounded, so they go oldest first when the repository's
+    budget needs the room.
+  - 7.2's fixed serving numbers (`maxhttpheaderlen` 1024, `zliblevel`, `zstdlevel`, the stream-clone rule of thumb,
+    `_maxpayload` 5300): each is learned per deployment or replaced by a stated bound (§4.17.3 "Learned tunables").
+- **Asked of the shared pieces (sent to g261, 2026-11-18).** A register entry that also carries a repository's own
+  state (Mercurial's phase roots and markers) beside its greens' versions; checks on greens a push does not move
+  (`check:heads`), made in the same step; a submit's message and the principal's identity in the tool's form, for the
+  commits the server makes; one LFS store for git and Mercurial.
+- **Nothing is built.** No code changed; the GAPS entry tracks the pieces.
+
+Applied in the same change to: §4.17.3 (new), GAPS (a §4.17.3 entry at the top), `research/mercurial-server.md` (new).
