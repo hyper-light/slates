@@ -44,9 +44,9 @@ use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
 use slates_http_edge::connection::Fields;
 use slates_http_edge::credential;
+use slates_rt::futures::yield_now;
 use slates_svn::authz::PrincipalRules;
 use slates_svn::dav::Bounds as XmlBounds;
-use slates_rt::futures::yield_now;
 use slates_svn::dav::site::{
   self, Answer as SiteAnswer, Headers, Report, ReportProgress, Request, Served,
 };

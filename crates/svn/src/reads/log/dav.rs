@@ -180,12 +180,9 @@ impl DavLog {
     let revprops = match &report.revprops {
       AskedRevprops::Default => Revprops::Named(compat_revprops()),
       AskedRevprops::All => Revprops::All,
-      AskedRevprops::Named(names) => Revprops::Named(
-        names
-          .iter()
-          .map(|name| name.as_bytes().to_vec())
-          .collect(),
-      ),
+      AskedRevprops::Named(names) => {
+        Revprops::Named(names.iter().map(|name| name.as_bytes().to_vec()).collect())
+      }
     };
     let request = LogRequest {
       paths: report
@@ -263,4 +260,3 @@ impl DavLog {
     }
   }
 }
-

@@ -581,7 +581,10 @@ fn a_log_report_is_streamed_by_the_principals_rules() {
 <D:version-name>1</D:version-name>\n<D:creator-displayname>alice</D:creator-displayname>\n<S:date>{DATE}</S:date>\n\
 </S:log-item>\n</S:log-report>\n"
   );
-  let content_type = (b"Content-Type".to_vec(), b"text/xml; charset=\"utf-8\"".to_vec());
+  let content_type = (
+    b"Content-Type".to_vec(),
+    b"text/xml; charset=\"utf-8\"".to_vec(),
+  );
   assert_eq!(
     (status, fields, String::from_utf8(reply).unwrap()),
     (200, vec![content_type], expected)
@@ -798,8 +801,9 @@ fn stock_svn_reads_a_repository_through_the_site_over_https() {
       (false, true),
     )
   );
-  let unseen =
-    |(_, output): &(bool, String), hidden: &[&str]| hidden.iter().all(|word| !output.contains(word));
+  let unseen = |(_, output): &(bool, String), hidden: &[&str]| {
+    hidden.iter().all(|word| !output.contains(word))
+  };
   assert_eq!(
     (
       read(&log, &["r1 | alice |"]) && unseen(&log, &["the first"]),

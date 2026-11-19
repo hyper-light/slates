@@ -835,9 +835,19 @@ fn unlock_refused(request: &UnlockRequest, refusal: &LockRefusal, filesystem: &s
       let message = format!(
         "User '{user}' is trying to use a lock owned by '{owner}' in filesystem '{filesystem}'"
       );
-      error_answer(convert_status(code, HTTP_INTERNAL_SERVER_ERROR), true, code, &message)
+      error_answer(
+        convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+        true,
+        code,
+        &message,
+      )
     }
-    _ => error_answer(convert_status(code, HTTP_INTERNAL_SERVER_ERROR), false, code, UNLOCK_FAILED),
+    _ => error_answer(
+      convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+      false,
+      code,
+      UNLOCK_FAILED,
+    ),
   }
 }
 
@@ -853,7 +863,12 @@ fn lock_refused(refusal: &LockRefusal, filesystem: &str) -> HttpAnswer {
   let code = refusal.subversion_code();
   let message =
     lock_error_message(refusal, filesystem).unwrap_or_else(|| String::from(LOCK_FAILED));
-  error_answer(convert_status(code, HTTP_INTERNAL_SERVER_ERROR), true, code, &message)
+  error_answer(
+    convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+    true,
+    code,
+    &message,
+  )
 }
 
 /// FSFS's message for a refusal `append_locks` passes on with its own text (`SVN_ERR_IS_LOCK_ERROR`, no such lock):

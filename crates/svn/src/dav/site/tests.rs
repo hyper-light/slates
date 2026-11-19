@@ -551,8 +551,16 @@ fn log_items(body: &[u8]) -> Vec<(String, Vec<String>)> {
   report
     .elements()
     .map(|item| {
-      let revision = item.elements().find(|child| child.name == "version-name").unwrap().text();
-      let changed = item.elements().filter(|child| child.name.ends_with("-path")).map(change).collect();
+      let revision = item
+        .elements()
+        .find(|child| child.name == "version-name")
+        .unwrap()
+        .text();
+      let changed = item
+        .elements()
+        .filter(|child| child.name.ends_with("-path"))
+        .map(change)
+        .collect();
       (revision, changed)
     })
     .collect()
@@ -575,14 +583,32 @@ fn a_log_report_streams_its_walk_and_is_refused_before_its_first_byte() {
   let text = String::from_utf8(body.clone()).unwrap();
   let start = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:log-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n<S:log-item>\n";
   assert_eq!(
-    (headers, ended, text.starts_with(start), text.ends_with("</S:log-item>\n</S:log-report>\n")),
-    (vec![("Content-Type", String::from("text/xml; charset=\"utf-8\""))], ReportProgress::Done, true, true)
+    (
+      headers,
+      ended,
+      text.starts_with(start),
+      text.ends_with("</S:log-item>\n</S:log-report>\n")
+    ),
+    (
+      vec![("Content-Type", String::from("text/xml; charset=\"utf-8\""))],
+      ReportProgress::Done,
+      true,
+      true
+    )
   );
-  let changed = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect::<Vec<_>>();
+  let changed = |paths: &[&str]| {
+    paths
+      .iter()
+      .map(|path| (*path).to_owned())
+      .collect::<Vec<_>>()
+  };
   assert_eq!(
     log_items(&body),
     vec![
-      ("5".to_owned(), changed(&["modified-path /trunk/a.txt ", "added-path /trunk/big.txt "])),
+      (
+        "5".to_owned(),
+        changed(&["modified-path /trunk/a.txt ", "added-path /trunk/big.txt "])
+      ),
       (
         "4".to_owned(),
         changed(&[
@@ -607,7 +633,10 @@ xmlns:C=\"svn:\">\n<C:error/>\n<m:human-readable errcode=\"160013\">\n{words}\n<
   let ReportProgress::Refused(refused) = ended else {
     panic!("not refused before its first byte: {ended:?}");
   };
-  assert_eq!((written.len(), refused.status, text_of(&refused)), (0, 404, error));
+  assert_eq!(
+    (written.len(), refused.status, text_of(&refused)),
+    (0, 404, error)
+  );
 }
 
 /// A-681 (`dav_method_report`, `deliver_report`; the module doc's departure): do REPORT a log on a missing file, a
@@ -622,12 +651,17 @@ fn a_report_is_refused_by_its_resource_its_name_and_its_limit() {
     b"<S:log-report xmlns:S=\"svn:\"><S:limit>-1</S:limit><S:path></S:path></S:log-report>";
   let unserved = fixture.anonymous("REPORT", "/trunk", None, dated);
   let statuses = [
-    fixture.anonymous("REPORT", "/trunk/missing.txt", None, log).status,
+    fixture
+      .anonymous("REPORT", "/trunk/missing.txt", None, log)
+      .status,
     unserved.status,
     fixture.anonymous("REPORT", "/trunk", None, negative).status,
   ];
   assert_eq!(
-    (statuses, text_of(&unserved).contains("The requested report is unknown")),
+    (
+      statuses,
+      text_of(&unserved).contains("The requested report is unknown")
+    ),
     ([404, 501, 400], true)
   );
 }

@@ -62,7 +62,9 @@
 mod tests;
 
 use super::drive::uri_encode;
-use super::locking::{DAV_XML_CONTENT_TYPE, HttpAnswer, convert_status, error_answer, lockdiscovery};
+use super::locking::{
+  DAV_XML_CONTENT_TYPE, HttpAnswer, convert_status, error_answer, lockdiscovery,
+};
 use super::request::{self, PropertyName, PropfindRequest, Report as Asked, svn_time};
 use super::response::{self, Body, BulkUpdates, Capability, Httpv2, live_prop};
 use super::xml::{base64_lines, is_xml_safe, quote};
