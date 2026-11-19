@@ -792,9 +792,9 @@ impl<S> Work<'_, '_, S> {
       let Some(id) = blame_at(self.store, *tree, path)?.0 else {
         continue;
       };
-      if read_node(self.store, id)?.content == content {
+      if index == 0 && read_node(self.store, id)?.content == content {
         self.counters.kept = self.counters.kept.saturating_add(1);
-        return Ok((index > 0).then_some(id));
+        return Ok(None);
       }
       if !candidates.contains(&id) {
         candidates.push(id);
@@ -888,7 +888,9 @@ impl<S> Work<'_, '_, S> {
       }
       self.charge(diff_bytes(old.len(), file.len()))?;
       for (from, to) in matched(old, file).ok_or(BlameRefused::Exhausted)? {
-        if let (Some(slot), Some(line)) = (lines.get_mut(to), attribution.get(from)) {
+        if let (Some(slot), Some(line)) = (lines.get_mut(to), attribution.get(from))
+          && slot.is_none()
+        {
           *slot = Some(*line);
         }
       }
