@@ -19163,7 +19163,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   staged as a metadata entry is, to measure before it lands); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
-  that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
+  that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it,
+  **built by A-527 the same day** (`HostError::Win32`, a refusal in Win32's numbering beside `Unavailable`'s errno; the
+  Windows writer's rule pure in `crates/land/src/windows_codes.rs`, a name that exists and a full disk given their
+  errnos and every other code kept as itself; the Windows base host's codes typed so; the engine reading one as no kind
+  it tells apart; its unit tests ran on the Mac Studio, the Windows lanes filed for main; still owed with it: past the
+  seam one number field still holds either numbering — the landing report's `Failed { errno }`, the volume's
+  `BaseUnavailable`, the wire's `TargetRefusal::Host`, `HostAnswer::Errno` and `BaseUnavailable` — so a reader there
+  told the host is Windows' reads a Win32 code, and any other reads an errno; typing them is the wire's own piece, a
+  contract change; and the engine's own errnos are Linux's and macOS's numbers side by side, so an errno one platform
+  numbers as the other's kind (Linux's 45 `EL2NSYNC` as macOS's `ENOTSUP`, 69 `ESRMNT` as macOS's `EDQUOT`) would read
+  as that kind, which no call the writer makes is known to answer).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

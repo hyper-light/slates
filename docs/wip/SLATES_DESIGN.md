@@ -10220,7 +10220,12 @@ entry either old or new, never torn).
    exchange's temporary and a clear's fresh directory take the aside name, so the displaced entry
    lands there. An exchange back removes only the temporary by its descriptor's inode, or the fresh
    directory by the identity it had at its hidden name; anything else there is kept. The seam offers
-   no rename that replaces its destination.
+   no rename that replaces its destination. A refusal the seam gives a number is typed by the numbering it is in
+   (A-527): an errno (`HostError::Unavailable`) or a Win32 error code (`HostError::Win32`). The engine tells refusals
+   apart by an errno's number (a name that exists, a full disk, a verb the filesystem lacks), so the Windows writer gives
+   a Win32 code of such a kind that kind's errno and keeps every other one as the Win32 code it is: a Win32 code whose
+   number is one of those errnos (`ERROR_NOT_SAME_DEVICE` 17, `EEXIST`'s) never reads as it, and ends the landing as any
+   refusal the engine does not tell apart does.
 7. *Batches inside the landing (A-130).* A file is staged — written, given its mode and mtime, and
    written out — and waits, open at its hidden name, for its batch's barrier; then the batch's files
    are placed. A batch holds at most one copy window of pages (`chunk_bytes`), each file counted as at
@@ -35519,6 +35524,34 @@ case, `fleet.heal.adopted_replaced`).
   layout bump so a mixed fleet never reads an older build's confirmation as certified. An owner's settle certifies
   content the same way, and A-508's holders then drop content too. The replace could also run at once for an adopted
   volume rather than at the healer's cadence.
+
+### A-527 — The land seam's numbering is typed: a Win32 code is never read as the errno of its number (2026-11-19, g085, UI goal 88's O4; §4.15 step 6; A-185, A-458, A-519)
+Applied in the same change to: §4.15 step 6 (the rule), GAPS (A-185's owed numbering: built, with what it leaves),
+`crates/vfs` (`src/host/mod.rs`: `HostError::Win32`; `src/base.rs`: the base plane's two mappings), `crates/land`
+(`src/windows_codes.rs`, new, the Windows writer's rule, pure, and its test; `src/os_windows.rs`: `code_refusal` and
+`io_refusal` through it, the errnos of the kinds from it; `src/engine.rs`: a Win32 refusal read as no kind the engine
+tells apart), `crates/base` (`src/windows.rs`: the Windows host's codes typed) and `crates/server` (`src/error.rs`,
+`src/landing.rs`, `src/daemon.rs`, `src/verbs.rs`: a Win32 refusal passed on as its own number; the barrier thread's
+refusals typed by platform).
+- **What was there.** `HostError::Unavailable(i32)` carried an errno on Linux and macOS and, on Windows, either an errno
+  the writer chose for a kind the engine tells apart (`EEXIST`, `ENOSPC`, `EOPNOTSUPP`, `EPERM`) or a bare Win32 code.
+  The engine tells refusals apart by an errno's number, and five Win32 codes carry one of those numbers
+  (`ERROR_NOT_SAME_DEVICE` 17 `EEXIST`, `ERROR_BAD_COMMAND` 22 `EINVAL`, `ERROR_OUT_OF_PAPER` 28 `ENOSPC`,
+  `ERROR_TOO_MANY_SESS` 69 macOS's `EDQUOT`, `ERROR_INSUFFICIENT_BUFFER` 122 Linux's `EDQUOT`): a Windows refusal could
+  read as a name in use, a filesystem without an exchange, or a full disk.
+- **The rule.** A refusal the seam numbers is typed by its numbering: `Unavailable(errno)` or `Win32(code)`. The
+  Windows writer gives a code the errno of a kind the engine tells apart (`ERROR_FILE_EXISTS` and `ERROR_ALREADY_EXISTS`
+  `EEXIST`, `ERROR_HANDLE_DISK_FULL` and `ERROR_DISK_FULL` `ENOSPC`, and the writer's own choices of `EOPNOTSUPP` and
+  `EPERM` as before) and keeps every other as the Win32 code it is; the Windows base host's codes are typed so too. The
+  engine reads a Win32 refusal as no kind: a write it refuses ends the landing, a metadata entry's open it refuses fails
+  that entry alone, and a removal it refuses is the target in use, as an errno the engine does not tell apart is read.
+  Past the seam one number field holds either numbering, as before (GAPS).
+- **Tests.** Failing first on the Mac Studio (2026-11-19, kiln, load 19.1 to 25.6, debug): `cargo test --locked -p
+  slates-land --lib windows_codes` 1 of 1 failed, `a_win32_code_is_never_read_as_the_errno_of_its_number`, at
+  `ERROR_NOT_SAME_DEVICE` (`Unavailable(17)` where `Win32(17)` was wanted). With the change (load 18.4 to 19.3):
+  `slates-land --lib` 45 passed, the writer ignored; `slates-vfs --lib -- host::` 10 of 10; `slates-server --lib --
+  landing::` 12 of 12, the server compiled on macOS with its mappings; `cargo fmt` laid the test out. Windows only,
+  filed for main: the land suites and the Windows base host compiled and run there, with the xwin check and clippy.
 
 ### A-525 — A move's overdue bound and the telemetry horizon read the failover delay, and the anchor's crash-loop cap is the NFSv4 lease its daemon grants (2026-11-18, UI goal 86 via g076b: D-c, the 10 s placeholder's readers and L-h; R3; §4.4 "Derived constants", §4.10 "Ownership follows the writer", §4.14; A-291, A-311, A-363, A-414, A-425)
 
