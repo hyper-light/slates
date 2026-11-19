@@ -10,6 +10,7 @@
 
 use super::super::discovery::head_revs;
 use super::super::pull::{self, Outgoing};
+use super::super::session::{self, Refused, Step};
 use super::super::tests::{
   Changeset, History, ancestors, at, captured, hex, history, joined, node_for, room,
 };
@@ -456,7 +457,13 @@ fn headers(bundle: &Bundle2<'_>) -> Vec<Header> {
 fn check_getbundle(served: &Served, arguments: &Arguments<'_>, theirs: &[u8]) {
   let mut ours = Vec::new();
   getbundle(served, &asked(arguments), &mut room(), &mut ours).unwrap();
-  let ours = Bundle2::decode(&ours, &mut room()).unwrap();
+  check_streams(served, &ours, theirs);
+}
+
+/// Checks a bundle2 stream against 7.2's: its parameters, every part's header, each payload byte for byte but the
+/// changegroup's, which is compared by meaning.
+fn check_streams(served: &Served, ours: &[u8], theirs: &[u8]) {
+  let ours = Bundle2::decode(ours, &mut room()).unwrap();
   let theirs = Bundle2::decode(theirs, &mut room()).unwrap();
   assert_eq!(
     (&ours.params, headers(&ours)),
@@ -533,6 +540,268 @@ fn every_session_getbundle_answers_as_mercurial_meant_it() {
     checked,
     [&session[..], &session, &session, &["listkeys"]].concat()
   );
+}
+
+/// The answers the SSH version 1 session gives a client's bytes, one per request, then the empty line that ends it.
+fn serve_whole(served: &Served, client: &[u8]) -> Vec<Vec<u8>> {
+  let input = [client, b"\n"].concat();
+  let mut rest = input.as_slice();
+  let mut answers = Vec::new();
+  loop {
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    match session::serve(served, rest, &mut room(), &mut stdout, &mut stderr) {
+      Read::Done(Step::Answered { refused: None }, used) => {
+        answers.push(stdout);
+        rest = &rest[used..];
+      }
+      Read::Done(Step::Ended { refused: None }, used) if used == rest.len() => return answers,
+      other => panic!("{other:?}: {}", String::from_utf8_lossy(&stderr)),
+    }
+  }
+}
+
+/// Checks `hello`'s answer: a string holding a capabilities line of what is served, each capability one 7.2
+/// advertised with the same value, `bundle2`'s a subset of 7.2's.
+fn check_hello(ours: &[u8], theirs: &[u8]) {
+  let Ok(Read::Done(value, _)) = ssh::string(ours, &room()) else {
+    panic!("a string answer");
+  };
+  let ours = capabilities::decode_hello(value).unwrap();
+  let theirs = capabilities::decode_hello(theirs).unwrap();
+  let names: Vec<&[u8]> = ours.iter().map(|(name, _)| name).collect();
+  let served = [
+    &b"batch"[..],
+    b"branchmap",
+    b"bundle2",
+    b"getbundle",
+    b"known",
+    b"protocaps",
+  ];
+  assert_eq!(names, served);
+  for (name, value) in ours.iter() {
+    let held = theirs.get(name).unwrap();
+    if name == capabilities::BUNDLE2 {
+      check_bundle2_subset(value.unwrap(), held.unwrap());
+    } else {
+      assert_eq!(value, held);
+    }
+  }
+}
+
+/// Checks that every bundle2 capability of `ours`, and each of its values, is one of `theirs`.
+fn check_bundle2_subset(ours: &[u8], theirs: &[u8]) {
+  let (mut ours_quoted, mut theirs_quoted) = (Vec::new(), Vec::new());
+  let (mut ours_unquoted, mut theirs_unquoted) = (Vec::new(), Vec::new());
+  let ours = capabilities::decode_bundle2_value(ours, &mut room(), &mut ours_quoted).unwrap();
+  let theirs = capabilities::decode_bundle2_value(theirs, &mut room(), &mut theirs_quoted).unwrap();
+  let ours = capabilities::decode_bundle2(ours, &mut room(), &mut ours_unquoted).unwrap();
+  let theirs = capabilities::decode_bundle2(theirs, &mut room(), &mut theirs_unquoted).unwrap();
+  for (name, values) in ours.iter() {
+    let held = theirs.get(name).unwrap();
+    assert!(
+      values.iter().all(|value| held.contains(value)),
+      "{}",
+      String::from_utf8_lossy(name)
+    );
+  }
+}
+
+/// Checks one answer of the session against 7.2's: `hello` by its capabilities, `getbundle` by meaning, every other
+/// string byte for byte with its framing.
+fn check_answer(served: &Served, command: &[u8], theirs: &[u8], ours: &[u8]) {
+  match command {
+    b"hello" => check_hello(ours, theirs),
+    b"getbundle" => check_streams(served, ours, theirs),
+    _ => {
+      let mut framed = Vec::new();
+      ssh::respond(theirs, &mut framed);
+      assert_eq!(
+        String::from_utf8_lossy(ours),
+        String::from_utf8_lossy(&framed)
+      );
+    }
+  }
+}
+
+/// AC-HG.1 (golden), A-619 part 3: do serve each captured session whole through the SSH version 1 session (the
+/// client's bytes as 7.2's client wrote them, then the empty line that ends a session) from a store holding what 7.2
+/// had sent up to it. Expect `between`, `protocaps`, `batch` and `listkeys` answered byte for byte as 7.2 answered,
+/// `hello` a capabilities line of what is served (each capability one 7.2 advertised), every `getbundle` stream as 7.2
+/// meant it, and the session ended by its empty line with all of its input taken.
+#[test]
+fn every_session_is_served_whole_as_mercurial_served_it() {
+  let mut served = Served::default();
+  let mut answered = 0;
+  for session in SESSIONS {
+    served.history = captured(session.state, session.bookmarks);
+    let requests = requests(session.client);
+    let theirs = answers(session.server, &requests);
+    let at = requests
+      .iter()
+      .position(|(command, _)| *command == b"getbundle")
+      .unwrap();
+    served.take(theirs[at]);
+    let ours = serve_whole(&served, session.client);
+    assert_eq!(ours.len(), requests.len());
+    for (((command, _), theirs), ours) in requests.iter().zip(&theirs).zip(&ours) {
+      check_answer(&served, command, theirs, ours);
+      answered += 1;
+    }
+  }
+  assert_eq!(answered, 16);
+}
+
+/// What one session step answers `input` with: the step, stdout and stderr.
+fn step(served: &Served, input: &[u8], room: u64) -> (Read<Step>, Vec<u8>, Vec<u8>) {
+  let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+  let read = session::serve(
+    served,
+    input,
+    &mut Admission::new(room),
+    &mut stdout,
+    &mut stderr,
+  );
+  (read, stdout, stderr)
+}
+
+/// A request of one command and its arguments as 7.2's client frames them, the dictionary's entries in order.
+fn request(
+  command: &[u8],
+  named: &[(&[u8], &[u8])],
+  dictionary: Option<&[(&[u8], &[u8])]>,
+) -> Vec<u8> {
+  let mut out = [command, b"\n"].concat();
+  let line = |key: &[u8], len: usize| [key, b" ", len.to_string().as_bytes(), b"\n"].concat();
+  if let Some(entries) = dictionary {
+    out.extend_from_slice(&line(b"*", entries.len()));
+    for (key, value) in entries {
+      out.extend_from_slice(&[&line(key, value.len())[..], value].concat());
+    }
+  }
+  for (key, value) in named {
+    out.extend_from_slice(&[&line(key, value.len())[..], value].concat());
+  }
+  out
+}
+
+/// AC-HG.9 (hostile input), A-619 part 3: do send the session a name 7.2 lacks, a command 7.2 serves and this server
+/// does not (with its argument), a batch calling `getbundle`, a batch call without its space, `known` of a node that
+/// is not hex, and `getbundle` with no bundle2 capability. Expect an empty string for the unknown name; every other one
+/// answered out of band (an empty line on stdout, the words and `\n-\n` on stderr) naming its refusal by kind, each
+/// request taken whole, and the session going on.
+#[test]
+fn a_request_this_server_cannot_answer_is_refused_out_of_band() {
+  let served = cloned();
+  let unknown = step(&served, b"frobnicate\n", 1 << 20);
+  assert_eq!(
+    (unknown.0, unknown.1, unknown.2),
+    (
+      Read::Done(Step::Answered { refused: None }, 11),
+      b"0\n".to_vec(),
+      Vec::new()
+    )
+  );
+  let batch_of = |cmds: &[u8]| request(b"batch", &[(b"cmds", cmds)], Some(&[]));
+  for (input, refused) in [
+    (
+      request(b"lookup", &[(b"key", b"tip")], None),
+      Refused::NotServed,
+    ),
+    (batch_of(b"heads ;getbundle "), Refused::NotServed),
+    (
+      batch_of(b"heads"),
+      Refused::Batch(crate::batch::Refusal::Call { call: 0 }),
+    ),
+    (
+      request(b"known", &[(b"nodes", b"xyz")], Some(&[])),
+      Refused::Serve(Refusal::NodeList { at: 0 }),
+    ),
+    (
+      request(b"getbundle", &[], Some(&[(b"common", b"")])),
+      Refused::Serve(Refusal::NoBundle2),
+    ),
+  ] {
+    let (read, stdout, stderr) = step(&served, &input, 1 << 20);
+    assert_eq!(
+      (read, stdout),
+      (
+        Read::Done(
+          Step::Answered {
+            refused: Some(refused)
+          },
+          input.len()
+        ),
+        b"\n".to_vec()
+      )
+    );
+    assert!(stderr.ends_with(b"\n-\n") && stderr.len() > 3);
+  }
+}
+
+/// AC-HG.9, A-619 part 3: do ask `getbundle` of a bundle2 client that lists only changegroup version 01. Expect, as 7.2
+/// answers an abort of a bundle2 request, a bundle2 stream of one `ERROR:ABORT` part whose mandatory `message` is 7.2's
+/// "no common changegroup version", and nothing on stderr.
+#[test]
+fn a_bundle2_request_refused_is_answered_with_an_abort_part() {
+  let served = cloned();
+  let old = caps(b"HG20\nchangegroup=01");
+  let input = request(b"getbundle", &[], Some(&[(b"bundlecaps", &old)]));
+  let (read, stdout, stderr) = step(&served, &input, 1 << 20);
+  let refused = Refused::Serve(Refusal::NoCommonExchange {
+    what: "changegroup version",
+  });
+  assert_eq!(
+    (read, stderr),
+    (
+      Read::Done(
+        Step::Answered {
+          refused: Some(refused)
+        },
+        input.len()
+      ),
+      Vec::new()
+    )
+  );
+  let stream = Bundle2::decode(&stdout, &mut room()).unwrap();
+  let parts: Vec<(&[u8], Option<&[u8]>, usize)> = stream
+    .top_level()
+    .map(|(_, part)| (part.kind, part.param(b"message"), part.mandatory_params))
+    .collect();
+  assert_eq!(
+    parts,
+    [(
+      &b"ERROR:ABORT"[..],
+      Some(&b"no common changegroup version"[..]),
+      1
+    )]
+  );
+}
+
+/// AC-HG.9, A-619 part 3: do send the empty line that ends a session, part of a command line, part of an argument, an
+/// argument longer than the admission leaves, and a line longer than any command's. Expect the session ended by the
+/// empty line; more asked for each part, never an answer; and the last two answered out of band and the session ended,
+/// the rest of the input taken.
+#[test]
+fn a_session_ends_on_an_empty_line_or_an_unreadable_request() {
+  let served = cloned();
+  assert_eq!(
+    step(&served, b"\n", 1 << 20).0,
+    Read::Done(Step::Ended { refused: None }, 1)
+  );
+  for part in [&b"heads"[..], b"between\npairs 81\n000"] {
+    let (read, stdout, _) = step(&served, part, 1 << 20);
+    assert!(matches!(read, Read::More { needed } if needed > part.len()) && stdout.is_empty());
+  }
+  let long = [&b"between\npairs 99999\n"[..], &[b'0'; 64]].concat();
+  let line = vec![b'x'; 64];
+  for input in [long, line] {
+    let (read, stdout, stderr) = step(&served, &input, 1 << 10);
+    let ended = matches!(read, Read::Done(Step::Ended { refused: Some(Refused::Request(_)) }, used) if used == input.len());
+    assert!(
+      ended && stdout == b"\n" && stderr.ends_with(b"\n-\n"),
+      "{read:?}"
+    );
+  }
 }
 
 /// Shape: the paths a generated history's changesets edit, few enough that branches often edit one alike.
@@ -1162,6 +1431,22 @@ proptest! {
     prop_assume!(history.count() > 0);
     let (ours, oracle) = both_packings(history, &edits, &heads, &common);
     prop_assert_eq!(ours, oracle);
+  }
+
+  /// AC-HG.9 (hostile input), A-619 part 3: do feed the session arbitrary bytes, step after step. Expect each step to
+  /// ask for more than it holds, or to take between one byte and all of it, until the session ends or the input runs
+  /// out; never a panic.
+  #[test]
+  fn arbitrary_session_input_never_panics(input in proptest::collection::vec(any::<u8>(), 0..300)) {
+    let served = cloned();
+    let mut rest = input.as_slice();
+    while let (Read::Done(done, used), _, _) = step(&served, rest, 1 << 16) {
+      prop_assert!(used > 0 && used <= rest.len());
+      rest = rest.get(used..).unwrap_or_default();
+      if matches!(done, Step::Ended { .. }) {
+        break;
+      }
+    }
   }
 
   /// AC-HG.9 (hostile input), A-619: do ask the clone's store for arbitrary heads, common nodes, capabilities, booleans
