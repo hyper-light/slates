@@ -472,11 +472,26 @@ fn lent_to_read<T>(
 ) -> T {
   lend(store, stores, 0);
   let answer = read(stores);
+  set_back(stores);
+  answer
+}
+
+/// [`lent_to_read`] over the whole shard's state: what a step needs that reads the stores beside the shard's greens and
+/// records, as git's push judges each command over the greens, its repository's store and its quarantine at once
+/// (A-654). Read only, so the room lent is given back and nothing is charged.
+pub(crate) fn with_room<T>(state: &mut ShardState, read: impl FnOnce(&ShardState) -> T) -> T {
+  lend(&mut state.store, &mut state.vcs_stores, 0);
+  let answer = read(state);
+  set_back(&mut state.vcs_stores);
+  answer
+}
+
+/// Sets the content store's budget back to what is charged after a read lent room ([`lent_to_read`], [`with_room`]).
+fn set_back(stores: &mut VcsStores) {
   let charged = stores.charged;
   if let Some(content) = stores.content.as_mut() {
     content.set_budget(charged);
   }
-  answer
 }
 
 /// A git push in its quarantine (§4.17.2 "A push" item 3): each object admitted to the repository's store as it comes
@@ -515,10 +530,11 @@ impl SealedPush {
     self.repository
   }
 
-  /// Its objects, in quarantine until a commit takes them: what a hook's view shows of the push
-  /// (`crate::git_hooks`, A-665 part 2), in git's quarantine for `pre-receive` and among the
-  /// repository's packs for `update`.
-  pub(crate) fn push(&self) -> &Push {
+  /// The objects it holds in quarantine, read only: what a ref's work is read from beside the repository's index
+  /// (A-638's `PushedObjects`), and how a move changes its ref (A-644's `Repository::change`), as git's push judges
+  /// each command (A-654). Also what a hook's view shows of the push (`crate::git_hooks`, A-665
+  /// part 2): in git's quarantine for `pre-receive`, among the repository's packs for `update`.
+  pub(crate) fn quarantine(&self) -> &Push {
     &self.push
   }
 

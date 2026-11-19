@@ -42,7 +42,9 @@
 //! attachment the mount edges serve a read at a time from [`GitHookView::read`] (on Linux inside
 //! the launcher's namespace, §4.6), where only its tests present it today, by writing it into a
 //! scratch directory; its seals kept as derived data across views, since a pack's name hashes what
-//! it is made from; receive-pack's calls (A-654); and git's words for each outcome.
+//! it is made from; the calls of git's push driver (`crate::git_push`, A-654 part 2), which
+//! answers every command `hook not run` while a git hook is configured until they land; and git's
+//! words for each outcome.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -102,8 +104,8 @@ impl<'p> ShownPush<'p> {
   /// The push as part 1's view takes it.
   fn pushed(self) -> Pushed<'p> {
     match self {
-      ShownPush::Quarantined(sealed) => Pushed::Quarantined(sealed.push()),
-      ShownPush::Migrated(sealed) => Pushed::Migrated(sealed.push()),
+      ShownPush::Quarantined(sealed) => Pushed::Quarantined(sealed.quarantine()),
+      ShownPush::Migrated(sealed) => Pushed::Migrated(sealed.quarantine()),
     }
   }
 
