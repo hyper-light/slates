@@ -17,6 +17,11 @@
 //! `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it); it lacks `lookup` (a pull of a named revision is refused
 //! by the client), `pushkey`, `unbundle` and stream clones, which later pieces serve.
 //!
+//! **Shared with HTTP** (A-650 part 1). [`dispatch`] answers a command whatever carries it, giving 7.2's three kinds
+//! of answer (a string, a stream, an error out of band) for its transport to frame. The transport decides what
+//! `capabilities` and `hello` list (over HTTP, `compression`, `httpheader` and `httpmediatype` beside the rest, and no
+//! `protocaps`) and the words a bundle1 `getbundle` is refused with (over HTTP, 7.2's own).
+//!
 //! **Stricter than 7.2, on purpose.** A request that cannot be read (a line too long for any command, an argument past
 //! the admission) is answered out of band and ends the session, where 7.2 fails mid-stream. A command's own refusal is
 //! answered out of band and the session goes on, where 7.2's exceptions end the process. A batch call of a command that
@@ -25,9 +30,10 @@
 use super::getbundle::{Asked, Store, getbundle};
 use super::{Refusal, discovery, pull};
 use crate::bundle2::{Bundle2, Event, Param, Part};
+use crate::decimal::Decimal;
 use crate::ssh::{self, Read};
 use crate::wire::{Arguments, Spec};
-use crate::{Admission, PastAdmission, batch, capabilities, pushkey};
+use crate::{Admission, PastAdmission, batch, capabilities, compression, http, pushkey};
 
 /// Format: 7.2's version 1 commands and their argument specs (`wireprotov1server.commands`).
 const COMMANDS: [(&[u8], &[u8]); 21] = [
@@ -76,6 +82,33 @@ const BUNDLE2_SERVED: [(&[u8], &[&[u8]]); 7] = [
   (b"phases", &[b"heads"]),
 ];
 
+/// Format: the capabilities advertised over HTTP, sorted as `capabilities` sorts them: SSH's but `protocaps` (an HTTP
+/// client says what it reads in `X-HgProto`), and what 7.2's `httpv1protocolhandler.addcapabilities` adds beside
+/// `batch`: `compression`, `httpheader` and `httpmediatype`.
+const SERVED_HTTP: [&[u8]; 8] = [
+  b"batch",
+  b"branchmap",
+  b"bundle2",
+  b"compression",
+  b"getbundle",
+  b"httpheader",
+  b"httpmediatype",
+  b"known",
+];
+
+/// Format: `compression`'s value over HTTP: the engines a `0.2` answer may be written in, each of A-598's by its wire
+/// name; which one an answer takes is its caller's choice ([`super::http::Compressor`]).
+const HTTP_ENGINES: &[u8] = b"zstd,zlib,bzip2,none";
+
+/// Format: `httpmediatype`'s value, as 7.2 advertises it: `0.1` requests read (`rx`), `0.1` and `0.2` answers written
+/// (`tx`).
+const HTTP_MEDIA_TYPES: &[u8] = b"0.1rx,0.1tx,0.2tx";
+
+/// Format: 7.2's answer over HTTP to a bundle1 `getbundle` where bundle2 is required (`wireprotov1server.py`'s
+/// `bundle2required`: the message, then the hint in parentheses, each line ended).
+const BUNDLE2_REQUIRED: &[u8] = b"incompatible Mercurial client; bundle2 required\n\
+  (see https://www.mercurial-scm.org/wiki/IncompatibleClient)\n";
+
 /// Format: `protocaps`' answer.
 const OK: &[u8] = b"OK";
 
@@ -119,6 +152,18 @@ pub enum Refused {
   },
   /// The command's own refusal.
   Serve(Refusal),
+  /// An HTTP request whose arguments could not be read (A-650 part 1, [`super::http`]).
+  Http(http::Refusal),
+  /// An HTTP request naming no command 7.2's table holds (7.2: "requested wire protocol command is not available over
+  /// HTTP").
+  NotAvailable,
+  /// A stream answer its chosen engine could not compress.
+  Compression(compression::EncodeRefusal),
+  /// A stream answer's compression chosen in an engine the client does not read.
+  EngineNotRead {
+    /// The engine.
+    engine: compression::Engine,
+  },
   /// A request that needs more input than its channel lets the client send unconsumed, so it can never be whole
   /// (A-650 part 2, [`super::stdio`]).
   PastWindow {
@@ -169,11 +214,7 @@ pub fn serve(
   if command.is_empty() {
     return Read::Done(Step::Ended { refused: None }, used);
   }
-  let Some(spec) = COMMANDS
-    .iter()
-    .find(|(name, _)| *name == command)
-    .map(|(_, spec)| Spec(*spec))
-  else {
+  let Some(spec) = spec_of(command) else {
     ssh::respond(&[], stdout);
     return Read::Done(Step::Answered { refused: None }, used);
   };
@@ -207,7 +248,8 @@ fn ended(
   )
 }
 
-/// Answers one read request; the refusal its error answer reports, if any.
+/// Answers one read request over SSH, framed as 7.2 frames it there (`_runsshserver`): a string as `<length>\n<value>`,
+/// a stream as it is, an error out of band; the refusal its error answer reports, if any.
 fn answer(
   store: &impl Store,
   command: &[u8],
@@ -217,36 +259,100 @@ fn answer(
   stdout: &mut Vec<u8>,
   stderr: &mut Vec<u8>,
 ) -> Option<Refused> {
+  let (answered, refused) = dispatch(store, Transport::Ssh, command, spec, arguments, admission);
+  match answered {
+    Answer::Bytes(value) => match admission.charge(ssh::respond_len(&value)) {
+      Ok(()) => {
+        ssh::respond(&value, stdout);
+        refused
+      }
+      Err(past) => {
+        let refused = Refused::from(past);
+        ssh::respond_error(&message(&refused), stdout, stderr);
+        Some(refused)
+      }
+    },
+    Answer::Stream { stream, .. } => {
+      stdout.extend_from_slice(&stream);
+      refused
+    }
+    Answer::OutOfBand(words) => {
+      ssh::respond_error(&words, stdout, stderr);
+      refused
+    }
+  }
+}
+
+/// Which transport a command is answered over (§4.17.3 "The wire surface"): what `capabilities` and `hello` list, and
+/// the words a bundle1 `getbundle` is refused with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transport {
+  /// SSH version 1 (this module's session).
+  Ssh,
+  /// HTTP version 1 ([`super::http`]).
+  Http {
+    /// `httpheader`: the longest header line the server's edge reads, which a client splits its arguments to.
+    header_line: u64,
+  },
+}
+
+/// A command's answer before its transport frames it: 7.2's three kinds of answer (`wireprototypes`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+  /// A string (`bytesresponse`).
+  Bytes(Vec<u8>),
+  /// A bundle2 stream (`streamres`): `getbundle`'s, or the abort part 7.2 answers a refused bundle2 request with, which
+  /// 7.2 sends uncompressed (`prefer_uncompressed`).
+  Stream {
+    /// The stream.
+    stream: Vec<u8>,
+    /// Whether 7.2 sends it uncompressed.
+    prefer_uncompressed: bool,
+  },
+  /// An error out of band (`ooberror`): its words.
+  OutOfBand(Vec<u8>),
+}
+
+/// The argument spec 7.2 reads `command`'s arguments by (`wireprotov1server.commands`), `None` for a name its table
+/// lacks.
+pub(crate) fn spec_of(command: &[u8]) -> Option<Spec<'static>> {
+  COMMANDS
+    .iter()
+    .find(|(name, _)| *name == command)
+    .map(|(_, spec)| Spec(*spec))
+}
+
+/// Answers `command`, its arguments read by `spec`, over `transport`: its answer, and the refusal an error answer
+/// reports. Everything held is charged to `admission`.
+pub(crate) fn dispatch(
+  store: &impl Store,
+  transport: Transport,
+  command: &[u8],
+  spec: Spec<'_>,
+  arguments: &Arguments<'_>,
+  admission: &mut Admission,
+) -> (Answer, Option<Refused>) {
   if command == b"getbundle" {
-    return getbundle_answer(store, arguments, admission, stdout, stderr);
+    return getbundle_answer(store, transport, arguments, admission);
   }
   let mut value = Vec::new();
   let answered = if command == b"batch" {
     let cmds = arguments.get(spec, b"cmds").unwrap_or_default();
-    batch_answer(store, cmds, admission, &mut value)
+    batch_answer(store, transport, cmds, admission, &mut value)
   } else {
     let named = |name: &[u8]| arguments.get(spec, name);
-    string_answer(store, command, named, admission, &mut value)
+    string_answer(store, transport, command, named, admission, &mut value)
   };
-  match answered.and_then(|()| {
-    admission
-      .charge(ssh::respond_len(&value))
-      .map_err(Refused::from)
-  }) {
-    Ok(()) => {
-      ssh::respond(&value, stdout);
-      None
-    }
-    Err(refused) => {
-      ssh::respond_error(&message(&refused), stdout, stderr);
-      Some(refused)
-    }
+  match answered {
+    Ok(()) => (Answer::Bytes(value), None),
+    Err(refused) => (Answer::OutOfBand(message(&refused)), Some(refused)),
   }
 }
 
 /// Writes the answer of a command that answers a string, its arguments found by name.
 fn string_answer<'a>(
   store: &impl Store,
+  transport: Transport,
   command: &[u8],
   argument: impl Fn(&[u8]) -> Option<&'a [u8]>,
   admission: &mut Admission,
@@ -260,10 +366,10 @@ fn string_answer<'a>(
     b"branches" => discovery::branches(store, need(b"nodes")?, admission, out)?,
     b"branchmap" => discovery::branchmap(store, admission, out)?,
     b"listkeys" => pull::listkeys(store, need(b"namespace")?, admission, out)?,
-    b"capabilities" => advertised(admission, out)?,
+    b"capabilities" => advertised(transport, admission, out)?,
     b"hello" => {
       let mut line = Vec::new();
-      advertised(admission, &mut line)?;
+      advertised(transport, admission, &mut line)?;
       capabilities::encode_hello(&line, out);
     }
     b"protocaps" => out.extend_from_slice(OK),
@@ -272,21 +378,32 @@ fn string_answer<'a>(
   Ok(())
 }
 
-/// Writes the capabilities line: [`SERVED`], `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`].
-fn advertised(admission: &mut Admission, out: &mut Vec<u8>) -> Result<(), Refused> {
+/// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`]; over HTTP [`SERVED_HTTP`],
+/// `httpheader`'s value the transport's; `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`].
+fn advertised(
+  transport: Transport,
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
   let mut blob = Vec::new();
   capabilities::encode_bundle2(&BUNDLE2_SERVED, &mut blob);
   let mut quoted = Vec::new();
   capabilities::encode_bundle2_value(&blob, &mut quoted);
-  let line: Vec<(&[u8], Option<&[u8]>)> = SERVED
-    .iter()
-    .map(|name| {
-      (
-        *name,
-        (*name == capabilities::BUNDLE2).then_some(quoted.as_slice()),
-      )
-    })
-    .collect();
+  let (names, header_line): (&[&[u8]], u64) = match transport {
+    Transport::Ssh => (&SERVED, 0),
+    Transport::Http { header_line } => (&SERVED_HTTP, header_line),
+  };
+  let header_line = Decimal::unsigned(header_line);
+  let value = |name: &[u8]| -> Option<&[u8]> {
+    match name {
+      b"bundle2" => Some(quoted.as_slice()),
+      b"compression" => Some(HTTP_ENGINES),
+      b"httpheader" => Some(header_line.as_bytes()),
+      b"httpmediatype" => Some(HTTP_MEDIA_TYPES),
+      _ => None,
+    }
+  };
+  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(name))).collect();
   let len = line.iter().fold(0_usize, |total, (name, value)| {
     total
       .saturating_add(name.len())
@@ -305,6 +422,7 @@ fn advertised(admission: &mut Admission, out: &mut Vec<u8>) -> Result<(), Refuse
 /// a string is refused, and with it the batch.
 fn batch_answer(
   store: &impl Store,
+  transport: Transport,
   cmds: &[u8],
   admission: &mut Admission,
   out: &mut Vec<u8>,
@@ -325,7 +443,14 @@ fn batch_answer(
         .map(|(_, value)| *value)
     };
     let mut result = Vec::new();
-    string_answer(store, call.command, argument, admission, &mut result)?;
+    string_answer(
+      store,
+      transport,
+      call.command,
+      argument,
+      admission,
+      &mut result,
+    )?;
     results.push(result);
   }
   let total = results.iter().fold(0_u64, |total, result| {
@@ -341,15 +466,14 @@ fn batch_answer(
   Ok(())
 }
 
-/// Answers a `getbundle`: its stream; a refusal of a bundle2 request as an `ERROR:ABORT` part, of a bundle1 request
-/// out of band.
+/// Answers a `getbundle`: its stream; a refusal of a bundle2 request as an `ERROR:ABORT` part, sent uncompressed; of a
+/// bundle1 request out of band, over HTTP in 7.2's own words ([`BUNDLE2_REQUIRED`]).
 fn getbundle_answer(
   store: &impl Store,
+  transport: Transport,
   arguments: &Arguments<'_>,
   admission: &mut Admission,
-  stdout: &mut Vec<u8>,
-  stderr: &mut Vec<u8>,
-) -> Option<Refused> {
+) -> (Answer, Option<Refused>) {
   let asked = Asked {
     heads: arguments.entry(b"heads").unwrap_or_default(),
     common: arguments.entry(b"common").unwrap_or_default(),
@@ -363,18 +487,33 @@ fn getbundle_answer(
   let mut stream = Vec::new();
   let refusal = match getbundle(store, &asked, admission, &mut stream) {
     Ok(()) => {
-      stdout.extend_from_slice(&stream);
-      return None;
+      let answer = Answer::Stream {
+        stream,
+        prefer_uncompressed: false,
+      };
+      return (answer, None);
     }
     Err(refusal) => refusal,
   };
-  let bundle1 = refusal == Refusal::NoBundle2;
   let refused = Refused::Serve(refusal);
-  let words = message(&refused);
-  if bundle1 || abort_stream(&words, stdout).is_err() {
-    ssh::respond_error(&words, stdout, stderr);
+  let words = match (refusal, transport) {
+    (Refusal::NoBundle2, Transport::Http { .. }) => BUNDLE2_REQUIRED.to_vec(),
+    _ => message(&refused),
+  };
+  if refusal == Refusal::NoBundle2 {
+    return (Answer::OutOfBand(words), Some(refused));
   }
-  Some(refused)
+  let mut abort = Vec::new();
+  match abort_stream(&words, &mut abort) {
+    Ok(()) => {
+      let answer = Answer::Stream {
+        stream: abort,
+        prefer_uncompressed: true,
+      };
+      (answer, Some(refused))
+    }
+    Err(_) => (Answer::OutOfBand(words), Some(refused)),
+  }
 }
 
 /// Appends a bundle2 stream of one `ERROR:ABORT` part carrying `words` (`wireprotov1server.getbundle`'s answer to an
@@ -407,6 +546,14 @@ pub(super) fn message(refused: &Refused) -> Vec<u8> {
       format!("missing argument {}", String::from_utf8_lossy(name))
     }
     Refused::Serve(refusal) => serve_message(refusal),
+    Refused::Http(refusal) => format!("unreadable request: {refusal:?}"),
+    Refused::NotAvailable => {
+      "requested wire protocol command is not available over HTTP".to_owned()
+    }
+    Refused::Compression(refusal) => format!("the answer could not be compressed: {refusal:?}"),
+    Refused::EngineNotRead { engine } => {
+      format!("the answer's engine {engine:?} is not one the client reads")
+    }
     Refused::PastWindow { needed, capacity } => {
       format!("a request of {needed} bytes is past the channel's window of {capacity}")
     }

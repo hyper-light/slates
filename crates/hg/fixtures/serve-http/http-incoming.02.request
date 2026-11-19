@@ -1,0 +1,9 @@
+GET /?cmd=batch HTTP/1.1
+Accept-Encoding: identity
+vary: X-HgArg-1,X-HgProto-1
+x-hgarg-1: cmds=heads+%3Bknown+nodes%3D915f4e5fb110061d475cb0b49317192f6545e945+ead0123e146ac0258da45482be6c41cf02e275d5+bc458a12b6379f5848e6b0adf458be552adc72be+36cd38c37546278c0100f8934acd9fabe60788e6
+x-hgproto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull
+accept: application/mercurial-0.1
+host: 127.0.0.1:50531
+user-agent: mercurial/proto-1.0 (Mercurial 7.2)
+

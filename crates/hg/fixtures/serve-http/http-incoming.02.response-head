@@ -1,0 +1,6 @@
+HTTP/1.1 200 Script output follows
+Server: BaseHTTP/0.6 Python/3.12.16
+Date: Thu, 19 Nov 2026 07:07:00 GMT
+Content-Type: application/mercurial-0.1
+Content-Length: 169
+
