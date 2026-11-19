@@ -278,6 +278,21 @@
 > (A-603) with A-614's store as the repository; then the fsck checks of new objects, the server loop over one
 > connection, review requests over `refs/for/`, hidden refs and signed pushes. Clippy, `xtask` and the lint matrix
 > over the change are main's (run requests).
+> **A-618 (2026-11-19, g225; shared piece 4, works from a client's push):** built in the engine
+> (`slates_merge::push`). A push's base tree and pushed tree are compared by the tool's ids through `PushObjects`, never
+> reading a subtree whose id stayed, and become the work §4.17.1 items 2 and 3 name, the head as `slates.vcs.head` on
+> the root; composed against the green, the post-state the pushed blobs, every operation and byte charged to the
+> caller's room, every refusal typed. An oracle comparing the whole trees key by key matched every build byte for byte
+> with the exact reads a walk by identity makes, over 256 generated histories whose census met skipped subtrees, refused
+> kind changes, removed directories, modes, links and whole-file replacements; the client-fidelity test after every
+> accepted push found, and the engine now fixes, a removed file's or directory's mode and attributes outliving it (bug
+> record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
+> --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
+> mutation. Owed: git's store
+> implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6); submodule links (§4.17.2
+> item 5's special node kind); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
+> 64-bit path indices ended the 65,535-name cap this piece first refused past).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
@@ -415,32 +430,34 @@
 > the Mac Studio (see A-609). Owed from it: the update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK,
 > `list-report` and `file-revs-report`, and main's live capture against `mod_dav_svn`. A-627 (2026-11-19, g250):
 > `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token`
-> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued); owed: the replay
-> drive, LOCK's answer, and LOCK and UNLOCK onto the A-602 guards. A-531 (2026-11-19): the ra_svn item codec, its bounds
-> the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see
-> A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities,
-> predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive
-> filesystem applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on
-> the Mac Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store,
-> §4.17.1 shared piece 3), and a large revision applied in slices (with the server). A-605 (2026-11-19, g262, UI goal
-> 92): mergeinfo, piece 9: the `svn:mergeinfo` value read and written as Subversion reads and writes it, every refusal
-> typed by its message; the range-list algebra transcribed from `mergeinfo.c`, Subversion's inexact walk with
-> inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over the index, its descendants found
-> by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem on generated
-> histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed from it: `svn
-> mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra with piece 7's location segments and
-> log; the property's UTF-8 and CR checks with piece 7's property validation. A-613 (2026-11-19, g262, UI goal 93), its
-> first part: the ra_svn read commands' sans-io handler, `get-latest-rev`, `get-dated-rev`, `rev-proplist`, `rev-prop`,
-> `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to transcripts of stock `svnserve` 1.15.0
-> (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac Studio, red-checked
-> six ways (see A-613). Owed from it: the other read commands, then `svn mergeinfo --show-revs`, and read access by
-> A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state machine that does
-> no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by a relay
-> (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the greeting's
-> `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's `hmac` and
-> `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 139 of 139 on the Mac Studio
-> over main (575188f7f), the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the URL's
-> canonical form, the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
+> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued); owed: the
+> replay drive, LOCK's answer, and LOCK and UNLOCK onto the A-602 guards. A-531 (2026-11-19): the ra_svn item codec, its
+> bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
+> (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
+> identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
+> oracle a naive filesystem applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p
+> slates-svn --lib` on the Mac Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with
+> the object store, §4.17.1 shared piece 3), and a large revision applied in slices (with the server). A-605
+> (2026-11-19, g262, UI goal 92): mergeinfo, piece 9: the `svn:mergeinfo` value read and written as Subversion reads and
+> writes it, every refusal typed by its message; the range-list algebra transcribed from `mergeinfo.c`, Subversion's
+> inexact walk with inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over the index, its
+> descendants found by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem
+> on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed
+> from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra with piece 7's
+> location segments and log; the property's UTF-8 and CR checks with piece 7's property validation. A-613 (2026-11-19,
+> g262, UI goal 93), its first part: the ra_svn read commands' sans-io handler, `get-latest-rev`, `get-dated-rev`,
+> `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to transcripts of stock
+> `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac
+> Studio, red-checked six ways (see A-613); its second part's first slice, `get-dir` and `get-locations`, the two stock
+> sessions waiting on them replayed whole. Owed from it: `get-file`, `list`, `log` with merged revisions,
+> `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then `svn mergeinfo --show-revs`, and read access by
+> A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
+> machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
+> a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
+> greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's
+> `hmac` and `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 139 of 139 on the Mac
+> Studio over main (575188f7f), the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the
+> URL's canonical form, the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
 > (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and `svn_path_remove_components`),
 > with piece 7's connection task, which today gives the handshake those values; (2) a limit on failed attempts per
 > principal and per address, learned (`svnserve`'s loop has none, and neither has the handshake), with §4.13's
@@ -9511,6 +9528,11 @@ The merge engine on one node landed the same day (`engine.rs`), composing the pu
 
 Owed (the rest of Phase 6): the deriver's interaction edges (a file/directory/symlink/link transition at one path, a metadata or link then a rename of that path, symlink rename, a write through a hard link, and the rare reused-base-path rename combination above), each a typed refusal today; the engine now consumes the whole ops document (`6164ef9`), so every namespace kind merges through it — directory creation, mode, symlink, file rename, directory removal, hard link and xattr — and several dimensions on one path in one increment merge together; the fully general intra-increment coordination (a path both renamed away and recreated in one increment) remains; per-range identity in the engine's verdict; the checkpoint folding above; the fenced ledger-register commit and holder recomputation in a fleet (the single-node commit is an in-memory chain append; the fleet register, mirror and reconfiguration protocols are now simulated, §8h); these build on the
 green-volume data model (§4.5's journal is in place; the fleet version chain is not yet).
+
+**Found by A-618 (2026-11-19), fixed by A-621:** an ops document's `u16` path table aliased every name past the
+65,535th; A-621's entry above records the fix, and A-618's push refuses nothing for its size. **Closed by A-618:** a
+removed file's or directory's mode and attributes stayed in the green, so a path made again took them; they now go with
+it, as a special node's did (`docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`).
 
 ## 8g. Phase 7 groundwork (2026-09-05)
 

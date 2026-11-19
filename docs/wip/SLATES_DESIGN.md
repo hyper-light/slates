@@ -11486,6 +11486,14 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > **Status (2026-11-19, A-534).** Built in the engine: `crates/merge/src/ptrie.rs` (the tree), `crates/merge/src/dims.rs`
 > (the eight maps), `crates/merge/src/engine/branch.rs` (`Lineage`).
 >
+> **Status (2026-11-19, A-618).** Two rules of the state. The root, the empty path (the server keys a volume's `/` so),
+> is always present for modes and attributes: the deriver composes them and the engine lands them, which a push's head
+> needs (§4.17.1 "A push is a work" item 3) and an agent's `chmod` or `setxattr` of a mount's root declared to a refusal
+> before. And a removed file or directory takes its mode and attributes with it once nothing stands at its path, as a
+> special node's did: they are the inode's, so a path made again starts without them (`Green::drop_metadata`; a rename
+> or a file made again within one version keeps them). The removal is recorded as any change is (the history keeps the
+> values, the identity and the verdict's change index see it).
+>
 > **Status (2026-11-19, A-575).** The server holds a repository's greens in one lineage on the repository's partition
 > (`crates/server/src/greens.rs`): a verb lends a member's engine out of its lineage for one borrow (`Lent`) and every
 > other lend of that lineage meanwhile is refused and counted; a member's destroy retires it at once and gives what
@@ -11835,6 +11843,30 @@ is one more version, and the chain itself is never rewritten.
 > (§4.10).
 
 **A push is a work.**
+
+> **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
+> into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
+> the tool named them by, read through `PushObjects` (tree entries, a blob's length, a blob's bytes; a store implements
+> it, git's over `slates-vcs` in §4.17.2 piece 5), on an explicit stack; a subtree whose id is the base's is never read,
+> so a push costs the directories on the paths it changed (counted: trees read, blobs read, subtrees skipped). It makes
+> the operations item 2 names: a changed file replaced whole (`Truncate` then its bytes, which the deriver composes into
+> one `Delete` of the base length and one `Insert`), `Create`, `Unlink`, `Mkdir` before what a directory holds, `Rmdir`
+> after it, `SetMode` 0755 for an executable and 0644 for a file that stops being one, `Symlink`; and item 3's head, one
+> `SetXattr` of `slates.vcs.head` on the root, the empty path, which the deriver and the engine now hold always present
+> (§4.16). It composes them against the green's base, lays the post-state from the pushed blobs, charges every
+> operation, queued step and byte against the caller's room as it is made (a file's length before its bytes), and
+> refuses typed: a base the green does not hold, an object the store cannot give as its kind, a name or a link target
+> slates cannot hold, a name twice in a tree, a submodule link (its special node kind is §4.17.2 item 5's, owed), a path
+> that changes kind (the deriver's composition is owed, GAPS §8f), a work past its room (which bounds a push of any
+> size: an ops document names as many paths as its work declares since A-621, and a push of 70,000 paths lands as one
+> work), and a base the green disagrees with. Item 4's client-fidelity test runs after every push of generated
+> histories, and found that a removed file or directory left its mode and attributes in the green, so a path made again
+> took them (a file deleted and pushed again as plain kept the deleted one's mode 0755); a removed file or directory now
+> takes its mode and attributes with it, as a special node's did (§4.16). Owed: git's tree entries mapped onto
+> `PushObjects` by git's store (piece 5) and the receive-pack verb that submits the work (§4.17.2 piece 6); submodule
+> links; kind transitions; one copy of a pushed blob's bytes shared by the store and the green (A-581's owed content
+> index); the post-state assembly shared with the server's (`verbs::assemble_post_state`), so the two never lay a
+> document out apart.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -13202,9 +13234,12 @@ and export by landing).
 > Held to transcripts of stock `svnserve` 1.15.0 answering stock `svn` 1.15.0 and scripted clients
 > (`crates/svn/fixtures/reads`, recorded by its `make-fixtures.py` through a relay, each file's SHA-256 in
 > `SHA256SUMS`), property lists compared as sets: `svnserve` writes them in APR's per-table seeded hash order, three
-> recordings gave three orders, and slates writes them in name order. Owed: `get-file`, `get-dir`, `list`, `log` with
-> merged revisions, `get-locations`, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then
-> `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
+> recordings gave three orders, and slates writes them in name order. Its second part's first slice (2026-11-19):
+> `get-dir` (the node's and the entry properties, the dirent fields asked for, the ancestors' properties) and
+> `get-locations` (`svn_repos_trace_node_locations` over the index: the closest copy by FSFS's youngest copy root, its
+> source, the same line at the same path), with `svn info` of a file and `svn proplist --show-inherited-props` replayed
+> whole. Owed: `get-file`, `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+> `get-deleted-rev`, then `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -41956,11 +41991,20 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   hostile commands, never a panic. Red-checked six ways (a directory's size 0, `get-iprops` taking the youngest, an
   authentication request before an unknown command's refusal, a huge revision read as malformed, mergeinfo keys left
   absolute, dates before 1970 accepted): each failed its tests.
-- **Owed** (the next parts): `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`,
-  `get-location-segments`, `get-file-revs`, `get-deleted-rev`, each with its transcripts (two stock sessions recorded
-  here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
-  revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
-  anonymous read makes when the session could authenticate.
+- **Part 2, its first slice** (2026-11-19): `get-dir` and `get-locations`, recorded in three more scripted sessions
+  (every dirent field, a field subset, inherited properties, a file refused "Can't get entries of non-directory"
+  160016, an absent path; a copy crossed, revisions after the peg kept while the line reaches back to the same path,
+  a tag, a deleted file refused for the revision after its deletion, an absent path and a bad peg refused after
+  `done`, a revision list holding a string ending the connection), and the two stock sessions recorded earlier
+  (`svn info` of a file at an older revision, `svn proplist --show-inherited-props`) replayed whole with the
+  session's base taken from the client's URL. Found by the recording: `get-dir` writes a directory's size 0 (`stat`
+  writes 2^64 - 1), the stored date as it is and time 0's date for an entry without one; both commands' entries come
+  in hash order, compared as sets. The session value gains the repository's UUID (`svn:entry:uuid`). Studio:
+  `cargo test -p slates-svn --lib reads` all passing, fixtures' sums checked.
+- **Owed** (the next slices): `get-file`, `list`, `log` with merged revisions, `get-location-segments`,
+  `get-file-revs`, `get-deleted-rev`, each with its transcripts; then `svn mergeinfo --show-revs`'s eligible and
+  merged revisions from the segments and the log; read access by A-606's rules, and the authentication request a
+  denied anonymous read makes when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
@@ -42330,6 +42374,62 @@ entry), `research/mercurial-server.md` (§18).
   linked to common ones; files from their manifests at the paths they touch; full texts or held deltas, version 02 or
   03), the bundle2 a `getbundle` answers with its parts in 7.2's order, golden over the script's recorded sessions;
   `obsolete`'s `listkeys` dump and the `obsmarkers` part; then `slates hg serve --stdio`'s loop and HTTP version 1.
+
+### A-618 — A client's push becomes a work by its trees' identities, the head an attribute of the root, and a removed file's metadata goes with it (2026-11-19, g225, UI goal 93; §4.17.1 "A push is a work" items 2 to 4, shared piece 4; §4.16 "The state's maps"; after A-534, A-581, A-603)
+Applied in the same change to:
+- §4.17.1's status ("A push is a work"), §4.16's status ("The state's maps"), GAPS (the §4.17 entry; §8f: the removed
+  metadata, closed), and the bug record
+  `docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`;
+- `crates/merge` (`push.rs` and `push/tests.rs`, new; `lib.rs`'s `mod` line; `increment.rs`'s present directories;
+  `engine.rs`'s metadata merges, `commit`, `drop_metadata` and `holds`).
+- **The walk.** `push::build` compares the base version's tree and the pushed tree entry by entry by the tool's ids,
+  read through `PushObjects` (a tree's entries, a blob's length, a blob's bytes, each refusal typed `Unavailable`), on
+  an explicit stack. A directory whose id stayed is never read; one whose id changed has both its trees read; one on a
+  side alone has its one tree read, its contents made or removed. The reads are counted (`Reads`: trees, blobs,
+  subtrees skipped).
+- **The work.** The operations §4.17.1 item 2 names, as a work volume's journal would hold them: a changed file
+  `Truncate` to nothing then its bytes (the deriver composes one `Delete` of the base length and one `Insert`),
+  `Create` and its bytes, `Unlink`, `Mkdir` before what a directory holds, `Rmdir` after it, `SetMode` 0755 for an
+  executable and 0644 for a file that stops being one (a file a green records no mode for checks out 0644), `Symlink`,
+  and a changed link `Unlink` then `Symlink`. Item 3's head is one `SetXattr` of `slates.vcs.head` on the root to the
+  tool's head (git: the commit id's raw bytes). The journal composes against `Green::base_for` (only the paths it
+  names), the post-state is laid from the pushed blobs by the deriver's plan, and the identity is BLAKE3 under a
+  context of its own over the push's name, its base, the document and the post-state.
+- **Bounds and refusals.** Every operation, queued step and post-state byte is charged against the caller's room as it
+  is made, a file's length before its bytes are read, so a push past it is refused before its bytes are held and a store
+  whose trees nest without end is refused at the room. Refused, typed (`PushRefused`): a base past the green's head; an
+  object the store cannot give as its kind; a name slates cannot hold in a path (not UTF-8, empty, `.`, `..`, `/`,
+  NUL) and a name twice in a tree; a link target not UTF-8 or holding NUL; a submodule link (§4.17.2 item 5's special
+  node kind is owed); a path changing between a file, a directory and a link (the deriver's composition is owed); a
+  base the green disagrees with (the deriver's refusal). A work of any size is bounded by its room alone: the cap of
+  65,535 names this piece first refused past is gone with A-621's 64-bit path indices, and a push of 70,000 paths
+  lands as one work.
+- **The root.** The deriver's present directories and the engine's metadata merges hold the root, the empty path,
+  always present, so the head lands and an agent's `chmod` or `setxattr` of a mount's root composes (both were refused:
+  `SetModeMissing("")`, `XattrMissing("")`).
+- **A removed file's metadata.** The client-fidelity test found a file deleted and pushed again as plain holding the
+  deleted one's mode 0755: removing a file, a directory or a link left the path's mode and attributes in the green, as
+  removing a special node did not. `commit` now drops them (`drop_metadata`, `remove_special`'s code shared) for each
+  path a version removed at which nothing then stands; the history, the identity and the verdict's change index see it.
+- **Tests** (`cargo test --locked -p slates-merge --lib`, Mac Studio, debug: 88 of 88 on the tree merged with main
+  and A-621, 23.82 s, its own target directory). Failing first: with the walk a stub that
+  refused every push and the root absent, 11 of 11 push tests failed; the removed-metadata test failed against the
+  engine before its fix (mode 0755, the attribute, mode 0700 at the removed paths). An oracle compares the two whole
+  trees key by key, makes the journal the design states, composes it, lays its own post-state from the trees' bytes,
+  and predicts the reads a walk by identity makes; over 256 generated histories (twelve paths deep and shallow, files of
+  four contents with or without the executable bit, links of two targets, up to seven pushes each) every build equals
+  it byte for byte with those reads, every accepted push leaves the green holding exactly the pushed tree and its head,
+  and a census proves the histories met skipped subtrees, refused kind changes, removed directories, modes, links and
+  whole-file replacements. Beside it: a first push; a push reading only the changed subtree, by the build's count and
+  the store's; modes, links and removed directories as the design names them; two pushes from one base meeting on the
+  root's head (`MetaMeta`), the same push again accepted with nothing changed; the root's mode and attribute; every
+  refusal by kind. Red by mutation, one at a time on a copy: equal subtrees read anyway (3 tests), the executable bit
+  ignored (2), the engine without the root (8), a retarget without its unlink (2).
+- **Owed.** git's store implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6);
+  submodule links; kind transitions; one copy of a pushed blob for the store
+  and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
+  server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
+  checkout of a repository's green must pass over.
 
 ### A-627, continued — The update-report's answer: the editor drive in send-all mode, written as update.c writes it (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part)
 Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), and `crates/svn` (`dav/drive.rs` and its
