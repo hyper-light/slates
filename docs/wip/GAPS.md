@@ -317,7 +317,7 @@
 > record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
 > --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
 > mutation. Owed: receive-pack submitting the work (piece 6; git's store implementing
-> `PushObjects` is A-638's, below); submodule links (§4.17.2 item 5's special node kind, A-637); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> `PushObjects` is A-638's, below; submodule links are A-637's, below); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
 > post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
 > 64-bit path indices ended the 65,535-name cap this piece first refused past).
 <<<<<<< HEAD
@@ -331,6 +331,13 @@
 > store, and two pushes made works through it, are among the tests. Owed: receive-pack's part 2 submitting each ref's
 > work through these views. A `Cow` return on `unpack::Outside` and `receive::Repository` would let a view lend an
 > assembled base without keeping it (those traits are A-608's and A-620's).
+>
+> **A-637 (2026-11-19, g225; §4.17.2 item 5, a submodule's link):** built in `slates-merge`. `SpecialKind::Gitlink`
+> holds the commit's id, encoded beside A-294's device kinds. A-618's push makes, moves and removes a link, and lays
+> each node's encoding where the deriver placed it (it had laid only file and attribute bytes). The engine takes a link
+> moved to another commit as the same kind (`SpecialKind::same_type`); before, every move was `TypeChanged`. Tests:
+> `slates-merge --lib` 97 of 97 on the Mac Studio, red first and red four ways by mutation. Owed: a link's form in a
+> volume and in a checkout (git's: an empty directory).
 =======
 > **A-624 part 2 (2026-11-19, g230; piece 14's rest):** `slates-git` (`v2`) reads `object-info` and `bundle-uri`
 > requests and answers them over traits: `object-info` as git 2.50.1 answers (`size` only when asked, an unknown

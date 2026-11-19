@@ -12415,6 +12415,14 @@ engine: the verdict, rebase, position mapping, the register).
 > `100644`, `100700` and `100775` as `100755`, and a typeless `644` as `160000`). Proven by receive-pack resolving a
 > thin pack of two deltas on a base the store holds across windows, and by two pushes becoming works through the store
 > (versions 1 and 2, the unchanged directory never read).
+>
+> **Status (2026-11-19, A-637: item 5's submodule link built in the merge engine).** A tree's `160000` entry is a
+> special node holding the commit's id (`SpecialKind::Gitlink` in `slates-merge`), encoded beside A-294's device kinds.
+> A push makes it (`Mknod`, no owner, time or permission bit, since git records none), moves it to another commit
+> (`Unlink` then `Mknod`) and removes it (`Unlink`). The engine takes a link moved to another commit as the same kind:
+> two pushes moving one link apart from one base conflict `CreateCreate`. A path changing to or from a link is a typed
+> kind change (GAPS §8f). A link's form in a volume and in a checkout is owed (git checks a submodule out as an empty
+> directory).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -43163,3 +43171,38 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
 - **Owed.** receive-pack's part 2 submitting each ref's work through these views (A-620's part 2). The submodule link's
   special-node kind (A-637). Charging the transient tables A-618's walk holds, beside the store's room.
+
+### A-637 — A submodule's link is a special node holding its commit: encoded beside A-294's device kinds, made by a push, moved as the same kind (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "Trees as a volume" item 5; §4.16's names with no content; §4.17.1 "A push is a work"; after A-294, A-618, A-638)
+
+- **What.** `SpecialKind::Gitlink { commit }` (`crates/merge/src/special.rs`): the commit of another repository a name
+  stands at, by the tool's id (git's 20 or 32 bytes). It is encoded as a FIFO's fields under kind byte 4, then the
+  id's length in one byte and its bytes. An empty id, or one past 32 bytes, is refused by kind; a short one as
+  truncated. No earlier encoding moved, and a test holds the FIFO's and a character device's bytes.
+- **The push.** A-618's `build` makes a submodule entry an `Mknod` of that node, with no owner, time or permission
+  bit, since git records none. A link moved to another commit is `Unlink` then `Mknod`, which the deriver composes
+  into one `Mknod`; a removed one is `Unlink`. A path changing to or from a link stays a typed `KindChanged` (GAPS
+  §8f), and `PushRefused::Submodule` is gone.
+- **Found on the way, fixed in the same change.**
+  - The build laid only file and attribute bytes in the post-state. The deriver places each `Mknod`'s node encoding
+    after them, and the engine reads it there, so any node a push made would have been refused as truncated. The build
+    now lays each node's encoding where the deriver placed it.
+  - The engine judged any difference of `SpecialKind` a type change, so a link moved to another commit was
+    `TypeChanged`. `SpecialKind::same_type` makes a link to any commit one type, since its commit is what it holds, as
+    a symbolic link's target is. Every other kind keeps its whole value, so A-294's renumbered device stays another
+    node. Two pushes moving one link apart from one base conflict `CreateCreate`; pushes that agree are accepted.
+- **Tests and runs.** Three encoding tests (`special/tests.rs`, new): the bytes laid out by hand at both id lengths,
+  every refusal, and the earlier kinds unchanged. In `push/tests.rs`:
+  - a link made, moved and removed, each held to the oracle;
+  - five paths changing kind, two of them to or from a link;
+  - two pushes moving one link from one base;
+  - the generated histories with links to two commits, the census requiring links made.
+
+  On the Mac Studio, 2026-11-19, the tests were red first: 5 of 96 failed against stubs. Next, 2 failed on the
+  engine's rule (`TypeChanged`). Then `cargo test -p slates-merge --lib` passed 97 of 97, and fmt was clean. Red four
+  ways by mutation: the whole-kind comparison (3 failed), no node bytes (4), an empty id taken (1), and a move without
+  its `Unlink` (3).
+- **Applied in the same change to:** `crates/merge/src/special.rs` (and `special/tests.rs`, new), `push.rs`,
+  `push/tests.rs`, `engine.rs` (`merge_special`), §4.17.2's status, GAPS §4.17.
+- **Owed.** A link's form in a volume and in a checkout: git checks a submodule out as an empty directory. The
+  server's paths from a volume's nodes to a green's (`merge_service`, `verbs`) never meet one, since a volume holds no
+  link yet.
