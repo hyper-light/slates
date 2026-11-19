@@ -178,6 +178,9 @@ pub struct PartitionSnapshot {
   /// Every lineage's members (§4.17.1 item 4, A-575; appended), lineage by lineage in id order, each in the order it
   /// joined.
   pub repository_members: Vec<crate::catalog::MemberRecord>,
+  /// Every repository's register: its next position and its own state (§4.17.1 shared piece 2, A-603; appended), by
+  /// repository order.
+  pub repository_registers: Vec<crate::catalog::RegisterRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -1495,9 +1498,24 @@ impl Partition {
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryDestroyed { .. }
-      | Op::RepositoryGreenJoined { .. } => self
-        .repositories
-        .check(op, self.caps.volumes, |id| self.held(id)),
+      | Op::RepositoryGreenJoined { .. } => self.repositories.check(
+        op,
+        self.caps.volumes,
+        |id| self.held(id),
+        |green| self.green_head(green),
+      ),
+      // An entry of a repository's register (A-603): its rules, then its versions' chain entries and the state it adds
+      // within the merge budget, less the state it removes.
+      Op::RepositoryAdvanced { entry } => {
+        self.repositories.check(
+          op,
+          self.caps.volumes,
+          |id| self.held(id),
+          |green| self.green_head(green),
+        )?;
+        let bytes = crate::repository::Repositories::entry_bytes(entry);
+        self.merge_bytes_fit(bytes.released, bytes.added)
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1977,7 +1995,8 @@ impl Partition {
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryDestroyed { .. }
-      | Op::RepositoryGreenJoined { .. } => self.repositories.apply(op),
+      | Op::RepositoryGreenJoined { .. }
+      | Op::RepositoryAdvanced { .. } => self.apply_repository(op),
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -2290,6 +2309,8 @@ impl Partition {
           .entry(*green)
           .or_default()
           .push(increment.clone());
+        // A member's version recorded alone is an entry of its repository's register (A-603).
+        self.repositories.versioned(*green);
         Ok(())
       }
       Op::GreenOriginated { green, origin } => {
@@ -2354,6 +2375,28 @@ impl Partition {
 
   /// Whether replacing `released` bytes of the merge budget with `added` keeps it within the partition's cap: the
   /// typed refusal at the bound otherwise (bounded growth, CLAUDE.md banned item 8).
+  /// Applies a repository operation (A-515, A-575, A-603): the repositories' own change, then an entry's versions as
+  /// the greens' chain entries, each charged to the merge budget with what the repositories' state gained, less what it
+  /// released.
+  fn apply_repository(&mut self, op: &Op) -> Result<(), DbError> {
+    let bytes = self.repositories.apply(op)?;
+    if let Op::RepositoryAdvanced { entry } = op {
+      for version in &entry.versions {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(version.entry.len());
+        self
+          .green_chains
+          .entry(version.green)
+          .or_default()
+          .push(version.entry.clone());
+      }
+    }
+    self.green_chain_bytes = self
+      .green_chain_bytes
+      .saturating_sub(bytes.released)
+      .saturating_add(bytes.added);
+    Ok(())
+  }
+
   fn merge_bytes_fit(&self, released: usize, added: usize) -> Result<(), DbError> {
     if self
       .green_chain_bytes
@@ -2626,6 +2669,7 @@ impl Partition {
       repositories: self.repositories.repositories().cloned().collect(),
       repository_branches: self.repositories.bindings().collect(),
       repository_members: self.repositories.memberships().collect(),
+      repository_registers: self.repositories.registers().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2874,7 +2918,12 @@ impl Partition {
       &snapshot.repositories,
       &snapshot.repository_branches,
       &snapshot.repository_members,
+      &snapshot.repository_registers,
     )?;
+    // The repositories' own state is charged to the merge budget as it was when recorded (A-603).
+    p.green_chain_bytes = p
+      .green_chain_bytes
+      .saturating_add(p.repositories.state_bytes());
     Ok(p)
   }
 
