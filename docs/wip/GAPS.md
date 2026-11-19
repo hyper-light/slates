@@ -305,6 +305,18 @@
 > with each object's SHA-256 an index row and uploads checked against it, lock records per repository); expiries
 > learned from the deployment's token lifetimes; the stock client end to end against slates' own server (main's run);
 > Mercurial's `lfs` (§4.17.3), which moves the module to a crate both servers use.
+> **A-629 part 1 (2026-11-19, g293; serving Git LFS, slates-git's half):** `slates-git` (`lfs::serve`, `lfs::objects`)
+> routes and answers the batch API, the basic transfers and the locks API over three seams: `Access` (vcs_policy's
+> check, A-597), the objects in `slates-vcs` (named by SHA-256, checked on arrival, nothing of a mismatch kept) and
+> `Locks` (the repository's lock log, A-642). An action's `expires_at` is the asking credential's expiry, none for one
+> that never expires (main's ruling; it replaces A-610's owed "expiries learned"). `Accept` by RFC 9110's precedence and
+> zero weights; `401` with `LFS-Authenticate` without credentials; every answer charged before it is made; a page cut
+> with the cursor that ends it reserved, and `413` for a page that cannot hold one lock. Proven by the stock git-lfs
+> 3.8.1 client's 24 recorded exchanges replayed through the server and a property test of the paging rule; `cargo test
+> -p slates-git --lib` on the Mac Studio: 293 of 293, the 22 new failing first against stubs.
+> Owed (part 2): the lock log in slates-db, guarded then applied (A-642); `Access` over vcs_policy and the lock owner
+> rule in slates-server; each repository's LFS index; the call A-625's edge makes. Then a streaming put in
+> `slates-vcs`, so an upload is not held whole; the stock client end to end against slates (main's run).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still

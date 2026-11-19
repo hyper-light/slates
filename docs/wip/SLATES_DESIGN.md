@@ -12404,6 +12404,21 @@ engine: the verdict, rebase, position mapping, the register).
 > against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
 > records, who may do what) is the server's part.
 >
+> **Status (2026-11-19, A-629 part 1: serving Git LFS, slates-git's half).** `crates/git` (`lfs::serve`,
+> `lfs::objects`) routes a request slates-http has read under `<repo>/info/lfs`: the batch API, the locks API and the
+> basic adapter's transfers this server hands out (`PUT` and `GET` of `objects/{oid}`, `POST objects/{oid}/verify`),
+> the repository's path decoded as git's smart HTTP routes decode one, media types and `Accept` held to RFC 9110 (the
+> most specific range decides; a zero weight refuses). It answers over three seams the server implements: who may do
+> what (`Access`, vcs_policy's check, A-597), the objects (`slates-vcs`, each named by its SHA-256 and checked on
+> arrival, its bytes the shared store's by BLAKE3), and the locks (`Locks`, the repository's lock log, A-642). An action
+> expires exactly when the credential that asked for it does, and carries no expiry when that credential never does; a
+> refusal of a request without credentials is `401` with `LFS-Authenticate`. Every answer is charged before it is made
+> and allocated at its measured length; a page of locks borrows the log's records and is cut by the client's limit, or
+> where the room would no longer hold the next lock and the cursor after it. Proven by replaying the stock git-lfs 3.8.1
+> client's 24 recorded exchanges through the routes and the server, and by a property test of the paging rule. Part 2
+> is the server's: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
+> repository's LFS index beside the shared store; the call A-625's edge makes.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -12634,8 +12649,10 @@ create or update a reference named "refs/for/master", but may create or update a
 
 **Large files.** Git LFS's batch API [B: git-lfs `docs/api/batch.md`, `basic-transfers.md`, `locking.md`]: a
 `POST` to `<repo>.git/info/lfs/objects/batch` names an `operation` (upload or download) and objects by SHA-256 `oid` and
-`size`; the answer gives each object's actions (`href`, headers, `expires_in`); a basic transfer is a plain `PUT` or
-`GET` of the bytes; locks are per path. An LFS object is content in the volume store, deduplicated by BLAKE3 like every
+`size`; the answer gives each object's actions (`href`, headers, and the expiry of the credential that asked, since a
+transfer authenticates at the edge as the batch did: `expires_at` for a token that expires, none for one that does not,
+A-629); a basic transfer is a plain `PUT` or `GET` of the bytes; locks are per path, kept in the repository's lock log
+(A-642). An LFS object is content in the volume store, deduplicated by BLAKE3 like every
 other byte, with its SHA-256 name an index row and the bytes checked against it on upload. A version's tree holds the
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
 is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
@@ -43499,6 +43516,80 @@ Applied in the same change to:
   - a hard link names its target by path, so the head's removal of a file that links name is accepted and the links
     then name whatever is made there next;
   - the IPC node's unlink scans every attribute change and every hard link once per unlink.
+
+### A-629 part 1 — Serving Git LFS, slates-git's half: routes, answers and bounds over three seams, objects named by SHA-256 and checked on arrival, actions that expire with the credential that asked (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Pieces (git)" piece 12's second part; after A-610, A-581, A-595 and A-597; with A-642)
+Applied in the same change to:
+- §4.17.2's "Large files" (the actions' expiry, the lock log) and its status; GAPS (the §4.17 entry);
+- `crates/git` (`lfs/serve.rs` and `lfs/objects.rs`, new, with `tests/lfs_serve.rs` and `tests/lfs_objects.rs`;
+  `lfs.rs`, the two modules' lines and `Oid`'s `AsRef<[u8]>`; `lfs/locks.rs`, `listed_len` and `cursor_len`;
+  `tests/lfs.rs`, each recorded request's `Content-Type` and `Accept`).
+- **The split.** A-629 serves LFS. Part 1 is slates-git alone: the routes and the answers, written against three seams
+  the server implements. Part 2 is the server's (slates-db and slates-server): the lock log, `Access` over vcs_policy,
+  each repository's LFS index, and the call A-625's edge makes. A-642 (Ada, the same day) keeps a repository's own
+  state in logs of its own, so the locks are the repository's lock log, guarded then applied, and never changes on
+  A-603's repository-wide entry; A-642 has the pushes keep their traits, and `Locks` is this one's.
+- **Routes** [B: git-lfs v3.8.1 `docs/api/server-discovery.md`, `batch.md`, `basic-transfers.md`, `locking.md`]. Under
+  the LFS server URL git-lfs derives, `<repo>/info/lfs`: `POST objects/batch`; `POST locks`, `GET locks`,
+  `POST locks/verify` and `POST locks/{id}/unlock` (A-610's route); and the basic transfers this server hands out as
+  actions, each href under the request's own LFS server URL: `PUT` and `GET` of `objects/{oid}`, and
+  `POST objects/{oid}/verify`. The path is decoded once: an escape that names a slash or a NUL, or a repository path
+  that is not UTF-8, is `400`; an empty, `.` or `..` segment is `404`; the last whole `/info/lfs` ends the repository's
+  path. A method an endpoint does not take is `405` with `Allow` (`400` to HTTP/1.0, which has no `405`). A malformed
+  escape never reaches a route: slates-http's reader refuses it as a bad request target (RFC 3986 §2.1), which the
+  first green run found.
+- **Media types** [B: RFC 9110 §12.5.1, §12.4.2, §5.6.1]. A JSON endpoint's body is `application/vnd.git-lfs+json`, a
+  `charset` taken as batch.md asks, else `415`. An answer's type must be acceptable: of the `Accept` ranges that cover
+  LFS's type, the most specific decides (the type, then `application/*`, then `*/*`), and a zero weight (`q=0`, `0.`,
+  `0.000`) is "not acceptable", so `406`. Empty list elements are no ranges, and no `Accept` takes anything. A
+  transfer's bytes are not JSON and are not held to it.
+- **Who may do what.** Each request asks `Access` for a `Need` on the ref it names, or on the repository's whole
+  namespace for a transfer, which names none: `Download`, `Upload`, `ListLocks` (locking.md: pull access), `Lock`,
+  `VerifyLocks`, `Unlock` (push access) and `UnlockOthers` (another user's lock, which also takes `force`). A refusal
+  of a request that sent no credentials is `401` with `LFS-Authenticate` when the edge gave a challenge (batch.md), so
+  git-lfs asks for credentials and retries; of one that did, `403`. Another user's lock without `force` is `403`.
+- **Objects** [B: git-lfs `docs/spec.md`]. An object's id is the SHA-256 of its bytes (aws-lc-rs). An upload is
+  admitted through `slates-vcs`'s quarantine with that naming (A-581): bytes that are not their oid are `422` and
+  nothing of them is kept, the store's content count and bytes unchanged; bytes that are go in as one row of the
+  repository's LFS index, keyed by the oid's 32 bytes and apart from its git objects' index, the content the shared
+  store's by BLAKE3. A store past its budget is `507`. A batch answers a download where the object is held at the size
+  asked, an upload and its verification where none is, nothing where it is held, and a per-object `404` or `422`
+  otherwise.
+- **Expiry** (main's ruling, 2026-11-19, replacing the learned expiry A-610 left owed). A transfer authenticates at the
+  edge as the batch did, so an action works exactly as long as the credential that asked for it: its `expires_at` is
+  that credential's expiry when the edge knows one (a bearer token's, handed in with the principal), and an action
+  asked with one that never expires (Basic) carries none. Nothing is chosen, signed or learned here.
+- **Bounds.** Every answer is charged to the request's admission before it is made, and allocated at its measured
+  length: a batch answer's hrefs and the slots that hold them, then its body; a lock or a conflict; a page. A page of
+  locks borrows the log's records, never copies them. It charges its frame, then each lock at its place in a list (the
+  comma before it, so at most a byte a list over what it writes) with the page's slot for it, while the client's limit
+  allows and the room holds the lock and the cursor naming the one after it, then the cursor that ends it. So that
+  cursor always fits, and a page that cannot hold one lock is `413`, never an empty page whose cursor names the lock it
+  could not hold, which would bring the client back to it for ever. A cursor that names no place in the log is `422`,
+  as is a query's `limit` that is no number.
+- **The locks' seam.** `take` (or the lock that holds the path: `409` with it), `find`, `listed_from` (the log's order
+  from the place a cursor names, inclusive; `None` for no place) and `release`; a full log is `507`. A lock's id names
+  its place in the log, so a cursor naming a lock released since still names a place; ids are RFC 3986 unreserved
+  characters, since git-lfs writes them into a path unescaped (A-610).
+- **Changed during the piece, and why.** The first page copied each record and wrote its frame and cursor uncharged;
+  it now borrows the records and charges every byte. The seam's visiting callback became an iterator, so a page can
+  see the lock after the one it weighs. The first `Accept` check took any covering range; it now follows RFC 9110's
+  precedence and zero weights and skips empty elements.
+- **Tests** (`tests/lfs_serve.rs`, 17; `tests/lfs_objects.rs`, 5): the stock git-lfs 3.8.1 client's 24 recorded
+  exchanges (A-610's fixture) replayed through the routes and the server, the transfers at this server's own hrefs:
+  every status, every object's answer, the locks and the conflict whole, every page beginning as recorded, every
+  downloaded byte. Then the route table and its refusals; `Accept`'s precedence and weights; `405`'s `Allow`; policy,
+  `401`'s challenge, the expiry, an upload checked against its oid, the unlock rules; pages by limit and by room;
+  `413`, `422` and `507` by kind; and a property test that follows the cursors against the paging rule, stated over
+  the locks' JSON. On the Mac Studio (M3 Ultra, debug, 2026-11-19): red at 05:55Z, the 22 new tests failing with nine
+  entry points stubbed on its clone (never committed) and 271 others passing; green at 05:58Z on cb761ddbf,
+  `cargo test -p slates-git --lib` 293 of 293, fmt clean. The first green had reused the red build: both clones shared
+  one target directory, and cargo names a workspace member by its path from the workspace root and judges it fresh by
+  its dep-info's absolute paths, which named the red copy's unchanged files. Red and green now build in target
+  directories of their own.
+- **Owed.** Part 2: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
+  repository's LFS index; the call A-625's edge makes. Then a streaming put in `slates-vcs`, so an upload is admitted
+  window by window rather than whole; the stock client end to end against slates (main's run); Mercurial's `lfs`
+  (§4.17.3).
 
 ### A-637 — A submodule's link is a special node holding its commit: encoded beside A-294's device kinds, made by a push, moved as the same kind (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "Trees as a volume" item 5; §4.16's names with no content; §4.17.1 "A push is a work"; after A-294, A-618, A-638)
 
