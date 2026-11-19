@@ -62,7 +62,10 @@
 //! differs from the node or copy source a row names; a copy whose source is past the previous revision or absent
 //! there; a text on a directory; a row whose fields contradict each other, `svn:mergeinfo` gained or lost without the mergeinfo flag among
 //! them; and an index that would outgrow the room its caller gives. Each refusal is typed and names the Subversion error
-//! it is answered with ([`IndexRefusal::subversion_code`]).
+//! it is answered with ([`IndexRefusal::subversion_code`]). A record can be checked first ([`Index::plan`]) and
+//! committed later ([`Index::commit_planned`]), as the owner's commit step checks a revision before its log records it
+//! and commits it after (A-655); a plan committed after another revision was appended is refused, typed, with nothing
+//! changed.
 //!
 //! The room is the caller's: the most entries (node rows and deletions) the index may hold, which the owner derives
 //! from its shard's room (§4.17.4 item 12); every other table grows at most linearly in them. Holding the tables as
@@ -170,6 +173,11 @@ const SVN_ERR_FS_ALREADY_EXISTS: u32 = 160_020;
 /// `SVN_ERR_FS_ROOT_DIR`, "Attempt to remove or recreate fs root dir".
 /// Format: the filesystem category's start plus 21 (`svn_error_codes.h`).
 const SVN_ERR_FS_ROOT_DIR: u32 = 160_021;
+
+/// `SVN_ERR_FS_TXN_OUT_OF_DATE`, which FSFS's commit answers "Transaction out of date" when its transaction's base is
+/// no longer the youngest revision (`transaction.c` `commit_body` 3784-3786).
+/// Format: the filesystem category's start plus 28 (`svn_error_codes.h` 693-694).
+const SVN_ERR_FS_TXN_OUT_OF_DATE: u32 = 160_028;
 
 /// A node's kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -420,6 +428,14 @@ pub enum IndexRefusal {
     /// The room given.
     room: usize,
   },
+  /// A plan committed after another revision was appended since it was made ([`Index::commit_planned`]): FSFS's
+  /// commit of a transaction whose base is no longer the youngest (`SVN_ERR_FS_TXN_OUT_OF_DATE`).
+  OutOfDate {
+    /// The revision the plan makes.
+    planned: Revision,
+    /// The revision the index makes next.
+    next: Revision,
+  },
   /// A count or an identity past 2^64 - 1, or a row the index names and does not hold (`SVN_ERR_FS_CORRUPT`).
   Corrupt,
 }
@@ -437,6 +453,7 @@ impl IndexRefusal {
       Self::DirectoryText { .. } => SVN_ERR_FS_NOT_FILE,
       Self::RootChange => SVN_ERR_FS_ROOT_DIR,
       Self::Room { .. } => SVN_ERR_FS_GENERAL,
+      Self::OutOfDate { .. } => SVN_ERR_FS_TXN_OUT_OF_DATE,
       Self::KindMismatch { .. }
       | Self::Duplicate { .. }
       | Self::Malformed { .. }
@@ -844,10 +861,18 @@ impl Index {
     self.rows.len().saturating_add(self.deletions)
   }
 
-  /// Applies the next revision's record and answers its number. Refused, typed, when the record is not one an FSFS
-  /// commit writes against the youngest revision or when the index would hold more than `room` entries; a refused
-  /// record changes nothing.
+  /// Applies the next revision's record and answers its number: [`Index::plan`], then [`Index::commit_planned`].
+  /// Refused, typed, when the record is not one an FSFS commit writes against the youngest revision or when the index
+  /// would hold more than `room` entries; a refused record changes nothing.
   pub fn append(&mut self, record: RevisionRecord, room: usize) -> Result<Revision, IndexRefusal> {
+    let planned = self.plan(record, room)?;
+    self.commit_planned(planned)
+  }
+
+  /// Checks the next revision's record against the youngest revision, every check [`Index::append`] makes, and
+  /// changes nothing: the revision it makes, ready for [`Index::commit_planned`]. An owner checks a revision so
+  /// before its log records it and commits it after, so a record the index refuses is never recorded (A-655).
+  pub fn plan(&self, record: RevisionRecord, room: usize) -> Result<Planned, IndexRefusal> {
     let revision = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
     check_transaction_name(&record.transaction)?;
     let changes = sorted_rows(record.changes)?;
@@ -865,7 +890,32 @@ impl Index {
       return Err(IndexRefusal::Room { needed, room });
     }
     self.check_plan(&plan)?;
-    self.commit(revision, plan, record.transaction, changes);
+    Ok(Planned {
+      revision,
+      plan,
+      transaction: record.transaction,
+      changes,
+    })
+  }
+
+  /// Commits a revision [`Index::plan`] checked, and answers its number. Refused with nothing changed when a revision
+  /// was appended since the plan was made ([`IndexRefusal::OutOfDate`]): the plan numbers its rows and paths after the
+  /// index as it was then.
+  pub fn commit_planned(&mut self, planned: Planned) -> Result<Revision, IndexRefusal> {
+    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
+    if planned.revision != next {
+      return Err(IndexRefusal::OutOfDate {
+        planned: planned.revision,
+        next,
+      });
+    }
+    let Planned {
+      revision,
+      plan,
+      transaction,
+      changes,
+    } = planned;
+    self.commit(revision, plan, transaction, changes);
     Ok(revision)
   }
 
@@ -1153,7 +1203,34 @@ struct Staged {
   shape: Option<Shape>,
 }
 
+/// A revision's record checked against the youngest revision by [`Index::plan`]: what [`Index::commit_planned`]
+/// commits, so long as no revision was appended since.
+#[derive(Debug)]
+pub struct Planned {
+  /// The revision it makes.
+  revision: Revision,
+  /// What it makes: its node-revisions, its new paths and what it did at each path.
+  plan: Plan,
+  /// The transaction's name.
+  transaction: String,
+  /// The changed-path rows, sorted by path.
+  changes: Vec<ChangedPath>,
+}
+
+impl Planned {
+  /// The revision it makes.
+  pub fn revision(&self) -> Revision {
+    self.revision
+  }
+
+  /// Its changed-path rows, sorted by path.
+  pub fn changes(&self) -> &[ChangedPath] {
+    &self.changes
+  }
+}
+
 /// A revision built and checked, ready to be committed.
+#[derive(Debug)]
 struct Plan {
   /// The node-revisions it made, numbered after the index's.
   rows: Vec<Row>,

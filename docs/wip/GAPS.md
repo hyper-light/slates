@@ -5,6 +5,26 @@
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
 > **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). OWED: the git store serving D(k) from its values; A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
+> **A-664 (2026-11-19, g308; §4.17.1 "A push is a work" items 3 and 4; §4.17.2 piece 13; §4.17.3 decision 7 and piece
+> 6): the commits the server makes.** Part 2 BUILT: `slates-git`'s `derived` module makes a version's git objects as
+> two types of A-647's derived data: its trees (`Trees`, derived from the change the path map reads: each file's mode
+> from its class, git's order, only the change's directories made again, a directory past one node through lists) and
+> its commit (`Commits`: a pushed version's client commit, or the server's of the version's tree, its parents' commits,
+> the principal's identity at the merge record's time in UTC and the submit's message, as `git commit-tree -m` writes
+> it); every object made passes git's strict fsck. Golden vectors from stock git 2.50.1 (`fixtures/made`), an oracle
+> over generated histories against the trees built from each version's whole path map, and a determinism gate (A-664's
+> entry has the runs). OWED: part 1, each principal's record holding its tool identities (git's name and email,
+> Mercurial's `Name <address>`), set by its owner on the control channel, and a submit to a repository's green
+> carrying a message, refused `MessageRequired` without one and `IdentityRequired` for a principal with no identity in
+> the repository's tool, before any work is built; part 3, the made commit recorded with the version (the merge record
+> carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
+> it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
+> `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
+> `.gitmodules` link, a name past 4096 bytes); a `.gitmodules` blob's own checks; blob ids read by content from the git
+> store's rows, so a rename or a revert hashes nothing; a derivation's transient listings charged to the store; then
+> Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
+> record) by the same rule, main to start them.
+>
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** OWED: A-603's repository-wide register position replaced by each green's own log; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own (g261, with A-635/A-636).
 >
 > §4.17.1 maps repositories, branches,
@@ -604,9 +624,10 @@
 > Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
 > history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
-> import, with later pieces: the import sliced under the shard's step budget and resumed after a host's pending read,
-> rather than run again; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from
-> §4.15's host seam to `RepositoryFiles` (one name at a time; a store name that is not UTF-8, which only the plain
+> import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
+> import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
+> `verify`); and the server's adapter from §4.15's host seam to `RepositoryFiles` (one name at a time; a store name that
+> is not UTF-8, which only the plain
 > encoding leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
@@ -629,7 +650,12 @@
 > sessions handed in at every cut down to a byte. **Built (A-649 part 3a):** revlogs read by ranges through the seam
 > (its length, then ranges), the reader's one algorithm over a byte source (whole slices for the `Revlog` facade, ranges
 > for the import), never a split or docketed revlog whole; texts rebuilt from the one before where the chain passes
-> through it (7.2's revision cache), counted; red first (1 failed), 271 of 271. Owed, in order, after §4.17.1's seven
+> through it (7.2's revision cache), counted; red first (1 failed), 271 of 271.
+> **Built (A-649 part 3b):** the import in slices (`import::Import`, advanced a turn at a time under the owner's quantum
+> on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
+> nothing); red first (2 failed), then 278 of 278 on Windows x86_64 (jupiter) against three stores imported a unit a
+> turn equal to one call; the macOS run owed.
+> Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
@@ -713,7 +739,15 @@
 > A-606) and authenticating for write (`must_have_access`, the lock tokens' writes), through one entry point for the
 > svn:// connection task (`commit::drive::commit`, A-656); `cargo test --locked -p slates-svn --lib` on the Mac Studio,
 > red first (see A-655 part 1). Owed from it: part 2, the owner's commit step through A-635's `RepositoryLogs::append`,
-> which a dump's import drives too (A-652 part 3). A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with
+> which a dump's import drives too (A-652 part 3). A-655 part 2a (2026-11-19, g268, UI goal 93): one `Revision` a
+> client's accepted work (dated at the owner's instant, its `svn:txn-` properties dropped) or an imported dump revision
+> is made into, committed by one step over a repository's records (`Repository::check`, then `apply`; `Index::plan` and
+> `commit_planned`; the lock entries all or none), which A-628's import now takes too; the drive waits for start-commit
+> at `open-root`, its revision properties checked first, and for pre-commit before the verdict (A-661's `Step::Hook`,
+> `Due`, `Drive::resume`); `cargo test --locked -p slates-svn --lib` on Windows x86_64 (jupiter; the macOS run owed),
+> red first (see A-655 part 2a). Owed from it: part 2b, the server's step over A-662's map (the green's version and the
+> Subversion record in one durable entry through A-635's append, a `Moved` append judged again by position, recovery),
+> then A-652 part 3. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with
 > stealing) and `unlock`
 > (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
