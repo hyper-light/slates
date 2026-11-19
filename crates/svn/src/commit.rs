@@ -45,6 +45,9 @@
 //! whole trees; the verdict, its lock check the lock table's, must answer every generated history as they do: the same
 //! commit, the same conflict at the same path found by the same check, or the same lock in the way.
 //!
+//! The drive's commands are read in [`edit`] (A-617): the commit's request and every editor command, as `svnserve`
+//! reads them.
+//!
 //! Not here: the drive's other checks (a copy's source, checksums, property values, authorization) and its early-error
 //! rule (piece 7); hooks (item 9); the lock table (A-602).
 //!
@@ -58,6 +61,8 @@ use crate::index::{
   Revision, RevisionRecord, Trial, TrialNode,
 };
 use crate::lock::LockRefusal;
+
+pub mod edit;
 
 /// `SVN_ERR_FS_NO_SUCH_REVISION`, "No such revision %ld": a client's revision past the transaction's base.
 /// Format: the filesystem category's start, 120,000 + 8 × 5,000 = 160,000, plus 6 (`svn_error_codes.h` 121-122,

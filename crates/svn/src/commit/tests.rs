@@ -565,8 +565,23 @@ fn a_work_its_base_cannot_hold_is_refused_with_the_indexs_refusal() {
 /// A tree of the naive filesystem: every path's node.
 type Tree = BTreeMap<String, usize>;
 
-/// What `merge()` answers: nothing to refuse, or a conflict's path and the check that found it.
-type Merged = Result<(), (String, ConflictKind)>;
+/// Why the transcribed `merge()` stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Stopped {
+  /// A conflict at a path, found by a check.
+  Conflict(String, ConflictKind),
+  /// `merge()`'s first check (1908-1913) met a node that is not a directory, which no generated history reaches: the
+  /// case fails, as the verdict refuses such an index as corrupt.
+  NotADirectory(String),
+}
+
+/// What `merge()` answers: nothing to refuse, or why it stopped.
+type Merged = Result<(), Stopped>;
+
+/// A conflict at `path` found by `kind`.
+fn stop(path: &str, kind: ConflictKind) -> Stopped {
+  Stopped::Conflict(path.to_owned(), kind)
+}
 
 /// The three trees `merge()` reads: the transaction's, the head's and the base's.
 #[derive(Clone, Copy)]
@@ -588,6 +603,8 @@ enum Answer {
   Conflict(String, ConflictKind),
   /// A lock in the way.
   Locked(LockRefusal),
+  /// The transcription met a node that is not a directory where `merge()` checks one (never the verdict's answer).
+  NotADirectory(String),
 }
 
 /// `dirent_uri.c` `svn_fspath__skip_ancestor` (2664) through `svn_relpath_skip_ancestor` (1530-1551), transcribed:
@@ -688,12 +705,12 @@ fn merge(fs: &NaiveFs, trees: Trees<'_>, path: &str) -> Merged {
   }
   // 1908-1913: never met, since an entry's kinds are judged before `merge()` goes down into it, and every root is a
   // directory; the verdict refuses an index that breaks this as corrupt.
-  assert!(
-    [target, source, ancestor]
-      .iter()
-      .all(|node| fs.nodes[*node].kind == NodeKind::Directory),
-    "merge() met a node that is not a directory at {path}"
-  );
+  if [target, source, ancestor]
+    .iter()
+    .any(|node| fs.nodes[*node].kind != NodeKind::Directory)
+  {
+    return Err(Stopped::NotADirectory(path.to_owned()));
+  }
   merge_properties(fs, trees, path)?;
   merge_ancestor_entries(fs, trees, path)?;
   merge_source_additions(trees, path)
@@ -704,12 +721,12 @@ fn merge(fs: &NaiveFs, trees: Trees<'_>, path: &str) -> Merged {
 fn merge_properties(fs: &NaiveFs, trees: Trees<'_>, path: &str) -> Merged {
   let properties = |tree: &Tree| fs.nodes[tree[path]].properties;
   if properties(trees.source) != properties(trees.ancestor) {
-    return Err((path.to_owned(), ConflictKind::PropertiesChanged));
+    return Err(stop(path, ConflictKind::PropertiesChanged));
   }
   if properties(trees.target) != properties(trees.ancestor)
     && compare_dir_structure(fs, (trees.source, trees.ancestor), path)
   {
-    return Err((path.to_owned(), ConflictKind::StructureChanged));
+    return Err(stop(path, ConflictKind::StructureChanged));
   }
   Ok(())
 }
@@ -749,13 +766,13 @@ fn merge_changed_entry(
     } else {
       ConflictKind::DeletedAgainstChange
     };
-    return Err((entry_path.to_owned(), kind));
+    return Err(stop(entry_path, kind));
   };
   if let Some(kind) = file_among(fs, [s_entry, t_entry, a_entry]) {
-    return Err((entry_path.to_owned(), kind));
+    return Err(stop(entry_path, kind));
   }
   if !same_line(fs, s_entry, a_entry) || !same_line(fs, t_entry, a_entry) {
-    return Err((entry_path.to_owned(), ConflictKind::NotADirectModification));
+    return Err(stop(entry_path, ConflictKind::NotADirectModification));
   }
   merge(fs, trees, entry_path)
 }
@@ -781,7 +798,7 @@ fn merge_source_additions(trees: Trees<'_>, path: &str) -> Merged {
       continue;
     }
     if t_entries.contains_key(name) {
-      return Err((joined_path(path, name), ConflictKind::AddedTwice));
+      return Err(Stopped::Conflict(joined_path(path, name), ConflictKind::AddedTwice));
     }
   }
   Ok(())
@@ -909,6 +926,7 @@ impl Census {
           self.locked_beneath += 1;
         }
       }
+      Answer::NotADirectory(_) => {}
     }
   }
 
@@ -1124,7 +1142,7 @@ fn locks_of(
     }
     table.apply(&LockEntry::Set(lock)).unwrap();
   }
-  let user = (case.user % ANONYMOUS_ONE_IN != 0).then(|| COMMITTER.to_owned());
+  let user = (!case.user.is_multiple_of(ANONYMOUS_ONE_IN)).then(|| COMMITTER.to_owned());
   let commit = CommitLocks {
     user,
     presented,
@@ -1142,7 +1160,8 @@ fn oracle_answer(
   census: &mut Census,
 ) -> Answer {
   match merge(fs, trees, "/") {
-    Err((path, kind)) => Answer::Conflict(path, kind),
+    Err(Stopped::Conflict(path, kind)) => Answer::Conflict(path, kind),
+    Err(Stopped::NotADirectory(path)) => Answer::NotADirectory(path),
     Ok(()) => verify_locks(changes, locks, census),
   }
 }
@@ -1170,12 +1189,18 @@ fn check_case(case: &Case, census: &mut Census) -> Result<(), String> {
   let mut txn = fs.begin_on(base);
   let changes = txn.rows_from(&work_wishes(case, base));
   let target = txn.into_tree();
-  let tree = |revision: Revision| &fs.trees[usize::try_from(revision).unwrap()];
-  let (table, commit) = locks_of(&fs, tree(head), &changes, case);
+  let tree = |revision: Revision| {
+    usize::try_from(revision)
+      .ok()
+      .and_then(|at| fs.trees.get(at))
+      .ok_or_else(|| format!("the naive filesystem holds no revision {revision}"))
+  };
+  let (head_tree, base_tree) = (tree(head)?, tree(base)?);
+  let (table, commit) = locks_of(&fs, head_tree, &changes, case);
   let trees = Trees {
     target: &target,
-    source: tree(head),
-    ancestor: tree(base),
+    source: head_tree,
+    ancestor: base_tree,
   };
   let oracle = oracle_answer(&fs, trees, &changes, (&table, &commit), census);
   let rule = rule_answer(&index, base, changes.clone(), (&table, &commit))?;
