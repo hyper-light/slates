@@ -4735,6 +4735,7 @@ async fn init_shard(
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
+    state_logs: crate::state_log::StateLogs::default(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),
     nfs_service: crate::nfs::ServiceTimes::default(),
