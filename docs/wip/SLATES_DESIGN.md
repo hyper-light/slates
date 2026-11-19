@@ -12977,6 +12977,12 @@ engine: the verdict, rebase, position mapping, the register).
 > receive-pack judges ref names, a hook's git walks the hook view itself, and Subversion's path reads walk its own node
 > history over revisions. A-614 is complete with parts 1 and 2.
 >
+> **Status (2026-11-19, A-653 continued (3): git's delta search a bounded amount a step).** `store::Search` indexes
+> the source and then scans the target a step at a time, each step at most its budget's blocks of the source or its
+> budget of the target, one copy and the target's last bytes past it, and writes the delta one pass writes, byte for
+> byte; `delta_of` is one search run to its end. Owed: its users, upload's objects past a window (part 2) and the
+> fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search).
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -49715,6 +49721,43 @@ Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the mac
   Mercurial hook variables (owed, now closed); `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`;
   `crates/server/src/vcs_hooks.rs`; `crates/hg/src/push/classify.rs` and `classify_tests.rs`;
   `crates/hg/fixtures/hooks/` (new).
+
+### A-653, continued (3) — git's delta search a bounded amount a step: `store::Search` (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4; CLAUDE.md §3 "Bounded work everywhere"; A-614 part 2's `deltas.rs`; part 1 of "a delta search for an object past a window")
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`store::deltas`:
+`Search`, `SearchStep`, `SearchCounters`, `delta_of` one search run to its end; their re-export from `store`;
+`tests::store::deltas`, new).
+
+- **Why.** A-639's stream sends an object past a window whole, with no delta trial, since `delta_of` searched a whole
+  source and a whole target in one call, which no unit bounded by a window could do (A-653's owed "a delta search for
+  an object past a window"). Main's split (2026-11-19): part 1, the search itself a bounded amount a step; part 2, the
+  stream's objects past a window searched through it, their buffers and the source's index charged to the request's
+  own admission, sent whole only where the admission cannot hold them, that case counted, and git's rule read from
+  `pack-objects.c` at v2.50.1 before it is relied on. No constant of git's (its 512 MiB `core.bigFileThreshold`) is
+  taken: a number from one tool is still arbitrary under R3.
+- **The search in steps.** `Search::step(source, target, budget)` indexes the source's whole blocks, at most the
+  budget's and one at least, each hash keeping its first offset as one pass keeps it; once the index is whole, it
+  writes the sizes and scans the target from where the last step stopped, with the one pass's own loop, until the scan
+  has passed the budget. A match found at the step's last position carries it one copy further (64 KiB at most, git's
+  longest copy), and the target's last bytes, short of a block, go with the step that reaches them. Between steps it
+  holds the index, the delta so far, the scan's place and rolling hash, and the lengths the first step was handed: a
+  step handed others ends the search with no delta. Its end lets the index go. `delta_of` runs one search to its end
+  at a budget of every byte, a stage a step, so every caller of A-614 part 2's search writes what it wrote.
+- **Tests**, failing first against `Search`'s first state, the whole search in its first step:
+  `a_delta_is_searched_a_budget_a_step_as_one_pass_searches_it` (a 2,000-line text against itself with three lines
+  edited, 64 bytes a step: no step past its budget, a step at least for each budget of the source, and the delta the
+  one-pass reference's, byte for byte, applying back to the target) and
+  `every_search_at_any_budget_writes_the_reference_delta` (targets cut from random sources with random inserts, as
+  A-614 part 2's delta property builds them, at random budgets and at one for the whole: every step bounded, the delta
+  the reference's). The reference is A-614 part 2's search kept whole in the test module, the specification.
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  store:: upload::`: with the first state, 123 passed, 2 failed (the two tests above, the bounded one at its first
+  step past the budget, the property at a case it found), 4 ignored; with the search, 125 passed, 0 failed, 4
+  ignored, every store and upload test that deltas now searching through it; over the tree landed, merged with
+  main's A-677 (slates-merge), the same 125; `cargo fmt -p slates-git -- --check` clean. No integration target
+  reaches the search.
+- **Owed.** Part 2, as main ruled it (above); the fragment encoder's per-object unit, once `Encoder::put` steps its
+  trials through a search; the red-checks and the other platforms' runs (main's).
 
 ### A-647 part 3 — git's store serves every version's D(k) and reached set from its value of the reach sets, the chains' copies dropped; a value names its sets' bytes as an object of any length (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 2, A-614)
 
