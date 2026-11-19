@@ -80,7 +80,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
       client.status_pages.expire(now, &mut state.store.metadata);
     }
   }
-  let next = [
+  let earliest = [
     state.staging.next_expiry(),
     state.capture_deadlines.first().map(|(at, ..)| *at),
     state.db.partition_mut().next_lease_expiry(),
@@ -89,37 +89,37 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   ]
   .into_iter()
   .flatten()
-  .min()
-  // A deadline still past after its pass is one its job could not end (a record the catalog refused): it is tried again
-  // the shard's window on, never spun on. The red check of a retry the keeper never took found the spin: the watchdog
-  // ended the test daemon, its shard 3.5 s on its CPU without a step (A-536).
-  .map(|at| {
-    if at <= now {
-      count_stuck(state, now)
-    } else {
-      at
-    }
-  });
+  .min();
+  if earliest.is_some_and(|at| at <= now) {
+    state.count(DEADLINE_STUCK, 1);
+  }
+  let window = crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
+  let next = armed_for(earliest, now, window);
   state.deadline_armed = next;
   next.map(|at| at.saturating_sub(now))
 }
 
-/// Format: the counter of the keeper's passes that left a deadline past due (a job's record refused), each tried again a
-/// window later.
-const DEADLINE_STUCK: &str = "deadline.stuck";
-
-/// Counts a pass that left a deadline past due, and answers when it is tried again: the shard's window after `now`
-/// (A-455's window over the overrun this shard measured).
-fn count_stuck(state: &mut ShardState, now: u64) -> u64 {
-  state.count(DEADLINE_STUCK, 1);
-  now.saturating_add(crate::watchdog::watch_window_ns(
-    slates_rt::futures::scheduler_overrun_ns(),
-  ))
+/// When the keeper sleeps until, given the earliest deadline its pass left: that deadline, or, for one still past after
+/// the pass (a job that could not end it: a record the catalog refused), `window` after `now`, so it is tried again a
+/// window on and never spun on. The red check of a retry the keeper never took found the spin: the watchdog ended the
+/// test daemon, its shard 3.5 s on its CPU without a step (A-536).
+fn armed_for(earliest: Option<u64>, now: u64, window: u64) -> Option<u64> {
+  earliest.map(|at| {
+    if at <= now {
+      now.saturating_add(window)
+    } else {
+      at
+    }
+  })
 }
 
-/// Closes every state borrow (`state::try_with_state`): a lease the borrow entered to lapse before the deadline the
-/// keeper sleeps for wakes it, so it re-arms (A-536). The keeper's own pass notes the leases it renews, after it armed
-/// for them, so they wake nothing.
+/// Format: the counter of the keeper's passes that left a deadline past due (a job's record refused), each tried again a
+/// window later ([`armed_for`]).
+const DEADLINE_STUCK: &str = "deadline.stuck";
+
+/// Closes every state borrow (`state::try_with_state`): a lease or a CLI attachment's term the borrow entered to lapse
+/// before the deadline the keeper sleeps for wakes it, so it re-arms (A-536). The keeper's own pass notes the leases it
+/// renews, after it armed for them, so they wake nothing.
 pub(crate) fn after_borrow(state: &mut ShardState) {
   let partition = state.db.partition_mut();
   let earliest = [partition.take_noted_lease(), partition.take_noted_term()]
@@ -278,6 +278,17 @@ mod tests {
     daemon.stop();
     let released = released.expect("the lease was released within half a liveness window");
     println!("a write lease due in {SOON_NS} ns released {released:?} after it was recorded");
+  }
+
+  /// A-536. Do: arm the keeper for no deadline, for one ahead of now, for one at now and for one behind it, as a pass
+  /// leaves them. Expect: none, that one, and the window after now for both the others: a deadline its job could not end
+  /// is tried again a window on, never spun on (job 3's red check found the spin).
+  #[test]
+  fn a_deadline_still_past_after_its_pass_is_tried_again_a_window_on() {
+    assert_eq!(super::armed_for(None, 10, 5), None);
+    assert_eq!(super::armed_for(Some(12), 10, 5), Some(12));
+    assert_eq!(super::armed_for(Some(10), 10, 5), Some(15));
+    assert_eq!(super::armed_for(Some(3), 10, 5), Some(15));
   }
 
   /// A-536 (destroys off the tick). Do: on a one-shard daemon, set a refused destroy record's retry a tenth of a
