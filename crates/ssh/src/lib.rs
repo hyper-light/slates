@@ -101,3 +101,17 @@ mod keylife_tests;
 #[cfg(test)]
 #[path = "tests/transport.rs"]
 mod transport_tests;
+
+// Red (A-633): the tests below name the authentication and channel layers, which are not built yet.
+
+#[cfg(test)]
+#[path = "tests/command.rs"]
+mod command_tests;
+
+#[cfg(test)]
+#[path = "tests/userauth.rs"]
+mod userauth_tests;
+
+#[cfg(test)]
+#[path = "tests/session.rs"]
+mod session_tests;
