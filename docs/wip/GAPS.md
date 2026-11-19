@@ -245,7 +245,7 @@
 > with each hook's arguments, standard input and environment as stock `svnserve` 1.15 hands them, and `svn_told`,
 > `svnserve`'s own words for every outcome; slates ships no `svnlook` (Ada's scope: a hook runs the stock one). Held to
 > 33 cases recorded from stock `svnserve` 1.15.0 on the Mac Studio (`crates/svn/fixtures/hooks`, 325 files, SHA-256
-> checked): `cargo test -p slates-server --lib vcs_hooks` 28 of 28, red ten ways. Found by the recording: lock-token
+> checked): `cargo test -p slates-server --lib -- vcs_hooks hook_driver` 37 of 37, red eleven ways. Found by the recording: lock-token
 > lines carry the client's relative path; no token, no input (A-597's builder and its test had `LOCK-TOKENS:` and a
 > blank line); an empty hooks-env section is none; a program that cannot be executed is exit 255 with no output. Owed:
 > the record's six new points (`HookPointName`, A-622's wire tags); a hooks-env the owner can set; from A-622 part 3's

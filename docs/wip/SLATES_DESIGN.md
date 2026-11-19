@@ -13792,8 +13792,8 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > the client is told of each outcome (`svn_told`, `svn_told_unconfigured`). Held to stock `svnserve` 1.15.0's own runs
 > on the Mac Studio, recorded by `crates/svn/fixtures/hooks/make-fixtures.py`: 33 cases, 64 hook runs and every byte
 > `svnserve` sent, SHA-256 checked. Every recorded input is rebuilt byte for byte, and every refusal's words are found
-> in the bytes `svnserve` sent. `cargo test -p slates-server --lib vcs_hooks`: 28 of 28; red ten ways, each guard broken
-> in a copy failing the tests that hold it. slates ships no `svnlook`; the rebuilt one was stopped by Ada's scope, and
+> in the bytes `svnserve` sent. `cargo test -p slates-server --lib -- vcs_hooks hook_driver`: 37 of 37 on the tree merged
+> with A-622 part 3; red eleven ways, each guard broken in a copy failing the tests that hold it. slates ships no `svnlook`; the rebuilt one was stopped by Ada's scope, and
 > its recordings stay on the unmerged branch `agents/g229-a623-svnlook`.
 > Owed: the record's six new points (`HookPointName` names pre-commit, pre-revprop-change and post-commit alone; the
 > others need wire tags, A-622); a hooks-env the owner can set (until then every hook runs with an empty environment,
@@ -43517,7 +43517,8 @@ Applied in the same change to:
   (1 test), nothing escaped (2), an empty section kept (2), sections not merged (6), a cut character kept (1),
   `apr_exit_why_e` 1 for a signal (2), exit 1 for a failed `exec` (2), post-lock's failure unwrapped (1), standard error
   read past its NUL (2), and A-597's `LOCK-TOKENS:` with no token (2: the token test and the recorded commits); the file
-  put back, 28 of 28 again.
+  put back, 28 of 28 again. On the tree merged with A-622 part 3 (06aa369e6): `-- vcs_hooks hook_driver` 37 of 37, fmt
+  clean; red once more, the driver's clearing taken out: its new test fails and nothing else (8 of 9).
 - **Owed.** The record's six new points (`HookPointName` names three; the rest need wire tags, A-622); a hooks-env the
   owner can set, until which every hook runs with an empty environment, as `svnserve` with no hooks-env file; from
   A-622 part 3's driver: the directory `/` and what REPOS names, which a stock `svnlook -t TXN REPOS` must be able to
