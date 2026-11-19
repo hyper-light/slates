@@ -32,14 +32,20 @@
 //! the transaction's name, its instant and its room ([`Connection::commit`]). A-655's entry point
 //! decides the principal's access and answers ([`commit_drive::commit`]); the client's editor
 //! commands then go to its drive ([`Drive::command`]), which writes each early refusal at once, the
-//! client pipelining (`edit-pipeline`). At `close-edit` the drive accepts the work
-//! ([`Turn::Accepted`]): the caller makes it and answers with the revision it made
+//! client pipelining (`edit-pipeline`). Where `svnserve` runs a hook inside a command, start-commit
+//! at `open-root` and pre-commit at `close-edit` (A-661), the drive waits ([`Turn::Hook`]): the
+//! caller runs it over the transaction ([`Connection::pending`]) and answers
+//! ([`Connection::answer_hook`]); a failure is the command's, and the client's commands are then
+//! dropped until its `abort-edit`. Once pre-commit passed, `close-edit`'s verdict accepts the work
+//! ([`Turn::Accepted`]): the caller makes it through the owner's commit step (A-655's revision of
+//! the work and the repository's commit) and answers with the revision made
 //! ([`Connection::committed`]: `close-edit`'s success, the trivial auth request and the new
-//! revision, `serve.c` 1555-1577 and `editorp.c` 888-905), or refuses it
-//! ([`Connection::not_committed`]): the refusal is `close-edit`'s failure, and the client's commands
-//! are then read and dropped until its `abort-edit` or `success`, as `svn_ra_svn_drive_editor2`
-//! drops them (`editorp.c` 1149-1208). Until the owner makes commits (A-655 part 2), its caller
-//! refuses every one ([`Uncommitted::NotServed`]); nothing else applies a work.
+//! revision, `serve.c` 1555-1577 and `editorp.c` 888-905), or refuses it in the step's words
+//! ([`Connection::not_committed`], [`Uncommitted::Step`]): the refusal is `close-edit`'s failure,
+//! and the client's commands are then read and dropped until its `abort-edit` or `success`, as
+//! `svn_ra_svn_drive_editor2` drops them (`editorp.c` 1149-1208). Until the owner's step appends
+//! through the repository's logs (A-655 part 2b), the daemon refuses every work
+//! ([`Uncommitted::NotServed`]); nothing else applies one.
 //!
 //! **One connection, two transports.** The same connection serves `svn://` over TCP and
 //! `svnserve -t` through an SSH tunnel (piece 12): a tunnel's user comes in through the repository
@@ -68,7 +74,8 @@ mod tests;
 use std::ffi::CStr;
 
 use crate::authz::{self, Authz};
-use crate::commit::drive::{self as commit_drive, Begun, Drive, DriveRefusal, Start, Step, Work};
+use crate::commit::drive::{self as commit_drive, Begun, Drive, Due, Pending, Start, Step, Work};
+use crate::commit::revision::StepRefusal;
 use crate::handshake::{
   self, Access, ClientOpen, CommandMechanisms, CramKey, Principal, Repository, Session, Unserved,
   Verdict,
@@ -201,11 +208,13 @@ pub struct Made<'a> {
 /// `close-edit`'s failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Uncommitted {
-  /// The commit rule refused the work when the owner made it, a commit or a lock having landed
-  /// since the drive's verdict: in the drive's own words ([`Drive::errors`]).
-  Refused(DriveRefusal),
-  /// The owner makes no commits yet (A-655 part 2, owed): `SVN_ERR_UNSUPPORTED_FEATURE` (200007),
-  /// "This server does not make commits yet".
+  /// The owner's commit step refused the revision made of the work (A-655's [`StepRefusal`]): a
+  /// revision committed since the drive's verdict, "Transaction out of date" (160028), as FSFS's
+  /// commit answers a transaction whose base moved; the room; corrupt records.
+  Step(StepRefusal),
+  /// The daemon makes no commits yet, until the owner's step appends through the repository's logs
+  /// (A-655 part 2b): `SVN_ERR_UNSUPPORTED_FEATURE` (200007), "This server does not make commits
+  /// yet".
   NotServed,
 }
 
@@ -264,9 +273,19 @@ pub enum Turn<'a> {
     /// The bytes taken.
     consumed: usize,
   },
-  /// The commit's drive accepted its work at `close-edit`, `consumed` bytes: the caller makes the
-  /// work, then answers with the revision it made ([`Connection::committed`]) or refuses it
-  /// ([`Connection::not_committed`]).
+  /// The commit's drive waits for a hook `svnserve` runs inside the command it just took,
+  /// `consumed` bytes (A-661): start-commit at `open-root`, pre-commit at `close-edit`. The caller
+  /// runs it over the transaction ([`Connection::pending`]) and answers ([`Connection::answer_hook`])
+  /// before anything else.
+  Hook {
+    /// The hook.
+    due: Due,
+    /// The bytes taken.
+    consumed: usize,
+  },
+  /// The commit's drive accepted its work at `close-edit`: the caller makes the work, then answers
+  /// with the revision it made ([`Connection::committed`]) or refuses it
+  /// ([`Connection::not_committed`]). `consumed` is 0 where the acceptance came of a hook's answer.
   Accepted {
     /// The work.
     work: Box<Work>,
@@ -293,7 +312,8 @@ pub enum Waiting {
   /// A report's commands.
   Report,
   /// Nothing from the client: an answer is being written (a drive, a long read's rest, a command
-  /// run again), or the caller's own answer is awaited (a commit's start, its work's verdict).
+  /// run again), or the caller's own answer is awaited (a commit's start, a hook's answer, its
+  /// work's verdict).
   Writing,
   /// The client's answer to `close-edit` or `abort-edit`.
   EditAnswer,
@@ -365,7 +385,7 @@ struct Established {
 
 /// A command an authentication for it interrupted, run again once the client is established.
 #[derive(Debug)]
-enum Pending {
+enum Interrupted {
   /// `commit`: its item, and what the caller began it with.
   Commit {
     /// The item.
@@ -393,13 +413,15 @@ enum Phase {
   /// `commit` was read, its item kept: the caller's start is awaited.
   CommitAsked(Box<Established>, Vec<u8>),
   /// An authentication for one command runs.
-  Authenticating(Box<Established>, Box<handshake::Server>, Box<Pending>),
+  Authenticating(Box<Established>, Box<handshake::Server>, Box<Interrupted>),
   /// An authentication for one command ended: the command runs again at the next call.
-  Resuming(Box<Established>, Box<Pending>),
+  Resuming(Box<Established>, Box<Interrupted>),
   /// A commit's drive takes the client's editor commands.
   Committing(Box<Established>, Box<Drive>),
+  /// A commit's drive waits for a hook's answer, the caller's.
+  Hooked(Box<Established>, Box<Drive>),
   /// A commit's work was accepted: the caller's verdict is awaited.
-  Accepted(Box<Established>, Box<Drive>),
+  Accepted(Box<Established>),
   /// A commit's work was refused at `close-edit`: the client's commands are dropped until its
   /// `abort-edit` or `success`.
   Dropping(Box<Established>),
@@ -419,7 +441,8 @@ impl std::fmt::Debug for Phase {
       Self::Authenticating(..) => "Authenticating",
       Self::Resuming(..) => "Resuming",
       Self::Committing(..) => "Committing",
-      Self::Accepted(..) => "Accepted",
+      Self::Hooked(..) => "Hooked",
+      Self::Accepted(_) => "Accepted",
       Self::Dropping(_) => "Dropping",
       Self::Ended => "Ended",
     })
@@ -459,9 +482,11 @@ impl Connection {
     match &self.phase {
       Phase::Handshake(_) | Phase::Authenticating(..) => Waiting::Handshake,
       Phase::Commands(_) => Waiting::Command,
-      Phase::Streaming(..) | Phase::CommitAsked(..) | Phase::Resuming(..) | Phase::Accepted(..) => {
-        Waiting::Writing
-      }
+      Phase::Streaming(..)
+      | Phase::CommitAsked(..)
+      | Phase::Resuming(..)
+      | Phase::Hooked(..)
+      | Phase::Accepted(_) => Waiting::Writing,
       Phase::Reporting(_, exchange) => match exchange.awaiting() {
         Awaiting::Report => Waiting::Report,
         Awaiting::Drive => Waiting::Writing,
@@ -483,7 +508,8 @@ impl Connection {
       | Phase::Authenticating(established, _, _)
       | Phase::Resuming(established, _)
       | Phase::Committing(established, _)
-      | Phase::Accepted(established, _)
+      | Phase::Hooked(established, _)
+      | Phase::Accepted(established)
       | Phase::Dropping(established) => Some(&established.session),
       Phase::Handshake(_) | Phase::Ended => None,
     }
@@ -494,8 +520,8 @@ impl Connection {
   ///
   /// # Errors
   /// [`Refused`] for client bytes that end the connection, and for the caller's own errors: a call
-  /// out of turn (where a commit's start or its work's verdict is awaited, or after the end), or
-  /// one without sources, which ends the connection.
+  /// out of turn (where a commit's start, a hook's answer or its work's verdict is awaited, or after
+  /// the end), or one without sources, which ends the connection.
   pub fn receive<'a, R, G>(
     &mut self,
     sources: Option<&Sources<'_, R, G>>,
@@ -509,14 +535,14 @@ impl Connection {
   {
     if matches!(
       self.phase,
-      Phase::CommitAsked(..) | Phase::Accepted(..) | Phase::Ended
+      Phase::CommitAsked(..) | Phase::Hooked(..) | Phase::Accepted(_) | Phase::Ended
     ) {
       return Err(Refused::OutOfTurn);
     }
     match std::mem::replace(&mut self.phase, Phase::Ended) {
       Phase::Handshake(server) => self.handshake(server, input, out),
-      Phase::Authenticating(established, server, pending) => {
-        self.authenticating(established, server, pending, input, out)
+      Phase::Authenticating(established, server, interrupted) => {
+        self.authenticating(established, server, interrupted, input, out)
       }
       phase => {
         let sources = sources.ok_or(Refused::NoSources)?;
@@ -620,13 +646,13 @@ impl Connection {
           other.map_err(Refused::Handshake)
         }
       },
-      Phase::Authenticating(established, mut server, pending) => match server.key(key, out) {
+      Phase::Authenticating(established, mut server, interrupted) => match server.key(key, out) {
         Ok(Verdict::Established(principal)) => {
-          self.authenticated(established, &server, pending)?;
+          self.authenticated(established, &server, interrupted)?;
           Ok(Verdict::Established(principal))
         }
         other => {
-          self.phase = Phase::Authenticating(established, server, pending);
+          self.phase = Phase::Authenticating(established, server, interrupted);
           other.map_err(Refused::Handshake)
         }
       },
@@ -665,6 +691,53 @@ impl Connection {
     self.begin_commit(established, command, start, false, &sources.policy, out)
   }
 
+  /// The transaction a due hook runs over (A-661): its name, base, revision properties, rows and
+  /// contents so far, as the drive holds them; none unless a hook's answer is awaited.
+  pub fn pending(&self) -> Option<Pending<'_>> {
+    match &self.phase {
+      Phase::Hooked(_, drive) => Some(drive.pending()),
+      _ => None,
+    }
+  }
+
+  /// Answers the hook the drive waits for: `Ok` lets the command go on; `Err` holds the hook's
+  /// failure, outermost first, written as the command's failure, after which the client's commands
+  /// are dropped until its `abort-edit` (A-655's [`Drive::resume`]). The turn is the drive's next
+  /// step's, none of the client's input taken: [`Turn::Took`] with nothing consumed, or
+  /// [`Turn::Accepted`] where pre-commit's answer let `close-edit`'s verdict accept the work.
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a hook's answer is awaited; [`Refused::Item`] where the failure
+  /// cannot be written.
+  pub fn answer_hook<R, G>(
+    &mut self,
+    answer: Result<(), Vec<(u32, String)>>,
+    sources: &Sources<'_, R, G>,
+    out: &mut Vec<u8>,
+  ) -> Result<Turn<'static>, Refused>
+  where
+    R: commit_drive::Green + ?Sized,
+    G: ?Sized,
+  {
+    let (established, mut drive) = match std::mem::replace(&mut self.phase, Phase::Ended) {
+      Phase::Hooked(established, drive) => (established, drive),
+      other => {
+        self.phase = other;
+        return Err(Refused::OutOfTurn);
+      }
+    };
+    let step = drive
+      .resume(
+        sources.index,
+        sources.repository,
+        sources.locks,
+        answer,
+        out,
+      )
+      .map_err(Refused::Item)?;
+    self.stepped(established, drive, step, 0)
+  }
+
   /// Answers the accepted commit with the revision the owner made of it (`serve.c` 1555-1577,
   /// [`commit_drive::write_commit_info`]): `close-edit`'s success, the trivial auth request, then
   /// the revision, its date, its author and the post-commit hook's words; the session's commands
@@ -674,7 +747,7 @@ impl Connection {
   /// [`Refused::OutOfTurn`] unless a work was just accepted.
   pub fn committed(&mut self, made: &Made<'_>, out: &mut Vec<u8>) -> Result<(), Refused> {
     let established = match std::mem::replace(&mut self.phase, Phase::Ended) {
-      Phase::Accepted(established, _) => established,
+      Phase::Accepted(established) => established,
       other => {
         self.phase = other;
         return Err(Refused::OutOfTurn);
@@ -699,15 +772,15 @@ impl Connection {
   /// # Errors
   /// [`Refused::OutOfTurn`] unless a work was just accepted.
   pub fn not_committed(&mut self, failure: &Uncommitted, out: &mut Vec<u8>) -> Result<(), Refused> {
-    let (established, drive) = match std::mem::replace(&mut self.phase, Phase::Ended) {
-      Phase::Accepted(established, drive) => (established, drive),
+    let established = match std::mem::replace(&mut self.phase, Phase::Ended) {
+      Phase::Accepted(established) => established,
       other => {
         self.phase = other;
         return Err(Refused::OutOfTurn);
       }
     };
     let errors = match failure {
-      Uncommitted::Refused(refusal) => drive.errors(refusal),
+      Uncommitted::Step(refusal) => vec![(refusal.subversion_code(), refusal.message())],
       Uncommitted::NotServed => vec![(SVN_ERR_UNSUPPORTED_FEATURE, NOT_SERVED.to_owned())],
     };
     write_failure(&errors, out)?;
@@ -745,7 +818,7 @@ impl Connection {
       Phase::Reporting(established, exchange) => {
         self.exchange(established, exchange, sources, input, out, budget)
       }
-      Phase::Resuming(established, pending) => self.resume(established, *pending, sources, out),
+      Phase::Resuming(established, interrupted) => self.resume(established, *interrupted, sources, out),
       Phase::Committing(established, drive) => {
         self.editing(established, drive, sources, input, out)
       }
@@ -753,7 +826,8 @@ impl Connection {
       Phase::Handshake(_)
       | Phase::Authenticating(..)
       | Phase::CommitAsked(..)
-      | Phase::Accepted(..)
+      | Phase::Hooked(..)
+      | Phase::Accepted(_)
       | Phase::Ended => Err(Refused::OutOfTurn),
     }
   }
@@ -809,7 +883,7 @@ impl Connection {
     &mut self,
     established: Box<Established>,
     mut server: Box<handshake::Server>,
-    pending: Box<Pending>,
+    interrupted: Box<Interrupted>,
     input: &'a [u8],
     out: &mut Vec<u8>,
   ) -> Result<Turn<'a>, Refused> {
@@ -818,7 +892,7 @@ impl Connection {
         principal,
         consumed,
       } => {
-        self.authenticated(established, &server, pending)?;
+        self.authenticated(established, &server, interrupted)?;
         return Ok(Turn::Established {
           principal,
           consumed,
@@ -830,7 +904,7 @@ impl Connection {
       handshake::Progress::Failed { consumed, .. } => Turn::Took { consumed },
       handshake::Progress::Opened { .. } => return Err(Refused::OutOfTurn),
     };
-    self.phase = Phase::Authenticating(established, server, pending);
+    self.phase = Phase::Authenticating(established, server, interrupted);
     Ok(turn)
   }
 
@@ -840,10 +914,10 @@ impl Connection {
     &mut self,
     mut established: Box<Established>,
     server: &handshake::Server,
-    pending: Box<Pending>,
+    interrupted: Box<Interrupted>,
   ) -> Result<(), Refused> {
     established.session = server.session().cloned().ok_or(Refused::OutOfTurn)?;
-    self.phase = Phase::Resuming(established, pending);
+    self.phase = Phase::Resuming(established, interrupted);
     Ok(())
   }
 
@@ -895,8 +969,8 @@ impl Connection {
             self.phase = Phase::Reporting(established, exchange);
             Turn::Took { consumed }
           }
-          Answered::Authenticating(server, pending) => {
-            self.phase = Phase::Authenticating(established, server, pending);
+          Answered::Authenticating(server, interrupted) => {
+            self.phase = Phase::Authenticating(established, server, interrupted);
             Turn::Took { consumed }
           }
           Answered::CommitAsked => {
@@ -953,10 +1027,10 @@ impl Connection {
       && !readable
       && let Some(server) = self.ask(established, &sources.policy, authz::Access::Read, out)?
     {
-      let pending = Pending::Update {
+      let interrupted = Interrupted::Update {
         command: item.to_vec(),
       };
-      return Ok(Answered::Authenticating(server, Box::new(pending)));
+      return Ok(Answered::Authenticating(server, Box::new(interrupted)));
     }
     Ok(
       match self.begin_report(established, sources.index, request, readable, false, out)? {
@@ -1033,7 +1107,7 @@ impl Connection {
   fn resume<'a, R, G>(
     &mut self,
     established: Box<Established>,
-    pending: Pending,
+    interrupted: Interrupted,
     sources: &Sources<'_, R, G>,
     out: &mut Vec<u8>,
   ) -> Result<Turn<'a>, Refused>
@@ -1041,11 +1115,11 @@ impl Connection {
     R: ?Sized,
     G: Guards + ?Sized,
   {
-    match pending {
-      Pending::Commit { command, start } => {
+    match interrupted {
+      Interrupted::Commit { command, start } => {
         self.begin_commit(established, command, start, true, &sources.policy, out)?;
       }
-      Pending::Update { command } => {
+      Interrupted::Update { command } => {
         let request = {
           let value = self.whole_item(&command)?;
           let (_, params) = command_of(&value).ok_or(Refused::Malformed)?;
@@ -1088,8 +1162,8 @@ impl Connection {
         };
         match asked {
           Some(server) => {
-            let pending = Box::new(Pending::Commit { command, start });
-            self.phase = Phase::Authenticating(established, server, pending);
+            let interrupted = Box::new(Interrupted::Commit { command, start });
+            self.phase = Phase::Authenticating(established, server, interrupted);
           }
           None => {
             ReportFailure::NotAuthorized
@@ -1170,18 +1244,36 @@ impl Connection {
         out,
       )
       .map_err(Refused::Item)?;
-    match step {
+    self.stepped(established, drive, step, consumed)
+  }
+
+  /// Where a drive's step leaves the connection, and its turn, `consumed` the bytes the step took.
+  fn stepped<'a>(
+    &mut self,
+    established: Box<Established>,
+    drive: Box<Drive>,
+    step: Step,
+    consumed: usize,
+  ) -> Result<Turn<'a>, Refused> {
+    Ok(match step {
       Step::Taken | Step::Refused | Step::Dropped => {
         self.phase = Phase::Committing(established, drive);
+        Turn::Took { consumed }
       }
-      Step::Ended => self.phase = Phase::Commands(established),
+      Step::Ended => {
+        self.phase = Phase::Commands(established);
+        Turn::Took { consumed }
+      }
+      Step::Hook(due) => {
+        self.phase = Phase::Hooked(established, drive);
+        Turn::Hook { due, consumed }
+      }
       Step::Accepted(work) => {
-        self.phase = Phase::Accepted(established, drive);
-        return Ok(Turn::Accepted { work, consumed });
+        self.phase = Phase::Accepted(established);
+        Turn::Accepted { work, consumed }
       }
       Step::Close => return Err(Refused::Malformed),
-    }
-    Ok(Turn::Took { consumed })
+    })
   }
 
   /// One of the client's commands after its commit was refused at `close-edit`: `abort-edit` or
@@ -1318,7 +1410,7 @@ enum Answered {
   /// A report command begun: its exchange runs.
   Reporting(Box<Exchange>),
   /// An authentication for the command asked: it runs, then the command again.
-  Authenticating(Box<handshake::Server>, Box<Pending>),
+  Authenticating(Box<handshake::Server>, Box<Interrupted>),
   /// `commit`: the caller's start is awaited.
   CommitAsked,
   /// As a command not served yet.
