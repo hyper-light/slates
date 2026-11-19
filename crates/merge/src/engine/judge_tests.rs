@@ -165,22 +165,25 @@ fn landed(green: &mut Green, edits: &[Edit], id: u64) -> u64 {
 /// windows answer it again from the cache; a work accepted before is answered its version.
 #[test]
 fn a_held_verdict_commits_at_its_head_and_is_refused_once_the_green_moved() {
-  let mut green = Green::new();
-  landed(&mut green, &[Edit::Write(0, b"base".to_vec())], 1);
-  assert_a_held_verdict_commits_as_a_submit_would(&mut green);
+  let based = || {
+    let mut green = Green::new();
+    landed(&mut green, &[Edit::Write(0, b"base".to_vec())], 1);
+    green
+  };
+  let mut green = based();
+  assert_a_held_verdict_commits_as_a_submit_would(&mut green, based());
   assert_a_held_verdict_is_refused_once_its_green_moved(&mut green);
   assert_conflicts_and_retries_are_answered(&mut green);
 }
 
 /// A-635's first part: a work judged at version 1 applies nothing, and commits as version 2 with what a submit would
-/// record, leaving the green as the submit leaves its copy.
-fn assert_a_held_verdict_commits_as_a_submit_would(green: &mut Green) {
+/// record, leaving the green as the submit leaves its twin, a green made by the same steps.
+fn assert_a_held_verdict_commits_as_a_submit_would(green: &mut Green, mut submitted: Green) {
   let before = seen(green);
   let accepting = work(green, 1, &[Edit::Write(1, b"b".to_vec())], 2);
   let held = accepted(green.judge(&accepting));
   assert_eq!(held.at(), 1);
   assert_eq!(seen(green), before, "a judgment applied something");
-  let mut submitted = green.clone();
   let answered = submitted.submit_resolved(&accepting);
   assert_eq!(answered.1.as_deref(), Some(held.applied()));
   let committed = green.commit_judged(held).map(|(version, applied)| {

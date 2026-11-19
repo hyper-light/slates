@@ -125,7 +125,7 @@ pub(crate) struct Pushed {
 }
 
 /// Why one change was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ChangeRefusal {
   /// The verdict's windows (§4.16): the head another push moved first (`MetaMeta` on `slates.vcs.head`), or paths.
   Conflict {
@@ -152,7 +152,7 @@ pub(crate) enum ChangeRefusal {
 }
 
 /// One change refused: its index among the push's changes, and why.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChangeRefused {
   /// The change's index.
   pub(crate) index: usize,
@@ -161,7 +161,7 @@ pub(crate) struct ChangeRefused {
 }
 
 /// A push refused, typed; nothing of it applied.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PushRefused {
   /// The repository: none here (`NotFound`), or another principal's (`Forbidden`, until the policy of piece 7).
   Repository(Refusal),

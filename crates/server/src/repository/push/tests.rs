@@ -62,7 +62,7 @@ fn key(kind: &[u8], bytes: &[u8]) -> ObjectKey {
 
 impl Store {
   /// A tree holding `files` at its top, each a plain file; its id.
-  fn tree(&mut self, files: &[(&str, &[u8])]) -> ObjectKey {
+  fn put_tree(&mut self, files: &[(&str, &[u8])]) -> ObjectKey {
     let mut entries = Vec::new();
     let mut encoded = Vec::new();
     for (name, bytes) in files {
@@ -232,7 +232,7 @@ fn two_branches(state: &mut ShardState) -> (RepositoryId, [DbVolumeId; 2], Store
   let (repo, main) = repository(state, "tree");
   let topic = branch(state, "tree", ("topic", "main"));
   let mut store = Store::default();
-  let one = store.tree(&[("f", b"one")]);
+  let one = store.put_tree(&[("f", b"one")]);
   let first = work(state, main, (0, None), (one, b"c1"), (&store, 1));
   let pushed = push(
     state,
@@ -266,8 +266,8 @@ fn a_push_moves_every_branch_or_none_of_them() {
   crate::daemon::audit_on_shard(|state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let at = position(state, repo).expect("the register");
-    let two = store.tree(&[("f", b"two")]);
-    let topical = store.tree(&[("g", b"topic")]);
+    let two = store.put_tree(&[("f", b"two")]);
+    let topical = store.put_tree(&[("g", b"topic")]);
     let together = vec![
       BranchChange::Update {
         green: main,
@@ -280,8 +280,8 @@ fn a_push_moves_every_branch_or_none_of_them() {
     ];
     assert_both_moved_in_one_entry(state, (repo, at), [main, topic], together.clone());
     assert_sent_again_records_nothing(state, (repo, at), [main, topic], together);
-    let three = store.tree(&[("f", b"three")]);
-    let stale = store.tree(&[("g", b"stale")]);
+    let three = store.put_tree(&[("f", b"three")]);
+    let stale = store.put_tree(&[("g", b"stale")]);
     let charged = state.green_retention.get(&main).copied();
     let changes = vec![
       BranchChange::Update {
@@ -382,8 +382,8 @@ fn a_push_creates_and_deletes_branches_in_the_same_step() {
   crate::daemon::audit_on_shard(|state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let at = position(state, repo).expect("the register");
-    let featured = store.tree(&[("f", b"one"), ("h", b"new")]);
-    let two = store.tree(&[("f", b"two")]);
+    let featured = store.put_tree(&[("f", b"one"), ("h", b"new")]);
+    let two = store.put_tree(&[("f", b"two")]);
     let changes = vec![
       BranchChange::Create {
         name: "feature".to_owned(),
@@ -451,7 +451,7 @@ fn every_refused_change_is_named_and_nothing_is_applied() {
   crate::daemon::audit_on_shard(|state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let lone = lone_green(state);
-    let two = store.tree(&[("f", b"two")]);
+    let two = store.put_tree(&[("f", b"two")]);
     let moving = work(state, main, (1, Some(one)), (two, b"c2"), (&store, 8));
     let changes = vec![
       create("main", main, 1),
@@ -525,7 +525,7 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
   store: &mut Store,
 ) {
   let [main, topic] = greens;
-  let first = store.tree(&[("g", b"first")]);
+  let first = store.put_tree(&[("g", b"first")]);
   let landed = work(state, topic, (0, None), (first, b"t1"), (store, 9));
   let pushed = push(
     state,
@@ -538,9 +538,9 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
     EntryParts::default(),
   );
   assert!(pushed.is_ok(), "{pushed:?}");
-  let late = store.tree(&[("g", b"late")]);
-  let made = store.tree(&[("f", b"one"), ("x", b"x")]);
-  let one = store.tree(&[("f", b"one")]);
+  let late = store.put_tree(&[("g", b"late")]);
+  let made = store.put_tree(&[("f", b"one"), ("x", b"x")]);
+  let one = store.put_tree(&[("f", b"one")]);
   let changes = vec![
     BranchChange::Create {
       name: "made".to_owned(),
@@ -571,7 +571,7 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
 fn the_gates_and_the_entry_refuse_the_whole_push() {
   crate::daemon::audit_on_shard(|state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
-    let two = store.tree(&[("f", b"two")]);
+    let two = store.put_tree(&[("f", b"two")]);
     let moving = work(state, main, (1, Some(one)), (two, b"c2"), (&store, 12));
     assert_a_failed_check_refuses_the_entry(state, (repo, [main, topic]), moving.clone());
     assert_the_state_moves_with_the_push(state, repo, main, moving);
@@ -656,8 +656,8 @@ fn assert_the_write_policy_gates_the_push(
   main: DbVolumeId,
   store: &mut Store,
 ) {
-  let three = store.tree(&[("f", b"three")]);
-  let two = store.tree(&[("f", b"two")]);
+  let three = store.put_tree(&[("f", b"three")]);
+  let two = store.put_tree(&[("f", b"two")]);
   let moving = work(state, main, (2, Some(two)), (three, b"c3"), (store, 13));
   for (mode, refusal) in [
     (
