@@ -925,8 +925,7 @@ impl Repository {
     Ok(())
   }
 
-  /// The push's objects new to the repository, by type and then id (A-639: a push's new objects of one type take
-  /// one run of positions, so a fragment's two parts are a run each): id, type, root content and length.
+  /// The push's objects new to the repository, in their ids' order: id, type, root content and length.
   fn fresh(
     &self,
     store: &ContentStore,
@@ -940,19 +939,23 @@ impl Repository {
         fresh.push((id, kind, content, len));
       }
     }
-    fresh.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     Ok(fresh)
   }
 
-  /// A position for each fresh object, the next ones in order; and the next position after them.
+  /// A position for each fresh object, the next ones in order by type and then id; and the next position after them.
+  /// By type (A-639): a push's new objects of one type take one run of positions, so a fragment's two parts, its blobs
+  /// and the rest, are a run each, and upload-pack's sets of them stay a few runs.
   fn positions_for(
     &self,
     fresh: &[(ObjectId, Kind, ContentId, u64)],
   ) -> Result<(BTreeMap<ObjectId, u64>, u64), StoreRefused> {
+    let mut order: Vec<(Kind, ObjectId)> =
+      fresh.iter().map(|(id, kind, ..)| (*kind, *id)).collect();
+    order.sort_unstable();
     let mut positions = BTreeMap::new();
     let mut next = self.next_position;
-    for (id, ..) in fresh {
-      positions.insert(*id, next);
+    for (_, id) in order {
+      positions.insert(id, next);
       next = next
         .checked_add(1)
         .filter(|next| *next < u64::MAX)
