@@ -35,9 +35,15 @@
 //! While its KEXINIT is out and its NEWKEYS is not, [`ServerTransport::send`] answers [`SendRefusal::Rekeying`], and the
 //! caller sends again after [`Event::Rekeyed`]. A key that reaches its whole limit anyway ends the connection.
 //!
+//! **Key exchange** ([`crate::kex`]). The method is the client's first choice of `mlkem768x25519-sha256` (A-634) and
+//! `curve25519-sha256`; both run as `SSH_MSG_KEX_ECDH_INIT` and `SSH_MSG_KEX_ECDH_REPLY`, the hybrid's values longer, and
+//! a value that fails its method's checks ends the connection with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`.
+//!
+//! **Extensions.** After the first `SSH_MSG_NEWKEYS`, when the client's KEXINIT lists `ext-info-c`, the server sends
+//! RFC 8308's `SSH_MSG_EXT_INFO` with the extensions its caller configured (A-633: `server-sig-algs`).
+//!
 //! **Refusals.** Every refusal is a [`Refusal`]; the transport sends `SSH_MSG_DISCONNECT` with its reason and closes.
-//! Not built here: user authentication and channels (the next pieces), RFC 8308's `SSH_MSG_EXT_INFO` (the
-//! authentication piece's, when it offers RSA keys), compression, and key exchanges other than `curve25519-sha256`.
+//! Not built here: user authentication and channels ([`crate::session`] above it), compression, and other key exchanges.
 
 use crate::entropy::Entropy;
 use crate::hostkey::HostKey;
@@ -46,9 +52,11 @@ use crate::ident::{
 };
 use crate::kex::{
   ExchangeInputs, HASH_LEN, KEX_ECDH_INIT, KEX_ECDH_REPLY, KexRefusal, X25519_LEN,
-  curve25519_server, ecdh_reply, exchange_hash, new_keys, read_ecdh_init,
+  curve25519_server, ecdh_reply, exchange_hash, mlkem768x25519_server, new_keys, read_ecdh_init,
 };
-use crate::kexinit::{COOKIE_LEN, KEXINIT, KexInit, Negotiated, negotiate, server_kexinit};
+use crate::kexinit::{
+  COOKIE_LEN, KEXINIT, KexInit, KexMethod, Negotiated, negotiate, server_kexinit,
+};
 use crate::keylife::{KeyLimits, UsageCap};
 use crate::packet::{
   Cipher, KeyMaterialRefusal, LENGTH_LEN, MAX_PACKET_EVERY_PEER_ACCEPTS, Opener, SealRefusal,
@@ -129,9 +137,11 @@ pub enum ConfigRefusal {
   Encoding(WireRefusal),
 }
 
-/// The ciphers a key exchange agreed.
+/// What a key exchange agreed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Algorithms {
+  /// The key exchange method, so a deployment can count the connections that ran the post-quantum hybrid (A-634).
+  pub kex: KexMethod,
   /// What the client sends.
   pub client_to_server: Cipher,
   /// What the server sends.
@@ -147,7 +157,7 @@ pub struct Established {
   pub strict: bool,
   /// Whether the client listed `ext-info-c` (RFC 8308 §2.1), for the authentication layer.
   pub client_ext_info: bool,
-  /// The ciphers.
+  /// The method and the ciphers.
   pub algorithms: Algorithms,
 }
 
@@ -760,7 +770,10 @@ impl<E: Entropy> ServerTransport<E> {
       .entropy
       .fill(&mut private)
       .map_err(|_| Refusal::Entropy)?;
-    let half = curve25519_server(&private, client_public);
+    let half = match negotiated.kex {
+      KexMethod::Mlkem768X25519Sha256 => mlkem768x25519_server(&private, client_public),
+      KexMethod::Curve25519Sha256 => curve25519_server(&private, client_public),
+    };
     private.fill(0);
     let half = half.map_err(Refusal::Kex)?;
     let hash = self.exchange_hash_of(
@@ -858,6 +871,7 @@ impl<E: Entropy> ServerTransport<E> {
     self.key_installed_ns = now_ns;
     self.last_exchange_ns = now_ns.saturating_sub(exchange.started_ns);
     let algorithms = Algorithms {
+      kex: negotiated.kex,
       client_to_server: negotiated.client_to_server,
       server_to_client: negotiated.server_to_client,
     };

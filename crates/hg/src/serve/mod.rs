@@ -23,6 +23,7 @@
 pub mod discovery;
 pub mod getbundle;
 pub mod pull;
+pub mod session;
 
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, Node, PastAdmission, phases::Phase, pushkey};
@@ -63,7 +64,7 @@ pub trait Repository {
 }
 
 /// Why a request was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
   /// An item of a node list that is not 40 hexadecimal digits.
   NodeList {

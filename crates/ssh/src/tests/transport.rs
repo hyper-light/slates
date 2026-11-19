@@ -1,4 +1,5 @@
-//! The server's transport over whole connections with the test client (A-594; RFC 4253; the strict-kex draft §3).
+//! The server's transport over whole connections with the test client (A-594, A-634; RFC 4253; the strict-kex draft
+//! §3; the hybrid draft).
 
 use proptest::prelude::*;
 
@@ -6,11 +7,11 @@ use crate::client::{Client, ClientOptions, put_string};
 use crate::hostkey::HostKey;
 use crate::ident::{IdentificationRefusal, software_version};
 use crate::kex::KexRefusal;
-use crate::kexinit::{KexInit, KexInitRefusal, List};
+use crate::kexinit::{KexInit, KexInitRefusal, KexMethod, List};
 use crate::keylife::{RECOMMENDED_KEY_TIME_NS, UsageCap};
 use crate::packet::{Cipher, MAX_PACKET_EVERY_PEER_ACCEPTS, PacketRefusal, Sealer};
 use crate::refusal::{Direction, Refusal};
-use crate::support::{FailingAfter, Seeded, hex_array};
+use crate::support::{FailingAfter, Seeded, hex, hex_array, mlkem_key_pair, with_coefficient};
 use crate::transport::{
   Algorithms, ConfigRefusal, Event, SendRefusal, ServerTransport, TransportConfig,
 };
@@ -150,10 +151,10 @@ fn clear_packet(payload: &[u8]) -> Vec<u8> {
   out
 }
 
-/// A-594: do connect a client like OpenSSH 10's under each cipher, with and without strict key exchange, ask for
-/// `ssh-userauth`, and pass a message each way. Expect the first exchange to end with the session id the client computed
-/// and verified the host key's signature over, the cipher and strictness agreed, the service accepted, the client's
-/// message raised, and the server's opened by the client.
+/// A-594, A-634: do connect a client like OpenSSH 10's under each cipher, with and without strict key exchange, ask for
+/// `ssh-userauth`, and pass a message each way. Expect the first exchange to run the post-quantum hybrid and end with
+/// the session id the client computed and verified the host key's signature over, the cipher and strictness agreed, the
+/// service accepted, the client's message raised, and the server's opened by the client.
 #[test]
 fn a_stock_client_connects_under_each_cipher_and_strictness() {
   for (cipher_name, cipher, strict) in [
@@ -168,7 +169,7 @@ fn a_stock_client_connects_under_each_cipher_and_strictness() {
 }
 
 /// Connects a client like OpenSSH 10's under `cipher` and checks the first exchange: the session id the client verified
-/// the host key's signature over, the cipher and strictness agreed, the host key and the client's line.
+/// the host key's signature over, the hybrid, the cipher and strictness agreed, the host key and the client's line.
 fn connected(cipher_name: &str, cipher: Cipher, strict: bool) -> Session {
   let mut session = Session::new(config(), ClientOptions::openssh_like(cipher_name, strict));
   session.pump().unwrap();
@@ -177,6 +178,7 @@ fn connected(cipher_name: &str, cipher: Cipher, strict: bool) -> Session {
     .session_id
     .expect("the client verified the exchange");
   let algorithms = Algorithms {
+    kex: KexMethod::Mlkem768X25519Sha256,
     client_to_server: cipher,
     server_to_client: cipher,
   };
@@ -238,6 +240,7 @@ fn each_direction_runs_its_own_cipher() {
   assert_eq!(
     established.algorithms,
     Algorithms {
+      kex: KexMethod::Mlkem768X25519Sha256,
       client_to_server: Cipher::Aes256Gcm,
       server_to_client: Cipher::ChaCha20Poly1305
     }
@@ -415,11 +418,11 @@ fn a_client_sharing_no_cipher_is_refused() {
   assert_eq!(disconnect_reason(session.last_received()), 3);
 }
 
-/// A-594 hostile (RFC 8731 §3): do send an exchange whose public key is the all-zero point. Expect the exchange refused
-/// and disconnect reason 3.
+/// A-594 hostile (RFC 8731 §3): do send a `curve25519-sha256` exchange whose public key is the all-zero point. Expect
+/// the exchange refused and disconnect reason 3.
 #[test]
 fn a_small_order_client_key_is_refused() {
-  let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
+  let mut session = Session::new(config(), ClientOptions::classical(CHACHA, true));
   let first = session.client.take_output();
   session.to_server(&first).unwrap();
   let mut init = vec![30];
@@ -498,9 +501,9 @@ fn bad_identifications_are_refused() {
   );
 }
 
-/// A-594 (RFC 4253 §9): do start a key exchange from the client once the service is accepted, then pass messages. Expect
-/// the server's KEXINIT without the strict markers, the exchange raised as a rekey, a new exchange hash with the session
-/// id unchanged, and messages passing both ways under the new keys.
+/// A-594, A-634 (RFC 4253 §9): do start a key exchange from the client once the service is accepted, then pass messages.
+/// Expect the server's KEXINIT without the strict markers, the exchange raised as a rekey under the hybrid, a new
+/// exchange hash with the session id unchanged, and messages passing both ways under the new keys.
 #[test]
 fn a_client_rekey_keeps_the_session_id() {
   for cipher in [CHACHA, GCM] {
@@ -512,10 +515,10 @@ fn a_client_rekey_keeps_the_session_id() {
     let read = KexInit::read(&server_kexinit).unwrap();
     let hashes = &session.client.exchange_hashes;
     let observed = (
-      session
-        .events
-        .iter()
-        .any(|event| matches!(event, Event::Rekeyed(_))),
+      session.events.iter().any(|event| match event {
+        Event::Rekeyed(algorithms) => algorithms.kex == KexMethod::Mlkem768X25519Sha256,
+        _ => false,
+      }),
       session.client.server_newkeys,
       hashes.len() == 2 && hashes.first() != hashes.last(),
       session.server.session_id() == Some(&session_id),
@@ -676,11 +679,13 @@ fn input_waits_while_the_output_is_full() {
   );
 }
 
-/// A-594 determinism: do run the same connection twice from the same seeds. Expect the server's bytes identical.
+/// A-594 determinism, A-634: do run the same `curve25519-sha256` connection twice from the same seeds. Expect the
+/// server's bytes identical. A hybrid connection is not reproducible from the seeds, since its encapsulation draws on
+/// AWS-LC's own generator (`entropy`'s module doc says why), so this holds the classical exchange.
 #[test]
 fn a_connection_from_the_same_seeds_is_byte_identical() {
   let run = || {
-    let mut session = Session::serving(config(), ClientOptions::openssh_like(GCM, true));
+    let mut session = Session::serving(config(), ClientOptions::classical(GCM, true));
     session.server.send(&[94, 1, 2], 0).unwrap();
     session.pump().unwrap();
     session.transcript
@@ -688,26 +693,97 @@ fn a_connection_from_the_same_seeds_is_byte_identical() {
   assert_eq!(run(), run());
 }
 
-/// A-594 (RFC 4253 §7): do connect a client that guesses right (its first exchange packet sent with its KEXINIT) and one
-/// that guesses wrong (a guessed packet for a method the server does not run). Expect both to finish the exchange: the
-/// right guess used, the wrong one ignored.
+/// A-594, A-634 (RFC 4253 §7): do connect a client that guesses right (its hybrid `C_INIT` sent with its KEXINIT, its
+/// first method being the server's) and one that guesses wrong (a client preferring `sntrup761x25519-sha512@openssh.com`
+/// as OpenSSH 9 did, whose guessed packet is for a method the server does not run). Expect both to finish the exchange: the right guess used, the client sending one exchange
+/// message; the wrong one ignored, the client sending a second, which the server answers.
 #[test]
 fn guesses_are_used_or_ignored() {
   let mut right = ClientOptions::openssh_like(CHACHA, true);
   right.first_kex_packet_follows = true;
-  let mut session = Session::new(config(), right);
-  session.pump().unwrap();
-  assert!(matches!(session.events[0], Event::Established(_)));
-
   let mut wrong = ClientOptions::openssh_like(CHACHA, true);
-  wrong.kex.insert(0, "mlkem768x25519-sha256".to_string());
+  let sntrup = "sntrup761x25519-sha512@openssh.com";
+  wrong.kex.retain(|name| name != sntrup);
+  wrong.kex.insert(0, sntrup.to_string());
   wrong.first_kex_packet_follows = true;
   let mut guess = vec![30];
-  put_string(&mut guess, &[0x77; 1216]);
+  put_string(&mut guess, &[0x77; 1190]);
   wrong.guess = Some(guess);
-  let mut session = Session::new(config(), wrong);
-  session.pump().unwrap();
-  assert!(matches!(session.events[0], Event::Established(_)));
+  let observed = [right, wrong].map(|options| {
+    let mut session = Session::new(config(), options);
+    session.pump().unwrap();
+    let established = matches!(session.events.first(), Some(Event::Established(_)));
+    (established, session.client.exchange_inits_sent)
+  });
+  assert_eq!(observed, [(true, 1), (true, 2)]);
+}
+
+/// A-634 (RFC 4253 §7.1, the client's first choice): do connect a client without the hybrid and one that lists
+/// `curve25519-sha256` before it, under each cipher, pass a message each way, and rekey from the client. Expect
+/// `curve25519-sha256` agreed for both, whatever the server prefers, in the first exchange and in the rekey.
+#[test]
+fn a_client_preferring_curve25519_gets_it() {
+  for (cipher_name, cipher) in [(CHACHA, Cipher::ChaCha20Poly1305), (GCM, Cipher::Aes256Gcm)] {
+    let mut preferring = ClientOptions::openssh_like(cipher_name, true);
+    preferring.kex.retain(|name| name != "curve25519-sha256");
+    preferring.kex.insert(0, "curve25519-sha256".to_string());
+    for options in [ClientOptions::classical(cipher_name, true), preferring] {
+      let mut session = Session::new(config(), options);
+      session.pump().unwrap();
+      let first = session.events.first().cloned();
+      serves_both_ways(&mut session);
+      session.client.start_rekey();
+      session.pump().unwrap();
+      let algorithms = Algorithms {
+        kex: KexMethod::Curve25519Sha256,
+        client_to_server: cipher,
+        server_to_client: cipher,
+      };
+      let established =
+        matches!(first, Some(Event::Established(reached)) if reached.algorithms == algorithms);
+      assert_eq!(
+        (established, session.events.last().cloned()),
+        (true, Some(Event::Rekeyed(algorithms)))
+      );
+    }
+  }
+}
+
+/// A-634 hostile (the hybrid draft §2.1; FIPS 203 §7.2; RFC 8731 §3): do send hybrid exchanges whose `C_INIT` is a byte
+/// short, is a classical 32-byte key, holds an encapsulation key with a coefficient of q, or holds the all-zero X25519
+/// point. Expect each refused by its kind with disconnect reason 3, `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, as the draft
+/// says.
+#[test]
+fn bad_hybrid_values_end_the_exchange() {
+  let (_, key) = mlkem_key_pair();
+  let bob = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+  let cases: [(Vec<u8>, KexRefusal); 4] = [
+    (vec![9; 1215], KexRefusal::PublicKeyLength { length: 1215 }),
+    (bob.clone(), KexRefusal::PublicKeyLength { length: 32 }),
+    (
+      [with_coefficient(&key, 0, 3329), bob].concat(),
+      KexRefusal::EncapsulationFailed,
+    ),
+    (
+      [key, vec![0; 32]].concat(),
+      KexRefusal::SharedSecretRejected,
+    ),
+  ];
+  for (init, refusal) in cases {
+    let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
+    let first = session.client.take_output();
+    session.to_server(&first).unwrap();
+    let mut message = vec![30];
+    put_string(&mut message, &init);
+    session.client.send(&message);
+    let bad = session.client.take_output();
+    let outcome = session.to_server(&bad);
+    session.to_client();
+    assert_eq!(
+      (outcome, disconnect_reason(session.last_received())),
+      (Err(Refusal::Kex(refusal)), 3)
+    );
+  }
 }
 
 /// A-594: do set up a transport with a packet cap below RFC 4253 §6.1's 35000 bytes, and with entropy that fails.

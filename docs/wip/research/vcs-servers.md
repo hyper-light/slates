@@ -305,6 +305,76 @@ repository's list written as git writes its configuration, and read as git's cli
 `packfile-uris` choice sends by URI only a suffix of the fetch's units that URI packs tile in order, since the inline
 pack is indexed before any URI pack can supply a base.
 
+### 5.7 The SSH server's authentication and channel (A-633, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| RFC 4252, 4254, 8332 | the RFC Editor's text | a36b882cf77b1073, bfc727e9350067ea, b194d8da7a5b07cf |
+| git `quote.c`, `connect.c` | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 9a53645731a1b83f, 02363f9f84e69ca0 |
+| Mercurial `mercurial/sshpeer.py`, `mercurial/utils/procutil.py`, `contrib/hg-ssh` | 7.2's PyPI source distribution, SHA-256 `a250227e…` (as §4.17.3's notes) | d84a797aff1ce219, c5412a454a414111, 323bfa2b2375e0a0 |
+| Subversion `subversion/libsvn_ra_svn/client.c` | `1.14.x` at `d434dc14866e0c48602dba59a15443255d0b8c1e` | 3c3b9263dd7223a9 |
+
+What it rests on (quoted):
+- **The probe and the query** [B: RFC 4252 §4, §5.2, §7]: "The main purpose of sending this request is to get the
+  list of supported methods from the server"; a query "MUST respond ... with either SSH_MSG_USERAUTH_FAILURE or ...
+  SSH_MSG_USERAUTH_PK_OK"; the signed data's eight fields; "partial success MUST be TRUE if the authentication request
+  to which this is a response was successful"; "SHOULD limit the number of failed authentication attempts ... (the
+  RECOMMENDED limit is 20 attempts)".
+- **RSA with SHA-2** [B: RFC 8332 §3, §3.2]: the `ssh-rsa` key format is kept; "the client MUST encode the same algorithm
+  name in the signature"; "A verifier MAY accept shorter encodings of S with one or more leading zeros omitted".
+- **Extensions** [B: RFC 8308 §2.4, §3.1]: the server may send `SSH_MSG_EXT_INFO` "As the next packet following the
+  server's first SSH_MSG_NEWKEYS"; "a server MUST enumerate all public key algorithms it might accept during user
+  authentication".
+- **Channels** [B: RFC 4254 §5.1-§5.3, §6.4, §6.5, §6.10]: the open and its failure reasons; "MUST NOT advertise a
+  maximum packet size that would result in transport packets larger than its transport layer is willing to receive";
+  the window "MUST NOT be increased above 2^32 - 1 bytes"; "Only one of these requests can succeed per channel"; "The
+  channel needs to be closed with SSH_MSG_CHANNEL_CLOSE after this message".
+- **The clients' commands** [C]: git builds `prog SP sq_quote(path)` and `sq_dequote` reads a quoted run then only
+  `\'` or `\!` between reopened quotes; Mercurial 7.2 sends `%s -R %s serve --stdio%s` with `_serverquote` (bare for
+  `[a-zA-Z0-9@%_+=:,./-]`, else `'...'` with `'\''`), and `contrib/hg-ssh` takes exactly `['hg', '-R', path, 'serve',
+  '--stdio']`; Subversion's tunnel agent appends `svnserve -t` after the host.
+
+### 5.8 The post-quantum hybrid exchange (A-634, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| `draft-ietf-sshm-mlkem-hybrid-kex-10` | the IETF archive's text (the newest revision the datatracker named that day) | d7e1ff8723466a80 |
+| FIPS 203 (ML-KEM) | `NIST.FIPS.203.pdf` from nvlpubs.nist.gov | fe1f12f32a7e44ec |
+| OpenSSH release notes 10.0, 10.1, 10.2 | openssh.com's `txt/release-10.0`, `-10.1`, `-10.2` | 988550ce34c71941, f0465b36d7886bad, af431f2e9f30b280 |
+| OpenSSH's post-quantum page | `https://www.openssh.com/pq.html` | 6a6dc8e9af25ff99 |
+| OpenSSH `kexmlkem768x25519.c`, `myproposal.h` | openssh-portable `master` at `fa4b2a82be7df9768272cfabc2d78e4a12c2b3c0` | 0fbdf9f4baeab94f, 2d390158f9ae54d6 |
+| AWS-LC's ML-KEM: `ml_kem.h`, `mlkem_native_config.h`, `mlkem/kem.c` | the vendored aws-lc-sys 0.45.0, `vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_kem/` | 0709c8738f69680c, 671e5e7137733b21, 3922156826521429 |
+
+What it rests on (quoted):
+- **The exchange** [B: the draft §2.1, §2.3.3, §2.4, §2.5]: `C_INIT = C_PK2 || C_PK1` and `S_REPLY = S_CT2 || S_PK1`,
+  the ML-KEM value first; the server "MUST check that the length of the C_INIT is the sum of the expected length of each
+  public key" and "MUST perform the encapsulation key checks defined in Section 7.2 of [FIPS203]", and on failure abort
+  with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`; "K = HASH(K_PQ || K_CL)", the two secrets "encoded as fixed-length byte
+  arrays, not as integers"; "K is encoded as a string"; the messages are numbers 30 and 31 (§2.2); and no method of the
+  draft makes a packet past RFC 4253's 35000 bytes (§3). The draft gives no test vectors.
+- **ML-KEM** [B: FIPS 203 §7.2, Table 2, Table 3, Algorithm 20]: the encapsulation key check is a type check (length
+  384k + 32) and a modulus check (`ByteEncode12(ByteDecode12(ek[0:384k]))` equal to its input, so every integer is in
+  `[0, q - 1]`); "ML-KEM.Encaps shall not be run with an encapsulation key that has not been checked", though the check
+  "need not be performed by the encapsulating party"; ML-KEM-768 has k = 3, q = 3329, d_u = 10, d_v = 4, a 1184-byte
+  encapsulation key, a 1088-byte ciphertext and a 32-byte shared secret; `m` is "32 random bytes".
+- **AWS-LC** [C]: `mlk_kem_enc_derand` calls `mlk_kem_check_pk` ("Implements @[FIPS203, Section 7.2, Modulus check]",
+  `kem.c` line 331), which decodes, reduces, re-encodes and compares; `mlk_randombytes` is `RAND_bytes` under
+  `AWSLC_ABORT_IF_NOT_ONE` (`mlkem_native_config.h` 81-89); `ml_kem.h` names 1184, 1088 and 32 bytes; aws-lc-rs's
+  `EncapsulationKey::new` checks the length alone and `encapsulate` takes no bytes of the caller's.
+- **OpenSSH** [B: release notes; pq.html; C: source]: 10.0 (2025-04-09) "the hybrid post-quantum algorithm
+  mlkem768x25519-sha256 is now used by default for key agreement"; 10.1 (2025-10-06) "add a warning when the connection
+  negotiates a non-post quantum key agreement algorithm", "controlled via a new WarnWeakCrypto ssh_config option,
+  defaulting to on"; 10.2 (2025-10-10) has nothing on it; the page gives the warning ("** WARNING: connection is not
+  using a post-quantum key exchange algorithm.") and names the two methods that silence it, `mlkem768x25519-sha256`
+  and `sntrup761x25519-sha512`; `KEX_CLIENT_KEX` lists `mlkem768x25519-sha256` first; `kex_kem_mlkem768x25519_enc`
+  checks the length, encapsulates, and puts SHA-256 of the ML-KEM secret and the raw X25519 secret as a string.
+
+What follows for slates (A-634): the server offers the hybrid first and keeps `curve25519-sha256` for clients without
+it; the modulus check is AWS-LC's, held by a hostile test rather than written twice; `sntrup761x25519-sha512` is not
+offered, since AWS-LC has no NTRU Prime and every client that warns offers the hybrid; and the encapsulation's
+randomness is AWS-LC's own, the same generator the crate's entropy reads, so only the tests' seeded transcripts lose
+reproducibility under the hybrid.
+
 ## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
 
 Read 2026-11-19 (UTC) by g255. Each file was downloaded and hashed; the lines cited are each file's own.
@@ -371,32 +441,3 @@ Read 2026-11-19 (UTC) by g255. Each file was downloaded and hashed; the lines ci
   hosting server's; a policy rule is one statement, so authz's union of lines within a section stays the authorization
   file's (A-606); and every hook's deadline is learned from its own runs, with no deadline before its first finished
   run but its client's connection.
-
-### 5.6 The SSH server's authentication and channel (A-633, read 2026-11-19)
-
-| Source | Revision read | sha256 (first 16 hex) |
-|---|---|---|
-| RFC 4252, 4254, 8332 | the RFC Editor's text | a36b882cf77b1073, bfc727e9350067ea, b194d8da7a5b07cf |
-| git `quote.c`, `connect.c` | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 9a53645731a1b83f, 02363f9f84e69ca0 |
-| Mercurial `mercurial/sshpeer.py`, `mercurial/utils/procutil.py`, `contrib/hg-ssh` | 7.2's PyPI source distribution, SHA-256 `a250227e…` (as §4.17.3's notes) | d84a797aff1ce219, c5412a454a414111, 323bfa2b2375e0a0 |
-| Subversion `subversion/libsvn_ra_svn/client.c` | `1.14.x` at `d434dc14866e0c48602dba59a15443255d0b8c1e` | 3c3b9263dd7223a9 |
-
-What it rests on (quoted):
-- **The probe and the query** [B: RFC 4252 §4, §5.2, §7]: "The main purpose of sending this request is to get the
-  list of supported methods from the server"; a query "MUST respond ... with either SSH_MSG_USERAUTH_FAILURE or ...
-  SSH_MSG_USERAUTH_PK_OK"; the signed data's eight fields; "partial success MUST be TRUE if the authentication request
-  to which this is a response was successful"; "SHOULD limit the number of failed authentication attempts ... (the
-  RECOMMENDED limit is 20 attempts)".
-- **RSA with SHA-2** [B: RFC 8332 §3, §3.2]: the `ssh-rsa` key format is kept; "the client MUST encode the same algorithm
-  name in the signature"; "A verifier MAY accept shorter encodings of S with one or more leading zeros omitted".
-- **Extensions** [B: RFC 8308 §2.4, §3.1]: the server may send `SSH_MSG_EXT_INFO` "As the next packet following the
-  server's first SSH_MSG_NEWKEYS"; "a server MUST enumerate all public key algorithms it might accept during user
-  authentication".
-- **Channels** [B: RFC 4254 §5.1-§5.3, §6.4, §6.5, §6.10]: the open and its failure reasons; "MUST NOT advertise a
-  maximum packet size that would result in transport packets larger than its transport layer is willing to receive";
-  the window "MUST NOT be increased above 2^32 - 1 bytes"; "Only one of these requests can succeed per channel"; "The
-  channel needs to be closed with SSH_MSG_CHANNEL_CLOSE after this message".
-- **The clients' commands** [C]: git builds `prog SP sq_quote(path)` and `sq_dequote` reads a quoted run then only
-  `\'` or `\!` between reopened quotes; Mercurial 7.2 sends `%s -R %s serve --stdio%s` with `_serverquote` (bare for
-  `[a-zA-Z0-9@%_+=:,./-]`, else `'...'` with `'\''`), and `contrib/hg-ssh` takes exactly `['hg', '-R', path, 'serve',
-  '--stdio']`; Subversion's tunnel agent appends `svnserve -t` after the host.

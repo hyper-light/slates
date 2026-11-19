@@ -1,16 +1,26 @@
-//! `curve25519-sha256`, the exchange hash and key derivation (A-594; RFC 8731, RFC 7748 §6.1, RFC 5656 §4, RFC 4253
-//! §7.2), held to published vectors.
+//! `curve25519-sha256` and `mlkem768x25519-sha256`, the exchange hash and key derivation (A-594, A-634; RFC 8731,
+//! RFC 7748 §6.1, RFC 5656 §4, RFC 4253 §7.2, `draft-ietf-sshm-mlkem-hybrid-kex-10`), held to published vectors.
 
-use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, SHA256};
+use aws_lc_rs::digest::{self, SHA1_FOR_LEGACY_USE_ONLY, SHA256};
+use aws_lc_rs::kem::Ciphertext;
 
 use crate::client::{mpint, put_string};
 use crate::kex::{
-  ExchangeInputs, KexRefusal, curve25519_server, derive, ecdh_reply, exchange_hash, new_keys,
-  read_ecdh_init,
+  ExchangeInputs, KexRefusal, MLKEM768_CIPHERTEXT_LEN, curve25519_server, derive, ecdh_reply,
+  exchange_hash, mlkem768x25519_server, new_keys, read_ecdh_init,
 };
 use crate::packet::Cipher;
-use crate::support::{hex, hex_array};
+use crate::support::{hex, hex_array, mlkem_key_pair, with_coefficient};
 use crate::wire::WireRefusal;
+
+/// RFC 7748 §6.1's Alice: her private key, the server's in the golden cases.
+const ALICE_PRIVATE: &str = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+/// RFC 7748 §6.1's Alice: her public key.
+const ALICE_PUBLIC: &str = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+/// RFC 7748 §6.1's Bob: his public key, the client's in the golden cases.
+const BOB_PUBLIC: &str = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+/// RFC 7748 §6.1's shared secret.
+const RFC7748_SHARED: &str = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
 
 /// One NIST CAVS 14.1 SSH KDF case (AWS-LC's `crypto/evp_extra/sshkdf_tests.txt` at `02561621`, the vendored release's
 /// commit).
@@ -93,15 +103,11 @@ fn key_derivation_matches_nists_vectors() {
 /// whose first byte, 0x4a, needs no leading zero.
 #[test]
 fn the_server_half_matches_rfc_7748() {
-  let alice_private =
-    hex_array::<32>("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
-  let bob_public = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+  let alice_private = hex_array::<32>(ALICE_PRIVATE);
+  let bob_public = hex(BOB_PUBLIC);
   let half = curve25519_server(&alice_private, &bob_public).unwrap();
-  assert_eq!(
-    half.public.to_vec(),
-    hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
-  );
-  let shared = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+  assert_eq!(half.public, hex(ALICE_PUBLIC));
+  let shared = hex(RFC7748_SHARED);
   assert_eq!(
     half.shared_secret.bytes(),
     &hex("00000020 4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")[..]
@@ -138,6 +144,86 @@ fn small_order_and_wrong_length_client_keys_are_refused() {
     curve25519_server(&private, &[9; 33]).unwrap_err(),
     KexRefusal::PublicKeyLength { length: 33 }
   );
+}
+
+/// A-634 golden where the documents give one (the hybrid draft §2.1, §2.3.3, §2.4; RFC 7748 §6.1): do run the hybrid's
+/// server half 64 times with Alice's private key against one `C_INIT` of a fresh ML-KEM-768 encapsulation key and Bob's
+/// public key, and decapsulate each reply's ciphertext with the client's key. Expect each `S_REPLY` to be the 1088-byte
+/// ciphertext and then Alice's public key, and each `K` the `string` of SHA-256 over the decapsulated secret and then
+/// RFC 7748's shared secret, runs whose hash has its top bit set among them (there an `mpint` would add a zero byte, so
+/// only those runs tell the two encodings apart; this counter is the test's non-vacuity); and 64 different ciphertexts,
+/// since the draft's §6 says implementations "MUST NOT reuse randomness in the generation of ML-KEM ciphertexts".
+#[test]
+fn the_hybrid_server_half_agrees_with_a_decapsulating_client() {
+  let alice_private = hex_array::<32>(ALICE_PRIVATE);
+  let (client_key, encapsulation_key) = mlkem_key_pair();
+  let init = [encapsulation_key, hex(BOB_PUBLIC)].concat();
+  let mut ciphertexts = Vec::new();
+  let mut top_bit_set = 0usize;
+  for _ in 0..64 {
+    let half = mlkem768x25519_server(&alice_private, &init).unwrap();
+    let (ciphertext, server_public) = half.public.split_at(MLKEM768_CIPHERTEXT_LEN);
+    let post_quantum = client_key
+      .decapsulate(Ciphertext::from(ciphertext))
+      .unwrap();
+    let both = [post_quantum.as_ref(), &hex(RFC7748_SHARED)[..]].concat();
+    let hashed = digest::digest(&SHA256, &both);
+    let mut expected = Vec::new();
+    put_string(&mut expected, hashed.as_ref());
+    assert_eq!(
+      (server_public.to_vec(), half.shared_secret.bytes().to_vec()),
+      (hex(ALICE_PUBLIC), expected)
+    );
+    top_bit_set += usize::from(hashed.as_ref()[0] & 0x80 != 0);
+    ciphertexts.push(ciphertext.to_vec());
+  }
+  ciphertexts.sort();
+  ciphertexts.dedup();
+  assert_eq!((ciphertexts.len(), top_bit_set > 0), (64, true));
+}
+
+/// A-634 hostile (the hybrid draft §2.1: the server "MUST check that the length of the C_INIT is the sum of the expected
+/// length of each public key" and "MUST perform the encapsulation key checks defined in Section 7.2 of \[FIPS203\]";
+/// RFC 8731 §3 for the X25519 half): do run the hybrid's server half on `C_INIT`s a byte short and a byte long, a
+/// classical 32-byte key, encapsulation keys whose first or last coefficient is q (3329) or 4095, and a good key beside
+/// the all-zero X25519 point; and, as controls, keys whose first or last coefficient is q - 1 and one whose seed bytes
+/// are all ones. Expect each refused by its kind, AWS-LC's modulus check refusing the encapsulation, and the controls
+/// served.
+#[test]
+fn bad_hybrid_client_values_are_refused() {
+  let (_, key) = mlkem_key_pair();
+  let bob = hex(BOB_PUBLIC);
+  let init = |encapsulation: &[u8], x25519: &[u8]| [encapsulation, x25519].concat();
+  let last = 3 * 256 - 1;
+  let reseeded = [&key[..1152], &[0xff; 32][..]].concat();
+  let cases: [(Vec<u8>, Result<(), KexRefusal>); 10] = [
+    (
+      vec![9; 1215],
+      Err(KexRefusal::PublicKeyLength { length: 1215 }),
+    ),
+    (
+      vec![9; 1217],
+      Err(KexRefusal::PublicKeyLength { length: 1217 }),
+    ),
+    (bob.clone(), Err(KexRefusal::PublicKeyLength { length: 32 })),
+    (
+      init(&with_coefficient(&key, 0, 3329), &bob),
+      Err(KexRefusal::EncapsulationFailed),
+    ),
+    (
+      init(&with_coefficient(&key, last, 4095), &bob),
+      Err(KexRefusal::EncapsulationFailed),
+    ),
+    (init(&key, &[0; 32]), Err(KexRefusal::SharedSecretRejected)),
+    (init(&with_coefficient(&key, 0, 3328), &bob), Ok(())),
+    (init(&with_coefficient(&key, last, 3328), &bob), Ok(())),
+    (init(&reseeded, &bob), Ok(())),
+    (init(&key, &bob), Ok(())),
+  ];
+  for (index, (init, expected)) in cases.into_iter().enumerate() {
+    let outcome = mlkem768x25519_server(&[0x42; 32], &init).map(|_| ());
+    assert_eq!(outcome, expected, "case {index}");
+  }
 }
 
 /// A-594 (RFC 5656 §4): do hash an exchange's inputs, and hash by hand the same fields, each as a `string` but `K`,
