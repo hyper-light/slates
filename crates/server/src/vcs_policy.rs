@@ -50,11 +50,26 @@
 //! to a head that does not descend from the current one rewrites, a removal deletes). The first change refused is the
 //! push's typed refusal ([`PushRefusal`]), naming it by index and the rule that decided. A change no rule speaks to is
 //! its repository's owner's alone, who holds every right a policy leaves unruled (A-575, §4.13).
+//!
+//! **A protected name's requirements (A-644; §4.17.2 "Protected branches, in git's terms").** Two rights are
+//! requirements rather than permissions: bringing a name a merge commit ([`Right::MergeCommit`]) and bringing it a
+//! commit no trusted signer signed ([`Right::UnsignedCommit`]). A rule that denies one imposes it (a linear history,
+//! signed commits), a later rule that allows it lifts it for whom it names (git's precedence: the last covering rule),
+//! and where no rule speaks nothing is required, so a policy that never names them asks nothing more of a push than it
+//! did. A requirement is judged after the change's own right, in the design's order (a fast-forward or a rewrite, a
+//! delete, then a linear history, then signatures), and only where a rule imposes it: the change's [`Brings`] is asked
+//! then and not before, so a name no requirement covers costs no walk and no signature. The trusted signers are the
+//! record's (`RepositoryPolicy::signers`), read as A-321's keys once a push. The requirements are git's alone (the
+//! database's guard holds them to git), so their refusals name git's commits.
 
 use std::collections::HashMap;
 
 use slates_db::catalog::{Principal, RepositoryRecord};
+use slates_git::object_name::ObjectId;
+use slates_git::store::{StoreRefused, Unsigned};
 use slates_vcs::wildmatch::{Glob, is_glob_special};
+
+use crate::signed_work::{SignatureRefusal, TrustedKey};
 
 /// A right a rule allows or denies (§4.17.1 "Policy": "who may read, who may submit, whether a rewrite ... or a delete
 /// is allowed").
@@ -68,6 +83,10 @@ pub(crate) enum Right {
   Rewrite,
   /// Delete it: its name retired from the namespace, its green kept (§4.17.1 "The repository and its greens" item 5).
   Delete,
+  /// Bring it a merge commit, one of more than one parent (A-644): a requirement, judged only where a rule denies it.
+  MergeCommit,
+  /// Bring it a commit no trusted signer signed (A-644): a requirement, as `MergeCommit` is.
+  UnsignedCommit,
 }
 
 /// Whether a rule allows its right or denies it.
@@ -658,13 +677,31 @@ impl SvnPolicy {
   }
 }
 
-/// One name a push changes, and the right its change needs, as the push's own tool classified it (A-622 part 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One name a push changes, the right its change needs, as the push's own tool classified it (A-622 part 2), and what
+/// it brings, which a requirement judges (A-644).
+#[derive(Clone, Copy)]
 pub(crate) struct Asked<'a> {
   /// The name.
   pub(crate) name: Name<'a>,
   /// The right the change needs.
   pub(crate) right: Right,
+  /// What the change brings to the name, asked only where a rule imposes a requirement; none for a change that brings
+  /// nothing a requirement reads (a delete, or a tool that has no requirements).
+  pub(crate) brings: Option<&'a dyn Brings>,
+}
+
+/// What a change brings to its name, which a requirement judges (A-644): A-614's store's answers on git's push path
+/// (`crate::git_protect::StoreBrings`). Each is asked at most once a change, and only where a rule imposes its
+/// requirement.
+pub(crate) trait Brings {
+  /// The first merge commit the change brings.
+  fn merge_commit(&self) -> Result<Option<ObjectId>, StoreRefused>;
+
+  /// The first commit the change brings that none of `signers` signed, and why.
+  fn unsigned_commit(
+    &self,
+    signers: &[TrustedKey],
+  ) -> Result<Option<(ObjectId, Unsigned<SignatureRefusal>)>, StoreRefused>;
 }
 
 /// A name as each tool's push names it.
@@ -710,6 +747,34 @@ pub(crate) enum PushRefusal {
   Unreadable {
     /// The rule's index among the policy's rules.
     rule: u32,
+  },
+  /// Rule `rule` keeps the name's history linear, and the change brings the merge commit `commit` (A-644).
+  MergeCommit {
+    /// The change's index.
+    index: u32,
+    /// The rule that imposes the requirement.
+    rule: u32,
+    /// The first merge commit the change brings.
+    commit: ObjectId,
+  },
+  /// Rule `rule` requires signed commits, and the change brings `commit`, which no trusted signer signed (A-644).
+  UnsignedCommit {
+    /// The change's index.
+    index: u32,
+    /// The rule that imposes the requirement.
+    rule: u32,
+    /// The first such commit the change brings.
+    commit: ObjectId,
+    /// Why its signature is not a trusted signer's.
+    why: Unsigned<SignatureRefusal>,
+  },
+  /// What the change brings could not be read to judge a requirement: its store refused, a store whose index and
+  /// content disagree, and the push is refused rather than judged without it (A-644).
+  Unjudged {
+    /// The change's index.
+    index: u32,
+    /// The store's refusal.
+    refused: StoreRefused,
   },
 }
 
@@ -813,6 +878,8 @@ fn right_of(right: slates_db::catalog::PolicyRight) -> Right {
     slates_db::catalog::PolicyRight::Submit => Right::Submit,
     slates_db::catalog::PolicyRight::Rewrite => Right::Rewrite,
     slates_db::catalog::PolicyRight::Delete => Right::Delete,
+    slates_db::catalog::PolicyRight::MergeCommit => Right::MergeCommit,
+    slates_db::catalog::PolicyRight::UnsignedCommit => Right::UnsignedCommit,
   }
 }
 
@@ -833,31 +900,101 @@ fn who_of(who: &slates_db::catalog::PolicyWho) -> Who {
 }
 
 /// The check point every push calls before it submits its register entry (the module doc, A-622 part 2): each change
-/// in `asked`, in order, judged by `record`'s policy for `principal`; the first refused is the push's refusal. A change
-/// no rule speaks to is the owner's alone.
+/// in `asked`, in order, judged by `record`'s policy for `principal`, its own right first and then the requirements a
+/// rule imposes on it (A-644); the first refused is the push's refusal. A change no rule speaks to is the owner's alone.
 pub(crate) fn admit(
   record: &RepositoryRecord,
   principal: &Principal,
   asked: &[Asked<'_>],
 ) -> Result<(), PushRefusal> {
   let compiled = Compiled::of(record)?;
+  let mut signers: Option<Vec<TrustedKey>> = None;
   for (index, change) in asked.iter().enumerate() {
     let index = index_of(index);
-    match compiled.verdict(change.name, principal, change.right) {
-      None => return Err(PushRefusal::OtherTool { index }),
-      Some(Verdict::Allowed { .. }) => {}
-      Some(Verdict::Unruled) if *principal == record.owner => {}
-      Some(Verdict::Unruled) => return Err(PushRefusal::NotPermitted { index }),
-      Some(Verdict::NotListed) => return Err(PushRefusal::NotListed { index }),
-      Some(Verdict::Denied { rule }) => {
-        return Err(PushRefusal::Denied {
-          index,
-          rule: index_of(rule),
-        });
-      }
+    admit_right(&compiled, record, principal, change, index)?;
+    if let Some(brings) = change.brings {
+      let judged = Judged {
+        compiled: &compiled,
+        record,
+        principal,
+      };
+      judged.requirements(change.name, (brings, index), &mut signers)?;
     }
   }
   Ok(())
+}
+
+/// Whether `principal` holds `change`'s own right on its name (A-622 part 2).
+fn admit_right(
+  compiled: &Compiled,
+  record: &RepositoryRecord,
+  principal: &Principal,
+  change: &Asked<'_>,
+  index: u32,
+) -> Result<(), PushRefusal> {
+  match compiled.verdict(change.name, principal, change.right) {
+    None => Err(PushRefusal::OtherTool { index }),
+    Some(Verdict::Allowed { .. }) => Ok(()),
+    Some(Verdict::Unruled) if *principal == record.owner => Ok(()),
+    Some(Verdict::Unruled) => Err(PushRefusal::NotPermitted { index }),
+    Some(Verdict::NotListed) => Err(PushRefusal::NotListed { index }),
+    Some(Verdict::Denied { rule }) => Err(PushRefusal::Denied {
+      index,
+      rule: index_of(rule),
+    }),
+  }
+}
+
+/// One push's requirements, judged against its repository's compiled policy for its principal (A-644).
+struct Judged<'j> {
+  compiled: &'j Compiled,
+  record: &'j RepositoryRecord,
+  principal: &'j Principal,
+}
+
+impl Judged<'_> {
+  /// The rule that imposes `requirement` on the principal at `name`: the deciding rule, where it denies. A rule that
+  /// allows it, or none, imposes nothing.
+  fn imposed(&self, name: Name<'_>, requirement: Right) -> Option<u32> {
+    match self.compiled.verdict(name, self.principal, requirement) {
+      Some(Verdict::Denied { rule }) => Some(index_of(rule)),
+      _ => None,
+    }
+  }
+
+  /// The requirements imposed at `name`, each judged by what change `index` brings: a linear history, then signed
+  /// commits under the record's signers, read once a push into `signers`.
+  fn requirements(
+    &self,
+    name: Name<'_>,
+    (brings, index): (&dyn Brings, u32),
+    signers: &mut Option<Vec<TrustedKey>>,
+  ) -> Result<(), PushRefusal> {
+    let unjudged = |refused| PushRefusal::Unjudged { index, refused };
+    if let Some(rule) = self.imposed(name, Right::MergeCommit)
+      && let Some(commit) = brings.merge_commit().map_err(unjudged)?
+    {
+      return Err(PushRefusal::MergeCommit {
+        index,
+        rule,
+        commit,
+      });
+    }
+    let Some(rule) = self.imposed(name, Right::UnsignedCommit) else {
+      return Ok(());
+    };
+    let keys =
+      signers.get_or_insert_with(|| crate::signed_work::trusted_of(&self.record.policy.signers));
+    match brings.unsigned_commit(keys).map_err(unjudged)? {
+      Some((commit, why)) => Err(PushRefusal::UnsignedCommit {
+        index,
+        rule,
+        commit,
+        why,
+      }),
+      None => Ok(()),
+    }
+  }
 }
 
 /// Whether `principal` may reach `record`'s repository for any of `rights` at all (A-625 part 2): its owner always, who
@@ -1602,6 +1739,7 @@ mod tests {
         rules,
         hooks: Vec::new(),
         hooks_env: Vec::new(),
+        signers: Vec::new(),
       },
     }
   }
@@ -1611,6 +1749,7 @@ mod tests {
     super::Asked {
       name: super::Name::Ref(name.as_bytes()),
       right,
+      brings: None,
     }
   }
 
@@ -1673,6 +1812,7 @@ mod tests {
     let other_tool = super::Asked {
       name: super::Name::Hg(Namespace::Branch, "default"),
       right: Right::Submit,
+      brings: None,
     };
     assert_eq!(
       super::admit(&git, &owner, &[other_tool]),
@@ -1706,6 +1846,7 @@ mod tests {
         &[super::Asked {
           name: super::Name::Hg(namespace, name),
           right: Right::Submit,
+          brings: None,
         }],
       )
     };
@@ -1742,6 +1883,7 @@ mod tests {
         &[super::Asked {
           name: super::Name::Path(path.as_bytes()),
           right: Right::Submit,
+          brings: None,
         }],
       )
     };
@@ -1831,6 +1973,271 @@ mod tests {
     assert_eq!(
       super::reaches(&damaged, &principal(OWNER), read),
       Err(super::PushRefusal::Unreadable { rule: 0 })
+    );
+  }
+
+  /// What a test change brings: a merge commit or none, an unsigned commit or none, or a store's refusal; each
+  /// question counted (merge commits, signatures) and the signers handed kept, in SSH wire form.
+  struct Bringing {
+    merge: Option<super::ObjectId>,
+    unsigned: Option<(super::ObjectId, super::Unsigned<super::SignatureRefusal>)>,
+    refused: Option<super::StoreRefused>,
+    asked: std::cell::Cell<(u32, u32)>,
+    signers: std::cell::RefCell<Vec<Vec<u8>>>,
+  }
+
+  impl Bringing {
+    /// A change bringing `merge` and `unsigned`.
+    fn of(
+      merge: Option<super::ObjectId>,
+      unsigned: Option<(super::ObjectId, super::Unsigned<super::SignatureRefusal>)>,
+    ) -> Bringing {
+      Bringing {
+        merge,
+        unsigned,
+        refused: None,
+        asked: std::cell::Cell::new((0, 0)),
+        signers: std::cell::RefCell::new(Vec::new()),
+      }
+    }
+  }
+
+  impl super::Brings for Bringing {
+    fn merge_commit(&self) -> Result<Option<super::ObjectId>, super::StoreRefused> {
+      let (merges, signatures) = self.asked.get();
+      self.asked.set((merges + 1, signatures));
+      self.refused.map_or(Ok(self.merge), Err)
+    }
+
+    fn unsigned_commit(
+      &self,
+      signers: &[super::TrustedKey],
+    ) -> Result<
+      Option<(super::ObjectId, super::Unsigned<super::SignatureRefusal>)>,
+      super::StoreRefused,
+    > {
+      let (merges, signatures) = self.asked.get();
+      self.asked.set((merges, signatures + 1));
+      let wire = signers.iter().map(|key| key.wire().to_vec()).collect();
+      self.signers.replace(wire);
+      self.refused.map_or(Ok(self.unsigned), Err)
+    }
+  }
+
+  /// A commit's id, `fill` in every byte.
+  fn commit_id(fill: u8) -> super::ObjectId {
+    let hex = format!("{fill:02x}").repeat(20);
+    super::ObjectId::from_hex(slates_git::object_name::ObjectFormat::Sha1, hex.as_bytes()).unwrap()
+  }
+
+  /// An `ssh-ed25519` public key in SSH wire form, `fill` in every byte of its key.
+  fn signer_key(fill: u8) -> Vec<u8> {
+    let mut blob = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
+    blob.extend_from_slice(&[fill; 32]);
+    blob
+  }
+
+  /// A git change of `name` needing `right`, bringing `brings`.
+  fn bringing<'a>(name: &'a str, right: Right, brings: &'a Bringing) -> super::Asked<'a> {
+    super::Asked {
+      name: super::Name::Ref(name.as_bytes()),
+      right,
+      brings: Some(brings),
+    }
+  }
+
+  /// A rule over git ref pattern `pattern`.
+  fn git_rule(
+    pattern: &str,
+    (right, effect): (
+      slates_db::catalog::PolicyRight,
+      slates_db::catalog::PolicyEffect,
+    ),
+    who: slates_db::catalog::PolicyWho,
+  ) -> slates_db::catalog::PolicyRule {
+    record_rule(
+      slates_db::catalog::PolicyNames::Refs,
+      pattern,
+      (right, effect),
+      who,
+    )
+  }
+
+  /// One push's verdict on `asked` by `uid`, and how often its one change's facts were asked.
+  fn judged(
+    record: &super::RepositoryRecord,
+    uid: u32,
+    (name, right, brings): (&str, Right, &Bringing),
+  ) -> (Result<(), super::PushRefusal>, (u32, u32)) {
+    let verdict = super::admit(record, &principal(uid), &[bringing(name, right, brings)]);
+    (verdict, brings.asked.get())
+  }
+
+  /// A-644 (§4.17.2 "Protected branches": a linear history, a requirement). Do: in a git repository whose rules let a
+  /// stranger submit under `refs/heads/`, deny everyone merge commits on `main`, lift that for the stranger in a later
+  /// rule, and deny everyone `main`'s rewrite, push a merge commit to `main` as the owner and as the stranger, to a
+  /// feature branch, and as a rewrite of `main`. Expect: the owner refused `MergeCommit` naming rule 1 and the commit,
+  /// the change's facts asked once; the stranger admitted by rule 2 and the feature branch admitted, neither asked; the
+  /// rewrite refused by its own right's rule 3 before any requirement is asked.
+  #[test]
+  fn a_requirement_binds_only_where_a_rule_imposes_it() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let git = record(
+      VcsTool::Git,
+      vec![
+        git_rule(
+          "refs/heads/",
+          (PolicyRight::Submit, PolicyEffect::Allow),
+          record_only(&[STRANGER]),
+        ),
+        git_rule(
+          "refs/heads/main",
+          (PolicyRight::MergeCommit, PolicyEffect::Deny),
+          PolicyWho::Anyone,
+        ),
+        git_rule(
+          "refs/heads/main",
+          (PolicyRight::MergeCommit, PolicyEffect::Allow),
+          record_only(&[STRANGER]),
+        ),
+        git_rule(
+          "refs/heads/main",
+          (PolicyRight::Rewrite, PolicyEffect::Deny),
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let merge = commit_id(7);
+    let main = "refs/heads/main";
+    let cases = [
+      (OWNER, main, Right::Submit),
+      (STRANGER, main, Right::Submit),
+      (OWNER, "refs/heads/feature", Right::Submit),
+      (OWNER, main, Right::Rewrite),
+    ];
+    let answers: Vec<_> = cases
+      .iter()
+      .map(|(uid, name, right)| {
+        judged(
+          &git,
+          *uid,
+          (*name, *right, &Bringing::of(Some(merge), None)),
+        )
+      })
+      .collect();
+    let refused = super::PushRefusal::MergeCommit {
+      index: 0,
+      rule: 1,
+      commit: merge,
+    };
+    let rewrite = super::PushRefusal::Denied { index: 0, rule: 3 };
+    let expected = vec![
+      (Err(refused), (1, 0)),
+      (Ok(()), (0, 0)),
+      (Ok(()), (0, 0)),
+      (Err(rewrite), (0, 0)),
+    ];
+    assert_eq!(answers, expected);
+  }
+
+  /// A-644 (signed commits, a requirement judged under the record's signers). Do: in a git repository whose rule denies
+  /// everyone unsigned commits on `main` and whose policy trusts two keys, push to `main` a change bringing a commit
+  /// another key signed, one bringing none unsigned, and a push of a feature branch then `main`. Expect: the first
+  /// refused `UnsignedCommit` with the commit and why, the verifier handed exactly the record's two keys; the second
+  /// admitted; the two-change push refused at its second change, its first never asked.
+  #[test]
+  fn signed_commits_are_judged_under_the_records_signers() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let mut git = record(
+      VcsTool::Git,
+      vec![git_rule(
+        "refs/heads/main",
+        (PolicyRight::UnsignedCommit, PolicyEffect::Deny),
+        PolicyWho::Anyone,
+      )],
+    );
+    git.policy.signers = vec![signer_key(1), signer_key(2)];
+    let commit = commit_id(9);
+    let why = super::Unsigned::Ssh(super::SignatureRefusal::UnregisteredKey);
+    let unsigned = Bringing::of(None, Some((commit, why)));
+    let main = "refs/heads/main";
+    let refused = super::PushRefusal::UnsignedCommit {
+      index: 0,
+      rule: 0,
+      commit,
+      why,
+    };
+    assert_eq!(
+      judged(&git, OWNER, (main, Right::Submit, &unsigned)),
+      (Err(refused), (0, 1))
+    );
+    assert_eq!(unsigned.signers.take(), vec![signer_key(1), signer_key(2)]);
+    let signed = Bringing::of(None, None);
+    assert_eq!(
+      judged(&git, OWNER, (main, Right::Submit, &signed)),
+      (Ok(()), (0, 1))
+    );
+    let (feature, again) = (
+      Bringing::of(None, None),
+      Bringing::of(None, Some((commit, why))),
+    );
+    let push = [
+      bringing("refs/heads/feature", Right::Submit, &feature),
+      bringing(main, Right::Submit, &again),
+    ];
+    let second = super::PushRefusal::UnsignedCommit {
+      index: 1,
+      rule: 0,
+      commit,
+      why,
+    };
+    assert_eq!(super::admit(&git, &principal(OWNER), &push), Err(second));
+    assert_eq!((feature.asked.get(), again.asked.get()), ((0, 0), (0, 1)));
+  }
+
+  /// A-644 (the design's order: a linear history, then signatures; a damaged store never judged around). Do: with both
+  /// requirements imposed on `main`, push a change bringing a merge commit and an unsigned one; then one whose store
+  /// refuses. Expect: `MergeCommit`, the signatures never asked; then `Unjudged` with the store's refusal.
+  #[test]
+  fn a_linear_history_is_judged_before_signatures_and_a_store_refusal_is_typed() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let deny = |right| {
+      git_rule(
+        "refs/heads/main",
+        (right, PolicyEffect::Deny),
+        PolicyWho::Anyone,
+      )
+    };
+    let git = record(
+      VcsTool::Git,
+      vec![
+        deny(PolicyRight::UnsignedCommit),
+        deny(PolicyRight::MergeCommit),
+      ],
+    );
+    let (merge, other) = (commit_id(3), commit_id(4));
+    let both = Bringing::of(Some(merge), Some((other, super::Unsigned::Missing)));
+    let main = "refs/heads/main";
+    let refused = super::PushRefusal::MergeCommit {
+      index: 0,
+      rule: 1,
+      commit: merge,
+    };
+    assert_eq!(
+      judged(&git, OWNER, (main, Right::Submit, &both)),
+      (Err(refused), (1, 0))
+    );
+    let broken = Bringing {
+      refused: Some(super::StoreRefused::Unsealed),
+      ..Bringing::of(None, None)
+    };
+    let unjudged = super::PushRefusal::Unjudged {
+      index: 0,
+      refused: super::StoreRefused::Unsealed,
+    };
+    assert_eq!(
+      judged(&git, OWNER, (main, Right::Submit, &broken)),
+      (Err(unjudged), (1, 0))
     );
   }
 }

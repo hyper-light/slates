@@ -16,6 +16,12 @@
 //! 3. **Trees and blobs.** Each sent commit's root tree is opened at depth 0, its entries at depth 1, and so on; a tree
 //!    or blob is sent when nothing left out holds it and the filter admits it at the least depth it is met at. A tree met
 //!    again shallower is opened again, as git's `tree:` filter reopens it; under any other filter each tree opens once.
+//!    Under a `sparse:oid` filter, served alone (A-640 part 4), the walk is git's `filter_sparse` [C:
+//!    `list-objects-filter.c`, `list-objects.c` `process_tree` and `process_blob`]: each tree it reaches is sent, and a
+//!    blob when the path it is met at is matched, a path the patterns leave undecided taking the verdict of the tree it
+//!    is in, and the root's base being not matched. A tree no blob below which was left out is done and never walked
+//!    again; any other is walked again wherever it is met, so a blob left out at one path is sent when another path to
+//!    it is matched. What is sent is what some path decides, whatever order the trees are met in.
 //! 4. **The wants themselves**, and every tag a want's chain of tags passes through, are sent whatever the filter; a
 //!    wanted tree's entries are met at depth 0, as git meets the entries of a tree a client named.
 //! 5. **`include-tag`**: each annotated tag under `refs/tags/` whose chain ends at an object the pack carries is sent,
@@ -26,9 +32,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::paint::{HAVE, Paint, WANT};
 use super::ready::peel;
 use super::shallow::Cut;
-use super::{Counters, Filter, Graph, Refusal, Request, Run, charge};
+use super::sparse::Verdict;
+use super::{Counters, Filter, Graph, Patterns, Refusal, Request, Run, charge};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectId};
+
+/// Format: the byte between a path's segments.
+const SLASH: u8 = b'/';
 
 /// The sides of a pack: what the request wants and has, and the cut its shallow lines make.
 pub(super) struct Sides<'s, N> {
@@ -55,9 +65,11 @@ pub(super) fn select<S: Graph>(
   let left_out = left_out(graph, request, sides, &sent, admission)?;
   let mut chosen = Chosen {
     filter: request.filter,
+    sparse: sparse_patterns(request),
     left_out: &left_out,
     objects: BTreeSet::new(),
     opened: BTreeMap::new(),
+    done: BTreeSet::new(),
   };
   for commit in &sent {
     if chosen.admits(Kind::Commit, 0, 0) {
@@ -258,6 +270,61 @@ struct Chosen<'c, N> {
   objects: BTreeSet<N>,
   /// Each tree opened, and the depth its entries were met at the last time it was, the least so far.
   opened: BTreeMap<N, u64>,
+  /// The patterns of a `sparse:oid` filter, which decide by path.
+  sparse: Option<&'c Patterns>,
+  /// Under a `sparse:oid` filter, each tree no blob below which was left out: never walked again.
+  done: BTreeSet<N>,
+}
+
+/// One `sparse:oid` walk from a root tree: the path of the tree being walked, its segments joined by `/` and a `/` after
+/// it once it is not empty (git's `base`), and a frame for each tree on that path.
+struct SparseWalk<'p, N> {
+  /// The patterns.
+  patterns: &'p Patterns,
+  /// The path.
+  path: Vec<u8>,
+  /// The frames, the tree being walked last.
+  frames: Vec<Frame<N>>,
+}
+
+/// A tree being walked under a `sparse:oid` filter (git's `struct frame`).
+struct Frame<N> {
+  /// The tree.
+  tree: N,
+  /// The path's length before the tree's name.
+  base: usize,
+  /// Whether a path below it that the patterns leave undecided is matched (`default_match`).
+  matched: bool,
+  /// Whether a blob below it was left out in this walk (`child_prov_omit`).
+  left_out_below: bool,
+  /// Its entries not yet met, with their names, the next last.
+  entries: Vec<(N, Vec<u8>)>,
+}
+
+/// The patterns the walk asks of each path: the request's, when its filter is `sparse:oid` alone (a combination holding
+/// one, or one without its patterns, was refused before the walk).
+fn sparse_patterns<'r>(request: &Request<'r>) -> Option<&'r Patterns> {
+  match request.filter {
+    Some(Filter::SparseOid(_)) => request.sparse,
+    _ => None,
+  }
+}
+
+/// Whether a path is matched: by its own verdict, or by `inherited`, the verdict of the tree it is in, when its own is
+/// undecided.
+fn decided(verdict: Verdict, inherited: bool) -> bool {
+  match verdict {
+    Verdict::Matched => true,
+    Verdict::NotMatched => false,
+    Verdict::Undecided => inherited,
+  }
+}
+
+/// Charges `bytes` kept to `admission`.
+fn charge_bytes(admission: &mut Admission, bytes: usize) -> Result<(), Refusal> {
+  admission
+    .charge(crate::to_u64(bytes))
+    .map_err(Refusal::PastAdmission)
 }
 
 impl<N: Copy + Ord> Chosen<'_, N> {
@@ -292,10 +359,131 @@ impl<N: Copy + Ord> Chosen<'_, N> {
     if self.left_out.contains(&tree) {
       return Ok(());
     }
+    if let Some(patterns) = self.sparse {
+      return self.walk_sparse(graph, tree, patterns, admission, counters);
+    }
     if self.admits(Kind::Tree, 0, 0) {
       self.take(tree, admission)?;
     }
     self.open(graph, tree, 1, admission, counters)
+  }
+
+  /// A `sparse:oid` filter's walk from `root`, a sent commit's tree or a wanted one (git's `process_tree` under
+  /// `filter_sparse`; the module doc's item 3), without recursion: a frame for each tree on the path walked.
+  fn walk_sparse<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    root: N,
+    patterns: &Patterns,
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    let mut walk = SparseWalk {
+      patterns,
+      path: Vec::new(),
+      frames: Vec::new(),
+    };
+    self.enter(graph, &mut walk, root, &[], admission, counters)?;
+    while let Some(frame) = walk.frames.last_mut() {
+      match frame.entries.pop() {
+        Some((entry, name)) => match graph.kind(entry) {
+          Kind::Tree => self.enter(graph, &mut walk, entry, &name, admission, counters)?,
+          Kind::Blob => self.blob(&mut walk, entry, &name, admission)?,
+          Kind::Commit | Kind::Tag => {}
+        },
+        None => self.leave(&mut walk, admission)?,
+      }
+    }
+    Ok(())
+  }
+
+  /// Meets `tree`, named `name` in the tree on top of the walk (git's `LOFS_BEGIN_TREE`): sends it, decides the verdict
+  /// a path below it that the patterns leave undecided takes, and keeps a frame for it; nothing when the client holds it
+  /// or it is done.
+  fn enter<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    walk: &mut SparseWalk<'_, N>,
+    tree: N,
+    name: &[u8],
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<(), Refusal> {
+    if self.left_out.contains(&tree) || self.done.contains(&tree) {
+      return Ok(());
+    }
+    let base = walk.path.len();
+    charge_bytes(admission, name.len().saturating_add(1))?;
+    walk.path.extend_from_slice(name);
+    let inherited = walk.frames.last().is_some_and(|frame| frame.matched);
+    let matched = decided(walk.patterns.decide(&walk.path, true), inherited);
+    self.take(tree, admission)?;
+    if !walk.path.is_empty() {
+      walk.path.push(SLASH);
+    }
+    let mut entries: Vec<(N, Vec<u8>)> = graph.named_entries(tree).collect();
+    admission
+      .charge_items::<(N, Vec<u8>)>(entries.len())
+      .map_err(Refusal::PastAdmission)?;
+    charge_bytes(admission, entries.iter().map(|(_, name)| name.len()).sum())?;
+    charge::<Frame<N>>(admission)?;
+    entries.reverse();
+    counters.trees = counters.trees.saturating_add(1);
+    walk.frames.push(Frame {
+      tree,
+      base,
+      matched,
+      left_out_below: false,
+      entries,
+    });
+    Ok(())
+  }
+
+  /// Meets `blob`, named `name` in the tree on top of the walk (git's `LOFS_BLOB`): sent when its path is matched;
+  /// otherwise left out for now, its tree told, and asked again wherever else it is met.
+  fn blob(
+    &mut self,
+    walk: &mut SparseWalk<'_, N>,
+    blob: N,
+    name: &[u8],
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    if self.left_out.contains(&blob) || self.objects.contains(&blob) {
+      return Ok(());
+    }
+    let Some(frame) = walk.frames.last_mut() else {
+      return Ok(());
+    };
+    let base = walk.path.len();
+    charge_bytes(admission, name.len())?;
+    walk.path.extend_from_slice(name);
+    let matched = decided(walk.patterns.decide(&walk.path, false), frame.matched);
+    walk.path.truncate(base);
+    if matched {
+      return self.take(blob, admission);
+    }
+    frame.left_out_below = true;
+    Ok(())
+  }
+
+  /// Leaves the tree on top of the walk (git's `LOFS_END_TREE`): done when no blob below it was left out, and its tree
+  /// told when one was.
+  fn leave(
+    &mut self,
+    walk: &mut SparseWalk<'_, N>,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let Some(frame) = walk.frames.pop() else {
+      return Ok(());
+    };
+    walk.path.truncate(frame.base);
+    if let Some(parent) = walk.frames.last_mut() {
+      parent.left_out_below |= frame.left_out_below;
+    }
+    if !frame.left_out_below && self.done.insert(frame.tree) {
+      charge::<N>(admission)?;
+    }
+    Ok(())
   }
 
   /// Opens `tree`, its entries met at `depth`, and every tree below it, without recursion.
@@ -366,6 +554,9 @@ impl<N: Copy + Ord> Chosen<'_, N> {
         }
         Kind::Tree => {
           self.take(current, admission)?;
+          if let Some(patterns) = self.sparse {
+            return self.walk_sparse(graph, current, patterns, admission, counters);
+          }
           return self.open(graph, current, 0, admission, counters);
         }
         Kind::Blob => return self.take(current, admission),

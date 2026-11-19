@@ -253,6 +253,14 @@
 > 10 and the slates-vcs test). `sparse:oid` stays refused until the next slices: the walk by path with git's tree
 > frames and the graph's named entries; `<blob-ish>` resolved and its blob read by the service, git's two refusals'
 > words, and a stock git exchange recorded. Owed (main): the Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, second slice (2026-11-19, g296; the walk by path):** under a `sparse:oid` filter served alone, with
+> the patterns the request carries, the negotiation walks trees by path with git's frames (`filter_sparse`): every
+> tree sent, a blob when a path to it is matched, a done tree never walked again and any other again at each path;
+> the graph names its entries (`Graph::named_entries`, the store reading them). Refused: `sparse:oid` without its
+> patterns, and within `combine:` (git's answer there turns on its order of walk). 39 of 39 on the Mac Studio (r6
+> over main bb535bd4d; failing first in r213, 4 of 39 with the walk stubbed; the oracle's census now requires the
+> sparse path). Owed: the service's slice (`<blob-ish>` resolved, its blob read, git's two refusals' words, a stock
+> git exchange recorded); main's Linux and Windows runs, clippy, xtask, docs.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -710,11 +718,21 @@
 > verifier, OpenPGP and X.509 refused typed. `receive::protected` answers in git's words (`non-fast-forward`, `deletion
 > prohibited`, and `hook declined` after a hook's words in git's 128-byte pieces). A-590's payload left in a header
 > named `gpgsig…` that git leaves out; fixed here, red first. Golden vectors (`fixtures/protected`): twelve pushes stock
-> git 2.50.1 made to a stock server protecting `main`, and the signatures and payloads git's verifier read. Owed (part
-> 2): the policy's requirement rules and its trust list of commit signers (A-622's record), `admit`'s typed refusals
-> mapped to these words, and A-321's verifier under git's namespace; then receive-pack's part 2 asking them (A-620).
-> The walks are not yet sliced under the shard's budget (the store's owed item): a create of a protected name walks,
-> and verifies, its whole history at once.
+> git 2.50.1 made to a stock server protecting `main`, and the signatures and payloads git's verifier read.
+>
+> **A-644 part 2 (2026-11-19, g230; protected branches through the policy):** A-622's rules gain two requirement rights
+> (`MergeCommit`, `UnsignedCommit`: a rule denying one imposes it, a later allowing one lifts it, none asks nothing),
+> held to git by the database's guard, and the policy the keys trusted to sign commits (`signers`, appended to the record
+> and to `SetRepositoryPolicy`; each key A-321 reads, once, a git repository's alone). `vcs_policy::admit` judges a
+> change's own right, then a linear history, then signed commits, asking what the change brings only where a rule
+> imposes a requirement, typed `MergeCommit`, `UnsignedCommit`, `Unjudged`. `crates/server` `git_protect`: the store's
+> answers (`StoreBrings`), A-321's verifier under git's namespace (`signed_work::verify_in`, `CommitKeys`), the refusals
+> in git's words (`declined`); the twelve pushes answered through the policy with every byte git wrote. Owed:
+> receive-pack's server half asking it for each command (A-620 part 2's judge composed with the server's greens and
+> appends); Mercurial's linear history on its push path (A-641); OpenPGP and X.509 signatures. The walks are not yet
+> sliced under the shard's budget (the store's owed item): a create of a protected name walks, and verifies, its whole
+> history at once. Found beside it: `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`
+> fails on main (8b3297fe0) on the Mac Studio, 3 of 3 alone.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
@@ -1152,8 +1170,16 @@
 > slates-merge lib 76 of 76 filtered
 > to the copy, checkpoint, branch, node, reanchor and stack tests, `--test checkpoint` 4 of 4, `--test chain_replay` 3
 > of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 6 of 6 (layout 12 refused at start, new); Windows and Linux
-> owed. Owed from A-626: a rebase restating a copy (part 4); a
-> restore that grafts
+> owed. A-626 part 4 (2026-11-19, g307): a rebase restating a copy built, the deriver's `VolumeOp::Copy` composed
+> against the copied tree `Green::base_for` puts at its destination, a file edited beneath a copy restated as edits
+> over what it brings, a work's logged journal holding a copy (`LoggedOp::Copy`, the anchor's layout 14); a work's own
+> shard composes no journal holding a copy (its fetched entries are a path's each, never a tree), so the green's owner
+> composes it, counted `merge.work.copy_composed_by_owner` (see A-626 part 4); on macOS arm64 (kiln r15) slates-merge
+> lib 67 of 67 filtered, `--test increment`, `rebase` and `base_for` whole, slates-server lib 7 of 7 filtered,
+> slates-anchor 2 of 2 and 7 of 7, fmt clean, and again over main ee5cbed4c (kiln r40); Windows and Linux owed. Owed from A-626: the work
+> model
+> resolving copies, so a rebased work's `Rebased::changed` and its reads and listing see the copied files it left
+> alone (they name only the files it changed today); a restore that grafts
 > a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
 > if measured worth it; the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
@@ -1216,6 +1242,10 @@
 > principal, compiled once by the connection and asked through `authz::may_read` by the read commands, `update`'s
 > target and the report drive alike, where the update and its drive had asked the caller's guards; `Guards` keeps the
 > locks alone. Red then green (macOS arm64, Mac Studio, 158 of 158). Owed: the Windows run and red-checks (main's).
+> Continued (3), 2026-11-19: one record of locks; an update's drive reads A-602's lock table at the call's instant
+> (`Sources::now`), where it had asked the caller's `Guards::lock_token`; `Guards` removed. Red then green (macOS
+> arm64, Mac Studio, 130 of 130). Owed: the commit drive's second compile of `Policy::authz`; the Windows run and
+> red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
