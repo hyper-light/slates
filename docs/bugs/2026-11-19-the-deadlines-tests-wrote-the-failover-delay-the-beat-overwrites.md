@@ -58,6 +58,8 @@ Mac Studio M3 Ultra, kiln, debug, 2026-11-19 (the test binary run directly):
 
 ## Siblings
 
-The six other test sites that write `failover_ns` (`moves.rs`, `nfs.rs`, `telemetry.rs`, two in `verbs.rs`,
-`work_home.rs`) each write and read it inside one `audit_on_shard` closure. No beat runs between the write and the read,
-so none is affected.
+The seven other test sites that write `failover_ns` (`moves.rs`, `nfs.rs`, `telemetry.rs`, two in `verbs.rs`,
+`work_home.rs`, and `fleet.rs`'s `a_shard_is_fanned_the_failover_delay_when_it_moves`, which A-574 added and the first
+sweep missed) each write and read it inside one `audit_on_shard` closure. No beat runs between the write and the read,
+so none is affected. The product writes it in three places: the beat's publication and its fan to the shards in
+`fleet.rs`, and `Daemon::inject_failover`.

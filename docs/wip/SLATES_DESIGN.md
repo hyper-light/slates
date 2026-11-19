@@ -47331,8 +47331,8 @@ Applied in the same change to: `crates/server/src/deadlines.rs`'s tests;
   past the half window it looks for. The CLI attachment's test wrote it the same way and passed only because it reads
   its delay in the same observe.
 - **The fix.** Both tests inject their delay with `Daemon::inject_failover`, which every beat then publishes; nothing
-  else in the module writes `failover_ns`. The six other test sites that write it each read it within one
-  `audit_on_shard` closure, where no beat runs between, so none needs it.
+  else in the module writes `failover_ns`. The seven other test sites that write it (`fleet.rs`'s fan test among
+  them) each read it within one `audit_on_shard` closure, where no beat runs between, so none needs it.
 - **Under load.** Asked to check the write lease's test under load: one whole-suite run of eleven with the fix missed
   the bare half window in it and in the CLI attachment's test (load average 14.7). With the look allowed ten seconds,
   every release in the whole suite came 101 to 166 ms after its 100 ms term. `look_until` now widens its half window
