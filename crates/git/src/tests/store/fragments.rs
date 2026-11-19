@@ -21,10 +21,12 @@ use crate::unpack::{NoIndex, read_whole};
 
 use crate::store::Push;
 
-use super::{EXCHANGE, Made, Source, Ticks, blob, commit, push_and_move, store, tree};
+use super::{
+  EXCHANGE, Made, Source, Ticks, blob, brought_by, commit, pack_of, push_and_move, store, tree,
+};
 
 /// A text of numbered lines, `lines` long, the lines in `edited` edited.
-fn text(lines: u32, edited: &[u32]) -> Vec<u8> {
+pub(super) fn text(lines: u32, edited: &[u32]) -> Vec<u8> {
   let mut out = Vec::new();
   for line in 0..lines {
     let words = if edited.contains(&line) {
@@ -125,7 +127,7 @@ fn rebuild_rule() {
 }
 
 /// A commit over `big` (a text file) and `small`, and its objects.
-fn commit_over(format: ObjectFormat, big: &[u8], parents: &[ObjectId], seconds: u64) -> Vec<Made> {
+pub(super) fn commit_over(format: ObjectFormat, big: &[u8], parents: &[ObjectId], seconds: u64) -> Vec<Made> {
   let (big, small) = (blob(format, big), blob(format, b"small\n"));
   let root = tree(
     format,
@@ -177,7 +179,7 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
   for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
     let mut store = store();
     let (repository, first, second) = two_versions(format, &mut store);
-    let pack = repository.pack(&store, 1, (0, 1)).unwrap();
+    let pack = pack_of(&repository, &store, &brought_by(&repository, 1, 0..=1));
     let read = unpacked(format, &pack);
     let made: BTreeMap<ObjectId, Vec<u8>> = first
       .iter()
@@ -251,7 +253,10 @@ fn similar_files_in_one_version_are_offset_deltas_within_the_learned_depth() {
     (offsets, blobs.iter().map(|entry| entry.depth).max()),
     (2, Some(1))
   );
-  let read = unpacked(format, &repository.pack(&store, 1, (0, 0)).unwrap());
+  let read = unpacked(
+    format,
+    &pack_of(&repository, &store, &brought_by(&repository, 1, [0])),
+  );
   assert_eq!(read.len(), objects.len());
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
@@ -266,7 +271,7 @@ fn a_fragments_entries_keep_their_offsets_and_crcs() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, ..) = two_versions(format, &mut store);
-  let pack = repository.pack(&store, 1, (0, 0)).unwrap();
+  let pack = pack_of(&repository, &store, &brought_by(&repository, 1, [0]));
   let objects = read_whole(&pack, format, &NoIndex, &mut Admission::new(u64::MAX))
     .unwrap()
     .objects;
@@ -317,7 +322,10 @@ fn a_clone_is_its_base_pack_and_the_fragments_after_it() {
     .chain(&second)
     .map(|object| object.id)
     .collect();
-  let cloned = unpacked(format, &repository.clone_pack(&store, 1).unwrap());
+  let cloned = unpacked(
+    format,
+    &pack_of(&repository, &store, repository.reached(1).unwrap()),
+  );
   assert_eq!(cloned.keys().copied().collect::<BTreeSet<_>>(), reach);
   let third = commit_over(format, &text(200, &[3]), &[second[0].id], 3);
   push_and_move(
@@ -330,7 +338,10 @@ fn a_clone_is_its_base_pack_and_the_fragments_after_it() {
   repository
     .encode_fragments(&mut store, (1, 2), &mut clock, EXCHANGE)
     .unwrap();
-  let cloned = unpacked(format, &repository.clone_pack(&store, 1).unwrap());
+  let cloned = unpacked(
+    format,
+    &pack_of(&repository, &store, repository.reached(1).unwrap()),
+  );
   assert!(third.iter().all(|object| cloned.contains_key(&object.id)));
   assert_eq!(repository.counters().rebuilds, 1);
   repository.clone_took(1, u64::MAX / 2);
@@ -348,7 +359,7 @@ fn a_sample_pack_for_verify_pack() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, ..) = two_versions(format, &mut store);
-  let pack = repository.pack(&store, 1, (0, 1)).unwrap();
+  let pack = pack_of(&repository, &store, &brought_by(&repository, 1, 0..=1));
   let hex: String = pack.iter().map(|byte| format!("{byte:02x}")).collect();
   std::io::stdout().write_all(hex.as_bytes()).unwrap();
   repository.release(&mut store).unwrap();
@@ -385,7 +396,7 @@ fn double_hashing_costs() {
   repository
     .encode_fragments(&mut store, (1, 0), &mut Ticks(0), EXCHANGE)
     .unwrap();
-  let pack = repository.pack(&store, 1, (0, 0)).unwrap();
+  let pack = pack_of(&repository, &store, &brought_by(&repository, 1, [0]));
   let start = Instant::now();
   let read = read_whole(&pack, format, &NoIndex, &mut Admission::new(u64::MAX)).unwrap();
   let reading = start.elapsed();

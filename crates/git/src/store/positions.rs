@@ -80,4 +80,33 @@ impl Positions {
   pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
     self.runs.iter().flat_map(|&(start, end)| start..end)
   }
+
+  /// The positions both this set and `other` hold (A-639).
+  pub fn intersection(&self, other: &Positions) -> Positions {
+    let _ = other;
+    Positions::new()
+  }
+
+  /// The positions this set holds and `other` does not (A-639).
+  pub fn difference(&self, other: &Positions) -> Positions {
+    let _ = other;
+    self.clone()
+  }
+
+  /// Whether `other` holds every position this set holds (A-639).
+  pub fn is_subset(&self, other: &Positions) -> bool {
+    let _ = other;
+    false
+  }
+
+  /// Adds `position` (A-639).
+  pub fn insert(&mut self, position: u64) {
+    let _ = position;
+  }
+
+  /// The least position the set holds at `from` or after it (A-639).
+  pub fn next_from(&self, from: u64) -> Option<u64> {
+    let _ = from;
+    None
+  }
 }

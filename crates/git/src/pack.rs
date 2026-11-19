@@ -247,6 +247,14 @@ impl<O: Out> Out for Checksummed<'_, O> {
   }
 }
 
+/// Puts the header of a pack of `objects` objects at version 2: what [`Writer::new`] writes, and what a writer that
+/// streams a pack across turns and keeps its own checksum writes first (A-639's upload-pack stream).
+pub(crate) fn put_header(objects: u32, out: &mut impl Out) {
+  out.put(&SIGNATURE);
+  out.put(&VERSION_TWO.to_be_bytes());
+  out.put(&objects.to_be_bytes());
+}
+
 /// Writes a pack as git does: [`Writer::new`] writes the header at version 2, the caller puts the objects through
 /// [`Out`], and [`Writer::finish`] writes the trailer, the checksum of every byte before it, computed as they passed.
 pub struct Writer<'o, O: Out>(Checksummed<'o, O>);
@@ -255,9 +263,7 @@ impl<'o, O: Out> Writer<'o, O> {
   /// Begins a pack of `objects` objects in `format`'s hash: writes its header.
   pub fn new(format: ObjectFormat, objects: u32, out: &'o mut O) -> Self {
     let mut checksummed = Checksummed::new(format, out);
-    checksummed.put(&SIGNATURE);
-    checksummed.put(&VERSION_TWO.to_be_bytes());
-    checksummed.put(&objects.to_be_bytes());
+    put_header(objects, &mut checksummed);
     Self(checksummed)
   }
 
