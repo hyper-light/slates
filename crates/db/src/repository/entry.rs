@@ -1,4 +1,5 @@
-//! An entry of a repository's register: its guard and its byte measure (§4.17.1 item 2, shared piece 2; A-603).
+//! An entry of a repository's logs: its guard and its byte measure (§4.17.1 item 2, shared piece 2; A-603, rebuilt by
+//! A-642).
 //!
 //! A repository's greens share one register, and one entry of it commits any set of the repository's changes as one
 //! durable step: several greens' versions (git's atomic push: "Either all refs are updated or none" [B:
@@ -6,13 +7,14 @@
 //! its lineage, its namespace's changes (§4.17.1 item 3), and its own state (Mercurial's phase roots and obsolescence
 //! markers, §4.17.3 decisions 3 and 4), moved with the push that moves them or alone.
 //!
-//! **The rule the guard keeps.** An entry is judged at its register position: it must take the register's next
-//! position; its checks read the register's state there, before any of its own changes, so a check holds at exactly
-//! the position the entry commits at (Mercurial's `check:heads` and `unbundle`'s `heads`: every head unchanged, read in
-//! the push's own register step, §4.17.3 decision 6); then its members join, its versions commit, its names change and
-//! its state moves, each item judged against what the items before it left, as the apply will apply them. Anything
-//! that does not hold refuses the whole entry, typed, before the log records any of it; the apply is then
-//! unconditional, so a replay of the log rebuilds the same register (guard then apply, `crate::partition`).
+//! **The rule the guard keeps.** An entry is judged against each log's own position, never a position of the whole
+//! repository (A-642): its checks read each log before any of its own changes, so a check holds at exactly the positions
+//! the entry appends at (Mercurial's `check:heads` and `unbundle`'s `heads`, every head unchanged, read in the push's own
+//! step, §4.17.3 decision 6); each version appends to its green's log only while the green is at the position the push
+//! read, the version before it, and a green that moved is refused `Moved`, named; then its members join, its names
+//! change and its state moves, each item judged against what the items before it left, as the apply will apply them.
+//! Anything that does not hold refuses the whole entry, typed, before the log records any of it; the apply is then
+//! unconditional, so a replay of the log rebuilds the same logs (guard then apply, `crate::partition`).
 //!
 //! **No copy of the tables.** The guard keeps what the entry's earlier items changed in an `Overlay` of small maps
 //! over the register's state, so judging an entry costs its own items, each a lookup, never a copy of the namespace or
@@ -59,6 +61,11 @@ pub(super) fn root_bytes(node: &[u8]) -> usize {
   node.len().saturating_add(size_of::<u8>())
 }
 
+/// The bytes a lock holds: its path and its record.
+pub(super) fn lock_bytes(path: &str, lock: &[u8]) -> usize {
+  path.len().saturating_add(lock.len())
+}
+
 /// A marker's identity: BLAKE3 of its bytes, so a held marker is found by a lookup, and two markers with the same bytes
 /// are one marker, as Mercurial's obsstore keeps them [C: `obsolete.py` `obsstore.add`, which skips a known marker].
 pub(super) fn marker_id(marker: &[u8]) -> [u8; 32] {
@@ -88,6 +95,8 @@ struct Overlay<'entry> {
   roots: BTreeMap<(u8, &'entry [u8]), bool>,
   /// Markers added earlier in the entry, by identity.
   markers: BTreeSet<[u8; 32]>,
+  /// Locks taken (`Some`) or released (`None`) earlier in the entry, by path.
+  locks: BTreeMap<&'entry str, Option<&'entry [u8]>>,
 }
 
 /// The guard for `entry` (`Partition::check` for `Op::RepositoryAdvanced`): the module docs' rule. `held` says what the
@@ -105,18 +114,12 @@ pub(super) fn check(
     .registers
     .get(&entry.repository)
     .ok_or(DbError::NotFound)?;
-  if entry.position != register.next {
-    return Err(DbError::OutOfOrder {
-      named: entry.position,
-      expected: register.next,
-    });
-  }
   for (index, check) in entry.checks.iter().enumerate() {
-    if !holds(repositories, entry.repository, check, &head) {
-      return Err(DbError::CheckFailed {
+    holds(repositories, (entry.repository, register), check, &head).map_err(|failed| {
+      failed.unwrap_or(DbError::CheckFailed {
         index: index_of(index),
-      });
-    }
+      })
+    })?;
   }
   let mut overlay = Overlay::default();
   for member in &entry.joined {
@@ -138,21 +141,31 @@ pub(super) fn check(
   Ok(())
 }
 
-/// Whether `check` holds in `repository` at the register's position.
+/// Whether `check` holds in `repository`, each log at its own position: `Err(Some(_))` naming a green that moved,
+/// `Err(None)` for any other check that does not hold.
 fn holds(
   repositories: &Repositories,
-  repository: RepositoryId,
+  (repository, register): (RepositoryId, &Register),
   check: &RepositoryCheck,
   head: &impl Fn(VolumeId) -> u64,
-) -> bool {
-  match check {
-    // A head the check names is a head of this repository: a green of another, or none, holds no head here.
+) -> Result<(), Option<DbError>> {
+  let held = match check {
+    // A head the check names is a head of this repository: a green of another, or none, holds no head here; one that
+    // moved is named, as a version's green that moved is (A-642).
     RepositoryCheck::Head { green, version } => {
-      repositories
+      let member = repositories
         .members
         .get(green)
-        .is_some_and(|member| member.repository == repository)
-        && head(*green) == *version
+        .is_some_and(|member| member.repository == repository);
+      let at = head(*green);
+      if member && at != *version {
+        return Err(Some(DbError::Moved {
+          green: green.bytes,
+          read: *version,
+          at,
+        }));
+      }
+      member
     }
     RepositoryCheck::Names { prefix, bound } => {
       let mut held = repositories.branches(repository, prefix);
@@ -162,7 +175,9 @@ fn holds(
           .is_some_and(|(name, green)| name == binding.name && green == binding.green)
       }) && held.next().is_none()
     }
-  }
+    RepositoryCheck::Log { log, position } => register.position(*log) == *position,
+  };
+  if held { Ok(()) } else { Err(None) }
 }
 
 /// What an entry adds to the partition's merge budget and gives back of it (module docs): every version's chain entry
@@ -197,6 +212,14 @@ pub(super) fn change_bytes(change: &StateChange) -> StateBytes {
     StateChange::MarkerAdded { marker } => StateBytes {
       added: marker.len(),
       released: 0,
+    },
+    StateChange::LockTaken { path, lock } => StateBytes {
+      added: lock_bytes(path, lock),
+      released: 0,
+    },
+    StateChange::LockReleased { path, lock } => StateBytes {
+      added: 0,
+      released: lock_bytes(path, lock),
     },
   }
 }
@@ -306,16 +329,16 @@ impl<'entry> Overlay<'entry> {
     if !self.member_of(repositories, repository, version.green) {
       return Err(DbError::NotFound);
     }
-    let expected = self
+    let at = self
       .heads
       .get(&version.green)
       .copied()
-      .unwrap_or_else(|| head(version.green))
-      .saturating_add(1);
-    if version.version != expected {
-      return Err(DbError::OutOfOrder {
-        named: version.version,
-        expected,
+      .unwrap_or_else(|| head(version.green));
+    if version.version != at.saturating_add(1) {
+      return Err(DbError::Moved {
+        green: version.green.bytes,
+        read: version.version.saturating_sub(1),
+        at,
       });
     }
     self.heads.insert(version.green, version.version);
@@ -399,6 +422,31 @@ impl<'entry> Overlay<'entry> {
         self.markers.insert(id);
         true
       }
+      StateChange::LockTaken { path, lock } => {
+        if self.lock(register, path).is_some() {
+          return false;
+        }
+        self.locks.insert(path.as_str(), Some(lock.as_slice()));
+        true
+      }
+      StateChange::LockReleased { path, lock } => {
+        if self.lock(register, path) != Some(lock.as_slice()) {
+          return false;
+        }
+        self.locks.insert(path.as_str(), None);
+        true
+      }
+    }
+  }
+
+  /// The lock `path` holds at this point of the entry.
+  fn lock<'held>(&self, register: &'held Register, path: &str) -> Option<&'held [u8]>
+  where
+    'entry: 'held,
+  {
+    match self.locks.get(path) {
+      Some(held) => *held,
+      None => register.lock(path),
     }
   }
 

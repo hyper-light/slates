@@ -1932,6 +1932,7 @@ name = "slates-svn"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "blake3",
  "hmac",
  "lz4_flex",
  "md-5",
