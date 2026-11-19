@@ -20,18 +20,8 @@
 //! **The bound.** A value whose piece list would cost more than its bytes is stored as one chunk instead (compaction):
 //! a version never costs more than a whole copy, which is what every version cost before, and a file edited in many
 //! places is rewritten once its pieces outweigh it. No constant: the rule is the two sizes.
-//!
-//! **Replicas reading in place (A-273).** A replica of the green on another shard names these chunks rather than
-//! copying them (A-64: content once): each chunk is a sealed block in the green's store (`crate::store`,
-//! `slates_mem::sealed`), the owner's own, read in place by its replicas through their own tables of the same chunks
-//! ([`Chunks::replica`]). The owner's last piece leaving a chunk releases its slot here at once and its block in the
-//! store, which keeps the block (its bytes unchanged, its room unreused) until every replica has passed the feed message
-//! that released it, and charges it to the green's retained bytes meanwhile ([`Chunks::held_bytes`]). Positions, not
-//! versions: a fold of the history releases chunks with no new version. With no replica a release frees at once, as it
-//! always did.
 
 use crate::ops_doc::{Op, OpKind};
-use slates_mem::sealed::{Block, Changes, Left, Passed, ReaderRefusal};
 
 /// A run of a value's bytes: `len` bytes at `at` within chunk `chunk`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,26 +37,15 @@ struct Piece {
 /// Format: the bytes one piece costs in a value's list, the measure compaction weighs against the value's bytes.
 pub(crate) const PIECE_BYTES: usize = size_of::<Piece>();
 
-/// The arena of immutable chunks a green's history values share (module docs): each chunk a sealed block in the
-/// green's store (`crate::store`), its owner's own or, on a replica, its owner's read in place.
+/// The arena of immutable chunks a green's history values share (module docs).
 #[derive(Debug, Default)]
 pub(crate) struct Chunks {
-  /// Where the chunks' bytes are, and where the green's current values are too (A-273 step 3).
-  store: crate::store::Store,
-  /// Each slot's chunk; `None` once released.
-  slots: Vec<Option<Entry>>,
-  /// Released slots, reused first.
+  /// Each slot's bytes and the pieces naming it; `None` once freed.
+  slots: Vec<Option<(Vec<u8>, usize)>>,
+  /// Freed slots, reused first.
   free: Vec<usize>,
   /// The bytes the live chunks hold.
   bytes: usize,
-}
-
-/// A live chunk: its block, its length and the pieces naming it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Entry {
-  block: Block,
-  len: usize,
-  refs: usize,
 }
 
 impl Chunks {
@@ -87,187 +66,57 @@ impl Chunks {
     seen
       .into_iter()
       .filter_map(|chunk| self.slots.get(chunk).and_then(Option::as_ref))
-      .map(|entry| entry.len)
-      .fold(0, usize::saturating_add)
+      .map(|(bytes, _)| bytes.len())
+      .sum()
   }
 
   /// Adds a chunk holding `bytes`, named by no piece yet.
   fn add(&mut self, bytes: Vec<u8>) -> usize {
     let len = bytes.len();
-    let block = self.store.seal(bytes);
     self.bytes = self.bytes.saturating_add(len);
-    let entry = Some(Entry {
-      block,
-      len,
-      refs: 0,
-    });
     if let Some(chunk) = self.free.pop()
       && let Some(slot) = self.slots.get_mut(chunk)
     {
-      *slot = entry;
+      *slot = Some((bytes, 0));
       return chunk;
     }
-    self.slots.push(entry);
+    self.slots.push(Some((bytes, 0)));
     self.slots.len().saturating_sub(1)
   }
 
   /// One more piece names `chunk`.
   fn retain(&mut self, chunk: usize) {
-    if let Some(Some(entry)) = self.slots.get_mut(chunk) {
-      entry.refs = entry.refs.saturating_add(1);
+    if let Some(Some((_, refs))) = self.slots.get_mut(chunk) {
+      *refs = refs.saturating_add(1);
     }
   }
 
-  /// One piece naming `chunk` is gone; the chunk is released with its last, its block released in the store (kept there
-  /// for the green's replicas until each has passed this release, A-273) and its slot reused.
+  /// One piece naming `chunk` is gone; the chunk is freed with its last.
   fn release(&mut self, chunk: usize) {
     let Some(slot) = self.slots.get_mut(chunk) else {
       return;
     };
-    let Some(entry) = slot.as_mut() else {
-      return;
+    let freed = match slot {
+      Some((bytes, refs)) => {
+        *refs = refs.saturating_sub(1);
+        (*refs == 0).then_some(bytes.len())
+      }
+      None => None,
     };
-    entry.refs = entry.refs.saturating_sub(1);
-    if entry.refs > 0 {
-      return;
+    if let Some(len) = freed {
+      *slot = None;
+      self.bytes = self.bytes.saturating_sub(len);
+      self.free.push(chunk);
     }
-    let (block, len) = (entry.block, entry.len);
-    *slot = None;
-    self.free.push(chunk);
-    self.bytes = self.bytes.saturating_sub(len);
-    self.store.release(block);
   }
 
-  /// A current value's block holding `bytes` (the green's current files live in the store beside its chunks).
-  pub(crate) fn seal(&mut self, bytes: Vec<u8>) -> Block {
-    self.store.seal(bytes)
-  }
-
-  /// A current value's bytes, read where the store keeps them.
-  pub(crate) fn block_bytes(&self, block: Block) -> &[u8] {
-    self.store.bytes(block)
-  }
-
-  /// A current value the green names no more.
-  pub(crate) fn release_block(&mut self, block: Block) {
-    self.store.release(block);
-  }
-
-  /// The feed position: on the owner, the position of its next message, which a release is stamped with; on a replica,
-  /// the next message it applies (A-273).
-  pub(crate) fn position(&self) -> u64 {
-    self.store.position()
-  }
-
-  /// The owner's blocks sealed and released since its last feed message, at its position, which then moves past it.
-  pub(crate) fn take_changes(&mut self) -> Option<Changes> {
-    self.store.take_changes()
-  }
-
-  /// A replica of these chunks now (A-273): registered with the owner's blocks, every chunk named as the owner names it,
-  /// read in place. Refused past `limit` replicas, and on a replica, which has no blocks of its own to give.
-  pub(crate) fn replica(&mut self, limit: usize) -> Result<Chunks, crate::replica::ReplicaRefusal> {
-    let joined = self.store.join(limit)?;
-    Ok(Chunks {
-      store: crate::store::Store::reading(joined),
-      slots: self.slots.clone(),
-      free: self.free.clone(),
-      bytes: self.bytes,
-    })
-  }
-
-  /// A replica passed a feed message: the owner frees what every replica has passed.
-  pub(crate) fn acknowledge(&mut self, passed: Passed) {
-    self.store.acknowledge(passed);
-  }
-
-  /// A replica is done: the owner keeps nothing for it.
-  pub(crate) fn leave(&mut self, left: Left) {
-    self.store.leave(left);
-  }
-
-  /// A replica's registration given back for its owner's [`Chunks::leave`].
-  pub(crate) fn into_left(self) -> Option<Left> {
-    self.store.into_left()
-  }
-
-  /// A replica about to replay the message carrying `changes` (`crate::store::Store::begin`).
-  pub(crate) fn begin(&mut self, changes: &Changes) -> Result<(), ReaderRefusal> {
-    self.store.begin(changes)
-  }
-
-  /// The bytes the owner keeps for its replicas past which the slowest is evicted (A-273 step 4).
-  pub(crate) fn set_held_limit(&mut self, bytes: usize) {
-    self.store.set_held_limit(bytes);
-  }
-
-  /// At the start of a change on the owner: every replica evicted if the last change was never sent to them.
-  pub(crate) fn evict_if_unfed(&mut self) {
-    self.store.evict_if_unfed();
-  }
-
-  /// Replicas the owner evicted: for what it kept for them, and for changes left unfed.
-  pub(crate) fn evictions(&self) -> (u64, u64) {
-    self.store.evictions()
-  }
-
-  /// Whether `changes` says the owner evicted this replica.
-  pub(crate) fn evicted_by(&self, changes: &Changes) -> bool {
-    self.store.evicted_by(changes)
-  }
-
-  /// The bytes a replica's own table of these chunks costs (A-273 step 4): its slots.
-  pub(crate) fn table_bytes(&self) -> usize {
-    self
-      .slots
-      .len()
-      .saturating_add(self.free.len())
-      .saturating_mul(size_of::<Option<Entry>>())
-  }
-
-  /// A replica done replaying it (`crate::store::Store::finish`).
-  pub(crate) fn finish(&mut self, changes: &Changes) -> Option<Passed> {
-    self.store.finish(changes)
-  }
-
-  /// The replicas registered with these chunks' blocks (A-273), evicted ones that have not left among them.
-  pub(crate) fn replicas(&self) -> usize {
-    self.store.replicas()
-  }
-
-  /// The bytes of chunks and values kept on the owner only for its replicas (A-273): its memory, charged with its own.
-  pub(crate) fn held_bytes(&self) -> usize {
-    self.store.held_bytes()
-  }
-
-  /// [`Chunks::held_bytes`] recounted from the owner's kept list itself.
-  pub(crate) fn held_bytes_recounted(&self) -> usize {
-    self.store.held_bytes_recounted()
-  }
-
-  /// The frees kept for a replica since the green was made (A-273's non-vacuity counter).
-  pub(crate) fn frees_held(&self) -> u64 {
-    self.store.frees_held()
-  }
-
-  /// Reads the store could not answer (`crate::store`): never on a green whose replay is its owner's.
-  pub(crate) fn reads_refused(&self) -> u64 {
-    self.store.reads_refused()
-  }
-
-  /// Whether these chunks are a replica's reading of its owner's.
-  pub(crate) fn is_replica(&self) -> bool {
-    self.store.is_replica()
-  }
-
-  /// The bytes of `piece`, read where its chunk's block is.
+  /// The bytes of `piece`, or none if its chunk is gone (never, while a value names it).
   fn bytes_of(&self, piece: &Piece) -> &[u8] {
     self
       .slots
       .get(piece.chunk)
       .and_then(Option::as_ref)
-      .map(|entry| self.store.bytes(entry.block))
-      .and_then(|bytes| bytes.get(piece.at..piece.at.saturating_add(piece.len)))
+      .and_then(|(bytes, _)| bytes.get(piece.at..piece.at.saturating_add(piece.len)))
       .unwrap_or_default()
   }
 }
@@ -811,105 +660,5 @@ mod tests {
     }
     assert_eq!(chunks.bytes(), FILE + EDITS * EDIT as usize);
     assert_eq!(values.last().unwrap().materialize(&chunks), bytes);
-  }
-
-  /// Shape: the replicas a test's owner takes, more than any test makes.
-  const READERS: usize = 4;
-
-  /// `value` read through `chunks`: `bytes`.
-  fn reads(value: &Value, chunks: &Chunks, bytes: &[u8]) {
-    assert_eq!(value.materialize(chunks), bytes);
-  }
-
-  /// The bytes the owner's chunks keep for its replicas: `held`, equal to their recount.
-  fn keeps(chunks: &Chunks, held: usize) {
-    assert_eq!(
-      (chunks.held_bytes(), chunks.held_bytes_recounted()),
-      (held, held)
-    );
-  }
-
-  /// A-273 "Frees deferred until every replica has passed them", step 3. Do: an owner's value of 64 bytes; a replica's
-  /// chunks are made from the owner's, so its copy of the value reads the owner's block in place; the owner releases
-  /// its value and stores another of other bytes, and takes the feed message's changes; the replica replays the same
-  /// two steps, adopting the owner's new block, and passes the message. Expect: until the replica passes, its copy reads
-  /// its 64 bytes and the free is held and charged; the owner frees the block at the replica's acknowledgement, not
-  /// before; the replica's new value reads the owner's new bytes in place, and the replica sealed nothing of its own.
-  #[test]
-  fn a_chunk_released_while_a_replica_reads_it_stays_until_the_replica_passes_its_release() {
-    let mut chunks = Chunks::default();
-    let first = vec![7u8; 64];
-    let owner = Value::whole(&mut chunks, &first);
-    let mut replica_chunks = chunks.replica(READERS).unwrap();
-    let replica = owner.clone();
-    owner.release(&mut chunks);
-    let second = Value::whole(&mut chunks, &[9u8; 64]);
-    let changes = chunks.take_changes().unwrap();
-    // The replica reads the bytes it named, in place, and the owner keeps them for it.
-    reads(&replica, &replica_chunks, &first);
-    assert_eq!(chunks.frees_held(), 1);
-    keeps(&chunks, first.len());
-    replica_chunks.begin(&changes).unwrap();
-    replica.release(&mut replica_chunks);
-    let adopted = Value::whole(&mut replica_chunks, &[9u8; 64]);
-    let passed = replica_chunks.finish(&changes).unwrap();
-    // Passed, but not yet acknowledged: still kept; freed at the acknowledgement.
-    keeps(&chunks, first.len());
-    chunks.acknowledge(passed);
-    keeps(&chunks, 0);
-    reads(&adopted, &replica_chunks, &[9u8; 64]);
-    assert_eq!(adopted, second, "the replica names the owner's chunk");
-    assert_eq!(replica_chunks.reads_refused(), 0);
-    chunks.leave(replica_chunks.into_left().unwrap());
-    second.release(&mut chunks);
-    assert_eq!(chunks.bytes(), 0);
-  }
-
-  /// A-273. Do: as above, but the replica leaves (dropped, rebuilt or ended) instead of acknowledging. Expect: the
-  /// held chunk is freed at the leave, and a later release with no replica is freed at once, nothing held.
-  #[test]
-  fn a_replica_that_leaves_holds_no_free() {
-    let mut chunks = Chunks::default();
-    let owner = Value::whole(&mut chunks, &[1u8; 32]);
-    let replica = chunks.replica(READERS).unwrap();
-    owner.release(&mut chunks);
-    assert_eq!(chunks.held_bytes(), 32);
-    chunks.leave(replica.into_left().unwrap());
-    assert_eq!(chunks.held_bytes(), 0);
-    let later = Value::whole(&mut chunks, &[2u8; 32]);
-    later.release(&mut chunks);
-    assert_eq!(
-      (chunks.bytes(), chunks.held_bytes(), chunks.frees_held()),
-      (0, 0, 1)
-    );
-  }
-
-  /// A-273 step 3: a replica whose replay seals bytes the owner did not seal, or seals more blocks than the owner did,
-  /// is refused at the message's end: it is not the owner's green.
-  #[test]
-  fn a_replay_that_seals_other_bytes_than_its_owner_is_refused() {
-    let mut chunks = Chunks::default();
-    let mut replica_chunks = chunks.replica(READERS).unwrap();
-    let owner = Value::whole(&mut chunks, &[3u8; 16]);
-    let changes = chunks.take_changes().unwrap();
-    replica_chunks.begin(&changes).unwrap();
-    let other = Value::whole(&mut replica_chunks, &[4u8; 16]);
-    assert!(replica_chunks.finish(&changes).is_none(), "other bytes");
-    let mut twice = chunks.replica(READERS).unwrap();
-    let again = Value::whole(&mut chunks, &[5u8; 8]);
-    let changes = chunks.take_changes().unwrap();
-    twice.begin(&changes).unwrap();
-    let first = Value::whole(&mut twice, &[5u8; 8]);
-    let extra = Value::whole(&mut twice, &[6u8; 8]);
-    assert!(
-      twice.finish(&changes).is_none(),
-      "more blocks than the owner"
-    );
-    drop((other, first, extra));
-    chunks.leave(replica_chunks.into_left().unwrap());
-    chunks.leave(twice.into_left().unwrap());
-    owner.release(&mut chunks);
-    again.release(&mut chunks);
-    assert_eq!((chunks.bytes(), chunks.held_bytes()), (0, 0));
   }
 }

@@ -35,8 +35,10 @@
 //! path, stamped into the root handle and every handle derived from it, and validated against the
 //! attachment record on every request. A bare `/` lists nothing and enters nothing. The attachment a
 //! host mount rides on is the **mount's** (`Consumer::Bridge`): it outlives the client that attached
-//! and a daemon restart (the kernel's handles must keep validating), and it ends with the kernel's
-//! `UMNT` of the mount path ([`unmount_capability`]), a `detach`, or the volume's destroy.
+//! and a daemon restart (the kernel's handles must keep validating), and it ends when the kernel unmounts the mount
+//! (seen through the kernel's own unmount event on the shard that holds it, A-511; on macOS, `own_nfs::watch`), with a
+//! `detach`, or with the volume's destroy. A `UMNT` ends nothing: it is a hint any local process can send, and the
+//! kernel sends none at a forced unmount.
 //!
 //! A volume appears under its **provisioned name** (§4.6 "Chosen path"): the slot carries the name
 //! ([`crate::state::VolumeSlot`]), [`ShardVolumeSet::entries`] lists it, and a root `LOOKUP`/`MNT` of a
@@ -107,7 +109,7 @@ use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
   reply_record, request_volume, root_volume, serve_call,
 };
-use slates_db::catalog::{AttachForm, Consumer, Principal, VolumeId};
+use slates_db::catalog::{Principal, VolumeId};
 use slates_db::register::ObjectId;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
@@ -852,8 +854,8 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
       let _dir = Nfsfh3::decode(&mut reader).ok()?;
       Some(reader.string(NFS_MAXNAMELEN).ok()?.to_owned())
     }
-    // A `MNT` and the kernel's `UMNT` of the same path both route to the name's owner: the mount is served
-    // there, and the unmount ends the mount's attachment there (AUD-01).
+    // A `MNT` routes to the name's owner, where the mount is served; the kernel's `UMNT` of the same path goes there
+    // too and is answered void (it ends nothing: the kernel's own unmount event does, A-511).
     MOUNT_PROGRAM if is_mount_request(program, procedure) => {
       let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
       let name = path.trim_matches('/');
@@ -871,175 +873,6 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
 /// (§4.13; AUD-01): the mount to be served under it, the unmount to end its attachment.
 fn is_mount_request(program: u32, procedure: u32) -> bool {
   program == MOUNT_PROGRAM && (procedure == MOUNTPROC3_MNT || procedure == MOUNTPROC3_UMNT)
-}
-
-/// The kernel's `UMNT` of `/<name>` ends the attachment of the mount it unmounts (§4.6, §4.13; AUD-01),
-/// once the kernel's mount table confirms that mount is gone. The path is the mount's source name, with
-/// no capability (§4.6 A-34), so a `UMNT` alone proves nothing: any local process could send one. On the
-/// name's owner shard every host mount (`Consumer::Bridge`) of the named volume bound to a mount point is
-/// watched by [`confirm_unmount`]: an attachment ends (as a `detach` would, `verbs::end_attachment`) when
-/// its mount point no longer holds this volume's mount, and one whose mount is still there when the
-/// confirmation's learned bound passes ([`unmount_bound_ns`], A-493) is a mount nobody unmounted, left as it is.
-/// `UMNT` has no status (RFC 1813 §5.2.3), so the reply is void; `args` is `/<name>`.
-fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
-  let Ok(path) = XdrReader::new(args).string(MNT_PATH_MAX) else {
-    return;
-  };
-  let name = path.trim_matches('/').to_owned();
-  if name.is_empty() || name.contains('@') {
-    return;
-  }
-  let mounts: Vec<(u64, String)> = state::with_state(|s| {
-    let Some(volume) = s.db.partition().volume_by_name(&name).map(|v| v.id) else {
-      return Vec::new();
-    };
-    s.db
-      .partition()
-      .attachments_of(volume)
-      .into_iter()
-      .filter_map(|record| match (&record.consumer, &record.form) {
-        (Consumer::Bridge, AttachForm::ChosenPath { path })
-        | (
-          Consumer::Bridge,
-          AttachForm::ScopedMount {
-            mount_point: Some(path),
-            ..
-          }
-          | AttachForm::BoundMount {
-            mount_point: Some(path),
-            ..
-          },
-        ) => Some((record.id, path.clone())),
-        _ => None,
-      })
-      .collect()
-  })
-  .unwrap_or_default();
-  if mounts.is_empty() {
-    let _ = state::with_state_counted(|s| s.count("nfs.unmount_refused", 1));
-    return;
-  }
-  match futures::spawn(confirm_unmount(name, mounts)) {
-    Ok(task) => {
-      let _ = futures::detach(task);
-    }
-    Err(_) => {
-      crate::fleet::count_refusal("nfs.unmount_refused");
-    }
-  }
-}
-
-/// Derived: how long a `UMNT` waits for its mount to leave the kernel's mount table (A-493): the pace this shard
-/// learned of the kernel's unmounts (`ShardState::unmount_times`, the learner the told waits use,
-/// `crate::learned_wait::LearnedWait`: the tail of the confirmations that completed plus the liveness window a live party
-/// may be late by, backed off after each that ran out), never further than the node's failover delay
-/// (`ShardState::failover_ns`). A `UMNT` is a hint, never proof: it removes an entry from a server's mount list, which
-/// goes stale when a client never sends one (RFC 1813 §5.2.2, §5.2.3), and any local process may send one. The kernel
-/// sends it while it unmounts, so a genuine one's mount leaves the table within the kernel's own remaining steps, as long
-/// as this host's kernel takes under its load; a mount still there past the learned pace was not being unmounted. Until
-/// A-493 the bound was one liveness budget, fixed, so a genuine unmount slower than that on a loaded host was left as a
-/// mount nobody unmounted, its attachment kept.
-pub(crate) fn unmount_bound_ns(s: &ShardState) -> u64 {
-  s.unmount_times.bound_ns(s.failover_ns)
-}
-
-/// What a `UMNT`'s wait found ([`wait_for_unmount`]).
-#[derive(Debug, PartialEq, Eq)]
-enum Unmounted {
-  /// These attachments' mount points no longer hold the volume's mount.
-  Gone(Vec<u64>),
-  /// Every mount was still there at the learned bound: a mount nobody unmounted.
-  Unconfirmed,
-  /// No poll could be timed (off a shard): given up, never spun on.
-  Unpolled,
-}
-
-/// Waits for one of `mounts` (attachment, mount point) to stop holding `name`'s mount, `still_mounted` asked at the
-/// fleet's poll interval, for at most this shard's learned bound ([`unmount_bound_ns`]), folding what it measured into
-/// that learning: a confirmation that completed is a sample, one that ran out backs the bound off. It stops at the
-/// first mount gone: a `UMNT` is one unmount.
-async fn wait_for_unmount(
-  name: &str,
-  mounts: &[(u64, String)],
-  still_mounted: impl Fn(&str, &str) -> bool,
-) -> Unmounted {
-  let began = futures::now_ns();
-  let bound =
-    state::with_state(|s| unmount_bound_ns(s)).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
-  let poll = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-  loop {
-    let gone: Vec<u64> = mounts
-      .iter()
-      .filter(|(_, point)| !still_mounted(point, name))
-      .map(|(attachment, _)| *attachment)
-      .collect();
-    let waited_ns = futures::now_ns().saturating_sub(began);
-    if !gone.is_empty() {
-      let _ = state::with_state_counted(|s| s.unmount_times.completed(waited_ns));
-      return Unmounted::Gone(gone);
-    }
-    if waited_ns >= bound {
-      let _ = state::with_state_counted(|s| s.unmount_times.ran_out());
-      return Unmounted::Unconfirmed;
-    }
-    if futures::sleep(poll).await.is_err() {
-      return Unmounted::Unpolled;
-    }
-  }
-}
-
-/// Ends each of `mounts` (attachment, mount point) whose point no longer holds `name`'s mount once the kernel's mount
-/// table shows it gone ([`wait_for_unmount`] over [`holds_mount_of`], [`unmount_capability`]), as a `detach` would; a
-/// confirmation that found none gone is counted.
-async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
-  match wait_for_unmount(&name, &mounts, holds_mount_of).await {
-    Unmounted::Gone(gone) => {
-      let _ = state::with_state_counted(|s| {
-        for attachment in gone {
-          let ended = s
-            .db
-            .partition()
-            .attachment(attachment)
-            .cloned()
-            .is_some_and(|record| {
-              crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_ok()
-            });
-          if !ended {
-            s.count("nfs.unmount_refused", 1);
-          }
-        }
-      });
-    }
-    Unmounted::Unconfirmed | Unmounted::Unpolled => {
-      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-    }
-  }
-}
-
-/// Whether `mount_point` is still where `name`'s loopback mount is: the kernel's mount table
-/// (`getfsstat(MNT_NOWAIT)`, `slates_bridge_oci::mount_table`) lists a mount exactly there whose source is
-/// `slates:/<name>` (§4.6 A-34). The table is read, never the mount: a `statfs` of the point would send
-/// an NFS request to this very daemon, and on a single shard the shard that must answer is the one
-/// waiting (the hazard `slates-bridge-oci`'s module doc records). A table that cannot be read counts as
-/// the mount still being there, so nothing ends on a read error.
-#[cfg(target_os = "macos")]
-fn holds_mount_of(mount_point: &str, name: &str) -> bool {
-  let Ok(entries) = slates_bridge_oci::mount_table::mount_table() else {
-    return true;
-  };
-  let source = format!("slates:/{name}");
-  entries
-    .iter()
-    .rev()
-    .find(|entry| entry.mount_point.trim_end_matches('/') == mount_point.trim_end_matches('/'))
-    .is_some_and(|entry| entry.source == source)
-}
-
-/// Off macOS a loopback NFS mount is not how volumes are mounted (Linux uses FUSE, which ends its
-/// attachment when the kernel closes the device); a `UMNT` there is never taken as proof of an unmount.
-#[cfg(not(target_os = "macos"))]
-fn holds_mount_of(_mount_point: &str, _name: &str) -> bool {
-  true
 }
 
 /// Splits a mount path of the form `<name>@<attachment_hex>.<token_hex>` — or `@<attachment_hex>.<token_hex>`
@@ -1089,8 +922,8 @@ fn presented_capability(
 ) -> (Option<MountCapability>, Option<Vec<u8>>) {
   if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
     // The kernel's `UMNT` names the volume by the mount's source (`slates:/<name>` gives `/<name>`), with
-    // no capability (§4.6 A-34); it presents none, and the unmount is confirmed against the kernel's
-    // mount table before anything ends ([`unmount_capability`]).
+    // no capability (§4.6 A-34); it presents none, and it ends nothing: the kernel's own unmount event ends a
+    // mount's attachment (A-511).
     return (None, None);
   }
   if is_mount_request(program, procedure) {
@@ -1191,11 +1024,6 @@ fn serve_local(
     s.tracer
       .open_root(request, Chokepoint::BridgeRequest, start_ns)
   });
-  // The kernel's unmount ends the mount's attachment here, on the name's owner shard (AUD-01); the
-  // bridge then answers the void `UMNT` reply.
-  if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
-    unmount_capability(requester.capability, args);
-  }
   let requester_dialect = requester.dialect;
   let mut service = MultiExport::new(
     ShardVolumeSet {
@@ -3908,95 +3736,5 @@ mod tests {
       "a client silent a whole lease makes room"
     );
     assert!(!table.holds_client(idle.clientid));
-  }
-
-  /// Shape: a confirmation's first bound on a shard that measured nothing: the liveness window the learner adds to the
-  /// tail it learned (`crate::learned_wait::LearnedWait`), and the fixed bound every `UMNT` had until A-493.
-  const FIRST_UNMOUNT_BOUND_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
-  /// Shape: how long a loaded host's kernel took, after its `UMNT`, to take its mount out of the table, as this shard
-  /// measured it: a window and a half.
-  const SLOW_UNMOUNT_NS: u64 = FIRST_UNMOUNT_BOUND_NS + FIRST_UNMOUNT_BOUND_NS / 2;
-  /// Shape: when the slow test's mount leaves the table: a window and a fifth after its `UMNT`, past the old fixed bound.
-  const LEAVES_AFTER_NS: u64 = FIRST_UNMOUNT_BOUND_NS + FIRST_UNMOUNT_BOUND_NS / 5;
-  /// Shape: how long the test thread waits for a confirmation's outcome: four slow unmounts.
-  const OUTCOME_WAIT_NS: u64 = 4 * SLOW_UNMOUNT_NS;
-  /// Shape: the attachment the tests' mount stands for.
-  const MOUNTED: u64 = 9;
-  /// Shape: the tests' mount point; nothing is read there (the tests stand in for the kernel's table).
-  const POINT: &str = "/Volumes/unmount-test";
-
-  /// A-493 (R3's class C; §4.6 A-34, RFC 1813 §5.2.3): a `UMNT`'s confirmation waits at the pace this shard learned of
-  /// its kernel's unmounts, never a fixed second. Do: on a shard that measured an unmount as slow as a window and a
-  /// half, wait for a `UMNT` whose mount leaves the kernel's table (stood in for) a window and a fifth after it. Expect
-  /// the mount confirmed gone. Before, the confirmation gave up at one liveness budget, so a genuine unmount slower than
-  /// that on a loaded host left its attachment kept as a mount nobody unmounted.
-  #[test]
-  fn a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace() {
-    let daemon = crate::daemon::audit_daemon();
-    let (sent, answered) = std::sync::mpsc::sync_channel(1);
-    crate::daemon::observe_first(&daemon, move |s| {
-      s.unmount_times.completed(SLOW_UNMOUNT_NS);
-      let task = futures::spawn(async move {
-        let leaves_at = futures::now_ns().saturating_add(LEAVES_AFTER_NS);
-        let mounts = vec![(MOUNTED, POINT.to_owned())];
-        let outcome =
-          wait_for_unmount("unmounted", &mounts, |_, _| futures::now_ns() < leaves_at).await;
-        let _ = sent.send(outcome);
-      })
-      .unwrap();
-      futures::detach(task).unwrap();
-    });
-    let outcome = answered.recv_timeout(std::time::Duration::from_nanos(OUTCOME_WAIT_NS));
-    daemon.stop();
-    assert_eq!(
-      outcome,
-      Ok(Unmounted::Gone(vec![MOUNTED])),
-      "a genuine unmount slower than the old fixed bound was not confirmed at the learned pace"
-    );
-  }
-
-  /// A-493 (R3's class C; RFC 1813 §5.2.2: a mount list goes stale): a `UMNT` whose mount never leaves the table, a
-  /// forged one, is given up at the learned bound, and the next confirmation waits longer (RFC 6298 §5.5's back-off). Do:
-  /// on a shard that measured nothing, wait for a `UMNT` whose mount stays. Expect it unconfirmed after the first bound
-  /// at the earliest, and the shard's next bound past the first. Before, every confirmation gave up at the same fixed
-  /// second whatever the ones before it had found.
-  #[test]
-  fn a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off() {
-    let daemon = crate::daemon::audit_daemon();
-    let (sent, answered) = std::sync::mpsc::sync_channel(1);
-    crate::daemon::observe_first(&daemon, move |s| {
-      let first = unmount_bound_ns(s);
-      let task = futures::spawn(async move {
-        let began = futures::now_ns();
-        let mounts = vec![(MOUNTED, POINT.to_owned())];
-        let outcome = wait_for_unmount("stays", &mounts, |_, _| true).await;
-        let waited = futures::now_ns().saturating_sub(began);
-        let next = state::with_state(|s| unmount_bound_ns(s));
-        let _ = sent.send((first, outcome, waited, next));
-      })
-      .unwrap();
-      futures::detach(task).unwrap();
-    });
-    let answer = answered.recv_timeout(std::time::Duration::from_nanos(OUTCOME_WAIT_NS));
-    daemon.stop();
-    let (first, outcome, waited, next) = answer.expect("the confirmation ended");
-    println!("a mount that stays: {outcome:?} after {waited} ns; bound {first} ns, then {next:?}");
-    assert_eq!(
-      first, FIRST_UNMOUNT_BOUND_NS,
-      "a shard that measured nothing waits one window first"
-    );
-    assert_eq!(
-      outcome,
-      Unmounted::Unconfirmed,
-      "a mount that stays is not taken as unmounted"
-    );
-    assert!(
-      waited >= first,
-      "given up before its bound ({waited} ns of {first})"
-    );
-    assert!(
-      next.is_some_and(|next| next > first),
-      "the next confirmation's bound did not back off: {next:?} after {first}"
-    );
   }
 }

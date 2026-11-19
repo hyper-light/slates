@@ -10,7 +10,7 @@
 //! once, and the count starts again. The first failed start is restarted at once. A second in a
 //! row is a crash loop: recorded as `CrashLoop` in the segment, and restarted after a backoff of at
 //! least the failed daemon's own life, doubling with each further failure up to the policy's cap
-//! ([`RestartPolicy`], the operator's failover SLO), and never shorter than the failed start took.
+//! ([`RestartPolicy`], the NFSv4 lease its daemon grants, A-525), and never shorter than the failed start took.
 //! So a loop spends at most half its time starting, however long each start takes and whether or
 //! not each daemon served a moment first, and supervision never gives up: every hard mount waits
 //! on the daemon.
@@ -79,19 +79,22 @@ pub struct RestartPolicy {
 }
 
 impl RestartPolicy {
-  /// Derived: the cap is the operator's failover SLO (`slates_server::config::FAILOVER_SLO_NS` until the operator gives
-  /// one): the outage an operator accepts for a failed owner, and the lease the daemon grants every NFSv4 client
-  /// (`crates/server/src/delegation.rs`). Capped there, a crash-looping daemon is started again within one SLO of its
-  /// last failure, so once the cause clears it serves within the bound the operator set, and its NFSv4 clients' leases
-  /// have not all expired meanwhile. Until 2026-11-17 the cap was 60 s, a hard Linux NFS mount's major timeout
-  /// (`nfs(5)`, `timeo` 600), which no mount slates makes sets.
-  pub fn derive(failover_slo_ns: u64) -> Derived<RestartPolicy> {
+  /// Derived: the cap is the NFSv4 lease the daemon grants every client (`lease_ns`: the server's
+  /// `config::NfsV4Caps::lease_ns`, A-425, an idle Linux client's renewal floor and a liveness window, in whole seconds).
+  /// Capped there, a crash-looping daemon is started again within one lease of its last failure (and never sooner than
+  /// the failed start took), so once the cause clears it serves again before a client that renews at its floor has seen
+  /// its lease run out, and the client keeps its opens, locks and delegations instead of losing them to the outage. The
+  /// lease is the term the daemon's own clients hold it to; nothing about the cap is a setting. Until A-525 the cap was
+  /// the operator's ten-second failover placeholder, past the lease, and until 2026-11-17 60 s, a hard Linux NFS
+  /// mount's major timeout (`nfs(5)`, `timeo` 600), which no mount slates makes sets.
+  pub fn derive(lease_ns: u64) -> Derived<RestartPolicy> {
     derived!(
       RestartPolicy {
-        backoff_cap_ns: failover_slo_ns.max(1),
+        backoff_cap_ns: lease_ns.max(1),
       },
-      "backoff_cap_ns = failover_slo_ns: a crash loop's doubling stops at the operator's failover SLO, the NFSv4 lease",
-      ["failover_slo_ns"]
+      "backoff_cap_ns = nfs_v4_lease_ns: a crash loop's doubling stops at the NFSv4 lease the daemon grants, so a \
+       client renewing at its floor finds the daemon back before its lease runs out",
+      ["nfs_v4_lease_ns"]
     )
   }
 }
@@ -1136,17 +1139,17 @@ impl DeviceHold {
 mod backoff_tests {
   use super::*;
 
-  /// Shape: the failover SLO the tests derive their cap from: ten seconds, the default's.
-  const SLO_NS: u64 = 10_000_000_000;
-  /// Shape: a failed start's life, many times under the SLO: 300 ms.
+  /// Shape: the lease the tests derive their cap from: ten seconds, many lives long.
+  const LEASE_NS: u64 = 10_000_000_000;
+  /// Shape: a failed start's life, many times under the lease: 300 ms.
   const LIFE_NS: u64 = 300_000_000;
 
   /// A-311, §2.6 step 1. Do: follow a crash loop's backoffs over failed starts of one life, under the cap the anchor
-  /// derives from a failover SLO many lives long. Expect the first backoff the failed start's own life, each next twice
+  /// derives from a lease many lives long. Expect the first backoff the failed start's own life, each next twice
   /// the last, and the cap once the doubling passes it, held there.
   #[test]
   fn a_crash_loops_backoff_starts_at_the_failed_starts_life_and_doubles_to_the_cap() {
-    let cap = RestartPolicy::derive(SLO_NS).get().backoff_cap_ns;
+    let cap = RestartPolicy::derive(LEASE_NS).get().backoff_cap_ns;
     let mut last = None;
     let mut backoffs = Vec::new();
     for _ in 0..8 {
@@ -1163,8 +1166,8 @@ mod backoff_tests {
         8 * LIFE_NS,
         16 * LIFE_NS,
         32 * LIFE_NS,
-        SLO_NS,
-        SLO_NS
+        LEASE_NS,
+        LEASE_NS
       ]
     );
   }
@@ -1176,9 +1179,12 @@ mod backoff_tests {
   #[test]
   fn a_daemon_has_recovered_once_it_has_served_as_long_as_its_start_took() {
     assert_eq!(recovered_at(0, LIFE_NS), 2 * LIFE_NS);
-    assert_eq!(recovered_at(SLO_NS, SLO_NS + LIFE_NS), SLO_NS + 2 * LIFE_NS);
-    assert_eq!(recovered_at(SLO_NS, SLO_NS), SLO_NS);
-    assert_eq!(recovered_at(SLO_NS, LIFE_NS), LIFE_NS);
+    assert_eq!(
+      recovered_at(LEASE_NS, LEASE_NS + LIFE_NS),
+      LEASE_NS + 2 * LIFE_NS
+    );
+    assert_eq!(recovered_at(LEASE_NS, LEASE_NS), LEASE_NS);
+    assert_eq!(recovered_at(LEASE_NS, LIFE_NS), LIFE_NS);
   }
 
   /// A-311. Do: back off failed starts longer than the cap, and a loop whose starts grow longer mid-way. Expect every
@@ -1186,8 +1192,8 @@ mod backoff_tests {
   /// the cap; and a start that takes no measurable time still waits a nanosecond, never none.
   #[test]
   fn a_backoff_is_never_shorter_than_the_failed_starts_own_life() {
-    let cap = RestartPolicy::derive(SLO_NS).get().backoff_cap_ns;
-    let long = 3 * SLO_NS;
+    let cap = RestartPolicy::derive(LEASE_NS).get().backoff_cap_ns;
+    let long = 3 * LEASE_NS;
     assert_eq!(crash_loop_backoff(long, None, cap), long);
     assert_eq!(crash_loop_backoff(long, Some(long), cap), long);
     assert_eq!(crash_loop_backoff(long, Some(LIFE_NS), cap), long);
@@ -1195,7 +1201,7 @@ mod backoff_tests {
     assert_eq!(
       RestartPolicy::derive(0).get().backoff_cap_ns,
       1,
-      "no SLO still caps at a nanosecond, never at zero"
+      "no lease still caps at a nanosecond, never at zero"
     );
   }
 }

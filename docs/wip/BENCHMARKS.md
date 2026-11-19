@@ -14491,3 +14491,79 @@ did not rise, no step of the return was longer than the step the setup had alrea
   64 KiB, so the same wrap would be 16,384 periods, about 27 minutes on its own (computed here, not measured). Before
   A-323 the wrap was one turn, and about a GiB ran past the window; now it places, slowly. Reported to
   goal 230.
+
+## A green's replicas on the shards that hold its works: measured and rejected (A-273, A-457, A-465, A-473, A-502; removed by A-528; goal 87; 2026-11-18 and 19)
+
+**What it was.** A-273: every shard holding works of a green kept a replica of the green's engine, made from its
+owner's, so a work's rebase and its base reads were answered on the work's own shard with no hop to the owner, whose
+one thread A-273 had measured at 51 to 53% of its wall on verdicts and rebases at the 3,000-client rung. In the engine
+(steps 1 to 4): the green's content in sealed blocks its replicas read in place, a feed of each version and fold by
+position, and derived bounds. On the shards: A-457 (a replica on every other shard, made before the green's first
+change, fed over the cross-shard carrier), A-465 (a work's base reads and rebase answered by its shard's replica),
+A-473 (an unused replica given back) and A-502 (a turn's changes fed in one message after the turn's replies).
+
+**Environment and command.** The supervisor's A/B on the Mac Studio adas-mac-studio.local-2 (d1323898, Apple M3 Ultra,
+32 cores, macOS 26.4), release builds, the daemon in the harness's process, `fs/` of linux v7.4-rc1, 1,000 clients:
+`load_bench --tree <linux-v7.4-rc1>/fs --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+--reply-patience 60 --think-us <Z>` at Z = 50,000 and 20,000 µs, three rounds of each, the two arms back to back with
+their order alternating by round (`ab2.sh <labelA> <branchA> <labelB> <branchB> 3 50000 20000`,
+`~/.cache/g083-scripts/` on the Studio). Without the replicas, "norepl": 95bbed246, which is ef82f7340 less A-457's and
+A-465's code. With them: ef82f7340 in r406 (A-457 and A-465), and in r100 6d9115aa4 (`agents/main-ab-a502`: A-457,
+A-465, A-473 and A-502). r406 ran at load 11 to 22. Milliseconds; none given up and no oracle failure in any run.
+
+r406 (2026-11-18), p99 by round:
+
+| Z µs | kind | norepl | replicas |
+|---|---|---|---|
+| 50,000 | Edit | 1.98, 2.03, 3.30 | 3.68, 0.48, 0.26 |
+| 50,000 | ReadHead | 2.01, 1.89, 3.98 | 8.53, 2.48, 0.67 |
+| 50,000 | Rebase | 3.63, 3.42, 6.68 | 5.94, 0.64, 0.38 |
+| 50,000 | SubmitAccepted | 3.09, 4.32, 6.96 | 12.48, 10.70, 9.75 |
+| 50,000 | SubmitConflict | 3.52, 3.14, 5.62 | 12.68, 26.04, 20.22 |
+| 20,000 | Edit | 0.62, 2.79, 11.30 | 1.23, 14.03, 5.24 |
+| 20,000 | ReadHead | 0.56, 3.02, 10.52 | 26.73, 58.66, 24.96 |
+| 20,000 | Rebase | 0.80, 4.73, 16.70 | 1.65, 17.55, 6.44 |
+| 20,000 | SubmitAccepted | 0.81, 3.88, 13.61 | 60.78, 88.90, 77.99 |
+| 20,000 | SubmitConflict | 0.77, 3.79, 14.57 | 74.52, 101.66, 89.57 |
+
+The offered verdicts a second matched (50,000: 1,469, 1,520, 1,458 against 1,517, 1,503, 1,467; 20,000: 3,651, 3,615,
+3,565 against 3,603, 3,323, 3,381).
+
+r100 (2026-11-19, about 00:50 UTC), p50 / p99 by round:
+
+| Z µs | kind | norepl | replicas (with A-502) |
+|---|---|---|---|
+| 20,000 | Edit | 0.20 / 21.56, 0.15 / 0.78, 0.38 / 14.81 | 0.11 / 177.61, 0.11 / 171.97, 0.15 / 159.98 |
+| 20,000 | ReadHead | 0.24 / 23.25, 0.15 / 3.04, 1.00 / 14.14 | 30.82 / 181.06, 29.74 / 155.00, 27.40 / 181.64 |
+| 20,000 | Rebase | 0.41 / 32.89, 0.29 / 10.22, 1.36 / 24.14 | 0.24 / 223.78, 0.22 / 211.89, 0.45 / 230.72 |
+| 20,000 | SubmitAccepted | 0.42 / 29.21, 0.31 / 2.70, 1.14 / 22.92 | 40.04 / 267.14, 40.51 / 223.95, 34.27 / 287.42 |
+| 20,000 | SubmitConflict | 0.39 / 31.05, 0.28 / 6.67, 1.27 / 21.02 | 40.36 / 252.63, 38.98 / 216.22, 37.11 / 301.99 |
+| 50,000 | Edit | 0.12 / 1.15, 0.12 / 3.54, 0.12 / 0.30 | 0.10 / 160.52, 0.10 / 111.66, 0.10 / 163.39 |
+| 50,000 | ReadHead | 0.09 / 1.32, 0.09 / 4.13, 0.09 / 0.23 | 32.28 / 151.84, 26.32 / 109.90, 43.27 / 151.30 |
+| 50,000 | Rebase | 0.20 / 3.21, 0.21 / 7.45, 0.21 / 0.43 | 0.21 / 201.76, 0.20 / 133.67, 0.23 / 188.24 |
+| 50,000 | SubmitAccepted | 0.23 / 2.81, 0.23 / 7.08, 0.23 / 0.41 | 42.82 / 272.35, 35.91 / 180.42, 56.86 / 242.01 |
+| 50,000 | SubmitConflict | 0.20 / 2.83, 0.20 / 5.07, 0.20 / 0.39 | 42.39 / 234.78, 33.89 / 159.03, 56.47 / 223.60 |
+
+**Why rejected.** With the feed inside the submit (r406), the replicas made both kinds of submit slower at p99 in
+every round (accepted at a 20 ms think: 60.78, 88.90 and 77.99 ms against 0.81, 3.88 and 13.61) and head reads in five
+rounds of six, and the rebases they served were better in three rounds of six. With the feed after the turn (A-502,
+r100), they lost everywhere but two p50s: an edit's, lower in every round (0.10 to 0.15 against 0.12 to 0.38 ms), and
+a rebase's, lower at a 20 ms think (0.22 to 0.45 against 0.29 to 1.36 ms) and even at 50 ms. Head reads and submits,
+which the owner still answers, waited 26.3 to 56.9 ms at p50 against 0.09 to 1.27 ms, and every kind's p99 was 110 to
+302 ms against 0.23 to 32.9 ms. A losing A/B does not land: A-528 removed the replicas whole, and a work's rebase and base reads are the
+owner's again (the owner-shard path as it is).
+
+**A hypothesis, not measured: eviction and remake churn.** The pattern points at the owner, since the kinds it answers
+(head reads, submits) waited tens of milliseconds at p50 while the rebases the replicas answered and the edits on the
+work's own shard did not. An owner kept the blocks it released for its slowest replica only up to `held_limit`, its
+per-green budget less its own retention, and the settle folds the retention only as far as the budget needs, so under
+load the limit sat near zero and the first release evicted the slowest replica. An evicted replica refused its next
+message and left, and A-465 made it again before the owner's next change, inside that change's submit, by cloning every
+index of the engine on the owner's one thread; a submit that paid a remake, and every request queued behind it there,
+waited for the clone. A-502 may have made it worse, since a turn's messages held to the turn's end kept the released
+blocks for the replicas longer. The counters that would have tested it (`merge.replica.remade` and
+`merge.replica.route_evicted` on the shards, the owner's evictions for lagging replicas) were not in the runs' logs,
+and it was not chased (A-528).
+
+**What it leaves.** Without the replicas, the p99 at 1,000 clients is still 0.23 to 32.9 ms across these rounds: the
+contended rounds, not the replicas' target, are goal 87's next piece.

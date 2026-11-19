@@ -17,7 +17,7 @@
 //! liveness (`Liveness::daemon_gone`: its exit watch, and the start stamp in the instance's bootstrap object, which such
 //! a restart changes and nothing else) on A-443's doubling: the first look once the wait has lasted twice the longer of
 //! the time it had waited when it first parked and the client's wake estimate, each later one at twice the time waited
-//! (`Looks`). The looks cost the logarithm of the wait, counted in wakes, and such a departure is seen within the time
+//! (`crate::looks`). The looks cost the logarithm of the wait, counted in wakes, and such a departure is seen within the time
 //! already waited. Until A-456 every wait re-armed at the client's reply deadline, the anchor's liveness budget (a
 //! second), and asked the daemon's liveness there, so a call whose daemon died waited up to that second to learn it.
 //! [`ClientEnd::wait`] keeps its caller's deadline and asks nothing of the daemon.
@@ -32,6 +32,9 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use slates_machine::wake::WakeEstimate;
+
+#[cfg(any(target_os = "macos", windows))]
+use crate::looks::Looks;
 
 use crate::error::IpcError;
 use crate::region::{
@@ -1041,59 +1044,6 @@ struct Unsettled {
   waker_confirms: bool,
 }
 
-/// When a departure wait whose park cannot wait on every departure next looks at the daemon's life (macOS, Windows;
-/// A-456 on A-443's doubling). The first look comes once the wait has lasted twice the longer of the time it had waited at its
-/// first park and the client's wake estimate: a look costs a park's timeout and a wake, so none comes sooner than twice
-/// the measured cost of one. Each later look comes at twice the time waited at the one before. A wait of `t` then makes
-/// at most `log2(t / first) + 1` looks, and a departure is seen by twice the time waited when it happened, or at the
-/// first look when it came before that.
-#[cfg(any(target_os = "macos", windows, test))]
-#[derive(Clone, Copy, Debug, Default)]
-struct Looks {
-  /// The time waited at which the next look is due; `None` until the wait's first park fixes it.
-  next_ns: Option<u64>,
-}
-
-#[cfg(any(target_os = "macos", windows, test))]
-impl Looks {
-  /// Whether a look is due at `elapsed_ns` waited; the first call fixes the first look from `elapsed_ns` and the wake
-  /// estimate `wake_ns` ([`first_look_ns`]).
-  fn due(&mut self, elapsed_ns: u64, wake_ns: u64) -> bool {
-    let next_ns = *self
-      .next_ns
-      .get_or_insert_with(|| first_look_ns(elapsed_ns, wake_ns));
-    elapsed_ns >= next_ns
-  }
-
-  /// A look made at `elapsed_ns` found the daemon alive: the next comes at twice the time waited.
-  fn looked(&mut self, elapsed_ns: u64) {
-    self.next_ns = Some(
-      elapsed_ns
-        .saturating_mul(2)
-        .max(elapsed_ns.saturating_add(1)),
-    );
-  }
-
-  /// How long a park may wait before the next look is due (`None` until the first park fixed it).
-  fn until(&self, elapsed_ns: u64) -> Option<u64> {
-    self
-      .next_ns
-      .map(|next_ns| next_ns.saturating_sub(elapsed_ns))
-  }
-}
-
-/// Derived: the time waited at a departure wait's first look (`Looks`): twice the longer of the time waited at its first
-/// park and the wake estimate.
-#[cfg(any(target_os = "macos", windows, test))]
-fn first_look_ns(elapsed_ns: u64, wake_ns: u64) -> u64 {
-  slates_machine::derived!(
-    elapsed_ns.max(wake_ns).saturating_mul(2).max(1),
-    "2 × max(time waited at the first park, wake estimate)",
-    ["elapsed_ns", "wake_ns"]
-  )
-  .get()
-}
-
 /// Whether a park's wake goes on to be judged by its stamp ([`ClientEnd::settle_wakes`]), from the client's
 /// own switch count across its wait (`slates_machine::switches`). Where the daemon's wake confirms a sleeper
 /// found (`waker_confirms`), that confirmation judges and every park goes on. Elsewhere (Windows' Event, and a Linux
@@ -1387,53 +1337,6 @@ mod judged {
       assert!(
         wait_may_teach(true, before, after),
         "the daemon's confirmation, {before:?} → {after:?}"
-      );
-    }
-  }
-}
-
-#[cfg(test)]
-mod looks {
-  use super::{Looks, first_look_ns};
-
-  /// Shape: where the schedule is walked from, as (the time waited at the first park, the wake estimate) in
-  /// nanoseconds: a first park inside the wake (a caller that spins for none of it), one at it, and one well past it (a
-  /// spin window chosen long).
-  const STARTS: [(u64, u64); 3] = [(0, 3_000), (3_000, 3_000), (200_000, 3_000)];
-  /// Shape: the wait the schedule is walked across: half again the second the wait re-armed at before A-456.
-  const WAIT_NS: u64 = 1_500_000_000;
-
-  /// A-456 on A-443's doubling. Do: walk a look schedule across a wait from each start, each park timing out when the
-  /// next look is due, and look then. Expect: no look at the first park; the first at twice the longer of the time waited
-  /// at the first park and the wake estimate; each later one at twice the time waited at the one before; and no more
-  /// looks across the wait than the logarithm of the wait over the first look's time, plus two (the last one past it).
-  #[test]
-  fn looks_come_at_twice_the_time_waited_from_twice_the_longer_of_the_first_park_and_the_wake() {
-    for (first_park_ns, wake_ns) in STARTS {
-      let first = first_look_ns(first_park_ns, wake_ns);
-      assert_eq!(first, 2 * first_park_ns.max(wake_ns), "the first look");
-      let mut looks = Looks::default();
-      assert!(
-        !looks.due(first_park_ns, wake_ns),
-        "no look at the first park"
-      );
-      let mut elapsed = first_park_ns;
-      let mut made: Vec<u64> = Vec::new();
-      while elapsed < WAIT_NS {
-        elapsed += looks.until(elapsed).unwrap();
-        assert!(looks.due(elapsed, wake_ns), "a look due at {elapsed} ns");
-        made.push(elapsed);
-        looks.looked(elapsed);
-      }
-      assert_eq!(made.first(), Some(&first));
-      for pair in made.windows(2) {
-        assert_eq!(pair[1], 2 * pair[0], "the looks at {made:?}");
-      }
-      let bound = u64::from((WAIT_NS / first).ilog2()) + 2;
-      assert!(
-        u64::try_from(made.len()).unwrap() <= bound,
-        "{} looks across {WAIT_NS} ns from {first} ns, past the bound {bound}",
-        made.len()
       );
     }
   }
