@@ -765,6 +765,10 @@ pub struct ShardState {
   /// no engine is installed and every verb naming one is refused typed, while its durable origin and chain
   /// stay untouched as the evidence a reviewed recovery works from. Bounded by the partition's greens.
   pub fenced_greens: BTreeMap<VolumeId, crate::merge_service::GreenFence>,
+  /// The version-control repositories' stores on this shard (A-662, `crate::vcs_store`): one content store, and each
+  /// repository's tool store with its derived values, made with its record and made again by a recovery from its
+  /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
+  pub(crate) vcs_stores: crate::vcs_store::VcsStores,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,

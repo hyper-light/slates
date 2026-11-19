@@ -4764,6 +4764,7 @@ async fn init_shard(
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
+    vcs_stores: crate::vcs_store::VcsStores::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),
   };
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything

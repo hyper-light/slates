@@ -187,6 +187,11 @@ mod vcs_http;
 // key's keeping, the key store and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_ssh;
+// The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
+// tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
+// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_store;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;
