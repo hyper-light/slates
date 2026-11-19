@@ -51,9 +51,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
-  AtomicRecord, BranchRecord, LockRecord, LogName, LogSpan, MemberOrigin, MemberRecord, NameChange,
-  PhaseRoot, RegisterRecord, RepositoryId, RepositoryPolicy, RepositoryRecord, StateChange,
-  StateLog, VolumeId,
+  AtomicHeld, AtomicRecord, BranchRecord, GreenPosition, LockRecord, LogName, LogSpan,
+  MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
+  RepositoryPolicy, RepositoryRecord, StateChange, StateLog, VolumeId,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -481,9 +481,29 @@ impl Repositories {
     self.atomic.get(key).map(|(record, _)| record)
   }
 
-  /// Every atomic record kept, in key order: what a snapshot carries (A-642).
+  /// Every atomic record kept, in key order (A-642).
   pub fn atomic_records(&self) -> impl Iterator<Item = &AtomicRecord> + '_ {
     self.atomic.values().map(|(record, _)| record)
+  }
+
+  /// Every atomic record kept with the positions pointing to it still, in key order: what a snapshot carries (A-642),
+  /// so a rebuilt partition points exactly where the live one did.
+  pub fn atomic_held(&self) -> Vec<AtomicHeld> {
+    let mut held: BTreeMap<(LogName, u64), Vec<GreenPosition>> = BTreeMap::new();
+    for ((green, version), key) in &self.atomic_at {
+      held.entry(*key).or_default().push(GreenPosition {
+        green: *green,
+        version: *version,
+      });
+    }
+    self
+      .atomic
+      .iter()
+      .map(|(key, (record, _))| AtomicHeld {
+        record: record.clone(),
+        pointers: held.remove(key).unwrap_or_default(),
+      })
+      .collect()
   }
 
   /// The first atomic record kept that `cut` splits (A-642): a cut of logs at positions that holds part of the record
@@ -924,6 +944,34 @@ impl Repositories {
     self.atomic.insert(key, (record, pointers));
   }
 
+  /// An atomic record a snapshot carried, with exactly the pointers it had (A-642). A record listed twice, one no
+  /// position points to, or a pointer outside its green's span or pointing twice, is a corrupt snapshot.
+  fn restore_atomic(&mut self, held: &AtomicHeld) -> Result<(), DbError> {
+    let corrupt = DbError::Corrupt {
+      seq: 0,
+      reason: "a snapshot's atomic record is listed twice, points nowhere, or is pointed to from outside its spans",
+    };
+    let first = held.record.spans.first().ok_or_else(|| corrupt.clone())?;
+    let key = (first.log, first.to);
+    if held.pointers.is_empty() || self.atomic.contains_key(&key) {
+      return Err(corrupt);
+    }
+    for pointer in &held.pointers {
+      let within = held.record.spans.iter().any(|span| {
+        span.log == LogName::Green { green: pointer.green }
+          && pointer.version > span.from
+          && pointer.version <= span.to
+      });
+      let at = (pointer.green, pointer.version);
+      if !within || self.atomic_at.insert(at, key).is_some() {
+        return Err(corrupt);
+      }
+    }
+    let pointers = u64::try_from(held.pointers.len()).unwrap_or(u64::MAX);
+    self.atomic.insert(key, (held.record.clone(), pointers));
+    Ok(())
+  }
+
   /// `green`'s log folded through `floor` (its checkpoint, or everything at its destroy): its pointers there go, and so
   /// does each atomic record no green's log points to any more (A-642).
   pub fn fold_atomic(&mut self, green: VolumeId, floor: u64) {
@@ -997,7 +1045,7 @@ impl Repositories {
     bindings: &[BranchRecord],
     members: &[MemberRecord],
     registers: &[RegisterRecord],
-    atomic: &[AtomicRecord],
+    atomic: &[AtomicHeld],
   ) -> Result<Repositories, DbError> {
     let mut repositories = Repositories::new();
     for record in records {
@@ -1050,15 +1098,8 @@ impl Repositories {
         reason: "a snapshot's repository carries no register",
       });
     }
-    for record in atomic {
-      let kept = repositories.atomic.len();
-      repositories.keep_atomic(record.clone());
-      if repositories.atomic.len() == kept {
-        return Err(DbError::Corrupt {
-          seq: 0,
-          reason: "a snapshot's atomic record is listed twice, or moves no log",
-        });
-      }
+    for held in atomic {
+      repositories.restore_atomic(held)?;
     }
     Ok(repositories)
   }

@@ -186,8 +186,8 @@ pub struct PartitionSnapshot {
   /// Every repository's own state: its state logs' positions and what they hold (§4.17.1 shared piece 2, A-603 rebuilt
   /// by A-642; appended), by repository order.
   pub repository_registers: Vec<crate::catalog::RegisterRecord>,
-  /// The atomic records kept, by key (A-642; appended).
-  pub atomic_records: Vec<crate::catalog::AtomicRecord>,
+  /// The atomic records kept, by key, each with the positions pointing to it still (A-642; appended).
+  pub atomic_records: Vec<crate::catalog::AtomicHeld>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -2788,7 +2788,7 @@ impl Partition {
       review_comments: self.reviews.comment_records().cloned().collect(),
       review_approvals: self.reviews.approval_records().cloned().collect(),
       repository_registers: self.repositories.registers().collect(),
-      atomic_records: self.repositories.atomic_records().cloned().collect(),
+      atomic_records: self.repositories.atomic_held(),
       work_logs: self
         .work_logs
         .iter()

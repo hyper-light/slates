@@ -1748,6 +1748,25 @@ pub struct AtomicRecord {
   pub spans: Vec<LogSpan>,
 }
 
+/// A position of a green's log (A-642): a version of the green.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenPosition {
+  /// The green.
+  pub green: VolumeId,
+  /// The version.
+  pub version: u64,
+}
+
+/// An atomic record as a partition snapshot carries it (A-642): the record and the positions of greens' logs that point
+/// to it still, those its greens' checkpoints and destroys have not folded.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AtomicHeld {
+  /// The record.
+  pub record: AtomicRecord,
+  /// The positions pointing to it.
+  pub pointers: Vec<GreenPosition>,
+}
+
 /// Where a holder's logs stand against an atomic record (A-642).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Join {
