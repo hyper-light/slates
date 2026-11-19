@@ -2009,9 +2009,50 @@ impl compound::Backend for PurgeBackend {
   }
 }
 
-/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): at the reap loop's cadence,
-/// so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a client. A
-/// table that is not built yet is built when its partition owes purges, as its first compound would build it.
+/// Keeps the deadline of this shard's next purge round (A-570), as each access to the NFSv4 table closes
+/// (`crate::nfs_state::record_clients`): while the table owes a purge, a round a retry window on
+/// (`crate::deadlines::retry_window_ns`), so one an owner could not take goes again then; none once it owes nothing. A
+/// round in flight, a client's own included, settles what its owners took before the deadline comes. Until A-570 the
+/// reap loop's tick sent what was owed once a liveness window, whether anything was owed or not.
+pub(crate) fn note_purges(state: &mut ShardState) {
+  let owes = state
+    .nfs_v4
+    .as_ref()
+    .is_some_and(|server| server.sessions.owes());
+  if !owes {
+    state.nfs_purge_at = None;
+    return;
+  }
+  if state.nfs_purge_at.is_none() {
+    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    let at = now.saturating_add(crate::deadlines::retry_window_ns());
+    state.nfs_purge_at = Some(at);
+    crate::deadlines::noted(state, at);
+  }
+}
+
+/// Owes a purge round at once when the shard's partition starts owing purges a predecessor journaled (A-570): every
+/// purge a restart left owed goes out at the start, not a tick later.
+pub(crate) fn arm_purges_at_start(state: &mut ShardState, now: u64) {
+  if state.db.partition().nfs_purges().next().is_some() {
+    state.nfs_purge_at = Some(now);
+  }
+}
+
+/// Hands a purge round to the shard's reaper (A-570), from the deadline keeper's pass at `nfs_purge_at`: the round
+/// awaits its owners' answers, so the keeper does not run it.
+pub(crate) fn owe_purge_round(state: &mut ShardState) {
+  state.nfs_purge_at = None;
+  state.nfs_purge_owed = true;
+  if let Some(reaper) = state.reaper_task {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): run by the shard's reaper
+/// when the deadline keeper hands it a round (A-570: at a start that owes purges, and a retry window after a round left
+/// any owed), so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a
+/// client. A table that is not built yet is built when its partition owes purges, as its first compound would build it.
 pub(crate) async fn purge_owed_here() {
   let owes = state::with_state(|s| {
     if s.nfs_v4.is_none() && s.db.partition().nfs_purges().next().is_some() {
@@ -3736,5 +3777,91 @@ mod tests {
       "a client silent a whole lease makes room"
     );
     assert!(!table.holds_client(idle.clientid));
+  }
+}
+
+#[cfg(test)]
+mod purge_round_tests {
+  use std::time::{Duration, Instant};
+
+  use slates_bridge_nfs::v4::session::ExchangeId;
+  use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
+  use slates_vfs::clock::Clock;
+
+  use crate::daemon::LIVENESS_BUDGET_NS;
+
+  /// Shape: how long the test lets its daemon run before the purge is owed: past the reap loop's first look a window
+  /// into the start, by half a window, so the loop's next look comes half a window after the refused round.
+  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS / 2 * 3;
+  /// Shape: how long past a window after the refused round the test waits for the next round: half a window.
+  const AGAIN_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
+  /// Shape: the pause between the test's looks.
+  const LOOK_PAUSE_NS: u64 = 1_000_000;
+  /// Shape: the NFSv4 client the test makes and drops: any owner and uid.
+  const OWNER: &[u8] = b"purge-round-test";
+
+  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon past the reap loop's first look, its owners refusing
+  /// every purge (`Daemon::inject_nfs_purge_refusal`'s flag), make and drop an NFSv4 client, so its table owes the
+  /// purge, and run a purge round as a client's call would, refused; then watch for the next round. Expect: the next
+  /// round no sooner than a window after the refused one and within half a window more, at the deadline the table's
+  /// debt set. The reap loop's tick sent what was owed at its looks, half a window after the refused round here.
+  #[test]
+  fn a_refused_purge_goes_again_a_window_after_its_round() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    // The harness waits out the reap loop's first look; the daemon under test runs on.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
+    let refused_at = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.nfs_purges_refused = true;
+      if state.nfs_v4.is_none() {
+        state.nfs_v4 = crate::nfs_state::server(state);
+      }
+      let now = state.clock.monotonic_ns();
+      let server = state.nfs_v4.as_mut().unwrap();
+      let granted = server
+        .sessions
+        .exchange_id(
+          &ExchangeId {
+            verifier: [1; VERIFIER_SIZE],
+            owner: OWNER.to_vec(),
+            principal: 0,
+          },
+          now,
+        )
+        .unwrap();
+      server.sessions.destroy_clientid(granted.clientid).unwrap();
+      assert!(crate::nfs_state::record_clients(state));
+      let round = slates_rt::futures::spawn(super::purge_owed_here()).unwrap();
+      let _ = slates_rt::futures::detach(round);
+    });
+    let refusals = |daemon: &crate::daemon::Daemon| {
+      crate::daemon::observe_first(daemon, |state| {
+        state
+          .refusals
+          .get(super::NFS4_PURGES_REFUSED_INJECTED)
+          .copied()
+          .unwrap_or(0)
+      })
+    };
+    let again = loop {
+      if refusals(&daemon) >= 2 {
+        break Some(refused_at.elapsed());
+      }
+      if refused_at.elapsed() > Duration::from_nanos(LIVENESS_BUDGET_NS + AGAIN_WITHIN_NS) {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    };
+    daemon.stop();
+    let again = again
+      .expect("the refused purge went again within half a window past a window after its round");
+    println!("a refused purge went again {again:?} after its round");
+    assert!(
+      again >= Duration::from_nanos(LIVENESS_BUDGET_NS),
+      "not sent again before a window after the refused round: {again:?}"
+    );
   }
 }

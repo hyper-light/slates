@@ -241,7 +241,14 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 86
+slates-machine = 97
+# 2026-11-19 (+11, A-570; 86 -> 97): the host's memory-pressure reports (`memory_pressure.rs`), the kernel's own event
+#   in place of the reap loop's once-a-window sample. macOS (+7): libdispatch's memory-pressure source, which no crate
+#   the workspace takes wraps: the `unsafe extern` block, the global queue, the source's creation, the block that sets
+#   its context and handlers and resumes it, the report handler's read of its context, the cancel handler's free of
+#   it, and the drop's cancel and release. Windows (+4): `CreateMemoryResourceNotification`, the handle taken into an
+#   `OwnedHandle`, `QueryMemoryResourceNotification` at the open, and `GetLastError` for a refusal. Linux: none
+#   (rustix's safe epoll and file calls).
 # 2026-11-18 (+1, A-456, Linux only; 85 -> 86): `switches::switches_now`'s Linux arm, one `libc::getrusage` with
 #   `RUSAGE_THREAD` into a zeroed, fully sized `rusage` this frame owns (rustix has no `getrusage`). A client's park that
 #   waits on its daemon's departure beside its reply polls a descriptor, so the daemon's futex wake cannot confirm it
