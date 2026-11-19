@@ -848,6 +848,22 @@ fn run(f: usize, seeds: u64, mutation: Mutation) -> (Vec<(u64, String)>, Counts)
   (broken, counts)
 }
 
+/// Prints, for a mutation's broken seeds, how many first broke each check.
+fn say_broken(mutation: Mutation, f: usize, seeds: u64, broken: &[(u64, String)]) {
+  let tally: BTreeMap<&str, usize> = broken.iter().fold(BTreeMap::new(), |mut tally, (_, said)| {
+    let check = ["Agreement", "Continuity", "StaleNeverCommits", "ReadSafety"]
+      .into_iter()
+      .find(|check| said.contains(check))
+      .unwrap_or("other");
+    *tally.entry(check).or_default() += 1;
+    tally
+  });
+  println!(
+    "register nemesis, {mutation:?} at f = {f}: {} of {seeds} seeds broke, first breaking {tally:?}",
+    broken.len()
+  );
+}
+
 /// Goal 81's chaos part, its network half (§4.8; design models 1 and 4). Do: run the nemesis over [`SEEDS`] seeds at
 /// `f = 1` and `f = 2` (three and five holders): latency, loss, duplication, reordering, one-way and two-way cuts,
 /// holders knocked offline and back from their persisted state, owners paused and resumed, new epochs throughout.
@@ -888,6 +904,7 @@ fn the_fenced_register_holds_its_invariants_under_the_network_nemesis() {
 fn a_promise_that_raises_no_fence_breaks_the_register_under_the_nemesis() {
   for f in [1, 2] {
     let (broken, _) = run(f, SEEDS, Mutation::PromiseWithoutFence);
+    say_broken(Mutation::PromiseWithoutFence, f, SEEDS, &broken);
     assert!(
       !broken.is_empty(),
       "f = {f}: no seed broke a check with promises that raise no fence"
@@ -902,6 +919,7 @@ fn a_promise_that_raises_no_fence_breaks_the_register_under_the_nemesis() {
 fn a_restart_that_forgets_the_fence_breaks_the_register_under_the_nemesis() {
   for f in [1, 2] {
     let (broken, _) = run(f, RESTART_SEEDS, Mutation::RestartWithoutFence);
+    say_broken(Mutation::RestartWithoutFence, f, RESTART_SEEDS, &broken);
     assert!(
       !broken.is_empty(),
       "f = {f}: no seed broke a check with restarts that forget the fence"
@@ -916,6 +934,7 @@ fn a_restart_that_forgets_the_fence_breaks_the_register_under_the_nemesis() {
 fn an_owner_that_promotes_on_a_minority_breaks_the_register_under_the_nemesis() {
   for f in [1, 2] {
     let (broken, _) = run(f, SEEDS, Mutation::PromoteOnMinority);
+    say_broken(Mutation::PromoteOnMinority, f, SEEDS, &broken);
     assert!(
       !broken.is_empty(),
       "f = {f}: no seed broke a check with owners that promote on a minority"
