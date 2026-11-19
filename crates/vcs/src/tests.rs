@@ -174,7 +174,12 @@ fn assert_empty(store: &ContentStore) {
   assert_eq!((store.used(), store.charged()), (0, 0));
 }
 
-fn assert_object_row(index: &Index, store: &ContentStore, id: &[u8], expected: (u8, u64, ContentId)) {
+fn assert_object_row(
+  index: &Index,
+  store: &ContentStore,
+  id: &[u8],
+  expected: (u8, u64, ContentId),
+) {
   let found = index.get(store, id).unwrap();
   assert_eq!(object_row(&found), Some(expected));
 }
@@ -455,7 +460,10 @@ fn two_repositories_that_seal_the_same_rows_share_one_table() {
   let tables: Vec<ContentId> = first.tables().collect();
   assert_eq!(second.tables().collect::<Vec<_>>(), tables);
   assert_eq!(
-    (store.holders(&tables[0]), store.holders(&ContentId::of(b"a"))),
+    (
+      store.holders(&tables[0]),
+      store.holders(&ContentId::of(b"a"))
+    ),
     (2, 1)
   );
   assert_eq!(read(&first, &store), read(&second, &store));
@@ -532,7 +540,10 @@ fn no_table_passes_the_window_and_the_tail_seals_once_its_rows_no_longer_fit_one
   assert_eq!(index.rows(), 40);
   index.seal_all(&mut store).unwrap();
   assert_eq!(index.compact(&mut store, usize::MAX), Ok(40));
-  assert_eq!(index.run_tables().iter().map(Vec::len).collect::<Vec<_>>(), vec![7]);
+  assert_eq!(
+    index.run_tables().iter().map(Vec::len).collect::<Vec<_>>(),
+    vec![7]
+  );
   assert_tables_within_the_window(&index, &store);
   assert_eq!(read(&index, &store).len(), 40);
   index.release(&mut store).unwrap();
@@ -603,13 +614,16 @@ fn the_index_refuses_past_the_budget(store: &mut ContentStore) {
   }));
   assert_eq!(index.insert(store, row(b"ab", &[], b"")), refused);
   let both = index.insert_all(store, &[row(b"a", &[], b""), row(b"b", &[], b"")]);
-  assert!(matches!(both, Err(IndexRefused::Content(ContentRefused::OverBudget { .. }))));
-  assert_eq!(
-    index.insert(store, row(b"a", &[], b"")),
-    Ok(Inserted::New)
-  );
+  assert!(matches!(
+    both,
+    Err(IndexRefused::Content(ContentRefused::OverBudget { .. }))
+  ));
+  assert_eq!(index.insert(store, row(b"a", &[], b"")), Ok(Inserted::New));
   let sealed = index.seal_all(store);
-  assert!(matches!(sealed, Err(IndexRefused::Content(ContentRefused::OverBudget { .. }))));
+  assert!(matches!(
+    sealed,
+    Err(IndexRefused::Content(ContentRefused::OverBudget { .. }))
+  ));
   assert_eq!((index.tail_len(), store.charged()), (1, one_row));
   assert!(index.get(store, b"a").is_some());
   index.release(store).unwrap();
@@ -624,7 +638,10 @@ fn an_arrival_an_insert_or_a_seal_past_the_budget_changes_nothing() {
   let mut push = Quarantine::new();
   let id = named(&GitShaped, 3, b"", b"too large");
   let refused = push.admit(&mut store, &GitShaped, git_arriving(&id, b"too large"));
-  assert!(matches!(refused, Err(AdmitRefused::Content(ContentRefused::OverBudget { .. }))));
+  assert!(matches!(
+    refused,
+    Err(AdmitRefused::Content(ContentRefused::OverBudget { .. }))
+  ));
   assert!(push.is_empty() && store.is_empty());
   the_index_refuses_past_the_budget(&mut store);
   assert_empty(&store);
@@ -632,7 +649,11 @@ fn an_arrival_an_insert_or_a_seal_past_the_budget_changes_nothing() {
 
 /// A held row inserted again: the same answered `Identical` with no second hold, another payload refused, and a batch of
 /// a new row and the held one answered by count.
-fn a_held_row_is_identical_or_differs(index: &mut Index, store: &mut ContentStore, content: &[ContentId]) {
+fn a_held_row_is_identical_or_differs(
+  index: &mut Index,
+  store: &mut ContentStore,
+  content: &[ContentId],
+) {
   assert_eq!(
     index.insert(store, row(b"k", content, b"1")),
     Ok(Inserted::Identical)
@@ -740,16 +761,45 @@ struct Arrival {
 #[derive(Clone, Debug)]
 enum Step {
   Admit(Arrival),
-  Commit { push: usize, index: usize },
-  Abandon { push: usize },
-  Insert { index: usize, key: u8, blob: usize, payload: u8 },
-  Get { index: usize, key: u8 },
-  Seal { index: usize, all: bool },
-  Compact { index: usize, runs: usize },
-  Due { index: usize, lookups_ns: u64, inserts_ns: u64 },
-  Fork { index: usize },
-  Release { index: usize },
-  Recreate { index: usize },
+  Commit {
+    push: usize,
+    index: usize,
+  },
+  Abandon {
+    push: usize,
+  },
+  Insert {
+    index: usize,
+    key: u8,
+    blob: usize,
+    payload: u8,
+  },
+  Get {
+    index: usize,
+    key: u8,
+  },
+  Seal {
+    index: usize,
+    all: bool,
+  },
+  Compact {
+    index: usize,
+    runs: usize,
+  },
+  Due {
+    index: usize,
+    lookups_ns: u64,
+    inserts_ns: u64,
+  },
+  Fork {
+    index: usize,
+  },
+  Release {
+    index: usize,
+  },
+  Recreate {
+    index: usize,
+  },
 }
 
 /// The bytes the oracle's objects are drawn from: two equal ones under other names, so tools and pushes share them; a
@@ -828,13 +878,17 @@ struct Real {
 fn start() -> (Real, Model) {
   let real = Real {
     store: ContentStore::new(1 << 24, WINDOW).unwrap(),
-    indexes: (0..INDEXES).map(|slot| (slot == 0).then(Index::new)).collect(),
+    indexes: (0..INDEXES)
+      .map(|slot| (slot == 0).then(Index::new))
+      .collect(),
     pushes: (0..PUSHES).map(|_| Quarantine::new()).collect(),
   };
   let blobs = blobs();
   let layouts = blobs.iter().map(|bytes| layout(bytes.as_slice())).collect();
   let model = Model {
-    indexes: (0..INDEXES).map(|slot| (slot == 0).then(BTreeMap::new)).collect(),
+    indexes: (0..INDEXES)
+      .map(|slot| (slot == 0).then(BTreeMap::new))
+      .collect(),
     pushes: vec![BTreeMap::new(); PUSHES],
     blobs,
     layouts,
@@ -852,10 +906,13 @@ fn object_body(kind: u8, bytes: &[u8]) -> Vec<u8> {
 
 fn admit(real: &mut Real, model: &mut Model, arrival: Arrival) {
   let bytes = model.blobs[arrival.blob].clone();
-  let (kind, context) = (arrival.kind, match arrival.tool {
-    Tool::Git => &b""[..],
-    Tool::Hg => PARENTS,
-  });
+  let (kind, context) = (
+    arrival.kind,
+    match arrival.tool {
+      Tool::Git => &b""[..],
+      Tool::Hg => PARENTS,
+    },
+  );
   let id_of = |bytes: &[u8]| match arrival.tool {
     Tool::Git => named(&GitShaped, kind, context, bytes),
     Tool::Hg => named(&HgShaped, kind, context, bytes),

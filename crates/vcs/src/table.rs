@@ -446,7 +446,10 @@ mod tests {
       TableView::open(&foreign).unwrap_err(),
       TableRefused::ForeignMagic
     );
-    assert_eq!(opened_with_word(&bytes, 8, u64::MAX), Err(TableRefused::Truncated));
+    assert_eq!(
+      opened_with_word(&bytes, 8, u64::MAX),
+      Err(TableRefused::Truncated)
+    );
     assert!(opened_with_word(&bytes, 8, 4).is_err());
     assert_eq!(
       opened_with_word(&bytes, HEADER_BYTES, 1),

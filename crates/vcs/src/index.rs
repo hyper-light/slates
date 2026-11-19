@@ -752,9 +752,7 @@ impl Index {
     let mut need: u64 = 0;
     for run in merging.iter().filter_map(|at| self.runs.get(*at)) {
       for fence in &run.fences {
-        let bytes = store
-          .get(&fence.table)
-          .ok_or(IndexRefused::LayerMissing)?;
+        let bytes = store.get(&fence.table).ok_or(IndexRefused::LayerMissing)?;
         let bytes = u64::try_from(bytes.len()).map_err(|_| TableRefused::TooLarge)?;
         need = need.checked_add(bytes).ok_or(TableRefused::TooLarge)?;
       }

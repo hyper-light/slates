@@ -129,17 +129,12 @@ impl Compaction {
   /// The largest `j` whose merge is due, given `rows[i]`, the rows of the newest `i + 1` compactable runs: some rent was
   /// paid toward it, and it has reached the predicted price.
   pub fn due(&self, rows: &[u64]) -> Option<usize> {
-    self
-      .rents
-      .iter()
-      .enumerate()
-      .rev()
-      .find_map(|(at, rent)| {
-        let j = at.saturating_add(2);
-        let rows = *rows.get(j.checked_sub(1)?)?;
-        let price = self.predicted_ns(rows)?;
-        (rows > 0 && *rent > 0 && *rent >= price).then_some(j)
-      })
+    self.rents.iter().enumerate().rev().find_map(|(at, rent)| {
+      let j = at.saturating_add(2);
+      let rows = *rows.get(j.checked_sub(1)?)?;
+      let price = self.predicted_ns(rows)?;
+      (rows > 0 && *rent > 0 && *rent >= price).then_some(j)
+    })
   }
 
   /// The rent paid toward merging the newest `j` compactable runs.

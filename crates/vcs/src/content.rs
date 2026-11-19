@@ -46,7 +46,8 @@ pub const IDENTITY_BYTES: usize = blake3::OUT_LEN;
 
 /// Format: the context a list's identity is derived under ([`Form::List`]), in the form the `blake3` crate's
 /// `derive_key` documents: "[application] [commit timestamp] [purpose]".
-const LIST_CONTEXT: &str = "slates-vcs 2026-11-19 object store: the identities of an object's windows";
+const LIST_CONTEXT: &str =
+  "slates-vcs 2026-11-19 object store: the identities of an object's windows";
 
 /// Format: the context a table's identity is derived under ([`Form::Table`]).
 const TABLE_CONTEXT: &str = "slates-vcs 2026-11-19 object store: an index table";
@@ -185,10 +186,7 @@ enum NodeBytes<'b> {
   /// A window of the object's bytes.
   Window(&'b [u8]),
   /// A list: the identities of the nodes a level below, `first..first + count` of that level.
-  List {
-    bytes: Vec<u8>,
-    first: usize,
-  },
+  List { bytes: Vec<u8>, first: usize },
 }
 
 impl Node<'_> {
@@ -828,7 +826,11 @@ mod tests {
     );
     // Five distinct windows, three lists over six identities, two over three, one root.
     assert_eq!((store.len(), store.counters().lists), (5 + 3 + 2 + 1, 6));
-    assert!(store.identities().all(|id| store.get(id).unwrap().len() <= NARROW));
+    assert!(
+      store
+        .identities()
+        .all(|id| store.get(id).unwrap().len() <= NARROW)
+    );
     let len = u64::try_from(bytes.len()).unwrap();
     assert_eq!(store.object_bytes(&root, len).as_deref(), Some(bytes));
     root
@@ -870,7 +872,10 @@ mod tests {
     let root = roomy.put_object(&bytes).unwrap();
     let (len, used) = (roomy.len(), roomy.used());
     assert_eq!(roomy.put_object(&bytes).unwrap(), root);
-    assert_eq!((roomy.len(), roomy.used(), roomy.holders(&root)), (len, used, 2));
+    assert_eq!(
+      (roomy.len(), roomy.used(), roomy.holders(&root)),
+      (len, used, 2)
+    );
     let mut short = ContentStore::new(used - 1, NARROW).unwrap();
     assert_eq!(
       short.put_object(&bytes),
@@ -907,7 +912,10 @@ mod tests {
     let spelled = store.put(&list).unwrap();
     assert_ne!(spelled, root);
     assert_eq!(store.form(&spelled), Some(Form::Window));
-    assert_eq!(store.object_bytes(&spelled, 64).as_deref(), Some(list.as_slice()));
+    assert_eq!(
+      store.object_bytes(&spelled, 64).as_deref(),
+      Some(list.as_slice())
+    );
     let table = store.put_tables(&[list.as_slice()], 0, 0).unwrap();
     assert!(table[0].fresh && table[0].identity != spelled && table[0].identity != root);
     store.release(&spelled).unwrap();
