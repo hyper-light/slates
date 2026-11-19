@@ -64,7 +64,9 @@ Windows x86_64 (jupiter), 2026-11-19, kiln, debug, rustc 1.98.1, each run in a c
 Studio was offline): `cargo test --locked -p slates-hg --lib`. Red, the tests alone against the old rule
 (`agents/g300-a667-branch-heads-red`, 5c88fd3e9): 276 passed, 6 failed, the five new tests and A-619's corrected
 oracle, each answering the old rule's extra heads (g304's history `[0, 1, 2]` where 7.2's heads are `[1, 2]`). First
-green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone. Green (87690ec64): 284 of 284. The macOS run is
+green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone. Green (87690ec64): 284 of 284. Merged with main
+b79ece5d5 (7e4388e32), 284 of 284, with one line removed in the clone alone: that main's `slates-merge` builds as a
+dependency only without its `test-model` gate on `history_touches` (c370dddbe, reported to main). The macOS run is
 owed.
 
 ## Apart from 7.2, on purpose

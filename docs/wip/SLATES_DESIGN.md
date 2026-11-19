@@ -47025,7 +47025,9 @@ Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::disco
   slates-hg --lib` 276 passed and 6 failed, the five new tests and A-619's corrected oracle, each answering the old
   rule's extra heads. First green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone, which stated the old
   rule too and is corrected. Green: 284 of 284 at 87690ec64 (main's 278 and A-667's six), in a target directory of its
-  own; rustfmt's layout from those runs. The tests: g304's history, the two measured histories, a closed head kept and
+  own; rustfmt's layout from those runs. Merged with main b79ece5d5, whose slates-merge builds as a dependency only with
+  its `test-model` gate on `history_touches` removed (c370dddbe; reported to main), removed in the clone alone: 284 of
+  284 at 7e4388e32. The tests: g304's history, the two measured histories, a closed head kept and
   ending a head through it, a generated oracle over histories moving between two branches with merges of any earlier
   revisions, and its non-vacuity from fixed seeds. Owed: the same run on macOS.
 - **Owed.** An obsolete changeset the served view shows is never a head in 7.2 (lines 351-358) and its ancestors are
