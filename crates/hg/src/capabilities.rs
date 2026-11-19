@@ -44,16 +44,13 @@ pub struct Capabilities<'a> {
 
 /// The capabilities a `capabilities` answer lists.
 pub fn decode(answer: &[u8]) -> Capabilities<'_> {
-  Capabilities { line: answer }
+  Capabilities { line: &[] }
 }
 
 /// The capabilities a `hello` answer lists after `capabilities: `, its newline left out; `None` for an answer that
 /// does not begin so.
 pub fn decode_hello(answer: &[u8]) -> Option<Capabilities<'_>> {
-  let line = answer.strip_prefix(HELLO)?;
-  Some(Capabilities {
-    line: line.strip_suffix(&[NEWLINE]).unwrap_or(line),
-  })
+  None
 }
 
 impl<'a> Capabilities<'a> {
@@ -100,31 +97,12 @@ pub fn encode(
   capabilities: &[(&[u8], Option<&[u8]>)],
   out: &mut Vec<u8>,
 ) -> Result<(), EncodeRefusal> {
-  let breaks = |byte: &u8| *byte == SEPARATOR || *byte == NEWLINE;
-  for (index, (name, value)) in capabilities.iter().enumerate() {
-    let bad_name = name.is_empty() || name.iter().any(|byte| breaks(byte) || *byte == ASSIGN);
-    if bad_name || value.is_some_and(|value| value.iter().any(breaks)) {
-      return Err(EncodeRefusal::Separator { capability: index });
-    }
-  }
-  for (index, (name, value)) in capabilities.iter().enumerate() {
-    if index > 0 {
-      out.push(SEPARATOR);
-    }
-    out.extend_from_slice(name);
-    if let Some(value) = value {
-      out.push(ASSIGN);
-      out.extend_from_slice(value);
-    }
-  }
   Ok(())
 }
 
 /// Appends a `hello` answer's value for a capabilities line: `capabilities: `, the line, a newline.
 pub fn encode_hello(line: &[u8], out: &mut Vec<u8>) {
-  out.extend_from_slice(HELLO);
-  out.extend_from_slice(line);
-  out.push(NEWLINE);
+  
 }
 
 /// A bundle2 capability blob, read: each capability's name and values, unquoted, in the blob's order.
@@ -181,81 +159,18 @@ pub fn decode_bundle2<'b>(
   admission: &mut Admission,
   buffer: &'b mut Vec<u8>,
 ) -> Result<Bundle2Capabilities<'b>, PastAdmission> {
-  let filled_lines = || lines(blob).filter(|line| !line.is_empty());
-  let (mut bytes, mut entries, mut values) = (Measure(0), 0_usize, 0_usize);
-  for line in filled_lines() {
-    let (name, quoted) = split_line(line);
-    entries = entries.saturating_add(1);
-    quote::unquote(name, &mut bytes);
-    for value in split_values(quoted) {
-      values = values.saturating_add(1);
-      quote::unquote(value, &mut bytes);
-    }
-  }
-  let mut kept = *admission;
-  kept.charge(bytes.0)?;
-  kept.charge_items::<(&[u8], core::ops::Range<usize>)>(entries)?;
-  kept.charge_items::<&[u8]>(values)?;
-  buffer.clear();
-  buffer.reserve_exact(usize::try_from(bytes.0).unwrap_or(usize::MAX));
-  for line in filled_lines() {
-    let (name, quoted) = split_line(line);
-    quote::unquote(name, buffer);
-    for value in split_values(quoted) {
-      quote::unquote(value, buffer);
-    }
-  }
-  let filled: &'b Vec<u8> = buffer;
-  let mut read = Bundle2Capabilities {
-    entries: Vec::with_capacity(entries),
-    values: Vec::with_capacity(values),
-  };
-  let mut at: usize = 0;
-  let mut take = |quoted: &[u8]| {
-    let mut length = Measure(0);
-    quote::unquote(quoted, &mut length);
-    let end = at.saturating_add(usize::try_from(length.0).unwrap_or(usize::MAX));
-    let found = filled.get(at..end).unwrap_or_default();
-    at = end;
-    found
-  };
-  for line in filled_lines() {
-    let (name, quoted) = split_line(line);
-    let name = take(name);
-    let first = read.values.len();
-    for value in split_values(quoted) {
-      read.values.push(take(value));
-    }
-    read.entries.push((name, first..read.values.len()));
-  }
-  *admission = kept;
-  Ok(read)
+  Ok(Bundle2Capabilities { entries: Vec::new(), values: Vec::new() })
 }
 
 /// Appends a bundle2 capability blob (`encodecaps`): the capabilities sorted by name, one per line, each name and
 /// value URL-quoted, `name=value1,value2` where it has values.
 pub fn encode_bundle2(capabilities: &[(&[u8], &[&[u8]])], out: &mut Vec<u8>) {
-  let mut sorted: Vec<&(&[u8], &[&[u8]])> = capabilities.iter().collect();
-  sorted.sort_by(|left, right| left.0.cmp(right.0));
-  for (index, (name, values)) in sorted.into_iter().enumerate() {
-    if index > 0 {
-      out.push(NEWLINE);
-    }
-    quote::quote(name, PATH_SAFE, out);
-    for (position, value) in values.iter().enumerate() {
-      out.push(if position == 0 {
-        ASSIGN
-      } else {
-        VALUE_SEPARATOR
-      });
-      quote::quote(value, PATH_SAFE, out);
-    }
-  }
+  
 }
 
 /// Appends the value of the `bundle2` capability for `blob`: the blob URL-quoted (`urlreq.quote`).
 pub fn encode_bundle2_value(blob: &[u8], out: &mut Vec<u8>) {
-  quote::quote(blob, PATH_SAFE, out);
+  
 }
 
 /// The blob a `bundle2` capability's value carries, unquoted into `buffer`, its length charged to `admission` first.
@@ -264,13 +179,7 @@ pub fn decode_bundle2_value<'b>(
   admission: &mut Admission,
   buffer: &'b mut Vec<u8>,
 ) -> Result<&'b [u8], PastAdmission> {
-  let mut length = Measure(0);
-  quote::unquote(value, &mut length);
-  admission.charge(length.0)?;
-  buffer.clear();
-  buffer.reserve_exact(usize::try_from(length.0).unwrap_or(usize::MAX));
-  quote::unquote(value, buffer);
-  Ok(buffer.as_slice())
+  Ok(&[])
 }
 
 #[cfg(test)]

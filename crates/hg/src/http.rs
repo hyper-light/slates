@@ -211,10 +211,7 @@ fn decimal(text: &[u8]) -> Option<u64> {
 
 /// The body after the arguments `X-HgArgs-Post` puts at its front: `unbundle`'s input.
 pub fn payload<'a>(request: &Request<'a>) -> Result<&'a [u8], Refusal> {
-  Ok(match source(request)? {
-    Source::Post(arguments) => request.body.get(arguments.len()..).unwrap_or_default(),
-    Source::Headers => request.body,
-  })
+  Err(Refusal::PostArguments)
 }
 
 /// A request's form fields, decoded: the query's, and the arguments' (the body's front or the numbered headers').
@@ -285,45 +282,7 @@ pub fn fields<'b>(
   admission: &mut Admission,
   buffer: &'b mut Vec<u8>,
 ) -> Result<Fields<'b>, Refusal> {
-  let mut peak = *admission;
-  let joined: Vec<u8>;
-  let arguments_text: &[u8] = match source(request)? {
-    Source::Post(text) => text,
-    Source::Headers => {
-      let length = request
-        .numbered(ARGUMENT_HEADER)
-        .fold(0_usize, |total, value| total.saturating_add(value.len()));
-      peak.charge(to_u64(length))?;
-      let mut scratch = Vec::with_capacity(length);
-      for value in request.numbered(ARGUMENT_HEADER) {
-        scratch.extend_from_slice(value);
-      }
-      joined = scratch;
-      &joined
-    }
-  };
-  let (query_bytes, query_count) = measure_form(request.query);
-  let (argument_bytes, argument_count) = measure_form(arguments_text);
-  let bytes = query_bytes.saturating_add(argument_bytes);
-  let mut kept = *admission;
-  for charged in [&mut peak, &mut kept] {
-    charged.charge(bytes)?;
-    charged.charge_items::<(&[u8], &[u8])>(query_count.saturating_add(argument_count))?;
-  }
-  buffer.clear();
-  buffer.reserve_exact(usize::try_from(bytes).unwrap_or(usize::MAX));
-  for text in [request.query, arguments_text] {
-    for (name, value) in raw_fields(text) {
-      quote::unquote_plus(name, buffer);
-      quote::unquote_plus(value, buffer);
-    }
-  }
-  let filled: &'b Vec<u8> = buffer;
-  let mut at: usize = 0;
-  let query = slice_fields(request.query, filled, &mut at, query_count);
-  let arguments = slice_fields(arguments_text, filled, &mut at, argument_count);
-  *admission = kept;
-  Ok(Fields { query, arguments })
+  Err(Refusal::PostArguments)
 }
 
 /// The value of the first field named `name`.
@@ -337,12 +296,12 @@ fn first<'b>(fields: &[(&'b [u8], &'b [u8])], name: &[u8]) -> Option<&'b [u8]> {
 impl<'b> Fields<'b> {
   /// The command: the query's first `cmd` field.
   pub fn command(&self) -> Option<&'b [u8]> {
-    first(&self.query, COMMAND)
+  None
   }
 
   /// The value 7.2 reads for `name` (`knownargs[k][0]`): the arguments' first field of that name, else the query's.
   pub fn value(&self, name: &[u8]) -> Option<&'b [u8]> {
-    first(&self.arguments, name).or_else(|| first(&self.query, name))
+  None
   }
 
   /// The command's arguments for `spec` (`getargs`): each named one's value ([`Fields::value`]), refused where the
@@ -354,25 +313,7 @@ impl<'b> Fields<'b> {
     spec: Spec<'_>,
     admission: &mut Admission,
   ) -> Result<Arguments<'b>, Refusal> {
-    let named_count = spec.named().count();
-    let mut peak = *admission;
-    let mut kept = *admission;
-    for charged in [&mut peak, &mut kept] {
-      charged.charge_items::<&[u8]>(named_count)?;
-    }
-    let mut named = Vec::with_capacity(named_count);
-    for (position, name) in spec.named().enumerate() {
-      named.push(self.value(name).ok_or(Refusal::MissingArgument {
-        position: to_u64(position),
-      })?);
-    }
-    let dictionary = if spec.takes_dictionary() {
-      self.dictionary(spec, &mut peak, &mut kept)?
-    } else {
-      Vec::new()
-    };
-    *admission = kept;
-    Ok(Arguments { named, dictionary })
+  Err(Refusal::MissingArgument { position: 0 })
   }
 
   /// Every name but `cmd` and the spec's, once each at its first place, with its value.
@@ -433,15 +374,7 @@ pub fn protocol_caps(
   request: &Request<'_>,
   admission: &mut Admission,
 ) -> Result<ProtocolCaps, PastAdmission> {
-  let length = request
-    .numbered(PROTOCOL_HEADER)
-    .fold(0_usize, |total, value| total.saturating_add(value.len()));
-  admission.charge(to_u64(length))?;
-  let mut text = Vec::with_capacity(length);
-  for value in request.numbered(PROTOCOL_HEADER) {
-    text.extend_from_slice(value);
-  }
-  Ok(ProtocolCaps { text })
+  Ok(ProtocolCaps { text: Vec::new() })
 }
 
 impl ProtocolCaps {
@@ -472,52 +405,28 @@ impl ProtocolCaps {
 /// Appends the header of an `application/mercurial-0.2` body (`genversion2`): the engine name's length in one byte,
 /// then the name.
 pub fn encode_v2_header(engine: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
-  let length = u8::try_from(engine.len())
-    .ok()
-    .filter(|length| *length > 0)
-    .ok_or(EncodeRefusal::EngineName)?;
-  out.push(length);
-  out.extend_from_slice(engine);
-  Ok(())
+  Err(EncodeRefusal::EngineName)
 }
 
 /// The engine an `application/mercurial-0.2` body names, and the payload after it.
 pub fn decode_v2(body: &[u8]) -> Result<(&[u8], &[u8]), Refusal> {
-  let (&length, rest) = body.split_first().ok_or(Refusal::MediaHeader)?;
-  let length = usize::from(length);
-  if length == 0 {
-    return Err(Refusal::MediaHeader);
-  }
-  let engine = rest.get(..length).ok_or(Refusal::MediaHeader)?;
-  Ok((engine, rest.get(length..).unwrap_or_default()))
+  Err(Refusal::MediaHeader)
 }
 
 /// Appends the body of a push answered without bundle2 (`pushres`): the result, a newline, the output.
 pub fn encode_push_result(result: i64, output: &[u8], out: &mut Vec<u8>) {
-  out.extend_from_slice(Decimal::signed(result).as_bytes());
-  out.push(NEWLINE);
-  out.extend_from_slice(output);
+  
 }
 
 /// Appends the body of a push refused without bundle2 (`pusherr`): `0`, a newline, the message, a newline.
 pub fn encode_push_error(message: &[u8], out: &mut Vec<u8>) {
-  out.extend_from_slice(REFUSED);
-  out.push(NEWLINE);
-  out.extend_from_slice(message);
-  out.push(NEWLINE);
+  
 }
 
 /// Appends `fields` as `urlencode` writes them, in the order given: `name=value` joined by `&`, each quoted with a
 /// space as `+`.
 pub fn encode_form(fields: &[(&[u8], &[u8])], out: &mut Vec<u8>) {
-  for (index, (name, value)) in fields.iter().enumerate() {
-    if index > 0 {
-      out.push(FIELD_SEPARATOR);
-    }
-    quote::quote_plus(name, out);
-    out.push(ASSIGN);
-    quote::quote_plus(value, out);
-  }
+  
 }
 
 /// The values `encodevalueinheaders` splits `value` into for headers named `<prefix>-<N>`, each header line (name,
@@ -527,12 +436,7 @@ pub fn header_values<'v>(
   prefix: &[u8],
   limit: usize,
 ) -> Result<core::slice::Chunks<'v, u8>, EncodeRefusal> {
-  let size = limit
-    .checked_sub(prefix.len().saturating_add(NUMBER_ROOM))
-    .and_then(|left| left.checked_sub(HEADER_OVERHEAD))
-    .filter(|size| *size > 0)
-    .ok_or(EncodeRefusal::HeaderLimit)?;
-  Ok(value.chunks(size))
+  Err(EncodeRefusal::HeaderLimit)
 }
 
 #[cfg(test)]

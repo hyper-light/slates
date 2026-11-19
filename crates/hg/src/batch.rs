@@ -74,7 +74,7 @@ impl From<PastAdmission> for Refusal {
 
 /// Appends `plain` escaped (`escapebatcharg`).
 pub fn escape(plain: &[u8], out: &mut Vec<u8>) {
-  escape_into(plain, out);
+  
 }
 
 /// Writes `plain` escaped.
@@ -162,26 +162,7 @@ pub fn calls<'b>(
   admission: &mut Admission,
   buffer: &'b mut Vec<u8>,
 ) -> Result<Vec<Call<'b>>, Refusal> {
-  let sizes = measure(cmds)?;
-  let mut kept = *admission;
-  kept.charge(sizes.bytes)?;
-  kept.charge_items::<Call<'_>>(sizes.calls)?;
-  kept.charge_items::<(&[u8], &[u8])>(sizes.arguments)?;
-  buffer.clear();
-  buffer.reserve_exact(usize::try_from(sizes.bytes).unwrap_or(usize::MAX));
-  for (index, call) in split_calls(cmds).enumerate() {
-    let (command, arguments) = call?;
-    buffer.extend_from_slice(command);
-    for argument in split_arguments(arguments, to_u64(index)) {
-      let (name, value) = argument?;
-      unescape_into(name, to_u64(index), buffer)?;
-      unescape_into(value, to_u64(index), buffer)?;
-    }
-  }
-  let filled: &'b Vec<u8> = buffer;
-  let built = slice_calls(cmds, filled, sizes.calls)?;
-  *admission = kept;
-  Ok(built)
+  Ok(Vec::new())
 }
 
 /// Checks every call and counts what [`calls`] will hold.
@@ -236,31 +217,12 @@ fn slice_calls<'b>(cmds: &[u8], filled: &'b [u8], count: usize) -> Result<Vec<Ca
 /// Appends a `cmds` argument as 7.2's client writes it (`encodebatchcmds`): each command, a space, its arguments as
 /// `name=value` escaped and joined by `,`; the calls joined by `;`.
 pub fn encode_calls(calls: &[(&[u8], &[(&[u8], &[u8])])], out: &mut Vec<u8>) {
-  for (index, (command, arguments)) in calls.iter().enumerate() {
-    if index > 0 {
-      out.push(CALL_SEPARATOR);
-    }
-    out.extend_from_slice(command);
-    out.push(COMMAND_SEPARATOR);
-    for (position, (name, value)) in arguments.iter().enumerate() {
-      if position > 0 {
-        out.push(ARGUMENT_SEPARATOR);
-      }
-      escape_into(name, out);
-      out.push(VALUE_SEPARATOR);
-      escape_into(value, out);
-    }
-  }
+  
 }
 
 /// Appends a batch's answer (`batch`): each call's answer escaped, joined by `;`.
 pub fn encode_results(results: &[&[u8]], out: &mut Vec<u8>) {
-  for (index, result) in results.iter().enumerate() {
-    if index > 0 {
-      out.push(CALL_SEPARATOR);
-    }
-    escape_into(result, out);
-  }
+  
 }
 
 /// The answers of a batch's answer, unescaped into `buffer`, as 7.2's client reads them (`_submitbatch`). The exact
@@ -270,32 +232,7 @@ pub fn results<'b>(
   admission: &mut Admission,
   buffer: &'b mut Vec<u8>,
 ) -> Result<Vec<&'b [u8]>, Refusal> {
-  let parts = || answer.split(|byte| *byte == CALL_SEPARATOR).enumerate();
-  let mut bytes = Measure(0);
-  for (index, part) in parts() {
-    unescape_into(part, to_u64(index), &mut bytes)?;
-  }
-  let count = parts().count();
-  let mut kept = *admission;
-  kept.charge(bytes.0)?;
-  kept.charge_items::<&[u8]>(count)?;
-  buffer.clear();
-  buffer.reserve_exact(usize::try_from(bytes.0).unwrap_or(usize::MAX));
-  for (index, part) in parts() {
-    unescape_into(part, to_u64(index), buffer)?;
-  }
-  let filled: &'b Vec<u8> = buffer;
-  let mut built = Vec::with_capacity(count);
-  let mut at: usize = 0;
-  for (index, part) in parts() {
-    let mut length = Measure(0);
-    unescape_into(part, to_u64(index), &mut length)?;
-    let end = at.saturating_add(usize::try_from(length.0).unwrap_or(usize::MAX));
-    built.push(filled.get(at..end).unwrap_or_default());
-    at = end;
-  }
-  *admission = kept;
-  Ok(built)
+  Ok(Vec::new())
 }
 
 #[cfg(test)]

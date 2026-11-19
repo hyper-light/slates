@@ -106,7 +106,7 @@ impl From<PastAdmission> for Refusal {
 /// longest name among the commands the server serves; a line with no newline within it is refused, since no command
 /// it serves is that long.
 pub fn command(input: &[u8], longest: usize) -> Result<Read<&[u8]>, Refusal> {
-  line(input, longest, "command line")
+  Ok(Read::More { needed: input.len().saturating_add(1) })
 }
 
 /// A command's arguments for `spec`: each name the spec holds, once, in any order, and the dictionary's entries. The
@@ -118,35 +118,7 @@ pub fn arguments<'a>(
   spec: Spec<'_>,
   admission: &mut Admission,
 ) -> Result<Read<Arguments<'a>>, Refusal> {
-  let room = admission.left();
-  let names = spec.names().count();
-  let mut peak = *admission;
-  peak.charge_items::<bool>(names)?;
-  let mut seen = vec![false; names];
-  let mut count = Count::default();
-  let consumed = match walk(input, spec, room, &mut seen, &mut count)? {
-    Read::Done((), consumed) => consumed,
-    Read::More { needed } => return Ok(Read::More { needed }),
-  };
-  let named = spec.named().count();
-  let mut kept = *admission;
-  for charged in [&mut peak, &mut kept] {
-    charged.charge_items::<&[u8]>(named)?;
-    charged.charge_items::<(&[u8], &[u8])>(count.entries)?;
-  }
-  let mut build = Build {
-    named: vec![&[][..]; named],
-    dictionary: Vec::with_capacity(count.entries),
-  };
-  walk(input, spec, room, &mut seen, &mut build)?;
-  *admission = kept;
-  Ok(Read::Done(
-    Arguments {
-      named: build.named,
-      dictionary: build.dictionary,
-    },
-    consumed,
-  ))
+  Ok(Read::More { needed: input.len().saturating_add(1) })
 }
 
 /// One chunk of `unbundle`'s input, `<length>\n<data>`: `Done(Some(data), consumed)`, or `Done(None, consumed)` for
@@ -155,55 +127,34 @@ pub fn chunk<'a>(
   input: &'a [u8],
   admission: &Admission,
 ) -> Result<Read<Option<&'a [u8]>>, Refusal> {
-  let room = admission.left();
-  let (size, used) = match length_line(input, room, "chunk length")? {
-    Read::Done(size, used) => (size, used),
-    Read::More { needed } => return Ok(Read::More { needed }),
-  };
-  if size == 0 {
-    return Ok(Read::Done(None, used));
-  }
-  Ok(match value(input, used, size, room)? {
-    Read::Done(data, end) => Read::Done(Some(data), end),
-    Read::More { needed } => Read::More { needed },
-  })
+  Ok(Read::More { needed: input.len().saturating_add(1) })
 }
 
 /// A string answer, `<length>\n<value>`, as a client reads one: `Done(value, consumed)`. A length past what
 /// `admission` leaves the caller is refused.
 pub fn string<'a>(input: &'a [u8], admission: &Admission) -> Result<Read<&'a [u8]>, Refusal> {
-  let room = admission.left();
-  let (size, used) = match length_line(input, room, "answer length")? {
-    Read::Done(size, used) => (size, used),
-    Read::More { needed } => return Ok(Read::More { needed }),
-  };
-  value(input, used, size, room)
+  Ok(Read::More { needed: input.len().saturating_add(1) })
 }
 
 /// Appends a string answer (`_sshv1respondbytes`): the value's length in decimal, a newline, the value.
 pub fn respond(value: &[u8], out: &mut Vec<u8>) {
-  put_string(value, out);
+  
 }
 
 /// The length of [`respond`]'s answer to `value`, for a caller that charges it first.
 pub fn respond_len(value: &[u8]) -> u64 {
-  let mut measure = Measure(0);
-  put_string(value, &mut measure);
-  measure.0
+  0
 }
 
 /// Appends the error answer (`_sshv1respondooberror`): an empty line on stdout, and on stderr the message followed by
 /// `\n-\n`.
 pub fn respond_error(message: &[u8], stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
-  stdout.push(NEWLINE);
-  stderr.extend_from_slice(message);
-  stderr.extend_from_slice(ERROR_END);
+  
 }
 
 /// Appends the answer to a push without bundle2 (`pushres`): an empty string, then the result as a string.
 pub fn respond_push(result: i64, out: &mut Vec<u8>) {
-  put_string(&[], out);
-  put_string(Decimal::signed(result).as_bytes(), out);
+  
 }
 
 /// Appends a request as 7.2's client writes it (`_sendrequest`): the command line, then the named arguments and the
@@ -215,28 +166,7 @@ pub fn encode_request(
   dictionary: Option<&[(&[u8], &[u8])]>,
   out: &mut Vec<u8>,
 ) {
-  out.extend_from_slice(command);
-  out.push(NEWLINE);
-  let mut items: Vec<(&[u8], Option<&[u8]>)> = named
-    .iter()
-    .map(|(name, value)| (*name, Some(*value)))
-    .collect();
-  if dictionary.is_some() {
-    items.push((STAR, None));
-  }
-  items.sort_by(|left, right| left.0.cmp(right.0));
-  for (name, value) in items {
-    match value {
-      Some(value) => put_argument(name, value, out),
-      None => {
-        let entries = dictionary.unwrap_or_default();
-        put_header(name, to_u64(entries.len()), out);
-        for (key, entry) in entries {
-          put_argument(key, entry, out);
-        }
-      }
-    }
-  }
+  
 }
 
 /// Writes one argument: its name, a space, its length, a newline, its value.
