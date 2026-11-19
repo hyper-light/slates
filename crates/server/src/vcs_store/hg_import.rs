@@ -168,7 +168,7 @@ impl Clock for ShardClock {
 
 /// Derived: the most an import holds at once, its room (the module doc): one client region's bytes, what one request of
 /// the version-control edge may hold.
-fn room_of(state: &ShardState) -> u64 {
+pub(crate) fn room_of(state: &ShardState) -> u64 {
   u64::try_from(state.config.region.total_bytes()).unwrap_or(u64::MAX)
 }
 

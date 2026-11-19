@@ -28,12 +28,12 @@ use slates_ipc::protocol::{
   ArchiveFault, AttachRequest, AttachTransport, AuditKind, BaseReport, CauseRecord, ConflictClass,
   Conformance, CredentialMaterial, DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes,
   EntryKind, Established, GrantScope, GrantState, HookPointName, HostAnswer, HostPathReason,
-  Intent, IpcNodeKind, KernelCache, LandingDegradation, LandingStage, MoveRefusal, NamePolicy,
-  ObjectFormat, OwnMountUse, PlannedAction, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight,
-  PolicySubject, PolicyWho, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody,
-  RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass, SnapshotBoundary,
-  TargetPathConstraint, TargetRefusal, UnsupportedReason, VcsTool, Verification, VolumeRefusal,
-  WatcherState, WorkOp, WriteAct, WriteMode,
+  ImportFault, Intent, IpcNodeKind, KernelCache, LandingDegradation, LandingStage, MoveRefusal,
+  NamePolicy, ObjectFormat, OwnMountUse, PlannedAction, PolicyEffect, PolicyEntry, PolicyNames,
+  PolicyRight, PolicySubject, PolicyWho, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
+  Refusal, ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass,
+  SnapshotBoundary, TargetPathConstraint, TargetRefusal, UnsupportedReason, VcsTool, Verification,
+  VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -63,6 +63,7 @@ fn schemas() -> Vec<&'static str> {
     <HookPointName as Wire>::SCHEMA,
     <HostAnswer as Wire>::SCHEMA,
     <HostPathReason as Wire>::SCHEMA,
+    <ImportFault as Wire>::SCHEMA,
     <Intent as Wire>::SCHEMA,
     <IpcNodeKind as Wire>::SCHEMA,
     <KernelCache as Wire>::SCHEMA,
