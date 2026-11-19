@@ -6,9 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "Mercurial's exchange formats (§4.17.3, A-514): bundle2, bundle1, changegroups and their deltas, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission."
+description = "Mercurial's exchange formats and objects (§4.17.3, A-514, A-545, A-569, A-588): bundle2, bundle1, changegroups and their deltas, part payloads, the wire protocol, changesets, manifests and file revisions with their nodes, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission."
 
 [dependencies]
+# The SHA-1 of a Mercurial node (A-588), through AWS-LC: the one cryptographic library slates builds on (A-66).
+aws-lc-rs = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
