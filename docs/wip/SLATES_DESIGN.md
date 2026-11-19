@@ -11405,8 +11405,8 @@ absent at the head and unchanged after the base, and its source's tree unchanged
 > file, a symbolic link, a hard link and a directory, each removed and made again while works based behind the head
 > change a mode, an attribute or a name, every answer held to the rule and a census requiring each case to run. Probed
 > and owed (GAPS): a link renamed over a regular file keeps the file beside it; a directory's removal takes no base; an
-> unlink or a directory's removal ignores a metadata change after its base; a hard link to a target made again links
-> the new file; and a removed node's mode and attributes pass to the next node made at its path.
+> unlink or a directory's removal ignores a metadata change after its base; and a hard link to a target made again
+> links the new file.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -42877,9 +42877,9 @@ Applied in the same change to:
   regular file's. The mode, attribute-set and attribute-removal verdicts refuse `DeleteModify` when the path's node was
   removed after the base, unless the work makes the path itself (`established`). The rename verdict already read the
   record, so a replaced link's rename is `RenameRename`.
-- **Tests** (debug, Mac Studio, 2026-11-19, load 6 to 8), green on kiln r786:
-  - `cargo test -p slates-merge --lib`, the whole suite, 79 of 79;
-  - `cargo fmt -p slates-merge -- --check`, clean.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 6 to 9), green on kiln r786 and, merged with main, r810:
+  - `cargo test -p slates-merge --lib`, the whole suite, 79 of 79 (r786) and 92 of 92 (r810);
+  - `cargo fmt -p slates-merge -- --check`, clean on both.
 
   The failing-first tests:
   - each metadata change based before its file was made again is `DeleteModify`, the head unmoved and the metadata
@@ -42893,13 +42893,16 @@ Applied in the same change to:
   Red on r786, with the records and checks reversed: all three failed. The mode change was `Accepted { version: 3 }`
   and changed the new file's metadata; the symlink's rename was `Accepted { version: 3 }` and moved the new link; the
   oracle shrank to a symlink made again, then an attribute removal on it based before that, accepted.
-- **Siblings probed, not changed** (GAPS; a scratch test on the Studio, never committed):
+- **Siblings probed, not changed** (GAPS; a scratch test on the Studio, never committed, re-run merged with main on
+  r810):
   - a symbolic link or a hard link renamed over an unchanged regular file is accepted, even at the head, and the green
     then holds both the file and the link at one path;
   - a directory's removal takes no base, so one based before the directory was made again removes the new one;
   - a file's unlink or a directory's removal based before a mode or attribute change at the head is accepted;
-  - a hard link made to a target removed and made again after its base links the new file;
-  - a removed node's mode and attributes outlive it: the next file or directory made at its path shows them.
+  - a hard link made to a target removed and made again after its base links the new file.
+
+  A fifth, a removed node's mode and attributes outliving it and passing to the next node made at its path, was found
+  before the merge and closed by A-618 meanwhile; r810 answers neither after a removal or a remake.
 
 ### A-632 — a chain entry finds what its increment declared in one pass (2026-11-19, g267, UI goal 93; §4.16 "Commit"; found by A-621's reading)
 Applied in the same change to:
@@ -42914,7 +42917,8 @@ Applied in the same change to:
 - **The index.** One pass over the increment's ops builds each path's content ops in order and each copy's source
   version by destination, then source, the first one a pair declares. Encode and decode build it once, so each op is
   visited once and each effect is an ordered-map lookup. The entry's bytes are unchanged; it stays version 5.
-- **Tests** (debug, Mac Studio, 2026-11-19), green on kiln r786: `cargo test -p slates-merge --lib`, 79 of 79. The
+- **Tests** (debug, Mac Studio, 2026-11-19), green on kiln r786: `cargo test -p slates-merge --lib`, 79 of 79, and 92 of
+  92 merged with main (r810). The
   failing-first test counts the increment's ops visited (a counter in test builds): an entry splicing 1,000 files as
   declared visits 1,000 on encode and 1,000 on decode, and decodes to what was recorded. Red on r786, with the index
   rebuilt for every effect: 1,000,000 each way.

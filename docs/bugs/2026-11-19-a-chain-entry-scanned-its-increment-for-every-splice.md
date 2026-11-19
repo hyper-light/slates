@@ -37,4 +37,4 @@ was written.
 `chain_entry::tests::an_entry_finds_each_splices_declared_ops_in_one_pass`: an entry splicing 1,000 files, each as
 declared, counting the ops the encode and the decode visit (a counter in test builds). Expect 1,000 each way, and the
 entry to decode to what was recorded. Red on r786 with the index rebuilt for every effect: 1,000,000 each way. Green on
-r786: `cargo test -p slates-merge --lib` 79 of 79.
+r786: `cargo test -p slates-merge --lib` 79 of 79; merged with main (r810), 92 of 92.

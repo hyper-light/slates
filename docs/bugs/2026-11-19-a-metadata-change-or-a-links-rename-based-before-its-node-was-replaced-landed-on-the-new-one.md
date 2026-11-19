@@ -61,11 +61,12 @@ and re-creation, whether an agent's work through the SDK or a mount, or a server
   refused, a file's rename refused, and an accept.
 
 Red on r786 with the edits reversed: all three failed. Green on r786: `cargo test -p slates-merge --lib` 79 of 79, and
-`cargo fmt -p slates-merge -- --check` clean.
+`cargo fmt -p slates-merge -- --check` clean. Merged with main (r810): 92 of 92, and fmt clean.
 
 ## Siblings (reported, not changed; GAPS)
 
-Probed on the Mac Studio with a scratch test that was never committed (2026-11-19, after r786):
+Probed on the Mac Studio with a scratch test that was never committed (2026-11-19, after r786), and probed again on
+the tree merged with main (r810), where the first four still hold:
 - A symbolic link or a hard link renamed over an unchanged regular file, even with the work based at the head:
   `Accepted { version: 1 }`, and the green then holds both the file (4 bytes) and the link at `f`. `merge_rename` emits
   the link at the destination and the source's removal, but no removal of the file it replaces.
@@ -76,5 +77,7 @@ Probed on the Mac Studio with a scratch test that was never committed (2026-11-1
   or an attribute change only for an IPC node, and `merge_rmdir` reads neither.
 - A hard link made to a target that was removed and made again after the work's base: accepted, naming the new file
   (13 bytes). `merge_hardlink` judges only the link's own path.
-- A removed node's mode and attributes outlive it. After `f` is unlinked, the green still answers mode 0o644 and
-  `user.k = v` for it, and a file made again at `f` shows both. A directory made again shows the removed one's 0o700.
+- A removed node's mode and attributes outlived it. After `f` was unlinked, the green still answered mode 0o644 and
+  `user.k = v` for it, and a file made again at `f` showed both; a directory made again showed the removed one's 0o700.
+  A-618 closed this on main meanwhile (`docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`): on
+  r810 neither is answered after a removal or a remake.

@@ -2191,14 +2191,14 @@
 > `f` was made again, `Accepted { version: 3 }`), and the rename moved the new link. Tests
 > (`crates/merge/src/engine/replaced_node_tests.rs`): each case, and a generated oracle over a file, a symlink, a hard
 > link and a directory removed and made again while works behind the head change a mode, an attribute or a name, with a
-> census requiring each case to run. Green on the Mac Studio (r786: `slates-merge --lib` 79 of 79, fmt clean); red with
-> the records and checks reversed (r786: all three failed). Owed to main: the merge crate's integration suites and
+> census requiring each case to run. Green on the Mac Studio (r786: `slates-merge --lib` 79 of 79, fmt clean; merged
+> with main, r810: 92 of 92, fmt clean); red with the records and checks reversed (r786: all three failed). Owed to main: the merge crate's integration suites and
 > clippy. Bug record:
 > `docs/bugs/2026-11-19-a-metadata-change-or-a-links-rename-based-before-its-node-was-replaced-landed-on-the-new-one.md`.
 
-> **Five siblings of A-631's verdicts, probed and open (2026-11-19, A-631's sweep, g267; §4.16 "The verdict": "delete
+> **Four siblings of A-631's verdicts, probed and open (2026-11-19, A-631's sweep, g267; §4.16 "The verdict": "delete
 > against modify in either direction"; D-27).** Probed on the Mac Studio with a scratch test, never committed, against
-> `crates/merge` at A-631:
+> `crates/merge` at A-631 merged with main (kiln r810):
 > 1. A symbolic link or a hard link renamed over an unchanged regular file is accepted, even by a work based at the
 >    head (`Accepted { version: 1 }`), and the green then holds both the file (4 bytes) and the link at one path.
 >    `merge_rename` emits the link at the destination and the source's removal, but no removal of the file it replaces.
@@ -2211,13 +2211,11 @@
 >    removal.
 > 4. A hard link made to a target removed and made again after the work's base is accepted and names the new file
 >    (13 bytes); `merge_hardlink` judges only the link's own path.
-> 5. A removed node's mode and attributes outlive it. After `f` (0o644, `user.k = v`) is unlinked, `Green::mode` and
->    `Green::xattr` still answer both, and the file made again at `f` shows both; a directory made again shows the
->    removed one's 0o700. No removal clears the path-keyed maps.
 >
-> Owed: a failing test of each, then the design's rule: for 1, the replaced file removed and recorded as a file's rename
-> over a file is; for 2 and 3, `DeleteModify`; for 4, `DeleteModify` on the target; for 5, a removal clearing its node's
-> mode and attributes, live and in replay.
+> A fifth, probed before the merge, was closed by A-618 meanwhile: a removed node's mode and attributes outlived it and
+> passed to the next node made at its path; on r810 neither is answered after a removal or a remake. Owed: a failing
+> test of each of the four, then the design's rule: for 1, the replaced file removed and recorded as a file's rename
+> over a file is; for 2 and 3, `DeleteModify`; for 4, `DeleteModify` on the target.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a
@@ -2226,7 +2224,8 @@
 > on the owner's commit and every holder's replay. An index built once per entry encoded or decoded (`Declared`)
 > replaces both, so each op is visited once; the entry's bytes are unchanged. Test: a counter of the ops visited, a
 > thousand splices visiting a thousand ops on encode and a thousand on decode. Red with the index rebuilt for every
-> effect: a million each way (kiln r786); green on r786 (`slates-merge --lib` 79 of 79). Bug record:
+> effect: a million each way (kiln r786); green on r786 (`slates-merge --lib` 79 of 79) and merged with main on r810
+> (92 of 92). Bug record:
 > `docs/bugs/2026-11-19-a-chain-entry-scanned-its-increment-for-every-splice.md`.
 
 > **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
