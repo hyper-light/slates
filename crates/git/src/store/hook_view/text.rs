@@ -116,9 +116,7 @@ impl RefLine {
     let line = hex
       .saturating_add(to_u64(self.name.len()))
       .saturating_add(FRAMING);
-    let peeled = self
-      .peeled
-      .map_or(0, |_| hex.saturating_add(FRAMING));
+    let peeled = self.peeled.map_or(0, |_| hex.saturating_add(FRAMING));
     line.saturating_add(peeled)
   }
 }
@@ -214,10 +212,7 @@ impl PackedRefs {
       if line.at >= end {
         break;
       }
-      let within = (
-        from.saturating_sub(line.at),
-        end.saturating_sub(line.at),
-      );
+      let within = (from.saturating_sub(line.at), end.saturating_sub(line.at));
       copy(&line.bytes(), within, out);
     }
   }

@@ -390,7 +390,8 @@
 > object; the push in git's quarantine for `pre-receive` with receive-pack's environment, among the packs for
 > `update`. A pack's trailer, Adler-32s and index are its seal, derived in slices and kept by the caller; every other
 > byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
-> of the store and the push back through the view's packs, counted. Found: stock receive-pack sets
+> of the store and the push back through the view's packs, counted (Windows x86_64, jupiter: red 13 of 15, then the
+> two vacuous ones made to read and red 2 of 2; green 15 of 15, the crate 462 of 462 with 4 ignored; macOS owed). Found: stock receive-pack sets
 > `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unsets it (reported to main). Owed: part 2, the view presented to the hook
 > driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
 > from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a

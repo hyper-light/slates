@@ -157,7 +157,9 @@ fn read_file(
   let mut bytes = Vec::new();
   let mut at = 0;
   while at < len {
-    view.read(store, seals, path, (at, window), &mut bytes).unwrap();
+    view
+      .read(store, seals, path, (at, window), &mut bytes)
+      .unwrap();
     at += window;
   }
   assert_eq!(to_u64(bytes.len()), len);
@@ -394,19 +396,30 @@ fn a_pack_git_wrote_laid_out_and_sealed_reads_back_with_index_packs_index() {
       version: 0,
     };
     let mut room = Admission::new(ROOM);
-    let unit = lay_out(format, PackKind::Fragments, &[(source, false, &kept)], Vec::new(), &mut room)
-      .unwrap();
+    let unit = lay_out(
+      format,
+      PackKind::Fragments,
+      &[(source, false, &kept)],
+      Vec::new(),
+      &mut room,
+    )
+    .unwrap();
     let count = u32::from_be_bytes(pack[8..12].try_into().unwrap());
     let lens = (unit.len, unit.idx_len, unit.count);
     assert_eq!(lens, (to_u64(pack.len()), to_u64(idx.len()), count));
     let mut sealing = Sealing::of(&unit);
     let mut clock = Ticks(0);
-    while !sealing.step_on(&unit, &store, one_unit(&mut clock)).unwrap() {}
+    while !sealing
+      .step_on(&unit, &store, one_unit(&mut clock))
+      .unwrap()
+    {}
     let seal = sealing
       .finish_with(&unit, &Given(&kept), &mut store, &mut room)
       .unwrap();
     let mut read = Vec::new();
-    unit.fill(&store, seal.known(), (0, unit.len), &mut read).unwrap();
+    unit
+      .fill(&store, seal.known(), (0, unit.len), &mut read)
+      .unwrap();
     assert_eq!(read, pack);
     let (content, len) = seal.index();
     let mut index = Vec::new();
@@ -597,7 +610,13 @@ fn every_object_of_the_store_and_the_push_is_in_the_views_packs_counted() {
     let seals = seal_all(&view, &built.repository, &mut built.store);
     let mut seen = BTreeSet::new();
     for path in pack_paths(&view) {
-      seen.extend(verified(&view, &built.store, &seals, (&path, window), format));
+      seen.extend(verified(
+        &view,
+        &built.store,
+        &seals,
+        (&path, window),
+        format,
+      ));
     }
     assert_eq!(seen, every_object(&built));
     assert_counted(view.counters(), &built);
@@ -663,11 +682,19 @@ fn refused_before_the_seal(view: &HookView, store: &ContentStore, path: &[u8]) {
   let unsealed: BTreeMap<ObjectId, Seal> = BTreeMap::new();
   let refused = Err(ReadRefused::Unsealed { pack });
   let mut out = Vec::new();
-  assert_eq!(view.read(store, &unsealed, path, (trailer, 1), &mut out), refused);
+  assert_eq!(
+    view.read(store, &unsealed, path, (trailer, 1), &mut out),
+    refused
+  );
   let index = index_path(path);
-  assert_eq!(view.read(store, &unsealed, &index, (0, 1), &mut out), refused);
+  assert_eq!(
+    view.read(store, &unsealed, &index, (0, 1), &mut out),
+    refused
+  );
   if kind == PackKind::BasePack {
-    view.read(store, &unsealed, path, (0, trailer), &mut out).unwrap();
+    view
+      .read(store, &unsealed, path, (0, trailer), &mut out)
+      .unwrap();
     assert_eq!(to_u64(out.len()), trailer);
   }
 }
@@ -738,7 +765,12 @@ fn ours(view: &HookView) -> Vec<(String, Vec<u8>)> {
 #[test]
 fn the_hook_environment_is_what_receive_pack_hands_its_hooks() {
   let (repository, mut store) = served_encoded();
-  let next = commit_over(ObjectFormat::Sha1, b"pushed\n", &[served::id(served::THIRD)], 9);
+  let next = commit_over(
+    ObjectFormat::Sha1,
+    b"pushed\n",
+    &[served::id(served::THIRD)],
+    9,
+  );
   let push = sealed(&repository, &mut store, next);
   let quarantined = open(
     &repository,
@@ -829,7 +861,10 @@ fn an_alternates_path_holding_the_separator_is_quoted_as_git_quotes_it() {
   let alternates = "GIT_ALTERNATE_OBJECT_DIRECTORIES";
   let plain = format!("/srv/a{SEPARATOR}b");
   let expected = format!("\"/srv/a{SEPARATOR}b/./objects\"");
-  assert_eq!(value_at(&view, plain.as_bytes(), alternates), expected.as_bytes());
+  assert_eq!(
+    value_at(&view, plain.as_bytes(), alternates),
+    expected.as_bytes()
+  );
   let mut odd = format!("/srv/a{SEPARATOR}\"").into_bytes();
   odd.extend_from_slice(b"\xc3\xa9\tb");
   let expected = format!("\"/srv/a{SEPARATOR}\\\"\\303\\251\\tb/./objects\"");
@@ -868,7 +903,13 @@ fn each_snapshot_refusal_is_typed_and_holds_nothing() {
   ];
   for (refs, head, refused) in cases {
     let snapshot = Snapshot { refs, head };
-    let opened = HookView::open(&repository, &mut store, &snapshot, None, &mut Admission::new(ROOM));
+    let opened = HookView::open(
+      &repository,
+      &mut store,
+      &snapshot,
+      None,
+      &mut Admission::new(ROOM),
+    );
     assert_eq!(opened.unwrap_err(), refused);
   }
   assert_eq!(store.holders(&kept), before);
@@ -889,9 +930,21 @@ fn a_foreign_push_and_too_little_room_are_refused_and_a_closed_view_holds_nothin
   };
   let foreign = Push::new(ObjectFormat::Sha256);
   let pushed = Some(Pushed::Quarantined(&foreign));
-  let opened = HookView::open(&repository, &mut store, &snapshot, pushed, &mut Admission::new(ROOM));
+  let opened = HookView::open(
+    &repository,
+    &mut store,
+    &snapshot,
+    pushed,
+    &mut Admission::new(ROOM),
+  );
   assert_eq!(opened.unwrap_err(), ViewRefused::ForeignPush);
-  let opened = HookView::open(&repository, &mut store, &snapshot, None, &mut Admission::new(64));
+  let opened = HookView::open(
+    &repository,
+    &mut store,
+    &snapshot,
+    None,
+    &mut Admission::new(64),
+  );
   assert!(matches!(opened, Err(ViewRefused::PastAdmission(_))));
   assert_eq!(store.holders(&kept), before);
   let view = open(&repository, &mut store, &SERVED_REFS, None);
@@ -934,7 +987,13 @@ fn a_base_pack_made_again_stays_readable_and_its_seal_is_refused_by_kind() {
   let mut bytes = Vec::new();
   let unsealed: BTreeMap<ObjectId, Seal> = BTreeMap::new();
   view
-    .read(&built.store, &unsealed, path.as_bytes(), before_trailer, &mut bytes)
+    .read(
+      &built.store,
+      &unsealed,
+      path.as_bytes(),
+      before_trailer,
+      &mut bytes,
+    )
     .unwrap();
   let sealed = seal_one(&view, &built.repository, &mut built.store, &base);
   assert_eq!(sealed, Err(SealRefused::Changed { pack: base }));

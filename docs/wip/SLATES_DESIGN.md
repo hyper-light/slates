@@ -12733,8 +12733,9 @@ engine: the verdict, rebase, position mapping, the register).
 > sealed. Proven against what stock git made (`fixtures/view`): the layout, `HEAD`, both formats' `config`,
 > `packed-refs` and the hooks' environment; git's own packs laid out and indexed byte for byte as `index-pack` indexes
 > them; and an oracle reading every object of the store and of the push back through the view's packs, each checked
-> as `git verify-pack` checks one, counted. Owed: part 2, the view presented to the hook driver on the owner shard
-> (after A-662); main's run of stock git over a mounted view.
+> as `git verify-pack` checks one, counted (Windows x86_64, jupiter: 15 of 15, the crate 462 of 462; macOS owed).
+> Owed: part 2, the view presented to the hook driver on the owner shard (after A-662); main's run of stock git over
+> the view.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -46416,7 +46417,7 @@ Applied in the same change to:
   variable is never taken (the fixtures' `loose` and `pack` pushes, `receive.advertisePushOptions` off). `githooks.adoc`
   says the variables "will not be set", and `slates-server`'s `vcs_hooks::push_option_env` follows the document.
   Reported to main; not changed here.
-- **Tests** (`src/tests/store/hook_view.rs`, `hook_view_stored.rs`; run results below). The layout, `HEAD` and both
+- **Tests** (`src/tests/store/hook_view.rs`, `hook_view_stored.rs`). The layout, `HEAD` and both
   formats' `config` against `git init --bare`, `index-pack` and `pack-refs`; `packed-refs` read in every window size;
   git's own SHA-1 and SHA-256 packs laid out as a kept part and sealed, read back as git's pack and `index-pack`'s index
   byte for byte; the oracle, a repository of every case in both formats (two base packs, one passed over; two
@@ -46427,8 +46428,22 @@ Applied in the same change to:
   `pre-receive` (loose and packed), `update` and `post-receive`, and the quarantine's listing; `env_append`'s quoting;
   the refusals by kind with nothing held; a base pack made again under an open view; the stored-block streams against
   zlib (flate2), in every window, and Adler-32 against RFC 1950's vectors.
+- **Runs** (Windows x86_64, jupiter, kiln, debug, 2026-11-19, a fresh clone of the pushed branch for each, its own
+  target directory; the Mac Studio was offline, so the macOS run is owed and filed).
+  - Red at a719726, the branch merged with main, four entry points stubbed (`HookView::open` an empty view,
+    `Unit::fill`, the stored stream's `fill` and `Adler32::update` writing nothing): `cargo test --locked -p
+    slates-git --lib -- hook_view` 13 of 15 failed. The two that passed read nothing and compared nothing with nothing,
+    so each now holds what it reads (a whole stream its full length; the view its five packs and every file), and at
+    ce13693, stubbed again, both failed (2 of 2).
+  - Green at ce13693: 15 of 15, one ignored (main's run, below), the log compiling slates-git afresh; the crate whole,
+    `cargo test --locked -p slates-git --lib`, 462 passed and 4 ignored, which is main's Windows baseline at 018d32ba2
+    (447 and 3) with these 15 and the one. rustfmt's layout from that run.
+  - The fixtures were made on a MacBook with the same stock git (2.50.1, Apple Git-155); making them again on the
+    Studio and comparing byte for byte is filed.
 - **Owed.** Part 2, the view presented to the hook driver on the owner shard (after A-662), its seals kept as derived
   data; a seal made where a version's fragments are encoded, when the bytes pass anyway; `packed-refs` read from the
   register's sorted namespace by ranges for a repository of very many refs; the cover kept as derived data, grown as
   versions are encoded, and the fragments after a base pack merged into larger packs so a hook's `git` searches few
-  indexes; the open sliced where the rest or the refs are large; main's run of stock git over a mounted view (filed).
+  indexes; the open sliced where the rest or the refs are large; main's runs (filed): stock git over the view
+  (`a_view_for_stock_git` prints a sealed view and its environment), the macOS unit run, the fixtures made again on the
+  Studio, clippy, `xtask` and the docs.

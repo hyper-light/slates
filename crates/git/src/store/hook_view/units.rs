@@ -41,9 +41,7 @@ impl Source {
   /// The part of blobs (`blobs`) or of the other kinds the store keeps there now.
   pub(in crate::store) fn kept(self, repository: &Repository, blobs: bool) -> Option<&Kept> {
     match self {
-      Source::Base { green } => repository
-        .base_part(green, blobs)
-        .map(|(_, kept)| kept),
+      Source::Base { green } => repository.base_part(green, blobs).map(|(_, kept)| kept),
       Source::Version { green, version } => repository.fragment_part(green, version, blobs),
     }
   }
@@ -559,7 +557,10 @@ impl Unit {
     };
     stored::fill(
       whole.len,
-      (from.max(header_len).saturating_sub(header_len), to.saturating_sub(header_len)),
+      (
+        from.max(header_len).saturating_sub(header_len),
+        to.saturating_sub(header_len),
+      ),
       &mut source,
       out,
     )

@@ -262,11 +262,7 @@ impl Sealing {
       self.adlers.push(sum.value());
       Stage::Pack { at: object.at }
     } else {
-      Stage::Adler {
-        whole,
-        at: to,
-        sum,
-      }
+      Stage::Adler { whole, at: to, sum }
     };
     Ok(())
   }

@@ -519,7 +519,10 @@ impl HookView {
   /// is handed beside its own input: `GIT_DIR`, and for a quarantined push the variables
   /// receive-pack sets to its quarantine (the `environment` module's docs), sorted by name.
   pub fn environment(&self, root: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
-    environment::environment(root, self.quarantine.as_ref().map(|(_, name)| name.as_slice()))
+    environment::environment(
+      root,
+      self.quarantine.as_ref().map(|(_, name)| name.as_slice()),
+    )
   }
 
   /// The pack named `pack`, found by halving.
