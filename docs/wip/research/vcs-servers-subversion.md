@@ -34,6 +34,11 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_subr/xml.c` (read 2026-11-19 for A-602) | `aeffb5c3effa073f` | C |
 | `subversion/libsvn_subr/ctype.c` (read 2026-11-19 for A-602) | `8c00533a27dc55f5` | C |
 | `subversion/include/svn_ctype.h` (read 2026-11-19 for A-602) | `2928f028e729a7b1` | B |
+| `subversion/libsvn_fs_fs/fs_fs.c` (read 2026-11-19 for A-592) | `b12b91eb0418577d` | C |
+| `subversion/libsvn_fs_fs/dag.c` (read 2026-11-19 for A-592) | `9efbb054b8818693` | C |
+| `subversion/libsvn_subr/path.c` (read 2026-11-19 for A-592) | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/sorts.c` (read 2026-11-19 for A-592) | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_subr/dirent_uri.c` (read 2026-11-19 for A-592) | `fe05687a2dedb22c` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -191,6 +196,23 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   `E210001` unknown command, `E210004` malformed data, `E210009` request size, `E220001` unreadable, `E220002`
   partially readable, `E220004` unwritable, `E125005` bad property value. (Derivation script kept outside the tree;
   `grep -n 'SVN_ERRDEF' svn_error_codes.h` shows each offset.)
+- **The merge, then the locks** [C: `tree.c` `svn_fs_fs__commit_txn` 2194 on, `merge_changes` 2284; `transaction.c`
+  `commit_body` 3797; read 2026-11-19 for A-592]: FSFS merges the head into the transaction first, and only a merged
+  transaction reaches `commit_body`, whose `verify_locks` checks the locks; so a work that conflicts is answered with
+  the conflict whatever locks stand in its way. The drive checks locks too: `fs-wrap.c` 151-152 begins a commit's
+  transaction with `SVN_FS_TXN_CHECK_LOCKS`, which `tree.c` honours at each editor call (1614, 2497, 2554, 2645).
+- **Subversion's path order** [C: `sorts.c` `svn_sort_compare_items_as_paths` 69-79, which is `path.c`
+  `svn_path_compare_paths` 418-453]: "Children of paths are greater than their parents, but less than greater siblings
+  of their parents": a `/` sorts before every other byte, so `/a/b` comes before `/a-b`, which byte order puts first.
+  `svn_fspath__skip_ancestor` (`dirent_uri.c` 2664, through `svn_relpath_skip_ancestor` 1530-1551) is what
+  `verify_locks` skips a checked subtree's paths by.
+- **Property lists compare by content** [C: `fs_fs.c` `svn_fs_fs__prop_rep_equal` 1608-1665]: the same representation
+  is equal, committed representations with different MD5s differ, and otherwise both lists are read and compared, so
+  an empty list and no list are equal.
+- **A transaction root's created revision** [C: `dag.c` `svn_fs_fs__dag_get_revision`]: "In the special case that
+  this is an unmodified transaction root, we need to actually get the revision of the noderev's predecessor (the
+  revision root); see Issue #2608"; every other node the transaction made answers no revision, so the drive's
+  out-of-date test passes it unless the client named a revision past the transaction's base.
 
 ## 7. Properties, locks, mergeinfo, hooks, authorization
 
@@ -305,3 +327,54 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
 4. Every constant the reference servers expose (§8) is a tunable slates learns (§4.17.1's rule).
 5. The test suite drives `svnadmin` and `svnlook` against a repository path, so slates must answer those verbs over its
    own repository, and the server must read the repository directory's `conf/` and `hooks/` (§9).
+
+## 11. Mergeinfo (A-605, §4.17.4 item 8 and piece 9)
+
+Read 2026-11-19 by g262 at the same revision (`1.14.x` at `d434dc14`), fetched as in §1. The sha256 prefixes:
+
+| File | sha256 (prefix) | Tier |
+|---|---|---|
+| `subversion/include/svn_mergeinfo.h` | `129d6739fee73856` (as §1) | B |
+| `subversion/include/private/svn_mergeinfo_private.h` | `d5b71c114d393f66` | B |
+| `subversion/include/svn_types.h` | `6167309dad233964` | B |
+| `subversion/libsvn_subr/mergeinfo.c` | `538cc82a8d6bca2f` | C |
+| `subversion/tests/libsvn_subr/mergeinfo-test.c` | `28381a00f69941fd` | C |
+| `subversion/libsvn_subr/types.c` | `8c9fe593b18d24cf` | C |
+| `subversion/libsvn_subr/string.c` | `62b5ad96280ba127` | C |
+| `subversion/libsvn_subr/dirent_uri.c` | `fe05687a2dedb22c` | C |
+| `subversion/libsvn_subr/path.c` | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/sorts.c` | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_fs_fs/dag.c` | `9efbb054b8818693` | C |
+| `subversion/libsvn_fs_util/fs-util.c` | `2c9eb29504df0be3` | C |
+| `subversion/libsvn_client/mergeinfo.c` | `b92a177e7a6abae0` | C |
+
+and `tree.c`, `fs-wrap.c`, `log.c`, `serve.c` and the protocol at §1's hashes.
+
+- **The parser** [C: `mergeinfo.c` `parse_pathname`, `parse_rangelist`, `parse_revision_line`, `parse_top`,
+  `svn_rangelist__canonicalize`; `types.c` `svn_revnum_parse`; `string.c` `svn__strtoul`]: a line's last colon divides;
+  the path is `svn_fspath__canonicalize`d (`dirent_uri.c` `canonicalize`: empty and `.` segments dropped, `..` kept); a
+  revision is digits alone (`svn__strtoul` reads no sign and no space), "longer than 10 digits" and a ten-digit value past
+  `APR_INT32_MAX` refused; `0` refused; horizontal space skipped only after the colon; "Range list parsing ended before
+  hitting newline" refuses a comma at the value's end while a comma before a newline passes; a key named twice is merged
+  (`svn_rangelist_merge2`, the comment on issue #3547); the value is read with `strlen`, and `verify_mergeinfo`
+  (`fs-wrap.c`) refuses a value whose `strlen` is not its length before parsing it. `svn_mergeinfo_parse` returns
+  `SVN_ERR_MERGEINFO_PARSE_ERROR` (200020) on top of every refusal.
+- **The algebra** [C: `mergeinfo.c`]: 1.14's union is a sweep over both lists' intervals in which a revision takes the
+  larger of `MI_NONE`, `MI_NON_INHERITABLE`, `MI_INHERITABLE` (`rangelist_merge`); intersection and removal are one walk
+  (`rangelist_intersect_or_remove`) that pushes through `combine_with_lastrange`. With `consider_inheritance` the walk is
+  not exact per revision: a first-list range met by a second-list range of the other kind is passed when it sorts first,
+  so `1-10` intersected with `3-4*,5-6` is empty and `1-10` with `3-4*,5-6` removed is `1-10` (traced by hand on the
+  code; the module's bound tests hold what is exact). The stock client computes `svn mergeinfo --show-revs` with these
+  functions (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`: `svn_mergeinfo_intersect2(..., TRUE)`,
+  `svn_rangelist_remove(..., TRUE)`, `svn_rangelist_diff(..., TRUE)`), so a server's answer equal to it needs these
+  functions as they are.
+- **The queries** [C: `tree.c` 4133-4420; `dag.c` 270-300; `fs-util.c` `svn_fs__append_to_merged_froms`; `fs-wrap.c`
+  `svn_repos_fs_get_mergeinfo2`]: the path must exist (`open_path` with no flags); the nearest node with `minfo-here` from
+  the path up (nearest-ancestor starts at the parent and answers none at the root; explicit looks at the path alone); a
+  value that fails to parse is none and ends the search (issue #3896); an ancestor's value is `svn_mergeinfo_inheritable2`
+  then extended by the path beneath it; descendants are crawled entering a directory only when `minfo-cnt` > 1, or = 1
+  without `minfo-here`; "claims to have mergeinfo but doesn't" is `SVN_ERR_FS_CORRUPT`; the repository layer filters the
+  requested paths by read access and not the descendants, and always adjusts what is inherited.
+- **Elision** [C: `libsvn_client/mergeinfo.c` `should_elide_mergeinfo`, `svn_client__elide_mergeinfo`]: no mergeinfo
+  never elides; empty elides to none or empty; any other never to none or empty, else when `svn_mergeinfo__equals` with
+  inheritance considered.
