@@ -101,9 +101,9 @@ fn commits<S: Graph>(
   }
   paint.run(graph, &sides.cut.grafts, |_| false, admission, counters)?;
   let sent = paint.chosen();
-  for _ in &sent {
-    charge::<S::Node>(admission)?;
-  }
+  admission
+    .charge_items::<S::Node>(sent.len())
+    .map_err(Refusal::PastAdmission)?;
   Ok(sent)
 }
 

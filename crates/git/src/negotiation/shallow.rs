@@ -20,6 +20,7 @@
 //! an empty shallow-info section, as git sends one. A client's shallow line naming an object the store does not hold is
 //! left out, as git leaves it out, and one naming an object that is no commit is refused.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::paint::{HAVE, Paint, WANT};
@@ -163,9 +164,9 @@ fn by_depth<S: Graph>(
   let mut depths: BTreeMap<S::Node, u32> = BTreeMap::new();
   let mut queue = VecDeque::new();
   for root in roots {
-    if !depths.contains_key(&root) {
+    if let Entry::Vacant(slot) = depths.entry(root) {
       charge::<(S::Node, u32)>(admission)?;
-      depths.insert(root, 1);
+      slot.insert(1);
       queue.push_back(root);
     }
   }
@@ -179,9 +180,9 @@ fn by_depth<S: Graph>(
     }
     whole.insert(commit);
     for parent in graph.parents(commit) {
-      if !depths.contains_key(&parent) {
+      if let Entry::Vacant(slot) = depths.entry(parent) {
         charge::<(S::Node, u32)>(admission)?;
-        depths.insert(parent, at.saturating_add(1));
+        slot.insert(at.saturating_add(1));
         queue.push_back(parent);
       }
     }
@@ -250,6 +251,9 @@ fn by_rev_list<S: Graph>(
     |commit| since.is_some_and(|time| graph.commit(commit).is_some_and(|row| row.date < time));
   paint.run(graph, &BTreeSet::new(), old, admission, counters)?;
   let selected = paint.chosen();
+  admission
+    .charge_items::<S::Node>(selected.len())
+    .map_err(Refusal::PastAdmission)?;
   if selected.is_empty() {
     return Err(Refusal::NothingSelected);
   }
