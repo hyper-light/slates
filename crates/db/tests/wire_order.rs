@@ -19,7 +19,10 @@
 mod order;
 
 use slates_db::catalog::{
-  AttachForm, AuditKind, BaseRecord, Consumer, GrantScope, GrantState, GrantSurface, HookPointName, LandingState, LogName, MemberOrigin, NameChange, NamePolicy, ObjectFormat, PlacementState, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyWho, Principal, RepositoryCheck, Role, SealKeyOwner, SizeClass, StateChange, StateLog, VcsTool, VolumeState, WriteMode,
+  AttachForm, AuditKind, BaseRecord, Consumer, GrantScope, GrantState, GrantSurface, HookPointName,
+  LandingState, LogName, MemberOrigin, NameChange, NamePolicy, ObjectFormat, PlacementState,
+  PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyWho, Principal, RepositoryCheck, Role,
+  SealKeyOwner, SizeClass, StateChange, StateLog, VcsTool, VolumeState, WriteMode,
 };
 use slates_db::op::Op;
 use slates_wire::Wire;

@@ -147,7 +147,10 @@ fn repository(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) 
     panic!("no repository: {reply:?}")
   };
   let repositories = state.db.partition().repositories();
-  let repo = repositories.repository_named(name).expect("the repository").id;
+  let repo = repositories
+    .repository_named(name)
+    .expect("the repository")
+    .id;
   (repo, to_db_volume(id))
 }
 
@@ -235,9 +238,9 @@ fn kept(state: &mut ShardState, repository: RepositoryId, greens: &[DbVolumeId])
     .iter()
     .map(|green| {
       let mut engine = state.greens.get_mut(green);
-      let (engine_head, identity) = engine
-        .as_mut()
-        .map_or((None, None), |engine| (Some(engine.head()), Some(engine.head_identity())));
+      let (engine_head, identity) = engine.as_mut().map_or((None, None), |engine| {
+        (Some(engine.head()), Some(engine.head_identity()))
+      });
       drop(engine);
       (
         state.db.partition().green_head(*green),
@@ -360,7 +363,10 @@ fn assert_both_moved_in_one_record(
   assert_eq!(record_at(state, topic, 1), Some(record.clone()));
   assert_eq!(
     logs_of(&record),
-    vec![LogName::Green { green: main }, LogName::Green { green: topic }]
+    vec![
+      LogName::Green { green: main },
+      LogName::Green { green: topic }
+    ]
   );
   assert_eq!(file(state, main, "f").as_deref(), Some(&b"two"[..]));
   assert_eq!(file(state, topic, "g").as_deref(), Some(&b"topic"[..]));
@@ -404,7 +410,11 @@ fn assert_refused_whole(
   };
   let named: Vec<usize> = refused.iter().map(|refused| refused.index).collect();
   assert_eq!(named, indexes);
-  assert_eq!(kept(state, repo, &greens), before, "a refused push applied something");
+  assert_eq!(
+    kept(state, repo, &greens),
+    before,
+    "a refused push applied something"
+  );
   refused
 }
 
@@ -424,7 +434,13 @@ fn a_push_creates_and_deletes_branches_in_the_same_step() {
         name: "feature".to_owned(),
         from: main,
         version: 1,
-        work: Some(work(state, main, (1, Some(one)), (featured, b"fe1"), (&store, 6))),
+        work: Some(work(
+          state,
+          main,
+          (1, Some(one)),
+          (featured, b"fe1"),
+          (&store, 6),
+        )),
       },
       BranchChange::Delete {
         name: "topic".to_owned(),
@@ -447,14 +463,20 @@ fn assert_created_deleted_and_moved(
   pushed: &Pushed,
   [main, topic]: [DbVolumeId; 2],
 ) {
-  let Some(BranchPushed::Created { green: feature, version: 1 }) = pushed.changes.first().cloned()
+  let Some(BranchPushed::Created {
+    green: feature,
+    version: 1,
+  }) = pushed.changes.first().cloned()
   else {
     panic!("no branch made: {pushed:?}")
   };
   let repositories = state.db.partition().repositories();
   assert_eq!(repositories.branch(repo, "feature"), Some(feature));
   assert_eq!(repositories.branch(repo, "topic"), None);
-  assert!(repositories.member(topic).is_some(), "a deleted branch's green is kept");
+  assert!(
+    repositories.member(topic).is_some(),
+    "a deleted branch's green is kept"
+  );
   assert_eq!(file(state, feature, "f").as_deref(), Some(&b"one"[..]));
   assert_eq!(file(state, feature, "h").as_deref(), Some(&b"new"[..]));
   assert_eq!(head(state, feature).as_deref(), Some(&b"fe1"[..]));
@@ -516,7 +538,10 @@ fn every_refused_change_is_named_and_nothing_is_applied() {
     ];
     let refused = assert_refused_whole(state, (repo, [main, topic]), changes, &[0, 1, 2, 3, 4, 5]);
     assert_eq!(
-      refused.iter().map(|refused| refused.why.clone()).collect::<Vec<_>>(),
+      refused
+        .iter()
+        .map(|refused| refused.why.clone())
+        .collect::<Vec<_>>(),
       vec![
         ChangeRefusal::Refused(Refusal::AlreadyExists {
           existing: crate::verbs::to_wire_volume(main)
@@ -586,7 +611,13 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
       name: "made".to_owned(),
       from: main,
       version: 1,
-      work: Some(work(state, main, (1, Some(one)), (made, b"m1"), (store, 10))),
+      work: Some(work(
+        state,
+        main,
+        (1, Some(one)),
+        (made, b"m1"),
+        (store, 10),
+      )),
     },
     BranchChange::Update {
       green: topic,
@@ -598,7 +629,10 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
     refused.first().map(|refused| &refused.why),
     Some(ChangeRefusal::Conflict { windows }) if !windows.is_empty()
   ));
-  assert_eq!(state.db.partition().repositories().branch(repo, "made"), None);
+  assert_eq!(
+    state.db.partition().repositories().branch(repo, "made"),
+    None
+  );
 }
 
 /// A-635 (the gates every merge passes, and the entry's own refusals). Do: push a move with a check of another
@@ -617,9 +651,7 @@ fn the_gates_and_the_entry_refuse_the_whole_push() {
     assert_a_failed_check_refuses_the_entry(state, (repo, [main, topic]), moving.clone());
     assert_the_state_moves_with_the_push(state, repo, main, moving);
     assert_the_write_policy_gates_the_push(state, repo, main, &mut store);
-    let elsewhere = RepositoryId {
-      bytes: [0xee; 16],
-    };
+    let elsewhere = RepositoryId { bytes: [0xee; 16] };
     assert_eq!(
       push(state, &stranger(), repo, Vec::new(), EntryParts::default()),
       Err(PushRefused::Repository(Refusal::Forbidden {
@@ -627,7 +659,13 @@ fn the_gates_and_the_entry_refuse_the_whole_push() {
       }))
     );
     assert_eq!(
-      push(state, &owner(), elsewhere, Vec::new(), EntryParts::default()),
+      push(
+        state,
+        &owner(),
+        elsewhere,
+        Vec::new(),
+        EntryParts::default()
+      ),
       Err(PushRefused::Repository(Refusal::NotFound))
     );
   });
@@ -725,7 +763,12 @@ fn assert_the_write_policy_gates_the_push(
         },
       }),
     ),
-    (WriteMode::Ask, ChangeRefusal::ApprovalRequired { identity: moving.id }),
+    (
+      WriteMode::Ask,
+      ChangeRefusal::ApprovalRequired {
+        identity: moving.id,
+      },
+    ),
   ] {
     let policy = Op::VolumeWritePolicySet {
       id: main,
@@ -735,7 +778,10 @@ fn assert_the_write_policy_gates_the_push(
         require_signed_merges: false,
       },
     };
-    state.db.mutate(&mut state.segment, &policy, 0).expect("the policy is set");
+    state
+      .db
+      .mutate(&mut state.segment, &policy, 0)
+      .expect("the policy is set");
     let changes = vec![BranchChange::Update {
       green: main,
       work: moving.clone(),

@@ -359,7 +359,11 @@ fn assert_stale_and_outside_entries_are_refused(
   for outsider in [plain, foreign, green(99)] {
     let mut outside = at(repo);
     outside.versions = vec![version(c, 1, b"c1"), version(outsider, 1, b"x")];
-    assert_eq!(advance(partition, outside), Err(DbError::NotFound), "{outsider:?}");
+    assert_eq!(
+      advance(partition, outside),
+      Err(DbError::NotFound),
+      "{outsider:?}"
+    );
   }
   assert_eq!(
     partition.to_snapshot(0),
@@ -510,7 +514,11 @@ fn the_repositorys_state_moves_in_logs_of_its_own_with_its_push_or_alone() {
   };
   assert_eq!(partition.repositories().atomic_at(a, 1), Some(&record));
   let mut alone = at(repo);
-  alone.state = vec![root_removed(1, 1), root_added(1, 2), locked("x.bin", b"lock-1")];
+  alone.state = vec![
+    root_removed(1, 1),
+    root_added(1, 2),
+    locked("x.bin", b"lock-1"),
+  ];
   advance(&mut partition, alone).unwrap();
   assert_state_logs_read_back(&partition, repo);
   assert_wrong_state_changes_are_refused(&mut partition, repo, a);
@@ -540,7 +548,11 @@ fn assert_state_logs_read_back(partition: &Partition, repo: RepositoryId) {
   assert_eq!(positions, vec![Some(6), Some(3), Some(2), Some(1)]);
 }
 
-fn assert_wrong_state_changes_are_refused(partition: &mut Partition, repo: RepositoryId, a: VolumeId) {
+fn assert_wrong_state_changes_are_refused(
+  partition: &mut Partition,
+  repo: RepositoryId,
+  a: VolumeId,
+) {
   let before = partition.to_snapshot(0);
   for (state, index) in [
     (vec![root_added(1, 2)], 0),
@@ -876,10 +888,17 @@ struct EntryStep {
 enum Step {
   Advance(EntryStep),
   /// One member's version alone (`Op::GreenAdvanced`), a single-green push between the records.
-  Single { green: u8 },
+  Single {
+    green: u8,
+  },
   /// A member's checkpoint `back` versions below its head.
-  Checkpoint { green: u8, back: u8 },
-  Destroy { volume: u8 },
+  Checkpoint {
+    green: u8,
+    back: u8,
+  },
+  Destroy {
+    volume: u8,
+  },
   Snapshot,
   Crash,
 }
@@ -903,9 +922,7 @@ fn check_step() -> impl Strategy<Value = CheckStep> {
 fn name_step() -> impl Strategy<Value = NameStep> {
   (0..6u8, 0..=NAMES, pick(), any::<bool>()).prop_map(|(kind, name, green, some)| match kind {
     0..=2 => NameStep::Bind { name, green },
-    3 | 4 => NameStep::Retire {
-      name: name % NAMES,
-    },
+    3 | 4 => NameStep::Retire { name: name % NAMES },
     _ => NameStep::Default {
       name: some.then_some(name),
     },
@@ -917,18 +934,23 @@ fn state_step() -> impl Strategy<Value = StateStep> {
     0 => StateStep::Add { phase, node },
     1 => StateStep::Remove { phase, node },
     2 => StateStep::Marker { marker: n },
-    3 => StateStep::Lock { path: n, lock: node },
-    _ => StateStep::Unlock { path: n, lock: node },
+    3 => StateStep::Lock {
+      path: n,
+      lock: node,
+    },
+    _ => StateStep::Unlock {
+      path: n,
+      lock: node,
+    },
   })
 }
 
 fn entry_step() -> impl Strategy<Value = EntryStep> {
-  let join = (0..VOLUMES, any::<u8>(), pick(), 0..4u8).prop_map(|(volume, root, from, version)| {
-    JoinStep {
+  let join =
+    (0..VOLUMES, any::<u8>(), pick(), 0..4u8).prop_map(|(volume, root, from, version)| JoinStep {
       volume,
       from: (root % 10 != 0).then_some((from, version)),
-    }
-  });
+    });
   (
     proptest::bool::weighted(0.6),
     proptest::collection::vec(check_step(), 0..3),
@@ -948,20 +970,17 @@ fn entry_step() -> impl Strategy<Value = EntryStep> {
 }
 
 fn step() -> impl Strategy<Value = Step> {
-  (
-    0..20u8,
-    entry_step(),
-    0..VOLUMES,
-    any::<u8>(),
-  )
-    .prop_map(|(kind, entry, volume, n)| match kind {
-      0..=10 => Step::Advance(entry),
-      11..=13 => Step::Single { green: n },
-      14 => Step::Checkpoint { green: n, back: volume },
-      15 => Step::Destroy { volume },
-      16 => Step::Snapshot,
-      _ => Step::Crash,
-    })
+  (0..20u8, entry_step(), 0..VOLUMES, any::<u8>()).prop_map(|(kind, entry, volume, n)| match kind {
+    0..=10 => Step::Advance(entry),
+    11..=13 => Step::Single { green: n },
+    14 => Step::Checkpoint {
+      green: n,
+      back: volume,
+    },
+    15 => Step::Destroy { volume },
+    16 => Step::Snapshot,
+    _ => Step::Crash,
+  })
 }
 
 /// What an operation was answered, by kind, with what an entry's refusal names.
@@ -1120,7 +1139,9 @@ impl Model {
         Ok(())
       }
       RepositoryCheck::Names { prefix, bound } if self.under(prefix) != *bound => Err(failed),
-      RepositoryCheck::Log { log, position } if self.state_position(*log) != *position => Err(failed),
+      RepositoryCheck::Log { log, position } if self.state_position(*log) != *position => {
+        Err(failed)
+      }
       _ => Ok(()),
     }
   }
@@ -1172,7 +1193,11 @@ impl Model {
       spans
         .entry(log)
         .and_modify(|span| span.to = span.to.max(version.version))
-        .or_insert(span(log, before.head(index_of(version.green)), version.version));
+        .or_insert(span(
+          log,
+          before.head(index_of(version.green)),
+          version.version,
+        ));
     }
     for log in STATE_LOGS {
       let (from, to) = (before.state_position(log), self.state_position(log));
@@ -1388,7 +1413,11 @@ impl Model {
       }
     }
     for made in entry.versions {
-      let next = version(made.green, scratch.head(index_of(made.green)) + 1, &made.entry);
+      let next = version(
+        made.green,
+        scratch.head(index_of(made.green)) + 1,
+        &made.entry,
+      );
       if scratch.version(&next).is_ok() {
         kept.versions.push(next);
       }
@@ -1410,7 +1439,11 @@ impl Model {
   fn made(&self, repository: RepositoryId, step: &EntryStep) -> RepositoryEntry {
     let mut heads: BTreeMap<u8, u64> = BTreeMap::new();
     let mut entry = at(repository);
-    entry.checks = step.checks.iter().map(|check| self.check_of(check)).collect();
+    entry.checks = step
+      .checks
+      .iter()
+      .map(|check| self.check_of(check))
+      .collect();
     entry.joined = step
       .joins
       .iter()
@@ -1428,13 +1461,23 @@ impl Model {
       .collect();
     for (green, skew) in &step.versions {
       let green = self.picked(*green);
-      let next = heads.get(&green).copied().unwrap_or_else(|| self.head(green)) + 1;
+      let next = heads
+        .get(&green)
+        .copied()
+        .unwrap_or_else(|| self.head(green))
+        + 1;
       let version_made = skew.apply(next);
       heads.insert(green, version_made);
       let bytes = format!("{green}@{version_made}").into_bytes();
-      entry.versions.push(version(volume_of(green), version_made, &bytes));
+      entry
+        .versions
+        .push(version(volume_of(green), version_made, &bytes));
     }
-    entry.names = step.names.iter().map(|change| self.name_of_step(change)).collect();
+    entry.names = step
+      .names
+      .iter()
+      .map(|change| self.name_of_step(change))
+      .collect();
     entry.state = step.state.iter().map(state_of_step).collect();
     entry
   }
@@ -1497,7 +1540,11 @@ fn state_of_step(change: &StateStep) -> StateChange {
 /// What the partition holds of the repository, in the model's terms.
 fn observed(partition: &Partition, repository: RepositoryId) -> Model {
   let repositories = partition.repositories();
-  let position = |log| repositories.log_position(repository, log).unwrap_or(u64::MAX);
+  let position = |log| {
+    repositories
+      .log_position(repository, log)
+      .unwrap_or(u64::MAX)
+  };
   let records = repositories
     .atomic_records()
     .map(|record| {
@@ -1774,7 +1821,9 @@ impl History {
     if log.entries.is_empty() {
       return Ok(());
     }
-    let version = log.head().saturating_sub(u64::from(back) % log.entries.len() as u64);
+    let version = log
+      .head()
+      .saturating_sub(u64::from(back) % log.entries.len() as u64);
     let records = self.model.records.len();
     self.model.checkpoint(green, version);
     census.records_folded += u64::from(self.model.records.len() < records);

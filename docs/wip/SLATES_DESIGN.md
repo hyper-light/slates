@@ -43189,3 +43189,77 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
 - **Owed.** receive-pack's part 2 submitting each ref's work through these views (A-620's part 2). The submodule link's
   special-node kind (A-637). Charging the transient tables A-618's walk holds, beside the store's room.
+
+### A-635 — The push over several works, all or none, and A-603's entry rebuilt to A-642's logs: each green its own log, an atomic record a holder applies at its join, a cut that splits one refused (2026-11-19, g261 for UI goal 93; §4.17.1 items 2 and 3 and shared piece 2; §4.16 "Commit"; §4.17.2 "A push" steps 6 and 7; §4.17.3 decision 6; A-642; after A-603, A-618)
+Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
+GAPS (the §4.17 entry), `crates/merge/src/engine.rs` (`Judged`, `Judgment`, `HeadMoved`, `Green::judge`,
+`Green::commit_judged`; `submit_resolved` made of them) and `engine/judge_tests.rs` (new), `crates/merge/src/lib.rs`,
+`crates/db/src/{catalog,error,lib,partition,repository}.rs` and `repository/entry.rs` with its tests (rewritten),
+`crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/protocol.rs` (`DatabaseRefusal::Moved`, appended; `OutOfOrder`
+superseded, kept on the wire), `crates/ipc/tests/wire_order.txt`, `crates/server/src/{error,repository,verbs}.rs` and
+`crates/server/src/repository/push.rs` with its tests (new).
+- **What was there.** A-603's register gave every change of a repository the next position of one repository-wide
+  register; a push of several greens had no verdict that judged all of its works before any committed; A-618 made a
+  client's push into one work per green. Ada's A-642 (2026-11-19, worst case: a huge push to one green would stall
+  every other green's commits behind it until it replicated) replaced the register with each green's own log.
+- **The verdict split.** `Green::judge` decides an increment as a submit does and holds the verdict (`Judged`: the
+  increment, the head it was judged at, its effects and what the chain records of them), applying nothing but a
+  conflict's entry in the rejected-result cache; `Green::commit_judged` commits it as the version after that head, or
+  refuses `HeadMoved` with nothing applied once the green moved. `submit_resolved` is a judgment committed at once, so a
+  submit and a push run one verdict.
+- **The push.** `crates/server/src/repository/push.rs`, one interface: `RepositoryLogs::append(principal, repository,
+  changes, parts) -> Result<Pushed, PushRefused>`, implemented by the shard's state (`push`), and fakeable by a tool's
+  tests. Each change is `BranchChange::Update { green, work }` (A-618's work against the branch's green),
+  `Create { name, from, version, work }` (a new branch made at `version` of member `from`, moved by a work made against
+  `from` at `version`, which applies to the new green at its version 0) or `Delete { name, version }` (retired, its green
+  kept, unless it moved past the version the client saw); `EntryParts` carries checks, names and state changes. Nothing
+  is applied until everything passed: each change's rules (a member, a free or bound name, a version a branch can be made
+  at, one change a green or a name, each green's write policy, evidence and signature gates, A-285 and A-321); the new
+  branches made in memory (`Lineage::branch`); each green's retention secured; every work's verdict held; the whole
+  entry judged by the register's guard with its new greens counted held (`Partition::check_creating`, which judges
+  their records and then the entry before either is recorded). Then the verdicts commit, at the heads they were judged
+  at, and the new greens' records and the entry are one log record. A refusal names every change refused and why
+  (`ChangeRefused { index, why }`: the verdict's windows, `Moved`, `Twice`, `ApprovalRequired` naming the work an
+  approver would approve, or the wire's typed refusal) or the entry's (`PushRefused::Entry`), and gives back what it
+  held: a branch made in memory is retired, every retention trued up. A work sent again is answered its version and
+  records nothing.
+- **A-642's logs.** No position of a whole repository: each green keeps its own log (its chain), and the repository's
+  own state is kept in logs of its own, the names log (the namespace and the lineage's joins), the phases, markers and
+  locks logs, each at its own position, moved only by its own changes; the policy's version is its own (A-622). A
+  version appends only while its green is at the position the push read, else the entry is refused `Moved { green,
+  read, at }`; a head check compares a green's position the same way; `RepositoryCheck::Log` compares a state log's.
+  Git LFS's locks are state changes (`LockTaken`, refused on a locked path; `LockReleased`, refused unless the path
+  holds exactly that lock). A member's version alone is again `Op::GreenAdvanced`, its own log's append.
+- **Atomic records.** An entry that moves two logs or more, a green's among them, is an `AtomicRecord`: its spans list
+  each log it moved, from the position it found to the one it left. Each position it took on each green's log points to
+  it (`Repositories::atomic_at`); a holder applies it only at its join (`AtomicRecord::join`: `Ready` with every log at
+  its predecessor, `Waiting`, `Applied`, `Diverged`); a cut that holds part of it is refused
+  (`Repositories::split_by`); a recovery replays the partition's log, which holds the record whole, and a snapshot
+  carries each record with the positions still pointing to it (`AtomicHeld`): the model test's first run found a
+  restore that derived the pointers from the spans bring back one a checkpoint had folded. A record goes once no green's
+  log points to it (its checkpoints and destroys).
+- **Tests** (Mac Studio, 2026-11-19, on the tree merged with main at 06d05cbca): `cargo test -p slates-merge --lib`
+  94 of 94, `-p slates-db --lib` 138 of 138, `-p slates-ipc --lib` 74 passed and 2 ignored, `-p slates-server --lib`
+  577 passed, 3 ignored, 1 failed (main's status-capture deadline test); `cargo fmt --all` applied from the Studio's
+  diff. The engine's oracle holds judging then committing equal to a submit over 256 generated histories (census: 1,977
+  accepts, 251 works sent again, 609 conflicts). The db's unit tests drive each rule (several greens together or none,
+  `Moved` naming the green; checks of heads, names and state logs; the state's logs and locks; the budget; no change
+  waiting on another log's position; a holder's join and a split cut; a record's life), and its model test runs 128
+  generated histories through a database over a real anchor segment with crashes at random points: Agreement (every
+  answer and the whole repository equal to the rules over plain maps, an entry all or none by construction),
+  StaleNeverCommits (an entry made against a moved green refused naming it, nothing of it applied) and NoLoss (every
+  recovered partition equal to the live one whole); census: 181 atomic records over several greens, 344 single-green
+  appends interleaved with records, 408 state moves with versions and 153 alone, 119 stale entries refused, 134 by a
+  check, 50 by a state change, 398 by a rule, 76 records folded, 18 members destroyed, and 307 recoveries from a snapshot
+  and 32 from the log with a record held. The server's tests push A-618's works built over a store: two branches in one
+  record, the same push again recording nothing, a stale work refusing the whole push with nothing applied and its
+  retention given back; a create, a delete and a move in one record; every refused change named by its index and kind;
+  a conflict retiring the branch made for it; the gates (forbidding and asking policies, a failed check, a stranger, no
+  repository). Red sixteen ways: in the engine, a commit without its head check and a verdict held at the wrong head; in
+  the database, the version's position, the head check's `Moved`, the state log check, the record kept, its fold, the
+  snapshot's pointers, the join, the split, the names log and the lock's precondition; in the server, a refused verdict
+  ignored, a branch made in memory kept, a delete's version unchecked and a retention not given back.
+- **Owed.** The fleet half (A-636): each green's log and each state log replicated on its own, holders applying atomic
+  records at their joins, replicas refusing split cuts, takeovers adopting each log and each record whole; the
+  repository policy's check before the verdict (A-622's next part); a stack of several works on one green in one push
+  (works over works, piece 5).

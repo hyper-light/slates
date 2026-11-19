@@ -315,13 +315,20 @@ fn plan(
   let mut refused = Vec::new();
   for (index, change) in changes.into_iter().enumerate() {
     let planned = match change {
-      BranchChange::Update { green, work } => plan_update(state, record.id, (green, work), &mut greens),
+      BranchChange::Update { green, work } => {
+        plan_update(state, record.id, (green, work), &mut greens)
+      }
       BranchChange::Create {
         name,
         from,
         version,
         work,
-      } => plan_create(state, (record, principal), (name, from, version, work), &mut names),
+      } => plan_create(
+        state,
+        (record, principal),
+        (name, from, version, work),
+        &mut names,
+      ),
       BranchChange::Delete { name, version } => {
         plan_delete(state, record.id, (name, version), (&mut names, &mut greens))
       }
@@ -432,7 +439,8 @@ fn plan_create(
     return Err(refused(Refusal::NotFound));
   }
   let version = super::branch_version(state, from, Some(version)).map_err(refused)?;
-  let id = crate::verbs::fresh_volume_id(state).ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
+  let id =
+    crate::verbs::fresh_volume_id(state).ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
   let named = super::member_name(&record.name, &name, id).map_err(refused)?;
   let require_evidence = requires_evidence(state, from);
   if require_evidence && work.as_ref().is_some_and(|work| work.evidence.is_empty()) {
@@ -549,7 +557,11 @@ fn make(state: &mut ShardState, steps: &[Step], held: &mut Held) -> Result<(), V
 }
 
 /// Secures each work's retention on its green before the verdict (A-16), folding first to leave it room.
-fn secure(state: &mut ShardState, steps: &[Step], held: &mut Held) -> Result<(), Vec<ChangeRefused>> {
+fn secure(
+  state: &mut ShardState,
+  steps: &[Step],
+  held: &mut Held,
+) -> Result<(), Vec<ChangeRefused>> {
   let mut refused = Vec::new();
   for (index, step) in steps.iter().enumerate() {
     let Some((green, work)) = step.work() else {
@@ -608,7 +620,10 @@ fn judge(
       verdicts.push(None);
       continue;
     };
-    let judgment = state.greens.get_mut(&green).map(|mut engine| engine.judge(work));
+    let judgment = state
+      .greens
+      .get_mut(&green)
+      .map(|mut engine| engine.judge(work));
     let why = match judgment {
       Some(Judgment::Accepted(judged)) => {
         verdicts.push(Some(Verdict::Held(judged)));
@@ -624,10 +639,12 @@ fn judge(
         }
         ChangeRefusal::Conflict { windows }
       }
-      Some(Judgment::BaseUnavailable { base, .. }) => ChangeRefusal::Refused(Refusal::UnknownBase {
-        green: to_wire_volume(green),
-        version: base,
-      }),
+      Some(Judgment::BaseUnavailable { base, .. }) => {
+        ChangeRefusal::Refused(Refusal::UnknownBase {
+          green: to_wire_volume(green),
+          version: base,
+        })
+      }
       None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
     };
     verdicts.push(None);
@@ -655,7 +672,11 @@ fn entry(
   };
   for step in steps {
     match step {
-      Step::Delete { name, green, version } => {
+      Step::Delete {
+        name,
+        green,
+        version,
+      } => {
         entry.checks.push(RepositoryCheck::Head {
           green: *green,
           version: *version,
@@ -800,7 +821,8 @@ fn recorded_entry(
           .map(|mut engine| engine.head_identity())
       })
       .flatten();
-    let bytes = slates_merge::chain_entry::encode(&work.encode(), work, applied, None, identity, None);
+    let bytes =
+      slates_merge::chain_entry::encode(&work.encode(), work, applied, None, identity, None);
     versions.push(GreenVersion {
       green,
       version: *version,
@@ -841,7 +863,15 @@ fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), PushRefused> {
 fn after(state: &mut ShardState, steps: &[Step], committed: &Committed, held: &mut Held) {
   for (step, made) in steps.iter().zip(committed) {
     if let Step::Create { record, .. } = step {
-      crate::merge_service::enqueue_record(state, record.id, 0, [0u8; 32], 0, Vec::new(), (None, None));
+      crate::merge_service::enqueue_record(
+        state,
+        record.id,
+        0,
+        [0u8; 32],
+        0,
+        Vec::new(),
+        (None, None),
+      );
     }
     if let (Some((green, work)), Some((version, _, false))) = (step.work(), made) {
       crate::merge_service::enqueue_record(

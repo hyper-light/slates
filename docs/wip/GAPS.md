@@ -178,6 +178,16 @@
 > the repository's candidates, holders recomputing every version of an entry before acknowledging, all or none,
 > takeovers adopting whole entries, the repository record replicated with it). Until then an entry of several greens is
 > atomic on its owner and not across a takeover.
+> **A-635 (2026-11-19, g261; the push over several works, and A-603 rebuilt to A-642's logs):** `Green::judge` and
+> `Green::commit_judged` split the verdict, so a push holds every work's verdict before any commits; the server's one
+> interface `RepositoryLogs::append` (`crates/server/src/repository/push.rs`) takes updates, creates and deletes with
+> checks, names and state, all or none, typed refusals naming each change refused. A-603's repository-wide position is
+> gone: each green keeps its own log, a version appends only at the position the push read (`Moved` naming the green
+> otherwise), the repository's state is kept in logs of its own (names, phases, markers, locks), and an entry over two
+> logs or more is an atomic record each green's log points to, applied by a holder at its join, a cut splitting it
+> refused. Tests on the Mac Studio: merge 94/94, db 138/138 (model test with crashes: Agreement, StaleNeverCommits,
+> NoLoss), ipc 74, server 577 with main's known failure; red sixteen ways. Owed: the fleet half (A-636), the policy's
+> check (A-622's next part), stacks of works on one green (piece 5).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the

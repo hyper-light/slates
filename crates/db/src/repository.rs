@@ -859,7 +859,11 @@ impl Repositories {
     entry: &crate::catalog::RepositoryEntry,
     greens: Vec<LogSpan>,
   ) -> Result<StateBytes, DbError> {
-    let Some(before) = self.registers.get(&entry.repository).map(Register::positions) else {
+    let Some(before) = self
+      .registers
+      .get(&entry.repository)
+      .map(Register::positions)
+    else {
       return Err(DbError::NotFound);
     };
     if !self.records.contains_key(&entry.repository) {
@@ -888,7 +892,10 @@ impl Repositories {
       }
     }
     let namespace = entry.joined.len().saturating_add(entry.names.len());
-    self.names_moved(entry.repository, u64::try_from(namespace).unwrap_or(u64::MAX));
+    self.names_moved(
+      entry.repository,
+      u64::try_from(namespace).unwrap_or(u64::MAX),
+    );
     let mut bytes = StateBytes::default();
     let mut spans = greens;
     if let Some(register) = self.registers.get_mut(&entry.repository) {
@@ -958,7 +965,10 @@ impl Repositories {
     }
     for pointer in &held.pointers {
       let within = held.record.spans.iter().any(|span| {
-        span.log == LogName::Green { green: pointer.green }
+        span.log
+          == LogName::Green {
+            green: pointer.green,
+          }
           && pointer.version > span.from
           && pointer.version <= span.to
       });

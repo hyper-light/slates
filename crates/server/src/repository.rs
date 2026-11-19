@@ -36,8 +36,8 @@
 //! its id.
 
 use slates_db::catalog::{
-  BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy,
-  PolicyRecord, Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
+  BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
+  Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
   SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::op::Op;
@@ -950,7 +950,8 @@ mod tests {
           .repositories()
           .log_position(repo, slates_db::catalog::StateLog::Names)
       };
-      let head_of = |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
+      let head_of =
+        |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
       assert_eq!(names(state), Some(2), "the root joined and its name bound");
       write(state, root, b"v1", 1);
       write(state, root, b"v2", 2);
@@ -965,10 +966,16 @@ mod tests {
       retire_and_bind_again(state, topic);
       assert_eq!(names(state), Some(6));
       write(state, topic, b"t1", 3);
-      assert_eq!((names(state), head_of(state, topic), head_of(state, root)), (Some(6), 1, 2));
+      assert_eq!(
+        (names(state), head_of(state, topic), head_of(state, root)),
+        (Some(6), 1, 2)
+      );
       assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic);
       assert_eq!(names(state), Some(6));
-      assert_eq!(state.db.partition().repositories().atomic_records().count(), 0);
+      assert_eq!(
+        state.db.partition().repositories().atomic_records().count(),
+        0
+      );
     });
   }
 
