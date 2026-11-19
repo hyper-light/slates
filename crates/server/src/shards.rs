@@ -605,6 +605,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
     rights: granted,
     // A guest presents no mount capability: the zero token is refused by every edge that checks one.
     token: [0; 16],
+    mount: None,
   };
   let registry = match s.attachments.attach(
     volume,

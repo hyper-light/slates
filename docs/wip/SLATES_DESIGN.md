@@ -3023,7 +3023,14 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
   has none) and an unmount slower than any bound all end their attachments when the kernel lets the mount go, and a
   mount that stays keeps its attachment. Until A-511 a `UMNT` started a confirmation against the table that gave up
   at a bound (a fixed second, then the pace learned in A-493), and a mount unmounted with no `UMNT` kept its
-  attachment for good.
+  attachment for good. Since A-540 the mount's id also lives in its attachment's durable record once the mount is
+  seen (`Op::AttachmentMountSeen`, at the bind and at a start that finds it), so a restarted daemon reads the table
+  once as it starts (`own_nfs::learn`) and ends every attachment whose recorded mount the table no longer names: the
+  kernel let it go while no daemon ran. An attachment whose record keeps no id was never seen mounted, and the
+  table's silence about its point proves nothing: a bind of a point that holds no mount records the same as a bind of
+  a live one (`own_nfs.bind_unconfirmed`), and the CLI and the kernel may name one point differently. Ending it could
+  end a live mount's attachment, so it keeps the rule before A-540: held if its volume's mount is at exactly its
+  point (its id recorded from then on), left for a `detach` if not.
 - **OCI binds.** The source mount's attachment is found by that same bound mount point in the
   daemon's records.
 - **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
@@ -4438,6 +4445,13 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > **Reconciled 2026-11-06 (VFS plan Step 15).** The Linux bind over the daemon's FUSE mount and the container lane run
 > on a real kernel in CI (6ba06780, f7c88d2f; 9edd0681), and a live guest is AC-9.7's evidence on the vhost-user route
 > (5ad111d3). Still owed: a live guest of the in-process route.
+>
+> **The form through the library (A-520, 2026-11-18).** A host that drives slates through its library alone (§4.12)
+> binds a volume's mount into a container with `Instance::bind_into_container` and the seam's verb of that name, which
+> ask this form and answer the binding's attachment and the runtime's entry (`ContainerBind`, `CONTRACT` = 44); the
+> simulator judges the mounts it recorded as this form judges the kernel's table. kiln's container engine binds each
+> agent's workspace mount so (kiln's `docs/agentic.md` W9). Still the command line's alone, owed to the library next:
+> the engine's profile (`slates oci-runtime`) and the check just before the runtime binds (`slates oci-check`).
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -9101,6 +9115,12 @@ it builds against the contract and adds to it rather than around it.
 > `MountFault::Busy`; a call that said done while the table still lists the mount is `MountFault::StillMounted`; a
 > table that could not be read is `MountFault::MountTable`. Linux keeps `fusermount3 -u`, the setuid helper its FUSE
 > mount is made through (`umount2(2)` needs `CAP_SYS_ADMIN`), under the same table judgment.
+> **`CONTRACT` = 44 (A-520):** a host mount bound into a container is a verb of the contract:
+> `Instance::bind_into_container(volume, source, destination, intent)` and the seam's verb answer a `ContainerBind`, the
+> binding's attachment and the entry the host's OCI runtime performs (`OciBinding` and its `HostMountEvidence`, now
+> re-exported), refused typed as the daemon refuses §4.6 A-9's form. Until then the form was the wire's and the command
+> line's alone, and kiln, which reaches slates only through this library, could not bind an agent's volume into its
+> container.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -11011,8 +11031,10 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > of reach (against A-207 and the recovery rule above, "unserved until it has"), and each floor holding its green's
 > checkpoint at its base. The list is now read, never taken (`verbs::unbuilt_works`), each ask is made once more after
 > a lost answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
-> nothing (`verbs::install_replayed_work`). Owed: a work whose asks go unanswered twice stays unbuilt until the next
-> start; its verbs then answer `NotFound` rather than `Unpublished`.
+> nothing (`verbs::install_replayed_work`). *Done by A-533 (2026-11-19):* a work whose asks go unanswered twice keeps
+> its record and answers `Unpublished`, never recorded as the request's completion, and its shard asks its green's
+> owner again as clients are let in, by messages each shard runs when it next runs: no timer, and no wait holds the
+> admission.
 
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
@@ -11745,6 +11767,14 @@ signature verification).
 > **Status (2026-11-18, A-499).** Designed; nothing is built. Built on §4.17.1 without redefining it, from Mercurial
 > 7.2's own documents and code and hg-evolve 12.0.0 (the topic and evolve extensions). The reading notes, every source
 > named to its file, are `research/mercurial-server.md`. The pieces are listed at the end, after the shared ones.
+>
+> **Status (2026-11-19, A-514: piece 1's framings built).** `crates/hg` (`slates-hg`) decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas as pure functions over bytes: every length read as 7.2 reads it
+> (signed 32-bit, so `0xFFFF_FFFF` is −1), checked against the bytes left, every structure counted before it is built
+> and charged exactly to the caller's admission, no recursion however deep bundle2's interruptions nest. Proven against
+> golden vectors stock Mercurial 7.2 made (`crates/hg/fixtures`, the command in `make-fixtures.sh`): each bundle decodes
+> as 7.2's own `debugbundle` lists it, every text rebuilds from its deltas, each encodes back to its bytes. Still owed
+> from piece 1: the parts' own payloads (phase-heads, bookmarks, the check parts, markers, pushkey values).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12108,7 +12138,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties.
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, `crates/hg`): the framings,
+   bundle1 and the deltas; owed: the parts' payloads, from phase-heads to pushkey values.
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping.
@@ -35697,6 +35728,15 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   debug, 2026-11-18, load 16 to 19): `slates-client --lib` green with
   `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; red with the old spin through a
   reply deadline put back: "spun at 3000 ns, past the wake estimate".
+- **A delivery's read** (Linux; `Client::recv_delivery`, `ClientEnd::wait_delivery`, `Liveness::wait_delivery`). After a
+  reply that names a descriptor the client yielded until the descriptor was there or its reply deadline passed, and
+  gave up `DeadlineExceeded` there. The daemon sends the descriptor before that reply and answers a typed refusal where
+  the send failed (`MapUnavailable`, a stream's hand-off refused), so the descriptor is waiting or comes a scheduling
+  tick later: the wait is now one `poll` of the control socket for readability or its peer's close, with no timeout,
+  and a daemon gone with nothing delivered ends it `ChannelLost`. macOS has no control socket and is refused
+  `Unsupported` (its descriptors come by the socket route). Checks (Mac Studio, debug, 2026-11-18, load 18 to 20):
+  `slates-ipc --lib` 64 of 64 (1 ignored) and `slates-client --lib` 8 of 8 on macOS; the Linux test
+  `a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock` is main's to run.
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -35827,6 +35867,240 @@ entry), `crates/svn` (`src/lib.rs`, `src/ra_svn.rs` and `src/ra_svn/tests.rs`, n
   slates-svn --lib` 33 of 33 (15 of the item codec, 18 of svndiff) before and after `cargo fmt`, and `cargo fmt --check`
   clean. The one-crate clippy and `cargo xtask check` are main's (the run-request queue).
 - **Owed.** §4.17.4's pieces 3 to 14; the server derives each bound when it reads commands (piece 7).
+
+### A-535 — A loopback mount is offered only where no one but root can capture loopback traffic (2026-11-18, goal 85, g079; §4.6 "macOS", §4.13 the mount capability; AUD-01, A-34)
+Applied in the same change to: GAPS (the 2026-10-04 loopback confidentiality entry), `crates/api/src/error.rs`
+(`MountMissing::PrivateLoopback`), `crates/api/src/mount.rs` (`available` on macOS and the BSDs, `bpf_devices`,
+`capture_open`, `loopback_available`, the unit test), `crates/api/src/lib.rs` (contract 43), `docs/library.md`, and
+the bug record `docs/bugs/2026-11-18-a-macos-mounts-capability-was-readable-by-any-group-granted-loopback-capture.md`.
+- **What was there.** A loopback NFS mount's capability (AUD-01: the attachment and its 16-byte token) rides every
+  file handle in the clear, and the macOS kernel client speaks neither RPC-with-TLS (RFC 9289) nor RPCSEC_GSS, so that
+  leg cannot be encrypted. macOS lets only root capture loopback by default, but a host that gives `/dev/bpf*` to a
+  group (Wireshark's ChmodBPF, `access_bpf`) lets each member read every mount's capability off loopback and replay it
+  from a client of its own, with a uid of its choosing (AUTH_SYS is a claim). The mount was offered anyway.
+- **The rule.** The loopback mount is a host fact only where capture is root's alone: every BPF device
+  (`/dev/bpf`, `/dev/bpf<n>`) is read by root alone, by its mode (no group or other read bit) and its owner (root).
+  Elsewhere `mount::available` answers `Unsupported { PrivateLoopback }`, and so does every mount, before anything is
+  attached; the words name the devices and the fix (give them back to root).
+- **Rejected.** (1) Refusing calls on a connection a user process owns: a daemon running as the user cannot tell
+  another user's process from the kernel's socket, since `proc_pidfdinfo` refuses other users' processes, and the
+  kernel's port is unprivileged because the mount clears `NFS_MFLAG_RESVPORT` (R10). (2) Rotating the token per
+  mount: each mount's attachment has its own token already. (3) Binding a token to the first connection that uses it:
+  it breaks clients that open several connections on one mount (the hostile suite's honest clients, Linux's
+  `nconnect`), and a mount's first call still races a sniffer.
+- **Cost.** A host whose BPF devices a group may read cannot mount until they are root's again. Measured: none of the
+  five Macs slates runs on (2026-11-18) is such a host.
+- **Tests.** `a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback` (`crates/api/src/mount.rs`,
+  the lib's unit tests, every host): devices as macOS and as ChmodBPF leave them, read by anyone, owned by a user, and
+  none; the availability under each answer. Red with the old rule on the Mac Studio; the module 12 of 12 with the new.
+
+### A-514 — Mercurial's bundle2, bundle1, changegroups and deltas, decoded and encoded as a pure core and held to golden vectors stock Mercurial 7.2 made (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-16, A-499)
+Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (new, `slates-hg`: `bundle2`, `bundle1`,
+`changegroup`, `delta`, the cursor and the admission, with `fixtures/` and its `make-fixtures.sh`), `Cargo.lock`,
+`unsafe-budget.toml` (`slates-hg = 0`), `.gitattributes` (the fixtures' bundles binary), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§12).
+- **What it does.** Reads and writes the three framings a Mercurial exchange uses, byte for byte as 7.2 writes them:
+  a bundle2 stream (`HG20`: stream parameters, parts with mandatory and advisory parameters, chunked payloads, the
+  interrupt), a bundle1 (`HG10UN` and a changegroup `01`), and changegroups `01` to `05` (the changelog's group, the
+  manifest's, from `03` the tree-manifest list, the file list; each version's delta header from 7.2's code), with the
+  deltas inside them (mpatch's hunks, checked by its C rules, applied into one vector of the exact length). Nothing
+  else: no node is hashed (piece 3), no part is handled (piece 5), and a stream compressed with `GZ`, `BZ` or `ZS` is
+  refused by kind until the engines are wired (D-17).
+- **From the sources (read 2026-11-18 and 2026-11-19, `research/mercurial-server.md` §2, §3 and §12).** Every length is
+  a signed big-endian 32-bit integer as 7.2 reads it, so `0xFFFF_FFFF` is −1: a refused length, or in a bundle2
+  payload the interrupt. A changegroup chunk length from 1 to 4 is refused, not read as empty. The tree-manifest list is
+  in every changegroup from `03`, empty or not, though `internals.changegroups` says otherwise. Changegroup `04` is
+  7.2's 130-byte delta-information header (its code), not the sidedata version its document describes (moved to `05`).
+  A part type is 1 to 255 bytes of `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter. A stream parameter
+  is matched without case, and only `Compression` is known.
+- **Stricter than 7.2, on purpose.** A part header whose parameters run past it, or that leaves bytes unread, is
+  refused (7.2 slices short and ignores the rest); a repeated parameter key is refused (the document's "MUST be
+  unique"; 7.2 keeps the last); an empty part type and bytes after a stream's or a changegroup's end are refused.
+- **Caps, none a literal.** The input (a length past the bytes left is `Truncated`) and the caller's `Admission`, the
+  room its request's budget gives (A-16): a decode walks its input once to check and count it, charges the exact
+  total, then builds every vector once at its final size. Interruptions nest without recursion, counted, so ten
+  thousand nested parts decode within their admission and are refused one byte short of it.
+- **Golden vectors.** Made once on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock Mercurial 7.2 from PyPI
+  through `uvx` (CPython 3.12.16), exactly: `OUT=$(mktemp -d ~/.cache/g291-fixtures.XXXXXX) &&
+  ~/.cache/g291-scratch/make-fixtures.sh "$OUT"`, the script checked in as `crates/hg/fixtures/make-fixtures.sh`: one
+  repository (a named branch, a copy, a bookmark, a merge, a subdirectory, a draft amended under evolution), bundled as
+  `none-v1` and `none-v2;cg.version=02|03|04;phases=true;obsolescence=true`, with 7.2's `debugbundle` of each and its
+  log. The ten files' SHA-256 matched after the copy. Two of 7.2's own listing limits showed up and are recorded there:
+  `debugbundle --all` fails on a `04` bundle's full texts (`TypeError` at `debugcommands.py:398`) and lists no file of
+  a `03` bundle.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug, load 18.9 to 26.4).** `cargo test --locked -p slates-hg --lib`: 39 of
+  39 in 1.2 s; `cargo fmt -p slates-hg --check` clean. Golden: the three bundle2 streams hold the parts 7.2 lists and
+  encode back to their bytes; changegroups `01` and `02` decode as 7.2 lists every revision (nodes, parents, link,
+  delta base, delta length), `03` and `04` as far as 7.2's listing goes and equal to `02` beyond it; every file text,
+  the copy's metadata block included, rebuilds from its deltas in all four versions alike, each changeset's text
+  beginning with its manifest's node and ending with its description; every changegroup encodes back to its bytes.
+  Hostile: foreign magics; `len = u32::MAX` and `i32::MAX` in every length; every cut of every fixture; every bit of a
+  fixture flipped one at a time (refused, or read and encoded back: to itself for a stream, to the same bytes for a
+  changegroup); stream parameters as 7.2 judges them;
+  misread part headers; nesting past the admission; arbitrary bytes (property tests). An oracle: `apply` equals a splice
+  model over generated hunks. Red-checked once in a disposable copy: with the chunk-length rule, the trailing-bytes
+  check and mpatch's start-past-end rule removed, the four tests written for them failed and 35 passed.
+- **Owed.** The parts' payloads (phase-heads, bookmarks, the check parts, markers in formats 0 and 1, pushkey values),
+  compressed bundle streams once the D-17 engines are wired, and a golden `05` changegroup (7.2's bundle types offer
+  `01` to `04`; `05` is held to its layout in 7.2's code by a round trip).
+
+### A-538 — A stale copy's content goes on a confirmation that certifies it; an older build's confirmation certifies nothing (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; the content release signal's second half; A-529, A-335)
+Applied in the same change to: GAPS (A-529's entry), `crates/db/src/register.rs` (`Retirement::certified`,
+`CompletedTakeover::certified`, `RegionalConfiguration::certifies_content`), `crates/cluster/src/raft_wire.rs` (regional
+layout 6; layout 5 still read, uncertified), `crates/server/src/content_retention.rs` (`release_certified`) and
+`crates/server/src/takeover.rs` (`let_go_stale`'s certified case, `fleet.takeover.released_certified`).
+- **What was there.** Since A-529 a successor confirms only once it serves each adopted volume from its own placement,
+  so its confirmation certifies that no head it serves names a holder outside that placement. Holders did not use it.
+  A stale copy whose content its own head named was kept whole for good (A-335,
+  `fleet.takeover.kept_holding_content`).
+- **The rule.** Each retirement and completion record says whether its confirmations certify their content. This build
+  marks every retirement it makes certified, and a record carries the mark from its retirement. Where the copy's
+  successor confirmed on a certified takeover, and the holder is outside that successor's placement, the holder lets
+  go the content its own stale records name (`content_retention::release_certified`). Content placed ahead of those
+  records stays: it may be the successor's own re-placement, made while this holder was a candidate, which its
+  republished head names. The copy then goes whole unless such content remains. A settled line's lagging holder judges
+  no successor's placement, so its content goes only as its retention rule lets it, as before.
+- **Mixed fleets.** The regional layout is 6. Each retirement and record carries a certification byte after its
+  version. A configuration an older build wrote (layout 5) is still read, with every takeover uncertified: its
+  confirmations may have come before the content was placed again, so their holders keep the content. Any other layout
+  is refused by name.
+- **Tests.** `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation` (red before:
+  kept whole). `a_holder_outside_the_successors_placement_keeps_the_content_its_head_names` now runs on an uncertified
+  takeover; red with an uncertified takeover's content let go. `a_layout_five_configuration_reads_its_takeovers_as_uncertified`
+  (`crates/cluster/src/raft_wire.rs`), `a_takeover_this_build_makes_certifies_its_content` (`crates/db/src/register.rs`),
+  and the A-341 holder test, whose head's content now goes at the certified confirmation. Kiln on the Mac Studio,
+  2026-11-19, debug: `slates-db` `register::` 86 of 86, `slates-cluster` `raft_wire::` 22 of 22, `slates-server`
+  `takeover::`, retention, the healer and the holder tests 33 of 33; red once on a mutated copy that let an uncertified
+  takeover's content go: the uncertified A-335 test failed at its first install.
+- **Owed.** An owner's settle certifies content the same way, and A-508's holders then drop content too.
+### A-533 — A work left unbuilt at recovery answers `Unpublished`, never recorded, and is asked for again as clients are let in, by messages, never a timer (2026-11-19, goal 85 via g225; A-513's remainder; §4.16 "Recovery"; A-207, A-247)
+
+- **What was there.** At recovery a work whose green lives on another partition is replayed through the green's owner
+  (A-247), each ask made once more after a lost answer (A-513). A work whose asks both went unanswered kept its record
+  and stayed unbuilt until the daemon's next start, and its verbs ran and answered `NotFound`, as if it were gone,
+  against §4.16's rule that such a work "is unserved (`Unpublished`) until it has" been replayed. And an `Unpublished`
+  a verb answered was recorded as the request's completion, though the protocol defines it as never answered from
+  memory: a resend under the same id met it for good.
+- **The rule.** A verb naming a work recorded unbuilt answers `Unpublished` (`work_home::unbuilt_refusal`, counted
+  `merge.work_unbuilt_unpublished`). `Unpublished` is now a reply of a verb not started (`verbs::not_started`, beside
+  `Overloaded`), so it is never recorded and a resend under its id runs the verb. As clients are let in, every shard is
+  told to ask its recorded works' green owners again (`daemon::ask_again_for_unbuilt_works`,
+  `verbs::ask_owners_to_replay`, counted `merge.work_rebuild_asked_again`): a message the owner runs when it next runs,
+  at once or once it comes back from a stop, replays the work and sends the outcome back by a message of its own, which
+  installs it once (`install_replayed_work`, A-513). Each message waits for room on its target's channel while that
+  shard lives (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
+- **Why this and not another.** Events, not a clock: the shards that did not answer run these messages when they run
+  again, which is exactly when a replay can succeed, so the retry needs no timer and holds no admission, and a work's
+  verbs meanwhile tell its client to come back rather than that the work is gone.
+- **What it changes beside.** Every `Unpublished` a verb answers inside its transaction is now left unrecorded, as the
+  protocol always said; the `Overloaded` count (`verb.overloaded_unrecorded`) counts `Overloaded` alone.
+- **Tests.** `an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt` (on a shard: a
+  recorded unbuilt work's read answered `Unpublished`; its record ended; the resend under the same id runs and answers
+  `NotFound`) and `an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it` (a two-shard daemon:
+  the green on one shard, the work recorded unbuilt on the other, the work installed by the owner's message)
+  (`crates/server/src/verbs.rs`).
+
+Applied in the same change to: §4.16 (A-513's status: its owed item done), GAPS (A-513's remainder closed), A-513's bug
+record, `crates/server/src/{work_home,verbs,daemon}.rs`.
+
+### A-520 — A host mount bound into a container is a verb of the library, so a host that reaches slates only through it binds a volume into a container (2026-11-18, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9, §4.12; `CONTRACT` = 44)
+Applied in the same change to: §4.6 (A-9's OCI record: the form through the library), §4.12's contract log (`CONTRACT`
+= 44), GAPS (the library's entry), `docs/library.md` (the seam's verbs, the serving list, what is owed),
+`crates/api/src/container.rs` (new: `ContainerBind`, `Instance::bind_into_container`, the source's spelling, and their
+tests), `crates/api/src/seam.rs` (the verb on `Volumes`), `crates/api/src/sim.rs` (the simulator's bind, a mount's and a
+bind's records, a bind ending with its mount, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 44; `OciBinding`
+and `HostMountEvidence` re-exported) and `crates/api/tests/api.rs` (the conformance suite's stranger, and a kernel-mount
+test).
+- **Why.** kiln reaches slates through this library alone (A-278), and its container engine (kiln's `docs/agentic.md`
+  W9) runs each agent's container on the agent's workspace volume, bound from the host's mount and never copied. §4.6
+  A-9's OCI form was the wire's (`AttachRequest::Oci`) and the command line's (`slates attach --oci-source`) alone.
+- **The verb.** `Instance::bind_into_container(volume, source, destination, intent)` asks the form and answers a
+  `ContainerBind`: the binding's attachment (ended by `detach`, and with its source mount) and the `OciBinding` entry the
+  host hands its runtime as it is. An answer that established no binding is a protocol fault, never a binding made up.
+  Its refusals are the daemon's, typed as the contract already typed them: `NotFound`, `Unsupported::Attachment`
+  (Windows' `HostPlatform`; a host without its mount bridge `HostMountRequired`), `Invalid::ChosenPath` (`NotAbsolute`,
+  `DestinationNotAbsolute`, `NotAMountPoint`, `ForeignFilesystem`, `DescendantMount`, and on macOS `NotThisVolume`), and
+  `Denied::Rights` (no mount of the volume's by this caller at the path, or a read-only one bound for writing).
+- **The source's spelling.** The daemon compares the source with the kernel's table, which names a mount by its real
+  path, so the library spells the source by its folder's real path with its own name kept: never the mount point
+  resolved whole, which looks into the mount (a request to the very daemon asked; on a `hard` NFS mount, one that waits
+  on its server). A source with no folder to resolve goes as given and the daemon judges it. The command line still
+  resolves its `--oci-source` whole (`crates/cli/src/verbs.rs`), looking into the mount: reported, not changed.
+- **The simulator.** It binds only the mounts it recorded, judged in the daemon's order (absolute source, absolute
+  destination, a mount at the path, the newest there, none beneath it, the volume's and writable for a writable bind),
+  answers Slates' own entry (`slates_bridge_oci::binding`), claims none of a kernel table's evidence beyond whether the
+  mount was made shared, and ends a bind with its mount. Another volume's mount it refuses `Denied::Rights`, as Linux's
+  daemon does at its records; macOS's daemon refuses it earlier, `NotThisVolume`, by the NFS source that names the
+  volume, so the conformance suite holds the two to the stranger alone (`NotFound` on every platform, the volume found
+  before the form is judged).
+- **Tests.** `crates/api/src/container.rs`: `a_bind_answers_the_binding_the_daemon_established_and_nothing_else`,
+  `a_source_is_spelled_by_its_folders_real_path_and_its_own_name` (macOS: `/var` spelled `/private/var`);
+  `crates/api/src/sim.rs`: `a_mounts_bind_answers_the_runtimes_entry_and_ends_with_its_mount`,
+  `a_bind_the_daemon_would_refuse_is_refused_typed_and_holds_nothing` (a simulator with room for exactly what the cases
+  keep, so a refusal that held an attachment would refuse the last bind) and, on Windows' own build,
+  `a_bind_on_windows_is_refused_as_the_daemon_refuses_it`. Filed for main: the conformance suite's stranger, and
+  `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`, a kernel mount,
+  `SLATES_TEST_MOUNT=1`, macOS and Linux).
+- **Evidence (the Mac Studio, kiln, 2026-11-18, debug, load 20 to 21).** Red first, on a scratch copy whose verb
+  answered as the library did (no binding taken, the simulator offering none, the source sent as given; scratch branch
+  `agents/g293-a520-red`, never merged): `cargo test --locked -p slates-api --lib -- container:: sim::tests
+  contract_history` failed the four new tests (run r201: the bind refused `HostMountRequired`, `/var/…` left unspelled,
+  the binding not taken) and passed the contract's history. Green with this change's code, file for file (scratch
+  a728e2afa, run r208): the same command 5 of 5, and the crate's whole `cargo test --locked -p slates-api --lib` 76
+  passed, 4 ignored. Main's A-535 took contract 43 meanwhile, so this change is 44, its history's line and constant
+  renumbered, nothing else. `cargo fmt -p slates-api` laid the code out.
+- **Owed** (A-520's next pieces, kiln goal 01a1f124): the engine's profile (`slates oci-runtime`) and the check just
+  before a runtime binds (`slates oci-check`) as library calls, so a host binds through the library alone; the judge's
+  profiles for the engines slates has run since it was written (rootless podman, G-mount step 3, and podman's command
+  line); and Windows, which binds nothing (G-mount step 4) until a route into Docker Desktop's VM is measured (kiln's
+  W9: WSL 2's 9P server over a WinFsp drive, else the network export).
+
+### A-540 — A host mount's attachment keeps its mount's id in its durable record, and a restarted daemon ends each attachment whose recorded mount the table no longer names (2026-11-19, g232; UI goal 86, A-511's owed item; §4.6 A-34, A-227, A-511)
+
+Applied in the same change to: §4.6's unmount paragraph, GAPS (R3's class C), `crates/db/src/catalog.rs`
+(`AttachmentRecord::mount`, appended), `crates/db/src/op.rs` (`Op::AttachmentMountSeen`, appended) and `partition.rs`
+(its guard and apply), `crates/db/tests/wire_order.txt` (tag 88 published), `crates/db/src/replay.rs` (its test),
+`crates/db/tests/model.rs`, `crates/base/src/own_mounts.rs` (`mount_id_in`), `crates/server/src/own_nfs.rs` (`learn`
+over one table read, `learn_from`, `hold`, `record_seen`, `let_go_of`), `crates/server/src/verbs.rs` (`bind_mount`
+holds through `own_nfs::hold`), and the record literals in
+`crates/server/src/{daemon,merge_service,oci,shards,verbs,virtiofs}.rs`.
+- **What was there.** A mount's id lived only in its shard's memory (A-227's `OwnNfsMount`). A successor learned its
+  predecessor's mounts by looking up each bound point in the table, once per attachment. A point whose mount the
+  kernel let go while no daemon ran recorded nothing, so its attachment waited for a `detach` for good (A-511's owed
+  item). A-511's watch could not help: it judges only the mounts a shard holds.
+- **The rule.** The mount's id is kept in its attachment's durable record once the mount is seen:
+  `Op::AttachmentMountSeen`, appended, written in the bind's own transaction when the bind found the mount
+  (`own_nfs::hold`), and at a start that finds a never-seen attachment's mount at its point. A start reads the table
+  once (`own_nfs::learn`, one `getfsstat`) and judges each host mount's attachment by what its record keeps:
+  - a recorded id the table still names: the mount is held as the shard's;
+  - a recorded id the table no longer names: the kernel let the mount go while no daemon ran, and the attachment ends
+    as a `detach` would (`verbs::end_attachment`, `Ending::Otherwise`), its container binds with it;
+  - no recorded id: the rule before A-540, held if its volume's mount is at exactly its point (its id recorded from
+    then on), left as it is if not.
+
+  The id, not the point, is the judge, as it is for A-511's watch: another mount of the same volume at the same point
+  is a new mount with a new id, and it does not keep the old mount's attachment.
+- **Why a record with no id keeps the old rule.** The table's silence about its point proves nothing. A bind of a
+  point that holds no mount records the same as a bind of a live one (`own_nfs.bind_unconfirmed`, A-227), and the CLI
+  and the kernel may name one point differently, so ending such an attachment at a start could end a live mount's.
+  The recorded id is the evidence that this attachment's mount existed, and only that id's absence proves the kernel
+  let the mount go.
+- **Format.** `AttachmentRecord::mount` and `Op::AttachmentMountSeen` are appended (D-15). Tag 88 is published in
+  `crates/db/tests/wire_order.txt`, written by hand in the writer's format: an agent runs only `--lib` tests, and the
+  wire-order test is main's to run.
+- **Tests.** In `own_nfs.rs`, with the kernel's table stood in for:
+  - `a_restart_ends_an_attachment_whose_recorded_mount_the_table_no_longer_lists`;
+  - `a_restart_holds_an_attachment_whose_recorded_mount_the_table_still_lists`;
+  - `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`;
+  - `a_held_mount_keeps_its_id_in_its_attachments_record`.
+
+  In `slates-db`, `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`. Red-checked once (the Mac
+  Studio, 2026-11-19) with a start ignoring recorded ids, nothing keeping an id and the apply dropping the op: the db
+  test and 3 of the 4 server tests failed. The one that passed asserts what both rules do, holding a mount still at its
+  point. The old rule held another mount at the point for the attachment, `(true, Some(gone), Some(another), 0)`. All
+  passed restored, A-511's 5 with them.
+- **Owed.** Main's runs: the db integration tests (`model`, `wire_order`), and the live macOS mount suite across a
+  restart with a mount unmounted while no daemon ran.
 
 ### A-541 — A clone counts its snapshot's inodes, whatever its origin made or removed since (2026-11-19, goal 85; found by A-532; §4.2's inode dimension, §4.4 snapshots and clones, D-5)
 Applied in the same change to: A-532's entry (its finding marked fixed); GAPS, §8c (the fix and the siblings left open);

@@ -16,7 +16,8 @@
 //!   folder, empty, a clone of a snapshot, a green, a work volume), snapshot, destroy, list, a typed status, and an
 //!   overlay's drift as typed entries.
 //! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
-//!   a descriptor a VMM takes.
+//!   a descriptor a VMM takes; and a host mount bound into a container ([`container`], A-520), the entry the host's OCI
+//!   runtime performs, verified in the kernel's mount table.
 //! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
 //!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
 //!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
@@ -66,6 +67,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod asynchronous;
+pub mod container;
 pub mod error;
 pub mod exec;
 pub mod grant;
@@ -85,6 +87,7 @@ pub mod start;
 pub mod volume;
 
 pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
+pub use container::ContainerBind;
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
   KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
@@ -234,9 +237,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`MountFault::NotMounted`] before any call, and the new refusals are [`MountFault::Busy`] (`EBUSY`: a process holds
 /// a file on the mount), [`MountFault::StillMounted`] (the call said done and the table disagrees) and
 /// [`MountFault::MountTable`] (the table could not be read) (the same day).
+/// 43: a macOS or BSD host whose loopback anyone but root can capture (a `/dev/bpf` device a group or another user may
+/// read, as Wireshark's ChmodBPF leaves them) is told [`mount::available`] `Unsupported`, and refused the loopback
+/// mount, typed [`MountMissing::PrivateLoopback`]: a mount's capability rides every file handle in the clear, which the
+/// kernel's NFS client cannot encrypt (A-535; the same day).
+/// 44: a host mount bound into a container (A-520; §4.6 A-9's OCI form, until then the CLI's and the wire's alone):
+/// [`Instance::bind_into_container`] and the seam's `bind_into_container` answer a [`ContainerBind`], the binding's
+/// attachment and the entry the host's OCI runtime performs ([`OciBinding`], with its [`HostMountEvidence`]), refused
+/// typed as the daemon refuses the form (`Invalid::ChosenPath`, `Unsupported::Attachment`, `Denied::Rights`); the
+/// simulator answers it from the mounts it recorded (kiln's container engine, kiln goal 01a1f124; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 42;
+pub const CONTRACT: u32 = 44;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
@@ -248,11 +260,12 @@ pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, 
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
   ARCHIVE_FILE, ArchiveFault, AttachTransport, ChangedCursor, ConflictClass, DaemonReport,
-  DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostPathReason,
-  Intent, JournalReport, LandingDegradation, LandingDurability, LossReport, MountReport,
-  NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
-  Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport,
-  TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostMountEvidence,
+  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
+  MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
+  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
+  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
+  VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
