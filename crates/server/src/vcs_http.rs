@@ -2,8 +2,8 @@
 //! "Pieces (git)" piece 8; §4.3, R6): a listener on the runtime's TCP, one connection a task, each driving
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
-//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's (§4.17.3) and Subversion's (§4.17.4) on the same
-//! edge.
+//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's (§4.17.4) on
+//! the same edge.
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -49,13 +49,15 @@
 //! drains for a staged close. One body run or one reply run a turn (§4.3): the task yields after each, so a large push or
 //! clone never holds its shard, and a drain yields after each read it drops.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the operator's identity, an authenticator
-//! over §4.13's principals and keys, the repositories' lookup on their partitions); the services' server halves (git's
-//! upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land; Mercurial's and
-//! Subversion's sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run).
+//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the operator's identity, an
+//! authenticator over §4.13's principals and keys, the repositories' lookup on their partitions); the services' server
+//! halves (git's upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land;
+//! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
+//! Subversion's site; the MCP edge onto this engine; the live `git clone` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;
+mod hg;
 pub(crate) mod waits;
 
 pub(crate) use daemon_edge::start;
@@ -189,6 +191,11 @@ pub(crate) trait Exchange {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
   /// The request's body has ended.
   async fn body_end(&mut self) -> Result<(), Failed>;
+  /// The fields the reply's head carries after the decision's, asked once as the reply begins, after the body has
+  /// ended: none unless the reply's outcome decides them, as a Mercurial command's decides its media type (A-650).
+  async fn reply_fields(&mut self) -> Result<Fields, Failed> {
+    Ok(Fields::new())
+  }
   /// Appends the reply's next run to `out`: `true` while more follows, `false` once the reply has ended.
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed>;
 }
@@ -752,12 +759,14 @@ fn waited<T>(outcome: Raced<T>, started_ns: u64) -> (Waited<T>, bool) {
   }
 }
 
-/// A service a decided request started, and whether its reply is the head alone.
+/// A service a decided request started, whether its reply is the head alone, and whether its reply's fields were asked.
 struct Started<E> {
   /// The exchange.
   exchange: E,
   /// Whether the reply is the head alone.
   head_only: bool,
+  /// Whether the exchange's reply fields have been asked for and given to the engine.
+  fields_given: bool,
 }
 
 /// One connection's parts beside its engine: its socket, its edge and seat, its waits, its site and the service its
@@ -911,6 +920,7 @@ impl<S: Site> Parts<S> {
         self.service = Some(Started {
           exchange,
           head_only,
+          fields_given: false,
         });
         connection.decide(Decision::Serve { fields, head_only });
       }
@@ -956,12 +966,24 @@ impl<S: Site> Parts<S> {
     Flow::Go
   }
 
-  /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn.
+  /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn. The service's
+  /// reply fields go to the engine first, once, before any of the reply.
   async fn reply(&mut self, connection: &mut Connection) -> Flow {
     let Some(started) = self.service.as_mut() else {
       connection.fail(Status::INTERNAL_SERVER_ERROR);
       return Flow::Go;
     };
+    if !started.fields_given {
+      started.fields_given = true;
+      match started.exchange.reply_fields().await {
+        Ok(fields) => connection.reply_fields(fields),
+        Err(Failed(status)) => {
+          self.service = None;
+          connection.fail(status);
+          return Flow::Go;
+        }
+      }
+    }
     if started.head_only {
       self.service = None;
       connection.reply_end();

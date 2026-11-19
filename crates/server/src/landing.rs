@@ -3376,6 +3376,28 @@ pub fn policy_proof(
   *hasher.finalize().as_bytes()
 }
 
+/// Format: the domain tag of an identities proof (A-664), so it never verifies as a grant, enrollment, revocation or
+/// policy proof.
+const IDENTITIES_DOMAIN: &[u8] = b"slates.identities";
+
+/// The proof that sets `principal`'s tool `identities` from version `read` (A-664): the keyed hash under the launcher's
+/// secret over the principal, the identities and the version read, as a policy's is (A-285), under its own domain.
+pub fn identities_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  principal: &slates_ipc::protocol::Principal,
+  identities: &slates_ipc::protocol::ToolIdentities,
+  read: u64,
+) -> [u8; 32] {
+  let mut bytes = Vec::new();
+  slates_wire::Wire::encode(principal, &mut bytes);
+  slates_wire::Wire::encode(identities, &mut bytes);
+  bytes.extend_from_slice(&read.to_le_bytes());
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(IDENTITIES_DOMAIN);
+  hasher.update(&bytes);
+  *hasher.finalize().as_bytes()
+}
+
 /// Whether `proof` is the launcher's (A-285, R10): `make`'s proof under the secret this daemon minted at its start (the
 /// issuer, held by the anchor's tree), or under the launcher secret its starter handed the anchor (kept by the launcher
 /// across its own restarts and the daemon's), compared in constant time. The same formula and domain under either:
