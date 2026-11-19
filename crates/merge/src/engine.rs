@@ -2359,14 +2359,9 @@ impl Green {
       .saturating_add(self.special_history_bytes)
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
-  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
-  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
-  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
-  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
-  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
-  /// Whether the file at `path` was removed after version `base` (`file_removed`): unlinked, renamed away or renamed
-  /// onto after the base, whatever stands at the path now (A-612).
+  /// Whether the node at `path` was removed after version `base` (`file_removed`): a file of any
+  /// type, removed, renamed away or renamed onto after the base, whatever stands at the path now
+  /// (A-612, A-631).
   fn file_removed_since(&self, path: &str, base: u64) -> bool {
     self
       .file_removed
@@ -2374,6 +2369,12 @@ impl Green {
       .is_some_and(|version| *version > base)
   }
 
+  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
+  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
+  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
+  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
+  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
+  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     if base < self.folded_below {
       return self.intervening_walk(path, base);
