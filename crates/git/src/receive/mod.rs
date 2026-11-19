@@ -64,6 +64,7 @@ pub mod fsck;
 mod report;
 mod request;
 mod session;
+pub mod works;
 
 pub use advertisement::{Advertised, write_advertisement};
 pub use connect::{Connected, connectivity};

@@ -55,9 +55,6 @@ pub enum GraphFault {
   Store(StoreRefused),
 }
 
-/// Format: the most bytes an object name takes, SHA-256's, all zero: the null name, read for a node with no rows.
-const ZEROS: [u8; 32] = [0; 32];
-
 /// A repository's store, and the refs that name its greens, read as the negotiation's [`Graph`].
 pub struct StoreGraph<'r> {
   /// The repository.
@@ -73,27 +70,29 @@ pub struct StoreGraph<'r> {
 }
 
 impl<'r> StoreGraph<'r> {
-  /// `repository`'s objects in `store`, with `refs` naming its greens; `None` only where the format's null name could
-  /// not be made, which no format allows.
+  /// `repository`'s objects in `store`, with `refs` naming its greens.
   pub fn new(
     repository: &'r Repository,
     store: &'r ContentStore,
     refs: &'r [NamedRef<'r>],
-  ) -> Option<StoreGraph<'r>> {
-    let format = repository.format();
-    let null = ObjectId::from_bytes(format, ZEROS.get(..format.raw_len())?)?;
-    Some(StoreGraph {
+  ) -> StoreGraph<'r> {
+    StoreGraph {
       repository,
       store,
-      null,
+      null: ObjectId::null(repository.format()),
       refs,
       fault: Cell::new(None),
-    })
+    }
   }
 
   /// The first read that failed, if any: an answer made while one did is refused.
   pub fn fault(&self) -> Option<GraphFault> {
     self.fault.get()
+  }
+
+  /// The object `green`'s current version names, by position: `None` for a green with no version, or one deleted.
+  pub fn head(&self, green: u64) -> Option<u64> {
+    self.chain(green).and_then(Chain::head)
   }
 
   /// Keeps `fault` when it is the first.
