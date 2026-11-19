@@ -78,6 +78,15 @@ const PENDING_STUCK: &str = "merge.work.pending_stuck";
 const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
 /// Format: a work's increment composed on its own shard (A-247), the non-vacuity count of `composed`.
 pub(crate) const COMPOSED_ON_WORK: &str = "merge.work.composed_on_work";
+/// Counter: a work's journal holding a copy (A-626 part 4) composed by its green's owner, against `Green::base_for`,
+/// which puts each copied tree at its destination. The work's own shard composes none: the entries it fetches are a
+/// path's each, never a tree (A-247), so it fetches nothing for such a journal and leaves its composition to the owner.
+pub(crate) const COPY_COMPOSED_BY_OWNER: &str = "merge.work.copy_composed_by_owner";
+
+/// Whether a work's journal declares a copy (A-626 part 4).
+pub(crate) fn holds_copy(journal: &[VolumeOp]) -> bool {
+  journal.iter().any(|op| matches!(op, VolumeOp::Copy { .. }))
+}
 /// Format: a submit held on its work's shard until the work's catalog register, its route, was committed, before the
 /// green's owner was asked for a verdict (A-298), the non-vacuity count of [`await_route`].
 pub(crate) const AWAITED_ROUTE: &str = "merge.work.awaited_route";
@@ -489,7 +498,8 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
 /// path whose base entries it has not fetched, or one it neither holds nor has fetched the bytes of. `None` when it has
 /// all it needs, and after this verb's fetch.
 fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
-  if state.work_home.fetched.is_some() {
+  // A journal holding a copy is composed by the owner, which holds the copied trees (`COPY_COMPOSED_BY_OWNER`).
+  if state.work_home.fetched.is_some() || holds_copy(&sealed.journal) {
     return None;
   }
   let w = state.works.get(&sealed.work)?;
@@ -514,6 +524,9 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
   let Some(w) = state.works.get(&sealed.work) else {
     return sealed;
   };
+  if holds_copy(&sealed.journal) {
+    return sealed;
+  }
   let named: std::collections::BTreeSet<&str> = sealed
     .journal
     .iter()
@@ -1679,5 +1692,91 @@ mod tests {
       release_expired_at(state, deferred + 3 * lease);
       assert!(!held(&*state), "the verb is released at the failover delay");
     });
+  }
+
+  /// How many journals holding a copy their green's owner composed, on `state` (`COPY_COMPOSED_BY_OWNER`).
+  fn composed_by_owner(state: &crate::state::ShardState) -> u64 {
+    state
+      .refusals
+      .get(super::COPY_COMPOSED_BY_OWNER)
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// A sealed work of `green` based at version 0 declaring `journal`, its increment composed nowhere (A-247).
+  fn sealed_at_0(green: DbVolumeId, journal: Vec<super::VolumeOp>) -> super::SealedWork {
+    super::SealedWork {
+      work: DbVolumeId { bytes: [7; 16] },
+      green,
+      base_version: 0,
+      journal,
+      files: super::WorkFiles::default(),
+      composed: None,
+    }
+  }
+
+  /// What the owner answered a rebase: the journal it restated, or the reply it refused with.
+  fn answered(answer: &super::RebaseAnswer) -> String {
+    match answer {
+      super::RebaseAnswer::Rebased { journal, .. } => format!("rebased to {journal:?}"),
+      super::RebaseAnswer::Reply(reply) => format!("answered {reply:?}"),
+    }
+  }
+
+  /// A-626 part 4 (main's ruling: the green's owner composes a journal holding a copy, where a refusal would answer
+  /// nothing): the owner counts each such composition, `merge.work.copy_composed_by_owner`. Do: on one shard, make a
+  /// green; hand the owner's rebase step a sealed work whose journal copies the root at version 0 to `b`, its increment
+  /// composed nowhere; then one whose journal makes a directory. Expect: the first counts once, whatever the owner
+  /// answers it (the work model resolving copies is owed, GAPS); the second rebases clean and counts nothing more.
+  #[test]
+  fn a_journal_holding_a_copy_is_composed_by_the_owner_and_counted() {
+    let (copy_answer, directory_rebased, counts) = crate::daemon::audit_on_shard(|state| {
+      let principal = slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let created = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::CreateGreen {
+          name: "copies".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      );
+      let slates_ipc::protocol::ReplyBody::GreenCreated { id } = created else {
+        panic!("no green: {created:?}")
+      };
+      let green = crate::verbs::to_db_volume(id);
+      let before = composed_by_owner(state);
+      let copy = super::VolumeOp::Copy {
+        from: String::new(),
+        to: "b".to_owned(),
+        version: 0,
+        replace: false,
+      };
+      let copied = crate::verbs::owner_rebase(state, sealed_at_0(green, vec![copy]));
+      let after_copy = composed_by_owner(state);
+      let mkdir = super::VolumeOp::Mkdir {
+        path: "d".to_owned(),
+      };
+      let made = crate::verbs::owner_rebase(state, sealed_at_0(green, vec![mkdir]));
+      (
+        answered(&copied),
+        matches!(made, super::RebaseAnswer::Rebased { .. }),
+        [before, after_copy, composed_by_owner(state)],
+      )
+    });
+    eprintln!("the owner's answer to the copy: {copy_answer}");
+    assert!(
+      directory_rebased,
+      "the owner rebased the work making a directory"
+    );
+    assert_eq!(
+      counts,
+      [0, 1, 1],
+      "the count before, after the copy ({copy_answer}), after the directory"
+    );
   }
 }

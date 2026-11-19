@@ -11706,6 +11706,15 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > every checkpoint, 2,048 bytes, had held the service's doubling rule from folding a small green's early versions.
 > Owed: a rebase that restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since
 > its version, where the checkpoint lists it key by key (the A-626 part 3 entry).
+>
+> **Status (2026-11-19, A-626 part 4).** Built: a rebase restates a copy (`crates/merge/src/engine/copy_restate.rs`), as
+> the deriver's `VolumeOp::Copy` and, after it, every operation its work made in the copied tree as the work made it:
+> a file edited there as edits over what the copy brings, never a rename. The deriver composes a journal holding a copy
+> against a base holding the copied tree at its destination (`Green::base_for`: the source's tree at the copy's version,
+> re-rooted), refusing an operation in a destination's tree before its copy (`Unsupported`). A work's logged journal
+> holds a copy (`LoggedOp::Copy`, the anchor's layout 14); a work's own shard leaves such a journal to the green's owner
+> to compose. Owed: the work model resolving copies, so a rebased work sees the copied files it left alone (the A-626
+> part 4 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -14261,6 +14270,9 @@ and export by landing).
 > layout 12; version 5 and layout 13 since its continuation (1), the sum carried beside a copy's record alone), so a
 > repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a rebase restating a
 > copy (part 4).
+>
+> **Status (2026-11-19, A-626 part 4).** Built: a work holding a copy rebases, its copy and its edits in the copied tree
+> restated, and composes again over the head. Owed: the work model resolving copies.
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -49969,3 +49981,51 @@ comment where `published` chooses a new shipper's holders); GAPS (the register n
     `a_successors_live_log_goes_on_past_every_position_durable_before_it` and
     `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to`.
   - The Linux and Windows runs are owed.
+
+### A-626 part 4 — A rebase restates a copy: the deriver's `VolumeOp::Copy`, composed against the copied tree, and a work's logged journal holding one, the anchor's layout 14 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path" and "Composition at seal", §4.17.4 item 3 and piece 3; A-586, A-626 parts 1 to 3, A-663, A-247)
+Applied in the same change to: §4.16 and §4.17.4 (status blocks), GAPS (the §4.17.4 entry), `crates/merge/src/increment.rs`
+(`VolumeOp::Copy`, `check_copies`, `emit_copies`), `crates/merge/src/engine/copy_restate.rs` (new: `copied_base`,
+`restate_sourced`, `copy_roots`, `copied_edit`), `crates/merge/src/engine.rs` (`base_for` laying in each copied tree,
+`Green::rebase` restating a copy where it refused one, `rebased_from`'s copy arm, `link_places` moving no link for a
+copied tree's edit), `crates/server/src/work_log.rs` (`LoggedOp::Copy`, appended last), `crates/server/src/work_home.rs`
+(`holds_copy`, `COPY_COMPOSED_BY_OWNER`), `crates/server/src/verbs.rs` (the count, where the owner composes),
+`crates/server/src/listing.rs` (a replacing copy's arm), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 14), and the
+tests (`src/increment/tests.rs`, `src/engine/copy_restate_tests.rs`, new; `copy_tests.rs` without the refusal's test;
+`crates/server/src/work_home.rs`'s, the owner's count; `crates/anchor/tests/anchor.rs`, a segment of layout 13 refused
+at start).
+- **What was there.** `Green::rebase` refused a work holding a copy (`TypeChanged` on its destination): a journal had no
+  operation to restate one as, and the deriver composed none.
+- **The deriver.** `VolumeOp::Copy { from, to, version, replace }` composes to one `Copy` (`REPLACE` where it replaces),
+  laid out by destination. What the journal does in the copied tree after it composes against the copied tree, which
+  `Green::base_for` puts at the destination for each copy the journal declares, in its order: the source's tree at the
+  copy's version, re-rooted, in place of whatever the destination's tree held. An operation in a destination's tree
+  before its copy is refused `Unsupported`: it would be composed against what the copy brings.
+- **The restatement.** A copy is restated as `VolumeOp::Copy`, before every operation in its tree; a file set beneath it
+  from its source (`ContentSource::Copied`, which a rename's edited destination names too) is the work's edit there,
+  restated over the bytes the copy brings, never a rename, and moves no node for A-663's link placement.
+- **The server.** A work's logged journal carries a copy (`LoggedOp::Copy`, appended so every tag before it stands;
+  the layout 14, one bump a landing by main's ruling, after A-626 part 3, continued (1) took 13). A work's own shard composes no journal holding a copy, since the
+  entries it fetches are a path's each and never a tree (A-247): it fetches nothing for one, and the green's owner
+  composes it against `Green::base_for`, counted `merge.work.copy_composed_by_owner`. A replacing copy takes the
+  journal's declared directories and symbolic links in its destination's tree out of the work's listing.
+- **The owner's extra cost** (main's ruling: the owner composing beats a refusal, which would answer nothing). A work
+  whose journal holds a copy is composed on its green's owner, as every work was before A-247: its sealed journal and
+  files go to the owner's shard, and the composition reads each copied tree once, every key at the copy's version
+  (`copied_base`, O(the copied trees' keys)), beside the deriver's own pass over the journal. A work with no copy is
+  composed where it was. `merge.work.copy_composed_by_owner` counts each such composition, and a test holds it moved.
+- **Owed.** The work model resolving copies: `Rebased::changed` names the files a rebased work changed, so its reads
+  and its listing do not yet show the copied files it left alone.
+- **Tests.** The deriver: a copy and an edit beneath it composed, the replace flag, an operation before its copy
+  refused, copies laid out by destination. The restatement: a copy of `trunk` at version 1 with an edit beneath it
+  rebased past a change to its source, restated as the copy and the edit. The oracle: generated works over the fixture
+  (copies of `trunk`, `trunk/d` or the root at version 1 or the head to `b` or `tags/t`, edits and files made in the
+  copied tree, a rename out of it, a link into it), each rebased as it submits: refused alike, a type change among the
+  windows, where it renames out or links in (A-586), else its restated journal composed again over the head and
+  submitted giving the green the original submit gives; a census of copies, edits and made files restated, renames out
+  and links in refused. Its first run (kiln r193) met a work that edits a copied file and renames one out: refused
+  alike, two type changes and a delete against modify on the rename's destination, whose source the base never held;
+  the oracle had asked type changes alone, and that work is now a fixed test. The owner's count
+  (`crates/server/src/work_home.rs`): a sealed work whose journal copies the root, handed to the owner's rebase step
+  composed nowhere, counts once whatever the owner answers it; one making a directory rebases clean and counts nothing.
+  A segment of layout 13 refused at start.
+- **Evidence.** Pending the Studio run.

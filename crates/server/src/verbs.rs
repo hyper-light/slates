@@ -9401,6 +9401,9 @@ fn judge_submission(
   // this verb, on the single-threaded owner shard — every declared operation before it is in the
   // increment, and a write that arrives after it is a later verb that lands in the next increment,
   // never this one.
+  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
+  }
   let (green_id, inc) = match build_increment(state, sealed, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
@@ -9712,6 +9715,9 @@ fn map_rebase(
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
+  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
+  }
   let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
