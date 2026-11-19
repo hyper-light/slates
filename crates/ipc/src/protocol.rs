@@ -1239,8 +1239,8 @@ pub enum RequestBody {
     material: CredentialMaterial,
     /// When it stops proving `principal` (wall clock, nanoseconds since the Unix epoch); none for never.
     expires_ns: Option<u64>,
-    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential" ‖ the three fields' wire
-    /// encodings)`.
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential-enroll" ‖ the wire encodings
+    /// of principal, material and expires_ns, in that order)`.
     proof: [u8; 32],
   },
   /// Revoke the version-control credential named `id` (§4.13; A-625 part 3): the human surface, proving issuer
