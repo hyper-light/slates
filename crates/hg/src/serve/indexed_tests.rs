@@ -838,7 +838,7 @@ fn a_root_the_changelog_lacks_is_dropped_and_counted() {
 /// null node, as 7.2 answers for an empty repository.
 #[test]
 fn a_public_history_is_served_whole_and_an_empty_one_answers_the_null_node() {
-  let made: Vec<Made> = (0..5)
+  let made: Vec<Made> = (0_usize..5)
     .map(|rev| Made {
       parents: [rev.checked_sub(1), None],
       root: None,
