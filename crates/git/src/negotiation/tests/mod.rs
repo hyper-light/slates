@@ -1594,7 +1594,7 @@ fn every_answer_is_the_oracles() {
   let unmet: Vec<&str> = census
     .counts()
     .iter()
-    .take(21)
+    .take(23)
     .filter(|(_, count)| *count == 0)
     .map(|(name, _)| *name)
     .collect();
