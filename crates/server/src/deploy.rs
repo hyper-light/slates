@@ -568,6 +568,10 @@ pub fn plan(
       reason,
     })?;
   }
+  // The version-control edge presents what the transport and the RPC-with-TLS export present (A-625 part 3): the
+  // node's certificate and key, copied before the key moves into the transport's identity, which keeps it private.
+  let edge_identity =
+    crate::config::EdgeIdentity::new(vec![entry.certificate.to_vec()], key.secret_der().to_vec());
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
   check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
@@ -598,7 +602,7 @@ pub fn plan(
       peers,
       resolver,
     },
-    edge_identity: crate::config::EdgeIdentity::new(Vec::new(), Vec::new()),
+    edge_identity,
   })
 }
 

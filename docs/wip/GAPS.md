@@ -454,9 +454,13 @@
 > credentials` 5 of 5, `slates-server --lib credentials` 9 of 9 and `--lib vcs_http` 32 of 32, `slates-http-edge --lib`
 > 31 of 31, `slates-cli` `credential` 1 of 1, `--test wire_order` 2 of 2 in `slates-db` and `slates-ipc`. Owed:
 > upload-pack served once A-662's stores land (`503` until then), A-654's session, LFS's routes on the site (main's
-> Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet identity's hand-in, a consumer's
-> revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live
-> `git clone` (main's).
+> Streamed/AfterBody ruling), a consumer's revocation in the SSH edge's key holders (A-651), listing credentials,
+> Mercurial's and Subversion's sites, the live `git clone` (main's).
+> **A-625 part 3, continued: `--vcs-http ADDRESS` (2026-11-19, g299):** `slates anchor|daemon --vcs-http ADDRESS`
+> starts the shared edge there, and the daemon logs where it serves; a fleet node's edge presents the node's own
+> certificate and key, handed over by its deployment plan (`FleetPlan::edge_identity`); a daemon that is no fleet node
+> serves cleartext, on loopback alone, any other address refused as usage before anything starts. EVIDENCE. Owed: the
+> anchor holding the edge's listener across a daemon's restart; the option on a library starter's anchor.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

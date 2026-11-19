@@ -12,6 +12,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
 
   anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
   daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
+           [--vcs-http ADDRESS]                                either role: serve git over HTTP(S) at ADDRESS; loopback
+                                                               alone unless --fleet gives the node's HTTPS identity
   profile  [--quick] [--json]                      measure and print the machine profile
   version                                          print this binary's version (`slates VERSION`)
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
@@ -741,6 +743,7 @@ const VALUES: &[&str] = &[
   "--shards",
   "--fleet",
   "--node",
+  "--vcs-http",
   "--bounded",
   "--dynamic",
   "--base",
@@ -1292,6 +1295,24 @@ fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
   }
 }
 
+/// `--vcs-http ADDRESS`, the version-control servers' shared HTTP edge (A-625 part 3), read as the roles read it
+/// (`slates_api::role::vcs_http_address`): an address off loopback on a daemon that is no fleet node (`fleet_node`
+/// false) would serve cleartext there, so it is refused as usage before anything starts.
+fn vcs_http_of(
+  taken: &Taken,
+  fleet_node: bool,
+) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
+  taken
+    .value("--vcs-http")
+    .map(|text| {
+      slates_api::role::vcs_http_address(text, fleet_node).map_err(|reason| ParseError::BadValue {
+        what: "--vcs-http",
+        reason,
+      })
+    })
+    .transpose()
+}
+
 fn size_of(taken: &Taken) -> Result<SizeClass, ParseError> {
   match (taken.value("--bounded"), taken.value("--dynamic")) {
     (Some(limit), None) => Ok(SizeClass::Bounded {
@@ -1745,15 +1766,16 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node"],
+        values: &["--shards", "--fleet", "--node", "--vcs-http"],
         switches: &["--quick"],
       })?;
+      let fleet = fleet_of(&taken)?;
       let options = ProcessOptions {
         instance: taken.instance(),
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
-        fleet: fleet_of(&taken)?,
-        vcs_http: None,
+        vcs_http: vcs_http_of(&taken, fleet.is_some())?,
+        fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
         Command::Anchor(options)

@@ -12650,9 +12650,22 @@ engine: the verdict, rebase, position mapping, the register).
 > arrivals waiting as the shard has seats, closed and counted past that), decided again, and served with its partition
 > read locally. Every refusal is typed and counted by kind. Owed: upload-pack served once each repository's store lives
 > on its owner shard (A-662; `503` until then), receive-pack's session (A-654), LFS's routes on the site under main's
-> ruling (a route says whether its status is fixed at the head or decided after its body), the operator's flag for the
-> edge's address and the fleet identity's hand-in in the daemon role, a consumer's revocation in the SSH edge's key
-> holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone` (main's).
+> ruling (a route says whether its status is fixed at the head or decided after its body), a consumer's revocation in
+> the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone`
+> (main's).
+>
+> **Status (2026-11-19, A-625 part 3 continued: the operator starts the edge, built).** `slates anchor` and `slates
+> daemon` take `--vcs-http ADDRESS`, an IPv4 address and port (port 0 the system's pick), and the daemon starts the
+> shared edge there and logs where it serves (`slates daemon: the version-control HTTP edge serves HTTPS on IP:PORT`, or
+> `cleartext`) before the line that says it serves; the anchor hands the address to the daemon it starts. A fleet
+> node's edge presents the node's own certificate and key, the ones its transport and its RPC-with-TLS export present:
+> the deployment plan hands them over (`FleetPlan::edge_identity`) from the DER the command read from the manifest's
+> files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
+> no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
+> the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
+> anything starts, rather than by a daemon that would start without its edge. Owed: the anchor holding the edge's
+> listener across a daemon's restart, as it holds the export's; the option on a library starter's anchor
+> (`slates_api::start`).
 >
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
@@ -48796,3 +48809,26 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
   `crates/merge/tests/engine.rs` (`symlink_merges`' last base), `crates/server/src/verbs.rs` (`map_rebase`:
   `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
+
+### A-625 part 3, continued — `--vcs-http ADDRESS`: the operator starts the shared HTTP edge, a fleet node presenting its own identity (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1; after A-625 part 3)
+Applied in the same change to: §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/api` (`role::ProcessOptions`'s
+`vcs_http`, `role::vcs_http_address`, `Role::parse` and `Role::args`, the daemon role's start and its log line;
+`CONTRACT` 51); `crates/cli` (the `anchor` and `daemon` grammar and usage); `crates/server` (`deploy::FleetPlan`'s
+`edge_identity`); `docs/cli.md`; the README's command table.
+- **What.** A-625 part 3 left the edge reachable only through `DaemonConfig::vcs_http`. The roles now take
+  `--vcs-http ADDRESS`; the daemon role fills the configuration from it, and a fleet node's identity comes from its
+  deployment plan, so nothing new reads a file and the daemon reads none (R1).
+- **Decisions.** (1) The identity is the node's own, the one its transport and its RPC-with-TLS export present, as the
+  config's own doc and main's ruling say; the plan copies the certificate and key DER it already holds before the key
+  moves into the transport's `Identity`, which keeps its key private, rather than widening `slates-transport`'s API.
+  (2) Cleartext off loopback is refused where the flag is read, as usage (the anchor's and the daemon's exit for a
+  refused configuration), before anything starts: the edge's own refusal at its start would leave a daemon serving
+  without the edge the operator asked for, with a log line as the only sign; the edge keeps its own refusal for any
+  other caller of `DaemonConfig::vcs_http`. Both refuse by one predicate, `Ipv4Addr::is_loopback`. (3) One reader,
+  `slates_api::role::vcs_http_address`, serves both the roles' grammar and the `slates` command's, as `shard_count`
+  does. (4) The daemon names where its edge serves before its serving line, from one thread of one process, so a reader
+  of the one has read the other; port 0 is the system's pick and the line is how an operator learns it.
+- **Tests.** EVIDENCE
+- **Owed.** The anchor holding the edge's listener across a daemon's restart, as it holds the RPC-with-TLS export's (a
+  restart rebinds now, and a port 0 changes); the option on a library starter's anchor (`slates_api::start`); HTTPS end
+  to end on a fleet node (main's live run, with the clone).
