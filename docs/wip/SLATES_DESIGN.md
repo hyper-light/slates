@@ -14836,6 +14836,25 @@ for Subversion.)
   through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
   slates' own SSH server (§4.17.2, A-633) the same `svnserve -t` is read from the `exec` request and served in the
   daemon, the principal the one the client's key proved.
+
+> **Status (2026-11-19, A-688: svn+ssh over slates' own SSH server).** Built in `crates/server`'s `vcs_ssh::svn`: the
+> SSH site's `exec` of `svnserve -t` (`SvnServices`, beside the other services) runs A-656's one ra_svn connection over
+> the channel, the greeting written first. The client's URL is found as `find_repos` finds it: the longest run of
+> leading segments naming a Subversion repository here, its root URL the client's URL cut after it; `..` refused
+> E125001, another scheme E125002, no repository E210005; a principal A-597's policy lets reach it for no right
+> refused E170001 "No access allowed to this repository". The tunnel's user, which `EXTERNAL` takes, is the principal
+> the client's key proved, named by its index key in hexadecimal until §4.13 names people, never the SSH login. The
+> repository's sources are lent afresh each step (`SvnStores`); a commit begins with its transaction, its hooks pass
+> where none is configured and refuse it where one is, and its work is refused 200007 until A-655 part 2b. The tunnel
+> ends as `svnserve -t` 1.15.0 ends: its error on standard error, `svnserve: E` and six digits, and `EXIT_FAILURE`.
+> Held to stock `svnserve -t`: the recorded `mkdir` commit item for item through the commit's start, and the scripted
+> sessions recorded on the Mac Studio (2026-11-19), their output, standard error and exit status; and end to end over
+> the SSH edge with a key. @@TESTS@@ Owed: the lender of a store over A-662's map (no Subversion store holds a green,
+> lock table, UUID or `svnserve.conf` facts yet), which the daemon's site needs to start the tunnel; the daemon's edge
+> (A-684); a configured hook run rather than refused; CRAM-MD5 through the tunnel; a client that leaves during a refused
+> edit's drop ends E210002 where `svnserve` exits 0; `svn checkout svn+ssh://` with a stock client against a daemon
+> (main's run).
+
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
   COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
@@ -50857,3 +50876,58 @@ sources).
   across a window's edge (an object past a window trying earlier ones within one and the reverse, as git's order by
   name and size would); the live clone over the HTTP edge with the store's production lender (A-625 part 3); the
   red-checks and the other platforms' runs (main's).
+
+### A-688 — svn+ssh over slates' own SSH server: the SSH site's `svnserve -t` runs A-656's ra_svn connection over the channel, the key's principal the tunnel's user (2026-11-19, g229, UI goal 93; §4.17.4 "The wire" (svn+ssh) and piece 12; after A-656, A-651, A-633, A-597 and A-662)
+Applied in the same change to:
+- §4.17.4's status under "The wire" (svn+ssh); GAPS (the §4.17 entry, after A-651 part 2's line, and A-656's owed
+  line);
+- `crates/server` (new: `vcs_ssh::svn`, `SvnServices`, `SvnCommand`, `SvnStores`, and its tests; `vcs_ssh::site`'s
+  not-served words shared; the edge's test of a tunnel end to end); `crates/svn` (`handshake::Unserved::failure`, the
+  error a refused URL is answered with, which the tunnel also ends with).
+- **The session** (`SvnCommand`). As `svnserve -t` does, the tunnel speaks first: the greeting is written as the
+  command starts. The client's answer names a URL, found as `svnserve`'s `find_repos` finds it (`serve.c` at
+  `d434dc14`, 1.15.0 alike) [C]: the path beneath the scheme (`svn`, an optional `+` and a tunnel's name, `://`) and
+  host, each segment percent-decoded as `svn_path_uri_decode` decodes one, a `..` segment refused "Couldn't determine
+  repository path" (E125001), then the longest run of leading segments naming a Subversion repository on this shard;
+  its root URL is the client's URL cut after that run. Another scheme is refused "Non-svn URL passed to svn server"
+  (E125002), a URL no Subversion repository holds "No repository found in '…'" (E210005), a git repository's name
+  alike. Then A-597's policy: a principal it lets reach the repository for none of its rights is refused "No access
+  allowed to this repository" (E170001), as the site judges Mercurial's `serve --stdio`; each command is then the
+  session's to judge (the repository's own `svnserve.conf` and authorization file, lent with its sources).
+- **Who** (§4.13; §4.17.4: "the principal the one the client's key proved"). The tunnel's user, which `EXTERNAL`
+  takes, is that principal, named as slates' version-control answers name one until §4.13 names principals for people:
+  its index key in hexadecimal (`lfs::owner_name`). The SSH login proves nothing and names no one: a client can send
+  any login, so `EXTERNAL` naming the login (`git`, as every git and svn+ssh client sends) is refused "Requested
+  username does not match", as `svnserve -t` refuses a name other than its tunnel's user.
+- **The sources** (`SvnStores`). What the handshake tells the client (the UUID, the realm, mergeinfo, who may read)
+  and, from the session's establishment on, the repository's index, green, lock table, policy and the owner's instant
+  are lent afresh for each step, as git's site lends its stores (A-640 part 2), so a shard's state is never held across
+  a wait. A repository whose store is not held here, or whose store goes away mid-session, is not served, in the site's
+  words, with nothing more written to the client.
+- **A commit.** `commit` begins A-656's drive with its transaction (the youngest revision, `-`, the connection's count
+  of commits in base 36). A hook the drive waits for (A-661) passes where the repository's policy configures none at
+  its point, as `svnserve` answers a point with no hook; where one is configured the commit is refused there, since
+  running a hook needs the transaction's view, owed with the owner's commit step, and no hook is ever skipped. An
+  accepted work is refused 200007 "This server does not make commits yet" until A-655 part 2b appends.
+- **How it ends** (recorded, below). The error that ended the connection on standard error, `svnserve: E`, its number
+  in six digits, `: ` and its message, and `EXIT_FAILURE` (1); a clean end 0 with nothing: a client that leaves between
+  commands or inside a command's item. A client that leaves during the handshake, a report or an edit, E210002; a
+  malformed item, E210004; protocol version 3 and a client without `edit-pipeline`, E210006 in the handshake's words;
+  each refused URL as above, written to the client too. Where `svnserve` aborts and on the caller's own errors the
+  tunnel ends 1 with nothing more, counted.
+- **The oracle.** Stock `svnserve -t` 1.15.0 (Homebrew's, the Mac Studio, macOS arm64), two ways. The recorded `mkdir`
+  commit (`crates/svn/fixtures/commit/`, made through `svnserve -t`), item for item through the commit's start. And
+  sessions recorded for this piece at 2026-11-19T22:27:07Z and 22:33:56Z: each scripted client's bytes piped to
+  `svnserve -t --tunnel-user=alice -r ROOT`, ROOT holding `repo` (`svnadmin create`, `svnadmin setuuid
+  00000000-0000-4000-8000-00000000a617`, `anon-access = none`, `auth-access = write`) and `closed` (`auth-access =
+  none`), its output, standard error and exit status kept; the first six sessions' bytes are pinned by SHA-256 in the
+  tests. One recorded ending the tunnel does not meet: a client that leaves while a refused edit's commands are being
+  dropped (`open-dir` of a missing path, then gone) ends 0 there and E210002 here, since A-656's `Waiting` does not
+  tell the drop from a live edit (GAPS).
+- **Tests.** @@TESTS@@
+- **Owed.** The lender of a Subversion store over A-662's map: A-662's Subversion entry holds the index alone, with no
+  green, lock table, UUID or `svnserve.conf` facts, so no production lender exists and the daemon's site cannot start
+  the tunnel until one does; the daemon's SSH edge (A-684) and the connection moved to the repository's owner shard;
+  running a configured hook; CRAM-MD5 through the tunnel (the credentials record holds no keys for it); a URL
+  canonicalized as `svn_uri_canonicalize` would (stock clients send canonical URLs); the drop's ending above; `svn
+  checkout svn+ssh://` with a stock client against a daemon, the other platforms' runs and the red-checks (main's).

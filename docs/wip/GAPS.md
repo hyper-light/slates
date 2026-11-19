@@ -309,6 +309,17 @@
 > negotiates in rounds (`--lib vcs_ssh`: red 23 of 25 at 8dfd557f, green 25 of 25 at caa2fc0f, macOS arm64, Mac
 > Studio). Owed: the `StoreLender` over A-662's map (A-662's), without which no store is lent and the edge's services
 > stay `NotYet`; the stateful v0 session over SSH; main's live `git clone` over SSH.
+> **A-688 (2026-11-19, g229; svn+ssh over slates' own SSH server, §4.17.4 piece 12):** `vcs_ssh::svn` serves the SSH
+> site's `svnserve -t` (`SvnServices` beside the other services): A-656's ra_svn connection over the channel, the
+> client's URL found as `find_repos` finds it (E125001, E125002, E210005), A-597's policy asked (E170001), the tunnel's
+> user the principal the key proved (its index key in hexadecimal), never the SSH login; sources lent a step at a time
+> (`SvnStores`); a commit begun, its hooks passed where none is configured, its work refused 200007; the tunnel ending as
+> `svnserve -t` 1.15.0 ends, held to stock recordings (the `mkdir` commit; scripted sessions recorded on the Mac Studio,
+> 2026-11-19) and end to end over the SSH edge. @@TESTS@@ Owed: the lender of a Subversion store over A-662's map (its
+> entry holds the index alone), without which the daemon's site cannot start the tunnel; the daemon's edge (A-684); a
+> configured hook run, not refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends
+> E210002 where `svnserve` exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout
+> svn+ssh://` against a daemon.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1269,7 +1280,8 @@
 > own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
 > `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
 > once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
-> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> tunnel's entry point (built since, A-688) (one learned-wait mechanism for the three edges, after A-625's and A-651's
+> land); the daemon's
 > commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
 > authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
 > for anonymous): the read commands' authorization is owed (A-606).

@@ -14,6 +14,7 @@ use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
 use super::site::{Command, Dispatched, Next, Refused, SshSite, Stepped};
 use super::ssh_client::{Client, ClientOptions, put_string, read_string};
+use super::svn::tests as svn_tests;
 use super::waits::PHASES;
 use super::{Bounds, Counts, EdgeState, serve};
 use crate::daemon::LIVENESS_BUDGET_NS;
@@ -233,6 +234,17 @@ where
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
+  served_by(seats, || Site, client)
+}
+
+/// [`served`] with the sites `site` makes, one a connection.
+fn served_by<S, M, C, R>(seats: usize, site: M, client: C) -> (R, Seen)
+where
+  S: SshSite + 'static,
+  M: FnMut() -> S + 'static,
+  C: FnOnce(SocketAddrV4) -> R + Send + 'static,
+  R: Send + 'static,
+{
   let runtime = runtime();
   let bounds = Bounds::of_shard(seats, ROOM_BYTES, TICK_NS);
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog())
@@ -244,7 +256,7 @@ where
     .expect("the edge's state kept on its shard");
   runtime
     .spawn(async move {
-      let _ = serve(listener, state, || Site).await;
+      let _ = serve(listener, state, site).await;
     })
     .expect("the listener's task");
   let shard = runtime.shard_id().0;
@@ -430,6 +442,13 @@ fn send_data(peer: &mut Peer, data: &[u8]) {
   let mut message = vec![94];
   message.extend_from_slice(&peer.channel.to_be_bytes());
   put_string(&mut message, data);
+  peer.send(&message);
+}
+
+/// Ends the client's input on the session (RFC 4254 §5.3: `SSH_MSG_CHANNEL_EOF`).
+fn send_eof(peer: &mut Peer) {
+  let mut message = vec![96];
+  message.extend_from_slice(&peer.channel.to_be_bytes());
   peer.send(&message);
 }
 
@@ -670,5 +689,39 @@ fn a_slow_push_is_reaped_when_a_new_connection_needs_its_seat() {
       seen.backoffs[3]
     ),
     (1, true, 1, 1)
+  );
+}
+
+/// A-688 (§4.17.4 "svn+ssh": over slates' own SSH server `svnserve -t` is read from the `exec` request and served in the
+/// daemon, the principal the one the client's key proved). Do: authenticate with the held key, run `svnserve -t` through
+/// the site with Subversion's tunnel over an empty repository the key's principal owns, send a scripted stock client's
+/// session (its answer to the greeting naming the repository, `EXTERNAL`, `get-latest-rev`) and EOF, and read to the
+/// end. Expect: what stock `svnserve -t` 1.15.0 wrote on that session (`super::svn::tests`' recording), its greeting less
+/// `svndiff1`, as standard output; nothing on standard error; exit-status 0, EOF and close, in order; one command run.
+#[test]
+fn an_svnserve_tunnel_serves_a_stock_session_over_the_channel() {
+  let site = || svn_tests::tunnel_site(Keys, HOLDER);
+  let (transcript, seen) = served_by(ONE_SEAT, site, |address| {
+    let mut peer = Peer::connect(address)?;
+    (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+    (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+    exec(&mut peer, b"svnserve -t").then_some(())?;
+    send_data(&mut peer, &svn_tests::latest_client());
+    send_eof(&mut peer);
+    Some(transcript(&mut peer))
+  });
+  assert_eq!(
+    transcript,
+    Some(Transcript {
+      out: svn_tests::latest_answer(),
+      err: Vec::new(),
+      status: Some(0),
+      order: vec![94, 98, 96, 97],
+      ended: true,
+    })
+  );
+  assert_eq!(
+    (seen.counts.commands_run, seen.counts.commands_refused),
+    (1, 0)
   );
 }

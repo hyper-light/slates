@@ -34,16 +34,19 @@
 //! `Uncommitted::NotServed`, "This server does not make commits yet" (200007), as slates-svn says the daemon refuses
 //! every work until the owner's step appends.
 //!
-//! **How the tunnel ends**, as stock `svnserve -t` 1.15.0 ends (recorded with hand-made clients on the Mac Studio,
-//! 2026-11-19, A-688): the error that ended the connection on standard error, `svnserve: E` and its number in six digits,
-//! `: ` and its message, and `EXIT_FAILURE` (1); a clean end, 0 with nothing. Recorded: a client that leaves between
+//! **How the tunnel ends**, as stock `svnserve -t` 1.15.0 ends: the error that ended the connection on standard error,
+//! `svnserve: E` and its number in six digits, `: ` and its message, and `EXIT_FAILURE` (1); a clean end, 0 with
+//! nothing. Recorded on the Mac Studio, 2026-11-19T22:27Z and 22:34Z, scripted clients' bytes piped to
+//! `svnserve -t --tunnel-user=alice -r ROOT` (the tests' oracle, `tests/svn.rs`): a client that leaves between
 //! commands, or inside a command's item, 0; a malformed item, E210004 "Malformed network data"; a client that leaves
-//! during the handshake, inside a report or inside a commit's edit, E210002 "Network connection closed unexpectedly"; a
-//! URL no repository holds, E210005, written to the client too; protocol version 3 and a client without
+//! during the handshake, inside a report or inside a commit's edit, E210002 "Network connection closed unexpectedly";
+//! a URL no repository holds, E210005, one of another scheme, E125002, one climbing out with `..`, E125001, and a
+//! repository closed to the user, E170001, each written to the client too; protocol version 3 and a client without
 //! `edit-pipeline`, E210006 in the handshake's words. A client that leaves while its refused edit's commands are being
-//! dropped ends E210002 here where `svnserve` exits 0, since the connection's [`Waiting`] does not tell the drop from a
-//! live edit (GAPS). Where `svnserve` aborts (`serve::Refused::Aborted`) and on the caller's own errors, the tunnel ends
-//! 1 with nothing more, counted: an abort is a signal, which an exit status cannot carry.
+//! dropped ends E210002 here where `svnserve` exits 0 (recorded: `open-dir` of a missing path, then the client gone),
+//! since the connection's [`Waiting`] does not tell the drop from a live edit (GAPS); one that ends the drop with
+//! `abort-edit` first ends 0 as there. Where `svnserve` aborts (`serve::Refused::Aborted`) and on the caller's own
+//! errors, the tunnel ends 1 with nothing more, counted: an abort is a signal, which an exit status cannot carry.
 //!
 //! **Bounds** ([`TunnelBounds`]) are the caller's, each derived from its shard's budget when the daemon starts the edge
 //! (owed with it, as `ToolServices`' room is): one item's bytes, a report's room and the nodes a drive holds open
@@ -147,7 +150,11 @@ pub(crate) trait SvnStores {
   /// Runs `step` over what repository `id`'s sessions are opened with; none when its store is not held here.
   fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T>;
   /// Runs `step` over repository `id`'s sources at the owner's instant; none when its store is not held here.
-  fn lend<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Sources<'_, Self::Green>) -> T) -> Option<T>;
+  fn lend<T>(
+    &mut self,
+    id: RepositoryId,
+    step: impl FnOnce(&Sources<'_, Self::Green>) -> T,
+  ) -> Option<T>;
 }
 
 /// A tunnel's bounds, each its caller's (the module doc).
@@ -733,14 +740,24 @@ fn path_start(url: &[u8]) -> Option<usize> {
   }
   if url.get(at) == Some(&b'+') {
     let rest = url.get(at..)?;
-    at = at.checked_add(rest.iter().position(|byte| *byte == b':').unwrap_or(rest.len()))?;
+    at = at.checked_add(
+      rest
+        .iter()
+        .position(|byte| *byte == b':')
+        .unwrap_or(rest.len()),
+    )?;
   }
   if !url.get(at..)?.starts_with(SCHEME_END) {
     return None;
   }
   at = at.checked_add(SCHEME_END.len())?;
   let host = url.get(at..)?;
-  at.checked_add(host.iter().position(|byte| *byte == b'/').unwrap_or(host.len()))
+  at.checked_add(
+    host
+      .iter()
+      .position(|byte| *byte == b'/')
+      .unwrap_or(host.len()),
+  )
 }
 
 /// The path's segments from `path_at` in `url`, each percent-decoded with where it ends in `url`, empty ones passed over;
@@ -766,17 +783,18 @@ fn segments(url: &[u8], path_at: usize) -> Option<Vec<(Vec<u8>, usize)>> {
   Some(found)
 }
 
-/// `raw` with every `%` and two hexadecimal digits made the byte they name, as `svn_path_uri_decode` decodes a path, and
-/// every other byte kept.
+/// `raw` with every `%` and two hexadecimal digits made the byte they name, as `svn_path_uri_decode` decodes a path
+/// (`apr_isxdigit` on both), and every other byte kept.
 fn percent_decoded(raw: &[u8]) -> Vec<u8> {
   let mut decoded = Vec::with_capacity(raw.len());
   let mut rest = raw;
   while let Some((&byte, after)) = rest.split_first() {
-    let named = (byte == b'%')
-      .then(|| after.get(..2))
-      .flatten()
-      .and_then(|digits| std::str::from_utf8(digits).ok())
-      .and_then(|digits| u8::from_str_radix(digits, HEX_RADIX).ok());
+    let named = match after {
+      [high, low, ..] if byte == b'%' => hex_digit(*high)
+        .zip(hex_digit(*low))
+        .and_then(|(high, low)| u8::try_from(high.checked_mul(HEX_RADIX)?.checked_add(low)?).ok()),
+      _ => None,
+    };
     match named {
       Some(value) => {
         decoded.push(value);
@@ -789,6 +807,11 @@ fn percent_decoded(raw: &[u8]) -> Vec<u8> {
     }
   }
   decoded
+}
+
+/// The value of the hexadecimal digit `byte`, either case; none for any other byte.
+fn hex_digit(byte: u8) -> Option<u32> {
+  char::from(byte).to_digit(HEX_RADIX)
 }
 
 /// The name of the transaction a connection's `count`th commit begins on `base` (the module doc's commit).
@@ -868,6 +891,7 @@ fn item_words(error: ItemError) -> (u32, String) {
   (error.subversion_code(), message.to_owned())
 }
 
+// The edge's own tests run a tunnel through this module's test site (`super::tests`).
 #[cfg(test)]
 #[path = "tests/svn.rs"]
-mod tests;
+pub(super) mod tests;
