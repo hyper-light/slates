@@ -10401,6 +10401,7 @@ fn attach(
     principal: principal.clone(),
     rights: granted_rights(rights, intent),
     token,
+    mount: None,
   };
   if let Some(defer) = deferred_mount(&form) {
     return defer(
@@ -11427,11 +11428,11 @@ fn bind_mount(
     now,
   ) {
     Ok(_) => {
-      // The mount is watched from here: the kernel's unmount of it ends this attachment whenever it comes (A-511).
+      // The mount is held as this shard's, its id kept in the attachment's record (A-540), and watched from here: the
+      // kernel's unmount of it ends this attachment whenever it comes (A-511).
       #[cfg(target_os = "macos")]
       if let Some(own) = own {
-        state.own_nfs_mounts.insert(attachment, own);
-        crate::own_nfs::watch(state);
+        crate::own_nfs::hold(state, attachment, own);
       }
       ReplyBody::MountBound
     }

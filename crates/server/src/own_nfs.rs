@@ -8,8 +8,14 @@
 //! kernel's table (`getfsstat(MNT_NOWAIT)`, no RPC, nothing opened) names the mount at exactly the bound point (the CLI
 //! binds the path the kernel records, `std::fs::canonicalize`) whose source is the volume's, and its filesystem id is
 //! what the base plane and the landing walk compare (`slates_base::own_mounts`). A record ends with its attachment
-//! (`verbs::end_attachment`); a mount the table no longer names was unmounted while no daemon ran, and nothing is
-//! recorded for it.
+//! (`verbs::end_attachment`).
+//!
+//! **The id outlives the daemon (A-540).** The mount's id is also kept in its attachment's durable record once the
+//! mount is seen (`Op::AttachmentMountSeen`, at the bind and at a start that finds it), so a successor reads the table
+//! once as it starts ([`learn`]) and ends the attachment of every recorded mount the table no longer names: the kernel
+//! let it go while no daemon ran. An attachment whose record keeps no id was never seen mounted, and the table's
+//! silence about its point proves nothing (a bind of a point holding no mount records the same as a live one's), so it
+//! keeps the rule before A-540: held if its volume's mount is at its point, left for a `detach` if not.
 //!
 //! **The kernel's unmount ends the attachment (A-511).** A shard that holds an own mount watches the kernel's unmounts
 //! ([`watch`]): the kernel's own event (`slates_bridge_oci::mount_table::UnmountWatch`, `EVFILT_FS` on `VQ_UNMOUNT`)
@@ -26,10 +32,12 @@ use std::collections::BTreeSet;
 
 use crate::state::{self, ShardState};
 use slates_base::own_mounts::Unrecorded;
-use slates_bridge_oci::mount_table::{MountTableError, UnmountWatch};
+use slates_bridge_oci::mount_table::{MountEntry, MountTableError, UnmountWatch};
 use slates_db::catalog::{AttachmentRecord, Consumer};
+use slates_db::op::Op;
 use slates_ipc::protocol::Refusal;
 use slates_rt::futures;
+use slates_vfs::clock::Clock;
 
 /// The refusal of a mount at `mount_point` this daemon could not record, typed (A-299); the point and why are logged.
 fn refusal(why: Unrecorded, mount_point: &str) -> Refusal {
@@ -114,26 +122,58 @@ pub(crate) fn bound(
     .map_err(|why| refusal(why, mount_point))
 }
 
-/// Learns the mounts this shard's catalog names that the kernel's table still holds, a predecessor's that outlived
-/// it (A-227): each recorded before the shard serves any base or landing. A record the table does not hold is a mount
-/// that went while no daemon ran, and nothing is recorded for it. Refused at the set's bound, which is the most
-/// attachments the shards hold, so a start that meets it is refused rather than serve a mount it does not record.
+/// Learns the mounts this shard's catalog names that the kernel's table still holds, a predecessor's that outlived it
+/// (A-227), each recorded before the shard serves any base or landing, from one read of the table (A-540). A table that
+/// cannot be read learns and ends nothing ([`TABLE_UNREAD`]). Refused at the set's bound, which is the most attachments
+/// the shards hold, so a start that meets it is refused rather than serve a mount it does not record.
 pub(crate) fn learn(state: &mut ShardState) -> Result<(), Refusal> {
-  let mut learned = Vec::new();
+  let Ok(table) = slates_bridge_oci::mount_table::mount_table() else {
+    state.count(TABLE_UNREAD, 1);
+    return Ok(());
+  };
+  learn_from(state, &table)
+}
+
+/// [`learn`] over `table`, read once: the kernel's, or a test's stand-in. Each host mount's attachment is judged by
+/// what its record keeps (A-540):
+/// - a mount id (the mount was seen, at its bind or at an earlier start): still named, the mount is held as this
+///   shard's; no longer named, the kernel let it go while no daemon ran, and the attachment ends as a `detach` would;
+/// - none (never seen mounted): the rule before A-540, since the table's silence about its point proves nothing (a bind
+///   of a point holding no mount records the same as a bind of a live one, [`BIND_UNCONFIRMED`], and the CLI and the
+///   kernel may name one point differently). A mount of its volume at exactly its point is held and its id recorded
+///   now; none found leaves the attachment as it is, for a `detach`.
+fn learn_from(state: &mut ShardState, table: &[MountEntry]) -> Result<(), Refusal> {
+  let named: BTreeSet<u64> = table
+    .iter()
+    .map(slates_base::own_mounts::table_id)
+    .collect();
+  let mut learned: Vec<(u64, OwnNfsMount)> = Vec::new();
+  let mut seen: Vec<(u64, u64)> = Vec::new();
+  let mut gone: Vec<u64> = Vec::new();
   for volume in state.db.partition().volumes() {
     for record in state.db.partition().attachments_of(volume.id) {
       let Some((point, name)) = mount_of(state, record) else {
         continue;
       };
-      // Two records naming one point find one mount, which has one holder.
-      let Some(id) = id_at(point, name) else {
-        continue;
+      let id = match record.mount {
+        Some(id) if named.contains(&id) => id,
+        Some(_) => {
+          gone.push(record.id);
+          continue;
+        }
+        None => {
+          let source = source_of(name);
+          let Some(id) =
+            slates_base::own_mounts::mount_id_in(table, point, |named| named == source)
+          else {
+            continue;
+          };
+          seen.push((record.id, id));
+          id
+        }
       };
-      if held(state, id)
-        || learned
-          .iter()
-          .any(|(_, own): &(u64, OwnNfsMount)| own.0 == id)
-      {
+      // Two records naming one point find one mount, which has one holder.
+      if held(state, id) || learned.iter().any(|(_, own)| own.0 == id) {
         continue;
       }
       learned.push((
@@ -143,7 +183,46 @@ pub(crate) fn learn(state: &mut ShardState) -> Result<(), Refusal> {
     }
   }
   state.own_nfs_mounts.extend(learned);
+  for (attachment, mount) in seen {
+    record_seen(state, attachment, mount);
+  }
+  let_go_of(state, &gone);
   Ok(())
+}
+
+/// Counter: seen mounts whose id could not be written into their attachment's record (A-540): a successor judges that
+/// attachment by the rule for one never seen.
+const ID_UNRECORDED: &str = "own_nfs.mount_id_unrecorded";
+
+/// Holds `own`, the mount the CLI just bound for `attachment`, as this shard's (A-227): its id kept in the attachment's
+/// durable record (A-540), in the bind's own transaction, so a successor's start can tell whether the kernel let it go
+/// while no daemon ran; and watched from here (A-511).
+pub(crate) fn hold(state: &mut ShardState, attachment: u64, own: OwnNfsMount) {
+  record_seen(state, attachment, own.0);
+  state.own_nfs_mounts.insert(attachment, own);
+  watch(state);
+}
+
+/// Keeps `mount`, the kernel's id of the mount `attachment` was seen bound to, in the attachment's durable record
+/// (`Op::AttachmentMountSeen`, A-540); a record that keeps it already is left as it is. One that could not be written
+/// is counted ([`ID_UNRECORDED`]).
+fn record_seen(state: &mut ShardState, attachment: u64, mount: u64) {
+  let kept = state
+    .db
+    .partition()
+    .attachment(attachment)
+    .is_some_and(|record| record.mount == Some(mount));
+  if kept {
+    return;
+  }
+  let now = state.clock.monotonic_ns();
+  let seen = Op::AttachmentMountSeen {
+    id: attachment,
+    mount,
+  };
+  if state.db.mutate(&mut state.segment, &seen, now).is_err() {
+    state.count(ID_UNRECORDED, 1);
+  }
 }
 
 /// Counter: the kernel's table read to judge this shard's own mounts ([`let_go_of_unmounted`], A-511): once as the
@@ -153,8 +232,8 @@ const JUDGED: &str = "own_nfs.unmount_judged";
 /// Counter: attachments ended because the kernel let their mount go (A-511).
 const UNMOUNTED: &str = "own_nfs.unmounted";
 
-/// Counter: judgments that ended nothing because the kernel's table could not be read (A-511): nothing ends on a read
-/// error.
+/// Counter: judgments that ended nothing because the kernel's table could not be read, the watch's (A-511) and a
+/// start's (A-540): nothing ends on a read error.
 const TABLE_UNREAD: &str = "own_nfs.table_unread";
 
 /// Counter: mounts the kernel let go whose attachment's end could not be recorded (A-511). The mount stays recorded as
@@ -278,8 +357,16 @@ fn let_go_of_unmounted(
       .map(|(attachment, own)| (*attachment, own.0)),
     &named,
   );
+  let_go_of(state, &gone)
+}
+
+/// Ends each of `attachments`, whose mount the kernel let go, as a `detach` would (`verbs::end_attachment`,
+/// `Ending::Otherwise`, since the mount is gone already), its own-mount record with it: the watch's judgment (A-511)
+/// and a start's (A-540). How many ended ([`UNMOUNTED`]); one whose end could not be recorded is counted
+/// ([`END_REFUSED`]).
+fn let_go_of(state: &mut ShardState, attachments: &[u64]) -> usize {
   let mut ended: usize = 0;
-  for attachment in gone {
+  for &attachment in attachments {
     let Some(record) = state.db.partition().attachment(attachment).cloned() else {
       // The record ended without letting its mount go: only the record of ours is left to end.
       state.own_nfs_mounts.remove(&attachment);
@@ -353,6 +440,15 @@ mod tests {
   /// A volume named `name` on this shard and a host mount's attachment of it bound at [`POINT`], recorded as this
   /// shard's own mount `id`, as a bind of a mount the kernel's table named records it: the attachment.
   fn own_mount(s: &mut ShardState, name: &str, id: u64) -> u64 {
+    let attachment = bound_attachment(s, name, POINT, None);
+    s.own_nfs_mounts
+      .insert(attachment, OwnNfsMount::record(id).unwrap());
+    attachment
+  }
+
+  /// A volume named `name` on this shard and a host mount's attachment of it bound at `point`, whose record keeps
+  /// `seen` as its mount's id (A-540), as a predecessor's catalog holds it: the attachment. Nothing is held in memory.
+  fn bound_attachment(s: &mut ShardState, name: &str, point: &str, seen: Option<u64>) -> u64 {
     let owner = Principal::Uid {
       host: slates_db::HostId(0),
       uid: OWNER_UID,
@@ -383,17 +479,42 @@ mod tests {
         consumer: Consumer::Bridge,
         snapshot: None,
         form: AttachForm::ChosenPath {
-          path: POINT.to_owned(),
+          path: point.to_owned(),
         },
         principal: volume.owner.clone(),
         rights: crate::verbs::rights_of(&volume, &volume.owner),
         token: [0; 16],
+        mount: seen,
       },
     };
     s.db.mutate(&mut s.segment, &op, now).unwrap();
-    s.own_nfs_mounts
-      .insert(attachment, OwnNfsMount::record(id).unwrap());
     attachment
+  }
+
+  /// The kernel's table entry for the slates mount of the volume named `name` at `point`, under id `id` (its two words
+  /// as `slates_base::own_mounts::table_id` packs them).
+  fn entry(id: u64, point: &str, name: &str) -> MountEntry {
+    MountEntry {
+      identity: slates_bridge_oci::mount_table::MountIdentity {
+        device: id >> u32::BITS,
+        mount: id & u64::from(u32::MAX),
+      },
+      mount_point: point.to_owned(),
+      fstype: "nfs".to_owned(),
+      source: source_of(name),
+    }
+  }
+
+  /// What the shard holds of `attachment` after a start: whether its record lives, the id its record keeps, the id held
+  /// for it in memory, and how many attachments ended as unmounted.
+  fn after_start(s: &ShardState, attachment: u64) -> (bool, Option<u64>, Option<u64>, u64) {
+    let record = s.db.partition().attachment(attachment);
+    (
+      record.is_some(),
+      record.and_then(|record| record.mount),
+      s.own_nfs_mounts.get(&attachment).map(|own| own.0),
+      s.refusals.get(UNMOUNTED).copied().unwrap_or(0),
+    )
   }
 
   /// Starts the shard's watch over a stand-in table that names mount `id` while `mounted` holds: the pipe end that
@@ -598,6 +719,90 @@ mod tests {
       (ended, kept, own, unread),
       (0, true, true, 1),
       "an unreadable table ended nothing and was counted"
+    );
+  }
+
+  /// A-540: a successor ends the attachment of a mount the kernel let go while no daemon ran. Do: learn, as a start
+  /// does, a host mount's attachment whose record keeps its mount's id, from a table that no longer names that id (it
+  /// names another mount of the same volume at the same point instead). Expect the attachment ended and counted, and
+  /// nothing held for it. Before, a start judged only by the point, so it held the other mount for this attachment, and
+  /// a mount gone with no other in its place left its attachment waiting for a `detach` for good.
+  #[test]
+  fn a_restart_ends_an_attachment_whose_recorded_mount_the_table_no_longer_lists() {
+    const GONE: u64 = (11 << u32::BITS) | 1;
+    const ANOTHER: u64 = (11 << u32::BITS) | 2;
+    let after = crate::daemon::audit_on_shard(|s| {
+      let point = "/Volumes/a540-gone";
+      let attachment = bound_attachment(s, "gone-while-down", point, Some(GONE));
+      learn_from(s, &[entry(ANOTHER, point, "gone-while-down")]).unwrap();
+      after_start(s, attachment)
+    });
+    assert_eq!(
+      after,
+      (false, None, None, 1),
+      "the attachment of a mount the table no longer names ended at the start"
+    );
+  }
+
+  /// A-540: a successor holds a mount whose recorded id the table still names. Do: learn an attachment whose record
+  /// keeps its mount's id, from a table naming that id. Expect the attachment kept, its mount held under that id, and
+  /// nothing ended.
+  #[test]
+  fn a_restart_holds_an_attachment_whose_recorded_mount_the_table_still_lists() {
+    const KEPT: u64 = (12 << u32::BITS) | 1;
+    let after = crate::daemon::audit_on_shard(|s| {
+      let point = "/Volumes/a540-kept";
+      let attachment = bound_attachment(s, "still-mounted", point, Some(KEPT));
+      learn_from(s, &[entry(KEPT, point, "still-mounted")]).unwrap();
+      after_start(s, attachment)
+    });
+    assert_eq!(
+      after,
+      (true, Some(KEPT), Some(KEPT), 0),
+      "a mount the table still names is held, its attachment kept"
+    );
+  }
+
+  /// A-540: an attachment never seen mounted keeps the rule before A-540, since the table's silence about its point
+  /// proves nothing. Do: learn two attachments whose records keep no id, one at a point where the table names a mount
+  /// of its volume and one at a point where it names nothing. Expect the first held and its id kept in its record from
+  /// then on; the second kept as it is, neither held nor ended, its record still keeping no id.
+  #[test]
+  fn an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart() {
+    const FOUND: u64 = (13 << u32::BITS) | 1;
+    let (found, unseen) = crate::daemon::audit_on_shard(|s| {
+      let found = bound_attachment(s, "found-at-start", "/Volumes/a540-found", None);
+      let unseen = bound_attachment(s, "never-seen", "/Volumes/a540-unseen", None);
+      learn_from(s, &[entry(FOUND, "/Volumes/a540-found", "found-at-start")]).unwrap();
+      (after_start(s, found), after_start(s, unseen))
+    });
+    assert_eq!(
+      found,
+      (true, Some(FOUND), Some(FOUND), 0),
+      "a mount found at its point is held and its id kept from then on"
+    );
+    assert_eq!(
+      unseen,
+      (true, None, None, 0),
+      "an attachment never seen mounted is neither held nor ended"
+    );
+  }
+
+  /// A-540: a bind of a seen mount keeps the mount's id in the attachment's durable record. Do: hold a mount for a
+  /// bound attachment, as a bind that found its mount in the kernel's table does. Expect the record keeping the
+  /// mount's id and the mount held.
+  #[test]
+  fn a_held_mount_keeps_its_id_in_its_attachments_record() {
+    const BOUND: u64 = (14 << u32::BITS) | 1;
+    let after = crate::daemon::audit_on_shard(|s| {
+      let attachment = bound_attachment(s, "bound-and-seen", "/Volumes/a540-bound", None);
+      hold(s, attachment, OwnNfsMount::record(BOUND).unwrap());
+      after_start(s, attachment)
+    });
+    assert_eq!(
+      after,
+      (true, Some(BOUND), Some(BOUND), 0),
+      "the bind kept the mount's id in the attachment's record"
     );
   }
 }

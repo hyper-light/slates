@@ -3023,7 +3023,14 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
   has none) and an unmount slower than any bound all end their attachments when the kernel lets the mount go, and a
   mount that stays keeps its attachment. Until A-511 a `UMNT` started a confirmation against the table that gave up
   at a bound (a fixed second, then the pace learned in A-493), and a mount unmounted with no `UMNT` kept its
-  attachment for good.
+  attachment for good. Since A-540 the mount's id also lives in its attachment's durable record once the mount is
+  seen (`Op::AttachmentMountSeen`, at the bind and at a start that finds it), so a restarted daemon reads the table
+  once as it starts (`own_nfs::learn`) and ends every attachment whose recorded mount the table no longer names: the
+  kernel let it go while no daemon ran. An attachment whose record keeps no id was never seen mounted, and the
+  table's silence about its point proves nothing: a bind of a point that holds no mount records the same as a bind of
+  a live one (`own_nfs.bind_unconfirmed`), and the CLI and the kernel may name one point differently. Ending it could
+  end a live mount's attachment, so it keeps the rule before A-540: held if its volume's mount is at exactly its
+  point (its id recorded from then on), left for a `detach` if not.
 - **OCI binds.** The source mount's attachment is found by that same bound mount point in the
   daemon's records.
 - **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
@@ -35737,6 +35744,16 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   `Unsupported` (its descriptors come by the socket route). Checks (Mac Studio, debug, 2026-11-18, load 18 to 20):
   `slates-ipc --lib` 64 of 64 (1 ignored) and `slates-client --lib` 8 of 8 on macOS; the Linux test
   `a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock` is main's to run.
+- **The macOS route's claim steps** (`slates_ipc::route::claim`, A-161, A-173). Each socket read and write waited the
+  caller's reply deadline at a time (`SO_RCVTIMEO`, `SO_SNDTIMEO`), then asked a liveness callback and waited again
+  while the daemon lived. Now no step has a timeout: each waits while the route's connection lives, as the daemon's
+  side waits while the client's does (A-492). A daemon that goes closes its end with its process, or with its route's
+  task when it stops inside its process, and the next read meets the close at once; a live daemon answers however
+  slow. `claim` takes no bound and no callback; the client's `claim_offer` and `claim_map` and the integration tests
+  call it so. Checks (Mac Studio, debug, 2026-11-18, load 17 to 20): `slates-ipc --lib` 65 of 65 (1 ignored) with
+  `a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound` (a stand-in daemon holding its challenge 1.5 s),
+  `slates-client --lib` 8 of 8; red with a fixed one-second step bound put back: `OsRefused { call: "recv route", code:
+  Some(35) }` after 1.01 s.
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -36054,6 +36071,53 @@ test).
   profiles for the engines slates has run since it was written (rootless podman, G-mount step 3, and podman's command
   line); and Windows, which binds nothing (G-mount step 4) until a route into Docker Desktop's VM is measured (kiln's
   W9: WSL 2's 9P server over a WinFsp drive, else the network export).
+
+### A-540 — A host mount's attachment keeps its mount's id in its durable record, and a restarted daemon ends each attachment whose recorded mount the table no longer names (2026-11-19, g232; UI goal 86, A-511's owed item; §4.6 A-34, A-227, A-511)
+
+Applied in the same change to: §4.6's unmount paragraph, GAPS (R3's class C), `crates/db/src/catalog.rs`
+(`AttachmentRecord::mount`, appended), `crates/db/src/op.rs` (`Op::AttachmentMountSeen`, appended) and `partition.rs`
+(its guard and apply), `crates/db/tests/wire_order.txt` (tag 88 published), `crates/db/src/replay.rs` (its test),
+`crates/db/tests/model.rs`, `crates/base/src/own_mounts.rs` (`mount_id_in`), `crates/server/src/own_nfs.rs` (`learn`
+over one table read, `learn_from`, `hold`, `record_seen`, `let_go_of`), `crates/server/src/verbs.rs` (`bind_mount`
+holds through `own_nfs::hold`), and the record literals in
+`crates/server/src/{daemon,merge_service,oci,shards,verbs,virtiofs}.rs`.
+- **What was there.** A mount's id lived only in its shard's memory (A-227's `OwnNfsMount`). A successor learned its
+  predecessor's mounts by looking up each bound point in the table, once per attachment. A point whose mount the
+  kernel let go while no daemon ran recorded nothing, so its attachment waited for a `detach` for good (A-511's owed
+  item). A-511's watch could not help: it judges only the mounts a shard holds.
+- **The rule.** The mount's id is kept in its attachment's durable record once the mount is seen:
+  `Op::AttachmentMountSeen`, appended, written in the bind's own transaction when the bind found the mount
+  (`own_nfs::hold`), and at a start that finds a never-seen attachment's mount at its point. A start reads the table
+  once (`own_nfs::learn`, one `getfsstat`) and judges each host mount's attachment by what its record keeps:
+  - a recorded id the table still names: the mount is held as the shard's;
+  - a recorded id the table no longer names: the kernel let the mount go while no daemon ran, and the attachment ends
+    as a `detach` would (`verbs::end_attachment`, `Ending::Otherwise`), its container binds with it;
+  - no recorded id: the rule before A-540, held if its volume's mount is at exactly its point (its id recorded from
+    then on), left as it is if not.
+
+  The id, not the point, is the judge, as it is for A-511's watch: another mount of the same volume at the same point
+  is a new mount with a new id, and it does not keep the old mount's attachment.
+- **Why a record with no id keeps the old rule.** The table's silence about its point proves nothing. A bind of a
+  point that holds no mount records the same as a bind of a live one (`own_nfs.bind_unconfirmed`, A-227), and the CLI
+  and the kernel may name one point differently, so ending such an attachment at a start could end a live mount's.
+  The recorded id is the evidence that this attachment's mount existed, and only that id's absence proves the kernel
+  let the mount go.
+- **Format.** `AttachmentRecord::mount` and `Op::AttachmentMountSeen` are appended (D-15). Tag 88 is published in
+  `crates/db/tests/wire_order.txt`, written by hand in the writer's format: an agent runs only `--lib` tests, and the
+  wire-order test is main's to run.
+- **Tests.** In `own_nfs.rs`, with the kernel's table stood in for:
+  - `a_restart_ends_an_attachment_whose_recorded_mount_the_table_no_longer_lists`;
+  - `a_restart_holds_an_attachment_whose_recorded_mount_the_table_still_lists`;
+  - `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`;
+  - `a_held_mount_keeps_its_id_in_its_attachments_record`.
+
+  In `slates-db`, `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`. Red-checked once (the Mac
+  Studio, 2026-11-19) with a start ignoring recorded ids, nothing keeping an id and the apply dropping the op: the db
+  test and 3 of the 4 server tests failed. The one that passed asserts what both rules do, holding a mount still at its
+  point. The old rule held another mount at the point for the attachment, `(true, Some(gone), Some(another), 0)`. All
+  passed restored, A-511's 5 with them.
+- **Owed.** Main's runs: the db integration tests (`model`, `wire_order`), and the live macOS mount suite across a
+  restart with a mount unmounted while no daemon ran.
 
 ### A-543 — The path an open names, as the volume stores each component, for a WinFsp drive over a folding volume (2026-11-18, goal 85, g079; §4.4 name policy, §4.6 "Windows"; A-300; T-4.6)
 Applied in the same change to: GAPS (the folding-drive entry: part 1 built, part 2 owed), `crates/vfs/src/volume.rs`
