@@ -13945,18 +13945,36 @@ signature verification).
 > every room up to the least to their answers. Owed: the view handed to the daemon's sites over A-662's stores (A-680
 > part 2).
 >
+> **Status (2026-11-19, A-680 part 2a: Mercurial's site on the daemon's edge, over each repository's served view).** The
+> daemon's HTTP edge hands each request to its tool's site (`vcs_http::ToolSites`): Mercurial's for a request whose
+> query names a command, as hgweb tells a wire request from its pages (`wireprotoserver.handlewsgirequest`), git's for
+> every other, so a repository of the other tool is answered as one that does not exist. Mercurial's site reads each
+> repository through `vcs_store::hg_view::ServedViews`, the lender both edges reach a Mercurial store through: on the
+> shard the request moved to, afresh for each step, the repository's served view (A-680 part 1) over its index and the
+> shard's content store in A-662's map, with its register's phase roots and bookmarks (each `bookmark:` name's green's
+> head) as they stand then, made within the request's room. Every repository publishes until its record carries 7.2's
+> `phases.publish` (decision 3). A store the map does not hold, one an import is filling, and a view that cannot be made
+> (counted) are `503`. The register is the record: an imported repository's phase roots and bookmarks are served once
+> its import records them there (A-687). Proven on macOS arm64 (Mac Studio, kiln r357, 2026-11-19; the other platforms
+> owed): `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and the namespace's names, 51 of 51, fmt
+> clean: a two-shard daemon's edge, over TLS with a bearer token, answers `capabilities` and `heads` of a Mercurial
+> repository on the other shard whose store took `fixtures/state`'s `states` by an import, `heads` equal to its
+> history's heads read from the index, while a git repository asked as Mercurial asks is `404` and git's own request
+> still git's; the lender lends nothing while an import fills a store, for a git repository or an unknown one, or past
+> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
+> the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
+>
 > **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
 > `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
 > a divergent name, one with an `@` before its end, as 7.2's `listbinbookmarks` leaves it out (`bookmarks.py` 475-484:
 > `hasnode(v) and not isdivergent(k)`); the rule is `crate::bookmarks::divergent`, which the push's refusal of a
-> divergent name now shares.
-> Before, every bookmark naming a held changeset was listed, and A-619's oracle stated the same over names that never
-> held an `@`. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19): `fixtures/state`'s `divergent`,
-> where `feature` moved apart in a clone and the clone was pulled back so 7.2 kept the clone's as `feature@1`, answers
-> `@` and `feature` to `hg debugpushkey` over `hg serve`, and a clone over it holds those two, where slates' view of it
-> answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and r356 green, 2026-11-19; the other
-> platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0 failed, fmt clean
-> (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
+> divergent name now shares. Before, every bookmark naming a held changeset was listed, and A-619's oracle stated the
+> same over names that never held an `@`. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19):
+> `fixtures/state`'s `divergent`, where `feature` moved apart in a clone and the clone was pulled back so 7.2 kept the
+> clone's as `feature@1`, answers `@` and `feature` to `hg debugpushkey` over `hg serve`, and a clone over it holds
+> those two, where slates' view of it answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and
+> r356 green, 2026-11-19; the other platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0
+> failed, fmt clean (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14374,8 +14392,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and
-   A-662's stores handed to the site with the view over them (A-680 part 2).
+   owed: the process around the stdio session, the learned response compression (the first value until then), and the
+   site's pushes (`unbundle` through `hg_push`, A-680 part 2b). Built (A-680 part 2a, `vcs_http::ToolSites`,
+   `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from its store on its owner
+   shard.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -51739,6 +51759,45 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   (the five readers), `engine/node_tests.rs` and `engine/copy_tests.rs`; §4.17.1's and §4.17.2's statuses and piece
   13; GAPS (A-664's entry).
 
+### A-680 part 2a — Mercurial's site on the daemon's edge: a request whose query names a command handed to it, each repository's served view lent from its store on its owner shard with its register's state (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-650 part 1, A-662, A-680 part 1, A-625 part 3)
+Applied in the same change to: §4.17.3 (a status block, piece 4's line), `crates/server` (`vcs_http`: `ToolSites`,
+`ToolExchange`, `Decided::map`, `hg` made crate-visible; `vcs_http::hg`: `HgStores` lending a view made within the
+request's room, `wire_request`, `NoStores` removed; `vcs_http::daemon_edge`: `DaemonSite` both sites; `vcs_store`:
+`mercurial_ref`, `hg_view` new with its tests; `repository::hg_push`: `bookmark_of`; the edge's and the site's tests),
+`crates/cli` (the stock-hg tests' ignore reasons: the refusal waits on A-686 alone, the round trip on A-680 part 2b and
+A-686), GAPS (the §4.17.3 entry).
+- **Why.** The daemon's edge served git's site alone, so stock hg met `404` from a running daemon (g083's interop tests,
+  `crates/cli/tests/cli.rs`), and Mercurial's site, tested alone, answered every repository `503` (`NoStores`) since
+  nothing lent it a store.
+- **Which site.** A request whose query names a command (`cmd`) is Mercurial's, as hgweb tells a wire request from its
+  pages (7.2's `wireprotoserver.handlewsgirequest`: "if b'cmd' not in req.qsparams: return False"); every other is
+  git's, whose requests never name one, so git's answers are unchanged. A repository of the other tool is answered `404`
+  by the site asked. hgweb's pages (piece 12) name no command, so they reach git's site and are `404` there.
+- **The lender** (`ServedViews`). Each step's view is made afresh on the shard the site moved the connection to (A-625
+  part 3), so nothing of the shard is held across a wait: the repository's index and the shard's content store from
+  A-662's map, its register's phase roots and bookmarks copied and charged to the request's room, then A-680 part 1's
+  view over them, charged to the same room; the step gets what is left of it. `HgStores::lend` takes that room and its
+  view type is generic over the borrow (`type Store<'s>`), since the view borrows the shard's state for the step alone.
+  A store an import is filling is not lent, so no client is served half a history; a view that cannot be made is counted
+  (`vcs_store.hg_view.unmade`); each is `503`.
+- **Decided.** Every repository publishes, Mercurial's default (decision 3), until its record carries `phases.publish`.
+  A bookmark is a name `bookmark_of` reads back exactly (`bookmark_name`'s inverse) whose green names a head; a phase
+  root of a phase or node Mercurial does not have is not read; neither is ever written by a push.
+- **Tests** (macOS arm64, Mac Studio, kiln r357, 2026-11-19). `cargo test --locked -p slates-server --lib -- vcs_http::
+  vcs_store::hg_view repository::hg_push::tests::names --test-threads=4` 51 of 51; `cargo fmt --check -p slates-server`
+  clean. `a_mercurial_repositorys_store_is_served_over_the_daemons_edge`: a two-shard daemon, a Mercurial repository on
+  the other shard's partition holding `fixtures/state`'s `states` by an import, and a git repository; over TLS with the
+  owner's bearer token, `capabilities` `200` naming `getbundle` and `httpheader`, `heads` `200` equal to the heads read
+  from the index (no row names them as a parent, newest first), the git repository asked as Mercurial asks `404`, and
+  git's own request answered by git's site. `t_a680_a_view_is_lent_from_the_store_or_not_at_all`: nothing while the
+  import fills the store, the imported history's five changesets once it ends, nothing for a git repository or an
+  unknown id (uncounted), and nothing past the room (counted). `bookmark_of` reads every name `bookmark_name` writes
+  back, and no second spelling, line's name or name without its end. No integration target reaches the site yet: the
+  stock-hg CLI tests wait on A-685 and A-686 too.
+- **Owed.** The site's pushes (`unbundle` through `hg_push`: the push capabilities, the exchange driving prepare,
+  admission, hooks and the landing, the reply framed as 7.2's `streamreslegacy`; A-680 part 2b); the stock `hg` round
+  trip over the edge (g083's tests, once A-685 and A-686 land); the other platforms' runs (main's).
+
 ### A-690 — Divergent bookmarks left out where bookmarks are served, as 7.2's `listbinbookmarks` leaves them out (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" items 1 and 3; A-619, A-680 part 1)
 Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::divergent`, `push::classify`,
 `serve::pull::bookmark_entries`, `serve::Repository::bookmarks`' doc, `serve::tests`' generator and oracle,
@@ -51762,10 +51821,12 @@ Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::d
 - **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r340 over ab23dd3e0 (the fixture and the golden alone):
   `cargo test --locked -p slates-hg --lib serve::` 52 passed and 1 failed, the golden, at `listkeys bookmarks`
   (`feature@1` answered). Green: kiln r356 over 15342a05f: `cargo test --locked -p slates-hg --lib -- serve:: push::
-  bookmarks::` 93 passed and 0 failed; `cargo fmt -p slates-hg -- --check` clean. The golden holds `divergent`'s three changesets,
-  none left out, `heads` (two), `branchmap` (`default`'s two heads), `listkeys` of `bookmarks` and `phases`, and the
-  `bookmarks` part's entries to stock 7.2's, the view holding all three bookmarks. The serve oracle now generates names
-  with an `@` inside them and at their end, and states `isdivergent` as 7.2's source states it.
+  bookmarks::` 93 passed and 0 failed; `cargo fmt -p slates-hg -- --check` clean. Again over the landing merged with
+  main 0462bd922 (8afa1583c; A-664 part 3 adds to slates-merge, which slates-hg links): 93 passed and 0 failed,
+  slates-merge and slates-hg compiled afresh, fmt clean. The golden holds `divergent`'s three changesets, none left
+  out, `heads` (two), `branchmap` (`default`'s two heads), `listkeys` of `bookmarks` and `phases`, and the `bookmarks`
+  part's entries to stock 7.2's, the view holding all three bookmarks. The serve oracle now generates names with an
+  `@` inside them and at their end, and states `isdivergent` as 7.2's source states it.
 - **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
   draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
 - **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
