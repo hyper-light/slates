@@ -134,6 +134,7 @@ impl Pair {
 /// A session whose client finished its first exchange and had `ssh-userauth` accepted.
 fn serving(config: SessionConfig, options: ClientOptions) -> Pair {
   let mut pair = Pair::new(config, options);
+  pair.pump().unwrap();
   let mut service = vec![5];
   put_string(&mut service, b"ssh-userauth");
   pair.exchange(&service).unwrap();
