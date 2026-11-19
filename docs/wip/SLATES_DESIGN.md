@@ -12974,6 +12974,12 @@ engine: the verdict, rebase, position mapping, the register).
 > receive-pack judges ref names, a hook's git walks the hook view itself, and Subversion's path reads walk its own node
 > history over revisions. A-614 is complete with parts 1 and 2.
 >
+> **Status (2026-11-19, A-653 continued (3): git's delta search a bounded amount a step).** `store::Search` indexes
+> the source and then scans the target a step at a time, each step at most its budget's blocks of the source or its
+> budget of the target, one copy and the target's last bytes past it, and writes the delta one pass writes, byte for
+> byte; `delta_of` is one search run to its end. Owed: its users, upload's objects past a window (part 2) and the
+> fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search).
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -14417,16 +14423,16 @@ and export by landing).
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
-> (`reads::Repository`: entries, property lists, revision properties, texts in runs) and the session's `Guards` (its
-> locks and what its principal may read): an explicit stack of frames, never recursion, a step at a time under the
-> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
-> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
-> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
-> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from
-> each session's own report over `history.txt` rebuilt into an index and a green and checked against
-> `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
-> delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
-> sent today as new data; and the handler.
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs), the session's `Guards` (its locks)
+> and its one compiled read rule, which its read commands ask too (A-656 continued (2)): an explicit stack of frames,
+> never recursion, a step at a time under the caller's budget, the report read one path ahead as `reporter.c` reads it;
+> entry properties, lock tokens removed, property differences, absent entries, deletions with `svn_repos_deleted_rev`'s
+> revision, depth upgrades and exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve`
+> makes in its words. Held to every drive `svnserve` made in the recorded sessions (27, the early answer's being the
+> handler's), replayed from each session's own report over `history.txt` rebuilt into an index and a green and checked
+> against `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by
+> what its delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base
+> (`xdelta.c`), sent today as new data; and the handler.
 >
 > **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
 > (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
@@ -49748,3 +49754,71 @@ Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the mac
   Mercurial hook variables (owed, now closed); `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`;
   `crates/server/src/vcs_hooks.rs`; `crates/hg/src/push/classify.rs` and `classify_tests.rs`;
   `crates/hg/fixtures/hooks/` (new).
+
+### A-653, continued (3) — git's delta search a bounded amount a step: `store::Search` (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4; CLAUDE.md §3 "Bounded work everywhere"; A-614 part 2's `deltas.rs`; part 1 of "a delta search for an object past a window")
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`store::deltas`:
+`Search`, `SearchStep`, `SearchCounters`, `delta_of` one search run to its end; their re-export from `store`;
+`tests::store::deltas`, new).
+
+- **Why.** A-639's stream sends an object past a window whole, with no delta trial, since `delta_of` searched a whole
+  source and a whole target in one call, which no unit bounded by a window could do (A-653's owed "a delta search for
+  an object past a window"). Main's split (2026-11-19): part 1, the search itself a bounded amount a step; part 2, the
+  stream's objects past a window searched through it, their buffers and the source's index charged to the request's
+  own admission, sent whole only where the admission cannot hold them, that case counted, and git's rule read from
+  `pack-objects.c` at v2.50.1 before it is relied on. No constant of git's (its 512 MiB `core.bigFileThreshold`) is
+  taken: a number from one tool is still arbitrary under R3.
+- **The search in steps.** `Search::step(source, target, budget)` indexes the source's whole blocks, at most the
+  budget's and one at least, each hash keeping its first offset as one pass keeps it; once the index is whole, it
+  writes the sizes and scans the target from where the last step stopped, with the one pass's own loop, until the scan
+  has passed the budget. A match found at the step's last position carries it one copy further (64 KiB at most, git's
+  longest copy), and the target's last bytes, short of a block, go with the step that reaches them. Between steps it
+  holds the index, the delta so far, the scan's place and rolling hash, and the lengths the first step was handed: a
+  step handed others ends the search with no delta. Its end lets the index go. `delta_of` runs one search to its end
+  at a budget of every byte, a stage a step, so every caller of A-614 part 2's search writes what it wrote.
+- **Tests**, failing first against `Search`'s first state, the whole search in its first step:
+  `a_delta_is_searched_a_budget_a_step_as_one_pass_searches_it` (a 2,000-line text against itself with three lines
+  edited, 64 bytes a step: no step past its budget, a step at least for each budget of the source, and the delta the
+  one-pass reference's, byte for byte, applying back to the target) and
+  `every_search_at_any_budget_writes_the_reference_delta` (targets cut from random sources with random inserts, as
+  A-614 part 2's delta property builds them, at random budgets and at one for the whole: every step bounded, the delta
+  the reference's). The reference is A-614 part 2's search kept whole in the test module, the specification.
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  store:: upload::`: with the first state, 123 passed, 2 failed (the two tests above, the bounded one at its first
+  step past the budget, the property at a case it found), 4 ignored; with the search, 125 passed, 0 failed, 4
+  ignored, every store and upload test that deltas now searching through it; over the tree landed, merged with
+  main's A-677 (slates-merge), the same 125; `cargo fmt -p slates-git -- --check` clean. No integration target
+  reaches the search.
+- **Owed.** Part 2, as main ruled it (above); the fragment encoder's per-object unit, once `Encoder::put` steps its
+  trials through a search; the red-checks and the other platforms' runs (main's).
+
+### A-656, continued (2) — One read rule for a session: an update, its drive and the reads judge paths alike (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-616 part 2's second slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/authz.rs` (`may_read`); `crates/svn/src/reads.rs`; `crates/svn/src/report/drive.rs` (`Guards`,
+`Sources::rules`, `Drive::next`), `report/drive/green.rs` (`FixtureGuards`, `AUTHZ`, `rules_of`) and the drive's
+tests; `crates/svn/src/report/exchange.rs` and its tests; `crates/svn/src/serve.rs` (`ReadRules::for_principal`,
+`Established::compiled_read_rules`) and its tests;
+`docs/bugs/2026-11-19-an-update-read-by-the-callers-guards-where-the-reads-used-the-sessions-rules.md`.
+
+- **Found** by g297 (A-613's eighth slice, step 6): `update` judged its target, and its drive every path, by the
+  caller's `Guards::may_read`, while the read commands judged by the rules `Policy::authz` gives the session's
+  principal, compiled by the connection (A-606): two sources for one principal's read rule, which could disagree. With
+  guards that hid less than the rules, an anonymous `update` of `/trunk/secret` began its report and an update of
+  `/trunk` added `secret`, while `check-path secret` was refused "Authorization failed".
+- **One rule.** `authz::may_read(rules, path)` is a session's one read rule, `authz_check_access` for
+  `svn_authz_read`: every path where the repository names no authorization file; with rules, a path they give read or
+  write access; a path that is no repository path, never. The connection compiles the principal's rules once
+  (`ReadRules::for_principal`, again only after an authentication changes the principal) and hands the same set to the
+  read commands (`reads::Session::authz`), to `update`'s target check and to the report drive
+  (`drive::Sources::rules`), which judges the edit's root, each entry and each copy source by it. `Guards` keeps the
+  locks alone.
+- **Tests.** `an_update_and_the_reads_judge_one_path_by_the_one_rule_set` (`serve/tests.rs`): an anonymous session
+  whose guards carry no read rule, on the fixtures' repository whose rules keep `/trunk/secret` from all but alice:
+  `check-path secret` and `update secret` both refused "Authorization failed" where users hold no keys, and an update
+  of `/trunk` from nothing sends `secret` absent and never adds it. Red before the change (macOS arm64, Mac Studio,
+  2026-11-19, over main at `733e6de6b`): the check refused, the update answered `( success ( ( ) 0: ) )` and awaited
+  its report. The drive's and the exchange's tests judge reads by the recorder's own rules compiled for the anonymous
+  principal (`green::rules_of`), where they had guards hiding `/trunk/secret` by hand. Run (macOS arm64, Mac Studio,
+  2026-11-19): `cargo test --locked -p slates-svn --lib -- report:: reads:: serve:: authz::` 158 of 158, `cargo fmt -p
+  slates-svn -- --check` clean; the crate has no integration target.
+- **Owed.** The Windows run and red-checks (main's).
