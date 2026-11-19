@@ -46,11 +46,15 @@
 //! commit, the same conflict at the same path found by the same check, or the same lock in the way.
 //!
 //! The drive's commands are read in [`edit`] (A-617): the commit's request and every editor command, as `svnserve`
-//! reads them. The drive is [`drive`] (A-617): each command checked as it arrives, with this module's out-of-date test
-//! and the lock table's check, declared on the drive's rows, and [`verdict`] run at `close-edit`.
+//! reads them. The drive is [`drive`] (A-617, A-655): each command checked as it arrives, with this module's
+//! out-of-date test and the lock table's check, declared on the drive's rows, start-commit and pre-commit waited for
+//! where `svnserve` runs them (A-661), and [`verdict`] run at `close-edit` once pre-commit passed. What the version
+//! records is [`revision`] (A-655, item 3.5): one value a client's accepted work or an imported dump revision is made
+//! into, which the one commit step commits ([`crate::migration::Repository::check`] and
+//! [`crate::migration::Repository::apply`]).
 //!
-//! Not here: the drive's other checks (a copy's source, checksums, property values, authorization) and its early-error
-//! rule (piece 7); hooks (item 9); the lock table (A-602).
+//! Not here: running the hooks (item 9, A-623's and A-661's glue); the lock table (A-602); the green's version and its
+//! durable record (the owner's, A-655 part 2's server half).
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -65,6 +69,7 @@ use crate::lock::LockRefusal;
 
 pub mod drive;
 pub mod edit;
+pub mod revision;
 
 /// `SVN_ERR_FS_NO_SUCH_REVISION`, "No such revision %ld": a client's revision past the transaction's base.
 /// Format: the filesystem category's start, 120,000 + 8 × 5,000 = 160,000, plus 6 (`svn_error_codes.h` 121-122,
