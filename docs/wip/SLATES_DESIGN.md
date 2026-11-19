@@ -4452,8 +4452,10 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > binds a volume's mount into a container with `Instance::bind_into_container` and the seam's verb of that name, which
 > ask this form and answer the binding's attachment and the runtime's entry (`ContainerBind`, `CONTRACT` = 44); the
 > simulator judges the mounts it recorded as this form judges the kernel's table. kiln's container engine binds each
-> agent's workspace mount so (kiln's `docs/agentic.md` W9). Still the command line's alone, owed to the library next:
-> the engine's profile (`slates oci-runtime`) and the check just before the runtime binds (`slates oci-check`).
+> agent's workspace mount so (kiln's `docs/agentic.md` W9). Since A-520's second piece (2026-11-19, `CONTRACT` = 47)
+> the rest of the handoff is the library's too, and the command line calls it: the engine's profile, judged before a
+> host mounts for it (`container_engine::engine_profile`, under `slates oci-runtime`), and the check just before the
+> runtime binds that the source is still the mount verified (`container::check_source`, under `slates oci-check`).
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -9149,6 +9151,13 @@ it builds against the contract and adds to it rather than around it.
 > `AT_STATX_DONT_SYNC` and compared by device), with `HoldersUnread` saying why none were read (macOS: every libproc
 > answer stats the file). On Linux a plain `fusermount3 -u` refused while the table still lists the mount is
 > `MountFault::Busy`, where it was `MountFault::Unmount` with the helper's exit.
+> **`CONTRACT` = 47 (A-520, second piece):** the container handoff's other two steps are library calls, which the
+> command line now makes: `container_engine::engine_profile(runtime)` asks the runtime's engine for its profile,
+> bounded as the command line asked it, and judges it, answering an `EngineProfile` or an `EngineFault` (the judge's
+> refusal before any profile, `Untested` with the profile it refused, an engine unreachable, an answer too large or
+> not in its shape, or a host that asks no engine); `container::check_source` and `ContainerBind::check_source`
+> judge whether a bind's source is still the mount verified, the table first and then the identity the kernel never
+> reuses, refusing `SourceFault`. `slates-bridge-oci` is linked on every platform, its judge's types the contract's.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -36527,3 +36536,52 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-520, second piece — The container engine's profile and the check just before a runtime binds are library calls, which the command line makes (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9, §4.12; AUD-29-66, AUD-29-67; `CONTRACT` = 47)
+Applied in the same change to: §4.6 (A-9's OCI record: the form through the library), §4.12's contract log
+(`CONTRACT` = 47), GAPS (the library's entry), `docs/library.md` (the serving list, what is owed),
+`docs/wip/oci-handoff.md` (a note that the handshake and the check moved), `crates/api/src/container_engine.rs` (new:
+the handshake moved from the command line over an injected query, `EngineProfile`, `EngineFault`, the judge's types
+re-exported, and the tests), `crates/api/src/container.rs` (`check_source`, `ContainerBind::check_source`, `SourceFault`,
+the judgment over an injected table and identity, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 47),
+`crates/api/Cargo.toml` (`slates-bridge-oci` on every platform), `crates/cli/src/oci_runtime.rs` (it prints the
+library's answer), `crates/cli/src/verbs.rs` (`oci_check` calls the library), `crates/cli/src/main.rs` (two comments),
+and `crates/cli/Cargo.toml` with `Cargo.lock` (the command line no longer links `slates-bridge-oci` itself).
+- **Why.** kiln's container engine reaches slates through this library alone (A-278), and §4.6 A-9's handoff asks two
+  things of a harness besides the bind (A-520's first piece): its runtime's profile, judged before it mounts for a
+  container (AUD-29-67), and the check that a bind's source is still the mount verified, made just before its runtime
+  binds it (AUD-29-66). Both were the command line's alone (`slates oci-runtime`, `slates oci-check`).
+- **The profile.** `container_engine::engine_profile(runtime)` asks in the order that consults least, as the command
+  line did: the runtime admitted by name before anything runs; the endpoint (`DOCKER_HOST`, else the context's),
+  refused unless local before the engine is asked; then the engine's statement; each query bounded by the daemon's
+  observe budget and one page. Its answer is an `EngineProfile` (the endpoint, the profile, the `TestedProfile` it holds)
+  or an `EngineFault`: `Refused` (the judge's refusal before any profile), `Untested` (a profile established and refused,
+  carried with its endpoint and profile, so the command line prints it before the refusal as it did, and a host can say
+  which engine it refused), `Unreachable`, `TooLarge`, `Unreadable`, or `Unsupported` where no Unix pipes are polled
+  (Windows, where no host mount is bound into a container either). The order is a pure function of an injected query
+  (`profile_of`), tested on every host.
+- **The check.** `container::check_source(source, identity)` and `ContainerBind::check_source()` read the kernel's table
+  first (no mount at the source is `Missing`, no identity read), then the identity of the mount there, which the kernel
+  never reuses (a kernel without one is `Uncheckable`; another refused read `Identity`), and compare (`Replaced`, naming
+  both mounts). The judgment is pure over the table and the identity it is given (`judged`); a host with no table to read
+  is told so by the table itself (`MountTable(Unsupported)`), never judged unchanged.
+- **Every platform links `slates-bridge-oci`,** whose macOS and Linux code sits in `cfg` arms beside fallbacks that answer
+  `Unsupported`, so its judge's types are the contract's everywhere and the check runs one code path on every host. No
+  crate had built it on Windows before; that build is main's (filed).
+- **Tests.** `crates/api/src/container_engine.rs`: `docker_desktop_on_macos_holds_its_tested_profile_and_the_context_is_asked_only_unnamed`,
+  `each_engine_on_each_host_holds_its_tested_profile_or_is_refused_typed`, `nothing_is_asked_past_a_refusal`, and the two
+  hostile-answer parser tests moved from the command line; `crates/api/src/container.rs`:
+  `a_source_is_judged_by_the_table_first_then_by_the_identity_the_kernel_never_reuses` and
+  `a_source_is_checked_against_the_hosts_own_table` (the root, read and nothing touched). Filed for main: the command
+  line's own tests and its Windows build, and the container tests that run `slates oci-runtime` and `slates oci-check`
+  by use (`crates/cli/tests/cli.rs`, T-4.13 and the replaced-source tests).
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug, load 4).** Red first, on a copy of this change made on the
+  Studio, never committed, whose engine judgment answered before asking anything (`Unsupported`) and whose check
+  judged every source unchanged: `cargo test --locked -p slates-api --lib -- container_engine:: container::tests
+  contract_history` failed the five new tests and passed the two moved parser tests, the bind's two and the
+  contract's history (run r15). Green with the change, the same copy restored from its commit: 10 of 10, and the
+  crate's whole `cargo test --locked -p slates-api --lib` 87 passed, 4 ignored. Main's A-524 took contract 46
+  meanwhile, so this change is 47; `cargo fmt -p slates-api -p slates-cli` laid the code out.
+- **Owed.** The judge's profiles for the engines slates has run since it was written (rootless podman, G-mount step 3,
+  and podman's command line, both refused today), and Windows, which binds nothing (G-mount step 4) until a route into
+  Docker Desktop's VM is measured (kiln's W9).

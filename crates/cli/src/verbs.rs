@@ -1123,49 +1123,23 @@ fn established_text(established: &Established) -> String {
 /// handed a replacement or a bare directory where the mount was.
 #[cfg(unix)]
 pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
-  let table = slates_bridge_oci::mount_table::mount_table()
-    .map_err(|e| Failure::Failed(format!("reading the mount table: {e}")))?;
-  let verified = slates_bridge_oci::mount_table::MountIdentity {
+  // The library's check (`slates_api::container::check_source`, moved there from here by A-520): the kernel's table
+  // first, so a source whose mount is gone is `SourceMissing` rather than a failed identity read, then the identity
+  // the kernel never reuses, read of this path now, so a replacement is `SourceReplaced`
+  // (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`).
+  let verified = slates_api::container::MountIdentity {
     mount: check.mount_id,
     device: check.device,
   };
-  // Whether anything is mounted there at all is the table's to answer, and it is answered first: on a path
-  // whose mount is gone there is nothing to identify, and a harness must hear `SourceMissing` rather than a
-  // failed identity read — the two mean different things to it (it would bind a bare directory).
-  if !slates_bridge_oci::verify::mounted_at(&table, &check.source) {
-    return Err(Failure::Refused(format!(
-      "SourceMissing: no mount is at {} any more",
-      check.source
-    )));
-  }
-  // What decides is then the identity the kernel does not reuse, read of this path now. A kernel that cannot
-  // name a mount uniquely refuses, since this check would otherwise pass a replacement
-  // (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`).
-  let live = match slates_bridge_oci::mount_table::mount_identity_at(&check.source) {
-    Ok(live) => live,
-    Err(slates_bridge_oci::mount_table::MountTableError::NoUniqueMountId) => {
-      return Err(Failure::Refused(
-        "SourceUncheckable: this kernel does not report a mount id it never reuses, so a replacement at this          path cannot be told from the mount verified (Linux 6.8 added it)"
-          .to_owned(),
-      ));
-    }
-    Err(e) => return Err(Failure::Failed(format!("reading the mount identity: {e}"))),
-  };
-  match slates_bridge_oci::verify::source_unchanged(&table, &check.source, verified, live) {
+  match slates_api::container::check_source(&check.source, verified) {
     Ok(()) => {
       slates_machine::out_line!("unchanged: {}", check.source);
       Ok(())
     }
-    Err(slates_bridge_oci::verify::SourceChange::Missing) => Err(Failure::Refused(format!(
-      "SourceMissing: no mount is at {} any more",
-      check.source
-    ))),
-    Err(slates_bridge_oci::verify::SourceChange::Replaced { found, .. }) => {
-      Err(Failure::Refused(format!(
-        "SourceReplaced: {} is now mount {} on device {}, not the mount verified",
-        check.source, found.mount, found.device
-      )))
-    }
+    Err(
+      fault @ (slates_api::SourceFault::MountTable(_) | slates_api::SourceFault::Identity(_)),
+    ) => Err(Failure::Failed(fault.to_string())),
+    Err(fault) => Err(Failure::Refused(fault.to_string())),
   }
 }
 
