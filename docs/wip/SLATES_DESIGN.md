@@ -1955,8 +1955,12 @@ landing constants are in §4.15.
 > `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry horizon read the failover delay, the
 > anchor's crash-loop cap is the NFSv4 lease its daemon grants, a FUSE helper is waited for as long as its shard's
 > helpers have taken (learned, backed off to the failover delay), and a status capture is held the failover delay from
-> its capture. The operator's failover SLO above is now a check against the published delay
-> (`FleetReport::failover`), not an input.
+> its capture. **Since A-574 a laptop's detection is measured, not the liveness window**: where no peer's detector judges
+> a node (a laptop at `f = 0`, a fleet node before its detector's first period), `D` is the widest window the watchdog
+> judges the daemon's shards by (A-455) and then the lapse bound its anchor publishes (A-467, `SUP_LAPSE_BOUND`), read
+> at every beat on every node, laptop or fleet, and the delay goes to every shard by the beat's own fan, which a laptop
+> runs too (on a quiet laptop about three seconds of `F`, where A-405's fixed window gave two). The operator's failover
+> SLO above is now a check against the published delay (`FleetReport::failover`), not an input.
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -2899,9 +2903,11 @@ before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so 
 shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
 while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
 cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
-after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
-opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
-(GAPS).
+after its last publication (another path's create a listing showed, a base directory first loaded then) is in no image
+and no head: the successor refuses it, never serving it, and the round names it too in its place. Every publication
+records the volume's live counter beside its reserved ceiling (A-150), and the numbers between the two are exactly those
+the dead daemon could have handed out since without another publication (A-578), so a descriptor opened before the
+death drops their pages as well.
 
 **Every round a mount builds on its serving thread is sliced** (A-562). The journal gather walks a backlog of records,
 the overrun round every node and name the kernel holds, and the takeover round its inode set; each grows with what
@@ -37890,7 +37896,8 @@ publication" and "an outsider's change beneath a base during a takeover's gap"),
   pages, since no walk can name them until each publication records the volume's live counter beside its reserved
   ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
   between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
-  kill-in-window tests) are Linux's, main's to run.
+  kill-in-window tests) are Linux's, main's to run. The numbers closed by A-578 (2026-11-19): every publication records
+  the live counter, and the round names the numbers between it and the ceiling.
 
 ### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
 
@@ -38437,3 +38444,93 @@ a `more` that never stops them.
   charge before them answered 13,503 bytes after sequence 128 where 105 waited. The Linux and Windows halves
   (`channel.rs`, the server's `fuse.rs` and `winfsp.rs`) and the integration suites were not compiled here; they are
   filed for main's lanes.
+
+### A-574 — A laptop's failover detection is what its watchdog and its anchor measure: the widest shard window, then the anchor's lapse bound, read at every beat on every node (2026-11-19, UI goal 86 via g076b; R3's class D, its last fixed-window term; R8; §4.4 "Derived constants", §4.14 `daemon.alive`; A-363, A-405, A-455, A-467)
+Applied in the same change to: §4.4's status (the failover delay's paragraph), GAPS (the failover delay's entry: A-405's
+sentence and the class D line), `docs/cli.md` (an unrenewed CLI attachment's lapse on a laptop),
+`crates/anchor/src/{layout,segment}.rs` (`SUP_LAPSE_BOUND`, `Supervision::record_lapse_bound`, `lapse_bound_ns`, the
+word declared), `crates/api/src/role/anchor.rs` (`publish_lapse_bound` in the observation loop),
+`crates/cluster/src/failover.rs` (`supervision`, `Failover::supervise`, its readings; `Failover::supervised` deleted;
+the laptop paragraph; two tests), `crates/server/src/watchdog.rs` (`widest_window_ns`), `crates/server/src/fleet.rs`
+(`refresh_supervision`, `publish_failover`, `fan_failover` and its counters; the configuration fan no longer carries the
+delay; its test), `crates/server/src/daemon.rs` (the boot reading in `init_shard`, the beat's reading and fan in
+`heartbeat_loop`, `stop_parts` over `widest_window_ns`, `inject_failover`'s note, the test) and `crates/cli/tests/cli.rs`
+(formation's allowed counters: `fleet.failover_fan.sent`).
+- **What was there.** A node no peer's detector judges (a laptop at `f = 0`, a fleet node before its detector's first
+  period) took the liveness window `W` as its detection term (A-405: `Failover::supervised(LIVENESS_BUDGET_NS)`), set
+  once at boot, whatever the host. And a laptop never refreshed its failover estimate at all: the estimate is refreshed
+  by the fleet's record-plane coordinator and fanned with the fleet's configuration, neither of which a laptop runs, so
+  every shard of a laptop held the value its boot computed, for good.
+- **What detection is there.** A laptop's detector is its supervision (A-232). Its watchdog judges a shard stuck once
+  the window it judges that shard by has passed since the shard last moved (A-455: `W` raised to the scheduler overrun
+  the shard measured, within the observation budget), and only then withholds the beat; its anchor kills the daemon
+  once that beat is its lapse bound old (A-467: `W` plus the anchor's own measured lateness p99, within the same
+  ceiling) and starts it again. So a wedge is detected after the stuck shard's window and then the anchor's lapse, in
+  turn: A-405's single window left the anchor's lapse out, and on a quiet host undercounted by a window.
+- **The rule.** `D` where no peer's detector judges the node is the widest window the watchdog judges the daemon's
+  shards by, then the anchor's lapse bound (`slates_cluster::failover::supervision`); a daemon run alone, whose watchdog
+  ends it at the verdict, has no lapse, the window alone. The anchor publishes its lapse bound in its supervision block
+  whenever it moves (`SUP_LAPSE_BOUND`, zero where no anchor wrote one; no layout change, as the anchor's other words).
+  The control shard reads both at every beat (`heartbeat_loop`, `fleet::refresh_supervision`), on every node, laptop or
+  fleet, and publishes the delay (`fleet::publish_failover`, the same publication the coordinator's refresh uses); a
+  shard reads the same at its boot. The beat then fans the delay to every other shard where it moved
+  (`fleet::fan_failover`, counted `fleet.failover_fan.sent` and `.refused`), so the configuration fan no longer carries
+  it: one fan on every node.
+- **R8.** One estimator and one sum on every node: a laptop's detection and confirmation are its degenerate inputs (no
+  detector's term, no council's), never a branch, and a fleet node's supervision is read the same way and stands until
+  its detector's term replaces it.
+- **What changes.** A laptop's failover delay at rest is the window, the anchor's lapse and the recovery prior, about
+  three seconds where it was two, and it follows the machine: a host that holds a shard off its CPU, or an anchor whose
+  own waits run late, lengthens it as long as they lengthen detection. Every wait that reads the delay follows on a
+  laptop: an unrenewed CLI attachment's term, a write lease's, a staging buffer's, a status capture's, a FUSE helper's
+  ceiling, a taken-back copy's claim. A test's injected delay is held on every shard by the same beat.
+- **Tests.** `a_nodes_supervision_is_its_watchdogs_widest_window_then_its_anchors_lapse` and
+  `a_laptop_and_a_fleet_node_derive_their_failover_delay_by_one_sum` (`crates/cluster/src/failover.rs`),
+  `a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse` (`crates/server/src/daemon.rs`: a
+  two-shard daemon with no fleet, the lapse bound published in its block as its anchor does; every shard's delay comes to
+  hold it, the control shard's detection the widest window and then exactly the lapse), and
+  `a_shard_is_fanned_the_failover_delay_when_it_moves` (`crates/server/src/fleet.rs`, now the beat's fan).
+- **Evidence.** On the Mac Studio (kiln r256, 2026-11-19, load 2.4, debug build). Red first, on the tests alone
+  (`da2c2d30e`): the supervision read `Term { ns: 1000000000, samples: 0 }` where the rule gives 2.2 s and a reading, and
+  the laptop daemon's delay never held the published lapse within ten seconds. Green on the change merged with main
+  (`714f2ce20`): `cargo test --locked -p slates-cluster --lib -- failover::` 12 of 12, `-p slates-anchor --lib` 40 of
+  40, `-p slates-server --lib -- laptop_failover_tests fleet::tests::a_shard_is_fanned fleet::tests::an_installed_fan
+  watchdog late_beat_tests starved_share_tests` 34 of 34, `-p slates-api --lib -- role::anchor` 13 of 13 (one ignored,
+  the held process's role), `cargo fmt --all --check` clean. A real anchor's publication and the beat's fan in a
+  formed fleet are main's to run (the anchor and CLI flows, the fleet formation test).
+
+### A-578 — Every publication records the live inode counter beside the reserved ceiling, and a takeover names the numbers between them (2026-11-19, g232; UI goal 85, A-573's owed item; §4.6 "A mount taken over by a restarted daemon", §4.8 publications; A-150, A-573; image version 33)
+Applied in the same change to: §4.6 (the takeover paragraph), A-573 (its owed item closed), GAPS (A-573's two still-open
+notes), `crates/vfs/src/recover.rs` (`IMAGE_VERSION` 33, `VolumeImage::live_counter`, `to_image`, `encode_image_into`,
+the rebuild), `crates/vfs/src/delta.rs` (`VolumeDelta::live_counter`, `delta`, `encode_delta`, `VolumeImage::apply`),
+`crates/vfs/src/volume.rs` (`unrecorded_counters`, `visit_head_inodes`), `crates/vfs/src/base.rs` (tests),
+`crates/vfs/tests/model.rs` (the publication oracle).
+- **What was there.** A publication recorded only the reserved ceiling (A-150): the counter plus the store's reserve,
+  where a successor starts. A number the dead daemon issued after its last publication, below that ceiling, is in no
+  image: another path's create a listing showed, or a base directory's entries first loaded after it. A-573's round
+  named every inode the successor holds, and could not name these, so a descriptor a kernel opened on one before the
+  death kept its cached pages; the successor refused the number (`NotFound`) and never served it.
+- **The rule.** Each publication records the volume's live counter beside its reserved ceiling: the image
+  (`VolumeImage::live_counter`) and every delta (`VolumeDelta::live_counter`), in both encodings, the struct builders
+  and the streamed encoders the daemon writes. Recovery folds the deltas into the image and rebuilds the volume with the
+  counters from the live one up to the ceiling (`Volume::unrecorded_counters`): numbers no image holds and this daemon
+  never issues, since its own counter starts at the ceiling. The takeover walk of the head
+  (`Volume::visit_head_inodes`) names them in their place in counter order: the restored inodes below them, then each
+  of them under the volume's prefix, then what this daemon issued since. An image whose live counter passes its ceiling
+  is refused (`RecoveryIncomplete`). The live counter stays out of the roots a clean volume is judged by: a base
+  directory's load issues numbers and changes nothing published, and the last publication's two counters already bound
+  what was issued since. The gap is at most a reserve of numbers per takeover (A-150's 262,144 on the box), each a
+  `FUSE_NOTIFY_INVAL_INODE` the kernel answers at once for a number it never cached, sent in the round's slices.
+- **Format.** Image version 33: the image and every delta carry the new counter, so a reader of version 32 refuses it,
+  and this reader refuses 32. No shim reads the old form.
+- **Tests.** `a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover` (red first: a file made
+  and a base directory first loaded after the publication; the successor refuses both numbers and its walk names both),
+  `the_takeover_walk_in_slices_joins_whole_across_the_unrecorded_counters` (the walk across the restored inodes, the
+  unrecorded counters and the successor's own, whole and in slices of 1 to 5),
+  `an_image_whose_live_counter_passes_its_ceiling_is_refused` (hostile), all in `crates/vfs/src/base.rs` under a
+  nonzero reserve. The publication oracle (`check_publication`, `crates/vfs/tests/model.rs`) now checks each folded
+  publication's two counters against the volume's own and that they differ, under the model's nonzero reserve (A-150's
+  gotcha: with none they coincide, and an encoder writing one for the other passes unseen); main's to run. On the Mac
+  Studio (debug, 2026-11-19, load 19 to 23): `slates-vfs --lib` 90 of 90 (1 ignored), `slates-bridge-core --lib` 40 of
+  40; red with the unrecorded counters dropped at the rebuild: the first test failed at its naming, its refusal holding;
+  red with the ceiling's check removed: the hostile image rebuilt.

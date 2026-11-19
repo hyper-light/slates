@@ -4118,8 +4118,10 @@
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
-> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
-> (two seconds there); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
+> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision as its detection, and
+> **since A-574 that detection is measured**: the widest window the watchdog judges the daemon's shards by and then the
+> lapse bound its anchor publishes, read at every beat on every node and fanned to every shard by the beat (about three
+> seconds of `F` on a quiet laptop, where the fixed window gave two); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
 > take the failover delay as their term**, and a write lease stays its holder's while any of its write attachments
 > lives (renewed at each lapse; another principal refused `LeaseHeld` meanwhile), where before it ran out at its term
 > under a live writer. **Since A-425 the NFSv4 lease is derived**: an idle Linux client's renewal floor (5 s,
@@ -4212,9 +4214,9 @@
 > purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
 > leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
 > re-arm.
-> Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
-> in the event-driven reaper series), and a laptop's
-> failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
+> Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
+> series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
+> the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -18137,20 +18139,20 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   looked the inode up after the last publication, no restored reference names it, and the takeover round left it
   cached. The change was never acknowledged, so this is a dirty read surviving a crash, not a lost acknowledgement. Not
   reproduced. Now a mount of the head is sent every inode of the head (`Volume::visit_head_inodes`;
-  `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover`, red with the old set). **Still
-  open:** a number the dead daemon issued after its last publication (an unpublished create a listing showed) is in no
-  image and no head; the successor refuses it (`NotFound`), never serving it, but a descriptor opened before the death
-  keeps its cached pages until each publication records the volume's live counter beside its reserved ceiling (the
-  image and the delta, both encodings, the publication oracle), so the round can name the numbers between the two.
+  `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover`, red with the old set). A number
+  the dead daemon issued after its last publication (an unpublished create a listing showed) is in no image and no
+  head; the successor refuses it (`NotFound`), never serving it, and since A-578 (2026-11-19) names it too: every
+  publication records the volume's live counter beside its reserved ceiling (image version 33, both encodings), and the
+  round names the numbers between the two
+  (`a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover`, red without it).
 - **An outsider's change beneath a base during a takeover's gap (from A-158) — fixed 2026-11-19 (A-573, B10 (b)) for
   every base file the successor holds.** A base file the kernel looked up after the last publication is in no restored
   reference, and the successor's watcher did not run while no daemon did. Its names and attributes revalidate within
   the base's timestamp granularity, but its cached pages stayed (a FUSE mount asks no `FUSE_AUTO_INVAL_DATA`). Not
   reproduced. Now every inode of the head is named, base files loaded before the last publication among them
   (`a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit`, red with the
-  old set). **Still open:** a base directory first loaded after the last publication gave its files numbers no image
-  holds, so they are the numbers above: refused, never served, their pages kept by a descriptor opened before the
-  death until publications record the live counter.
+  old set). A base directory first loaded after the last publication gave its files numbers no image holds, so they are
+  the numbers above: refused, never served, and named by the round since A-578 (2026-11-19).
 - **Kernels before FUSE 7.44 keep renamed-away names across a takeover (open, from A-158).** They take no
   `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
   mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but
