@@ -305,6 +305,44 @@ repository's list written as git writes its configuration, and read as git's cli
 `packfile-uris` choice sends by URI only a suffix of the fetch's units that URI packs tile in order, since the inline
 pack is indexed before any URI pack can supply a base.
 
+### 5.7 Protected branches: git's own refusals, a hook's words, and what a commit signature covers (A-644, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| `builtin/receive-pack.c`, `commit.c`, `gpg-interface.c` | git `v2.50.1` | 6e3cec699acf968d, 19583027a3899ea3, bed3d128e23439e4 |
+| `Documentation/config/receive.adoc`, `Documentation/githooks.adoc` | git `v2.50.1` | 4c50a43076bf4bba, dc7165822ba02f5c |
+| `routers/private/hook_pre_receive.go`, `routers/private/hook_verification.go` | Gitea `v1.24.0` | cb0325ee50ed2074, 48dcea533dea9fec |
+
+What a protected branch rests on (quoted):
+- **git refuses two things itself** [B: `config/receive.adoc`]: `receive.denyNonFastForwards` "will deny a ref update which
+  is not a fast-forward ... even if that push is forced", and `receive.denyDeletes` "will deny a ref update that deletes
+  the ref". [C: `receive-pack.c` `update()`, lines 1519-1580] a delete of a branch: `rp_error("denying ref deletion for
+  %s", name)` and the reason `deletion prohibited`; a non-fast-forward of a branch: `rp_error("denying non-fast-forward
+  %s" " (you should pull first)", name)` and `non-fast-forward`, both judged before the update hook runs.
+- **The rest is a hook's** [B: `githooks.adoc` "update"]: "The hook executes once for each ref to be updated"; "Exiting
+  with a non-zero status prevents `git receive-pack` from updating that ref". [C: `update()`] after a refusing hook,
+  `rp_error("hook declined to update %s", name)` and the reason `hook declined`. [C: `run_update_hook`,
+  `copy_to_sideband`, line 502] the hook's standard error and output go to band 2 as read, `char data[128]` a read, so a
+  line longer than 128 bytes arrives in pieces (captured: `fixtures/protected/untrusted.response.bin`).
+- **What a commit signature covers** [C: `commit.c` `parse_buffer_signed_by_header`, line 1170]: a line of the
+  repository's own header (`gpg_sig_headers`: `gpgsig`, `gpgsig-sha256`) and its continuation lines are the signature,
+  every one in order; any other line that `starts_with(line, "gpgsig")` is left out of the payload with its continuation
+  lines; everything else is the payload. [C: `gpg-interface.c` `get_format_by_sig`, line 136] the format is chosen by
+  `starts_with(sig, ...)` over `openpgp_sigs` (`-----BEGIN PGP SIGNATURE-----`, `-----BEGIN PGP MESSAGE-----`),
+  `x509_sigs` (`-----BEGIN SIGNED MESSAGE-----`) and `ssh_sigs` (`-----BEGIN SSH SIGNATURE-----`); SSH signs and
+  verifies with `-n git`.
+- **What a hosted server judges** [C: Gitea `hook_verification.go` lines 33-38]: "When creating a new branch, the
+  oldCommitID is empty, by using "newCommitID --not --all"", and otherwise `oldCommitID + "..." + newCommitID`; its
+  refusals are its pre-receive hook's (`hook_pre_receive.go`: "branch %s is protected from force push", "... from
+  deletion", "... from unverified commit %s").
+
+What follows for slates (A-644): a rewrite and a delete a branch refuses answer in git's own words; a linear history
+and signed commits answer as git's update hook would, `hook declined` after the words relayed in git's 128-byte pieces.
+A commit's signature and payload are split exactly as `commit.c` splits them, and its format told by its armour as
+`gpg-interface.c` tells it. What a move brings is judged against its own ref alone (A-642): a create brings its whole
+history. Gitea's `--not --all` reads every ref's position (a global reference, A-642) and lets a protected branch be
+made at a commit pushed first to a branch nothing protects; it is not followed.
+
 ## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
 
 Read 2026-11-19 (UTC) by g255. Each file was downloaded and hashed; the lines cited are each file's own.
