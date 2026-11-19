@@ -11036,7 +11036,10 @@ xattr changes on one path. Fetch, outside the pure core: the candidates' bytes b
 two: memcmp; equal bytes are `AcceptIdentical`, unequal are `Conflict`. Neither pass performs
 I/O, reads a clock, draws randomness, or calls the system allocator (a lint and a test enforce
 it). Fast path: if `last_changed[path] <= base` for every path in the increment, the verdict is
-`Accept` with no range work at all; this is what a basis buys, and it never decides a conflict.
+`Accept` with no range work at all; this is what a basis buys, and it never decides a conflict. An operation marked
+node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
+change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
+Subversion client's commit needs.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -12219,13 +12222,19 @@ and export by landing).
 > **Status (2026-11-18, A-500).** Designed. Built: the svndiff codec (`crates/svn`, `slates-svn`: versions 0 and 2,
 > the decoder with every refusal Subversion's own decoder makes plus the 64-bit overflow it lets through, the encoder,
 > and the reference applier, held to `notes/svndiff`'s worked example as golden vectors). Everything else is owed, in
-> the pieces at the end.
+> the pieces at the end. The reading notes, with every source's revision, hash and quoted lines, are
+> `research/vcs-servers-subversion.md` (cited below as "notes §n").
 >
 > **Status (2026-11-19, A-531).** Built: the ra_svn item codec (`slates-svn`'s `ra_svn`): a parser that reads words,
 > numbers, strings and lists from a buffer the caller holds, resuming where it stopped so a byte is read once, within
 > bounds the caller gives and none of its own, and a writer that writes as `svnserve` writes, held to the protocol
-> document's items as golden vectors (piece 2 below). The reading notes, with every source's revision, hash and quoted lines, are
-> `research/vcs-servers-subversion.md` (cited below as "notes §n").
+> document's items as golden vectors (piece 2 below).
+>
+> **Status (2026-11-19, A-542, its first half).** Built: node-exclusive operations in the merge engine
+> (`slates-merge`): `NODE_EXCLUSIVE`, the high bit of an operation's flags, and the verdict's pass that refuses a
+> node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
+> Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
+> (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12596,8 +12605,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
    vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
    cut anywhere).
-3. The engine's node-exclusive operations and `Copy` that shares a subtree by reference (with §4.17.1's pieces 1 and
-   4).
+3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
+   persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts.
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
@@ -36309,6 +36318,43 @@ Applied in the same change to: GAPS (the folding-drive entry: part 1 built, part
 - **Tests.** `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (`crates/bridge-core/src/
   lib.rs`): three spellings on a folding volume name `\Src\Main.RS`, an exact volume finds only its own spelling. Red
   with the open named as asked on the Mac Studio; green with the walk.
+
+### A-542 — Node-exclusive operations in the merge engine: a path a node-exclusive operation changes conflicts when it changed after the base, whatever the bytes (2026-11-19, g292 for UI goal 91; §4.16 "The verdict", §4.17.4 item 3 and piece 3; A-500, A-534)
+Applied in the same change to: §4.16 (the verdict's node-exclusive exception), §4.17.4 (a status block, piece 3; the
+A-500 status block's last sentence restored to it, which A-531's edit had moved), GAPS (the §4.17.4 entry),
+`crates/merge/src/ops_doc.rs` (`NODE_EXCLUSIVE`, `Op::is_node_exclusive`), `crates/merge/src/engine.rs`
+(`decide_node_exclusive`, `changed_after`, `node_exclusive_paths`), `crates/merge/src/engine/node_exclusive_tests.rs`
+(new).
+- **What was there.** §4.16's verdict accepts a change disjoint by range from what landed since the base, and an
+  identical one. A stock Subversion client cannot take either: FSFS fails a node changed on both sides, "even an
+  identical replacement", and holds that "two additions are not auto-mergeable" (`libsvn_fs_fs/tree.c` `merge()`), and
+  the client records each node it committed as made at the new revision with its own bytes and properties.
+- **The decision.** An operation may be marked node-exclusive by the high bit of its flags, which no kind set before, so
+  every document written before means what it meant. After the dimension verdicts, one pass judges each path a
+  node-exclusive operation changes, a move's source among them, once: if its last change in the change index is past
+  the increment's base, it is a conflict, named by the operation's kind (an edit `Overlap`, an addition `CreateCreate`,
+  a removal `DeleteModify`, a move `RenameRename`, metadata `MetaMeta`). It only refuses what the dimension verdicts
+  would accept, and touches none of the green's state. The rule's directory half (a directory whose properties changed
+  meanwhile against any change beneath it; a directory's own property change against a change of its entries; FSFS's
+  subtree-wide last change) is §4.17.4's piece 5, with its FSFS oracle.
+- **Copy, the second half, owed.** The green's per-path state is plain ordered maps today, so a copy by reference needs
+  A-534's persistent radix tree (g261, in progress, `crates/merge/src/ptrie.rs`): the copy will move the source's own
+  key to the destination and `graft` the source's `subtree` under it in each current-value map, O(path length) per
+  map, and begin each copied key's history at the copy's version with its source recorded. Building a second
+  persistent structure here was ruled out, and g261 built its tree so a prefix is one shared node.
+- **Tests** (`node_exclusive_tests.rs`, a module of the engine). Seven cases, each running one work plain and
+  node-exclusive against the same change since its base (§4.16 accepts the plain one, the flag refuses it): an
+  identical overwrite, a disjoint one, a property change against a text change, an identical addition, a move whose
+  source changed, a delete against a change (refused both ways), and nodes unchanged (accepted both ways); and a
+  property against a reference written apart from the engine: generated histories of plain changes to five files'
+  text and property lists, then a node-exclusive work at a generated base, which must conflict on exactly the paths
+  it changes whose last change is past its base.
+- **Evidence** (the Mac Studio, kiln, 2026-11-18 16:53 and 16:57 PST, load 19 to 23, debug builds of fresh clones of
+  the branch). Failing first: with the pass removed from a copy of the tree, `cargo test --locked -p slates-merge --lib
+  node_exclusive` failed 6 of 8, the two passes the cases the plain verdict already decides alike (the delete against a
+  change, refused; nodes unchanged, accepted). With it, 8 of 8, and the crate's whole `--lib` suite 11 of 11, before
+  and after `cargo fmt`. The crate's integration suites (`crates/merge/tests/`), its clippy and `cargo xtask check` are
+  main's (the run-request queue); no test there sets the flag, so their verdicts are the ones they were.
 
 ### A-524 — The S3 base's host: a miss parked as a pending answer, a directory its listing for one round trip, a file bound to its object; `SimS3`, its oracle; and the library's naming of a base (2026-11-19, goal g268; Mantle's CP-T10.5 part 3; §4.15 "An S3 base"; §4.5, §4.9; R3, R8; RFC 9002; A-151, A-163, A-464, A-471)
 Applied in the same change to: `crates/base/src/s3` (`host`, `sim`, `name`, `fetch` and `time`, each with its tests;
