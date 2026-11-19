@@ -38,13 +38,16 @@
 //! `update`, a push to `post-receive`), or an input at another tool's point, is refused before any
 //! process starts.
 //!
-//! **Owed** (GAPS, the §4.17 entry): part 3, the view presented at a path, as a read-only
+//! **Shown at a path** ([`PresentView`], A-665 part 3). git's push driver (`crate::git_push`)
+//! opens a view at each of receive-pack's points, seals it, has its presenter show it at a path,
+//! and runs the point's hook there through [`run`]. The presenter is a seam: the read-only
 //! attachment the mount edges serve a read at a time from [`GitHookView::read`] (on Linux inside
-//! the launcher's namespace, §4.6), where only its tests present it today, by writing it into a
-//! scratch directory; its seals kept as derived data across views, since a pack's name hashes what
-//! it is made from; the calls of git's push driver (`crate::git_push`, A-654 part 2), which
-//! answers every command `hook not run` while a git hook is configured until they land; and git's
-//! words for each outcome.
+//! the launcher's namespace, §4.6) is its daemon implementation, owed; until it lands the daemon
+//! shows no view (`git_push::Unpresented`), so a push whose repository configures a git hook is
+//! refused `hook not run`, and the tests show a view by writing it into a scratch directory.
+//!
+//! **Owed** (GAPS, the §4.17 entry): the read-only attachment above; its seals kept as derived
+//! data across views, since a pack's name hashes what it is made from.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -66,8 +69,9 @@ use crate::state::ShardState;
 use crate::vcs_hooks::{EnvValue, HookInput, HookPoint, Lesson, Outcome};
 use crate::vcs_store::{GitStore, SealedPush, VcsStores, green_key, settle, within_budget};
 
+// Its presenter serves git's push driver's hook tests too (`crate::git_push`, A-665 part 3).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Counter: a hold, a seal or a charge a closing view gave back that the store refused; the rest
 /// was given back. Zero in every correct use. Format: a counter name in the status report.
@@ -461,6 +465,20 @@ pub(crate) struct Presented {
   env: Vec<(String, EnvValue)>,
 }
 
+/// What shows a hook's view at a path a hook process opens (the module docs, "Shown at a path"):
+/// the read-only attachment the mount edges serve, owed; the tests' scratch directory.
+pub(crate) trait PresentView {
+  /// Whether this presenter can show a view at all: asked before a push's objects are taken in,
+  /// so a push whose hooks cannot run holds nothing.
+  fn can_present(&self) -> bool;
+
+  /// Shows `view` and answers the absolute path a hook runs in it at; `None` where it cannot.
+  fn present(&mut self, state: &ShardState, view: &GitHookView) -> Option<PathBuf>;
+
+  /// Ends the showing at `root`, its hook having run.
+  fn withdraw(&mut self, root: &Path);
+}
+
 /// What a git hook's run needs from its caller beside the hook's input.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GitHookSite<'a> {
@@ -534,7 +552,7 @@ fn sees(point: HookPoint, shows: Shows) -> Result<(), GitHookRefused> {
 
 /// The hook `policy` configures at `point`, if any: git keeps one hook a point, named for it
 /// (A-622's guard).
-fn configured(policy: &RepositoryPolicy, point: HookPoint) -> Option<&HookConfig> {
+pub(crate) fn configured(policy: &RepositoryPolicy, point: HookPoint) -> Option<&HookConfig> {
   policy
     .hooks
     .iter()
