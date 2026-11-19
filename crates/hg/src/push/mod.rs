@@ -1,8 +1,10 @@
 //! A push's `unbundle`, part 1 (A-641; §4.17.3 "Push" steps 1, 4 and 7, piece 5): what a client's bundle2 asks, read
 //! part by part as 7.2's part handlers read it ([`read`]); the race checks it carries, judged against the served view
-//! the push read ([`check`]); and the reply 7.2's server writes for each outcome ([`reply`]). The works a push makes of
-//! its changesets (§4.17.1 "A push is a work"), their landing on each green's own log at the positions the push read
-//! (A-642), and the policy and the hooks at their points are the piece's next parts.
+//! the push read ([`check`]); and the reply 7.2's server writes for each outcome ([`reply`]). Part 2: its changegroup
+//! verified against what the repository holds ([`verify`]), and the work each line's or bookmark's move makes, its
+//! trees laid out from flat manifests and compared by A-618's builder ([`tree`]). Their landing on each green's own log
+//! at the positions the push read (A-642), which lines and bookmarks a push moves, and the policy and the hooks at
+//! their points are the piece's next parts.
 //!
 //! **Sources** (read 2026-11-19 in the wheel of Mercurial 7.2 that uv installs, CPython 3.12, on the Mac Studio; each
 //! file's SHA-256 in `docs/wip/research/mercurial-server.md` §20) \[C\]: `bundle2.py` (`_gethandler`, `_processpart`,
@@ -40,6 +42,8 @@
 
 pub mod check;
 pub mod reply;
+pub mod tree;
+pub mod verify;
 
 use std::borrow::Cow;
 
@@ -566,3 +570,7 @@ fn target_phase(part: &Part<'_>) -> Result<Option<Phase>, Refusal> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "work_tests.rs"]
+mod work_tests;
