@@ -656,7 +656,8 @@
 > makes each revision and a range exported in format 2 as `svn_repos_dump_fs4` writes it; the golden dumps exported
 > again byte for byte after import, every revision's changed paths `svnlook changed`'s, import(export(R)) = R for them
 > and for generated histories held to a model tree; `cargo test -p slates-svn --lib --locked` 313 of 313 on the Mac
-> Studio (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
+> Studio, and 357 of 358 on the tree merged with main, the one failure main's own A-613 `reads` proptest, which fails
+> alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
 > deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
 > shard's budget); main's: clippy and `xtask` over the module. Found by it, for A-553's owner: the index refuses a

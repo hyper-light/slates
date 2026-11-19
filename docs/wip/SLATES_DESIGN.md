@@ -44424,7 +44424,12 @@ Applied in the same change to:
 - **Tests** (`crates/svn/src/migration/tests*`, 27; Mac Studio, 2026-11-19, kiln, debug). Red first: the 27 over the
   two verbs stubbed to refuse failed 27 of 27 (dfc714085); then `cargo test -p slates-svn --lib --locked` 313 of 313 at
   7156ebc0e and again at f4dc10b69, rustfmt's layout taken from that run (the first green run had shared its target
-  directory with the red tree and reused its binary; the rerun touched the sources). Golden: `full.dump` and
+  directory with the red tree and reused its binary; the rerun touched the sources). On the tree merged with main
+  (1fbcc1e79, `slates-svn` then holding A-613's `list` and `get-location-segments` and A-617's report): 357 of 358 with
+  `--locked`, rustfmt clean, the one failure main's own `reads::tests::hostile_commands_are_answered_or_end_the_connection`
+  (A-613: `list` with the parameters `5:trunk ( ) true` streams fewer than four items), which fails alone on origin/main
+  a5dffc913 replayed from its seed `cc 8c15aaa60f4700e2c4cf9ad02498c39f24f70500057be3b37f4181c424a4d919`, reported to
+  main. Golden: `full.dump` and
   `part1.dump` imported and exported again byte for byte; `deltas.dump`, `part1.dump` then `part2.dump`, and the two as
   one stream, whole, a byte at a time and in pieces of 7 and 4,096, each importing to `full.dump`'s history and
   exporting as `full.dump`; every revision's changed paths equal, line for line, to `svnlook changed --copy-info` of the
