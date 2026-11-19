@@ -27,7 +27,6 @@ use crate::index::{Action, ContentIdentity, NodeKind};
 use crate::lock::{HeadView, LockRequest, LockTarget};
 use crate::mergeinfo::Contents;
 use crate::migration::{Repository as Records, Room};
-use crate::report::drive::green::FixtureGuards;
 use crate::report::recorded::{command, items, value_of};
 
 /// A recorded connection: its name, its tunnel's user and its two streams.
@@ -333,17 +332,14 @@ impl Replay {
   }
 }
 
-/// What every call hands over, the guards `guards` (`make-fixtures.py`'s `svnserve.conf`: no
-/// anonymous access, authenticated users write, no authorization file).
-fn sources<'s>(
-  view: &'s View<'s>,
-  guards: &'s FixtureGuards,
-) -> Sources<'s, View<'s>, FixtureGuards> {
+/// What every call hands over (`make-fixtures.py`'s `svnserve.conf`: no anonymous access,
+/// authenticated users write, no authorization file), the records' locks judged at the epoch.
+fn sources<'s>(view: &'s View<'s>) -> Sources<'s, View<'s>> {
   Sources {
     index: view.records.index(),
     repository: view,
-    guards,
     locks: view.records.locks(),
+    now: AprTime(0),
     policy: Policy {
       anonymous: authz::Access::None,
       authenticated: authz::Access::Write,
@@ -414,7 +410,6 @@ fn replay_connection(
     tunnel_user: Some(user),
     cram_md5: false,
   };
-  let guards = FixtureGuards::default();
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();
   let mut next = items(client).into_iter();
@@ -422,7 +417,7 @@ fn replay_connection(
   let mut established = false;
   loop {
     let view = replay.view();
-    let given = sources(&view, &guards);
+    let given = sources(&view);
     let turn = connection.receive(established.then_some(&given), &held, &mut out, PLENTY);
     match turn {
       Ok(Turn::NeedMore { .. }) => {
@@ -455,14 +450,12 @@ fn replay_connection(
           room: ROOM,
         };
         let view = replay.view();
-        connection
-          .commit(start, &sources(&view, &guards), &mut out)
-          .unwrap();
+        connection.commit(start, &sources(&view), &mut out).unwrap();
       }
       Ok(Turn::Hook { consumed, .. }) => {
         held.drain(..consumed);
         let view = replay.view();
-        let answered = connection.answer_hook(Ok(()), &sources(&view, &guards), &mut out);
+        let answered = connection.answer_hook(Ok(()), &sources(&view), &mut out);
         match answered {
           Ok(Turn::Took { consumed: 0 }) => {}
           Ok(Turn::Accepted { work, consumed: 0 }) => {

@@ -11,7 +11,9 @@
 //!
 //! The entry is made with the repository's record by `CreateRepository` on its owner shard ([`make`]), freed with the
 //! repository ([`free`]), and made again by a recovery ([`recover`]). The servers reach a store only through this map,
-//! a step at a time, and keep no store of their own.
+//! a step at a time, and keep no store of their own. A Mercurial store made empty takes the history of a repository
+//! directory on the host through an import ([`hg_import`], A-675), which lives in the map between its turns, one a
+//! repository, and is given back with the repository.
 //!
 //! **Budget (§4.2).** Every byte the content store counts (objects, rows, tables, the versions' records, derived values)
 //! is charged to the shard's memory budget as retention, as a green's history is (`merge_service`). A step that grows the
@@ -62,6 +64,7 @@ use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
 
+pub(crate) mod hg_import;
 pub(crate) mod paths;
 pub(crate) mod record;
 #[cfg(test)]
@@ -103,6 +106,9 @@ pub(crate) struct VcsStores {
   unrecovered: BTreeMap<RepositoryId, ReplayRefused>,
   /// What the content store holds of the shard's budget, charged as retention.
   charged: u64,
+  /// Each Mercurial repository's import under way, between its turns ([`hg_import`]): one a repository, so bounded by
+  /// the partition's repositories.
+  imports: BTreeMap<RepositoryId, hg_import::Importing>,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -255,6 +261,11 @@ impl VcsStores {
     self.entries.contains_key(&id)
   }
 
+  /// Whether an import of repository `id` is under way ([`hg_import`]).
+  pub(crate) fn importing(&self, id: RepositoryId) -> bool {
+    self.imports.contains_key(&id)
+  }
+
   /// Why repository `id`'s store was not made again by the recovery, if it was not.
   pub(crate) fn unrecovered(&self, id: RepositoryId) -> Option<&ReplayRefused> {
     self.unrecovered.get(&id)
@@ -372,10 +383,12 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
 /// A store not made ([`made`]).
 struct Unmade;
 
-/// Frees repository `id`'s store with the repository (module docs): every hold of its rows, tables, versions and
-/// derived values given back to the content store, then the shard's charge trued up to what remains. A refusal while
-/// giving back is counted, and the rest is given back.
+/// Frees repository `id`'s store with the repository (module docs): an import of it under way given back first
+/// ([`hg_import::abandon`]), then every hold of its rows, tables, versions and derived values given back to the content
+/// store, then the shard's charge trued up to what remains. A refusal while giving back is counted, and the rest is
+/// given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
+  hg_import::abandon(state, id);
   state.vcs_stores.unrecovered.remove(&id);
   if !release(&mut state.vcs_stores, id) {
     state.count(RELEASE_REFUSED, 1);

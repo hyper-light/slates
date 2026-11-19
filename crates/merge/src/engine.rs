@@ -409,7 +409,8 @@ pub enum Rebased {
     /// The head the work is now based on.
     version: u64,
     /// Per path the work changed: its bytes after the rebase where they differ from the head's, or
-    /// `None` where the work removes a file the head holds.
+    /// `None` where the work removes a file the head holds; and each link the work's removal or
+    /// replacement of a file's home hands its node to, holding the node's bytes (A-669, A-677).
     changed: BTreeMap<String, Option<Vec<u8>>>,
     /// The work's declared operations restated relative to the new base.
     journal: Vec<crate::increment::VolumeOp>,
@@ -1512,8 +1513,9 @@ impl Green {
 
   /// The green's checkpoint at version `at` (§4.16; [`crate::checkpoint`]): every key whose value in effect at `at` was
   /// set after the origin by its own change, with that version and value, and every increment accepted at or before
-  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and the identity's
-  /// sum at `at` (A-626 part 3, `copy_checkpoint`). `None` when `at` is past the head or below the folded floor (its
+  /// `at`; every copy made at or before `at`, the keys of its tree holding then what it gave them, and, beside a copy's
+  /// record alone, the identity's sum at `at` (A-626 part 3 and its continuation (1), `copy_checkpoint`). `None` when
+  /// `at` is past the head or below the folded floor (its
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
@@ -1521,6 +1523,10 @@ impl Green {
       return None;
     }
     let (copied, listed) = self.copied_at(at);
+    let copies = self.copy_records_at(at);
+    // The sum stands for what the copies' entries hold beyond the restored state's own, so it travels beside a copy's
+    // record alone: without one, a restore's own entries are the identity (A-626 part 3, continued (1)).
+    let sum = (!copies.is_empty()).then(|| self.sum_at(at));
     let mut checkpoint = crate::checkpoint::Checkpoint {
       version: at,
       accepted: self
@@ -1552,9 +1558,9 @@ impl Green {
       hardlinks: changed_at(&self.hardlink_history, at),
       specials: changed_at(&self.special_history, at),
       xattrs: changed_at(&self.xattr_history, at),
-      copies: self.copy_records_at(at),
+      copies,
       copied,
-      sum: self.sum_at(at),
+      sum,
       head_check: None,
     };
     Green::leave_out_copied(&mut checkpoint, &listed);
@@ -1608,9 +1614,12 @@ impl Green {
     green.special_history_bytes = green.special_history_recounted();
     green.index_restored_changes();
     // The copied trees' keys and the copies' records after the change index, which counts the restored histories alone,
-    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3).
+    // then the identity's sum, which stands for what the restored state's entries do not (A-626 part 3). A checkpoint
+    // with no copy's record carries none: the entries placed above are the identity (A-626 part 3, continued (1)).
     green.restore_copied(&checkpoint.copied, &checkpoint.copies);
-    green.take_sum(&checkpoint.sum);
+    if let Some(sum) = &checkpoint.sum {
+      green.take_sum(sum);
+    }
     self
   }
 
@@ -2316,6 +2325,16 @@ impl Green {
       .into_iter()
       .filter(|(link, target)| named_link(link, target))
       .collect();
+    // Each copy the journal declares, in its order, brings its source's tree at the copy's version to its destination,
+    // in place of what the destination's tree held there (A-626 part 4, `copy_restate`).
+    for op in journal {
+      if let crate::increment::VolumeOp::Copy {
+        from, to, version, ..
+      } = op
+      {
+        self.copied_base((from, to, *version), &mut base);
+      }
+    }
     base
   }
 
@@ -4002,7 +4021,8 @@ impl Green {
   /// attributes, and every other surviving link names it there. When the version renames a home,
   /// its links name the new home. Derived from the head and the version's own effects, so a replay
   /// derives the same; never recorded, since they are the node model's consequence, not a work's
-  /// operation, and a rebase restates only the work's (`Green::rebased_from`).
+  /// operation, and a rebase's journal restates only the work's (`Green::rebased_from`), while its
+  /// changes show the files the moves leave ([`Green::heirs_of`], A-677).
   fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
     let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     let mut removed: BTreeSet<&str> = BTreeSet::new();
@@ -4043,6 +4063,22 @@ impl Green {
       self.hand_over(home, self.surviving_links(home, &links), &mut moves);
     }
     moves
+  }
+
+  /// The files a version's node moves leave at the links its removed or replaced homes hand their
+  /// nodes to ([`Green::node_moves`], [`Green::hand_over`]): each heir with the node's bytes, as the
+  /// commit makes them (A-669's rule: the link takes the node as the version leaves it). A rebase's
+  /// changes hold them so the work reads the link the submit would keep, while its journal holds
+  /// none, since a volume's link names the node already (A-677).
+  fn heirs_of(&self, effects: &[Effect]) -> Vec<(String, Option<Vec<u8>>)> {
+    self
+      .node_moves(effects)
+      .into_iter()
+      .filter_map(|moved| match moved {
+        Effect::SetContent(heir, bytes, ..) => Some((heir, Some(bytes.unwrap_or_default()))),
+        _ => None,
+      })
+      .collect()
   }
 
   /// The links naming the node at `home` once the version's link effects (`links`: each link's last
@@ -5134,17 +5170,6 @@ impl Green {
       };
     }
     let resolved = Green::resolve(inc);
-    // A journal has no copy to restate one as (A-586; owed with the deriver's copy): each copy is named, typed, and the
-    // green is not judged.
-    if !resolved.copies.is_empty() {
-      return Rebased::Conflict {
-        windows: resolved
-          .copies
-          .keys()
-          .map(|dst| Green::window(dst, MergeConflictClass::TypeChanged))
-          .collect(),
-      };
-    }
     // The verdict is `submit`'s, on an immutable green; it adds to the fast-path counter (through `merge_content`),
     // which a rebase puts back, since it merges nothing.
     let fast_path_before = self.fast_path_hits.get();
@@ -5184,10 +5209,14 @@ impl Green {
   /// them ([`in_replay_order`], A-663): each hard link where the node it names still stands at the name
   /// it names it by, and one made where the head holds another after that one's removal. A node handed
   /// on to a link with the work's writes is restated as the work made it, the writes on its home and
-  /// then the home's removal ([`Green::handed_in`], A-669). The green is not touched.
+  /// then the home's removal ([`Green::handed_in`], A-669). A node the work's removal or replacement
+  /// of its home hands on to a link is in the changes at that link, holding the node's bytes, and in
+  /// no operation of the journal ([`Green::heirs_of`], A-677). The green is not touched.
   fn rebased_from(&self, mut effects: Vec<Effect>, to: u64, post_state: &[u8]) -> Rebased {
     use crate::increment::VolumeOp;
     self.make_mapped(&mut effects, post_state);
+    // The links the version's removals and replacements hand a node to, as the commit hands it on (A-669's rule).
+    let heirs = self.heirs_of(&effects);
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     // The sources of the renames restated: each one's removal is the rename's, not an unlink of its own.
@@ -5200,6 +5229,9 @@ impl Green {
     // it), since a volume's link names the node already. The link's removal and the node's mode and attributes at it
     // are the commit's.
     let (handed, refilled) = self.handed_in(&effects);
+    // The copies restated so far, each destination with its source's version: a file set beneath one from its source
+    // is the work's edit there, restated over what the copy brings (A-626 part 4, `copy_restate`).
+    let mut copies: Vec<(String, u64)> = Vec::new();
     for effect in in_replay_order(effects) {
       match effect {
         Effect::Special(path, node) => {
@@ -5221,21 +5253,14 @@ impl Green {
         }
         // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
         // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
-        // replayed over a head that holds the destination it would add them to that file's own.
-        Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => {
-          journal.push(VolumeOp::Rename {
-            from: from.clone(),
-            to: path.clone(),
-          });
-          // The edits the work made after the rename follow it, over the bytes it moved (A-547).
-          let moved_len = self
-            .content
-            .get(&from)
-            .map_or(0, |moved| moved.len() as u64);
-          journal.extend(content_volume_ops(&path, &edits, moved_len));
-          moved_from.insert(from);
-          changed.insert(path, Some(bytes.unwrap_or_default()));
-        }
+        // replayed over a head that holds the destination it would add them to that file's own. A file beneath a copy
+        // names its source in the copied tree too, and is the work's edit there (`Green::restate_sourced`).
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => self
+          .restate_sourced(
+            (path, bytes.unwrap_or_default(), from, edits),
+            (&copies, &mut moved_from),
+            (&mut journal, &mut changed),
+          ),
         Effect::SetContent(path, bytes, ops, _) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
@@ -5269,10 +5294,27 @@ impl Green {
           journal.push(VolumeOp::SetXattr { path, name, value });
         }
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
-        // `Green::rebase` answers a work holding a copy before it restates anything (A-586).
-        Effect::CopyTree { .. } => {}
+        // A copy as the deriver's copy (A-626 part 4): the verdict's copies come first, so what the work does beneath
+        // one is restated after it, against what it brings.
+        Effect::CopyTree {
+          dst,
+          from,
+          version,
+          replace,
+          ..
+        } => {
+          copies.push((dst.clone(), version));
+          journal.push(VolumeOp::Copy {
+            from,
+            to: dst,
+            version,
+            replace,
+          });
+        }
       }
     }
+    // After the work's own changes, as the commit applies its node moves after the version's effects.
+    changed.extend(heirs);
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
     // removal of a file the head does not hold, are no change.
     changed.retain(|path, after| after.as_deref() != self.content.get(path));
@@ -5318,8 +5360,13 @@ fn in_replay_order(effects: Vec<Effect>) -> Vec<Effect> {
 /// such place keeps its own; both bounds cross only in a document the deriver never composes (a link's own rename over
 /// a held name, whose node another rename moves first), where the link keeps the verdict's order as before.
 fn link_places(effects: &[Effect]) -> BTreeMap<usize, usize> {
+  // A file set beneath a copy names its source in the copied tree, and moves no node (A-626 part 4).
+  let roots = copy_restate::copy_roots(effects);
   let mut unhomed: BTreeMap<&str, usize> = BTreeMap::new();
   for (index, effect) in effects.iter().enumerate() {
+    if copy_restate::copied_edit(effect, &roots) {
+      continue;
+    }
     for home in effect.unhomes().into_iter().flatten() {
       unhomed.entry(home).or_insert(index);
     }
@@ -5485,6 +5532,8 @@ mod copy;
 
 mod copy_checkpoint;
 
+mod copy_restate;
+
 #[cfg(test)]
 mod copy_tests;
 
@@ -5515,6 +5564,9 @@ mod node_tests;
 
 #[cfg(test)]
 mod restate_tests;
+
+#[cfg(test)]
+mod copy_restate_tests;
 
 #[cfg(test)]
 mod tests {

@@ -14,10 +14,12 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// host code typed by its numbering: a completion record keeps its reply's bytes, whose errno fields a Windows daemon of
 /// layout 10 filled with Win32 error codes, now an errno alone beside an appended Win32 variant (A-539, 2026-11-19), 12
 /// a green's checkpoint carries its copies' records, their trees' keys and the identity's sum (version 4, A-626 part 3,
-/// 2026-11-19), so a version 3 checkpoint is never read: its segment is refused at adoption, before anything is served.
-/// An older segment is refused, never misread.
+/// 2026-11-19), so a version 3 checkpoint is never read: its segment is refused at adoption, before anything is served,
+/// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
+/// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
+/// A-626 part 4, 2026-11-19). An older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 12;
+pub const LAYOUT_VERSION: u32 = 14;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus

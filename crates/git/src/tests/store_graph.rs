@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use super::{GraphFault, StoreGraph};
 use crate::Admission;
 use crate::fixtures::{FETCH_CLONE_RESPONSE, FETCH_HAVES_RESPONSE};
-use crate::negotiation::{Acknowledgments, Answer, Graph, Request, Run, negotiate};
+use crate::negotiation::{
+  Acknowledgments, Answer, Filter, Graph, Patterns, Request, Run, negotiate,
+};
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tree::Tree;
 use crate::served::{self, FIRST, MAIN, REFS, SECOND, SIDE, TAG, THIRD, V1, id};
@@ -220,6 +222,7 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
     shallow: &[],
     deepen: None,
     filter: None,
+    sparse: None,
     include_tag: false,
     thin: true,
   };
@@ -265,5 +268,51 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
   assert!(pack.runs.is_empty() && outcome.counters.walked > 0);
   let sent: BTreeSet<ObjectId> = pack.objects.iter().map(|node| graph.id(*node)).collect();
   assert_eq!(sent, git_pack(FETCH_CLONE_RESPONSE, &served));
+  assert_eq!(graph.fault(), None);
+}
+
+/// A-640 part 4 (git's `filter_sparse` over the real store's named entries): do clone `third` as stock git's clone asks
+/// it, under a `sparse:oid` filter whose patterns match every path (`*`, which matches every name, the root's empty one
+/// too), then under one holding no pattern. Expect: the first sends exactly what stock git's clone pack holds; the
+/// second the same less every blob, every tree still sent, as git sends every tree under a sparse filter.
+#[test]
+fn a_sparse_clone_sends_every_tree_and_the_blobs_its_patterns_match() {
+  let served = served::served();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
+  let wants = [id(THIRD)];
+  let filter = Filter::SparseOid(b"main:.sparse".to_vec());
+  let clone = |patterns: &[u8]| -> BTreeSet<ObjectId> {
+    let patterns = Patterns::read(patterns, &mut Admission::new(u64::MAX)).unwrap();
+    let request = Request {
+      wants: &wants,
+      haves: &[],
+      done: true,
+      wait_for_done: false,
+      shallow: &[],
+      deepen: None,
+      filter: Some(&filter),
+      sparse: Some(&patterns),
+      include_tag: false,
+      thin: true,
+    };
+    let outcome = negotiate(&graph, &request, &mut Admission::new(u64::MAX)).unwrap();
+    let Answer::Pack(pack) = &outcome.answer else {
+      panic!("{:?}", outcome.answer)
+    };
+    pack.objects.iter().map(|node| graph.id(*node)).collect()
+  };
+  let git = git_pack(FETCH_CLONE_RESPONSE, &served);
+  assert_eq!(clone(b"*\n"), git);
+  let blobs: BTreeSet<ObjectId> = git
+    .iter()
+    .filter(|object| {
+      graph
+        .node(object)
+        .is_some_and(|node| graph.kind(node) == Kind::Blob)
+    })
+    .copied()
+    .collect();
+  assert!(!blobs.is_empty());
+  assert_eq!(clone(b""), git.difference(&blobs).copied().collect());
   assert_eq!(graph.fault(), None);
 }

@@ -163,6 +163,11 @@ mod wildmatch_reference;
 // (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_policy;
+// A protected git branch, the server's half (A-644 part 2): what a ref's change brings, read from A-614's store, for
+// the policy's check point; A-321's verifier under git's namespace; the check point's refusals in git's words. No caller
+// outside tests until receive-pack's server half asks it (A-620 part 2's judge over the store).
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_protect;
 // §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside
 // tests until the servers' push paths start hooks (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]
@@ -184,9 +189,9 @@ pub mod credentials;
 #[cfg_attr(not(test), allow(dead_code))]
 mod svn_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
-// each phase's wait learned, the bounds derived from the shard's budget, git's site, a connection moved to its
-// repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until each
-// repository's store lives on its owner shard (A-662).
+// each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
+// moved to its repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until
+// each repository's store lives on its owner shard (A-662).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
 // §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
@@ -197,11 +202,12 @@ mod vcs_http;
 mod vcs_ssh;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
 // tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
-// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654).
+// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654), and
+// its Mercurial import (A-675) none until the verb that asks for one (its piece).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_store;
-// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). No caller
-// outside tests until the daemon imports a repository's directory (its piece).
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). Its caller is
+// the store map's import (`vcs_store::hg_import`, A-675), which has none outside tests until its verb.
 #[cfg_attr(not(test), allow(dead_code))]
 mod hg_base;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait

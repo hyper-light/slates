@@ -11,9 +11,10 @@
 
 use super::*;
 use crate::index::Index;
+use crate::lock::LockTable;
 use crate::report::RequestKind;
 use crate::report::drive::green::{
-  FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5,
+  Green, NOW, locks_of, normalize, repository, rules_of, texts_by_md5,
 };
 use crate::report::recorded::{
   Recorded, SESSIONS, command, context, drive_items, finished_report, items, read_drive, recorded,
@@ -50,7 +51,7 @@ enum Ending {
   Waiting,
 }
 
-/// The fixtures' repository, and the guards a session's drive ran under.
+/// The fixtures' repository, and the locks a session's drive ran under.
 struct Fixture {
   /// The index.
   index: Index,
@@ -73,10 +74,11 @@ struct Replay<'r> {
 /// What a replay wrote, how it ended, and how many of its turns wrote.
 type Replayed = (Vec<u8>, Ending, usize);
 
-/// Replays an exchange begun with `request` in `context`.
+/// Replays an exchange begun with `request` in `context`, its drive's reads judged by the anonymous
+/// principal's rules.
 fn replay(
   fixture: &Fixture,
-  guards: &FixtureGuards,
+  locks: &LockTable,
   context: &Context<'_>,
   request: Request,
   mut plan: Replay<'_>,
@@ -86,10 +88,13 @@ fn replay(
     Opened::Reporting(exchange) => exchange,
     Opened::Failed(failure) => return (out, Ending::Failed(failure), 0),
   };
+  let anonymous = rules_of(None);
   let sources = Sources {
     index: &fixture.index,
     repository: &fixture.green,
-    guards,
+    locks,
+    now: NOW,
+    rules: Some(&anonymous),
   };
   let mut pieces = plan.pieces.into_iter();
   let mut held: Vec<u8> = Vec::new();
@@ -152,12 +157,12 @@ fn has_report(recorded: Recorded) -> bool {
     .any(|item| command(item).is_some_and(|(name, _)| RequestKind::of(&name).is_some()))
 }
 
-/// The guards a session's drive ran under.
-fn session_guards(recorded: Recorded) -> FixtureGuards {
+/// The locks a session's drive ran under.
+fn session_locks(recorded: Recorded) -> LockTable {
   if recorded.name == "update-with-lock.1" {
-    guards_of(recorded.name, &finished_report(recorded))
+    locks_of(recorded.name, &finished_report(recorded))
   } else {
-    FixtureGuards::anonymous()
+    LockTable::new()
   }
 }
 
@@ -182,7 +187,7 @@ fn replay_session(
   };
   replay(
     fixture,
-    &session_guards(recorded),
+    &session_locks(recorded),
     &context,
     request,
     replay_of,
@@ -345,13 +350,7 @@ fn early(fixture: &Fixture, turns: usize, answer: &[u8]) -> Replayed {
     budget: SMALLEST,
     early_after: Some((turns, answer.to_vec())),
   };
-  replay(
-    fixture,
-    &FixtureGuards::anonymous(),
-    &context,
-    request,
-    replay_of,
-  )
+  replay(fixture, &LockTable::new(), &context, request, replay_of)
 }
 
 /// A-616 part 2 (`check_for_error_internal`): answer the recorded checkout's drive early, after
@@ -395,13 +394,7 @@ fn answered(fixture: &Fixture, name: &str, answer: &[u8]) -> Vec<u8> {
     budget: PLENTY,
     early_after: None,
   };
-  let (out, ending, _) = replay(
-    fixture,
-    &FixtureGuards::anonymous(),
-    &context,
-    request,
-    replay_of,
-  );
+  let (out, ending, _) = replay(fixture, &LockTable::new(), &context, request, replay_of);
   assert_eq!(
     ending,
     Ending::Answered,
@@ -536,13 +529,7 @@ fn an_answer_past_its_bounds_ends_the_connection() {
       budget: PLENTY,
       early_after: None,
     };
-    let (out, ending, _) = replay(
-      &fixture,
-      &FixtureGuards::anonymous(),
-      &context,
-      request,
-      replay_of,
-    );
+    let (out, ending, _) = replay(&fixture, &LockTable::new(), &context, request, replay_of);
     assert!(
       matches!(ending, Ending::Refused(Refused::Item(_))),
       "{ending:?}"

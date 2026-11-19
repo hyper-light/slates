@@ -199,6 +199,9 @@ pub struct Plan {
   pub added: Option<(Node, Node)>,
   /// The branches whose lines it moves, makes or retires, sorted.
   pub touched: Vec<Vec<u8>>,
+  /// Each branch it brings changesets on and the first of them in arrival order, in that order: the changeset `acl`
+  /// names when it refuses the branch (A-657 part 4).
+  pub firsts: Vec<(Vec<u8>, Node)>,
 }
 
 /// Why a push could not be placed; nothing of it is kept.
@@ -309,8 +312,11 @@ struct Graph<'v, V> {
   brought: Vec<Brought>,
   /// Each brought changeset's index, by node.
   by_node: BTreeMap<Node, usize>,
-  /// The brought changesets' branches, interned.
+  /// The brought changesets' branches, interned: each name once, numbered in the order first brought.
   branches: Vec<Vec<u8>>,
+  /// Each interned branch's number, by name: a push may bring a branch a changeset, so a name is found in logarithmic
+  /// time, never by a walk over every branch before it.
+  interned: BTreeMap<Vec<u8>, usize>,
   /// Whether the changegroup part has been taken: until then a brought changeset is not known.
   taken: bool,
   /// The view's revisions this push made public.
@@ -339,6 +345,7 @@ impl<'v, V: Repository> Graph<'v, V> {
       brought: Vec::with_capacity(brought.len()),
       by_node: BTreeMap::new(),
       branches: Vec::new(),
+      interned: BTreeMap::new(),
       taken: false,
       published: BTreeSet::new(),
       phases: Vec::with_capacity(brought.len()),
@@ -364,15 +371,21 @@ impl<'v, V: Repository> Graph<'v, V> {
     Ok(graph)
   }
 
-  /// `branch`'s interned number.
+  /// `branch`'s interned number, the next one when it is new.
   fn intern(&mut self, branch: Vec<u8>, admission: &mut Admission) -> Result<usize, PastAdmission> {
-    if let Some(at) = self.branches.iter().position(|held| *held == branch) {
-      return Ok(at);
+    if let Some(at) = self.interned.get(&branch) {
+      return Ok(*at);
     }
-    admission.charge(to_u64(branch.len()))?;
+    let bytes = to_u64(branch.len());
+    admission.charge(bytes)?;
     admission.charge_items::<Vec<u8>>(1)?;
+    // The copy of the name the index keys it by.
+    admission.charge(bytes)?;
+    admission.charge_items::<(Vec<u8>, usize)>(1)?;
+    let at = self.branches.len();
+    self.interned.insert(branch.clone(), at);
     self.branches.push(branch);
-    Ok(self.branches.len().saturating_sub(1))
+    Ok(at)
   }
 
   /// Where `node` stands: brought, or the view's; none for the null node or one outside both.
@@ -606,6 +619,21 @@ pub fn classify(
     .first()
     .zip(graph.brought.last())
     .map(|(first, last)| (first.node, last.node));
+  admission.charge_items::<bool>(graph.branches.len())?;
+  let mut seen = vec![false; graph.branches.len()];
+  for brought in &graph.brought {
+    if let Some(first) = seen.get_mut(brought.branch).filter(|seen| !**seen) {
+      *first = true;
+      let branch = graph
+        .branches
+        .get(brought.branch)
+        .cloned()
+        .unwrap_or_default();
+      admission.charge(to_u64(branch.len()))?;
+      admission.charge_items::<(Vec<u8>, Node)>(1)?;
+      plan.firsts.push((branch, brought.node));
+    }
+  }
   Ok(plan)
 }
 

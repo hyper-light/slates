@@ -12,7 +12,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::copy::{appearance_bytes, in_tree, joined, relative};
-use super::{Green, Increment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
+use super::{Green, Increment, Lineage, Outcome, Reanchored, change_bytes};
 use crate::chain_entry;
 use crate::checkpoint::{Checkpoint, Tables};
 use crate::increment::Base;
@@ -610,26 +610,6 @@ fn a_green_holding_a_copy_is_checkpointed_and_restored() {
     assert_eq!(read, expected, "restored at {at}");
     assert_eq!(read.3, read.4, "the restored identity is its recount");
   }
-}
-
-/// A-586 (owed: a rebase restating a copy). Do: rebase a work holding a copy. Expect: a type conflict naming its
-/// destination, and the green untouched.
-#[test]
-fn a_rebase_of_a_work_with_a_copy_is_refused_typed() {
-  let mut green = trunk();
-  let identity = green.head_identity();
-  let rebased = green.rebase(&one_copy("trunk", "b", 1).at(2, 1));
-  assert_eq!(
-    rebased,
-    Rebased::Conflict {
-      windows: vec![super::ConflictWindow {
-        path: "b".to_owned(),
-        range: Range::new(0, 0),
-        class: MergeConflictClass::TypeChanged,
-      }],
-    }
-  );
-  assert_eq!((green.head(), green.head_identity()), (1, identity));
 }
 
 /// Every path a base names, in any dimension.
@@ -1248,10 +1228,10 @@ fn replay_entry(
 /// checkpoint taken after its trunk changed and before a copy of the trunk from earlier replays the copy, then a change
 /// to a file the copy brought, its identity read only after both. Do: checkpoint [`trunk_changed_after_1`] at 3, copy
 /// the trunk at 1 to `b` as version 4 and overwrite `b/a` as 5; restore the checkpoint and replay 4 and 5, each entry
-/// encoded and decoded. Expect: the replica hashes as its owner at 5, its identity equals its recount, and its
-/// checkpoint at 3 carries its owner's sum there. Before, each read what the copy gave `b/a` from the trunk's history at
-/// 1, which the restored green does not hold: it read nothing there, so the replica hashed otherwise than its owner and
-/// its checkpoint carried another sum.
+/// encoded and decoded. Expect: the replica hashes as its owner at 5, its identity equals its recount, its identity
+/// moved to 3 is its owner's, and so is its checkpoint at 3 (which carries no sum since A-626 part 3, continued (1)).
+/// Before, each read what the copy gave `b/a` from the trunk's history at 1, which the restored green does not hold: it
+/// read nothing there, so the replica hashed otherwise than its owner and moved another sum to 3.
 #[test]
 fn a_replica_restored_after_a_copys_source_version_hashes_as_its_owner() {
   let mut green = trunk_changed_after_1();
@@ -1276,10 +1256,18 @@ fn a_replica_restored_after_a_copys_source_version_hashes_as_its_owner() {
     replica.head_identity(),
     replica.head_identity_from_scratch()
   );
-  let sum = |green: &Green| green.checkpoint(3).expect("a checkpoint at 3").sum;
+  // Below the copy, the identity moved to 3 is its owner's (`Green::sum_at`, what a branch there carries), and so is the
+  // whole checkpoint at 3, which carries no sum since no copy stands at or before it (A-626 part 3, continued (1)).
+  let moved = |green: &Green| green.sum_at(3);
   assert!(
-    sum(&replica) == sum(&green),
-    "the replica's checkpoint at 3 carries another sum"
+    moved(&replica) == moved(&green),
+    "the replica moves its identity to 3 otherwise than its owner"
+  );
+  let encoded = |green: &Green| green.checkpoint(3).map(|checkpoint| checkpoint.encode());
+  assert_eq!(
+    encoded(&replica),
+    encoded(&green),
+    "the replica's checkpoint at 3"
   );
 }
 

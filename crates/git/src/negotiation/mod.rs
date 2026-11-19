@@ -34,7 +34,8 @@
 //!
 //! **Filters** [B: `rev-list-options` "--filter"; C: `list-objects-filter.c`, `list-objects-filter-options.c`]: see
 //! [`filter`]. The wants, and what their tags name, are sent whatever the filter, as git sends the objects a client
-//! named.
+//! named. A `sparse:oid` filter is served with the patterns the server read from its blob ([`sparse`]), alone: every
+//! tree the walk reaches is sent, and a blob when a path it is met at is matched (the `objects` module).
 //!
 //! **Bounds (§4.2, §4.9).** Every walk is iterative, never recursive, and every entry it keeps (a commit's flags, a
 //! queued commit, a tree seen, an object chosen) is charged to the caller's [`Admission`] before it is kept, at its own
@@ -47,11 +48,13 @@ mod one_round;
 mod paint;
 mod ready;
 mod shallow;
+pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
 use crate::{Admission, PastAdmission};
 
 pub use filter::Filter;
+pub use sparse::Patterns;
 
 /// Format: the depth git reads as no depth at all, its `INFINITE_DEPTH`, which `git fetch --unshallow` sends: every
 /// shallow commit of the client is made whole (`upload-pack.c` `deepen`).
@@ -79,6 +82,9 @@ pub trait Graph {
   /// A tree's entries the store holds: its subtrees and blobs, never a submodule's commit (a gitlink, which no
   /// repository but the submodule's holds).
   fn entries(&self, tree: Self::Node) -> impl Iterator<Item = Self::Node>;
+  /// The same entries, in the tree's order, each with its name: what a sparse filter asks its patterns of (A-640
+  /// part 4).
+  fn named_entries(&self, tree: Self::Node) -> impl Iterator<Item = (Self::Node, Vec<u8>)>;
   /// A blob's size in bytes.
   fn size(&self, blob: Self::Node) -> u64;
   /// What an annotated tag names, when the store holds it.
@@ -146,6 +152,9 @@ pub struct Request<'r> {
   pub deepen: Option<Deepen<'r>>,
   /// The filter asked, if any.
   pub filter: Option<&'r Filter>,
+  /// The patterns of the filter's `sparse:oid`, read from its blob by the server (A-640 part 4); a `sparse:oid` filter
+  /// without them is refused.
+  pub sparse: Option<&'r Patterns>,
   /// `include-tag`: send the annotated tags of objects the pack carries.
   pub include_tag: bool,
   /// `thin-pack`: the client takes a pack whose deltas name bases it holds. In a shallow exchange git's server then
@@ -281,7 +290,7 @@ pub fn negotiate<S: Graph>(
   let common = ready::common(graph, request.haves, admission)?;
   let client_shallow = shallow::client(graph, request.shallow, admission)?;
   if let Some(found) = request.filter {
-    filter::check_served(found).map_err(Refusal::Filter)?;
+    filter::check_served(found, request.sparse.is_some()).map_err(Refusal::Filter)?;
   }
   let runs = one_round::runs(graph, request, &wants, &common, &client_shallow, admission)?;
   counters.one_round = runs.answered;
