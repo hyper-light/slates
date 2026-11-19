@@ -40,6 +40,9 @@
 //! of the commit rows (part 3); the walks and a commit sliced under the shard's budget, and their transient sets charged;
 //! the versions' records kept as content, replicated as the index's tables are.
 
+mod deltas;
+mod fragment;
+pub mod learn;
 mod naming;
 mod positions;
 mod push;
@@ -47,6 +50,8 @@ mod repository;
 pub mod rows;
 pub mod views;
 
+pub use deltas::delta_of;
+pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};

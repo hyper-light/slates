@@ -1,0 +1,4 @@
+svn, version 1.15.0 (r1937767)
+   compiled Sep 24 2026, 10:40:23 on aarch64-apple-darwin25.6.0
+svnserve, version 1.15.0 (r1937767)
+   compiled Sep 24 2026, 10:40:23 on aarch64-apple-darwin25.6.0

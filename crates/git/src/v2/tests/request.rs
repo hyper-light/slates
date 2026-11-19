@@ -27,7 +27,7 @@ fn command(stream: &[u8]) -> CommandRequest<'_> {
 fn fetch_arguments<'a>(request: &CommandRequest<'a>) -> Vec<F<'a>> {
   match &request.arguments {
     Arguments::Fetch(arguments) => arguments.iter().map(|line| line.value).collect(),
-    Arguments::LsRefs(_) => panic!("not fetch"),
+    other => panic!("not fetch: {other:?}"),
   }
 }
 
@@ -312,7 +312,7 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
       Refusal::UnknownCommand { at: 0 },
     ),
     (
-      wire(&[Packet::Data(b"command=object-info\n"), Packet::Flush]),
+      wire(&[Packet::Data(b"command=object-infos\n"), Packet::Flush]),
       Refusal::UnknownCommand { at: 0 },
     ),
     (
