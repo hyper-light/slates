@@ -142,9 +142,18 @@ fn pack_of(answer: &[u8]) -> Vec<u8> {
 
 /// The ids of the objects `pack` holds, read whole as git's index-pack reads one, in name order.
 fn ids_in(pack: &[u8]) -> Vec<String> {
-  let unpacked = unpack::read_whole(pack, ObjectFormat::Sha1, &NoIndex, &mut Admission::new(ROOM))
-    .expect("a whole pack");
-  let mut ids: Vec<String> = unpacked.objects.iter().map(|object| object.id.to_string()).collect();
+  let unpacked = unpack::read_whole(
+    pack,
+    ObjectFormat::Sha1,
+    &NoIndex,
+    &mut Admission::new(ROOM),
+  )
+  .expect("a whole pack");
+  let mut ids: Vec<String> = unpacked
+    .objects
+    .iter()
+    .map(|object| object.id.to_string())
+    .collect();
   ids.sort();
   ids
 }
@@ -330,7 +339,11 @@ fn t_a682_a_store_not_held_here_is_not_lent() {
       },
     );
     assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-    let spaced = state.db.partition().repositories().repository_named("unnamed-head");
+    let spaced = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named("unnamed-head");
     let spaced = spaced.map(|record| record.id).expect("the record");
     let nobody = RepositoryId { bytes: [0xa6; 16] };
     let asked = |state: &mut ShardState, id| {
@@ -338,7 +351,11 @@ fn t_a682_a_store_not_held_here_is_not_lent() {
       let objects = lend_on(state, (id, None), |_, _| ()).is_some();
       (request, objects)
     };
-    [asked(state, mercurial), asked(state, spaced), asked(state, nobody)]
+    [
+      asked(state, mercurial),
+      asked(state, spaced),
+      asked(state, nobody),
+    ]
   });
   assert_eq!(lent, [(false, false), (false, true), (false, false)]);
 }
@@ -348,7 +365,10 @@ fn t_a682_a_store_not_held_here_is_not_lent() {
 async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), String> {
   let mut written = Vec::new();
   for _ in 0..STEPS {
-    let stepped = command.step().await.map_err(|refused| format!("{refused:?}"))?;
+    let stepped = command
+      .step()
+      .await
+      .map_err(|refused| format!("{refused:?}"))?;
     let out = command.output().1.to_vec();
     command.sent(0, out.len());
     written.extend(out);
@@ -424,6 +444,11 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
     ids_in(&pack_of(&fetched.0)),
     ended,
   );
-  let expected = (true, expected, ids_of(&objects), (Vec::new(), Next::Exited(0)));
+  let expected = (
+    true,
+    expected,
+    ids_of(&objects),
+    (Vec::new(), Next::Exited(0)),
+  );
   assert_eq!(observed, expected, "{advertised:?}");
 }

@@ -32,9 +32,7 @@ use slates_rt::tcp::TcpListener;
 use slates_rt::{RtError, Runtime, ShardId, futures};
 use slates_vfs::clock::Clock;
 
-use super::git::{
-  Authenticator, GitSite, Located, Proven, Repositories, Unproven, UploadServices,
-};
+use super::git::{Authenticator, GitSite, Located, Proven, Repositories, Unproven, UploadServices};
 use super::{Bounds, EdgeState, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
 use crate::vcs_store::upload::ShardStores;

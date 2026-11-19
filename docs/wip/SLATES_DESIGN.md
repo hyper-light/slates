@@ -12730,6 +12730,22 @@ engine: the verdict, rebase, position mapping, the register).
 > listener across a daemon's restart, as it holds the export's; the option on a library starter's anchor
 > (`slates_api::start`).
 >
+> **Status (2026-11-19, A-682: upload-pack served from each repository's store on its owner shard).** The daemon's
+> git site serves upload-pack from the store A-662 keeps on the repository's owner shard, lent by
+> `vcs_store::upload::ShardStores`, the `StoreLender` over the shard's map. The step that answers a request (the
+> advertisement, `ls-refs`, a `fetch`) is lent A-614's store, the content store, the refs the asker may read and the
+> branch `HEAD` names, read from the partition's register as the step runs; every later step of the answer is lent the
+> objects alone, since the pack's source names what it sends by position. Each register name is a git ref (a name under
+> `refs/` as it is, a short one under `refs/heads/`, as LFS names the default branch); a name git's
+> `check_refname_format` refuses is not lent, since protocol v2's lines refuse it and one such name would refuse every
+> listing; a ref is lent only to a reader the repository's policy lets read it (git's `transfer.hideRefs` precedence,
+> a ref no rule speaks to its owner's alone), and `HEAD` reads as unborn to a reader that may not read its branch. The
+> pack is A-639's stream through A-653's `Fragments`, its turns on the shard's clock within the step quantum the shard
+> keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
+> take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
+> hidden ref alone reaches, fetchable by id until slates-git hides them; the daemon starting the SSH edge (A-651); the
+> live stock `git clone` over the daemon's edge (the next piece) and the other platforms (main's).
+>
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
 > service names as its reply begins (`Connection::reply_fields`, asked once through `Exchange::reply_fields`, none by
@@ -50270,3 +50286,68 @@ at start).
   `--test anchor a_segment_` 7 of 7, the layout 13 refusal among them; the three crates' fmt checks clean. The same
   runs over main ee5cbed4c, after A-644 part 2's server, db and ipc changes (kiln r40, at 15ba6b078): 67 of 67, 42 of
   42, 3 of 3, 3 of 3, 7 of 7, 2 of 2 and 7 of 7, fmt clean.
+
+### A-682 — The daemon's StoreLender over A-662's map: upload-pack served from each repository's store on its owner shard, its refs lent by the asker's read right (2026-11-19, g309 for UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" items 1 and 2, §4.17.1 "Policy"; A-625 part 3's second slice; after A-614, A-640 part 2, A-651 part 2, A-653 and A-662)
+Applied in the same change to:
+- §4.17.2's statuses (A-682's, after A-625 part 3's);
+- GAPS (the §4.17 entry: A-682's line; the owed lists of A-662, A-651 part 2 and A-625 part 3);
+- `crates/server`: `vcs_store/upload.rs` and its tests `vcs_store/upload/tests.rs` (new); `vcs_store.rs` (the module)
+  and `vcs_store/tests.rs` (its push helpers shared with the new tests); `vcs_http/git/upload.rs` (`StoreLender::lend`
+  takes the asker, `lend_objects` new), `vcs_http/git.rs` (`Unserved` moved into the site's tests, the one place it is
+  used), `vcs_http/daemon_edge.rs` (the daemon's site) and `vcs_http.rs`; `vcs_ssh/git.rs` and `vcs_ssh/site.rs` (the
+  session's asker); `vcs_policy.rs` (`permits`); `lib.rs` (the modules' notes); the tests of the git site, the SSH
+  command and the daemon's edge.
+
+- **What.** The daemon's git site (`vcs_http::daemon_edge::DaemonSite`) serves upload-pack through
+  `UploadServices<ShardStores>`. `ShardStores` holds nothing: each step borrows the shard's state for its own length
+  (`state::with_state_counted`) and lends A-614's store and the content store from A-662's map (`VcsStores::git_ref`),
+  the content store lent the room the shard's budget admits for the step's reads and set back after it
+  (`vcs_store::lent_to_read`). A store the map does not hold here (another shard's, one a recovery could not make
+  again, another tool's) is not lent, and the edge answers `503` as for a service not served. Before this change no
+  lender existed outside tests, so the daemon's site answered every upload-pack `503`.
+- **The asker's refs at the request's step alone.** upload-pack reads refs only while it answers a request: `ls-refs`
+  lists them, a `fetch` looks its `want-ref`s and `deepen-not`s up among them and checks their order, and v0's
+  advertisement lists them. Every later step only writes the answer: `Answer::write` hands the store to the pack's
+  source, and A-653's `Fragments::write` reads `served.repository` and `served.store` alone, naming objects by
+  position. So the seam has two calls: `lend`, for a request's step, takes the asker and reads the register and the
+  policy as it runs; `lend_objects`, for an answer's later steps, reads no ref, so each costs its room and one packet
+  whatever the repository's refs (A-640 part 2's bound) rather than a walk of the register a packet.
+- **Each register name a git ref.** §4.17.1 makes each git ref a green bound to a name; a name under `refs/` is that
+  ref, any other a branch under `refs/heads/`, the rule `crate::lfs` names the default branch by, and `HEAD` names the
+  default branch. The register takes any name but an empty one or one holding a NUL (A-515), while protocol v2's lines
+  refuse a name git's `check_refname_format` refuses (`slates_git::v2::ls_refs`), so a branch named `my topic` would
+  have refused every listing of its repository: the lender leaves such a name out (`slates_git::refname::is_valid`),
+  and a repository whose default branch is such a name is not lent, since slates-git's answers always name `HEAD`'s
+  branch. Two names that make one ref (`main` beside `refs/heads/main`) are both lent; upload-pack's order check then
+  refuses every answer that lists or looks up refs (`upload::refs::check_order`), rather than the lender choosing one,
+  which A-654's receive path must not create (GAPS' tripwire).
+- **Refs by the asker's read right.** The edge admits a principal to a repository when some rule lets it read some
+  name (`vcs_policy::reaches`, A-625 part 2), "each name then judged by the rule that decides it". This is that
+  judgement for reads: `vcs_policy::permits` judges a ref's `Read` as `admit` judges a push's own right, git's
+  precedence (the last rule that covers the ref decides) with a ref no rule speaks to its owner's alone (A-575). A ref
+  the asker may not read is neither listed nor found by name (`want-ref` and `deepen-not` answer git's "unknown ref"),
+  and `HEAD`, looked up among the refs lent, reads as unborn to an asker that may not read its branch. The objects such
+  a ref alone reaches stay fetchable by id: slates-git's negotiation answers a want of any object the store holds
+  (`negotiation::Refusal::NotOurs` names one it lacks), so hiding them is slates-git's, owed there.
+- **The pack.** `ShardPacks` is A-653's `Fragments`, each turn on the shard's clock (`slates_rt::futures::now_ns`,
+  §4.3) within the step quantum the shard keeps now (`DaemonConfig::step_quantum_ns`, its live wake estimate), at the
+  owner's exchange: `Exchange { ns: 1e9, bytes: memcpy_bytes_per_second }`. Derived: a saved byte is worth the time
+  this machine takes to copy it, the neutral worth the archive's codec policy prices a byte at (`DaemonConfig::codec`,
+  memcpy at the largest probed size, §4.11), until the live memory-pressure and load signals move both.
+- **The SSH site.** `UploadCommand` takes the session's principal, and `ToolServices<ShardStores>` is what the SSH
+  edge's site runs once the daemon starts that edge (A-651's owed); its test drives it on a daemon's shard.
+- **Tests** (`crates/server`). The daemon's edge over TLS, red first: the owner's advertisement at protocol v0 and v2
+  answered `200` from the store on the repository's shard after the move, and an `ls-refs` asking for `HEAD` with
+  `symrefs` and `unborn` answered `unborn HEAD symref-target:refs/heads/main`, the record's default branch; nothing
+  counted unavailable. The lender on a real one-shard daemon whose repository took its objects through A-635's append
+  (`vcs_store::upload::tests`): `ls-refs` listing `HEAD` and `refs/heads/main` at the pushed commit, and a `fetch` of
+  it whose pack, read whole as index-pack reads one, holds exactly the commit, its tree and its blob; a reader one rule
+  lets read `main` alone seeing `HEAD` and `main` while the owner sees `topic` too, the reader's `want-ref` of `topic`
+  refused `UnknownRef`; a branch named `my topic` left out of a whole listing; a Mercurial store, a git repository whose
+  default branch is `my main` and an unknown id not lent to a request (the second's objects still lent to an answer's
+  later steps); and an SSH session started by the SSH site's services over `ShardStores` from a task on the shard,
+  advertised, answering `ls-refs` and the `fetch` with the same pack, and ended 0 by a flush.
+- **Evidence.** @@EVIDENCE@@
+- **Owed.** The objects a hidden ref alone reaches hidden by slates-git; the daemon starting the SSH edge (A-651); the
+  live stock `git clone` and fetch over the daemon's edge (the next piece, g309's); the exchange moved by the live
+  signals; Linux and Windows runs, clippy, the doc and lint gates (main's).

@@ -66,9 +66,9 @@ use crate::state::ShardState;
 
 pub(crate) mod hg_import;
 pub(crate) mod record;
-pub(crate) mod upload;
 #[cfg(test)]
 mod tests;
+pub(crate) mod upload;
 
 use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 
