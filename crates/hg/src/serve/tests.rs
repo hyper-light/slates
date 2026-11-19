@@ -284,12 +284,14 @@ fn oracle_branches(history: &History, top: Node) -> [Node; 4] {
   }
 }
 
+/// Each branch's heads by 7.2's rule (A-667; `branchmap.py`: "A branchhead is a revision such that no descendant is on
+/// the same branch"): each revision no later revision on its branch has as an ancestor.
 fn oracle_branchmap(history: &History) -> BTreeMap<Vec<u8>, Vec<Rev>> {
   let mut map: BTreeMap<Vec<u8>, Vec<Rev>> = BTreeMap::new();
   for rev in 0..history.count() {
     let branch = history.branch(rev);
-    let continued = (0..history.count())
-      .any(|child| history.branch(child) == branch && history.parents(child).contains(&Some(rev)));
+    let continued = (rev + 1..history.count())
+      .any(|later| history.branch(later) == branch && ancestors(history, &[later]).contains(&rev));
     if !continued {
       map.entry(branch.to_vec()).or_default().push(rev);
     }

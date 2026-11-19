@@ -47,9 +47,18 @@
 //!   commands: the owner appends other commits to the index while drives run (the conflict case), so each command is
 //!   handed the index, and reads at the base do not move. A-592's transaction ([`crate::index::Trial`]), every identity
 //!   FSFS gives, is built from the rows once, by the verdict.
-//! - **`close-edit`** runs the verdict (A-592's [`verdict`]: FSFS's merge at commit, then the lock table's check with
-//!   the commit's tokens, its releases decided). An accepted work is handed to the caller ([`Step::Accepted`]), who
-//!   commits it and then writes `svnserve`'s answer ([`write_commit_info`]); a refusal is written.
+//! - **Hooks** (A-661): `open-root` checks its revision, then every revision property the transaction is begun with
+//!   (`svn_repos_fs_change_txn_props`, `fs-wrap.c` 344-357, in name order where `svnserve` takes APR's hash order),
+//!   then waits for start-commit ([`Step::Hook`], [`Due::StartCommit`]) before its root opens; `close-edit` waits for
+//!   pre-commit ([`Due::PreCommit`]) before the verdict, as `svn_repos_fs_commit_txn` runs it before FSFS's merge. The
+//!   caller runs the hook, which reads the transaction through [`Drive::pending`], and hands its answer to
+//!   [`Drive::resume`]: passed, the command goes on; refused, the hook's errors are the command's failure, under the
+//!   early-error rule.
+//! - **`close-edit`** runs the verdict once pre-commit passed (A-592's [`verdict`]: FSFS's merge at commit against the
+//!   head as it stands then, then the lock table's check with the commit's tokens, its releases decided). An accepted
+//!   work, which names the head its verdict judged against and keeps no ephemeral `svn:txn-` property (`fs-wrap.c`
+//!   72-89), is handed to the caller ([`Step::Accepted`]), who commits it ([`super::revision`]) and then writes
+//!   `svnserve`'s answer ([`write_commit_info`]); a refusal is written.
 //! - **The early-error rule** (`editorp.c` 1149-1208): a refused command's failure is written at once, the edit
 //!   aborted, and every command after it read and dropped, malformed or not, until `abort-edit` or `success`, which end
 //!   the drive without an answer. `abort-edit` while driving is answered `( success ( ) )`. A client's `failure` and
@@ -227,6 +236,11 @@ const ENTRY_PREFIX: &[u8] = b"svn:entry:";
 /// The property whose value must be a date.
 /// Format: `svn_props.h` `SVN_PROP_REVISION_DATE`; `fs-wrap.c` 250.
 const REVISION_DATE: &[u8] = b"svn:date";
+
+/// What begins the name of an ephemeral transaction property, which the client sends with its revision properties
+/// and no revision keeps (`svn:txn-user-agent`, `svn:txn-client-compat-version`).
+/// Format: `SVN_PROP_TXN_PREFIX`, `SVN_PROP_PREFIX "txn-"` (`svn_props.h` 706).
+const TXN_PREFIX: &[u8] = b"svn:txn-";
 
 /// The carriage return an `svn:` property may not hold.
 /// Format: `fs-wrap.c` 237, `strchr(value->data, '\r')`.
@@ -690,19 +704,66 @@ pub enum Step {
   /// `close-edit` accepted the work. Nothing is written: the caller commits it, then writes the answer
   /// ([`write_commit_info`]).
   Accepted(Box<Work>),
+  /// The command waits for a hook `svnserve` runs inside it (A-661): run it, then hand its answer to
+  /// [`Drive::resume`] before any other item. Nothing is written.
+  Hook(Due),
   /// An item `svnserve` refuses outside a command error: the connection ends, nothing written.
   Close,
+}
+
+/// A hook a command waits for, where `svnserve` runs it (A-661; the hook glue runs it and [`Drive::resume`] takes its
+/// answer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Due {
+  /// start-commit, which `open-root` runs once its revision is checked, as the transaction is made on the youngest
+  /// revision (`commit.c` `open_root` 437-441, `fs-wrap.c` `svn_repos_fs_begin_txn_for_commit2` 151-178, the
+  /// revision properties checked first).
+  StartCommit {
+    /// The transaction's name.
+    transaction: String,
+  },
+  /// pre-commit, which `close-edit` runs before FSFS's merge and its lock check (`commit.c` `close_edit` 816,
+  /// `fs-wrap.c` `svn_repos_fs_commit_txn` 69-71): the verdict judges the work against the head as it stands once the
+  /// hook passed.
+  PreCommit {
+    /// The transaction's name.
+    transaction: String,
+  },
+}
+
+/// What a hook reads of the transaction its command waits on ([`Drive::pending`], A-661): what FSFS's read-only view of
+/// a transaction (`svnlook -t`'s, owed) is built over.
+#[derive(Clone, Copy, Debug)]
+pub struct Pending<'drive> {
+  /// The transaction's name.
+  pub transaction: &'drive str,
+  /// The revision it was begun on: the youngest at `open-root`.
+  pub base: Revision,
+  /// The revision properties it was begun with, the client's ephemeral `svn:txn-` ones among them, each name once in
+  /// name order.
+  pub revision_properties: &'drive [(Vec<u8>, Vec<u8>)],
+  /// Its changed-path rows so far, by path.
+  pub rows: &'drive BTreeMap<String, ChangedPath>,
+  /// The texts it made, by identity.
+  pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The property lists it made, by identity, each sorted by name.
+  pub property_lists: &'drive BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 /// An accepted work: what the caller commits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Work {
+  /// The youngest revision its verdict judged it against: it commits as the revision after, and only while this is
+  /// still the youngest (FSFS makes the head it merged the transaction's base, `tree.c` 2291, and its commit refuses
+  /// a base no longer the youngest, `transaction.c` 3784-3786).
+  pub head: Revision,
   /// The revision's record: the transaction's name and its changed-path rows.
   pub record: RevisionRecord,
   /// The lock entries the verdict decided, the presented locks released among them.
   pub lock_entries: Vec<LockEntry>,
   /// The revision's properties but its date: the client's, or `svn:log` alone, and `svn:author` the principal's
-  /// (`serve.c` 1526-1541).
+  /// (`serve.c` 1526-1541), each name once in name order; the ephemeral `svn:txn-` properties the client sent are
+  /// dropped once pre-commit passed, as `svn_repos_fs_commit_txn` drops them before it commits (`fs-wrap.c` 72-89).
   pub revision_properties: Vec<(Vec<u8>, Vec<u8>)>,
   /// The texts the work made, by identity.
   pub texts: BTreeMap<ContentIdentity, Vec<u8>>,
@@ -715,10 +776,31 @@ pub struct Work {
 enum Phase {
   /// Taking commands.
   Driving,
+  /// A command waiting for its hook's answer ([`Drive::resume`]).
+  Waiting(Pause),
   /// After a refusal: reading and dropping until `abort-edit` or `success`.
   Dropping,
   /// Ended.
   Done,
+}
+
+/// The command a hook paused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pause {
+  /// `open-root`, for start-commit.
+  OpenRoot,
+  /// `close-edit`, for pre-commit.
+  CloseEdit,
+}
+
+/// What `open-root` makes once start-commit passed: the root directory's token, and the revision the client holds it
+/// at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRoot {
+  /// The root's token.
+  token: Vec<u8>,
+  /// The revision the client holds the root at, when it said.
+  revision: Option<Revision>,
 }
 
 /// A directory token's directory (`commit.c` `struct dir_baton`).
@@ -1122,8 +1204,10 @@ pub struct Drive {
   setup: Setup,
   /// Where it is.
   phase: Phase,
-  /// Whether `open-root` came.
+  /// Whether `open-root` came and its start-commit passed.
   opened: bool,
+  /// What `open-root` makes once its start-commit passes.
+  pending_root: Option<PendingRoot>,
   /// The transaction's base: the youngest at `open-root`.
   base: Revision,
   /// The tokens the client named, by their bytes.
@@ -1147,6 +1231,7 @@ impl Drive {
       setup,
       phase: Phase::Driving,
       opened: false,
+      pending_root: None,
       base: 0,
       tokens: BTreeMap::new(),
       rows: BTreeMap::new(),
@@ -1157,7 +1242,8 @@ impl Drive {
     }
   }
 
-  /// Takes one item the client sent during the drive, writing what `svnserve` writes for it.
+  /// Takes one item the client sent during the drive, writing what `svnserve` writes for it. An item handed in while a
+  /// hook is due ([`Step::Hook`]) ends the drive ([`Step::Close`]): `svnserve` reads nothing while its hook runs.
   ///
   /// # Errors
   /// [`ItemError`] when an answer cannot be written, which none here can give.
@@ -1171,6 +1257,10 @@ impl Drive {
   ) -> Result<Step, ItemError> {
     match self.phase {
       Phase::Done => return Ok(Step::Close),
+      Phase::Waiting(_) => {
+        self.phase = Phase::Done;
+        return Ok(Step::Close);
+      }
       Phase::Dropping => return Ok(self.drop_one(item)),
       Phase::Driving => {}
     }
@@ -1186,7 +1276,67 @@ impl Drive {
       green,
       locks,
     };
-    match self.run(&world, &command) {
+    let outcome = self.run(&world, &command);
+    self.answer(outcome, out)
+  }
+
+  /// Takes the answer of the hook the last command waits for (A-661): `Ok` goes on with the command, `open-root`'s
+  /// transaction made and the command taken, `close-edit`'s verdict judged against `index` and `locks` as they stand
+  /// now; `Err` holds the errors `svnserve` writes for the hook's refusal, outermost first, and refuses the command
+  /// with them under the early-error rule (written, then every item dropped until `abort-edit`). Called with no hook
+  /// due, the drive ends ([`Step::Close`]).
+  ///
+  /// # Errors
+  /// [`ItemError`] when an answer cannot be written, which none here can give.
+  pub fn resume<G: Green + ?Sized>(
+    &mut self,
+    index: &Index,
+    green: &G,
+    locks: &LockTable,
+    answer: Result<(), Vec<(u32, String)>>,
+    out: &mut Vec<u8>,
+  ) -> Result<Step, ItemError> {
+    let Phase::Waiting(pause) = self.phase else {
+      self.phase = Phase::Done;
+      return Ok(Step::Close);
+    };
+    self.phase = Phase::Driving;
+    if let Err(errors) = answer {
+      write_failure_errors(&errors, out)?;
+      self.phase = Phase::Dropping;
+      return Ok(Step::Refused);
+    }
+    let outcome = match pause {
+      Pause::OpenRoot => self.make_root(),
+      Pause::CloseEdit => self.judge(&World {
+        index,
+        green,
+        locks,
+      }),
+    };
+    self.answer(outcome, out)
+  }
+
+  /// The transaction as a hook reads it while its command waits ([`Step::Hook`]): its name, base, revision properties,
+  /// rows, texts and property lists so far.
+  pub fn pending(&self) -> Pending<'_> {
+    Pending {
+      transaction: &self.setup.transaction,
+      base: self.base,
+      revision_properties: &self.setup.revision_properties,
+      rows: &self.rows,
+      texts: &self.texts,
+      property_lists: &self.property_lists,
+    }
+  }
+
+  /// What a command's outcome makes of the drive, and its step.
+  fn answer(
+    &mut self,
+    outcome: Result<Outcome, Stop>,
+    out: &mut Vec<u8>,
+  ) -> Result<Step, ItemError> {
+    match outcome {
       Ok(Outcome::Taken) => Ok(Step::Taken),
       Ok(Outcome::Aborted) => {
         self.phase = Phase::Done;
@@ -1199,6 +1349,13 @@ impl Drive {
       Ok(Outcome::Accepted(work)) => {
         self.phase = Phase::Done;
         Ok(Step::Accepted(work))
+      }
+      Ok(Outcome::Hook(due)) => {
+        self.phase = Phase::Waiting(match due {
+          Due::StartCommit { .. } => Pause::OpenRoot,
+          Due::PreCommit { .. } => Pause::CloseEdit,
+        });
+        Ok(Step::Hook(due))
       }
       Err(Stop::Close) => {
         self.phase = Phase::Done;
@@ -1438,13 +1595,16 @@ impl Drive {
         file,
         text_checksum,
       } => self.close_file(world, file, text_checksum),
-      EditCommand::CloseEdit => self.close_edit(world),
+      EditCommand::CloseEdit => self.close_edit(),
       EditCommand::AbortEdit => Ok(Outcome::Aborted),
       EditCommand::FinishReplay | EditCommand::Failure => Err(Stop::Close),
     }
   }
 
-  /// `open-root` (`commit.c` 413-466): the transaction begun on the youngest.
+  /// `open-root` (`commit.c` 413-466): the revision checked, then the transaction begun on the youngest as
+  /// `svn_repos_fs_begin_txn_for_commit2` begins it (`fs-wrap.c` 132-184): its revision properties checked
+  /// (`svn_repos_fs_change_txn_props`, 344-357), then start-commit ([`Due::StartCommit`]); the root is opened once
+  /// the hook passed ([`Drive::resume`]).
   fn open_root(
     &mut self,
     index: &Index,
@@ -1455,7 +1615,22 @@ impl Drive {
     if let Some(revision) = revision.filter(|revision| *revision > youngest) {
       return Err(DriveRefusal::PastHead { revision, youngest }.into());
     }
+    for (name, value) in &self.setup.revision_properties {
+      validate_prop(name, Some(value.as_slice()))?;
+    }
     self.base = youngest;
+    self.pending_root = Some(PendingRoot {
+      token: root.to_vec(),
+      revision,
+    });
+    Ok(Outcome::Hook(Due::StartCommit {
+      transaction: self.setup.transaction.clone(),
+    }))
+  }
+
+  /// The root opened once start-commit passed: the transaction made on the youngest `open-root` read.
+  fn make_root(&mut self) -> Result<Outcome, Stop> {
+    let PendingRoot { token, revision } = self.pending_root.take().ok_or(Stop::Close)?;
     self.opened = true;
     self.rows.clear();
     let directory = Directory {
@@ -1464,9 +1639,7 @@ impl Drive {
       base: revision,
       checked: false,
     };
-    self
-      .tokens
-      .insert(root.to_vec(), Baton::Directory(directory));
+    self.tokens.insert(token, Baton::Directory(directory));
     Ok(Outcome::Taken)
   }
 
@@ -1874,11 +2047,22 @@ impl Drive {
     Ok(Outcome::Taken)
   }
 
-  /// `close-edit` (`commit.c` 798-882): the verdict, A-592's merge then A-602's lock check with the commit's tokens.
-  fn close_edit<G: Green + ?Sized>(&mut self, world: &World<'_, G>) -> Result<Outcome, Stop> {
+  /// `close-edit` (`commit.c` 798-882): with no transaction refused (811-813), else pre-commit first
+  /// ([`Due::PreCommit`]), as `svn_repos_fs_commit_txn` runs it before FSFS's merge; the verdict follows once the hook
+  /// passed ([`Drive::resume`]).
+  fn close_edit(&mut self) -> Result<Outcome, Stop> {
     if !self.opened {
       return Err(DriveRefusal::NoTransaction.into());
     }
+    Ok(Outcome::Hook(Due::PreCommit {
+      transaction: self.setup.transaction.clone(),
+    }))
+  }
+
+  /// `close-edit` once pre-commit passed: the verdict against the head as it stands now (A-592's: FSFS's merge, then
+  /// the lock table's check), and the accepted work without the ephemeral `svn:txn-` properties, which
+  /// `svn_repos_fs_commit_txn` drops after pre-commit and before it commits (`fs-wrap.c` 72-89).
+  fn judge<G: Green + ?Sized>(&mut self, world: &World<'_, G>) -> Result<Outcome, Stop> {
     let record = RevisionRecord {
       transaction: self.setup.transaction.clone(),
       changes: self.rows.values().cloned().collect(),
@@ -1894,10 +2078,13 @@ impl Drive {
         now,
       )
     })?;
+    let mut revision_properties = std::mem::take(&mut self.setup.revision_properties);
+    revision_properties.retain(|(name, _)| !name.starts_with(TXN_PREFIX));
     Ok(Outcome::Accepted(Box::new(Work {
+      head: world.index.youngest(),
       record,
       lock_entries,
-      revision_properties: std::mem::take(&mut self.setup.revision_properties),
+      revision_properties,
       texts: std::mem::take(&mut self.texts),
       property_lists: std::mem::take(&mut self.property_lists),
     })))
@@ -2238,6 +2425,8 @@ enum Outcome {
   Aborted,
   /// `close-edit`, accepted.
   Accepted(Box<Work>),
+  /// Waiting for a hook.
+  Hook(Due),
 }
 
 /// A deletion's row.
@@ -2310,12 +2499,22 @@ fn escaped(path: &[u8]) -> String {
 /// `svn_repos_fs_change_node_prop`'s checks before FSFS's (`fs-wrap.c` 327-338): `svn:mergeinfo` verified, then
 /// `svn_repos__validate_prop` (202-263). A deletion is never refused.
 fn validate_property(path: &str, name: &[u8], value: Option<&[u8]>) -> Result<(), DriveRefusal> {
+  if let Some(value) = value
+    && name == MERGEINFO
+  {
+    verify_mergeinfo(path, value)?;
+  }
+  validate_prop(name, value)
+}
+
+/// `svn_repos__validate_prop` (`fs-wrap.c` 202-263), which a node's property change meets and so does every revision
+/// property `open-root` begins the transaction with (`svn_repos_fs_change_txn_props`, 344-357): a deletion never
+/// refused; a property `svn:wc:` or `svn:entry:` never stored; an `svn:` value UTF-8 without a carriage return, and
+/// `svn:date` a date.
+fn validate_prop(name: &[u8], value: Option<&[u8]>) -> Result<(), DriveRefusal> {
   let Some(value) = value else {
     return Ok(());
   };
-  if name == MERGEINFO {
-    verify_mergeinfo(path, value)?;
-  }
   let named = || String::from_utf8_lossy(name).into_owned();
   if name.starts_with(WC_PREFIX) || name.starts_with(ENTRY_PREFIX) {
     return Err(DriveRefusal::NotRegular { name: named() });

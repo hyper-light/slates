@@ -770,7 +770,10 @@ impl Import {
           });
         }
         self.imported.file_logs = self.imported.file_logs.saturating_add(1);
-        let total = self.imported.file_revisions.saturating_add(u64::from(revisions));
+        let total = self
+          .imported
+          .file_revisions
+          .saturating_add(u64::from(revisions));
         self.imported.file_revisions = total;
         self.next_file(at.saturating_add(1))
       }
@@ -988,7 +991,9 @@ impl Import {
       .keys()
       .fold(0_usize, |total, name| total.saturating_add(name.len()));
     self.room.charge(to_u64(names))?;
-    self.room.charge_items::<(Vec<u8>, Node)>(read.found.len())?;
+    self
+      .room
+      .charge_items::<(Vec<u8>, Node)>(read.found.len())?;
     self.imported.bookmarks = read.found.into_iter().collect();
     self.imported.dropped_bookmarks = read.dropped;
     self.imported.malformed_bookmarks = read.malformed;
@@ -1108,8 +1113,11 @@ fn open_revlog<F: RepositoryFiles>(
       split(files, shape, radix, index, header, len)
     }
     _ => {
-      let whole = files.read(&index.names(), 0, len, room)?.unwrap_or_default();
-      let outline = Outline::of_index(&whole, room).map_err(|refused| revlog_refused(radix, refused))?;
+      let whole = files
+        .read(&index.names(), 0, len, room)?
+        .unwrap_or_default();
+      let outline =
+        Outline::of_index(&whole, room).map_err(|refused| revlog_refused(radix, refused))?;
       Ok((outline, Bytes::Whole(whole)))
     }
   }
@@ -1147,8 +1155,14 @@ fn docketed<F: RepositoryFiles>(
   let docket = files.read(&path.names(), 0, len, room)?.unwrap_or_default();
   let read = revlog::read_docket(&docket).map_err(|refused| revlog_refused(radix, refused))?;
   let outline = Outline::of_docket(&read).map_err(|refused| revlog_refused(radix, refused))?;
-  let index = store_path(shape, &[radix, &[ID_SEPARATOR], read.index_id, DOCKET_INDEX].concat())?;
-  let data = store_path(shape, &[radix, &[ID_SEPARATOR], read.data_id, DOCKET_DATA].concat())?;
+  let index = store_path(
+    shape,
+    &[radix, &[ID_SEPARATOR], read.index_id, DOCKET_INDEX].concat(),
+  )?;
+  let data = store_path(
+    shape,
+    &[radix, &[ID_SEPARATOR], read.data_id, DOCKET_DATA].concat(),
+  )?;
   let (index_end, data_end) = (read.index_end, read.data_end);
   holds(files, radix, &index, index_end, "an index file")?;
   holds(files, radix, &data, data_end, "a data file")?;

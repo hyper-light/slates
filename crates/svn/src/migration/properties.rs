@@ -28,7 +28,7 @@ const VALUE_ENTRY: &[u8] = b"V ";
 const LINE_FEED: u8 = b'\n';
 
 /// The bytes of `properties` as FSFS keeps them.
-pub(super) fn encode(properties: &Properties) -> Vec<u8> {
+pub(crate) fn encode(properties: &Properties) -> Vec<u8> {
   let mut bytes = Vec::new();
   for (name, value) in properties {
     entry(&mut bytes, NAME_ENTRY, name);
@@ -49,22 +49,31 @@ fn entry(bytes: &mut Vec<u8>, prefix: &[u8], data: &[u8]) {
 
 /// The list `bytes` hold, if they are a list [`encode`] wrote: entries in strictly increasing name order, every
 /// length decimal digits, nothing after `END`.
-pub(super) fn decode(bytes: &[u8]) -> Option<Properties> {
-  let mut properties = Properties::new();
+pub(crate) fn decode(bytes: &[u8]) -> Option<Properties> {
+  Some(
+    entries(bytes)?
+      .into_iter()
+      .map(|(name, value)| (name.to_vec(), value.to_vec()))
+      .collect(),
+  )
+}
+
+/// The entries of the list `bytes` hold, in name order, each borrowed from `bytes`, if they are a list [`encode`]
+/// wrote ([`decode`]'s rules).
+pub(crate) fn entries(bytes: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+  let mut entries: Vec<(&[u8], &[u8])> = Vec::new();
   let mut rest = bytes;
   loop {
     if rest == TERMINATOR {
-      return Some(properties);
+      return Some(entries);
     }
     let (name, after_name) = take_entry(rest, NAME_ENTRY)?;
     let (value, after_value) = take_entry(after_name, VALUE_ENTRY)?;
-    let in_order = properties
-      .last_key_value()
-      .is_none_or(|(last, _)| last.as_slice() < name);
+    let in_order = entries.last().is_none_or(|(last, _)| *last < name);
     if !in_order {
       return None;
     }
-    properties.insert(name.to_vec(), value.to_vec());
+    entries.push((name, value));
     rest = after_value;
   }
 }

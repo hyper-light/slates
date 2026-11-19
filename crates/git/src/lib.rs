@@ -44,6 +44,7 @@
 
 mod admission;
 pub mod delta;
+pub mod derived;
 pub mod entry;
 pub mod http;
 pub mod lfs;
