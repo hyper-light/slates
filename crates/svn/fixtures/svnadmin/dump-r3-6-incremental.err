@@ -1,0 +1,8 @@
+WARNING 0x0000: Referencing data in revision 2, which is older than the oldest dumped revision (r3).  Loading this dump into an empty repository will fail.
+WARNING 0x0000: Referencing data in revision 2, which is older than the oldest dumped revision (r3).  Loading this dump into an empty repository will fail.
+WARNING 0x0000: Referencing data in revision 2, which is older than the oldest dumped revision (r3).  Loading this dump into an empty repository will fail.
+* Dumped revision 3.
+* Dumped revision 4.
+* Dumped revision 5.
+* Dumped revision 6.
+WARNING 0x0000: The range of revisions dumped contained references to copy sources outside that range.

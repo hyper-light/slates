@@ -1,0 +1,64 @@
+<<< Skipped original revision 0
+<<< Skipped original revision 1
+<<< Skipped original revision 2
+<<< Skipped original revision 3
+<<< Started new transaction, based on original revision 4
+     * editing path : trunk/dir ... done.
+     * editing path : trunk/link ... done.
+
+------- Committed revision 4 >>>
+
+<<< Started new transaction, based on original revision 5
+     * editing path : branches/b1/dir ... done.
+     * editing path : trunk/run.sh ... done.
+
+------- Committed revision 5 >>>
+
+<<< Started new transaction, based on original revision 6
+     * editing path : branches/b1 ... done.
+     * editing path : branches/b1 ...COPIED... done.
+     * editing path : branches/b1/bin.dat ... done.
+     * editing path : branches/b1/bin.dat ...COPIED... done.
+     * editing path : trunk/a: b c.txt ... done.
+     * editing path : trunk/a: b c.txt ...COPIED... done.
+     * editing path : trunk/bin.dat ... done.
+     * editing path : trunk/bin.dat ...COPIED... done.
+
+------- Committed revision 6 >>>
+
+<<< Started new transaction, based on original revision 7
+     * editing path : trunk/big.txt ... done.
+
+------- Committed revision 7 >>>
+
+<<< Started new transaction, based on original revision 8
+     * editing path : trunk/big.txt ... done.
+
+------- Committed revision 8 >>>
+
+<<< Started new transaction, based on original revision 9
+     * editing path : tags/v1 ...COPIED... done.
+
+------- Committed revision 9 >>>
+
+<<< Started new transaction, based on original revision 10
+     * editing path : branches/b1/a.txt ... done.
+
+------- Committed revision 10 >>>
+
+<<< Started new transaction, based on original revision 11
+     * editing path : trunk ... done.
+     * editing path : trunk/a.txt ... done.
+
+------- Committed revision 11 >>>
+
+<<< Started new transaction, based on original revision 12
+     * editing path : trunk/a-from-r1.txt ...COPIED... done.
+
+------- Committed revision 12 >>>
+
+<<< Started new transaction, based on original revision 13
+     * editing path :  ... done.
+
+------- Committed revision 13 >>>
+

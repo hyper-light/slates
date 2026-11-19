@@ -1,0 +1,4 @@
+svnadmin: E200014: Checksum mismatch for '/trunk/a.txt':
+   expected:  00000000000000000000000000000001
+     actual:  6c7831c26f0d0a5f807006854aa682f4
+

@@ -1,0 +1,206 @@
+SVN-fs-dump-format-version: 2
+
+UUID: 7bf7a5ef-cabf-0310-b7d4-93df341afa7e
+
+Revision-number: 3
+Prop-content-length: 164
+Content-length: 164
+
+K 10
+svn:author
+V 4
+test
+K 8
+svn:date
+V 27
+2005-04-07T22:13:03.000000Z
+K 7
+svn:log
+V 65
+r3: a branch, a file copied then changed, a file copied as it was
+PROPS-END
+
+Node-path: branches/b1
+Node-kind: dir
+Node-action: add
+Node-copyfrom-rev: 2
+Node-copyfrom-path: trunk
+
+
+Node-path: trunk/a-copy.txt
+Node-kind: file
+Node-action: add
+Node-copyfrom-rev: 2
+Node-copyfrom-path: trunk/a.txt
+Text-copy-source-md5: 7c5313cf169b02976bef6c727b7f2b78
+Text-copy-source-sha1: e70de14ec931aec24019cc1e19ea29edf734ac8b
+Text-content-md5: e4a018bb5cf803834325807a621d2989
+Text-content-sha1: 747ff52f808192ce3c9a47c5496875a0f4335dc7
+Text-content-length: 44
+Content-length: 44
+
+alpha
+BETA
+gamma
+delta
+copied, then changed
+
+
+Node-path: trunk/empty-copy
+Node-kind: file
+Node-action: add
+Node-copyfrom-rev: 2
+Node-copyfrom-path: trunk/empty
+Text-copy-source-md5: d41d8cd98f00b204e9800998ecf8427e
+Text-copy-source-sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709
+Prop-content-length: 35
+Content-length: 35
+
+K 11
+copied-prop
+V 3
+yes
+PROPS-END
+
+
+Revision-number: 4
+Prop-content-length: 133
+Content-length: 133
+
+K 10
+svn:author
+V 4
+test
+K 8
+svn:date
+V 27
+2005-04-07T22:13:04.000000Z
+K 7
+svn:log
+V 34
+r4: a file and a directory deleted
+PROPS-END
+
+Node-path: trunk/dir
+Node-action: delete
+
+
+Node-path: trunk/link
+Node-action: delete
+
+
+Revision-number: 5
+Prop-content-length: 150
+Content-length: 150
+
+K 10
+svn:author
+V 4
+test
+K 8
+svn:date
+V 27
+2005-04-07T22:13:05.000000Z
+K 7
+svn:log
+V 51
+r5: a file and a directory replaced without history
+PROPS-END
+
+Node-path: branches/b1/dir
+Node-kind: dir
+Node-action: replace
+Prop-content-length: 10
+Content-length: 10
+
+PROPS-END
+
+
+Node-path: trunk/run.sh
+Node-kind: file
+Node-action: replace
+Text-content-md5: 4f07cb61b5e7ecef32e98ee126b474c7
+Text-content-sha1: 93cfa46de7d7389f422527e7f11769c510d3fe2e
+Prop-content-length: 10
+Text-content-length: 24
+Content-length: 34
+
+PROPS-END
+#!/bin/sh
+echo replaced
+
+
+Revision-number: 6
+Prop-content-length: 144
+Content-length: 144
+
+K 10
+svn:author
+V 4
+test
+K 8
+svn:date
+V 27
+2005-04-07T22:13:06.000000Z
+K 7
+svn:log
+V 45
+r6: a file and a directory replaced by copies
+PROPS-END
+
+Node-path: branches/b1
+Node-action: delete
+
+Node-path: branches/b1
+Node-kind: dir
+Node-action: add
+Node-copyfrom-rev: 5
+Node-copyfrom-path: trunk
+
+
+Node-path: branches/b1/bin.dat
+Node-action: delete
+
+Node-path: branches/b1/bin.dat
+Node-kind: file
+Node-action: add
+Node-copyfrom-rev: 5
+Node-copyfrom-path: trunk/a.txt
+Text-copy-source-md5: 7c5313cf169b02976bef6c727b7f2b78
+Text-copy-source-sha1: e70de14ec931aec24019cc1e19ea29edf734ac8b
+
+
+Node-path: trunk/a: b c.txt
+Node-action: delete
+
+Node-path: trunk/a: b c.txt
+Node-kind: file
+Node-action: add
+Node-copyfrom-rev: 5
+Node-copyfrom-path: trunk/a.txt
+Text-copy-source-md5: 7c5313cf169b02976bef6c727b7f2b78
+Text-copy-source-sha1: e70de14ec931aec24019cc1e19ea29edf734ac8b
+Text-content-md5: ff9d66b02f507f55200eaf2307753253
+Text-content-sha1: 877eecbede5958df7dc80e8643b5eae269e35443
+Text-content-length: 35
+Content-length: 35
+
+alpha
+BETA
+gamma
+delta
+and changed
+
+
+Node-path: trunk/bin.dat
+Node-action: delete
+
+Node-path: trunk/bin.dat
+Node-kind: file
+Node-action: add
+Node-copyfrom-rev: 5
+Node-copyfrom-path: trunk/a.txt
+Text-copy-source-md5: 7c5313cf169b02976bef6c727b7f2b78
+Text-copy-source-sha1: e70de14ec931aec24019cc1e19ea29edf734ac8b
+
+

@@ -1,0 +1,90 @@
+<<< Started new transaction, based on original revision 1
+     * editing path : sub/dir/branches ... done.
+     * editing path : sub/dir/tags ... done.
+     * editing path : sub/dir/trunk ... done.
+     * editing path : sub/dir/trunk/a.txt ... done.
+     * editing path : sub/dir/trunk/a: b c.txt ... done.
+     * editing path : sub/dir/trunk/bin.dat ... done.
+     * editing path : sub/dir/trunk/dir ... done.
+     * editing path : sub/dir/trunk/dir/deep.txt ... done.
+     * editing path : sub/dir/trunk/empty ... done.
+     * editing path : sub/dir/trunk/link ... done.
+     * editing path : sub/dir/trunk/run.sh ... done.
+
+------- Committed new rev 2 (loaded from original rev 1) >>>
+
+<<< Started new transaction, based on original revision 2
+     * editing path : sub/dir ... done.
+     * editing path : sub/dir/trunk ... done.
+     * editing path : sub/dir/trunk/a.txt ... done.
+     * editing path : sub/dir/trunk/bin.dat ... done.
+
+------- Committed new rev 3 (loaded from original rev 2) >>>
+
+<<< Started new transaction, based on original revision 3
+     * editing path : sub/dir/branches/b1 ...COPIED... done.
+     * editing path : sub/dir/trunk/a-copy.txt ...COPIED... done.
+     * editing path : sub/dir/trunk/empty-copy ...COPIED... done.
+
+------- Committed new rev 4 (loaded from original rev 3) >>>
+
+<<< Started new transaction, based on original revision 4
+     * editing path : sub/dir/trunk/dir ... done.
+     * editing path : sub/dir/trunk/link ... done.
+
+------- Committed new rev 5 (loaded from original rev 4) >>>
+
+<<< Started new transaction, based on original revision 5
+     * editing path : sub/dir/branches/b1/dir ... done.
+     * editing path : sub/dir/trunk/run.sh ... done.
+
+------- Committed new rev 6 (loaded from original rev 5) >>>
+
+<<< Started new transaction, based on original revision 6
+     * editing path : sub/dir/branches/b1 ... done.
+     * editing path : sub/dir/branches/b1 ...COPIED... done.
+     * editing path : sub/dir/branches/b1/bin.dat ... done.
+     * editing path : sub/dir/branches/b1/bin.dat ...COPIED... done.
+     * editing path : sub/dir/trunk/a: b c.txt ... done.
+     * editing path : sub/dir/trunk/a: b c.txt ...COPIED... done.
+     * editing path : sub/dir/trunk/bin.dat ... done.
+     * editing path : sub/dir/trunk/bin.dat ...COPIED... done.
+
+------- Committed new rev 7 (loaded from original rev 6) >>>
+
+<<< Started new transaction, based on original revision 7
+     * editing path : sub/dir/trunk/big.txt ... done.
+
+------- Committed new rev 8 (loaded from original rev 7) >>>
+
+<<< Started new transaction, based on original revision 8
+     * editing path : sub/dir/trunk/big.txt ... done.
+
+------- Committed new rev 9 (loaded from original rev 8) >>>
+
+<<< Started new transaction, based on original revision 9
+     * editing path : sub/dir/tags/v1 ...COPIED... done.
+
+------- Committed new rev 10 (loaded from original rev 9) >>>
+
+<<< Started new transaction, based on original revision 10
+     * editing path : sub/dir/branches/b1/a.txt ... done.
+
+------- Committed new rev 11 (loaded from original rev 10) >>>
+
+<<< Started new transaction, based on original revision 11
+     * editing path : sub/dir/trunk ... done.
+     * editing path : sub/dir/trunk/a.txt ... done.
+
+------- Committed new rev 12 (loaded from original rev 11) >>>
+
+<<< Started new transaction, based on original revision 12
+     * editing path : sub/dir/trunk/a-from-r1.txt ...COPIED... done.
+
+------- Committed new rev 13 (loaded from original rev 12) >>>
+
+<<< Started new transaction, based on original revision 13
+     * editing path : sub/dir ... done.
+
+------- Committed new rev 14 (loaded from original rev 13) >>>
+

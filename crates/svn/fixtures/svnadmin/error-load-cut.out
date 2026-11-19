@@ -1,0 +1,16 @@
+<<< Started new transaction, based on original revision 1
+     * editing path : branches ... done.
+     * editing path : tags ... done.
+     * editing path : trunk ... done.
+     * editing path : trunk/a.txt ... done.
+     * editing path : trunk/a: b c.txt ... done.
+     * editing path : trunk/bin.dat ... done.
+     * editing path : trunk/dir ... done.
+     * editing path : trunk/dir/deep.txt ... done.
+     * editing path : trunk/empty ... done.
+     * editing path : trunk/link ... done.
+     * editing path : trunk/run.sh ... done.
+
+------- Committed revision 1 >>>
+
+<<< Started new transaction, based on original revision 2
