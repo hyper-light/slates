@@ -42145,7 +42145,9 @@ Applied in the same change to:
   segments reach. git's `wildmatch` is read once into tokens and matched by carrying the set of text positions reached:
   no recursion, and time in proportion to the tokens times the text, where `dowild` recurses at every star.
 - **The hooks.** The points and their phases. The inputs in each tool's terms: git's `old new ref` lines and
-  `GIT_PUSH_OPTION_*`, the count unset when no push options were negotiated, `update`'s three arguments, and
+  `GIT_PUSH_OPTION_*`, the count unset when no push options were negotiated (wrong: stock receive-pack sets it `0`
+  there, found by A-665 and fixed, `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`),
+  `update`'s three arguments, and
   `post-receive` given only the commands that applied (`builtin/receive-pack.c` 834-995); Mercurial's `HG_HOOKTYPE`,
   `HG_HOOKNAME`, `HG_NODE`, `HG_NODE_LAST`, `HG_SOURCE` (`serve`), `HG_URL`, and `HG_PENDING` naming the view for
   `pretxnchangegroup`; Subversion's arguments and its `LOCK-TOKENS:` input (`hooks.c` 510-683). The words: git's and
@@ -46728,8 +46730,9 @@ Applied in the same change to:
 - **Found: stock receive-pack sets `GIT_PUSH_OPTION_COUNT=0` on a push that negotiated no push options.**
   `cmd_receive_pack` always hands `run_receive_hook` its option list, so `run_and_feed_hook`'s branch that unsets the
   variable is never taken (the fixtures' `loose` and `pack` pushes, `receive.advertisePushOptions` off). `githooks.adoc`
-  says the variables "will not be set", and `slates-server`'s `vcs_hooks::push_option_env` follows the document.
-  Reported to main; not changed here.
+  says the variables "will not be set", and `slates-server`'s `vcs_hooks::push_option_env` followed the document.
+  Fixed after this piece landed, the same day
+  (`docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`).
 - **Tests** (`src/tests/store/hook_view.rs`, `hook_view_stored.rs`). The layout, `HEAD` and both
   formats' `config` against `git init --bare`, `index-pack` and `pack-refs`; `packed-refs` read in every window size;
   git's own SHA-1 and SHA-256 packs laid out as a kept part and sealed, read back as git's pack and `index-pack`'s index
