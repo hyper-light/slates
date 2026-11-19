@@ -319,7 +319,7 @@ fn change(work: &mut Work, path: &str, how: u8, mark: u8) {
   if how % 3 != 1 {
     work.overwrite(path, u64::from(how % 4), &[mark]);
   }
-  if how % 3 != 0 {
+  if !how.is_multiple_of(3) {
     work.set_xattr(path, PROPS, &[mark]);
   }
 }

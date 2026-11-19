@@ -174,12 +174,7 @@ fn takeover_round(kernel_bumps_epoch: bool) -> Delivered {
       "a change turn delivers: {step:?}"
     );
     let (bumped, unsupported, invalidated) = state.take_takeover_counts();
-    (
-      bumped,
-      unsupported,
-      invalidated,
-      state.owes_takeover_round(),
-    )
+    (bumped, unsupported, invalidated, state.owes_round_now())
   };
   let began = Instant::now();
   while told.len() < packets {

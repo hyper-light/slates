@@ -541,6 +541,7 @@ impl Bridge for ScopedBridge<'_> {
     cx: &OpContext,
     cursor: InvalidationCursor,
     out: &mut Vec<Invalidation>,
+    more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     // The inner bridge draws its invalidations from the whole volume's journal, so the stream names objects
     // across every scope. The scope invariant holds here too — an `Inode` invalidation names an inode and an
@@ -548,8 +549,9 @@ impl Bridge for ScopedBridge<'_> {
     // a name in an out-of-scope directory (§4.6; "nothing outside is ever shown"). Keep only those the scope
     // admits, by the same `within` climb every other verb uses; the parent's membership is the test for an
     // entry, exactly as a listing checks its entries.
+    // The inner gather's slice bounds what this filter walks: the invalidations of the records it took (A-562).
     let start = out.len();
-    let next = self.inner.invalidations(cx, cursor, out)?;
+    let next = self.inner.invalidations(cx, cursor, out, more)?;
     for invalidation in out.split_off(start) {
       let object = match &invalidation {
         Invalidation::Inode { ino, .. } => *ino,

@@ -29,6 +29,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+// A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
+mod base_wait;
 mod carry;
 pub mod catalog;
 pub mod config;
@@ -43,6 +45,7 @@ pub mod daemon;
 pub mod deploy;
 mod direct_map;
 pub mod discovery;
+mod pressure;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.

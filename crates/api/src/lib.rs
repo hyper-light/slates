@@ -19,7 +19,9 @@
 //!   a descriptor a VMM takes; and a host mount bound into a container ([`container`], A-520), the entry the host's OCI
 //!   runtime performs, verified in the kernel's mount table, the container engine's profile judged first
 //!   ([`container_engine`]) and the bind's source checked again just before the runtime binds it
-//!   ([`container::check_source`]).
+//!   ([`container::check_source`]); and a volume exported to one client on another machine ([`export`], A-521), the
+//!   path its capability authorizes, which that client's mount names (a pod's PersistentVolume, which kubelet mounts
+//!   over the node's network export), ended by the export's detach.
 //! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
 //!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
 //!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
@@ -73,6 +75,7 @@ pub mod container;
 pub mod container_engine;
 pub mod error;
 pub mod exec;
+pub mod export;
 pub mod grant;
 pub mod instance;
 pub mod issuer;
@@ -99,6 +102,7 @@ pub use error::{
   Unsupported, Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
+pub use export::{ExportOptions, Exported};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
@@ -281,9 +285,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Win32 error code (none where the host named none), where it held a bare number; the wire's
 /// `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
 /// `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone (2026-11-19).
+/// 50: a volume exported to one client (A-521; §4.6 "Kubernetes publication without privilege", until then the command
+/// line's `slates export` and the raw client's alone): [`Instance::export`] and the seam's `export` attach the volume
+/// bound to the client's Unix identity (A-115) and answer an [`Exported`], the export's attachment, which its detach
+/// ends with its capability, and the path that capability authorizes, which the client's mount names (a
+/// PersistentVolume's `nfs.path`), its `Debug` showing the path without its token; [`ExportOptions`] asks for it
+/// read-only or beneath a directory; the simulator answers it with a path of its own per export (kiln's Kubernetes
+/// engine, its W10; 2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 49;
+pub const CONTRACT: u32 = 50;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

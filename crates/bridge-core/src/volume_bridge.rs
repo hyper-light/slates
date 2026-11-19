@@ -1746,6 +1746,7 @@ impl Bridge for VolumeBridge<'_> {
     cx: &OpContext,
     cursor: InvalidationCursor,
     out: &mut Vec<Invalidation>,
+    more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     self.authorize_read(cx)?;
     // 1. The journal: every record since the cursor is a change this transport did not make (it
@@ -1765,7 +1766,8 @@ impl Bridge for VolumeBridge<'_> {
     if matches!(cx.view, View::Current) {
       // What waited for this round is the journal budget's input (§4.5: mutation rate × lag × record size, measured as
       // the backlog itself). This is the journal's only consuming round in production, and its start is the earliest
-      // record this attachment's reader may read again, so an open reader's point moves to it.
+      // record this attachment's reader may read again, so an open reader's point moves to it. Each slice of a round
+      // sliced across turns is one, measured from its own start in a segment's records at most (A-562).
       self
         .volume
         .note_journal_round(cx.attachment.key(), cursor.journal_seq);
@@ -1773,12 +1775,30 @@ impl Bridge for VolumeBridge<'_> {
       if cursor.journal_seq.saturating_add(1) < log.oldest_seq() {
         out.push(Invalidation::Everything);
       } else {
-        let records: Vec<(Op, Box<str>, Option<InodeNo>)> = log
-          .since(cursor.journal_seq)
-          .map(|r| (r.op.clone(), r.path.clone(), r.inode))
-          .collect();
-        for (op, path, inode) in records {
+        // One record at a time, taken out of the log before it is resolved, so the gather stops where its slice ends
+        // (A-562): `more` is asked before each record after the first, and at its `Break` the transport is handed the
+        // cursor through the last record taken, the base plane's half left for a gather that reaches the head.
+        let mut through = cursor.journal_seq;
+        let mut first = true;
+        loop {
+          let next = self
+            .volume
+            .op_log()
+            .since(through)
+            .next()
+            .map(|r| (r.seq, r.op.clone(), r.path.clone(), r.inode));
+          let Some((seq, op, path, inode)) = next else {
+            break;
+          };
+          if !first && more().is_break() {
+            return Ok(InvalidationCursor {
+              journal_seq: through,
+              ..cursor
+            });
+          }
+          first = false;
           self.journal_invalidations(&op, &path, inode, out);
+          through = seq;
         }
       }
     }
@@ -1855,7 +1875,13 @@ impl Bridge for VolumeBridge<'_> {
     after: Option<u64>,
     visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
   ) -> bool {
-    self.volume.visit_takeover_inodes(cx.owner, after, visit)
+    // A mount of the head may hold, from a lookup no image recorded, what the dead daemon showed and this daemon never
+    // had: every inode of the head is named (A-573). A pinned view's version takes no head change: its references and
+    // the replay (A-158).
+    match cx.view {
+      View::Current => self.volume.visit_head_inodes(self.store, after, visit),
+      View::Version(_) => self.volume.visit_takeover_inodes(cx.owner, after, visit),
+    }
   }
 
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {

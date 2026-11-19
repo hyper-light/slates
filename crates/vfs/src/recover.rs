@@ -100,9 +100,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// earlier version would find no directory to rebuild there, so it refuses this one.
 /// 32 (A-532, 2026-11-19) each snapshot carries the orphans it froze, the files the head held with no name left when it
 /// was taken, so a clone of it made after a restart keeps their orphan records too.
+/// 33 (A-578, 2026-11-19) the image and every delta carry the volume's live inode counter beside its reserved ceiling,
+/// so a successor names to every mount it took over the numbers the dead daemon may have issued after its last
+/// publication; a reader of an earlier version has no such counter, so it refuses this one.
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 32;
+pub const IMAGE_VERSION: u16 = 33;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -501,8 +504,12 @@ pub struct VolumeImage {
   pub policy: PolicyImage,
   /// The head epoch.
   pub epoch: u64,
-  /// The next inode counter to hand out.
+  /// The reserved ceiling (A-150): the counter a successor hands out from, past every number the volume could hand out
+  /// before its next publication.
   pub next_counter: u64,
+  /// The volume's live counter when the image was taken (A-578): every number it had issued is below it, and a number
+  /// from it up to `next_counter` may have been handed to a client after it, which a successor never had.
+  pub live_counter: u64,
   /// The origin epoch, for a clone; `None` for a scratch volume.
   pub origin_epoch: Option<u64>,
   /// The quota parameters.
@@ -1519,6 +1526,8 @@ impl Volume {
       // The reserved ceiling, not the live counter (A-150): a successor starts past every number handed out before the
       // next publication.
       next_counter: self.recorded_counter(store),
+      // And the live counter beside it (A-578): the numbers between the two are what a successor never had.
+      live_counter: self.next_counter,
       origin_epoch: self.origin_epoch.map(|e| e.0),
       quota: quota_image(&self.quota),
       root_no: root_no.0,
@@ -1577,8 +1586,10 @@ impl Volume {
     self.prefix.encode(fields);
     policy_image(self.policy).encode(fields);
     self.epoch.0.encode(fields);
-    // The reserved ceiling, as `to_image` records it (A-150): this stream is the checkpoint the daemon writes.
+    // The reserved ceiling, as `to_image` records it (A-150): this stream is the checkpoint the daemon writes. Then the
+    // live counter beside it (A-578).
     self.recorded_counter(store).encode(fields);
+    self.next_counter.encode(fields);
     self.origin_epoch.map(|e| e.0).encode(fields);
     quota_image(&self.quota).encode(fields);
     root_no.0.encode(fields);
@@ -2417,12 +2428,17 @@ impl Volume {
     let quota = quota_from_image(image.quota)?;
     let epoch = Epoch(image.epoch);
     let root_no = InodeNo(image.root_no);
+    // A live counter past the reserved ceiling names numbers the volume could never have handed out: a malformed image.
+    if image.live_counter > image.next_counter {
+      return Err(VfsError::RecoveryIncomplete);
+    }
     let seed = VolumeSeed {
       prefix: image.prefix,
       root_no,
       policy,
       epoch,
       next_counter: image.next_counter,
+      unrecorded_counters: image.live_counter..image.next_counter,
       origin_epoch: image.origin_epoch.map(Epoch),
       quota,
     };
@@ -2865,8 +2881,8 @@ impl Volume {
     }
     // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
     // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
-    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which takes a whiteout as an entry and
-    // which the caller sets the head's count back over.
+    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which the caller sets the head's count
+    // back over.
     let mut entries = snap
       .inodes
       .iter()

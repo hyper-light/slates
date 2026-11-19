@@ -3614,8 +3614,8 @@ const HEAL_REPAIRED_LATE: &str = "fleet.heal.repaired_late";
 const HEAL_REFILL_OUTLASTED_ROUND: &str = "fleet.heal.refill_outlasted_round";
 
 /// The head snapshot of `id` that still needs sealing — its id and the head sequence — or `None` when the
-/// volume has no snapshot yet, or its head is already recorded placed (a finished seal is dropped). A seal in
-/// progress for an older snapshot is dropped too: the newer snapshot supersedes it.
+/// volume has no snapshot of its own yet, or its head is already recorded placed (a finished seal is dropped). A
+/// seal in progress for an older snapshot is dropped too: the newer snapshot supersedes it.
 fn sealable_head(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -3631,11 +3631,15 @@ fn sealable_head(
     return None; // Nothing sealed yet: the creation head names no content.
   }
   let (head, sequence) = (record.head, record.epoch);
-  let placed = state
-    .db
-    .partition()
-    .snapshot(id, head)
-    .is_some_and(|snapshot| matches!(snapshot.placed, PlacementState::Placed { .. }));
+  // A head that is none of the volume's own snapshots here has nothing to seal: a clone's, until its first snapshot (its
+  // record starts as a copy of its origin's, `verbs::publish_clone_as`, so its head names its origin's snapshot, which
+  // its own tree cannot walk), or one recovery reset to none (`verbs::reconcile_lost`). Before, `start_seal` was refused
+  // for it, counted `fleet.seal`, every period until the volume's next snapshot: for every clone made (A-565's piece).
+  let Some(snapshot) = state.db.partition().snapshot(id, head) else {
+    state.seals.remove(&object);
+    return None;
+  };
+  let placed = matches!(snapshot.placed, PlacementState::Placed { .. });
   if placed {
     // A finished seal is dropped — unless it is the healer's re-offer of this placed snapshot, which is
     // kept until its round has run (§4.10 "the healer"); it is dropped when it re-records the placement.
@@ -5773,9 +5777,18 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       .get(usize::from(partition))
       .copied()
       .ok_or(VolumeWait::Shard)?;
-    Ok::<_, VolumeWait>((placed, catalog_sequence, catalog, catalog_placed, target))
+    // A move this node adopts (A-291): its adoption, kept here until the move is reported adopted, marks the volume's
+    // materialization as the move's, whose live log is exactly the head it hands over (A-565).
+    let moved = s.move_adoptions.contains_key(&object);
+    Ok::<_, VolumeWait>((
+      placed,
+      catalog_sequence,
+      catalog,
+      catalog_placed,
+      (target, moved),
+    ))
   });
-  let (placed, catalog_sequence, catalog, catalog_placed, target) = match taken {
+  let (placed, catalog_sequence, catalog, catalog_placed, (target, moved)) = match taken {
     Some(Ok(taken)) => taken,
     Some(Err(waits)) => {
       // Each period's wait is counted by what it waits for, so a successor that adopted a head and never serves
@@ -5843,6 +5856,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       catalog_placed,
       region,
       past_tolerance,
+      moved,
     };
     return begin_materializing(origin, target, making, Source::Live(fetched)).await;
   }
@@ -5902,6 +5916,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     catalog_placed,
     region,
     past_tolerance,
+    moved,
   };
   let source = Source::Archive {
     archive,
@@ -6082,6 +6097,8 @@ struct MakeTaken {
   catalog_placed: crate::head::PlacedHead,
   region: Vec<u64>,
   past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
+  /// Whether this node adopts the volume by a planned move ([`crate::moves`]; `verbs::TakenOver::moved`, A-565).
+  moved: bool,
 }
 
 /// What a taken-over volume is made from on its owner shard.
@@ -6292,6 +6309,7 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
     catalog_placed,
     region,
     past_tolerance,
+    moved,
   } = making;
   let (archive, adopted) = match source {
     Source::Live(fetched) => {
@@ -6327,6 +6345,7 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
       from_live_log,
       past_tolerance,
     },
+    moved,
   };
   if !made {
     restore_and_begin((object, id), &catalog, archive, &taken_over()).await?;
@@ -10121,7 +10140,6 @@ pub(crate) struct Delivered {
   root: u64,
   ready: Option<bool>,
   lease: u64,
-  failover: u64,
 }
 
 /// The control shard's memory of the configuration fan (AUD-29-29): what each other shard last received, and
@@ -10133,6 +10151,9 @@ pub(crate) struct Fanned {
   shards: std::collections::BTreeMap<u16, Delivered>,
   lease: crate::lease::OwnerLease,
   lease_generation: u64,
+  /// The failover delay each other shard last received from the beat's own fan ([`fan_failover`], A-574). Bounded by
+  /// the daemon's shards.
+  failover: std::collections::BTreeMap<u16, u64>,
 }
 
 impl Fanned {
@@ -10156,13 +10177,11 @@ impl Fanned {
       root: (root.version > had.root).then(|| root.clone()),
       ready: (had.ready != Some(state.consensus_ready)).then_some(state.consensus_ready),
       lease: (self.lease_generation > had.lease).then(|| self.lease.clone()),
-      failover: (state.failover_ns != had.failover).then_some(state.failover_ns),
       now: Delivered {
         placement: placement.version,
         root: root.version,
         ready: Some(state.consensus_ready),
         lease: self.lease_generation,
-        failover: state.failover_ns,
       },
     };
     fan.carries().then_some(fan)
@@ -10172,6 +10191,17 @@ impl Fanned {
   fn record(&mut self, shard: u16, delivered: Delivered) {
     self.shards.insert(shard, delivered);
   }
+
+  /// The failover delay `shard` is owed: `failover_ns`, the control shard's, when it is not what the shard last received
+  /// ([`fan_failover`], A-574).
+  fn failover_owed(&self, failover_ns: u64, shard: u16) -> Option<u64> {
+    (self.failover.get(&shard) != Some(&failover_ns)).then_some(failover_ns)
+  }
+
+  /// Records that `shard`'s channel accepted a failover delay of `failover_ns`.
+  fn record_failover(&mut self, shard: u16, failover_ns: u64) {
+    self.failover.insert(shard, failover_ns);
+  }
 }
 
 /// One shard's configuration fan: each part present only when the shard lacks it.
@@ -10180,18 +10210,12 @@ struct Fan {
   root: Option<slates_db::register::RootConfiguration>,
   ready: Option<bool>,
   lease: Option<crate::lease::OwnerLease>,
-  /// The control shard's failover delay, in whole periods (A-363).
-  failover: Option<u64>,
   now: Delivered,
 }
 
 impl Fan {
   fn carries(&self) -> bool {
-    self.placement.is_some()
-      || self.root.is_some()
-      || self.ready.is_some()
-      || self.lease.is_some()
-      || self.failover.is_some()
+    self.placement.is_some() || self.root.is_some() || self.ready.is_some() || self.lease.is_some()
   }
 
   fn delivered(&self) -> Delivered {
@@ -10227,9 +10251,47 @@ impl Fan {
     if let Some(lease) = self.lease {
       s.lease = lease;
     }
-    // The failover delay the control shard estimated, which this shard's waits read (A-363).
-    if let Some(failover_ns) = self.failover {
-      s.failover_ns = failover_ns;
+  }
+}
+
+/// Counter: a beat's fan of the failover delay to a shard whose last received delay it no longer was (A-574).
+pub(crate) const FAILOVER_FAN_SENT: &str = "fleet.failover_fan.sent";
+/// Counter: a shard's bounded channel refused the failover delay's fan; it is sent again at the next beat (A-574).
+pub(crate) const FAILOVER_FAN_REFUSED: &str = "fleet.failover_fan.refused";
+
+/// Fans this node's failover delay to every other shard whose last received delay it is not (A-363, A-574), from the
+/// control shard's beat on every node, laptop or fleet (`daemon::heartbeat_loop`), so every shard's waits read the
+/// control shard's estimate within a beat of its moving. A shard whose channel refused it is fanned again at the next
+/// beat. Until A-574 the coordinator's configuration fan carried it, which a laptop does not run, so a laptop's other
+/// shards read the delay their boot set, for good.
+pub(crate) fn fan_failover() {
+  let Some((origin, owed)) = state::with_state(|s| {
+    let owed: Vec<(u16, u64)> = s
+      .shards
+      .iter()
+      .copied()
+      .filter(|shard| *shard != s.shard)
+      .filter_map(|shard| {
+        s.fanned
+          .failover_owed(s.failover_ns, shard)
+          .map(|failover_ns| (shard, failover_ns))
+      })
+      .collect();
+    (s.shard, owed)
+  }) else {
+    return;
+  };
+  for (shard, failover_ns) in owed {
+    match run_on(origin, shard, move |s| s.failover_ns = failover_ns) {
+      Ok(()) => {
+        let _ = state::with_state_counted(|s| {
+          s.fanned.record_failover(shard, failover_ns);
+          count_refusal_in(s, FAILOVER_FAN_SENT);
+        });
+      }
+      Err(_) => {
+        let _ = state::with_state_counted(|s| count_refusal_in(s, FAILOVER_FAN_REFUSED));
+      }
     }
   }
 }
@@ -10246,11 +10308,29 @@ fn refresh_failover(state: &mut ShardState) {
     .as_ref()
     .and_then(slates_cluster::member_plane::MemberPlane::detection);
   let timing = state.council_timing;
-  let estimate = state.failover.refresh(detection, &timing, HEARTBEAT_NS);
-  // What this shard's waits read, and the fan carries to the others when it moves.
+  state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+  publish_failover(state);
+}
+
+/// Reads this node's supervision for the beat (A-574): the widest window the watchdog judges this daemon's shards by
+/// (A-455) and the lapse bound its anchor publishes (A-467, `lapse_bound_ns`, `None` where no anchor publishes one),
+/// into the failover estimate, where they are the detection while no peer's detector judges the node (a laptop at
+/// `f = 0`, a fleet node before its detector's first period), then publishes the delay. The control shard's beat runs it
+/// on every node, laptop or fleet, and fans the delay to every shard ([`fan_failover`]).
+pub(crate) fn refresh_supervision(state: &mut ShardState, lapse_bound_ns: Option<u64>) {
+  let widest_window_ns = crate::watchdog::widest_window_ns(&state.shards);
+  state.failover.supervise(widest_window_ns, lapse_bound_ns);
+  publish_failover(state);
+}
+
+/// Publishes this node's failover estimate as the delay its waits read (A-363): the estimate in whole coordinator
+/// periods, or a test's injection. Run on the control shard after each refresh of a term, the coordinator's (detection
+/// and confirmation, [`refresh_failover`]) and the beat's (the anchor's supervision, [`refresh_supervision`]); the beat
+/// fans it to every other shard where it moved ([`fan_failover`]).
+pub(crate) fn publish_failover(state: &mut ShardState) {
   state.failover_ns = state
     .injected_failover_ns
-    .unwrap_or_else(|| failover_in_periods(estimate.total_ns()));
+    .unwrap_or_else(|| failover_in_periods(state.failover.estimate().total_ns()));
 }
 
 /// Derived: a failover delay of `ns` in whole coordinator periods, rounded up (A-363): the granularity every wait that
@@ -11688,6 +11768,80 @@ mod discovery_wait_tests {
 
 #[cfg(test)]
 mod tests {
+  /// A-565's piece (the sibling A-544 saw). Do: on a shard, clone a volume's snapshot and ask the home seal walk what the
+  /// clone has to seal before it takes a snapshot of its own, then after its first, recorded unplaced as at `f > 0` (a
+  /// laptop records a new snapshot placed on its owner at once, leaving nothing to seal). Expect nothing before (its
+  /// head is still its origin's, which its own tree cannot walk) and its own head after. Before, the walk named its
+  /// origin's head, and `start_seal` was refused for it, counted `fleet.seal`, every period until the clone's first
+  /// snapshot: for every clone made.
+  #[test]
+  fn a_clone_has_nothing_to_seal_until_its_first_snapshot() {
+    let (before, after, own) = crate::daemon::audit_on_shard(|state| {
+      use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
+      let owner = slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let ReplyBody::Created { id: origin } = crate::verbs::dispatch(
+        state,
+        1,
+        &owner,
+        RequestBody::Create {
+          name: "unsealed-origin".to_owned(),
+          size: SizeClass::Dynamic { max: 1 << 20 },
+          names: NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let ReplyBody::Snapshotted { id: snapshot, .. } =
+        crate::verbs::dispatch(state, 1, &owner, RequestBody::Snapshot { volume: origin })
+      else {
+        panic!("the origin was snapshotted")
+      };
+      let ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
+        state,
+        1,
+        &owner,
+        RequestBody::Clone {
+          volume: origin,
+          snapshot,
+          name: "unsealed-clone".to_owned(),
+        },
+      ) else {
+        panic!("the clone was made")
+      };
+      let id = crate::verbs::to_db_volume(clone);
+      let object = super::ObjectId(id.bytes);
+      let before = super::sealable_head(state, id, object);
+      let ReplyBody::Snapshotted { .. } =
+        crate::verbs::dispatch(state, 1, &owner, RequestBody::Snapshot { volume: clone })
+      else {
+        panic!("the clone was snapshotted")
+      };
+      let own = state.db.partition().volume(id).map(|record| record.head);
+      if let Some(own) = own {
+        let unplaced = slates_db::Op::SnapshotPlaced {
+          volume: id,
+          id: own,
+          placed: super::PlacementState::Local,
+        };
+        state.db.mutate(&mut state.segment, &unplaced, 0).unwrap();
+      }
+      (before, super::sealable_head(state, id, object), own)
+    });
+    assert_eq!(
+      before, None,
+      "a clone has nothing of its own to seal before its first snapshot"
+    );
+    assert_eq!(
+      after.map(|(head, _)| head),
+      own,
+      "its first snapshot of its own is what it seals"
+    );
+  }
 
   /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
   /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
@@ -12575,38 +12729,44 @@ mod tests {
     });
   }
 
-  /// A-363. Do: fan a shard everything, then move the control shard's failover delay by a period, then deliver it, then
-  /// install a fan carrying a failover delay on a shard. Expect the first fan to carry the delay; a moved delay owed
-  /// alone, nothing else; nothing owed once it is delivered; and the receiver to read the delay it was fanned: every
-  /// shard's waits read the control shard's estimate, sent only when it moves.
+  /// A-363, A-574. Do: ask what a shard is owed of the failover delay before any fan, record it delivered, move the
+  /// control shard's delay by a period, record that, and ask the configuration fan what the shard is owed. Expect the
+  /// delay owed at first; nothing once delivered; the moved delay owed; nothing once that is delivered; and no
+  /// configuration fan owed for a moved delay alone: every shard's waits read the control shard's estimate, sent only
+  /// when it moves, by the beat's own fan on every node, laptop or fleet.
   #[test]
   fn a_shard_is_fanned_the_failover_delay_when_it_moves() {
     crate::daemon::audit_on_shard(|s| {
-      s.fanned.observe_lease(&s.lease);
-      let first = s.fanned.owed(s, OTHER_SHARD).expect("a first fan is owed");
       assert_eq!(
-        first.failover,
+        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
         Some(s.failover_ns),
         "the first fan carries the delay"
       );
-      s.fanned.record(OTHER_SHARD, first.delivered());
-      assert!(s.fanned.owed(s, OTHER_SHARD).is_none(), "nothing moved");
-      s.failover_ns = s.failover_ns.saturating_add(HEARTBEAT_NS);
-      let moved = s.fanned.owed(s, OTHER_SHARD).expect("the delay moved");
-      assert_eq!(moved.failover, Some(s.failover_ns));
-      assert!(
-        moved.placement.is_none()
-          && moved.root.is_none()
-          && moved.ready.is_none()
-          && moved.lease.is_none(),
-        "the delay is owed alone"
+      s.fanned.record_failover(OTHER_SHARD, s.failover_ns);
+      assert_eq!(
+        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
+        None,
+        "nothing moved"
       );
-      s.fanned.record(OTHER_SHARD, moved.delivered());
-      assert!(s.fanned.owed(s, OTHER_SHARD).is_none(), "delivered");
-      let fanned = s.failover_ns;
-      s.failover_ns = 0;
-      moved.install(s);
-      assert_eq!(s.failover_ns, fanned, "the receiver reads the fanned delay");
+      s.fanned.observe_lease(&s.lease);
+      let configuration = s.fanned.owed(s, OTHER_SHARD).expect("a first fan is owed");
+      s.fanned.record(OTHER_SHARD, configuration.delivered());
+      s.failover_ns = s.failover_ns.saturating_add(HEARTBEAT_NS);
+      assert_eq!(
+        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
+        Some(s.failover_ns),
+        "the moved delay is owed"
+      );
+      assert!(
+        s.fanned.owed(s, OTHER_SHARD).is_none(),
+        "the configuration fan does not carry it"
+      );
+      s.fanned.record_failover(OTHER_SHARD, s.failover_ns);
+      assert_eq!(
+        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
+        None,
+        "delivered"
+      );
     });
   }
 
@@ -12626,7 +12786,6 @@ mod tests {
         root: None,
         ready: None,
         lease: Some(fanned.clone()),
-        failover: None,
         now: Delivered::default(),
       }
       .install(s);
