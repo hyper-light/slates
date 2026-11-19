@@ -28,7 +28,7 @@ const REPOSITORY: &str = include_str!("../../fixtures/reads/repository.txt");
 /// One node of the green: its kind and its property list.
 type GreenNode = (NodeKind, PropertyList);
 
-/// The green the transcripts' repository holds: every revision's tree, the property lists and the revision
+/// The green the transcripts' repository holds: every revision's tree, the property lists, the texts and the revision
 /// properties.
 #[derive(Debug, Default)]
 struct Green {
@@ -36,9 +36,15 @@ struct Green {
   trees: Vec<BTreeMap<String, GreenNode>>,
   /// The property lists, by identity.
   lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  /// The texts, by identity.
+  texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// Every revision's properties.
   revisions: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
 }
+
+/// The most bytes of a text the test green hands over at once: less than one of `get-file`'s strings, so each string
+/// is gathered from several pieces, as from a chunked text.
+const PIECE: usize = 1_000;
 
 impl Contents for Green {
   fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
@@ -84,6 +90,12 @@ impl Repository for Green {
         .map(|(name, value)| (name.as_slice(), value.as_slice()))
         .collect(),
     )
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    let text = self.texts.get(identity)?;
+    let start = usize::try_from(offset).ok()?;
+    text.get(start..start.saturating_add(PIECE).min(text.len()))
   }
 }
 
@@ -190,6 +202,7 @@ impl Fixture {
       "add" => Action::Add,
       "change" => Action::Modify,
       "delete" => Action::Delete,
+      "replace" => Action::Replace,
       other => panic!("an unknown action {other}"),
     };
     let field = |name: &str| {
@@ -209,19 +222,22 @@ impl Fixture {
     let text = field("text").map(|text| {
       let bytes = unhex(text);
       let (md5, sha1) = (unhex(field("md5").unwrap()), unhex(field("sha1").unwrap()));
+      let mut identity = [0_u8; 32];
+      identity[..16].copy_from_slice(&md5);
+      let size = u64::try_from(bytes.len()).unwrap();
+      self.green.texts.insert(identity, bytes);
       Text {
-        identity: {
-          let mut identity = [0_u8; 32];
-          identity[..16].copy_from_slice(&md5);
-          identity
-        },
+        identity,
         md5: md5.try_into().unwrap(),
         sha1: sha1.try_into().unwrap(),
-        size: u64::try_from(bytes.len()).unwrap(),
+        size,
       }
     });
+    if matches!(action, Action::Delete | Action::Replace) {
+      tree.retain(|place, _| !at_or_beneath(place, &path));
+    }
     match action {
-      Action::Delete => tree.retain(|place, _| !at_or_beneath(place, &path)),
+      Action::Delete => {}
       _ if copy_from.is_some() => {
         let source = copy_from.as_ref().unwrap();
         let from = self.green.trees[usize::try_from(source.revision).unwrap()].clone();
@@ -316,7 +332,30 @@ fn normalized(value: &Value<'_>) -> String {
 }
 
 /// The commands whose answers hold property lists, compared as sets.
-const PROPERTY_LISTS: [&str; 4] = ["rev-proplist", "get-iprops", "get-dir", "get-locations"];
+const PROPERTY_LISTS: [&str; 5] = [
+  "rev-proplist",
+  "get-iprops",
+  "get-dir",
+  "get-locations",
+  "get-file",
+];
+
+/// The room each slice of a streamed answer is given in the replays: one byte, so each slice is the least a slice
+/// may be, one item.
+const SLICE_ROOM: usize = 1;
+
+/// A command's outcome with a streamed answer written whole, a slice of [`SLICE_ROOM`] at a time.
+fn drained(outcome: Outcome, fixture: &Fixture, session: &Session<'_>, out: &mut Vec<u8>) -> Outcome {
+  let Outcome::Streaming(mut stream) = outcome else {
+    return outcome;
+  };
+  while stream
+    .resume(&fixture.index, &fixture.green, session, out, SLICE_ROOM)
+    .unwrap()
+    == Progress::More
+  {}
+  Outcome::Answered
+}
 
 /// Replays a recorded session through the handler: each client command after the handshake answered, each answer
 /// `svnserve`'s, the commands in `elsewhere` (another piece's) skipped with their two items, a malformed command ending
@@ -335,7 +374,9 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
   for command in commands.iter().skip(2) {
     let word = command_word(name, command);
     let mut out = Vec::new();
-    match answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap() {
+    let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
+    match drained(outcome, &fixture, &session, &mut out) {
+      Outcome::Streaming(_) => panic!("{name}: a drained stream streams"),
       Outcome::Answered => {
         at = same_answer(name, word, &items(&out), &answers, at);
         answered += 1;
@@ -455,6 +496,8 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("get-dir"), 7),
     (transcript!("get-locations"), 8),
     (transcript!("hostile-locations"), 0),
+    (transcript!("get-file"), 18),
+    (transcript!("hostile-get-file"), 0),
     (transcript!("unknown-command"), 2),
     (transcript!("hostile-malformed"), 0),
   ];
@@ -474,6 +517,8 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-revprop-list"), 1),
     (transcript!("svn-info-file"), 5),
     (transcript!("svn-proplist-inherited"), 4),
+    (transcript!("svn-cat"), 4),
+    (transcript!("svn-cat-big"), 3),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
@@ -490,6 +535,10 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "get-file",
+    "hostile-get-file",
+    "svn-cat",
+    "svn-cat-big",
     "get-dir",
     "get-locations",
     "hostile-locations",
@@ -661,6 +710,137 @@ fn dates_are_read_and_written_as_subversion_reads_and_writes_them() {
   }
 }
 
+/// The session at the repository's root.
+const ROOT_SESSION: Session<'static> = Session {
+  base: "/",
+  uuid: UUID,
+};
+
+/// One command's whole answer against `repository`, a streamed rest resumed in `room` until it is whole and once more;
+/// answers the outcome, the answer and how many slices the stream took.
+fn streamed<R: Repository>(
+  fixture: &Fixture,
+  repository: &R,
+  command: &[u8],
+  room: usize,
+) -> (Outcome, Vec<u8>, usize) {
+  let value = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, repository, &ROOT_SESSION, &value, &mut out).unwrap();
+  let Outcome::Streaming(mut stream) = outcome.clone() else {
+    return (outcome, out, 0);
+  };
+  let mut slices = 1;
+  while stream
+    .resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room)
+    .unwrap()
+    == Progress::More
+  {
+    slices += 1;
+  }
+  let whole = out.len();
+  let again = stream.resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room);
+  assert_eq!((again, out.len()), (Ok(Progress::Done), whole));
+  (outcome, out, slices)
+}
+
+/// The lengths of an answer's strings, in order.
+fn string_lengths(answer: &[u8]) -> Vec<usize> {
+  items(answer)
+    .iter()
+    .filter_map(|item| match item {
+      Value::String(bytes) => Some(bytes.len()),
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-613 part 2 (`get-file`, item 11): a file's text streams a slice at a time in the room the caller gives, one
+/// string a slice in a room of one byte and the end in one more, the whole answer in one slice in a room past its
+/// size, the same bytes either way; a finished stream writes nothing more.
+#[test]
+fn a_files_text_streams_a_slice_at_a_time_in_the_room_given() {
+  let fixture = Fixture::new();
+  let command = b"( get-file ( 13:trunk/big.txt ( 9 ) false true ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert_eq!((narrow_slices, wide_slices), (4, 1));
+  assert_eq!(string_lengths(&wide), [4_096, 4_096, 1_818, 0]);
+}
+
+/// The fixture's green with every text lost past its first `kept` bytes.
+struct Torn<'green> {
+  /// The green.
+  green: &'green Green,
+  /// The bytes of each text still held.
+  kept: u64,
+}
+
+impl Contents for Torn<'_> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.green.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.green.mergeinfo_value(properties)
+  }
+}
+
+impl Repository for Torn<'_> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.revision_properties(revision)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.properties(identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    let left = usize::try_from(self.kept.checked_sub(offset)?).ok()?;
+    let piece = self.green.text(identity, offset)?;
+    if left == 0 {
+      return None;
+    }
+    piece.get(..piece.len().min(left))
+  }
+}
+
+/// A-613 part 2 (`get-file`): a text the index names and the green does not hold ends after what was read with the
+/// empty string and a refusal, `Filesystem is corrupt`, as `svnserve` ends a read that fails.
+#[test]
+fn a_text_the_green_does_not_hold_ends_with_a_refusal() {
+  let fixture = Fixture::new();
+  let torn = Torn {
+    green: &fixture.green,
+    kept: 5_000,
+  };
+  let command = b"( get-file ( 13:trunk/big.txt ( 9 ) false true ) ) ";
+  let (_, out, _) = streamed(&fixture, &torn, command, usize::MAX);
+  assert_eq!(string_lengths(&out), [4_096, 0]);
+  assert!(out.ends_with(b"0: ( failure ( ( 160004 21:Filesystem is corrupt 0: 0 ) ) ) "));
+}
+
+/// A-613 part 2 (`get-file`): its parameters as `svn_ra_svn__parse_tuple(params, "c(?r)bb?B")` reads them: a missing
+/// boolean, a fifth item that is no boolean, a revision that is no list, each end the connection with nothing written.
+#[test]
+fn get_file_parameters_are_read_as_svn_ra_svn_parse_tuple_reads_them() {
+  for malformed in [
+    b"( get-file ( 11:trunk/a.txt ( ) true ) ) ".as_slice(),
+    b"( get-file ( 11:trunk/a.txt ( ) true true maybe ) ) ",
+    b"( get-file ( 11:trunk/a.txt ( ) true true 1 ) ) ",
+    b"( get-file ( 11:trunk/a.txt ( ) 1 true ) ) ",
+    b"( get-file ( 11:trunk/a.txt 2 true true ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -683,6 +863,8 @@ fn hostile_param() -> impl Strategy<Value = String> {
     "inherited ",
     "( 5:trunk 1:x ) ",
     "27:2026-01-03T03:00:00.000000Z ",
+    "11:trunk/a.txt ",
+    "false ",
   ]);
   (0_u8..3, shapes, any::<u64>(), "[a-z/.\\x00]{0,12}").prop_map(|(pick, shape, number, text)| {
     match pick {
@@ -702,7 +884,7 @@ proptest! {
   fn hostile_commands_are_answered_or_end_the_connection(
     name in prop::sample::select(vec![
       "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
-      "get-mergeinfo", "get-iprops", "no-such-command",
+      "get-mergeinfo", "get-iprops", "get-file", "no-such-command",
     ]),
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {
@@ -720,6 +902,16 @@ proptest! {
       Outcome::Answered => {
         let answers = items(&out);
         prop_assert!(!answers.is_empty() && answers.len() <= 2);
+      }
+      Outcome::Streaming(mut stream) => {
+        let session = Session { base: "/", uuid: UUID };
+        let mut slices = 0_usize;
+        while stream.resume(&fixture.index, &fixture.green, &session, &mut out, 1)
+          .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))? == Progress::More {
+          slices += 1;
+          prop_assert!(slices < 64, "a stream that does not end");
+        }
+        prop_assert!(items(&out).len() >= 4);
       }
     }
   }
