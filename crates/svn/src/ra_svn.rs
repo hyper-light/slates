@@ -120,7 +120,9 @@ impl Bounds {
       Value::Number(number) => decimal_len(*number).checked_add(1)?,
       Value::String(bytes) => {
         let length = u64::try_from(bytes.len()).ok()?;
-        decimal_len(length).checked_add(bytes.len())?.checked_add(2)?
+        decimal_len(length)
+          .checked_add(bytes.len())?
+          .checked_add(2)?
       }
       Value::List(items) => {
         let inner = depth.checked_add(1)?;
@@ -549,7 +551,9 @@ fn is_whitespace(byte: u8) -> bool {
 /// Whether `word` is one the grammar allows: a letter, then letters, digits and `-`.
 fn is_word(word: &str) -> bool {
   let mut bytes = word.bytes();
-  bytes.next().is_some_and(|first| first.is_ascii_alphabetic())
+  bytes
+    .next()
+    .is_some_and(|first| first.is_ascii_alphabetic())
     && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == WORD_HYPHEN)
 }
 
@@ -568,7 +572,8 @@ pub fn write(value: &Value<'_>, out: &mut Vec<u8>) -> Result<(), ItemError> {
     }
     Value::Number(number) => write_decimal(*number, out),
     Value::String(bytes) => {
-      let length = u64::try_from(bytes.len()).map_err(|_| ItemError::ItemTooLarge { at: out.len() })?;
+      let length =
+        u64::try_from(bytes.len()).map_err(|_| ItemError::ItemTooLarge { at: out.len() })?;
       write_decimal(length, out);
       out.push(STRING_MARK);
       out.extend_from_slice(bytes);

@@ -51,11 +51,13 @@ list ) ) ) ";
 
 /// §2's client response (112-113: `response: ( version:number ( cap:word ... ) url:string ? ra-client:string ( ?
 /// client:string ) )`).
-const CLIENT_RESPONSE: &[u8] = b"( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo \
+const CLIENT_RESPONSE: &[u8] =
+  b"( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo \
 log-revprops ) 29:svn://example.org/repos/trunk 10:SVN/1.14.5 ( ) ) ";
 
 /// §2's auth request (126: `auth-request: ( ( mech:word ... ) realm:string )`) inside a success response.
-const AUTH_REQUEST: &[u8] = b"( success ( ( ANONYMOUS CRAM-MD5 ) 36:2f8a43a4-6c31-4b54-9d9e-6c0f1b0e6b01 ) ) ";
+const AUTH_REQUEST: &[u8] =
+  b"( success ( ( ANONYMOUS CRAM-MD5 ) 36:2f8a43a4-6c31-4b54-9d9e-6c0f1b0e6b01 ) ) ";
 
 /// §2's auth response (134: `auth-response: ( mech:word [ token:string ] )`), an anonymous one with an empty token.
 const AUTH_RESPONSE: &[u8] = b"( ANONYMOUS ( 0: ) ) ";
@@ -88,7 +90,12 @@ fn golden() -> Vec<(&'static [u8], Value<'static>)> {
       FAILURE,
       l(vec![
         w("failure"),
-        l(vec![l(vec![n(160_024), s(b"Conflict at '/trunk'"), s(b"commit.c"), n(42)])]),
+        l(vec![l(vec![
+          n(160_024),
+          s(b"Conflict at '/trunk'"),
+          s(b"commit.c"),
+          n(42),
+        ])]),
       ]),
     ),
     (
@@ -139,7 +146,10 @@ fn golden() -> Vec<(&'static [u8], Value<'static>)> {
       AUTH_REQUEST,
       l(vec![
         w("success"),
-        l(vec![l(vec![w("ANONYMOUS"), w("CRAM-MD5")]), s(b"2f8a43a4-6c31-4b54-9d9e-6c0f1b0e6b01")]),
+        l(vec![
+          l(vec![w("ANONYMOUS"), w("CRAM-MD5")]),
+          s(b"2f8a43a4-6c31-4b54-9d9e-6c0f1b0e6b01"),
+        ]),
       ]),
     ),
     (AUTH_RESPONSE, l(vec![w("ANONYMOUS"), l(vec![s(b"")])])),
@@ -147,16 +157,30 @@ fn golden() -> Vec<(&'static [u8], Value<'static>)> {
     (LATEST_REV, l(vec![w("success"), l(vec![n(1202)])])),
     (
       COMMIT_INFO,
-      l(vec![n(1203), l(vec![s(b"2026-11-18T23:40:40.000000Z")]), l(vec![s(b"carol")]), l(vec![])]),
+      l(vec![
+        n(1203),
+        l(vec![s(b"2026-11-18T23:40:40.000000Z")]),
+        l(vec![s(b"carol")]),
+        l(vec![]),
+      ]),
     ),
-    (OPEN_ROOT, l(vec![w("open-root"), l(vec![l(vec![n(1202)]), s(b"d0")])])),
+    (
+      OPEN_ROOT,
+      l(vec![w("open-root"), l(vec![l(vec![n(1202)]), s(b"d0")])]),
+    ),
     (
       TEXTDELTA_CHUNK,
-      l(vec![w("textdelta-chunk"), l(vec![s(b"c1"), s(b"SVN\x00\x00\x0c\x10(")])]),
+      l(vec![
+        w("textdelta-chunk"),
+        l(vec![s(b"c1"), s(b"SVN\x00\x00\x0c\x10(")]),
+      ]),
     ),
     (
       SET_PATH,
-      l(vec![w("set-path"), l(vec![s(b""), n(1200), w("false"), l(vec![]), w("infinity")])]),
+      l(vec![
+        w("set-path"),
+        l(vec![s(b""), n(1200), w("false"), l(vec![]), w("infinity")]),
+      ]),
     ),
   ]
 }
@@ -204,10 +228,18 @@ fn refused_by(error: ItemError, field: usize) -> bool {
 fn the_protocols_items_read_and_write_as_the_document_and_svnserve_give_them() {
   for (bytes, value) in golden() {
     let bounds = Bounds::of(&value).unwrap();
-    assert_eq!(bounds.item_bytes, bytes.len(), "{}", String::from_utf8_lossy(bytes));
+    assert_eq!(
+      bounds.item_bytes,
+      bytes.len(),
+      "{}",
+      String::from_utf8_lossy(bytes)
+    );
     assert_eq!(
       read(bytes, bounds),
-      Ok(Parsed::Item { value: value.clone(), consumed: bytes.len() }),
+      Ok(Parsed::Item {
+        value: value.clone(),
+        consumed: bytes.len()
+      }),
       "{}",
       String::from_utf8_lossy(bytes)
     );
@@ -222,7 +254,10 @@ fn an_item_ended_by_a_line_feed_reads_as_one_ended_by_a_space() {
   let bounds = Bounds::of(&section_1_example()).unwrap();
   assert_eq!(
     read(SECTION_1_EXAMPLE_LF, bounds),
-    Ok(Parsed::Item { value: section_1_example(), consumed: SECTION_1_EXAMPLE_LF.len() })
+    Ok(Parsed::Item {
+      value: section_1_example(),
+      consumed: SECTION_1_EXAMPLE_LF.len()
+    })
   );
   assert_eq!(written(&section_1_example()), SECTION_1_EXAMPLE);
 }
@@ -234,15 +269,26 @@ fn an_item_ended_by_a_line_feed_reads_as_one_ended_by_a_space() {
 fn each_bound_derived_from_a_vector_is_exactly_enough() {
   for (bytes, value) in golden() {
     let bounds = Bounds::of(&value).unwrap();
+    let mut lowered_and_refused = 0;
     for field in 0..4 {
-      let Some(lower) = lowered(bounds, field) else { continue };
+      let Some(lower) = lowered(bounds, field) else {
+        continue;
+      };
       let outcome = read(bytes, lower);
       assert!(
         matches!(outcome, Err(error) if refused_by(error, field)),
         "{} with field {field} lowered: {outcome:?}",
         String::from_utf8_lossy(bytes)
       );
+      lowered_and_refused += 1;
     }
+    // Every item takes bytes and is at least one item, so those two bounds at least were lowered and refused: a
+    // measure of nothing would leave this test nothing to check (the stub's run passed it so, before this line).
+    assert!(
+      lowered_and_refused >= 2,
+      "{} measured {bounds:?}",
+      String::from_utf8_lossy(bytes)
+    );
   }
 }
 
@@ -252,10 +298,22 @@ fn each_bound_derived_from_a_vector_is_exactly_enough() {
 #[test]
 fn a_string_declaring_more_than_its_bound_is_refused_at_its_colon() {
   let bounds = Bounds::of(&section_1_example()).unwrap();
-  assert_eq!(read(b"4294967295:", bounds), Err(ItemError::ItemTooLarge { at: 10 }));
-  assert_eq!(read(b"18446744073709551615:", bounds), Err(ItemError::ItemTooLarge { at: 20 }));
-  assert_eq!(read(b"18446744073709551616:", bounds), Err(ItemError::NumberTooLarge { at: 19 }));
-  assert_eq!(ItemError::ItemTooLarge { at: 10 }.subversion_code(), 210_009);
+  assert_eq!(
+    read(b"4294967295:", bounds),
+    Err(ItemError::ItemTooLarge { at: 10 })
+  );
+  assert_eq!(
+    read(b"18446744073709551615:", bounds),
+    Err(ItemError::ItemTooLarge { at: 20 })
+  );
+  assert_eq!(
+    read(b"18446744073709551616:", bounds),
+    Err(ItemError::NumberTooLarge { at: 19 })
+  );
+  assert_eq!(
+    ItemError::ItemTooLarge { at: 10 }.subversion_code(),
+    210_009
+  );
 }
 
 /// A-531 (numbers at their limit, `protocol` §1 `number = 1*DIGIT`): read 2^64 - 1, expect it; read 2^64, expect it
@@ -266,11 +324,23 @@ fn a_number_past_sixty_four_bits_is_refused_exactly() {
   let bounds = Bounds::of(&largest).unwrap();
   assert_eq!(
     read(b"18446744073709551615 ", bounds),
-    Ok(Parsed::Item { value: largest, consumed: 21 })
+    Ok(Parsed::Item {
+      value: largest,
+      consumed: 21
+    })
   );
-  let wider = Bounds { item_bytes: bounds.item_bytes + 1, ..bounds };
-  assert_eq!(read(b"18446744073709551616 ", wider), Err(ItemError::NumberTooLarge { at: 19 }));
-  assert_eq!(ItemError::NumberTooLarge { at: 19 }.subversion_code(), 210_004);
+  let wider = Bounds {
+    item_bytes: bounds.item_bytes + 1,
+    ..bounds
+  };
+  assert_eq!(
+    read(b"18446744073709551616 ", wider),
+    Err(ItemError::NumberTooLarge { at: 19 })
+  );
+  assert_eq!(
+    ItemError::NumberTooLarge { at: 19 }.subversion_code(),
+    210_004
+  );
 }
 
 /// A-531 (hostile input, truncated items): read every proper prefix of every golden vector, expect a call for more
@@ -283,7 +353,10 @@ fn every_truncated_vector_asks_for_more_and_is_refused_at_the_end() {
       let mut parser = Parser::new(bounds);
       match parser.parse(&bytes[..cut]) {
         Ok(Parsed::NeedMore { needed }) => {
-          assert!(needed > cut && needed <= bounds.item_bytes, "cut {cut}: needed {needed}");
+          assert!(
+            needed > cut && needed <= bounds.item_bytes,
+            "cut {cut}: needed {needed}"
+          );
         }
         other => panic!("{} cut at {cut}: {other:?}", String::from_utf8_lossy(bytes)),
       }
@@ -301,14 +374,38 @@ fn every_truncated_vector_asks_for_more_and_is_refused_at_the_end() {
 fn nesting_past_the_bound_is_refused_at_its_open() {
   let nested = l(vec![l(vec![l(vec![])])]);
   let bounds = Bounds::of(&nested).unwrap();
-  assert_eq!(read(b"( ( ( ) ) ) ", bounds), Ok(Parsed::Item { value: nested, consumed: 12 }));
+  assert_eq!(
+    read(b"( ( ( ) ) ) ", bounds),
+    Ok(Parsed::Item {
+      value: nested,
+      consumed: 12
+    })
+  );
   let shallower = Bounds { depth: 2, ..bounds };
-  assert_eq!(read(b"( ( ( ) ) ) ", shallower), Err(ItemError::NestedTooDeep { at: 4 }));
-  let deepest = golden().iter().map(|(_, value)| Bounds::of(value).unwrap().depth).max().unwrap();
+  assert_eq!(
+    read(b"( ( ( ) ) ) ", shallower),
+    Err(ItemError::NestedTooDeep { at: 4 })
+  );
+  let deepest = golden()
+    .iter()
+    .map(|(_, value)| Bounds::of(value).unwrap().depth)
+    .max()
+    .unwrap();
   let flood = vec![b'('; 1_000_000];
-  let generous = Bounds { item_bytes: flood.len() + 1, word_bytes: 0, depth: deepest, nodes: flood.len() };
-  assert_eq!(read(&flood, generous), Err(ItemError::NestedTooDeep { at: deepest }));
-  assert_eq!(ItemError::NestedTooDeep { at: 0 }.subversion_code(), 210_004);
+  let generous = Bounds {
+    item_bytes: flood.len() + 1,
+    word_bytes: 0,
+    depth: deepest,
+    nodes: flood.len(),
+  };
+  assert_eq!(
+    read(&flood, generous),
+    Err(ItemError::NestedTooDeep { at: deepest })
+  );
+  assert_eq!(
+    ItemError::NestedTooDeep { at: 0 }.subversion_code(),
+    210_004
+  );
 }
 
 /// A-531 (hostile input, foreign bytes): read bytes no item starts with (`#`, `{`, a tab and a carriage return, which
@@ -318,10 +415,23 @@ fn nesting_past_the_bound_is_refused_at_its_open() {
 #[test]
 fn foreign_bytes_and_items_without_whitespace_are_refused_where_they_stand() {
   let bounds = Bounds::of(&section_1_example()).unwrap();
-  let foreign: [&[u8]; 9] =
-    [b"#", b"{", b"\t", b"\r", b"\x00", b"\xff", b")", b"-word ", "\u{e9}t\u{e9} ".as_bytes()];
+  let foreign: [&[u8]; 9] = [
+    b"#",
+    b"{",
+    b"\t",
+    b"\r",
+    b"\x00",
+    b"\xff",
+    b")",
+    b"-word ",
+    "\u{e9}t\u{e9} ".as_bytes(),
+  ];
   for bytes in foreign {
-    assert_eq!(read(bytes, bounds), Err(ItemError::Malformed { at: 0 }), "{bytes:?}");
+    assert_eq!(
+      read(bytes, bounds),
+      Err(ItemError::Malformed { at: 0 }),
+      "{bytes:?}"
+    );
   }
   let unended: [(&[u8], usize); 6] = [
     (b"(word) ", 5),
@@ -332,7 +442,12 @@ fn foreign_bytes_and_items_without_whitespace_are_refused_where_they_stand() {
     (b"( word\t) ", 6),
   ];
   for (bytes, at) in unended {
-    assert_eq!(read(bytes, bounds), Err(ItemError::Malformed { at }), "{}", String::from_utf8_lossy(bytes));
+    assert_eq!(
+      read(bytes, bounds),
+      Err(ItemError::Malformed { at }),
+      "{}",
+      String::from_utf8_lossy(bytes)
+    );
   }
   assert_eq!(ItemError::Malformed { at: 0 }.subversion_code(), 210_004);
 }
@@ -344,13 +459,22 @@ fn foreign_bytes_and_items_without_whitespace_are_refused_where_they_stand() {
 fn a_word_past_the_word_bound_is_refused_at_the_letter_past_it() {
   let longest = w("abcdefghijklmnopqrstuvwx");
   let too_long: &[u8] = b"abcdefghijklmnopqrstuvwxy ";
-  let bounds = Bounds { item_bytes: too_long.len(), ..Bounds::of(&longest).unwrap() };
+  let bounds = Bounds {
+    item_bytes: too_long.len(),
+    ..Bounds::of(&longest).unwrap()
+  };
   assert_eq!(bounds.word_bytes, 24);
   assert_eq!(
     read(b"abcdefghijklmnopqrstuvwx ", bounds),
-    Ok(Parsed::Item { value: longest, consumed: 25 })
+    Ok(Parsed::Item {
+      value: longest,
+      consumed: 25
+    })
   );
-  assert_eq!(read(too_long, bounds), Err(ItemError::WordTooLong { at: 24 }));
+  assert_eq!(
+    read(too_long, bounds),
+    Err(ItemError::WordTooLong { at: 24 })
+  );
 }
 
 /// A-531 (the item and byte bounds): read a list of three words within a bound of three items, expect the third word
@@ -360,11 +484,23 @@ fn too_many_items_or_bytes_are_refused_where_they_pass_the_bound() {
   let three = l(vec![w("a"), w("b"), w("c")]);
   let bounds = Bounds::of(&three).unwrap();
   assert_eq!(bounds.nodes, 4);
-  assert_eq!(read(b"( a b c ) ", Bounds { nodes: 3, ..bounds }), Err(ItemError::TooManyItems { at: 6 }));
+  assert_eq!(
+    read(b"( a b c ) ", Bounds { nodes: 3, ..bounds }),
+    Err(ItemError::TooManyItems { at: 6 })
+  );
   let abc = l(vec![w("abc")]);
   let tight = Bounds::of(&abc).unwrap();
   assert_eq!(tight.item_bytes, 8);
-  assert_eq!(read(b"( abc ) ", Bounds { item_bytes: 7, ..tight }), Err(ItemError::ItemTooLarge { at: 7 }));
+  assert_eq!(
+    read(
+      b"( abc ) ",
+      Bounds {
+        item_bytes: 7,
+        ..tight
+      }
+    ),
+    Err(ItemError::ItemTooLarge { at: 7 })
+  );
   assert_eq!(ItemError::TooManyItems { at: 6 }.subversion_code(), 210_009);
 }
 
@@ -373,10 +509,27 @@ fn too_many_items_or_bytes_are_refused_where_they_pass_the_bound() {
 #[test]
 fn items_follow_one_another_in_one_buffer() {
   let bytes = b"\n  ( a ) ( b ) ";
-  let bounds = Bounds { item_bytes: bytes.len(), word_bytes: 1, depth: 1, nodes: 2 };
+  let bounds = Bounds {
+    item_bytes: bytes.len(),
+    word_bytes: 1,
+    depth: 1,
+    nodes: 2,
+  };
   let mut parser = Parser::new(bounds);
-  assert_eq!(parser.parse(bytes), Ok(Parsed::Item { value: l(vec![w("a")]), consumed: 9 }));
-  assert_eq!(parser.parse(&bytes[9..]), Ok(Parsed::Item { value: l(vec![w("b")]), consumed: 6 }));
+  assert_eq!(
+    parser.parse(bytes),
+    Ok(Parsed::Item {
+      value: l(vec![w("a")]),
+      consumed: 9
+    })
+  );
+  assert_eq!(
+    parser.parse(&bytes[9..]),
+    Ok(Parsed::Item {
+      value: l(vec![w("b")]),
+      consumed: 6
+    })
+  );
   assert_eq!(parser.finish(), Ok(()));
 }
 
@@ -385,7 +538,11 @@ fn items_follow_one_another_in_one_buffer() {
 #[test]
 fn a_word_outside_the_grammar_is_never_written() {
   for word in ["", "1abc", "a b", "a_b", "\u{e9}t\u{e9}"] {
-    assert_eq!(write(&Value::Word(word), &mut Vec::new()), Err(ItemError::InvalidWord), "{word:?}");
+    assert_eq!(
+      write(&Value::Word(word), &mut Vec::new()),
+      Err(ItemError::InvalidWord),
+      "{word:?}"
+    );
   }
 }
 
@@ -413,8 +570,16 @@ impl Owned {
 /// Words of the grammar: a letter, then letters, digits and `-`.
 fn words() -> impl Strategy<Value = String> {
   let letters: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
-  let rest: Vec<char> = letters.iter().copied().chain('0'..='9').chain(['-']).collect();
-  (prop::sample::select(letters), prop::collection::vec(prop::sample::select(rest), 0..16))
+  let rest: Vec<char> = letters
+    .iter()
+    .copied()
+    .chain('0'..='9')
+    .chain(['-'])
+    .collect();
+  (
+    prop::sample::select(letters),
+    prop::collection::vec(prop::sample::select(rest), 0..16),
+  )
     .prop_map(|(first, rest)| std::iter::once(first).chain(rest).collect())
 }
 
@@ -425,12 +590,19 @@ fn items() -> impl Strategy<Value = Owned> {
     any::<u64>().prop_map(Owned::Number),
     prop::collection::vec(any::<u8>(), 0..24).prop_map(Owned::String),
   ];
-  leaf.prop_recursive(4, 48, 6, |inner| prop::collection::vec(inner, 0..6).prop_map(Owned::List))
+  leaf.prop_recursive(4, 48, 6, |inner| {
+    prop::collection::vec(inner, 0..6).prop_map(Owned::List)
+  })
 }
 
 /// Bounds from the length of arbitrary bytes alone: the most such bytes could need.
 fn bounds_of_len(len: usize) -> Bounds {
-  Bounds { item_bytes: len, word_bytes: len, depth: len, nodes: len }
+  Bounds {
+    item_bytes: len,
+    word_bytes: len,
+    depth: len,
+    nodes: len,
+  }
 }
 
 proptest! {
