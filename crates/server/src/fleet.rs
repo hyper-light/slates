@@ -96,7 +96,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{
   Acceptor, Authority, DomainId, HostEpoch, HostId, ObjectId, Placement, Quorum, Record, RegionId,
-  RegisterError, encode_refusal,
+  RegisterClass, RegisterError, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::shard::Kept;
@@ -2171,6 +2171,11 @@ pub(crate) fn hold_checked_record(
 /// tombstone releases the destroyed volume's content, or at its retirement the volume's records
 /// ([`crate::tombstone::on_held`]).
 fn after_held_record(state: &mut ShardState, record: &Record) {
+  // A state log's part is a ledger position of a repository's own state: nothing to compact, no content to judge, and
+  // never a tombstone (A-636 part 2b).
+  if let RegisterClass::State(_) = record.object.class() {
+    return;
+  }
   if crate::catalog::is_single_value(&record.value)
     && let Some(acceptor) = state.holder_records.get_mut(&record.object)
   {
@@ -2386,7 +2391,12 @@ pub(crate) fn check_held_record(
       },
     )
     .check(record),
+  }?;
+  // A state log's part is held only where it continues this holder's copy of its log (A-636 part 2b).
+  if let RegisterClass::State(log) = record.object.class() {
+    crate::state_log::check_held(state, record, log)?;
   }
+  Ok(())
 }
 
 /// A volume head this node owns that is not yet held by every candidate, with everything the register commit
@@ -2479,6 +2489,58 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
   heads.extend(owed_adopted_work_catalogs(state, config, local));
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
+  }
+  heads.extend(owed_state_log_parts(state, config, local));
+  heads
+}
+
+/// The parts of the repositories' state logs this owner shard still owes some candidate (A-636 part 2b;
+/// `crate::state_log`), each log's in position order, so a holder meets each part after its predecessor: a log's
+/// register at each part's position, to the log's candidates (its repository's), with the candidates that hold it
+/// already (their highest acknowledgement at or past it). A part every remote candidate holds is let go when its last
+/// acknowledgement comes, so none is owed here.
+fn owed_state_log_parts(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  let mut heads = Vec::new();
+  for (register, parts, acked) in state.state_logs.owed() {
+    let placement = config.place(register);
+    for (sequence, value) in parts {
+      let holding: Vec<HostId> = placement
+        .candidates
+        .iter()
+        .copied()
+        .filter(|candidate| acked.get(candidate).is_some_and(|held| held >= sequence))
+        .collect();
+      let owed = placement
+        .candidates
+        .iter()
+        .any(|candidate| *candidate != local && !holding.contains(candidate));
+      if !owed {
+        continue;
+      }
+      heads.push(Head {
+        shard: state.shard,
+        object: register,
+        record: Record {
+          owner: local,
+          object: register,
+          sequence: *sequence,
+          epoch: config.host_epoch,
+          generation: config.version,
+          value: value.clone(),
+        },
+        shape: Placement {
+          acked: Vec::new(),
+          ..placement.clone()
+        },
+        acked: holding,
+        quorum: config.quorum,
+        live: false,
+      });
+    }
   }
   heads
 }
@@ -11074,7 +11136,11 @@ async fn ship_shard_heads(
   let work = call_within(
     origin,
     shard,
-    move |s| unplaced_heads(s, local),
+    move |s| {
+      // The state logs' records the partition handed on since the last pass become parts owed (A-636 part 2b).
+      crate::state_log::take_made(s);
+      unplaced_heads(s, local)
+    },
     HEARTBEAT_NS,
   )
   .await
@@ -11149,13 +11215,9 @@ async fn ship_head(
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
-  let catalog = head.object.is_catalog();
+  let counters = ship_counters(head.object.class());
   if holders.is_empty() {
-    count_refusal(if catalog {
-      SHIP_CATALOG_NO_SESSION
-    } else {
-      SHIP_HEAD_NO_SESSION
-    });
+    count_refusal(counters.no_session);
     // No live session to a candidate that still needs the head; retry next period.
     return HeadShipped {
       dispatch: None,
@@ -11195,7 +11257,7 @@ async fn ship_head(
     });
   }
   count_refusal(ship_outcome_counter(
-    catalog,
+    counters,
     &committed.outcome,
     head.quorum,
   ));
@@ -11232,22 +11294,71 @@ async fn ship_head(
   }
 }
 
-/// The counter naming one head or catalog commit's outcome: placed at `f + 1`, acknowledged short of it, uncertain, or
-/// refused before anything was dispatched.
+/// The counters one register class's shipments are counted under: a volume's own register (its head or tombstone), its
+/// catalog, or a repository's state log (A-636 part 2b), each its own, so a state log's part is never counted as its
+/// repository's head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShipCounters {
+  /// Committed at `f + 1` by one ship.
+  placed: &'static str,
+  /// Acknowledged by fewer than `f + 1` candidates.
+  short: &'static str,
+  /// Its outcome uncertain (the dispatch's budget ran out).
+  uncertain: &'static str,
+  /// Refused by the runtime before anything was dispatched.
+  failed: &'static str,
+  /// Owed to candidates none of which had a session to ride.
+  no_session: &'static str,
+}
+
+/// The counters of a volume's own register (its head, or its tombstone).
+const HEAD_SHIPS: ShipCounters = ShipCounters {
+  placed: SHIP_HEAD_PLACED,
+  short: SHIP_HEAD_SHORT,
+  uncertain: SHIP_HEAD_UNCERTAIN,
+  failed: SHIP_HEAD_FAILED,
+  no_session: SHIP_HEAD_NO_SESSION,
+};
+
+/// The counters of a catalog register.
+const CATALOG_SHIPS: ShipCounters = ShipCounters {
+  placed: SHIP_CATALOG_PLACED,
+  short: SHIP_CATALOG_SHORT,
+  uncertain: SHIP_CATALOG_UNCERTAIN,
+  failed: SHIP_CATALOG_FAILED,
+  no_session: SHIP_CATALOG_NO_SESSION,
+};
+
+/// The counters of a state log's part (A-636 part 2b).
+const STATE_LOG_SHIPS: ShipCounters = ShipCounters {
+  placed: "fleet.ship.state_log.placed",
+  short: "fleet.ship.state_log.short",
+  uncertain: "fleet.ship.state_log.uncertain",
+  failed: "fleet.ship.state_log.failed",
+  no_session: "fleet.ship.state_log.no_session",
+};
+
+/// The counters a register of `class` ships under, read from its id's class (A-636 part 2a), never from its value.
+fn ship_counters(class: RegisterClass) -> ShipCounters {
+  match class {
+    RegisterClass::Own => HEAD_SHIPS,
+    RegisterClass::Catalog => CATALOG_SHIPS,
+    RegisterClass::State(_) => STATE_LOG_SHIPS,
+  }
+}
+
+/// The counter naming one shipment's outcome among `counters`: placed at `f + 1`, acknowledged short of it, uncertain,
+/// or refused before anything was dispatched.
 fn ship_outcome_counter(
-  catalog: bool,
+  counters: ShipCounters,
   outcome: &Result<Placement, ClusterError>,
   quorum: Quorum,
 ) -> &'static str {
-  match (catalog, outcome) {
-    (true, Ok(placement)) if placement.placed(quorum) => SHIP_CATALOG_PLACED,
-    (false, Ok(placement)) if placement.placed(quorum) => SHIP_HEAD_PLACED,
-    (true, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_CATALOG_SHORT,
-    (false, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_HEAD_SHORT,
-    (true, Err(ClusterError::Uncertain { .. })) => SHIP_CATALOG_UNCERTAIN,
-    (false, Err(ClusterError::Uncertain { .. })) => SHIP_HEAD_UNCERTAIN,
-    (true, Err(_)) => SHIP_CATALOG_FAILED,
-    (false, Err(_)) => SHIP_HEAD_FAILED,
+  match outcome {
+    Ok(placement) if placement.placed(quorum) => counters.placed,
+    Ok(_) | Err(ClusterError::NotPlaced { .. }) => counters.short,
+    Err(ClusterError::Uncertain { .. }) => counters.uncertain,
+    Err(_) => counters.failed,
   }
 }
 
@@ -11286,6 +11397,12 @@ fn record_acks_in(
   epoch: HostEpoch,
   placement: Placement,
 ) {
+  // A state log's part is a ledger position, its candidates' acknowledgements kept per log (A-636 part 2b): never the
+  // one sequence a head's placement keeps, and never a live volume's.
+  if let RegisterClass::State(_) = object.class() {
+    crate::state_log::acknowledged(state, object, sequence, &placement);
+    return;
+  }
   let entry = state
     .placed_heads
     .entry(object)
@@ -11879,7 +11996,7 @@ mod tests {
   /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
   /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
   /// ([`super::install_slice`]), as the coordinator's period drives it ([`super::drive_install_walk`]).
-  fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
+  pub(super) fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
     let regional = state.council.configuration().clone();
     let Some(configuration) = regional.configuration_for(local) else {
       return;
@@ -12861,5 +12978,300 @@ mod root_learner_tests {
       vec![voter]
     );
     assert_eq!(with_shown_peer(vec![voter], None, local), vec![voter]);
+  }
+}
+
+#[cfg(test)]
+mod state_log_tests {
+  use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+  use slates_db::catalog::{LogName, LogSpan, LoggedChange, NameChange, RepositoryId, StateLog};
+  use slates_db::catalog::{StateLogRecord, VolumeId};
+  use slates_db::register::{Ack, FIRST_EPOCH, Quorum, RegisterClass};
+  use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
+
+  use super::{HostId, ObjectId, Placement, Record};
+  use crate::state::ShardState;
+
+  /// This node and two members admitted beside it, a region of three at `f = 1`, its configuration installed as the
+  /// coordinator installs it: every object's candidates are the three.
+  fn region_of_three(state: &mut ShardState) -> (HostId, [HostId; 2]) {
+    let local = state.fleet.host();
+    let others = [HostId(local.0 ^ 1), HostId(local.0 ^ 2)];
+    state.council = RegionalCouncil::new(
+      local,
+      vec![local],
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    for host in others {
+      assert!(
+        state
+          .council
+          .propose(Reconfiguration::Admit { host, domain: None })
+      );
+    }
+    super::tests::walk_the_install(state, local);
+    (local, others)
+  }
+
+  /// The owning principal the verbs run as.
+  fn owner() -> slates_db::catalog::Principal {
+    slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    }
+  }
+
+  /// A repository `name` made on `state`'s shard with its default branch `main`, and a branch `topic` of it: its id.
+  fn repository_and_branch(state: &mut ShardState, name: &str) -> RepositoryId {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.to_owned(),
+        tool: VcsTool::Git,
+        format: ObjectFormat::Sha1,
+        default_branch: "main".to_owned(),
+        green: None,
+      },
+    );
+    assert!(
+      matches!(created, ReplyBody::GreenCreated { .. }),
+      "{created:?}"
+    );
+    let branched = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: name.to_owned(),
+        name: "topic".to_owned(),
+        from: "main".to_owned(),
+        version: None,
+      },
+    );
+    assert!(
+      matches!(branched, ReplyBody::GreenCreated { .. }),
+      "{branched:?}"
+    );
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .map(|record| record.id)
+      .unwrap()
+  }
+
+  /// A-636 part 2b. Do: on an owner shard in a region of three at `f = 1`, create a repository and a branch of it, ask
+  /// the record plane what it owes, then record a commit round of the first part acknowledged by one remote candidate,
+  /// and another by the other, as `ship_head`'s rounds record them. Expect: the names log's two parts owed in position
+  /// order (the root joined and the default bound, 0 to 2; the branch joined and bound, 2 to 4), each at the names
+  /// log's register, to the repository's own candidates, its value the record itself, naming one operation each; no
+  /// other state log owed anything; the first part still owed to the candidate that lacks it, then let go once both
+  /// hold it, the second still owed to both; and no acknowledgement of a part kept as a head's placement.
+  #[test]
+  fn an_owners_state_log_records_are_owed_to_the_repositorys_candidates_in_order() {
+    crate::daemon::audit_on_shard(|state| {
+      let (local, [b, c]) = region_of_three(state);
+      let repo = repository_and_branch(state, "shipped");
+      crate::state_log::take_made(state);
+      let register = LogName::State {
+        repository: repo,
+        log: StateLog::Names,
+      }
+      .register();
+      let config = state.fleet.configuration().clone();
+      let owed = super::owed_state_log_parts(state, &config, local);
+      let candidates = config.place(ObjectId(repo.bytes)).candidates;
+      assert_eq!(candidates.len(), 3, "{candidates:?}");
+      let parts: Vec<(ObjectId, u64, u64, Vec<HostId>)> = owed
+        .iter()
+        .map(|head| {
+          let part = crate::state_log::record_of(&head.record.value).unwrap();
+          assert_eq!(head.shape.candidates, candidates);
+          assert_eq!(
+            head.record.sequence, part.to,
+            "a part sits at the position it leaves"
+          );
+          (head.object, part.from, part.to, head.acked.clone())
+        })
+        .collect();
+      assert_eq!(
+        parts,
+        vec![(register, 0, 2, Vec::new()), (register, 2, 4, Vec::new())]
+      );
+      let placement = Placement {
+        acked: vec![local, b],
+        ..config.place(register)
+      };
+      super::record_acks_in(state, register, 2, FIRST_EPOCH, placement.clone());
+      let owed = super::owed_state_log_parts(state, &config, local);
+      assert_eq!(
+        owed
+          .iter()
+          .map(|head| (head.record.sequence, head.acked.clone()))
+          .collect::<Vec<_>>(),
+        vec![(2, vec![b]), (4, Vec::new())]
+      );
+      let placement = Placement {
+        acked: vec![c],
+        ..placement
+      };
+      super::record_acks_in(state, register, 2, FIRST_EPOCH, placement);
+      let owed = super::owed_state_log_parts(state, &config, local);
+      assert_eq!(
+        owed
+          .iter()
+          .map(|head| head.record.sequence)
+          .collect::<Vec<_>>(),
+        vec![4]
+      );
+      assert!(!state.placed_heads.contains_key(&register));
+    });
+  }
+
+  /// The names log's part of `repository` from `from` to `to`, one bind a position, as one operation's.
+  fn names_part(repository: RepositoryId, (from, to): (u64, u64)) -> StateLogRecord {
+    let log = LogName::State {
+      repository,
+      log: StateLog::Names,
+    };
+    StateLogRecord {
+      repository,
+      log: StateLog::Names,
+      from,
+      to,
+      identity: [u8::try_from(to).unwrap(); 32],
+      spans: vec![LogSpan { log, from, to }],
+      changes: (from..to)
+        .map(|position| LoggedChange::Named {
+          change: NameChange::Bind {
+            name: format!("b{position}"),
+            green: VolumeId::default(),
+          },
+        })
+        .collect(),
+    }
+  }
+
+  /// A-636 part 2b. Do: on a holder in a region of three at `f = 1`, receive from a repository's owner its names log's
+  /// parts as the record plane ships them: the part from 2 to 3 before the first; the first, 0 to 2; the one from 2 to 3
+  /// again; then 3 to 5; and at that register a value that reads as a volume's head. Expect: the part past a gap
+  /// refused with no acknowledgement, counted `discontinuous`; the others acknowledged in order, every position kept (a
+  /// ledger: none compacted to the newest); the head-shaped value refused, counted malformed.
+  #[test]
+  fn a_holder_holds_a_repositorys_state_log_as_a_prefix_never_compacted() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let (local, [owner, _]) = region_of_three(state);
+      let repo = RepositoryId {
+        bytes: ObjectId::new(owner, 5).0,
+      };
+      let register = LogName::State {
+        repository: repo,
+        log: StateLog::Names,
+      }
+      .register();
+      let generation = state.fleet.configuration().version;
+      let shipped = |part: &StateLogRecord| Record {
+        owner,
+        object: register,
+        sequence: part.to,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: crate::state_log::value_of(part),
+      };
+      let mut acked = Vec::new();
+      for span in [(2, 3), (0, 2), (2, 3), (3, 5)] {
+        let reply =
+          super::accept_held_record(state, local, owner, &shipped(&names_part(repo, span)));
+        acked.push(Ack::decode(&reply).is_ok());
+      }
+      let head = crate::head::HeadValue {
+        manifest: None,
+        content_holders: Vec::new(),
+        sealing: None,
+      };
+      let headlike = Record {
+        sequence: 6,
+        value: head.to_record_bytes(),
+        ..shipped(&names_part(repo, (5, 6)))
+      };
+      acked.push(Ack::decode(&super::accept_held_record(state, local, owner, &headlike)).is_ok());
+      let kept: Vec<u64> = [2, 3, 5]
+        .into_iter()
+        .filter(|position| {
+          state
+            .holder_records
+            .get(&register)
+            .is_some_and(|copy| copy.value_at(register, *position).is_some())
+        })
+        .collect();
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        acked,
+        kept,
+        count("fleet.record.refused.state_log.discontinuous"),
+        count("fleet.record.refused.state_log.malformed"),
+      )
+    });
+    assert_eq!(seen.0, vec![false, true, true, true, false], "{seen:?}");
+    assert_eq!(seen.1, vec![2, 3, 5], "every position kept: {seen:?}");
+    assert_eq!((seen.2, seen.3), (1, 1), "{seen:?}");
+  }
+
+  /// A-636 part 2b. Do: name the counters a volume's head, its catalog and each of a repository's state logs ship
+  /// under, placed and short of placed. Expect: each class its own, a state log's never its repository's head's.
+  #[test]
+  fn a_state_logs_part_ships_under_its_own_counters_never_its_repositorys_heads() {
+    let quorum = Quorum { f: 1 };
+    let candidates = vec![HostId(1), HostId(2), HostId(3)];
+    let placed = Placement {
+      acked: vec![HostId(1), HostId(2)],
+      ..Placement::of(&candidates)
+    };
+    let short = Placement {
+      acked: vec![HostId(1)],
+      ..Placement::of(&candidates)
+    };
+    let repository = ObjectId::new(HostId(1), 5);
+    let outcome = |object: ObjectId, placement: &Placement| {
+      super::ship_outcome_counter(
+        super::ship_counters(object.class()),
+        &Ok(placement.clone()),
+        quorum,
+      )
+    };
+    assert_eq!(outcome(repository, &placed), super::SHIP_HEAD_PLACED);
+    assert_eq!(
+      outcome(repository.catalog(), &short),
+      super::SHIP_CATALOG_SHORT
+    );
+    for log in [
+      StateLog::Names,
+      StateLog::Phases,
+      StateLog::Markers,
+      StateLog::Locks,
+    ] {
+      let register = repository.in_class(RegisterClass::State(log));
+      assert_eq!(
+        outcome(register, &placed),
+        "fleet.ship.state_log.placed",
+        "{log:?}"
+      );
+      assert_eq!(
+        outcome(register, &short),
+        "fleet.ship.state_log.short",
+        "{log:?}"
+      );
+      assert_eq!(
+        super::ship_counters(register.class()).no_session,
+        "fleet.ship.state_log.no_session"
+      );
+    }
   }
 }

@@ -236,6 +236,8 @@ pub mod shards;
 #[cfg(target_os = "macos")]
 mod shards_route;
 pub mod state;
+// A repository's state logs shipped to their holders a log at a time (A-636 part 2b).
+mod state_log;
 mod status_pages;
 pub mod takeover;
 pub mod telemetry;
