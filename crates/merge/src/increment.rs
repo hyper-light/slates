@@ -19,6 +19,14 @@
 //! - A new file renamed over a base file is the write-and-rename pattern: it composes to the base
 //!   file's content being replaced (a delete and the new bytes), not a rename — the destination
 //!   file simply has new content (§4.16).
+//! - A base file written to and then removed, or replaced by renaming another base file onto it,
+//!   while a hard link the base had to it still names its node, leaves the node to that link with
+//!   the writes (A-669; A-646's decision, the heir takes the node as the work left it): the writes
+//!   are declared at the link, where the node stands at seal and the seal reads them, beside the
+//!   removal, and the engine makes the link the node's home with them. When only a link the work
+//!   made still names the node, or the work made the file again at its name, the composition is
+//!   owed: `Unsupported`, never the writes dropped. Until A-669 they were dropped, and the link
+//!   kept the head's bytes.
 //!
 //! Composition is arithmetic on the declared operations, never a comparison of file states
 //! (D-27's never-diff clause).
@@ -580,7 +588,9 @@ fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
   Ok(())
 }
 
-/// An `Unlink`: kills the live (or materialized-base) entity at `path`.
+/// An `Unlink`: kills the live (or materialized-base) entity at `path`. Its writes stay with it: a hard link may still
+/// name its node, and then the seal declares them there ([`heirs_of_writes`], A-669). Until A-669 they were cleared
+/// here, and the green handed the link the head's bytes, so a write was lost with its file's name.
 fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(), DeriveError> {
   let index = live_index(entities, path)
     .or_else(|| materialize_base(entities, base, path))
@@ -589,7 +599,6 @@ fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
     .get_mut(index)
     .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
   unlinked.live = false;
-  unlinked.content.clear();
   Ok(())
 }
 
@@ -962,13 +971,15 @@ fn hardlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeS
 /// Composes the hard link operations — `Link`, and `Unlink` on a hard link path — per link path,
 /// exactly as [`compose_symlinks`] does for symlinks: a new or retargeted link is one `Link`; a
 /// base link removed is one `Unlink`; a link created then unlinked, or a base link removed then
-/// recreated to the same target, is nothing. Whether the shared content survives an unlink is the
-/// merge's concern at apply time, not the composition's.
-fn compose_hardlinks(
+/// recreated to the same target, is nothing ([`link_emissions`] over these states). Whether the
+/// shared content survives an unlink is the merge's concern at apply time, not the composition's;
+/// the writes a removed file leaves to a link are the seal's ([`heirs_of_writes`], A-669). The
+/// states are each link path the journal touched, from its base state.
+fn link_states(
   base: &Base,
   journal: &[VolumeOp],
   paths: &std::collections::BTreeSet<String>,
-) -> Result<Vec<LinkEmission>, DeriveError> {
+) -> Result<std::collections::BTreeMap<String, LinkState>, DeriveError> {
   let mut state: std::collections::BTreeMap<String, LinkState> = std::collections::BTreeMap::new();
   let initial = |path: &str| -> LinkState {
     match base_hardlink_target(base, path) {
@@ -1010,7 +1021,111 @@ fn compose_hardlinks(
     }
     note_made(op, &mut made);
   }
-  Ok(link_emissions(base, state))
+  Ok(state)
+}
+
+/// Where the writes of a removed or replaced base file go, by its entity's index (A-669; A-646's decision: a removed
+/// or replaced home leaves its node to its least surviving link, and the node is as the work left it). A base file the
+/// journal wrote to and then removed, or replaced by renaming another file onto it, keeps its node while a hard link
+/// still names it, and a volume reads the writes at that link. So the seal declares them at the link ([`classify`]),
+/// where the seal's reader finds the node's bytes, beside the file's removal, and the engine makes the link the node's
+/// home with them (`Green::merge_handed`). The heir is the least of the base's links to the file that the journal left
+/// as they were. Refused, typed (`Unsupported`, owed), never accepted without the writes: writes whose node only links
+/// the journal made still name, and writes to a file the journal made again at its own name, whose new node is
+/// composed as an edit of the old one (GAPS). Until A-669 the writes were dropped with the file, and the green handed
+/// the link the head's bytes.
+fn heirs_of_writes(
+  base: &Base,
+  entities: &[Entity],
+  links: &std::collections::BTreeMap<String, LinkState>,
+) -> Result<std::collections::BTreeMap<usize, String>, DeriveError> {
+  let mut heirs = std::collections::BTreeMap::new();
+  for (index, entity) in entities.iter().enumerate() {
+    let Some(origin) = entity.origin.as_deref().filter(|_| !entity.live) else {
+      continue;
+    };
+    let (writes, _) = compose_content_sized(entity.base_len, &entity.content);
+    if writes.is_empty() {
+      continue;
+    }
+    let (kept, made) = node_names(base, links, origin);
+    if kept.is_empty() && made.is_empty() {
+      // The node goes with its last name, and its writes with it.
+      continue;
+    }
+    let made_again = entities
+      .iter()
+      .any(|other| other.live && other.origin.as_deref() == Some(origin));
+    match kept.into_iter().next() {
+      Some(heir) if !made_again => {
+        heirs.insert(index, heir);
+      }
+      _ => return Err(DeriveError::Unsupported(origin.to_owned())),
+    }
+  }
+  Ok(heirs)
+}
+
+/// The link paths naming `origin`'s base node once the journal's links apply (`links`, each link path the journal
+/// touched; an untouched base link keeps its base target): those the base had to the file and the journal left as
+/// they were (the first set), and the others (links the journal made to the file, or to a link naming it).
+fn node_names(
+  base: &Base,
+  links: &std::collections::BTreeMap<String, LinkState>,
+  origin: &str,
+) -> (
+  std::collections::BTreeSet<String>,
+  std::collections::BTreeSet<String>,
+) {
+  let paths: std::collections::BTreeSet<&str> = base
+    .hardlinks
+    .iter()
+    .map(|(path, _)| path.as_str())
+    .chain(links.keys().map(String::as_str))
+    .collect();
+  let mut naming: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  // A link names the node its target names: the file itself, or a link already found naming it. A pass adds a link or
+  // ends the search, so it takes at most one pass a link.
+  for _ in 0..=paths.len() {
+    let found: Vec<&str> = paths
+      .iter()
+      .copied()
+      .filter(|path| !naming.contains(path))
+      .filter(|path| {
+        standing_target(base, links, path)
+          .is_some_and(|target| target == origin || naming.contains(target))
+      })
+      .collect();
+    if found.is_empty() {
+      break;
+    }
+    naming.extend(found);
+  }
+  let as_based = |path: &&str| {
+    base_hardlink_target(base, path) == Some(origin)
+      && links
+        .get(*path)
+        .is_none_or(|(here, target, node)| *here && target == origin && *node == NodeOrigin::Base)
+  };
+  let (kept, made): (Vec<&str>, Vec<&str>) = naming.into_iter().partition(as_based);
+  (
+    kept.into_iter().map(str::to_owned).collect(),
+    made.into_iter().map(str::to_owned).collect(),
+  )
+}
+
+/// The target the link at `path` names once the journal's links apply (`links`), or its base target where the journal
+/// left it alone; `None` where no link stands.
+fn standing_target<'a>(
+  base: &'a Base,
+  links: &'a std::collections::BTreeMap<String, LinkState>,
+  path: &str,
+) -> Option<&'a str> {
+  match links.get(path) {
+    Some((true, target, _)) => Some(target.as_str()),
+    Some((false, ..)) => None,
+    None => base_hardlink_target(base, path),
+  }
 }
 
 /// The links a composed state declares: a link standing where the base had none, or another, or
@@ -1106,7 +1221,7 @@ pub fn compose_volume_planned(
   let sym_paths = symlink_paths(base, journal);
   let symlinks = compose_symlinks(base, journal, &sym_paths)?;
   let link_paths = hardlink_paths(base, journal);
-  let hardlinks = compose_hardlinks(base, journal, &link_paths)?;
+  let link_state = link_states(base, journal, &link_paths)?;
   let mut entities: Vec<Entity> = Vec::new();
   for op in journal {
     if op.is_directory() || op.is_symlink() || op.is_link() || matches!(op, VolumeOp::Mknod { .. })
@@ -1151,9 +1266,11 @@ pub fn compose_volume_planned(
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
   let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
+  let heirs = heirs_of_writes(base, &entities, &link_state)?;
+  let hardlinks = link_emissions(base, link_state);
   let mut plan = PostStatePlan::new();
   let mut doc = seal(
-    entities,
+    (entities, &heirs),
     (directories, modes, symlinks, xattrs, hardlinks),
     &mut plan,
   );
@@ -1321,12 +1438,26 @@ struct Emission {
 /// Classifies the sealed entity set into the surviving files' emissions and the base paths to
 /// unlink. A base file edited to no net change is dropped (so a touched-then-reverted file leaves
 /// no trace and the identity stays minimal); a gone base path is unlinked only when no surviving
-/// file occupies it (a rename or content replacement onto that path covers its removal).
-fn classify(entities: Vec<Entity>) -> (Vec<Emission>, Vec<String>) {
+/// file occupies it (a rename or content replacement onto that path covers its removal). A gone
+/// base file whose writes a link inherits (`heirs`, by entity index, [`heirs_of_writes`]) is also an
+/// emission at that link: the writes, which the seal reads there (A-669).
+fn classify(
+  entities: Vec<Entity>,
+  heirs: &std::collections::BTreeMap<usize, String>,
+) -> (Vec<Emission>, Vec<String>) {
   let mut emissions: Vec<Emission> = Vec::new();
   let mut survivors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
   let mut gone: Vec<String> = Vec::new();
-  for entity in entities {
+  for (index, entity) in entities.into_iter().enumerate() {
+    if let Some(heir) = heirs.get(&index) {
+      let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
+      emissions.push(Emission {
+        final_path: heir.clone(),
+        source: None,
+        created: false,
+        ops,
+      });
+    }
     if entity.live {
       survivors.insert(entity.final_path.clone());
       let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
@@ -1487,11 +1618,11 @@ type Namespace = (
 );
 
 fn seal(
-  entities: Vec<Entity>,
+  (entities, heirs): (Vec<Entity>, &std::collections::BTreeMap<usize, String>),
   (directories, modes, symlinks, xattrs, hardlinks): Namespace,
   plan: &mut PostStatePlan,
 ) -> OpsDoc {
-  let (mut emissions, removed) = classify(entities);
+  let (mut emissions, removed) = classify(entities, heirs);
   let names = document_names(
     &emissions,
     &removed,
