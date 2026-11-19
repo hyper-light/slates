@@ -303,9 +303,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// with [`role::vcs_http_address`] (an address off loopback refused for a daemon that is no fleet node, whose edge
 /// would serve cleartext) and [`role::Role::args`] gives back to the daemon an anchor starts; a fleet node's edge
 /// presents the node's own identity; a starter's anchor asks for none (2026-11-19).
+/// 53: a host's anchor starts the version-control edge too, and holds its port (A-625 part 3): [`StartSpec`] gains
+/// `vcs_http`, which its anchor's role and command carry; an anchor binds the edge's listener once, at that address, and
+/// hands it to every daemon it starts, so a restart never drops the edge's port; an address it cannot bind ends its
+/// start, as a fleet node's serve sockets do (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 52;
+pub const CONTRACT: u32 = 53;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

@@ -736,7 +736,7 @@ fn hg_session(
 /// `--hidden`, sending the handshake alone; then run it for a repository nobody has. Expect: the first session's standard
 /// output the session's capabilities, 7.2's empty line and 7.2's eight answers byte for byte, then exit-status 0, EOF and
 /// close in order; the second's 7.2's warning on standard error before its answers; the third refused in 7.2's words,
-/// 255; two commands run and one refused.
+/// 255; each connection ended by the edge after the client's close; two commands run and one refused.
 #[test]
 fn an_hg_client_is_served_over_the_edge_as_7_2_serves_it() {
   let lends = Lends::probed();
@@ -767,18 +767,21 @@ fn an_hg_client_is_served_over_the_edge_as_7_2_serves_it() {
         err: Vec::new(),
         status: Some(EXIT_STATUS),
         order: vec![94, 98, 96, 97],
+        ended: true,
       }),
       Some(Transcript {
         out: answered,
         err: hidden_warning(&HOLDER),
         status: Some(EXIT_STATUS),
         order: vec![95, 94, 98, 96, 97],
+        ended: true,
       }),
       Some(Transcript {
         out: Vec::new(),
         err: b"abort: repository hg/none not found\n".to_vec(),
         status: Some(HG_ABORT_STATUS),
         order: vec![95, 98, 96, 97],
+        ended: true,
       })
     )
   );
