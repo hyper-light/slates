@@ -41,3 +41,6 @@ pub mod reads;
 pub mod report;
 pub mod serve;
 pub mod svndiff;
+
+#[cfg(test)]
+mod fixture_sums;
