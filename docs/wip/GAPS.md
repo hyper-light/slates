@@ -224,6 +224,17 @@
 > refused with `ERR` until then, v0's ref names held to A-615's rule); `sparse:oid` (part 4); the pack from A-639's
 > fragments behind `PackSource`; `packfile-uris` and `bundle-uri` from the store's URI packs and bundle list;
 > progress on band 2; the walk in cooperative slices; hidden refs, which are policy.
+> **A-640 part 3 (2026-11-19, g296; protocol v0 and v1):** `upload::serve` answers v0 and v1 as git's smart HTTP does
+> (`upload::v0`): the ref advertisement in `send_ref`'s order, and each request whole and stateless, the shallow-update
+> first, the acknowledgments as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed` (`no-done`
+> too) and neither, and the pack on side-band-64k, side-band (995 bytes a packet) or bare. Held to stock git 2.50.1's
+> six stateless answers and nine one-round sessions packet for packet (424 of 424 on the Mac Studio, red nine ways).
+> The goldens found A-615's bug (`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`): a thin
+> pack in a shallow exchange leaves out every had commit's tree, as `pack-objects --objects-edge-aggressive` does, and
+> only then (its oracle states it too). v0's advertised ref names are held to `refname::is_valid`. The service's pack
+> now comes from A-639's stream (`upload::Fragments`, a turn of it a call on the owner's clock, one call a step and its
+> packets framed full), closing part 2's owed pack: 460 of 460 on Windows x86_64 (jupiter; 3 ignored; red four ways;
+> the macOS run owed). Owed in A-640: `sparse:oid` (part 4); a stateful v0 session, an SSH client's.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -976,6 +987,21 @@
 > replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
 > them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
 > A-652's generator.
+> A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
+> command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
+> land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
+> Continued (1), 2026-11-19: `commit` through the connection (A-655's entry point and drive; the hooks the drive waits
+> for, A-661, handed to the caller; the accepted work answered with its revision, or refused at `close-edit` in A-655's
+> step's words, the client's commands then dropped until `abort-edit` or `success`; the crate's tests commit through
+> A-655 part 2a's step, the daemon refuses every work 200007 until part 2b), and `svnserve`'s authentication for one
+> command (`must_have_access`) for `commit` and `update`, held to every recorded commit connection and to `svnserve`'s
+> own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
+> `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
+> once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
+> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
+> authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
+> for anonymous): the read commands' authorization is owed (A-606).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

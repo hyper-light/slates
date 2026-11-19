@@ -221,6 +221,19 @@ enum Phase {
   Answered,
 }
 
+/// What an exchange waits on its client for, which its caller's waits are learned by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Awaiting {
+  /// The report's commands.
+  Report,
+  /// Nothing: its drive is being written.
+  Drive,
+  /// The client's answer to `close-edit` or `abort-edit`.
+  Answer,
+  /// Nothing more: the command is answered.
+  Nothing,
+}
+
 /// One report command's exchange (module documentation).
 #[derive(Debug)]
 pub struct Exchange {
@@ -257,6 +270,16 @@ impl Exchange {
       })),
       Begun::Failed(failure) => Opened::Failed(failure),
     })
+  }
+
+  /// What the exchange waits on its client for now.
+  pub fn awaiting(&self) -> Awaiting {
+    match self.phase {
+      Phase::Reporting(_) => Awaiting::Report,
+      Phase::Driving(..) => Awaiting::Drive,
+      Phase::Closing(_) | Phase::Aborting(_) => Awaiting::Answer,
+      Phase::Answered => Awaiting::Nothing,
+    }
   }
 
   /// Goes on with `input`, the client's bytes not yet taken, appending to `out` within `budget`.
