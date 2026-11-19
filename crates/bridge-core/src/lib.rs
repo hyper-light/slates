@@ -831,11 +831,18 @@ pub trait Bridge {
   /// named by `cx` did not make itself — and returns the cursor to pass next time. Bounded by the
   /// journal's retention budget and by the entries loaded under the hinted directories. The
   /// default reports nothing, for a bridge that changes only through its own transport.
+  ///
+  /// **Slices** (A-562). The gather runs on the serving thread, so it takes what its turn allows: `more` is asked
+  /// before each journal record after the first, and at [`std::ops::ControlFlow::Break`] the gather stops there and
+  /// returns the cursor through the last record it took, the rest owed to the next gather, which resumes from it. A
+  /// gather that `more` never stops reports everything owed. The changes beneath a base directory are gathered only once
+  /// the journal's are whole, in the same gather.
   fn invalidations(
     &mut self,
     _cx: &OpContext,
     cursor: InvalidationCursor,
     _out: &mut Vec<Invalidation>,
+    _more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     Ok(cursor)
   }
