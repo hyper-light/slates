@@ -472,6 +472,16 @@
 > 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
 > only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
 > the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
+> **A-653 (2026-11-19, g083; partly wanted parts):** A-639's stream reads a kept part only partly wanted entry by entry,
+> its wanted entries alone judged: each kept part keeps its entries' indexes in position order (four bytes an entry,
+> charged), so a stream marks the entries it wants by halving, a window's worth of handles a unit, and a fetch of two
+> files of forty judges two. A `blob:limit` clone takes its small blobs from the kept parts; each object still wanted
+> after the head cover is offered the parts of the version its row says brought it, so a partial clone's later fetch
+> of blobs by id is answered from the fragments. One pack source, g296's `upload::Fragments` (A-640 part 3); this
+> piece's own adapter was dropped for it. Closes A-639's "a part only partly wanted read entry by entry". Owed: the
+> real clone's requests (small.git, A-582's five) answered through `Fragments` with every version encoded and a base
+> pack made, each object once (the next piece; A-640 part 3 landed at f607f424c); a delta search past a window; the
+> fragments' encoding sliced; the marking's red-checks and the other platforms' runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
