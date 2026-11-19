@@ -11,16 +11,16 @@
 //!
 //! **The refs, read by the asker's rights.** The step that answers a request ([`StoreLender::lend`]) reads the
 //! repository's names from the partition's register as it runs. Each name binds a green, which is a git ref (§4.17.1's
-//! terms: "each ref (`refs/heads/*`, `refs/tags/*` and every other ref)"): a name under `refs/` as it is, any other a
-//! branch under `refs/heads/`, the rule `crate::lfs` names the default branch by. A name that makes no ref git can
-//! carry (`slates_git::refname::is_valid`, git's `check_refname_format`: a space, a `..`, a control byte) is not lent,
-//! since protocol v2's lines refuse one and a single such name would refuse every `ls-refs`. A ref is lent only to a
-//! reader the repository's policy lets read it (`crate::vcs_policy::permits`: git's `transfer.hideRefs` precedence, the
-//! last rule that covers the ref deciding, and a ref no rule speaks to the owner's alone), so a hidden ref is neither
-//! advertised nor wanted by name (`want-ref`, `deepen-not`). `HEAD` names the repository's default branch by the same
-//! rule, and reads as unborn to a reader that may not read that branch, since its target is looked up among the refs
-//! lent. The refs are sorted by their full names; two names that make one ref (`main` and `refs/heads/main`) meet
-//! upload-pack's own order check, which refuses the request rather than serve either.
+//! terms: "each ref (`refs/heads/*`, `refs/tags/*` and every other ref)"), by git's push's rule (`crate::git_push`'s
+//! `ref_of`, A-654), so both services see one ref a name: a short name `N` is `refs/heads/N`, a name under `refs/` is
+//! itself, and a name beginning `refs/heads/` is no ref, since its ref is another name's, so names and refs map one to
+//! one. A name that makes no ref git can carry (git's `check_refname_format`: a space, a `..`, a control byte) is no
+//! ref either, since protocol v2's lines refuse one and a single such name would refuse every `ls-refs`. A ref is lent
+//! only to a reader the repository's policy lets read it, hidden as git's push hides one from its pusher
+//! (`crate::git_push`'s `PolicyHidden`: A-622's `Read`, git's `transfer.hideRefs` precedence, a ref no rule speaks to
+//! the owner's alone), so a hidden ref is neither advertised nor wanted by name (`want-ref`, `deepen-not`). `HEAD` names
+//! the repository's default branch by the same rule, and reads as unborn to a reader that may not read that branch,
+//! since its target is looked up among the refs lent. The refs are lent in name order, as upload-pack reads them.
 //!
 //! **A pack's steps read no refs.** After the request's step, an answer's steps hand the store to the pack's source
 //! alone, which names what it sends by position (`slates_git::upload::Answer::write`), so they are lent the objects
@@ -34,31 +34,24 @@
 //! **Owed** (GAPS' §4.17 entry). The objects a hidden ref alone reaches stay fetchable by their ids: slates-git's
 //! negotiation answers a want of any object the store holds (`negotiation::Refusal::NotOurs` names one it lacks), so
 //! hiding them is slates-git's hidden refs, owed there. A repository with no default branch, or one whose default
-//! branch makes no ref git can carry, is not lent, since slates-git's answers always name `HEAD`'s branch (no verb
-//! records none today; `Op::RepositoryDefaultSet` can). The exchange is §4.11's at neutral until the live
-//! memory-pressure and load signals move it, as the codec policy's are.
+//! branch is no ref, is not lent, since slates-git's answers always name `HEAD`'s branch (no verb records none today;
+//! `Op::RepositoryDefaultSet` can). The exchange is §4.11's at neutral until the live memory-pressure and load signals
+//! move it, as the codec policy's are.
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord};
 use slates_git::Admission;
-use slates_git::refname;
+use slates_git::receive::HiddenRefs;
 use slates_git::store::NamedRef;
 use slates_git::store::learn::{Clock, Exchange};
 use slates_git::upload::{Fragments, PackPlan, PackRefused, PackSource, Served, Streamed};
 
 use crate::config::DaemonConfig;
+use crate::git_push::{PolicyHidden, ref_of};
 use crate::state::ShardState;
 use crate::vcs_http::git::StoreLender;
-use crate::vcs_policy::{Compiled, Name, Right};
 
 #[cfg(test)]
 mod tests;
-
-/// Format: what every git ref's full name begins with (`git check-ref-format`).
-const REFS: &str = "refs/";
-
-/// Format: the namespace a branch's short name lives under (`git check-ref-format`), as `crate::lfs` names the default
-/// branch.
-const HEADS: &str = "refs/heads/";
 
 /// Format: nanoseconds in a second, the measured throughput's unit of time against the exchange's.
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -106,12 +99,12 @@ pub(crate) fn lend_on<R>(
       let (record, head) = lendable(state, id)?;
       (head, readable_refs(state, record, reader)?)
     }
-    None => (String::new(), Vec::new()),
+    None => (Vec::new(), Vec::new()),
   };
   let refs: Vec<NamedRef<'_>> = named
     .iter()
     .map(|(name, green)| NamedRef {
-      name: name.as_bytes(),
+      name,
       green: *green,
     })
     .collect();
@@ -122,7 +115,7 @@ pub(crate) fn lend_on<R>(
       repository: &store.repository,
       store: content,
       refs: &refs,
-      head: head.as_bytes(),
+      head: &head,
     };
     Some(step(&served, &mut packs))
   })
@@ -130,49 +123,32 @@ pub(crate) fn lend_on<R>(
 
 /// Repository `id`'s record and the full name of the branch its `HEAD` names, when its git store is held on `state`'s
 /// shard and can be lent (the module doc): none for a store not held here, one of another tool, or a repository with no
-/// default branch or one that makes no ref git can carry.
-fn lendable(state: &ShardState, id: RepositoryId) -> Option<(&RepositoryRecord, String)> {
+/// default branch or one whose default branch is no ref.
+fn lendable(state: &ShardState, id: RepositoryId) -> Option<(&RepositoryRecord, Vec<u8>)> {
   state.vcs_stores.git_ref(id)?;
   let record = state.db.partition().repositories().repository(id)?;
-  let head = git_ref_name(record.default_branch.as_deref()?);
-  refname::is_valid(head.as_bytes()).then_some((record, head))
+  let head = ref_of(record.default_branch.as_deref()?)?;
+  Some((record, head))
 }
 
 /// The refs of `record`'s repository that `reader` may read (the module doc): each ref's full name and its green's key
-/// in the store, in name order, every name a ref git can carry; none when the repository's policy cannot be read.
+/// in the store, in name order, one ref a name; none when the repository's policy cannot be read.
 fn readable_refs(
   state: &ShardState,
   record: &RepositoryRecord,
   reader: &Principal,
-) -> Option<Vec<(String, u64)>> {
-  let compiled = Compiled::of(record).ok()?;
-  let mut refs: Vec<(String, u64)> = state
+) -> Option<Vec<(Vec<u8>, u64)>> {
+  let hidden = PolicyHidden::of(record, reader).ok()?;
+  let mut refs: Vec<(Vec<u8>, u64)> = state
     .db
     .partition()
     .repositories()
     .branches(record.id, "")
-    .map(|(name, green)| (git_ref_name(name), super::green_key(green)))
-    .filter(|(name, _)| refname::is_valid(name.as_bytes()))
-    .filter(|(name, _)| {
-      crate::vcs_policy::permits(
-        &compiled,
-        (record, reader),
-        (Name::Ref(name.as_bytes()), Right::Read),
-      )
-    })
+    .filter_map(|(name, green)| Some((ref_of(name)?, super::green_key(green))))
+    .filter(|(name, _)| !hidden.is_hidden(name))
     .collect();
-  refs.sort_by(|left, right| left.0.cmp(&right.0));
+  refs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
   Some(refs)
-}
-
-/// The git ref a name of the repository's register binds (the module doc): a name under `refs/` as it is, any other a
-/// branch's, under `refs/heads/`.
-fn git_ref_name(name: &str) -> String {
-  if name.starts_with(REFS) {
-    name.to_owned()
-  } else {
-    format!("{HEADS}{name}")
-  }
 }
 
 /// Derived: the owner's exchange, what a byte the fragments' encoder saves is worth in its time (§4.11's value of a byte

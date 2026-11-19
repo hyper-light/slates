@@ -12735,11 +12735,12 @@ engine: the verdict, rebase, position mapping, the register).
 > `vcs_store::upload::ShardStores`, the `StoreLender` over the shard's map. The step that answers a request (the
 > advertisement, `ls-refs`, a `fetch`) is lent A-614's store, the content store, the refs the asker may read and the
 > branch `HEAD` names, read from the partition's register as the step runs; every later step of the answer is lent the
-> objects alone, since the pack's source names what it sends by position. Each register name is a git ref (a name under
-> `refs/` as it is, a short one under `refs/heads/`, as LFS names the default branch); a name git's
-> `check_refname_format` refuses is not lent, since protocol v2's lines refuse it and one such name would refuse every
-> listing; a ref is lent only to a reader the repository's policy lets read it (git's `transfer.hideRefs` precedence,
-> a ref no rule speaks to its owner's alone), and `HEAD` reads as unborn to a reader that may not read its branch. The
+> objects alone, since the pack's source names what it sends by position. Each register name is a git ref by git's
+> push's rule (A-654's `git_push::ref_of`: a short name `N` is `refs/heads/N`, a name under `refs/` is itself, and a
+> name beginning `refs/heads/` or one git's `check_refname_format` refuses is no ref), so both services see one ref a
+> name and no listing meets a name protocol v2 cannot carry; a ref the repository's policy hides from the asker is
+> hidden as from a pusher (A-654's `PolicyHidden`: A-622's `Read`, git's `transfer.hideRefs` precedence, a ref no rule
+> speaks to its owner's alone), and `HEAD` reads as unborn to a reader that may not read its branch. The
 > pack is A-639's stream through A-653's `Fragments`, its turns on the shard's clock within the step quantum the shard
 > keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
 > take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
@@ -13062,6 +13063,22 @@ engine: the verdict, rebase, position mapping, the register).
 > would). Proven by the twelve pushes of A-644's golden vectors answered through the policy with every byte stock git
 > wrote, and by the commit signatures stock git made verifying under git's namespace alone. Owed: receive-pack's server
 > half asking it for each command (A-620 part 2's judge composed with the server's greens and appends).
+>
+> **Status (2026-11-19, A-654 part 2: git's push driver on the owner shard).** `crates/server` (`git_push`) is
+> receive-pack's one entry point for both edges, each call one step on the repository's owner shard.
+> `ReceivePack::start` advertises each branch whose green holds a git head (a namespace name `N` is the ref
+> `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under the repository's policy
+> hidden as `receive.hideRefs` hides one; `input` and `end` run A-620's session over A-638's index view, lent the
+> shard's room; `answer` refuses every command `hook not run` while a git hook is configured and its view is not served
+> (A-665 part 2), else admits the checked objects to A-662's quarantine and seals them, asks each command of A-622's
+> policy through A-644 part 2's check point before its work is built (the right its change needs, then a protected
+> name's linear history and signed commits on what it brings), refused in git's words, judges with A-654 part 1's
+> verdicts over the shard's greens, appends each entry through A-635's append with A-662's store moves (one entry each,
+> all in one under `atomic`), and writes git's report. A ref's base is its green's head alone, held at the append by
+> compare and swap, until A-664's server-made commits; a create is made at its first parent's version, or from the
+> default branch's empty green while that branch is unborn. Six pushes stock git 2.50.1 made are answered with git's
+> bytes. Owed: the edges' calls, the hooks' runs, older bases (A-664), the policy's principals other than the owner at
+> A-635's append, push options, review requests, the new versions' fragments off the answer's path.
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -50287,6 +50304,77 @@ at start).
   runs over main ee5cbed4c, after A-644 part 2's server, db and ipc changes (kiln r40, at 15ba6b078): 67 of 67, 42 of
   42, 3 of 3, 3 of 3, 7 of 7, 2 of 2 and 7 of 7, fmt clean.
 
+### A-654 part 2 — git's push driver on the owner shard (2026-11-19, g258, UI goal 93; §4.17.1 "A push is a work" items 1 to 5 and "Policy"; §4.17.2 "A push" items 1 to 7, "Access", "Protected branches, in git's terms" and "Hooks, in git's terms"; A-620, A-622, A-635, A-638, A-642, A-644, A-662)
+
+- **What was there.** A-654 part 1 made slates-git's receive-pack session keepable between an edge's calls and its
+  verdicts read-only beside the appends; A-662 put each repository's store on its owner shard and appended a git push
+  through `push_sealed`; A-644 part 2 built the policy's check point for a protected name (`git_protect`). Nothing in
+  the server drove a push: the HTTP site answered receive-pack `503`, and the SSH edge answered it as not served.
+- **The decision.** (1) One sans-io driver, `git_push::ReceivePack`, which both edges call a step at a time: `start`
+  (writing the advertisement when the transport opens with it), `input`, `end`, `answer`. No call holds anything of the
+  shard after it returns, and every read of the store is lent the room the shard can admit now (`vcs_store::with_room`),
+  since A-614's store parses within its content store's room. The request, the pack and what reading and answering them
+  builds are charged to the room the edge gives the push, as A-625's request room. (2) A namespace name `N` is the ref
+  `refs/heads/N`, a name beginning `refs/` is itself, and a name beginning `refs/heads/` is no ref, so names and refs
+  map one to one (`namespace_of` checks the round trip). A branch is advertised once its green holds a git head in the
+  store, so git sees a new repository's default branch unborn. (3) A ref's base is its green's head alone: a command's
+  old value names a version only when it is the head of the newest of the store's versions of its green and that version
+  is the green's head now, and the append holds the green to the position its verdict read (compare and swap). A push
+  based on an older version, or made after a submit moved the green without git, is a ref that moved until A-664's
+  server-made commits let a work based on an older version be composed and its result named. An annotated tag's tree is
+  read through the tag's bytes, since A-614's rows hold no tag's target. (4) A-622's policy is asked per command before
+  its work is built, through A-644 part 2's check point: A-644's `Repository::change` gives the right the change needs
+  (`git_protect::right_of`: Submit for a create or a fast-forward, Rewrite for a rewrite, Delete for a delete), and
+  `vcs_policy::admit` judges it and, where a rule imposes them, the requirements on what the change brings
+  (`StoreBrings`: a linear history, commits a trusted key signed). A refusal is in git's words
+  (`git_protect::declined`): `non-fast-forward` and `deletion prohibited` as git refuses them itself, every other as git
+  answers an update hook refusing it. A change whose ref names no born green is judged against a key no green has (the
+  repository's own id's, minted by the counter its greens' ids are), so a create brings every commit its head reaches,
+  as A-644 judges one. §4.17.2's item 6 lists the work first; the policy goes first here as git's `update()` refuses
+  before it runs a hook, the cheaper refusal first. A ref the pusher may not read is hidden as `receive.hideRefs` hides
+  one, by the policy the push started under, compiled once (`vcs_policy::admit_right`, now visible to the crate). (5) A
+  configured git hook refuses every command `hook not run`, a line naming it, until A-665 part 2 serves its view: no ref
+  moves that a configured hook was not asked about. (6) A create is made from the member whose store head is its first
+  parent, where a branch can still be made at that version (the default branch's first), else at the default branch's
+  newest version; while the default branch is unborn, from its green, which must be empty at its version 0: the default
+  branch itself is moved by the work, any other ref is a new branch made at that empty version, and a default branch
+  holding files no commit names refuses it, typed (A-664's to commit). (7) A push's name is a BLAKE3 key derivation over
+  its repository and commands, so a push sent again makes the same works and A-635 answers each the version it made. (8)
+  A-635's refusals are git's: a conflict, a green moved and a name taken or gone since the push read it are a ref that
+  moved; anything else is the append's own reason in slates' words, its typed refusal named as Mercurial's push names
+  its own. (9) receive-pack advertises upload-pack's agent, `slates_git::upload::AGENT`, now public, so both name the
+  server alike.
+- **Tests** (`crates/server/src/git_push/tests.rs`): six pushes stock git 2.50.1 made, captured by
+  `crates/git/fixtures/push/make-push-fixtures.sh` (create, a thin-pack update, an annotated tag, a branch at a held
+  commit with an empty pack, a branch at a new commit, its delete), fed through the driver a few bytes at a time in the
+  script's order, each advertisement equal to the refs git's server held then and each answer the very bytes `git
+  receive-pack` wrote, each ref's green holding the text its commit names, one register record a push; the policy hiding
+  a ref and refusing its delete as git refuses a hidden ref's, `deletion prohibited`, a submission refused through the
+  check point as an update hook refuses it naming the rule, and a configured `pre-receive` hook refusing typed, each
+  refused push recording nothing; `atomic` all or none at the verdict and at the append (a branch the CLI made, which
+  git sees unborn, refusing a create of its name), and a push without it applying a ref at a time. A protected name's
+  linear history and signed commits are A-644 part 2's own tests.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). Red first, the
+  three tests over a stub driver refusing every call (a56e7a725, kiln r223): `cargo test --locked -p slates-server --lib
+  -- git_push:: repository::push:: vcs_policy:: vcs_store:: --test-threads=4` 32 passed and the 3 new failed at `start`.
+  Green at e6d2b1405 (r234): 35 of 35, fmt clean, no warning. Over main bb535bd4d (62db35348, r16): 40 of 40. Over main
+  ee5cbed4c, the policy step moved onto A-644 part 2's check point and `git_protect::` added to the filters (0850516b3):
+  46 of 46, the merge's first build having stopped at the tests' `SetRepositoryPolicy`, to which A-644 part 2 gave
+  `signers`. Over main 3612d1ef9 as it lands (8af0bd751; main's b5231f0ff after it changes comments and documents
+  alone): the same filters 46 of 46 (`git_push` 3, `git_protect` 3, `repository::push` 4, `vcs_policy` 18, `vcs_store`
+  18), `cargo fmt --all -- --check` clean, no warning. No integration target pushes through git yet: no edge calls the
+  driver.
+- **Owed.** The edges' calls: g299's `GitServices` for the HTTP site and g294's channel for SSH. The hooks run over
+  A-665 part 2's view (`pre-receive` with every command, `update` per ref, `post-receive` after). A push based on an
+  older version (A-664). A principal the policy allows who is not the repository's owner, whom A-635's append refuses
+  `Forbidden` until its owner check gives way to the policy. Push options. Review requests (`refs/for/`). The new
+  versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8). A tag of a tag.
+- **Applied in the same change to:** `crates/server/src/git_push.rs` (new) and `git_push/tests.rs`, `lib.rs` (the
+  module, and `git_protect`'s note), `vcs_store.rs` (`with_room`, `SealedPush::quarantine`), `vcs_policy.rs`
+  (`admit_right` visible to the crate), `repository.rs` (`branch_version` visible to the crate),
+  `crates/git/src/upload/mod.rs` (`AGENT` public); §4.17.2's status; GAPS (the A-654 entry, and A-644 part 2's owed
+  line).
+
 ### A-682 — The daemon's StoreLender over A-662's map: upload-pack served from each repository's store on its owner shard, its refs lent by the asker's read right (2026-11-19, g309 for UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" items 1 and 2, §4.17.1 "Policy"; A-625 part 3's second slice; after A-614, A-640 part 2, A-651 part 2, A-653 and A-662)
 Applied in the same change to:
 - §4.17.2's statuses (A-682's, after A-625 part 3's);
@@ -50295,8 +50383,9 @@ Applied in the same change to:
   and `vcs_store/tests.rs` (its push helpers shared with the new tests); `vcs_http/git/upload.rs` (`StoreLender::lend`
   takes the asker, `lend_objects` new), `vcs_http/git.rs` (`Unserved` moved into the site's tests, the one place it is
   used), `vcs_http/daemon_edge.rs` (the daemon's site) and `vcs_http.rs`; `vcs_ssh/git.rs` and `vcs_ssh/site.rs` (the
-  session's asker); `vcs_policy.rs` (`permits`); `lib.rs` (the modules' notes); the tests of the git site, the SSH
-  command and the daemon's edge.
+  session's asker); `git_push.rs` (A-654's `ref_of` and `PolicyHidden` visible to the crate, so both services name and
+  hide refs by one rule); `lib.rs` (the modules' notes); the tests of the git site, the SSH command and the daemon's
+  edge.
 
 - **What.** The daemon's git site (`vcs_http::daemon_edge::DaemonSite`) serves upload-pack through
   `UploadServices<ShardStores>`. `ShardStores` holds nothing: each step borrows the shard's state for its own length
@@ -50312,19 +50401,21 @@ Applied in the same change to:
   position. So the seam has two calls: `lend`, for a request's step, takes the asker and reads the register and the
   policy as it runs; `lend_objects`, for an answer's later steps, reads no ref, so each costs its room and one packet
   whatever the repository's refs (A-640 part 2's bound) rather than a walk of the register a packet.
-- **Each register name a git ref.** §4.17.1 makes each git ref a green bound to a name; a name under `refs/` is that
-  ref, any other a branch under `refs/heads/`, the rule `crate::lfs` names the default branch by, and `HEAD` names the
-  default branch. The register takes any name but an empty one or one holding a NUL (A-515), while protocol v2's lines
-  refuse a name git's `check_refname_format` refuses (`slates_git::v2::ls_refs`), so a branch named `my topic` would
-  have refused every listing of its repository: the lender leaves such a name out (`slates_git::refname::is_valid`),
-  and a repository whose default branch is such a name is not lent, since slates-git's answers always name `HEAD`'s
-  branch. Two names that make one ref (`main` beside `refs/heads/main`) are both lent; upload-pack's order check then
-  refuses every answer that lists or looks up refs (`upload::refs::check_order`), rather than the lender choosing one,
-  which A-654's receive path must not create (GAPS' tripwire).
+- **Each register name one git ref, by git's push's rule.** §4.17.1 makes each git ref a green bound to a name, and
+  A-654 states which: a short name `N` is the ref `refs/heads/N`, a name under `refs/` is itself, and a name beginning
+  `refs/heads/` is no ref, since its ref is another name's, so names and refs map one to one (`git_push::ref_of`).
+  The lender names refs by that same function, so receive-pack and upload-pack never disagree about a ref; a first
+  draft that mapped names itself would have listed `refs/heads/main` twice for a register holding `main` and
+  `refs/heads/main`, and upload-pack's order check would then have refused every listing (`upload::refs::check_order`).
+  The register takes any name but an empty one or one holding a NUL (A-515), while protocol v2's lines refuse a name
+  git's `check_refname_format` refuses (`slates_git::v2::ls_refs`); `ref_of` answers no ref for one, so a branch named
+  `my topic` is left out rather than refusing its repository's every listing, and a repository whose default branch
+  is no ref is not lent, since slates-git's answers always name `HEAD`'s branch.
 - **Refs by the asker's read right.** The edge admits a principal to a repository when some rule lets it read some
   name (`vcs_policy::reaches`, A-625 part 2), "each name then judged by the rule that decides it". This is that
-  judgement for reads: `vcs_policy::permits` judges a ref's `Read` as `admit` judges a push's own right, git's
-  precedence (the last rule that covers the ref decides) with a ref no rule speaks to its owner's alone (A-575). A ref
+  judgement for reads, and A-654 already makes it for a pusher (`git_push::PolicyHidden`: A-622's `Read` judged by
+  `vcs_policy::admit_right` as a push's own right is, git's precedence, the last rule that covers the ref deciding, a
+  ref no rule speaks to its owner's alone, A-575), so the lender asks the same value, compiled once a request. A ref
   the asker may not read is neither listed nor found by name (`want-ref` and `deepen-not` answer git's "unknown ref"),
   and `HEAD`, looked up among the refs lent, reads as unborn to an asker that may not read its branch. The objects such
   a ref alone reaches stay fetchable by id: slates-git's negotiation answers a want of any object the store holds
@@ -50343,7 +50434,8 @@ Applied in the same change to:
   (`vcs_store::upload::tests`): `ls-refs` listing `HEAD` and `refs/heads/main` at the pushed commit, and a `fetch` of
   it whose pack, read whole as index-pack reads one, holds exactly the commit, its tree and its blob; a reader one rule
   lets read `main` alone seeing `HEAD` and `main` while the owner sees `topic` too, the reader's `want-ref` of `topic`
-  refused `UnknownRef`; a branch named `my topic` left out of a whole listing; a Mercurial store, a git repository whose
+  refused `UnknownRef`; branches named `my topic` and `refs/heads/main` (beside `main`) left out of a whole listing
+  that names `refs/heads/main` once; a Mercurial store, a git repository whose
   default branch is `my main` and an unknown id not lent to a request (the second's objects still lent to an answer's
   later steps); and an SSH session started by the SSH site's services over `ShardStores` from a task on the shard,
   advertised, answering `ls-refs` and the `fetch` with the same pack, and ended 0 by a flush.

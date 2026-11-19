@@ -924,8 +924,9 @@ pub(crate) fn admit(
   Ok(())
 }
 
-/// Whether `principal` holds `change`'s own right on its name (A-622 part 2).
-fn admit_right(
+/// Whether `principal` holds `change`'s own right on its name (A-622 part 2): over a policy compiled once, as git's
+/// receive-pack hides each ref its pusher may not read (A-654).
+pub(crate) fn admit_right(
   compiled: &Compiled,
   record: &RepositoryRecord,
   principal: &Principal,
@@ -943,22 +944,6 @@ fn admit_right(
       rule: index_of(rule),
     }),
   }
-}
-
-/// Whether `principal` holds `right` on `name` by `record`'s policy, `compiled` once for many names: judged as [`admit`]
-/// judges a change's own right, so a name no rule speaks to is the owner's alone. What upload-pack's refs are read by,
-/// each ref lent to a reader that may read it (`crate::vcs_store::upload`, A-682).
-pub(crate) fn permits(
-  compiled: &Compiled,
-  (record, principal): (&RepositoryRecord, &Principal),
-  (name, right): (Name<'_>, Right),
-) -> bool {
-  let change = Asked {
-    name,
-    right,
-    brings: None,
-  };
-  admit_right(compiled, record, principal, &change, 0).is_ok()
 }
 
 /// One push's requirements, judged against its repository's compiled policy for its principal (A-644).

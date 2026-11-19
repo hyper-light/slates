@@ -1,7 +1,7 @@
-//! A-682's tests: the daemon's lender over A-662's map, driven as upload-pack's edges drive it, each on a real one-shard
-//! daemon whose repository took its objects through A-635's append: a pushed branch listed and fetched whole, a ref the
-//! reader may not read neither listed nor wanted, a name git cannot carry not lent, a store not held here not lent, and
-//! an SSH session the SSH site's services start over the daemon's lender.
+//! A-682's tests: the daemon's lender over A-662's map, driven as upload-pack's edges drive it, each on a real
+//! one-shard daemon whose repository took its objects through A-635's append: a pushed branch listed and fetched whole,
+//! a ref the reader may not read neither listed nor wanted, a name that is no git ref not lent, a store not held here
+//! not lent, and an SSH session the SSH site's services start over the daemon's lender.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -301,13 +301,15 @@ fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
   assert_eq!(observed, (everything, main, Some(unknown)));
 }
 
-/// A-682 (a name git's `check_refname_format` refuses is no ref protocol v2 can carry). Do: push a commit to a
-/// repository's `main` and make the branch `my topic`, a name with a space, at it; ask `ls-refs` as the owner. Expect:
-/// `HEAD` and `main` listed and the answer whole, the name git cannot carry left out rather than refusing the listing.
+/// A-682 (each register name one git ref by git's push's rule, A-654's `ref_of`). Do: push a commit to a repository's
+/// `main`, and make at it the branch `my topic`, a name git's `check_refname_format` refuses, and the branch
+/// `refs/heads/main`, a name whose ref is `main`'s; ask `ls-refs` as the owner. Expect: `HEAD` and `refs/heads/main`
+/// listed once each and the answer whole: neither name is a git ref, so neither refuses the listing (a name protocol v2
+/// cannot carry; one ref listed twice, which upload-pack's order check refuses).
 #[test]
-fn t_a682_a_name_git_cannot_carry_is_not_lent() {
+fn t_a682_a_name_that_is_no_git_ref_is_not_lent() {
   let (listed, head) = crate::daemon::audit_on_shard(|state| {
-    let (id, _, head) = pushed_repository(state, "spaced", &["my topic"]);
+    let (id, _, head) = pushed_repository(state, "spaced", &["my topic", "refs/heads/main"]);
     let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
     (listed, head)
   });

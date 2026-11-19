@@ -80,6 +80,8 @@ struct Fixture {
   locks: LockTable,
   /// The rules of [`AUTHZ`].
   authz: Authz,
+  /// The instant every call hands over, at which locks are judged: [`NOW`] unless a test moves it.
+  now: AprTime,
 }
 
 /// The fixtures' repository built.
@@ -90,6 +92,7 @@ fn fixture() -> Fixture {
     green,
     locks: LockTable::new(),
     authz: Authz::parse(AUTHZ, None, authz::Bounds::of(AUTHZ, None)).unwrap(),
+    now: NOW,
   }
 }
 
@@ -101,13 +104,14 @@ impl Fixture {
     self.sources_with(&self.locks)
   }
 
-  /// [`Fixture::sources`] with `locks` for the repository's lock table, judged at [`NOW`].
+  /// [`Fixture::sources`] with `locks` for the repository's lock table, judged at the fixture's
+  /// instant.
   fn sources_with<'f>(&'f self, locks: &'f LockTable) -> Sources<'f, Green> {
     Sources {
       index: &self.index,
       repository: &self.green,
       locks,
-      now: NOW,
+      now: self.now,
       policy: Policy {
         anonymous: authz::Access::Read,
         authenticated: authz::Access::Write,
@@ -886,8 +890,9 @@ const UPDATE_TRUNK_HOLDING_A_TXTS_LOCK: &[u8] =
   ( 52:opaquelocktoken:5b2b37fb-8a42-4f4a-9c0d-6a3e1f2d0c11 ) infinity ) ) \
   ( finish-report ( ) ) ";
 
-/// alice's lock on `/trunk/a.txt`, [`A_TXT_TOKEN`], made at the epoch and never expiring.
-fn a_txts_lock() -> LockEntry {
+/// alice's lock on `/trunk/a.txt`, [`A_TXT_TOKEN`], made at the epoch and expiring at `expires`
+/// (never, for none).
+fn a_txts_lock(expires: Option<AprTime>) -> LockEntry {
   LockEntry::Set(Lock {
     path: String::from("/trunk/a.txt"),
     token: LockToken::supplied(A_TXT_TOKEN).unwrap(),
@@ -895,7 +900,7 @@ fn a_txts_lock() -> LockEntry {
     comment: None,
     is_dav_comment: false,
     created: AprTime(0),
-    expires: None,
+    expires,
   })
 }
 
@@ -910,7 +915,7 @@ fn a_txts_lock() -> LockEntry {
 #[test]
 fn an_update_keeps_a_lock_the_lock_table_holds_and_takes_away_one_it_does_not() {
   let mut held = fixture();
-  held.locks.apply(&a_txts_lock()).unwrap();
+  held.locks.apply(&a_txts_lock(None)).unwrap();
   let mut connection = established();
   let kept = send_in_slices(&held, &mut connection, UPDATE_TRUNK_HOLDING_A_TXTS_LOCK);
   assert!(!kept.contains("svn:entry:lock-token"), "{kept}");
@@ -918,6 +923,47 @@ fn an_update_keeps_a_lock_the_lock_table_holds_and_takes_away_one_it_does_not() 
   let mut connection = established();
   let taken = send_in_slices(&none, &mut connection, UPDATE_TRUNK_HOLDING_A_TXTS_LOCK);
   assert!(taken.contains("20:svn:entry:lock-token ( )"), "{taken}");
+}
+
+/// The instant the expiring lock on `a.txt` expires in the expiry test: a second past the epoch.
+/// The lock binds at it and has lapsed a microsecond later (`lock.c` `lock_expired`: past it).
+/// Format: `apr_time_t`, microseconds since the Unix epoch.
+const A_TXT_EXPIRES: AprTime = AprTime(1_000_000);
+
+/// A microsecond past [`A_TXT_EXPIRES`].
+/// Format: `apr_time_t`, microseconds since the Unix epoch.
+const PAST_A_TXT_EXPIRY: AprTime = AprTime(1_000_001);
+
+/// What [`UPDATE_TRUNK_HOLDING_A_TXTS_LOCK`] makes the connection write, the repository's lock
+/// table holding `lock` (nothing for `None`) and every call handing over `now`.
+fn update_holding_a_txts_token(lock: Option<&LockEntry>, now: AprTime) -> String {
+  let mut fixture = fixture();
+  if let Some(lock) = lock {
+    fixture.locks.apply(lock).unwrap();
+  }
+  fixture.now = now;
+  let mut connection = established();
+  send_in_slices(&fixture, &mut connection, UPDATE_TRUNK_HOLDING_A_TXTS_LOCK)
+}
+
+/// A-656 continued (3), its lock's instant (`reporter.c`'s `svn_fs_get_lock`, which takes an
+/// expired lock for none; A-602's `LockTable::get_lock` at the caller's `Sources::now`): with
+/// alice's lock on `a.txt` expiring at [`A_TXT_EXPIRES`], update `/trunk` from a working copy
+/// holding its token, once with every call at the expiry and once a microsecond past it; expect
+/// at the expiry, byte for byte, the update a lock that never expires gets (`a.txt` left alone),
+/// and past it the update an empty lock table gets (its token taken away, `svn:entry:lock-token`
+/// with no value).
+#[test]
+fn an_update_keeps_a_lock_until_it_expires_and_takes_its_token_away_after() {
+  let expiring = a_txts_lock(Some(A_TXT_EXPIRES));
+  let at_expiry = update_holding_a_txts_token(Some(&expiring), A_TXT_EXPIRES);
+  let past_expiry = update_holding_a_txts_token(Some(&expiring), PAST_A_TXT_EXPIRY);
+  let held = update_holding_a_txts_token(Some(&a_txts_lock(None)), PAST_A_TXT_EXPIRY);
+  let none = update_holding_a_txts_token(None, A_TXT_EXPIRES);
+  assert!(held.contains("( close-edit ( ) ) "), "{held}");
+  assert!(!held.contains("svn:entry:lock-token"), "{held}");
+  assert!(none.contains("20:svn:entry:lock-token ( )"), "{none}");
+  assert_eq!((at_expiry, past_expiry), (held, none));
 }
 
 /// Sends `command` on an established connection a byte of room and a step a call, until the
