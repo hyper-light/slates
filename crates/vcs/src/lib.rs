@@ -6,7 +6,7 @@
 //! a hash of its own (git's SHA-1 or SHA-256 of `<type> <length>\0<content>`, Mercurial's SHA-1 of the sorted parents
 //! and the text, Subversion's MD5 and SHA-1 of a file's text). slates keeps every object's raw bytes once, as content
 //! named by BLAKE3 identity, whichever tool brought it, and gives each repository an index from its tool's id to the
-//! row it keeps for the object. Four parts:
+//! row it keeps for the object. Five parts:
 //!
 //! - [`content`]: the content store. Bytes by identity, one copy however many objects, tools and repositories name
 //!   them, held by count and freed with their last holder, within a budget the caller derives from its shard's memory
@@ -29,6 +29,12 @@
 //!   quarantine [B: git-receive-pack, "QUARANTINE ENVIRONMENT"]. An object whose bytes do not hash to the id the
 //!   client claimed, or that its tool refuses to name, is refused by kind, and nothing of its push is indexed; a
 //!   refused or abandoned push leaves nothing behind.
+//!
+//! - [`derived`]: derived data, one mechanism (A-645, A-647): every structure that is not a change (a version's map of
+//!   paths to contents, and the tool stores as they become types) is a pure function of a version's change and its
+//!   parents' values of the same type, kept immutable under the type's name and the version's, computed eagerly or
+//!   lazily by the type's own declaration, a unit at a time under the shard's slices. Its first type is
+//!   [`derived::paths`], a version's map of paths to contents.
 //!
 //! **What holds what.** A content is held once by each list entry, tail row and quarantined object that names it, and
 //! once by each stored table whose rows name it, however many indexes hold that table. A table is held once by each
@@ -58,6 +64,7 @@
 
 pub mod arrival;
 pub mod content;
+pub mod derived;
 pub mod index;
 pub mod rule;
 pub mod table;
@@ -66,7 +73,10 @@ pub use arrival::{
   AdmitRefused, Admitted, Arriving, CommitRefused, Naming, Quarantine, object_payload, object_row,
 };
 pub use content::{
-  ContentCounters, ContentId, ContentRefused, ContentStore, Form, Stored, Windows,
+  ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form, Stored, Windows,
+};
+pub use derived::{
+  Derivations, DerivedCounters, DerivedRefused, DerivedType, Fill, Graph, Mode, Progress, Read,
 };
 pub use index::{Batch, Index, IndexCounters, IndexRefused, Inserted, NewRow};
 pub use rule::Compaction;
