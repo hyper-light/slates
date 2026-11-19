@@ -42,10 +42,11 @@ UUID = "00000000-0000-4000-8000-0000000a0616"
 # The text of every line of a `lines:` file, and of an edited one.
 LINE = "line %d of a text long enough to need several windows\n"
 EDITED_LINE = "line %d, edited on the branch of history\n"
-# svnserve.conf: anonymous users read; alice writes; the authorization file hides /trunk/secret from all but alice.
+# svnserve.conf: anonymous users read; alice writes (a lock needs write); the authorization file hides /trunk/secret
+# from all but alice.
 SVNSERVE_CONF = "[general]\nanon-access = read\nauth-access = write\npassword-db = passwd\nauthz-db = authz\n"
 PASSWD = "[users]\nalice = secret\n"
-AUTHZ = "[/]\n* = r\n[/trunk/secret]\n* =\nalice = rw\n"
+AUTHZ = "[/]\n* = r\nalice = rw\n[/trunk/secret]\n* =\nalice = rw\n"
 
 
 def unescape(text):
