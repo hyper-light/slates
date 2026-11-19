@@ -835,7 +835,13 @@
 > built, version 4 (the copies' records, the copied trees' keys holding what their copy gave them, set by a restore with
 > no history, and the identity's running sum, which the restore takes), the anchor's layout 12 refusing every older
 > segment at adoption, so no version 3 checkpoint is ever read; the service's `merge.checkpoint.unavailable` now counts
-> only a floor folded past (see A-626 part 3). Owed from A-626: a rebase restating a copy (part 4); a restore that grafts
+> only a floor folded past (see A-626 part 3). A-626 part 4 (2026-11-19, g307): a rebase restating a copy built, the
+> deriver's `VolumeOp::Copy` composed against the copied tree `Green::base_for` puts at its destination, a file edited
+> beneath a copy restated as edits over what it brings, a work's logged journal holding a copy (`LoggedOp::Copy`, the
+> anchor's layout 13); a work's own shard composes no journal holding a copy (its fetched entries are a path's each,
+> never a tree), so the green's owner composes it, counted `merge.work.copy_composed_by_owner` (see A-626 part 4).
+> Owed from A-626: the work model resolving copies, so a rebased work's `Rebased::changed` and its reads and listing
+> see the copied files it left alone (they name only the files it changed today); a restore that grafts
 > a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
 > if measured worth it; the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
