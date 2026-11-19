@@ -179,7 +179,10 @@ impl fmt::Display for DbError {
         "a register entry naming {named} where the register holds {expected} next"
       ),
       Self::CheckFailed { index } => {
-        write!(f, "a register entry's check {index} does not hold at its position")
+        write!(
+          f,
+          "a register entry's check {index} does not hold at its position"
+        )
       }
       Self::StateChanged { index } => write!(
         f,

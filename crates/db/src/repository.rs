@@ -352,7 +352,10 @@ impl Repositories {
 
   /// The position the next entry of `repository`'s register takes (A-603); `None` for no such repository.
   pub fn position(&self, repository: RepositoryId) -> Option<u64> {
-    self.registers.get(&repository).map(|register| register.next)
+    self
+      .registers
+      .get(&repository)
+      .map(|register| register.next)
   }
 
   /// `repository`'s phase roots, each `(phase, node)`, in that order (A-603).
@@ -599,7 +602,10 @@ impl Repositories {
   /// Applies an entry the guard admitted (A-603), unconditionally: its members join, its names change and its state
   /// moves, in order, and it takes the register's next position; its versions are the partition's chains. An entry of a
   /// repository this partition does not hold is a corrupted history, refused before anything changes.
-  fn apply_entry(&mut self, entry: &crate::catalog::RepositoryEntry) -> Result<StateBytes, DbError> {
+  fn apply_entry(
+    &mut self,
+    entry: &crate::catalog::RepositoryEntry,
+  ) -> Result<StateBytes, DbError> {
     if !self.records.contains_key(&entry.repository)
       || !self.registers.contains_key(&entry.repository)
     {

@@ -6,9 +6,11 @@
 // proptest's strategy types carry `Arc` (D-8's harness exception).
 #![allow(clippy::disallowed_types)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
+use proptest::test_runner::{Config, TestRunner};
 use slates_anchor::{AnchorSegment, Geometry};
 use slates_machine::facts::Identity;
 
@@ -432,7 +434,8 @@ fn second_repository_with_root(partition: &mut Partition, root: VolumeId) -> Vol
 /// refuses its entry `StateChanged` naming its index, nothing applied, the version included; a partition rebuilt from
 /// its snapshot answers the same.
 #[test]
-fn the_repositorys_state_moves_with_its_push_or_alone_and_only_from_the_state_it_was_made_against() {
+fn the_repositorys_state_moves_with_its_push_or_alone_and_only_from_the_state_it_was_made_against()
+{
   let (mut partition, repo, [a, ..]) = three_branches(caps(ROOMY));
   let roots = |partition: &Partition| -> Vec<(u8, Vec<u8>)> {
     partition
@@ -458,7 +461,11 @@ fn the_repositorys_state_moves_with_its_push_or_alone_and_only_from_the_state_it
   phases.state = vec![root_removed(1, 1), root_added(1, 2), root_added(2, 1)];
   advance(&mut partition, phases).unwrap();
   assert_eq!(roots(&partition), vec![(1, vec![2; 20]), (2, vec![1; 20])]);
-  assert_eq!(chain(&partition, a).len(), 1, "a phase move alone moved a green");
+  assert_eq!(
+    chain(&partition, a).len(),
+    1,
+    "a phase move alone moved a green"
+  );
   assert_eq!(position(&partition, repo), Some(3));
   let before = partition.to_snapshot(0);
   for (state, index) in [
@@ -824,16 +831,14 @@ fn entry_step() -> impl Strategy<Value = EntryStep> {
     proptest::collection::vec(name, 0..3),
     proptest::collection::vec(state, 0..4),
   )
-    .prop_map(
-      |(skew, checks, joins, versions, names, state)| EntryStep {
-        skew,
-        checks,
-        joins,
-        versions,
-        names,
-        state,
-      },
-    )
+    .prop_map(|(skew, checks, joins, versions, names, state)| EntryStep {
+      skew,
+      checks,
+      joins,
+      versions,
+      names,
+      state,
+    })
 }
 
 fn step() -> impl Strategy<Value = Step> {
@@ -1269,11 +1274,63 @@ fn failed(error: impl std::fmt::Debug) -> TestCaseError {
   TestCaseError::fail(format!("{error:?}"))
 }
 
+/// What the generated histories met, across every case: the model test's non-vacuity counters, so a generator that
+/// stopped making the steps that matter fails rather than passes on trivial histories.
+#[derive(Debug, Default)]
+struct Census {
+  /// Accepted entries committing versions of two greens or more.
+  several_greens: u64,
+  /// Accepted entries committing two versions or more of one green (a stack landed whole).
+  stacked: u64,
+  /// Accepted entries moving the repository's state with versions.
+  state_with_versions: u64,
+  /// Accepted entries moving the repository's state alone.
+  state_alone: u64,
+  /// Accepted entries whose checks held.
+  checks_held: u64,
+  /// Entries refused by a check, by a state change, out of order, and by a rule of the lineage or the namespace.
+  check_failed: u64,
+  /// See [`Census::check_failed`].
+  state_changed: u64,
+  /// See [`Census::check_failed`].
+  out_of_order: u64,
+  /// See [`Census::check_failed`].
+  refused_by_rule: u64,
+  /// Destroys of a member, which take the register a position.
+  member_destroyed: u64,
+  /// Recoveries from a snapshot and the log after it.
+  recovered_from_snapshot: u64,
+  /// Recoveries from the log alone.
+  recovered_from_log: u64,
+}
+
+impl Census {
+  /// Counts an entry and what it was answered.
+  fn entry(&mut self, entry: &RepositoryEntry, answer: &Answer) {
+    let greens: BTreeSet<VolumeId> = entry.versions.iter().map(|version| version.green).collect();
+    match answer {
+      Answer::Ok => {
+        self.several_greens += u64::from(greens.len() > 1);
+        self.stacked += u64::from(greens.len() < entry.versions.len());
+        let moves_state = !entry.state.is_empty();
+        self.state_with_versions += u64::from(moves_state && !entry.versions.is_empty());
+        self.state_alone += u64::from(moves_state && entry.versions.is_empty());
+        self.checks_held += u64::from(!entry.checks.is_empty());
+      }
+      Answer::CheckFailed(_) => self.check_failed += 1,
+      Answer::StateChanged(_) => self.state_changed += 1,
+      Answer::OutOfOrder { .. } => self.out_of_order += 1,
+      _ => self.refused_by_rule += 1,
+    }
+  }
+}
+
 /// Runs a generated history through a database over its own segment: every answer and the whole repository equal the
 /// model's after every step; at every crash the database is dropped and recovered from the segment, and the recovered
 /// partition equals the live one whole.
 fn every_history_equals_the_rules_and_survives_every_crash(
   steps: &[Step],
+  census: &mut Census,
 ) -> Result<(), TestCaseError> {
   let mut seg = segment(&format!("slates-db-a603-{}", std::process::id()));
   let policy = SnapshotPolicy {
@@ -1310,11 +1367,14 @@ fn every_history_equals_the_rules_and_survives_every_crash(
       Step::Advance(made) => {
         let entry = model.build(repo, made);
         let expected = model.advance(&entry);
+        census.entry(&entry, &expected);
         let real = answer_of(db.mutate(&mut seg, &Op::RepositoryAdvanced { entry }, now_ns));
         prop_assert_eq!(real, expected, "step {:?}", step);
       }
       Step::Destroy { volume } => {
+        let member = model.is_member(*volume);
         let expected = model.destroy(*volume);
+        census.member_destroyed += u64::from(member && expected == Answer::Ok);
         let real = answer_of(db.mutate(
           &mut seg,
           &Op::VolumeDestroyed {
@@ -1337,34 +1397,65 @@ fn every_history_equals_the_rules_and_survives_every_crash(
         );
         prop_assert_eq!(recovered.next_seq(), seq);
         prop_assert!(!stats.torn, "a clean crash has no torn tail");
+        if stats.snapshot.is_some() {
+          census.recovered_from_snapshot += 1;
+        } else {
+          census.recovered_from_log += 1;
+        }
         db = recovered;
         db.set_policy(policy);
       }
     }
-    prop_assert_eq!(observed(db.partition(), repo), model.clone(), "after {:?}", step);
+    prop_assert_eq!(
+      observed(db.partition(), repo),
+      model.clone(),
+      "after {:?}",
+      step
+    );
   }
   Ok(())
 }
 
-proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
+/// A-603 (§4.17.1 shared piece 2; the pattern of `crates/db/src/partition.rs` and `crates/db/tests/model.rs`). Do: run
+/// generated histories over one repository through a database over a real anchor segment: entries joining members,
+/// committing versions of one or several greens, changing names and the default, moving phase roots and adding markers,
+/// with checks of heads and of names under prefixes, each item mostly right and sometimes made against another state;
+/// destroys of any volume; snapshots; and crashes, at each of which the database is dropped and recovered from its
+/// segment. Expect: every answer (accepted, or which refusal and what it names) and the whole repository after every
+/// step (its position, members in the order they joined, names, default, every green's head and chain, phase roots,
+/// markers in the order received) equal the design's rules kept over plain maps, where an entry is all or none by
+/// construction; every recovered partition equals the live one whole; and the census shows every kind of entry,
+/// refusal, destroy and recovery was met.
+#[test]
+fn every_history_of_entries_equals_the_rules_and_every_crash_recovers_it() {
+  let census = RefCell::new(Census::default());
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
     cases: slates_test_seeds::cases(128),
-    ..ProptestConfig::default()
-  }))]
-
-  /// A-603 (§4.17.1 shared piece 2; the pattern of `crates/db/src/partition.rs` and `crates/db/tests/model.rs`). Do:
-  /// run a generated history over one repository through a database over a real anchor segment: entries joining
-  /// members, committing versions of one or several greens, changing names and the default, moving phase roots and
-  /// adding markers, with checks of heads and of names under prefixes, each item mostly right and sometimes made against
-  /// another state; destroys of any volume; snapshots; and crashes, at each of which the database is dropped and
-  /// recovered from its segment. Expect: every answer (accepted, or which refusal and what it names) and the whole
-  /// repository after every step (its position, members in the order they joined, names, default, every green's head
-  /// and chain, phase roots, markers in the order received) equal the design's rules kept over plain maps, where an
-  /// entry is all or none by construction; and every recovered partition equals the live one whole.
-  #[test]
-  fn every_history_of_entries_equals_the_rules_and_every_crash_recovers_it(
-    steps in proptest::collection::vec(step(), 0..48),
-  ) {
-    every_history_equals_the_rules_and_survives_every_crash(&steps)?;
+    ..Config::default()
+  }));
+  let result = runner.run(&proptest::collection::vec(step(), 0..48), |steps| {
+    every_history_equals_the_rules_and_survives_every_crash(&steps, &mut census.borrow_mut())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
   }
+  let census = census.into_inner();
+  let met = [
+    census.several_greens,
+    census.stacked,
+    census.state_with_versions,
+    census.state_alone,
+    census.checks_held,
+    census.check_failed,
+    census.state_changed,
+    census.out_of_order,
+    census.refused_by_rule,
+    census.member_destroyed,
+    census.recovered_from_snapshot,
+    census.recovered_from_log,
+  ];
+  assert!(
+    met.iter().all(|&count| count > 0),
+    "a kind of step never met: {census:?}"
+  );
 }

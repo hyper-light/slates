@@ -863,8 +863,7 @@ mod tests {
     crate::daemon::audit_on_shard(|state| {
       let root = green_of(create(state, "tree", "main"));
       let repo = repository(state, "tree");
-      let position =
-        |state: &ShardState| state.db.partition().repositories().position(repo);
+      let position = |state: &ShardState| state.db.partition().repositories().position(repo);
       assert_eq!(position(state), Some(1), "the create is one entry");
       write(state, root, b"v1", 1);
       write(state, root, b"v2", 2);

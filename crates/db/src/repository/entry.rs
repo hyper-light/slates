@@ -203,17 +203,32 @@ pub(super) fn change_bytes(change: &StateChange) -> StateBytes {
 
 impl<'entry> Overlay<'entry> {
   /// Whether `green` is a member of `repository` at this point of the entry.
-  fn member_of(&self, repositories: &Repositories, repository: RepositoryId, green: VolumeId) -> bool {
+  fn member_of(
+    &self,
+    repositories: &Repositories,
+    repository: RepositoryId,
+    green: VolumeId,
+  ) -> bool {
     self
       .joined
       .get(&green)
       .map(|member| member.repository)
-      .or_else(|| repositories.members.get(&green).map(|member| member.repository))
+      .or_else(|| {
+        repositories
+          .members
+          .get(&green)
+          .map(|member| member.repository)
+      })
       == Some(repository)
   }
 
   /// The green `name` binds at this point of the entry.
-  fn binding(&self, repositories: &Repositories, repository: RepositoryId, name: &str) -> Option<VolumeId> {
+  fn binding(
+    &self,
+    repositories: &Repositories,
+    repository: RepositoryId,
+    name: &str,
+  ) -> Option<VolumeId> {
     match self.names.get(name) {
       Some(bound) => *bound,
       None => repositories.branch(repository, name),
