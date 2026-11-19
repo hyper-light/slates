@@ -146,6 +146,13 @@ impl Greens for Read<'_> {
       tree: self.served.tree,
     })
   }
+
+  /// The served branch is the default and has a head, so every create is made at its one version.
+  fn base_of_create(&self, _parent: Option<&ObjectId>) -> Option<(GreenRead<'_>, Version)> {
+    let read = self.read(MAIN)?;
+    let version = self.version_of(GREEN, &self.served.head)?;
+    Some((read, version))
+  }
 }
 
 /// A-642's appends over a model of per-green logs: each green's position, the names greens were
@@ -352,9 +359,10 @@ fn an_old_value_no_version_held_is_a_ref_that_moved() {
   }
 }
 
-/// A-620 part 2 (§4.17.1's namespace item 4: a create makes a new green). Do: create `topic` at a
-/// new commit. Expect: `ok`; one create appended under its name; its work, submitted to a new
-/// green, holding the client's bytes and head.
+/// A-620 part 2, A-654 (§4.17.1's namespace item 4: a create makes a new green, made at its first
+/// parent's version). Do: create `topic` at a new commit on the served head. Expect: `ok`; one
+/// create appended under its name, made at the served branch's version 1; its work, submitted to a
+/// green holding that version, holding the client's bytes and head.
 #[test]
 fn a_create_is_a_new_green_holding_the_clients_tree() {
   let mut served = Served::new();
@@ -367,16 +375,56 @@ fn a_create_is_a_new_green_holding_the_clients_tree() {
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
-  let named =
-    matches!(logs.appended.as_slice(), [Entry::Create { name, .. }] if name == b"refs/heads/topic");
+  let named = matches!(
+    logs.appended.as_slice(),
+    [Entry::Create { name, from: Some((GREEN, 1)), .. }] if name == b"refs/heads/topic"
+  );
   assert!(named, "{:?}", logs.appended);
-  let mut green = Green::new();
-  let verdict = green.submit(only_increment(&logs).unwrap());
+  let increment = only_increment(&logs).unwrap().clone();
+  let verdict = served.green.submit(&increment);
   assert!(
-    matches!(verdict, Verdict::Accepted { version: 1 }),
+    matches!(verdict, Verdict::Accepted { version: 2 }),
     "{verdict:?}"
   );
-  assert_holds(&green, b"topic\n", topic);
+  assert_holds(&served.green, b"topic\n", topic);
+}
+
+/// A-654 (main's ruling: an orphan create is made at the default branch's head, its work the whole
+/// difference against that head's tree). Do: create `orphan` at a root commit whose tree holds a
+/// file the served tree does not, and not the served one. Expect: `ok`; the create made at the
+/// served branch's version 1; its work, submitted to a green holding that version, leaving exactly
+/// the client's tree: the served file gone, the client's present, the head the client's.
+#[test]
+fn an_orphan_create_states_the_whole_difference_from_the_default_head() {
+  let mut served = Served::new();
+  let blob = id_of(Kind::Blob, b"other\n");
+  let tree = tree_bytes(&[(b"100644", b"other", blob)]);
+  let commit = commit_text(id_of(Kind::Tree, &tree), &[]);
+  let orphan = id_of(Kind::Commit, &commit);
+  let objects = vec![
+    (Kind::Blob, b"other\n".to_vec()),
+    (Kind::Tree, tree),
+    (Kind::Commit, commit),
+  ];
+  let bytes = push_of(
+    &[(zero(), orphan, b"refs/heads/orphan")],
+    &objects,
+    b" report-status",
+  );
+  let mut logs = Logs::served();
+  let received = pushed(&mut served, &bytes, &mut logs);
+  assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
+  let made_at = matches!(
+    logs.appended.as_slice(),
+    [Entry::Create { from: Some((GREEN, 1)), .. }]
+  );
+  assert!(made_at, "{:?}", logs.appended);
+  let increment = only_increment(&logs).unwrap().clone();
+  let verdict = served.green.submit(&increment);
+  assert!(matches!(verdict, Verdict::Accepted { version: 2 }), "{verdict:?}");
+  assert_eq!(served.green.content("file"), None);
+  assert_eq!(served.green.content("other"), Some(&b"other\n"[..]));
+  assert_eq!(served.green.xattr(ROOT, HEAD_ATTRIBUTE), Some(orphan.as_bytes()));
 }
 
 /// A-620 part 2 (§4.17.1 item 6: a tag is a green). Do: create `refs/tags/v1` at an annotated tag

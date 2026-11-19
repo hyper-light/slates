@@ -11,8 +11,12 @@
 //!   work is built;
 //! - its work is A-618's: the whole-file operations between that version's tree and the tree the
 //!   new value names, and the head operation (items 2 and 3);
-//! - a create's work is built over an empty green, which its append makes the ref's green; a create
-//!   of a ref that names a green is a ref that moved, as git's lock refuses a ref that exists;
+//! - a create is made at the version of a green its new value's first parent heads, where one can
+//!   still be branched from, else at the default branch's head ([`Greens::base_of_create`]), and its
+//!   work states the whole difference against that version's tree, so the new green holds exactly
+//!   the client's tree; in a repository whose default branch is unborn, over an empty green. A
+//!   create of a ref that names a green is a ref that moved, as git's lock refuses a ref that exists
+//!   (A-654, main's ruling of 2026-11-19);
 //! - a delete retires the green, its old value the green's head, or the ref moved.
 //!
 //! A ref's tree is its commit's, or the tree it names; a tag (a green too, §4.17.1 item 6) may name
@@ -97,6 +101,11 @@ pub trait Greens {
 
   /// The version of `green` whose head is `head`, if one held it (§4.17.1 item 1: a push's base).
   fn version_of(&self, green: u64, head: &ObjectId) -> Option<Version>;
+
+  /// The green and version a create whose new value's first parent is `parent` is made at (module
+  /// docs): the version whose head is `parent` where one can still be branched from; else the
+  /// default branch's head; none while the default branch is unborn.
+  fn base_of_create(&self, parent: Option<&ObjectId>) -> Option<(GreenRead<'_>, Version)>;
 }
 
 /// What a command's verdict carries to its append: one entry for a green's own log (A-642).
@@ -115,7 +124,9 @@ pub enum Entry {
   Create {
     /// The ref.
     name: Vec<u8>,
-    /// Its first work, built over an empty green.
+    /// The green and version it is made at ([`Greens::base_of_create`]); none to make it empty.
+    from: Option<(u64, u64)>,
+    /// Its first work, built against that version, or over an empty green.
     increment: Increment,
   },
   /// The green retired (§4.17.1: a deleted branch's chain kept for its retention), only while it
@@ -217,14 +228,41 @@ where
     })
   }
 
-  /// A create's work, over an empty green.
+  /// A create's work, against the version it is made at, or over an empty green (module docs).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
-    let empty = Green::new();
-    let increment = self.work(command, pushed, &empty, None)?;
+    let parent = self.first_parent(&command.new, pushed);
+    let (from, increment) = match self.greens.base_of_create(parent.as_ref()) {
+      Some((read, version)) => (
+        Some((read.id, version.number)),
+        self.work(command, pushed, read.green, Some(version))?,
+      ),
+      None => (None, self.work(command, pushed, &Green::new(), None)?),
+    };
     Ok(Entry::Create {
       name: command.name.clone(),
+      from,
       increment,
     })
+  }
+
+  /// The first parent of the commit `head` names, through an annotated tag: none for a root commit,
+  /// a tree, or an object neither the push nor the repository holds.
+  fn first_parent(&self, head: &ObjectId, pushed: &Pushed<'_>) -> Option<ObjectId> {
+    let format = head.format();
+    let mut scratch = Admission::new(u64::MAX);
+    let (kind, content) = self.object(head, pushed)?;
+    let target = match kind {
+      Kind::Tag => Tag::parse(content, &mut scratch).ok()?.object(format)?,
+      _ => *head,
+    };
+    let (kind, content) = self.object(&target, pushed)?;
+    if kind != Kind::Commit {
+      return None;
+    }
+    Commit::parse(content, &mut scratch)
+      .ok()?
+      .parents(format)
+      .next()
   }
 
   /// A delete: the green retired, its old value its head.
