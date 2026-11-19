@@ -503,6 +503,8 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("hostile-locations"), 0),
     (transcript!("get-file"), 18),
     (transcript!("hostile-get-file"), 0),
+    (transcript!("list"), 16),
+    (transcript!("hostile-list"), 0),
     (transcript!("unknown-command"), 2),
     (transcript!("hostile-malformed"), 0),
   ];
@@ -524,10 +526,11 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-proplist-inherited"), 4),
     (transcript!("svn-cat"), 4),
     (transcript!("svn-cat-big"), 3),
+    (transcript!("svn-ls"), 2),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
-      replay(name, client, server, &["get-lock"]),
+      replay(name, client, server, &["get-lock", "get-locks"]),
       commands,
       "{name}"
     );
@@ -540,6 +543,9 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "list",
+    "hostile-list",
+    "svn-ls",
     "get-file",
     "hostile-get-file",
     "svn-cat",
@@ -864,6 +870,117 @@ fn get_file_parameters_are_read_as_svn_ra_svn_parse_tuple_reads_them() {
   }
 }
 
+/// The fixture's green with one revision's `svn:date` replaced by a value that does not parse.
+struct Garbled<'green> {
+  /// The green.
+  green: &'green Green,
+  /// The revision whose date is garbled.
+  revision: Revision,
+}
+
+impl Contents for Garbled<'_> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.green.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.green.mergeinfo_value(properties)
+  }
+}
+
+impl Repository for Garbled<'_> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    let properties = self.green.revision_properties(revision)?;
+    if revision != self.revision {
+      return Some(properties);
+    }
+    let garbled: &[u8] = b"not a date";
+    Some(
+      properties
+        .into_iter()
+        .map(|(name, value)| (name, if name == b"svn:date" { garbled } else { value }))
+        .collect(),
+    )
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.properties(identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    self.green.text(identity, offset)
+  }
+}
+
+/// A-613 part 2 (`list`): a listing streams a slice at a time, each slice ending once what it wrote and the entries it
+/// visited reach the room: the same bytes in a room of one byte as in one past the answer.
+#[test]
+fn a_listing_streams_a_slice_at_a_time_in_the_room_given() {
+  let fixture = Fixture::new();
+  let command = b"( list ( 0: ( ) infinity ( kind size ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert_eq!(wide_slices, 1);
+  let dirents = items(&wide).len().saturating_sub(3);
+  assert!(narrow_slices > dirents, "{narrow_slices} slices, {dirents} dirents");
+}
+
+/// A-613 part 2 (`list`): `fill_dirent` parses each created revision's date, and one that does not parse refuses the
+/// listing after the dirents before it, with `done` then "Bogus date"; with no field beyond the kind asked no date is
+/// read and the listing is whole.
+#[test]
+fn a_date_that_does_not_parse_refuses_the_listing_after_done() {
+  let fixture = Fixture::new();
+  let garbled = Garbled {
+    green: &fixture.green,
+    revision: 8,
+  };
+  let command = b"( list ( 5:trunk ( 11 ) immediates ( kind time ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &garbled, command, usize::MAX);
+  let out = String::from_utf8(out).unwrap();
+  assert!(
+    out.ends_with(
+      "( 6:/trunk dir ( ) ( ) ( ) ( 27:2026-01-10T10:00:00.000000Z ) ( ) ) done \
+       ( failure ( ( 125003 10:Bogus date 0: 0 ) ) ) "
+    ),
+    "{out}"
+  );
+  let command = b"( list ( 5:trunk ( 11 ) immediates ( kind ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &garbled, command, usize::MAX);
+  assert!(out.ends_with(b"( 16:/trunk/empty.txt file ) done ( success ( ) ) "));
+}
+
+/// A-613 part 2 (`list`): its parameters as `svn_ra_svn__parse_tuple(params, "c(?r)w?l?l")`, `parse_dirent_fields`
+/// and the pattern loop read them: no depth word, a depth that is a string, fields or patterns that are no list, a
+/// field that is no word and a pattern that is no string each end the connection with nothing written; a pattern is
+/// read to its first NUL.
+#[test]
+fn list_parameters_are_read_as_svnserve_reads_them() {
+  for malformed in [
+    b"( list ( 5:trunk ( ) ) ) ".as_slice(),
+    b"( list ( 5:trunk ( ) 8:infinity ) ) ",
+    b"( list ( 5:trunk ( ) infinity kind ) ) ",
+    b"( list ( 5:trunk ( ) infinity ( kind ) 3:a.* ) ) ",
+    b"( list ( 5:trunk ( ) infinity ( kind ) ( pattern ) ) ) ",
+    b"( list ( 5:trunk ( ) infinity ( 4:kind ) ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let fixture = Fixture::new();
+  let command = b"( list ( 5:trunk ( ) immediates ( kind ) ( 7:read*\0x ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    out,
+    b"( success ( ( ) 0: ) ) ( 17:/trunk/README.TXT file ) done ( success ( ) ) "
+  );
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -888,6 +1005,8 @@ fn hostile_param() -> impl Strategy<Value = String> {
     "27:2026-01-03T03:00:00.000000Z ",
     "11:trunk/a.txt ",
     "false ",
+    "infinity ",
+    "( kind size ) ",
   ]);
   (0_u8..3, shapes, any::<u64>(), "[a-z/.\\x00]{0,12}").prop_map(|(pick, shape, number, text)| {
     match pick {
@@ -907,7 +1026,7 @@ proptest! {
   fn hostile_commands_are_answered_or_end_the_connection(
     name in prop::sample::select(vec![
       "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
-      "get-mergeinfo", "get-iprops", "get-file", "no-such-command",
+      "get-mergeinfo", "get-iprops", "get-file", "list", "no-such-command",
     ]),
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {
@@ -932,7 +1051,7 @@ proptest! {
         while stream.resume(&fixture.index, &fixture.green, &session, &mut out, 1)
           .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))? == Progress::More {
           slices += 1;
-          prop_assert!(slices < 64, "a stream that does not end");
+          prop_assert!(slices < 1_024, "a stream that does not end");
         }
         prop_assert!(items(&out).len() >= 4);
       }
