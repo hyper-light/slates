@@ -253,6 +253,9 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
         self.on_transport_event(event)?;
         continue;
       }
+      if self.transport.is_closed() {
+        break;
+      }
       let rest = input.get(consumed..).unwrap_or(&[]);
       if rest.is_empty() {
         break;
@@ -440,9 +443,10 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
     Ok(())
   }
 
-  /// Whether reading must wait for the caller.
+  /// Whether reading must wait for the caller. A closed transport still gives up the event it last raised, such as the
+  /// client's disconnect, so it is checked after the transport's event is taken.
   fn blocked(&self) -> bool {
-    self.pending.is_some() || self.outbox_bytes >= self.outbox_cap || self.transport.is_closed()
+    self.pending.is_some() || self.outbox_bytes >= self.outbox_cap
   }
 
   /// Takes and handles the transport's waiting event; whether there was one.
