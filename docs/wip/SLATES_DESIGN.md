@@ -43060,6 +43060,13 @@ Applied in the same change to:
     each log, and an atomic record whole or not at all, held to the register's invariants (NoLoss, Agreement,
     StaleNeverCommits) by a model test that crashes and recovers at random points.
   - Subversion is unaffected: a Subversion repository is one green (§4.17.4), so it keeps one ordered log.
+- **Lock-free, server-side merging (Ada, 2026-11-19: slates works primarily like EdenFS and Sapling, offering git,
+  Mercurial and Subversion compatibility; the reference design's principle is server-side lock-free incremental
+  commits with no global references).** A work submitted to a green that moved past its base is judged and rebased by
+  the verdict on the owner shard (accept, identical or conflict). It is never refused for its older base, so a hot
+  green gives no client a compare-and-swap retry loop. Stock clients bound this where their own semantics do: git
+  refuses a push to a moved branch as a non-fast-forward, so a git push is rebased server-side only where the
+  branch's policy turns pushrebase on; Mercurial's pushrebase takes it as is.
 - **Owed.** A-603's entry rebuilt to this shape, and its fleet half on each green's log (g261, with A-635 and A-636).
   The pushes coding against it (receive-pack A-620, Mercurial's unbundle A-641, LFS locks A-629) keep their traits.
 - **Applied in the same change to:** §4.17.1 shared piece 2's text; GAPS' §4.17 entry.
