@@ -9649,8 +9649,10 @@ fn map_rebase(
         verdict: 0,
       })
     }
-    // A base below the green's checkpoint (W3): unknown, as the submit answers it.
-    slates_merge::engine::Rebased::BaseUnavailable { base, .. } => {
+    // A base below the green's checkpoint (W3), or past its head, a version it never made (A-658): unknown, as the
+    // submit answers it.
+    slates_merge::engine::Rebased::BaseUnavailable { base, .. }
+    | slates_merge::engine::Rebased::BaseAhead { base, .. } => {
       RebaseAnswer::Reply(refused(Refusal::UnknownBase {
         green: to_wire_volume(green_id),
         version: base,

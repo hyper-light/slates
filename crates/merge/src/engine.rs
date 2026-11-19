@@ -273,6 +273,113 @@ pub struct HeadMoved {
   pub head: u64,
 }
 
+/// A verdict computed anywhere (A-658; A-645 "Merges computed anywhere, committed by position"): what
+/// [`Green::compute`] reached for an increment at the head of the green that computed it. It holds nothing of that
+/// green: the increment's identity and base, the head it was computed against (the position the green's owner checks
+/// before it appends, A-635's rule), and the verdict, each accepted effect with the bytes it sets and what the chain
+/// records of it. Every version up to that head is immutable and every copy of the green holds it alike, so the owner
+/// or any copy rebuilt from the chain's entries (a holder's replica) computes the same result and moves it to the owner.
+pub struct Computed {
+  /// The increment it judged.
+  id: [u8; 32],
+  /// The increment's base.
+  base: u64,
+  /// The head it was computed against: the position the owner checks.
+  at: u64,
+  /// What the verdict reached there.
+  reached: Reached,
+}
+
+/// What a computed verdict reached ([`Computed`]).
+enum Reached {
+  /// The green that computed it had accepted the same increment before, as this version.
+  Before(u64),
+  /// Accepted: the effects in the order a commit applies them, and what the chain records of each.
+  Accepted {
+    /// The effects.
+    effects: Vec<Effect>,
+    /// What the chain records of them.
+    applied: Vec<crate::chain_entry::Applied>,
+  },
+  /// The conflict windows.
+  Conflict(Vec<ConflictWindow>),
+}
+
+impl Computed {
+  /// The increment it judged.
+  pub fn id(&self) -> [u8; 32] {
+    self.id
+  }
+
+  /// The increment's base.
+  pub fn base(&self) -> u64 {
+    self.base
+  }
+
+  /// The head it was computed against: the position the owner checks before it appends.
+  pub fn at(&self) -> u64 {
+    self.at
+  }
+
+  /// The version the green that computed it had accepted the same increment as, if it had.
+  pub fn accepted_before(&self) -> Option<u64> {
+    match &self.reached {
+      Reached::Before(version) => Some(*version),
+      Reached::Accepted { .. } | Reached::Conflict(_) => None,
+    }
+  }
+
+  /// What the chain would record of the version it makes, when it accepts.
+  pub fn applied(&self) -> Option<&[crate::chain_entry::Applied]> {
+    match &self.reached {
+      Reached::Accepted { applied, .. } => Some(applied),
+      Reached::Before(_) | Reached::Conflict(_) => None,
+    }
+  }
+
+  /// The conflict windows, when it conflicts.
+  pub fn windows(&self) -> Option<&[ConflictWindow]> {
+    match &self.reached {
+      Reached::Conflict(windows) => Some(windows),
+      Reached::Before(_) | Reached::Accepted { .. } => None,
+    }
+  }
+}
+
+impl core::fmt::Debug for Computed {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Computed")
+      .field("id", &self.id)
+      .field("base", &self.base)
+      .field("at", &self.at)
+      .field("accepted_before", &self.accepted_before())
+      .field("applied", &self.applied())
+      .field("windows", &self.windows())
+      .finish()
+  }
+}
+
+/// Why a green computes no verdict for an increment ([`Green::compute`], A-658), typed: it does not hold every version
+/// the increment is judged over. Neither is a verdict; the caller computes on a green that holds them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComputeRefused {
+  /// The base is below the version this green was restored at from a checkpoint: the deltas it would be mapped through
+  /// are folded away.
+  BaseUnavailable {
+    /// The increment's base.
+    base: u64,
+    /// The oldest base this green judges.
+    floor: u64,
+  },
+  /// The base is past this green's head: this copy has not reached the version the work was based on.
+  BaseAhead {
+    /// The increment's base.
+    base: u64,
+    /// This green's head.
+    head: u64,
+  },
+}
+
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
 /// a rebase; only the work moves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,6 +410,14 @@ pub enum Rebased {
     base: u64,
     /// The oldest base the green still maps.
     floor: u64,
+  },
+  /// The work's base is past the green's head (A-658): a copy of the green that has not reached the work's base
+  /// rebases nothing, never onto an older version; on the owner it is a version the green never made.
+  BaseAhead {
+    /// The work's base.
+    base: u64,
+    /// The green's head.
+    head: u64,
   },
 }
 
@@ -4100,6 +4215,14 @@ impl Green {
     }
   }
 
+  /// The verdict of `inc` at this green's head, computed anywhere (A-658). Red-first stub: refuses everything.
+  pub fn compute(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
+    Err(ComputeRefused::BaseAhead {
+      base: inc.base,
+      head: self.head(),
+    })
+  }
+
   /// Judges an increment and holds the verdict (A-635): what a submit decides, nothing of it applied to the green but the
   /// rejected-result cache's entry for a conflict, which a submit keeps too. An increment accepted before is answered
   /// its version; a conflict the cache holds, its windows; a base below the checkpoint, unavailable; anything else is
@@ -4927,6 +5050,8 @@ pub use reanchor::{ReanchorRefused, Reanchored};
 
 #[cfg(test)]
 mod judge_tests;
+#[cfg(test)]
+mod compute_tests;
 #[cfg(test)]
 mod node_exclusive_tests;
 
