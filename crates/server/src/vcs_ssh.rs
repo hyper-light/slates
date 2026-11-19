@@ -60,10 +60,11 @@
 //! (`slates_ssh::keylife::key_time_limit_ns`). Only a connection that ended as its client ended it is a sample.
 //!
 //! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the host key's keeping, an edge state
-//! kept on every shard); the services still refused as not served, each until it lands (git's upload-pack until a
-//! lender holds A-662's stores, A-682; Mercurial's `serve --stdio`, A-679; Subversion's tunnel, §4.17.4 piece 12), git's
-//! receive-pack running A-654 part 2's driver already (`receive`, A-683); Subversion's tunnel moved to the shard of the
-//! repository its greeting names; the live `git clone` and `git push` over SSH (main's runs).
+//! kept on every shard, the site's services over A-682's store lender and the shard's state); the services still
+//! refused as not served, each until it lands (Mercurial's `serve --stdio`, A-679; Subversion's tunnel, §4.17.4 piece
+//! 12), git's upload-pack (`git`, its store lent by A-682's `ShardStores`) and receive-pack (`receive`, A-654 part 2's
+//! driver, A-683) running already; Subversion's tunnel moved to the shard of the repository its greeting names; the
+//! live `git clone` and `git push` over SSH (main's runs).
 
 mod git;
 mod receive;

@@ -9,10 +9,8 @@ use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
 use slates_db::catalog::{Principal, RepositoryId};
-use slates_git::PastAdmission;
 use slates_git::http::Version;
 use slates_git::pktline::{self, Packet};
-use slates_git::upload::{PackPlan, PackRefused, PackSource, Served};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
@@ -26,10 +24,11 @@ use crate::git_push::tests::{chain, files, git_repository, gits_report, owner, t
 use crate::state::ShardState;
 use crate::vcs_http::Bounds;
 use crate::vcs_http::daemon_edge::ShardRepositories;
-use crate::vcs_http::git::{ShardLender, StoreLender, ThisShard};
+use crate::vcs_http::git::{ShardLender, ThisShard};
 use crate::vcs_ssh::receive::ReceiveCommand;
 use crate::vcs_ssh::site::{Command, GIT_DIE_STATUS, Refused, ToolServices, ToolSite};
 use crate::vcs_ssh::{EdgeState, serve};
+use crate::vcs_store::upload::ShardStores;
 
 /// Shape: the room each push is admitted: far past the fixture's bytes and what reading it builds (the driver's tests'
 /// room).
@@ -68,67 +67,14 @@ impl KeyHolders for OwnerKeys {
   }
 }
 
-/// What [`NoPacks`] answers if asked: no session of these tests fetches.
-fn no_pack() -> PackRefused {
-  PackRefused::PastAdmission(PastAdmission { asked: 1, left: 0 })
-}
-
-/// A pack source no session of these tests begins.
-#[derive(Clone, Copy, Debug)]
-struct NoPacks;
-
-impl PackSource for NoPacks {
-  type Pack = ();
-
-  fn begin(
-    &mut self,
-    _served: &Served<'_>,
-    _plan: &PackPlan<'_>,
-    _admission: &mut slates_git::Admission,
-  ) -> Result<(), PackRefused> {
-    Err(no_pack())
-  }
-
-  fn write(
-    &mut self,
-    _served: &Served<'_>,
-    _pack: &mut (),
-    _admission: &mut slates_git::Admission,
-    _out: &mut Vec<u8>,
-    _room: usize,
-  ) -> Result<bool, PackRefused> {
-    Err(no_pack())
-  }
-}
-
-/// Upload-pack's lender holding no store, as none does until A-662's lender lands: receive-pack needs none.
-#[derive(Clone, Copy, Debug)]
-struct HoldsNone;
-
-impl StoreLender for HoldsNone {
-  type Packs = NoPacks;
-
-  fn holds(&self, _id: RepositoryId) -> bool {
-    false
-  }
-
-  fn lend<R>(
-    &mut self,
-    _id: RepositoryId,
-    _step: impl FnOnce(&Served<'_>, &mut NoPacks) -> R,
-  ) -> Option<R> {
-    None
-  }
-}
-
 /// The edge's production site: the owner's key, repositories found on the shard's own partition as the HTTP edge finds
-/// them, and the services the server runs, each push lent the state of the shard the connection runs on as the daemon
-/// lends it ([`ThisShard`]) and admitted [`ROOM`].
-fn site() -> ToolSite<OwnerKeys, ShardRepositories, ToolServices<HoldsNone, ThisShard>> {
+/// them, and the services the daemon's sites run: upload-pack lent each store from A-662's map ([`ShardStores`], A-682),
+/// and each push lent the state of the shard the connection runs on ([`ThisShard`]) and admitted [`ROOM`].
+fn site() -> ToolSite<OwnerKeys, ShardRepositories, ToolServices<ShardStores, ThisShard>> {
   ToolSite::new(
     OwnerKeys,
     ShardRepositories,
-    ToolServices::new(HoldsNone, ThisShard, ROOM),
+    ToolServices::new(ShardStores, ThisShard, ROOM),
   )
 }
 
