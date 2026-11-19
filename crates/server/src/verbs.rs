@@ -11917,6 +11917,11 @@ fn resize(
   // settle the byte reservation the same way.
   // Never refused: `new_allowance` is at least the live count, the setter's one refusal. Counted all the same.
   let allowed = slot.volume.set_inode_allowance(new_allowance);
+  // The entry allowance moves with the policy as the inode allowance does (§4.2), never below the entries the volume
+  // holds, as a create's admission derives it and a restart floors it. It reserves nothing. Before A-572 a resize left
+  // it at the share of the size the volume was made with.
+  let entries = entry_allowance(size).max(slot.volume.entry_usage().0);
+  let entries_allowed = slot.volume.set_entry_allowance(entries);
   slot.version_credit = settle_resized_credit(
     &mut state.store.versions,
     &slot.volume,
@@ -11935,6 +11940,7 @@ fn resize(
     }
   }
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, entries_allowed);
   let now = state.clock.monotonic_ns();
   if let Err(e) = state.db.mutate(
     &mut state.segment,
