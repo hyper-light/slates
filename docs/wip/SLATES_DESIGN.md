@@ -13152,6 +13152,10 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
   that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
   and bytes as two contents of its row.
+- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, and an object row's `O` and the node
+  (`HgIndex::commit_objects`, a push's quarantine committed tagged), so no key of one kind equals one of another
+  whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long, as a node
+  is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on these rows.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
