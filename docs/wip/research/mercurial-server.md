@@ -875,3 +875,26 @@ server's directory are the ones its reviewed expected-failure list starts from.
   incoming: the same three (its `getbundle` 338 bytes) and `listkeys` of the phases. The client sent
   `X-HgProto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull` with every command after `capabilities`, and its
   arguments in `X-HgArg-1` alone, each request by `GET`.
+
+## 26. Found while building the served view (A-680 part 1, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`, CPython 3.12; stock 7.2's `served` filter over `fixtures/state`'s two repositories, `fixtures/state/make-served-fixtures.sh`)
+
+- **`served` is two filters joined** (`repoview.computeunserved`): the revisions `visible` hides and those
+  `served.hidden` hides (`computesecret`: the `remotehiddenphases`, secret 2, archived 32 and internal 96). `hg serve`
+  answers every peer from it (`wireprotov1server.getdispatchrepo`, `server.view` at its default).
+- **`visible`** (`computehidden`): `hideablerevs` (the obsolete revisions and those of the `localhiddenphases`, internal
+  and archived) less `pinnedrevs` (the working directory's parents, every bookmark's changeset, the local tags' and,
+  while files are unresolved, an active merge's two sides); then `_revealancestors` from every revision of a
+  `mutablephases` phase (draft, secret, archived, internal) that is not hidden: each hidden parent leaves the hidden set
+  and is walked in turn, on a stack, so a chain of hidden ancestors is revealed through hidden ones. A public revision
+  reveals nothing (it is not mutable) and needs nothing revealed (its ancestors are public, never hideable).
+- **Obsolete** (`obsolete._computeobsoleteset`): a revision of the `relevant_mutable_phases`, draft and secret, whose
+  node is a key of `obsstore.successors`, which keys every marker by its predecessor, a prune's too. An archived or
+  internal revision is hideable by its phase alone.
+- **Phase roots** (`phases._readroots`): a root whose node the changelog lacks is dropped (`removing unknown node %s
+  from %i-phase boundary`) and the roots marked dirty, never refused.
+- **The captures.** Each repository made again from its committed store, `.hg/requires` and `.hg/bookmarks` (its nodes
+  the fixtures' own) and opened with evolution on and publishing off: `served` keeps `c3daaa7` (public), `baa2576` and
+  `b252f2a` (draft), and leaves out `a1286ad` (hidden: amended into `b252f2a`, no bookmark on it, no visible descendant)
+  and `4ed9423` (secret); `heads` and `branchmap` answer `b252f2a` alone; `listkeys bookmarks` answers `one` and `two`,
+  never `secret-one`, whose changeset is secret; `listkeys phases` answers the one draft root, `baa2576`. Both
+  repositories (bookmarks in `.hg/bookmarks`, and in the store) answer alike.

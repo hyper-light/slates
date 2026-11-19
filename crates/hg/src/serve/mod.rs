@@ -17,7 +17,9 @@
 //!
 //! **The served view.** A [`Repository`] numbers the changesets it serves `0` to `count() - 1`, every parent before
 //! its child, as a revlog numbers them; it holds no secret and no hidden changeset (§4.17.3 "Pull and clone" item 2),
-//! and since a visible changeset's ancestors are visible, that numbering is the served view's own.
+//! and since a visible changeset's ancestors are visible, that numbering is the served view's own. [`indexed`] makes
+//! one, with its [`getbundle::Store`], from a repository's index, its content store and its register's state, held to
+//! 7.2's `served` filter (A-680 part 1).
 //!
 //! **Hostile input and work (§4.9).** A client's node lists are read within the request's [`Admission`], each item
 //! exactly 40 hexadecimal digits (7.2's `bin` would take an empty item between two spaces, and answer it unknown), the
@@ -28,6 +30,7 @@
 pub mod discovery;
 pub mod getbundle;
 pub mod http;
+pub mod indexed;
 pub mod pull;
 pub mod session;
 pub mod stdio;

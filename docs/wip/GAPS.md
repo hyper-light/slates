@@ -763,14 +763,14 @@
 > history at once. Found beside it: `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`
 > fails on main (8b3297fe0) on the Mac Studio, 3 of 3 alone.
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
-> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
-> objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
-> 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619), the session over a byte channel (A-650 part 2) and HTTP version 1 (A-650 part 1); piece 5's first part,
-> a push's bundle read, its race
-> checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
-> for A-598 and A-619, g301 for A-641, g303 for A-650).**
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads (A-545)
+> and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its objects and
+> nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part 1) and an
+> existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1 (A-619), the
+> session over a byte channel (A-650 part 2), HTTP version 1 (A-650 part 1) and the served view over a repository's
+> index (A-680 part 1); piece 5's first part, a push's bundle read, its race checks and its reply (A-641 part 1)
+> (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079 for A-598 and A-619, g301 for A-641,
+> g303 for A-650 and A-680).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -928,6 +928,16 @@
 > recorded first; a resend takes the held route over; every refusal by kind (`ImportFault`, the API's
 > `Invalid::Import`); proven on macOS arm64 (Mac Studio, kiln r110): the verb's 4 tests (red first), `vcs_store::` 18 of
 > 18, `wire_order` 2 of 2, `slates-api`'s `error` tests 12 of 12 with the refusal's typing.
+> **Built (A-680 part 1):** the served view over a repository's index (`serve::indexed`): its changelog rows, the
+> content store and its register's state (phase roots, bookmarks, publishing) served as 7.2's `served` filter serves
+> them (hidden: obsolete, archived or internal, pinned by no bookmark, and revealed by no visible descendant that is not
+> public; then secret, archived and internal left out), numbered densely, walked from the first changeset that is not
+> public, each list charged to the request's room; texts lent in place where the store holds one window, else copied
+> within the room (`getbundle::Store` lends that way, its `file_node` gone: a path's file node found in its manifest's
+> text by halving, `manifest::find`); a root the changelog lacks dropped and counted. `slates-hg --lib serve::
+> manifest::` 61 of 61 (red first, 6 of the view's 9 failing against a stub), `slates-server --lib vcs_http::hg` 7 of 7
+> and fmt clean on macOS arm64 (Mac Studio, kiln r256, 2026-11-19), the two `fixtures/state` repositories held to stock
+> 7.2's `served` answers; the other platforms owed.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -944,7 +954,8 @@
 > query where `414` was expected and its other three statuses as expected; then `slates-server --lib vcs_http::hg` 7 of
 > 7, `slates-hg --lib http` 22 of 22 and fmt clean on macOS arm64 (Mac Studio, kiln r212); the other platforms owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
-> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site (g303, running) and that loop
+> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site with the served view over
+> them (A-680 part 2, g303, running) and that loop
 > (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
@@ -954,7 +965,8 @@
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the served view over them (with A-650's site);
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the site's use of the served view over them
+> (A-680 part 2; the view is built, A-680 part 1);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
