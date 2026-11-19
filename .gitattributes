@@ -38,3 +38,5 @@ vendor/**       !text !eol
 # standing between a golden vector and its bytes.
 *.png           -text
 *.bin           -text
+# Mercurial bundles stock `hg` 7.2 wrote: slates-hg's golden vectors (A-514).
+crates/hg/fixtures/*.hg -text

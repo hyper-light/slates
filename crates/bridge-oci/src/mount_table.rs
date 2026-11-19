@@ -4,6 +4,11 @@
 //! for the kernel's cached table; Linux reads `/proc/self/mountinfo`, the kernel's own table, through
 //! a read-only descriptor; every other platform is refused typed. The parser of the Linux text is pure
 //! and tested on every host.
+//!
+//! The table's changes come through a second seam, [`UnmountWatch`] (A-511): a descriptor that reads ready once the
+//! kernel has posted that a filesystem left the table, so a daemon learns of an unmount by the kernel's own event and
+//! reads the table once for it, never polling it and never trusting a protocol's hint (an NFS `UMNT` is one any local
+//! process can send, and the kernel sends none at a forced unmount).
 
 use std::fmt;
 
@@ -152,9 +157,176 @@ pub fn mount_identity_at(_path: &str) -> Result<MountIdentity, MountTableError> 
   })
 }
 
+/// A watch of the kernel's unmounts (A-511, §4.6): a descriptor that reads ready once the kernel has posted that a
+/// filesystem left its mount table. A shard's readiness wait registers [`UnmountWatch::descriptor`]
+/// (`slates_rt::readiness::readable`, A-149), and [`UnmountWatch::take`] empties what was posted, so the descriptor
+/// reads ready again only at the next change. Which filesystem left is not said: the caller reads the table once
+/// ([`mount_table`]) and judges which of its mounts are gone. One seam, paired per platform:
+///
+/// - **macOS.** A kqueue holding one `EVFILT_FS` filter (`sys/event.h`) on `VQ_UNMOUNT`, "filesystem has left"
+///   (`sys/mount.h`). Apple's kqueue(2) does not document the filter (it lists `EVFILT_READ` through `EVFILT_TIMER`),
+///   so its behaviour is read from XNU's source (`bsd/vfs/vfs_subr.c`, read 2026-11-18): the filter watches the
+///   whole system, not a descriptor (`filt_fsattach` hangs it on the one list `vfs_event_signal` posts to); it sees
+///   only events after it is attached and clears itself once read (`EV_CLEAR`, set by the attach); its flag word
+///   picks the events it fires on (`filt_fsevent`). XNU's `dounmount` (`bsd/vfs/vfs_syscalls.c`) takes the mount off
+///   the list `getfsstat` reads (`mount_list_remove`) before it posts `VQ_UNMOUNT`, so a table read after the event
+///   never still names the mount that left. A kqueue's own descriptor reads ready while the queue holds an event
+///   (`bsd/kern/kern_event.c`, `filt_kqueue`), and that is the edge a shard's own kqueue waits for.
+/// - **Linux.** An epoll instance holding `/proc/self/mountinfo` (proc_pid_mountinfo(5)) for `EPOLLPRI`. The file
+///   is pollable as `/proc/pid/mounts` is: "a change in this file (i.e., a filesystem mount or unmount) causes …
+///   poll(2) and epoll_wait(2) [to] mark the file as having a priority event (POLLPRI)" (proc_pid_mounts(5)); the
+///   two files share one poll function (`fs/proc_namespace.c`, `mounts_poll`, read 2026-11-18). That function reports
+///   the file readable always, so a readable wait on the file itself would fire at once, every time; it adds
+///   `EPOLLPRI | EPOLLERR` once per change of the mount namespace since the open file was last polled, and the poll
+///   itself consumes the change, not a read. The instance's own descriptor reads ready while the file has such a
+///   change (epoll(7): an epoll descriptor is itself pollable), so the shard's epoll waits on the instance, never on
+///   the file. Every change posts, a mount as well as an unmount; the caller's judgment finds nothing gone then.
+/// - **Elsewhere** the watch is refused typed, as the table is.
+#[derive(Debug)]
+pub struct UnmountWatch {
+  queue: watch::Queue,
+}
+
+impl UnmountWatch {
+  /// Opens the watch: the kernel's queue and its one filter, registered now. Only changes after this call are posted,
+  /// so a caller reads the table once after opening for anything that left before.
+  pub fn open() -> Result<UnmountWatch, MountTableError> {
+    watch::open().map(|queue| UnmountWatch { queue })
+  }
+
+  /// The descriptor that reads ready once a change was posted: the queue's own, never the table's.
+  pub fn descriptor(&self) -> i32 {
+    watch::descriptor(&self.queue)
+  }
+
+  /// Takes what was posted, without waiting, so the descriptor reads ready again only at the next change.
+  pub fn take(&mut self) -> Result<(), MountTableError> {
+    watch::take(&mut self.queue)
+  }
+}
+
+#[cfg(target_os = "macos")]
+use self::macos as watch;
+
+#[cfg(target_os = "linux")]
+use self::linux as watch;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use self::other as watch;
+
+/// The unmount watch where no queue is built: [`UnmountWatch::open`] is refused, so no watch is ever made.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod other {
+  use super::MountTableError;
+
+  /// No queue exists here.
+  #[derive(Debug)]
+  pub(super) enum Queue {}
+
+  pub(super) fn open() -> Result<Queue, MountTableError> {
+    Err(MountTableError::Unsupported {
+      platform: std::env::consts::OS,
+    })
+  }
+
+  pub(super) fn descriptor(queue: &Queue) -> i32 {
+    match *queue {}
+  }
+
+  pub(super) fn take(queue: &mut Queue) -> Result<(), MountTableError> {
+    match *queue {}
+  }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
+  use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+
   use super::{MountEntry, MountTableError};
+
+  /// Format: `VQ_UNMOUNT`, the vfsquery flag "filesystem has left" (`sys/mount.h`): the one event the unmount watch's
+  /// filter fires on (XNU's `filt_fsevent` sets a flag only where the filter's own flag word has it).
+  const VQ_UNMOUNT: u32 = 0x0010;
+
+  /// Shape: the events one take reads. The queue holds one filter, and a cleared-on-read filter is one event however
+  /// many unmounts it gathered (`filt_fsevent` ORs each into the event's flags).
+  const POSTED_PER_TAKE: usize = 1;
+
+  /// The unmount watch's queue: a kqueue holding the one `EVFILT_FS` filter ([`super::UnmountWatch`]).
+  #[derive(Debug)]
+  pub(super) struct Queue {
+    queue: OwnedFd,
+  }
+
+  /// The filter's record with `flags`: `EVFILT_FS` on `VQ_UNMOUNT`. Its identifier is ignored (the filter watches the
+  /// whole system, XNU `filt_fsattach`).
+  fn unmount_filter(flags: u16) -> libc::kevent {
+    libc::kevent {
+      ident: 0,
+      filter: libc::EVFILT_FS,
+      flags,
+      fflags: VQ_UNMOUNT,
+      data: 0,
+      udata: std::ptr::null_mut(),
+    }
+  }
+
+  /// One `kevent(2)` on `queue` that waits for nothing: `changes` applied, then at most `posted.len()` posted events
+  /// read into `posted`. How many were read, or the errno: with no room for an error record, a change the kernel
+  /// refuses fails the whole call (kevent(2)).
+  fn kevent_now(
+    queue: BorrowedFd<'_>,
+    changes: &[libc::kevent],
+    posted: &mut [libc::kevent],
+  ) -> Result<usize, MountTableError> {
+    let too_many = || MountTableError::TooLarge {
+      cap: usize::try_from(libc::c_int::MAX).unwrap_or(usize::MAX),
+    };
+    let changes_len = libc::c_int::try_from(changes.len()).map_err(|_| too_many())?;
+    let posted_len = libc::c_int::try_from(posted.len()).map_err(|_| too_many())?;
+    let now = libc::timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    // SAFETY: `queue` is a live kqueue descriptor the watch owns for the call; `changes` holds `changes_len`
+    // initialized records and `posted` has room for `posted_len`, both borrowed for the call, which reads the first
+    // and writes at most `posted_len` whole records into the second (kevent(2)); `now` is a zero timeout, so the call
+    // returns at once. rustix's `kevent` cannot name `EVFILT_FS` (its `EventFilter` has no such variant), so this is
+    // the raw call.
+    let read = unsafe {
+      libc::kevent(
+        queue.as_raw_fd(),
+        changes.as_ptr(),
+        changes_len,
+        posted.as_mut_ptr(),
+        posted_len,
+        &now,
+      )
+    };
+    usize::try_from(read).map_err(|_| MountTableError::Query {
+      errno: last_errno(),
+    })
+  }
+
+  /// A kqueue with the unmount filter registered on it.
+  pub(super) fn open() -> Result<Queue, MountTableError> {
+    let queue = rustix::event::kqueue::kqueue().map_err(|e| MountTableError::Query {
+      errno: e.raw_os_error(),
+    })?;
+    kevent_now(queue.as_fd(), &[unmount_filter(libc::EV_ADD)], &mut [])?;
+    Ok(Queue { queue })
+  }
+
+  /// The queue's own descriptor.
+  pub(super) fn descriptor(queue: &Queue) -> i32 {
+    queue.queue.as_raw_fd()
+  }
+
+  /// Reads the filter's posted event, if any, which clears it.
+  pub(super) fn take(queue: &mut Queue) -> Result<(), MountTableError> {
+    let mut posted = [unmount_filter(0); POSTED_PER_TAKE];
+    kevent_now(queue.queue.as_fd(), &[], &mut posted).map(|_| ())
+  }
 
   /// A NUL-terminated C string field of a `statfs` record as text, stopping at the first NUL. Each
   /// `c_char` is one byte, reinterpreted bit for bit (a path byte above 127 is a UTF-8 continuation
@@ -229,9 +401,67 @@ mod macos {
 
 #[cfg(target_os = "linux")]
 mod linux {
+  use std::os::fd::{AsRawFd, OwnedFd};
+
+  use rustix::event::epoll;
   use rustix::fs::{Mode, OFlags};
 
   use super::MountTableError;
+
+  /// Shape: the events one take reads: the instance holds one file.
+  const POSTED_PER_TAKE: usize = 1;
+
+  /// The unmount watch's queue ([`super::UnmountWatch`]): an epoll instance holding `/proc/self/mountinfo` for
+  /// `EPOLLPRI`, and the open file it holds.
+  #[derive(Debug)]
+  pub(super) struct Queue {
+    events: OwnedFd,
+    /// Kept open for the registration: closing the file takes it out of the instance's interest list (epoll(7)).
+    _table: OwnedFd,
+  }
+
+  /// An epoll instance with `/proc/self/mountinfo` registered for its priority event, level-triggered: the file's poll
+  /// reports a change once and consumes it (`fs/proc_namespace.c`, `mounts_poll`), so the registration need not be
+  /// edge-triggered to fire once per change.
+  pub(super) fn open() -> Result<Queue, MountTableError> {
+    let table = rustix::fs::open(MOUNTINFO, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+      .map_err(errno_of)?;
+    let events = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(errno_of)?;
+    epoll::add(
+      &events,
+      &table,
+      epoll::EventData::new_u64(0),
+      epoll::EventFlags::PRI,
+    )
+    .map_err(errno_of)?;
+    Ok(Queue {
+      events,
+      _table: table,
+    })
+  }
+
+  /// The instance's own descriptor.
+  pub(super) fn descriptor(queue: &Queue) -> i32 {
+    queue.events.as_raw_fd()
+  }
+
+  /// Reads the file's posted change, if the instance still holds one, without waiting. A wait the kernel interrupted
+  /// took nothing, and the next readiness wait finds the change still there.
+  pub(super) fn take(queue: &mut Queue) -> Result<(), MountTableError> {
+    let mut posted: Vec<epoll::Event> = Vec::with_capacity(POSTED_PER_TAKE);
+    let now = rustix::event::Timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    match epoll::wait(
+      &queue.events,
+      rustix::buffer::spare_capacity(&mut posted),
+      Some(&now),
+    ) {
+      Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+      Err(e) => Err(errno_of(e)),
+    }
+  }
 
   /// Format: the kernel's table of this process's mount namespace (proc(5)).
   const MOUNTINFO: &str = "/proc/self/mountinfo";
@@ -404,4 +634,34 @@ pub fn parse_mountinfo(text: &str) -> Result<Vec<MountEntry>, MountTableError> {
     });
   }
   Ok(entries)
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+  use super::UnmountWatch;
+
+  /// A-511 (§4.6). Do: open the unmount watch on this host's kernel, take what it holds twice, and poll its descriptor
+  /// without waiting, as a shard's readiness wait registers it. Expect the kernel to take the filter (`EVFILT_FS` on
+  /// `VQ_UNMOUNT` on macOS, `/proc/self/mountinfo` for `EPOLLPRI` on Linux), each take to answer, and poll(2) to answer
+  /// for the descriptor. Whether anything was posted is not asserted: any process on the host may unmount at any
+  /// moment. A real unmount's event ending its attachment is the CLI's live mount suite's to prove.
+  #[test]
+  fn the_unmount_watch_opens_on_the_kernels_own_event_and_its_descriptor_is_pollable() {
+    let mut watch = UnmountWatch::open().expect("the kernel took the unmount filter");
+    watch.take().expect("a take answers");
+    watch.take().expect("a second take answers");
+    // SAFETY: the descriptor is the watch's own queue, open for as long as `watch` lives, which outlives the borrow.
+    let queue = unsafe { std::os::fd::BorrowedFd::borrow_raw(watch.descriptor()) };
+    let mut polled = [rustix::event::PollFd::from_borrowed_fd(
+      queue,
+      rustix::event::PollFlags::IN,
+    )];
+    let now = rustix::event::Timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    let ready =
+      rustix::event::poll(&mut polled, Some(&now)).expect("poll(2) answers for the queue");
+    println!("the unmount watch's queue: {ready} descriptor(s) ready at once");
+  }
 }

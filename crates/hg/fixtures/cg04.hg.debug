@@ -1,0 +1,16 @@
+Stream params: {}
+changegroup -- {nbchanges: 7, version: 04} (mandatory: True)
+    1f0dee641bb7258c56bd60e93edfa2405381c41e
+    63f48007cba6a817327f94cbc0bd132cfe4f9945
+    c854155b53212d15ecd65b2b4247c5325a007656
+    ba83e36a5162b3043450424b28ae97c799a037fd
+    184946a33fa8c9dbea2a8e8b9cb614b700e208b1
+    3694402b93f01c8bb8c1e9d2ea6abd5ef165976a
+    ff4c595d695566baed3bd608d1cdbc549e122717
+cache:rev-branch-cache -- {} (mandatory: False)
+obsmarkers -- {} (mandatory: True)
+    version: 1 (92 bytes)
+    a34a6ff55100b26a5acd91fb3335aee5d8aa59ab ff4c595d695566baed3bd608d1cdbc549e122717 0 (Thu Jan 01 00:00:00 1970 +0000) {'ef1': '9', 'operation': 'amend', 'user': 'test'}
+phase-heads -- {} (mandatory: True)
+    3694402b93f01c8bb8c1e9d2ea6abd5ef165976a public
+    ff4c595d695566baed3bd608d1cdbc549e122717 draft

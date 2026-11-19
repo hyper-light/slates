@@ -1367,6 +1367,10 @@ pub enum MountMissing {
   /// The machine does not let WinFsp's driver make a mount's drive (Windows, A-369): an Administrator sets
   /// `MountUseMountmgrFromFSD` to 1 once, which the driver reads at every mount (A-417).
   MountManager,
+  /// Someone besides root can capture this host's loopback traffic (macOS and the BSDs, A-535): a `/dev/bpf` device a
+  /// group or another user may read, as Wireshark's ChmodBPF leaves them. A loopback mount's capability crosses loopback
+  /// in the clear, since the kernel's NFS client speaks neither RPC-with-TLS nor RPCSEC_GSS, so it would be theirs.
+  PrivateLoopback,
 }
 
 impl fmt::Display for MountMissing {
@@ -1398,6 +1402,11 @@ impl fmt::Display for MountMissing {
       Self::MountManager => {
         "this machine does not let WinFsp's driver make a mount's drive: an Administrator allows it once with \
          `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f`"
+      }
+      Self::PrivateLoopback => {
+        "loopback traffic here can be captured by more than root (a /dev/bpf device a group or another user may read, \
+         as Wireshark's ChmodBPF leaves them), and a mount's capability crosses loopback in the clear: give /dev/bpf* \
+         back to root alone (remove ChmodBPF, or `sudo chmod 600 /dev/bpf*` until the next boot) to mount here"
       }
     })
   }

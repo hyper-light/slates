@@ -45,9 +45,14 @@
 //! its profile, and [`runtime`] judges the answer against the evidence — the one profile a container workload
 //! has run through, or a typed refusal (AUD-29-67).
 //!
-//! The crate holds no `std::fs`, no `std::net`, no socket and no directory creation; its one `unsafe`
-//! block is the macOS `getfsstat` pair (no safe wrapper exists). The pure parts — the table parser,
-//! the verification and the entry — are tested on every host with simulated tables (`tests/verify.rs`).
+//! The table's changes are watched through the kernel's own event, never polled (A-511): `EVFILT_FS` on `VQ_UNMOUNT`
+//! on macOS, `/proc/self/mountinfo`'s priority event on Linux ([`mount_table::UnmountWatch`]); a daemon reads the
+//! table once per event to judge which of its mounts left.
+//!
+//! The crate holds no `std::fs`, no `std::net`, no socket and no directory creation; its two `unsafe`
+//! blocks are the macOS `getfsstat` pair and the macOS unmount watch's `kevent` (no safe wrapper names
+//! `EVFILT_FS`). The pure parts — the table parser, the verification and the entry — are tested on every
+//! host with simulated tables (`tests/verify.rs`).
 //! Record: `docs/wip/oci-handoff.md`.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
