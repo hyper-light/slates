@@ -238,8 +238,14 @@ mod tests {
     let started = Instant::now();
     let longest = longest_gap_ns(window);
     let watched = nanos(started.elapsed());
-    assert!(watched >= nanos(window), "watched {watched} ns of a {window:?} window");
-    assert!(longest <= watched, "a gap of {longest} ns in {watched} ns watched");
+    assert!(
+      watched >= nanos(window),
+      "watched {watched} ns of a {window:?} window"
+    );
+    assert!(
+      longest <= watched,
+      "a gap of {longest} ns in {watched} ns watched"
+    );
   }
 
   #[test]

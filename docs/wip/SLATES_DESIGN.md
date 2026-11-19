@@ -36662,4 +36662,12 @@ row, the bound's verdict).
   the server, and `met\tno` otherwise.
 - **Tests.** Failing first on the Mac Studio (debug, r52, 2026-11-19): `slates-machine`'s three attribution tests
   against stub functions (`None` for every harness part, `Met` for every verdict) failed, the stalled-sweep reply read
-  as no harness part where 29.005 ms was, and a server part past the bound read as met.
+  as no harness part where 29.005 ms was, and a server part past the bound read as met. Green with the rule (r80):
+  `cargo test --locked -p slates-machine --lib attribution` 3 of 3 and `bench::` 4 of 4 (the noise probe's own test),
+  `-p slates-ipc --lib` 69 passed and 1 ignored (the slot's four stamp tests among them: widened back within a wrap,
+  zero and a pre-clock landing none, carried through a write and a read, a stamp taken now between the readings around
+  it), `-p slates-client --lib` 8 of 8, and `-p slates-server --lib` 485 passed and 3 ignored, every daemon in them
+  replying through stamped slots; rustfmt's layout taken. The bench is an example, compiled and run by main: its new
+  unit test is `a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`.
+- **Owed (main's).** The example and the suites built and run, the lint matrix, and the A/B again on a quiet machine
+  reading the split rows.

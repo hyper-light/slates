@@ -137,7 +137,8 @@ impl Slot {
 /// The stamp a producer writes into the slot it pushes now (module docs, "The stamp"): the low 32 bits of the host's
 /// monotonic clock, with the lowest bit set.
 pub fn stamp_now() -> u32 {
-  u32::try_from(slates_machine::clock::monotonic_ns() & STAMP_BITS).map_or(u32::MAX, |low| low | STAMPED)
+  u32::try_from(slates_machine::clock::monotonic_ns() & STAMP_BITS)
+    .map_or(u32::MAX, |low| low | STAMPED)
 }
 
 /// When a slot stamped `stamp` landed, on the host's monotonic clock, given `by_ns`, a reading of that clock taken at
@@ -487,7 +488,13 @@ mod tests {
     let slot = Slot::inline(0x0001_0002_0000_0003, b"answered").unwrap();
     let stamp = stamp_at(123_456_789);
     let read = decode_body(&encode_body(&slot, stamp)).unwrap();
-    assert_eq!(read, Slot { stamp, ..slot.clone() });
+    assert_eq!(
+      read,
+      Slot {
+        stamp,
+        ..slot.clone()
+      }
+    );
     let unstamped = decode_body(&encode_body(&slot, 0)).unwrap();
     assert_eq!(unstamped.stamp, 0);
   }

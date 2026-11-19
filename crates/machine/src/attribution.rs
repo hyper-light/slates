@@ -113,7 +113,10 @@ mod tests {
     for (why, unknown) in [
       ("no request stamp", exchange(None, Some(10), 20)),
       ("no reply stamp", exchange(Some(10), None, 20)),
-      ("a reply before its request", exchange(Some(10), Some(5), 20)),
+      (
+        "a reply before its request",
+        exchange(Some(10), Some(5), 20),
+      ),
       ("a reply after its taking", exchange(Some(10), Some(30), 20)),
     ] {
       assert_eq!(harness_part(&unknown), None, "{why}");
@@ -122,7 +125,11 @@ mod tests {
       sent_ns: 10,
       ..exchange(Some(5), Some(15), 20)
     };
-    assert_eq!(harness_part(&before_its_sending), None, "a request before its sending");
+    assert_eq!(
+      harness_part(&before_its_sending),
+      None,
+      "a request before its sending"
+    );
     assert_eq!(
       harness_part(&exchange(Some(0), Some(20), 20)),
       Some(0),

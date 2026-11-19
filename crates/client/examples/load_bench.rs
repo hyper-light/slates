@@ -372,7 +372,10 @@ impl Tally {
       (&mut self.servers, &mut tally.servers),
       (&mut self.harnesses, &mut tally.harnesses),
       (&mut self.operation_servers, &mut tally.operation_servers),
-      (&mut self.operation_harnesses, &mut tally.operation_harnesses),
+      (
+        &mut self.operation_harnesses,
+        &mut tally.operation_harnesses,
+      ),
     ] {
       for (kind, mut samples) in std::mem::take(theirs) {
         mine.entry(kind).or_default().append(&mut samples);
@@ -1261,7 +1264,9 @@ impl Worker {
       }
       self.tally.held_ns = self.tally.held_ns.saturating_add(now.saturating_sub(due));
       // The client's own harness time too (A-559): an operation, a cycle or a round open across the hold holds it.
-      self.agents[a].harness_ns = self.agents[a].harness_ns.saturating_add(now.saturating_sub(due));
+      self.agents[a].harness_ns = self.agents[a]
+        .harness_ns
+        .saturating_add(now.saturating_sub(due));
       if !self.send(a) {
         kept.push(std::cmp::Reverse((now, a)));
       }
@@ -1322,11 +1327,17 @@ impl Worker {
   /// the daemon's, the reply taken by `now`. An attempt with no such part (a stamp missing or out of order) is counted
   /// `unsplit`, and the whole of it is the server's.
   fn count_harness(&mut self, a: usize, stamp: u32, now: u64) {
+    // A stamp is a reading of the host's clock itself, and the worker's instants count from the level's epoch on it.
+    let epoch = self.clock.epoch;
+    let landed = |stamp: u32, by: u64| {
+      slates_ipc::slot::landed_ns(stamp, by.saturating_add(epoch))
+        .map(|at| at.saturating_sub(epoch))
+    };
     let agent = &mut self.agents[a];
     let exchange = Exchange {
       sent_ns: agent.attempt_sent_ns,
-      request_landed_ns: slates_ipc::slot::landed_ns(agent.request_stamp, agent.handed_ns),
-      reply_landed_ns: slates_ipc::slot::landed_ns(stamp, now),
+      request_landed_ns: landed(agent.request_stamp, agent.handed_ns),
+      reply_landed_ns: landed(stamp, now),
       taken_ns: now,
     };
     match harness_part(&exchange) {
