@@ -1018,6 +1018,21 @@ impl Resolved {
     cleared
   }
 
+  /// The node a hard link to `target` names, through the links the increment makes (`a` to `b`,
+  /// `b` to `c`: `c`), at most one step a link it makes: the final target, and that path again
+  /// when the increment brings it into being itself (its own node, A-646), else none (the node at
+  /// the target at the work's base).
+  fn link_node<'a>(&'a self, target: &'a str) -> (&'a str, Option<&'a str>) {
+    let mut node = target;
+    for _ in 0..self.hardlinks.len() {
+      match self.hardlinks.get(node) {
+        Some(next) => node = next.as_str(),
+        None => break,
+      }
+    }
+    (node, self.establishes(node).then_some(node))
+  }
+
   /// Whether this increment itself brings `path` into being — a file it creates or renames into, or a
   /// directory it makes. The metadata dimensions (mode, xattr) consult this so a file created and
   /// chmod'd (or xattr'd) in one increment is not a delete/modify conflict against the not-yet-
@@ -2582,23 +2597,13 @@ impl Green {
     self.file_named(a) == self.file_named(b)
   }
 
-  /// Whether a hard link names `path` (`links_to`): one lookup (A-646; it scanned every link).
-  fn named_by_links(&self, path: &str) -> bool {
-    #[cfg(test)]
-    scan_tests::count_examined();
-    self
-      .links_to
-      .get(path)
-      .is_some_and(|links| !links.is_empty())
-  }
-
   /// What a rename replaces at its destination `dst`, as POSIX `rename` replaces any destination
   /// but a directory: the effect removing the node standing there; none for a free destination, a
   /// file a file's set overwrites (A-612 records it), or a node the increment removes itself
   /// (`cleared`). Refused when the node is not the one the work's base held: a directory, or a
   /// symbolic link, hard link or IPC node changed after the base, is a type change, and a file
-  /// changed after it rename against rename; an IPC node a hard link names is delete against
-  /// modify, as its unlink is (A-643; A-646: an unchanged link or IPC node was refused too).
+  /// changed after it rename against rename (A-643; A-646: an unchanged link or IPC node was
+  /// refused too). A node hard links name survives the replacement at them (`Green::node_moves`).
   fn replaced_by_rename(
     &self,
     dst: &str,
@@ -2617,9 +2622,6 @@ impl Green {
     }
     if self.changed_last(self.last_changed.get(dst), dst) > base {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
-    }
-    if special && self.named_by_links(dst) {
-      return Err(Green::window(dst, MergeConflictClass::DeleteModify));
     }
     if cleared.contains(dst) {
       return Ok(None);
@@ -2771,10 +2773,11 @@ impl Green {
   /// removes directories); a path that is a directory falls through to the no-op.
   fn merge_unlink(&self, path: &str, base: u64) -> Result<Option<Effect>, ConflictWindow> {
     if self.specials.contains_key(path) {
-      // Two lookups, whatever the green holds: the node's last change in any dimension, its kind,
-      // mode or an attribute (`changed_after`), and the links naming it (`links_to`). Each had
-      // scanned every attribute change and every hard link of the green (A-646).
-      if self.changed_after(path, base) || self.named_by_links(path) {
+      // One lookup, whatever the green holds: the node's last change in any dimension, its kind,
+      // mode or an attribute (`changed_after`). It had scanned every attribute change and every
+      // hard link of the green; the links naming it no longer refuse its removal, since they keep
+      // the node (A-646).
+      if self.changed_after(path, base) {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
       }
       return Ok(Some(Effect::RemoveSpecial(path.to_owned())));
@@ -3052,13 +3055,15 @@ impl Green {
     Ok(Some(Effect::Symlink(path.to_owned(), target.to_owned())))
   }
 
-  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict, and so is a
-  /// target removed after the base, A-643).
+  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict). The link
+  /// names a node, never a path (A-646): its target is the home of the node the work named, the
+  /// one it makes (`made`), or the one at the target at the work's base, while that has not
+  /// changed since (`Green::node_home`; A-643 refused a target removed after the base).
   fn merge_hardlink(
     &self,
     path: &str,
     base: u64,
-    (target, target_established): (&str, bool),
+    (target, made): (&str, Option<&str>),
   ) -> Result<Option<Effect>, ConflictWindow> {
     // A file, directory or symlink already at this path is a different kind — a type conflict. An
     // existing hard link is not: that is the retarget case decided just below.
@@ -3069,19 +3074,42 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    // A target removed after the work's base is gone for the work, whatever stands at its path
-    // now: a link to it is delete against modify on the link, never a name for the file made in
-    // its place, unless the work makes the target itself (A-643).
-    if !target_established && self.file_removed_since(target, base) {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
-    }
+    let home = match made {
+      Some(home) => home.to_owned(),
+      None => self
+        .node_home(target, base)
+        .map_err(|class| Green::window(path, class))?,
+    };
     if self.changed_last(self.hardlink_changed.get(path), path) > base {
-      if self.hardlinks.get(path).map(String::as_str) == Some(target) {
+      if self.hardlinks.get(path) == Some(&home) {
         return Ok(None);
       }
       return Err(Green::window(path, MergeConflictClass::CreateCreate));
     }
-    Ok(Some(Effect::Hardlink(path.to_owned(), target.to_owned())))
+    Ok(Some(Effect::Hardlink(path.to_owned(), home)))
+  }
+
+  /// The home now of the node at `path` at version `base`: the file or IPC node a hard link there
+  /// names, or the one there, while it has not changed since the base (A-646). A node changed or
+  /// removed since, or moved away (its link changed, its file removed), is gone for a work based
+  /// before: delete against modify. A path holding no file or IPC node is a type change.
+  fn node_home(&self, path: &str, base: u64) -> Result<String, MergeConflictClass> {
+    if let Some(home) = self.hardlinks.get(path) {
+      if self.changed_after(path, base) {
+        return Err(MergeConflictClass::DeleteModify);
+      }
+      return Ok(home.clone());
+    }
+    if self.content.contains_key(path) || self.specials.contains_key(path) {
+      if self.file_removed_since(path, base) {
+        return Err(MergeConflictClass::DeleteModify);
+      }
+      return Ok(path.to_owned());
+    }
+    if self.dirs.contains_key(path) || self.symlinks.contains_key(path) {
+      return Err(MergeConflictClass::TypeChanged);
+    }
+    Err(MergeConflictClass::DeleteModify)
   }
 
   /// Merges an xattr set; a differing intervening value for the same `(path, name)` conflicts.
@@ -3335,10 +3363,11 @@ impl Green {
       record(effects, windows, self.merge_symlink(path, inc.base, target));
     }
     for (path, target) in &r.hardlinks {
+      let (target, made) = r.link_node(target);
       record(
         effects,
         windows,
-        self.merge_hardlink(path, inc.base, (target, r.establishes(target))),
+        self.merge_hardlink(path, inc.base, (target, made)),
       );
     }
     for (path, name, value) in &r.xattr_sets {
@@ -3467,7 +3496,9 @@ impl Green {
   /// Applies the accepted effects, committing version `version`: the copies first (`commit_copies`, A-586 and A-626),
   /// so what the version does to a copied tree lands on what the copy brought, then every other effect, the content's
   /// removals and sets last.
-  fn commit(&mut self, effects: Vec<Effect>, version: u64) {
+  fn commit(&mut self, mut effects: Vec<Effect>, version: u64) {
+    let moves = self.node_moves(&effects);
+    effects.extend(moves);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
     let mut staged = Staged::default();
@@ -3492,6 +3523,111 @@ impl Green {
     }
     self.deltas.push(delta);
     self.record_changes(version, changed);
+  }
+
+  /// The effects a version's node moves add to it (A-646: a hard link names its node, never a
+  /// path). A node is its home, the one path holding its content or IPC node, and the hard links
+  /// naming it there. When the version removes or replaces a home while links still name its node,
+  /// the least surviving link becomes the home: it takes the node's content or IPC node, mode and
+  /// attributes, and every other surviving link names it there. When the version renames a home,
+  /// its links name the new home. Derived from the head and the version's own effects, so a replay
+  /// derives the same; never recorded, since they are the node model's consequence, not a work's
+  /// operation, and a rebase restates only the work's (`Green::rebased_from`).
+  fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
+    let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    let mut removed: BTreeSet<&str> = BTreeSet::new();
+    let mut copied: Vec<(&str, &str)> = Vec::new();
+    for effect in effects {
+      match effect {
+        Effect::Hardlink(path, target) => {
+          links.insert(path, Some(target.as_str()));
+        }
+        Effect::RemoveHardlink(path) => {
+          links.insert(path, None);
+        }
+        Effect::RemoveContent(path) | Effect::RemoveSpecial(path) => {
+          removed.insert(path);
+        }
+        Effect::SetContent(path, _, _, ContentSource::Copied(from, _)) if from != path => {
+          copied.push((from.as_str(), path.as_str()));
+        }
+        _ => {}
+      }
+    }
+    let mut moves = Vec::new();
+    let mut renamed: BTreeSet<&str> = BTreeSet::new();
+    for (from, to) in &copied {
+      if removed.contains(from) {
+        renamed.insert(*from);
+        for link in self.surviving_links(from, &links) {
+          moves.push(Effect::Hardlink(link.to_owned(), (*to).to_owned()));
+        }
+      }
+    }
+    let replaced = copied
+      .iter()
+      .map(|(_, to)| *to)
+      .filter(|to| self.content.contains_key(to));
+    let left: BTreeSet<&str> = removed.iter().copied().chain(replaced).collect();
+    for home in left.difference(&renamed) {
+      self.hand_over(home, self.surviving_links(home, &links), &mut moves);
+    }
+    moves
+  }
+
+  /// The links naming the node at `home` once the version's link effects (`links`: each link's last
+  /// target, `None` for a removal) apply: the head's links to it the version keeps, and the links
+  /// it makes to it.
+  fn surviving_links<'a>(
+    &'a self,
+    home: &str,
+    links: &BTreeMap<&'a str, Option<&'a str>>,
+  ) -> BTreeSet<&'a str> {
+    let kept = self
+      .links_to
+      .get(home)
+      .into_iter()
+      .flatten()
+      .map(String::as_str)
+      .filter(|link| !links.contains_key(link));
+    let made = links
+      .iter()
+      .filter(|(_, target)| **target == Some(home))
+      .map(|(link, _)| *link);
+    kept.chain(made).collect()
+  }
+
+  /// Hands the node at `home`, which the version removes or replaces, to the least of the links
+  /// that survive it: that link becomes the node's home, holding its content or IPC node, its mode
+  /// and its attributes, and the other links name it there (A-646). Nothing when no link survives:
+  /// the node goes with its home.
+  fn hand_over(&self, home: &str, survivors: BTreeSet<&str>, moves: &mut Vec<Effect>) {
+    let mut survivors = survivors.into_iter();
+    let Some(heir) = survivors.next() else {
+      return;
+    };
+    let heir_path = heir.to_owned();
+    if let Some(bytes) = self.content.get(home) {
+      let whole = insert_whole(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+      moves.push(Effect::SetContent(
+        heir_path.clone(),
+        bytes.to_vec(),
+        vec![whole],
+        ContentSource::Copied(home.to_owned(), Vec::new()),
+      ));
+    } else if let Some(node) = self.specials.get(home) {
+      moves.push(Effect::Special(heir_path.clone(), *node));
+    }
+    moves.push(Effect::RemoveHardlink(heir_path.clone()));
+    if let Some(mode) = self.modes.get(home) {
+      moves.push(Effect::Mode(heir_path.clone(), *mode));
+    }
+    for (name, value) in self.xattrs.of(home) {
+      moves.push(Effect::SetXattr(heir_path.clone(), name, value.clone()));
+    }
+    for link in survivors {
+      moves.push(Effect::Hardlink(link.to_owned(), heir_path.clone()));
+    }
   }
 
   /// Applies one accepted effect at `version`, but a file's removal or new bytes, which are staged for the end of the
