@@ -336,7 +336,7 @@ fn every_malformed_request_is_refused_by_kind() {
   let with = |objects: &str| format!("{{\"operation\":\"download\",\"objects\":[{objects}]}}");
   let one = |size: &str| with(&format!("{{\"oid\":\"{oid}\",\"size\":{size}}}"));
   let empty = "{\"operation\":\"download\",\"objects\":[]";
-  let cases: Vec<(String, &str, fn(u64) -> Refusal)> = vec![
+  let cases: [(String, &str, fn(u64) -> Refusal); 24] = [
     ("[]".to_string(), "[", |at| Refusal::Type {
       field: Field::Body,
       at,

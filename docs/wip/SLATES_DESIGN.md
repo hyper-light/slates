@@ -12034,6 +12034,18 @@ engine: the verdict, rebase, position mapping, the register).
 > each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
 > `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
 > packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
+>
+> **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
+> batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
+> (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
+> It reads the locks API's bodies (create, verify with its cursor and limit, unlock with `force`) and its list query as
+> Go writes it, and writes its answers (a lock, a conflict, a list page and a verification page with `next_cursor`). It
+> reads a pointer file as git-lfs's own reader does, telling the canonical encoding apart, and writes only that
+> encoding. JSON is validated as a loop, its nesting's bookkeeping charged to the caller's admission, then walked in
+> place; malformed JSON, an unknown operation, an oid that is not 64 lower-case hexadecimal digits, a negative size and
+> a number past Go's `int64` are refused by kind. Proven against git-lfs v3.8.1's documents and pointer tests and
+> against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
+> records, who may do what) is the server's part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -40002,3 +40014,102 @@ tail's seal, derived; the merge point, learned), GAPS (the §4.17 entry), `crate
   implemented (each server's pieces), content-defined cuts of tables and of the large-file class, pruning, wire-form
   caches, the fleet. Main's heavier checks are filed in the run-request queue: clippy and the cross-target lint matrix
   over `crates/vcs`, and the doc build.
+
+### A-610 — Git LFS on the server side, as codecs: the batch API and the basic adapter's actions, the locks API, and the pointer file, every JSON body read within the caller's admission (2026-11-19, g293, UI goal 93; §4.17.2 "Large files" and "Pieces (git)" piece 12; §4.9; after A-582)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`lfs.rs` and `lfs/json.rs`, `batch.rs`, `locks.rs`, `pointer.rs`, new; their tests `tests/lfs.rs`,
+  `lfs_json.rs`, `lfs_batch.rs`, `lfs_locks.rs`, `lfs_pointer.rs`; the golden vectors `fixtures/lfs/`; `lib.rs`'s `mod`
+  line; `Cargo.toml`);
+- the lock (slates-git gains `serde_json`, a dev-dependency already in the workspace; nothing re-resolved).
+- **Where it lives.** In slates-git, as the module `lfs`: Git LFS is §4.17.2's piece 12. Mercurial's `lfs` extension
+  speaks the same batch API (§4.17.2 "Large files"); when §4.17.3 takes it, the module moves to a crate both servers
+  use.
+- **Sources** [B, C], read 2026-11-19 at git-lfs v3.8.1 (tag object 36e29152, commit a662a6dbf, released 2026-10-22):
+  `docs/api/batch.md`, `basic-transfers.md`, `locking.md`, `server-discovery.md` and `docs/spec.md`; the JSON schemas in
+  `tq/schemas/` and `locking/schemas/`; and what the client runs: its request structs (`tq/api.go`, `tq/transfer.go`,
+  `locking/api.go`), its pointer reader (`lfs/pointer.go`, `lfs/scanner.go`'s `BlobSizeCutoff`, `errors/types.go`'s
+  `StandardizeBadPointerError`) and its test server (`t/cmd/lfstest-gitserver.go`). Where the documents and the client
+  differ, the client is followed: it writes `"ref": null` without a ref and an empty `hash_algo` when unset, and lists
+  its transfer adapters as `lfs-standalone-file`, `basic` and `ssh`.
+- **JSON, within bounds** (`lfs::json`). Reading is two steps. A validator checks RFC 8259's grammar in one pass, as a
+  loop, never by recursion: strings in UTF-8 with escapes well formed and surrogates paired, numbers as §6 writes them,
+  one value and nothing after it. It keeps one bit for each open container, eight bytes for every 64 levels, charged to
+  the caller's admission as the nesting deepens, so nesting deeper than the request was admitted for is refused by kind;
+  no fixed depth is written. A cursor then walks the validated body, borrowing strings and numbers in place and skipping
+  unused values by counting brackets. A number becomes an integer only when asked, refused past 64 bits or with a
+  fraction or an exponent, so a huge number costs its digits' reading and nothing else. Writing is compact, with `"`,
+  `\` and control characters escaped. Hand-written rather than serde_json, because each refusal names its kind and byte
+  and every allocation is charged before it is made; serde_json is the tests' oracle instead.
+- **The batch API** (`lfs::batch`). A request names its `operation`, the `objects` (an `oid` and a `size` each), and
+  optionally `transfers`, `ref` and `hash_algo`; a verify callback's body is one such object. The lists' exact size is
+  charged before they are built; strings stay borrowed. Read as the client writes, and stricter where a server must be:
+  - unknown fields are skipped, as Go's decoder skips them;
+  - a known field given twice is refused (Go keeps the last), so an operation cannot read one way to one reader and
+    another way to the next;
+  - an oid is 64 lower-case hexadecimal digits, as git-lfs reads and writes it, escaped or not;
+  - a size is an integer from zero to Go's `int64` maximum, the client's `Size int64`; a negative one, a fraction, an
+    exponent and anything larger are each refused by kind;
+  - a `hash_algo` other than `sha256` is refused (`null` and the client's empty string read as `sha256`), since no other
+    names an object the server could store; the server answers it as a validation error.
+  An answer gives each object the basic adapter's actions (a `download`; an `upload` and optionally a `verify`), each an
+  `href`, headers and `expires_in` (within ±2147483647) or `expires_at` (RFC 3339, upper case, to the second); or
+  nothing for an upload the server holds; or an error with LFS's codes (404, 409, 410, 422). It names `basic` and
+  `sha256`. Every header name must be an HTTP token and no value may carry a control character but a tab, so a server
+  cannot hand a client a header that ends its line; a size past `int64` is refused too. Each is checked before the first
+  byte is written. The body of an answer other than 200 is `message`, and optionally `request_id` and
+  `documentation_url`.
+- **The locks API** (`lfs::locks`). It reads a lock's creation (`path` required, `ref`), a verification (`ref`,
+  `cursor`, `limit`) and an unlock (`force`, `ref`), `null` reading as absent where the client's Go struct reads it so.
+  It reads the list query as Go's `url.Values.Encode` writes it: `+` for a space and `%XX` escapes, well formed and
+  UTF-8, a known key once, `limit` decimal within `int64`, empty pairs and unknown keys skipped. It writes a lock
+  created or released, a conflict (the existing lock and why), a list page and a verification page (`ours`, `theirs`),
+  each with `next_cursor` when more match. A route names `/objects/batch`, `/locks`, `/locks/verify` and
+  `/locks/{id}/unlock`; the client writes the id into the path unescaped (`locking/api.go`), so a server issues ids of
+  RFC 3986's unreserved characters.
+- **The pointer file** (`lfs::pointer`). Written as the specification's one encoding, which is git-lfs's `Encoded`:
+  the version line, the extensions by priority, `oid sha256:`, `size`, each ending in a line feed, and nothing for size
+  zero. Read as git-lfs's `DecodePointerFromBlob` reads it, since a server that disagreed would miss objects its clients
+  fetch:
+  - 1024 bytes or more is no pointer, and the empty blob is the empty pointer;
+  - a marker word (`git-media`, `hawser`, `git-lfs`) must appear;
+  - Unicode white space is trimmed (Go's `bytes.TrimSpace`; Rust's `char::is_whitespace` is the same White_Space
+    property), lines are split with a last carriage return dropped, and blank lines are skipped;
+  - keys come in order with extension lines (`\Aext-\d{1}-\w+`) between them;
+  - the version is one of git-lfs's three URLs, the oid and the extensions' oids are `sha256:` and 64 digits, and the
+    size is read as Go's `strconv.ParseInt` reads it, not negative;
+  - no two extensions share a priority, and one key given twice keeps its last value.
+  The answer says whether the bytes are canonical, and each refusal says whether git-lfs would take the blob for no
+  pointer at all (its `NotAPointerError`). Nothing allocates: ten extension slots, one per priority digit.
+- **Golden vectors.**
+  - git-lfs v3.8.1's four documents, verbatim (`fixtures/lfs/fetch-git-lfs-docs.sh` fetches them at the commit and
+    checks each SHA-256); the tests read their JSON examples and the specification's pointers from them.
+  - Its pointer tests (`lfs/pointer_test.go`), transcribed: three canonical examples, five non-canonical, 21 invalid.
+  - The stock client's exchange (`fixtures/lfs/make-lfs-exchange.sh` with `responder.py`): git-lfs 3.8.1 (Homebrew,
+    darwin arm64, go 1.27.3) and git 2.50.1 against a recorded responder on the Mac Studio, 2026-11-19 04:27Z. It holds
+    24 exchanges: lock verification with a cursor, two batch uploads, PUTs and verify callbacks, locks created and a
+    409, lists paged by a cursor and by path, unlocks with and without force, and download batches with a per-object
+    404, which the client reported as "[404] Object does not exist". Its bytes were brought back from the Studio's
+    output and checked against the Studio's SHA-256 (`e06b5e56…`).
+- **Tests** (`cargo test -p slates-git --lib`, Mac Studio M3 Ultra, debug). Red first: on the Studio's clone alone,
+  never committed, the 20 entry points were stubbed to answers that do nothing, and 50 of 50 new tests failed. Green
+  (`--locked`, 2026-11-19 04:59Z): 126 of 126, the 50 new among them (batch 12, JSON 10, locks 11, pointer 11, shared
+  6), and `cargo fmt --check` clean. The tests:
+  - every request the stock client sent is read as sent, and every answer it accepted is written, from its fields, as
+    JSON equal to the recording's; the documents' examples are read and written the same way;
+  - every cut of every recorded body is refused as truncated;
+  - nesting a million deep is refused at the depth the admission allows, without recursion;
+  - the refusal tables cover each kind, at its byte, for the requests, the query and the pointer;
+  - git-lfs's own pointer tests pass as git-lfs passes them;
+  - a differential proptest holds the validator to serde_json on JSON texts and their mutations, setting aside numbers
+    serde_json refuses as out of f64's range;
+  - model proptests write any answers and any pointer and read them back, read any request serde_json writes, and
+    write any instant as a calendar walked year by year writes it.
+- **Owed.**
+  - Serving it: the routes and media types in the smart HTTP server (piece 8), authorization (read for download,
+    write for upload and locks, `force` for another's lock), the object store (an LFS object as content deduplicated by
+    BLAKE3 with its SHA-256 an index row, the upload checked against it), and lock records per repository, with cursors
+    in id order.
+  - Each action's expiry learned from the deployment's own token lifetimes (§4.17.1's rule).
+  - The stock client driven end to end against slates' own server, main's run once the routes exist.
+  - Mercurial's `lfs` (§4.17.3).
