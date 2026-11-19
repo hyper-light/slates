@@ -11492,7 +11492,8 @@ against what that copy brings there.
 > - Renaming the home moves the node, and its links name it at the new path.
 > - A later file at a path the node left is another node, which no link names.
 > - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
->   unchanged since, a file while it was not removed since), or the one the work makes.
+>   unchanged since, a file or IPC node that stood there at the base and was not removed since), or the one the work
+>   makes. A node made at the target after the base is none the work saw (A-676).
 >
 > The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
 > head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
@@ -11508,7 +11509,10 @@ against what that copy brings there.
 > restate_tests.rs`). Since A-670 a work never hands a node to a link it never saw: removing a file, or renaming
 > another over it, is refused when a link naming it was made after the work's base and none of the base's links to it
 > outlives the work (delete against modify, rename against rename), unless the work hands the node on itself; a
-> stack's upper alike for a link another version made under the stack.
+> stack's upper alike for a link another version made under the stack. Since A-676 a link to a file or IPC node made
+> at its target after the work's base, where none stood then, is refused delete against modify
+> (`Green::node_stood_at`): the verdict had judged such a target only by a removal since, so a forged link named a node
+> its work never saw.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -48843,3 +48847,34 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   each part whole into the content store, which has no put by pieces; the owner driving encodings by turns once it
   holds a git repository (A-625 part 3); a turn's span measured on the owner (main's); the red-checks and the other
   platforms' runs (main's).
+
+### A-676 — A link to a node made at its target after the work's base is refused (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "The verdict", A-646's decision; found by g307's reading)
+
+- **What was wrong.** A hard link a work makes names the node at its target at the work's base (A-646). For a file or
+  IPC node standing at the target now, `Green::node_home` asked only whether one was removed there after the base
+  (`file_removed_since`), so a node made there after the base, where nothing stood at it, answered as the link's node:
+  the link was accepted naming a node its work never saw, though `node_home`'s own doc and A-646's rule make it delete
+  against modify. No deriver makes such a link (`link(2)` answers `ENOENT` at the base, and a target the work makes is
+  its own, `made`), so only a forged or hand-built increment reached it. g307 found it by reading, fixing
+  `hard_link_merges` (8d7209388).
+- **The change.** `Green::node_stood_at(path, base)`: whether a file or an IPC node stood at the path at the base, read
+  off the histories by the one history rule and the copies (`content_len_at`, `special_at`), never by copying the file;
+  `node_home` refuses a node at the target that stood nowhere at the base, as it refuses one removed since. Exact at and
+  above the fold floor, as `special_kind_changed`'s read of the base is; the service folds only below the oldest base a
+  live reader names. A copy replacing the target after the base needs nothing new: `remove_file_now` records it in
+  `file_removed`.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, 2026-11-19). `a_link_to_a_node_made_after_its_base_conflicts`
+  (`crates/merge/src/engine/node_tests.rs`): a file, and a FIFO (`Work::fifo`), made at `made` after version 0, each
+  linked by a work based at 0; each must be refused `DeleteModify` with no link made, and the test names every kind it
+  misjudges. Red (20:05 UTC) with `engine.rs` put back to its state before the fix (main effb30ac2) in a scratch clone:
+  `cargo test --locked -p slates-merge --lib -- engine::node_tests::a_link_to_a_node_made_after_its_base_conflicts`
+  failed, both links accepted (`a file: Accepted { version: 2 }; a FIFO: Accepted { version: 2 }`). Green over main
+  effb30ac2: `cargo test --locked -p slates-merge --lib -- engine::node_tests engine::replaced_node_tests
+  engine::restate_tests engine::stack` 62 of 62. Over main 545181b30 (A-658 part 1, the verdict computed anywhere;
+  20:11 UTC): the same with `engine::compute_tests` 68 of 68; `cargo test --locked -p slates-merge --test engine --
+  hardlink hard_link` 6 of 6; `cargo fmt -p slates-merge -- --check` clean. Main's commits since, to 5c0967fb2, touch
+  nothing slates-merge builds from. Main's (§8): the other platforms, clippy and the whole suites.
+- **Applied in the same change to:** §4.16 A-646's decision (the link rule's bullet, and its status); GAPS (A-676's
+  entry after A-643's siblings); `crates/merge/src/engine.rs` (`node_home`, `node_stood_at`),
+  `crates/merge/src/engine/node_tests.rs`, `crates/merge/src/engine/replaced_node_tests.rs` (`Work::fifo`, `fifo_node`);
+  `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md` (new).
