@@ -1151,7 +1151,7 @@ impl Green {
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
-      bytes,
+      Some(bytes),
       whole,
       ContentSource::Created(ops.to_vec()),
     )))
@@ -1173,7 +1173,7 @@ impl Green {
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
-      bytes,
+      Some(bytes),
       whole,
       ContentSource::Copied(from.to_owned(), ops.to_vec()),
     )))
