@@ -1,6 +1,12 @@
 //! The service's pack from A-639's stream (A-640 part 3, joining A-639): stock git's fetches answered with the packs
-//! the store streams from its own objects.
+//! the store streams from its own objects. And from the parts the store keeps (A-653): a stock clone of small.git
+//! before any version is encoded and once every one is, and every fetch stock git answered from A-582's repository
+//! with every version encoded and `main`'s base pack made, each pack holding each object once; a pack through the
+//! source copying the kept parts; and a plan past its admission refused.
 
+use std::collections::BTreeSet;
+
+use super::clone::{FETCH, branches, refs, small};
 use super::{MAIN_REF, read_fetch, serving};
 use crate::Admission;
 use crate::fixtures::{
@@ -9,9 +15,13 @@ use crate::fixtures::{
   FETCH_REF_IN_WANT_RESPONSE, FETCH_SHALLOW_REQUEST, FETCH_SHALLOW_RESPONSE,
 };
 use crate::http::Version;
-use crate::served::{self, REFS};
+use crate::object_name::{ObjectFormat, ObjectId};
+use crate::served::{self, MAIN, REFS, SIDE, V1};
 use crate::store::learn::{Clock, Exchange};
+use crate::unpack::{self, NoIndex, Object};
 use crate::upload::{Asked, Fragments, PackPlan, PackRefused, PackSource, Served, Written, serve};
+use crate::v2::Line;
+use crate::v2::fetch::{Event, Section, decode_response};
 
 /// A source that asks the source it wraps for at most `most` bytes a call, so what one turn wrote is handed out over
 /// many calls.
@@ -82,9 +92,7 @@ const EXCHANGES: [(&str, &[u8], &[u8]); 5] = [
   ),
 ];
 
-/// The answer to `request` from the fixture repository, its pack from A-639's stream turning `quantum_ns` at a time and
-/// asked for at most `most` bytes a call, written in steps of at most `room` bytes: its bytes, and how many steps wrote
-/// nothing.
+/// The answer to `request` from the fixture repository, its refs `REFS` and its head `main` ([`streamed_from`]).
 fn streamed(
   fixture: &served::Served,
   request: &[u8],
@@ -93,9 +101,21 @@ fn streamed(
   most: usize,
 ) -> (Vec<u8>, usize) {
   let served = serving(fixture, &REFS, MAIN_REF);
+  streamed_from(&served, request, quantum_ns, room, most)
+}
+
+/// The answer to `request` from `served`, its pack from A-639's stream turning `quantum_ns` at a time and asked for at
+/// most `most` bytes a call, written in steps of at most `room` bytes: its bytes, and how many steps wrote nothing.
+fn streamed_from(
+  served: &Served<'_>,
+  request: &[u8],
+  quantum_ns: u64,
+  room: usize,
+  most: usize,
+) -> (Vec<u8>, usize) {
   let mut clock = Ticks(0);
   let mut answer = serve(
-    &served,
+    served,
     Version::V2,
     Asked::Request(request),
     &mut Narrow {
@@ -121,7 +141,7 @@ fn streamed(
       most,
     };
     let before = bytes.len();
-    if answer.write(&served, &mut source, &mut bytes, room) == Written::End {
+    if answer.write(served, &mut source, &mut bytes, room) == Written::End {
       assert_eq!(answer.refusal(), None);
       return (bytes, empty);
     }
@@ -181,4 +201,215 @@ fn a_turn_handed_out_a_byte_a_call_writes_the_same_answer() {
   );
   let (narrow, _) = streamed(&fixture, FETCH_CLONE_REQUEST, LONG_TURN, usize::MAX, 1);
   assert_eq!(narrow, whole);
+}
+
+/// The objects of the pack a `fetch` response carries, in pack order, a thin pack's bases taken from `objects`; none
+/// when it carries no pack.
+fn pack_objects(response: &[u8], objects: &[Object]) -> Vec<Object> {
+  let events = decode_response(
+    response,
+    ObjectFormat::Sha1,
+    false,
+    &mut Admission::new(u64::MAX),
+  )
+  .unwrap();
+  let pack: Vec<u8> = events
+    .iter()
+    .filter_map(|event| match event {
+      Event::Pack(bytes) => Some(*bytes),
+      _ => None,
+    })
+    .flatten()
+    .copied()
+    .collect();
+  if pack.is_empty() {
+    return Vec::new();
+  }
+  let mut reader = unpack::Reader::new(ObjectFormat::Sha1, &NoIndex);
+  let mut admission = Admission::new(u64::MAX);
+  assert_eq!(reader.read(&pack, &mut admission).unwrap(), pack.len());
+  reader
+    .finish_with(&served::Bases(objects), &mut admission)
+    .unwrap()
+    .objects
+}
+
+/// The ids read, each once: a repeat fails the test.
+fn once(objects: &[Object]) -> BTreeSet<ObjectId> {
+  let ids: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
+  assert_eq!(ids.len(), objects.len(), "an object sent twice");
+  ids
+}
+
+/// Every version of each of `greens` in `fixture` encoded, as the owner encodes each after its commit.
+fn encode_all(fixture: &mut served::Served, greens: impl IntoIterator<Item = u64>) {
+  for green in greens {
+    for version in 0..fixture.repository.versions(green) {
+      fixture
+        .repository
+        .encode_fragments(
+          &mut fixture.store,
+          (green, version),
+          &mut Ticks(0),
+          EXCHANGE,
+        )
+        .unwrap();
+    }
+  }
+}
+
+/// A-582's repository with every version of its three greens encoded and `main`'s base pack made, as the owner keeps
+/// it once its encodings have run: the parts a fetch's pack is read from.
+fn encoded_fixture() -> served::Served {
+  let mut fixture = served::served();
+  encode_all(&mut fixture, [MAIN, SIDE, V1]);
+  fixture
+    .repository
+    .rebuild_base(&mut fixture.store, MAIN, &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  fixture
+}
+
+/// What small.git answers the `fetch` a stock `git clone` sent, through A-639's stream in long turns, every branch's
+/// versions encoded first when `encoded`; and small.git's objects.
+fn small_clone(encoded: bool) -> (Vec<u8>, Vec<Object>) {
+  let (mut fixture, _) = small();
+  let names = branches();
+  if encoded {
+    encode_all(&mut fixture, 1..=u64::try_from(names.len()).unwrap());
+  }
+  let refs = refs(&names);
+  let served = serving(&fixture, &refs, MAIN_REF);
+  let (bytes, _) = streamed_from(&served, FETCH, LONG_TURN, usize::MAX, usize::MAX);
+  (bytes, fixture.objects)
+}
+
+/// A-653 (A-640's clone through A-640 part 3's source, from the store's parts): do serve the `fetch` a stock
+/// `git clone` of small.git sent (32 wants, `thin-pack`, `ofs-delta`, `done`), before any version is encoded and once
+/// every version is. Expect: the packfile section alone, its pack exactly small.git's 32 objects, each once.
+#[test]
+fn a_stock_clones_fetch_is_answered_from_the_stores_parts() {
+  for encoded in [false, true] {
+    let (bytes, objects) = small_clone(encoded);
+    let (events, _) = read_fetch(&bytes, false, &objects);
+    assert_eq!(
+      events,
+      [Event::Header(Line::lf(Section::Packfile)), Event::Flush],
+      "encoded {encoded}"
+    );
+    let every: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
+    assert_eq!(
+      once(&pack_objects(&bytes, &objects)),
+      every,
+      "encoded {encoded}"
+    );
+  }
+}
+
+/// A-653 (§4.17.2 "A fetch"; git's `fetch-clone`, `fetch-haves`, `fetch-shallow`, `fetch-ref-in-want` and
+/// `fetch-progress` exchanges through A-640 part 3's source, from the store's parts): do send each request stock git's
+/// client sent, with every version encoded and `main`'s base pack made, so the runs' fragments, the base pack and the
+/// parts partly wanted are what is sent. Expect: every packet but the pack's data the one stock git 2.50.1 sent (its
+/// progress aside), and a pack of exactly the objects git's held, each once, a thin one completed from the
+/// repository's objects.
+#[test]
+fn every_fetch_stock_git_answered_is_answered_from_the_stores_parts() {
+  let fixture = encoded_fixture();
+  for (name, request, response) in EXCHANGES {
+    let (bytes, _) = streamed(&fixture, request, LONG_TURN, usize::MAX, usize::MAX);
+    assert_eq!(
+      read_fetch(&bytes, false, &fixture.objects),
+      read_fetch(response, false, &fixture.objects),
+      "{name}"
+    );
+    once(&pack_objects(&bytes, &fixture.objects));
+  }
+}
+
+/// Every object of `fixture`, by position, ascending.
+fn every_position(fixture: &served::Served) -> Vec<u64> {
+  let mut positions: Vec<u64> = fixture
+    .objects
+    .iter()
+    .map(|object| {
+      fixture
+        .repository
+        .object(&fixture.store, &object.id)
+        .unwrap()
+        .position
+    })
+    .collect();
+  positions.sort_unstable();
+  positions
+}
+
+/// A-653 (the store's parts through A-640 part 3's source, `Streamed::counters`). Do: begin through the source the pack
+/// of every object of A-582's repository, every version encoded and `main`'s base pack made, and write it. Expect: the
+/// base pack's parts copied whole; `v1`'s part, its tag wanted beside the objects the base pack sent, read entry by
+/// entry; nothing encoded afresh; and a pack of exactly every object, each once.
+#[test]
+fn a_pack_through_the_source_is_read_from_the_kept_parts() {
+  let fixture = encoded_fixture();
+  let objects = every_position(&fixture);
+  let plan = PackPlan {
+    runs: &[],
+    objects: &objects,
+    filter: None,
+    thin: false,
+    ofs_delta: true,
+  };
+  let served = serving(&fixture, &REFS, MAIN_REF);
+  let mut clock = Ticks(0);
+  let mut source = Fragments {
+    clock: &mut clock,
+    exchange: EXCHANGE,
+    quantum_ns: LONG_TURN,
+  };
+  let mut pack = source
+    .begin(&served, &plan, &mut Admission::new(u64::MAX))
+    .unwrap();
+  let mut bytes = Vec::new();
+  while source
+    .write(&served, &mut pack, &mut bytes, usize::MAX)
+    .unwrap()
+  {}
+  let counters = pack.counters();
+  let loose = counters.loose_whole + counters.loose_deltas;
+  assert!(
+    counters.parts_copied > 0 && counters.parts_by_entry > 0 && loose == 0,
+    "{counters:?}"
+  );
+  let read = unpack::read_whole(
+    &bytes,
+    ObjectFormat::Sha1,
+    &NoIndex,
+    &mut Admission::new(u64::MAX),
+  )
+  .unwrap();
+  let every: BTreeSet<ObjectId> = fixture.objects.iter().map(|object| object.id).collect();
+  assert_eq!(once(&read.objects), every);
+}
+
+/// A-653 (what a pack keeps until its end is charged first, A-640 part 3's plan copied). Do: begin the pack of every
+/// object with no room admitted. Expect: refused past its admission.
+#[test]
+fn a_plan_past_its_admission_is_refused() {
+  let fixture = served::served();
+  let objects = every_position(&fixture);
+  let plan = PackPlan {
+    runs: &[],
+    objects: &objects,
+    filter: None,
+    thin: true,
+    ofs_delta: true,
+  };
+  let served = serving(&fixture, &REFS, MAIN_REF);
+  let mut clock = Ticks(0);
+  let mut source = Fragments {
+    clock: &mut clock,
+    exchange: EXCHANGE,
+    quantum_ns: LONG_TURN,
+  };
+  let begun = source.begin(&served, &plan, &mut Admission::new(0));
+  assert!(matches!(begun, Err(PackRefused::PastAdmission(_))));
 }
