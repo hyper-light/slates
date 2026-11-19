@@ -2436,16 +2436,17 @@
 >    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
 >    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
-> 2. The engine's half fixed (A-646 part 2a; §4.16's decision): a hard link names its node, never a path. A removed or
->    replaced home hands the node to its least surviving link, with its content or IPC node, mode and attributes. A
->    renamed home's links follow it, and a later file at the path is another node. A link a work makes names the node
->    at its target at the work's base, or the work's own. Red on kiln r1019 (9 failed: links left naming an empty path,
->    a new file, or a link); green on r1019, 124 of 124, and merged with main on r1032, 126 of 126. Owed, part 2b: the ops document says so, a node table a link
->    names, under a new format version with golden vectors re-derived (A-621's way). Bug record:
->    `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+> 2. Fixed (A-646 parts 2a and 2b; §4.16's decision): a hard link names its node, never a path. In the engine (2a), a
+>    removed or replaced home hands the node to its least surviving link, with its content or IPC node, mode and
+>    attributes; a renamed home's links follow it; a later file at the path is another node (red on kiln r1019; green
+>    124 of 124, merged 126 of 126 on r1032). In the ops document (2b), version 3 holds a node table a link names, the
+>    node at its target at the work's base or the one the work makes, its golden vectors re-derived independently
+>    (218 bytes, `553a422f…6c0d92`) and the determinism gate holding with nodes (red on r1104, 12 failed; green 134
+>    of 134). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
->    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
->    entries examined where the scan examined 2,000 (r960).
+>    (`links_to`), two lookups where it scanned every attribute change and every hard link; a counter test shows 2
+>    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links
+>    naming the node keep it rather than refuse its removal.
 > Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found

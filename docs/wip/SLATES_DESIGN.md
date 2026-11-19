@@ -11294,7 +11294,8 @@ struct Increment { id: IncrementId /* blake3(work_volume, base, post_state, ops_
                    evidence: SmallVec<Blake3> /* opaque to slates */ }
 struct OpRecord { kind: u8, flags: u8, path: u64, at: u64, len: u64, src: u64 }   // 34 bytes, little-endian, written field by field (version 2, A-621)
 enum OpKind { Overwrite, Extend, Truncate, Insert, Delete, Create, Unlink, Mkdir, Rmdir, Rename, Link, Symlink, SetMode, SetXattr, RemoveXattr, Mknod }
-struct OpsDoc { header: WireHeader /* magic, version 2, path and op counts as u64 */, paths: PathTable /* path → bytes, sorted, unique */, ops: [OpRecord] }
+struct NodeRecord { origin: u8 /* 0: the node at the path at the work's base; 1: the one the work makes there */, path: u64 }   // 9 bytes (version 3, A-646)
+struct OpsDoc { header: WireHeader /* magic, version 3, path, node and op counts as u64 */, paths: PathTable /* path → bytes, sorted, unique */, nodes: [NodeRecord] /* the nodes hard links name, sorted by path then origin, unique */, ops: [OpRecord] /* a Link's src a node record */ }
 struct CanonicalDelta { version: Version, ops: Handle<OpsDoc>, effects: Art<PathKey, RangeSet> /* per path: ranges touched and size shifts */ }
 struct MergeRecord { green: VolumeId, version: Version, increment: IncrementId, verdict: VerdictSummary, manifest: Blake3, host_epoch: u64 }
 struct ConflictWindow { path: PathKey, mine: (u64, u64), theirs: (u64, u64), theirs_version: Version, class: MergeConflictClass }
@@ -11318,6 +11319,19 @@ shard by handle while pinned (D-7); the merge record is an entry of the green's 
 > read as the first, every later index would name the path after its own. A version 1 document, and a version 4 chain
 > entry, are refused `BadVersion`, never read under the other layout. The golden vectors are version 2's, derived by
 > an independent encoder and BLAKE3 that reproduce version 1's vector from version 1's layout.
+
+> **Status (2026-11-19, A-646 part 2b: a hard link names a node of the document).** The ops document is version 3. Its
+> node table follows the paths: each record is an origin byte, the node at a path at the work's base or the node the
+> work makes there, and the index of that path, 9 bytes, sorted by path then origin, each node once. A `Link` op's
+> `src` names a record. Until then it named a path, which the engine read at the head, so a link followed whatever
+> stood at its target's path. The deriver records the base's node unless the increment made something at the target
+> before the link (a file it created, an IPC node, one renamed there, a link made there). A made target the increment
+> moves or removes after the link is refused `Unsupported`, a composition owed. The engine reaches a node the work
+> makes through the work's own renames (the source's node, which the commit's node moves carry) and links. A
+> version 2 document is refused `BadVersion`; a node record naming no known origin or no path of the table is
+> `BadNode`, and a node twice `DuplicateNode`. The golden vectors are version 3's (218 bytes, `553a422f…6c0d92`),
+> derived by an independent encoder and BLAKE3 that reproduce version 2's vector and the empty input's. The
+> determinism gate holds with nodes named in opposite orders.
 
 **Declared operations (the journal, §4.5).** Every mutation is declared at the boundary where it
 happens: through a mount, `write(off, len)` is `Overwrite` (or `Extend` past the end) and
@@ -11468,8 +11482,8 @@ against what that copy brings there.
 > restates only the work's operations. A minted inode number was rejected: it would have to be persisted in every
 > checkpoint and carried through copies and branches, for no difference anyone can observe, since the home is unique at
 > every version and moves with its node. Status: the engine since A-646 part 2a (`crates/merge/src/engine/
-> node_tests.rs`; the whole-state oracle follows nodes). Owed, part 2b: the ops document says so, a node table that a
-> link names, under a new format version.
+> node_tests.rs`; the whole-state oracle follows nodes); the ops document since part 2b, version 3, whose node table a
+> link names, the node at its target at the work's base or the one the work makes (§4.16 "Data model").
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -45066,3 +45080,59 @@ Applied in the same change to:
 
   Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
   removal of `TARGET`, which left `h` a link naming nothing.
+
+### A-646 part 2b — the ops document names a hard link's node, never its path: version 3 (2026-11-19, g267, UI goal 93; §4.16 "Data model"; A-646's decision)
+Applied in the same change to:
+- §4.16's data model (the node record, the document's header and table) and its status; A-646's decision's status;
+  GAPS (A-643's second sibling, fixed);
+- `crates/merge`:
+  - `ops_doc.rs`: version 3, `NodeOrigin`, `NodeRef`, `NodeTable`, `BadNode` and `DuplicateNode`; its tests: the
+    golden vectors re-derived, the node table's round trip, determinism and hostile records;
+  - `engine.rs`: `link_target` and `LinkTarget`, `Resolved::link_node` reading the origin; `engine/copy.rs`;
+  - `increment.rs`: `LinkEmission` with the origin, `note_made`, `made_target_moved`, `link_emissions`; its new tests
+    in `src/increment/tests.rs`;
+  - the tests' `Link` builders (`replaced_node_tests.rs` with `link_made`, `node_tests.rs`, `copy_tests.rs`,
+    `branch/tests.rs`, `tests/common/mod.rs`, `tests/increment.rs`).
+- **The defect.** A `Link` op named its target by a path index, which the engine read at the head. A work's link went
+  to whatever stood at the target's path when the verdict ran, not the node the work linked to. And two works that
+  differ, `ln g l; mv f g` and `mv f g; ln g l`, sealed to one document.
+- **The format, the design's way.** Version 3 holds a node table after the paths. Each record is an origin byte (0, the
+  node at the path at the work's base; 1, the node the work makes there) and that path's index, 9 bytes, sorted by path
+  then origin, each node once. A `Link`'s `src` is a record's index. Canonicalization remaps the records through the
+  path table's remap and the links through the records'. Decode refuses an unknown origin or a path the table does not
+  hold (`BadNode`), a node twice (`DuplicateNode`), and a wild count before any allocation (`Truncated`). A version 2
+  document is refused `BadVersion`: replaced, not layered. The chain entry's own record layout is unchanged, and an
+  entry holding a version 2 document is refused through it.
+- **Golden vectors.** The document is version 2's three operations and a link naming the node at `src/lib.rs` at the
+  base: 218 bytes, identity `553a422f323766ffb303343fb617e8651c1c08ee1802e34b1258d1b11c6c0d92`. Both were derived
+  outside the crate, by a field-by-field encoder and a BLAKE3 in Python, which reproduce version 2's vector
+  (`11ede55e…d370763b`) from version 2's layout and the empty input's (`af1349b9…`). The determinism gate builds the
+  node table twice, its nodes named in opposite orders, with the same bytes.
+- **The deriver** names the base's node unless the increment made something at the target before the link: a file it
+  created, an IPC node, one it renamed there, or a link it made there. A made target the increment moves or removes
+  after the link is refused `Unsupported`, since the record names the path it was made at; a composition owed.
+- **The engine** reads the origin. A node at the base resolves as part 2a resolves a link's target. A node the work
+  makes is one it creates or makes as an IPC node, or, through the work's own links, theirs. One it renames there is
+  the rename source's node at the base, which the commit's node moves carry to the destination; so `mv f g; ln g l`
+  names `f`'s node, and `ln g l; mv f g` keeps `l` on `g`'s old one. A made node the work does not make is
+  `TypeChanged`.
+- **Sibling fixed in passing:** `tests/common/mod.rs`'s index still returned `u16` after A-621 widened interning to
+  `u64`, so the ten integration suites that include it did not compile. It is `u64` now; those suites are main's to
+  run.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 12 to 16), green on kiln r1104: `cargo test -p slates-merge --lib`,
+  134 of 134; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests:
+  - the golden vectors;
+  - the node table's round trip, a node named twice recorded once;
+  - the determinism gate with nodes;
+  - hostile node records;
+  - version 2 refused;
+  - a link to a node the work makes;
+  - a made node the work does not make, refused;
+  - a link made before or after a rename onto its target naming the old node or the moved one;
+  - the deriver's origins (base, created, renamed there);
+  - its refusal of a made target moved or removed.
+
+  Red on r1104, with version 2's layout, every link's node at the base and the deriver naming base nodes alone, inside
+  the new types: 12 of the 45 tests the run selected failed. The golden encoding came out version 2's; the node table
+  came back empty; a made link was `DeleteModify`; the link made after the rename named `h`, the old node; the
+  deriver named a created file's node `Base`.

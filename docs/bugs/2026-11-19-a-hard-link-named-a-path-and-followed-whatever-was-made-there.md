@@ -52,8 +52,11 @@ Red on r1019 with part 2a's engine change reversed: 9 failed. The oracle shrank 
 a link naming nothing. Green on r1019: `cargo test -p slates-merge --lib` 124 of 124, fmt clean; merged with main
 (r1032), 126 of 126.
 
-## Owed (A-646 part 2b)
+## Fixed in the ops document (A-646 part 2b)
 
-The ops document names a link's target by a path index, which the engine now reads as the node at that path at the
-work's base, unless the work makes the target itself. The document is to say so: a node table, with each link naming a
-node, made by the work or held at a path at its base, under a new format version with golden vectors re-derived.
+A `Link` op named its target by a path index, which the engine read at the head. Since version 3 the document holds a
+node table, and a link names one of its records: the node at the target at the work's base, or the one the work makes
+there. The deriver records which, and the engine resolves a made node through the work's own renames and links. So
+`ln g l; mv f g` keeps `l` on `g`'s old node, and `mv f g; ln g l` names `f`'s. The golden vectors were re-derived
+independently (218 bytes, `553a422f…6c0d92`). Red on kiln r1104 (12 of the 45 tests the run selected failed); green on
+r1104, `cargo test -p slates-merge --lib` 134 of 134.
