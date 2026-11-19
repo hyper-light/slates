@@ -36,6 +36,7 @@ use slates_ipc::protocol::{
   Authorship, GitIdentity, Refusal, ReplyBody, RequestBody, ToolIdentities, VcsTool,
 };
 use slates_mem::Handle;
+use slates_vfs::clock::Clock;
 use slates_wire::request::RequestId;
 
 use crate::error::refusal_of_db;
