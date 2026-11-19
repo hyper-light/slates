@@ -10950,9 +10950,9 @@ declares nothing), Part 6 (the merge oracle and the purity lint).
 ### 4.17 Version-control servers: git, Mercurial and Subversion over greens and works (D-28)
 
 > **Status (2026-11-18, A-497).** Designed; nothing is built. The section has four parts. §4.17.1, the shared mapping,
-> is written here, and the three servers build on it without redefining its terms: §4.17.2 git (g261), §4.17.3
-> Mercurial (g291) and §4.17.4 Subversion (g292), each landing as its own amendment. The reading notes, with every
-> source's revision and the lines quoted, are `research/vcs-servers.md`.
+> and §4.17.2, git (g261, A-497's second part), are written here; §4.17.3 Mercurial (g291) and §4.17.4 Subversion
+> (g292) follow, each landing as its own amendment, and every server builds on §4.17.1 without redefining its terms.
+> The reading notes, with every source's revision and the lines quoted, are `research/vcs-servers.md`.
 
 **Role.** slates serves stock git, Mercurial and Subversion clients over each tool's own protocols, as a hosting server
 does: clone, fetch, push, branches, review, protected branches, hooks and access control. The repository lives in
@@ -11017,8 +11017,8 @@ decides the details.
 - the tool's objects that the version brought, each held as content (below).
 
 The chain is the history of the branch's values, which a server keeps as its reflog. Version N+1's head descends from
-version N's unless the policy allows a rewrite (a non-fast-forward push in git, a forced push in Mercurial); a rewrite is
-one more version, and the chain itself is never rewritten.
+version N's unless the policy allows a rewrite (a non-fast-forward push in git, a forced push in Mercurial); a rewrite
+is one more version, and the chain itself is never rewritten.
 
 **Objects: one copy, indexed by the tool's id.**
 1. Every object's raw bytes, the bytes the tool hashes to name it, are content in the volume store, chunked and
@@ -11184,7 +11184,9 @@ shown.
 - Dataset: the Linux kernel tree the load tests already hold, as a git repository, and its conversions to Mercurial
   and Subversion, each recorded with the command that made it.
 - Operations, each from a stock client: clone; fetch after one, ten and a hundred upstream commits; push of one commit
-  and of a hundred; a server-side merge; `log` and `blame` of one path.
+  and of a hundred; a server-side merge; `log` and `blame` of one path. Subversion's client asks the server for `log`
+  and `blame`; git's and Mercurial's compute them from their own clone, so for those two the server's own API is
+  measured against the competitor's (Gitaly's calls, `hg serve`'s web interface).
 - Measures: wall time at the client, the server's CPU time and peak memory, and throughput with N concurrent clients.
   The competitor and slates each serve warm (the competitor's files in the page cache), so the comparison is the
   servers' and not the disks'.
@@ -11242,6 +11244,294 @@ Each server's pieces follow these, in its own section.
 (placement and replication of greens), §4.11 (content identity and deduplication), §4.12 (an agent's SDK work becomes a
 commit), §4.13 (principals and capabilities), §4.15 (import from a host directory; export by landing), §4.16 (the
 engine: the verdict, rebase, position mapping, the register).
+
+#### 4.17.2 The git server
+
+> **Status (2026-11-18, A-497's second part).** Designed; nothing is built. It builds on §4.17.1 and redefines none of
+> its terms. Reading notes: `research/vcs-servers.md` §5.
+
+**Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
+by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
+commands are `ls-refs`, `fetch`, `object-info` and `bundle-uri` [B: gitprotocol-v2]; it defines no push, so a push
+speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on either version.
+
+**Transports.**
+1. **Smart HTTP** [B: gitprotocol-http]. `GET <repo>/info/refs?service=git-upload-pack` (or `git-receive-pack`)
+   answers the advertisement: protocol v2's capabilities when the request carries `Git-Protocol: version=2`
+   [B: gitprotocol-v2 "HTTP Transport"], otherwise the pack protocol's ref advertisement after the line
+   `# service=<service>`. `POST <repo>/git-upload-pack` and `POST <repo>/git-receive-pack` carry the requests, with the
+   content types `application/x-<service>-request` and `-result`, and `Cache-Control: no-cache` on every answer. The
+   server reads chunked and gzip-encoded request bodies (`Content-Encoding: gzip`, which git sends for a long request)
+   and writes chunked responses, as the document asks of a server ("Servers SHOULD support chunked encoding for both
+   request and response bodies"). No repository is `404`; a repository the principal may not reach is `403`, which the
+   document requires ("If there is a repository at `$GIT_URL`, but access is not currently permitted, the server MUST
+   respond with the `403 Forbidden` HTTP status code"); a request without credentials is `401` with its challenge (HTTP
+   semantics, RFC 9110). TLS is rustls over aws-lc-rs, already in the workspace. Every request is a future on a shard
+   (R6): no process starts per request, where `git-http-backend` is "A simple CGI program" [B: git-http-backend] whose
+   fetch runs `upload-pack` and `pack-objects` as further processes. The MCP edge's HTTP/1.1 server
+   (`crates/mcp/src/http.rs`) is the starting point; the git edge adds TLS, chunked and gzip bodies, and streaming
+   responses.
+2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
+   one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
+   [B: RFC 8709], with the RSA and ECDSA key forms users already hold as owed reading; ciphers `aes256-gcm@openssh.com`
+   and `chacha20-poly1305@openssh.com`, the forms OpenSSH clients speak ("Because of problems with the design of the
+   algorithm negotiation in this RFC, OpenSSH (and other SSH implementations) use different rules" [B: OpenSSH
+   `PROTOCOL` §1.6, §1.7]). The channel accepts one `exec` request whose command is exactly `git-upload-pack '<path>'`
+   or `git-receive-pack '<path>'`; the server parses it and never runs a command ("Normal precautions MUST be taken to
+   prevent the execution of unauthorized commands" [B: RFC 4254 §6.5]). It accepts the `env` request for
+   `GIT_PROTOCOL` alone ("It is recommended that implementations either maintain a list of allowable variable names"
+   [B: RFC 4254 §6.4]), which is how a client asks for v2 over SSH ("the GIT_PROTOCOL environment variable must be set
+   explicitly to include "version=2"" [B: gitprotocol-v2]). There is no shell, no subsystem and no forwarding. The
+   server is slates' own because the alternative, the host's `sshd` with a forced command per key, starts processes on
+   every connection and puts the host's SSH configuration on the path. It listens on an unprivileged port (R10); a host
+   that wants port 22 forwards it with the OS's own facility.
+3. **`git://` is not served.** It carries no authentication ("those repositories will be writable by anyone who can
+   access that port (9418)" [B: gitprotocol-pack]) and no integrity.
+
+**The wire.**
+- pkt-lines [B: gitprotocol-common]: four hexadecimal digits of length, which counts themselves; "The maximum length of
+  a pkt-line's data component is 65516 bytes" and none may exceed 65520; `0000` is the flush packet, and v2 adds
+  `0001` (delimiter) and `0002` (response end) [B: gitprotocol-v2]. A length over 65520, the length `0003` (shorter
+  than its own header, and no special packet) or a byte that is not a hexadecimal digit is a typed refusal; `0004`, the
+  empty line the document says should not be sent, is read as empty. The codec is a pure core with golden vectors from
+  the document's own examples (piece 1).
+- Side band: during a pack, channel 1 carries the pack, 2 progress and 3 a fatal error [B: gitprotocol-v2 "packfile
+  section"]; `ERR <text>` is the pack protocol's error line [B: gitprotocol-pack].
+- v2 capabilities advertised: `agent`, `ls-refs=symrefs peel ref-prefix unborn`, `fetch=shallow filter ref-in-want
+  sideband-all packfile-uris wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and
+  `object-info`. A v0 or v1 fetch (the old ref advertisement and its negotiation) is a later piece.
+- receive-pack capabilities: `report-status`, `report-status-v2`, `delete-refs`, `ofs-delta`, `atomic`,
+  `push-options`, `side-band-64k`, `quiet`, `object-format` and `agent`.
+
+**The repository in git's terms.**
+1. **Object names.** A SHA-1 repository hashes with collision detection, as git itself has since 2.13 ("moved to a
+   hardened SHA-1 implementation by default, which isn't vulnerable to the SHAttered attack" [B:
+   hash-function-transition]); a SHA-256 repository hashes with SHA-256, announced by `object-format`. An object's id
+   hashes `<type> <length>\0<content>`; the store keeps the content, and for a blob that content is the file's bytes in
+   the checkout (§4.17.1, objects item 1).
+2. **Index rows.** Each object's row (§4.17.1, objects item 3) holds its type, length, content identity and the version
+   that brought it. A commit's row adds what git's commit-graph keeps: its parents by position, root tree, commit date,
+   generation number and the Bloom filter of the paths it changed against its first parent [B: gitformat-commit-graph].
+   The rows are computed when the push that brings the commits is admitted, in time proportional to the new commits;
+   nothing rewrites them later.
+3. **What each version brought.** Version k records D(k): the objects reachable from its head and not from version k-1's
+   head. It is computed when the push is admitted, by a walk from the new head that stops at every object the green had
+   already reached; that set is kept per green as a compressed bitmap over the repository's object positions, the
+   structure git uses for the same question ("Bitmaps store reachability information about the set of objects in a
+   packfile" [B: bitmap-format]). A tree the green already reached is skipped whole, since everything it names was
+   reached with it, so the walk costs the objects new to this branch and the entries of its new trees. When the push
+   brings only objects new to the repository, D(k) is exactly what it brought; a push that names objects other branches
+   hold (a merge, a fast-forward to another branch's commit) adds those. When versions M+1 to N are fast-forwards, what
+   a client holding version M's head needs to reach version N's is the union of D(M+1) to D(N), with no walk at all:
+   reachable(N) is reachable(M) together with D(M+1) to D(N), and each D(k) shares nothing with reachable(k-1), which
+   contains reachable(M). The green's reached set is always exactly what its current head reaches: a fast-forward adds
+   D(k) to it; a version that rewrote the branch computes its D(k) against the old set the same way, then makes the set
+   again from the newest version, on any green of the repository, whose head the new head descends from (found through
+   the commit rows, so a rebased feature branch starts from its target branch's set), walking only what lies beyond it.
+   The union rule holds within each run of fast-forwards; the fetch's walk (below) covers the rest.
+4. **Pack fragments.** Each version's D(k) is also kept encoded, once, as a pack fragment stored as content: each
+   object zlib-compressed, deltas chosen by the learned window and depth (below), a base inside the fragment named by
+   offset (`OBJ_OFS_DELTA`) and a base in an earlier version named by id (`OBJ_REF_DELTA`), and each entry's CRC32 kept,
+   as git's pack index keeps it "so compressed data can be copied directly from pack to pack during repacking without
+   undetected data corruption" [B: gitformat-pack, idx v2]. Commits and trees are kept apart from blobs, so a fetch that
+   wants no blobs is a concatenation too. The green also keeps a base pack: every object up to a version C as one
+   self-contained pack, rebuilt when the learned rule below says.
+5. **Trees as a volume.** A version's tree is the green's snapshot. Mode 100644 is a regular file with permission bits
+   0644, 100755 one with 0755, 120000 a symlink, 040000 a directory, and 160000 (a submodule's commit) is a special node
+   holding the commit's id: a new special-node kind beside A-294's device kinds. The raw tree objects stay the truth for
+   the wire, so a tree git once wrote with a mode or an order that its fsck now only warns about is still served byte
+   for byte.
+6. **Refs.** Every ref is a green (§4.17.1). `HEAD` is the repository's default branch as a symref. An annotated tag's
+   peeled target is kept in the namespace for `ls-refs peel`. A ref name obeys `git check-ref-format`'s rules, which the
+   protocol document lists [B: gitprotocol-common]; any other is refused.
+
+**A push.** receive-pack, as one work per ref (§4.17.1). Each step is bounded by the shard's budgets and runs in
+cooperative slices (§4.3).
+1. Advertise the refs at one register position, the first line carrying the capabilities after a NUL.
+2. Read the commands (`old-id new-id name`) and, when negotiated, the push options; then the pack, as it streams in.
+3. Read the pack as it arrives: each entry's type and size, inflate it, resolve a delta against a base in the pack or,
+   for the thin pack a push may send ("Receive-pack, on the other hand, is assumed by default to be able to handle thin
+   packs" [B: gitprotocol-capabilities]), against a base in the repository's index; hash the object; check the trailer.
+   Each object's content goes into the work, the quarantine of §4.17.1. The bytes a push may hold in flight come from
+   the shard's memory budget and the measured rate of inflating and hashing, with a typed refusal at the bound; there is
+   no fixed maximum input size.
+4. Check every new object as git's `transfer.fsckObjects` does, always, where git's own default is off
+   ("Defaults to false" [B: config `receive.fsckObjects`]): malformed trees, entries named `.git` in any case or `..`,
+   bad modes, bad dates and the `.gitmodules` checks. Each failure is a typed refusal naming the object and the check.
+5. Connectivity: every object a new commit, tree or tag names is either in the push or in the repository's index. The
+   index is complete by construction, since nothing is indexed until its push has passed this check, so the check costs
+   time proportional to the new objects and walks no history (git's receive-pack walks reachability for it).
+6. Per command, the work of §4.17.1: whole-file operations from the identities in the old and new head's trees, and the
+   head operation. A create makes a new green from the new commit's tree; a delete sets the head to none and retires
+   the green. Then the policy's checks: fast-forward (is the old head an ancestor of the new? a walk back from the new
+   head that stops at the old head's generation number, so it costs the commits between), deletes, linear history,
+   signatures and required evidence; then the admission hooks (`pre-receive` with every command, `update` per ref).
+7. The verdict per green: with `atomic`, one register entry for all the refs; without, one per green. The answer is
+   `unpack ok` and then `ok <ref>` or `ng <ref> <reason>` per command [B: gitprotocol-pack "Report Status"].
+8. After the commit: the observing hooks (`post-receive`), then the new versions' pack fragments are built off the
+   answer's path (each D(k) was computed at admission). A fetch that comes before a fragment exists sends those objects
+   from the compressed forms the push brought them in.
+
+A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
+instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
+create or update a reference named "refs/for/master", but may create or update a pull request" [B: config
+`receive.procReceiveRefs`]), and the answer names the request's ref through report-status-v2's `option refname`
+[B: gitprotocol-pack].
+
+**A fetch.** upload-pack's v2 commands.
+1. `ls-refs` reads the namespace at one register position; it is sorted, so each `ref-prefix` is a range; it answers
+   symrefs, peeled tags and an unborn `HEAD` as asked [B: gitprotocol-v2 "ls-refs"].
+2. `fetch` takes the wants (by policy: advertised tips, or any reachable object, which partial clones' later fetches
+   need), the haves and `done`.
+   - Each have is looked up in the index. When one is the head of a version M on the chain of the green whose head is
+     wanted, the objects to send are D(M+1) to D(N), and the answer is `ready` in the first round: a client one or more
+     versions behind negotiates in one request.
+   - Otherwise the server walks from the wants back through commit rows, by generation number, until it meets commits
+     the haves reach, and answers `ACK` for common haves or `NAK`, as the protocol defines [B: gitprotocol-v2
+     "acknowledgments section"]. The walk runs in slices; its memory is admitted from the shard's budget with a typed
+     refusal.
+3. The pack: a header with the object count, then the fragments for D(M+1) to D(N) in order, then any objects the walk
+   found, encoded from their kept compressed forms, then the trailer hash, computed as the bytes stream out. A
+   fragment's offset deltas stay valid when fragments are joined, and its id deltas name bases either earlier in the
+   same pack or, in a thin pack, held by the client. A client that did not ask for `thin-pack` ("A client MUST NOT
+   request the 'thin-pack' capability if it cannot turn a thin pack into a self-contained pack" [B:
+   gitprotocol-capabilities]) is sent the base whole, ahead of the delta that names it.
+   - A clone is the base pack and then the fragments after version C.
+   - Shallow requests (`deepen`, `deepen-since`, `deepen-not`, `deepen-relative`) walk commit rows by depth or commit
+     date and answer the `shallow-info` section; the boundary commits' trees go whole, encoded from their kept forms.
+   - Filters [B: rev-list-options `--filter`]: `blob:none` and `object:type` choose fragment classes; `blob:limit`,
+     `tree:<depth>`, `sparse:oid` and `combine:` choose objects by their index rows (size, depth, path).
+   - `include-tag`, `ofs-delta`, `no-progress` and `sideband-all` behave as the protocol defines. With `packfile-uris`
+     or `bundle-uri` the server may name the base pack and runs of fragments as static, content-addressed URIs that any
+     cache can hold.
+4. `object-info` answers type and size from the index rows.
+
+**Large files.** Git LFS's batch API [B: git-lfs `docs/api/batch.md`, `basic-transfers.md`, `locking.md`]: a
+`POST` to `<repo>.git/info/lfs/objects/batch` names an `operation` (upload or download) and objects by SHA-256 `oid` and
+`size`; the answer gives each object's actions (`href`, headers, `expires_in`); a basic transfer is a plain `PUT` or
+`GET` of the bytes; locks are per path. An LFS object is content in the volume store, deduplicated by BLAKE3 like every
+other byte, with its SHA-256 name an index row and the bytes checked against it on upload. A version's tree holds the
+pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
+is served as well.
+
+**Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS; SSH: the user's public key. Each
+proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and `git-receive-pack`
+(write) per repository and per ref. Hidden refs are policy, as git's `receive.hideRefs` is.
+
+**Protected branches, in git's terms.** Refuse a non-fast-forward; refuse a delete; require linear history (no merge
+commit in the pushed range); require signed commits, checking SSH-format commit signatures with A-321's verifier
+(OpenPGP and X.509 signatures are a later piece); require evidence and reviews (§4.17.1).
+
+**Hooks, in git's terms.** `pre-receive`, `update` and `post-receive` run with git's inputs (the `old new ref` lines on
+standard input, the `GIT_PUSH_OPTION_*` variables) per §4.17.1. A hook expects a repository it can run `git` in, so it
+runs over a read-only view of the green's version as a bare repository, with the work's objects visible as git's
+quarantine shows them to a hook. Building that view (packs and refs generated from the index on demand) is a piece.
+
+**Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
+(parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
+merged, at the merge record's time) or rebases the request's commits, keeping their authors, by the policy's method.
+`log` and `blame` of a path through slates' API: the change index and `last_changed` narrow the path's history to
+versions, and the commit rows' Bloom filters narrow it to commits. Blame's line attribution uses git's own diff
+algorithm, so its answer equals `git blame`'s; it is a read of history, decides no write, and never feeds a verdict.
+
+**Tunables, each learned (§4.17.1's rule).**
+
+| Tunable | Estimator and inputs | Bound | First value |
+|---|---|---|---|
+| Delta window (candidates tried per object) | the window past which the measured bytes a further candidate saves, valued by memory pressure (§4.11's value of a byte), fall below its measured CPU time, valued by load (§4.11's value of CPU); sampled from every fragment the server encodes | the fragment's slice budget (§4.3) | the push's own pack: the deltas the client chose are the first sample |
+| Delta depth | the deepest chain whose measured reconstruction cost per read, times the measured read rate of such objects, stays below the bytes the chain saves | git's format limit, 4095 [B: config `pack.depth`] | the depth of the deltas in the push's own pack |
+| zlib level per object class | §4.11's cost model on the repository's own sampled objects | the levels zlib defines | §4.11's cost model's first sample |
+| Base-pack rebuild point | rebuild when the measured extra cost of serving the fragments after version C (their bytes and per-fragment work), times the measured clone rate since C, exceeds the measured cost of a rebuild | one rebuild in flight per green | the first clone's measured cost against the measured cost of the first rebuild |
+| Cache shares (fragments, kept compressed objects, commit rows, index tables) | shares of the shard's memory budget (§4.2) that equalize each cache's marginal misses saved per byte, from miss-ratio curves sampled online | the shard's budget | equal shares until the first curves exist (no literal: an equal split of a measured budget) |
+| Push bytes in flight and pushes per shard | the shard's memory budget over the measured inflate and hash rate | the shard's budget, typed refusal | the first push's own size |
+| Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
+| Reaping a stalled client | silence past the tail of the gaps seen for that phase of the exchange, with the estimate's own error added (A-363's form) | the shard's connection budget | the round trip measured at connect |
+| Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
+| Index table merges | merge two immutable tables when the measured cost of probing one more table, times the measured lookup rate, exceeds the measured merge cost spread over the tables' expected life | one merge in flight per repository | merge when the first lookup's measured probe cost exceeds its measured share of a merge |
+
+git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
+`pack.window`, `pack.depth`]; its own notes call them "magic values" [B: technical `pack-heuristics`].
+
+**The interop proof, for git.**
+- Clients: stock git at the newest release and at the oldest release that speaks protocol v2 by default, plus at least
+  one client not built from git's source (one built on libgit2 or on gitoxide), so an answer only git tolerates is
+  caught.
+- The differential corpus: each operation by each client against `git-http-backend` (with `transfer.fsckObjects` on)
+  and against slates, over the same repository: clone (full, `--depth`, `--filter=blob:none`, `--filter=blob:limit`);
+  fetch (fast-forward, after a forced update, tags, prune); push (create, update, delete, force, `--atomic`, `-o`
+  options, a push to `refs/for/`); over protocol v2, in SHA-1 and SHA-256 repositories, over HTTP and SSH. Compared:
+  the client's refs, `git rev-list --objects --all` sorted, `git fsck --strict` on the client's copy, the exit codes,
+  and each ref's `ok` or `ng`.
+- git's own transport tests (`t55*`, `t57*`) with the server half routed to slates: whether git's harness admits that
+  is unknown; the experiment is a shim for `git-upload-pack` and `git-receive-pack` first on the tests' exec path,
+  speaking to slates, recording which tests run that way.
+- Hostile input: every parser (pkt-line, pack entry, delta, tree, commit, tag, HTTP, SSH) has the project's hostile
+  input tests: lengths at and past their caps, truncation, bit flips, foreign magic, delta chains that loop.
+
+**The order-of-magnitude target, for git.** Main measures by §4.17.1's method.
+- Competitors: `git-http-backend` at the git release the record names, as a CGI under a web server as its documentation
+  shows [B: git-http-backend], with the repository's commit-graph and bitmaps written first so git is at its best; and
+  Gitaly at its recorded release (`master` was `ca6ca9db` when this was read), behind the HTTP front GitLab places
+  before it (GitLab Workhorse; from memory, to be checked before the run).
+- Dataset: the Linux kernel tree the load tests hold, its commit recorded.
+- Operations, and where the speed is meant to come from (each a hypothesis until measured):
+  - fetch one, ten and a hundred commits behind: no process start (git's fetch over HTTP starts the backend,
+    `upload-pack` and `pack-objects`), one index lookup for the have, the fragments already encoded (no delta search
+    and no compression on the request's path), no disk. The server's time is the target: at least ten times less.
+  - push of one commit and of a hundred: connectivity in time proportional to the new objects instead of a walk, one
+    register append instead of lock files. The server's time: at least ten times less.
+  - ref advertisement and `ls-refs` with every tag: a sorted namespace at one cut.
+  - clone (full, shallow, `blob:none`): the base pack streamed from RAM with the trailer computed as it streams. git
+    with bitmaps and pack reuse streams as well, so a full clone's wall time is bounded on both sides by the wire and by
+    the client's own indexing; it is reported as such, with the server's CPU per clone and time to its first byte
+    measured apart. A shallow clone, where git reuses less, is where server work dominates.
+  - a server-side merge, and `log` and `blame` of a path, through slates' API against Gitaly's own calls for them.
+- Load: 1, 8, 64 and 512 concurrent clients, for throughput as well as latency.
+
+**Failure matrix (git).** A pack cut short or with a wrong trailer: `unpack` with the error, nothing kept. A delta whose
+base is in neither the pack nor the index: `unpack` naming the base. An object that fails the fsck checks: `unpack`
+naming the object and the check. A client gone mid-push: the work is released. A have the index does not know: not
+common, as in git. A request past its memory admission: a typed refusal sent as an `ERR` line [B: gitprotocol-pack].
+An SSH client whose keys no principal holds: disconnected once its methods are exhausted, as RFC 4252 describes.
+
+**Refusals (git).** §4.17.1's, plus `PackMalformed { at, what }`, `DeltaBaseMissing { oid }`, `FsckFailed { oid, check
+}`, `NotFastForward { ref }`, `RefNameInvalid { ref }`, `PushTooLarge { admitted }` and `ProtocolViolation { what }`,
+each sent in git's words: `unpack <reason>`, `ng <ref> <reason>` or an `ERR` line.
+
+**Worked example.** A client last fetched `master` at version 812 (head C812); `master` is now at 815. The client sends
+`ls-refs` (one cut: `master` is C815) and then `fetch` with `want C815` and `have C812`. C812 is version 812's head on
+`master`'s chain, so the server answers `ready` at once and streams a pack: the header counting the objects of D(813),
+D(814) and D(815), the three fragments as kept, and the trailer computed over them. No object is compressed and no delta
+is searched on the request's path. Had the client sent haves the index did not place on that chain (a fork's commits,
+say), the server would walk commit rows from C815 to meet them and answer `ACK` and `NAK` as git does.
+
+**Laptop degenerate.** The same listeners on the laptop's loopback or network, one node, f = 0 (§4.17.1).
+
+**Pieces (git), in order.** Each is one piece with its own tests; §4.17.1's shared pieces come first where named.
+1. The pkt-line codec and side-band framing: a pure core with golden vectors from git's documents and hostile input.
+2. The object codecs: the object header and identity (collision-detecting SHA-1 and SHA-256), a pack entry's header,
+   and delta instructions with an applier; golden vectors from packs stock git wrote, recorded with the commands.
+3. The pack reader: streaming, bounded, inflating, resolving deltas against the pack and the index, checking the
+   trailer; hostile input. (A deflate implementation enters the workspace here, chosen by measurement.)
+4. The tree, commit and tag parsers with the fsck checks.
+5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack.
+6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
+   report-status-v2, atomic.
+7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise; packs from
+   fragments; shallow; filters; `include-tag`; `object-info`.
+8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
+9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
+10. Hooks over a read-only bare-repository view; push options; push to review with report-status-v2.
+11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
+12. Git LFS: the batch API, basic transfers and locks.
+13. Server-side merge and rebase of review requests; `log` and `blame` through the API.
+14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
+15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
+    landing.
+
+**Integration points.** §4.17.1 (everything shared), §4.2 (budgets), §4.3 (slices and the runtime's listeners), §4.11
+(content, the codec cost model), §4.13 (principals and keys), §4.16 (the verdict), A-294 (special nodes), A-321 (SSH
+signature verification).
 
 ---
 
@@ -33007,5 +33297,22 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   terms.
 - **Nothing is built.** No code changed; the GAPS entry tracks the pieces.
 
+- **Second part (2026-11-18): §4.17.2, the git server.** Fetch over protocol v2 and push over receive-pack's exchange
+  (v2 defines no push), on smart HTTP and on an SSH server of slates' own; `git://` is not served. Each version keeps
+  D(k), the objects its head reached that the previous head did not, and a pack fragment encoding them once, so a
+  client one or more versions behind fetches in one round with no walk, no delta search and no compression on the
+  request's path; a clone is a base pack and fragments. A push is read as it streams, checked as git's
+  `transfer.fsckObjects` would check it (always; git's default is off), and its connectivity checked against an index
+  that is complete by construction, in time proportional to the new objects. Push to `refs/for/<branch>` makes a
+  review request, answered with report-status-v2. Git LFS's batch API serves large files from the volume store. Every
+  tunable git fixes by a constant (window 10, depth 50, keepalive 5 s) is learned. The interop proof is a differential
+  corpus against `git-http-backend` with git, a libgit2 or gitoxide client, protocol v2, SHA-1 and SHA-256; the target
+  is at least ten times less server time than `git-http-backend` and Gitaly for fetch and push on the Linux kernel tree,
+  with a full clone's wire- and client-bound wall time reported as such. Fifteen pieces, in order. Reading notes:
+  `research/vcs-servers.md` §5.
+- **Corrected in the second part.** §4.17.1's method measured `log` and `blame` "from a stock client"; git's and
+  Mercurial's clients compute both from their own clone, so for those two the server's API is measured instead.
+
 Applied in the same change to: Part 0 (§0.1's reading order), Part 3 (D-28), §4.17 (new), GAPS (a §4.17 entry at the
-top), `research/vcs-servers.md` (new).
+top), `research/vcs-servers.md` (new). The second part: §4.17's status, §4.17.1's method (the `log` and `blame`
+correction), §4.17.2 (new), GAPS (the §4.17 entry), `research/vcs-servers.md` §5.

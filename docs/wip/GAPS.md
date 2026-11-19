@@ -1,13 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping is designed, nothing is built (2026-11-18, A-497, D-28; UI goal 91;
-> owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches, pushes, stacked changes,
-> review requests, objects and history onto greens and works; §4.17.2 (git), §4.17.3 (Mercurial) and §4.17.4
-> (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces of §4.17.1 (the repository record
-> and green ids carrying its partition; one register entry for several greens; the object store and its index; works
-> from a client's push, with the head operation and the client-fidelity test; works over works and bases given as trees;
-> review records; policy and hooks), then each tool's pieces. No speed is claimed until main measures it by §4.17.1's
-> method.
+> **§4.17 version-control servers: the shared mapping and the git server are designed, nothing is built (2026-11-18,
+> A-497, D-28; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
+> §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
+> of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
+> object store and its index; works from a client's push, with the head operation and the client-fidelity test; works
+> over works and bases given as trees; review records; policy and hooks), then each tool's pieces (§4.17.2's fifteen for
+> git, starting with the pkt-line codec). No speed is claimed until main measures it by §4.17.1's and §4.17.2's method.
 
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
