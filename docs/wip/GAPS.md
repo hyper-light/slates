@@ -633,7 +633,8 @@
 > through it (7.2's revision cache), counted; red first (1 failed), 271 of 271.
 > **Built (A-649 part 3b):** the import in slices (`import::Import`, advanced a turn at a time under the owner's quantum
 > on its clock, one revision read, kept and appended a unit, no borrow held between turns, abandoned or refused holding
-> nothing); red first, then green against three stores imported a unit a turn equal to one call.
+> nothing); red first (2 failed), then 278 of 278 on Windows x86_64 (jupiter) against three stores imported a unit a
+> turn equal to one call; the macOS run owed.
 > Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full

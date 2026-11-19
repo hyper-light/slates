@@ -13281,7 +13281,7 @@ signature verification).
 > one: a log opened, one revision read, kept and appended at once (no log's group held), one changeset's manifest
 > checked, the repository's state read; no borrow held between turns; abandoned, it gives back everything. `import`
 > is its thin facade. Proven by three stores imported a unit a turn equal row for row to one call, and an import
-> abandoned or refused midway holding nothing.
+> abandoned or refused midway holding nothing (Windows x86_64, jupiter: 278 of 278, red 2 failed; macOS owed).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -46343,8 +46343,11 @@ Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`imp
   the import holds one revision's text, the one before it and the walk's listing. The import is still kept or refused
   whole, since a refusal releases its new index; a node a log holds twice is still refused, each append held to the
   number its revlog gives it.
-- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-slices-red` (not for main: the turn's
-  quantum ignored, so a turn runs to the end), the two new tests failing by their assertions. Green: every golden and
-  hostile test unchanged through the facade; new: the dotencode, version 2 and state repositories imported a unit a
-  turn (each turn one unit, more turns than revisions) equal row for row to one call, and an import abandoned after
-  twenty turns or refused by its host midway leaving the store as it was, a further turn refused as ended.
+- **Tests (Windows x86_64, jupiter, 2026-11-19, kiln, debug, rustc 1.98.1; the Mac Studio was offline).** Red: branch
+  `agents/g300-a649-slices-red` (43e391354, not for main: the turn's quantum ignored, so a turn runs to the end),
+  `cargo test --locked -p slates-hg --lib` 276 passed and 2 failed, the two new tests by their assertions (one turn for
+  89 units; `Done` where `More` was due). Green: 278 of 278 at f77f36847, in a target directory of its own (main's
+  Windows baseline at 018d32ba2: 276 of 276); rustfmt's layout from that run. Every golden and hostile test unchanged
+  through the facade; new: the dotencode, version 2 and state repositories imported a unit a turn (each turn one unit,
+  more turns than revisions) equal row for row to one call, and an import abandoned after twenty turns or refused by
+  its host midway leaving the store as it was, a further turn refused as ended. Owed: the same run on macOS.

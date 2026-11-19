@@ -908,11 +908,19 @@ fn an_import_a_unit_a_turn_equals_the_whole_import() {
   for name in ["dot", "v2", "states"] {
     let mut store = store();
     let (mut piecewise, turns) = sliced(&mut repository(name), &mut store);
-    let revisions = u64::from(piecewise.changesets) + u64::from(piecewise.manifests) + piecewise.file_revisions;
-    assert!(turns > revisions, "{name}: {turns} turns for {revisions} revisions");
+    let revisions =
+      u64::from(piecewise.changesets) + u64::from(piecewise.manifests) + piecewise.file_revisions;
+    assert!(
+      turns > revisions,
+      "{name}: {turns} turns for {revisions} revisions"
+    );
     let mut whole_store = self::store();
     let mut whole = import(&mut repository(name), &mut whole_store, room()).unwrap();
-    assert_eq!(rows(&mut piecewise, &store), rows(&mut whole, &whole_store), "{name}");
+    assert_eq!(
+      rows(&mut piecewise, &store),
+      rows(&mut whole, &whole_store),
+      "{name}"
+    );
   }
 }
 
@@ -926,19 +934,37 @@ fn an_import_ended_midway_holds_nothing() {
   let mut store = store();
   let mut import = Import::start(&mut repository, room()).unwrap();
   for _ in 0..20 {
-    let turn = Turn { clock: &mut clock, quantum_ns: 1 };
-    assert_eq!(import.advance(&mut repository, &mut store, turn), Ok(Progress::More));
+    let turn = Turn {
+      clock: &mut clock,
+      quantum_ns: 1,
+    };
+    assert_eq!(
+      import.advance(&mut repository, &mut store, turn),
+      Ok(Progress::More)
+    );
   }
   assert!(store.used() > 0);
   import.abandon(&mut store).unwrap();
   assert_eq!((store.len(), store.used()), (0, 0));
   repository.pending = Some(b"store/data/plain.txt.i".to_vec());
   let mut import = Import::start(&mut repository, room()).unwrap();
-  let turn = Turn { clock: &mut clock, quantum_ns: u64::MAX };
-  assert_eq!(import.advance(&mut repository, &mut store, turn), Err(ImportRefused::Host(Pending)));
+  let turn = Turn {
+    clock: &mut clock,
+    quantum_ns: u64::MAX,
+  };
+  assert_eq!(
+    import.advance(&mut repository, &mut store, turn),
+    Err(ImportRefused::Host(Pending))
+  );
   assert_eq!((store.len(), store.used()), (0, 0));
-  let turn = Turn { clock: &mut clock, quantum_ns: 1 };
-  assert_eq!(import.advance(&mut repository, &mut store, turn), Err(ImportRefused::Ended));
+  let turn = Turn {
+    clock: &mut clock,
+    quantum_ns: 1,
+  };
+  assert_eq!(
+    import.advance(&mut repository, &mut store, turn),
+    Err(ImportRefused::Ended)
+  );
 }
 
 proptest! {
