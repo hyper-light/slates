@@ -863,8 +863,7 @@
 > its repository's shard, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the
 > shard lacks (until the site is handed A-662's stores, after which that path goes), the media type named as the reply
 > begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
-> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, its own piece with its failing
-> test first (main's to start): a query's fields past the request's room are `400` where a path past it is `414`.
+> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed.
 > **Built (A-675):** the daemon's import of a Mercurial repository's directory (`slates-server`'s
 > `vcs_store::hg_import`): started into a repository's empty store, advanced a turn at a time on its owner shard within
 > the shard's quantum, its index then in the empty index's place; at most one client region's bytes held, charged while
@@ -879,6 +878,13 @@
 > meets exactly at 4,095 and 4,096 bytes. Red first on main with the oracle alone
 > (`cargo test --locked -p slates-hg --lib compression`: 2 of 18 failed, both at zlib level 1, as jupiter's r92 found),
 > then `slates-hg --lib` 308 of 308 and fmt clean on macOS arm64 (Mac Studio, kiln r181); the other platforms owed.
+> **Fixed (A-674, 2026-11-19, g303): a query past the request's room answered `414`.** The hg site answered `400` for a
+> query whose fields were past the request's room, where a path past it was `414` and git's routes answer a target past
+> theirs `414` (RFC 9110 §15.5.15); `route` now tells the query codec's `PastAdmission` from its other refusals
+> (`query_refused`, every refusal named, so one the codec adds is judged before it compiles). Red first:
+> `cargo test --locked -p slates-server --lib vcs_http::hg` 6 passed and 1 failed, the room test reading `400` for the
+> query where `414` was expected and its other three statuses as expected; then `slates-server --lib vcs_http::hg` 7 of
+> 7, `slates-hg --lib http` 22 of 22 and fmt clean on macOS arm64 (Mac Studio, kiln r212); the other platforms owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
 > g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and

@@ -49644,3 +49644,22 @@ Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the mac
   arbitrary bytes (generated), none past `bound`.
 - **Owed.** The other platforms' runs (main's). The proptest's failing seed from the red run is not kept: its block has
   no seed file, and the table holds the same case.
+
+### A-674 — A query past the request's room answered `414`, as a path past it and git's routes answer a target past theirs (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Access"; A-650 part 1's "Decided"; RFC 9110 §15.5.15)
+Applied in the same change to: `crates/server` (`vcs_http::hg`: `route` and `query_refused`, the module doc's order; the
+room test's query case), GAPS (§4.17.3: the open item closed, a Fixed line).
+- **What was wrong.** A-650 part 1's site answered `414` for a path past the request's room but `400` for a query whose
+  fields were past it: `route` mapped every refusal of the query's codec (`slates_hg::serve::http::command`) to `400`,
+  `PastAdmission` among them. A client could not tell a target too long to read from a malformed one, where git's routes
+  answer both lengths `414`.
+- **Decided.** A query whose fields are past the request's room is `414` (RFC 9110 §15.5.15: a target "longer than the
+  server is willing to interpret"), as a path past it is; the codec's other refusals stay `400`, each named in
+  `query_refused`, so a refusal the codec gains is judged there before the site compiles.
+- **Tests** (macOS arm64, Mac Studio, kiln r212, 2026-11-19, over main 1c6ac5006). Red first, the room test's query case
+  alone (the site's `hg.rs` as main has it): `cargo test --locked -p slates-server --lib vcs_http::hg` 6 passed and 1
+  failed, the room test reading `400` for the query where `414` was expected and its other three statuses as expected.
+  Green: `cargo test --locked -p slates-server --lib vcs_http::hg` 7 of 7; `cargo test --locked -p slates-hg --lib http`
+  22 of 22; `cargo fmt -p slates-server -p slates-hg -- --check` clean. The test: the owner's `heads` to a site
+  admitting 256 bytes a request, by a path past them, by a query whose fields are past them, and with an `X-HgArg`
+  header past them, then of a repository whose policy holds a rule only git reads: `414`, `414`, `431`, `500`.
+- **Owed.** The other platforms' runs (main's).
