@@ -256,6 +256,9 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::Attached { .. } => Refusal::MoveRefused {
       reason: slates_ipc::protocol::MoveRefusal::Attached,
     },
+    // A repository's namespace binds greens only, under non-empty names without NUL bytes (§4.17.1, A-515).
+    DbError::NotGreen => Refusal::NotGreen,
+    DbError::InvalidName => Refusal::InvalidName,
   }
 }
 

@@ -8,7 +8,10 @@
 //! On Windows (A-300) the lane runs the roster's version-control workloads over the WinFsp drive, each script run by
 //! Git for Windows' `sh` in an NTFS folder of the scratch and in a folder of the drive, in a directory's plain drive
 //! form (`D:\a`, never the verbatim `\\?\D:\a` a canonical path has, which a shell's `pwd` would not print); and the
-//! drive's runs are judged under its stated differences (`slates_conformance::workload::stated_differences`).
+//! drive's runs are judged under its stated differences (`slates_conformance::workload::stated_differences`), which
+//! hold only where the drive refuses a hard link: before the workloads run, the harness gives one file of the mount's
+//! workload root a second name ([`mount_links`], A-498), so a drive under a driver carrying `docs/wip/winfsp-patches`
+//! is held to NTFS's link counts.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -17,8 +20,8 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::{Counts, WorkloadResult, WorkloadStatus};
 use slates_conformance::workload::{
-  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ENVIRONMENT, Entry, EntryKind, Manifest, ROSTER, Workload,
-  compare_with, stated_differences,
+  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ENVIRONMENT, Entry, EntryKind, HardLinks, Manifest,
+  ROSTER, Workload, compare_with, stated_differences,
 };
 
 use super::slates::{Session, folds_names};
@@ -203,6 +206,7 @@ fn run_one(
   run: &Run<'_>,
   workload: &Workload,
   (host_root, mount_root): (&Path, &Path),
+  links: HardLinks,
   notes: &mut Vec<String>,
 ) -> Result<WorkloadResult, Failure> {
   if !tool_on_path(workload.tool) {
@@ -219,7 +223,12 @@ fn run_one(
     &mount_root.join(workload.name),
     run.scratch.path(),
   )?;
-  let status = compare_with(workload, &host, &mount, stated_differences(run.transport));
+  let status = compare_with(
+    workload,
+    &host,
+    &mount,
+    stated_differences(run.transport, links),
+  );
   match status
     .failure_note(workload.name)
     .or_else(|| status.stated_note(workload.name))
@@ -236,23 +245,61 @@ fn run_one(
   })
 }
 
+/// Format: the file the harness gives a second name in the mount's workload root, and that name.
+const LINK_PROBE: (&str, &str) = (".hard-link-probe", ".hard-link-probe-second-name");
+
+/// Whether the mount makes a hard link (A-498): a file made in the mount's workload root (`root`) given a second name,
+/// both names removed after; a refusal is printed with its error. This is the route's own answer, never assumed of it:
+/// one WinFsp transport covers a drive whose driver links (`docs/wip/winfsp-patches`, A-360) and one whose driver
+/// refuses, as WinFsp's as released does (`ERROR_NOT_SUPPORTED`).
+fn mount_links(root: &Path) -> Result<HardLinks, Failure> {
+  let (first, second) = (root.join(LINK_PROBE.0), root.join(LINK_PROBE.1));
+  let remove = |path: &Path| {
+    std::fs::remove_file(path)
+      .map_err(|error| Failure(format!("remove {}: {error}", path.display())))
+  };
+  std::fs::write(&first, b"one file, two names\n")
+    .map_err(|error| Failure(format!("make {}: {error}", first.display())))?;
+  let links = match std::fs::hard_link(&first, &second) {
+    Ok(()) => {
+      remove(second.as_path())?;
+      HardLinks::Made
+    }
+    Err(error) => {
+      println!("workloads: the mount refused a hard link: {error}");
+      HardLinks::Refused
+    }
+  };
+  remove(first.as_path())?;
+  Ok(links)
+}
+
 /// The workload suite over the mount.
 pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let host_root = run.scratch.fresh("workloads-host")?;
   let fold = folds_names(&host_root);
   let session = Session::open(run, "workloads", super::VOLUME_SIZE, fold, None)?;
   let mount_root = session.workdir("workloads")?;
+  let links = mount_links(&mount_root)?;
   let mut tools = Vec::new();
   let mut notes = vec![format!(
     "the volume was created with --fold={fold} to match the host scratch's name policy; git identity and dates fixed; \
      sqlite busy timeout {SQLITE_BUSY_MS} ms; watcher wait {WATCH_SECONDS} s"
   )];
+  notes.push(format!(
+    "the mount {} a hard link (one file given a second name in its workload root before the workloads ran)",
+    match links {
+      HardLinks::Made => "made",
+      HardLinks::Refused => "refused",
+    }
+  ));
   notes.extend(owed_on_windows_note(run.os));
   for workload in ROSTER.iter().filter(|workload| runs_here(workload, run.os)) {
     tools.push(run_one(
       run,
       workload,
       (&host_root, &mount_root),
+      links,
       &mut notes,
     )?);
   }
@@ -454,11 +501,14 @@ mod tests {
   /// A run's output as a clone that copies prints it: each line of the workload's stated link counts with its count of
   /// files with two names as 0, the rest of the line kept (`5 of 5` becomes `0 of 5`, as on the WinFsp drive).
   fn as_a_copying_clone_prints(output: &str, workload: &str) -> String {
-    let starts: Vec<&str> = stated_differences(slates_conformance::Transport::NativeWindowsWinfsp)
-      .iter()
-      .filter(|entry| entry.workload == workload)
-      .map(|entry| entry.line_start)
-      .collect();
+    let starts: Vec<&str> = stated_differences(
+      slates_conformance::Transport::NativeWindowsWinfsp,
+      HardLinks::Refused,
+    )
+    .iter()
+    .filter(|entry| entry.workload == workload)
+    .map(|entry| entry.line_start)
+    .collect();
     output
       .lines()
       .map(|line| {
@@ -489,7 +539,10 @@ mod tests {
       crate::conformance::build_output(&format!("slates-vcs-stated-{}", std::process::id()))
         .unwrap();
     let scratch = super::super::Scratch { path, keep: false };
-    let stated = stated_differences(slates_conformance::Transport::NativeWindowsWinfsp);
+    let stated = stated_differences(
+      slates_conformance::Transport::NativeWindowsWinfsp,
+      HardLinks::Refused,
+    );
     for (name, stated_lines) in [("git-history", 1), ("mercurial", 2)] {
       let workload = ROSTER
         .iter()
