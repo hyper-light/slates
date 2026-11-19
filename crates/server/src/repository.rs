@@ -368,8 +368,9 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
 pub(crate) const LINEAGE_UNINSTALLED: &str = "repository.lineage_uninstalled";
 
 /// The version of `source` a branch is made at, checked: its head when `version` is none; `UnknownBase` past the head
-/// or below the oldest version the source reconstructs, in memory or at a recovery (its checkpoint's).
-fn branch_version(
+/// or below the oldest version the source reconstructs, in memory or at a recovery (its checkpoint's). git's push asks
+/// it of the version a create is made at (A-654).
+pub(crate) fn branch_version(
   state: &ShardState,
   source: DbVolumeId,
   version: Option<u64>,
