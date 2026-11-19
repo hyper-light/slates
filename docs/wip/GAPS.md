@@ -341,6 +341,16 @@
 > receive-pack and a store not held answer `503`. `slates-server --lib vcs_` 76 of 76 on the Mac Studio, red first (3
 > of 3). Owed: the server's store per repository and its lender (with A-653's pack source), the daemon starting an edge,
 > receive-pack's session (A-654), the live `git clone`.
+> **A-625 part 3, the credential record and the daemon's edge (2026-11-19, g299 under main's rulings):** one record of
+> version-control credentials (`slates-db` `credentials`: an SSH key by its blob under OpenSSH's fingerprint, an HTTP
+> token by its SHA-256 alone, each proving a principal until its wall-clock expiry, on the partition its id routes to),
+> enrolled and revoked only under the issuer's proof (`slates credential key|token|revoke`; `Forbidden` on a consumer's
+> channel), found by both edges through `credentials::find`. The daemon starts the HTTP edge from
+> `DaemonConfig::vcs_http`; a proven request's connection moves to its repository's shard and is decided there; every
+> refusal typed. EVIDENCE. Owed: upload-pack served once A-662's stores land (`503` until then), A-654's session,
+> LFS's routes on the site (main's Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet
+> identity's hand-in, a consumer's revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's
+> and Subversion's sites, the live `git clone` (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
