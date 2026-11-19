@@ -574,16 +574,22 @@
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
 > stub), the three captured sessions served whole. **Built (A-649 part 1):** every key of the index tagged by its kind
 > (`L`, `N`, and `O` for a push's object rows, `HgIndex::commit_objects`), so no log row can meet an object's id
-> whatever a path's length; red first (2 failed), 251 of 251. Owed, in order, after §4.17.1's seven pieces: (4, rest)
-> read serving: `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1,
-> held deltas in place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the
-> index's kept heads in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its
-> changesets classified into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the
-> landing, each moved green appended at the position the push read and the greens the checks read compared there
-> (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over
-> several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare
-> and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole
-> in one call, bounded by the admission), and the bundle read in slices too (part 1 holds it whole);
+> whatever a path's length; red first (2 failed), 251 of 251. **Built (A-641 part 2):** the changegroup verified against
+> what the repository holds as 7.2's `addgroup` and `server.validate` check it, paths audited as 7.2's `pathauditor`
+> audits them (transcribed: the first audit, written from the design's summary, took `a/.hg/b`, which 7.2 refuses), and
+> a line's move made A-618's work over its flat manifests laid out as directories named by their content; held to stock
+> 7.2's bundles (each branch head landed holding exactly what `hg cat` recorded) and hand-made changegroups breaking
+> each rule; red nine ways. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
+> `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
+> texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
+> the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
+> (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
+> refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens the
+> checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
+> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
+> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
+> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
+> it whole);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -791,8 +797,9 @@
 > A-616 part 2, its third slice (2026-11-19, g234): one report command's exchange on ra_svn (`report::exchange`), the
 > reporter, drive and writer joined as `accept_report` and `editorp.c` join them, the early answer, `close-edit`'s and
 > `abort-edit`'s answers and the client's errors read as `svnserve` reads them; all 34 recorded report commands
-> replayed against `svnserve`'s bytes; red six ways. Owed of A-616 now: the server's connection task that runs it
-> (piece 7's); the deltas of changed texts through A-652's generator; a recorded session of copy sources.
+> replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
+> them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
+> A-652's generator.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
