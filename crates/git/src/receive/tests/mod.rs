@@ -182,6 +182,7 @@ impl Judge for GitPolicy<'_> {
       .concat();
       return Err(Declined {
         reason: b"non-fast-forward".to_vec(),
+        hook: Vec::new(),
         message: Some(message(&line)),
       });
     }
@@ -696,6 +697,7 @@ fn a_ref_name_git_refuses_is_a_funny_refname() {
     let expected = if funny {
       Outcome::Ng(Declined {
         reason: b"funny refname".to_vec(),
+        hook: Vec::new(),
         message: Some(message(&line)),
       })
     } else {
@@ -822,6 +824,7 @@ fn reports_are_written_as_git_writes_them() {
   received.outcomes[0] = Outcome::Ok(vec![first, second]);
   received.outcomes[2] = Outcome::Ng(Declined {
     reason: b"hook declined".to_vec(),
+    hook: Vec::new(),
     message: Some(message(b"hook declined to update refs/heads/c")),
   });
   let lines = |texts: &[String]| {

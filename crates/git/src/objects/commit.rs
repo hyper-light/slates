@@ -3,9 +3,11 @@
 //! written back byte for byte, and checked as git's `fsck_commit` (fsck.c) checks them.
 //!
 //! A signed commit carries its signature in a header of continuation lines: `gpgsig` in a SHA-1 repository and
-//! `gpgsig-sha256` in a SHA-256 one, and a commit may carry both (gitformat-signature). The signature covers the commit
-//! without either header ([`Commit::write_signed_payload`], as commit.c's `parse_buffer_signed_by_header` makes it). A
-//! merge of a signed tag carries the whole tag in a `mergetag` header ([`Header::unfold`] writes it back out).
+//! `gpgsig-sha256` in a SHA-256 one, and a commit may carry both (gitformat-signature). What a verifier reads is
+//! commit.c's `parse_buffer_signed_by_header` \[C, v2.50.1\]: the signature is every header of the repository's own
+//! name, unfolded in order ([`Commit::write_signature`]), and it covers the commit without any header whose line begins
+//! `gpgsig` ([`Commit::write_signed_payload`]; A-644). A merge of a signed tag carries the whole tag in a `mergetag`
+//! header ([`Header::unfold`] writes it back out).
 
 use super::fsck::{FsckId, Report, Strictness};
 use super::headers::{self, Header};
@@ -106,11 +108,15 @@ impl<'a> Commit<'a> {
   /// The signature header of `format`'s repository (`gpgsig`, or `gpgsig-sha256`), whose lines
   /// ([`Header::unfold`]) are the signature.
   pub fn signature(&self, format: ObjectFormat) -> Option<&Header<'a>> {
-    let name = match format {
-      ObjectFormat::Sha1 => SHA1_SIGNATURE,
-      ObjectFormat::Sha256 => SHA256_SIGNATURE,
-    };
+    let name = signature_name(format);
     self.headers.iter().find(|header| header.name == name)
+  }
+
+  /// Writes the signature a verifier reads (A-644): every header of `format`'s repository's own signature name, each
+  /// unfolded, in order, as commit.c's `parse_buffer_signed_by_header` gathers them; whether there was one. Two such
+  /// headers are one signature of both, which no armour reads as one, so a verifier refuses it.
+  pub fn write_signature(&self, _format: ObjectFormat, _out: &mut impl Out) -> bool {
+    false
   }
 
   /// The `mergetag` headers: each a whole tag object, which [`Header::unfold`] writes out.
@@ -134,8 +140,9 @@ impl<'a> Commit<'a> {
     headers::write(&self.headers, self.message, out);
   }
 
-  /// Writes what a signature covers: the commit without its `gpgsig` and `gpgsig-sha256` headers, as commit.c's
-  /// `parse_buffer_signed_by_header` leaves out the repository's own signature header and the other format's.
+  /// Writes what a signature covers: the commit without any header whose line begins `gpgsig`, as commit.c's
+  /// `parse_buffer_signed_by_header` leaves out the repository's own signature header, the other format's, and any
+  /// other header so named (A-644: a payload that kept one would verify what git does not).
   pub fn write_signed_payload(&self, out: &mut impl Out) {
     for header in &self.headers {
       if header.name != SHA1_SIGNATURE && header.name != SHA256_SIGNATURE {
@@ -146,6 +153,14 @@ impl<'a> Commit<'a> {
       out.put(b"\n");
       out.put(message);
     }
+  }
+}
+
+/// The header `format`'s repository keeps a commit's signature in (commit.c's `gpg_sig_headers`).
+fn signature_name(format: ObjectFormat) -> &'static [u8] {
+  match format {
+    ObjectFormat::Sha1 => SHA1_SIGNATURE,
+    ObjectFormat::Sha256 => SHA256_SIGNATURE,
   }
 }
 

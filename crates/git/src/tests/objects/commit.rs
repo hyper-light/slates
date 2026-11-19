@@ -90,6 +90,62 @@ fn a_signature_unfolds_to_its_lines_and_covers_the_commit_without_it() {
   }
 }
 
+/// A commit with every kind of header a signature parser meets: an extra header whose name begins `gpgsig`, the
+/// SHA-1 signature header twice, the SHA-256 one, each with a continuation line, and a message.
+const SIGNED_HEADERS: &[u8] = b"tree 9bfbe8e1e9b6f4a2b8c41d3a14f5d1c6c5e0b8e1\n\
+author A U Thor <author@example.com> 1112911993 +0000\n\
+committer C O Mitter <committer@example.com> 1112911993 +0000\n\
+gpgsigx extra\n continued\n\
+gpgsig one\n first\n\
+gpgsig-sha256 other\n second\n\
+gpgsig two\n third\n\
+mergetag kept\n\
+\n\
+message\n";
+
+/// A-644 (commit.c's `parse_buffer_signed_by_header`, v2.50.1: a line of the repository's own signature header and its
+/// continuation lines are the signature, any other line beginning `gpgsig` is left out with its continuation lines,
+/// and everything else is the payload). Do: read a commit holding an extra header named `gpgsigx`, two `gpgsig`
+/// headers and a `gpgsig-sha256` one; write each format's signature and the payload. Expect: SHA-1's signature both
+/// `gpgsig` headers unfolded in order, SHA-256's its one header; the payload, in either format, the commit without
+/// any of the four headers (`gpgsigx` too, as git leaves it out); and a commit with no signature header writes none.
+#[test]
+fn a_signature_is_every_own_header_and_covers_no_header_named_gpgsig() {
+  let commit = Commit::parse(SIGNED_HEADERS, &mut ample()).unwrap();
+  let signature = |format| {
+    let mut out = Vec::new();
+    (commit.write_signature(format, &mut out), out)
+  };
+  assert_eq!(
+    signature(ObjectFormat::Sha1),
+    (true, b"one\nfirst\ntwo\nthird\n".to_vec())
+  );
+  assert_eq!(
+    signature(ObjectFormat::Sha256),
+    (true, b"other\nsecond\n".to_vec())
+  );
+  let mut payload = Vec::new();
+  commit.write_signed_payload(&mut payload);
+  let expected = b"tree 9bfbe8e1e9b6f4a2b8c41d3a14f5d1c6c5e0b8e1\n\
+author A U Thor <author@example.com> 1112911993 +0000\n\
+committer C O Mitter <committer@example.com> 1112911993 +0000\n\
+mergetag kept\n\
+\n\
+message\n";
+  assert_eq!(payload, expected);
+  let unsigned = Commit::parse(
+    golden(ObjectFormat::Sha1, "ok-commit-root").bytes,
+    &mut ample(),
+  );
+  let mut none = Vec::new();
+  assert!(
+    !unsigned
+      .unwrap()
+      .write_signature(ObjectFormat::Sha1, &mut none)
+  );
+  assert!(none.is_empty());
+}
+
 /// A-590 (gitformat-signature, "mergetag"). Do: read the merge of a signed tag, in both formats, and unfold its
 /// `mergetag` header. Expect: one, holding the signed tag stock git wrote, byte for byte, its empty lines included;
 /// read as a tag, it names the root commit and splits at its signature into the unsigned tag and the block.

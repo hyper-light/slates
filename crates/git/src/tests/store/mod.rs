@@ -17,6 +17,7 @@ use crate::store::{
 
 mod fragments;
 mod oracle;
+mod protect;
 
 /// Shape: the window the tests' content store holds content in.
 const WINDOW: usize = 1 << 10;

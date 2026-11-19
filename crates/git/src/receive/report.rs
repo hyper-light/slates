@@ -3,10 +3,11 @@
 //!
 //! The report is `unpack ok` or `unpack <reason>`, then each command's `ok <ref>` or `ng <ref> <reason>` in the order
 //! sent, then a flush. report-status-v2 adds, after an `ok`, the option lines of each report a hook made of it, each
-//! report after the first repeating the `ok` line. Under side-band-64k the report goes out whole on band 1, after the
-//! `rp_error` lines git sent on band 2 as it worked, and the answer ends with a flush of its own.
+//! report after the first repeating the `ok` line. Under side-band-64k the report goes out whole on band 1, after what
+//! git sent on band 2 as it worked: a hook's words in the pieces git reads them in, and the `rp_error` lines (A-644).
+//! The answer ends with a flush of its own.
 
-use super::{Outcome, Received, Refusal, Reported, unpack_words};
+use super::{Declined, Outcome, Received, Refusal, Reported, unpack_words};
 use crate::object_name::ObjectId;
 use crate::out::Out;
 use crate::pktline::{self, Packet};
@@ -55,10 +56,8 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
   let multiplexed = requested.side_band_64k;
   if multiplexed {
     for outcome in &received.outcomes {
-      if let Outcome::Ng(declined) = outcome
-        && let Some(line) = &declined.message
-      {
-        sideband::write(Band::Progress, line, out);
+      if let Outcome::Ng(declined) = outcome {
+        write_band_two(declined, out);
       }
     }
   }
@@ -75,6 +74,14 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
     write_line(Packet::Flush, out)?;
   }
   Ok(())
+}
+
+/// What git sends on band 2 of a refused command: a hook's words in the pieces `copy_to_sideband` reads them in, then
+/// the `rp_error` line.
+fn write_band_two(declined: &Declined, out: &mut impl Out) {
+  if let Some(line) = &declined.message {
+    sideband::write(Band::Progress, line, out);
+  }
 }
 
 /// The report's own packets: the unpack status, each command's line (and under v2 its option lines), a flush.
