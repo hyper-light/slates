@@ -67,6 +67,7 @@ use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
   Revision, RevisionRecord, Text,
 };
+use crate::authz::PrincipalRules;
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
 use crate::ra_svn::{ItemError, Value, write};
 use crate::svndiff::{self, Decoded, Decoder, InstructionFault, SvndiffError};
@@ -192,7 +193,7 @@ pub trait Green {
 }
 
 /// What a drive runs with: what `commit` brought and the session it came on (`serve.c` `commit` 1470-1556).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Setup {
   /// The session's path in the repository, canonical (`svnserve`'s `fs_path`): every editor path is joined to it.
   pub base_path: String,
@@ -209,6 +210,9 @@ pub struct Setup {
   /// How many bytes the work's new texts and property lists may hold, with the deltas being read: the caller's room,
   /// derived from its admission.
   pub room: usize,
+  /// The authorization rules the principal meets in this repository (A-606), compiled; `None` when the repository
+  /// names no authz file, which `svnserve` takes as every path allowed (`serve.c` `authz_check_access`).
+  pub rules: Option<PrincipalRules>,
 }
 
 /// Why a command was refused, each written as `svnserve` writes it ([`DriveRefusal::subversion_code`],
