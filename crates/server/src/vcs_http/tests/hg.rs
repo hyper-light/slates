@@ -238,10 +238,10 @@ fn stranger_may(right: PolicyRight) -> PolicyRule {
 }
 
 /// AC-HG.9, A-650 part 1: do send `hg` requests that break each step of hgweb's order in turn: a wire command by `PUT`,
-/// a path escaping a slash, no credentials, a repository of no name and one of git's, a stranger the policy lets read
-/// nothing, hgweb's own page, `unbundle` by `GET`, `unbundle` by `POST` from a stranger who may only read, and a
-/// repository whose store this shard does not hold. Expect `405`, `400`, `401`, `404` twice, `403`, `503`, `405`,
-/// `403` and `503`, and the owner's `heads`, at `/hg` and `/hg/`, served.
+/// a path escaping a slash, no credentials, a repository of no name and one of git's, hgweb's own page, `unbundle` by
+/// `GET`, `unbundle` by `POST` from a stranger who may only read, and a repository whose store this shard does not
+/// hold; then, with no rule, the stranger's `heads`. Expect `405`, `400`, `401`, `404` twice, `503`, `405`, `403` and
+/// `503`, and the owner's `heads` at `/hg/` served; then the stranger `403` and the owner's `heads` at `/hg` served.
 #[test]
 fn each_step_of_hgwebs_order_refuses_with_its_status() {
   let mut site = site(vec![stranger_may(PolicyRight::Read)]);
@@ -314,9 +314,10 @@ fn each_step_of_hgwebs_order_refuses_with_its_status() {
   );
 }
 
-/// AC-HG.9, A-650 part 1: do send a wire command by `PUT`, `unbundle` by `GET`, and `heads` with no credentials. Expect
-/// the first two's `Allow` naming the methods each may use, and the `401` carrying the bearer challenge a cleartext
-/// connection accepts, every one decided without proving a principal.
+/// AC-HG.9, A-650 part 1: do send a wire command by `PUT`, the owner's `unbundle` by `GET`, and `heads` with no
+/// credentials. Expect the first two's `Allow` naming the methods each may use, and the `401` carrying the bearer
+/// challenge a cleartext connection accepts; the first and the last decided before any principal is proved, the second
+/// after the owner's proof.
 #[test]
 fn refusals_name_what_the_client_may_do_instead() {
   let mut site = site(Vec::new());
