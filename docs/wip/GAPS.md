@@ -912,8 +912,8 @@
 >   two Mac runners is filed for main.
 > - **Kiln's workspaces as captured clones (A-463, kiln K5, 2026-11-18):** on a runner the server's `[slates_fleet]`
 >   lists, each workspace is an O(1) clone of its folder's captured base (one capture shared while the folder is as
->   captured, a base gone with its last clone), so it moves; its review and landing are A-424's; a workspace that moved
->   is landed nowhere until stage 2. Machines outside the fleet keep overlays. Held by kiln's real-instance test
+>   captured, a base gone with its last clone), so it moves; its review and landing are A-424's, and once moved A-503's
+>   (its move carries its capture). Machines outside the fleet keep overlays. Held by kiln's real-instance test
 >   (`captured_tests.rs`); the live move of a captured clone and the bare-metal run on its mount are filed for main.
 > - **Owed, in order:** the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
@@ -981,10 +981,11 @@
 >   over the simulated host (`crates/land/src/captured_tests.rs`). **Owed, in order:** (1) the advance: a second
 >   landing is judged against the capture again, so an outsider's later edit of a file the agent landed and did not
 >   touch since is a `ModifyModify` conflict (a refusal, never a loss) until the clone keeps what it landed as its base
->   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2, a moved clone: its capture stays on
->   the node that made it and the moved clone keeps no lineage, so it still lands as a scratch volume (every entry a
->   create, no removal carried) until the move carries its base (the plan: the old owner computes, at the move, the
->   captured identity of every path the clone changed, and the new owner keeps the moved head as the mark); (3) a kind
+>   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2 is built (A-503): a move carries
+>   the captured state of every path its clone changed in the volume's catalog, and the new owner keeps the moved head as
+>   its mark, so a moved clone lands against its capture; owed of it, the fleet's own three-daemon test (filed for main)
+>   and a captured clone taken over after its owner's loss, which carries nothing and still lands as a scratch volume;
+>   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
 >   captured clone into a real directory (run request filed). Kiln's W6 may land captured clones once (1) is built, or

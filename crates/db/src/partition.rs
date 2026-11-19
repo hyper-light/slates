@@ -169,6 +169,8 @@ pub struct PartitionSnapshot {
   /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
   /// (volume, snapshot) order.
   pub captured_bases: Vec<CapturedBase>,
+  /// Each volume's carried capture (A-503; 2026-11-18; appended), by volume order.
+  pub carried_captures: Vec<crate::catalog::CarriedCaptureRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -303,6 +305,10 @@ pub struct Partition {
   /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
   /// volume.
   captured_bases: std::collections::BTreeSet<CapturedBase>,
+  /// Each captured clone's carried capture (A-503): what its move carried of its capture, shipped in its catalog, and
+  /// the snapshot here it is relative to (its mark). One entry a volume at most; an entry leaves with its volume, and its
+  /// mark with its snapshot.
+  carried: BTreeMap<VolumeId, (crate::catalog::CarriedRecord, Option<SnapshotId>)>,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -429,6 +435,7 @@ impl Partition {
       audit_received: BTreeMap::new(),
       grants_issued_through: 0,
       captured_bases: std::collections::BTreeSet::new(),
+      carried: BTreeMap::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -820,6 +827,18 @@ impl Partition {
     self
       .captured_bases
       .contains(&CapturedBase { volume, snapshot })
+  }
+
+  /// What a captured clone's move carried of its capture (A-503), with the snapshot here it is relative to (its mark),
+  /// when this node holds one.
+  pub fn carried(
+    &self,
+    volume: VolumeId,
+  ) -> Option<(&crate::catalog::CarriedRecord, Option<SnapshotId>)> {
+    self
+      .carried
+      .get(&volume)
+      .map(|(carried, mark)| (carried, *mark))
   }
 
   /// A clone's lineage edge.
@@ -1371,6 +1390,14 @@ impl Partition {
         self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
         Ok(())
       }
+      // A carried capture names a volume here, and its mark one of that volume's snapshots (A-503).
+      Op::CaptureCarried { volume, mark, .. } | Op::CaptureAdopted { volume, mark, .. } => {
+        self.volume(*volume).ok_or(DbError::NotFound)?;
+        if let Some(mark) = mark {
+          self.snapshot(*volume, *mark).ok_or(DbError::NotFound)?;
+        }
+        Ok(())
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1798,6 +1825,28 @@ impl Partition {
         });
         Ok(())
       }
+      // The catalog register carries it (A-503), so its version moves as the write policy's does.
+      Op::CaptureCarried {
+        volume,
+        carried,
+        mark,
+      } => {
+        self.update_volume(*volume, |v| {
+          v.catalog_version = v.catalog_version.saturating_add(1);
+        })?;
+        self.carried.insert(*volume, (carried.clone(), *mark));
+        Ok(())
+      }
+      // Adopted with the volume's catalog, which already carries it: its version stays (A-503).
+      Op::CaptureAdopted {
+        volume,
+        carried,
+        mark,
+      } => {
+        self.volume(*volume).ok_or(DbError::NotFound)?;
+        self.carried.insert(*volume, (carried.clone(), *mark));
+        Ok(())
+      }
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -1839,6 +1888,12 @@ impl Partition {
           volume: *volume,
           snapshot: *id,
         });
+        // A carried capture's mark goes with its snapshot (A-503): its landings are refused from then on.
+        if let Some((_, mark)) = self.carried.get_mut(volume)
+          && *mark == Some(*id)
+        {
+          *mark = None;
+        }
         Ok(())
       }
       Op::LineageAdded { edge } => {
@@ -2242,6 +2297,7 @@ impl Partition {
     }
     self.lineage.remove(&id.bytes);
     self.captured_bases.retain(|captured| captured.volume != id);
+    self.carried.remove(&id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -2405,6 +2461,17 @@ impl Partition {
         .collect(),
       green_adoptions: self.green_adoptions.values().copied().collect(),
       captured_bases: self.captured_bases.iter().copied().collect(),
+      carried_captures: self
+        .carried
+        .iter()
+        .map(
+          |(volume, (carried, mark))| crate::catalog::CarriedCaptureRecord {
+            volume: *volume,
+            carried: carried.clone(),
+            mark: *mark,
+          },
+        )
+        .collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2643,6 +2710,11 @@ impl Partition {
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     p.captured_bases = snapshot.captured_bases.iter().copied().collect();
+    p.carried = snapshot
+      .carried_captures
+      .iter()
+      .map(|record| (record.volume, (record.carried.clone(), record.mark)))
+      .collect();
     Ok(p)
   }
 

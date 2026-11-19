@@ -2540,7 +2540,15 @@ fn owed_catalog(
     state,
     config,
     (catalog, record.catalog_version),
-    crate::catalog::CatalogValue::of(record).to_record_bytes(),
+    crate::catalog::CatalogValue::of(
+      record,
+      state
+        .db
+        .partition()
+        .carried(record.id)
+        .map(|(carried, _)| carried),
+    )
+    .to_record_bytes(),
     local,
   );
   let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
