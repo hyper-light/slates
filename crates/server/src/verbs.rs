@@ -5079,11 +5079,12 @@ fn dispatch_inner(
       rules,
       hooks,
       hooks_env,
+      signers,
     } => crate::repository::set_policy(
       state,
       principal,
       (&repository, read),
-      (&rules, &hooks, &hooks_env),
+      (&rules, &hooks, &hooks_env, &signers),
     ),
     RequestBody::Checkout {
       green,

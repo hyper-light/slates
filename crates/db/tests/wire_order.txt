@@ -186,6 +186,8 @@ PolicyRight 0 Read
 PolicyRight 1 Submit
 PolicyRight 2 Rewrite
 PolicyRight 3 Delete
+PolicyRight 4 MergeCommit
+PolicyRight 5 UnsignedCommit
 PolicyWho 0 Anyone
 PolicyWho 1 AnyOf
 Principal 0 Uid

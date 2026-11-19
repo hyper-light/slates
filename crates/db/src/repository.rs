@@ -1960,6 +1960,7 @@ mod tests {
       rules,
       hooks: Vec::new(),
       hooks_env: Vec::new(),
+      signers: Vec::new(),
     }
   }
 
@@ -2004,6 +2005,7 @@ mod tests {
         section("default", "LANG", b"en_US.UTF-8"),
         section("pre-lock", "TOKENS", b"made by the hook"),
       ],
+      signers: Vec::new(),
     };
     let set = Op::RepositoryPolicySet {
       repository: repo,

@@ -300,14 +300,12 @@ fn an_object_name_is_read_from_hex_of_either_case_and_refused_by_place() {
   );
 }
 
-/// Any of git's four types.
+/// git's four types.
+const KINDS: [Kind; 4] = [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag];
+
+/// Any of git's four types, chosen by index (no `prop_oneof!`, whose strategy is reference-counted, R2).
 fn kind() -> impl Strategy<Value = Kind> {
-  prop_oneof![
-    Just(Kind::Commit),
-    Just(Kind::Tree),
-    Just(Kind::Blob),
-    Just(Kind::Tag)
-  ]
+  (0..KINDS.len()).prop_map(|at| KINDS[at])
 }
 
 proptest! {

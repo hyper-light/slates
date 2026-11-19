@@ -100,6 +100,7 @@ impl Repositories for Held {
         rules,
         hooks: Vec::new(),
         hooks_env: Vec::new(),
+        signers: Vec::new(),
       },
     })
   }
