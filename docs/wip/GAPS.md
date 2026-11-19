@@ -452,6 +452,19 @@
 > receive-pack and a store not held answer `503`. `slates-server --lib vcs_` 76 of 76 on the Mac Studio, red first (3
 > of 3). Owed: the server's store per repository and its lender (with A-653's pack source), the daemon starting an edge,
 > receive-pack's session (A-654), the live `git clone`.
+> **A-625 part 3, the credential record and the daemon's edge (2026-11-19, g299 under main's rulings):** one record of
+> version-control credentials (`slates-db` `credentials`: an SSH key by its blob under OpenSSH's fingerprint, an HTTP
+> token by its SHA-256 alone, each proving a principal until its wall-clock expiry, on the partition its id routes to),
+> enrolled and revoked only under the issuer's proof (`slates credential key|token|revoke`; `Forbidden` on a consumer's
+> channel), found by both edges through `credentials::find`. The daemon starts the HTTP edge from
+> `DaemonConfig::vcs_http`; a proven request's connection moves to its repository's shard and is decided there; every
+> refusal typed. macOS arm64 (Mac Studio, kiln r46, the tree merged over main 71a43cd97, fmt clean): `slates-db --lib
+> credentials` 5 of 5, `slates-server --lib credentials` 9 of 9 and `--lib vcs_http` 32 of 32, `slates-http-edge --lib`
+> 31 of 31, `slates-cli` `credential` 1 of 1, `--test wire_order` 2 of 2 in `slates-db` and `slates-ipc`. Owed:
+> upload-pack served once A-662's stores land (`503` until then), A-654's session, LFS's routes on the site (main's
+> Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet identity's hand-in, a consumer's
+> revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live
+> `git clone` (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -953,9 +966,12 @@
 > replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
 > `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
 > among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
-> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0. Owed
+> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0; its eighth slice
+> (g297), read access by A-606's rules (the `locked` repository's four scripted and seven stock sessions replayed
+> whole, the connection judging each read by its principal's rules; macOS arm64, Mac Studio, 54 of 54), not yet
+> red-checked. Owed
 > from it: `list`'s fold of a name beyond ASCII (utf8proc's case
-> folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
+> folding and mark stripping need Unicode's tables; over ASCII it is exact); and a denied read's mid-command authentication request. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
 > greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's

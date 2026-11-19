@@ -50,6 +50,10 @@ pub enum Progress {
   More,
   /// The answer is whole.
   Done,
+  /// The connection ends here without a further word, as `svnserve`'s does where an assertion aborts its process
+  /// (`get-file-revs` of a file whose first location the session may not read); nothing more is written, and the
+  /// caller ends the connection.
+  Close,
 }
 
 impl Stream {
@@ -106,6 +110,7 @@ impl Stream {
       repository,
       base: session.base,
       uuid: session.uuid,
+      authz: session.authz,
       out,
     };
     match &mut self.rest {
