@@ -42,6 +42,7 @@
 
 mod admission;
 pub mod object_name;
+pub mod objects;
 pub mod out;
 pub mod pktline;
 pub mod sideband;
