@@ -130,10 +130,7 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::PolicyMismatch => Refusal::PolicyMismatch,
     // A read-only attachment's or a snapshot view's change, on the wire as the read-only volume it is.
     VfsError::ReadOnly => Refusal::ReadOnlyVolume,
-    VfsError::BaseUnavailable(errno) => Refusal::BaseUnavailable {
-      path: String::new(),
-      errno: *errno,
-    },
+    VfsError::BaseUnavailable(code) => base_unavailable(String::new(), *code),
     VfsError::Memory(MemError::BudgetExceeded { available, .. }) => Refusal::BudgetExceeded {
       available: *available,
     },
@@ -285,14 +282,28 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     H::NotDirectory => TargetRefusal::NotDirectory,
     H::NotFile => TargetRefusal::NotFile,
     H::StaleHandle => TargetRefusal::Stale,
-    H::Unavailable(errno) | H::OwnMount(errno) => TargetRefusal::Host { errno: *errno },
-    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
-    H::Win32(code) => TargetRefusal::Host {
-      errno: i32::try_from(*code).unwrap_or(i32::MAX),
+    // The code in the variant of its numbering (A-539): an errno in `Host`, a Win32 code in `HostWin32`.
+    H::Exists(code)
+    | H::NoSpace(code)
+    | H::Unsupported(code)
+    | H::Unavailable(code)
+    | H::OwnMount(code) => match code {
+      slates_vfs::host::OsCode::Win32(code) => TargetRefusal::HostWin32 { code: *code },
+      slates_vfs::host::OsCode::Errno(errno) => TargetRefusal::Host { errno: *errno },
     },
     // A target is a directory host's, which never answers a pending fetch (an S3 base's, A-524); were one to, it is a
-    // refusal no errno names.
+    // refusal no code names.
     H::Pending => TargetRefusal::Host { errno: 0 },
+  }
+}
+
+/// A base directory unavailable at `path`, by the code its host named, in the variant of its numbering (A-539): an
+/// errno in `BaseUnavailable` (0 where the host named none), a Win32 code in `BaseUnavailableWin32`.
+pub fn base_unavailable(path: String, code: Option<slates_vfs::host::OsCode>) -> Refusal {
+  match code {
+    Some(slates_vfs::host::OsCode::Win32(code)) => Refusal::BaseUnavailableWin32 { path, code },
+    Some(slates_vfs::host::OsCode::Errno(errno)) => Refusal::BaseUnavailable { path, errno },
+    None => Refusal::BaseUnavailable { path, errno: 0 },
   }
 }
 

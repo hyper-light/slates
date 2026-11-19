@@ -1,0 +1,17 @@
+Stream params: {}
+replycaps -- {} (mandatory: True)
+check:bookmarks -- {} (mandatory: True)
+check:phases -- {} (mandatory: True)
+check:updated-heads -- {} (mandatory: True)
+changegroup -- {version: 03} (mandatory: True)
+    format: id, p1, p2, cset, delta base, len(delta)
+
+    changelog
+    976eb9d7cd11eb8a63d94860fb7186069eef4a10 ad120869acf0c6c266f1293ca5da567d8b382f1d 0000000000000000000000000000000000000000 976eb9d7cd11eb8a63d94860fb7186069eef4a10 0000000000000000000000000000000000000000 135
+
+    manifest
+    c218a533844fa758ff5c06ed8de7f94fc47f02fb a0c8bcbbb45c63b90b70ad007bf38961f64f2af0 0000000000000000000000000000000000000000 976eb9d7cd11eb8a63d94860fb7186069eef4a10 a0c8bcbbb45c63b90b70ad007bf38961f64f2af0 55
+obsmarkers -- {} (mandatory: True)
+    version: 1 (92 bytes)
+    86d599a1904caf7869263a4d824bcb40473ed8fc 976eb9d7cd11eb8a63d94860fb7186069eef4a10 0 (Thu Jan 01 00:00:00 1970 +0000) {'ef1': '9', 'operation': 'amend', 'user': 'test'}
+bookmarks -- {} (mandatory: True)

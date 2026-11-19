@@ -186,7 +186,7 @@ fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String
     .files
     .sizes(crate::merge_service::work_base(state, work))
     .into_iter()
-    .map(|(path, len)| (path.to_owned(), EntryKind::File, len));
+    .map(|(path, len)| (path, EntryKind::File, len));
   files
     .chain(dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
     .chain(

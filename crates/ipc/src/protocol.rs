@@ -3397,10 +3397,16 @@ pub enum HostAnswer {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
-  /// The host's errno.
+  /// The host's errno (Linux, macOS), never a Win32 code (A-539: `Win32`).
   Errno {
     /// The errno.
     errno: i32,
+  },
+  /// The host's Win32 error code (Windows), in Win32's own numbering: never an errno, whatever its number (A-539).
+  /// `Errno` carries an errno alone. Appended.
+  Win32 {
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -3414,7 +3420,8 @@ pub enum LandingDegradation {
   },
   /// Media durability was not asked for: barriers only, the supported level.
   BarriersOnly,
-  /// The host stopped answering (a crash-like errno); the landing aborted and advanced nothing.
+  /// The host stopped answering (a crash-like errno; a Win32 code is `CrashedWin32`, A-539); the landing aborted and
+  /// advanced nothing.
   Crashed {
     /// The errno.
     errno: i32,
@@ -3451,6 +3458,12 @@ pub enum LandingDegradation {
     path: String,
     /// The path it is kept at.
     kept: String,
+  },
+  /// The host stopped answering with a Win32 error code (Windows), in Win32's own numbering (A-539); the landing
+  /// aborted and advanced nothing. `Crashed` carries an errno alone. Appended.
+  CrashedWin32 {
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -3590,7 +3603,8 @@ pub enum Refusal {
   InvalidName,
   /// A policy the base does not allow.
   PolicyMismatch,
-  /// The base directory is unavailable.
+  /// The base directory is unavailable: the host's errno, 0 where it named none (a Win32 code is
+  /// `BaseUnavailableWin32`, A-539).
   BaseUnavailable {
     /// The path.
     path: String,
@@ -3942,7 +3956,8 @@ pub enum Refusal {
   /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
   /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
   /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
-  /// not happen. Appended.
+  /// not happen. A consensus operation (a bootstrap, a recovery) answers it too when it ran on the control shard but
+  /// a shard of the daemon did not apply its publication within that shard's own time (A-566). Appended.
   DurabilityPending {
     /// How long the reply was held before it was told this, nanoseconds.
     held_ns: u64,
@@ -3965,6 +3980,14 @@ pub enum Refusal {
   ArchiveRefused {
     /// Why.
     fault: ArchiveFault,
+  },
+  /// The base directory is unavailable: the host's Win32 error code (Windows), in Win32's own numbering (A-539).
+  /// `BaseUnavailable` carries an errno alone. Appended.
+  BaseUnavailableWin32 {
+    /// The path.
+    path: String,
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -4008,9 +4031,9 @@ pub enum TargetRefusal {
     /// The owner's uid.
     owner: Option<u32>,
   },
-  /// The host refused the path: its OS error number.
+  /// The host refused the path: its errno (a Win32 code is `HostWin32`, A-539).
   Host {
-    /// The OS error number.
+    /// The errno.
     errno: i32,
   },
   /// The kernel's mount table names no mount of this daemon's there.
@@ -4046,6 +4069,12 @@ pub enum TargetRefusal {
   TooLong {
     /// The longest path the daemon takes there, in bytes.
     longest: u64,
+  },
+  /// The host refused the path: its Win32 error code (Windows), in Win32's own numbering (A-539). `Host` carries an
+  /// errno alone. Appended.
+  HostWin32 {
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -4981,6 +5010,7 @@ pub fn pack<M: Wire>(
     kind: SlotKind::Bulk,
     request,
     payload: payload.to_vec(),
+    stamp: 0,
   })
 }
 
@@ -5025,6 +5055,7 @@ pub fn owned(region: &ClientRegion, slot: Slot) -> Result<Slot, IpcError> {
     kind: SlotKind::Inline,
     request: slot.request,
     payload: bulk_body(region, &slot.payload)?,
+    stamp: slot.stamp,
   })
 }
 
