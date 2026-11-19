@@ -40,8 +40,9 @@ fn header(section: Section) -> Event<'static> {
 }
 
 /// A-582 part 2, golden vectors: do decode each `fetch` response stock git 2.50.1 wrote, then encode it. Expect: each
-/// section in order with its lines (git's `shallow` line without its LF), a pack beginning `PACK` version 2, progress on
-/// band 2 where it was left on, every packet of the `sideband-all` response on a band, and each stream's own bytes back.
+/// section in order with its lines (git's `shallow` line without its LF), a pack beginning `PACK` version 2, progress
+/// on band 2 where it was left on, every packet of the `sideband-all` response on a band, and each stream's own bytes
+/// back.
 #[test]
 fn stock_gits_responses_decode_to_their_sections_and_encode_back() {
   let main = sha1(MAIN);

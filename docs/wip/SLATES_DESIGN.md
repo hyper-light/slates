@@ -11364,7 +11364,9 @@ that host, and issued only when every identity the version references is placed.
 increment id already in `seen` returns its original result (the completion record holds the
 reply); retries are always safe. A signed submit's verdict rides the version's chain entry and the green's accepted
 record, a checkpoint keeping it once it folds the entry (A-321): the version's provenance, read back by `MergeRecord`
-and answering every later reply that names the version.
+and answering every later reply that names the version. A green that is a member of a repository commits each version
+as an entry of the repository's register, which one step can share with the repository's other greens' versions, its
+namespace and its own state (§4.17.1 shared piece 2, A-603).
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -11637,6 +11639,30 @@ decides the details.
 > branch keeps its source's checkpoint and history from passing that version (`merge_service::reachable_floor`): what a
 > long-lived branch costs its source is that history, bounded by the source's retention budget. Owed: a branch's base
 > recorded as a delta against its source's checkpoint, which ends both.
+>
+> **Status (2026-11-19, A-603: shared piece 2 built on the owner).** A repository's register is built in the metadata
+> database (`crates/db/src/repository.rs`, the entry's guard in `crates/db/src/repository/entry.rs`;
+> `Op::RepositoryAdvanced`). One entry commits, as one durable step, any of: several of the repository's greens'
+> versions (several of one green too, a stack landed whole), greens joining its lineage, its namespace's changes, and its
+> own state (Mercurial's phase roots and obsolescence markers, §4.17.3 decisions 3 and 4), with that state moved beside a
+> push or alone. Its checks are read at its position, before any of its own changes: a green's head (`check:heads` and
+> `unbundle`'s heads), and the exact names under a prefix (so no head was added or retired). The entry commits all of
+> it or none: each item is judged against what the items before it left, guard then apply, and a refusal is typed
+> (`OutOfOrder`, `CheckFailed` and `StateChanged` naming the item, or the namespace's and the lineage's own). Every
+> change of a repository takes the register's next position, whichever operation records it (A-515's and A-575's
+> operations, a member's version recorded alone, a member's destroy), so one position names one state of the
+> repository. The server's verbs and every member's version now record entries (`crates/server/src/repository.rs`,
+> `version_record`). The state is charged to the partition's merge budget; a partition snapshot carries the register;
+> a recovery rebuilds it, and the entries' versions replay into each green's chain as any version does. A model test
+> runs generated histories through a database over a real anchor segment, crashing it at random points, against the
+> rules kept over plain maps; its census meets every kind of entry, refusal and recovery. Owed: (1) the push that makes
+> an entry of several greens: its works are judged all before any commits (§4.16's verdict split into a judgment and its
+> commit), then one entry carries them, with piece 4's works from a client's push. (2) The fleet half: the register as
+> one ledger object of the repository's candidates (§4.8), its record the entry with each version's merge record value,
+> committed at f + 1; every holder recomputes every version of an entry before it acknowledges, all or none, and a
+> mismatch refuses the repository on that holder; a takeover adopts whole entries; and the repository record's own
+> replication rides it (A-515's owed half). Until then each member's version still ships on its green's own register,
+> so in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -11648,9 +11674,10 @@ decides the details.
    changesets and moves bookmarks are each one durable step, with no coordination call on the write path (§2 ban 10).
    Repositories spread across the fleet; one repository's greens serialize on its owner shard. §4.16 gives each green a
    register of its own; a register shared by a repository's greens, whose entry carries one or more of their merge
-   records, is the change this needs (a piece below).
+   records, is the change this needs (shared piece 2; built on the owner by A-603, its fleet half owed: status above).
 3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
-   of it, so two clients creating one name race on one append and one of them is refused.
+   of it, so two clients creating one name race on one append and one of them is refused (built, A-603: every change of
+   a repository takes one position of its register).
 4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
    identity, so creating it costs no walk of the tree. (The engine makes a green at another green's version without a
    walk since A-534, §4.16; the verb, `CreateGreen { base }`, still walks its base until piece 1's repository verbs use
@@ -11978,7 +12005,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
-   `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3).
+   `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
+   (A-603); owed: the push that judges several works before any commits, and the fleet half (the register as one ledger
+   object, holders recomputing whole entries, takeovers adopting them).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -12054,6 +12083,18 @@ engine: the verdict, rebase, position mapping, the register).
 > wrote or read decodes and encodes back to its exact bytes. One machine holds the response's section order, stepped by
 > the reader and the writer alike, so neither takes a section out of order. `object-info` and `bundle-uri` are refused
 > as unknown commands until their part, so a server advertises neither before it.
+>
+> **Status (2026-11-19, A-594: piece 9's transport built).** `crates/ssh` (`slates-ssh`) is the SSH server's transport
+> (RFC 4253) as a sans-io core that git's, Mercurial's and Subversion's SSH routes can share: the caller moves bytes and
+> the time in and reads events out. It sends its banner lines and identification, reads the client's line within RFC
+> 4253 §4.2's 255 bytes, negotiates by the client's first choice, runs `curve25519-sha256` with an `ssh-ed25519` host
+> key, and seals packets under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` through aws-lc-rs. Strict
+> key exchange, OpenSSH's answer to the Terrapin attack, is offered under both its names and enforced whenever the
+> client offers it. A key is replaced when either direction reaches half the bound its cipher's analysis gives (RFC 4344
+> §3), or when the key time passes; the key time is learned (the table below), and the server's estimator that feeds it
+> is owed with the listener. Held to the chacha20-poly1305 draft's worked packet, NIST's SSH key-derivation vectors,
+> RFC 7748's X25519 exchange and RFC 8032's Ed25519 tests, and to whole connections with a client written from the RFCs
+> alone. User authentication and the session channel are piece 9's next parts.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12255,6 +12296,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Reaping a stalled client | silence past the tail of the gaps seen for that phase of the exchange, with the estimate's own error added (A-363's form) | the shard's connection budget | the round trip measured at connect |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges | merge two immutable tables when the measured cost of probing one more table, times the measured lookup rate, exceeds the measured merge cost spread over the tables' expected life | one merge in flight per repository | merge when the first lookup's measured probe cost exceeds its measured share of a merge |
+| SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
 
 git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
 `pack.window`, `pack.depth`]; its own notes call them "magic values" [B: technical `pack-heuristics`].
@@ -12860,6 +12902,18 @@ and export by landing).
 > check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. Owed with the server
 > (piece 7): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each
 > command arrives, over a transaction built a command at a time.
+>
+> **Status (2026-11-19, A-599).** Built: ra_svn's greeting and authentication (`slates-svn`'s `handshake`, piece 7's
+> first part), a state machine that does no I/O, from the greeting to `repos-info`: the client's answer read as
+> `svnserve` reads it, the mechanisms `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` listed, taken and failed as `svnserve`
+> lists, takes and fails them, and `CRAM-MD5`'s HMAC-MD5 through RustCrypto's `hmac` and `md-5` (the vendored aws-lc-rs
+> has MD5 but HMAC over the SHA family alone), the keyed contexts held, never the secret. Its oracle is stock
+> Subversion 1.15.0's own sessions, `svn` against `svnserve`, every byte each way logged by a relay
+> (`crates/svn/fixtures/handshake/`): each is answered byte for byte as `svnserve` answered it, the greeting's
+> `svndiff1` aside, whole and cut anywhere, and each hostile one refused where `svnserve` refused it. The principal is
+> the one the successful attempt proved; three hostile inputs no stock client sends are refused where `svnserve` reads
+> them through a C string or to 64 levels (item 10's text below). Owed with the rest of piece 7: the URL's canonical
+> form, the repository it names and the root URL `repos-info` carries, as `find_repos` derives them.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13149,7 +13203,11 @@ standard error is the client's message (`E165001`); post-commit's becomes `commi
 `CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
 TLS; over `svn+ssh://` the SSH login. `CRAM-MD5` needs the server to hold the shared secret or its keyed-MD5
 "contexts", which "must both be protected" alike (RFC 2195 §2 and §4), so slates holds the contexts, never the
-cleartext, as §4.15's S3 credentials are held: in RAM on the owner and the anchor, never on disk. `svn://` carries no
+cleartext, as §4.15's S3 credentials are held: in RAM on the owner and the anchor, never on disk. The exchange is
+`svnserve`'s (`serve.c` `construct_server_baton`, `auth`; `cram.c`; built, A-599), stricter on three inputs no stock
+client sends: a CRAM-MD5 response holding a NUL is malformed, as `cram.c` finds every such response; an `EXTERNAL`
+token is compared whole, where `strcmp` stops at a NUL; and a list deeper than the handshake's prototypes is refused at
+its third level, where `svnserve` reads 64. `svn://` carries no
 encryption, so it is served on loopback alone unless the repository's policy names another interface; `svn+ssh://` and
 `https://` are the encrypted routes. Path rules are Subversion's authorization file (notes §7: per-repository and global
 sections, globs from 1.10, users, `@groups`, `&aliases`, `$anonymous`, `$authenticated`, `*`, `~`; 1.14.1's combining of
@@ -13281,8 +13339,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    test, the lock table's check after the merge, and `verify_locks` in the oracle).
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
    `uuid`, `youngest`; the dump round trip is their gate.
-7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
-   checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
+7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
+   the plain reads; the reporter (update, switch, status, diff, checkout); commit; log, locations, segments, file
+   revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
    oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
    log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
@@ -40273,3 +40332,203 @@ its tree, `into_tree`; the oracle's types open to the crate), and `crates/svn/sr
   2554 and 2645), as each command arrives, over a transaction built a command at a time; the drive's other checks. The
   merged version's identities and mergeinfo counts (FSFS's `update_ancestry` and mergeinfo increment) are the index's
   at the version's append (A-553), not the verdict's.
+
+### A-599 — ra_svn's greeting and authentication: a handshake that does no I/O, held to stock Subversion's own sessions (2026-11-19, g234, UI goal 92; §4.17.4 "5. The wire" and "10. Who may do what", piece 7's first part; after A-531)
+Applied in the same change to:
+- §4.17.4's status, item 10 and piece 7; GAPS (the §4.17.4 entry); the research notes (`vcs-servers-subversion.md` §1
+  and §2);
+- `crates/svn` (`handshake.rs` and `handshake/tests.rs`, new; `fixtures/handshake` with `make-fixtures.py` and
+  `SHA256SUMS`; `lib.rs`; `Cargo.toml`);
+- the workspace manifest and lock (`hmac` 0.12.1, `md-5` 0.10.6, and `subtle` under `digest` for `hmac`'s `mac`
+  feature; nothing else re-resolved, though cargo's own resolution also moved five packages to `windows-sys` 0.61.2).
+- **The exchange**, as `svnserve` makes it (`serve.c` at `d434dc14`: `construct_server_baton`, `send_mechs`, `auth`,
+  `internal_auth_request`, `find_repos`; `cram.c`). The greeting is `svnserve`'s without `svndiff1`. The client's answer
+  is read as `vparse_tuple` reads `nlc?c(?c)`: items past the prototype ignored, a `ra-client` with its client list or
+  not at all, then the version, the capabilities' kinds and `edit-pipeline` judged in that order; each refusal ends the
+  connection with nothing written. The caller names the repository or refuses the URL in `svnserve`'s words
+  (`SVN_ERR_BAD_URL`, `SVN_ERR_BAD_FILENAME`, `SVN_ERR_RA_SVN_REPOS_NOT_FOUND`); a repository that allows no one is
+  refused before any request. The mechanisms are listed, taken and failed in `send_mechs`' and `auth`'s order and words;
+  a failed attempt lets the client answer again; success writes `( success ( ) )` and `repos-info` at once. The
+  principal is the one the successful attempt proved, and nothing a failed attempt named is kept. CRAM-MD5's challenge
+  is `<nonce.time@host>` from parts the caller gives (the host a C string), its response split at the last space and
+  verified in constant time; a caller that can make no challenge fails the attempt as `cram.c` does.
+- **The dependency.** The vendored aws-lc-rs has MD5 (`digest::MD5_FOR_LEGACY_USE_ONLY`, a local change for S3) but no
+  HMAC over it: `hmac::Algorithm`'s field is private and its constants are the SHA family's (`vendor/aws-lc-rs/src/
+  hmac.rs` 124 and 143-155). Main approved RustCrypto's `hmac` and `md-5` for this mechanism alone; the keyed contexts
+  are what is held (RFC 2195 §4), never the secret.
+- **Evidence.** `make-fixtures.py` ran stock Subversion 1.15.0 (r1937767, Homebrew, the Mac Studio, 2026-11-19), `svn`
+  against `svnserve -d` through a relay on 127.0.0.1:3690 and against `svnserve -t` through a tunnel, each direction
+  logged before it was forwarded, `SHA256SUMS` checked on the Studio and again here: anonymous; CRAM-MD5 with secrets
+  of 11, 64 and 70 bytes; a wrong password; both mechanisms listed; `EXTERNAL`; no repository; no access; and
+  hand-made clients for each answer `svnserve` refuses, unlisted mechanisms, and an `EXTERNAL` token naming another
+  user. 1.15.0's `cram.c`, `internal_auth.c` and protocol document equal `d434dc14`'s byte for byte, and its `serve.c`
+  differs by a Windows include and a comment. The stock client is built with Cyrus SASL: its `ANONYMOUS` token is
+  base64 of `anonymous@` and its host's name with a line feed, and after a failure it sends `( CRAM-MD5 ( ) )` before
+  learning it has no further credentials (`cyrus_auth.c` 498-505, 553-555 at 1.15.0); a client without SASL sends an
+  empty token (`internal_auth.c`).
+- **Stricter than `svnserve`**, on hostile input alone: a CRAM-MD5 response holding a NUL is malformed (`cram.c` refuses
+  every one, reading a C string); an `EXTERNAL` token is compared whole (`strcmp` stops at a NUL), and an absent one is
+  an empty one; a list deeper than the handshake's prototypes is refused at its third level.
+- **Bounds.** The caller's item bytes; the longest word, 24 (`MAX_WORD_LENGTH`, 1.14 and 1.15 alike); depth 2; and the
+  item count the bytes over what one parsed item costs (`size_of::<Value>()`, 24 bytes on aarch64-apple-darwin), so a
+  message's parsed values take no more memory than its bytes may.
+- **Tests.** `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: 78 of 78 on the branch, then 139
+  of 139 on the tree merged with main at 575188f7f (A-602's locks and A-605's mergeinfo among them; `cargo fmt --check`
+  clean), the handshake's 28 after two long tests were split to stay within the lint wall's cognitive complexity of 10.
+  Every session replayed whole, in two pieces at every cut and cut short at every byte; RFC 2195's worked example;
+  RFC 2202's seven HMAC-MD5 vectors; `cram.c`'s digest and its reading of a response transcribed as oracles under
+  proptest; `vparse_tuple`'s tables; every bound exactly enough for every stock session; calls out of turn. Red first, on
+  the earlier draft given the API the tests drive: 17 of 25 passed, the 8 failures naming its three decisions (a
+  `ra-client` taken without its list; a NUL-holding response split; the item count the bytes over two, which let a
+  message's values cost twelve times its bytes).
+- **Owed** (GAPS): the URL's canonical form, the repository it names and the root URL `repos-info` carries, as
+  `find_repos` derives them; a learned limit on failed attempts (`svnserve` has none); the keyed contexts held across a
+  restart without the secret (§4.13).
+
+### A-594 — SSH's transport, the SSH server's first part: RFC 4253 as a sans-io core, strict key exchange, `curve25519-sha256` with `ssh-ed25519`, and keys retired by their ciphers' bounds and a learned time (2026-11-19, g294, UI goal 92; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; D-28)
+Applied in the same change to:
+- §4.17.2's status and its tunables table (the SSH key time); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.5
+  (new: the sources read for it, pinned by hash) and §5.4 (the drafts' owed reading discharged);
+- `crates/ssh` (new, `slates-ssh`: `lib.rs`, `wire`, `ident`, `packet`, `kexinit`, `kex`, `hostkey`, `keylife`,
+  `refusal`, `transport`, `entropy`; the tests in `src/tests`, with the test client in `src/tests/client.rs`);
+- the workspace lock (the new crate alone: its only dependency is aws-lc-rs, and proptest and `slates-test-seeds` for
+  its tests).
+- **Why a crate of its own.** git, Mercurial and Subversion each reach slates over SSH, so the transport carries no
+  tool's knowledge; the channel piece decides what an `exec` request names. §4.17.3 and §4.17.4 still describe the
+  host's `sshd` starting a slates CLI verb; this transport lets those routes be slates-served too, which is their
+  owners' call and not changed here.
+- **Sans-io.** `ServerTransport` takes the client's bytes and the time and gives events, output bytes and a timer. Its
+  random bytes (a KEXINIT's cookie, each packet's padding, each exchange's ephemeral key) come through an `Entropy`
+  seam whose one real implementation is AWS-LC's system generator, so a test runs a whole connection from known bytes.
+- **The identification** (RFC 4253 §4.2). Banner lines first, each checked never to begin "SSH-"; then
+  `SSH-2.0-slates_<version>`. The client's line is read within 255 bytes and refused on its 255th if that does not end
+  it. Following OpenSSH's own reader (`kex.c` at `fa4b2a82`): a line before the identification is refused, a bare LF
+  ends a line (which §4.2 allows), a NUL or a CR not followed by LF is refused, and any printable byte follows the
+  protocol version, since clients in use put a minus sign in their software version. Versions 2.0 and 1.99 are taken.
+- **Packets** (RFC 4253 §6; RFC 5647 §7; the chacha20-poly1305 draft §6, §7). From its first four bytes a packet's
+  length is refused if too short for a payload, not aligned to its cipher's block (8 in the clear and for ChaCha20, the
+  part after the length for the AEADs; 16 for AES), or past the caller's cap, which RFC 4253 §6.1's 35000 bytes floors;
+  so a hostile length costs nothing. The tag is checked before decryption, and the padding after (four bytes at least,
+  a payload left). Sending uses the least padding that aligns, drawn at random, and no packet larger than 35000 bytes.
+  AES-GCM's nonce is the IV's fixed field and its 64-bit invocation counter, counted up per packet and wrapping as RFC
+  5647's integer does; no key sees 2^64 packets, so no nonce repeats.
+- **Negotiation** (RFC 4253 §7.1). Per list, the client's first name the server runs. The MAC lists are skipped, as
+  both AEAD drafts say; the server's own MAC lists name `none` alone, since §7.1 requires one name and the server runs
+  no MAC apart from its ciphers. A marker (`kex-strict-*`, `ext-info-c`) is matched against the methods the server
+  runs, never its advertised list, so no marker is ever chosen, even one a client lists first. A guessed packet is
+  ignored when the guess was wrong, judged by the two lists' first names as OpenSSH judges it.
+- **Strict key exchange** (`draft-ietf-sshm-strict-kex-03` §3). The server offers both names; it is on when the client
+  offers either client name. Then the client's KEXINIT must be its first packet, only KEXINIT, NEWKEYS and the exchange
+  methods' messages (30 to 49) are taken until the first exchange ends, `SSH_MSG_KEX_ECDH_INIT` is taken once, and
+  each direction's sequence number restarts at zero after its NEWKEYS. A sequence number that would wrap before the
+  first exchange ends is refused with or without it. Without it the server carries numbers on, as RFC 4253 does: with
+  neither side sending `SSH_MSG_EXT_INFO`, the only message a Terrapin deletion could take is the first one after the
+  keys, whose loss stalls the connection rather than changing it.
+- **The exchange** (RFC 8731 §3, §3.1; RFC 5656 §4; RFC 4253 §7.2). Public keys of any length but 32 are refused, and
+  an all-zero secret is refused by an OR over its bytes, behind AWS-LC's own refusal of small-order points. K is the
+  secret read big-endian as an `mpint`; the hash covers `V_C`, `V_S`, both KEXINIT payloads, `K_S`, `Q_C`, `Q_S` and K;
+  the first hash is the session id; the keys are `HASH(K || H || letter || session_id)` extended as §7.2 says, wiped
+  from memory on drop (a best-effort overwrite through `core::hint::black_box`; no dependency taken for it).
+- **Keys' lives** (RFC 4344 §3; RFC 4253 §9). By use, derived from the cipher: 2^32 packets (RFC 4344 §3.1, and
+  ChaCha20's nonce space), and for AES 2^(L/4) = 2^32 blocks (§3.2, L = 128); ChaCha20 has no block bound. The server
+  starts a new exchange at half of each, the point RFC 4344 §3.1 prefers for packets ("rekey after receiving more than
+  2**31 packets"), and ends the connection only if a key reaches its whole limit, as when a client ignores the server's
+  KEXINIT and keeps sending. An operator's cap can only lower the limits. By time, learned: the tail of the lifetimes
+  this deployment's authenticated connections lived, within RFC 4253 §9's hour and the hour until one is measured
+  (`keylife::key_time_limit_ns`), never shorter than the connection's last exchange took, so a re-exchange can never
+  fill a connection. The server starts exchanges only after the service is accepted, so a service reply never falls
+  inside one.
+- **Back-pressure.** One packet is buffered in and one event waits; reading stops while an event waits or while a
+  packet cap of output is unwritten, so a client that floods and does not read grows nothing.
+- **Owed, in order.** User authentication by public key (RFC 4252), with RFC 8308's `SSH_MSG_EXT_INFO` and its
+  `server-sig-algs` when RSA keys are offered (RFC 8332 and RFC 5656 remain owed reading); the session channel with
+  git's `exec` and `env` (RFC 4254); the listener on the runtime, with the estimator of connection lifetimes that feeds
+  the key time and the host key's keeping; main's live interop with stock `ssh` clients. A post-quantum exchange:
+  OpenSSH 10's clients prefer `mlkem768x25519-sha256`, and (from memory, to be verified) OpenSSH 10.1 warns on every
+  connection whose exchange is not post-quantum; aws-lc-rs carries ML-KEM-768, so the hybrid is a follow-on piece with
+  its own design amendment.
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898, 68 of 68 at 33a9588). Red first at
+  c5a312d: 23 compile errors, each a module of the transport not yet built. Golden: the chacha20-poly1305 draft's
+  Appendix A packet sealed and opened byte for byte; NIST CAVS 14.1's SSH KDF vectors (SHA-1, whose 192-bit keys need
+  §7.2's extension, and SHA-256 in both groups); RFC 7748 §6.1's exchange as the server's half; RFC 8032 §7.1 tests 1
+  to 3 as host key and signature blobs; an AES-GCM oracle sealing by hand under RFC 5647 §7.1's nonce across the
+  counter's wrap. Hostile: identification lines at and past 255 bytes, lengths too short, unaligned, past the cap and
+  `u32::MAX`, bad padding, forged tags under both ciphers, small-order and wrong-length keys, every out-of-place message,
+  a refused service, an unshared cipher, and any bytes (proptest), each refused by its kind with its disconnect reason
+  checked by the client. Whole connections with the test client under both ciphers, strict and not, each direction its
+  own cipher, a right and a wrong guess, a client's rekey (session id kept), the server's rekeys by time and by use, a
+  client that never rekeys running out its key, both kinds of back-pressure, and the same seeds giving byte-identical
+  connections. Red four ways on the Studio: with the strict receive reset removed 12 of 26 transport tests failed; with
+  the KEXINIT-first check removed, its test failed; with the GCM counter frozen, 8 failed; with the all-zero check
+  removed, the small-order test still passed, since AWS-LC refuses those keys first (kept as RFC 8731's own check).
+
+### A-603 — A repository's register: one entry commits several greens' versions, members, names and the repository's own state as one step, its checks read at its position (2026-11-19, g261 for UI goal 92; §4.17.1 items 2 and 3 and shared piece 2; §4.17.3 decisions 3, 4 and 6; §4.16 "Commit"; D-28; after A-515, A-575)
+Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
+GAPS (the §4.17 entry), `crates/db/src/{catalog,op,error,partition,repository}.rs` (`RepositoryEntry`, `RepositoryCheck`,
+`NameBinding`, `GreenVersion`, `NameChange`, `StateChange`, `PhaseRoot`, `RegisterRecord`; `Op::RepositoryAdvanced`;
+`DbError::{OutOfOrder, CheckFailed, StateChanged}`; the snapshot's `repository_registers`), `crates/db/src/repository/entry.rs`
+and its tests (new), `crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/protocol.rs`
+(`DatabaseRefusal::{OutOfOrder, CheckFailed, StateChanged}`), `crates/ipc/tests/wire_order.txt`, and
+`crates/server/src/{error,repository,verbs}.rs`.
+- **What was there.** Each green's version was its own log record (`Op::GreenAdvanced`) and its own register in a fleet;
+  a repository's namespace changes were records of their own (A-515), one verb's several records one transaction
+  (A-575). Nothing committed several greens' versions as one step of the repository, nothing held a repository's own
+  state, and nothing could check a green a push does not move in the step that commits the push.
+- **The entry.** `Op::RepositoryAdvanced` carries one `RepositoryEntry`: the repository, the position it takes, its
+  checks, the greens joining the lineage, the greens' versions (each green's chain entry, opaque here, as
+  `GreenAdvanced`'s is), the namespace's changes (bind, retire, default) and the state's (a phase root added or
+  removed, a marker added). Git's atomic push is one entry of several greens' versions; a stack landed whole is one
+  entry of several versions of one green; a Mercurial push that adds changesets, moves bookmarks, phases and markers is
+  one entry; a phase move with no new changesets is an entry of state alone.
+- **The rule.** The entry takes the register's next position. Its checks read the register there, before any of its own
+  changes: a green's head is the version named (Mercurial's `check:heads` and `unbundle`'s heads, a head the push does
+  not move), and the names under a prefix are exactly the ones listed (no head added or retired where a range of names
+  holds the heads). Then its members join, its versions commit, its names change and its state moves, each item judged
+  against what the items before it left, by the lineage's and the namespace's own rules (A-515, A-575), a bind now
+  taking a member of the repository only; a version is the one after its green's head; a root added is not one, a root
+  removed is one, a marker added is not held. Anything that does not hold refuses the whole entry before the log records
+  any of it, typed: `OutOfOrder { named, expected }`, `CheckFailed { index }`, `StateChanged { index }`, or the
+  namespace's and the lineage's refusals; the apply is unconditional, so a replay rebuilds the same register. The guard
+  keeps what the entry's earlier items changed in an overlay of small maps keyed by borrows of the entry, so judging an
+  entry costs its own items, each a lookup; applying the entry to a clone of the tables was rejected on the design
+  ground that it costs the repository's size for every entry (not measured).
+- **One position, one state.** Every operation that changes a repository takes one position of its register: an entry,
+  each of A-515's and A-575's single operations, a member's version recorded alone (`GreenAdvanced`), and a member's
+  destroy (the repository it leaves). So a position names one state of the repository, whatever wrote the log, and a
+  register created with its repository goes with it. The server's verbs record one entry each (a repository's root
+  joining with its default branch's binding; a branch's member joining with its name's binding; a bind; a retire), and
+  `verbs::record_accepted` records every member's version as an entry (`repository::version_record`), so the server
+  makes one kind of record for every change of a repository; the single operations stay in the log's format for the
+  logs that hold them.
+- **The state, bounded.** Phase roots (each phase's nodes) and markers (in the order received, each found by its BLAKE3
+  identity, as Mercurial's obsstore skips a known marker) are the repository's own state. An entry's versions and the
+  state it adds are charged to the partition's merge budget with the chains and logs, refused `Capacity` past it; a
+  removed root and a destroyed repository give their bytes back; a snapshot's register is charged again when restored.
+- **Recovery.** The partition snapshot carries every register (`repository_registers`; a register naming no repository,
+  a second one for a repository, a repository without one, or a root or marker listed twice is a corrupt snapshot); the
+  log's entries replay through the same apply; an entry's versions are the greens' chain entries, so the server's
+  recovery replays them into each green as it replays every version.
+- **Tests** (Mac Studio, 2026-11-19; `cargo test -p slates-db --lib`, 127 of 127; `cargo test -p slates-server --lib
+  repository`; `cargo fmt --all` clean). Five unit tests drive the partition: several greens' versions together or none
+  (a skipped version, a stale position and a green outside the lineage each refused with nothing applied; a stack of
+  two versions of one green); checks at the position (a moved head, a retired and an added name under a prefix, a check
+  of the version the entry itself makes, heads outside the repository); the state with a push or alone and only from
+  the state it was made against; the budget (a marker, and two versions that fit one at a time and not together); one
+  position for every change. A model test runs 128 generated histories through a database over a real anchor segment,
+  crashing it at random points and comparing the recovered partition whole with the live one, and every answer and the
+  whole repository after every step with the rules kept over plain maps, where an entry is all or none by construction;
+  its census across the cases met 319 accepted entries of several greens, 625 stacks, 523 state moves with versions and
+  223 alone, 862 entries whose checks held, 179 refused by a check, 58 by a state change, 296 out of order, 435 by a
+  rule of the lineage or the namespace, 38 members destroyed, and 314 recoveries from a snapshot and 90 from the log
+  alone. Red ten ways in the database (the position, the checks, a version's order, the state's preconditions, a member
+  joined earlier in the entry, the positions, the versions' bytes in the budget, a names check's last name, the
+  registers in the snapshot, the restored state's charge) and two in the server (a member's version and a verb's entry
+  at a wrong position each refused, so both go through the entry). The server test: a repository's create is one entry,
+  each verb and each member's version one more, and a refused branch, a lone green's version and a refused bind none.
+- **Owed.** (1) The push that makes an entry of several greens: its works judged all before any commits, the engine's
+  verdict split into a judgment and its commit (§4.16), with piece 4's works from a client's push. (2) The fleet half:
+  the register as one ledger object of the repository's candidates (§4.8), its record the entry with each version's
+  merge record value, committed at f + 1; every holder recomputes every version of an entry before acknowledging it,
+  all or none, a mismatch refusing the repository on that holder; a takeover adopts whole entries; and the repository
+  record replicated with it (A-515's owed half). Until then each member's version ships on its green's own register, so
+  in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.

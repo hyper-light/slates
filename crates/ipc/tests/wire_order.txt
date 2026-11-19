@@ -57,6 +57,9 @@ DatabaseRefusal 1 NfsInstanceRegressed
 DatabaseRefusal 2 CheckpointOutOfRange
 DatabaseRefusal 3 SealKeyMalformed
 DatabaseRefusal 4 Encoding
+DatabaseRefusal 5 OutOfOrder
+DatabaseRefusal 6 CheckFailed
+DatabaseRefusal 7 StateChanged
 DeleteWhileOpen 0 NoKernelClient
 DeleteWhileOpen 1 Unlinked
 DeleteWhileOpen 2 SillyRenamed

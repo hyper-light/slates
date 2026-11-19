@@ -47,6 +47,9 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_ra_svn/marshal.c` | `908ccdd914cae15b` | C |
 | `subversion/svnserve/svnserve.c` | `43155c2bd557492f` | C |
 | `subversion/svnserve/serve.c` | `acb1cac75ea86ba7` | C |
+| `subversion/libsvn_ra_svn/cram.c` | `64e6271eacf19286` (A-599) | C |
+| `subversion/libsvn_ra_svn/internal_auth.c` | `61f373448a9c878c` (A-599) | C |
+| `subversion/libsvn_ra_svn/client.c` | `3c3b9263dd7223a9` (A-599) | C |
 | `subversion/mod_dav_svn/repos.c` | `940bc5282be7b763` | C |
 | `subversion/libsvn_repos/hooks.c` | `96392d3013a7f6bb` | C |
 | `subversion/libsvn_repos/log.c` | `d5f97de3e455314b` | C |
@@ -59,6 +62,13 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
 (`subversion.apache.org/docs/release-notes/1.10.html`, `1.14.html`, tier B); the book's path-based authorization page
 (`svnbook.red-bean.com/en/1.7/svn.serverconfig.pathbasedauthz.html`, tier B); RFC 2195, CRAM-MD5
 (`www.rfc-editor.org/rfc/rfc2195.txt`, tier B).
+
+For the handshake (A-599, 2026-11-19), RFC 2104 (HMAC, sha256 `64d5245a91019290`) and RFC 2202 (its HMAC-MD5 test
+cases, `c19effeca47e801b`), tier B; and the files of the release the fixtures were recorded with, Subversion 1.15.0,
+from `raw.githubusercontent.com/apache/subversion/1.15.0/<path>`, tier C: `libsvn_ra_svn/cram.c`, `internal_auth.c` and
+the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `8154654e07aa4eb4`, which differs from
+`d434dc14`'s by a Windows include and a comment; `libsvn_ra_svn/marshal.c` `361702975baa8c70`; `client.c`
+`b1d9607af70baf9c`; `cyrus_auth.c` `3bd4ba09916282fd`.
 
 ## 2. The wire: ra_svn (`svn://`, and `svn+ssh://` through a tunnel)
 
@@ -80,6 +90,23 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   with `edit-pipeline svndiff1 accepts-svndiff2 absent-entries commit-revprops depth log-revprops atomic-revprops
   partial-replay inherited-props ephemeral-txnprops file-revs-reverse list`; `mergeinfo` is a repository capability, in
   `repos-info` (`protocol` 169-176, 201-202).
+- **Authentication** [B: `protocol` 98-176; C: `serve.c` 580-721 and 4209-4433, `cram.c`, `internal_auth.c`;
+  M: `crates/svn/fixtures/handshake/`, stock 1.15.0's sessions, A-599]. The auth request lists `ANONYMOUS` (anonymous
+  read allowed), `EXTERNAL` (a tunnel's user, authenticated read allowed) and `CRAM-MD5` (a password database,
+  authenticated read allowed), in that order (`send_mechs`); a repository allowing none is refused "No access allowed
+  to this repository" (170001) before any request. `auth` takes `EXTERNAL` as the tunnel's user unless its token names
+  another ("Requested username does not match"), `ANONYMOUS` as no one, its token ignored, and `CRAM-MD5` by a
+  challenge `<random.microseconds@host>` (`cram.c` 154-156), the response a string `user hexdigest` split at its last
+  space with exactly 32 lowercase digits after it ("Malformed client response in authentication"), then "Username not
+  found" or "Password incorrect"; a response that is no string is passed over without a word. Any other mechanism is
+  "Must authenticate with listed mechanism". A failure lets the client answer again, with no limit
+  (`internal_auth_request`'s loop); a success writes `( success ( ) )` and `repos-info`. The answer to the greeting is
+  read as `nlc?c(?c)`: a `ra-client` without the client list after it is "Malformed network data" (recorded), and every
+  refusal before `find_repos` ends the connection with nothing written, the ones after it with a command failure whose
+  file is empty and line 0 in a release build (recorded). HMAC-MD5 in `compute_digest` hashes a password longer than 64
+  bytes first, as RFC 2104 does (recorded with 64- and 70-byte secrets). A client built with Cyrus SASL, as Homebrew's
+  1.15.0 is, sends `ANONYMOUS` base64 of `anonymous@` and its host with a line feed, and `CRAM-MD5` unencoded
+  (`cyrus_auth.c` 498-505, 553-555).
 - **Commands** [B: `protocol` 216-607]: the main set (reparent, get-latest-rev, get-dated-rev, change-rev-prop(2),
   rev-proplist, rev-prop, commit, get-file, get-dir, check-path, stat, get-mergeinfo, update, switch, status, diff, log,
   get-locations, get-location-segments, get-file-revs, lock(-many), unlock(-many), get-lock(s), replay(-range),

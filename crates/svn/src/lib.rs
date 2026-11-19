@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod commit;
+pub mod handshake;
 pub mod index;
 pub mod lock;
 pub mod mergeinfo;

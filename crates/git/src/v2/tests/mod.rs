@@ -419,6 +419,15 @@ fn any_fetch_argument() -> impl Strategy<Value = (u8, [u8; 20], u32, bool)> {
   )
 }
 
+/// How a line drawn with `lf` ends.
+fn ending(lf: bool) -> super::Ending {
+  if lf {
+    super::Ending::Lf
+  } else {
+    super::Ending::NoLf
+  }
+}
+
 /// The `fetch` argument `kind` names, with its values.
 fn fetch_argument(kind: u8, id: ObjectId, number: u32) -> fetch::Argument<'static> {
   match kind {
@@ -445,9 +454,9 @@ fn fetch_argument(kind: u8, id: ObjectId, number: u32) -> fetch::Argument<'stati
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
-  /// A-582 part 2: do write arbitrary `fetch` requests, each argument of any kind with any id, depth or time and
-  /// either ending, leaving out what git refuses (a second filter or list of protocols, `deepen` beside a cut by time or
-  /// rev), and decode what was written. Expect: the same request back.
+  /// A-582 part 2: do write arbitrary `fetch` requests, each argument of any kind with any id, depth or time and either
+  /// ending, leaving out what git refuses (a second filter or list of protocols, `deepen` beside a cut by time or rev),
+  /// and decode what was written. Expect: the same request back.
   #[test]
   fn any_fetch_request_written_decodes_back_to_itself(
     chosen in proptest::collection::vec(any_fetch_argument(), 0..24),
@@ -479,10 +488,11 @@ proptest! {
         }
         _ => true,
       })
-      .map(|(value, ending)| super::Line { value, ending: if ending { super::Ending::Lf } else { super::Ending::NoLf } })
+      .map(|(value, lf)| super::Line { value, ending: ending(lf) })
       .collect();
-    let command = super::Line { value: request::Head::Command, ending: if lf { super::Ending::Lf } else { super::Ending::NoLf } };
-    let format = super::Line::bare(request::Head::Capability(super::Capability { key: b"object-format", value: Some(b"sha1") }));
+    let command = super::Line { value: request::Head::Command, ending: ending(lf) };
+    let named = super::Capability { key: b"object-format", value: Some(b"sha1") };
+    let format = super::Line::bare(request::Head::Capability(named));
     let head = if command_first { vec![command, format] } else { vec![format, command] };
     let written = request::Request::Command(request::CommandRequest {
       head,
