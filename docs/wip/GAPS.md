@@ -38,6 +38,21 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
+> **§4.17.4 the Subversion server: designed, its svndiff codec built (2026-11-18, A-500, D-28; UI goal 91; g292).**
+> Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
+> head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
+> property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
+> properties and locks as register entries, reads by history lists, the change index and extent-list deltas, ra_svn
+> without zlib, `svn+ssh` through slates' `svnserve -t`, HTTPv2 then DeltaV, hooks with slates' `svnlook`, Subversion's
+> authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
+> 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
+> `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
+> Owed, in order: the ra_svn item codec; node-exclusive operations and `Copy` in the engine; the Subversion index; the
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
+> suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
+> No speed is claimed until measured.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
@@ -844,7 +859,12 @@
 > the volume saved while unchanged since the cut or a clone of the cut's snapshot, else `[1, why]` with nothing changed.
 > Found with it: a clone keeps no orphan record for a nameless file it carries from its snapshot, so nothing reclaims
 > it until the clone is destroyed (any clone of a snapshot taken while a file was held with no name). A SAVE's snapshot
-> is published on the owner shard, not yet waited for at a live-shipped volume's candidates (§4.10).
+> was published on the owner shard and not waited for at a live-shipped volume's candidates (§4.10). **Built since
+> (A-516, 2026-11-19):** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable where
+> the save's publication put it, as a guest's `FSYNC` on the stream waits (A-200), and is refused with its reason when
+> it is not within the liveness budget (`shards.save_held`, `shards.save_refused`); a volume shipped nowhere is
+> answered at once. Proven by the server's lib test over a real stream; Shards' own run of a save and a restore over a
+> live-shipped share is owed with its `shards restore` below. Still open of A-303's: the clone's orphan record above.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
@@ -2267,7 +2287,9 @@
 >   carries. Sibling fixed: a holder outside the successor's placement kept its stale copy for good when the last
 >   confirmation dropped the retirement in the same version. A move on an unresolved line is allowed (records are
 >   bounded, so an old volume's line reads unresolved once its record goes). The lineage model is
->   `docs/wip/models/Lineage.tla`, read as text only.
+>   `docs/wip/models/Lineage.tla`; since A-518 it states A-341, A-484 and A-508's holder rules as actions and checks
+>   `NoLastCopyLost` (no let-go removes the last member copy the newest committed record names) beside A-309's
+>   `ReclaimOnlyStale` and A-508's `SettleKeepsFPlusOne`; its TLC runs are main's (the model table, §10).
 > - **Fixed (A-309 piece 2): the members that exist now recover a cohort past its tolerance.** An object one of whose
 >   settled cohorts is short of its recovery quorum is adopted once every surviving member of its cohorts, settled and
 >   current, has promised it, with the newest record any of them holds (`Readiness::ReadyPastTolerance`,
@@ -3970,7 +3992,10 @@
 >   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
 >   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
 >   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
->   not built. Open: the Shards route's take of an offer.
+>   not built. The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
+>   its exchange and answers copies of its ends, kept on the owner shard until the exchange settles the claim, retired
+>   once handed or claimable again;
+>   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`).
 >   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
@@ -8890,6 +8915,8 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/InstallInTurns.tla` | `_lazy_copy_gen.cfg`, `_lazy_fence.cfg`, `_lazy_promote_auth.cfg`: one protection removed (a copy's own generation check; every fence raise but an accepted record's; phase one's demand that the copy name the successor) | no error, each (1 min 2 s; 39 s; 2 min 6 s) | 323,141; 192,633; 858,558 distinct | 38 | 2026-11-18 |
 | `models/InstallInTurns.tla` | `_lazy_copy_gen_fence.cfg`, `_lazy_fence_promote_auth.cfg`, `_lazy_copy_gen_promote_auth.cfg`: two removed | no error, each (38 s; 1 min 14 s; 3 min 30 s) | 323,141; 858,558; 1,436,869 distinct | 38 | 2026-11-18 |
 | `models/InstallInTurns.tla` | `InstallInTurns_lazy_all.cfg`: all three removed | StaleNeverCommits violated, as it must be (non-vacuity): a stale owner's record commits on copies that answered phase one under its authority, unfenced | at the violation | 12 | 2026-11-18 |
+| `models/Lineage.tla` | `MC_Lineage.cfg` (A-518): 4 hosts, 1 object, a region formed on its creator alone, F = 1, 2 retirements and 2 records kept, 3 records an object, versions up to 8 | not yet run (written 2026-11-19; main's run, run-requests.md) | — | — | — |
+| `models/Lineage.tla` | `MC_Lineage_two.cfg` (A-518): the same with 2 objects of 2 founding hosts, ranked apart | not yet run | — | — | — |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
@@ -18933,9 +18960,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows` and
   `a_part_way_fill_stays_counted_until_its_range_is_filled_again`; red without the fix 3 of 3 (the first slice still
   read `A` after the file was zeroed; one range counted where two held bytes), green with it, on the Mac Studio.
-  - **Open, the siblings it found (each from reading, each owed a failing test):** a successor's adopted DAX object
-    (A-365) may hold a fill's bytes in a range its range table does not name (a range the dead daemon was filling, or
-    one that failed there), which the successor's next fill skips as before A-419; and on Windows a range is committed
+  - **Fixed 2026-11-18 (A-526, goal 85, g079): a successor's adopted DAX object (A-365) could hold a fill's bytes in a
+    range its range table does not name** (a range the dead daemon was filling, or one that failed there), which the
+    successor's next fill skipped as before A-419. A backing taken back from a dead daemon now clears each range not
+    filled before its first fill (`ShardsBacking::owes_clear`); held by
+    `a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again` (bridge-core's unit tests), red
+    without the fix on the Mac Studio. Record:
+    `docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
+    **Left:** those bytes are counted by nothing until the range is filled or the backing goes (at most the ranges the
+    dead daemon's fills had begun and not finished).
+  - **Open, the other sibling (from reading, owed a failing test, a Windows one):** on Windows a range is committed
     before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's

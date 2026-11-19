@@ -4505,9 +4505,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   process the ask names, once the handle that process names is shown to be this stream's own object;
 - a VM's save and restore (Shards' D176 part 5; A-303): a SAVE, which the device sends while it is paused and so
   between requests, waits for the guest's stores through its maps to reach the volume, then takes a snapshot of the
-  volume for the attachment's own principal, publishes it, and is answered with the stream's tables, opaque to Shards
-  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, the form of SETXATTR
-  the guest's kernel sends (A-378), and each inode the guest holds with its references and opens. A RESTORE is taken
+  volume for the attachment's own principal, publishes it, waits on a live-shipped volume until its log is durable
+  where that publication put it, as a guest's `fsync` waits (A-516; refused with its reason when it is not within the
+  liveness budget), and is answered with the stream's tables, opaque to Shards and checked by a CRC-32C: the volume
+  and the snapshot, the directory presented, the owner view, the form of SETXATTR the guest's kernel sends (A-378),
+  and each inode the guest holds with its references and opens. A RESTORE is taken
   only as a fresh stream's first frame, onto the volume saved while unchanged since the cut or a clone of the cut's
   snapshot, presenting the same directory; the stream's attachment then holds what the saved one did, a file the guest
   held with no name left included, its guest is shown the same owners and its requests are read in the same form. A handle the restored guest's kernel kept gives its open back at its release, as one from
@@ -4719,6 +4721,10 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > (`crates/server/tests/shards.rs`; the tables' codec `crates/server/src/shards/tables.rs`; `Volume::held_by` and
 > `Volume::adopt_held`, `crates/vfs/tests/held.rs`). Owed on Shards' side: `shards restore` handing a restored VM a
 > served share (`--slates-fs-fd`, `--slates-fs-handle`), and its real-VM test of a save and a restore over slates.
+> **Since A-516 (2026-11-19)** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable
+> where the save's publication put it (`shards.save_held`), and is refused with its reason when it is not within the
+> liveness budget; a volume shipped nowhere is answered at once, as before (the server's lib test
+> `a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it`).
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12079,6 +12085,396 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 rebase), §4.8 (the register entry that carries phases and markers), §4.11 (one copy of each file's bytes), §4.12 (the
 CLI's `slates hg serve`), §4.13 (principals and their Mercurial identities), §4.15 (import of a repository directory,
 and export by landing).
+
+#### 4.17.4 The Subversion server
+
+> **Status (2026-11-18, A-500).** Designed. Built: the svndiff codec (`crates/svn`, `slates-svn`: versions 0 and 2,
+> the decoder with every refusal Subversion's own decoder makes plus the 64-bit overflow it lets through, the encoder,
+> and the reference applier, held to `notes/svndiff`'s worked example as golden vectors). Everything else is owed, in
+> the pieces at the end. The reading notes, with every source's revision, hash and quoted lines, are
+> `research/vcs-servers-subversion.md` (cited below as "notes §n").
+
+**Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
+which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
+`svn+ssh://` (the same protocol through an SSH tunnel) and `http://` and `https://` (mod_dav_svn's WebDAV/DeltaV and its
+HTTPv2). A repository is one green whose version N is revision N, and a branch is a directory in it (§4.17.1's row). A
+commit is a work submitted to that green; the verdict is Subversion's own commit rule; and a client ends exactly where
+`svnserve` would have left it (§4.17.1's client-fidelity rule).
+
+*Sources* (primary, read 2026-11-18; notes §1). Subversion's `1.14.x` branch at `d434dc14` (2026-11-01): the ra_svn
+protocol (`subversion/libsvn_ra_svn/protocol`), the HTTP notes (`notes/http-and-webdav/http-protocol-v2.txt`,
+`webdav-protocol`), the svndiff format (`notes/svndiff`), FSFS's design (`subversion/libsvn_fs_fs/structure`), the
+filesystem, repository, mergeinfo, properties and error headers, the locking specification, and the test suite's
+README, tier B; and the code that decides what the documents leave open, tier C: the commit editor
+(`libsvn_repos/commit.c`), FSFS's commit-time merge (`libsvn_fs_fs/tree.c`), the svndiff codec
+(`libsvn_delta/svndiff.c`, `libsvn_subr/encode.c`, `compress_lz4.c`), the ra_svn parser (`marshal.c`), the hooks
+(`hooks.c`), log's
+access rule (`log.c`), and the two servers (`svnserve/`, `mod_dav_svn/`).
+
+*1. What a Subversion server presents, and where each part lives.* A client sees a repository as a filesystem with
+history (notes §5): numbered immutable revisions, revision 0 an empty root; unversioned revision properties; named
+transactions that become revisions; node-revisions with ancestry; a changed-path list per revision; locks.
+
+| Subversion | What the client reads or sends | In slates |
+|---|---|---|
+| Repository | a UUID, a root URL, revisions 0 to N | §4.17.1's repository record, with its UUID, and its one green |
+| Revision N | an immutable tree | green version N; version 0 of a Subversion repository is an empty root directory |
+| Revision properties | `svn:author`, `svn:date`, `svn:log` and any others; changeable through a hook | the revision-property table (item 6): a commit's values recorded with its version, a change an entry of the repository's register |
+| Transaction | a named mutable tree on a base revision, with properties | a work on the green, based on the head when the commit began (item 3) |
+| Node-revision | kind; text with its MD5 and SHA-1; properties; created revision and path; predecessor; copy source and copy root; mergeinfo count | a row of the Subversion index (item 2), its text and property list held as content by identity |
+| Changed paths of a revision | path; add, delete, replace or modify; kind; text, property and mergeinfo changed; copy source | the revision's changed-path rows, recorded from the commit's own editor drive |
+| A copy: a branch, a tag | `add-dir` or `add-file` naming a copy source | a declared `Copy` in the green that shares the source by reference (item 3) |
+| Lock | path, token, owner, comment, creation and expiry | the lock table (item 7) |
+| `svn:mergeinfo` | a versioned property | a property like any other, indexed per version for its queries (item 8) |
+
+Files hold Subversion's repository-normal bytes, exactly what `svnlook cat` prints: end-of-line and keyword
+translation (`svn:eol-style`, `svn:keywords`) is the client's, never the server's. A node's properties are one sorted
+property list, held as content and named from the node by the reserved attribute `slates.svn.props`, so a large
+`svn:mergeinfo` costs one reference per node and one copy in the store (§4.17.1 "Objects"). A symbolic link is what
+Subversion stores, a file with `svn:special` and the text `link TARGET`, and the executable bit is the property
+`svn:executable`. Holding Subversion's model as it is keeps every byte and property a client committed exactly as it
+sent them; a translated view for agents (a link as a link, `svn:executable` as a mode) would be a view over this
+storage, not the storage, and is not part of this section.
+
+*2. The Subversion index* (§4.17.1 "Objects" item 3, this tool's layout). It lives on the repository's owner, as
+immutable sorted tables that are content plus a mutable tail, and every row is a function of the green's versions and
+their commit records (item 3), so replicas (A-273) and holders (§4.16 "Apply on holders") compute it and never receive
+it.
+- *Revisions:* per revision, its changed-path rows sorted by path, and its transaction's name.
+- *Nodes:* per path and created revision: kind; text identity (BLAKE3, the green's content) with the MD5 and SHA-1
+  clients check; size; property-list identity; predecessor and its count; copy source and copy root; the node's identity
+  (where it was born) and its copy identity, assigned by FSFS's rules (notes §5: a creation takes its parent's copy
+  identity, a copy gets a fresh one, a change made through a copied parent is a lazy copy with a fresh one), so the
+  three answers of `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the
+  node has `svn:mergeinfo`, with the count of such nodes beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
+- *History:* per path, the revisions at which a node-revision was created there, deletions included. FSFS makes a new
+  node-revision of every directory above a changed node (notes §5, "bubble-up"), so a directory's list holds every
+  revision that changed anything beneath it. The created revision of a path at revision R, which the out-of-date test,
+  `stat` and `svn:entry:committed-rev` all read, is one search in that list: its last entry at or before R, a deletion
+  meaning absent. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense
+  is its subtree's, which this list keeps.
+
+*3. A commit is a work, and its verdict is FSFS's commit rule.* (§4.17.1 "A push is a work" items 1, 2 and 5, made exact
+for Subversion.)
+1. **The transaction.** A `commit` (ra_svn), a POST to the me resource (HTTPv2) or a MKACTIVITY (HTTP v1) opens a work
+   on the green, based on the head at that moment: version B, the transaction's base. Every per-path test of the drive
+   compares with B, as Subversion's commit editor compares with its transaction's root (notes §6). start-commit runs
+   first (item 9). The transaction's name is B, a `-` and the work's id in base 36, which keeps to the letters, digits,
+   `-` and `.` that `svn_fs.h` promises.
+2. **The drive.** Each editor command is checked when it arrives, then declared on the work:
+   - `open-file`, `delete-entry`, and a property change on a directory, each carrying the client's base revision R of
+     that node: out of date (`E160028`) when R is below the node's created revision at B, and no such revision
+     (`E160006`) when R is past B (`commit.c` `check_out_of_date`); `delete-entry` of a path absent in the work and
+     `add-file` or `add-dir` of a path present in it (unless its parent was copied in this transaction) are out of date
+     too.
+   - A copy (`add-dir` or `add-file` with a copy source): the source must lie in this repository, the principal needs
+     read on it (recursive for a directory) and write on the target and its parent (item 10); declared as `Copy`.
+   - A text change (`apply-textdelta`, its windows, `close-file`): the base checksum must equal the stored MD5 of the
+     path's text in the work, the svndiff windows are applied as they arrive against that text (one window at a time,
+     each at most 102,400 target bytes, notes §4), the result's MD5 is taken as it is written and must equal
+     `close-file`'s (`E200014` otherwise), and the path's change is declared as one whole-file replacement (§4.17.1
+     item 2). The windows' source copies say which byte ranges of the new text are the base's own, so the new text's
+     extent list references those base extents rather than copies of them (§4.16 "Splice"). That decides storage only,
+     never the verdict: the client's delta is not read as an edit.
+   - A property change: refused as Subversion refuses it (`svn_repos__validate_prop`: regular properties only; a
+     translated `svn:` property UTF-8 with no CR; `svn:date` a date; `svn:mergeinfo` in its grammar; `E125005`,
+     `E200020`), else declared as one replacement of the node's property list.
+   - Every operation of a Subversion work is *node-exclusive*: the verdict judges it as touching the whole node, never
+     by byte range and never by identity (item 3.3). An agent's work and a server-side merge keep §4.16's byte ranges
+     (§4.17.1 item 4).
+3. **The verdict.** `close-edit` submits the work; pre-commit runs over its post-state (item 9); the merge task judges
+   it against the versions in (B, head]. The rule is FSFS's merge at commit (`tree.c` `merge()`, notes §6), stated on
+   the index:
+   1. a file the work changed (its text or its properties) that also changed in (B, head] is a conflict, even when
+      both made the same change ("If any of the three entries is of type file, declare a conflict");
+   2. for a name both sides changed: a double delete, a delete against a change, a replacement on either side ("even an
+      identical replacement") and an addition on both ("two additions are not auto-mergeable") are conflicts, and a
+      directory changed on both sides otherwise is judged entry by entry, by these rules, beneath it;
+   3. a directory on the path from the root to any node the work changed whose property list changed in (B, head] is a
+      conflict (FSFS refuses the source's property change of a directory both sides changed beneath);
+   4. a directory whose property list the work changed is a conflict when its names, or their node or copy identities,
+      changed in (B, head] (`compare_dir_structure`); a change that keeps an entry's identities is no conflict, and, as
+      in FSFS, the first change of a file inside a branch, which takes a fresh copy identity, counts;
+   5. otherwise the work is accepted: the new version is the head with the work's nodes, node by node, as FSFS's tree
+      merge takes each entry changed on one side alone from that side.
+
+   An accept answers `commit-info` (the new revision, its `svn:date` and `svn:author`, and post-commit's words if it
+   failed); a conflict answers FSFS's own `E160024` "Conflict at '<path>'", which the client reports as out of date. No
+   identity accept: the client records each node it committed as created at the new revision, so accepting an identical
+   change on top of someone else's would leave the client's `svn:entry:committed-rev` naming a revision in which the
+   server holds no change of that node, and `svnserve` would have refused it. *Raised with A-497's owner:* §4.17.1
+   items 2 and 5 state Subversion's commit as §4.16's verdict over whole-file operations, whose second pass accepts an
+   identical change and which knows neither rule 3 nor rule 4 nor a directory's subtree-wide last change; this section
+   states the exact rule, and §4.17.1 needs only to point here.
+4. **Locks at the verdict.** Before it accepts, the merge task reads the lock table for every node the work changes,
+   deletes or moves away, and every file beneath a deleted or replaced directory: a lock held by another principal is
+   `E160039`, a lock whose token the commit did not present is `E160037`. An accept releases the presented locks unless
+   the client asked to keep them. The check and the release are in the verdict's one step on the owner, so no lock
+   changes between them.
+5. **What the version records.** The revision's changed-path rows as the drive declared them (add; delete; replace, a
+   delete and an add of one path in one drive; modify; text changed when `apply-textdelta` came; properties changed;
+   mergeinfo changed; the copy source), the transaction's name, and the initial revision properties: `svn:author` the
+   authenticated principal's name (never the client's word), `svn:log` and the client's other properties from the commit
+   (`commit-revprops`, or the transaction's properties over HTTP), and `svn:date` the merge record's time, as §4.17.1
+   item 3 rules for every object the server makes. They are one content object named by the version's increment, so the
+   version and its Subversion record are one durable step, and every holder recomputes the index from them.
+6. **After.** post-commit runs and only observes (item 9).
+7. **A transaction's life.** Over ra_svn the work lives with its connection: `abort-edit`, a refused drive or a
+   connection that ends releases it. Over HTTP a transaction outlives requests: DELETE, its MERGE or its idle bound
+   (the table) releases it, and a request naming a released one is answered `E160007`, no such transaction.
+
+*4. Reads.* They run on any shard holding a replica of the green (A-273, A-465), never on the merge task's turn.
+- **update, switch, status `-u`, diff, checkout and export** (the reporter): the client reports its working copy
+  (`set-path`, `link-path`, `delete-path`, each with a revision, `start-empty` and a depth), and the server drives its
+  editor from that state to the target revision. A subtree reported at R and wanted at T whose history list has no
+  entry in (R, T] is skipped whole, as FSFS skips equal node-revision ids. Otherwise the change index (A-264) names
+  exactly the paths changed in (R, T] beneath it, walked in the editor's depth-first order. A changed file goes out as
+  an svndiff from its text at R to its text at T made from the two extent lists: an extent both share is a source copy,
+  an extent only T has is new data. Windows keep the format's limits (at most 102,400 bytes of source view and of
+  target, source views never sliding backward), and a shared run outside the window's admissible source view goes out
+  as new data. Checksums come from the node rows, entry properties (`svn:entry:committed-rev`, `committed-date`,
+  `last-author`, `uuid`, `lock-token`) from the node rows, the revision-property table and the lock table. A path the
+  principal may not read goes out as `absent-file` or `absent-dir` when the client announced `absent-entries`, and is
+  left out otherwise.
+- **checkout** is a report of "start-empty at T" on its root: every node is added, and each file's text goes out as
+  new-data windows read in place from its chunks (§4.17.1 "Objects": the file's bytes are the content; nothing is
+  copied into a buffer to be sent).
+- **log**: per path, the history list gives revisions newest first, crossing copies unless `strict-node` is set; the
+  revision rows give changed paths; the revision-property table the properties. Each revision is shown at the
+  principal's access level (notes §7: none; partial, `svn:date` and `svn:author` with the readable changed paths only;
+  full). `include-merged-revisions` reads the mergeinfo changes the revision's rows name.
+- **blame** (`get-file-revs`): the file's history across copies, and for each revision its properties, its property
+  changes and its text's svndiff from the previous revision's text, made from the extent lists as above. The client
+  computes the blame.
+- `get-locations`, `get-location-segments` and `get-deleted-rev` read the history lists and copy sources; `get-file`,
+  `get-dir`, `stat`, `check-path`, `list` and `get-iprops` (each ancestor's property list) read the node rows;
+  `rev-prop`, `rev-proplist` and `get-latest-rev` the revision tables; `get-dated-rev` is a binary search over the
+  revisions' `svn:date`, as `svn_repos_dated_revision` searches (`rev_hunt.c`).
+- `replay` and `replay-range` (svnsync, svnrdump) drive the editor with one revision's changes from its rows and the
+  deltas above.
+- `get-mergeinfo` (item 8).
+
+*5. The wire.* Every connection is a task on a shard of slates' own runtime (D-9, R6); nothing blocks a shard.
+- **ra_svn.** The item codec (grammar in notes §2) parses bytes in whatever pieces they arrive, with each item's cap
+  checked before a byte is held: a word at most 24 characters (what a stock 1.14 parser accepts; the protocol text's 31
+  is older), nesting at most 64, a number at most 2^64 - 1, a string's length against the cap of the field it fills (an
+  svndiff chunk: one window's largest encoding; a path or a property value: the connection's memory share, the table).
+  The greeting is `svnserve`'s, version 2 with the capabilities `edit-pipeline`, `accepts-svndiff2`, `absent-entries`,
+  `commit-revprops`, `depth`, `log-revprops`, `atomic-revprops`, `partial-replay`, `inherited-props`,
+  `ephemeral-txnprops`, `file-revs-reverse` and `list`, without
+  `svndiff1`: a sender uses zlib only for a peer that announced `svndiff1` (`marshal.c`, notes §2), so slates never
+  receives it and never needs zlib, and it answers clients older than 1.10 in version 0. `mergeinfo` is announced in
+  `repos-info`. An editor drive follows the protocol's early-error rule: an error is written as soon as it is known,
+  on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit`.
+- **svn+ssh.** sshd starts `svnserve -t` as the logged-in user; slates installs that command as one of its own (a CLI
+  verb under the name `svnserve`), which speaks ra_svn on its standard input and output and relays to the daemon
+  through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism).
+- **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
+  `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
+  COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
+  version-1 resources for older clients follow it as their own piece. HTTP/1.1 with keep-alive and pipelining; XML
+  bodies parsed with every cap checked before anything is held, as A-464's listing parser does; TLS through rustls over
+  aws-lc-rs, the workspace's one cryptographic library. Responses use svndiff 2 for a client that lists it in
+  `Accept-Encoding`, else 0; slates never advertises `svndiff1`, so no client sends it in a PUT (notes §3).
+- **svndiff** (built here, `slates-svn`): versions 0 and 2 (version 1 is refused, never having been offered).
+  Decoding makes every refusal Subversion's decoder makes (notes §4: the header; views and sections past their caps;
+  overflowing sums; a source view sliding backward, judged as Subversion judges it, only for a window with a source
+  view, against the previous window whatever its view; each instruction decodable, nonzero, inside the target, the
+  source and the new data, a target copy starting before the position; the target filled and the new data used exactly;
+  a compressed section's length, limit and result), and one it does not: an integer encoded past 64 bits, which
+  Subversion's decoder truncates. The encoder writes minimal integers and the short length form, and refuses a window
+  the decoder would refuse. The reference applier, byte by byte with a target copy's overlap repeating, is the oracle.
+
+*6. Revision properties.* A table on the repository's owner, by revision. A commit's values are recorded with its
+version (item 3.5). A change (`change-rev-prop`, `change-rev-prop2`, or PROPPATCH on `!svn/rev/N`) is an entry of the
+repository's register (§4.17.1), ordered with the versions and replicated with them: validated as a commit's are; gated
+by pre-revprop-change, whose absence refuses every change (`E165006`, Subversion's default, notes §7); compared with
+the old value the client sent (`atomic-revprops`, `E160049` on a difference); then applied; post-revprop-change
+observes. A read sees the newest entry.
+
+*7. Locks.* Each lock is an entry of the repository's register: the path, a token (`opaquelocktoken:` and a UUID, drawn
+on the owner before the append so every holder replays the same token), the owner (the principal), a comment, and its
+creation and expiry times. An expiry is judged when the lock is used, against the owner's clock, never in a holder's
+replay. `lock` and `lock-many` (with stealing), `unlock` and `unlock-many` (with breaking), `get-lock` and `get-locks`
+follow the locking specification (notes §7): only a file is locked; a current revision given with the request must not
+be out of date (`E160042`); pre-lock, post-lock, pre-unlock and post-unlock run around each. A lock is data the verdict
+reads, not a lock in the sense of §2 bans 1 and 10: nothing ever waits on it and no coordination call is made; a commit
+that meets another principal's lock is refused at once. `svn:needs-lock` is a property whose meaning is the client's.
+
+*8. Mergeinfo and merges.* `svn:mergeinfo` is a property whose value must parse (notes §7). `get-mergeinfo` answers it
+explicit (the node's own), inherited (the nearest ancestor's, each source path extended by the relative path, its
+non-inheritable ranges dropped, `svn_mergeinfo.h`) or nearest-ancestor, and with descendants finds the nodes with
+mergeinfo beneath a path by the per-directory counts, never entering a subtree that holds none. `svn merge` is the
+client's: it asks for mergeinfo, logs with merged revisions, location segments and diffs, merges text in its working
+copy and commits the result as any commit. The server never merges file contents (§2 ban 11).
+
+*Branches, tags, stacks, rebases and reviews* (what §4.17.1 leaves to this section).
+- A branch or a tag is a directory made by a copy of any path at any revision; Subversion has no other kind. Policy
+  protects a path prefix (`/trunk`, `/tags/**`) as §4.17.1's policy protects a green's name pattern: who may commit
+  under it, whether a directory under `/tags` may change after the revision that made it, what evidence a commit under
+  it needs.
+- The client has no stacked changes and no rebase: `svn update` merges the repository's changes into local edits, in
+  the client. On the server a stack is a chain of held commits (below), and a rebase of a held commit maps its
+  node-exclusive operations through the revisions since its base: a path changed meanwhile is a conflict naming it;
+  otherwise the work moves to the new base.
+- A review request takes one of two forms. *The branch form* is Subversion's own practice: the change lives on a branch
+  made by a copy, the review record names the branch's path and its revisions, and landing it is the author's
+  `svn merge` and commit, or a server-side merge when every path the branch changed is unchanged on the target since the
+  branch was made: one revision on the target that holds the branch's texts and properties for those paths and the
+  `svn:mergeinfo` the client's merge would record, judged node-exclusively, so a path changed on the target is a
+  conflict naming it. *The held form* is review before commit: under a path whose policy requires review, a commit is
+  held as a work instead of being submitted, and is answered as a pre-commit refusal (`E165001`) whose words name the
+  review; approving it submits the work under item 3 and makes the revision, and the author's next `svn update` meets
+  its own edits as the incoming change. A held commit built on another is a work over a work (§4.17.1).
+
+*9. Hooks* (§4.17.1's hook rule). start-commit (the repository's path, the user, the client's capabilities joined by
+`:`, the transaction), pre-commit (path, transaction; on standard input `LOCK-TOKENS:` and a `path|token` line per
+presented token), post-commit (path, revision, transaction), pre- and post-revprop-change (path, revision, author,
+property, action `A`, `M` or `D`; the new value, or the old one, on standard input) and the four lock hooks, each with
+`hooks.c`'s arguments (notes §7). A hook's standard input is a pipe, never Subversion's temporary file (R1). A stock
+hook reads the transaction with `svnlook -t TXN REPOS`, so slates installs its own `svnlook` (the subcommands hooks use:
+`author`, `cat`, `changed`, `date`, `diff`, `dirs-changed`, `filesize`, `history`, `info`, `lock`, `log`, `propget`,
+`proplist`, `tree`, `uuid`, `youngest`) first on the hook's `PATH`, answering from the work or the revision through the
+client channel and never from a disk, and REPOS is the repository's configured directory. A refusing pre-hook's
+standard error is the client's message (`E165001`); post-commit's becomes `commit-info`'s `post-commit-err`.
+
+*10. Who may do what.* The transport proves the principal (§4.13): over `svn://` the SASL mechanisms `ANONYMOUS`,
+`CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
+TLS; over `svn+ssh://` the SSH login. `CRAM-MD5` needs the server to hold the shared secret or its keyed-MD5
+"contexts", which "must both be protected" alike (RFC 2195 §2 and §4), so slates holds the contexts, never the
+cleartext, as §4.15's S3 credentials are held: in RAM on the owner and the anchor, never on disk. `svn://` carries no
+encryption, so it is served on loopback alone unless the repository's policy names another interface; `svn+ssh://` and
+`https://` are the encrypted routes. Path rules are Subversion's authorization file (notes §7: per-repository and global
+sections, globs from 1.10, users, `@groups`, `&aliases`, `$anonymous`, `$authenticated`, `*`, `~`; 1.14.1's combining of
+global and per-repository rules), compiled per file identity into a path trie per principal and consulted for every
+path the server sends (absent entries, log's access levels, `get-file`, `get-dir`) and every path a commit changes
+(write on the path and its parent; recursive write to delete or replace a directory; recursive read of a copy source).
+A principal with read on the whole repository and no rule beneath meets one comparison and no per-path check.
+
+*11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
+the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
+the large-file class by content-defined chunking, so a copy or a branch of a large file costs a reference. Locks and
+`svn:needs-lock` serve files no one can merge.
+
+*12. Every tunable, learned* (§4.17.1's rule: an estimator, its inputs, when it updates, its derived bounds, and a first
+value from the first request's own inputs, never a literal).
+
+| Tunable | Estimator | Inputs | Updates | Bounds | First value |
+|---|---|---|---|---|---|
+| Compress a window (svndiff 2) or send it stored | the argmin of predicted time: stored bytes over the connection's delivery rate, against LZ4's time plus compressed bytes over that rate | the connection's delivered bytes a second; the shard's LZ4 bytes a second; the compression ratio of the repository's content class (D-17) | every window sent | a choice of two; stored for a peer that did not announce svndiff 2 | the first window is compressed and timed, which gives its own ratio and rate |
+| The cap on a path, a property value or a log message | the connection's share of the shard's admittable memory, divided among the connections served now (A-188's share) | the shard's room (§4.2); live connections | every connection that opens or closes | the shard's admittable room; refused `E210009` past it | the share when the connection is accepted |
+| Socket send and receive buffers | the connection's bandwidth-delay product | its measured round trip and delivery rate | every window | the connection's memory share | the first exchange's round trip and rate |
+| A hook's deadline | a regression of the hook's run time on the commit's size (paths and bytes); the bound is the prediction plus the largest residual seen | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
+| An idle HTTP transaction's bound | the longest gap seen between two requests of one transaction that went on to commit | the gaps of committed transactions | every commit over HTTP | the shard's room for held works: past it the longest-idle goes first | none until a transaction has committed; the room alone |
+| Folding the index's tail into a table | fold when a lookup in the tail is measured slower than one in a folded table | per-lookup times of both | every sampled lookup | the shard's room | at the first sample where the tail is slower |
+| The wire-form cache (§4.17.1 "Objects" item 2: svndiff windows of hot versions) | keep what saves the most time per byte held: re-use rate times the encode time saved, over bytes | hits and encode times | every hit | the shard's room | empty |
+
+The window size is not a tunable: windows are as large as the format allows (102,400 bytes), which every stock decoder
+accepts and which costs the fewest headers. Long reads (log, checkout, blame, replay) are sliced under the shard's
+per-iteration budget (§4.3), and the replicas that serve them are A-273's and A-473's.
+
+*13. The order-of-magnitude target* (§4.17.1's method, for Subversion; main measures and records it).
+- **Competitors.** `svnserve` 1.14 in threads mode with its default cache, and Apache httpd 2.4 with `mod_dav_svn` 1.14
+  at its defaults, each over FSFS format 8 made by `svnadmin create`, warm, on the same machine: the repository on tmpfs
+  as their best case, and on the SSD as deployed.
+- **Dataset.** The load tests' kernel tree (Linux v7.4-rc1, `6628e7d4`) as a Subversion repository: (a) the tree
+  imported as one revision under `/trunk`; (b) the first-parent history from v7.3 to v7.4-rc1 replayed one commit a
+  revision (author, date and message as revision properties) by a recorded command that uses only `git` and `svn`, then
+  `svnadmin dump`; (c) a branch copied from `/trunk` with 10 and 100 revisions on it. The one dump is loaded by
+  `svnadmin load` into FSFS and by slates' load verb into slates, and each repository's own `svnadmin dump` must equal
+  the dump byte for byte before any timing (the fidelity gate).
+- **Operations,** from the stock client: checkout of `/trunk` at the head; update after 1, 10 and 100 revisions; commit
+  of 1 file and of 100 files, and 100 commits in a row; `log -v` of the last 1,000 revisions and `log` of one path;
+  `blame` of a file with a long history (`MAINTAINERS`); merge of the branch into a trunk working copy and its commit;
+  and update and commit with 1, 8 and 64 clients at once.
+- **Measures.** Wall time at the client; the server's CPU time and peak memory; throughput under concurrency; and the
+  server's own share: the time from a request's first byte to its answer's last, taken at a recording relay between the
+  client and each server, since a checkout's time is mostly the client's own (its files and its SQLite working copy). A
+  commit's comparison names its durability: FSFS answers after its writes reach its disk; slates answers after the
+  merge record commits at f+1 holders in RAM (§4.16), at f = 0 the anchor's RAM.
+- **Where the gain should come from** (each a hypothesis until measured): no delta chain to rebuild a text (FSFS stores
+  skip-deltas; slates holds the text's extents); an update that visits only the changed paths (the change index) rather
+  than comparing directories level by level; deltas made from extent lists rather than by comparing bytes; a
+  checkout's bytes written from their chunks; no lock file and no disk write on a commit's path; and requests from many
+  clients served by every shard at once, where `svnserve` gives each connection its own process or thread. "An order of
+  magnitude" is claimed per operation only where it was measured.
+
+*14. The interop proof* (main runs it).
+- **Subversion's own suite** (`subversion/tests/cmdline`, notes §9) at 1.14.x, every script run with
+  `--url=svn://127.0.0.1:<port>` and again with `--url=http://127.0.0.1:<port>` against a slates server whose root is
+  the suite's `svn-test-work` directory, with `--bin` naming a directory that holds the stock 1.14 client tools and
+  slates' own `svnadmin` and `svnlook` (the administration verbs, a piece below). The suite makes each repository with
+  `svnadmin create PATH` and writes `PATH/conf` and `PATH/hooks` itself, so slates' `svnadmin create` makes the
+  repository's green and its directory skeleton, the latter written under the launcher's write policy (a landing, R10),
+  and the server reads `conf/` and `hooks/` there, read-only. Expected failures are the tests of FSFS's own files and
+  maintenance (`svnadmin hotcopy`, `pack`, `upgrade`, `recover`, `svnfsfs`, the format tests), on a reviewed list that
+  only shrinks; every other test must pass.
+- **A differential run:** the same scripted session of stock-client operations against `svnserve` and against slates,
+  over one dump, the clients' working copies then compared whole (bytes, `svn status`, `svn info -R`,
+  `svn proplist -R -v`) and both repositories' `svnadmin dump` compared.
+
+*Failure matrix* (beyond §4.17.1's). A client gone during a drive: the work is released and nothing commits (over HTTP,
+at its idle bound). The owner lost after `close-edit`: the submit retries by the increment's identity (§4.16); a client
+that heard nothing finds its revision by `svn update`, which brings its own edits back as the incoming change. A text or
+base checksum that differs: `E200014`, the work released. A malformed item or svndiff: refused with its code (`E210004`,
+`E185000` to `E185005`, `E200046`) and the connection closed, as `svnserve` closes it. A hook past its deadline:
+refused, naming the hook. A lock in the way: refused as item 3.4 says. A holder whose recomputed index differs: as
+§4.16, fatal and loud.
+
+*Refusals*, each in Subversion's words and number (derived from `svn_error_codes.h`, notes §6): out of date at the
+drive `E160028`; conflict at the verdict `E160024`; no such revision `E160006`; no such transaction `E160007`; a lock
+held by another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a
+lock `E160042`; a revision property's old value differs `E160049`; hook refused `E165001`; revision properties not
+enabled `E165006`; post-commit failed `E165007`; not authorized `E170001`; unreadable `E220001`, unwritable `E220004`;
+checksum `E200014`; property value `E125005`; mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`;
+request too large `E210009`; svndiff `E185000` to `E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
+
+*Worked example.* Repository `kernel` is at revision 1,200. Carol's working copy mixes revisions: `/trunk` at 1,190 and
+`/trunk/kernel/sched/core.c` at 1,195. She commits an edit of `core.c`: the work's base B is 1,200, and `core.c`'s
+created revision at 1,200 is 1,195, so it is not out of date. During her drive Dan's commit lands as 1,201, changing
+`/trunk/kernel/fork.c`. At Carol's `close-edit` the verdict reads (1,200, 1,201]: `core.c` did not change there, and no
+directory above it changed its properties, so she is accepted as revision 1,202, whose `core.c` references her base's
+extents wherever her delta copied them. Eve then commits `core.c` from base 1,195: its created revision at B = 1,202 is
+1,202, so `open-file` answers `E160028`, "File '/trunk/kernel/sched/core.c' is out of date"; she updates and commits
+again, as revision 1,203. Frank finishes a merge by setting `svn:mergeinfo` on `/trunk`. His working copy is at 1,203,
+so B is 1,203 and `/trunk` is up to date (its created revision, which counts everything beneath it, is 1,203). During
+his drive Gina's commit lands as 1,204, changing `/trunk/README` in place: `/trunk`'s names and their identities are
+unchanged, so Frank is accepted as 1,205; had Gina added a file directly under `/trunk`, rule 4 would answer `E160024`
+"Conflict at '/trunk'". Failure: the owner dies after Frank's `close-edit` and before any answer. If the merge record
+had committed at f+1 holders, the takeover's successor serves revision 1,205 (§4.16), and Frank, whose client reported
+the lost connection, finds his own change in it at his next `svn update`; if it had not, nothing committed, and he
+commits again.
+
+*Laptop degenerate.* One node: the repository's green, its index and its register on one partition, every hook a local
+process, every arrow an in-process call; the code is the fleet's (R8).
+
+*Integration points.* §4.17.1 (everything above builds on it), §4.16 (node-exclusive operations, `Copy`, works), §4.8
+(the repository's register: revision properties and locks as its entries), §4.10 (placement and replication of the
+green, the index recomputed), §4.11 (content identity, chunks, content-defined chunking), §4.12 (the CLI's `svnadmin`,
+`svnlook` and `svnserve` verbs), §4.13 (principals, secrets), §4.14 (a counter per verb and per refusal code), §4.15
+(the repository's directory read, read-only; a dump loaded from a disk read as a base; an export by landing), Part 6
+(the suites).
+
+*Pieces that follow* (in order, each one piece with its own tests, after §4.17.1's shared pieces it needs).
+1. The svndiff codec (built here).
+2. The ra_svn item codec: the resumable parser and the writer, with the protocol's examples as golden vectors and
+   hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream cut
+   anywhere).
+3. The engine's node-exclusive operations and `Copy` that shares a subtree by reference (with §4.17.1's pieces 1 and
+   4).
+4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
+   revisions, histories, relations and mergeinfo counts.
+5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
+   must give the same accept or conflict, and the same conflicting path.
+6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
+   `uuid`, `youngest`; the dump round trip is their gate.
+7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
+   checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
+8. Locks. 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
+14. Review: held commits, the branch form's server-side merge, stacks of held commits.
+
+Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
 
 ---
 
@@ -23431,7 +23827,11 @@ Applied in the same change to:
     HKDF-SHA256 from the secret salted with both nonces, the client's proof and the daemon's confirmation each the
     attachment sealed with AES-256-GCM (the transcript as additional data, each key sealing one message at nonce
     zero). The owner shard checks the proof and retires the offer, so the secret never leaves it; the end goes by
-    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end.
+    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end. Since A-512 the owner first
+    claims the offer for the exchange and answers copies of the ends, keeping them until the exchange settles the
+    claim (`shards_route::settle`): retired once the client has its ends, claimable again when the hand-over failed. An
+    answer lost on its way back then loses nothing: the exchange asks once more and is answered the same claim, and no
+    other exchange can take the offer meanwhile.
   - Bounds: a shard's exchanges at its client seats (`Busy` past them), each waiting on its client while the client's
     connection lives (A-492; one liveness budget until then), the socket being the user's alone; every
     refusal is one byte naming its kind and every ending is counted (`shards.route_*`, `shards.route_claimed` the
@@ -26256,9 +26656,10 @@ Applied in the same change to:
   refused restore changes nothing. The live volume holds no file the saved guest held with no name once the saved
   stream ended (its sweep reclaimed it), so such a guest is restored onto a clone of the cut.
 - **Not here.** A SAVE's snapshot is published on the owner shard; a live-shipped volume's candidates (§4.10) are not
-  waited for, as a `FSYNC`'s durable reply waits. A clone keeps no orphan record for a nameless file it carries from
-  its snapshot, so once a restored guest lets such a file go nothing reclaims it until the clone is destroyed; that is
-  so for any clone of a snapshot taken while a file was held with no name, restored or not (GAPS).
+  waited for, as a `FSYNC`'s durable reply waits (built since, A-516, 2026-11-19: the tables wait for them). A clone
+  keeps no orphan record for a nameless file it carries from its snapshot, so once a restored guest lets such a file go
+  nothing reclaims it until the clone is destroyed; that is so for any clone of a snapshot taken while a file was held
+  with no name, restored or not (GAPS).
 - **Evidence.** The tables' unit tests (a round trip, the same bytes twice, every cut, every bit flipped, another
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
@@ -34719,6 +35120,162 @@ the writer's write-through files kept across a lend, `begin_barrier` leaving the
   against windows-sys) and `tests/os.rs`'s `a_read_only_files_metadata_entry_lands` (a file `attrib +R` made
   read-only, marked hidden through an overlay, lands `HIDDEN` and still `READONLY`, its entry written), with the xwin
   check and clippy.
+
+### A-512 — The socket route's take claims its offer for its exchange and keeps the ends until the exchange settles, so a lost answer loses nothing and nothing is handed twice (2026-11-19, goal 85 via g225; A-488's sibling; §4.6 the socket route; A-161, A-173, A-440, A-492)
+
+- **What was there.** On macOS an exchange asks the offer's owner shard to check the claim and hand over the ends
+  (`shards_route::take`), waiting in that shard's own time (A-440). The take retired the offer and moved its ends into
+  the answer. An owner shard that stopped for a window had its take forgotten by the exchange and ran it once it
+  resumed: the offer was retired, the answer with the ends was dropped, and dropping it closed them. A stream's other
+  side then read its end and ended the attachment; a map's copy never reached its client; a claim made again found no
+  offer.
+- **The rule.** The take claims the offer for the exchange, by the exchange's daemon nonce (`Offer::claimed_by`), and
+  answers copies of the ends; the ends stay with the offer. An ask of the same exchange is answered the same claim and
+  copies of the same ends, and every other exchange finds no offer. The exchange asks once more when its first answer
+  is lost; the second ask runs behind the first on the owner shard's channel. Once the exchange ends it settles its
+  claim there, after any take it asked (`settle`, in the owner shard's own time): `Handed` once the client has its ends,
+  which retires the offer and closes the ends kept there; `NotHanded` otherwise, which leaves the offer claimable
+  again; where the exchange holds no claim (refused, or the offer withdrawn) the settle changes nothing. The settle runs
+  behind every ask of its exchange, so no ask can claim again after it.
+- **Why this and not another.** A claim is the owner shard's effect, so its record is kept there, as A-488's seal and
+  A-505's send are, and in the offer itself, which the offer's existing bounds already count (`shards::pending_ends`
+  counts a claimed offer's ends as held, as they are). The ends are copied rather than moved because an answer between
+  shards can be lost, and an end moved into it would be closed with it.
+- **Tests.** `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice` (the first
+  take's answer dropped, the same claim asked again, another exchange's claim after) and
+  `a_claim_settled_not_handed_frees_its_offer_and_one_handed_retires_it` (`crates/server/src/shards_route.rs`). The A-440
+  and A-492 tests now read the claim where they read the retirement.
+
+Applied in the same change to: §4.6 (the socket route's claim), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A-488's
+siblings), A-488's bug record (its Shards-route sibling closed), `crates/server/src/shards_route.rs`.
+
+### A-518 — The lineage model states the holder rules of A-341, A-484 and A-508 and the property they keep: no let-go removes the last copy a committed record names (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; the goal's "Lineage gets its own model")
+Applied in the same change to: `docs/wip/models/Lineage.tla`, the new `docs/wip/models/MC_Lineage.tla`,
+`MC_Lineage.cfg` and `MC_Lineage_two.cfg`, and GAPS (A-309's entry and the model table, §10).
+- **What was there.** `Lineage.tla` (A-309) let a copy go on a settled line for a holder that took part in the takeover
+  and on a successor's confirmation for a holder asked in its round, and checked `ReclaimOnlyStale`. It stated none of
+  the later rules and was never run.
+- **The text.** Each holder rule is its own action, named for the property it protects:
+  - `AskedSettled` and `AskedConfirmed` (A-309) protect `ReclaimOnlyStale`.
+  - `UnaskedCovered` (A-341, A-484) lets a copy no round asked for go where its writer's takeover, the first since the
+    copy was written, recovered the object within tolerance with its share done. It is judged on the kept retirement
+    or the completion record, which now keeps the recovery cohorts and the survivors still members at completion
+    (`doneCohorts`, `doneHeld`). It protects `ReclaimOnlyStale`.
+  - `SettledAwayRule` (A-508) lets a live owner's copy, which that owner wrote, go from a holder outside all of the
+    owner's neighbourhoods where the owner's settled cohort is whole and `F + 1` wide. It protects
+    `SettleKeepsFPlusOne`: a record at least as new stays on `F + 1` other members, for any record a commit reached.
+  - Every rule protects `NoLastCopyLost`: no let-go removes the last member copy that the object's newest committed
+    record names.
+
+  The model gains what these need: a copy's writer (`Acceptor::written_by`), each record's sequence, and the ground
+  truth of commits (`cmt`, which no rule reads). An adoption commits under its successor's placement before the
+  successor confirms. A retirement's own loss of copies is the failure modelled, never a let-go.
+- **Owed.** Main's TLC runs of both configurations (run-requests.md, 2026-11-19); a counterexample comes back as a new
+  piece. The Rust lineage model's mirror of A-508 is main's to compile and run.
+
+### A-526 — A DAX backing taken back from a dead daemon clears each range not filled before its first fill (2026-11-18, goal 85, g079; §4.6 the backed route, the Shards form; A-365, A-419)
+Applied in the same change to: GAPS (A-419's sibling line), `crates/vfs/src/shards_backing.rs` (`ShardsBacking`'s
+`inherited`, set by `ShardsBackings::adopt_vmm`; `owes_clear`), `crates/bridge-core/src/dax_backing.rs` (a range's fill
+begins by clearing one `owes_clear` names; the failing test), and the bug record
+`docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
+- **What was there.** A successor takes a Shards stream's DAX object back from the anchor with the ranges the dead
+  daemon's range table names filled (A-365). The table names a range only once its ask was answered, so the range that
+  daemon was filling when it died, or one whose fill it had refused (A-419's uncleared range, kept in its memory alone),
+  is named by nothing, and its object may hold that fill's bytes. The successor's fill of such a range skips the
+  volume's holes and pages of zeros (§4.6), so where the file had become a hole or zeros since, the guest's map showed
+  the dead daemon's bytes.
+- **The rule.** A backing taken back is inherited: each range it has not filled is cleared before its first fill there,
+  as an uncleared range is (A-419). Once filled it is the successor's own, and nothing more is cleared.
+- **Why this and not another.** Recording each range in the table at its fill's start would name exactly the ranges to
+  clear, at the cost of a table write per range and a new table layout, which a daemon of the old layout clears whole.
+  Reading the object's allocated runs at adoption (`SEEK_DATA` on Linux) has no macOS counterpart for shared memory.
+  The clear costs nothing where nothing was stored: a hole punch over an empty range on Linux, a residency test over
+  it on macOS; Windows streams hold no resync.
+- **Left.** Bytes a dead daemon's fill left in an unnamed range are counted by nothing until the range is filled or the
+  backing goes: at most the ranges its fills had begun and not finished.
+- **Tests.** `a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again` (`crates/bridge-core/src/
+  dax_backing.rs`, the lib's unit tests: an object holding `A` over a range's first slice, taken back with no range
+  named, the file zeroed there, the range filled through the session that took it back). Red without the rule on the
+  Mac Studio; green with it.
+
+### A-500 — The Subversion server on greens and works: one green per repository whose version N is revision N, FSFS's own commit rule as a stock client's verdict, every tunable learned, and svndiff 0 and 2 built (2026-11-18, g292 for UI goal 91; new §4.17.4; D-27, D-28; A-497)
+Applied in the same change to: §4.17.4 (new), `research/vcs-servers-subversion.md` (new), `research/vcs-servers.md`
+(a pointer to it), GAPS (the §4.17.4 entry), `crates/svn` (new, `slates-svn`: `src/lib.rs`, `src/svndiff.rs`,
+`src/svndiff/tests.rs`), `Cargo.lock` (the crate), `unsafe-budget.toml` (`slates-svn = 0`).
+- **What was there.** §4.17.1 (A-497) mapped a Subversion repository onto one green whose version N is revision N,
+  declared a stock client's commit as whole-file operations and named its answers, and left to §4.17.4 the exact
+  commit rule, revision properties, locks, mergeinfo, stacks, reviews, hooks, authorization, the wire, the learned
+  tunables, the target and the interop proof.
+- **The decision.** A transaction is a work on the green at the head when the commit begins; the drive's out-of-date
+  tests compare with that one version, as Subversion's commit editor compares with its transaction's root; a stock
+  client's operations are node-exclusive; and the verdict over the versions since is FSFS's commit-time merge
+  (`tree.c` `merge()`), stated on the Subversion index: a file changed on both sides conflicts even when the changes
+  are identical, as do double deletes, deletes against changes, replacements and double additions; a directory whose
+  properties changed meanwhile conflicts with any change beneath it; a directory whose properties the commit changed
+  conflicts when its entries' names or identities changed meanwhile; everything else merges node by node. The index
+  keeps each path's history with FSFS's bubble-up, so a directory's created revision counts its whole subtree. Locks are
+  checked in the verdict's one step. Revision properties and locks are entries of the repository's register. Reads
+  skip unchanged subtrees by the history lists, walk only the changed paths by the change index (A-264), and send
+  deltas made from extent lists. ra_svn is served without `svndiff1`, so zlib is never received; `svn+ssh` runs through
+  slates' own `svnserve -t`; HTTPv2 comes first and DeltaV version 1 after it; stock hooks inspect transactions through
+  slates' own `svnlook`; path rules are Subversion's authorization file with 1.14.1's semantics. Every tunable has an
+  estimator, inputs, an update, derived bounds and a first value from its first request; the target and the interop
+  proof are main's runs, specified in §4.17.4 items 13 and 14.
+- **Where it departs from §4.17.1 (raised with A-497's owner through its inbox, 2026-11-18).** §4.17.1 items 2 and 5
+  state Subversion's commit as §4.16's verdict over whole-file operations. That verdict accepts an identical change
+  (FSFS refuses "even an identical replacement" and "two additions"), knows no directory property rule, and reads a
+  directory's last change as its own rather than its subtree's. §4.17.4 states the exact rule; §4.17.1 needs only a
+  pointer to it.
+- **Built: the svndiff codec** (`slates-svn`, no I/O): versions 0 and 2; the decoder makes every refusal Subversion's
+  decoder makes, in its order, and refuses an integer past 64 bits, which Subversion truncates; the encoder writes as
+  Subversion's does and refuses any window a decoder would; the reference applier. Tests: the specification's complete
+  example and instruction encodings as golden vectors, a version-2 vector derived from the specification, every hostile
+  shape (headers, limits, signed offsets, overlong integers, each instruction fault, backward views with Subversion's
+  rule for empty views, bad version-2 sections, a delta cut at every byte), and three properties (round trip in every
+  encoding against a reference applier written apart; any bytes decode to a typed answer; a delta fed in any pieces
+  decodes the same). Proven on the Mac Studio (kiln, 2026-11-18 16:21 PST, load 13.4 to 15.8, debug build, a fresh
+  clone of the branch): `cargo test --locked -p slates-svn --lib`, 18 of 18 in 0.08 s, and 18 of 18 again after `cargo
+  fmt`. The one-crate clippy, `cargo xtask check` (literals, structure, the unsafe budget) and the cross-target lint of
+  the new crate are main's (the run-request queue, 2026-11-18).
+- **Owed.** §4.17.4's pieces 2 to 14, after §4.17.1's shared pieces they need; then main's runs: Subversion's Python
+  suite over both URLs, the differential run, and the order-of-magnitude measurements.
+
+### A-516 — A SAVE's tables wait until a live-shipped volume's log is durable where the save put it (2026-11-19, goal 90; what Shards needs from slates; A-303's first "Not here"; §4.6 the Shards form, §4.10, A-200; Shards' D176 part 5)
+Applied in the same change to: §4.6, the Shards form's save-and-restore bullet and A-303's status; A-303's entry (its
+"Not here", the first item marked built); GAPS, A-281's entry (A-303's paragraph); and:
+- `crates/server`: `shards.rs` (`answer_save` holds the tables on `live_ship::durable_target`; `DurableOwed` names what
+  a held reply becomes, `Undurable::Errno` for a guest's `FSYNC` and `Undurable::Save`; `settle_durable` sends the
+  tables or refuses the SAVE; the counter `shards.save_held`; the module's notes; the lib test module, new);
+  `live_ship.rs` (`ship_to_silent_holders`, test support under `cfg(test)`).
+
+- **What was there.** A SAVE took its snapshot at the cut and published the owner shard before answering, so the
+  slates snapshot the VM's snapshot names survived a daemon restart. On a live-shipped volume it did not wait for the
+  volume's candidates, as a guest's `FSYNC` on the same stream waits (A-200): its tables went out while the publication
+  that holds the snapshot was on the owner alone. Shards keeps the tables in the VM's snapshot and hands them back at
+  its restore (Shards' coordinator's contract, 2026-11-18: SAVE answers `[0, tables]` and names a slates snapshot taken
+  at the cut; RESTORE accepts that snapshot, a clone of it, or the live volume unchanged since the cut, else
+  `[1, why]`). An owner lost after the answer left a successor without the snapshot the saved VM names, so its
+  restore had nothing to stand on.
+- **The rule.** After the publication captures the volume, the SAVE asks where the volume's log must be durable before
+  a verb that just published it may answer (`live_ship::durable_target`). Where nothing need wait (a volume shipped
+  nowhere, every laptop: `f = 0` is the same code with nothing to wait for, R8) it is answered at once, as before.
+  Otherwise its tables are owed and held (`shards.save_held`); the stream's task waits as a held `FSYNC` waits
+  (`live_ship::wait_durable`, the one bound every transport judges a held durable reply by), and then sends them
+  (`shards.saved`), or, when the log did not become durable there, replaces them with the SAVE's refusal and its
+  reason, "the save's snapshot could not be made durable" (`shards.save_refused`). Shards' wire is unchanged: a SAVE
+  is still answered `[0, tables]` or `[1, why]`, only later. A refused SAVE leaves its snapshot, as a SAVE refused
+  after its snapshot was taken always has.
+- **Tests.** The server's lib test
+  `a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it` (Unix): on an audit daemon, a
+  volume shipped nowhere and one shipped live to two holders at `f = 1` that never answer
+  (`live_ship::ship_to_silent_holders`), a Shards stream attached to each and a SAVE sent on it as Shards' device
+  sends one. The first is answered its tables at once and counted saved, nothing held; the second is held, then
+  refused with the undurable reason once its wait gives up, never answered with tables, counted held and refused.
+- **Evidence.** Red first, on main `6696fda78` with the test alone, on the Mac Studio (2026-11-19): the second SAVE was
+  answered at once, `(0, [2, 0, 0, 0, 187, ...])`, its tables, where the test asks for the refusal. Green with the
+  change, the same machine: `cargo test --locked -p slates-server --lib -- shards:: live_ship::` 29 of 29 in 2.79 s, the
+  new test among them (its hold given up within the bound). Filed for main: the Windows build, the server's Shards
+  suites, and Shards' own run of a save and a restore over a live-shipped share.
 
 ### A-498 — The WinFsp drive's link counts are stated only where the drive refuses a link: the harness learns it from the drive (2026-11-18, g258, UI goal 85; Part 6 "Real workloads", §4.6 Windows; amends A-300 and A-360)
 Applied in the same change to: A-300's record in Part 6 (its A-360 note), GAPS (the WinFsp version-control entry),
