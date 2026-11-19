@@ -22,8 +22,6 @@ import sys
 from mercurial import hg, ui as uimod
 repo = hg.repository(uimod.ui.load(), sys.argv[1].encode())
 with repo.wlock(), repo.lock():
-    open(sys.argv[1] + "/e", "wb").write(b"e\n")
-    repo[None].add([b"e"])
     repo.commit(text=b"escaped extras", user=b"Test <test@example.com>", date=b"0 0",
                 extra={b"note": b"a\nb\x00c\\d\re\x0012:tail", b"source": b"svn:1"})
 PY
@@ -82,6 +80,7 @@ printf 'several\nlines\n\nof description' > "$WORK/message"; hg commit -l "$WORK
 hg merge -q stable; hg commit -m 'merge stable'
 hg update -q stable; hg commit --close-branch -m 'close stable'
 hg update -q default; printf 'u\n' > u; hg add -q u; hg commit -u "$(printf 'T\303\251st <t@example.com>')" -m 'a user beyond ASCII'
+printf 'e\n' > e; hg add -q e
 py "$WORK/extras.py" "$WORK/repo"
 py "$WORK/dump.py" "$WORK/repo" "$OUT"
 hg log -G -T '{rev} {node|short} {branch} {desc|firstline}\n' > "$OUT/log.txt"
