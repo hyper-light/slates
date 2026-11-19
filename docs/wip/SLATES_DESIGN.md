@@ -12406,7 +12406,8 @@ under a grant (§4.15, R10).
 > contents it names or whose admission would record other objects (guard then apply). Owed: the snapshot carrying each
 > store's sealed tables by identity, so a recovery replays only the log's suffix; Mercurial's and Subversion's records
 > and replay (their push pieces); a recovered version's pack fragments encoded again off the answer's path (A-654); the
-> fleet half (A-636).
+> fleet half (A-636). Since A-687 a Mercurial import's entry holds its record, every revision it kept, whole, and a
+> recovery replays it into the same index (§4.17.3's A-687 status); a Mercurial push's record is still owed.
 
 **Every tunable is learned online.** The rule for every server in this section (Ada, 2026-11-18): a tunable is an
 estimate the server keeps learning from the deployment's own traffic. It is never a constant, and never a value measured
@@ -13760,6 +13761,22 @@ signature verification).
 > four tests (red first, the four failing against stubs), `vcs_store::` 18 of 18, `wire_order` 2 of 2 with the variants
 > published, and the API's typing of the refusal. Owed: the import made durable; until then a request that reached the
 > owner from another node is refused `Unawaited`.
+>
+> **Status (2026-11-19, A-687: the import made durable).** A done import lands as one entry of its repository's logs
+> (A-635's append, `repository::push::push_imported`), in the transaction that records its request's completion, so
+> the import and its answer are one durable step. The entry's objects are the import's record (`slates-hg`'s
+> `import::record`: every revision it kept, whole, with its node, parents, link and flags, in the import's order, then
+> its markers, and the room it ran within); its state is the phase roots it found, each added to the phases log
+> (decision 3); and each bookmark is a green bound to `bookmark:<label>:` (decision 2), made from the repository's root
+> at its head and moved to its changeset by a work A-618's builder makes from the imported index, as a push makes a
+> bookmark's. The store takes the index between the register's guard and the entry's apply, so an entry the guard
+> refuses never reaches it, and one refused after it makes the store again from the log. A recovery replays the record
+> through the import's own steps (each revision's flags and text held to its node, a changeset's manifest, branch and
+> closing read from its text, each kept and appended numbered its log's own, the markers in one batch) into the same
+> index, on this node or a successor, which never reads the importing host's directory (R8). Proven on macOS arm64 (Mac
+> Studio, RUN-PENDING-STATUS). Owed: an imported repository's branch heads as lines (decision 1; a push after an import
+> finds the root as its first line); a request forwarded from another node answered from its record; for a large
+> repository, the record and the bookmarks' works made in slices and the snapshot carrying the store's tables.
 
 > **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
 > `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
@@ -14239,7 +14256,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `crates/server`: `vcs_store::hg_import`): the daemon's import of a repository's directory through it, a turn at a
    time on the repository's owner shard, its index put in the place of the empty index A-662's map made the
    repository's Mercurial store with. Built (A-678, `crates/server`: `repository::import`; `crates/ipc`:
-   `ImportRepository`): the verb that asks for an import, answered when it ends. Owed: the import made durable.
+   `ImportRepository`): the verb that asks for an import, answered when it ends. Built (A-687, `crates/hg`:
+   `import::record`; `crates/server`: `vcs_store::hg_import::land`, `repository::push::push_imported`, the store map's
+   Mercurial replay): the import made durable, its entry holding its record, its phase roots and its bookmarks' greens,
+   its record replayed at recovery. Owed: an imported repository's branch heads as lines (decision 1).
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -50857,3 +50877,55 @@ sources).
   across a window's edge (an object past a window trying earlier ones within one and the reverse, as git's order by
   name and size would); the live clone over the HTTP edge with the store's production lender (A-625 part 3); the
   red-checks and the other platforms' runs (main's).
+
+### A-687 — An import made durable: its entry holds its record, its phase roots and its bookmarks' greens, and a recovery replays it (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, decisions 2 and 3; §4.17.1 "Durability and residency" and shared piece 2; R8; A-635, A-662, A-675, A-678)
+
+Applied in the same change to: §4.17.3 (its status, piece 3), §4.17.1 (A-662's status), `crates/hg` (`import::record`,
+new, its tests in `tests/import.rs`; `index`: `HgIndex::file_logs`; `import`: the record module and its docs),
+`crates/server` (`vcs_store::hg_import`: an import done waits in the shard's map until it lands, `land`,
+`place_imported`; `repository::push`: `push_imported`, the entry's objects and the store's step taken by kind;
+`vcs_store`: the Mercurial replay, `ReplayRefused::Mercurial` and `Released`; `repository::import`: the landing and the
+completion in one transaction; their tests), GAPS (the §4.17.3 entry).
+- **Why.** An import was held in RAM alone: its index was put in its store's place with nothing in the register, so a
+  restart left the store empty and a successor knew nothing of it, and its phase roots and bookmarks were answered and
+  dropped (A-675, A-678: "Owed: the import made durable").
+- **Decided: the record, not the directory.** A recovery replays the import's record; it never imports the directory
+  again. A successor replays the register on another host and cannot read the importing host's directory (R8), and the
+  directory may have changed since. As a git push's entry holds its objects (A-662), an import's entry holds its
+  revisions: every one it kept, whole, with its node, parents' nodes, link's node and 7.2's flags, in the import's order
+  (the changelog, the manifest log, each file log in its path's order), then the markers each alone in its obsstore
+  format, and the room the import ran within (`slates_hg::import::record`, magic `SHIR`, version 1, little-endian,
+  every count checked against the bytes left before anything is allocated). Not a revlog's deltas, which are the host's
+  encoding, nor the index's rows, which are made from the revisions; and not the directory's files, which a successor
+  would read through a host it lacks.
+- **The replay is the import's own steps.** Each revision's flags held to what 7.2 knows and its text to its node
+  (sha1dc), a changeset's manifest, branch and closing read from its text within the recorded room, a file revision's
+  block split from its bytes, each kept as content and appended at once, numbered its log's own, the tail sealed when
+  due; each changeset's manifest held to the manifest log; the markers in one batch. So the replayed index is the
+  import's row for row, and a recomputation that differs is refused by kind (§4.16), with nothing left held. Not
+  checked again: that each path a changeset names has a file log, which the import held its listing to; the record is
+  the listing now.
+- **The entry.** A done import waits in the shard's map, holding its index, until it lands (`hg_import::land`), as one
+  entry of A-635's append (`repository::push::push_imported`): its objects the record; its state each phase root added
+  (decision 3: draft, secret, archived and internal roots as the import found them); and each bookmark a green bound to
+  `bookmark:<label>:` (decision 2), made from the repository's root at its head and moved to the bookmark's changeset by
+  the work A-618's builder makes from the imported index (none where the root's head is that changeset), as a push
+  makes a bookmark (A-657). The store takes the index between the register's guard and the entry's apply
+  (`place_imported`), as a git push's store commits its objects: an entry the guard refuses never reaches the store, and
+  one refused after it makes the store again from the log. An import's entry is recorded whatever it moves, since its
+  record is the repository's history. The verb lands it in the transaction that records the request's completion, so
+  the import and its answer are one durable step; a transaction the database cannot make durable rolls back whole, the
+  shard's effects reconciled with the log and the store made again from it.
+- **Bounds.** The landing holds the record, whole, and the bookmarks' works, each within what the import's room (one
+  client region's bytes) leaves of the others, a work past it refused `PastRoom`; the record is charged to the
+  partition's merge budget with the entry, as a git push's is.
+- **Not taken (decided from the design, not measured).** Re-importing the directory at recovery (above). The markers as
+  the markers log's state changes: they are facts the index keeps as rows (A-649), the served view reads them there,
+  and the markers log is a push's (piece 7). Lines for the imported branch heads (decision 1) in this piece: the
+  brief's scope was the record, the phase roots and the bookmarks; owed below.
+- **Tests** (RUN-PENDING-TESTS).
+- **Owed.** An imported repository's branch heads as lines (decision 1): until then a push after an import finds the
+  root as its first line, empty, and each bookmark's green holds its tree from the root's version, never shared with a
+  line's; a request forwarded from another node answered from its record; for a large repository, the record and the
+  bookmarks' works made in slices rather than whole at the landing, the replay sliced within a record, and the snapshot
+  carrying the store's tables so a recovery replays only the log's suffix; a Mercurial push's record and replay.

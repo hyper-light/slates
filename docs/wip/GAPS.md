@@ -861,9 +861,8 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); and the import made durable (A-675 built the import, A-678 the verb that asks for one):
-> the register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the
-> directory again or replays its record (until then an import is not served, and a restart leaves its store empty).
+> `verify`); the import made durable is built (A-687, below); an imported repository's branch heads as lines (decision
+> 1) are owed.
 > **Built (A-619 part 3):**
 > `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
@@ -928,6 +927,15 @@
 > recorded first; a resend takes the held route over; every refusal by kind (`ImportFault`, the API's
 > `Invalid::Import`); proven on macOS arm64 (Mac Studio, kiln r110): the verb's 4 tests (red first), `vcs_store::` 18 of
 > 18, `wire_order` 2 of 2, `slates-api`'s `error` tests 12 of 12 with the refusal's typing.
+> **Built (A-687):** the import made durable: a done import lands as one entry of A-635's append
+> (`repository::push::push_imported`) in the transaction that records its request's completion: its objects the
+> import's record (`slates-hg`'s `import::record`: every revision it kept, whole, in its order, then its markers, and the
+> room it ran within), its state the phase roots it found, each bookmark a green bound to `bookmark:<label>:` made from
+> the root and moved by A-618's work; the index put in the store's place between the register's guard and the apply; a
+> recovery replays the record through the import's own steps into the same index, on any node (R8). Proven on macOS
+> arm64 (Mac Studio, RUN-PENDING-GAPS). Owed: an imported repository's branch heads as lines (decision 1; a push after
+> an import finds the root as its first line); a forwarded request answered from its record; the record, the bookmarks'
+> works and the replay in slices for a large repository, and the snapshot carrying the store's tables.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -954,7 +962,8 @@
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the served view over them (with A-650's site);
+> at recovery (an import's record replays since A-687; a push's entry holds none yet), and the served view over them
+> (with A-650's site);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
