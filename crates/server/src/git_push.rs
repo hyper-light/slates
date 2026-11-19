@@ -72,8 +72,8 @@
 //! recording nothing; `atomic` all or none, at the verdict and at the append, and a push without it a ref at a time. A
 //! protected name's linear history and signed commits are A-644 part 2's own tests (`git_protect/tests.rs`).
 //!
-//! **Owed** (GAPS' §4.17 entry): the edges' calls (g299's `GitServices` for the HTTP site, g294's channel for SSH); the
-//! hooks run over A-665 part 2's view; a push based on an older version (A-664); a principal the policy allows who is
+//! **Called by** the HTTP site's receive-pack (`vcs_http::git`'s `receive`, A-654 part 3). **Owed** (GAPS' §4.17
+//! entry): the SSH channel's call (g294); the hooks run over A-665 part 2's view; a push based on an older version (A-664); a principal the policy allows who is
 //! not the repository's owner, whom A-635's append refuses `Forbidden` until its owner check gives way to the policy;
 //! push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item
 //! 8); a tag of a tag.

@@ -15,8 +15,7 @@
 //! writes the answer, handing the store to the pack's source, which names what it sends by position, so it is lent the
 //! objects alone ([`StoreLender::lend_objects`]) and costs its room and one packet whatever the repository's refs. The
 //! daemon's lender is the owner shard's map of stores (`crate::vcs_store::upload::ShardStores`, A-662's map, with A-639's
-//! stream as the pack's source); a repository whose store it does not hold is `503`. receive-pack answers `503` until
-//! its session's entry point lands (A-654).
+//! stream as the pack's source); a repository whose store it does not hold is `503`.
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_git::Admission;
@@ -56,7 +55,7 @@ pub(crate) trait StoreLender {
 }
 
 /// git's services with upload-pack served from the stores `lender` lends, each request admitted `room` bytes;
-/// receive-pack answers `503` until its session's entry point lands (A-654).
+/// receive-pack is not its half: it answers `503` for it ([`super::Halves`] pairs the two).
 #[derive(Clone, Debug)]
 pub(crate) struct UploadServices<L> {
   /// Where the stores are lent.
@@ -152,6 +151,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Self {
       lender,
       repository,
+      admission,
       answer,
       ..
     } = self;
@@ -160,7 +160,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     };
     let written = lender
       .lend_objects(*repository, |served, packs| {
-        answer.write(served, packs, out, MAX_LEN)
+        answer.write(served, packs, admission, out, MAX_LEN)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     Ok(written == Written::More)

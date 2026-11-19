@@ -230,33 +230,65 @@ pub(crate) fn record_goes_to_holders(state: &ShardState, green: DbVolumeId) -> b
   !local_hold.placed(config.quorum)
 }
 
-/// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
-/// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
-/// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
-pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+/// What the doubling rule of [`checkpoint_green`] weighs for a green: the version a checkpoint would be taken at, the
+/// bytes it would fold there, and the size of the checkpoint the green holds. The rule reads them through
+/// [`fold_inputs`] alone, and so does a test whose expectation turns on whether the rule folds
+/// (`repository::tests::write_until_folded`), so the test follows the checkpoint's and the increments' encodings rather
+/// than leaning on their sizes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FoldInputs {
+  /// The version a checkpoint would be taken at: the green's checkpoint floor ([`checkpoint_floor`]).
+  pub(crate) floor: u64,
+  /// The bytes the checkpoint would fold: the chain's increments from the one after the version held (the
+  /// partition's `green_floor`) up to `floor`.
+  pub(crate) to_fold: usize,
+  /// The size of the checkpoint the green holds; 0 while it holds none, so its first one is taken at once.
+  pub(crate) held_bytes: usize,
+}
+
+impl FoldInputs {
+  /// Whether the doubling rule waits: the bytes to fold are still under the size of the checkpoint held.
+  pub(crate) fn waits(self) -> bool {
+    self.to_fold < self.held_bytes
+  }
+}
+
+/// The doubling rule's inputs for `green` as they stand ([`FoldInputs`]), or none when its checkpoint floor is not past
+/// the version its chain begins after, so a checkpoint would fold nothing.
+pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldInputs> {
   let floor = checkpoint_floor(state, green);
   let partition = state.db.partition();
   // The chain begins after the checkpoint held, or after the green's adoption by its takeover (A-333).
   let held = partition.green_floor(green);
-  let held_bytes = partition
-    .green_checkpoint(green)
-    .map_or(0, |(_, bytes)| bytes.len());
-  let Some(folds) = floor
+  let folds = floor
     .checked_sub(held)
     .filter(|folds| *folds > 0)
-    .and_then(|folds| usize::try_from(folds).ok())
-  else {
+    .and_then(|folds| usize::try_from(folds).ok())?;
+  Some(FoldInputs {
+    floor,
+    to_fold: partition
+      .green_chain(green)
+      .iter()
+      .take(folds)
+      .map(Vec::len)
+      .sum(),
+    held_bytes: partition
+      .green_checkpoint(green)
+      .map_or(0, |(_, bytes)| bytes.len()),
+  })
+}
+
+/// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
+/// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
+/// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
+pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+  let Some(inputs) = fold_inputs(state, green) else {
     return;
   };
-  let folded: usize = partition
-    .green_chain(green)
-    .iter()
-    .take(folds)
-    .map(Vec::len)
-    .sum();
-  if doubling == Doubling::Wait && folded < held_bytes {
+  if doubling == Doubling::Wait && inputs.waits() {
     return;
   }
+  let floor = inputs.floor;
   // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
   let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
     let mut checkpoint = engine.checkpoint(floor)?;

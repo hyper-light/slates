@@ -25,8 +25,10 @@
 //! 5. The service. One whose server half has not landed, or whose repository's store is not held here, is `503` (RFC
 //!    9110 §15.6.4: "the server is currently unable to handle the request"). upload-pack is served from a repository's
 //!    store by [`upload`] (A-640 part 2, A-625 part 3), the store lent from the owner shard's map a step at a time and
-//!    the refs lent those the principal may read (A-682); receive-pack answers `503` until its session's entry point
-//!    lands (A-654).
+//!    the refs lent those the principal may read (A-682); receive-pack by [`receive`] through the push driver on the
+//!    repository's owner shard (A-654 parts 2 and 3). [`Halves`] serves each from its own half. A service that cannot
+//!    start its push is refused as its driver says: the repository gone `404`, its policy unreadable `500`, its
+//!    advertisement unwritable `500`.
 //!
 //! Every refusal of steps 2 to 5 is typed ([`Refused`]) and counted under its kind in the shard's status counters.
 //!
@@ -49,8 +51,10 @@ use slates_http_edge::credential::{self, Credential, CredentialRefused};
 use super::{Answer, Decided, Exchange, Failed, Site};
 use crate::vcs_policy::{self, Right};
 
+mod receive;
 mod upload;
 
+pub(crate) use receive::{ReceiveServices, ThisShard};
 pub(crate) use upload::{StoreLender, UploadServices};
 
 /// What a request's credential proved (§4.13; A-625 part 3): its principal, and the expiry an LFS action carries.
@@ -122,6 +126,8 @@ pub(crate) enum Refused {
   Unreadable,
   /// The service's server half, or the repository's store, is not here: `503`.
   Unavailable,
+  /// The advertisement, its prelude or the service's own, could not be written: `500`.
+  Unwritable,
 }
 
 impl Refused {
@@ -137,7 +143,7 @@ impl Refused {
       Refused::Unproven(Unproven::Unanswered) | Refused::Unavailable => Status::SERVICE_UNAVAILABLE,
       Refused::NoRepository => Status::NOT_FOUND,
       Refused::Forbidden => Status::FORBIDDEN,
-      Refused::Unreadable => Status::INTERNAL_SERVER_ERROR,
+      Refused::Unreadable | Refused::Unwritable => Status::INTERNAL_SERVER_ERROR,
     }
   }
 
@@ -156,6 +162,7 @@ impl Refused {
       Refused::Forbidden => "vcs_http.git.forbidden",
       Refused::Unreadable => "vcs_http.git.policy_unreadable",
       Refused::Unavailable => "vcs_http.git.unavailable",
+      Refused::Unwritable => "vcs_http.git.unwritable",
     }
   }
 }
@@ -178,8 +185,26 @@ pub(crate) struct Start<'a> {
 /// Why a service did not start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ServiceRefused {
-  /// The service's server half has not landed: `503`.
+  /// The service's server half has not landed, or the repository's store is not here: `503`.
   Unavailable,
+  /// The repository is gone, or serves another tool, by the time its service starts: `404`.
+  NoRepository,
+  /// The repository's policy cannot be read: `500`.
+  Unreadable,
+  /// The service's advertisement could not be written: `500`.
+  Unwritable,
+}
+
+impl ServiceRefused {
+  /// The site's refusal it is answered and counted as.
+  fn kind(self) -> Refused {
+    match self {
+      ServiceRefused::Unavailable => Refused::Unavailable,
+      ServiceRefused::NoRepository => Refused::NoRepository,
+      ServiceRefused::Unreadable => Refused::Unreadable,
+      ServiceRefused::Unwritable => Refused::Unwritable,
+    }
+  }
 }
 
 /// git's two services behind the site: upload-pack (fetch and clone) and receive-pack (push).
@@ -188,6 +213,72 @@ pub(crate) trait GitServices {
   type Exchange: Exchange;
   /// Starts the service `start` names, or refuses it.
   fn start(&mut self, start: &Start<'_>) -> Result<Self::Exchange, ServiceRefused>;
+}
+
+/// git's two services, each from its own half: upload-pack's from `upload`, receive-pack's from `receive` (A-654 part
+/// 3), so each half is built and replaced on its own.
+#[derive(Clone, Debug)]
+pub(crate) struct Halves<U, R> {
+  /// upload-pack's half.
+  upload: U,
+  /// receive-pack's half.
+  receive: R,
+}
+
+impl<U, R> Halves<U, R> {
+  /// upload-pack from `upload`, receive-pack from `receive`.
+  pub(crate) fn new(upload: U, receive: R) -> Self {
+    Self { upload, receive }
+  }
+}
+
+/// The exchange of the half a request started.
+pub(crate) enum HalfExchange<U, R> {
+  /// upload-pack's.
+  Upload(U),
+  /// receive-pack's.
+  Receive(R),
+}
+
+impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
+  async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.body(run).await,
+      HalfExchange::Receive(receive) => receive.body(run).await,
+    }
+  }
+
+  async fn body_end(&mut self) -> Result<(), Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.body_end().await,
+      HalfExchange::Receive(receive) => receive.body_end().await,
+    }
+  }
+
+  async fn reply_fields(&mut self) -> Result<Fields, Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.reply_fields().await,
+      HalfExchange::Receive(receive) => receive.reply_fields().await,
+    }
+  }
+
+  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+    match self {
+      HalfExchange::Upload(upload) => upload.reply(out).await,
+      HalfExchange::Receive(receive) => receive.reply(out).await,
+    }
+  }
+}
+
+impl<U: GitServices, R: GitServices> GitServices for Halves<U, R> {
+  type Exchange = HalfExchange<U::Exchange, R::Exchange>;
+
+  fn start(&mut self, start: &Start<'_>) -> Result<Self::Exchange, ServiceRefused> {
+    match start.service {
+      Service::UploadPack => self.upload.start(start).map(HalfExchange::Upload),
+      Service::ReceivePack => self.receive.start(start).map(HalfExchange::Receive),
+    }
+  }
 }
 
 /// A served request's exchange: the advertisement's prelude first, when it has one, then the service's.
@@ -399,14 +490,12 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     };
     let service = match self.services.start(&start) {
       Ok(service) => service,
-      Err(ServiceRefused::Unavailable) => {
-        return self.refuse(Refused::Unavailable, secure, true);
-      }
+      Err(refused) => return self.refuse(refused.kind(), secure, true),
     };
     let mut prelude = Vec::new();
     let reply = if asked.advertise {
       if http::advertisement_prelude(asked.service, asked.version, &mut prelude).is_err() {
-        return refused_with(Status::INTERNAL_SERVER_ERROR, cache_fields(), true);
+        return self.refuse(Refused::Unwritable, secure, true);
       }
       Reply::Advertisement(asked.service)
     } else {

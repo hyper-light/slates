@@ -21,18 +21,21 @@
 //! (`verbs::owner_of_name`, as `CreateRepository` routes it): a name another shard holds moves the connection there
 //! (`Answer::Move`), so a repository is found, judged and served on its own shard, its partition read with no crossing.
 //!
-//! **What is served.** git's services as the server has them: upload-pack from each repository's store on its owner
-//! shard, lent from A-662's map a step at a time with the refs the principal may read
-//! (`crate::vcs_store::upload::ShardStores`, A-682), each request admitted the edge's room; receive-pack once its
-//! session lands (A-654), `503` until then.
+//! **What is served.** git's services as the server has them, each from its own half: upload-pack from each
+//! repository's store on its owner shard, lent from A-662's map a step at a time with the refs the principal may read
+//! (`crate::vcs_store::upload::ShardStores`, A-682), each request admitted the edge's room; receive-pack through the
+//! push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3).
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_http_edge::credential::Credential;
-use slates_rt::tcp::TcpListener;
+use slates_rt::tcp::{SocketAddrV4, TcpListener};
 use slates_rt::{RtError, Runtime, ShardId, futures};
 use slates_vfs::clock::Clock;
 
-use super::git::{Authenticator, GitSite, Located, Proven, Repositories, Unproven, UploadServices};
+use super::git::{
+  Authenticator, GitSite, Halves, Located, Proven, ReceiveServices, Repositories, ThisShard,
+  Unproven, UploadServices,
+};
 use super::{Bounds, EdgeState, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
 use crate::vcs_store::upload::ShardStores;
@@ -134,12 +137,15 @@ impl Repositories for ShardRepositories {
   }
 }
 
-/// git's site as the daemon serves it: upload-pack over this shard's stores (the module doc).
-pub(crate) type DaemonSite =
-  GitSite<RecordedCredentials, ShardRepositories, UploadServices<ShardStores>>;
+/// git's site as the daemon serves it (the module doc, "What is served").
+pub(crate) type DaemonSite = GitSite<
+  RecordedCredentials,
+  ShardRepositories,
+  Halves<UploadServices<ShardStores>, ReceiveServices<ThisShard>>,
+>;
 
 /// What makes the daemon's git site on any shard: its challenges name `realm`, it charges each route's path to the
-/// request's `room`, and upload-pack admits each request that room.
+/// request's `room`, and each service admits each request that room.
 fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
   move || {
     GitSite::new(
@@ -147,7 +153,10 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       room,
       RecordedCredentials,
       ShardRepositories,
-      UploadServices::new(ShardStores, room),
+      Halves::new(
+        UploadServices::new(ShardStores, room),
+        ReceiveServices::new(ThisShard, room),
+      ),
     )
   }
 }
@@ -164,11 +173,7 @@ pub(crate) fn start(
   let Some(edge) = &config.vcs_http else {
     return Ok(None);
   };
-  let bounds = Bounds::of_shard(
-    config.clients_per_shard,
-    config.region.total_bytes(),
-    config.runtime.timer_tick_ns,
-  );
+  let bounds = bounds_of(config);
   let identity = match edge
     .identity
     .as_ref()
@@ -187,14 +192,9 @@ pub(crate) fn start(
       "it has no identity, and serves cleartext on a loopback address alone",
     ));
   }
-  let listener = match TcpListener::bind(edge.address, bounds.backlog()) {
+  let listener = match listener_for(edge.address, bounds) {
     Ok(listener) => listener,
-    Err(error) => {
-      return Ok(not_started(&format!(
-        "{} did not bind: {error}",
-        edge.address
-      )));
-    }
+    Err(why) => return Ok(not_started(&why)),
   };
   let port = match listener.local_addr() {
     Ok(address) => address.port(),
@@ -234,6 +234,54 @@ pub(crate) fn start(
 fn not_started(why: &str) -> Option<u16> {
   slates_machine::log_line!("slates-server: the version-control HTTP edge did not start: {why}");
   None
+}
+
+/// The edge's bounds on each shard of `config`: its seats and request room from the shard's budget, its waits floored by
+/// the timer's tick ([`Bounds::of_shard`]).
+fn bounds_of(config: &DaemonConfig) -> Bounds {
+  Bounds::of_shard(
+    config.clients_per_shard,
+    config.region.total_bytes(),
+    config.runtime.timer_tick_ns,
+  )
+}
+
+/// Binds the edge's listener at `address`, its backlog the edge's seats on a shard of `config`: the daemon's own, and the
+/// one a supervising anchor binds once and holds for every daemon it starts
+/// (`crate::daemon::bind_vcs_http_listener`), so both queue alike.
+pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpListener, RtError> {
+  TcpListener::bind(address, bounds_of(config).backlog())
+}
+
+/// The edge's listener: the one a supervising anchor holds and handed over ([`slates_anchor::ENV_VCS_HTTP`]), adopted so
+/// the edge's port never drops while a daemon restarts (a client that connects then waits in its queue), when it listens
+/// where the configuration says ([`listens_at`]); else, with none handed over, one bound here at `address`. Why there
+/// is none, otherwise: a held listener elsewhere is refused, never served, since the edge would then answer somewhere
+/// the operator did not ask.
+fn listener_for(address: SocketAddrV4, bounds: Bounds) -> Result<TcpListener, String> {
+  match crate::daemon::held_listener(slates_anchor::ENV_VCS_HTTP) {
+    Some(Ok(held)) => {
+      let at = held
+        .local_addr()
+        .map_err(|error| format!("the anchor's listener's address is unread: {error}"))?;
+      if listens_at(at, address) {
+        Ok(held)
+      } else {
+        Err(format!(
+          "the anchor's listener is at {at}, not at {address}"
+        ))
+      }
+    }
+    Some(Err(error)) => Err(format!("the anchor's listener was not adopted: {error}")),
+    None => TcpListener::bind(address, bounds.backlog())
+      .map_err(|error| format!("{address} did not bind: {error}")),
+  }
+}
+
+/// Whether a listener bound at `at` listens where `address` says: at its address, and at its port unless it asks for
+/// any (port 0, the system's pick, which an anchor makes once for every daemon it starts).
+fn listens_at(at: SocketAddrV4, address: SocketAddrV4) -> bool {
+  at.ip() == address.ip() && (address.port() == 0 || at.port() == address.port())
 }
 
 #[cfg(test)]

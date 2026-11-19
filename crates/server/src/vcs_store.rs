@@ -109,6 +109,9 @@ pub(crate) struct VcsStores {
   /// Each Mercurial repository's import under way, between its turns ([`hg_import`]): one a repository, so bounded by
   /// the partition's repositories.
   imports: BTreeMap<RepositoryId, hg_import::Importing>,
+  /// The request each import's end answers, by repository (A-678; `crate::repository::import`): one an import, so
+  /// bounded as the imports are.
+  answers: BTreeMap<RepositoryId, crate::repository::import::Answer>,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -255,6 +258,28 @@ impl VcsStores {
   /// Whether an import of repository `id` is under way ([`hg_import`]).
   pub(crate) fn importing(&self, id: RepositoryId) -> bool {
     self.imports.contains_key(&id)
+  }
+
+  /// Holds `answer` as the request repository `id`'s import's end answers (A-678): the answer it replaces.
+  pub(crate) fn hold_answer(
+    &mut self,
+    id: RepositoryId,
+    answer: crate::repository::import::Answer,
+  ) -> Option<crate::repository::import::Answer> {
+    self.answers.insert(id, answer)
+  }
+
+  /// The request repository `id`'s import's end answers, if one is held.
+  pub(crate) fn answer(&self, id: RepositoryId) -> Option<&crate::repository::import::Answer> {
+    self.answers.get(&id)
+  }
+
+  /// Takes the request repository `id`'s import's end answers, if one is held.
+  pub(crate) fn take_answer(
+    &mut self,
+    id: RepositoryId,
+  ) -> Option<crate::repository::import::Answer> {
+    self.answers.remove(&id)
   }
 
   /// Why repository `id`'s store was not made again by the recovery, if it was not.

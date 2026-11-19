@@ -1,5 +1,6 @@
 //! Tests of the daemon's HTTP edge (A-625 part 3): a daemon in-process starts it from its configuration, and a rustls
-//! client over loopback TLS asks for a repository another shard's partition holds, with each kind of credential.
+//! client over loopback TLS asks for a repository another shard's partition holds, with each kind of credential;
+//! pushes to it the bytes stock git sent (A-654 part 3); and fetches back what it pushed (A-682).
 
 use std::io::{Read, Write};
 use std::net::TcpStream as ClientStream;
@@ -10,7 +11,16 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use slates_db::HostId;
 use slates_db::catalog::Principal;
-use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, ReplyBody, RequestBody, VcsTool};
+use slates_git::http::{self, Service, Version};
+use slates_git::object_name::{ObjectFormat as GitFormat, ObjectId};
+use slates_git::Admission;
+use slates_git::pktline::{self, Packet};
+use slates_git::receive::{Advertised, write_advertisement};
+use slates_git::unpack::{self, NoIndex};
+use slates_ipc::protocol::{
+  CredentialMaterial, ObjectFormat, PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+  ReplyBody, RequestBody, VcsTool,
+};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::config::{EdgeIdentity, VcsHttpConfig};
@@ -271,6 +281,80 @@ const LS_REFS_HEAD: &[u8] = b"0014command=ls-refs\n0001000csymrefs\n000bunborn\n
 /// naming its branch, then the flush [gitprotocol-v2: `obj-id-or-unborn SP refname *(SP ref-attribute)`].
 const UNBORN_MAIN: &[u8] = b"002eunborn HEAD symref-target:refs/heads/main\n0000";
 
+/// A-682 (A-625 part 3's upload-pack served from the store A-662 holds on the repository's shard). Do: start a two-shard
+/// daemon with its edge; create a git repository whose default branch is `main` on the second shard's partition, and
+/// enroll its owner's token; then, as the owner over TLS, ask for upload-pack's advertisement at protocol v2, and POST
+/// an `ls-refs` request asking for `HEAD` with `symrefs` and `unborn`. Expect: both answered `200`, moved to the
+/// repository's shard and served there from its store: the advertisement v2's capabilities, `version 2` first and
+/// `ls-refs=unborn` among them; the `ls-refs` answer `HEAD` unborn naming `refs/heads/main`, the default branch the
+/// repository's record names; and nothing counted unavailable on the repository's shard. Before A-682 the daemon's site
+/// lent no store, and both were `503`.
+#[test]
+fn a_daemons_edge_serves_upload_pack_from_the_store_its_repositorys_shard_holds() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let fields = format!(
+    "Host: localhost\r\nAuthorization: Bearer {OWNER_TOKEN}\r\nGit-Protocol: version=2\r\n"
+  );
+  let advertise = format!("GET /{name}/info/refs?service=git-upload-pack HTTP/1.1\r\n{fields}\r\n");
+  let advertise = advertise.into_bytes();
+  let mut ls_refs = format!(
+    "POST /{name}/git-upload-pack HTTP/1.1\r\n{fields}\
+     Content-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n",
+    LS_REFS_HEAD.len()
+  )
+  .into_bytes();
+  ls_refs.extend_from_slice(LS_REFS_HEAD);
+  let advertisement = exchange(port, &certificate, &advertise);
+  let listed = exchange(port, &certificate, &ls_refs);
+  let unavailable = counted_on(&daemon, REPOSITORY, "vcs_http.git.unavailable");
+  daemon.stop();
+  let (status, capabilities) = advertisement;
+  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&capabilities));
+  assert!(
+    capabilities.starts_with(b"000eversion 2\n"),
+    "{capabilities:?}"
+  );
+  assert!(
+    capabilities
+      .windows(b"ls-refs=unborn".len())
+      .any(|window| window == b"ls-refs=unborn"),
+    "{capabilities:?}"
+  );
+  assert_eq!(listed, (200, UNBORN_MAIN.to_vec()));
+  assert_eq!(unavailable, 0);
+}
+
+/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: ask whether listeners an anchor might hand over listen where a
+/// daemon's configuration says: at the same address and port; at the same address where the configuration asks for port
+/// 0 (the system's pick, which the anchor made once for every daemon); at another port; at another address. Expect: the
+/// first two taken and the last two refused, so a daemon adopts the anchor's listener only where it would have bound its
+/// own, and never serves the edge somewhere the operator did not ask.
+#[test]
+fn a_held_listener_is_adopted_only_where_the_configuration_says() {
+  let at = |octets: [u8; 4], port: u16| SocketAddrV4::new(Ipv4Addr::from(octets), port);
+  assert!(super::listens_at(
+    at([127, 0, 0, 1], 8080),
+    at([127, 0, 0, 1], 8080)
+  ));
+  assert!(super::listens_at(
+    at([127, 0, 0, 1], 51234),
+    at([127, 0, 0, 1], 0)
+  ));
+  assert!(!super::listens_at(
+    at([127, 0, 0, 1], 8081),
+    at([127, 0, 0, 1], 8080)
+  ));
+  assert!(!super::listens_at(
+    at([0, 0, 0, 0], 8080),
+    at([127, 0, 0, 1], 8080)
+  ));
+}
+
 /// One line of `stream`, its line feed included.
 fn line_of(stream: &mut impl Read) -> Vec<u8> {
   let mut line = Vec::new();
@@ -337,50 +421,286 @@ fn exchange(port: u16, certificate: &CertificateDer<'static>, request: &[u8]) ->
   (status, body_of(&mut stream, &head))
 }
 
-/// A-682 (A-625 part 3's upload-pack served from the store A-662 holds on the repository's shard). Do: start a two-shard
-/// daemon with its edge; create a git repository whose default branch is `main` on the second shard's partition, and
-/// enroll its owner's token; then, as the owner over TLS, ask for upload-pack's advertisement at protocol v2, and POST
-/// an `ls-refs` request asking for `HEAD` with `symrefs` and `unborn`. Expect: both answered `200`, moved to the
-/// repository's shard and served there from its store: the advertisement v2's capabilities, `version 2` first and
-/// `ls-refs=unborn` among them; the `ls-refs` answer `HEAD` unborn naming `refs/heads/main`, the default branch the
-/// repository's record names; and nothing counted unavailable on the repository's shard. Before A-682 the daemon's site
-/// lent no store, and both were `503`.
+/// Format: the content type of receive-pack's requests (gitprotocol-http), as stock git sends it.
+const RECEIVE_REQUEST: &str = "Content-Type: application/x-git-receive-pack-request";
+/// Format: stock git 2.50.1's push creating `main` in an empty repository, as `make-push-fixtures.sh` captured it
+/// (`crates/git/fixtures/push`): its commands, then its pack.
+const CREATE_REQUEST: &[u8] = include_bytes!("../../../../git/fixtures/push/create.request.bin");
+/// Format: what `git receive-pack` answered that push: its advertisement of no ref, then its report.
+const CREATE_RESPONSE: &[u8] = include_bytes!("../../../../git/fixtures/push/create.response.bin");
+/// Format: the agent the captured server advertised.
+const GITS_AGENT: &[u8] = b"git/2.50.1-Darwin";
+/// Format: the commit that push made `main`.
+const FIRST: &str = "b1fac94f2ed5e3cb5850e4b5f89d23fce635601e";
+/// Format: the zero id, a delete's new value.
+const ZERO: &str = "0000000000000000000000000000000000000000";
+/// Format: the capabilities stock git 2.50.1 sends on a push's first command (the fixtures' requests).
+const CAPABILITIES: &str =
+  " report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.50.1-Darwin";
+/// Format: the report line of a delete git refuses as `receive.denyDeletes` refuses one.
+const DELETION_PROHIBITED: &[u8] = b"ng refs/heads/main deletion prohibited";
+
+/// The object `hex` names, in SHA-1.
+fn named(hex: &str) -> ObjectId {
+  ObjectId::from_hex(GitFormat::Sha1, hex.as_bytes()).expect("an id")
+}
+
+/// receive-pack's advertisement of `refs` by a server advertising push options when `push_options`, under `agent`.
+fn receive_advertisement(refs: &[(ObjectId, &[u8])], push_options: bool, agent: &[u8]) -> Vec<u8> {
+  let advertised = Advertised {
+    format: GitFormat::Sha1,
+    atomic: true,
+    ofs_delta: true,
+    push_options,
+    session_id: None,
+    agent,
+  };
+  let mut out = Vec::new();
+  write_advertisement(refs, &advertised, &mut out).expect("an advertisement");
+  out
+}
+
+/// What the daemon's site answers receive-pack's advertisement with at protocol v0: the `# service=` prelude, then the
+/// push driver's advertisement of `refs` (this server's agent, no push options).
+fn served_advertisement(refs: &[(ObjectId, &[u8])]) -> Vec<u8> {
+  let mut out = Vec::new();
+  http::advertisement_prelude(Service::ReceivePack, Version::V0, &mut out).expect("a prelude");
+  out.extend(receive_advertisement(
+    refs,
+    false,
+    slates_git::upload::AGENT.as_bytes(),
+  ));
+  out
+}
+
+/// git's report to the `create` push: what `git receive-pack` wrote after its advertisement.
+fn gits_create_report() -> &'static [u8] {
+  let advertisement = receive_advertisement(&[], true, GITS_AGENT);
+  CREATE_RESPONSE
+    .strip_prefix(advertisement.as_slice())
+    .expect("git's advertisement first")
+}
+
+/// A push request deleting `main` at [`FIRST`], as stock git sends one: its command, then a flush and no pack.
+fn delete_of_main() -> Vec<u8> {
+  let line = format!("{FIRST} {ZERO} refs/heads/main\0{CAPABILITIES}");
+  let mut out = Vec::new();
+  pktline::write(Packet::Data(line.as_bytes()), &mut out).expect("a command");
+  pktline::write(Packet::Flush, &mut out).expect("a flush");
+  out
+}
+
+/// The owner's bearer credential.
+fn owner_bearer() -> String {
+  format!("Authorization: Bearer {OWNER_TOKEN}")
+}
+
+/// receive-pack's advertisement of repository `name` as the edge answers the owner: its status and body.
+fn advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16, Vec<u8>) {
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}/info/refs?service=git-receive-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  exchange(port, certificate, request.as_bytes())
+}
+
+/// `request` pushed to repository `name` by its owner as stock git posts it, with its length: the answer's status and
+/// body.
+fn pushed(edge: (u16, &CertificateDer<'static>), name: &str, request: &[u8]) -> (u16, Vec<u8>) {
+  let (port, certificate) = edge;
+  let mut sent = format!(
+    "POST /{name}/git-receive-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\n{RECEIVE_REQUEST}\r\n\
+     Content-Length: {}\r\n\r\n",
+    owner_bearer(),
+    request.len()
+  )
+  .into_bytes();
+  sent.extend_from_slice(request);
+  exchange(port, certificate, &sent)
+}
+
+/// Sets repository `name`'s policy, from its first version, to a rule denying everyone the deletion of `main`.
+fn deny_deletion(daemon: &Daemon, name: &str) {
+  let name = name.to_owned();
+  let reply = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::SetRepositoryPolicy {
+        repository: name.clone(),
+        read: 0,
+        rules: vec![PolicyRule {
+          names: PolicyNames::Refs,
+          pattern: "refs/heads/main".to_owned(),
+          right: PolicyRight::Delete,
+          effect: PolicyEffect::Deny,
+          who: PolicyWho::Anyone,
+        }],
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+      },
+    )
+  });
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// Asserts that `answer` is `200` with a report refusing `main`'s deletion as git refuses it.
+fn assert_deletion_prohibited(answer: &(u16, Vec<u8>)) {
+  let (status, report) = answer;
+  assert_eq!(*status, 200, "{}", String::from_utf8_lossy(report));
+  assert!(
+    report
+      .windows(DELETION_PROHIBITED.len())
+      .any(|line| line == DELETION_PROHIBITED),
+    "{}",
+    String::from_utf8_lossy(report)
+  );
+}
+
+/// A-654 part 3 (§4.17.2 "A push" and "Transports" item 1; gitprotocol-http's smart service; golden vectors: stock git
+/// 2.50.1's `create` push, captured by `make-push-fixtures.sh`). Do: start a two-shard daemon whose edge serves loopback
+/// TLS; create a git repository on the second shard's partition and enroll its owner's token; then, each on a new
+/// connection with the owner's bearer token, ask for receive-pack's advertisement, POST the request stock git sent to
+/// create `main`, ask for the advertisement again, set a policy denying `main`'s deletion, POST a delete of `main`, and
+/// ask for the advertisement once more. Expect: the first advertisement `200`, the `# service=` prelude and then no ref
+/// under this server's capabilities; the push `200`, its body the very report `git receive-pack` wrote; the second
+/// advertisement `main` at the pushed commit; the delete `200`, refused `deletion prohibited` in git's words; `main`
+/// still advertised at the pushed commit.
 #[test]
-fn a_daemons_edge_serves_upload_pack_from_the_store_its_repositorys_shard_holds() {
+fn a_stock_git_push_over_the_daemons_edge_lands_through_the_push_driver() {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = name_on_the_repositorys_partition();
   create(&daemon, &name);
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
-  let fields = format!(
-    "Host: localhost\r\nAuthorization: Bearer {OWNER_TOKEN}\r\nGit-Protocol: version=2\r\n"
-  );
-  let advertise = format!("GET /{name}/info/refs?service=git-upload-pack HTTP/1.1\r\n{fields}\r\n");
-  let advertise = advertise.into_bytes();
-  let mut ls_refs = format!(
-    "POST /{name}/git-upload-pack HTTP/1.1\r\n{fields}\
+  let edge = (port, &certificate);
+  let before = advertised(edge, &name);
+  let created = pushed(edge, &name, CREATE_REQUEST);
+  let after = advertised(edge, &name);
+  deny_deletion(&daemon, &name);
+  let deleted = pushed(edge, &name, &delete_of_main());
+  let last = advertised(edge, &name);
+  daemon.stop();
+  let main = [(named(FIRST), b"refs/heads/main".as_slice())];
+  assert_eq!(before, (200, served_advertisement(&[])));
+  assert_eq!(created, (200, gits_create_report().to_vec()));
+  assert_eq!(after, (200, served_advertisement(&main)));
+  assert_deletion_prohibited(&deleted);
+  assert_eq!(last, after);
+}
+
+/// Shape: the room a pack is read whole within here: far past the `create` push's three small objects.
+const PACK_ROOM: u64 = 1 << 20;
+
+/// The data packets of `bytes` from `at` to the first flush, each whole, and where that flush ends; bytes that end
+/// before one fail the test.
+fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
+  let mut lines = Vec::new();
+  loop {
+    let rest = bytes.get(at..).unwrap_or_default();
+    match pktline::read(rest, u64::try_from(at).unwrap_or(u64::MAX)) {
+      Ok(Some((Packet::Data(data), length))) => {
+        lines.push(data.to_vec());
+        at += length;
+      }
+      Ok(Some((Packet::Flush, length))) => return (lines, at + length),
+      other => panic!("no flush ended the packets ({other:?}): {bytes:?}"),
+    }
+  }
+}
+
+/// The ids of the objects `pack` holds, read whole as git's index-pack reads one, in name order.
+fn ids_in(pack: &[u8]) -> Vec<String> {
+  let mut admission = Admission::new(PACK_ROOM);
+  let unpacked = unpack::read_whole(pack, GitFormat::Sha1, &NoIndex, &mut admission);
+  let unpacked = unpacked.expect("a whole pack");
+  let mut ids: Vec<String> = unpacked
+    .objects
+    .iter()
+    .map(|object| object.id.to_string())
+    .collect();
+  ids.sort();
+  ids
+}
+
+/// The pack a protocol v2 `fetch` answer carries: its `packfile` section's band-1 data, joined.
+fn fetched_pack(answer: &[u8]) -> Vec<u8> {
+  let (lines, _) = packets_from(answer, 0);
+  let (section, packets) = lines.split_first().expect("a section");
+  assert_eq!(section.as_slice(), b"packfile\n", "{answer:?}");
+  let mut pack = Vec::new();
+  for line in packets {
+    match line.split_first() {
+      Some((1, data)) => pack.extend_from_slice(data),
+      other => panic!("not the pack's band: {other:?}"),
+    }
+  }
+  pack
+}
+
+/// upload-pack's answer to `request`, POSTed at protocol v2 by the owner of repository `name`: its status and body.
+fn uploaded(edge: (u16, &CertificateDer<'static>), name: &str, request: &[u8]) -> (u16, Vec<u8>) {
+  let (port, certificate) = edge;
+  let mut sent = format!(
+    "POST /{name}/git-upload-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\nGit-Protocol: version=2\r\n\
      Content-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n",
-    LS_REFS_HEAD.len()
+    owner_bearer(),
+    request.len()
   )
   .into_bytes();
-  ls_refs.extend_from_slice(LS_REFS_HEAD);
-  let advertisement = exchange(port, &certificate, &advertise);
-  let listed = exchange(port, &certificate, &ls_refs);
-  let unavailable = counted_on(&daemon, REPOSITORY, "vcs_http.git.unavailable");
+  sent.extend_from_slice(request);
+  exchange(port, certificate, &sent)
+}
+
+/// A v2 `fetch` of [`FIRST`] with `done` and no progress, as `git clone` asks for a branch's commit.
+fn fetch_of_first() -> Vec<u8> {
+  let mut request = Vec::new();
+  let lines = [
+    "command=fetch\n".to_owned(),
+    format!("want {FIRST}\n"),
+    "no-progress\n".to_owned(),
+    "done\n".to_owned(),
+  ];
+  let (command, arguments) = lines.split_first().expect("a command");
+  pktline::write(Packet::Data(command.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in arguments {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// A-682 with A-654 part 3 (§4.17.2 "A fetch" and "A push" over "Transports" item 1; golden vectors: stock git 2.50.1's
+/// `create` push). Do: start a two-shard daemon whose edge serves loopback TLS; create a git repository on the second
+/// shard's partition and enroll its owner's token; POST the request stock git sent to create `main` to receive-pack;
+/// then, as the owner at protocol v2 on the same edge, POST upload-pack an `ls-refs` asking for `HEAD` with `symrefs`
+/// and `unborn`, and a `fetch` of the pushed commit with `done`. Expect: the push `200`; `HEAD` listed at the pushed
+/// commit, naming `refs/heads/main`; the fetch `200`, its packfile section a whole pack holding exactly the objects
+/// stock git's push sent (the commit, its tree and its blob), so what one service admitted the other serves.
+#[test]
+fn a_branch_stock_git_pushed_over_the_daemons_edge_is_listed_and_fetched_whole_over_it() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let created = pushed(edge, &name, CREATE_REQUEST);
+  let listed = uploaded(edge, &name, LS_REFS_HEAD);
+  let fetched = uploaded(edge, &name, &fetch_of_first());
   daemon.stop();
-  let (status, capabilities) = advertisement;
-  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&capabilities));
-  assert!(
-    capabilities.starts_with(b"000eversion 2\n"),
-    "{capabilities:?}"
-  );
-  assert!(
-    capabilities
-      .windows(b"ls-refs=unborn".len())
-      .any(|window| window == b"ls-refs=unborn"),
-    "{capabilities:?}"
-  );
-  assert_eq!(listed, (200, UNBORN_MAIN.to_vec()));
-  assert_eq!(unavailable, 0);
+  let mut head = Vec::new();
+  let line = format!("{FIRST} HEAD symref-target:refs/heads/main\n");
+  pktline::write(Packet::Data(line.as_bytes()), &mut head).expect("the line");
+  pktline::write(Packet::Flush, &mut head).expect("the flush");
+  let (_, commands_end) = packets_from(CREATE_REQUEST, 0);
+  let pushed_pack = CREATE_REQUEST.get(commands_end..).expect("the push's pack");
+  assert_eq!((created.0, listed, fetched.0), (200, (200, head), 200));
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)), ids_in(pushed_pack));
 }

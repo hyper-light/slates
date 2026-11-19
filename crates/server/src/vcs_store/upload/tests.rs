@@ -97,7 +97,7 @@ fn answered(
   let mut out = Vec::new();
   for _ in 0..STEPS {
     let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut out, MAX_LEN)
+      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
     })
     .expect("the answer's step lent");
     if written == Written::End {

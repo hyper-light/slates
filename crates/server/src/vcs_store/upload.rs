@@ -209,12 +209,13 @@ impl PackSource for ShardPacks {
     &mut self,
     served: &Served<'_>,
     pack: &mut Streamed,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
     self
       .fragments(&mut ShardClock)
-      .write(served, pack, out, room)
+      .write(served, pack, admission, out, room)
   }
 }
 

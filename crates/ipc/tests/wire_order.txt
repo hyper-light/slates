@@ -114,6 +114,15 @@ HostPathReason 3 ForeignFilesystem
 HostPathReason 4 NotThisVolume
 HostPathReason 5 MountTableUnavailable
 HostPathReason 6 DescendantMount
+ImportFault 0 NotMercurial
+ImportFault 1 NotEmpty
+ImportFault 2 UnderWay
+ImportFault 3 Unawaited
+ImportFault 4 Format
+ImportFault 5 Damaged
+ImportFault 6 PastRoom
+ImportFault 7 Pending
+ImportFault 8 Abandoned
 Intent 0 Read
 Intent 1 Write
 IpcNodeKind 0 Fifo
@@ -281,6 +290,7 @@ Refusal 74 ArchiveRefused
 Refusal 75 BaseUnavailableWin32
 Refusal 76 MessageRequired
 Refusal 77 IdentityRequired
+Refusal 78 ImportRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -358,6 +368,7 @@ ReplyBody 73 ArchiveImported
 ReplyBody 74 CredentialEnrolled
 ReplyBody 75 CredentialRevoked
 ReplyBody 76 IdentitiesSet
+ReplyBody 77 RepositoryImported
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -448,6 +459,7 @@ RequestBody 86 SetRepositoryPolicy
 RequestBody 87 EnrollCredential
 RequestBody 88 RevokeCredential
 RequestBody 89 SetIdentities
+RequestBody 90 ImportRepository
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
