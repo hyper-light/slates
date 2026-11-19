@@ -4,8 +4,9 @@
 //! fragments, Mercurial's manifests, Subversion's node revisions, a version's map of paths to contents, blame, merge
 //! bases. A-645 asks for one mechanism for all of them, as Scion keeps (A-645's source, Anthropic's "Redesigning source
 //! control") and as Sapling's server keeps under `eden/mononoke/derived_data` \[C\]: `research/edenfs-scale-distribution.md`
-//! §2.1. This module is that mechanism; [`paths`] is its first type, and [`ancestry`] (A-666) the type that answers
-//! is-ancestor, merge bases and bisect's midpoint.
+//! §2.1. This module is that mechanism; [`paths`] is its first type, [`ancestry`] (A-666) the type that answers
+//! is-ancestor, merge bases and bisect's midpoint, and [`history`] (A-666 part 2) the one that answers each path's
+//! history, `log <path>` and `--follow`.
 //!
 //! **A type** ([`DerivedType`]) is a pure function of a version's change and its parents' values of the same type: its
 //! [`DerivedType::derive`] reads the change from the history ([`Graph`]) and the parents' values from the store, and
@@ -27,7 +28,8 @@
 //!
 //! **A fill** walks up from its version through the parents whose values are not kept, to the nearest ancestors whose
 //! values are (or to the history's roots), then derives downward, every parent before its child, and keeps each value
-//! as it goes. It does one unit a step ([`Fill::step`]): one version walked through, or one derived, so the owner runs
+//! as it goes. A type whose change names another earlier version (a copy from it) says so ([`DerivedType::inputs`]),
+//! and the fill walks and derives that version first as it does a parent. It does one unit a step ([`Fill::step`]): one version walked through, or one derived, so the owner runs
 //! it in its shard's slices, a unit at a time while the slice lasts, however long the history it fills (the server's
 //! `image::sliced` is that loop). What it waits on is charged to the store's budget as it grows and refused past it,
 //! typed, so a fill over a history of any length is bounded. A derivation is one unit as large as its version's
@@ -57,6 +59,7 @@ use crate::content::{ContentId, ContentRefused, ContentStore};
 use crate::index::{Index, IndexRefused, Inserted, NewRow};
 
 pub mod ancestry;
+pub mod history;
 pub mod paths;
 
 #[cfg(test)]
@@ -105,15 +108,28 @@ pub trait DerivedType {
   /// When its values are computed: its declaration.
   fn mode(&self) -> Mode;
 
-  /// The value of `version`, from its change (read from `source`) and `parents`, its parents' values in its parents'
-  /// order: the root of the value's contents in `store`, which the caller then holds once. The same version and the
-  /// same parents' values give the same root on every tier, at any time. Refused, it leaves the store as it was.
+  /// The versions whose values a derivation of `version` reads, in the order [`DerivedType::derive`] is given them: its
+  /// parents, then any other version its change names (path history's copy from an earlier version, A-666 part 2). A
+  /// fill derives each before `version`. `None` when the history holds no such version. Its parents, unless the type
+  /// says more.
+  fn inputs(
+    &self,
+    source: &Self::Source,
+    version: <Self::Source as Graph>::Version,
+  ) -> Option<Vec<<Self::Source as Graph>::Version>> {
+    source.parents(version)
+  }
+
+  /// The value of `version`, from its change (read from `source`) and `inputs`, the values of its
+  /// [`DerivedType::inputs`] in that order, its parents' first: the root of the value's contents in `store`, which the
+  /// caller then holds once. The same version and the same inputs' values give the same root on every tier, at any
+  /// time. Refused, it leaves the store as it was.
   fn derive(
     &mut self,
     source: &Self::Source,
     store: &mut ContentStore,
     version: <Self::Source as Graph>::Version,
-    parents: &[ContentId],
+    inputs: &[ContentId],
   ) -> Result<ContentId, Self::Refused>;
 }
 
@@ -492,7 +508,8 @@ impl<V: Copy + Ord + Debug> Fill<V> {
     }
   }
 
-  /// Walks the top version's parents: each whose value is not kept waits above it, the first parent on top.
+  /// Walks the top version's inputs ([`DerivedType::inputs`], its parents unless the type says more): each whose value
+  /// is not kept waits above it, the first on top.
   fn walk_top<T>(
     &mut self,
     derivations: &mut Derivations,
@@ -505,7 +522,7 @@ impl<V: Copy + Ord + Debug> Fill<V> {
     T: DerivedType,
     T::Source: Graph<Version = V>,
   {
-    let Some(parents) = source.parents(version) else {
+    let Some(parents) = ty.inputs(source, version) else {
       return Err(DerivedRefused::UnknownVersion { version });
     };
     let mut missing = Vec::with_capacity(parents.len());
@@ -534,7 +551,7 @@ impl<V: Copy + Ord + Debug> Fill<V> {
     Ok(Progress::More)
   }
 
-  /// Derives the top version from its parents' values and keeps it; a parent's value gone since the walk sends the
+  /// Derives the top version from its inputs' values and keeps it; an input's value gone since the walk sends the
   /// version back to be walked again.
   fn derive_top<T>(
     &mut self,
@@ -548,7 +565,7 @@ impl<V: Copy + Ord + Debug> Fill<V> {
     T: DerivedType,
     T::Source: Graph<Version = V>,
   {
-    let Some(parents) = source.parents(version) else {
+    let Some(parents) = ty.inputs(source, version) else {
       return Err(DerivedRefused::UnknownVersion { version });
     };
     let mut values = Vec::with_capacity(parents.len());
