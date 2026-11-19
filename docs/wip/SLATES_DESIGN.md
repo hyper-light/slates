@@ -35688,6 +35688,13 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   debug, 2026-11-18, load 16 to 19): `slates-client --lib` green with
   `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; red with the old spin through a
   reply deadline put back: "spun at 3000 ns, past the wake estimate".
+- **A delivery's read** (Linux; `Client::recv_delivery`, `ClientEnd::wait_delivery`, `Liveness::wait_delivery`). After a
+  reply that names a descriptor the client yielded until the descriptor was there or its reply deadline passed, and
+  gave up `DeadlineExceeded` there. The daemon sends the descriptor before that reply and answers a typed refusal where
+  the send failed (`MapUnavailable`, a stream's hand-off refused), so the descriptor is waiting or comes a scheduling
+  tick later: the wait is now one `poll` of the control socket for readability or its peer's close, with no timeout,
+  and a daemon gone with nothing delivered ends it `ChannelLost`. macOS has no control socket and is refused
+  `Unsupported` (its descriptors come by the socket route).
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for

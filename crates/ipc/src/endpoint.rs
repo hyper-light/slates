@@ -485,6 +485,22 @@ impl ClientEnd {
     }
   }
 
+  /// Waits, with no clock, until a delivery may be read or the daemon has gone (Linux, A-523;
+  /// `Liveness::wait_delivery`). macOS has no control socket, so no delivery ever comes over one there: refused
+  /// `Unsupported`. An end with no liveness check has no daemon to wait on, and returns at once.
+  #[cfg(unix)]
+  pub fn wait_delivery(&self) -> Result<(), crate::error::IpcError> {
+    match self.liveness.as_ref() {
+      #[cfg(target_os = "linux")]
+      Some(liveness) => liveness.wait_delivery(),
+      #[cfg(not(target_os = "linux"))]
+      Some(_) => Err(crate::error::IpcError::Unsupported {
+        feature: "a delivery over a control socket",
+      }),
+      None => Ok(()),
+    }
+  }
+
   /// The region.
   pub fn region(&self) -> &ClientRegion {
     &self.region
