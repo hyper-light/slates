@@ -1218,7 +1218,7 @@ fn replay_into(
     Some(RepositoryStore::Subversion(store)) => {
       replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
     }
-    Some(RepositoryStore::Mercurial(_)) => Err(ReplayRefused::Diverged),
+    Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
     None => Err(unheld),
   }
 }
