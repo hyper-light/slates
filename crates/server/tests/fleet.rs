@@ -28956,6 +28956,7 @@ fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
             write: None,
             write_version: 0,
             signers: Vec::new(),
+            carried: None,
           };
           s.pending_catalogs.insert(object, (1, catalog));
           s.placed_heads.insert(
@@ -29406,6 +29407,7 @@ fn plant_work_route(daemon: &Daemon) {
           write: None,
           write_version: 0,
           signers: Vec::new(),
+          carried: None,
         };
         s.pending_catalogs.insert(work, (1, catalog));
         s.fleet.track_object_owner(work.catalog(), local);
