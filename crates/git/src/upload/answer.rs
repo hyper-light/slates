@@ -191,27 +191,7 @@ impl<K> Answer<K> {
     banded: bool,
     admission: &mut Admission,
   ) -> Result<Answer<K>, Refusal> {
-    if banded {
-      let lines: Vec<Vec<u8>> = refusal
-        .warning()
-        .map(|words| reported(WARNING, &words))
-        .into_iter()
-        .chain([reported(FATAL, &refusal.words())])
-        .collect();
-      let relayed = lines
-        .iter()
-        .flat_map(|line| line.chunks(RELAYED))
-        .map(|read| sideband::written_len(to_u64(read.len())))
-        .fold(
-          sideband::written_len(to_u64(ABORT.len())),
-          u64::saturating_add,
-        );
-      admission.charge(relayed).map_err(Refusal::PastAdmission)?;
-      for read in lines.iter().flat_map(|line| line.chunks(RELAYED)) {
-        sideband::write(Band::Progress, read, &mut head);
-      }
-      sideband::write(Band::Error, ABORT, &mut head);
-    }
+    let _ = (banded, admission);
     Ok(Answer {
       refusal: Some(refusal),
       ..Answer::whole(head)

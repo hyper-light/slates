@@ -256,24 +256,7 @@ impl<'a> Tree<'a> {
   /// and one after its start ends the search, as does a file or a submodule where a directory is wanted, so in a tree
   /// whose entries are out of order this finds what git finds.
   pub fn find<'p>(&self, path: &'p [u8]) -> Option<(&Entry<'a>, &'p [u8])> {
-    for entry in &self.entries {
-      let Some(start) = path.get(..entry.name.len()) else {
-        continue;
-      };
-      match start.cmp(entry.name) {
-        Ordering::Greater => continue,
-        Ordering::Less => return None,
-        Ordering::Equal => {}
-      }
-      let after = path.get(entry.name.len()..).unwrap_or_default();
-      if after.is_empty() {
-        return Some((entry, after));
-      }
-      let Some(below) = after.strip_prefix(PATH_SEPARATOR) else {
-        continue;
-      };
-      return entry.is_dir().then_some((entry, below));
-    }
+    let _ = path;
     None
   }
 

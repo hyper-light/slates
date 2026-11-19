@@ -95,27 +95,8 @@ pub(super) fn read(
   filter: Option<&Filter>,
   admission: &mut Admission,
 ) -> Result<Read, Refusal> {
-  let Some(Filter::SparseOid(name)) = filter else {
-    return Ok(Read::default());
-  };
-  let refusal = match named(graph, served, name) {
-    Named::Object(id) => match patterns_of(graph, id, admission)? {
-      Ok(patterns) => {
-        return Ok(Read {
-          patterns: Some(patterns),
-          dies: None,
-        });
-      }
-      Err(refusal) => refusal,
-    },
-    Named::Nothing => Refusal::SparseBlob { name: name.clone() },
-    Named::Form => Refusal::SparseForm { name: name.clone() },
-    Named::Relative => Refusal::SparseRelative,
-  };
-  Ok(Read {
-    patterns: Some(Patterns::default()),
-    dies: Some(refusal),
-  })
+  let _ = (graph, served, filter, admission);
+  Ok(Read::default())
 }
 
 /// The patterns of the blob `id` (`add_patterns_from_blob_to_list`), its bytes and patterns charged to `admission`:
