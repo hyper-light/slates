@@ -8,7 +8,6 @@ mod fetch;
 mod ls_refs;
 mod refused;
 mod steps;
-mod store_packs;
 
 use std::collections::BTreeSet;
 use std::io::Write as _;

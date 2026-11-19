@@ -18,7 +18,7 @@ use crate::v2::{Ending, Line};
 
 /// Format: stock git's exchanges a fetch is held to, each named, its request and its answer
 /// (`fixtures/make-fixtures.sh`).
-pub(super) const EXCHANGES: [(&str, &[u8], &[u8]); 5] = [
+const EXCHANGES: [(&str, &[u8], &[u8]); 5] = [
   ("fetch-clone", FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE),
   ("fetch-haves", FETCH_HAVES_REQUEST, FETCH_HAVES_RESPONSE),
   (

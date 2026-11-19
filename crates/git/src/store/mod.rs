@@ -48,7 +48,7 @@
 //! encoded with the fragments' learned rules; each part copied byte for byte when the client reads it as kept, entry
 //! by entry otherwise, so no client is sent an offset delta it did not ask for or a base it lacks. A turn does units
 //! of work up to the owner's quantum and holds nothing borrowed between turns; every answered pack holds exactly the
-//! answer's objects, each once. upload-pack's service writes it through [`StorePacks`], A-640's `PackSource`.
+//! answer's objects, each once. upload-pack's service writes it through A-640's pack source over it.
 //!
 //! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks,
 //! a commit and a fragment's encoding sliced under the shard's budget, and their transient sets charged; a delta search
@@ -58,7 +58,6 @@ mod deltas;
 mod fragment;
 pub mod learn;
 mod naming;
-mod pack_source;
 mod positions;
 mod push;
 mod repository;
@@ -69,7 +68,6 @@ pub mod views;
 pub use deltas::delta_of;
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
-pub use pack_source::{StorePack, StorePacks};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
