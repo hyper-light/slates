@@ -11,6 +11,13 @@
 //! The classes are `slates_git::derived::FileClass`'s, so the trees A-664 part 2 derives read these maps' changes as
 //! they are.
 //!
+//! **And its git trees** (A-664 part 3, its commit). Beside each map the store keeps the head's git trees
+//! (`slates_git::derived::Trees`, A-664 part 2's value: a node a directory naming its tree object as git hashes it),
+//! made in the same step over the same change, or built whole from the same files where the map is: the tree the
+//! version's commit names (`super::commits`). A trees value is a function of the files alone, so the value derived
+//! version by version is the value built from scratch, identity for identity (A-664 part 2's oracle), and a recovery
+//! that builds it whole holds what the live store held.
+//!
 //! **The head's alone, and why.** A green's next map is derived from its head's, and nothing else reads an earlier one,
 //! so the store holds one map a green, replaced as each version commits, and what two heads share is held once (path
 //! copying). A recovery makes it again: A-662's rule is that a store made again from the log equals the live store
@@ -37,25 +44,26 @@
 //!
 //! **Budget.** The step's contents and nodes are the content store's, charged to the shard as A-662 charges a push:
 //! lent the room the shard's budget could admit now, grown first by the bytes the step brings, then trued up to what
-//! the store holds. A refused step (that room, a path the map refuses, the store's own) keeps nothing new, holds
-//! nothing new and is counted; the version's merge record is durable already, and the green's next map is built whole.
-//! A green that committed a version keeps a map after a recovery even where a refusal had left it none.
+//! the store holds. A refused step (that room, a path the map refuses, a tree git's strict fsck refuses, the store's
+//! own) keeps nothing new, holds nothing new and is counted: neither the map nor the trees, so the next step builds both
+//! whole again; the version's merge record is durable already, and its commit is not made (`super::commits`). A green
+//! that committed a version keeps a map after a recovery even where a refusal had left it none.
 //!
 //! **Counters.** [`DERIVED`] (a map derived from the one before: the non-vacuity count of the incremental path),
 //! [`BUILT`] (built from the whole head as a version commits), [`REMADE`] (built by a recovery), [`REFUSED`].
 //!
-//! **Owed** (GAPS, A-664): the trees and the commit derived from these changes, admitted to the store with the green's
-//! head moved and recorded with the version; a submit refused before its verdict when its post-state is one git cannot
-//! hold (a named pipe, a socket, a device, a `.git` name); a whole build and a whole map's release sliced a unit at a
-//! time (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
-//! source's head is the version it was made at; the holders' maps (A-636's fleet half); and a copy made through a work,
-//! which no client verb makes yet (A-626 part 4), driven through this module's whole build by a test.
+//! **Owed** (GAPS, A-664): a submit refused before its verdict when its post-state is one git cannot hold (a named
+//! pipe, a socket, a device, a `.git` name); a whole build and a whole map's release sliced a unit at a time (each is
+//! one step, as A-662's replay of a record is); a branch's first map derived from its source's where the source's head
+//! is the version it was made at; the holders' maps (A-636's fleet half); and a copy made through a work, which no
+//! client verb makes yet (A-626 part 4), driven through this module's whole build by a test.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::catalog::{RepositoryId, VolumeId as DbVolumeId};
-use slates_git::derived::FileClass;
+use slates_git::derived::{FileClass, Trees, TreesRefused};
+use slates_git::object_name::ObjectFormat;
 use slates_merge::engine::Green;
 use slates_merge::special::SpecialKind;
 use slates_vcs::derived::paths::{Change, Entry, PathMap, PathsRefused};
@@ -65,8 +73,9 @@ use slates_vfs::volume::Store;
 use super::{GitStore, RepositoryStore, VcsStores};
 use crate::state::ShardState;
 
+// Its works and submits serve the made commits' tests too (`super::commits`, A-664 part 3).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// The status count of the maps derived from the one before.
 pub(crate) const DERIVED: &str = "vcs_paths.derived";
@@ -98,13 +107,24 @@ pub(crate) fn declare(window: usize) -> Option<GreenPaths> {
   PathMap::declare(window, Mode::Eager).ok()
 }
 
-/// A green's map: the version it is of, and its root, which the store holds once.
+/// The git trees' type over a git repository's greens (module docs, "And its git trees").
+pub(crate) type GreenTrees = Trees<Heads>;
+
+/// The trees' type for a repository of `format` over a store of `window` (module docs); `None` for a window too small
+/// for a directory's node naming one subtree, or a list of two, which no content plane's window is.
+pub(crate) fn declare_trees(format: ObjectFormat, window: usize) -> Option<GreenTrees> {
+  Trees::declare(format, window, Mode::Eager).ok()
+}
+
+/// A green's map and its git trees: the version they are of, and their roots, each held once by the store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
   /// The version.
   pub(crate) version: u64,
   /// The map's root.
   pub(crate) root: ContentId,
+  /// The git trees' root: the node of the version's root tree, which its commit names (`super::commits`).
+  pub(crate) trees: ContentId,
 }
 
 /// A file as git holds it (module docs): its class and its bytes.
@@ -116,13 +136,13 @@ struct GitFile<'g> {
   bytes: Cow<'g, [u8]>,
 }
 
-/// What a step does: nothing, a change over the green's map, or a map of the whole head.
+/// What a step does: nothing, a change over the green's map and trees, or the map and trees of the whole head.
 #[derive(Debug)]
 enum Plan<'g> {
   /// The green's map is of the version already.
   Kept,
-  /// The version's change over the green's map, its root named: each path set to its file, or removed.
-  Change(ContentId, Vec<(Vec<u8>, Option<GitFile<'g>>)>),
+  /// The version's change over the green's map and trees, the version before's: each path set to its file, or removed.
+  Change(Head, Vec<(Vec<u8>, Option<GitFile<'g>>)>),
   /// Every file of the head.
   Whole(Vec<(Vec<u8>, GitFile<'g>)>),
 }
@@ -143,10 +163,12 @@ enum Stepped {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum StepRefused {
-  /// The repository's store is not git's, or declares no map.
+  /// The repository's store is not git's, or declares no map or no trees.
   NoMap,
   /// The map's own.
   Paths(PathsRefused),
+  /// The trees' own: above all a tree git's strict fsck refuses (a `.git` name).
+  Trees(TreesRefused),
   /// The content store's own.
   Content(ContentRefused),
 }
@@ -190,9 +212,9 @@ pub(crate) fn remake_green(state: &mut ShardState, green: DbVolumeId) {
   }
 }
 
-/// Gives back `green`'s map as it leaves `repository`'s lineage (`repository::retire_member`: its destroy, a fence, a
-/// refused push's branch made in memory): a store made again from the log keeps no map for a green that is no member,
-/// so the live one keeps none either (module docs). Nothing where the store keeps no map for it.
+/// Gives back `green`'s map and trees as it leaves `repository`'s lineage (`repository::retire_member`: its destroy, a
+/// fence, a refused push's branch made in memory): a store made again from the log keeps no map for a green that is no
+/// member, so the live one keeps none either (module docs). Nothing where the store keeps no map for it.
 pub(crate) fn forget(state: &mut ShardState, repository: RepositoryId, green: DbVolumeId) {
   let key = super::green_key(green);
   let released = {
@@ -202,12 +224,19 @@ pub(crate) fn forget(state: &mut ShardState, repository: RepositoryId, green: Db
     let Some(head) = git.heads.remove(&key) else {
       return;
     };
-    content.release(&head.root).is_ok()
+    release_head(content, &head)
   };
   if !released {
     state.count(super::RELEASE_REFUSED, 1);
   }
   super::settle(state);
+}
+
+/// Gives back a head's two holds, its map's root and its trees': whether both went back (the second is given back past
+/// a refusal of the first).
+pub(crate) fn release_head(content: &mut ContentStore, head: &Head) -> bool {
+  let map = content.release(&head.root).is_ok();
+  content.release(&head.trees).is_ok() && map
 }
 
 /// Counts a step's answer, a build under `built`.
@@ -255,7 +284,7 @@ fn step(
 }
 
 /// The git repository `green` is a member of, when its store is git's.
-fn git_repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
+pub(super) fn git_repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
   let repository = state
     .db
     .partition()
@@ -296,6 +325,9 @@ fn plan<'g>(
 ) -> Result<Plan<'g>, StepRefused> {
   let (content, git) = stores.git_ref(repository).ok_or(StepRefused::NoMap)?;
   let paths = git.paths.as_ref().ok_or(StepRefused::NoMap)?;
+  if git.trees.is_none() {
+    return Err(StepRefused::NoMap);
+  }
   let held = git.heads.get(&key).copied();
   if !whole && held.is_some_and(|head| head.version == version) {
     return Ok(Plan::Kept);
@@ -311,7 +343,7 @@ fn plan<'g>(
   )?;
   Ok(changed.map_or_else(
     || Plan::Whole(whole_head(engine)),
-    |files| Plan::Change(before.root, files),
+    |files| Plan::Change(before, files),
   ))
 }
 
@@ -451,9 +483,9 @@ fn plan_bytes(plan: &Plan<'_>) -> u64 {
   u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-/// Makes the planned map and keeps it as the green's (module docs): each content put, the map made, its root kept in
-/// place of the map before, then every other hold the step took given back, whatever the answer, so a refused step
-/// leaves the store as it was.
+/// Makes the planned map and trees and keeps them as the green's (module docs): each content put, the map made, the
+/// trees made over the same files, both roots kept in place of the ones before, then every other hold the step took
+/// given back, whatever the answer, so a refused step leaves the store as it was.
 fn made(
   stores: &mut VcsStores,
   repository: RepositoryId,
@@ -461,18 +493,27 @@ fn made(
   plan: Plan<'_>,
 ) -> Result<Stepped, StepRefused> {
   let (content, git) = stores.git(repository).ok_or(StepRefused::NoMap)?;
-  let GitStore { paths, heads, .. } = git;
+  let GitStore {
+    paths,
+    trees,
+    heads,
+    ..
+  } = git;
   let paths = paths.as_mut().ok_or(StepRefused::NoMap)?;
+  let trees = trees.as_mut().ok_or(StepRefused::NoMap)?;
   let mut held = Vec::new();
-  let answer = make(content, paths, plan, &mut held);
-  if let Ok(Some((root, _))) = &answer {
+  let answer = make(content, (paths, trees), plan, &mut held);
+  if let Ok(Some((root, tree_root, _))) = &answer {
     let made = Head {
       version,
       root: *root,
+      trees: *tree_root,
     };
-    // The step's hold on the root is the store's now; the map before is given back, what the two share held still.
+    // The step's holds on the roots are the store's now; the map and trees before are given back, what they share with
+    // the new ones held still.
     if let Some(before) = heads.insert(key, made) {
       held.push(before.root);
+      held.push(before.trees);
     }
   }
   // Every other hold goes back, past a refusal too; the first refusal is the answer (as `PathMap`'s own settle gives).
@@ -480,32 +521,54 @@ fn made(
     let this = content.release(id).map(drop);
     first.and(this)
   });
-  let stepped = answer?.map_or(Stepped::Kept, |(_, stepped)| stepped);
+  let stepped = answer?.map_or(Stepped::Kept, |(_, _, stepped)| stepped);
   released.map_err(StepRefused::Content)?;
   Ok(stepped)
 }
 
-/// [`made`]'s work: the new map's root, held once for the store, and how it was had, or nothing when the green's map is
-/// of the version already; every other hold it takes is noted in `held`, for [`made`] to give back.
+/// What [`make`] made: the map's root and the trees' root, each held once for the store, and how they were had; none
+/// when the green's map is of the version already.
+type Made = Option<(ContentId, ContentId, Stepped)>;
+
+/// [`made`]'s work: the new map and trees ([`Made`]); every other hold it takes is noted in `held`, for [`made`] to give
+/// back.
 fn make(
   content: &mut ContentStore,
-  paths: &mut GreenPaths,
+  (paths, trees): (&mut GreenPaths, &mut GreenTrees),
   plan: Plan<'_>,
   held: &mut Vec<ContentId>,
-) -> Result<Option<(ContentId, Stepped)>, StepRefused> {
+) -> Result<Made, StepRefused> {
   match plan {
     Plan::Kept => Ok(None),
     Plan::Change(before, files) => {
       let change = put_change(content, files, held)?;
       let root = paths
-        .apply(content, Some(before), &change)
+        .apply(content, Some(before.root), &change)
         .map_err(StepRefused::Paths)?;
-      Ok(Some((root, Stepped::Derived)))
+      let made = trees.apply(content, Some(before.trees), &change);
+      with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Derived)))
     }
     Plan::Whole(files) => {
       let entries = put_whole(content, files, held)?;
       let root = paths.build(content, &entries).map_err(StepRefused::Paths)?;
-      Ok(Some((root, Stepped::Built)))
+      let made = trees.build(content, &entries);
+      with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Built)))
+    }
+  }
+}
+
+/// The map's `root` with the trees `made` over the same files; the trees refused, the map's root goes back with the
+/// step's other holds, so a step keeps both or neither (module docs, "Budget").
+fn with_trees(
+  made: Result<ContentId, TreesRefused>,
+  root: ContentId,
+  held: &mut Vec<ContentId>,
+) -> Result<(ContentId, ContentId), StepRefused> {
+  match made {
+    Ok(trees) => Ok((root, trees)),
+    Err(refused) => {
+      held.push(root);
+      Err(StepRefused::Trees(refused))
     }
   }
 }

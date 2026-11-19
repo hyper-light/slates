@@ -38,12 +38,12 @@ fn owner() -> Principal {
 }
 
 /// `body` asked of `state` as the owner.
-fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
+pub(crate) fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
   dispatch(state, 1, &owner(), body)
 }
 
 /// A git repository named `name`: its id and its root green.
-fn git_repository(state: &mut ShardState, name: &str) -> (RepositoryId, VolumeId) {
+pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> (RepositoryId, VolumeId) {
   let reply = ask(
     state,
     RequestBody::CreateRepository {
@@ -63,7 +63,7 @@ fn git_repository(state: &mut ShardState, name: &str) -> (RepositoryId, VolumeId
 }
 
 /// One change a version's work makes.
-enum Op {
+pub(crate) enum Op {
   /// Splice `bytes` at `at` over `delete_len` bytes of the file at the path.
   Edit(&'static str, u64, u64, &'static [u8]),
   /// Declare a namespace or metadata operation.
@@ -71,13 +71,24 @@ enum Op {
 }
 
 /// A new file of `bytes` at `path`.
-fn create(path: &'static str, bytes: &'static [u8]) -> Op {
+pub(crate) fn create(path: &'static str, bytes: &'static [u8]) -> Op {
   Op::Edit(path, 0, 0, bytes)
 }
 
 /// A work over `green` making `ops`, submitted with a message and identities as a repository's green requires (A-664
 /// part 1), its work destroyed after: the version accepted.
-fn version(state: &mut ShardState, green: VolumeId, serial: u32, ops: Vec<Op>) -> u64 {
+pub(crate) fn version(state: &mut ShardState, green: VolumeId, serial: u32, ops: Vec<Op>) -> u64 {
+  let message = format!("version {serial}");
+  version_saying(state, (green, serial), ops, &message)
+}
+
+/// [`version`] submitted with `message`.
+pub(crate) fn version_saying(
+  state: &mut ShardState,
+  (green, serial): (VolumeId, u32),
+  ops: Vec<Op>,
+  message: &str,
+) -> u64 {
   let made = ask(
     state,
     RequestBody::CreateWork {
@@ -104,8 +115,7 @@ fn version(state: &mut ShardState, green: VolumeId, serial: u32, ops: Vec<Op>) -
     };
     assert!(!matches!(reply, ReplyBody::Refused { .. }), "{reply:?}");
   }
-  let message = format!("version {serial}");
-  let submitted = ask(state, crate::identities::authored(work, &message));
+  let submitted = ask(state, crate::identities::authored(work, message));
   let ReplyBody::Submitted {
     version: Some(version),
     ..
@@ -187,7 +197,7 @@ fn assert_kept(
 }
 
 /// The count named `name` on the shard.
-fn count(state: &ShardState, name: &str) -> u64 {
+pub(crate) fn count(state: &ShardState, name: &str) -> u64 {
   state.refusals.get(name).copied().unwrap_or(0)
 }
 
@@ -216,7 +226,7 @@ fn fifo() -> IpcNode {
 }
 
 /// A branch `name` of the repository `repository` made at its default branch's head: its green.
-fn branch(state: &mut ShardState, repository: &str, name: &str) -> VolumeId {
+pub(crate) fn branch(state: &mut ShardState, repository: &str, name: &str) -> VolumeId {
   let made = ask(
     state,
     RequestBody::CreateBranch {

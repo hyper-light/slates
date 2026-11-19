@@ -68,13 +68,13 @@ fn request(command: &str, arguments: &[String]) -> Vec<u8> {
 }
 
 /// An `ls-refs` request for `HEAD` and the branches, each symref's target named.
-fn ls_refs() -> Vec<u8> {
+pub(crate) fn ls_refs() -> Vec<u8> {
   let arguments = ["symrefs", "ref-prefix HEAD", "ref-prefix refs/heads/"];
   request("ls-refs", &arguments.map(str::to_owned))
 }
 
 /// A `fetch` request: `wants` by id, `refs` by name, and `done`, with no progress.
-fn fetch(wants: &[ObjectId], refs: &[&str]) -> Vec<u8> {
+pub(crate) fn fetch(wants: &[ObjectId], refs: &[&str]) -> Vec<u8> {
   let mut arguments: Vec<String> = wants.iter().map(|id| format!("want {id}")).collect();
   arguments.extend(refs.iter().map(|name| format!("want-ref {name}")));
   arguments.extend(["no-progress".to_owned(), "done".to_owned()]);
@@ -84,7 +84,7 @@ fn fetch(wants: &[ObjectId], refs: &[&str]) -> Vec<u8> {
 /// What `reader` is answered for `asked` of repository `id` on the shard, as an edge serves it: the request's step lent
 /// the refs `reader` may read, then each step of the answer lent the objects alone, one pkt-line's room a step. The
 /// answer's bytes and why it was refused, if it was.
-fn answered(
+pub(crate) fn answered(
   state: &mut ShardState,
   (id, reader): (RepositoryId, &Principal),
   asked: Asked<'_>,
@@ -108,7 +108,7 @@ fn answered(
 }
 
 /// The data packets of `bytes` up to the first flush, each whole; a stream that ends before one fails the test.
-fn lines_of(bytes: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn lines_of(bytes: &[u8]) -> Vec<Vec<u8>> {
   let mut lines = Vec::new();
   let mut at = 0;
   loop {
@@ -125,7 +125,7 @@ fn lines_of(bytes: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// The pack a `fetch` answer carries: its `packfile` section's band-1 data, joined; progress on band 2 dropped.
-fn pack_of(answer: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_of(answer: &[u8]) -> Vec<u8> {
   let lines = lines_of(answer);
   let (section, packets) = lines.split_first().expect("a section");
   assert_eq!(section.as_slice(), b"packfile\n", "{answer:?}");
@@ -166,7 +166,7 @@ fn ids_of(objects: &[Brought]) -> Vec<String> {
 }
 
 /// `ls-refs`' line for `name` at `head`, its symref's target `target` when it has one.
-fn ref_line(head: ObjectId, name: &str, target: Option<&str>) -> Vec<u8> {
+pub(crate) fn ref_line(head: ObjectId, name: &str, target: Option<&str>) -> Vec<u8> {
   match target {
     Some(target) => format!("{head} {name} symref-target:{target}\n").into_bytes(),
     None => format!("{head} {name}\n").into_bytes(),
