@@ -47,10 +47,10 @@ const COPY_MAX: usize = 1 << 16;
 /// hashing): odd, so multiplying by it loses no bit.
 const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// The branching factor of the standard library's B-tree (`B` in `alloc::collections::btree::node`,
-/// Rust std source; tier C): a node holds at most `2B - 1` entries, every node but the root at least
-/// `B - 1`. The index's charge is derived from it ([`index_most`]), as `slates-cluster`'s content
-/// hold derives its own (`btree_entry_bytes`).
+/// The branching factor of the standard library's B-tree (`B` in
+/// `alloc::collections::btree::node`, Rust std source; tier C): a node holds at most `2B - 1`
+/// entries, every node but the root at least `B - 1`. The index's charge is derived from it
+/// ([`index_most`]), as `slates-cluster`'s content hold derives its own (`btree_entry_bytes`).
 /// Format: the standard library's constant, restated so the charge follows the structure it bounds.
 const BTREE_B: usize = 6;
 
@@ -73,9 +73,9 @@ fn index_node_bytes() -> (u64, u64) {
   (rounded(leaf), rounded(internal))
 }
 
-/// The most heap bytes the index of a `source_len`-byte source can take: an entry a whole block at
-/// most, `n` entries in at most `n / (B - 1)` leaves and as many internal nodes, and a root that may
-/// hold as few as one entry, a leaf and an internal node beyond the entries' share.
+/// The most heap bytes the index of a `source_len`-byte source can take: an entry a whole block
+/// at most, `n` entries in at most `n / (B - 1)` leaves and as many internal nodes, and a root
+/// that may hold as few as one entry, a leaf and an internal node beyond the entries' share.
 fn index_most(source_len: usize) -> u64 {
   let (leaf, internal) = index_node_bytes();
   let nodes = leaf.saturating_add(internal);

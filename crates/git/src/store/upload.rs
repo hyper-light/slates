@@ -28,11 +28,16 @@
 //!    search (A-653 continued (4)): the object's bytes, the largest candidate's, the search's index and delta
 //!    ([`super::Search::held_most`]), and the best delta kept while another candidate is searched, all charged with a
 //!    [`Hold`] before the first byte is read and given back once the entry is sent. Where the admission cannot hold
-//!    it, the object is sent whole and counted (`loose_unsearched`). git searches every object of a type it can read
-//!    but those past `core.bigFileThreshold` (`pack-objects.c` at v2.50.1: `get_object_details`, lines 2541-2544, and
-//!    `prepare_pack`, line 3326), and its `pack.windowMemory`, unlimited by default (line 253), lets the oldest
-//!    candidates go past it but never the nearest (`find_deltas`, lines 2913-2919); slates takes neither constant
-//!    (R3): the request's own admission decides.
+//!    it, the object is sent whole and counted (`loose_unsearched`). git holds the same three for a trial and counts
+//!    them as its window's memory: the target's bytes, the source's and the source's index (`pack-objects.c` at
+//!    v2.50.1, `try_delta`, lines 2774, 2803 and 2813). It searches every object of a type it can read but those past
+//!    `core.bigFileThreshold` (`get_object_details`, lines 2541-2544, and `prepare_pack`, line 3326), and its
+//!    `pack.windowMemory`, unlimited by default (line 253), lets the oldest candidates go past it but never the nearest
+//!    (`find_deltas`, lines 2913-2919); slates takes neither constant (R3): the request's own admission decides. git
+//!    also skips a trial its sizes rule out: a source shorter than the target by half the target or more (less a
+//!    hash's length, the half scaled by the depth the source's chain leaves), or over 32 times the target's length
+//!    (`try_delta`, lines 2737-2755); slates' encoder tries every candidate its learned window holds, objects within a
+//!    window and past one alike, and the window learns what the trials save.
 //!
 //! The header counts the wanted objects; every one is sent exactly once, since each stage sends only what is still
 //! wanted and takes it out; the trailer is the checksum of every byte before it, made as the bytes pass, and the count
@@ -63,9 +68,10 @@
 //! answer's handles read; one object of a run judged by its row; a window's worth of a part's wanted positions marked
 //! among its entries, each found by halving the part's entries in position order, so a part's reading costs what it
 //! sends and never the whole part; one wanted entry of a part judged; one object still wanted offered its version's
-//! parts. So no unit outgrows a window and the learned window's trials, and nothing is held whole: between turns the
-//! stream holds no borrow of the store or the repository, names what it reads by green, version, class and content, and
-//! holds the wanted and sent sets as runs of positions (§4.17.2 item 3).
+//! parts. So no unit outgrows a window and the learned window's trials, and nothing is held whole but what a search
+//! holds, an object past a window and a candidate, while the request's admission holds them (**What it sends** 3):
+//! between turns the stream holds no borrow of the store or the repository, names what it reads by green, version,
+//! class and content, and holds the wanted and sent sets as runs of positions (§4.17.2 item 3).
 //!
 //! **A base pack made again** while a stream reads one of its parts entry by entry ends the stream refused
 //! ([`StoreRefused::BaseRebuilt`]), never a pack of two base packs' entries; the owner makes base packs between
@@ -1038,7 +1044,8 @@ impl<A: Answered> Upload<A> {
   }
 
   /// One object no part covered (module docs, **What it sends** 3): encoded with the fragments' encoder when it is a
-  /// window long at most, deflated whole a window a unit otherwise.
+  /// window long at most; past a window, searched against the earlier ones past a window when the request's admission
+  /// holds the search, and sent whole otherwise (`loose_large`).
   fn loose(
     &mut self,
     cx: &mut Context<'_>,
