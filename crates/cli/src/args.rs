@@ -1443,8 +1443,43 @@ fn credential_flags(taken: &Taken) -> Result<(Option<SharePrincipal>, Option<u64
 
 /// The verbs of the version-control credentials (A-625 part 3): `credential key`, `credential token`, `credential
 /// revoke`.
-fn parse_credential(_taken: &Taken, _words: &[&str]) -> Result<Option<Command>, ParseError> {
-  Ok(None)
+fn parse_credential(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["credential", "key", line] => {
+      let (principal, expires_s) = credential_flags(taken)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialKey {
+          line: (*line).to_owned(),
+          principal,
+          expires_s,
+        },
+      )))
+    }
+    ["credential", "token"] => {
+      let (principal, expires_s) = credential_flags(taken)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialToken {
+          principal,
+          expires_s,
+        },
+      )))
+    }
+    ["credential", "revoke", id] => {
+      taken.only(&NONE)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialRevoke {
+          id: credential_id(id)?,
+        },
+      )))
+    }
+    ["credential", ..] => Err(ParseError::Missing(
+      "credential key LINE | credential token | credential revoke ID",
+    )),
+    _ => Ok(None),
+  }
 }
 
 /// The verbs of the enrollment surface (§4.13): `enroll`, `revoke`, `share`.

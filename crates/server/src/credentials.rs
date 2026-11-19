@@ -54,8 +54,9 @@ const BY_CONSUMER: &str = "credential_by_consumer";
 const ISSUER_UNVERIFIED: &str = "grant_issuer_unverified";
 
 /// The SHA-256 of `bytes`.
-fn sha256(_bytes: &[u8]) -> [u8; 32] {
-  [0; 32]
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+  let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+  <[u8; 32]>::try_from(hash.as_ref()).unwrap_or_default()
 }
 
 /// An SSH key's id: the SHA-256 of its blob, OpenSSH's fingerprint (`ssh-keygen -l -E sha256`), so the id a human lists
@@ -156,8 +157,17 @@ impl std::fmt::Display for KeyLineRefusal {
 
 /// The blob of an OpenSSH public key line, as `ssh-keygen` writes a `.pub` file (`TYPE BASE64 [COMMENT]`, sshd(8)
 /// "AUTHORIZED_KEYS FILE FORMAT" without options): the key's field decoded, its first string the line's type.
-pub fn key_blob_of_line(_line: &str) -> Result<Vec<u8>, KeyLineRefusal> {
-  Err(KeyLineRefusal::Fields)
+pub fn key_blob_of_line(line: &str) -> Result<Vec<u8>, KeyLineRefusal> {
+  let mut fields = line.split_whitespace();
+  let (Some(kind), Some(encoded)) = (fields.next(), fields.next()) else {
+    return Err(KeyLineRefusal::Fields);
+  };
+  let blob = crate::signed_work::base64_decode(encoded).map_err(|_| KeyLineRefusal::Base64)?;
+  let mut reader = slates_ssh::wire::Reader::new(&blob);
+  match reader.string() {
+    Ok(named) if named == kind.as_bytes() => Ok(blob),
+    _ => Err(KeyLineRefusal::Type),
+  }
 }
 
 /// The key type of the key in `blob`, as the SSH edge takes keys (the module doc): the type of the first accepted
@@ -210,23 +220,71 @@ pub(crate) struct Enrollment {
 /// consumer's channel and `GrantIssuerUnverified` for a proof that does not verify, each counted; `BadRequest` for a key
 /// the SSH edge does not take; then recorded, or refused as the database refuses it (`AlreadyExists`,
 /// `TableAtCapacity`).
-pub(crate) fn enroll(
-  _state: &mut ShardState,
-  _channel: &Principal,
-  _asked: Enrollment,
-) -> ReplyBody {
-  refused(Refusal::NotFound)
+pub(crate) fn enroll(state: &mut ShardState, channel: &Principal, asked: Enrollment) -> ReplyBody {
+  if matches!(channel, Principal::Consumer { .. }) {
+    state.count(BY_CONSUMER, 1);
+    return forbidden("enroll_credential");
+  }
+  let Enrollment {
+    principal,
+    material,
+    expires_ns,
+    proof,
+  } = asked;
+  let proven = crate::landing::proven_by_launcher(
+    state,
+    |secret| enroll_proof(secret, &principal, &material, expires_ns),
+    &proof,
+  );
+  if !proven {
+    state.count(ISSUER_UNVERIFIED, 1);
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  let id = id_of(&material);
+  let kind = match kind_of(material) {
+    Ok(kind) => kind,
+    Err(reason) => return refused(Refusal::BadRequest { reason }),
+  };
+  let record = CredentialRecord {
+    id,
+    principal: to_db_principal(&principal),
+    kind,
+    expires_ns,
+  };
+  let now = state.clock.monotonic_ns();
+  match state
+    .db
+    .mutate(&mut state.segment, &Op::CredentialEnrolled { record }, now)
+  {
+    Ok(_) => ReplyBody::CredentialEnrolled { id },
+    Err(error) => refused(refusal_of_db(&error)),
+  }
 }
 
 /// `RevokeCredential` (the module doc), on the partition the id routes to: refused `Forbidden` on a consumer's channel
 /// and `GrantIssuerUnverified` for a proof that does not verify, each counted; then the record leaves, or `NotFound`.
 pub(crate) fn revoke(
-  _state: &mut ShardState,
-  _channel: &Principal,
-  _id: [u8; 32],
-  _proof: [u8; 32],
+  state: &mut ShardState,
+  channel: &Principal,
+  id: [u8; 32],
+  proof: [u8; 32],
 ) -> ReplyBody {
-  refused(Refusal::NotFound)
+  if matches!(channel, Principal::Consumer { .. }) {
+    state.count(BY_CONSUMER, 1);
+    return forbidden("revoke_credential");
+  }
+  if !crate::landing::proven_by_launcher(state, |secret| revoke_proof(secret, &id), &proof) {
+    state.count(ISSUER_UNVERIFIED, 1);
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  let now = state.clock.monotonic_ns();
+  match state
+    .db
+    .mutate(&mut state.segment, &Op::CredentialRevoked { id }, now)
+  {
+    Ok(_) => ReplyBody::CredentialRevoked,
+    Err(error) => refused(refusal_of_db(&error)),
+  }
 }
 
 /// Why a lookup gave no answer.
@@ -242,8 +300,21 @@ pub enum Unanswered {
 /// HTTP edge's authenticator and the SSH edge's key holders look a presented credential up by (the module doc). On the
 /// asking shard the lookup runs inline; on another it is one bounded call there, waited for in that shard's own time
 /// (`crate::xshard::call_in_shard_time_given_room`). None when no credential has that id.
-pub async fn find(_id: [u8; 32]) -> Result<Option<CredentialRecord>, Unanswered> {
-  Ok(None)
+pub async fn find(id: [u8; 32]) -> Result<Option<CredentialRecord>, Unanswered> {
+  let (origin, owner) = crate::state::with_state(|state| {
+    let owner = shard_of_partition(state, owner_of(&id, state.shards.len()));
+    (state.shard, owner)
+  })
+  .ok_or(Unanswered::NoShard)?;
+  let owner = owner.ok_or(Unanswered::NoShard)?;
+  crate::xshard::call_in_shard_time_given_room(
+    origin,
+    owner,
+    move |state| state.db.partition().credentials().get(&id).cloned(),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .ok_or(Unanswered::Silent)
 }
 
 #[cfg(test)]

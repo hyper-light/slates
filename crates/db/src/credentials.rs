@@ -77,20 +77,46 @@ impl Credentials {
 
   /// The bytes `op` releases and adds (the module doc's bounds): what the partition's budget must have room for before
   /// it is applied, and what the budget moves by when it is; nothing for another table's operation.
-  pub fn charge(&self, _op: &Op) -> (usize, usize) {
-    (0, 0)
+  pub fn charge(&self, op: &Op) -> (usize, usize) {
+    match op {
+      Op::CredentialEnrolled { record } => (0, record_bytes(record)),
+      Op::CredentialRevoked { id } => (self.records.get(id).map_or(0, record_bytes), 0),
+      _ => (0, 0),
+    }
   }
 
   /// The guard (the module doc): an enrollment whose id is held is `AlreadyExists`, a revocation of an id not held is
   /// `NotFound`; another table's operation passes.
-  pub fn check(&self, _op: &Op) -> Result<(), DbError> {
-    Ok(())
+  pub fn check(&self, op: &Op) -> Result<(), DbError> {
+    match op {
+      Op::CredentialEnrolled { record } if self.records.contains_key(&record.id) => {
+        Err(DbError::AlreadyExists {
+          existing: named(&record.id),
+        })
+      }
+      Op::CredentialRevoked { id } if !self.records.contains_key(id) => Err(DbError::NotFound),
+      _ => Ok(()),
+    }
   }
 
   /// Applies `op`, checked once before it was recorded: an enrollment holds its record, a revocation lets it go.
   /// `NotFound` for a revocation of an id not held, which only a log the guard never saw could carry.
-  pub fn apply(&mut self, _op: &Op) -> Result<(), DbError> {
-    Ok(())
+  pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
+    match op {
+      Op::CredentialEnrolled { record } => {
+        if let Some(replaced) = self.records.insert(record.id, record.clone()) {
+          self.bytes = self.bytes.saturating_sub(record_bytes(&replaced));
+        }
+        self.bytes = self.bytes.saturating_add(record_bytes(record));
+        Ok(())
+      }
+      Op::CredentialRevoked { id } => {
+        let removed = self.records.remove(id).ok_or(DbError::NotFound)?;
+        self.bytes = self.bytes.saturating_sub(record_bytes(&removed));
+        Ok(())
+      }
+      _ => Ok(()),
+    }
   }
 
   /// The table a snapshot carries, rebuilt with its bytes counted as when each record was enrolled.

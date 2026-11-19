@@ -227,8 +227,7 @@ pub struct CredentialRecord {
 impl CredentialRecord {
   /// Whether it still proves its principal at wall-clock instant `now_ns`: it has no expiry, or its expiry is later.
   pub fn live_at(&self, now_ns: u64) -> bool {
-    let _ = now_ns;
-    true
+    self.expires_ns.is_none_or(|expires_ns| now_ns < expires_ns)
   }
 }
 
