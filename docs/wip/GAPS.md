@@ -26,13 +26,25 @@
 > claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
 > submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
 > constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
-> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
+> `EvidenceRequired`, before any work is built (the api's contract 51). Part 3's first piece BUILT
+> (`crates/server/src/vcs_store/paths.rs` and its tests; A-664 part 3's entry has the runs, on macOS arm64): each member
+> green of a git repository keeps the map of paths to git's files of its head (A-647's path map of `FileClass` entries
+> over the shard's content store, one a green, its root held once by the store), made as each version commits on the
+> owner (a submit's after its record is appended, a push's after its entry is applied): derived from the one before over
+> the change index and the hard links naming each changed file (`Green::links_naming`; the index names a change to a
+> regular file at the file alone), built whole where no map of the version before is kept or a copy names a tree by its
+> destination alone (`Green::copied_after`, A-586); given back as the green leaves its lineage
+> (`repository::retire_member`), made again from the head by a recovery and a rebuild, freed with the repository; the
+> live store held equal to one made again after a branch's destroy. OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
 > commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
-> it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
-> `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
+> it and the branch's head names it, derived from the maps part 3's first piece keeps; the maps' whole builds and a
+> whole map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first
+> map derived from its source's where the source's head is the version it was made at; the holders' maps (A-636's
+> fleet half); a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> (A-626 part 4); a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
 > `.gitmodules` link, a name past 4096 bytes); a `.gitmodules` blob's own checks; blob ids read by content from the git
 > store's rows, so a rename or a revert hashes nothing; a derivation's transient listings charged to the store; then
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
@@ -87,6 +99,15 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
+> create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
+> `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
+> on `main`, Mercurial SHA-1 on `default`'s first line, Subversion's revisions bound to `root`); a format or branch the
+> tool cannot have is usage (exit 2), a name taken `AlreadyExists` (exit 1). Tests: the grammar's two and a real
+> anchor's CLI test (the A-685 entry has the runs). OWED: the other repository verbs on the command line (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`), the SDKs' and MCP's words, and the
+> server's own refusal of a format its tool does not name (it records the repository today and makes no git store for
+> `--tool git` in revisions; the CLI refuses it before asking).
 > **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
 > header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
 > `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
@@ -352,9 +373,10 @@
 > client's bytes handed to the driver as they arrive, the checked push answered with git's report and exit 0, a flush
 > alone with nothing, refusals in git's `die` words with 128 (a shard not lent in the site's not-served words). Stock
 > git 2.50.1's `create` push over a real SSH session to the production site lands (`--lib -- vcs_ssh git_push`: red 28
-> passed and the 2 new failing at 954ed792e; with `vcs_http`, 74 of 74 over main b94ae6e90, r286, and 77 of 77 merged
-> over 770ae8826, r313; macOS arm64, Mac Studio). Owed: a push over a connection A-651 part 4 moved to its owner
-> shard (a two-shard daemon, as the HTTP site's push test runs); main's live `git push` over SSH.
+> passed and the 2 new failing at 954ed792e; with `vcs_http`, 74 of 74 over main b94ae6e90, r286, then 77, 82 and 84
+> of as many over each merge as main moved, r313, r354 and r375, the last over 2f73eb075; macOS arm64, Mac Studio).
+> Owed: a push over a connection A-651 part 4 moved to its owner shard (a two-shard daemon, as the HTTP site's push
+> test runs); main's live `git push` over SSH.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1001,6 +1023,14 @@
 > manifest::` 61 of 61 (red first, 6 of the view's 9 failing against a stub), `slates-server --lib vcs_http::hg` 7 of 7
 > and fmt clean on macOS arm64 (Mac Studio, kiln r256, 2026-11-19), the two `fixtures/state` repositories held to stock
 > 7.2's `served` answers; the other platforms owed.
+> **Built (A-680 part 2a):** Mercurial's site on the daemon's edge (`vcs_http::ToolSites`: a request whose query names a
+> command is Mercurial's, as hgweb tells a wire request, every other git's), each repository's served view lent afresh
+> for each step from its store on its owner shard with its register's phase roots and bookmarks
+> (`vcs_store::hg_view::ServedViews`, which both edges reach a Mercurial store through; `NoStores` removed), made within
+> the request's room, a store an import is filling not lent; every repository publishing until its record carries
+> `phases.publish`. `slates-server --lib` filtered 51 of 51 and fmt clean on macOS arm64 (Mac Studio, kiln r357,
+> 2026-11-19): a daemon's edge answers `capabilities` and `heads` of a repository on another shard holding
+> `fixtures/state`'s `states` by an import; the other platforms owed.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1027,9 +1057,8 @@
 > main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); hg's
 > `serve --stdio` on the SSH edge (A-679, g304).
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
-> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site with the served view over
-> them (A-680 part 2, g303, running) and that loop
-> (their home on each owner shard is built); the learned
+> g304, running; the edge itself is A-651's, built); A-662's stores lent to that loop through the lender the HTTP site
+> reads them by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -1038,8 +1067,8 @@
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the site's use of the served view over them
-> (A-680 part 2; the view is built, A-680 part 1);
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the HTTP site's pushes through them (A-680 part
+> 2b; the served view and the site's lender are built);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
@@ -1050,6 +1079,15 @@
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
+
+> **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
+> Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part
+> read, listed every bookmark naming a held changeset; 7.2's `listbinbookmarks` (`bookmarks.py` 475-484) leaves out a
+> divergent name (`isdivergent`, 471-472: an `@` not as its last byte). Reproduced by use with stock 7.2 first (a
+> bookmark diverged in a clone and pulled back: `hg serve` answers `@` and `feature`, slates' view of the same
+> repository answered `feature@1` too); now the rule is `crate::bookmarks::divergent`, shared with the push's refusal;
+> red first (r340), green (r356) on macOS arm64, the other platforms owed
+> (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
 
 > **Fixed (g300, 2026-11-19, A-667; found by g304 against stock 7.2): Mercurial's branch heads were judged by a child on
 > the branch.** `serve::discovery::branch_head_revs` took a revision for its branch's head when no child of it was on
