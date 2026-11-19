@@ -1,24 +1,25 @@
-//! Subversion's `svnserve -t` behind the SSH edge (A-688; §4.17.4 "The wire" (svn+ssh) and piece 12, A-656's connection):
-//! slates-svn's one ra_svn connection ([`Connection`], the one `svn://` serves too), driven over an SSH session's
-//! standard input and output as `svnserve -t` serves its tunnel, the principal the one the client's key proved.
+//! Subversion's `svnserve -t` behind the SSH edge (A-688; §4.17.4 "The wire" (svn+ssh) and piece 12, A-656's
+//! connection): slates-svn's one ra_svn connection ([`Connection`], the one `svn://` serves too), driven over an SSH
+//! session's standard input and output as `svnserve -t` serves its tunnel, the principal the one the client's key
+//! proved.
 //!
-//! **The session.** As `svnserve -t` does, the tunnel speaks first: the greeting is written when the command starts. The
-//! client's answer names a URL, and the tunnel finds the repository it names as `svnserve`'s `find_repos` does
+//! **The session.** As `svnserve -t` does, the tunnel speaks first: the greeting is written when the command starts.
+//! The client's answer names a URL, and the tunnel finds the repository it names as `svnserve`'s `find_repos` does
 //! ([`found`]): the path beneath the URL's scheme and host (`skip_scheme_part`: `svn`, an optional `+` and a tunnel's
 //! name, `://`, then the host up to the first `/`), each segment percent-decoded, a `..` segment refused "Couldn't
 //! determine repository path", then the longest run of leading segments that names a Subversion repository here, as
 //! `svn_repos_find_root_path` walks up from the whole path. The repository's root URL is the client's URL cut after
-//! that run. A URL of another form is refused "Non-svn URL passed to svn server", one no repository holds "No repository
-//! found in '…'", and one whose repository's policy lets the principal reach it for none of its rights (A-597's
-//! `vcs_policy::reaches`, as the site judges Mercurial's `serve --stdio`) "No access allowed to this repository". A
-//! repository whose store is not held here ([`SvnStores::holds`]) is not served, in the site's words, with nothing
-//! written to the client.
+//! that run. A URL of another form is refused "Non-svn URL passed to svn server", one no repository holds "No
+//! repository found in '…'", and one whose repository's policy lets the principal reach it for none of its rights
+//! (A-597's `vcs_policy::reaches`, as the site judges Mercurial's `serve --stdio`) "No access allowed to this
+//! repository". A repository whose store is not held here ([`SvnStores::holds`]) is not served, in the site's words,
+//! with nothing written to the client.
 //!
 //! **Who.** The tunnel's user, which `EXTERNAL` takes (`handshake::Repository::tunnel_user`), is the principal the
 //! client's key proved (§4.13; §4.17.4: "the principal the one the client's key proved"), named as slates'
 //! version-control answers show a principal until §4.13 names principals for people: its index key in hexadecimal
-//! (`crate::lfs::owner_name`, the name an LFS lock's owner is shown by). The SSH login the client sent proves nothing and
-//! names no one here: a client could send any login, so taking it would let any key holder name any user.
+//! (`crate::lfs::owner_name`, the name an LFS lock's owner is shown by). The SSH login the client sent proves nothing
+//! and names no one here: a client could send any login, so taking it would let any key holder name any user.
 //!
 //! **The sources** ([`SvnStores`]). What the handshake tells the client (the UUID, the realm, mergeinfo, who may read)
 //! and, from the session's establishment on, the repository's sources (its index, green, lock table, policy and the
@@ -27,37 +28,40 @@
 //!
 //! **A commit.** The client's `commit` begins the drive (`Connection::commit`) with its transaction named B, a `-` and
 //! this connection's count of commits begun in base 36, B the youngest revision: §4.17.4 item 1 names it by the work's
-//! id, and no work is opened until the owner's commit step lands (A-655 part 2b). A hook the drive waits for (A-661)
-//! passes where the repository's policy configures none at its point, as `svnserve` answers a point with no hook
+//! id, and the tunnel opens no work until it calls the owner's commit step. A hook the drive waits for (A-661) passes
+//! where the repository's policy configures none at its point, as `svnserve` answers a point with no hook
 //! (`crate::svn_hooks`); where one is configured the commit is refused there with the not-served words, since running a
-//! hook needs the transaction's view, owed with the commit step, and no hook is ever skipped. An accepted work is refused
-//! `Uncommitted::NotServed`, "This server does not make commits yet" (200007), as slates-svn says the daemon refuses
-//! every work until the owner's step appends.
+//! hook needs the transaction's view, owed with the commit step, and no hook is ever skipped. An accepted work is
+//! refused `Uncommitted::NotServed`, "This server does not make commits yet" (200007), until the tunnel hands it to the
+//! owner's commit step (A-655 part 2b's `repository::svn_commit::commit`, which runs on the owner shard's state and
+//! which neither ra_svn transport calls yet).
 //!
 //! **How the tunnel ends**, as stock `svnserve -t` 1.15.0 ends: the error that ended the connection on standard error,
 //! `svnserve: E` and its number in six digits, `: ` and its message, and `EXIT_FAILURE` (1); a clean end, 0 with
-//! nothing. Recorded on the Mac Studio, 2026-11-19T22:27Z and 22:34Z, scripted clients' bytes piped to
-//! `svnserve -t --tunnel-user=alice -r ROOT` (the tests' oracle, `tests/svn.rs`): a client that leaves between
-//! commands, or inside a command's item, 0; a malformed item, E210004 "Malformed network data"; a client that leaves
-//! during the handshake, inside a report or inside a commit's edit, E210002 "Network connection closed unexpectedly";
-//! a URL no repository holds, E210005, one of another scheme, E125002, one climbing out with `..`, E125001, and a
-//! repository closed to the user, E170001, each written to the client too; protocol version 3 and a client without
-//! `edit-pipeline`, E210006 in the handshake's words. A client that leaves while its refused edit's commands are being
-//! dropped ends E210002 here where `svnserve` exits 0 (recorded: `open-dir` of a missing path, then the client gone),
-//! since the connection's [`Waiting`] does not tell the drop from a live edit (GAPS); one that ends the drop with
-//! `abort-edit` first ends 0 as there. Where `svnserve` aborts (`serve::Refused::Aborted`) and on the caller's own
-//! errors, the tunnel ends 1 with nothing more, counted: an abort is a signal, which an exit status cannot carry.
+//! nothing. Recorded on the Mac Studio, 2026-11-19T22:27Z and 22:34Z, scripted clients' bytes piped to `svnserve -t
+//! --tunnel-user=alice -r ROOT` (the tests' oracle, `tests/svn.rs`): a client that leaves between commands, or inside a
+//! command's item, 0; a malformed item, E210004 "Malformed network data"; a client that leaves during the handshake,
+//! inside a report or inside a commit's edit, E210002 "Network connection closed unexpectedly"; a URL no repository
+//! holds, E210005, one of another scheme, E125002, one climbing out with `..`, E125001, and a repository closed to the
+//! user, E170001, each written to the client too; protocol version 3 and a client without `edit-pipeline`, E210006 in
+//! the handshake's words. A client that leaves while its refused edit's commands are being dropped ends E210002 here
+//! where `svnserve` exits 0 (recorded: `open-dir` of a missing path, then the client gone), since the connection's
+//! [`Waiting`] does not tell the drop from a live edit (GAPS); one that ends the drop with `abort-edit` first ends 0 as
+//! there. Where `svnserve` aborts (`serve::Refused::Aborted`) and on the caller's own errors, the tunnel ends 1 with
+//! nothing more, counted: an abort is a signal, which an exit status cannot carry.
 //!
 //! **Bounds** ([`TunnelBounds`]) are the caller's, each derived from its shard's budget when the daemon starts the edge
 //! (owed with it, as `ToolServices`' room is): one item's bytes, a report's room and the nodes a drive holds open
-//! ([`Limits`]), what one step writes and its drive's steps ([`Budget`]), and a commit's room. The client's input held is
-//! at most the channel's window, which the session refuses to exceed, and each step gives back what it consumed.
+//! ([`Limits`]), what one step writes and its drive's steps ([`Budget`]), and a commit's room. The client's input held
+//! is at most the channel's window, which the session refuses to exceed, and each step gives back what it consumed.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the lender over A-662's map (each Subversion store with its green, lock table, UUID
-//! and `svnserve.conf`'s facts); the owner's commit step and the hooks' view; CRAM-MD5 through the tunnel, whose keys the
-//! record of credentials does not hold yet (a lender that lists it gets every challenge failed, as `svnserve` fails one
-//! it cannot make); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send canonical URLs); the drop's
-//! ending above.
+//! **Owed** (GAPS, the §4.17 entry): the lender over A-662's map (the records A-655 part 2b keeps in its Subversion
+//! arm: the index, revision properties, contents, lock table and UUID; with a directory's entries from the green and
+//! the repository's `svnserve.conf` facts; the HTTP edge's DAV site waits for the same lender behind its own
+//! `SvnStores`); the accepted work handed to the owner's commit step, and the hooks' view; CRAM-MD5 through the tunnel,
+//! whose keys the record of credentials does not hold yet (a lender that lists it gets every challenge failed, as
+//! `svnserve` fails one it cannot make); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send
+//! canonical URLs); the drop's ending above.
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_svn::commit::drive::{Due, Green};
@@ -115,7 +119,8 @@ const CLOSED_WORDS: &str = "Network connection closed unexpectedly";
 const MALFORMED_WORDS: &str = "Malformed network data";
 /// The words of an item past its bound: `SVN_ERR_RA_SVN_REQUEST_SIZE`'s own (slates-svn's `report::Refused`).
 const TOO_LONG_WORDS: &str = "Client request too long";
-/// The words a commit is refused with until the owner's step appends (slates-svn's `Uncommitted::NotServed`).
+/// The words a commit is refused with until the tunnel calls the owner's commit step (slates-svn's
+/// `Uncommitted::NotServed`).
 const NOT_COMMITTED_WORDS: &str = "This server does not make commits yet";
 
 /// The rights some name of a repository must grant a principal for its tunnel to open it: any of the four, each command
@@ -169,8 +174,8 @@ pub(crate) struct TunnelBounds {
 }
 
 /// The services with Subversion's tunnel served beside `other`'s: an `exec` of `svnserve -t` runs a tunnel over the
-/// repositories `repositories` finds and the stores `stores` lends; every other service is `other`'s to start. The tunnel
-/// needs the lookup itself, since its client names its repository inside the session, not in the `exec`.
+/// repositories `repositories` finds and the stores `stores` lends; every other service is `other`'s to start. The
+/// tunnel needs the lookup itself, since its client names its repository inside the session, not in the `exec`.
 pub(crate) struct SvnServices<S, R, V> {
   /// The other services.
   other: S,
@@ -636,7 +641,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     }
   }
 
-  /// Ends the tunnel because the repository's store is not held here: the site's not-served words, nothing more written.
+  /// Ends the tunnel because the repository's store is not held here: the site's not-served words, nothing more
+  /// written.
   fn not_held(&mut self) {
     crate::fleet::count_refusal(STORE_NOT_HELD);
     let refused = not_served(Service::Subversion);
@@ -760,8 +766,8 @@ fn path_start(url: &[u8]) -> Option<usize> {
   )
 }
 
-/// The path's segments from `path_at` in `url`, each percent-decoded with where it ends in `url`, empty ones passed over;
-/// none for a `..` segment (`repos_path_valid`).
+/// The path's segments from `path_at` in `url`, each percent-decoded with where it ends in `url`, empty ones passed
+/// over; none for a `..` segment (`repos_path_valid`).
 fn segments(url: &[u8], path_at: usize) -> Option<Vec<(Vec<u8>, usize)>> {
   let path = url.get(path_at..)?;
   let mut found = Vec::new();

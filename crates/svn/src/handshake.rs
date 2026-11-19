@@ -302,7 +302,7 @@ pub enum Unserved<'a> {
 impl Unserved<'_> {
   /// The error `svnserve` answers the URL with, its number and message: what [`Server::refuse`]
   /// writes as the command failure, and what `svnserve -t` then ends with on its standard error
-  /// (A-688, recorded for "No repository found").
+  /// (A-688: each recorded so from stock `svnserve -t` 1.15.0).
   pub fn failure(&self) -> (u32, Vec<u8>) {
     match *self {
       Unserved::BadUrl { url } => (

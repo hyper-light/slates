@@ -75,7 +75,7 @@ fn tree(files: &[(Vec<u8>, ObjectId)]) -> (ObjectId, Vec<u8>) {
 }
 
 /// An id's lowercase hex, as a commit names its tree and parents.
-fn hex(id: ObjectId) -> String {
+pub(crate) fn hex(id: ObjectId) -> String {
   id.as_bytes()
     .iter()
     .map(|byte| format!("{byte:02x}"))
@@ -99,7 +99,7 @@ fn commit(tree: ObjectId, parents: &[ObjectId], date: u64) -> (ObjectId, Vec<u8>
 }
 
 /// One object a push brings: its type, id and content.
-type Brought = (Kind, ObjectId, Vec<u8>);
+pub(crate) type Brought = (Kind, ObjectId, Vec<u8>);
 
 /// `brought` as a source hands it in, claimed by its id, at `depth`.
 fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
@@ -112,7 +112,7 @@ fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
 }
 
 /// A commit of a tree of `files` over `parents` at `date`: its blobs, its tree and itself, in that order, and its id.
-fn commit_of(
+pub(crate) fn commit_of(
   files: &[(Vec<u8>, Vec<u8>)],
   parents: &[ObjectId],
   date: u64,
@@ -975,7 +975,8 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The owner shard.
 
-fn owner() -> Principal {
+/// The principal every test repository is created by, and so its owner.
+pub(crate) fn owner() -> Principal {
   Principal::Uid {
     host: slates_db::HostId(0),
     uid: 1234,
@@ -983,7 +984,11 @@ fn owner() -> Principal {
 }
 
 /// Creates repository `name` of `tool` on the shard: its id and its root green.
-fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryId, DbVolumeId) {
+pub(crate) fn repository(
+  state: &mut ShardState,
+  name: &str,
+  tool: VcsTool,
+) -> (RepositoryId, DbVolumeId) {
   let reply = dispatch(
     state,
     1,
@@ -1004,12 +1009,13 @@ fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryI
   (record.id, to_db_volume(id))
 }
 
-/// A-662 (one map, each tool's arm, made with the record and freed with it). Do: create a git, a Mercurial and a
-/// Subversion repository; replay a record into the Mercurial and Subversion stores; take the Mercurial one's refusal as
-/// a recovery takes it; free all three. Expect: each store made on the owner shard as its tool's arm, git's in its
-/// record's format, Subversion's index at revision 0; the two replays refused `Owed`, their replay being their own push
-/// pieces'; the refused store given back and named unrecovered with why; after the frees no store is held, none
-/// unrecovered, and nothing is charged.
+/// A-662 (one map, each tool's arm, made with the record and freed with it), with A-655 part 2b's Subversion records.
+/// Do: create a git, a Mercurial and a Subversion repository; replay bytes that are no record into the Mercurial and
+/// Subversion stores; take the Mercurial one's refusal as a recovery takes it; free all three. Expect: each store made
+/// on the owner shard as its tool's arm, git's in its record's format, Subversion's records at revision 0 from its
+/// creation's record; Mercurial's replay refused `Owed`, its replay being its own push piece's, and Subversion's
+/// refused by the record's kind; the refused store given back and named unrecovered with why; after the frees no store
+/// is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
   crate::daemon::audit_on_shard(|state| {
@@ -1033,13 +1039,24 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     // Made with its record: Subversion's revision 0, an empty root.
     let youngest = state
       .vcs_stores
-      .subversion(svn)
-      .map(|store| store.index.youngest());
+      .subversion_records(svn)
+      .map(|records| records.youngest());
     assert_eq!(youngest, Some(0));
-    for repository in [hg, svn] {
+    let refused = [
+      (hg, ReplayRefused::Owed),
+      (
+        svn,
+        ReplayRefused::SvnRecord(slates_svn::commit::record::RecordRefused::Magic),
+      ),
+    ];
+    for (repository, why) in refused {
+      let room = slates_svn::migration::Room {
+        entries: 0,
+        bytes: 0,
+      };
       assert_eq!(
-        replay_into(&mut state.vcs_stores, repository, b"a record"),
-        Err(ReplayRefused::Owed)
+        replay_into(&mut state.vcs_stores, repository, b"a record", Some(room)),
+        Err(why)
       );
     }
     assert!(!super::replayed(state, hg, Err(ReplayRefused::Owed)));
@@ -1099,13 +1116,17 @@ fn begun_at(
 }
 
 /// A push begun on the shard with `objects` admitted whole.
-fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
+pub(crate) fn begun(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  objects: &[Brought],
+) -> GitPush {
   begun_at(state, repository, objects, 0)
 }
 
 /// A-618's work for `push` on `green`, from `base` (a version and its tree) to `head`'s tree, read through A-638's view
 /// with the room the shard lends the read.
-fn work_of(
+pub(crate) fn work_of(
   state: &mut ShardState,
   (push, green): (&GitPush, DbVolumeId),
   (version, base): (u64, Option<ObjectId>),
@@ -1135,7 +1156,7 @@ fn work_of(
 }
 
 /// `changes` appended with `sealed`'s objects and `moves` through A-635's append.
-fn appended(
+pub(crate) fn appended(
   state: &mut ShardState,
   repository: RepositoryId,
   changes: Vec<BranchChange>,
@@ -1152,7 +1173,7 @@ fn appended(
 
 /// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
 /// move and appended. The version it made.
-fn push_through(
+pub(crate) fn push_through(
   state: &mut ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
@@ -1174,7 +1195,7 @@ fn push_through(
 }
 
 /// The root tree a commit's content names.
-fn tree_of(objects: &[Brought]) -> ObjectId {
+pub(crate) fn tree_of(objects: &[Brought]) -> ObjectId {
   objects
     .iter()
     .find(|(kind, ..)| *kind == Kind::Tree)

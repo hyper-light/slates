@@ -99,7 +99,7 @@ const MKDIR_SERVER: &[u8] = include_bytes!("../../../../svn/fixtures/commit/mkdi
 const COMMIT_STARTED: usize = 6;
 /// How a client ends the edit it gave up (`editorp.c` 1205).
 const ABORT_EDIT: &[u8] = b"( abort-edit ( ) ) ";
-/// The failure the daemon answers `close-edit` with until the owner's step appends (slates-svn's
+/// The failure the tunnel answers `close-edit` with until it calls the owner's commit step (slates-svn's
 /// `Uncommitted::NotServed`, 200007).
 const NOT_COMMITTED: &[u8] =
   b"( failure ( ( 200007 37:This server does not make commits yet 0: 0 ) ) ) ";
@@ -701,9 +701,9 @@ fn the_scripted_sessions_are_the_recorded_ones() {
 /// through the site and hand its tunnel the recorded `mkdir` connection's client bytes, split inside an item, then
 /// `abort-edit`, as a client ends the edit it gave up, then end the input. Expect: stock `svnserve -t`'s bytes item for
 /// item through the commit's start (the greeting less `svndiff1`, the `EXTERNAL` request and its success, `repos-info`,
-/// the commit's trivial auth request and its success), then `close-edit` refused 200007, as the daemon refuses every
-/// work until the owner's step appends; nothing on standard error and exit 0, as `svnserve -t` ends a session left
-/// between commands; every byte consumed; and the repository's store lent.
+/// the commit's trivial auth request and its success), then `close-edit` refused 200007, as the tunnel refuses every
+/// work until it calls the owner's commit step; nothing on standard error and exit 0, as `svnserve -t` ends a session
+/// left between commands; every byte consumed; and the repository's store lent.
 #[test]
 fn a_stock_commit_is_answered_as_svnserve_t_answers_it_until_the_owners_step() {
   let (mut site, lends) = site(NoKeys, principal(OWNER));

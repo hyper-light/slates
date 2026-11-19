@@ -691,3 +691,65 @@ fn a_service_names_its_reply_fields_as_its_reply_begins() {
     (late, refused.to_owned(), decided)
   );
 }
+
+/// Shape: the status a WebDAV `PROPFIND` is answered with (RFC 4918 §11.1).
+const MULTI_STATUS: Status = Status {
+  code: 207,
+  reason: "Multi-Status",
+};
+
+/// Drives one GET through a connection whose decision serves it and whose service answers one run, naming `status` as
+/// its reply begins, or after its first run when `after_first`; what the connection wrote.
+fn served_with_status(status: Status, after_first: bool) -> String {
+  let mut connection = Connection::clear(ROOM);
+  let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
+  let mut status = Some(status);
+  loop {
+    match connection.next() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Read if fed => connection.peer_closed(),
+      Next::Read => {
+        fed = true;
+        connection.receive(b"PROPFIND /repo/!svn/rvr/5/trunk HTTP/1.1\r\nHost: h\r\n\r\n");
+      }
+      Next::Decide => connection.decide(Decision::Serve {
+        fields: Fields::new(),
+        head_only: false,
+      }),
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply if !after_first && status.is_some() => {
+        connection.reply_status(status.take().unwrap_or(Status::OK));
+      }
+      Next::Reply if runs == 0 => {
+        runs += 1;
+        connection.reply(b"answer");
+        if after_first {
+          connection.reply_status(status.take().unwrap_or(Status::OK));
+        }
+      }
+      Next::Reply => connection.reply_end(),
+      Next::CloseWrite | Next::Drain | Next::Close => {
+        return String::from_utf8_lossy(&written).into_owned();
+      }
+    }
+  }
+}
+
+/// A-681: do serve a request whose service names `207 Multi-Status` as its reply begins (a WebDAV `PROPFIND`'s
+/// answer, which only its outcome decides), then one naming it after its first run went out. Expect the first head's
+/// status line to be the service's, its body chunked as any reply's; and the second's to stay `200`, a status named
+/// late never written.
+#[test]
+fn a_service_names_its_reply_status_as_its_reply_begins() {
+  let body = "6\r\nanswer\r\n0\r\n\r\n";
+  let named = format!("HTTP/1.1 207 Multi-Status\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+  let late = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+  assert_eq!(
+    (
+      served_with_status(MULTI_STATUS, false),
+      served_with_status(MULTI_STATUS, true)
+    ),
+    (named, late)
+  );
+}
