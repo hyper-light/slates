@@ -1,0 +1,9 @@
+GET /?cmd=getbundle HTTP/1.1
+Accept-Encoding: identity
+vary: X-HgArg-1,X-HgProto-1
+x-hgarg-1: bookmarks=1&bundlecaps=HG20%2Cbundle2%3DHG20%250Abookmarks%250Achangegroup%253D01%252C02%252C03%250Acheckheads%253Drelated%250Adelta-compression%253Dnone%252Czlib%252Czstd%250Adigests%253Dmd5%252Csha1%252Csha512%250Aerror%253Dabort%252Cunsupportedcontent%252Cpushraced%252Cpushkey%250Ahgtagsfnodes%250Alistkeys%250Aobsmarkers%253DV0%252CV1%250Aphases%253Dheads%250Apushkey%250Aremote-changegroup%253Dhttp%252Chttps%250Astream%253Dv2&cg=1&common=915f4e5fb110061d475cb0b49317192f6545e945+ead0123e146ac0258da45482be6c41cf02e275d5+bc458a12b6379f5848e6b0adf458be552adc72be&heads=36cd38c37546278c0100f8934acd9fabe60788e6+bc458a12b6379f5848e6b0adf458be552adc72be+ead0123e146ac0258da45482be6c41cf02e275d5+915f4e5fb110061d475cb0b49317192f6545e945&listkeys=bookmarks&obsmarkers=1&phases=1
+x-hgproto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull
+accept: application/mercurial-0.1
+host: 127.0.0.1:50518
+user-agent: mercurial/proto-1.0 (Mercurial 7.2)
+

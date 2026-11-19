@@ -245,6 +245,14 @@
 > now comes from A-639's stream (`upload::Fragments`, a turn of it a call on the owner's clock, one call a step and its
 > packets framed full), closing part 2's owed pack: 460 of 460 on Windows x86_64 (jupiter; 3 ignored; red four ways;
 > the macOS run owed). Owed in A-640: `sparse:oid` (part 4); a stateful v0 session, an SSH client's.
+> **A-640 part 4, first slice (2026-11-19, g296; a sparse filter's pattern list):** `negotiation::sparse` reads a
+> `sparse:oid` blob's patterns and asks each path as git's `dir.c` does (its reading rules and 100 MiB limit, the last
+> matching pattern deciding, segment patterns anywhere and slashed ones from the root, globbed by
+> `slates_vcs::wildmatch`), charged to the request's admission (`Glob::kept_bytes`, new in slates-vcs). 10 of 10, and
+> slates-vcs 4 of 4, on the Mac Studio (r144 over main 5c0967fb2; failing first in r133 with the bodies stubbed, 9 of
+> 10 and the slates-vcs test). `sparse:oid` stays refused until the next slices: the walk by path with git's tree
+> frames and the graph's named entries; `<blob-ish>` resolved and its blob read by the service, git's two refusals'
+> words, and a stock git exchange recorded. Owed (main): the Linux and Windows runs, clippy, xtask, docs.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -438,8 +446,14 @@
 > §4.13's keys, the repositories' lookup on their partitions); upload-pack (A-615, A-640) and receive-pack's commit
 > (A-620 part 2) behind `GitServices`; serving across shards at A-645's scale (a connection moved to its repository's
 > owner shard once its head names it, or a listener on each shard); a bearer credential's expiry handed with its
-> principal for LFS's actions (A-629 part 2); Mercurial's and Subversion's sites; the MCP edge onto this engine; the
-> live `git clone` over HTTPS (main's, once upload-pack serves).
+> principal for LFS's actions (A-629 part 2); Subversion's site (Mercurial's is built, A-650 part 1, below); the MCP
+> edge onto this engine; the live `git clone` over HTTPS (main's, once upload-pack serves).
+> **A-650 part 1 (2026-11-19, g303): a reply's fields named as its reply begins.** The engine renders a served reply's
+> head with its first bytes, from the decision's fields and then the service's (`Connection::reply_fields`, asked once
+> through `Exchange::reply_fields`, none by default), since a Mercurial answer's media type follows from its command's
+> outcome; a field a reply cannot carry fails the request `500` before any of it is sent. `slates-http-edge --lib` 32 of
+> 32 and `slates-server --lib vcs_http` 40 of 40, the late fields over a real loopback connection among them, on macOS
+> arm64 (Mac Studio, kiln r6 and r137, 2026-11-19); the other platforms owed.
 > **A-625 part 2, continued (2026-11-19, g299 under main's rulings):** no wait is unbounded: before a phase has learned,
 > RFC 6298's first RTO from the connection's own handshake round trip (`slates_rt::tcp::TcpStream::round_trip`, the
 > kernel's record on Linux, macOS and Windows), the edge's TLS work added, then the handshake's duration, floored by the
@@ -696,7 +710,8 @@
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
 > objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
 > 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619), and the session over a byte channel (A-650 part 2); piece 5's first part, a push's bundle read, its race
+> (A-619), the session over a byte channel (A-650 part 2) and HTTP version 1 (A-650 part 1); piece 5's first part,
+> a push's bundle read, its race
 > checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
 > for A-598 and A-619, g301 for A-641, g303 for A-650).**
 > Built on §4.17.1: a named branch's
@@ -834,25 +849,42 @@
 > whatever a path's depth, everything closed when the lend ends; proven on macOS arm64 (Mac Studio, 11 of 11) by two
 > stores imported through the simulated host equal to the same files read from memory, the guards each by a test; its
 > red run against a stub and each guard's mutation owed to main.
-> Owed, in order, after §4.17.1's seven
-> pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
-> the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
-> texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
-> `pretxnchangegroup` and `changegroup` (A-657 part 4); the landing's seam (`hg_push::Objects`) handed each
-> repository's index and content store from their home on its owner shard (A-662 built it: `vcs_store`'s Mercurial
-> arm, made with the record, charged and freed with it), each push's record and its replay at recovery (A-662 refuses
-> a Mercurial record `Owed` until then), and the served view over them (with A-650's site); part
-> 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
-> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
-> the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one
-> position for every phase) measured under concurrent pushes before it is kept;
-> (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
-> view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
-> largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
-> differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
-> `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
-> is claimed until main measures it.
+> **Built (A-650 part 1):** HTTP version 1 (`serve::http`): the last `cmd` as hgweb reads it (A-569's codec, which read
+> the first, corrected), the session's dispatch over the HTTP transport (its capabilities; 7.2's `bundle2required`
+> words), the answer in `0.1`, `hg-error`, or `0.2` in an engine the client reads (`0.1` in zlib otherwise), the caller
+> choosing the engine and level, each answer charged at its engine's bound; `getbundle` judging bundle capabilities
+> before what is missing, in 7.2's order (a bundle1 client was sent a bundle2 abort for a head the view lacked); the
+> daemon's site (`vcs_http::hg`): hgweb's route, git's credentials (A-625 part 3's record), a proven request moved to
+> its repository's shard, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the
+> shard lacks (until the site is handed A-662's stores, after which that path goes), the media type named as the reply
+> begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
+> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, each its own piece with its
+> failing test first (main's to start): the zlib bound an answer is charged before it is compressed is stock zlib's
+> `compressBound`, which the linked zlib-rs's level 1 outgrows on bytes that do not compress (65,536 of the bytes its
+> fixed codes write in nine bits came to 73,721 against 65,569; Windows x86_64, jupiter, kiln r92, 2026-11-19), so a
+> compressor choosing zlib above level 0 could hold an answer up to about an eighth of its stream past its charge (the
+> site's first value takes zlib at level 0, stored, within it); and a query's fields past the request's room are `400`
+> where a path past it is `414`.
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
+> g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
+> response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
+> ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
+> around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
+> step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes: the policy
+> (`vcs_policy::admit`) and the hooks at `pretxnchangegroup` and `changegroup` (A-657 part 4); the landing's seam
+> (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
+> it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the served view over them (with A-650's site);
+> part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
+> compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
+> bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
+> `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
+> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
+> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
+> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
+> main measures it.
 
 > **Fixed (g300, 2026-11-19, A-667; found by g304 against stock 7.2): Mercurial's branch heads were judged by a child on
 > the branch.** `serve::discovery::branch_head_revs` took a revision for its branch's head when no child of it was on
@@ -1079,7 +1111,18 @@
 > over main 5c0a522f1 on macOS arm64 (Mac Studio, kiln r40) the focused runs green: slates-merge lib 73 of 73 filtered
 > to the copy, checkpoint, branch, node, reanchor and stack tests, the fixed history meeting all 13 census cases,
 > `--test checkpoint` 4 of 4, `--test chain_replay` 3 of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 5 of 5
-> (a segment of layout 11 refused at start, new); Linux owed. Owed from A-626: a rebase restating a copy (part 4); a
+> (a segment of layout 11 refused at start, new); Linux owed. A-626 part 3, continued (1) (2026-11-19, g307; a
+> regression part 3 made, found by g258, bisected by main): version 4 wrote the identity's 2,048-byte sum into every
+> checkpoint, so the service's doubling rule waited on that many bytes of increments for every green, and slates-server's
+> `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log` met its root's first version
+> unfolded (194 bytes to fold against a 2,233-byte checkpoint, kiln r122, Mac Studio); fixed by version 5, the copies'
+> section and the sum each behind a presence byte and written beside a copy's record alone, the anchor's layout 13
+> (`docs/bugs/2026-11-19-every-checkpoint-carried-the-identitys-sum-so-a-small-green-folded-late.md`); on macOS arm64
+> (kiln r146, and r164 over main b13a6e05f) the repository test passes, its root's checkpoint at 1 now 155 bytes,
+> slates-merge lib 76 of 76 filtered
+> to the copy, checkpoint, branch, node, reanchor and stack tests, `--test checkpoint` 4 of 4, `--test chain_replay` 3
+> of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 6 of 6 (layout 12 refused at start, new); Windows and Linux
+> owed. Owed from A-626: a rebase restating a copy (part 4); a
 > restore that grafts
 > a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
 > if measured worth it; the replaced tree held by reference rather than removed key by

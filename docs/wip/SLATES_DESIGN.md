@@ -11676,9 +11676,12 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > each copied tree's keys holding then what the copy above them gave them (set by a restore with no history, so each
 > reads by its record again), and the identity's running sum, moved to the version as a branch moves it, which the
 > restore takes (what it holds beyond the restored state's entries is kept for the recount). The anchor's layout is 12:
-> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Owed: a rebase that
-> restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since its version, where the
-> checkpoint lists it key by key (the A-626 part 3 entry).
+> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Since A-626 part 3,
+> continued (1), the copies' section and the sum each sit behind a presence byte, written beside a copy's record alone
+> (version 5, the anchor's layout 13): a green that never copied pays two bytes for them, where version 4's sum in
+> every checkpoint, 2,048 bytes, had held the service's doubling rule from folding a small green's early versions.
+> Owed: a rebase that restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since
+> its version, where the checkpoint lists it key by key (the A-626 part 3 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -12670,6 +12673,14 @@ engine: the verdict, rebase, position mapping, the register).
 > edge's address and the fleet identity's hand-in in the daemon role, a consumer's revocation in the SSH edge's key
 > holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone` (main's).
 >
+> **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
+> engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
+> service names as its reply begins (`Connection::reply_fields`, asked once through `Exchange::reply_fields`, none by
+> default, so git's site is unchanged): a Mercurial answer's media type follows from its command's outcome, as a push's
+> answer will and Subversion's WebDAV statuses will. A field a reply cannot carry fails the request `500` before any of
+> it is sent, the decision's at the decision and the service's as it names them. Mercurial's site is §4.17.3's
+> (`vcs_http::hg`, A-650 part 1); Subversion's is owed.
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -12969,6 +12980,14 @@ engine: the verdict, rebase, position mapping, the register).
 > would). Proven by the twelve pushes of A-644's golden vectors answered through the policy with every byte stock git
 > wrote, and by the commit signatures stock git made verifying under git's namespace alone. Owed: receive-pack's server
 > half asking it for each command (A-620 part 2's judge composed with the server's greens and appends).
+
+> **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
+> (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
+> limit, the byte-order mark, comments, carriage returns, NULs, trailing spaces) and asks each path what git's
+> `path_matches_pattern_list` answers outside cone mode: matched, not matched or undecided, by the last pattern that
+> matches, a segment pattern anywhere and a slashed one from the root, globbed by `slates_vcs::wildmatch` (A-671). The
+> filter is still refused as not served: the walk by path with git's tree frames, the graph's named entries and the
+> blob's name resolved are its next slices.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -13598,6 +13617,34 @@ signature verification).
 > histories (macOS arm64, Mac Studio: slates-hg's push tests 36 of 36, the server's 7 of 7; other platforms owed).
 > Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index and the
 > served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+>
+> **Status (2026-11-19, A-650 part 1: HTTP version 1 served).** `serve::http` answers a request as 7.2's `_callhttp`
+> does: its command the query's last `cmd`, as hgweb's `multidict` reads it (A-569's codec read the first, corrected);
+> its arguments by 7.2's spec from the query and the `X-HgArg` headers or the body's front; the command answered by the
+> session's dispatch over the HTTP transport (the capabilities with `compression`, `httpheader` and `httpmediatype` and
+> without `protocaps`; a bundle1 `getbundle` refused in 7.2's own `bundle2required` words); and the answer framed in
+> 7.2's media types: a string in `application/mercurial-0.1`, an error in `application/hg-error`, a stream in
+> `application/mercurial-0.2` in an engine the client reads (an abort part uncompressed, as 7.2 sends it), else in `0.1`
+> in zlib. The engine and level are the caller's (`Compressor`), and each answer is charged at its engine's documented
+> bound before it is made (zlib's, stock zlib's `compressBound`, is outgrown by the linked zlib-rs's level 1 on bytes
+> that do not compress: GAPS, its own piece). `getbundle` judges the bundle capabilities before what is missing, in
+> 7.2's order, so a bundle1 client is never sent a bundle2 abort. The daemon's site (`vcs_http::hg`) routes a
+> repository's URL as hgweb does, proves credentials as git's site does (by A-625 part 3's record), moves a proven
+> request for a repository another shard holds there (A-625 part 3), judges the policy in hgweb's order (read for every
+> request; a push also `POST` and a right to submit, rewrite or delete), and names the answer's media type as the reply
+> begins (the edge's `reply_fields`); hgweb's pages, and a repository whose store the shard does not hold, are `503`
+> until piece 12 and until the site is handed A-662's stores. Until the estimator below lands, a stream takes the
+> design's first value, the fastest form the client reads (`none` where it reads it, else its first engine at its
+> fastest level; zlib at level 0 to a `0.1` client). Proven by `slates-hg --lib` 306 of 306 (this piece's 9 among them),
+> `slates-http-edge --lib` 32 of 32 and `slates-server --lib vcs_http` 40 of 40 on macOS arm64 (Mac Studio, kiln r137 on
+> the tree that lands and r6 for the edge, 2026-11-19; the other platforms owed): a stock 7.2 client's clone, pull and
+> incoming over HTTP against stock `hg serve` (`crates/hg/fixtures/serve-http`), each answer as 7.2 meant it (strings
+> byte for byte in 7.2's media types, the capabilities a subset of 7.2's, each `getbundle`'s zstd stream inflated and
+> compared as the session's golden compares one); 7.2's own words for what it refuses; the abort and zlib framings; a
+> chooser past the client's engines refused; hostile requests; the site's statuses in hgweb's order; a proven request
+> moved to its repository's shard; the edge's late fields. Owed of piece 4: the estimator (the connection's delivery
+> rate, and this repository's compression speed and ratio), the answers sliced within the shard's budget, the process
+> around `slates hg serve --stdio`, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14008,8 +14055,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
-   3), and the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`); owed: the process
-   around it, HTTP.
+   3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
+   (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site); owed: the process around the stdio
+   session, the learned response compression (the first value until then), and A-662's stores handed to the site.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -14141,8 +14189,9 @@ and export by landing).
 > room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
 >
 > **Status (2026-11-19, A-626 part 3).** Built: a green holding copies is checkpointed (format version 4, the anchor's
-> layout 12), so a repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a
-> rebase restating a copy (part 4).
+> layout 12; version 5 and layout 13 since its continuation (1), the sum carried beside a copy's record alone), so a
+> repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a rebase restating a
+> copy (part 4).
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -49114,6 +49163,181 @@ Applied in the same change to: §4.17.4's status (A-613's reads and part 2's fir
   --check` clean; the crate has no integration target. The first build refused the shape count's closure returning its
   argument's borrow, a lifetime a closure cannot name; it is a function now.
 - **Owed.** The Windows run and red-checks (main's).
+
+### A-650 (part 1) — Mercurial over HTTP: HTTP version 1 answered as stock Mercurial 7.2 frames it, from the daemon's site on the shared edge, the answer's media type named as its reply begins (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-569, A-619, A-625, A-597, A-622; the stores it reads are A-662's)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), §4.17.2 (a status for the edge's change),
+`crates/hg` (new: `serve::http` with `answer`, `Answered`, `Compression`, `Compressor`, `Media`, `Permission`,
+`permission` and `command`; the session's `dispatch`, `Transport`, `Answer` and `spec_of`, and `Refused::Http`,
+`NotAvailable`, `Compression` and `EngineNotRead`; `http::Fields::command` reads the last `cmd`;
+`compression::Engine::wire_name`, `for_wire_name` and `bound`, `EncodeRefusal` now `Copy`; `serve::getbundle` judges
+the bundle capabilities first; `fixtures/serve-http` and its script, kept as captured by `.gitattributes`),
+`crates/http-edge` (`Connection::reply_fields`, the head rendered with the reply's first bytes), `crates/server`
+(`vcs_http::hg`: `HgSite`, `HgStores`, `NoStores`, `Fastest`, `HgExchange`; `Exchange::reply_fields`; a dependency on
+`slates-hg`), GAPS (the §4.17 edge entry and the §4.17.3 entry), `research/mercurial-server.md` (§25).
+- **What it does.** `serve::http::answer(store, request, header_line, compressor, admission)` answers an HTTP version 1
+  request as 7.2's `_callhttp` answers it: the query's last `cmd`, its arguments by 7.2's spec (A-569's codecs), the
+  command through the session's dispatch over the HTTP transport, and the answer in 7.2's media types: a string in
+  `application/mercurial-0.1`, an error in `application/hg-error` (ended by a line end as 7.2 forwards an abort, or in
+  7.2's own words where it has them), a stream in `application/mercurial-0.2` behind its engine's name in an engine the
+  client reads, else in `0.1` in zlib. The daemon's `HgSite` decides each head in hgweb's order and serves a command
+  through an `HgExchange`, which holds the request's `X-Hg` fields, query and body within the request's room and names
+  the answer's `Content-Type` as its reply begins.
+- **Decided.** The media type is the answer's, so the edge renders a reply's head with its first bytes and takes a
+  service's fields until then (`reply_fields`); a push's answer and Subversion's WebDAV statuses need the same. The
+  compression's engine and level are the caller's; until §4.17.3's estimator lands the site takes the design's first
+  value, the fastest form the client reads (`none` where read, which costs no compression time; else its first engine at
+  its fastest level; zlib level 0 to a `0.1` client). `httpheader` is the edge's line bound, 8000 (a client's count
+  holds the line end the edge's leaves out). A principal whose credentials hold and whom the policy refuses is `403`,
+  where hgweb answers `401`. hgweb's pages are `503` until piece 12; a repository whose store the shard lacks is `503`
+  until the site is handed A-662's stores, and that path goes then. A path past the request's room is `414`, as git's
+  routes answer a target past theirs, and a query's fields past it are `400` for now (`414` is its own piece); `X-Hg`
+  fields past it are `431`; a body past it is `413`; a policy holding a rule the repository's tool cannot read (a
+  damaged record) is `500`, never judged without the rule. On A-625 part 3's edge the site proves credentials by git's
+  `Authenticator::prove` over the record (a record that does not answer is `503`, its other refusals `401`, as git's
+  site answers them) and moves a proven request for a repository another shard holds there (`Answer::Move`) before it
+  looks the repository up.
+- **Found, and fixed here, failing tests first.** A-569's `Fields::command` read a query's first `cmd`, where hgweb's
+  `multidict` answers the last, which 7.2 serves (`hgweb/request.py`). A-619's `getbundle` computed what is missing
+  before it judged the bundle capabilities, so a bundle1 client naming a head the view lacks was answered with a bundle2
+  abort it cannot read; 7.2 refuses bundle1 first (`wireprotov1server.getbundle`), and so does this now, over SSH and
+  HTTP alike. And a trap: `.gitattributes`' `* text=auto eol=lf` normalized the captures' CRLF heads on their first
+  commit; `crates/hg/fixtures/serve-http/** -text` keeps them as captured, as A-569's are kept.
+- **Found, and left to its own piece** (main's to start, its failing test first). The room an answer is charged before
+  it is compressed counts zlib's at stock zlib's `compressBound`, which the linked backend outgrows: zlib-rs's level 1
+  (zlib-ng's `deflate_quick`) writes fixed codes, nine bits for the bytes 144 to 255, and never falls back to stored
+  blocks, so 65,536 such bytes came to 73,721 against that bound's 65,569 (Windows x86_64, jupiter, kiln r92,
+  2026-11-19). Nothing served today meets it: the site's first value compresses zlib only at level 0, stored, within the
+  bound (GAPS).
+- **Tests** (macOS arm64, Mac Studio, 2026-11-19, on the tree that lands, kiln r137:
+  `cargo test --locked -p slates-hg --lib` 306 of 306, this piece's 9 among them; `-p slates-server --lib vcs_http` 40
+  of 40: git's site 12, Mercurial's 7, the daemon's edge 1, the edge's serving 11 and the waits 9; `cargo fmt --check`
+  clean on the three crates; `-p slates-http-edge --lib` 32 of 32, r6, its inputs unchanged since. The first run, r6,
+  failed the golden alone: its helper inflated 7.2's zstd frames, which name a 2 MiB window and no content size
+  (2,490,432 bytes charged for the decoder), in the 1 MiB request room, and now has `INFLATE_ROOM`. No integration
+  target reaches `vcs_http`, private to its crate, or `slates-hg`. The other platforms owed). slates-hg: the 13 HTTP
+  exchanges of a stock 7.2 client's clone, pull and incoming against stock `hg serve` (`fixtures/serve-http`) answered
+  as 7.2 meant them: each in 7.2's media type, `batch` and `listkeys` byte for byte, the capabilities a subset of 7.2's
+  with its values, each `getbundle` a `0.2` zstd stream inflating to what 7.2's meant, the chooser asked once a stream
+  with the client's engines in its order; a command 7.2's table lacks, none at all, and A-569's capture of a bundle1
+  `getbundle` refused in 7.2's words and bytes; a stream charged its engine's bound before it is compressed (each
+  compressing engine refused at the least room that serves `none`, and served at the whole room); the abort part
+  uncompressed in `0.2`, and `0.1` in zlib to a client reading `0.1` alone or naming no engine this crate writes; a
+  chooser past what the client reads, or past an engine's levels, refused; `known` without its nodes, post arguments
+  past the body and a request past its room answered out of band; arbitrary requests answered in a media type, never a
+  panic (generated); each command's permission as 7.2's table; a repeated `cmd` read last and an argument first.
+  slates-http-edge: a service's field written after the decision's as its reply begins, a field no reply can carry
+  refused `500` in stages, and a field named after the first run never written. slates-server: hgweb's order a step at a
+  time (twelve requests on an open and a strict site, each judged before any is compared); the refusals' `Allow` and
+  challenge; a proven request for a repository another shard holds moved there, and a credential record that did not
+  answer `503` (A-625 part 3's edge); a path past the room `414`, `X-Hg` fields past it `431`, a damaged policy `500`; a
+  served command's media type named as its reply begins; a body past the room `413` and a store gone `503`; nothing
+  served until the stores land, and the first value's fastest forms; the late fields over a real loopback connection,
+  asked once, a failure there `503` in stages.
+- **Owed.** The site handed A-662's stores (their home on each owner shard is built), and with them the `503` path's
+  removal; the site's refusals counted by kind, as git's are since A-625 part 3; the learned response compression; the
+  answers sliced within the shard's step budget (a `getbundle` is made whole in one step, bounded by the request's
+  room); the daemon starting the edge with Mercurial's site beside git's; pushes over HTTP (piece 5's rest: `unbundle`
+  and `pushkey`, whose permission checks are in place and which are answered out of band until then); the live
+  `hg clone` and `hg pull` over HTTPS against the daemon (main's run); and two pieces of their own, each with its
+  failing test first: zlib's bound as the linked zlib-rs states it (`compress_bound`), and a query's fields past the
+  request's room `414`, as a path's are.
+
+### A-640 part 4, first slice — A sparse filter's pattern list, read and asked as git's `dir.c` reads and asks it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-671)
+Applied in the same change to:
+- §4.17.2's statuses (a status after A-640 part 3's);
+- GAPS (the A-640 entries);
+- `crates/git/src/negotiation/sparse.rs` (new) and its tests, `negotiation/tests/sparse.rs`; `negotiation/mod.rs` (the
+  module); `negotiation/filter.rs` (the module doc's `sparse:oid` line);
+- `crates/vcs/src/wildmatch.rs` (`Glob::kept_bytes` and its test).
+
+- **What git does** [C: `list-objects-filter.c` `filter_sparse_oid__init` and `filter_sparse`, `dir.c`, git v2.50.1,
+  read at the tag]. The filter resolves its `<blob-ish>` (`get_oid_with_context` with `GET_OID_BLOB`), reads the
+  blob's patterns with the root as their base (`add_patterns_from_blob_to_list(oid, "", 0)`), and dies on either
+  failure ("unable to access sparse blob in '%s'", "unable to parse sparse filter data in %s"). Walking each sent
+  commit's tree, it asks every tree's and blob's full path, a tree as a directory and a blob as a file,
+  `path_matches_pattern_list`; an undecided path takes the verdict of the tree it is in, below the root a base that is
+  not matched (`default_match = 0`, `NOT_MATCHED`, though that line's comment says "default to include"). Every tree is
+  sent; a blob is sent when matched, and is otherwise left out for now and asked again wherever else it is met.
+- **The list** (`negotiation::sparse::Patterns`): read and asked as its module doc states, each rule from the function
+  it names. Two of git's choices are tests by name: a slashed pattern's rest is globbed as a pattern of its own after
+  its literal bytes (`ab**/c` matches `abx/y/c`), and an empty pattern, from a line of spaces or of a carriage return
+  alone, matches the root tree, whose name is empty.
+- **The glob.** `slates_vcs::wildmatch` (A-671), which has `WM_PATHNAME`: git globs a segment pattern without it, which
+  changes a verdict only at a `/`, and neither a segment nor such a pattern holds one. The property below holds every
+  generated list to a transcription that calls the glob where git calls `fnmatch_icase_mem`.
+- **Bounds.** The list's slots are counted and charged before it is made; each pattern's bytes and compiled glob as it
+  is made, before the list keeps it (`Glob::kept_bytes`, new: the room a glob's tokens keep, none holding heap of its
+  own).
+- **Tests** (`negotiation/tests/sparse.rs`, 10): seven hand-traced cases (git's non-cone sparse-checkout example, `/*`
+  then `!/*/`; segments by name, ending and glob; slashed paths from the root; a rest globbed alone; trees alone; the
+  blob's reading rules; an empty list); git's 100 MiB limit at its edge, a missing last newline counted; the admission;
+  and a property over generated blobs and paths against `dir.c`'s reader and matcher transcribed in their own shape
+  (`add_patterns_from_buffer`, `trim_trailing_spaces`, `parse_path_pattern` at each ask,
+  `last_matching_pattern_from_list`, `match_basename`, `match_pathname`). slates-vcs:
+  `a_pattern_keeps_room_for_each_of_its_tokens`.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r144, over main 5c0967fb2 with this
+  slice (`agents/g296-a640-p4` at e2b66d21a): `cargo test --locked -p slates-git --lib negotiation::sparse` 10 of 10;
+  `cargo test --locked -p slates-vcs --lib wildmatch` 4 of 4; `cargo fmt -p slates-git -- --check` and
+  `cargo fmt -p slates-vcs -- --check` clean. Failing first (kiln r133, over main acc2ac16f with this slice, in the
+  clone): with `Patterns::read`, `Patterns::decide` and `Glob::kept_bytes` stubbed, 9 of the 10 failed (the empty
+  list's test passes against an empty list by construction) and the slates-vcs test failed; restored, 10 of 10 and 4
+  of 4. No integration target reaches the module: slates-git has none, and nothing outside it calls the module yet.
+  The Linux and Windows runs are owed.
+- **Next slices.** The walk by path (`negotiation/objects.rs`): the graph's tree entries with their names (`Graph`),
+  git's frames kept per tree (`default_match`, `child_prov_omit`), every tree sent and a blob when some path matches
+  it, a tree whose blobs all went marked done, each frame charged; the request's filter served with its patterns, and
+  the one-round runs refused for it as now (`Filter::is_per_object`). The service (`upload`): `<blob-ish>` resolved, a
+  full id or `<rev>:<path>` through the refs' rules and other forms refused by kind, its blob read within the request's
+  admission, git's two refusals' words, and a stock git `sparse:oid` exchange recorded as a golden.
+
+### A-626 part 3, continued (1) — A checkpoint carries its copies' section and the identity's sum beside a copy's record alone: version 5, the anchor's layout 13 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); a regression A-626 part 3 made, found by g258's run of slates-server's lib and bisected by main to 637a65d69; §4.16 "Deltas older than the derived retention fold into checkpoint deltas", W3's doubling rule)
+Applied in the same change to: §4.16 and §4.17.4 (A-626 part 3's status blocks), GAPS (the §4.17.4 entry),
+`crates/merge/src/checkpoint.rs` (version 5: `Checkpoint::sum` an `Option`, `encode_copies_into`, `take_copies_section`,
+`take_sum`; the module docs) and its tests (`src/checkpoint/tests.rs`: the golden vectors derived again, a golden
+checkpoint of a green that never copied), `crates/merge/src/engine.rs` (`Green::checkpoint` taking the sum beside a
+copy's record alone, the restore taking one only where carried), `crates/merge/src/engine/copy_checkpoint.rs` (the module
+docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison below the copy),
+`crates/merge/tests/checkpoint.rs` (main's, by reading), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 13),
+`crates/anchor/tests/anchor.rs` (a segment of layout 12 refused at start), and the bug record
+`docs/bugs/2026-11-19-every-checkpoint-carried-the-identitys-sum-so-a-small-green-folded-late.md`.
+- **What was there.** Version 4 wrote the identity's running sum, 2,048 bytes, into every checkpoint, though a restore
+  needs it only beside a copy's record: without one, the sum holds nothing beyond the entries the restore makes as it
+  places the state. The service's doubling rule (`merge_service::checkpoint_green_when`) takes a checkpoint once the
+  increments it would fold reach the size of the checkpoint it holds, so every green's chain then waited on 2,048 bytes
+  of increments before its next fold. slates-server's
+  `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log` met it: its root, written
+  twice with no reader left, kept version 1 (the second increment, 194 bytes, under the 2,233-byte checkpoint at 1;
+  kiln r122, Mac Studio), and a branch there was made where the test expects `UnknownBase`.
+- **The fix.** Version 5: the copies' section (the copies' records and the copied tables) and the sum each sit behind a
+  presence byte, as the head check does, and are written beside a copy's record alone; the engine computes the sum only
+  then, and the restore takes one only where the checkpoint carries it. A green that never copied checkpoints in
+  version 3's tables and two bytes more. The anchor's layout is 13, so a segment of version 4 checkpoints is refused at
+  adoption, typed, as part 3's layout refused version 3's.
+- **Rejected.** *The test as stale*: it states the rule as the service holds it, a fold taken once the increments
+  outweigh the checkpoint; what changed was the size of every green's checkpoint, by bytes only a copy needs. *An
+  exception in the doubling rule* (the sum's bytes left out of the held size): the bytes would stay in every checkpoint,
+  in the partition's log and its snapshots, and the rule would carry a detail of one format.
+- **Tests.** The red: the repository test on main. Golden vectors derived again by A-626 part 3's pure-Python BLAKE3,
+  which still reproduces version 4's pinned vector (2,497 bytes, `13b881c8…51df3`): the checkpoint holding a copy,
+  2,499 bytes, `05c1e7f6…3865f09`; a new one of a green that never copied, 115 bytes, `dfa590d1…6de08c04`, each of its
+  presence bytes refused `BadKind` when neither. A version 4 header refused `BadVersion`. Part 3's replica test compared
+  the sums carried at 3, below the copy, where none is carried now: it compares the identity each moves to 3
+  (`Green::sum_at`) and the whole checkpoints there. A segment of layout 12 refused at start.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). Red: the
+  repository test on main (main's bisect, kiln r104; r122 at 3329211, the doubling rule's inputs printed into its
+  clone alone: a 2,233-byte checkpoint at 1, 194 bytes to fold, no checkpoint at 2). Green, kiln r146 at 189ab8dc3
+  over main 545181b30, the code landed here: the repository test 1 passed, and printed again the checkpoint at 1 is
+  155 bytes and the one at 2 is taken (195); `cargo test --locked -p slates-merge --lib -- copy checkpoint
+  engine::branch engine::node_tests engine::reanchor engine::stack::tests` 76 passed, none failed, the copy oracle's
+  fixed history meeting all 13 census cases (279 checkpoints carrying copies and 275 listing copied keys over its run,
+  each restored and replayed to its owner's identity); `--test checkpoint checkpoint` 4 of 4; `--test chain_replay
+  checkpoint` 3 of 3; `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and `--test anchor a_segment_` 6 of 6,
+  the layout 12 refusal among them; both crates' fmt checks clean. The same runs over main b13a6e05f (kiln r164, at
+  8919290ed, after A-676, the ipc protocol's and the server's submit changes): the repository test 1 passed, slates-merge
+  lib 77 of 77 filtered, the checkpoint tests 4 of 4 and 3 of 3, slates-anchor 2 of 2 and 6 of 6, fmt clean. Main's
+  commits after b13a6e05f change only manifest comments, the server's Mercurial site over HTTP and slates-svn's report
+  editor, none of which slates-merge or slates-anchor builds from or the repository test reaches.
+- **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
 
 ### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
 Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's

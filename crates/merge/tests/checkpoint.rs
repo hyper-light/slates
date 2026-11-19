@@ -17,7 +17,7 @@ mod common;
 
 use common::generated::{Raw, increment_of, origin_of, raw};
 use proptest::prelude::*;
-use slates_merge::checkpoint::{Changed, Checkpoint, CopyRecord, SUM_BYTES, Sum, Tables};
+use slates_merge::checkpoint::{Changed, Checkpoint, CopyRecord, Sum, Tables};
 use slates_merge::engine::{Green, Increment, Outcome};
 use slates_merge::ops_doc::DocDecodeError;
 
@@ -256,7 +256,7 @@ fn every_table() -> Checkpoint {
       }],
       ..Tables::default()
     },
-    sum: Sum::default(),
+    sum: Some(Sum::default()),
   }
 }
 
@@ -307,10 +307,10 @@ fn a_hostile_checkpoint_is_refused_typed() {
   }
   .encode();
   let mut presence = empty_tables.clone();
-  // The files table's one entry ends with its presence byte, after its key and version; the six empty changed tables,
-  // the empty copies' records and seven empty copied tables (a count each), the identity's sum and the head check's own
-  // presence byte follow (version 4, A-626 part 3).
-  let after_files = (6 + 1 + 7) * size_of::<u32>() + SUM_BYTES + 1;
+  // The files table's one entry ends with its presence byte, after its key and version; the six empty changed tables
+  // (a count each) follow, then three presence bytes, each absent: the copies' section, the identity's sum and the head
+  // check (version 5, A-626 part 3, continued (1)).
+  let after_files = 6 * size_of::<u32>() + 3;
   let presence_at = empty_tables.len() - after_files - 1;
   presence[presence_at] = 7;
   assert_eq!(Checkpoint::decode(&presence), Err(DocDecodeError::BadKind));

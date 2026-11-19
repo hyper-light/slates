@@ -12,7 +12,8 @@
 //!
 //! **Transports.** [`session`] answers SSH version 1's requests one at a time from a buffer (A-619 part 3), and
 //! [`stdio`] runs such a session over a byte channel, the SSH server's session channel or any other carrier of
-//! `hg serve --stdio`'s standard streams (A-650 part 2).
+//! `hg serve --stdio`'s standard streams (A-650 part 2). [`http`] answers HTTP version 1's requests with the same
+//! commands, framed as 7.2 frames them over HTTP (A-650 part 1).
 //!
 //! **The served view.** A [`Repository`] numbers the changesets it serves `0` to `count() - 1`, every parent before
 //! its child, as a revlog numbers them; it holds no secret and no hidden changeset (§4.17.3 "Pull and clone" item 2),
@@ -26,6 +27,7 @@
 
 pub mod discovery;
 pub mod getbundle;
+pub mod http;
 pub mod pull;
 pub mod session;
 pub mod stdio;
