@@ -414,9 +414,14 @@ fn home_redirect(
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
 /// registration through cancellation; an unavailable shard cannot produce a successful bootstrap. Each call (the
 /// operation on the control shard, then its publication on every other) is waited for in its target's own time
-/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is refused `Overloaded` after a
-/// window with no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the
-/// wall second while the bootstrap went on).
+/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is given up after a window with
+/// no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the wall second
+/// while the bootstrap went on). `Overloaded` answers only an operation that has not run: one whose task this shard
+/// could not spawn, or whose control shard refused it or was given up before it ran. A control shard wedged past the
+/// window may still run the operation when its poll ends; each of the three (`serve_consensus_control`) meets a second
+/// run as the first's outcome (a bootstrap already authorized, a recovery's receipt for its digest, a plan is a read),
+/// so the resend the refusal invites takes effect once. Once the operation ran, its answer says so
+/// ([`published_or_pending`], A-566).
 fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
@@ -447,25 +452,7 @@ fn consensus_on_control(
         reply @ (ReplyBody::Acknowledged | ReplyBody::RecoveryStarted { .. }),
         publication,
         shards,
-      )) => {
-        let mut reply = reply;
-        for shard in shards.into_iter().filter(|shard| *shard != control) {
-          let publication = publication.clone();
-          if crate::xshard::call_in_shard_time(
-            origin,
-            shard,
-            move |state| publication.apply(state),
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await
-          .is_none()
-          {
-            reply = refused(Refusal::Overloaded { shard });
-            break;
-          }
-        }
-        reply
-      }
+      )) => published_or_pending(origin, control, reply, (publication, shards)).await,
       Some((reply, _, _)) => reply,
       None => refused(Refusal::Overloaded { shard: control }),
     };
@@ -477,6 +464,38 @@ fn consensus_on_control(
   // Freshly admitted on the current shard; no await can retire its slot before detach.
   let _ = slates_rt::futures::detach(task);
   Served::Forwarded
+}
+
+/// The answer of a consensus operation that ran on the control shard, `reply`, once its `publication` has gone to every
+/// other shard of `shards` (§4.8): `reply` when each applied it, each waited for in its own time
+/// (`xshard::call_in_shard_time`). When one did not, `DurabilityPending`, with how long it waited since the operation's
+/// answer: the operation ran and stands on the control shard but is not yet where its answer waits for it, and that is
+/// the request's recorded outcome, so a resend under its id meets it and the operation runs again only under a new id,
+/// whose run publishes again. Until A-566 this was `Overloaded`, which says the operation did not start: left
+/// unrecorded since A-563, its resend ran the operation a second time.
+async fn published_or_pending(
+  origin: u16,
+  control: u16,
+  reply: ReplyBody,
+  (publication, shards): (crate::consensus::Publication, Vec<u16>),
+) -> ReplyBody {
+  let answered_ns = slates_machine::clock::monotonic_ns();
+  for shard in shards.into_iter().filter(|shard| *shard != control) {
+    let publication = publication.clone();
+    if crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| publication.apply(state),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .is_none()
+    {
+      let held_ns = slates_machine::clock::monotonic_ns().saturating_sub(answered_ns);
+      return refused(Refusal::DurabilityPending { held_ns });
+    }
+  }
+  reply
 }
 
 /// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —
@@ -22598,6 +22617,129 @@ mod tests {
       seen.unserved,
       Some(4),
       "each send and each resend ran its scatter"
+    );
+  }
+
+  /// Fences the shard of `partition` as a failed consensus publication fences the control shard
+  /// (`Daemon::inject_consensus_failure`): every later borrow of its state is refused. The borrow that sets the fence is
+  /// refused at its own retention check, which names the fence it set.
+  fn fence_shard(daemon: &crate::daemon::Daemon, partition: usize) {
+    let fenced = daemon
+      .observation(
+        daemon.shards().get(partition).copied(),
+        crate::daemon::OBSERVE_BUDGET_NS,
+        |state| {
+          state.consensus_failure = Some(slates_anchor::AnchorError::Layout {
+            reason: "test support: a shard fenced as a failed consensus publication fences one",
+          });
+        },
+      )
+      .unwrap()
+      .wait();
+    assert!(
+      matches!(
+        fenced,
+        Err(crate::observe::ObserveError::State(
+          crate::state::StateAccess::Retention(_)
+        ))
+      ),
+      "the shard was fenced: {fenced:?}"
+    );
+  }
+
+  /// The root group's identity on the control shard now.
+  fn root_group(daemon: &crate::daemon::Daemon) -> Option<[u8; 32]> {
+    crate::daemon::observe_first(daemon, |state| {
+      state.root_group.as_ref().map(|group| group.id)
+    })
+  }
+
+  /// The answer to one request of the seated client: the one it was given at once, or else the next on its ring.
+  fn answer_of(end: &mut slates_ipc::ClientEnd, at_once: Option<ReplyBody>) -> Option<ReplyBody> {
+    at_once.or_else(|| answers_by_sequence(end, 1).into_values().next())
+  }
+
+  /// What the Recover test saw ([`recovered_past_a_fenced_shard`]).
+  struct Recovered {
+    /// The Recover's answer.
+    first: Option<ReplyBody>,
+    /// Its resend's answer, under the same id.
+    resent: Option<ReplyBody>,
+    /// The root group's identity before the Recover, after its answer, and after its resend's.
+    groups: [Option<[u8; 32]>; 3],
+  }
+
+  /// On a three-shard daemon whose third shard is fenced, a client seated on the second recovers the root group as its
+  /// first voter from a reviewed plan, then sends the same Recover again under its id, as a client resends a request
+  /// whose answer said it was not started.
+  fn recovered_past_a_fenced_shard() -> Recovered {
+    let daemon = crate::daemon::audit_daemon_of(3);
+    let (digest, proof) = crate::daemon::observe_first(&daemon, |state| {
+      let reviewed = crate::consensus_recovery::plan(state, true, None).unwrap();
+      let proof = crate::consensus_recovery::recovery_proof(&state.issuer_secret, &reviewed.digest);
+      (reviewed.digest, proof)
+    });
+    let before = root_group(&daemon);
+    fence_shard(&daemon, 2);
+    let recover = (
+      1,
+      super::RequestBody::Recover {
+        root: true,
+        target: None,
+        plan: digest,
+        proof,
+      },
+    );
+    let sent = recover.clone();
+    let (seat, region, at_once) = crate::daemon::observe_at(&daemon, 1, move |state| {
+      let (seat, region) = seat_asking(state);
+      let at_once = served_as_from_the_ring(state, seat, &sent);
+      (seat, region, at_once)
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answer_of(&mut end, at_once);
+    let after_first = root_group(&daemon);
+    let at_once = crate::daemon::observe_at(&daemon, 1, move |state| {
+      served_as_from_the_ring(state, seat, &recover)
+    });
+    let resent = answer_of(&mut end, at_once);
+    let after_resend = root_group(&daemon);
+    daemon.stop();
+    Recovered {
+      first,
+      resent,
+      groups: [before, after_first, after_resend],
+    }
+  }
+
+  /// A-566 (§4.8 explicit quorum-loss recovery; §4.9: `Overloaded` says a request was not started, so a resend under its
+  /// id runs it). Do: on a three-shard daemon whose third shard is fenced, so the control shard's publication of a
+  /// consensus operation to it is refused, recover the root group from a client seated on the second shard; then send
+  /// the same Recover again under its id. Expect: the answer says the recovery ran (`DurabilityPending`), the resend
+  /// meets that answer, and the root group was replaced once. Before, the answer was `Overloaded` naming the fenced
+  /// shard though the recovery had run, so since A-563 its resend ran the operation again.
+  #[test]
+  fn a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once() {
+    let seen = recovered_past_a_fenced_shard();
+    assert!(
+      matches!(
+        seen.first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::DurabilityPending { .. }
+        })
+      ),
+      "the Recover ran, and its answer says so: {:?}",
+      seen.first
+    );
+    assert_eq!(
+      seen.resent, seen.first,
+      "the resend under its id meets the Recover's answer"
+    );
+    let [before, after_first, after_resend] = seen.groups;
+    assert_ne!(before, after_first, "the Recover replaced the root group");
+    assert_eq!(
+      after_first, after_resend,
+      "once: the resend replaced it no further"
     );
   }
 
