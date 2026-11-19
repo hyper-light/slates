@@ -155,10 +155,12 @@ impl<'a> Entry<'a> {
   /// Stock git 2.50.1 reads `100600` and `100664` as `100644`, `100700` and `100775` as `100755`, and `644` as
   /// `160000` (`git ls-tree`, and `git ls-files -s` after `git read-tree`, 2026-11-19).
   pub fn canonical_mode(&self) -> Mode {
-    if self.mode & S_IFMT == S_IFREG | OWNER_EXECUTE {
-      Mode::Executable
-    } else {
-      Mode::File
+    match self.mode & S_IFMT {
+      S_IFREG if self.mode & OWNER_EXECUTE != 0 => Mode::Executable,
+      S_IFREG => Mode::File,
+      S_IFLNK => Mode::Symlink,
+      S_IFDIR => Mode::Directory,
+      _ => Mode::Gitlink,
     }
   }
 
