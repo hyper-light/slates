@@ -83,9 +83,10 @@ const REPLAYED: usize = 17;
 const YOUNGEST: Revision = 13;
 
 /// The items `svnserve` wrote with a property list in another order than slates' sorted one, APR's
-/// seeded hash order: compared as sets, and counted so the count cannot grow unseen.
+/// seeded hash order: compared as sets, and counted so the count cannot grow unseen. One: the
+/// entry properties of `import`'s `get-dir` before its commit.
 /// Shape: measured on Windows x86_64 (jupiter), 2026-11-19.
-const IN_HASH_ORDER: usize = 0;
+const IN_HASH_ORDER: usize = 1;
 
 /// The repository's root URL in the recordings (`make-fixtures.py` `URL`).
 const ROOT: &[u8] = b"svn+fixture://fixture/repo";
