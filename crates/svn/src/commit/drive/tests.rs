@@ -793,7 +793,11 @@ fn accepted_rows(step: &Step) -> Vec<(String, Action)> {
 #[test]
 fn a_path_beneath_a_copy_reads_the_copys_source() {
   let replay = replayed_until("edit-large");
-  let source = replay.index.node("/trunk/project/sub/b.txt", 3).unwrap().unwrap();
+  let source = replay
+    .index
+    .node("/trunk/project/sub/b.txt", 3)
+    .unwrap()
+    .unwrap();
   let base = displayed(&source.text().unwrap().md5);
   let empty = displayed(&md5_of(b"").unwrap());
   let commands = format!(
@@ -823,5 +827,8 @@ fn a_path_beneath_a_copy_reads_the_copys_source() {
     ("/trunk/project/sub2".to_owned(), Action::Add),
     ("/trunk/project/sub2/b.txt".to_owned(), Action::Modify),
   ];
-  assert_eq!((String::from_utf8_lossy(&out).into_owned(), rows), (String::new(), expected));
+  assert_eq!(
+    (String::from_utf8_lossy(&out).into_owned(), rows),
+    (String::new(), expected)
+  );
 }
