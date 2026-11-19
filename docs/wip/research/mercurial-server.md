@@ -768,3 +768,46 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **Mutable state and immutable rows.** The shared index never rewrites a row, while the phase roots and bookmarks move
   with every push, so they are the register's (A-642), and the import hands them back typed; markers, never changed once
   made, are the index's rows.
+
+## 24. Found while landing pushes (A-657, A-641 part 3, 2026-11-19; 7.2's code [C] in the wheel uv installs on the Mac Studio, `mercurial==7.2`, CPython 3.12, read with `inspect.getsource`; a run of stock `hg` 7.2 on the Mac Studio; the push fixtures' texts rebuilt)
+
+- **Phases on a push** (`changegroup.py` `cg1unpacker.apply`, `srctype` `serve`): a publishing repository takes
+  `targetphase = phaseall = public`, a non-publishing one `draft` ("Those changesets have been pushed from the outside,
+  their phases are going to be pushed alongside. Therefor `targetphase` is ignored."); then `registernew(targetphase,
+  added)` and `advanceboundary(phaseall, revs=duprevs + added)`, `duprevs` the changesets the bundle carried that the
+  repository held (`ondupchangelog`, `rev < clstart`). So a publishing push publishes every draft ancestor of what it
+  carried, held ones included.
+- **`advanceboundary`** (`phases.py` `phasecache.advanceboundary`): the given revisions above the target phase walked
+  down through every parent above it (a heap, highest first); a walked revision whose phase differs from both parents'
+  is a root removed; then every unwalked revision from the lowest walked one to the end, above the target, with a parent
+  walked and no unwalked parent of its own phase, is a new root of its phase. `updatephases` (the `phase-heads` part)
+  advances, phase by phase in `allphases` order, the heads not already in their phase. `pushphase` (the `phases`
+  pushkey): advances when the node's phase is the old one and the new one is lower (1), answers 1 when the node is in
+  the new phase already ("raced, but got correct result"), else 0.
+- **The change in heads** (`apply` and `revlog.headrevsdiff`, `dagop.headrevsdiff`): `len(heads_added) -
+  len(heads_removed)`, less every added head that closes its branch, then `+ 1`, or `- 1` when negative. The heads are
+  the changelog's, and from an empty changelog `headrevsdiff(0, n)` counts the null revision as removed (its loop starts
+  at `start - 1`, -1), so a first push of one head answers 1. The `pretxnchangegroup` hook runs inside `apply`, with
+  `node` and `node_last` the first and last added changesets, and only when it added some.
+- **Bookmarks** (`bundle2_part_handlers.py` `handlebookmark`, `bookmarks.py`): the `bookmarks` part is applied as it
+  is in mode `apply` (`bmstore.applychanges`: a node sets, none deletes); its race is the earlier `check:bookmarks`'s; a
+  divergent name (`isdivergent`: an `@` not at the end) aborts "cannot accept divergent bookmark %s!". With
+  `server.bookmarks-pushkey-compat` the part runs `prepushkey` and `pushkey` hooks per bookmark. The `bookmarks`
+  pushkey (`pushbookmark`): refused for a divergent name; 0 when the bookmark's hex is neither the old value nor the
+  new; an empty new value deletes; a new node the repository lacks is 0. A mandatory `pushkey` part that answers 0
+  raises `PushkeyFailed` with the part's `namespace`, `key`, `new`, `old` and `ret` parameters as sent.
+- **Hooks' words** (`hook.py` `_exthook`, `procutil.explainexit`): an external hook's environment is `HG_PENDING` (the
+  repository's root, when the transaction has pending writes), `HG_HOOKTYPE`, `HG_HOOKNAME`, `HGPLAIN` (empty unless
+  configured) and `HG_<ARG>` for each argument; it runs in the repository's root; a non-zero status at a point that
+  throws is `HookAbort("%s hook %s" % (name, desc))`, `desc` "exited with status %d" or "killed by signal %d"; at a point
+  that does not throw, `warning: %s hook %s` is printed and the transaction stands.
+- **Branch heads by descent, checked by a run** (Mac Studio, stock 7.2, a repository of `0` on `default`, `1` on
+  `stable` from it, `2` on `default` from `1`): `hg heads default` lists `2` alone, so a branch head is dropped when a
+  changeset of its branch descends from it through any branch, as `branchmap`'s update drops the ancestors of new heads.
+  slates-hg's `serve::discovery::branch_head_revs` drops a head only for a child on its branch, and would list `0` and
+  `2` (reported to main as a sibling of A-657, not changed here).
+- **The push fixtures' repository rebuilt** (`make-push-fixtures.sh`, user `test`, date `0 0`): each changeset's text
+  `{manifest hex}\ntest\n0 0\n{file}\n\n{description}`, each manifest `{path}\0{file node hex}\n` sorted, each file a
+  new file's bytes; the nodes computed from them are 7.2's (`base` ad120869…, `second` 59d5dc23… with manifest
+  a539ce0c…, `other` f2563910…, `plain` 048741fa… with manifest 8b52510d…), first checked with `python3 -I` and
+  `hashlib`, then by the server's tests.
