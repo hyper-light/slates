@@ -103,6 +103,17 @@ impl Glob {
     }
     reached.last().copied().unwrap_or(false)
   }
+
+  /// The bytes the compiled pattern keeps beyond its own size: its tokens' room, which holds nothing on the heap of its
+  /// own. A caller that keeps a pattern charges these to the request it serves (A-640 part 4: a sparse filter's
+  /// patterns, charged to the fetch's admission).
+  pub fn kept_bytes(&self) -> u64 {
+    let room = self
+      .tokens
+      .capacity()
+      .saturating_mul(core::mem::size_of::<Token>());
+    u64::try_from(room).unwrap_or(u64::MAX)
+  }
 }
 
 /// The positions `token` reaches in `text` from the positions in `from`, written into `to` (each of the text's length
@@ -438,6 +449,19 @@ mod tests {
   use proptest::prelude::*;
 
   use super::{Glob, reference};
+
+  /// A-640 part 4: do compile an empty pattern, then patterns of at least one, three and seven tokens (a byte; a set
+  /// and a star; a slash, `**/` and `?` besides). Expect: the empty one keeps nothing, and each other keeps room for
+  /// every one of its tokens, so a caller charging what it keeps charges every token.
+  #[test]
+  fn a_pattern_keeps_room_for_each_of_its_tokens() {
+    let token = u64::try_from(core::mem::size_of::<super::Token>()).unwrap();
+    assert_eq!(Glob::new(b"").kept_bytes(), 0);
+    for (pattern, tokens) in [(&b"a"[..], 1), (b"a[bc]*", 3), (b"a[bc]*/**/d?", 7)] {
+      let kept = Glob::new(pattern).kept_bytes();
+      assert!(kept >= tokens * token, "{pattern:?} keeps {kept} bytes");
+    }
+  }
 
   /// git's own vectors (`t/t3070-wildmatch.sh` at git e1ec09b23, 190 `match` lines): whether `wildmatch` with
   /// `WM_PATHNAME` matches each text with each pattern (the first column), with `t/helper/test-wildmatch.c`'s rule

@@ -12,7 +12,8 @@
 //!   ([`Green::identity_moved_to`], `branch`), which the restore takes as its own: what a copy's entry stands for (its
 //!   source's tree at the source's version) is read from histories a restored green no longer holds. What the sum
 //!   holds beyond the restored state's own entries is kept beside it (`copies_before`), so the recount still equals
-//!   the identity.
+//!   the identity. Without a copy's record at or before `F` it holds nothing beyond them, so the checkpoint carries
+//!   none and the restore keeps the identity its own entries make (A-626 part 3, continued (1)).
 //!
 //! A copy at or before `F` needs nothing more after the restore: its keys read their current values from its record
 //! on, and the identity is past it. A copy the restored green replays after `F` may name a source version before `F`
@@ -23,7 +24,9 @@
 //!
 //! **Cost.** Each copied tree at or before `F` is listed key by key, O(the trees' keys, and the files' bytes they hold),
 //! where the green holds each tree by reference: the price of a checkpoint that a restore reads alone. Moving the sum to
-//! `F` costs what a branch at `F` costs, the keys changed since `F`. A green with no copy pays nothing more but the sum.
+//! `F` costs what a branch at `F` costs, the keys changed since `F`, and its 2,048 bytes. A green with no copy pays two
+//! presence bytes and no sum: version 4 carried the sum in every checkpoint, and the service's doubling rule then held
+//! a small green's first versions unfolded (`crate::checkpoint`'s module docs).
 
 use std::collections::BTreeSet;
 

@@ -11676,9 +11676,12 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > each copied tree's keys holding then what the copy above them gave them (set by a restore with no history, so each
 > reads by its record again), and the identity's running sum, moved to the version as a branch moves it, which the
 > restore takes (what it holds beyond the restored state's entries is kept for the recount). The anchor's layout is 12:
-> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Owed: a rebase that
-> restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since its version, where the
-> checkpoint lists it key by key (the A-626 part 3 entry).
+> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Since A-626 part 3,
+> continued (1), the copies' section and the sum each sit behind a presence byte, written beside a copy's record alone
+> (version 5, the anchor's layout 13): a green that never copied pays two bytes for them, where version 4's sum in
+> every checkpoint, 2,048 bytes, had held the service's doubling rule from folding a small green's early versions.
+> Owed: a rebase that restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since
+> its version, where the checkpoint lists it key by key (the A-626 part 3 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -12550,6 +12553,15 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-651 part 2: git's upload-pack behind the SSH edge).** `crates/server`'s `vcs_ssh::git` runs
+> A-640's one entry point over an SSH session's standard input and output, the store lent a step at a time by the HTTP
+> edge's `StoreLender` (A-625 part 3): the advertisement first, each request measured whole by `whole_len`, consumed and
+> answered a pkt-line's room a step, a flush alone ending the session 0 and a refused request ending it with git's `die`
+> status, 128. The end of the client's input ends the session 0 before a request's first packet is whole and dies 128
+> after it, as git's reader does. A session at protocol v0 or v1 is refused with an `ERR` line naming v2, since
+> slates-git answers those protocols statelessly and a v0 client over SSH negotiates in rounds. `ToolServices` starts it
+> only over a store the lender holds, and none does until the lender over A-662's map lands, so it runs in tests alone.
+>
 > **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
 > the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
 > `slates-ssh`'s session. A key proves a principal only through the site's lookup, today `NoKeyRecord`, which refuses
@@ -12969,6 +12981,14 @@ engine: the verdict, rebase, position mapping, the register).
 > stateless answers and its one-round sessions. Those goldens found A-615's object choice missing git's rule for a
 > thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
 > session, an SSH client's, is owed.
+
+> **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
+> (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
+> limit, the byte-order mark, comments, carriage returns, NULs, trailing spaces) and asks each path what git's
+> `path_matches_pattern_list` answers outside cone mode: matched, not matched or undecided, by the last pattern that
+> matches, a segment pattern anywhere and a slashed one from the root, globbed by `slates_vcs::wildmatch` (A-671). The
+> filter is still refused as not served: the walk by path with git's tree frames, the graph's named entries and the
+> blob's name resolved are its next slices.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -14170,8 +14190,9 @@ and export by landing).
 > room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
 >
 > **Status (2026-11-19, A-626 part 3).** Built: a green holding copies is checkpointed (format version 4, the anchor's
-> layout 12), so a repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a
-> rebase restating a copy (part 4).
+> layout 12; version 5 and layout 13 since its continuation (1), the sum carried beside a copy's record alone), so a
+> repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a rebase restating a
+> copy (part 4).
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -49221,6 +49242,152 @@ the bundle capabilities first; `fixtures/serve-http` and its script, kept as cap
   `hg clone` and `hg pull` over HTTPS against the daemon (main's run); and two pieces of their own, each with its
   failing test first: zlib's bound as the linked zlib-rs states it (`compress_bound`), and a query's fields past the
   request's room `414`, as a path's are.
+
+### A-640 part 4, first slice — A sparse filter's pattern list, read and asked as git's `dir.c` reads and asks it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-671)
+Applied in the same change to:
+- §4.17.2's statuses (a status after A-640 part 3's);
+- GAPS (the A-640 entries);
+- `crates/git/src/negotiation/sparse.rs` (new) and its tests, `negotiation/tests/sparse.rs`; `negotiation/mod.rs` (the
+  module); `negotiation/filter.rs` (the module doc's `sparse:oid` line);
+- `crates/vcs/src/wildmatch.rs` (`Glob::kept_bytes` and its test).
+
+- **What git does** [C: `list-objects-filter.c` `filter_sparse_oid__init` and `filter_sparse`, `dir.c`, git v2.50.1,
+  read at the tag]. The filter resolves its `<blob-ish>` (`get_oid_with_context` with `GET_OID_BLOB`), reads the
+  blob's patterns with the root as their base (`add_patterns_from_blob_to_list(oid, "", 0)`), and dies on either
+  failure ("unable to access sparse blob in '%s'", "unable to parse sparse filter data in %s"). Walking each sent
+  commit's tree, it asks every tree's and blob's full path, a tree as a directory and a blob as a file,
+  `path_matches_pattern_list`; an undecided path takes the verdict of the tree it is in, below the root a base that is
+  not matched (`default_match = 0`, `NOT_MATCHED`, though that line's comment says "default to include"). Every tree is
+  sent; a blob is sent when matched, and is otherwise left out for now and asked again wherever else it is met.
+- **The list** (`negotiation::sparse::Patterns`): read and asked as its module doc states, each rule from the function
+  it names. Two of git's choices are tests by name: a slashed pattern's rest is globbed as a pattern of its own after
+  its literal bytes (`ab**/c` matches `abx/y/c`), and an empty pattern, from a line of spaces or of a carriage return
+  alone, matches the root tree, whose name is empty.
+- **The glob.** `slates_vcs::wildmatch` (A-671), which has `WM_PATHNAME`: git globs a segment pattern without it, which
+  changes a verdict only at a `/`, and neither a segment nor such a pattern holds one. The property below holds every
+  generated list to a transcription that calls the glob where git calls `fnmatch_icase_mem`.
+- **Bounds.** The list's slots are counted and charged before it is made; each pattern's bytes and compiled glob as it
+  is made, before the list keeps it (`Glob::kept_bytes`, new: the room a glob's tokens keep, none holding heap of its
+  own).
+- **Tests** (`negotiation/tests/sparse.rs`, 10): seven hand-traced cases (git's non-cone sparse-checkout example, `/*`
+  then `!/*/`; segments by name, ending and glob; slashed paths from the root; a rest globbed alone; trees alone; the
+  blob's reading rules; an empty list); git's 100 MiB limit at its edge, a missing last newline counted; the admission;
+  and a property over generated blobs and paths against `dir.c`'s reader and matcher transcribed in their own shape
+  (`add_patterns_from_buffer`, `trim_trailing_spaces`, `parse_path_pattern` at each ask,
+  `last_matching_pattern_from_list`, `match_basename`, `match_pathname`). slates-vcs:
+  `a_pattern_keeps_room_for_each_of_its_tokens`.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r144, over main 5c0967fb2 with this
+  slice (`agents/g296-a640-p4` at e2b66d21a): `cargo test --locked -p slates-git --lib negotiation::sparse` 10 of 10;
+  `cargo test --locked -p slates-vcs --lib wildmatch` 4 of 4; `cargo fmt -p slates-git -- --check` and
+  `cargo fmt -p slates-vcs -- --check` clean. Failing first (kiln r133, over main acc2ac16f with this slice, in the
+  clone): with `Patterns::read`, `Patterns::decide` and `Glob::kept_bytes` stubbed, 9 of the 10 failed (the empty
+  list's test passes against an empty list by construction) and the slates-vcs test failed; restored, 10 of 10 and 4
+  of 4. No integration target reaches the module: slates-git has none, and nothing outside it calls the module yet.
+  The Linux and Windows runs are owed.
+- **Next slices.** The walk by path (`negotiation/objects.rs`): the graph's tree entries with their names (`Graph`),
+  git's frames kept per tree (`default_match`, `child_prov_omit`), every tree sent and a blob when some path matches
+  it, a tree whose blobs all went marked done, each frame charged; the request's filter served with its patterns, and
+  the one-round runs refused for it as now (`Filter::is_per_object`). The service (`upload`): `<blob-ish>` resolved, a
+  full id or `<rev>:<path>` through the refs' rules and other forms refused by kind, its blob read within the request's
+  admission, git's two refusals' words, and a stock git `sparse:oid` exchange recorded as a golden.
+
+### A-626 part 3, continued (1) — A checkpoint carries its copies' section and the identity's sum beside a copy's record alone: version 5, the anchor's layout 13 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); a regression A-626 part 3 made, found by g258's run of slates-server's lib and bisected by main to 637a65d69; §4.16 "Deltas older than the derived retention fold into checkpoint deltas", W3's doubling rule)
+Applied in the same change to: §4.16 and §4.17.4 (A-626 part 3's status blocks), GAPS (the §4.17.4 entry),
+`crates/merge/src/checkpoint.rs` (version 5: `Checkpoint::sum` an `Option`, `encode_copies_into`, `take_copies_section`,
+`take_sum`; the module docs) and its tests (`src/checkpoint/tests.rs`: the golden vectors derived again, a golden
+checkpoint of a green that never copied), `crates/merge/src/engine.rs` (`Green::checkpoint` taking the sum beside a
+copy's record alone, the restore taking one only where carried), `crates/merge/src/engine/copy_checkpoint.rs` (the module
+docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison below the copy),
+`crates/merge/tests/checkpoint.rs` (main's, by reading), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 13),
+`crates/anchor/tests/anchor.rs` (a segment of layout 12 refused at start), and the bug record
+`docs/bugs/2026-11-19-every-checkpoint-carried-the-identitys-sum-so-a-small-green-folded-late.md`.
+- **What was there.** Version 4 wrote the identity's running sum, 2,048 bytes, into every checkpoint, though a restore
+  needs it only beside a copy's record: without one, the sum holds nothing beyond the entries the restore makes as it
+  places the state. The service's doubling rule (`merge_service::checkpoint_green_when`) takes a checkpoint once the
+  increments it would fold reach the size of the checkpoint it holds, so every green's chain then waited on 2,048 bytes
+  of increments before its next fold. slates-server's
+  `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log` met it: its root, written
+  twice with no reader left, kept version 1 (the second increment, 194 bytes, under the 2,233-byte checkpoint at 1;
+  kiln r122, Mac Studio), and a branch there was made where the test expects `UnknownBase`.
+- **The fix.** Version 5: the copies' section (the copies' records and the copied tables) and the sum each sit behind a
+  presence byte, as the head check does, and are written beside a copy's record alone; the engine computes the sum only
+  then, and the restore takes one only where the checkpoint carries it. A green that never copied checkpoints in
+  version 3's tables and two bytes more. The anchor's layout is 13, so a segment of version 4 checkpoints is refused at
+  adoption, typed, as part 3's layout refused version 3's.
+- **Rejected.** *The test as stale*: it states the rule as the service holds it, a fold taken once the increments
+  outweigh the checkpoint; what changed was the size of every green's checkpoint, by bytes only a copy needs. *An
+  exception in the doubling rule* (the sum's bytes left out of the held size): the bytes would stay in every checkpoint,
+  in the partition's log and its snapshots, and the rule would carry a detail of one format.
+- **Tests.** The red: the repository test on main. Golden vectors derived again by A-626 part 3's pure-Python BLAKE3,
+  which still reproduces version 4's pinned vector (2,497 bytes, `13b881c8…51df3`): the checkpoint holding a copy,
+  2,499 bytes, `05c1e7f6…3865f09`; a new one of a green that never copied, 115 bytes, `dfa590d1…6de08c04`, each of its
+  presence bytes refused `BadKind` when neither. A version 4 header refused `BadVersion`. Part 3's replica test compared
+  the sums carried at 3, below the copy, where none is carried now: it compares the identity each moves to 3
+  (`Green::sum_at`) and the whole checkpoints there. A segment of layout 12 refused at start.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). Red: the
+  repository test on main (main's bisect, kiln r104; r122 at 3329211, the doubling rule's inputs printed into its
+  clone alone: a 2,233-byte checkpoint at 1, 194 bytes to fold, no checkpoint at 2). Green, kiln r146 at 189ab8dc3
+  over main 545181b30, the code landed here: the repository test 1 passed, and printed again the checkpoint at 1 is
+  155 bytes and the one at 2 is taken (195); `cargo test --locked -p slates-merge --lib -- copy checkpoint
+  engine::branch engine::node_tests engine::reanchor engine::stack::tests` 76 passed, none failed, the copy oracle's
+  fixed history meeting all 13 census cases (279 checkpoints carrying copies and 275 listing copied keys over its run,
+  each restored and replayed to its owner's identity); `--test checkpoint checkpoint` 4 of 4; `--test chain_replay
+  checkpoint` 3 of 3; `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and `--test anchor a_segment_` 6 of 6,
+  the layout 12 refusal among them; both crates' fmt checks clean. The same runs over main b13a6e05f (kiln r164, at
+  8919290ed, after A-676, the ipc protocol's and the server's submit changes): the repository test 1 passed, slates-merge
+  lib 77 of 77 filtered, the checkpoint tests 4 of 4 and 3 of 3, slates-anchor 2 of 2 and 6 of 6, fmt clean. Main's
+  commits after b13a6e05f change only manifest comments, the server's Mercurial site over HTTP and slates-svn's report
+  editor, none of which slates-merge or slates-anchor builds from or the repository test reaches.
+- **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
+
+### A-651 part 2 — git's upload-pack behind the SSH edge: A-640's entry point over an SSH session, the store lent a step at a time, git's server's exit status at each end, and protocols v0 and v1 refused over SSH (2026-11-19, g294, UI goal 93; §4.17.2 "A fetch", "Transports" item 2 and "Pieces (git)" piece 9; after A-651 part 1, A-640 parts 2 and 3, A-625 part 3 and A-662)
+Applied in the same change to:
+- §4.17.2's status; GAPS (the §4.17 entry, after A-651's line); `research/vcs-servers.md` §5.10 (git's reader at the
+  end of its input, pinned by hash);
+- `crates/server` (new: `vcs_ssh::git`, `UploadCommand`, and its tests; `vcs_ssh::site` gains `ToolServices`, which
+  starts it, and says what each service waits for).
+- **The session** (`UploadCommand`). Over SSH upload-pack speaks first: the advertisement is written as the command
+  starts. Each request is then measured whole by `slates_git::v2::request::whole_len` as the client's bytes arrive
+  (A-640 part 2: "or what `request::whole_len` measured of an SSH session's input"), consumed (its bytes given back to
+  the channel's window), served within the edge's room, and answered one whole pkt-line's room a step
+  (`pktline::MAX_LEN`), the edge stepping again only once that step's bytes have gone to the channel. A flush alone ends
+  the session 0. A request upload-pack refuses is answered in git's words (`ERR`, or band 3 under `sideband-all`) and
+  ends the session with `die`'s status, 128, as git's own server dies on one (`serve.c`: "unknown capability") [C].
+- **The end of the client's input** (g294's finding, reading git at `e1ec09b2`) [C]. git's server is gentle on it
+  only until a request's first packet is whole: `serve.c`'s `process_request` peeks that packet under
+  `PACKET_READ_GENTLE_ON_EOF` and returns quietly on the end (lines 286, 295, 302), then clears the flag (304), and
+  `pkt-line.c`'s `get_packet_data` dies "the remote end hung up unexpectedly" at a later short read (339, 371). So the
+  edge ends the session 0 when the input ends before a first packet is whole, and with 128 in those words after it.
+  git judges each line as it reads it, so a request ending after a line git refuses dies in that refusal's words
+  instead, such as "no command requested" (`serve.c` 350); the status is the same.
+- **Protocols v0 and v1** (found merging main, where A-640 part 3 had made slates-git answer them). slates-git answers
+  them statelessly, a whole request at a time as smart HTTP sends one (`upload/v0.rs`: "Stateless only"), while a v0
+  client over SSH negotiates in rounds on one stream, sending its wants once and its haves round by round, so a
+  stateless answer to its second round would have lost its wants. The edge therefore refuses a session at v0 or v1 at
+  its start, before any advertisement: one `ERR` packet, "upload-pack serves protocol v2 alone over SSH: ask for it
+  with git -c protocol.version=2", which git's client shows as a remote error, then `die`'s 128. git's client asks for
+  v2 over SSH by default (slates-git's `upload` module doc: since git 2.26), through `GIT_PROTOCOL`, the session
+  channel's one `env`. The stateful v0 session is owed (slates-git's GAPS line).
+- **The services** (`ToolServices`). upload-pack starts only over a store the lender holds. receive-pack (A-654),
+  Mercurial's `serve --stdio` (a lender of its store) and Subversion's tunnel (A-656) stay not served. A-662 holds each
+  repository's store on its owner shard, but the `StoreLender` over that map is on A-662's owed list, so no lender
+  holds a store yet, and the edge's production services remain `NotYet`.
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_ssh`, macOS arm64, Mac Studio d1323898, debug,
+  2026-11-19). The six of `vcs_ssh::git::tests` step the command as the edge does, over an empty SHA-1 repository's
+  store lent by a test lender: a v2 session advertised, answered and ended at a flush; a refused request answered in
+  git's words with 128; a v0 and a v1 session each refused with one `ERR` packet naming v2; the end of input before a
+  whole first packet ending the session 0, and inside a request dying 128 in git's words; upload-pack started only
+  over a held store.
+  - Red over main 77e5ffb46 at 8dfd557f (part 2 through its failing test 335dba43): 23 of 25. The end of input inside
+    a request ended the session 0 where git dies 128, and a v0 session was given slates-git's v0 advertisement where
+    the edge must refuse it.
+  - Green at caa2fc0f (the fix b22dd97c, and the v0 and v1 refusal): 25 of 25, no warning; `cargo fmt -p
+    slates-server -- --check` clean. Part 2's first red and green (8cf81d67, 15cc6b6a) were never built alone; their
+    code is in both runs.
+  - The test pack source refuses past admission, as the HTTP edge's tests' does since A-640 part 3 removed the stall.
+- **Owed.** The `StoreLender` over A-662's map, which makes upload-pack reachable; the daemon starting the SSH edge; the
+  stateful protocol v0 session over SSH (slates-git's); receive-pack (A-654), a lender of Mercurial's store, and
+  Subversion's tunnel (A-656); main's live OpenSSH `git clone` over SSH once a lender holds a store.
 
 ### A-625 part 3, continued — `--vcs-http ADDRESS`: the operator starts the shared HTTP edge, a fleet node presenting its own identity (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1; after A-625 part 3)
 Applied in the same change to: §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/api` (`role::ProcessOptions`'s
