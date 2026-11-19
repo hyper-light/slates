@@ -7658,7 +7658,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > successor's shipper named fresh members as holders, which the daemon's successor does not (it ships to the record's
 > holders), so a later phase one could count `f + 1` holders that held nothing; the model now takes the superseded
 > shipper's committed holders (A-601). What a superseded owner answers from its own state is the owner lease's to stop
-> (§4.8 "Leases and reads"); this is the log's half: what a successor reads and then serves.
+> (§4.8 "Leases and reads"); this is the log's half: what a successor reads and then serves. The lease's half, that a
+> deposed owner's lease lapses before any successor can commit and a lapsed lease answers no latest-state read, is
+> proven by the tests A-601, continued (2) cites.
 >
 > **Holders follow the candidates (2026-11-07, A-200's amendment of that date).** The shipper's holder set changes by a
 > joint transition (`Shipper::begin_transition`, `transferred`, `activate`); the daemon begins one whenever the
@@ -49968,4 +49970,43 @@ comment where `published` chooses a new shipper's holders); GAPS (the register n
     them `a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`,
     `a_successors_live_log_goes_on_past_every_position_durable_before_it` and
     `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to`.
+  - The Linux and Windows runs are owed.
+
+### A-601, continued (2) — The lease's half: a deposed owner past its lease never answers a read older than an acknowledged commit, proven by tests that already stand (2026-11-19, g229, main's piece for UI goal 82; §4.8 "Leases and reads"; AUD-08, A-351)
+Applied in the same change to: §4.10's live-log status (the lease's half cited). No code changed.
+
+- **The question.** A-601's goal reads "a stale owner never answers a read older than an acknowledged commit". Its
+  check covers what a successor reads; what a deposed owner answers from its own state is the owner lease's to stop.
+  Does a test prove that an owner whose lease lapsed refuses reads, typed, before any successor can commit?
+- **Yes: four rules, each tested, read together.** A successor commits only after phase one gathers its promotion
+  quorum.
+  - A holder promises a departed owner's object only once its own last answer to that owner, which may feed the
+    owner's lease, is older than the membership horizon. Tested by
+    `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease` (`crates/server/src/daemon.rs`),
+    with the gate's rule in `crates/server/src/lease.rs`:
+    `a_promotion_waits_for_the_departed_owners_silence_or_acknowledgement` and
+    `a_former_members_last_answer_holds_its_promotion_until_its_horizon`.
+  - Every promotion quorum contains a holder whose confirmation the lease needs, and one confirmation fewer would
+    leave some quorum unconfirmed: `every_promotion_quorum_meets_the_lease_confirmations_and_no_fewer_suffice`
+    (lease.rs, over every cohort and live set up to its largest `f`).
+  - The lease holds only on `f` fresh confirmations naming the owner's standing, and lapses one nanosecond past its
+    bound, measured from the probe's send time: `f_other_fresh_recognized_confirmations_hold_the_lease`. The bound
+    sits strictly inside the holder's horizon, by the clock-rate tolerance: `the_owner_bound_sits_inside_the_horizon`.
+  - So by the time any successor holds its quorum, some holder in it last confirmed the owner more than a horizon
+    before, past the owner's bound: the owner's lease lapsed before any successor could commit, and while it held,
+    no successor had committed anything the owner's reads could miss.
+- **And a lapsed lease answers no latest-state read.** A read meeting an unconfirmed lease is parked, not answered
+  (`crate::lease_wait`), and is refused `LeaseUnconfirmed` if the bound passes first. End to end, in a three-node
+  `f = 1` fleet, `an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green` isolates the
+  owner on the probe plane and pauses its control shard past a lease bound. Its lease lapses by the clock, the
+  successor takes the green over and commits version 4, and the deposed owner's head version and head read are
+  refused `Refusal::LeaseUnconfirmed`, while its pinned version-1 read is still served.
+  `a_status_meeting_a_lapsed_lease_waits_and_is_served_once_the_lease_confirms` shows the park's other side: a status
+  meeting a lapsed lease waits, and is answered once the lease confirms, never refused at once.
+- **Tests** macOS arm64, Mac Studio, 2026-11-19, kiln r10, on main bb535bd4d (this change is documentation alone, so
+  main's tree is the one it describes), `--test-threads=4`.
+  - `cargo test --locked -p slates-server --lib`, filtered to `lease::` and the holder's deferral: 13 of 13, every
+    unit test cited above among them.
+  - `cargo test --locked -p slates-server --test fleet` with the isolated owner's test, the parked status's and
+    `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`: 3 of 3.
   - The Linux and Windows runs are owed.
