@@ -1591,22 +1591,27 @@ fn recorded_deltas(server: &[u8]) -> Vec<Vec<Vec<u8>>> {
 /// alone and more after it, and with the header alone and nothing else.
 fn delta_shapes(deltas: &[Vec<Vec<u8>>]) -> (usize, usize, usize, usize) {
   let header = b"SVN\0".as_slice();
-  let first = |strings: &&Vec<Vec<u8>>| strings.first().map(Vec::as_slice);
   let joined = deltas
     .iter()
     .filter(|strings| {
-      first(strings).is_some_and(|bytes| bytes.len() > header.len() && bytes.starts_with(header))
+      first_string(strings)
+        .is_some_and(|bytes| bytes.len() > header.len() && bytes.starts_with(header))
     })
     .count();
   let alone_then_more = deltas
     .iter()
-    .filter(|strings| first(strings) == Some(header) && strings.len() > 1)
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() > 1)
     .count();
   let alone = deltas
     .iter()
-    .filter(|strings| first(strings) == Some(header) && strings.len() == 1)
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() == 1)
     .count();
   (deltas.len(), joined, alone_then_more, alone)
+}
+
+/// A delta's first string, if it has one.
+fn first_string(strings: &[Vec<u8>]) -> Option<&[u8]> {
+  strings.first().map(Vec::as_slice)
 }
 
 /// The `textdelta-chunk`s the report editor writes, to a client that takes svndiff 0 alone, for an added file whose
