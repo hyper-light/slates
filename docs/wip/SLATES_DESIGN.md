@@ -11931,6 +11931,17 @@ decides the details.
 > long-lived branch costs its source is that history, bounded by the source's retention budget. Owed: a branch's base
 > recorded as a delta against its source's checkpoint, which ends both.
 >
+> **Status (2026-11-19, A-685: a repository made from the command line).** `slates repository create NAME --tool
+> git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]` sends `CreateRepository` through the client
+> (`Client::create_repository`, `RepositorySpec`) and prints the repository's name and its root green's id; a name any
+> repository holds is refused `AlreadyExists` (exit 1). What a creator names by default is decided beside the verb
+> (`crates/server/src/repository.rs`: `object_formats`, `root_binding`), so every surface creates alike: git's SHA-1
+> (or SHA-256), its root bound to `main` or the branch named, held to git's ref rules under `refs/heads/`; Mercurial's
+> SHA-1, its root the first line of `default` or of the branch named (`branch:<B>:0`, the name its push reads);
+> Subversion's revision numbers, its one green bound to `root`, no branch taken. A format or a branch the tool cannot
+> have is a usage error before the daemon is asked. Owed: the other repository verbs' words (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`) on the command line, and the SDKs' and MCP's.
+>
 > **Status (2026-11-19, A-603: shared piece 2 built on the owner).** A repository's register is built in the metadata
 > database (`crates/db/src/repository.rs`, the entry's guard in `crates/db/src/repository/entry.rs`;
 > `Op::RepositoryAdvanced`). One entry commits, as one durable step, any of: several of the repository's greens'
@@ -12614,6 +12625,18 @@ engine: the verdict, rebase, position mapping, the register).
 > of them lists the hybrid first, so none warns here. Held to whole handshakes and rekeys against the test client,
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
+>
+> **Status (2026-11-19, A-651 part 4: the SSH edge serves a repository from its owner shard).** An `exec` that names a
+> repository another shard's partition holds moves its connection there, as the HTTP edge moves one once a head names
+> its repository (main's ruling, A-625 part 3): the site locates the repository by its name's route (D-14), and the
+> edge hands that shard the connection whole, with the `exec` undecided: its socket's handle, its session (the keys,
+> sequence numbers and channel, and whatever the client sent after the `exec`), the client's bytes the session has not
+> taken, its waits, its phase and its proven principal. Its seat comes back first; there it takes a seat as a new
+> connection would, at most as many arrivals waiting as the shard has seats, and the `exec` is dispatched where the
+> repository's record, policy and store are read with no crossing. Each shard keeps its own edge state, and only the
+> listener's holds the host key. Subversion's tunnel names its repository in its greeting, not its `exec`, so it is
+> served where it was accepted until its own move (A-688). Keeping an edge state on every shard as the daemon starts
+> the edge is A-684's.
 >
 > **Status (2026-11-19, A-651 part 3: the SSH edge proves a key by the credential record).** A key the session cannot
 > answer for at once waits for the record: the edge's key holders (`RecordKeys`, which replaced `NoKeyRecord`) answer
@@ -51503,6 +51526,111 @@ tests, new; `vcs_http.rs`'s `Exchange::reply_status` and module documentation).
   (unreachable over HTTP by `SVNParentPath`'s first-segment rule without a longest-prefix search across partitions); a
   browser's `?p=` and `?r=` and a directory's HTML listing; Basic on the cleartext loopback edge (A-686); main's runs
   (clippy, `xtask`, the other platforms, red-checks).
+
+### A-651 part 4 — The SSH edge serves a repository from its owner shard: an `exec` naming a repository another shard holds moves its connection there whole, as the HTTP edge moves one, and is dispatched there (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2; D-14; main's ruling for the HTTP edge, A-625 part 3; main's finding (a) after A-651 part 3)
+Applied in the same change to:
+- §4.17.2's status (part 4's); GAPS (the §4.17 entry: part 4's line after part 3's, whose owed line it closes);
+- `crates/server` (`vcs_ssh`: the move, `Exit`, `Exec`, `Moving`, `migrate`, `arrived`, `serve_arrival`, `seated`,
+  `seat_arrival` and `Arriving`; an edge state kept per shard, `keep_here`, `here` and `EdgeState::arrivals`, the host
+  key held by the listener's alone; the waiters for a seat a list; the counts `moved`, `arrived` and
+  `arrivals_refused` and the refusals `vcs_ssh.move_refused`, `vcs_ssh.arrival_lost` and `vcs_ssh.arrival_refused`;
+  `serve` takes a site maker that is `Clone + Send`; `vcs_ssh::site`: `SshSite::locate`, `ToolSite`'s through its
+  repositories' `locate`; `vcs_http`: `ShardRepositories` re-exported for the SSH edge; the tests).
+- **The finding.** Main's finding (a) after part 3: the SSH site found a repository on its own shard's partition alone
+  (`Repositories::find`), so an `exec` naming a repository whose name routes to another shard's partition was refused
+  as the tool refuses a missing repository (git: `fatal: '<path>' does not appear to be a git repository`, 128), where
+  the HTTP edge locates it and moves the connection there.
+- **The rule** (the HTTP edge's, main's ruling of 2026-11-19). Once an `exec` names a repository another shard's
+  partition holds, the connection goes there whole, and the `exec` is dispatched and answered there. What moves: the
+  socket's handle (`TcpStream::into_owned`, adopted there by `from_owned`), the session (its transport's keys and
+  sequence numbers, the channel, and whatever the client sent after the `exec`), the client's bytes the session has
+  not taken, its waits (each shard learns its own), its phase, its proven principal and when it was accepted (a
+  lifetime sample for the key time counts from the accept). Its seat comes back on the shard it leaves first, so that
+  shard's listener may seat a new connection at once; there it takes a seat as a new connection is seated: a free one,
+  else the most overdue connection's, reaped for it, else it waits, at most as many arrivals waiting as the shard has
+  seats, past which it is closed and counted. A connection moves only once its key proved a principal: an `exec`
+  without one is refused where it came. A command that names no repository (`svnserve -t`, whose client names the
+  repository in its greeting) is decided where its connection was accepted.
+- **Who waits for a seat.** The listener's one waker became a list, each kept once (`Waker::will_wake`), since
+  connections that moved to a shard wait for its seats beside its listener; a seat's return or an overdue mark wakes
+  them all, and each looks again. The list holds at most the listener and the arrivals admitted, one per seat.
+- **The host key.** Only the listener's shard makes sessions, so only its state holds the host key's seed; every other
+  shard keeps one without (`EdgeState::arrivals`). A connection that moved carries its session, whose host key signs
+  its rekeys.
+- **Tests** (macOS arm64, Mac Studio d1323898, debug, 2026-11-19).
+  - `cargo test --locked -p slates-server --lib -- vcs_ssh --test-threads=4`: the site locates git's two services and
+    Mercurial's on a repository another shard holds, a path with its slash and one without, and git's on a repository
+    here and Subversion's tunnel here; and on a two-shard audit daemon whose SSH edge listens on its first shard, the
+    owner's key enrolled in the credential record and a git repository created on each shard's partition,
+    `git-upload-pack` over a connection each runs its command for its own repository on the shard that holds it, the
+    first shard counting two accepted, one moved and one run and the second one arrival and one run. That test serves
+    the production site (`ToolSite` over `RecordKeys` and `ShardRepositories`), its services a test's.
+  - Red at aa16b067 (the tests over a `locate` that answered here; over main 9f349d66, kiln r298): 28 of 30, the two
+    new tests failing: the site located every command here, and the second repository's `git-upload-pack` was refused
+    as git refuses a missing repository (`fatal: '/ssh-1.git' does not appear to be a git repository`). Green at
+    ae8071d7 (kiln r324): 30 of 30 on its first build, no warning, `cargo fmt -p slates-server -- --check` clean. As it
+    lands, over main 693bc8fe (gate copy 679b5677, kiln r335; slates-http, -http-edge, -svn, -git, -hg and -server
+    compiled afresh): 30 of 30, no warning, fmt clean.
+  - No integration target reaches the edge: nothing outside its tests starts it until A-684.
+- **Owed.** The daemon keeping an SSH edge state on every shard as it starts the edge (A-684, g299: `keep_here` with
+  `EdgeState::new` on the listener's shard and `EdgeState::arrivals` on the others); Subversion's tunnel moved to the
+  shard of the repository its greeting names (A-688); a test of an arrival that waits for a full shard's seat and of
+  one refused past the bound; main's live OpenSSH `git clone` over SSH and the other platforms' runs.
+
+### A-685 — A repository made from the command line: `slates repository create`, each tool's defaults decided beside the verb (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); §4.17.1 "The repository and its greens" item 1; §4.12; A-575's `CreateRepository`, the interop tests' first verb)
+
+Applied in the same change to: §4.17.1 (a status block), GAPS (the §4.17 entry), `docs/cli.md`, `crates/server`
+(`repository`: `object_formats`, `root_binding`, `RootRefused`, re-exported from the crate's root; `git_push`: `HEADS`
+and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_repository`; `VcsTool` and
+`ObjectFormat` re-exported), `crates/cli` (`args`: the verb, its four flags, its usage lines and two grammar tests;
+`verbs`: its answer; `tests/cli.rs`: the anchored test, the edge's request helper shared).
+- **What was there.** `CreateRepository` (A-575) was sent only by the server's own tests and the Subversion migration's
+  tests: no client or CLI verb made a repository, so no stock git, Mercurial or Subversion client could be pointed at
+  one, and every interop test was blocked on it.
+- **The verb.** `slates repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root
+  GREEN] [--json]` sends `CreateRepository` through the client (`Client::create_repository` with a `RepositorySpec`,
+  `CreateRepository`'s fields), routed to the partition the name hashes to as every repository verb is, and prints
+  `repository: NAME` and `id: ROOT`, the root green's id (the reply's `GreenCreated`), or `{"repository","id"}` under
+  `--json`. A refusal is the client's, exit 1 as every verb's: a name any repository holds, whatever its tool,
+  `AlreadyExists`; an empty name or one holding a NUL `InvalidName`; a root that cannot join `NotGreen`, `Forbidden` or
+  `NotFound`.
+- **Each tool's defaults, decided beside the verb.** A client names what the server's namespace reads, so the defaults
+  live in the server crate (`repository::object_formats`, `repository::root_binding`) and the command asks them; an SDK
+  or MCP surface creating a repository asks the same. Formats (item 1): git SHA-1, the format git takes when none is
+  named (A-600), or SHA-256; Mercurial SHA-1 alone; Subversion revision numbers alone; the first is each tool's default.
+  The root's binding: git's branch `N` is the name `N`, the ref `refs/heads/N` (`git_push`'s namespace), `main` when
+  none is named (the branch the server's push tests and its stock-git captures bind; a stock clone of the empty
+  repository takes it from the unborn `HEAD` the site advertises), held to git's ref rules (`git_push::ref_of`), and a
+  name beginning `refs/` refused since the namespace reads it as a ref of its own, never a branch; Mercurial's branch
+  `B` is its first line `branch:<B>:0`, `default`'s when none is named, the green `hg_push`'s module docs say the verb
+  makes and a new repository's first push takes (a root bound to the bare name would leave a first push "no line to
+  make a branch from"); Subversion's one green is bound to `root`, its branches being directories in it (§4.17.4), and
+  a branch named for it is refused. A format or a branch the tool cannot have is refused as usage (exit 2), naming the
+  flag, before the daemon is asked.
+- **Not taken.** A wire `default_branch` the server fills when empty: a second meaning for one field, a mode switch.
+  The defaults kept in the CLI: Mercurial's line names are the server's encoding, and a second copy would drift.
+- **Tests.** The grammar (`crates/cli/src/args.rs`): `the_grammar_parses_the_repository_verb` (each tool's defaults,
+  every flag as given, Mercurial's branch by its first line) and `the_grammar_refuses_a_repository_its_tool_cannot_have`
+  (no tool, a tool slates serves none of, a format each tool cannot name, `refs/heads/main` and `a..b` for git, a
+  branch for Subversion, a root that is no id, the verb's own form). A real anchor (`crates/cli/tests/cli.rs`,
+  `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`): an anchor with `--vcs-http 127.0.0.1:0`; the
+  create answers the name and a 32-digit root id; the name again, for Mercurial, refused `AlreadyExists` (exit 1); a
+  Mercurial, a Subversion and a SHA-256 git repository (`--json`) each created with its defaults; a token enrolled with
+  `slates credential token` and sent as a bearer token finds the repository by its name (receive-pack's advertisement,
+  `200`) where a name no repository has answers `404`. Where no issuer surface is published (Linux) the token's leg
+  skips loudly.
+- **Runs.** macOS arm64, Mac Studio (kiln r294, 2026-11-19 22:35-22:45Z, debug, rustc 1.98.1, `CARGO_BUILD_JOBS=2`, a
+  fresh clone of the branch at dbe8ba1ef, load 7.7). Red first, on the same tree with the verb's dispatch taken out of
+  the grammar, so `repository` is unknown to it: `cargo test --locked -p slates-cli --bin slates the_grammar` 11
+  passed, 2 failed (the two above, each at its first parse); `--test cli a_repository_the_cli_creates` 1 failed, its
+  first create answered exit 2 (usage). Green: `--bin slates the_grammar` 13 of 13; `--test cli vcs_http` 3 of 3 in
+  5.2 s (this test and the two A-625 edge tests, whose request helper it now shares). `cargo fmt -p slates-cli -p
+  slates-client -p slates-server -- --check` asked for layout alone; rustfmt's own patch from that clone is applied.
+  Main's: clippy, `xtask check`, the doc gates, the Linux and Windows runs.
+- **Owed.** The other repository verbs on the command line (`CreateBranch`, `BindBranch`, `RetireBranch`,
+  `SetRepositoryPolicy`, `ImportRepository`); the SDKs' and MCP's words for them; the server's own refusal of a format
+  its tool does not name (today it records the repository, and a git one in revision numbers gets no store,
+  `vcs_store.unmade` counted; the command refuses it before asking); the Linux and Windows runs (main's).
 
 ### A-689 — The svn:// listener: `slates anchor|daemon --vcs-svn ADDRESS`, held by the anchor across daemon restarts (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's first slice; after A-625 part 3 continued (2))
 Applied in the same change to: §4.17.4's status; §4.17.2's status (A-625 part 3 continued's reader, renamed); GAPS
