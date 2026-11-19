@@ -4238,7 +4238,7 @@ impl Green {
       .flat_map(|(dst, records)| {
         records
           .iter()
-          .map(move |record| copy::appearance_bytes(dst, &record.source))
+          .map(move |record| copy::record_bytes(dst, record))
       })
       .sum();
     indexed.saturating_add(copies)
@@ -4521,8 +4521,9 @@ impl Green {
   /// What the change index grows by when `inc` commits (§4.2 all-cost admission): each path its ops name, recorded at
   /// the new version and as its last change, and the hard links naming any of them that is a special. Secured before
   /// the verdict with [`Green::history_reservation`]; the settle after it trues the charge up to what the index holds,
-  /// crediting a path already recorded and charging the paths a directory's move derives for its children.
-  /// Nothing for an increment already accepted.
+  /// crediting a path already recorded and charging the paths a directory's move derives for its children. A copy from a
+  /// version its source changed after keeps its fix with its record until the fold floor reaches it (A-626 part 3),
+  /// charged here as its chain entry's room is ([`Green::copy_entry_room`]). Nothing for an increment already accepted.
   pub fn changes_reservation(&self, inc: &Increment) -> usize {
     if self.accepted.contains_key(&inc.id) {
       return 0;
@@ -4549,6 +4550,7 @@ impl Green {
     indexed
       .saturating_add(Green::copy_records_reservation(inc))
       .saturating_add(self.replace_changes_reservation(inc))
+      .saturating_add(self.copy_entry_room(inc))
   }
 
   /// The bytes the copies `inc` declares add to the change index's charge: one record each (A-586).
@@ -4795,6 +4797,7 @@ impl Green {
     let previous = self.folded_below;
     self.folded_below = floor;
     let before = self.history_bytes().saturating_add(self.changes_bytes);
+    self.release_kept_fixes(floor);
     self.fold_changes_before(previous, floor);
     self.fold_content_before(floor);
     self.fold_specials_before(floor);

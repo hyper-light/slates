@@ -14,6 +14,13 @@
 //!   holds beyond the restored state's own entries is kept beside it (`copies_before`), so the recount still equals
 //!   the identity.
 //!
+//! A copy at or before `F` needs nothing more after the restore: its keys read their current values from its record
+//! on, and the identity is past it. A copy the restored green replays after `F` may name a source version before `F`
+//! (the owner judged it above its own fold floor); what it brought is read from its graft, the source at the version
+//! before it with its fix, which its chain entry carries, never from the source's history at that version, which the
+//! restored green does not hold (`Green::brought_entry`, the parent module's docs). The checkpoint's format is the same
+//! either way: a copy's record carries no fix and no copied entry.
+//!
 //! **Cost.** Each copied tree at or before `F` is listed key by key, O(the trees' keys, and the files' bytes they hold),
 //! where the green holds each tree by reference: the price of a checkpoint that a restore reads alone. Moving the sum to
 //! `F` costs what a branch at `F` costs, the keys changed since `F`. A green with no copy pays nothing more but the sum.
@@ -294,12 +301,15 @@ impl Green {
       .iter()
       .position(|kept| kept.version > record.version)
       .unwrap_or(records.len());
+    // No fix: a copy at or before the checkpoint stands at or below the restored green's floor, where nothing reads what
+    // it brought (`Green::release_kept_fixes`).
     records.insert(
       at,
       Appearance {
         version: record.version,
         source: record.source.clone(),
         source_version: record.source_version,
+        fix: None,
       },
     );
     let last = self
