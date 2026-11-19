@@ -50,17 +50,20 @@ client-facing bound from what a resend waits on (counts or the daemon's time), r
 loadtest-scale's figures (each resend's lane queue position, age when served, lane entries per request
 id) and their failing test's name; none had arrived. Supervisor's order: this before other test flakes.
 
-## A-232 (g255): not started
-Design agreed with the supervisor 2026-11-08: a call waits while its daemon lives; a daemon judged stuck
-is ended by its supervisor (the anchor, or for a daemon run alone its own watchdog, on the same verdict).
-The client sees DaemonGone; Stalled for a live daemon goes away. Scope: slates_client::driver's overdue
-Stalled, the sync round_trip, send's ring-full wait (crates/client/src/client.rs), the watchdog's
-self-end for an unsupervised daemon, SDK tests asserting Stalled for a stopped daemon rewritten (not
-deleted); §4.7's two rules and §4.14 rewritten under A-232's amendment. Bound per liveness:
-t0 + 2·W + B + L + kill (W = LIVENESS_BUDGET_NS, B = HEARTBEAT_NS, L the anchor's measured lateness
-p99). Edge to name: a SIGSTOPped unsupervised daemon cannot end itself. Tests: CPUWeight=1 on Linux CI
-never fails a call; a stuck shard fails it within the bound; an unsupervised stuck daemon ends itself.
-Builds on liveness's starved-is-not-stuck rule (now on main per GAPS).
+## A-232 (g255): its core is on main (correction, read before starting)
+A kiln subagent started from my goal stack (01a1d6ca8b63, now gone) worked it while I was away and
+reported the goal met (2026-11-14), and main carries the rule since 2026-11-13: crates/client/src/client.rs's
+header says a live daemon's call waits however long the work or however starved its threads, a daemon
+judged stuck is ended by its supervisor or by its own watchdog when it runs alone, and the call then fails
+`DaemonGone`; `defers_reply` is gone. Record: docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md.
+Related on main: 3e93acc84 (reconnect while the rendezvous has a holder, else DaemonGone at once),
+61b5940f8 (one full-ring wait rule), 979584c68 (a lone daemon's end), 335ac9415. So check the goal's
+remaining items against main rather than building from scratch. The design agreed 2026-11-08, for
+comparison: Stalled for a live daemon goes away; the async driver, sync round_trip and ring-full wait
+follow one rule; SDK tests asserting Stalled for a stopped daemon rewritten; §4.7's two rules and §4.14
+under A-232's amendment; bound t0 + 2·W + B + L + kill (liveness); a SIGSTOPped unsupervised daemon cannot
+end itself; tests: CPUWeight=1 never fails a call, a stuck shard fails it within the bound, an unsupervised
+stuck daemon ends itself.
 
 ## How I ran evidence
 Diag lanes: push a commit adding `.github/workflows/diag-clients.yml` (and a `.github/diag-*.sh`
