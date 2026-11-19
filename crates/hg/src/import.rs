@@ -838,7 +838,7 @@ impl<F: RepositoryFiles> Walk<'_, F> {
     let read = if self.shape.bookmarks_in_store {
       self.read_store_file(BOOKMARKS, &mut room)?
     } else {
-      self.files.read(&[BOOKMARKS], &mut room)?
+      read_whole(self.files, &[BOOKMARKS], &mut room)?
     };
     let Some(bytes) = read else {
       return Ok(());
