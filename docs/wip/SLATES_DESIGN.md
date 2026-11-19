@@ -11492,7 +11492,8 @@ against what that copy brings there.
 > - Renaming the home moves the node, and its links name it at the new path.
 > - A later file at a path the node left is another node, which no link names.
 > - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
->   unchanged since, a file while it was not removed since), or the one the work makes.
+>   unchanged since, a file or IPC node that stood there at the base and was not removed since), or the one the work
+>   makes. A node made at the target after the base is none the work saw (A-676).
 >
 > The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
 > head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
@@ -11508,7 +11509,10 @@ against what that copy brings there.
 > restate_tests.rs`). Since A-670 a work never hands a node to a link it never saw: removing a file, or renaming
 > another over it, is refused when a link naming it was made after the work's base and none of the base's links to it
 > outlives the work (delete against modify, rename against rename), unless the work hands the node on itself; a
-> stack's upper alike for a link another version made under the stack.
+> stack's upper alike for a link another version made under the stack. Since A-676 a link to a file or IPC node made
+> at its target after the work's base, where none stood then, is refused delete against modify
+> (`Green::node_stood_at`): the verdict had judged such a target only by a removal since, so a forged link named a node
+> its work never saw.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -48851,6 +48855,80 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   each part whole into the content store, which has no put by pieces; the owner driving encodings by turns once it
   holds a git repository (A-625 part 3); a turn's span measured on the owner (main's); the red-checks and the other
   platforms' runs (main's).
+
+### A-654 part 1 — receive-pack's session owns its parts, and its verdicts are read only beside the appends (2026-11-19, g258, UI goal 93; §4.17.1 "A push is a work" items 1 to 5; §4.17.2 "A push" items 6 and 7; A-620, A-642, A-645, A-662)
+
+- **What was there.** A-620's `Session` borrowed its advertisement and its hidden refs for its life, and `Works` held
+  the greens shared and the appends exclusive at once; a create's work was built over an empty green. Neither fits
+  the server: a connection's task keeps its session between the bytes its edge hands it, and on the owner shard the
+  greens, the appends and the push's object view are one `ShardState`, which A-662's `push_sealed` changes.
+- **The decision.** (1) A create is made at the version of the green its new value's first parent heads, where one
+  can still be branched from, else at the default branch's head, its work the whole difference against that
+  version's tree; over an empty green only while the default branch is unborn (main's ruling of 2026-11-19).
+  (2) A green is lent to the judge for one call, by closure (`Greens::read`, `Greens::base_of_create`), as the server
+  lends one member of a lineage at a time (A-575). (3) `Session` keeps a copy of its advertisement (`Advertised` is
+  `Copy`) and owns its hidden refs, so a caller keeps it across its own steps; `HiddenRefs for &T` keeps callers that
+  hold the predicate themselves. (4) `Verdicts` judges a command and appends nothing; `Works` pairs it with an
+  `Appends`; a server whose greens and appends are one state judges through `Verdicts` between its own appends and
+  answers in git's words through `append_declined` and `atomic_declined`. (5) `Unappended::Refused { at, why }`: an
+  append's own refusal (the shard's budget, the register's capacity, an approval the branch requires) under git's
+  `failed to update ref`, slates' reason on band 2.
+- **Tests** (`crates/git/src/receive/tests/`): a create made at its first parent's version and an orphan create
+  stating the whole difference from the default head (`works.rs`); a session made from parts that go out of scope at
+  once, kept in a caller's struct and fed the create push in pieces, answering byte for byte as a borrowing one
+  (`session.rs`); an entry the append refused for its own reason answered in git's words with slates' on band 2,
+  alone and atomic (`works.rs`).
+- **Evidence.** macOS arm64, Mac Studio (kiln, debug, 2026-11-19), on the merged tree 6f2d690eb: `cargo test --locked
+  -p slates-git --lib receive::` 42 of 42, the five A-654 tests among them; `--lib protected_fixtures` 5 of 5 and
+  `--lib store::views` 7 of 7 (the other users of the reader and the judge); `cargo fmt --all -- --check` clean; no
+  warning in `receive`. The first run (r131) failed the annotated tag's test alone, written for A-620's create over an
+  empty green: under (1) a tag of a root commit is made at the default head and its work is the head alone, so the
+  test now submits it to a green holding that version. slates-git has no integration target, and nothing outside it
+  calls the session or the judge until part 2. Main's: clippy, `xtask check`, the doc gates and the other platforms.
+- **Owed (part 2): the server's driver** (`crates/server/src/git_push.rs`, one entry point for the HTTP edge, g299,
+  and the SSH edge, g294): `start` writes the advertisement of the branches whose greens hold a git head, a ref the
+  pusher may not read under A-622's policy hidden; `input` and `end` feed the session over A-638's `IndexedObjects`
+  lent the shard's room (A-662's `lent_to_read`); `answer` admits the checked objects to A-662's `GitPush` and seals
+  it, asks A-622's `admit` (Submit, Rewrite for a move A-614's admission finds no fast-forward, Delete), refuses
+  typed while a git hook is configured and its view is owed (A-665 part 2), and decides through a server judge:
+  `Verdicts` over the shard's greens, whose `version_of` answers only a green's current head until A-664's
+  server-made commits allow a push based on an older version, then `push_sealed` for each entry, or once for all
+  under `atomic`; the report written to the caller's bytes.
+- **Applied in the same change to:** `crates/git/src/receive/works.rs` (`Verdicts`, `Works`, `Greens`,
+  `Entry::Create::from`, `Unappended::Refused`, `append_declined`, `atomic_declined`, module docs),
+  `receive/session.rs`, `receive/request.rs` (`RequestReader` keeps a copy), `receive/mod.rs` (`HiddenRefs for &T`),
+  and their tests; GAPS (the §4.17 entry).
+
+### A-676 — A link to a node made at its target after the work's base is refused (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "The verdict", A-646's decision; found by g307's reading)
+
+- **What was wrong.** A hard link a work makes names the node at its target at the work's base (A-646). For a file or
+  IPC node standing at the target now, `Green::node_home` asked only whether one was removed there after the base
+  (`file_removed_since`), so a node made there after the base, where nothing stood at it, answered as the link's node:
+  the link was accepted naming a node its work never saw, though `node_home`'s own doc and A-646's rule make it delete
+  against modify. No deriver makes such a link (`link(2)` answers `ENOENT` at the base, and a target the work makes is
+  its own, `made`), so only a forged or hand-built increment reached it. g307 found it by reading, fixing
+  `hard_link_merges` (8d7209388).
+- **The change.** `Green::node_stood_at(path, base)`: whether a file or an IPC node stood at the path at the base, read
+  off the histories by the one history rule and the copies (`content_len_at`, `special_at`), never by copying the file;
+  `node_home` refuses a node at the target that stood nowhere at the base, as it refuses one removed since. Exact at and
+  above the fold floor, as `special_kind_changed`'s read of the base is; the service folds only below the oldest base a
+  live reader names. A copy replacing the target after the base needs nothing new: `remove_file_now` records it in
+  `file_removed`.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, 2026-11-19). `a_link_to_a_node_made_after_its_base_conflicts`
+  (`crates/merge/src/engine/node_tests.rs`): a file, and a FIFO (`Work::fifo`), made at `made` after version 0, each
+  linked by a work based at 0; each must be refused `DeleteModify` with no link made, and the test names every kind it
+  misjudges. Red (20:05 UTC) with `engine.rs` put back to its state before the fix (main effb30ac2) in a scratch clone:
+  `cargo test --locked -p slates-merge --lib -- engine::node_tests::a_link_to_a_node_made_after_its_base_conflicts`
+  failed, both links accepted (`a file: Accepted { version: 2 }; a FIFO: Accepted { version: 2 }`). Green over main
+  effb30ac2: `cargo test --locked -p slates-merge --lib -- engine::node_tests engine::replaced_node_tests
+  engine::restate_tests engine::stack` 62 of 62. Over main 545181b30 (A-658 part 1, the verdict computed anywhere;
+  20:11 UTC): the same with `engine::compute_tests` 68 of 68; `cargo test --locked -p slates-merge --test engine --
+  hardlink hard_link` 6 of 6; `cargo fmt -p slates-merge -- --check` clean. Main's commits since, to 5c0967fb2, touch
+  nothing slates-merge builds from. Main's (§8): the other platforms, clippy and the whole suites.
+- **Applied in the same change to:** §4.16 A-646's decision (the link rule's bullet, and its status); GAPS (A-676's
+  entry after A-643's siblings); `crates/merge/src/engine.rs` (`node_home`, `node_stood_at`),
+  `crates/merge/src/engine/node_tests.rs`, `crates/merge/src/engine/replaced_node_tests.rs` (`Work::fifo`, `fifo_node`);
+  `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md` (new).
 
 ### A-640 part 4, first slice — A sparse filter's pattern list, read and asked as git's `dir.c` reads and asks it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-671)
 Applied in the same change to:

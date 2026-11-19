@@ -36,6 +36,8 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304) and Subversion's (g268), refused `Owed` until then; the Subversion index charged by its bytes once slates-svn measures them; a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the `StoreLender` for upload-pack over this map (A-625 part 3); the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-654 part 1 (2026-11-19, g258; git's push end to end, its slates-git half).** BUILT: a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs, so a connection's task keeps it; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). OWED (part 2): the server's driver `crates/server/src/git_push.rs` (advertisement, input and end over A-638's view lent the shard's room, A-662's quarantine and seal, A-622's admit, hooks refused typed until A-665 part 2's view, a judge of `Verdicts` over the shard's greens with `push_sealed` per entry or all under `atomic`, the report), one entry point for the HTTP edge (g299) and the SSH edge (g294); a push based on an older version than its green's head refused as a ref that moved until A-664's server-made commits.
+>
 > §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
@@ -2963,6 +2965,19 @@
 >    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links
 >    naming the node keep it rather than refuse its removal.
 > Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
+
+> **A link to a node made at its target after the work's base was accepted: fixed (2026-11-19, A-676, g306; found by
+> g307's reading while fixing `hard_link_merges`; §4.16 "The verdict", A-646).** A hard link names the node at its
+> target at the work's base, and `Green::node_home` judged a file or IPC node standing at the target only by a removal
+> since the base, so one made there after the base, where none stood, was taken as the link's node: a forged link named
+> a node its work never saw (no deriver makes it, since `link(2)` answers `ENOENT` at the base). Now
+> `Green::node_stood_at` reads the base (`content_len_at`, `special_at`, never copying the file), and a node that stood
+> nowhere then is refused delete against modify, as one removed since is. Test:
+> `a_link_to_a_node_made_after_its_base_conflicts` (`crates/merge/src/engine/node_tests.rs`, a file and a FIFO). macOS
+> arm64 (Mac Studio, kiln, 2026-11-19): red with `engine.rs` as before the fix, both links accepted; green over main
+> 545181b30, `slates-merge --lib` filtered to the node, replaced-node, restate, stack and compute tests 68 of 68,
+> `--test engine` filtered to hard links 6 of 6, fmt clean; the other platforms are main's. Bug record:
+> `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a
