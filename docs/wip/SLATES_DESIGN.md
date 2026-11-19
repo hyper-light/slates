@@ -47370,14 +47370,16 @@ Applied in the same change to:
     holds between its admission and its append (a hook's wait); and each object's bytes are read back from the content
     store then (`ContentStore::windows`), so a push's bytes are held once, by its quarantine and charged, until its
     entry takes its record: the writer notes an object's type, id, root and length alone. Every record a push writes
-    carries its deepest chain, and a replay hands it to the replayed push (`Push::carried`), since a later append of a
-    push without `atomic` holds its moves alone. An object arriving under a claimed id the repository indexes already
-    is passed over at admission. `RepositoryEntry::objects` carries the record opaquely; the partition's register keeps
-    each entry's objects in the order it received them for the repository's life, charged to the merge budget and
-    carried by its snapshot (`Repositories::objects`, `object_record`). They take no position, so an entry with objects
-    and one green stays a single-green append and joins nothing (A-642). The store's versions of each green
-    (`GitStore::versions`) are charged to the content store's budget as A-614's store charges its chains, by their
-    entries.
+    carries its deepest chain, and a replay hands it to the replayed push (`Push::carried`): a later append of a push
+    without `atomic` holds its moves alone, and a push whose objects another committed first holds none, yet its
+    pack's chain is what the store's learned depth reads (`Repository::learned_depth`), whose value a recovery must
+    reach too. An object arriving under a claimed id the repository indexes already is passed over at admission; every
+    other object new to the push is noted, and the append decides. `RepositoryEntry::objects` carries the record
+    opaquely; the partition's register keeps each entry's objects in the order it received them for the repository's
+    life, charged to the merge budget and carried by its snapshot (`Repositories::objects`, `object_record`). They take
+    no position, so an entry with objects and one green stays a single-green append and joins nothing (A-642). The
+    store's versions of each green (`GitStore::versions`) are charged to the content store's budget as A-614's store
+    charges its chains, by their entries.
   - **Guard then apply.** The store commits between the register's guard (`Partition::check_creating`, which charged
     the record) and the entry's apply, inside the append (`repository::push::push_sealed`), so a push a rule, a verdict
     or the guard refuses never reaches the store; a store that refuses (its budget) refuses the entry with nothing
@@ -47422,7 +47424,8 @@ Applied in the same change to:
     held blobs sent again, objects in pack order and reversed, several pack depths) against a store never recovered and
     one made again from its records at generated points; after each recovery and at the end both equal whole (every
     position's id and row, each ref's D(k), heads, trees, derived values and reached set, every content with its
-    holders) and both make the same records; a fixed history counts every kind of push and three recoveries;
+    holders, the learned depth) and both make the same records; a fixed history counts every kind of push and three
+    recoveries;
   - a record whose bytes are not its identity's (`Identity`), one the admission would not make (`Diverged`) and one
     naming a commit nobody sent each refused, leaving the store as it was;
   - each tool's arm made with its record, Mercurial's and Subversion's records refused `Owed`, a refused store named
@@ -47431,9 +47434,12 @@ Applied in the same change to:
     each, the second without the blob the first brought; the charge equal to what the store holds; the store made again
     from the partition's log equal whole and replaying both records; freeing gives every byte back;
   - a push appended a ref at a time from one sealed push whose pack was two deep, and two pushes in flight sharing a
-    commit, each made again from the partition's log equal whole with every record replayed; the oracle generates both
-    (a push moving two refs committed a ref at a time; a push held back while the next commits a blob it holds), and the
-    fixed history's census counts each;
+    commit, the second from a deeper pack and recording no object, each made again from the partition's log equal whole
+    with every record replayed; the oracle generates both (a push moving two refs committed a ref at a time; a push held
+    back while the next commits a blob it holds, or everything it holds), and the fixed history's census counts each,
+    its held push's pack deeper than any before so a record holding no object must carry its chain;
+  - slates-git: a push of no object handed a chain (`Push::carried`) teaches the store's learned depth as the live
+    push did, at most git's limit (`a_chain_carried_by_a_push_of_no_object_teaches_the_depth`);
   - the writer: a record holds what the repository lacks when it is written, a long object's bytes whole from its
     windows, and an object the content store does not hold is refused `Unreadable`, never written short; a record's
     room the allocator refuses is answered `BudgetExceeded` with what the shard could admit;
@@ -47450,5 +47456,6 @@ Applied in the same change to:
   `state.rs`, `daemon.rs` (the field), `repository.rs` (`install_root` makes the store), `repository/push.rs`
   (`push_sealed`, the store's commit between the guard and the apply, the rebuild), `verbs.rs` (the recovery's call); `crates/db/src/catalog.rs` (`RepositoryEntry::objects`, `RegisterRecord::objects`),
   `repository.rs` (the register's objects, `objects`, `object_record`), `repository/entry.rs` (their charge) and its
-  tests; `crates/git/src/store/push.rs` (`Push::object` public, `Push::carried`); `Cargo.toml` (slates-hg, slates-svn),
+  tests; `crates/git/src/store/push.rs` (`Push::object` public, `Push::carried`), `store/repository.rs`
+  (`Repository::learned_depth`) and `tests/store/fragments.rs`; `Cargo.toml` (slates-hg, slates-svn),
   `crates/server/Cargo.toml`, `Cargo.lock`.

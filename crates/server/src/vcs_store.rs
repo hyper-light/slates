@@ -22,16 +22,18 @@
 //!
 //! **Durable as greens are.** A push's objects are its changeset; everything the store computes from them (positions,
 //! rows, D(k), reached sets, derived values, pack fragments) is derived. A git push's one entry (A-635's append) holds
-//! its record ([`record`]): the content identities of the objects its quarantine sealed that the repository did not
-//! hold, in admission order, with their bytes and the moves the store committed them with. The partition's register
-//! keeps each entry's objects for as long as the repository lives and a snapshot carries them (`slates_db`, A-662). The
-//! store commits between the register's guard and the entry's apply ([`commit`], called by the append), so a push the
-//! guard or a verdict refuses never reaches the store. A recovery makes each store again and replays every record, in
-//! log order, through the live path's own steps: admission, seal, the moves, the commit and the derived values kept
-//! ([`replay_git`]), and refuses a record whose objects are not the contents it names or whose admission makes another
-//! record. That is guard then apply, as `slates_db::partition` replays its log, so the store after a recovery equals the
-//! store before. A commit whose entry was then not made durable leaves the store ahead of the log, so the store is made
-//! again from the log the same way ([`rebuild`]).
+//! its record ([`record`]), written as the append commits: the objects of the push that the repository lacks then, by
+//! the predicate the store's commit gives positions by ([`record_of`]), by content identity in admission order with
+//! their bytes; the moves the store committed them with; and the deepest chain the push's pack carried, which every
+//! record of the push carries. The partition's register keeps each entry's objects for as long as the repository lives
+//! and a snapshot carries them (`slates_db`, A-662). The store commits between the register's guard and the entry's
+//! apply ([`commit`], called by the append), so a push the guard or a verdict refuses never reaches the store. A
+//! recovery makes each store again and replays every record, in log order, through the live path's own steps:
+//! admission, seal, the moves, the commit and the derived values kept ([`replay_git`]), and refuses a record whose
+//! objects are not the contents it names or whose admission would record other objects. That is guard then apply, as
+//! `slates_db::partition` replays its log, so the store after a recovery equals the store before. A commit whose entry
+//! was then not made durable leaves the store ahead of the log, so the store is made again from the log the same way
+//! ([`rebuild`]).
 //!
 //! **Keys.** A-614's store names a green by a `u64` ([`green_key`]): the half of its volume id that holds its partition
 //! and counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
@@ -429,8 +431,8 @@ fn within_budget<T>(
   answer
 }
 
-/// A git push in its quarantine (§4.17.2 "A push" item 3): each object admitted to the repository's store as it comes,
-/// and written to the push's record when the repository does not hold it.
+/// A git push in its quarantine (§4.17.2 "A push" item 3): each object admitted to the repository's store as it comes
+/// and noted for the push's record, which an append writes as it commits ([`SealedPush::record`]).
 #[derive(Debug)]
 pub(crate) struct GitPush {
   /// The repository.
@@ -583,9 +585,12 @@ fn abandon_push(state: &mut ShardState, push: Push) {
 }
 
 /// Admits one object into `push`: named by git's rule and checked against the id its source claims (A-614). An object
-/// the repository holds already is passed over, since the store reads an indexed object from its index before any
-/// push (A-638's order) and a commit gives positions only to objects the repository lacks; any other is noted for the
-/// record by the root the push's quarantine holds it under. So a replay of the record admits exactly what this admitted.
+/// arriving under a claimed id the repository indexes already is passed over, since the store reads an indexed object
+/// from its index before any push (A-638's order). Every object new to the push is noted for the record by the root its
+/// quarantine holds it under, whether or not the repository holds it now: which of them the record holds is decided
+/// when an append commits ([`record_of`]), by the predicate that commit gives positions by, since another push can
+/// commit an object this one holds between its admission and its append, and a store made again from the log can lose
+/// one. So the record names exactly the objects its commit positions.
 fn admit_object(
   content: &mut ContentStore,
   store: &GitStore,
@@ -601,7 +606,7 @@ fn admit_object(
   let (id, admitted) = push
     .admit::<_, Infallible>(content, &naming, incoming)
     .map_err(GitRefused::Object)?;
-  if admitted == Admitted::New && store.repository.object(content, &id).is_none() {
+  if admitted == Admitted::New {
     let (_, identity, len) = push
       .object(&id)
       .ok_or(GitRefused::Store(StoreRefused::Unreadable { id }))?;
@@ -615,18 +620,24 @@ fn admit_object(
   Ok(())
 }
 
-/// The record a commit of `moves` writes (`record::RecordWriter::finish`): the objects `writer` noted, read back from
-/// `content`, after `deepest` and `moves`.
+/// The record a commit of `moves` writes now (`record::RecordWriter::finish`): `deepest` and `moves`, then each object
+/// `writer` noted that the repository lacks now, its bytes read back from `content`. Lacking is the predicate the
+/// store's commit gives positions by (`Repository::object`, the index its `fresh` reads), so the record holds exactly
+/// the objects the commit that follows positions.
 pub(crate) fn record_of(
   content: &ContentStore,
   store: &GitStore,
   (writer, deepest): (&RecordWriter, u64),
   moves: &[RecordedMove],
 ) -> Result<Vec<u8>, GitRefused> {
-  let _ = store;
   writer
-    .finish(content, |_| true, (deepest, moves))
+    .finish(content, lacks(content, store), (deepest, moves))
     .map_err(unwritten)
+}
+
+/// Whether the repository lacks an object: the predicate a commit gives positions by ([`record_of`]).
+fn lacks<'s>(content: &'s ContentStore, store: &'s GitStore) -> impl Fn(&ObjectId) -> bool + 's {
+  move |id| store.repository.object(content, id).is_none()
 }
 
 /// Seals `push` and admits each of `moves` against the store, in order (A-614's `seal` and `admit`).
@@ -770,8 +781,9 @@ pub(crate) fn refusal_of(state: &mut ShardState, refused: &GitRefused) -> Refusa
 }
 
 /// Replays one record into `store` (module docs): every object checked against the content identity the record names
-/// before it is admitted, then the live path's own steps in its order; the admission's record must be the record. A
-/// refused replay gives back what it held. The derived values not kept, as [`commit_moves`] answers them.
+/// before it is admitted, then the live path's own steps in its order; the objects the admission would record must be
+/// the record's. A refused replay gives back what it held. The derived values not kept, as [`commit_moves`] answers
+/// them.
 fn replay_git(
   content: &mut ContentStore,
   store: &mut GitStore,
@@ -780,7 +792,7 @@ fn replay_git(
   let format = store.repository.format();
   let record = Record::decode(bytes, format).map_err(ReplayRefused::Record)?;
   let mut push = Push::new(format);
-  let replayed = replay_push(content, store, &mut push, (&record, bytes));
+  let replayed = replay_push(content, store, &mut push, &record);
   // A committed push holds nothing, so this gives back only what a refused replay held.
   let given = push.abandon(content);
   let unkept = replayed?;
@@ -788,23 +800,43 @@ fn replay_git(
   Ok(unkept)
 }
 
-/// [`replay_git`]'s steps over `push`: the objects, the record they make compared with the record, the seal and the
-/// moves, the commit.
+/// [`replay_git`]'s steps over `push`: the record's deepest chain carried (every record of a push carries it, the ones
+/// holding no object too, `Push::carried`), the objects, the objects the admission would record compared with the
+/// record's, the seal and the moves, the commit.
 fn replay_push(
   content: &mut ContentStore,
   store: &mut GitStore,
   push: &mut Push,
-  (record, bytes): (&Record<'_>, &[u8]),
+  record: &Record<'_>,
 ) -> Result<u64, ReplayRefused> {
+  push.carried(record.deepest);
   let mut remade = RecordWriter::default();
   replay_objects(content, store, (&mut *push, &mut remade), record)?;
-  let remade = record_of(content, store, (&remade, push.deepest()), &record.moves)
-    .map_err(ReplayRefused::Git)?;
-  if remade != bytes {
+  if !recorded_alike(content, store, &remade, record) {
     return Err(ReplayRefused::Diverged);
   }
   let moves = seal_moves(content, store, push, &record.moves).map_err(ReplayRefused::Git)?;
   commit_moves(content, store, push, (&moves, &record.moves)).map_err(ReplayRefused::Git)
+}
+
+/// Whether the objects the replay's admission would record now, by the predicate the live append wrote its record by
+/// ([`record_of`]), are the record's, in order, by type, content identity and length. Each identity was checked
+/// against the record's bytes before the object was admitted, so this compares the record written again without
+/// copying its bytes: a recomputation that differs is refused (§4.16).
+fn recorded_alike(
+  content: &ContentStore,
+  store: &GitStore,
+  remade: &RecordWriter,
+  record: &Record<'_>,
+) -> bool {
+  let admitted = remade
+    .lacked(lacks(content, store))
+    .map(|noted| (noted.kind, noted.identity, noted.len));
+  let recorded = record.objects.iter().map(|object| {
+    let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
+    (object.kind, object.identity, len)
+  });
+  admitted.eq(recorded)
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.

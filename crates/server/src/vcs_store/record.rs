@@ -4,10 +4,11 @@
 //! **What it holds.** The deepest delta chain the push's pack carried, which the store's learned depth reads (A-614 part
 //! 2); each ref's move, in the order the store committed them, by the green's key in the store, the green's version
 //! once the entry moved it (what a later push's old value is read back to, `super::GitStore::version_of`) and the commit
-//! its new head names, or none for a delete; then every object of the push that the repository lacks, in the order they
-//! were admitted, each by its type, its content identity (`slates_vcs::ContentStore::object_id`: the BLAKE3 the content
-//! plane holds it under, over its windows when it is longer than one) and its bytes. Positions, rows, D(k), reached sets,
-//! derived values and pack fragments are computed from these again, and never recorded.
+//! its new head names, or none for a delete; then every object of the push that the repository lacks when the record is
+//! written (`super::record_of`: the predicate the store's commit gives positions by), in the order they were admitted,
+//! each by its type, its content identity (`slates_vcs::ContentStore::object_id`: the BLAKE3 the content plane holds it
+//! under, over its windows when it is longer than one) and its bytes. Positions, rows, D(k), reached sets, derived
+//! values and pack fragments are computed from these again, and never recorded.
 //!
 //! **Written when an append commits.** The writer notes each object as the push admits it: its type, id, identity and
 //! length, never its bytes, which the push's quarantine holds and the shard's budget is charged for once. The record is
