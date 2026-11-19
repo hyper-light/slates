@@ -152,7 +152,7 @@ const GROUP_BITS: u32 = 7;
 /// The integers that begin an svndiff window: source view offset and length, target view length,
 /// instruction section length, new-data section length.
 /// Format: `notes/svndiff` 37-43, the window header.
-const WINDOW_HEADER_INTEGERS: usize = 5;
+pub(super) const WINDOW_HEADER_INTEGERS: usize = 5;
 
 /// Why a call could not be written; nothing was appended to the output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -673,7 +673,7 @@ fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], EditorRefused> {
 
 /// One svndiff integer at the start of `bytes`: its value and how many bytes it took; none when it
 /// is cut short, longer than the format allows, or past 64 bits.
-fn read_integer(bytes: &[u8]) -> Option<(u64, usize)> {
+pub(super) fn read_integer(bytes: &[u8]) -> Option<(u64, usize)> {
   let mut value = 0u64;
   for (index, &byte) in bytes.iter().take(INTEGER_LIMIT).enumerate() {
     if value.leading_zeros() < GROUP_BITS {
