@@ -174,6 +174,12 @@ mod hook_driver;
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
+// §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
+// phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
+// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
+// key's keeping, the key store and the repositories).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_ssh;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;
