@@ -161,6 +161,20 @@
 > the repository's candidates, holders recomputing every version of an entry before acknowledging, all or none,
 > takeovers adopting whole entries, the repository record replicated with it). Until then an entry of several greens is
 > atomic on its owner and not across a takeover.
+> **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
+> the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
+> exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
+> applier once its base is resolved (an offset delta's by offset; a reference delta's through an index, `Locate`, which
+> A-591's `Idx` answers, or by name among the pack's objects; a later base waits, resolved at the end from sorted tables
+> with no recursion), and the trailer checked. A base found nowhere, one that is no entry, one an index misplaced, and a
+> chain that loops are refused by kind; every size is charged to the admission before it is built, so a chain's depth is
+> bounded by the admission. It holds an index's names to the objects read, which A-591 left to it. Golden vectors: the
+> `ofs`, `ref` and `sha256` packs stock git 2.50.1 wrote, every object as `verify-pack -v` lists it, read whole, a byte
+> at a time and through git's own index. `cargo test -p slates-git --lib`: 96 of 96 on the Mac Studio, the 20 new
+> failing first against a stub, red four ways; 162 of 162 on the tree merged with main. Owed: a thin pack's bases from
+> the repository and an object too large to hold, streamed into content (pieces 5 and 6); a duplicate object refused
+> where the repository's index is built (git's strict "appears twice", piece 5). Clippy, `xtask` and the lint matrix
+> over the change are main's (run requests).
 > **A-597 (2026-11-19, g255; shared piece 7's matcher, hooks protocol and runner):** `crates/server` holds them, pure and
 > not yet called. `vcs_policy` is the policy by name pattern under each tool's own precedence: git's ref patterns cover
 > what `for-each-ref` matches and the last covering rule wins, as `transfer.hideRefs`; Mercurial's branch, bookmark and
