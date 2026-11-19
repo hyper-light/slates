@@ -38,11 +38,11 @@
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
 > record) by the same rule, main to start them.
 >
-> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts, takeovers fencing every log or none. OWED: its live plane (A-636 part 2, g261).
+> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. OWED: the partition's records shipped a log at a time (A-636 part 2b) and the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304) and Subversion's (g268), refused `Owed` until then; the Subversion index charged by its bytes once slates-svn measures them; a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the `StoreLender` for upload-pack over this map (A-625 part 3); the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
-> **A-654 part 1 (2026-11-19, g258; git's push end to end, its slates-git half).** BUILT: a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs, so a connection's task keeps it; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). OWED (part 2): the server's driver `crates/server/src/git_push.rs` (advertisement, input and end over A-638's view lent the shard's room, A-662's quarantine and seal, A-622's admit, hooks refused typed until A-665 part 2's view, a judge of `Verdicts` over the shard's greens with `push_sealed` per entry or all under `atomic`, the report), one entry point for the HTTP edge (g299) and the SSH edge (g294); a push based on an older version than its green's head refused as a ref that moved until A-664's server-made commits.
+> **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. OWED: the edges' calls (g299's `GitServices` for the HTTP site, g294's SSH channel); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >
 > §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
@@ -344,6 +344,25 @@
 > records of several logs committed whole, 12 dropped whole and 25 kept and finished by takeovers, 72 split reads
 > refused); red eight ways. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs'
 > register class, the server's takeover by this rule).
+> **A-636 part 2a (2026-11-19, g261; the live plane's first piece):** a repository's four state logs are registers of
+> the repository's class (`crates/db/src/register.rs`, `RegisterClass`, `ObjectId::in_class`; `LogName::register`): the
+> counter's second bit marks one and its top and third bits name which, so they are placed and taken over as the
+> repository is and its state moves as one, while the catalog's bit and every id with the second bit clear are as they
+> were; a partition mints at most 2^45 − 1 ids (was 2^47 − 1). A holder answers a takeover's round on the wire with one
+> log's promise (`Cohort::promise`), which the successor counts only for that log's round (`PhaseOne`, `Heard`), and a
+> takeover runs a log at a time, adopting every log or none, the logs read before a refusal staying fenced as a live
+> holder's fence does (part 1's ask-first rule replaced; `LogsTakeoverRefused::fenced`). A holder fenced on one log of
+> a record by such a refusal applies none of the record at its join until it holds the rest (`LogsCohort::apply`;
+> found by the model test, which now judges each holder's cut over every log it holds). Tests (macOS arm64, Mac Studio,
+> kiln r27, r98, r113): red first, six rules failing against the change stubbed and the holder's join failing 2 of 2
+> with its fix out; green, slates-db's lib filtered to register, ledger, catalog and mirror 116 of 116, `--test
+> ledger` 16 of 16, `--test mirror` 6 of 6, `--test wire_order` 2 of 2 (no wire type changed), the 11 slates-server
+> lib tests whose fixture ids set the class byte's second bit 11 of 11, fmt clean. Owed: the partition's records
+> shipped to each log's holders (2b); the server's takeover by this rule (2c), which must also give a repository's
+> greens their repository's successor (each green still follows its own id's, so a takeover can split one
+> repository's greens across hosts); before 2b ships a state log's record, the server's sites that tell a register's
+> class by `is_catalog` alone (`takeover.rs`, `fleet.rs`, `mirror.rs`) reading `ObjectId::class`; `fuse.rs`'s
+> fixture test on Linux.
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -728,8 +747,8 @@
 > imposes a requirement, typed `MergeCommit`, `UnsignedCommit`, `Unjudged`. `crates/server` `git_protect`: the store's
 > answers (`StoreBrings`), A-321's verifier under git's namespace (`signed_work::verify_in`, `CommitKeys`), the refusals
 > in git's words (`declined`); the twelve pushes answered through the policy with every byte git wrote. Owed:
-> receive-pack's server half asking it for each command (A-620 part 2's judge composed with the server's greens and
-> appends); Mercurial's linear history on its push path (A-641); OpenPGP and X.509 signatures. The walks are not yet
+> receive-pack's server half asks it for each command since A-654 part 2 (`git_push`, its edges' calls owed there);
+> Mercurial's linear history on its push path (A-641); OpenPGP and X.509 signatures. The walks are not yet
 > sliced under the shard's budget (the store's owed item): a create of a protected name walks, and verifies, its whole
 > history at once. Found beside it: `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`
 > fails on main (8b3297fe0) on the Mac Studio, 3 of 3 alone.
@@ -909,8 +928,9 @@
 > `cargo test --locked -p slates-server --lib vcs_http::hg` 6 passed and 1 failed, the room test reading `400` for the
 > query where `414` was expected and its other three statuses as expected; then `slates-server --lib vcs_http::hg` 7 of
 > 7, `slates-hg --lib http` 22 of 22 and fmt clean on macOS arm64 (Mac Studio, kiln r212); the other platforms owed.
-> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
-> g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
+> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site (g303, running) and that loop
+> (their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -1246,6 +1266,14 @@
 > (`Sources::now`), where it had asked the caller's `Guards::lock_token`; `Guards` removed. Red then green (macOS
 > arm64, Mac Studio, 130 of 130). Owed: the commit drive's second compile of `Policy::authz`; the Windows run and
 > red-checks (main's).
+> Its instant tested, 2026-11-19: a lock with an expiry binds at its expiry and lapses a microsecond past it (`lock.c`
+> `lock_expired`, strictly past). An update through the connection from a working copy holding the lock's token
+> writes, byte for byte, a never-expiring lock's update at the expiry (the token kept) and an empty table's past it
+> (the token taken away) (`an_update_keeps_a_lock_until_it_expires_and_takes_its_token_away_after`); alice's commit
+> naming bob's lock is refused `E160039` at `apply-textdelta` at the expiry and taken past it
+> (`a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after`). Both passed at once, no drive change (macOS
+> arm64, Mac Studio, over main `3612d1ef9`: `cargo test --locked -p slates-svn --lib -- commit:: serve:: lock::
+> report::` 132 of 132, fmt clean). Owed: the Windows run and red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
@@ -3083,8 +3111,9 @@
 > **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
 > sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
 > 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
->    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
->    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
+>    it, as POSIX `rename` does. A directory, or a link or IPC node changed after the base, is still refused. A rename
+>    over an IPC node a hard link names is accepted by the verdict since A-646 part 2 (the node goes to the link) and is
+>    refused only by the deriver (`PathKindConflict`) until the inode-aware journal (g305, A-677's siblings, 2026-11-19). Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
 > 2. Fixed (A-646 parts 2a and 2b; §4.16's decision): a hard link names its node, never a path. In the engine (2a), a
 >    removed or replaced home hands the node to its least surviving link, with its content or IPC node, mode and
