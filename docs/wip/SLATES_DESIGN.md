@@ -10059,7 +10059,10 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind; a move waits
 > until the head it hands over carries its record, so a refused carry holds the move back until it is refused
 > `Unplaced`, as before. A clone never sealed before its owner's loss reaches its successor as an empty tree, the
-> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost).
+> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost). **A live-shipped one
+> moves with its mark too (A-565):** its new owner rebuilds it from its live log, which the move made durable at
+> exactly the head it hands over, so the rebuild is that head and is marked as a seal's is; a takeover after an
+> owner's loss still marks nothing it rebuilt from a log, which may have run past the seal its head names.
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -37772,6 +37775,57 @@ publication" and "an outsider's change beneath a base during a takeover's gap"),
   ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
   between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
   kill-in-window tests) are Linux's, main's to run.
+
+### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
+
+- **What was there.** A move's new owner materializes a live-shipped volume from its live log, as a takeover's
+  successor does (`fleet::make_in_turns`), and A-503's adoption marked only a head materialized from a placed seal
+  (`verbs::finish_making`: never `from_live_log`), since a log rebuilt after an owner's loss may have run past the seal
+  its head names. So a live-shipped captured clone, moved, held no mark on its new owner, and its landing there was
+  refused by kind.
+- **The rule.** A move's rebuild from the log is the head the move hands over: its old owner froze the volume (no write,
+  no snapshot), took the head of its live tree (`verbs::head_for_move`) and reported the move only once the log was
+  durable at its head (`moves::ready_to_report`), so the log's tree is that head. The new owner learns that the
+  materialization is a move's from its adoption, which the control shard keeps until the move is reported adopted
+  (`ShardState::move_adoptions`; `fleet::MakeTaken::moved`, `verbs::TakenOver::moved`), and marks the materialized
+  snapshot when the head's identity is the carried one, as from a seal. A takeover after an owner's loss still marks
+  nothing it rebuilt from a log. Identities cannot decide that instead: the rebuild lays its archive out by the image's
+  extents (`live_ship::archive_of`), the seal by its chunker, so one tree has two identities.
+- **What a clone never sealed loses (settled for main).** A-544 states that a captured clone never sealed before its
+  owner's loss reaches its successor as an empty tree. Whether that loses an acknowledged write depends on the promise
+  the volume was made with:
+  - *Not live-shipped* (every kiln fleet workspace: kiln never turns live shipping on). A write is acknowledged once it
+    is published on its owner (D-18); across an owner's loss the design keeps only the newest placed seal, and the
+    volume's status reports the rest as its loss window: with no seal placed, its whole age (`verbs::at_risk_ns`). The
+    empty tree is inside the window the client was told of, so nothing acknowledged beyond the promise is lost.
+  - *Live-shipped* (a clone of a live origin inherits the flag). A write is acknowledged only once it is durable on `f`
+    candidates (A-200): a clone's first write publishes its whole image, inherited tree included, at its log's first
+    position and answers once that position is durable, so no write is lost. **The `Clone` verb itself is not held:** its
+    reply waits on the origin's log (`verbs::replicated_waits` takes the verb's own volume), which the clone did not
+    change, so the clone is answered while nothing of it is held anywhere else, and the status reports its window as zero.
+    At `f = 1` an owner lost before the clone's first write is durable leaves a successor with no log of it and no seal,
+    serving it empty: an acknowledged clone lost, a durability bug against the live-durability promise (goal 84). Filed as
+    its own bug, `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, with its failing test
+    parked (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `#[ignore]` until the fix).
+- **A clone seals nothing until its first snapshot (A-544's sibling, fixed here).** The home seal walk takes a head that
+  is none of the volume's own snapshots as nothing to seal (`fleet::sealable_head`): a fresh clone's head is its
+  origin's (`verbs::publish_clone_as` copies the origin's record), and recovery may reset a lost head to none
+  (`verbs::reconcile_lost`). Before, `start_seal` was refused for it and counted `fleet.seal` every period, for every
+  clone made, until its first snapshot.
+- **Tests.** `a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not` and the parked
+  `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable` (`crates/server/src/verbs.rs`);
+  `a_clone_has_nothing_to_seal_until_its_first_snapshot` (`crates/server/src/fleet.rs`). Red first on the Mac Studio
+  (2026-11-19, `cargo test --locked -p slates-server --lib`): with the move flag ignored and the old `sealable_head`,
+  both failed (the walk named the origin's head, `SnapshotId { value: 0 }` at sequence 1, where nothing was due; the
+  moved clone held no mark); with the change, 72 of 72 over the lib's `a565`, the seal test, `a544`, `carry::`,
+  `moves::`, `catalog::`, `landing::`, `fleet::` and `live_ship::` tests; the parked bug test fails as filed (`None`
+  where the clone's position 0 is due).
+- **Owed.** A takeover's rebuild of a live-shipped captured clone after its owner's loss marks nothing: a mark there
+  needs the log position its head was sealed at, so the rebuild can stop there for the mark and go on. The fleet's own
+  test of a moved live clone landing on its new owner (filed for main). The bug's fix (filed).
+
+Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267; the bug's entry), the bug record,
+`crates/server` (`verbs.rs`, `fleet.rs`, `live_ship.rs`: `owe_first_whole`, a test's live log).
 
 ### A-572 — A volume's entry count and allowance hold the namespace rule at a restart, a clone's admission and a resize (2026-11-19, goal 85, g234; A-549's sweep; §4.2's namespace dimension, §4.5 whiteouts, §4.8 recovery)
 Applied in the same changes to: A-549's entry and its bug record (the siblings marked fixed); GAPS, §8c; the bug record
