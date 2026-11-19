@@ -352,37 +352,46 @@ fn the_writer_refuses_a_header_git_would_not_read_and_writes_nothing() {
   }
 }
 
-/// Any entry a pack may hold, with where it begins and its pack's format: a whole object of any type, an offset delta
-/// whose base is anywhere from the pack's first entry to just before it (near and far), or a reference delta with any
-/// base name; any size git reads, small and large.
+/// Every type a whole object may have, for a selector to pick from.
+const KINDS: [Kind; 4] = [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag];
+
+/// Any entry a pack may hold, with where it begins and its pack's format: a whole object of any
+/// type, an offset delta whose base is anywhere from the pack's first entry to just before it (near
+/// and far), or a reference delta with any base name; any size git reads, small and large. Drawn as
+/// plain tuples and selectors, each choice as likely as the others, so the strategy needs no
+/// `Arc`-backed `prop_oneof!` (R2; `crates/vcs/src/tests.rs` `step` is the pattern).
 fn any_entry() -> impl Strategy<Value = (Header, u64, ObjectFormat)> {
-  let at = prop_oneof![PACK_HEADER_LEN + 1..300, PACK_HEADER_LEN + 1..=u64::MAX];
-  let size = prop_oneof![0..300u64, 0..1u64 << 60];
-  let format = prop_oneof![Just(ObjectFormat::Sha1), Just(ObjectFormat::Sha256)];
-  (at, size, format).prop_flat_map(|(at, size, format)| {
+  let at = (any::<bool>(), PACK_HEADER_LEN + 1..300, PACK_HEADER_LEN + 1..=u64::MAX);
+  let size = (any::<bool>(), 0..300u64, 0..1u64 << 60);
+  (at, size, any::<bool>()).prop_flat_map(|((near, near_at, far_at), sizes, sha256)| {
+    let at = if near { near_at } else { far_at };
+    let size = if sizes.0 { sizes.1 } else { sizes.2 };
+    let format = if sha256 {
+      ObjectFormat::Sha256
+    } else {
+      ObjectFormat::Sha1
+    };
     let farthest = at - PACK_HEADER_LEN;
-    let kind = prop_oneof![
-      Just(Kind::Commit),
-      Just(Kind::Tree),
-      Just(Kind::Blob),
-      Just(Kind::Tag)
-    ];
-    let offset = prop_oneof![1..=farthest.min(300), 1..=farthest];
+    let offsets = (any::<bool>(), 1..=farthest.min(300), 1..=farthest);
     let name = proptest::collection::vec(any::<u8>(), format.raw_len());
-    let representation = prop_oneof![
-      kind.prop_map(Representation::Whole),
-      offset.prop_map(move |offset| Representation::OfsDelta { base: at - offset }),
-      name.prop_map(move |name| Representation::RefDelta {
-        base: ObjectId::from_bytes(format, &name).unwrap(),
-      }),
-    ];
-    representation.prop_map(move |representation| {
-      let header = Header {
-        representation,
-        size,
-      };
-      (header, at, format)
-    })
+    (0u8..3, 0..KINDS.len(), offsets, name).prop_map(
+      move |(selector, kind, (near, near_offset, far_offset), name)| {
+        let representation = match selector {
+          0 => Representation::Whole(KINDS[kind]),
+          1 => Representation::OfsDelta {
+            base: at - if near { near_offset } else { far_offset },
+          },
+          _ => Representation::RefDelta {
+            base: ObjectId::from_bytes(format, &name).unwrap(),
+          },
+        };
+        let header = Header {
+          representation,
+          size,
+        };
+        (header, at, format)
+      },
+    )
   })
 }
 
