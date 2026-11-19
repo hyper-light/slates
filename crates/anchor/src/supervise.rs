@@ -80,6 +80,14 @@ pub const ENV_VCS_HTTP: &str = "SLATES_ANCHOR_VCS_HTTP";
 /// holds one (Unix), and a daemon without it binds its own.
 pub const ENV_VCS_SSH: &str = "SLATES_ANCHOR_VCS_SSH";
 
+/// Format: the environment variable carrying the descriptor of the svn:// listener the anchor holds (§4.17.4 piece 7;
+/// A-689), bound once at the address the operator gave (`--vcs-svn`) and inherited by every daemon across its spawn, as
+/// [`ENV_VCS_HTTP`]'s is, so the listener's port never drops while a daemon restarts: a client that connects then waits
+/// in the listener's queue for the next daemon. Set only when the anchor holds one (Unix, as the NFS listener's
+/// descriptor is), and a daemon without it binds its own. The daemon adopts it through
+/// `slates_rt::tcp::TcpListener::from_owned`.
+pub const ENV_VCS_SVN: &str = "SLATES_ANCHOR_VCS_SVN";
+
 /// Shape: the failed starts in a row that make a crash loop (A-311): two, the first repeat. One failure is an event, and
 /// restarting it at once is the quickest recovery there is; a second in a row says the next start may fail the same way,
 /// so it waits.
@@ -262,6 +270,11 @@ pub struct Supervisor {
   /// [`ENV_VCS_SSH`]), as the HTTP edge's is.
   #[cfg(unix)]
   vcs_ssh_listener: Option<OwnedFd>,
+  /// The svn:// listener the anchor holds, if any (A-689): bound once at the operator's address and handed to each
+  /// daemon it spawns (via [`ENV_VCS_SVN`]), so the listener's port survives a restart. Inheritable, as the NFS
+  /// listener is.
+  #[cfg(unix)]
+  vcs_svn_listener: Option<OwnedFd>,
   /// The FUSE devices the anchor holds across daemon restarts, and the channel daemons send them on (A-61;
   /// [`crate::held`]). Linux only, as FUSE is.
   #[cfg(unix)]
@@ -365,6 +378,7 @@ impl Supervisor {
       vcs_http_listener: None,
       #[cfg(unix)]
       vcs_ssh_listener: None,
+      vcs_svn_listener: None,
       #[cfg(unix)]
       devices: None,
       #[cfg(windows)]
@@ -689,6 +703,14 @@ impl Supervisor {
     self.vcs_ssh_listener = Some(fd);
   }
 
+  /// Holds `fd` — a bound, listening socket at the address the operator gave the svn:// listener — as the listener
+  /// handed to every daemon this supervisor spawns, so its port is stable across restarts (A-689). It must be
+  /// inheritable, as [`Supervisor::hold_nfs_listener`]'s is; the supervisor owns it for its life.
+  #[cfg(unix)]
+  pub fn hold_vcs_svn_listener(&mut self, fd: OwnedFd) {
+    self.vcs_svn_listener = Some(fd);
+  }
+
   /// The segment.
   pub fn segment(&self) -> &AnchorSegment {
     &self.segment
@@ -733,6 +755,11 @@ impl Supervisor {
     #[cfg(unix)]
     if let Some(fd) = &self.vcs_ssh_listener {
       env.push((ENV_VCS_SSH.to_owned(), fd.as_raw_fd().to_string()));
+    }
+    // And the held svn:// listener, the same way (A-689).
+    #[cfg(unix)]
+    if let Some(fd) = &self.vcs_svn_listener {
+      env.push((ENV_VCS_SVN.to_owned(), fd.as_raw_fd().to_string()));
     }
     // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
     // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the

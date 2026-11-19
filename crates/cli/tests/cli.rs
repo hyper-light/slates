@@ -13576,10 +13576,11 @@ fn answer_head(port: u16, request: &str, patience: Duration) -> std::io::Result<
   Ok(String::from_utf8_lossy(&head).to_ascii_lowercase())
 }
 
-/// The port the next daemon of an anchor names for its version-control edge, from the anchor's forwarded `lines`, read
-/// until that daemon says it serves (`serving_line`); none if it named none first.
+/// The port the next daemon of an anchor names for a version-control edge on the line that starts `port_line`, from
+/// the anchor's forwarded `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
 fn edge_port_before_serving(
   lines: &std::sync::mpsc::Receiver<String>,
+  port_line: &str,
   serving_line: &str,
 ) -> Option<u16> {
   let mut port = None;
@@ -13591,7 +13592,7 @@ fn edge_port_before_serving(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
     );
-    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+    if let Some(rest) = line.strip_prefix(port_line) {
       port = rest.trim().parse::<u16>().ok();
     }
     if line.starts_with(serving_line) {
@@ -13628,7 +13629,7 @@ fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
   let (lines, forwarding) = forward_lines(stderr);
   anchor.drain = Some(forwarding);
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let port = edge_port_before_serving(&lines, &serving_line)
+  let port = edge_port_before_serving(&lines, VCS_HTTP_CLEARTEXT_LINE, &serving_line)
     .expect("the daemon named its edge's port before it served");
   let first = bare_request(port, WAIT_FOR).expect("the edge answered");
   assert!(first.starts_with("http/1.1 401 "), "{first}");
@@ -14136,6 +14137,229 @@ fn each_tool_creates_with_its_defaults(instance: &str) {
   assert!(
     out.contains("\"repository\":\"a-sha256-one\"") && out.contains("\"id\":\""),
     "{out}"
+  );
+}
+
+/// Format: the start of the daemon's line naming where its svn:// listener serves (`crates/api/src/role/daemon.rs`),
+/// here on the loopback address the tests ask for; the port follows.
+const VCS_SVN_LINE: &str = "slates daemon: the svn:// listener serves on 127.0.0.1:";
+/// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`SVN_RECORDED_URL`] under a root
+/// holding no repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
+const SVNSERVE_NO_REPOSITORY: &[u8] =
+  include_bytes!("../../svn/fixtures/handshake/no-repository.server.bin");
+/// Format: what that client wrote: its answer to the greeting, naming [`SVN_RECORDED_URL`].
+const SVN_NO_REPOSITORY: &[u8] =
+  include_bytes!("../../svn/fixtures/handshake/no-repository.client.bin");
+/// Format: the URL the recorded client named, at `svnserve`'s default port; a client of the listener names its port.
+const SVN_RECORDED_URL: &str = "svn://127.0.0.1/missing";
+/// Format: where the recorded server's refusal starts, after its greeting.
+const SVN_REFUSAL_START: &[u8] = b"( failure ";
+/// Format: the capability `svnserve`'s greeting announces and slates' does not, its word and the space after it: a
+/// sender uses zlib only with a peer that announced `svndiff1` (`marshal.c`), so slates never receives zlib (§4.17.4
+/// "5. The wire"; `slates_svn::handshake`).
+const SVN_SVNDIFF1: &str = "svndiff1 ";
+
+/// The URL a client of the svn:// listener at loopback `port` names for the repository `missing`, as
+/// [`SVN_RECORDED_URL`] did.
+fn svn_url_at(port: u16) -> String {
+  format!("svn://127.0.0.1:{port}/missing")
+}
+
+/// ra_svn's string item holding `text`: its length, a colon, its bytes (`marshal.c`).
+fn svn_string(text: &str) -> String {
+  format!("{}:{text}", text.len())
+}
+
+/// `svnserve`'s words refusing `url` under a root that holds no repository (`serve.c` `find_repos`).
+fn svn_no_repository(url: &str) -> String {
+  format!("No repository found in '{url}'")
+}
+
+/// `recorded` with its one item `item` written as `replacement`: the recording must hold `item` exactly once, so the
+/// replacement keeps every other byte as stock Subversion wrote it.
+fn svn_replaced(recorded: &[u8], item: &str, replacement: &str) -> Vec<u8> {
+  let item = item.as_bytes();
+  let places: Vec<usize> = recorded
+    .windows(item.len())
+    .enumerate()
+    .filter(|(_, window)| *window == item)
+    .map(|(place, _)| place)
+    .collect();
+  assert_eq!(places.len(), 1, "the recording holds the item once");
+  let place = places[0];
+  let mut bytes = recorded[..place].to_vec();
+  bytes.extend_from_slice(replacement.as_bytes());
+  bytes.extend_from_slice(&recorded[place + item.len()..]);
+  bytes
+}
+
+/// What the svn:// listener at loopback `port` must send, as `svnserve` sent it: the greeting, its `svndiff1` taken out
+/// ([`SVN_SVNDIFF1`]), then the refusal of the recorded client's URL naming that port.
+fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
+  let refusal = SVNSERVE_NO_REPOSITORY
+    .windows(SVN_REFUSAL_START.len())
+    .position(|window| window == SVN_REFUSAL_START)
+    .expect("the recorded server refused");
+  (
+    svn_replaced(&SVNSERVE_NO_REPOSITORY[..refusal], SVN_SVNDIFF1, ""),
+    svn_replaced(
+      &SVNSERVE_NO_REPOSITORY[refusal..],
+      &svn_string(&svn_no_repository(SVN_RECORDED_URL)),
+      &svn_string(&svn_no_repository(&svn_url_at(port))),
+    ),
+  )
+}
+
+/// Speaks to the svn:// listener at loopback `port` as stock `svn` 1.15.0 spoke to `svnserve`, waiting `patience` for
+/// each read: reads as many bytes as the greeting holds, answers with the recorded client's answer naming that port,
+/// and reads until the listener closes. What it read before answering and after, or why there was none (a refused
+/// connection among them, or a silence past `patience`, which names the bytes read before it).
+fn svn_exchange(port: u16, patience: Duration) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+  use std::io::{Read, Write};
+  let (greeting, _) = svnserves_answers(port);
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  let mut greeted = Vec::new();
+  let mut chunk = [0u8; 4096];
+  while greeted.len() < greeting.len() {
+    let read = stream.read(&mut chunk).map_err(|error| {
+      std::io::Error::new(
+        error.kind(),
+        format!(
+          "{error}, the greeting read so far {:?}",
+          String::from_utf8_lossy(&greeted)
+        ),
+      )
+    })?;
+    if read == 0 {
+      break;
+    }
+    greeted.extend_from_slice(&chunk[..read]);
+  }
+  stream.write_all(&svn_replaced(
+    SVN_NO_REPOSITORY,
+    &svn_string(SVN_RECORDED_URL),
+    &svn_string(&svn_url_at(port)),
+  ))?;
+  let mut rest = Vec::new();
+  stream.read_to_end(&mut rest)?;
+  Ok((greeted, rest))
+}
+
+/// Asserts that `exchanged`, what [`svn_exchange`] read from the listener at `port`, is what `svnserve` sent: its
+/// greeting byte for byte but for `svndiff1`, then its refusal of the URL, "No repository found" (210005), and the
+/// connection's end.
+fn assert_svnserves_answers(exchanged: &(Vec<u8>, Vec<u8>), port: u16) {
+  let (greeting, refusal) = svnserves_answers(port);
+  assert_eq!(
+    String::from_utf8_lossy(&exchanged.0),
+    String::from_utf8_lossy(&greeting),
+    "the listener greets as svnserve does, svndiff1 aside"
+  );
+  assert_eq!(
+    String::from_utf8_lossy(&exchanged.1),
+    String::from_utf8_lossy(&refusal),
+    "the URL is refused as svnserve refuses it"
+  );
+}
+
+/// A-689 (§4.17.4 piece 7). Do: start an anchor whose daemon is asked for the svn:// listener on loopback, on a port
+/// the system picks (`--vcs-svn 127.0.0.1:0`); read the port the daemon names; connect, read the greeting, answer it as
+/// stock `svn` 1.15.0 answered `svnserve`, naming the repository `missing` at that port
+/// (`crates/svn/fixtures/handshake/no-repository.client.bin`), and read until the connection ends. Expect: the daemon
+/// names the listener's port before it says it serves; the greeting is `svnserve`'s byte for byte but for `svndiff1`
+/// (§4.17.4 "5. The wire"); the answer is refused as `svnserve` refuses a URL no repository holds, "No repository
+/// found" (210005), and the connection ends: the flag went from the anchor to its daemon, which runs A-656's
+/// connection on each connection it accepts.
+#[test]
+fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
+  let instance = format!("cli-vcs-svn-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = port_on(&lines, VCS_SVN_LINE)
+    .expect("the daemon named its svn:// listener's port before it served");
+  let exchanged = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  assert_svnserves_answers(&exchanged, port);
+}
+
+/// A-689 (§4.17.4 piece 7). Do: start an anchor with the svn:// listener on loopback (`--vcs-svn 127.0.0.1:0`); read
+/// the port its daemon names and speak to it as stock `svn` does; kill the daemon; once the anchor says it restarted
+/// it, connect to the same port again, before its successor serves; read the port the successor names. Expect: the
+/// connection made while the daemon was gone is greeted and answered by the successor as `svnserve` answers, and the
+/// successor names the same port: the anchor holds the listener, so a restart never drops its port.
+#[test]
+fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
+  let instance = format!("cli-vcs-svn-held-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-svn",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let port = edge_port_before_serving(&lines, VCS_SVN_LINE, &serving_line)
+    .expect("the daemon named its svn:// listener's port before it served");
+  let first = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  assert_svnserves_answers(&first, port);
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
+  let mut successor = None;
+  let mut while_restarting = None;
+  let mut again = None;
+  let mut served = false;
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(svn_exchange(port, START_CEILING));
+    }
+    if let Some(rest) = line.strip_prefix(VCS_SVN_LINE) {
+      again = rest.trim().parse::<u16>().ok();
+    }
+    served |= line.starts_with(&serving_line);
+  }
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let exchanged = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the svn:// listener's port was dropped while its daemon restarted: {error}")
+    });
+  assert_svnserves_answers(&exchanged, port);
+  assert_eq!(
+    again,
+    Some(port),
+    "the restarted daemon serves the svn:// listener on the port its anchor holds"
   );
 }
 

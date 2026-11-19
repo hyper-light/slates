@@ -32,7 +32,7 @@ entitlement. These limitations are open correctness/integration work, not option
 
 ```
 slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME] [--vcs-http ADDRESS]
-              [--vcs-ssh ADDRESS]
+              [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]
 ```
 
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
@@ -70,6 +70,16 @@ daemon it supervises, so a daemon's restart keeps both the port and the key, and
 line stays good for as long as the anchor runs. Clients sign in with a key a person enrolled with `slates
 credential key`. Use a port above 1023: slates needs no privilege, and a host that wants port 22 forwards
 it.
+
+`--vcs-svn ADDRESS` serves Subversion's own protocol, `svn://`, at ADDRESS, an IPv4 address and port (port 0
+lets the system pick one; `svnserve`'s is 3690); the daemon logs where it serves (`slates daemon: the svn://
+listener serves on IP:PORT`). `svn://` has no encryption, so a daemon that is no fleet node serves it on a
+loopback address alone: any other address is refused as a usage error before anything starts. The anchor
+binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
+daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon. An
+address the anchor cannot bind ends its start with an error naming it. For now every connection is greeted
+as `svnserve` greets one and its URL is answered "No repository found": serving the daemon's Subversion
+repositories is the next step.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 

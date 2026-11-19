@@ -247,6 +247,31 @@ fn publish_ssh_host_key(segment: &mut AnchorSegment) -> Result<(), Failure> {
   published
 }
 
+/// Binds the svn:// listener at the address the operator gave (`--vcs-svn`; A-689), as the daemon binds its own
+/// (`slates_server::daemon::bind_vcs_svn_listener`), and gives it to `supervisor` to hand to every daemon it spawns
+/// ([`slates_anchor::ENV_VCS_SVN`]), so the listener's port never drops while a daemon restarts: a client that connects
+/// then waits in the listener's queue for the next daemon. An address that cannot be bound refuses the anchor's start by
+/// name, as the HTTP edge's does: the operator asked for the listener there. One that cannot be made inheritable is not
+/// held, and each daemon binds its own, as for the NFS listener.
+#[cfg(unix)]
+fn hold_vcs_svn_listener(
+  supervisor: &mut Supervisor,
+  config: &DaemonConfig,
+  address: slates_rt::tcp::SocketAddrV4,
+) -> Result<(), Failure> {
+  let listener = slates_server::daemon::bind_vcs_svn_listener(config, address)
+    .map_err(|e| failed("vcs-svn", format!("{address}: {e}")))?;
+  let fd = listener.into_owned();
+  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+    slates_machine::log_line!(
+      "slates anchor: the svn:// listener cannot be made inheritable ({e}); each daemon binds its own"
+    );
+    return Ok(());
+  }
+  supervisor.hold_vcs_svn_listener(fd);
+  Ok(())
+}
+
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
@@ -356,6 +381,11 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   #[cfg(unix)]
   if let Some(address) = options.vcs_ssh {
     hold_vcs_ssh_listener(&mut supervisor, &config, address)?;
+  }
+  // And the svn:// listener (A-689): bound once here and handed to every daemon, so a restart never drops its port.
+  #[cfg(unix)]
+  if let Some(address) = options.vcs_svn {
+    hold_vcs_svn_listener(&mut supervisor, &config, address)?;
   }
   // The FUSE devices daemons mount are held the same way (A-61): a daemon sends each to the anchor, and the
   // next daemon takes back the mounts it recovers. A channel that cannot be opened refuses the anchor's start:

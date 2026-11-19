@@ -300,14 +300,21 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// request carries an `Authorship` (2026-11-19).
 /// 52: a role starts the version-control servers' shared HTTP edge (A-625 part 3; §4.17.2 "Transports" item 1):
 /// [`role::ProcessOptions`] gains `vcs_http`, the address `--vcs-http ADDRESS` names, which [`role::Role::parse`] reads
-/// with [`role::vcs_http_address`] (an address off loopback refused for a daemon that is no fleet node, whose edge
+/// with `role::vcs_http_address` (an address off loopback refused for a daemon that is no fleet node, whose edge
 /// would serve cleartext) and [`role::Role::args`] gives back to the daemon an anchor starts; a fleet node's edge
 /// presents the node's own identity; a starter's anchor asks for none (2026-11-19).
 /// 53: a host's anchor starts the version-control edge too, and holds its port (A-625 part 3): [`StartSpec`] gains
 /// `vcs_http`, which its anchor's role and command carry; an anchor binds the edge's listener once, at that address, and
 /// hands it to every daemon it starts, so a restart never drops the edge's port; an address it cannot bind ends its
 /// start, as a fleet node's serve sockets do (2026-11-19).
-/// 54: a role starts the version-control servers' SSH edge (A-684; §4.17.2 "Transports" item 2): [`role::ProcessOptions`]
+/// 54: a role starts the svn:// listener, and a host's anchor holds it (A-689, A-656 part 2; §4.17.4 piece 7):
+/// [`role::ProcessOptions`] gains `vcs_svn`, the address `--vcs-svn ADDRESS` names, which [`role::Role::parse`] reads
+/// with [`role::vcs_address`], now the one reader of both version-control flags (it replaces `vcs_http_address`: an
+/// address off loopback refused for a daemon that is no fleet node, which serves both in cleartext), and
+/// [`role::Role::args`] gives back to the daemon an anchor starts; [`StartSpec`] gains `vcs_svn`, which its anchor's
+/// role and command carry; an anchor binds the listener once, at that address, and hands it to every daemon it starts,
+/// so a restart never drops its port; an address it cannot bind ends its start (2026-11-19).
+/// 55: a role starts the version-control servers' SSH edge (A-684; §4.17.2 "Transports" item 2): [`role::ProcessOptions`]
 /// and [`StartSpec`] gain `vcs_ssh`, the address `--vcs-ssh ADDRESS` names, which [`role::Role::parse`] reads with
 /// [`role::vcs_ssh_address`] (any IPv4 address and port: SSH encrypts every connection) and [`role::Role::args`] gives
 /// back to the daemon an anchor starts; the anchor binds the edge's listener once and makes its Ed25519 host key at its
@@ -316,7 +323,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 54;
+pub const CONTRACT: u32 = 55;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

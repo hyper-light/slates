@@ -65,7 +65,7 @@ fn main() -> ExitCode {
   loopback address alone. The anchor binds the address once and holds it for every daemon it starts, so a
   restart never drops the port; an address it cannot bind ends its start.
 - `StartSpec.vcs_ssh = Some(address)` starts the version-control servers' SSH edge at `address`
-  (`--vcs-ssh`, contract 54), any IPv4 address: the anchor binds it once and makes the edge's Ed25519 host
+  (`--vcs-ssh`, contract 55), any IPv4 address: the anchor binds it once and makes the edge's Ed25519 host
   key at its start, and holds both for every daemon it starts, so a restart keeps the port and the key; a
   fleet node's edge presents the node's own Ed25519 key instead. The daemon's log names the port and the
   key's fingerprint (`slates daemon: the version-control SSH edge serves on ...`).

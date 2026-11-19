@@ -178,12 +178,14 @@ pub(crate) fn start(
       "it has no identity, and serves cleartext on a loopback address alone",
     ));
   }
-  let listener =
-    match crate::daemon::edge_listener(slates_anchor::ENV_VCS_HTTP, edge.address, bounds.backlog())
-    {
-      Ok(listener) => listener,
-      Err(why) => return Ok(not_started(&why)),
-    };
+  let listener = match crate::daemon::held_or_bound_listener(
+    slates_anchor::ENV_VCS_HTTP,
+    edge.address,
+    bounds.backlog(),
+  ) {
+    Ok(listener) => listener,
+    Err(why) => return Ok(not_started(&why)),
+  };
   let port = match listener.local_addr() {
     Ok(address) => address.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),

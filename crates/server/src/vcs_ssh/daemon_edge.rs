@@ -7,7 +7,7 @@
 //! the host key, every other's without one (`EdgeState::arrivals`), seating the connections that move there to their
 //! repository's owner (A-651 part 4). The control shard serves the listener ([`serve`]): the one a supervising anchor
 //! holds and handed over (`slates_anchor::ENV_VCS_SSH`), adopted where the configuration says, else one bound here
-//! (`crate::daemon::edge_listener`). The port and the host key's fingerprint are the daemon's to report
+//! (`crate::daemon::held_or_bound_listener`). The port and the host key's fingerprint are the daemon's to report
 //! (`crate::daemon::VcsSshEdge`): its log names both before it says it serves.
 //!
 //! **The host key** ([`host_seed`]; main's ruling, 2026-11-19). A fleet node's edge presents the node's own key, from
@@ -81,7 +81,7 @@ pub(crate) fn start(
     return Ok(not_started("its host key's seed makes no Ed25519 key"));
   };
   let bounds = crate::vcs_http::bounds_of(config);
-  let listener = match crate::daemon::edge_listener(
+  let listener = match crate::daemon::held_or_bound_listener(
     slates_anchor::ENV_VCS_SSH,
     edge.address,
     bounds.backlog(),

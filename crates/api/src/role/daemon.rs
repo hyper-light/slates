@@ -210,7 +210,7 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   };
   // The version-control servers' shared HTTP edge, when the operator asked for one (`--vcs-http`; §4.17.2 "Transports"
   // item 1, A-625 part 3): a fleet node's presents the node's own identity over HTTPS; a daemon that is no fleet node
-  // serves cleartext, on a loopback address alone, which the flag's reading held it to (`super::vcs_http_address`).
+  // serves cleartext, on a loopback address alone, which the flag's reading held it to (`super::vcs_address`).
   config.vcs_http = options.vcs_http.map(|address| VcsHttpConfig {
     address,
     identity: edge_identity.clone(),
@@ -226,6 +226,9 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     .vcs_http
     .as_ref()
     .map(|edge| (edge.address, edge.identity.is_some()));
+  // The svn:// listener, when the operator asked for one (`--vcs-svn`; §4.17.4 piece 7, A-656 part 2): cleartext as
+  // ra_svn is, on a loopback address alone for a daemon that is no fleet node, which the flag's reading held it to.
+  config.vcs_svn = options.vcs_svn;
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
   }
@@ -260,6 +263,15 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
       address.ip(),
       edge.port,
       edge.fingerprint
+    );
+  }
+  // Where the svn:// listener serves, before the serving line too; one asked for that did not start was logged.
+  if let Some(address) = options.vcs_svn
+    && let Some(port) = daemon.vcs_svn_port()
+  {
+    slates_machine::log_line!(
+      "slates daemon: the svn:// listener serves on {}:{port}",
+      address.ip()
     );
   }
   slates_machine::log_line!(

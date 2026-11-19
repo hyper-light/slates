@@ -19,6 +19,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
                                                                alone unless --fleet gives the node's HTTPS identity
            [--vcs-ssh ADDRESS]                                 either role: serve git, hg and svn over SSH at ADDRESS;
                                                                the daemon logs the host key's SHA256 fingerprint
+           [--vcs-svn ADDRESS]                                 either role: serve svn:// (cleartext) at ADDRESS; loopback
+                                                               alone unless --fleet
   profile  [--quick] [--json]                      measure and print the machine profile
   version                                          print this binary's version (`slates VERSION`)
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
@@ -760,6 +762,7 @@ const VALUES: &[&str] = &[
   "--node",
   "--vcs-http",
   "--vcs-ssh",
+  "--vcs-svn",
   "--bounded",
   "--dynamic",
   "--base",
@@ -1315,20 +1318,20 @@ fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
   }
 }
 
-/// `--vcs-http ADDRESS`, the version-control servers' shared HTTP edge (A-625 part 3), read as the roles read it
-/// (`slates_api::role::vcs_http_address`): an address off loopback on a daemon that is no fleet node (`fleet_node`
-/// false) would serve cleartext there, so it is refused as usage before anything starts.
-fn vcs_http_of(
+/// A version-control listener's address, `flag`'s: `--vcs-http ADDRESS`, the servers' shared HTTP edge (A-625 part 3),
+/// or `--vcs-svn ADDRESS`, the svn:// listener (A-656 part 2), read as the roles read them
+/// (`slates_api::role::vcs_address`): an address off loopback on a daemon that is no fleet node (`fleet_node` false)
+/// would serve cleartext there, so it is refused as usage before anything starts.
+fn vcs_address_of(
   taken: &Taken,
+  flag: &'static str,
   fleet_node: bool,
 ) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
   taken
-    .value("--vcs-http")
+    .value(flag)
     .map(|text| {
-      slates_api::role::vcs_http_address(text, fleet_node).map_err(|reason| ParseError::BadValue {
-        what: "--vcs-http",
-        reason,
-      })
+      slates_api::role::vcs_address(text, fleet_node)
+        .map_err(|reason| ParseError::BadValue { what: flag, reason })
     })
     .transpose()
 }
@@ -1911,7 +1914,14 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node", "--vcs-http", "--vcs-ssh"],
+        values: &[
+          "--shards",
+          "--fleet",
+          "--node",
+          "--vcs-http",
+          "--vcs-ssh",
+          "--vcs-svn",
+        ],
         switches: &["--quick"],
       })?;
       let fleet = fleet_of(&taken)?;
@@ -1919,8 +1929,9 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         instance: taken.instance(),
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
-        vcs_http: vcs_http_of(&taken, fleet.is_some())?,
+        vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
         vcs_ssh: vcs_ssh_of(&taken)?,
+        vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
         fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
@@ -2780,6 +2791,7 @@ mod tests {
         fleet: None,
         vcs_http: None,
         vcs_ssh: None,
+        vcs_svn: None,
       }))
     );
     assert_eq!(
@@ -2889,6 +2901,7 @@ mod tests {
         }),
         vcs_http: None,
         vcs_ssh: None,
+        vcs_svn: None,
       }))
     );
     assert!(matches!(
@@ -2918,6 +2931,7 @@ mod tests {
         fleet: None,
         vcs_http: Some(loopback),
         vcs_ssh: None,
+        vcs_svn: None,
       }))
     );
     let anchor = parse(&args(
@@ -2958,6 +2972,7 @@ mod tests {
         fleet: None,
         vcs_http: None,
         vcs_ssh: Some(loopback),
+        vcs_svn: None,
       }))
     );
     let anchor = parse(&args(
@@ -2975,6 +2990,43 @@ mod tests {
         ..
       })
     ));
+  }
+
+  /// A-656 part 2 (§4.17.4 piece 7). Do: parse `daemon --vcs-svn` on a loopback address beside `--vcs-http`, a fleet
+  /// node's `anchor --vcs-svn` on an address every interface reaches, and a daemon that is no fleet node asking for the
+  /// svn:// listener off loopback. Expect: each address read, the daemon's beside its HTTP edge's; the listener off
+  /// loopback without a fleet refused as a bad `--vcs-svn` naming loopback, since ra_svn is cleartext.
+  #[test]
+  fn the_grammar_parses_the_daemons_svn_listener() {
+    let loopback =
+      |port| slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, port);
+    assert_eq!(
+      parse(&args(
+        "daemon --instance a --vcs-http 127.0.0.1:8080 --vcs-svn 127.0.0.1:3690"
+      )),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: Some(loopback(8080)),
+        vcs_ssh: None,
+        vcs_svn: Some(loopback(3690)),
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --fleet /etc/slates/fleet.json --node b --vcs-svn 0.0.0.0:3690",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_svn
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 3690))),
+      "{anchor:?}"
+    );
+    let cleartext = parse(&args("daemon --vcs-svn 10.0.0.7:3690"));
+    assert!(
+      matches!(&cleartext, Err(ParseError::BadValue { what: "--vcs-svn", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
   }
 
   /// The merge service's grammar (§4.16 as a service): a green over a complete immutable base with
