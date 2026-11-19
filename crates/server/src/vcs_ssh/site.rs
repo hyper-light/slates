@@ -9,18 +9,23 @@
 //!    it, without one leading slash, and of the command's tool; none is refused as the tool refuses a missing repository
 //!    (git: `fatal: '<path>' does not appear to be a git repository`, its `die`'s 128 [C: git `builtin/upload-pack.c`,
 //!    `usage.c` at `e1ec09b2`]; Mercurial: `abort: repository <path> not found`, 255 [C: Mercurial 7.2 `localrepo.py`,
-//!    `scmutil.py`'s `callcatch`, `dispatch.py`'s `sys.exit(status & 255)`]). No second spelling is tried.
+//!    `scmutil.py`'s `callcatch`, `dispatch.py`'s `sys.exit(status & 255)`]). No second spelling is tried. Before it,
+//!    a Mercurial path that starts `--` is refused as 7.2's dispatch refuses it before opening anything, naming the
+//!    arguments as `stringutil.pprint` writes them: `abort: potentially unsafe serve --stdio invocation: ['-R',
+//!    '<path>', 'serve', '--stdio']`, `'--hidden'` last when asked, 255 [C: 7.2 `dispatch.py` `_runcatchfunc`; recorded
+//!    from stock 7.2 on 2026-11-19 (A-679)].
 //! 2. The policy: a principal the repository's policy lets reach it for none of the command's rights is refused
 //!    (`crate::vcs_policy::reaches`, A-597). upload-pack asks to read; receive-pack to submit, rewrite or delete;
 //!    Mercurial's `serve --stdio`, which pulls and pushes in one session, any of the four, each command then judged by
 //!    the session. A damaged policy is refused, never judged without it.
 //! 3. The service ([`Services`]): one the server cannot start is refused as not served ([`Unserved`]), as the HTTP edge
 //!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
-//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols), which no lender does until the
-//!    lender over A-662's map of stores on their owner shards lands (A-662's owed list). Mercurial's `serve --stdio`
-//!    (`slates_hg::serve::stdio::Stdio`, A-650 part 2) waits likewise for a lender of its store;
-//!    receive-pack (A-654) and Subversion's tunnel (A-656) wait for their entry points. Each becomes a [`Command`]
-//!    behind [`Services`] as it can run, and the not-served answer goes with the last of them.
+//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols), and Mercurial's `serve --stdio`
+//!    runs (`super::hg`, A-679: `slates_hg::serve::stdio::Stdio`, A-650 part 2) when the lender the HTTP site reads
+//!    Mercurial's stores from holds the repository's ([`HgStores`]); no lender does either until the lenders over
+//!    A-662's map of stores on their owner shards land (A-662's owed list). Receive-pack (A-654) and Subversion's
+//!    tunnel (A-656) wait for their entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the
+//!    not-served answer goes with the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
@@ -31,8 +36,10 @@ use slates_ssh::command::Command as Asked;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
 use super::git::UploadCommand;
+use super::hg::HgCommand;
 use crate::vcs_http::git::Repositories;
 use crate::vcs_http::git::StoreLender;
+use crate::vcs_http::hg::HgStores;
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key refused because no record of principals' keys exists yet ([`NoKeyRecord`]).
@@ -46,6 +53,9 @@ pub(crate) const GIT_DIE_STATUS: u32 = 128;
 pub(crate) const HG_ABORT_STATUS: u32 = 255;
 /// Format: svnserve's failure, `EXIT_FAILURE` (`svnserve.c` at `d434dc14`; C's `stdlib.h`).
 pub(crate) const SVNSERVE_FAILURE_STATUS: u32 = 1;
+/// Format: how a Mercurial repository argument begins that 7.2's dispatch refuses in a `serve --stdio`
+/// (`dispatch.py` `_runcatchfunc`: it prohibits "any repo name that starts with '--'").
+const HG_UNSAFE_START: &[u8] = b"--";
 
 /// A refused or failed command: what its client reads on standard error, and its exit status.
 #[derive(Clone, Debug, PartialEq, Eq)]
