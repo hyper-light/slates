@@ -1660,6 +1660,7 @@ dependencies = [
  "proptest",
  "sha1-checked",
  "slates-test-seeds",
+ "slates-vcs",
 ]
 
 [[package]]

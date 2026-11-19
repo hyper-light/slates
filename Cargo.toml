@@ -49,6 +49,7 @@ slates-cluster = { path = "crates/cluster", version = "0.1.0" }
 slates-archive = { path = "crates/archive", version = "0.1.0" }
 slates-image = { path = "crates/image", version = "0.1.0" }
 slates-conformance = { path = "crates/conformance", version = "0.1.0" }
+slates-vcs = { path = "crates/vcs", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
