@@ -360,3 +360,243 @@ pub(crate) fn parked(state: &ShardState) -> usize {
 pub(crate) fn parked_reply() -> ReplyBody {
   ReplyBody::Edited
 }
+
+#[cfg(test)]
+mod tests {
+  use slates_db::catalog::Principal;
+  use slates_db::register::HostId;
+  use slates_ipc::protocol::{NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, VolumeId};
+  use slates_wire::request::{RequestId, Seen};
+
+  use super::{EXPIRED, SERVED, join, parked, resolve};
+  use crate::state::ShardState;
+
+  /// Format: the client every test request is asked by.
+  const CLIENT: u32 = 7;
+  /// Format: the sequence of the one request each test asks.
+  const SEQUENCE: u32 = 1;
+
+  /// What a test saw of the one read it asked, as the module's contract names it.
+  #[derive(Debug, PartialEq, Eq)]
+  struct ReadSeen {
+    /// The read parked when it met the refusing lease: one waiter, nothing recorded.
+    parked_at_first: bool,
+    /// The reply recorded as the read's completion, by kind: `Some(true)` when it is the expected one.
+    recorded_as_expected: Option<bool>,
+    /// The module's count of verbs served after a wait ([`super::SERVED`]).
+    served: u64,
+    /// The module's count of verbs refused at their deadline ([`super::EXPIRED`]).
+    expired: u64,
+    /// The verbs parked once it resolved.
+    parked_after: usize,
+    /// Whether a retry of the request, once it resolved, still found it parked to join.
+    joined_after: bool,
+  }
+
+  fn principal() -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid: 1234,
+    }
+  }
+
+  /// A volume named `name` made on `state`'s shard through the verbs, owned by [`principal`].
+  fn volume_made(state: &mut ShardState, name: &str) -> Option<VolumeId> {
+    let created = crate::verbs::dispatch(
+      state,
+      CLIENT,
+      &principal(),
+      RequestBody::Create {
+        name: name.to_owned(),
+        size: SizeClass::Dynamic { max: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    match created {
+      ReplyBody::Created { id } => Some(id),
+      _ => None,
+    }
+  }
+
+  /// Makes `state`'s owner lease refuse, as a newer version of the owner's own authority announced to it does: the one
+  /// verdict an audit shard, whose lone owner's lease holds on no confirmation, can refuse with. The module asks only
+  /// whether the verdict holds (`verbs::lease_verdict`), never why.
+  fn lease_refuses(state: &mut ShardState) {
+    state.lease = crate::lease::OwnerLease {
+      superseded: Some(state.fleet.configuration().version.saturating_add(1)),
+      ..crate::lease::OwnerLease::default()
+    };
+  }
+
+  /// Lets `state`'s owner lease hold again, as a confirmation that reaches the shard does.
+  fn lease_confirms(state: &mut ShardState) {
+    state.lease = crate::lease::OwnerLease::default();
+  }
+
+  /// Asks `volume`'s status, a latest-state read, as request [`SEQUENCE`] of [`CLIENT`], run as `verbs::run_recorded`
+  /// runs a request up to its commit: under its completion key, in one durable step, with no reply route (as a verb
+  /// forwarded from another node, whose exchange reads the completion record). Whether it parked, with nothing
+  /// recorded.
+  fn ask_status(state: &mut ShardState, volume: VolumeId) -> bool {
+    let id = RequestId {
+      client: CLIENT,
+      sequence: SEQUENCE,
+    };
+    state.db.begin();
+    state.current_request = Some((state.origin_anchor.0, id));
+    let reply = crate::verbs::dispatch(state, CLIENT, &principal(), RequestBody::Status { volume });
+    state.current_request = None;
+    let deferred = std::mem::take(&mut state.acceptance_deferred);
+    let committed = state.db.commit(&mut state.segment).is_ok();
+    deferred
+      && committed
+      && reply == super::parked_reply()
+      && parked(state) == 1
+      && recorded(state).is_none()
+  }
+
+  /// The reply recorded as the request's completion, `None` while none is.
+  fn recorded(state: &ShardState) -> Option<ReplyBody> {
+    match state
+      .db
+      .partition()
+      .completion(state.origin_anchor.0, CLIENT, SEQUENCE)
+    {
+      Seen::Completed(bytes) => ReplyBody::from_bytes(&bytes).ok(),
+      _ => None,
+    }
+  }
+
+  fn counted(state: &ShardState, name: &str) -> u64 {
+    state.refusals.get(name).copied().unwrap_or(0)
+  }
+
+  /// What `state` shows of the request once it resolved, `expected` judging its recorded reply.
+  fn seen_after(
+    state: &mut ShardState,
+    parked_at_first: bool,
+    expected: impl Fn(&ReplyBody) -> bool,
+  ) -> ReadSeen {
+    let id = RequestId {
+      client: CLIENT,
+      sequence: SEQUENCE,
+    };
+    let origin = state.origin_anchor.0;
+    ReadSeen {
+      parked_at_first,
+      recorded_as_expected: recorded(state).map(|reply| expected(&reply)),
+      served: counted(state, SERVED),
+      expired: counted(state, EXPIRED),
+      parked_after: parked(state),
+      joined_after: join(state, origin, id),
+    }
+  }
+
+  /// §4.8 "Leases and reads" (AUD-08), `lease_wait`'s first rule. Do: make a volume, let the owner lease refuse, and
+  /// ask the volume's status as a recorded request; then let the lease confirm and resolve twice. Expect: the read
+  /// parked with nothing recorded, then ran once its lease confirmed: its completion is the volume's status, counted
+  /// served once and expired never; nothing is left parked, and a retry finds no request to join (it reads the
+  /// completion). The second resolve changes nothing.
+  #[test]
+  fn a_parked_read_runs_once_its_lease_confirms_and_only_once() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let volume = volume_made(state, "confirmed")?;
+      lease_refuses(state);
+      let parked_at_first = ask_status(state, volume);
+      lease_confirms(state);
+      resolve(state);
+      resolve(state);
+      Some(seen_after(state, parked_at_first, |reply| {
+        matches!(reply, ReplyBody::Status { .. })
+      }))
+    });
+    assert_eq!(
+      seen,
+      Some(ReadSeen {
+        parked_at_first: true,
+        recorded_as_expected: Some(true),
+        served: 1,
+        expired: 0,
+        parked_after: 0,
+        joined_after: false,
+      })
+    );
+  }
+
+  /// §4.8 "Leases and reads" (AUD-08), `lease_wait`'s second rule. Do: as above, but leave the lease refusing and put
+  /// the waiter's deadline (the lease bound from its parking, which a unit test does not sleep through) behind the
+  /// clock; resolve twice. Expect: the read refused `LeaseUnconfirmed` under the configuration's version and recorded
+  /// so as its completion, counted expired once and served never; nothing is left parked, and a retry joins nothing.
+  #[test]
+  fn a_parked_read_whose_lease_never_confirms_is_refused_lease_unconfirmed_at_its_deadline() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let volume = volume_made(state, "lapsed")?;
+      lease_refuses(state);
+      let parked_at_first = ask_status(state, volume);
+      let version = state.fleet.configuration().version;
+      for waiter in &mut state.lease_waiters.waiting {
+        waiter.deadline_ns = 0;
+      }
+      resolve(state);
+      resolve(state);
+      Some(seen_after(state, parked_at_first, |reply| {
+        matches!(
+          reply,
+          ReplyBody::Refused {
+            refusal: Refusal::LeaseUnconfirmed { version: refused_under },
+          } if *refused_under == version
+        )
+      }))
+    });
+    assert_eq!(
+      seen,
+      Some(ReadSeen {
+        parked_at_first: true,
+        recorded_as_expected: Some(true),
+        served: 0,
+        expired: 1,
+        parked_after: 0,
+        joined_after: false,
+      })
+    );
+  }
+
+  /// §4.8 "Leases and reads" (AUD-08), `lease_wait`'s wait: before its deadline a lease still refusing keeps the read
+  /// parked, and a retry joins it rather than parking twice. Do: park the read, resolve with the lease still refusing,
+  /// retry the request; then let the lease confirm and resolve. Expect: after the first resolve one waiter and nothing
+  /// recorded; the retry joined, and still one waiter; then one completion, the volume's status, counted served once.
+  #[test]
+  fn a_read_still_within_its_deadline_stays_parked_and_its_retry_joins_it() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let volume = volume_made(state, "waiting")?;
+      lease_refuses(state);
+      let asked = ask_status(state, volume);
+      resolve(state);
+      let id = RequestId {
+        client: CLIENT,
+        sequence: SEQUENCE,
+      };
+      let origin = state.origin_anchor.0;
+      let joined = join(state, origin, id);
+      let kept = parked(state) == 1 && recorded(state).is_none();
+      lease_confirms(state);
+      resolve(state);
+      Some(seen_after(state, asked && joined && kept, |reply| {
+        matches!(reply, ReplyBody::Status { .. })
+      }))
+    });
+    assert_eq!(
+      seen,
+      Some(ReadSeen {
+        parked_at_first: true,
+        recorded_as_expected: Some(true),
+        served: 1,
+        expired: 0,
+        parked_after: 0,
+        joined_after: false,
+      })
+    );
+  }
+}

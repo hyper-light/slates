@@ -27892,15 +27892,16 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
 }
 
 /// AC (§4.8 "Leases and reads"; AUD-08): in a three-node `f = 1` fleet a green advances three versions on
-/// its owner, then the owner is **isolated** on the probe plane (both directions) — it is not stopped, its
-/// client connection stays open. Its owner lease lapses by the host clock (measured across a scheduling
-/// pause of its control shard, so the lapse is by the clock, not by a loop running), and every read of the
-/// green's **latest state** on that connection — the head version, a head read, a status — refuses
-/// `LeaseUnconfirmed`, while an explicitly pinned immutable read (version 1) is still served. Meanwhile the
-/// surviving quorum retires the isolated owner, the successor rendezvous ranks first materializes the green
-/// and a new work advances it to version 4 — the new committed write the isolated owner must not serve
-/// stale. Non-vacuous: before the isolation the owner served all three of those reads; the successor's
-/// lease holds (a holder confirms it) so it serves version 4.
+/// its owner, then the owner is **isolated** on the probe plane (both directions) — it is not stopped, and the
+/// client that wrote the versions stays connected. Its owner lease lapses by the host clock (measured across a
+/// scheduling pause of its control shard, so the lapse is by the clock, not by a loop running), and each read
+/// of the green's **latest state** the test then asks it — the head version and a head read, through a client
+/// connected anew for each observation (`observe_taken_over_green`) — refuses `LeaseUnconfirmed`, while an
+/// explicitly pinned immutable read (version 1) is still served. Meanwhile the surviving quorum retires the
+/// isolated owner, the successor rendezvous ranks first materializes the green and a new work advances it to
+/// version 4 — the new committed write the isolated owner must not serve stale. Non-vacuous: before the
+/// isolation the owner served all three of those reads; the successor's lease holds (a holder confirms it) so
+/// it serves version 4.
 #[test]
 fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green() {
   let _serial = serialize_fleet_tests();
@@ -27926,7 +27927,7 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
   let object = ObjectId(green.bytes);
   let (both_caught_up, _) = holders_before_owner_death(&daemons, green);
 
-  // Before isolation the owner serves its green's latest state on this very connection.
+  // Before isolation the owner serves its green's latest state (each observation connects a client anew).
   let before = observe_taken_over_green(&daemons[0], green);
 
   // Isolate A on the probe plane, both directions: A no longer answers B/C (so the council retires it),
