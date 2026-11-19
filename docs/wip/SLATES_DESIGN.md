@@ -13706,8 +13706,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
-    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH and LOCK's request are built (A-627), and the
-    update-report and replay editor drives and LOCK's answer are owed.
+    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
+    built (A-627), and the replay drive, LOCK's answer and LOCK and UNLOCK onto the lock table are owed.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -42441,6 +42441,28 @@ Applied in the same change to:
   and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
   server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
   checkout of a repository's green must pass over.
+
+### A-627, continued — The update-report's answer: the editor drive in send-all mode, written as update.c writes it (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part)
+Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), and `crates/svn` (`dav/drive.rs` and its
+tests, new; `dav/listing.rs`'s flat base64 shared; `dav.rs`).
+
+- **Built.** `dav::Drive` takes the editor's calls and writes each as `reports/update.c`'s format strings do in
+  send-all mode, the mode stock ra_serf asks for when bulk updates are allowed:
+  - the header with `send-all` and `inline-props`, and the target revision;
+  - the anchor's `S:open-directory`, and `S:open-*` and `S:add-*` (`bc-url`, `sha1-checksum`, copy source), each with
+    the checked-in href `send_vsn_url` writes;
+  - `S:delete-entry` and `S:absent-*`;
+  - `S:set-prop` (escaped as `svn_xml_escape_cdata_string`, or base64 with line breaks) and `S:remove-prop`;
+  - `S:txdelta` with an optional `base-checksum`, the svndiff through the crate's encoder in base64 with no line breaks;
+  - a file's MD5 in `S:prop` before its close, and every close.
+
+  What to send is the server's: the delta between the client's reported state and the target over the index (piece 7's
+  reporter).
+- **Tests and the run.** Three tests: a drive of every call byte for byte, read back as well-formed XML, and the header
+  with neither mode and a copy's source. `cargo test --locked -p slates-svn --lib` passed 286 of 286 on the Mac Studio
+  (2026-11-19), and fmt was clean. Red once, on a copy that dropped the line feed after a base64 property's tag: the
+  drive test failed.
+- **Owed.** The replay drive (`replay.c`), LOCK's answer, and LOCK and UNLOCK onto the A-602 guards.
 
 ### A-625 part 1 — the HTTP edge's engine: one connection's request loop as a state machine over bytes, HTTPS, credentials, 100-continue, keep-alive, streamed bodies, typed refusals and the staged close (2026-11-19, g076b, UI goal 93; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's next part)
 Applied in the same change to:
