@@ -5,14 +5,25 @@
 //! **What a copy is.** `Copy` (`OpKind` 16) names its destination, its source and the source's version (Subversion's
 //! copy-from revision: FSFS copies only from a committed revision, `libsvn_fs_fs/tree.c` `copy_helper`). The verdict
 //! judges it node-exclusively, an addition: refused when the destination or anything beneath it is present at the head
-//! (unless the copy replaces it, below) or changed after the increment's base, when the source's tree changed after the
-//! version it is copied at, when
-//! nothing is there to copy, when the source's tree holds a hard link (Subversion has none, and each would add one more
-//! name to the reverse map of links, `links_to`), and when the destination is the root (always present; an editor
-//! never adds it). Accepted, the head's maps copy the source's tree by reference (`crate::dims`, "A tree is copied by
-//! reference"): since the source did not change after its version, the head's tree is that version's. The root is a
-//! source like any other: its tree is every key (a stock client copies `^/` into a child, `libsvn_client/copy.c`
-//! refusing a copy into its own child only between working copies).
+//! (unless the copy replaces it, below) or changed after the increment's base, when nothing stood in the source's tree
+//! at its version, when the source's tree holds a hard link (Subversion has none, and each would add one more name to
+//! the reverse map of links, `links_to`), and when the destination is the root (always present; an editor never adds
+//! it). Accepted, the head's maps copy the source's tree by reference (`crate::dims`, "A tree is copied by
+//! reference"). The root is a source like any other: its tree is every key (a stock client copies `^/` into a child,
+//! `libsvn_client/copy.c` refusing a copy into its own child only between working copies).
+//!
+//! **A copy from a version its source changed after** (A-626 part 2; FSFS copies from any committed revision, its
+//! node-revisions kept whole) brings the tree as it stood then. The maps hold only the head, so the copy grafts the
+//! head's tree and fixes it (`CopyFix`, in `crate::chain_entry`): the paths the change index names in the source's
+//! tree since the version are the only keys that can differ, each set to its value then where that differs from the
+//! head's; a copy made since inside the source is cut; one made since over it replaced the whole tree, so nothing of the
+//! head's is grafted and its keys then (each named by its removal) are set whole. The verdict reads the fix through a
+//! view of the source as the copy brings it (`SourceAt`): whether anything stood there is counted, never walked
+//! (`count_tree`, the radix tree's node counts). The fix is set at the commit with no key recorded: the copy's entry in
+//! the identity already stands for the source's tree at its version, and a key's first change after the copy records
+//! the value the copy gave it. The chain entry records the fix whole, so a replay reads no history whatever its holder
+//! folded or restored, and the room it needs is derived before the verdict (`Green::copy_entry_room`). A version whose
+//! values are folded away is refused, typed (`TypeChanged`): what it held is gone.
 //!
 //! **One record a copy, never one a key.** A copy is recorded once, at its destination: an appearance record (the
 //! version, the source, the source's version), one entry of the change index and one `last_changed` entry for the
@@ -66,6 +77,7 @@ use super::{
   IdentityKey, Increment, Resolved, SPECIAL_NODE_BYTES, apply, change_bytes, copy_entry, dir_entry,
   file_entry, insert_whole, link_entry, mode_entry, record, special_entry, union_keys, xattr_entry,
 };
+use crate::chain_entry::{Applied, CopyFix};
 use crate::dims::{Block, Held, HeldAttributes};
 use crate::identity::Entry;
 use crate::ops_doc::{Op, OpKind};
@@ -94,6 +106,285 @@ pub(super) struct CopySpec {
   pub(super) version: u64,
   /// Whether it replaces what its destination holds.
   pub(super) replace: bool,
+}
+
+/// Each copy's fix in one increment (A-626 part 2), by destination, computed once a verdict ([`Green::copy_fixes`]):
+/// none for a source unchanged since its version, the class that refuses one whose version's values are folded away or
+/// held a hard link.
+pub(super) type CopyFixes = BTreeMap<String, Result<Option<CopyFix>, MergeConflictClass>>;
+
+/// One copy as [`Green::commit_copies`] applies it: its destination and source, the source's version and whether it
+/// replaces, and its fix.
+type Committed<'a> = ((&'a str, &'a str), (u64, bool), Option<&'a CopyFix>);
+
+/// Whether a copy with `fix` grafts the head's keys at `rel` (relative to its source): not where it starts empty, nor
+/// in a cut.
+fn grafted_in(fix: &CopyFix, rel: &str) -> bool {
+  !fix.start_empty && !fix.cuts.iter().any(|cut| in_tree(rel, cut))
+}
+
+/// Counts one key of a fix against the head's graft ([`SourceAt::holds_tree`]): one gained where the fix sets a key the
+/// graft does not bring, one lost where it takes away one the graft brings.
+fn tally(counts: &mut (usize, usize), then: bool, brought: bool) {
+  if then && !brought {
+    counts.0 = counts.0.saturating_add(1);
+  } else if !then && brought {
+    counts.1 = counts.1.saturating_add(1);
+  }
+}
+
+/// A copy's source as the copy brings it (A-626 part 2): the head's tree, or, for a source changed after the copied
+/// version, the head's tree less its fix's cuts with its fix's values set, which is the source's tree at the version.
+/// What a verdict judges a copied tree against, and what replay reads an edited file's bytes from.
+#[derive(Clone, Copy)]
+pub(super) struct SourceAt<'a> {
+  green: &'a Green,
+  source: &'a str,
+  fix: Option<&'a CopyFix>,
+}
+
+impl<'a> SourceAt<'a> {
+  /// Where `path` lies in the source's tree, relative to it, and whether the head's keys there are grafted; `None`
+  /// outside the tree.
+  fn place<'p>(&self, path: &'p str) -> Option<(&'p str, bool)> {
+    let rel = relative(path, self.source)?;
+    Some((rel, self.fix.is_none_or(|fix| grafted_in(fix, rel))))
+  }
+
+  /// The file's bytes at `path`.
+  pub(super) fn content(&self, path: &str) -> Option<&'a [u8]> {
+    let Some(fix) = self.fix else {
+      return self.green.content.get(path);
+    };
+    let (rel, grafted) = self.place(path)?;
+    match fix.files.get(rel) {
+      Some(bytes) => bytes.as_deref(),
+      None => self.green.content.get(path).filter(|_| grafted),
+    }
+  }
+
+  /// Whether a directory stands at `path`.
+  fn dir(&self, path: &str) -> bool {
+    let Some(fix) = self.fix else {
+      return self.green.dirs.contains_key(path);
+    };
+    let Some((rel, grafted)) = self.place(path) else {
+      return false;
+    };
+    match fix.dirs.get(rel) {
+      Some(stood) => *stood,
+      None => grafted && self.green.dirs.contains_key(path),
+    }
+  }
+
+  /// The IPC node at `path`.
+  fn special(&self, path: &str) -> Option<SpecialNode> {
+    let Some(fix) = self.fix else {
+      return self.green.specials.get(path).copied();
+    };
+    let (rel, grafted) = self.place(path)?;
+    match fix.specials.get(rel) {
+      Some(node) => *node,
+      None => self.green.specials.get(path).copied().filter(|_| grafted),
+    }
+  }
+
+  /// The symbolic link's target at `path`.
+  fn symlink(&self, path: &str) -> Option<&'a str> {
+    let head = self.green.symlinks.get(path).map(String::as_str);
+    let Some(fix) = self.fix else {
+      return head;
+    };
+    let (rel, grafted) = self.place(path)?;
+    match fix.symlinks.get(rel) {
+      Some(target) => target.as_deref(),
+      None => head.filter(|_| grafted),
+    }
+  }
+
+  /// Whether a hard link stands at `path` (a fix never sets one: its version held none).
+  fn hardlink(&self, path: &str) -> bool {
+    self.place(path).is_some_and(|(_, grafted)| grafted) && self.green.hardlinks.contains_key(path)
+  }
+
+  /// The attribute `name`'s value at `path`.
+  fn xattr(&self, path: &str, name: &str) -> Option<&'a [u8]> {
+    let head = self.green.xattrs.get(path, name).map(Vec::as_slice);
+    let Some(fix) = self.fix else {
+      return head;
+    };
+    let (rel, grafted) = self.place(path)?;
+    match fix.xattrs.get(&(rel.to_owned(), name.to_owned())) {
+      Some(value) => value.as_deref(),
+      None => head.filter(|_| grafted),
+    }
+  }
+
+  /// Whether a file, directory or IPC node stands at `path`: what a mode or an attribute can be set on.
+  fn node_stands(&self, path: &str) -> bool {
+    self.content(path).is_some() || self.dir(path) || self.special(path).is_some()
+  }
+
+  /// Whether a file, directory, symbolic link, hard link or IPC node stands at `path`.
+  fn holds_node(&self, path: &str) -> bool {
+    self.node_stands(path) || self.symlink(path).is_some() || self.hardlink(path)
+  }
+
+  /// Whether a file, directory, symbolic link, hard link or IPC node stands beneath `prefix` and is not in `gone`, as
+  /// `merge_rmdir`'s check reads the head: the head's names there and the fix's, each judged as the copy brings it.
+  fn has_live_child(&self, prefix: &str, gone: &BTreeSet<String>) -> bool {
+    let green = self.green;
+    let head = green
+      .content
+      .prefix(prefix)
+      .map(|(path, _)| path)
+      .chain(green.dirs.prefix(prefix).map(|(path, _)| path))
+      .chain(green.symlinks.prefix(prefix).map(|(path, _)| path))
+      .chain(green.hardlinks.prefix(prefix).map(|(path, _)| path))
+      .chain(green.specials.prefix(prefix).map(|(path, _)| path));
+    let fixed = self
+      .fix
+      .into_iter()
+      .flat_map(|fix| {
+        fix
+          .files
+          .keys()
+          .chain(fix.dirs.keys())
+          .chain(fix.symlinks.keys())
+          .chain(fix.specials.keys())
+      })
+      .map(|rel| joined(self.source, rel))
+      .filter(|path| path.starts_with(prefix));
+    head
+      .chain(fixed)
+      .any(|path| !gone.contains(&path) && self.holds_node(&path))
+  }
+
+  /// Whether a key of `root`'s tree (in the source's) stands as the copy brings it: the head's keys the graft brings
+  /// there, counted, less those its cuts take, then each key of its fix gained or lost against them. Descents and
+  /// counts, never a walk of the tree.
+  pub(super) fn holds_tree(&self, root: &str) -> bool {
+    let Some(fix) = self.fix else {
+      return self.green.tree_held(root);
+    };
+    let Some((rel_root, grafted)) = self.place(root) else {
+      return false;
+    };
+    let brought = if grafted {
+      let cut = fix
+        .cuts
+        .iter()
+        .filter(|cut| in_tree(cut, rel_root))
+        .map(|cut| self.green.count_tree(&joined(self.source, cut)))
+        .fold(0, usize::saturating_add);
+      self.green.count_tree(root).saturating_sub(cut)
+    } else {
+      0
+    };
+    let mut counts = (0usize, 0usize);
+    self.balance_nodes(fix, rel_root, &mut counts);
+    self.balance_metadata(fix, rel_root, &mut counts);
+    brought.saturating_add(counts.0) > counts.1
+  }
+
+  /// [`SourceAt::holds_tree`]'s tally of the fix's files, IPC nodes and directories in `rel_root`'s tree.
+  fn balance_nodes(&self, fix: &CopyFix, rel_root: &str, counts: &mut (usize, usize)) {
+    let green = self.green;
+    let brought = |rel: &str, held: &dyn Fn(&str) -> bool| {
+      grafted_in(fix, rel) && held(&joined(self.source, rel))
+    };
+    for (rel, bytes) in fix.files.iter().filter(|(rel, _)| in_tree(rel, rel_root)) {
+      let held = brought(rel, &|path| green.content.contains_key(path));
+      tally(counts, bytes.is_some(), held);
+    }
+    for (rel, node) in fix
+      .specials
+      .iter()
+      .filter(|(rel, _)| in_tree(rel, rel_root))
+    {
+      let held = brought(rel, &|path| green.specials.contains_key(path));
+      tally(counts, node.is_some(), held);
+    }
+    for (rel, stood) in fix.dirs.iter().filter(|(rel, _)| in_tree(rel, rel_root)) {
+      let held = brought(rel, &|path| green.dirs.contains_key(path));
+      tally(counts, *stood, held);
+    }
+  }
+
+  /// [`SourceAt::holds_tree`]'s tally of the fix's modes, symbolic links and attributes in `rel_root`'s tree.
+  fn balance_metadata(&self, fix: &CopyFix, rel_root: &str, counts: &mut (usize, usize)) {
+    let green = self.green;
+    let brought = |rel: &str, held: &dyn Fn(&str) -> bool| {
+      grafted_in(fix, rel) && held(&joined(self.source, rel))
+    };
+    for (rel, mode) in fix.modes.iter().filter(|(rel, _)| in_tree(rel, rel_root)) {
+      let held = brought(rel, &|path| green.modes.contains_key(path));
+      tally(counts, mode.is_some(), held);
+    }
+    for (rel, target) in fix
+      .symlinks
+      .iter()
+      .filter(|(rel, _)| in_tree(rel, rel_root))
+    {
+      let held = brought(rel, &|path| green.symlinks.contains_key(path));
+      tally(counts, target.is_some(), held);
+    }
+    for ((rel, name), value) in fix
+      .xattrs
+      .iter()
+      .filter(|((rel, _), _)| in_tree(rel, rel_root))
+    {
+      let held = brought(rel, &|path| green.xattrs.contains_key(path, name));
+      tally(counts, value.is_some(), held);
+    }
+  }
+}
+
+/// The copies one chain entry records, for its other effects to read the copied trees by at replay (A-626 part 2): an
+/// edited file's bytes before the edit are those its copy brings, a fixed copy's from its fix.
+pub(super) struct EntryCopies<'a> {
+  copies: Vec<(&'a str, &'a str, Option<&'a CopyFix>)>,
+}
+
+impl<'a> EntryCopies<'a> {
+  /// The copies `applied` records.
+  pub(super) fn of(applied: &'a [Applied]) -> EntryCopies<'a> {
+    let copies = applied
+      .iter()
+      .filter_map(|applied| match applied {
+        Applied::CopyTree { dst, from, fix, .. } => {
+          Some((dst.as_str(), from.as_str(), fix.as_deref()))
+        }
+        _ => None,
+      })
+      .collect();
+    EntryCopies { copies }
+  }
+
+  /// The source of the innermost of these copies whose tree holds `dst`, as that copy brings it; the head's, for a path
+  /// in none.
+  pub(super) fn source_at<'g>(&self, green: &'g Green, dst: &str) -> SourceAt<'g>
+  where
+    'a: 'g,
+  {
+    let innermost = self
+      .copies
+      .iter()
+      .filter(|(at, ..)| in_tree(dst, at))
+      .max_by_key(|(at, ..)| at.len());
+    match innermost {
+      Some((_, from, fix)) => SourceAt {
+        green,
+        source: from,
+        fix: *fix,
+      },
+      None => SourceAt {
+        green,
+        source: "",
+        fix: None,
+      },
+    }
+  }
 }
 
 /// Every map's hold on a copy's source tree (A-626): taken before the version changes any map, so every copy of one
@@ -431,36 +722,83 @@ impl Green {
       .any(|entry| in_tree(&entry.path, path))
   }
 
+  /// Each copy's fix in `r` (A-626 part 2), by destination, computed once a verdict.
+  pub(super) fn copy_fixes(&self, r: &Resolved) -> CopyFixes {
+    r.copies
+      .iter()
+      .map(|(dst, spec)| (dst.clone(), self.copy_fix(&spec.source, spec.version)))
+      .collect()
+  }
+
+  /// The source of the copy `spec` as it brings it, with its fix (`fix`, from [`Green::copy_fixes`]) where it has one.
+  fn source_at<'a>(
+    &'a self,
+    spec: &'a CopySpec,
+    fix: Option<&'a Result<Option<CopyFix>, MergeConflictClass>>,
+  ) -> SourceAt<'a> {
+    SourceAt {
+      green: self,
+      source: &spec.source,
+      fix: fix
+        .and_then(|fix| fix.as_ref().ok())
+        .and_then(Option::as_ref),
+    }
+  }
+
   /// The verdict of each copy the increment declares (module docs), its effect or its conflict: a copy into another's
-  /// tree is judged against that tree (A-626), every other against the head.
+  /// tree is judged against what that copy brings there (A-626), every other against the head.
   pub(super) fn decide_copies(
     &self,
     inc: &Increment,
-    r: &Resolved,
+    (r, fixes): (&Resolved, &CopyFixes),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
     for (dst, spec) in &r.copies {
-      let verdict = match outer_of(&r.copies, dst) {
-        None => self.decide_copy(inc.base, dst, spec),
-        Some(outer) => self.decide_nested_copy(dst, spec, outer),
-      };
-      match verdict {
+      match self.decide_copy(inc.base, (dst, spec), (r, fixes)) {
         Ok(effect) => effects.push(effect),
         Err(window) => windows.push(window),
       }
     }
   }
 
-  /// One copy's verdict against the head (module docs): the conflict names the destination, by kind.
-  fn decide_copy(&self, base: u64, dst: &str, spec: &CopySpec) -> Result<Effect, ConflictWindow> {
-    if dst.is_empty() {
-      return Err(Green::window(dst, MergeConflictClass::TypeChanged));
-    }
-    if let Some(class) = self.destination_refused(base, dst, spec.replace) {
+  /// One copy's verdict (module docs); the conflict names the destination, by kind.
+  fn decide_copy(
+    &self,
+    base: u64,
+    (dst, spec): (&str, &CopySpec),
+    (r, fixes): (&Resolved, &CopyFixes),
+  ) -> Result<Effect, ConflictWindow> {
+    let fix = match fixes.get(dst) {
+      Some(Err(class)) => return Err(Green::window(dst, *class)),
+      Some(Ok(fix)) => fix.as_ref(),
+      None => None,
+    };
+    if let Some(class) = self.destination_refused_in(base, (dst, spec), (r, fixes)) {
       return Err(Green::window(dst, class));
     }
-    self.copy_of_source(dst, spec)
+    self.copy_of_source(dst, spec, fix)
+  }
+
+  /// Why `dst` takes no copy, if it takes none: against the head ([`Green::destination_refused`]), or, inside another
+  /// copy of the increment (A-626, a second copy into a copied tree; Subversion's move within one is a copy and a
+  /// removal), against what that copy brings there, which its verdict holds as its source's tree at its version: a tree
+  /// there takes the copy only as a replace.
+  fn destination_refused_in(
+    &self,
+    base: u64,
+    (dst, spec): (&str, &CopySpec),
+    (r, fixes): (&Resolved, &CopyFixes),
+  ) -> Option<MergeConflictClass> {
+    let Some((outer, outer_spec)) = outer_of(&r.copies, dst) else {
+      if dst.is_empty() {
+        return Some(MergeConflictClass::TypeChanged);
+      }
+      return self.destination_refused(base, dst, spec.replace);
+    };
+    let there = joined(&outer_spec.source, relative(dst, outer).unwrap_or_default());
+    let brought = self.source_at(outer_spec, fixes.get(outer));
+    (brought.holds_tree(&there) && !spec.replace).then_some(MergeConflictClass::CreateCreate)
   }
 
   /// Why the head's `dst` takes no copy, if it takes none: a tree there and no replace (`CreateCreate`, an add of a
@@ -483,144 +821,279 @@ impl Green {
       .then_some(MergeConflictClass::TypeChanged)
   }
 
-  /// A copy into another copy's tree in the same increment (A-626, a second copy into a copied tree; Subversion's move
-  /// within one is a copy and a removal): its destination is judged against the outer copy's source, which the outer
-  /// copy's verdict holds unchanged since its version, so a tree there takes the copy only as a replace.
-  fn decide_nested_copy(
+  /// The source's half of a copy's verdict (module docs), and the copy's effect: refused when the source version is past
+  /// the head, when nothing stood in the source's tree at it, and when the source's tree holds a hard link
+  /// (`TypeChanged`). A source changed after its version is copied as it stood then, through its fix (A-626 part 2).
+  fn copy_of_source(
     &self,
     dst: &str,
     spec: &CopySpec,
-    (outer, outer_spec): (&str, &CopySpec),
+    fix: Option<&CopyFix>,
   ) -> Result<Effect, ConflictWindow> {
-    let there = joined(&outer_spec.source, relative(dst, outer).unwrap_or_default());
-    if self.tree_held(&there) && !spec.replace {
-      return Err(Green::window(dst, MergeConflictClass::CreateCreate));
-    }
-    self.copy_of_source(dst, spec)
-  }
-
-  /// The source's half of a copy's verdict (module docs), and the copy's effect: refused when the source version is past
-  /// the head or nothing is there, when the source holds a hard link (`TypeChanged`), and when its tree changed after
-  /// that version (`RenameRename`).
-  fn copy_of_source(&self, dst: &str, spec: &CopySpec) -> Result<Effect, ConflictWindow> {
     let refused = |class| Err(Green::window(dst, class));
     if spec.version > self.head() {
       return refused(MergeConflictClass::TypeChanged);
     }
-    if self.tree_changed_after(&spec.source, spec.version) {
-      return refused(MergeConflictClass::RenameRename);
-    }
-    if !self.tree_held(&spec.source) || self.hardlinks.holds_tree(&spec.source) {
+    let brought = SourceAt {
+      green: self,
+      source: &spec.source,
+      fix,
+    };
+    if !brought.holds_tree(&spec.source) || self.hardlinks.holds_tree(&spec.source) {
       return refused(MergeConflictClass::TypeChanged);
     }
-    Ok(Effect::CopyTree(
-      dst.to_owned(),
-      spec.source.clone(),
-      spec.version,
-      spec.replace,
-    ))
+    Ok(Effect::CopyTree {
+      dst: dst.to_owned(),
+      from: spec.source.clone(),
+      version: spec.version,
+      replace: spec.replace,
+      fix: fix.cloned().map(Box::new),
+    })
   }
 
-  /// The operations on this increment's copied trees (module docs), judged against the copied tree: the source's at the
-  /// head.
+  /// What a copy of `source` at `version` changes in the head's tree it grafts, so it brings the tree as it stood at the
+  /// version (A-626 part 2; FSFS copies from any committed revision): none for a tree unchanged since. The paths the
+  /// change index names in the source's tree since the version are the only keys that can differ (a key unnamed since
+  /// is unchanged); a copy made since above the source replaced the whole tree, so nothing of the head's is grafted; one
+  /// made since inside it is cut. Refused, by class, when the version's values are folded away (below the fold floor or
+  /// the checkpoint the green was restored at) or a hard link stood in the tree at it. O(the change index's entries
+  /// since the version, and the keys at the paths it names).
+  pub(super) fn copy_fix(
+    &self,
+    source: &str,
+    version: u64,
+  ) -> Result<Option<CopyFix>, MergeConflictClass> {
+    if !self.tree_changed_after(source, version) {
+      return Ok(None);
+    }
+    if version < self.folded_below.max(self.deltas_from) {
+      return Err(MergeConflictClass::TypeChanged);
+    }
+    let named: BTreeSet<&str> = self
+      .changes
+      .range(version.saturating_add(1)..)
+      .flat_map(|(_, entries)| entries)
+      .map(|entry| entry.path.as_str())
+      .filter(|path| in_tree(path, source))
+      .collect();
+    let start_empty = self.replaced_after(source, version);
+    let mut fix = CopyFix {
+      start_empty,
+      ..CopyFix::default()
+    };
+    if !start_empty {
+      fix.cuts = self.cuts_after(source, version, &named);
+    }
+    for path in named {
+      self.fix_nodes(source, (path, version), &mut fix)?;
+      self.fix_attributes(source, (path, version), &mut fix);
+    }
+    Ok(Some(fix))
+  }
+
+  /// The trees of the copies made inside `source` after `version` (each a path the change index names, `named`),
+  /// relative to the source, the outermost of each nest only.
+  fn cuts_after(&self, source: &str, version: u64, named: &BTreeSet<&str>) -> BTreeSet<String> {
+    let mut cuts: BTreeSet<String> = BTreeSet::new();
+    for path in named {
+      let copied = self
+        .copies
+        .get(*path)
+        .is_some_and(|records| records.iter().any(|record| record.version > version));
+      let Some(rel) = relative(path, source).filter(|rel| !rel.is_empty()) else {
+        continue;
+      };
+      if copied && !cuts.iter().any(|cut| in_tree(rel, cut)) {
+        cuts.retain(|cut| !in_tree(cut, rel));
+        cuts.insert(rel.to_owned());
+      }
+    }
+    cuts
+  }
+
+  /// [`Green::copy_fix`] of the nodes at `path` (in `source`'s tree): its file, IPC node, directory, mode and symbolic
+  /// link at `version`, each recorded where it differs from what the head's graft brings; a hard link then refuses.
+  fn fix_nodes(
+    &self,
+    source: &str,
+    (path, version): (&str, u64),
+    fix: &mut CopyFix,
+  ) -> Result<(), MergeConflictClass> {
+    if self.hardlink_at(path, version).is_some() {
+      return Err(MergeConflictClass::TypeChanged);
+    }
+    let rel = relative(path, source).unwrap_or_default().to_owned();
+    let grafted = grafted_in(fix, &rel);
+    let then = self.content_ref_at(path, version);
+    if then.as_deref() != self.content.get(path).filter(|_| grafted) {
+      fix
+        .files
+        .insert(rel.clone(), then.map(std::borrow::Cow::into_owned));
+    }
+    let then = self.special_at(path, version);
+    if then != self.specials.get(path).copied().filter(|_| grafted) {
+      fix.specials.insert(rel.clone(), then);
+    }
+    let then = self.dir_at(path, version);
+    if then != (grafted && self.dirs.contains_key(path)) {
+      fix.dirs.insert(rel.clone(), then);
+    }
+    let then = self.mode_at(path, version);
+    if then != self.modes.get(path).copied().filter(|_| grafted) {
+      fix.modes.insert(rel.clone(), then);
+    }
+    let then = self.symlink_at(path, version);
+    if then.as_ref() != self.symlinks.get(path).filter(|_| grafted) {
+      fix.symlinks.insert(rel, then);
+    }
+    Ok(())
+  }
+
+  /// [`Green::copy_fix`] of the attributes at `path`: each name with a history of its own, recorded at `version` where it
+  /// differs from what the head's graft brings. A name with none is unchanged since version 0 or the copy that gave it,
+  /// so it reads alike at both ends; one the tree held at the version and lost since has a history (its removal), so
+  /// the head's names are never listed, a walk the copy does not take.
+  fn fix_attributes(&self, source: &str, (path, version): (&str, u64), fix: &mut CopyFix) {
+    let rel = relative(path, source).unwrap_or_default().to_owned();
+    let grafted = grafted_in(fix, &rel);
+    let from = (path.to_owned(), String::new());
+    let names: Vec<String> = self
+      .xattr_history
+      .range(from..)
+      .take_while(|((at, _), _)| at == path)
+      .map(|((_, name), _)| name.clone())
+      .collect();
+    for name in names {
+      let then = self.xattr_at(path, &name, version);
+      if then.as_ref() != self.xattrs.get(path, &name).filter(|_| grafted) {
+        fix.xattrs.insert((rel.clone(), name), then);
+      }
+    }
+  }
+
+  /// The operations on this increment's copied trees (module docs), judged against the copied tree: its copy's source
+  /// as the copy brings it.
   pub(super) fn decide_copied(
     &self,
     inc: &Increment,
-    r: &Resolved,
+    (r, fixes): (&Resolved, &CopyFixes),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
     let Some(copied) = r.copied.as_deref() else {
       return;
     };
-    let from = |path: &str| source_of(&r.copies, path);
+    let from = |path: &str| self.copied_source((r, fixes), path);
     self.decide_copied_content(inc, copied, &from, effects, windows);
-    self.decide_copied_names(copied, &from, effects, windows);
-    self.decide_copied_metadata(copied, &from, effects, windows);
+    Green::decide_copied_names(copied, &from, effects, windows);
+    Green::decide_copied_metadata(copied, &from, effects, windows);
+  }
+
+  /// Where `path`, in a copied tree of `r`, comes from: its innermost copy's source as that copy brings it, and its
+  /// place there (`path` itself, outside every copy: never, for the paths the split hands over).
+  fn copied_source<'a>(
+    &'a self,
+    (r, fixes): (&'a Resolved, &'a CopyFixes),
+    path: &str,
+  ) -> (SourceAt<'a>, String) {
+    match innermost(&r.copies, path) {
+      Some((dst, spec)) => (
+        self.source_at(spec, fixes.get(dst)),
+        joined(&spec.source, relative(path, dst).unwrap_or_default()),
+      ),
+      None => (
+        SourceAt {
+          green: self,
+          source: "",
+          fix: None,
+        },
+        path.to_owned(),
+      ),
+    }
   }
 
   /// [`Green::decide_copied`] of creations and edits of files.
-  fn decide_copied_content(
-    &self,
+  fn decide_copied_content<'a>(
+    &'a self,
     inc: &Increment,
     copied: &Resolved,
-    from: &impl Fn(&str) -> String,
+    from: &impl Fn(&str) -> (SourceAt<'a>, String),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
     for path in &copied.creates {
       let ops = copied.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-      record(
-        effects,
-        windows,
-        self.copied_create(path, &from(path.as_str()), ops, &inc.post_state),
-      );
+      let (brought, at) = from(path);
+      let verdict = Green::copied_create(path, (&brought, at.as_str()), ops, &inc.post_state);
+      record(effects, windows, verdict);
     }
     for (path, ops) in &copied.content {
       if !copied.creates.contains(path) {
-        record(
-          effects,
-          windows,
-          self.copied_edit(path, &from(path.as_str()), ops, &inc.post_state),
-        );
+        let (brought, at) = from(path);
+        let verdict = Green::copied_edit(path, (&brought, at.as_str()), ops, &inc.post_state);
+        record(effects, windows, verdict);
       }
     }
     for (path, node) in &copied.specials {
-      let refused = self.holds_node(&from(path.as_str()));
+      let (brought, at) = from(path);
+      let effect = Effect::Special(path.clone(), *node);
       record(
         effects,
         windows,
-        Green::unless(refused, path, Effect::Special(path.clone(), *node)),
+        Green::unless(brought.holds_node(&at), path, effect),
       );
     }
   }
 
   /// [`Green::decide_copied`] of removals and directories.
-  fn decide_copied_names(
-    &self,
+  fn decide_copied_names<'a>(
     copied: &Resolved,
-    from: &impl Fn(&str) -> String,
+    from: &impl Fn(&str) -> (SourceAt<'a>, String),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
     for path in &copied.unlinks {
+      let (brought, at) = from(path);
       record(
         effects,
         windows,
-        Ok(self.copied_unlink(path, &from(path.as_str()))),
+        Ok(Green::copied_unlink(path, (&brought, at.as_str()))),
       );
     }
     for path in &copied.mkdirs {
+      let (brought, at) = from(path);
       record(
         effects,
         windows,
-        self.copied_mkdir(path, &from(path.as_str())),
+        Green::copied_mkdir(path, (&brought, at.as_str())),
       );
     }
     let cleared: BTreeSet<String> = copied
       .cleared()
       .iter()
-      .map(|path| from(path.as_str()))
+      .map(|path| from(path.as_str()).1)
       .collect();
     for path in &copied.rmdirs {
+      let (brought, at) = from(path);
       record(
         effects,
         windows,
-        self.copied_rmdir(path, &from(path.as_str()), &cleared),
+        Green::copied_rmdir(path, (&brought, at.as_str()), &cleared),
       );
     }
   }
 
   /// [`Green::decide_copied`] of modes, symbolic links and attributes.
-  fn decide_copied_metadata(
-    &self,
+  fn decide_copied_metadata<'a>(
     copied: &Resolved,
-    from: &impl Fn(&str) -> String,
+    from: &impl Fn(&str) -> (SourceAt<'a>, String),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
-    let absent =
-      |path: &String| !self.node_stands(&from(path.as_str())) && !copied.establishes(path);
+    let absent = |path: &String| {
+      let (brought, at) = from(path);
+      !brought.node_stands(&at) && !copied.establishes(path)
+    };
     for (path, mode) in &copied.modes {
       let effect = Effect::Mode(path.clone(), *mode);
       record(
@@ -630,8 +1103,8 @@ impl Green {
       );
     }
     for (path, target) in &copied.symlinks {
-      let refused =
-        self.holds_node(&from(path.as_str())) && !self.symlinks.contains_key(from(path.as_str()));
+      let (brought, at) = from(path);
+      let refused = brought.holds_node(&at) && brought.symlink(&at).is_none();
       let effect = Effect::Symlink(path.clone(), target.clone());
       record(effects, windows, Green::unless(refused, path, effect));
     }
@@ -644,7 +1117,8 @@ impl Green {
       );
     }
     for (path, name) in &copied.xattr_removes {
-      let held = self.xattrs.contains_key(&from(path.as_str()), name);
+      let (brought, at) = from(path);
+      let held = brought.xattr(&at, name).is_some();
       let effect = held.then(|| Effect::RemoveXattr(path.clone(), name.clone()));
       record(effects, windows, Ok(effect));
     }
@@ -672,27 +1146,15 @@ impl Green {
     }
   }
 
-  /// Whether a file, directory, symbolic link, hard link or IPC node stands at `path`.
-  fn holds_node(&self, path: &str) -> bool {
-    self.node_stands(path) || self.symlinks.contains_key(path) || self.hardlinks.contains_key(path)
-  }
-
-  /// Whether a file, directory or IPC node stands at `path`: what a mode or an attribute can be set on.
-  fn node_stands(&self, path: &str) -> bool {
-    self.content.contains_key(path)
-      || self.dirs.contains_key(path)
-      || self.specials.contains_key(path)
-  }
-
-  /// A file created at `path` in a copied tree, where the copy brings nothing (`from`, its place in the source).
+  /// A file created at `path` in a copied tree, where the copy brings nothing (`from`, its place in the source as the
+  /// copy brings it).
   fn copied_create(
-    &self,
     path: &str,
-    from: &str,
+    (brought, from): (&SourceAt<'_>, &str),
     ops: &[Op],
     post_state: &[u8],
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if self.holds_node(from) {
+    if brought.holds_node(from) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     let bytes = apply(&[], ops, post_state);
@@ -705,16 +1167,16 @@ impl Green {
     )))
   }
 
-  /// A file the copy brings to `path` (from `from`), edited: the source's bytes with the edits spliced in, recorded as a
-  /// rename's edited destination is (A-547), so replay splices them into the source's bytes as the verdict did.
+  /// A file the copy brings to `path` (from `from`), edited: the bytes the copy brings with the edits spliced in,
+  /// recorded as a rename's edited destination is (A-547), so replay splices them into the same bytes as the verdict did
+  /// (a fixed copy's, A-626 part 2, read from its entry: `EntryCopies`).
   fn copied_edit(
-    &self,
     path: &str,
-    from: &str,
+    (brought, from): (&SourceAt<'_>, &str),
     ops: &[Op],
     post_state: &[u8],
   ) -> Result<Option<Effect>, ConflictWindow> {
-    let Some(source) = self.content.get(from) else {
+    let Some(source) = brought.content(from) else {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     };
     let bytes = apply(source, ops, post_state);
@@ -729,12 +1191,12 @@ impl Green {
 
   /// A name the copy brings to `path` removed: whatever its source (`from`) is, a file, a symbolic link or an IPC node;
   /// nothing for a name the copy does not bring, as an unlink of an absent name is nothing (`merge_unlink`).
-  fn copied_unlink(&self, path: &str, from: &str) -> Option<Effect> {
-    if self.content.contains_key(from) {
+  fn copied_unlink(path: &str, (brought, from): (&SourceAt<'_>, &str)) -> Option<Effect> {
+    if brought.content(from).is_some() {
       Some(Effect::RemoveContent(path.to_owned()))
-    } else if self.symlinks.contains_key(from) {
+    } else if brought.symlink(from).is_some() {
       Some(Effect::RemoveSymlink(path.to_owned()))
-    } else if self.specials.contains_key(from) {
+    } else if brought.special(from).is_some() {
       Some(Effect::RemoveSpecial(path.to_owned()))
     } else {
       None
@@ -743,11 +1205,14 @@ impl Green {
 
   /// A directory made at `path` in a copied tree: nothing where the copy brings one, a type conflict where it brings
   /// another kind.
-  fn copied_mkdir(&self, path: &str, from: &str) -> Result<Option<Effect>, ConflictWindow> {
-    if self.dirs.contains_key(from) {
+  fn copied_mkdir(
+    path: &str,
+    (brought, from): (&SourceAt<'_>, &str),
+  ) -> Result<Option<Effect>, ConflictWindow> {
+    if brought.dir(from) {
       return Ok(None);
     }
-    if self.holds_node(from) {
+    if brought.holds_node(from) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     Ok(Some(Effect::MakeDir(path.to_owned())))
@@ -756,13 +1221,12 @@ impl Green {
   /// A directory the copy brings to `path` removed, once the increment's own removals (`cleared`, in the source's
   /// paths) empty it, as `merge_rmdir` judges one.
   fn copied_rmdir(
-    &self,
     path: &str,
-    from: &str,
+    (brought, from): (&SourceAt<'_>, &str),
     cleared: &BTreeSet<String>,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.dirs.contains_key(from) {
-      if self.holds_node(from) {
+    if !brought.dir(from) {
+      if brought.holds_node(from) {
         return Err(Green::window(path, MergeConflictClass::TypeChanged));
       }
       return Ok(None);
@@ -770,15 +1234,19 @@ impl Green {
     // The directory's own key is no child of it (the root's tree holds the root's own key).
     let mut gone = cleared.clone();
     gone.insert(from.to_owned());
-    if self.has_live_child(&beneath_prefix(from), &gone) {
+    if brought.has_live_child(&beneath_prefix(from), &gone) {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     Ok(Some(Effect::RemoveDir(path.to_owned())))
   }
 
   /// The paths whose content ops in this increment's copied trees do not fit what they edit (`super::fits_base`): a
-  /// created path edits nothing, an edited one its source's bytes at the head.
-  pub(super) fn unfit_copied(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
+  /// created path edits nothing, an edited one the bytes its copy brings.
+  pub(super) fn unfit_copied(
+    &self,
+    inc: &Increment,
+    (r, fixes): (&Resolved, &CopyFixes),
+  ) -> Vec<String> {
     let Some(copied) = r.copied.as_deref() else {
       return Vec::new();
     };
@@ -790,10 +1258,9 @@ impl Green {
         let base_len = if copied.creates.contains(*path) {
           0
         } else {
-          let from = source_of(&r.copies, path);
-          self
-            .content
-            .get(&from)
+          let (brought, from) = self.copied_source((r, fixes), path);
+          brought
+            .content(&from)
             .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
         };
         !super::fits_base(ops, base_len, post_len)
@@ -802,31 +1269,76 @@ impl Green {
       .collect()
   }
 
+  /// How many keys `path`'s tree holds in every map (A-626 part 2): descents and the counts their nodes keep, no walk.
+  pub(super) fn count_tree(&self, path: &str) -> usize {
+    [
+      self.content.count_tree(path),
+      self.specials.count_tree(path),
+      self.dirs.count_tree(path),
+      self.modes.count_tree(path),
+      self.symlinks.count_tree(path),
+      self.hardlinks.count_tree(path),
+      self.xattrs.count_tree(path),
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add)
+  }
+
+  /// The room a chain entry for `inc` needs beyond what its increment declares (A-626 part 2): the fix each copy from a
+  /// version its source changed after records, as `chain_entry::fix_bytes` counts it. Derived from what this green's
+  /// histories hold now, never a fixed allowance: the service adds it to `chain_entry::entry_bound` before the verdict.
+  /// Nothing for an increment without such a copy.
+  pub fn copy_entry_room(&self, inc: &Increment) -> usize {
+    let r = Green::resolve(inc);
+    self
+      .copy_fixes(&r)
+      .values()
+      .filter_map(|fix| fix.as_ref().ok().and_then(Option::as_ref))
+      .map(crate::chain_entry::fix_bytes)
+      .fold(0, usize::saturating_add)
+  }
+
   /// Applies the copies among a version's accepted effects, in their destinations' order, an outer copy before one
   /// inside its tree (module docs): every source held first, as the version before this one, whatever a copy of this
   /// version takes away (FSFS copies from a revision, never a transaction); then each destination's tree taken away where
-  /// the copy replaces it, and the held source grafted there. The paths a replace took away, for the change index.
+  /// the copy replaces it, the held source grafted there, and a fixed copy's fix applied (A-626 part 2). The paths a
+  /// replace took away, for the change index.
   pub(super) fn commit_copies(&mut self, effects: &[Effect], version: u64) -> BTreeSet<String> {
-    let mut copies: Vec<(&str, &str, u64, bool)> = effects
+    let mut copies: Vec<Committed<'_>> = effects
       .iter()
       .filter_map(|effect| match effect {
-        Effect::CopyTree(dst, src, source_version, replace) => {
-          Some((dst.as_str(), src.as_str(), *source_version, *replace))
-        }
+        Effect::CopyTree {
+          dst,
+          from,
+          version,
+          replace,
+          fix,
+        } => Some((
+          (dst.as_str(), from.as_str()),
+          (*version, *replace),
+          fix.as_deref(),
+        )),
         _ => None,
       })
       .collect();
-    copies.sort_by(|a, b| a.0.cmp(b.0));
-    let held: Vec<HeldSource> = copies
+    copies.sort_by(|a, b| a.0.0.cmp(b.0.0));
+    // A source whose copy starts empty brings nothing of the head's, so it is not held.
+    let held: Vec<Option<HeldSource>> = copies
       .iter()
-      .map(|(_, src, ..)| self.hold_source(src))
+      .map(|((_, src), _, fix)| {
+        let grafted = fix.is_none_or(|fix| !fix.start_empty);
+        grafted.then(|| self.hold_source(src))
+      })
       .collect();
     let mut removed = BTreeSet::new();
-    for ((dst, src, source_version, replace), held) in copies.into_iter().zip(held) {
+    for (((dst, src), (source_version, replace), fix), held) in copies.into_iter().zip(held) {
       if replace {
         removed.extend(self.clear_tree(dst, version));
       }
       self.graft_source(held, (dst, src, source_version), version);
+      if let Some(fix) = fix {
+        self.apply_fix(dst, fix);
+      }
     }
     removed
   }
@@ -846,27 +1358,30 @@ impl Green {
 
   /// Grafts a held source at its copy's destination, at `version` (module docs): every map's graft (the reverse map of
   /// hard links has none: the source holds no link), and the copy's one record, `last_changed` entry and change-index
-  /// bytes. A map that refuses what the verdict judged possible is counted ([`Green::copies_refused`]), never silently.
+  /// bytes; nothing grafted for a copy that starts empty (`None`). A map that refuses what the verdict judged possible is
+  /// counted ([`Green::copies_refused`]), never silently.
   fn graft_source(
     &mut self,
-    held: HeldSource,
+    held: Option<HeldSource>,
     (dst, src, source_version): (&str, &str, u64),
     version: u64,
   ) {
-    let results = [
-      self.content.graft_tree(held.content, dst),
-      self.specials.graft_tree(held.specials, dst),
-      self.dirs.graft_tree(held.dirs, dst),
-      self.modes.graft_tree(held.modes, dst),
-      self.symlinks.graft_tree(held.symlinks, dst),
-      self.hardlinks.graft_tree(held.hardlinks, dst),
-      self.xattrs.graft_tree(held.xattrs, dst),
-    ];
-    if results.iter().any(Result::is_err) {
-      self.copies_refused = self.copies_refused.saturating_add(1);
-    }
-    if results.iter().flatten().any(|copied| copied.brought()) {
-      self.copies_grafted = self.copies_grafted.saturating_add(1);
+    if let Some(held) = held {
+      let results = [
+        self.content.graft_tree(held.content, dst),
+        self.specials.graft_tree(held.specials, dst),
+        self.dirs.graft_tree(held.dirs, dst),
+        self.modes.graft_tree(held.modes, dst),
+        self.symlinks.graft_tree(held.symlinks, dst),
+        self.hardlinks.graft_tree(held.hardlinks, dst),
+        self.xattrs.graft_tree(held.xattrs, dst),
+      ];
+      if results.iter().any(Result::is_err) {
+        self.copies_refused = self.copies_refused.saturating_add(1);
+      }
+      if results.iter().flatten().any(|copied| copied.brought()) {
+        self.copies_grafted = self.copies_grafted.saturating_add(1);
+      }
     }
     self.last_changed.insert(dst.to_owned(), version);
     self.changes_bytes = self
@@ -881,6 +1396,75 @@ impl Green {
         source: src.to_owned(),
         source_version,
       });
+  }
+
+  /// Brings what `dst` holds from the head's source tree to the source's tree at the copied version (A-626 part 2): the
+  /// fix's cuts taken away, then each of its values set. None of it is recorded key by key: the copy's record stands for
+  /// the tree it brings, its identity entry with it, and a key's first change after the copy records the value it gave.
+  fn apply_fix(&mut self, dst: &str, fix: &CopyFix) {
+    for cut in &fix.cuts {
+      let path = joined(dst, cut);
+      self.content.cut_tree(&path);
+      self.specials.cut_tree(&path);
+      self.dirs.cut_tree(&path);
+      self.modes.cut_tree(&path);
+      self.symlinks.cut_tree(&path);
+      self.hardlinks.cut_tree(&path);
+      self.xattrs.cut_tree(&path);
+    }
+    for (rel, bytes) in &fix.files {
+      let path = joined(dst, rel);
+      if let Some(bytes) = bytes {
+        self.content.insert(&path, bytes.clone());
+      } else {
+        self.content.remove(&path);
+      }
+    }
+    for (rel, node) in &fix.specials {
+      let path = joined(dst, rel);
+      if let Some(node) = node {
+        self.specials.insert(&path, *node);
+      } else {
+        self.specials.remove(&path);
+      }
+    }
+    for (rel, stood) in &fix.dirs {
+      let path = joined(dst, rel);
+      if *stood {
+        self.dirs.insert(&path, ());
+      } else {
+        self.dirs.remove(&path);
+      }
+    }
+    self.apply_fix_metadata(dst, fix);
+  }
+
+  /// [`Green::apply_fix`]'s modes, symbolic links and attributes.
+  fn apply_fix_metadata(&mut self, dst: &str, fix: &CopyFix) {
+    for (rel, mode) in &fix.modes {
+      let path = joined(dst, rel);
+      if let Some(mode) = mode {
+        self.modes.insert(&path, *mode);
+      } else {
+        self.modes.remove(&path);
+      }
+    }
+    for (rel, target) in &fix.symlinks {
+      let path = joined(dst, rel);
+      if let Some(target) = target {
+        self.symlinks.insert(&path, target.clone());
+      } else {
+        self.symlinks.remove(&path);
+      }
+    }
+    for ((rel, name), value) in &fix.xattrs {
+      let path = joined(dst, rel);
+      if let Some(value) = value {
+        self.xattrs.insert(&path, name, value.clone());
+      } else {
+        self.xattrs.remove(&path, name);
+      }
+    }
   }
 
   /// Takes `dst`'s tree away key by key at `version`, a replace's first step (A-626): every file, IPC node, directory,

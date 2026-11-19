@@ -232,7 +232,7 @@ impl Model {
     self.touched.insert(path);
   }
 
-  /// Replaces a node by a new one or by a copy, unless the copy is of the very node it would replace.
+  /// Replaces a node by a new one or by a copy, the very node it replaces among the copies (A-652).
   fn replace(&mut self, step: &Step) {
     let Some(path) = self.untouched(None, false, step.first) else {
       return;
@@ -253,9 +253,6 @@ impl Model {
       let Some((revision, source)) = self.copy_source(step) else {
         return;
       };
-      if self.working.get(&path) == Some(&source.1) {
-        return;
-      }
       let record = Node::replace(&path, source.1.kind).copied(revision as u64, &source.0);
       let (record, node) = changed_copy(record, &source.1, step);
       self.dump.node(&record);
