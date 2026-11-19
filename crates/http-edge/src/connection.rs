@@ -14,11 +14,12 @@
 //! HTTP/1.1 and framed by the close to HTTP/1.0, `Connection: close` when the connection ends after it. The status is
 //! the route's to decide, at its head or after its body ([`StatusMode`]; main's ruling, 2026-11-19: per route): a
 //! streamed route's is `200`, fixed by the decision, as git's services stream their replies; one decided after the body
-//! is the service's to name as its reply begins ([`Connection::reply_status`]), as Git LFS answers `201`, `409`, `422`,
-//! `413` and `507` once it has read the request (A-629). A field a reply cannot carry, a status no reply's content may
-//! follow, or a status named for a streamed route fails the request `500` before any of it is sent: the decision's at the
-//! decision, the service's as it names them. `100 Continue` is sent when a decision admits a request whose client waits
-//! for it: it sent
+//! is the service's to name as its reply begins ([`Connection::reply_status`]), `200` when it names no other: Git LFS's
+//! `201`, `409`, `422`, `413` and `507` once it has read the request (A-629), a WebDAV `PROPFIND`'s `207` or a refusal
+//! its body explains (Subversion's site, A-681). A field a reply cannot carry, a status no reply's content may follow,
+//! or a status other than `200` named for a streamed route fails the request `500` before any of it is sent: the
+//! decision's at the decision, the service's as it names them. `100 Continue` is sent when a decision admits a request
+//! whose client waits for it: it sent
 //! `Expect: 100-continue` and none of its body has come (RFC 9110 §10.1.1: "A server MAY omit sending a 100 (Continue)
 //! response if it has already received some or all of the content").
 //!
@@ -74,14 +75,15 @@ pub enum StatusMode {
   /// At the head: `200`, the reply streamed as the service writes it (git's services, Mercurial's commands).
   Streamed,
   /// After the request's body: the service names it as its reply begins ([`Connection::reply_status`]), `200` when it
-  /// names none (Git LFS, A-629).
+  /// names no other (Git LFS, A-629; Subversion's site, A-681).
   AfterBody,
 }
 
 /// A site's answer to a request's head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-  /// Serve it: the reply carries `fields`, its status `200` or the service's as `status` says; `head_only` for a `HEAD`
+  /// Serve it: the reply carries `fields`, its status `200` or, on a route that decides it after the body, the one its
+  /// service names as its reply begins ([`Connection::reply_status`]), as `status` says; `head_only` for a `HEAD`
   /// request, whose reply has no body.
   Serve {
     /// The reply's fields (its content type, cache fields and the like), in order.
@@ -186,7 +188,8 @@ struct Reply {
   head_only: bool,
   /// Whether any of the reply has been sent: the head goes with its first bytes, and a failure after this aborts.
   started: bool,
-  /// Its status: `200` until a route that decides it after the body names it.
+  /// The head's status: `200` unless a route that decides it after the body names another before any of the reply is
+  /// sent.
   status: Status,
   /// When its status is decided.
   mode: StatusMode,
@@ -740,10 +743,11 @@ impl Connection {
     }
   }
 
-  /// The status the service names for its reply as its reply begins, on a route that decides it after the body
-  /// ([`StatusMode::AfterBody`], the module doc). Taken only before any of the reply is sent, and only while a reply is
-  /// under way; one no reply's content may follow (`1xx`, `204`, `205`, `304`, or no status at all) or one named for a
-  /// streamed route fails the request `500`, in stages.
+  /// The status the service names for its reply's head as its reply begins (the module doc), in place of `200`. Taken
+  /// only before any of the reply is sent, and only while a reply is under way: on a route that decides it after the
+  /// body ([`StatusMode::AfterBody`]) any status a reply's content may follow, on a streamed route `200` alone, its
+  /// own. Any other (`1xx`, `204`, `205`, `304`, a code outside RFC 9110 §15's classes, or a status other than `200` on
+  /// a streamed route) fails the request `500`, in stages.
   pub fn reply_status(&mut self, status: Status) {
     let State::Reply { reply, .. } = &mut self.state else {
       return;
@@ -751,7 +755,11 @@ impl Connection {
     if reply.started {
       return;
     }
-    if reply.mode == StatusMode::AfterBody && carries_content(status) {
+    let taken = match reply.mode {
+      StatusMode::AfterBody => carries_content(status),
+      StatusMode::Streamed => status == Status::OK,
+    };
+    if taken {
       reply.status = status;
       return;
     }
@@ -857,7 +865,7 @@ impl Connection {
   }
 }
 
-/// Renders a served reply's head for `request` into `out`: `200`, `fields`, chunked to HTTP/1.1 and framed by the
+/// Renders a served reply's head for `request` into `out`: `status`, `fields`, chunked to HTTP/1.1 and framed by the
 /// close to HTTP/1.0, `Connection: close` when the connection ends after it. Refused, writing nothing, where a field
 /// cannot be carried.
 fn rendered(

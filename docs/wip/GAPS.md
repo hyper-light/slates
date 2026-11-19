@@ -709,9 +709,9 @@
 > **A-629 part 2c (2026-11-19, g230; Git LFS on the shared HTTP edge):** git's HTTP site routes `<repo>/info/lfs`
 > through `slates_git::lfs::serve::route` and the edge's authentication (a route's refusal whoever asks; `401` with
 > `LFS-Authenticate`; the owner shard, `404`, `403`; `503` at the head for an endpoint the service does not serve), and
-> a served LFS request decides its status after its body (`StatusMode::AfterBody`, `Connection::reply_status`; a `1xx`,
-> `204`, `205` or `304`, or a status on a streamed route, fails it `500`), its actions expiring with the bearer token
-> that asked. The daemon serves the locks API over the locks log (`ShardLfs`); the batch API and the transfers answer
+> a served LFS request decides its status after its body (`StatusMode::AfterBody`, `Connection::reply_status`, one
+> mechanism with A-681's Subversion site, whose route decides after its body too; a `1xx`, `204`, `205` or `304`, or a
+> status other than `200` on a streamed route, fails it `500`), its actions expiring with the bearer token that asked. The daemon serves the locks API over the locks log (`ShardLfs`); the batch API and the transfers answer
 > `503` at their head until A-581, so no upload is acknowledged that a restart would forget. Closes A-625 part 3's
 > "LFS's routes on the site" and part 2b-ii's "the edge's answer whose status follows the body". macOS arm64 (Mac
 > Studio, kiln r109): `slates-http-edge --lib connection::` 18 of 18, the new test failing first with the status never
@@ -1155,7 +1155,18 @@
 > the Mac Studio, red on a mutated copy (see A-627, completed). Owed from it: (1) the update-report's resource walk, a
 > pre-1.2 client's; (2) the drive's facts carrying `dav_svn__get_safe_cr`'s revision, not `svn_fs_node_created_rev`'s,
 > for a node beneath a copy not changed since (A-616's drive over the index); (3) main's live capture against Apache
-> with `mod_dav_svn`. A-531 (2026-11-19): the ra_svn item codec, its
+> with `mod_dav_svn`. A-681 part 1, its first slice (2026-11-19, g297): Subversion's DAV site on the shared HTTP edge
+> (`slates-svn`'s `dav::site`, `slates-server`'s `vcs_http::svn`): the read side's resources (a public URL,
+> `!svn/rvr`, `!svn/bc`) answered to OPTIONS, PROPFIND (depth 0 and 1) and GET and HEAD from the index, the green and
+> the lock table, each path judged by the principal's compiled read rules; OPTIONS lists only the capabilities served
+> (none yet); every REPORT and write method `501`; stock svn 1.15.0's `info`, `cat`, `ls` and `proplist -v` read a
+> repository through the edge over HTTPS on loopback, on the Mac Studio (see A-681 part 1). Owed from it: (1) the
+> REPORTs over the index, then the update-report and replay through A-627's drive, each capability listed as it is
+> served, so `svn log` and `svn checkout` reach a repository (part 1's next slices); (2) the write side (part 2); (3)
+> the daemon composing the site beside git's and handing it the stores, `503` until then; (4) a repository whose name
+> holds a slash, which `SVNParentPath`'s first-segment rule cannot reach over HTTP without a longest-prefix search
+> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`); (6) Basic on the cleartext
+> loopback edge (A-686). A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its

@@ -449,8 +449,12 @@ impl<L: LfsService> Exchange for LfsExchange<L> {
     Ok(())
   }
 
-  async fn reply_status(&mut self) -> Result<Option<Status>, Failed> {
-    Ok(self.answer.as_ref().map(|answer| answer.status))
+  fn reply_status(&self) -> Status {
+    // The body's end always leaves an answer; a reply asked without one fails as the server's.
+    self
+      .answer
+      .as_ref()
+      .map_or(Status::INTERNAL_SERVER_ERROR, |answer| answer.status)
   }
 
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
@@ -495,10 +499,10 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     }
   }
 
-  async fn reply_status(&mut self) -> Result<Option<Status>, Failed> {
+  fn reply_status(&self) -> Status {
     match self {
-      SiteExchange::Git(git) => git.reply_status().await,
-      SiteExchange::Lfs(lfs) => lfs.reply_status().await,
+      SiteExchange::Git(git) => git.reply_status(),
+      SiteExchange::Lfs(lfs) => lfs.reply_status(),
     }
   }
 

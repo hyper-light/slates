@@ -982,7 +982,7 @@ fn a_served_lfs_request_is_answered_after_its_body_with_its_services_status_and_
   }
   ready(exchange.body_end()).unwrap();
   let said = (
-    ready(exchange.reply_status()).unwrap(),
+    exchange.reply_status(),
     ready(exchange.reply_fields()).unwrap(),
     replies(&mut exchange),
   );
@@ -995,7 +995,7 @@ fn a_served_lfs_request_is_answered_after_its_body_with_its_services_status_and_
   assert_eq!(
     said,
     (
-      Some(CREATED),
+      CREATED,
       vec![(b"Content-Type".to_vec(), LFS_JSON.as_bytes().to_vec())],
       vec![call.into_bytes()]
     )

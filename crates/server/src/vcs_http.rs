@@ -2,8 +2,10 @@
 //! "Pieces (git)" piece 8; §4.3, R6): a listener on the runtime's TCP, one connection a task, each driving
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
-//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's (§4.17.4) on
-//! the same edge.
+//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's ([`svn`],
+//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, answered by `slates_svn::dav::site`) on the same
+//! edge. A reply's status is `200` unless its route decides it after the body and the exchange names another as its
+//! reply begins ([`Exchange::reply_status`]: Git LFS's answer's, a PROPFIND's `207`, or a refusal its body explains).
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -56,12 +58,15 @@
 //! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
 //! handed the stores (A-615, A-662), which answers `503` until then;
 //! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
-//! Subversion's site; the MCP edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's
-//! runs).
+//! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
+//! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
+//! `501` until then; the sites composed into one the daemon starts (git's alone today); the MCP edge onto this engine;
+//! the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
 pub(crate) mod git;
 mod hg;
+mod svn;
 pub(crate) mod waits;
 
 pub(crate) use daemon_edge::{bind, start};
@@ -195,11 +200,13 @@ pub(crate) trait Exchange {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
   /// The request's body has ended.
   async fn body_end(&mut self) -> Result<(), Failed>;
-  /// The status the reply's head carries, asked once as the reply begins, after the body has ended, on a route that
-  /// decides it after the body ([`StatusMode::AfterBody`]): none for `200`, every streamed route's, as git's and
-  /// Mercurial's services leave theirs; Git LFS names the status its answer decided (A-629).
-  async fn reply_status(&mut self) -> Result<Option<Status>, Failed> {
-    Ok(None)
+  /// The reply's status, asked once as the reply begins, after the body has ended and before the reply's fields: `200`
+  /// unless the reply's outcome decides another on a route that decides it after the body ([`StatusMode::AfterBody`]):
+  /// the status Git LFS's answer decided (A-629), a WebDAV `PROPFIND`'s `207` or a refusal its body explains
+  /// (Subversion's site, A-681). A streamed route's is `200`, as git's and Mercurial's services leave theirs; the
+  /// engine fails the request `500` for any other there.
+  fn reply_status(&self) -> Status {
+    Status::OK
   }
   /// The fields the reply's head carries after the decision's, asked once as the reply begins, after the body has
   /// ended: none unless the reply's outcome decides them, as a Mercurial command's decides its media type (A-650).
@@ -985,7 +992,7 @@ impl<S: Site> Parts<S> {
   }
 
   /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn. The service's
-  /// reply status, where it names one, and its reply fields go to the engine first, once, before any of the reply.
+  /// reply status and its reply fields go to the engine first, once, before any of the reply.
   async fn reply(&mut self, connection: &mut Connection) -> Flow {
     let Some(started) = self.service.as_mut() else {
       connection.fail(Status::INTERNAL_SERVER_ERROR);
@@ -993,16 +1000,9 @@ impl<S: Site> Parts<S> {
     };
     if !started.fields_given {
       started.fields_given = true;
-      match started.exchange.reply_status().await {
-        Ok(Some(status)) => connection.reply_status(status),
-        Ok(None) => {}
-        Err(Failed(status)) => {
-          self.service = None;
-          connection.fail(status);
-          return Flow::Go;
-        }
-      }
-      // A status the engine refused (a streamed route's, or one no reply's content may follow) failed the request.
+      connection.reply_status(started.exchange.reply_status());
+      // A status the engine refused (another than `200` on a streamed route, or one no reply's content may follow)
+      // failed the request.
       if connection.phase() != Phase::Reply {
         self.service = None;
         return Flow::Go;

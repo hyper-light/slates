@@ -133,12 +133,12 @@ impl Exchange for Echo {
     Ok(())
   }
 
-  async fn reply_status(&mut self) -> Result<Option<Status>, Failed> {
-    Ok(match self.body.as_slice() {
-      NAMES_CREATED => Some(CREATED),
-      NAMES_NO_CONTENT => Some(NO_CONTENT),
-      _ => None,
-    })
+  fn reply_status(&self) -> Status {
+    match self.body.as_slice() {
+      NAMES_CREATED => CREATED,
+      NAMES_NO_CONTENT => NO_CONTENT,
+      _ => Status::OK,
+    }
   }
 
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
