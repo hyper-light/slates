@@ -410,7 +410,7 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
   nested.copy("t2", "y", 5).copy("trunk", "y/a", 5);
   let mut moved = Work::exclusive();
   moved.copy("t2", "y", 4).rename("trunk/a", "y/q");
-  use MergeConflictClass::{CreateCreate, DeleteModify, RenameRename, TypeChanged};
+  use MergeConflictClass::{CreateCreate, DeleteModify, TypeChanged};
   let cases: Vec<(Work, u64, Vec<(&str, MergeConflictClass)>)> = vec![
     (one_copy("t2", "taken", 5), 5, vec![("taken", CreateCreate)]),
     (
@@ -422,7 +422,6 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
     (one_copy("nothing", "y", 5), 5, vec![("y", TypeChanged)]),
     (one_copy("t2", "y", 6), 5, vec![("y", TypeChanged)]),
     (one_copy("h", "y", 5), 5, vec![("y", TypeChanged)]),
-    (one_copy("trunk", "y", 4), 5, vec![("y", RenameRename)]),
     (one_copy("t2", "gone", 5), 3, vec![("gone", CreateCreate)]),
     (both, 5, vec![("y", TypeChanged)]),
     (nested, 5, vec![("y/a", CreateCreate)]),
@@ -986,6 +985,212 @@ fn a_branch_reads_a_key_through_the_copy_that_gave_it_its_value() {
   assert_branches_read_as_their_versions(up_to, 4);
 }
 
+/// A green at version 3 whose trunk changed after version 1 in every dimension it holds: `a` overwritten and its mode
+/// changed, `c` removed, `new` made and `d/b`'s property changed at 2; `d` given a property and `e` made at 3.
+fn trunk_changed_after_1() -> Green {
+  let mut green = trunk();
+  let mut second = Work::default();
+  second
+    .overwrite("trunk/a", 0, b"AL")
+    .unlink("trunk/c")
+    .create("trunk/new", b"new")
+    .xattr("trunk/d/b", PROPS, b"q2")
+    .mode("trunk/a", 0o600);
+  assert_eq!(accept(&mut green, &second, 2), 2);
+  let mut third = Work::default();
+  third.xattr("trunk/d", PROPS, b"pd").mkdir("trunk/e");
+  assert_eq!(accept(&mut green, &third, 3), 3);
+  green
+}
+
+/// What `base` holds of `root`'s tree, every path moved to its place in `to`'s, in [`sorted`]'s order.
+fn tree_moved(base: &Base, root: &str, to: &str) -> Base {
+  let place = |path: &str| relative(path, root).map(|rel| joined(to, rel));
+  sorted(Base {
+    files: base
+      .files
+      .iter()
+      .filter_map(|(path, len)| Some((place(path)?, *len)))
+      .collect(),
+    specials: Vec::new(),
+    dirs: base.dirs.iter().filter_map(|path| place(path)).collect(),
+    modes: base
+      .modes
+      .iter()
+      .filter_map(|(path, mode)| Some((place(path)?, *mode)))
+      .collect(),
+    symlinks: base
+      .symlinks
+      .iter()
+      .filter_map(|(path, target)| Some((place(path)?, target.clone())))
+      .collect(),
+    xattrs: base
+      .xattrs
+      .iter()
+      .filter_map(|(path, name, value)| Some((place(path)?, name.clone(), value.clone())))
+      .collect(),
+    hardlinks: Vec::new(),
+  })
+}
+
+/// Submits `work` at `green`'s head as increment `id`, which must be accepted: the increment and what its entry
+/// records.
+fn submit_recorded(
+  green: &mut Green,
+  work: &Work,
+  id: u64,
+) -> (Increment, Vec<chain_entry::Applied>) {
+  let increment = work.at(id, green.head());
+  let (outcome, applied) = green.submit_resolved(&increment);
+  assert!(
+    matches!(outcome, Outcome::Accepted { .. }),
+    "increment {id}: {outcome:?}"
+  );
+  (increment, applied.expect("an accepted version's effects"))
+}
+
+/// Replays `entries`, each encoded and decoded, on `replica`, and asserts it reads at every version and hashes as
+/// `green`.
+fn assert_replay_reads_alike(
+  green: &mut Green,
+  mut replica: Green,
+  entries: &[(Increment, Vec<chain_entry::Applied>)],
+) {
+  for (increment, applied) in entries {
+    let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
+    let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+    assert_eq!(&decoded.applied, applied);
+    replica.apply_recorded(&decoded.increment, &decoded.applied);
+  }
+  assert_eq!(replica.head(), green.head());
+  for version in 0..=green.head() {
+    assert_eq!(
+      replica.base_at(version),
+      green.base_at(version),
+      "the replay at {version}"
+    );
+  }
+  assert_eq!(replica.head_identity(), green.head_identity());
+}
+
+/// Asserts that `applied` records a fix, that `room` (the green's, derived before the verdict) is its size, and that
+/// the encoded entry fits the increment's own bound plus `room`.
+fn assert_fits_its_room(increment: &Increment, applied: &[chain_entry::Applied], room: usize) {
+  let fixes: usize = applied
+    .iter()
+    .filter_map(|applied| match applied {
+      chain_entry::Applied::CopyTree { fix: Some(fix), .. } => Some(chain_entry::fix_bytes(fix)),
+      _ => None,
+    })
+    .sum();
+  assert!(fixes > 0, "no fix recorded");
+  assert_eq!(room, fixes);
+  let bytes = increment.encode();
+  let entry = chain_entry::encode(&bytes, increment, applied, None, None, None);
+  let bound = chain_entry::entry_bound(bytes.len(), increment) + room;
+  assert!(entry.len() <= bound, "{} bytes past {bound}", entry.len());
+}
+
+/// A-626 part 2 (a copy from an older version of a source that changed since, as FSFS accepts it). Do: copy the trunk
+/// at version 1 to `b` after versions 2 and 3 changed it in every dimension, and replay that version's chain entry on
+/// a green holding the version before. Expect: accepted as version 4; `b` holds the trunk as it stood at version 1 (the
+/// trunk's base at 1 moved to `b`) and the trunk keeps its head; the change index names `b` alone; no map refused the
+/// copy; the identity equals its recount; the entry records the fix within the room the green derived for it before
+/// the verdict, and a copy of an unchanged source needs none; and the replica reads and hashes alike.
+#[test]
+fn a_copy_from_an_older_version_brings_the_source_as_it_stood() {
+  let mut green = trunk_changed_after_1();
+  let increment = one_copy("trunk", "b", 1).at(4, 3);
+  let room = green.copy_entry_room(&increment);
+  let (outcome, applied) = green.submit_resolved(&increment);
+  assert_eq!(outcome, Outcome::Accepted { version: 4 });
+  assert_holds_the_trunk_at(&green, "b");
+  assert_eq!(
+    tree_moved(&green.base_at(1), "trunk", "b"),
+    tree_moved(&green.base_at(4), "b", "b")
+  );
+  assert_eq!(green.content("trunk/a"), Some(&b"ALpha"[..]));
+  assert_eq!(green.changed_between(3, 4), ["b"]);
+  assert_eq!(green.copies_refused(), 0);
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  let applied = applied.expect("an accepted version's effects");
+  assert_fits_its_room(&increment, &applied, room);
+  assert_eq!(
+    green.copy_entry_room(&one_copy("trunk", "z", 3).at(9, 4)),
+    0
+  );
+  assert_replays_alike(&mut green, trunk_changed_after_1(), &increment, &applied);
+}
+
+/// A-626 part 2 (copies from before a copy inside the source and from before one over it). Do: on [`trunk_and_t2`],
+/// copy `t2` to `trunk/t` (version 3), the trunk at version 2 to `b` (4), replace the trunk with `t2` (5), and copy the
+/// trunk at version 4 to `c` (6); replay every one of those entries on a green holding version 2. Expect: each copy
+/// holds the trunk as the green reads it at the copy's version (`b` without `t`, the inner copy cut; `c` the trunk
+/// before its replace, `t` among it); the identity equals its recount; the replica reads at every version and hashes
+/// alike.
+#[test]
+fn copies_from_before_a_copy_inside_or_over_the_source_bring_it_as_it_stood() {
+  let mut green = trunk_and_t2();
+  let entries = vec![
+    submit_recorded(&mut green, &one_copy("t2", "trunk/t", 2), 3),
+    submit_recorded(&mut green, &one_copy("trunk", "b", 2), 4),
+    submit_recorded(&mut green, &replace_copy("t2", "trunk", 2), 5),
+    submit_recorded(&mut green, &one_copy("trunk", "c", 4), 6),
+  ];
+  assert_eq!(
+    tree_moved(&green.base_at(2), "trunk", "b"),
+    tree_moved(&green.base_at(6), "b", "b")
+  );
+  assert_eq!(
+    tree_moved(&green.base_at(4), "trunk", "c"),
+    tree_moved(&green.base_at(6), "c", "c")
+  );
+  assert_eq!(green.content("c/t/f"), Some(&b"f2"[..]));
+  assert_eq!(green.content("b/t/f"), None);
+  assert_eq!(green.copies_refused(), 0);
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  assert_replay_reads_alike(&mut green, trunk_and_t2(), &entries);
+}
+
+/// A-626 part 2 (an edit beneath a copy from an older version in the copy's own increment: a working copy's commit of
+/// `svn cp -r 1 trunk b` with an edit). Do: in one increment copy the trunk at version 1 to `b` and overwrite `b/a` at
+/// its fourth byte, after version 2 changed `trunk/a`'s first two; replay the entry on a green holding the version
+/// before. Expect: `b/a` holds the edit spliced into the bytes `trunk/a` held at 1 (`alpHA`, not the head's `ALpHA`),
+/// the identity equals its recount, and the replica reads and hashes alike.
+#[test]
+fn an_edit_beneath_a_copy_from_an_older_version_lands_on_the_bytes_it_brings() {
+  let mut green = trunk_changed_after_1();
+  let mut work = Work::exclusive();
+  work.copy("trunk", "b", 1).overwrite("b/a", 3, b"HA");
+  let increment = work.at(4, 3);
+  let (outcome, applied) = green.submit_resolved(&increment);
+  assert_eq!(outcome, Outcome::Accepted { version: 4 });
+  assert_eq!(green.content("b/a"), Some(&b"alpHA"[..]));
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  let applied = applied.expect("an accepted version's effects");
+  assert_replays_alike(&mut green, trunk_changed_after_1(), &increment, &applied);
+}
+
+/// A-626 part 2 (a copy from a version whose values are folded away). Do: fold the green's histories below version 3,
+/// then copy the trunk at version 1 (changed at 2, so its values then are needed) and at version 3 (unchanged since).
+/// Expect: the first a type conflict naming its destination, the green unchanged; the second accepted.
+#[test]
+fn a_copy_from_a_folded_version_is_refused_typed() {
+  let mut green = trunk_changed_after_1();
+  green.fold_history_before(3);
+  let head = green.head();
+  let stale = green.submit(&one_copy("trunk", "b", 1).at(4, head));
+  assert_eq!(
+    windows(&stale),
+    Some(vec![("b".to_owned(), MergeConflictClass::TypeChanged)])
+  );
+  assert_eq!(green.head(), head);
+  assert_eq!(
+    green.submit(&one_copy("trunk", "c", 3).at(5, head)),
+    Outcome::Accepted { version: 4 }
+  );
+}
+
 /// The attribute every file of the oracle's histories carries.
 const NAME: &str = "n";
 
@@ -1110,7 +1315,8 @@ struct Census {
   from_root: usize,
   from_before: usize,
   into_themselves: usize,
-  changed_after: usize,
+  /// Copies accepted from a version their source changed after (A-626 part 2).
+  from_changed: usize,
   /// Puts and takes of a path a copy's tree holds: a key's change after its copy.
   changed_beneath: usize,
   /// Replaces accepted over a destination that held something (A-626).
@@ -1129,9 +1335,9 @@ impl Census {
   fn count(&mut self, copy: &Declared, accepted: bool, (head, held, changed): (u64, bool, bool)) {
     if !accepted {
       self.refused += 1;
-      self.changed_after += usize::from(changed);
       return;
     }
+    self.from_changed += usize::from(changed);
     self.accepted += 1;
     self.from_root += usize::from(copy.src.is_empty());
     self.from_before += usize::from(copy.version < head);
@@ -1282,7 +1488,7 @@ type Landed = (State, BTreeSet<String>, BTreeSet<String>);
 
 /// The oracle's model (module docs): every version's tree, the paths each version names in the change index, and the
 /// destinations of the copies each made. It states the design's rules, never the engine's code: a copy brings its
-/// source's tree as the version before it held it, a replace takes its destination's tree away first, copies land in
+/// source's tree as the version it names held it (A-626 part 2), a replace takes its destination's tree away first, copies land in
 /// their destinations' order, and a copy stands where Subversion's commit would take it.
 struct Model {
   states: Vec<State>,
@@ -1355,24 +1561,26 @@ impl Model {
   /// each source holds something and did not change after its version.
   fn copies_stand(&self, copies: &[Declared]) -> bool {
     let head = self.current();
+    let held_at = |version: u64, root: &str| {
+      self
+        .state(version)
+        .is_some_and(|state| state.holds_tree(root))
+    };
     copies.iter().all(|copy| {
-      let place = outer_copy(copies, &copy.dst).map_or_else(
-        || copy.dst.clone(),
-        |outer| {
-          joined(
-            &outer.src,
-            relative(&copy.dst, &outer.dst).unwrap_or_default(),
-          )
-        },
-      );
-      let destination = !copy.dst.is_empty() && (copy.replace || !head.holds_tree(&place));
-      let source = head.holds_tree(&copy.src) && !self.changed_after(&copy.src, copy.version);
-      destination && source
+      let filled = match outer_copy(copies, &copy.dst) {
+        None => head.holds_tree(&copy.dst),
+        Some(outer) => {
+          let rel = relative(&copy.dst, &outer.dst).unwrap_or_default();
+          held_at(outer.version, &joined(&outer.src, rel))
+        }
+      };
+      let destination = !copy.dst.is_empty() && (copy.replace || !filled);
+      destination && held_at(copy.version, &copy.src)
     })
   }
 
-  /// What one increment of `copies` and the removals `unlinked` in their trees lands: every source read from the head
-  /// first, then in their destinations' order each replaced destination's tree taken away and each source's tree put
+  /// What one increment of `copies` and the removals `unlinked` in their trees lands: every source's tree read at its
+  /// version first (FSFS copies from any committed revision, A-626 part 2), then in their destinations' order each replaced destination's tree taken away and each source's tree put
   /// there, then the removals.
   fn after_copies(&self, copies: &[Declared], unlinked: &[String]) -> Landed {
     let mut next = self.current();
@@ -1380,7 +1588,12 @@ impl Model {
     order.sort_by(|a, b| a.dst.cmp(&b.dst));
     let sources: Vec<State> = order
       .iter()
-      .map(|copy| next.tree_at(&copy.src, &copy.dst))
+      .map(|copy| {
+        self
+          .state(copy.version)
+          .map(|state| state.tree_at(&copy.src, &copy.dst))
+          .unwrap_or_default()
+      })
       .collect();
     let mut named: BTreeSet<String> = order.iter().map(|copy| copy.dst.clone()).collect();
     let copied = named.clone();
@@ -1742,8 +1955,8 @@ fn run(steps: &[Step], census: &mut Census) -> Result<(), TestCaseError> {
 }
 
 /// A-586 and A-626 (the oracle). Do: generated histories of files and their attributes put and taken, directories made
-/// with modes, single copies of any path (the root among them) at the head or a version or two before it to any path
-/// (into the source's own tree among them), replacing what the destination holds or not, two copies nested in one
+/// with modes, single copies of any path (the root among them) at the head or a version or two before it, its tree
+/// changed since or not (A-626 part 2), to any path (into the source's own tree among them), replacing what the destination holds or not, two copies nested in one
 /// increment, and moves inside a copied tree as a stock client makes them, on a green and on a model that states every
 /// version's tree. Expect: the green decides every step as the model does; after every step it reads as the model at
 /// every version (each base, each file's bytes, the paths the change index names since), its identity equals its
@@ -1773,7 +1986,7 @@ fn every_copy_reads_as_its_model_over_every_history() {
     census.from_root,
     census.from_before,
     census.into_themselves,
-    census.changed_after,
+    census.from_changed,
     census.changed_beneath,
     census.replaced,
     census.nested,
