@@ -12116,7 +12116,12 @@ and export by landing).
 > **Status (2026-11-18, A-500).** Designed. Built: the svndiff codec (`crates/svn`, `slates-svn`: versions 0 and 2,
 > the decoder with every refusal Subversion's own decoder makes plus the 64-bit overflow it lets through, the encoder,
 > and the reference applier, held to `notes/svndiff`'s worked example as golden vectors). Everything else is owed, in
-> the pieces at the end. The reading notes, with every source's revision, hash and quoted lines, are
+> the pieces at the end.
+>
+> **Status (2026-11-19, A-531).** Built: the ra_svn item codec (`slates-svn`'s `ra_svn`): a parser that reads words,
+> numbers, strings and lists from a buffer the caller holds, resuming where it stopped so a byte is read once, within
+> bounds the caller gives and none of its own, and a writer that writes as `svnserve` writes, held to the protocol
+> document's items as golden vectors (piece 2 below). The reading notes, with every source's revision, hash and quoted lines, are
 > `research/vcs-servers-subversion.md` (cited below as "notes §n").
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
@@ -12280,10 +12285,13 @@ for Subversion.)
 - `get-mergeinfo` (item 8).
 
 *5. The wire.* Every connection is a task on a shard of slates' own runtime (D-9, R6); nothing blocks a shard.
-- **ra_svn.** The item codec (grammar in notes §2) parses bytes in whatever pieces they arrive, with each item's cap
-  checked before a byte is held: a word at most 24 characters (what a stock 1.14 parser accepts; the protocol text's 31
-  is older), nesting at most 64, a number at most 2^64 - 1, a string's length against the cap of the field it fills (an
-  svndiff chunk: one window's largest encoding; a path or a property value: the connection's memory share, the table).
+- **ra_svn.** The item codec (grammar in notes §2; built, A-531) parses bytes in whatever pieces they arrive, resuming
+  where it stopped, with every length checked before a byte is held, against bounds the caller derives and the codec
+  never fixes: the bytes an item may take (the connection's memory share, the table; a string's declared length is
+  checked against it at its `:`), the longest word (the longest a stock 1.14 parser accepts, 24, since no peer can send
+  a 1.14 server a longer one; the protocol text's 31 is older), the deepest list (the deepest prototype the server
+  reads), and the item count (the bytes bound over the two bytes the smallest item takes, and the memory a parsed item
+  costs); a number is at most 2^64 - 1, refused exactly past it.
   The greeting is `svnserve`'s, version 2 with the capabilities `edit-pipeline`, `accepts-svndiff2`, `absent-entries`,
   `commit-revprops`, `depth`, `log-revprops`, `atomic-revprops`, `partial-replay`, `inherited-props`,
   `ephemeral-txnprops`, `file-revs-reverse` and `list`, without
@@ -12482,9 +12490,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 
 *Pieces that follow* (in order, each one piece with its own tests, after §4.17.1's shared pieces it needs).
 1. The svndiff codec (built here).
-2. The ra_svn item codec: the resumable parser and the writer, with the protocol's examples as golden vectors and
-   hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream cut
-   anywhere).
+2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
+   vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
+   cut anywhere).
 3. The engine's node-exclusive operations and `Copy` that shares a subtree by reference (with §4.17.1's pieces 1 and
    4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
@@ -35367,3 +35375,31 @@ Applied in the same change to: §4.17.1 (a status block, the terms table, the cl
 identity, the hooks' first deadline, the worked example, the pieces list), §4.17.2 (large files), GAPS (the §4.17
 entry), `research/vcs-servers.md` §4, `crates/db/src/{repository,catalog,op,partition,error,lib}.rs`,
 `crates/db/tests/wire_order.{rs,txt}`, `crates/server/src/error.rs`.
+
+### A-531 — The ra_svn item codec: words, numbers, strings and lists read resumably within bounds the caller derives, and written as svnserve writes them (2026-11-19, g292 for UI goal 91; §4.17.4 "5. The wire" and piece 2; A-500)
+Applied in the same change to: §4.17.4 (a status block, the ra_svn paragraph's bounds, piece 2), GAPS (the §4.17.4
+entry), `crates/svn` (`src/lib.rs`, `src/ra_svn.rs` and `src/ra_svn/tests.rs`, new).
+- **What was there.** §4.17.4 named the item codec as its next piece and gave it fixed limits taken from the deployed
+  parser (a word of 24 characters, nesting of 64).
+- **The decision.** The codec holds no number of its own: every bound is the caller's (`Bounds`): the bytes an item may
+  take, the longest word, the deepest list and the item count, derived by the server from the data they govern (its
+  vocabulary, its prototypes) and from the deployment (the connection's memory share). `Bounds::of` gives the tightest
+  bounds a value needs, which is how a bound is derived from data. A string's declared length is checked against the
+  bytes bound at its `:`, before one byte of it is waited for; a word's length as it grows; a list's depth when it
+  opens; the count as each item starts. The parser keeps its place and the lists it has opened, never the bytes, so a
+  peer that sends a byte at a time costs a step a byte, and a string's bytes are skipped in one step. It accepts what
+  the deployed parser accepts (`marshal.c` `read_item`: whitespace after `(` optional, any amount between items) and the
+  writer writes what the deployed writer writes (`( `, `) `, one space after each item), so a value written and read is
+  the same value. Each refusal carries its offset and the number of the Subversion error a client is answered with
+  (`E210004` malformed, `E210009` too large, `E210002` cut short).
+- **Tests.** Golden vectors from the protocol document (§1's example, ended by a space and by its line feed; §1's
+  failure response; §2's greeting as `svnserve` announces it, the client's response, the auth request and response;
+  §3.1.1's `get-latest-rev` and `commit-info` in the form `svnserve` writes, which wraps date and author in optional
+  tuples the document does not show; §3.1.2's `open-root` and a binary `textdelta-chunk`; §3.1.3's `set-path` with
+  §4.2's empty tuple), each read within the tightest bounds of its value and each bound shown exactly enough (lowered by
+  one, it refuses); hostile input: a string declaring 4,294,967,295 bytes and 2^64 - 1 bytes refused at its colon, a
+  number past 64 bits, every truncation of every vector, nesting past the bound (a million `(` refused at the first past
+  it in one pass), foreign bytes, items not followed by whitespace, a word past its bound, too many items, too many
+  bytes; and three properties: any item written reads back within exactly its bounds, any item fed in any pieces reads
+  the same with every call for more bounded, and any bytes read to a typed answer.
+- **Owed.** §4.17.4's pieces 3 to 14; the server derives each bound when it reads commands (piece 7).
