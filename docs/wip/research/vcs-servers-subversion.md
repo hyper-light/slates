@@ -640,6 +640,13 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   answer `( ( md5 ) rev ( props ) [ ( iprops ) ] )`, the property list present even when not wanted, the inherited
   list only when asked (empty when no ancestor has properties); the text as strings of `get_file`'s 4,096-byte
   buffer, then the empty string and `( success ( ) )` (a read error there: the empty string and the refusal).
+- **`list`** [C: `serve.c` `list`, `parse_dirent_fields`; `list.c` `svn_repos_list`, `do_list`, `fill_dirent`;
+  `marshal.c` `svn_ra_svn__write_dirent`; `types.c` `svn_depth_from_word` (`8c9fe593b18d24cf`); `utf8proc.c`
+  `svn_utf__fuzzy_glob_match`, `normalize_cstring` (`d5fab817b5ea6d87`); recorded]: the revision is opened before
+  `done` (a revision past the youngest refused with no `done`); the depth refused after it, 165002; paths absolute;
+  `unknown` for a kind not asked; a dirent's lists empty for fields not asked; a directory's size 2^64 - 1; the date
+  parsed and written again (time 0's when none). Recorded: `README.TXT` matches `read*` (the name folded, the pattern
+  as the client sent it); `dir` matching neither `a*` nor `*.txt` walked, its `b.txt` reported.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and

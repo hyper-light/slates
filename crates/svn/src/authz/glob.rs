@@ -212,8 +212,9 @@ pub(super) fn has_wildcards(pattern: &[u8]) -> bool {
   false
 }
 
-/// `apr_fnmatch(pattern, string, 0) == 0`: whether `string` matches `pattern` whole.
-pub(super) fn fnmatch(pattern: &[u8], string: &[u8]) -> bool {
+/// `apr_fnmatch(pattern, string, 0) == 0`: whether `string` matches `pattern` whole. Also `list`'s match of a name
+/// against a pattern (`svn_utf__fuzzy_glob_match` calls `apr_fnmatch` with no flags; A-613 part 2).
+pub(crate) fn fnmatch(pattern: &[u8], string: &[u8]) -> bool {
   if pattern.first() != Some(&STAR) && (pattern.is_empty() || string.is_empty()) {
     return pattern.is_empty() && string.is_empty();
   }

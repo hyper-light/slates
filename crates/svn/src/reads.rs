@@ -32,16 +32,17 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`) and `get-file` (its own module, `file`). Owed with this piece: `list`, `log`
-//! with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by the
-//! authorization rules (A-606): today every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn_repos_trace_node_locations`), `get-file` and `list` (each its own module, `file` and `list`). Owed with this
+//! piece: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by
+//! the authorization rules (A-606): today every path is readable, as in an `anon-access = read` repository with no
+//! rules.
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
 //! Bounds: an answer holds what its command names, bounded by the index and the green (a property list, a revision's
 //! properties, a request's paths and their mergeinfo). A command whose answer grows with the repository writes its
 //! head and hands back a [`Stream`] that writes the rest a slice at a time, in the room the caller gives each slice
-//! (module `stream`): a file's text is never held whole.
+//! (module `stream`): a file's text is never held whole, nor a listing.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -168,7 +169,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 21] = [
+const ELSEWHERE: [&str; 20] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -189,7 +190,6 @@ const ELSEWHERE: [&str; 21] = [
   "replay",
   "replay-range",
   "get-deleted-rev",
-  "list",
 ];
 
 /// The separators of `svn_time_from_cstring`'s format, each after its field: year, month, day, hour, minute, second,
@@ -374,6 +374,7 @@ pub fn answer<R: Repository + ?Sized>(
     "get-dir" => reads.directory(params),
     "get-locations" => reads.locations(params),
     "get-file" => reads.file(params),
+    "list" => reads.list(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -1708,6 +1709,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 mod file;
+mod list;
 mod stream;
 
 pub use stream::{Progress, Stream};
