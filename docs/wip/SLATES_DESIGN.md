@@ -10829,8 +10829,9 @@ node and its rebuild's fresh one; none with one shard), a replica's own metadata
 budget and its shard's room), the bytes an owner keeps for lagging ones (the room its per-green budget leaves beyond
 its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
 rebuilt. Built in the engine (steps 1 to 4); on the shards (step 5a, A-457) the owner makes a replica on every other
-shard of its node before the green's first change, feeds it each change over the cross-shard carrier, charges it to its
-own shard, and makes every replica leave before it gives the engine up. A work's shard answers from its replica
+shard of its node before the green's first change, feeds it each change over the cross-shard carrier, a turn's changes
+in one message after the turn's replies and acknowledged once (A-502), charges it to its own shard, and makes every
+replica leave before it gives the engine up. A work's shard answers from its replica
 (step 5b, A-465) what the work asks of its green, its base at its version and its rebase, by the owner's own functions
 over the replica's engine, with no hop; what the replica does not hold is asked of the owner, counted by why, and a
 replica that left after a refusal or an eviction is made again before the owner's next change. A replica no work on its
@@ -25352,7 +25353,12 @@ what the replica cannot serve asked of the owner, counted by why; a replica that
 made again, counted, never one that left for its budget. The idle give-back built 2026-11-18 (g083, A-473, below): a
 replica no work on its shard has used for its idle window, the longest gap it has known between two uses, leaves, its
 charge credited, counted; only a recorded use arms the check; work that returns asks for it again, and the owner's next
-change remakes it. Owed: the supervisor's A/B at 1,000 clients and more (running). The text and its measurements are
+change remakes it. The supervisor's A/B at 1,000 clients (r406 on the Mac Studio, 2026-11-18) was not green: accepted
+submits' p99 at a 20 ms think went from 0.81, 3.88 and 13.61 ms without the replicas to 60.78, 88.90 and 77.99 ms with
+them, every message of the feed sent to every replica inside the submit, before its reply, and acknowledged one by one.
+A-502 built 2026-11-18 (g083, below): the owner queues a turn's messages and sends each replica's shard one message
+with them after the turn's replies, and each replica acknowledges a turn once. Owed: the A/B again; if it is still not
+green, the replicas come out, recorded measured-and-rejected. The text and its measurements are
 perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
@@ -32497,3 +32503,36 @@ record `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its
   volume moved to a third member, the install walked onto it, the target retired and the next install walked on). Red
   without the fix on the Mac Studio (the copy stayed routed to its old owner, and the target's takeover listed nothing
   for its successor); green with it.
+
+### A-502 — The owner feeds a turn's changes to each replica's shard in one message after the turn's replies, and each replica acknowledges a turn once (2026-11-18, goal 87 via g083; A-273; §4.16 "Rebase off the owner"; A-457, A-465, A-473)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and
+`crates/server/src/green_replicas.rs` (`queue_feed`, `arm_flush`, `flush`, `send_feed`, `send_turn`; `Message::Feed`
+carries a turn's messages; `apply` and `replay` take them in order and acknowledge once; the counters
+`merge.replica.feed_sent`, `merge.replica.flush_unarmed` and `merge.replica.acknowledged`; the test).
+
+- **What was measured.** The supervisor's A/B at 1,000 clients (r406 on the Mac Studio, 2026-11-18: `load_bench`, three
+  rounds at a 50 ms and a 20 ms mean think, load 11 to 22; with the replicas main ef82f7340, without them 95bbed246,
+  the same less A-457 and A-465) was not green. At a 20 ms think, accepted submits' p99 by round went from 0.81, 3.88
+  and 13.61 ms without the replicas to 60.78, 88.90 and 77.99 ms with them; conflicting submits from 0.77, 3.79 and
+  14.57 ms to 74.52, 101.66 and 89.57 ms; head reads from 0.56, 3.02 and 10.52 ms to 26.73, 58.66 and 24.96 ms. At a
+  50 ms think, edits and rebases improved in two rounds of three and submits got worse in all three (accepted 3.09,
+  4.32 and 6.96 ms to 12.48, 10.70 and 9.75 ms). None given up; no oracle failure.
+- **The cause, from the code.** The owner sent each message of the feed to every replica's shard as it took it,
+  inside the verb that made the change. A submit's changes (its settle's fold, when the floor moved, and its version)
+  each went to every other shard of the node over the cross-shard carrier before the submit's reply: a clone of the
+  message, a task and a channel push each, and a kick when the shard was parked. Every replica then acknowledged each
+  message, a task on the owner apiece. So for each accepted version the owner's one thread made a send and took an
+  acknowledgement for every other shard, for each change, on the path every verdict waits behind; and a work whose own
+  shard held a replica took the feed's message before its answer, which came behind it on the same channel.
+- **The rule.** The owner still takes each change's message in the step that made the change, as the sealed blocks'
+  one-message rule asks, and queues it (`queue_feed`). The first message queued after a flush arms the shard's flush
+  (`arm_flush`): one task, queued behind every task the turn ran or admitted, so every reply the turn sends goes first.
+  It sends each shard holding a replica of the engine one message carrying the turn's messages in order (`flush`,
+  `merge.replica.feed_sent`). The replica applies them in order, trues up its charge once and acknowledges once, the
+  acknowledgement of the last covering every one before (`merge.replica.acknowledged`); a refusal stops it there and
+  gives the replica back, as before. The owner's sends and the acknowledgements it takes are one a replica a turn,
+  however many changes the turn made, and none goes before a reply. A shard whose arena refuses the flush's task
+  flushes at once, counted (`merge.replica.flush_unarmed`): the feed then goes before the turn's later replies rather
+  than wait for a change that may never come. The queue is bounded by one turn's changes; an engine given up or
+  installed again before its flush is sent nothing, and the daemon's stop drops the queue.

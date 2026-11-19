@@ -749,7 +749,14 @@
 > (`merge.replica.idle_given_back`); only a recorded use arms the shard's one idle check, never a sweep; the first
 > request after asks the owner, once, to make it again (`merge.replica.route_idle`), and its next change does
 > (`merge.replica.remade`). A replica never used on its shard is not judged idle (no use to derive a window from).
-> **Owed:** the supervisor's A/B at 1,000 clients and more (running).
+> **A/B (r406, Mac Studio, 2026-11-18): not green.** At 1,000 clients and a 20 ms think, accepted submits' p99 went
+> from 0.81, 3.88 and 13.61 ms (three rounds) without the replicas to 60.78, 88.90 and 77.99 ms with them, conflicting
+> submits and head reads worse alike: the owner sent every replica each message of the feed inside the submit, before
+> its reply, and took an acknowledgement for each. **Built (A-502, 2026-11-18, g083):** the owner queues the feed's
+> messages and one task a turn sends each replica's shard the turn's in one message, after every reply of the turn
+> (`merge.replica.feed_sent`); each replica acknowledges a turn once (`merge.replica.acknowledged`); a flush whose task
+> the arena refuses goes at once, counted (`merge.replica.flush_unarmed`). **Owed:** the A/B again, the same arms; if
+> it is still not green, the replicas come out, recorded measured-and-rejected (BENCHMARKS).
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
