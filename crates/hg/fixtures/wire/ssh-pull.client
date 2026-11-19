@@ -1,0 +1,18 @@
+hello
+between
+pairs 81
+0000000000000000000000000000000000000000-0000000000000000000000000000000000000000protocaps
+caps 38
+comp=zstd,zlib,none,bzip2 partial-pullbatch
+* 0
+cmds 59
+heads ;known nodes=ad120869acf0c6c266f1293ca5da567d8b382f1dgetbundle
+* 7
+bundlecaps 316
+HG20,bundle2=HG20%0Abookmarks%0Achangegroup%3D01%2C02%2C03%0Acheckheads%3Drelated%0Adelta-compression%3Dnone%2Czlib%2Czstd%0Adigests%3Dmd5%2Csha1%2Csha512%0Aerror%3Dabort%2Cunsupportedcontent%2Cpushraced%2Cpushkey%0Ahgtagsfnodes%0Alistkeys%0Aphases%3Dheads%0Apushkey%0Aremote-changegroup%3Dhttp%2Chttps%0Astream%3Dv2common 40
+ad120869acf0c6c266f1293ca5da567d8b382f1dheads 40
+59d5dc23f8786c06d0fae53e625be1cdd640a783cg 1
+1phases 1
+1bookmarks 1
+1listkeys 9
+bookmarks

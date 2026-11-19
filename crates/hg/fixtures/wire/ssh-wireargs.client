@@ -1,0 +1,18 @@
+hello
+between
+pairs 81
+0000000000000000000000000000000000000000-0000000000000000000000000000000000000000protocaps
+caps 38
+comp=zstd,zlib,none,bzip2 partial-pulldebugwireargs
+* 2
+three 17
+a b=c&d+e%f;g,h:ifour 5
+caféone 2
+untwo 4
+deuxdebugwireargs
+* 2
+three 17
+a b=c&d+e%f;g,h:ifour 5
+caféone 2
+untwo 4
+deux

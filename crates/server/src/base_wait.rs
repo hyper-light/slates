@@ -27,6 +27,10 @@
 //! store client's learned waits and retries (A-471), so a store that does not answer settles its fetch with a refusal,
 //! which the request is answered, well before that.
 //!
+//! **Who lands a fetch.** The volume's fetch driver (`slates_base::s3::driver`), a task of its owner shard started with
+//! the volume ([`spawn_driver`]): it sleeps until the host wants a fetch, runs it against the store, and hands the answer
+//! to [`land`]; it ends when the host does.
+//!
 //! **Where it waits.** On the volume's owner shard, where the host, its fetches and the waits live: an NFS call parks in
 //! its connection's task, or in the owner's task of a call forwarded from another shard (`crate::nfs`). A FUSE request
 //! is answered the retry for now: parking it, holding the request off the device and dispatching it again when its
@@ -39,7 +43,8 @@ use std::task::{Context, Poll, Waker};
 
 use slates_base::BaseHost;
 use slates_base::s3::client::S3Error;
-use slates_base::s3::fetch::Fetched;
+use slates_base::s3::driver::{HostCell, drive};
+use slates_base::s3::fetch::{Fetch, Fetched, Store};
 use slates_base::s3::host::S3Host;
 use slates_db::catalog::VolumeId;
 use slates_vfs::host::{
@@ -192,10 +197,7 @@ fn waits_and_host(s: &mut ShardState, volume: VolumeId) -> (&mut BaseWaits, Opti
 /// every request parked on the fetch it settled woken to run again (A-555). How many were woken: none when it settled
 /// no fetch (a listing's page that asks for the next), when nothing waited on it, or when the volume or its S3 base is
 /// gone. The shard's driver of the host's fetches calls it as each answer arrives.
-#[expect(
-  dead_code,
-  reason = "its caller is the fetch driver, the S3 volume's next piece (GAPS A-464); the tests drive `land_on`"
-)]
+#[allow(dead_code)] // Reached through the fetch driver alone, which the S3 volume's create starts (A-555's next piece).
 pub(crate) fn land(
   s: &mut ShardState,
   volume: VolumeId,
@@ -205,6 +207,52 @@ pub(crate) fn land(
 ) -> usize {
   let (waits, host) = waits_and_host(s, volume);
   land_on(waits, host, (volume, ticket), answer, elapsed_ns)
+}
+
+/// The shard's home for the fetch driver of `volume`'s S3 base (`slates_base::s3::driver`): the volume's slot holds the
+/// host, and each answer goes to [`land`], which wakes the requests waiting on the fetch it settles.
+#[allow(dead_code)] // Made by `spawn_driver` alone, which the S3 volume's create calls (A-555's next piece).
+struct ShardCell {
+  volume: VolumeId,
+}
+
+impl HostCell for ShardCell {
+  fn next_fetch(&mut self, waker: &Waker) -> Poll<Option<(u64, Fetch)>> {
+    let volume = self.volume;
+    // `None`: the shard's state is out of reach (its shutdown), or the volume or its S3 base is gone: the driver ends.
+    let next = state::with_state(|s| {
+      let (_, host) = waits_and_host(s, volume);
+      host.map(|host| host.next_fetch_or_wait(waker))
+    })
+    .flatten();
+    match next {
+      None => Poll::Ready(None),
+      Some(Some(fetch)) => Poll::Ready(Some(fetch)),
+      Some(None) => Poll::Pending,
+    }
+  }
+
+  fn land(&mut self, ticket: u64, answer: Result<Fetched, S3Error>, elapsed_ns: u64) {
+    let volume = self.volume;
+    let _ = state::with_state_counted(|s| land(s, volume, ticket, answer, elapsed_ns));
+  }
+}
+
+/// Starts the fetch driver of `volume`'s S3 base on this shard, the volume's owner, over `store` (the volume's store
+/// client): it runs the host's fetches, one at a time, until the host is gone, its own end (the host wakes it as it is
+/// dropped), so the task is detached and needs no other owner. Refused off a shard, or when the shard's task arena is
+/// full.
+#[allow(dead_code)] // Its caller is the S3 volume's create and recovery (A-555's next piece, GAPS A-464).
+pub(crate) fn spawn_driver<S: Store + 'static>(
+  volume: VolumeId,
+  store: S,
+) -> Result<(), slates_rt::RtError> {
+  let driver = drive(
+    store,
+    ShardCell { volume },
+    slates_machine::clock::monotonic_ns,
+  );
+  slates_rt::futures::spawn(driver).and_then(slates_rt::futures::detach)
 }
 
 /// [`land`]'s step on the shard's `waits` and `host`, the S3 host of `volume`'s slot.

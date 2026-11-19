@@ -1955,8 +1955,12 @@ landing constants are in §4.15.
 > `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry horizon read the failover delay, the
 > anchor's crash-loop cap is the NFSv4 lease its daemon grants, a FUSE helper is waited for as long as its shard's
 > helpers have taken (learned, backed off to the failover delay), and a status capture is held the failover delay from
-> its capture. The operator's failover SLO above is now a check against the published delay
-> (`FleetReport::failover`), not an input.
+> its capture. **Since A-574 a laptop's detection is measured, not the liveness window**: where no peer's detector judges
+> a node (a laptop at `f = 0`, a fleet node before its detector's first period), `D` is the widest window the watchdog
+> judges the daemon's shards by (A-455) and then the lapse bound its anchor publishes (A-467, `SUP_LAPSE_BOUND`), read
+> at every beat on every node, laptop or fleet, and the delay goes to every shard by the beat's own fan, which a laptop
+> runs too (on a quiet laptop about three seconds of `F`, where A-405's fixed window gave two). The operator's failover
+> SLO above is now a check against the published delay (`FleetReport::failover`), not an input.
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -2102,7 +2106,8 @@ drift check `fstat`s.
 
 **Algorithms.**
 - Lookup: hash the name under the volume's equivalence policy (byte-exact: hash bytes; fold:
-  hash the folded, normalized form; compare folded forms on collision); `Small`: binary search
+  hash the folded, normalized form; upcase: hash each UTF-16 unit as Windows' upcase table maps
+  it, A-576; compare folded forms on collision); `Small`: binary search
   over `name_hash` then compare; `Indexed`: hash side index then ordered node for the entry. In
   a `Merged` directory the overlay is consulted first: an overlay entry wins, a `Whiteout` ends
   the lookup with `ENOENT`, otherwise the base listing is consulted (loaded on first use with the
@@ -2366,7 +2371,9 @@ names keep that name byte for byte, since the driver renames a node and the node
 must name it (`winfsp.h` 1285-1299). `GetFinalPathNameByHandleW` shows the made spelling. Three cases stay out of reach
 and are in GAPS: names the volume folds alike and Windows' table does not (normalization, the Kelvin sign) remain a node
 per spelling; a path past 1,024 units is upper-cased by the driver itself; and names the table folds alike and the
-volume keeps apart (`ς` and `σ`) share one node.
+volume keeps apart (`ς` and `σ`) share one node. A volume that folds by Windows' own table (`NameEquivalence::Upcase`,
+A-576) leaves neither name case: the drive and the volume take the same names for one, so a WinFsp drive's folding
+volume is to be one (A-576's part 2 lets a volume be made so).
 
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
@@ -2899,9 +2906,11 @@ before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so 
 shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
 while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
 cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
-after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
-opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
-(GAPS).
+after its last publication (another path's create a listing showed, a base directory first loaded then) is in no image
+and no head: the successor refuses it, never serving it, and the round names it too in its place. Every publication
+records the volume's live counter beside its reserved ceiling (A-150), and the numbers between the two are exactly those
+the dead daemon could have handed out since without another publication (A-578), so a descriptor opened before the
+death drops their pages as well.
 
 **Every round a mount builds on its serving thread is sliced** (A-562). The journal gather walks a backlog of records,
 the overrun round every node and name the kernel holds, and the takeover round its inode set; each grows with what
@@ -3987,14 +3996,16 @@ reaches the daemon through the rendezvous's socket file (A-187).
 >      `ShardsBackings::placements` reads where each placed range lies (its PMD mapping in `/proc/self/smaps`). A placed
 >      range is zeroed by stores, never a hole punch, which would split its page.
 >
->      **A decline is remembered until the reap tick.** A declined collapse is not free: the kernel tries to compact
+>      **A decline is remembered for a retry window.** A declined collapse is not free: the kernel tries to compact
 >      memory first, and on adacachy at load 90 a fill step that was declined took 1,954 and 2,832 µs, where calm runs
 >      placed every range. Asked once a range, a host out of huge pages would charge the shard that much for every range
 >      a guest maps, and a guest churning its ranges could make it pay again and again. So a decline likely to hold is
->      remembered, the next ranges are served on base pages without asking (counted as declined), and the daemon's reap
->      tick re-arms it (`ShardsBackings::place`, `rearm_placement`). The kernel is asked at most
->      once a tick per shard while it declines. A transient decline (`EAGAIN`, a page locked or held for the moment) is
->      not remembered. Proven in a child process whose huge pages the kernel refuses (`PR_SET_THP_DISABLE`): three
+>      remembered, the next ranges are served on base pages without asking (counted as declined), and the shard's
+>      deadline keeper re-arms it a retry window after the decline (`ShardsBackings::place`, `take_declined`,
+>      `rearm_placement`; A-570, the reap loop's tick until then). The kernel is asked at most once a window per shard
+>      while it declines, and nothing wakes while no decline is held. A transient decline (`EAGAIN`, a page locked or
+>      held for the moment) is not remembered.
+>      Proven in a child process whose huge pages the kernel refuses (`PR_SET_THP_DISABLE`): three
 >      ranges ask the kernel once, and a re-arm asks again
 >      (`a_declined_placement_is_remembered_until_re_armed`, `crates/bridge-core/tests/dax_backing.rs`).
 >
@@ -4300,7 +4311,8 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > gate (its registry, pins, two-phase revoke, `reopen`-on-map and reseal, and snapshot recall), the writable-DAX and
 > integrity-guard opt-ins, L1's zones, L2's shift, B2's net, the daemon's shift loop and scrub pass, the `Bridge`
 > trait's content-block methods, and the device's content-block map paths. The daemon starts no DAX loop of its own: its
-> reap tick re-arms placement and nothing else. A snapshot reader's `advance` marks the device's backings stale
+> deadline keeper re-arms a declined placement a retry window after the decline, and nothing else (A-570). A snapshot
+> reader's `advance` marks the device's backings stale
 > (`Device::view_advanced`), and a snapshot recalls nothing. Admission still refuses DAX over the in-process seam, now
 > for the reason that holds: no in-process VMM has run a guest over it (AC-9.7).
 >
@@ -4995,9 +5007,11 @@ root-relative path as an explicit alternative; it does not report that the reque
 > task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
 > them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
 > dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536),
-> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold and NFS purges (A-570): the NFSv4
-> table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands the reaper a round at once
-> at a start that owes purges and a retry window after any access that leaves it owing. Base hints are next.
+> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold, NFS purges and the huge-page
+> re-arm (A-570): the NFSv4 table notes what it owes as each access closes (`nfs::note_purges`), and the keeper hands
+> the reaper a round at once at a start that owes purges and a retry window after any access that leaves it owing; a
+> lasting decline of a huge-page placement is noted as each state borrow closes and re-armed by the keeper a retry
+> window after it. Left on the tick: base hints with their delegation drain, and the idle seal.
 
 > **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
 > named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
@@ -10328,6 +10342,16 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > own virtio-fs device and the typed channel's verbs (answered `Unpublished`, retryable); and the volume over an S3 base
 > (the wire's create, the credential's hand-off, the fetch driver), with the rest of A-524's owed list.
 
+> **Status (2026-11-19, A-555's second piece: the fetch driver).** Built: `slates_base::s3::driver::drive`, the task of
+> the volume's owner shard that runs its host's fetches against the store one at a time and hands each answer back,
+> timed, so the requests parked on a fetch are woken when it lands. An idle driver waits on the host itself
+> (`S3Host::next_fetch_or_wait`), which wakes it the moment a miss wants a fetch; a host dropped wakes its driver, which
+> ends, so the driver lives exactly as long as its host and needs no other owner. It is the same code over any store
+> (`s3::fetch::Store`: the network client, or `SimS3` in a test) and any home of the host (`HostCell`: the shard's
+> volume slot in the daemon, `crates/server/src/base_wait.rs`'s `spawn_driver`, whose answers go to `base_wait::land`).
+> Owed: its start where a volume over an S3 base is made or recovered (the wire's create, A-555's next piece), and
+> fetches side by side within the requests that wait on them, which a measurement decides.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -12145,6 +12169,20 @@ signature verification).
 > obsstores; each payload decodes as 7.2's listings and logs say and encodes back to its bytes. The crate root now
 > carries the no-panic attribute (`arithmetic_side_effects` denied outside tests). Still owed from piece 1: compressed
 > streams, once the D-17 engines are wired.
+>
+> **Status (2026-11-19, A-569: piece 2, the protocol codecs, built).** `slates-hg` reads and writes the wire protocol's
+> version 1 framings as pure functions over bytes: SSH's command lines, arguments with their lengths, the dictionary
+> (`*`), `unbundle`'s chunked input, string answers, a push's answer and the out-of-band error form (`ssh`); HTTP's
+> arguments from the query, from the `X-HgArg-<N>` headers joined and from the body's front behind `X-HgArgs-Post`, in
+> 7.2's precedence and dictionary order, what a client reads (`X-HgProto`), and the `0.1`, `0.2` and `hg-error`
+> framings (`http`); the capabilities line and the bundle2 capability blob through both of its quotings
+> (`capabilities`); `batch`'s escapes and calls (`batch`); a command's argument spec (`wire`). Every line is bounded by
+> the server's own command table and spec and the digits of the caller's room, every length and count by that room,
+> and every decoded byte and vector counted and charged to the caller's admission before it is built; an SSH read says
+> how many bytes it still needs. Proven against 103 captures stock 7.2 made over SSH and HTTP
+> (`crates/hg/fixtures/wire`, the command in `make-wire-fixtures.sh`): a clone, a pull, a push, `debugwireargs` through
+> each way of carrying arguments, and a refused bundle1 client, every request and answer read and written again to its
+> bytes. Compression engines (D-17) and serving the commands (piece 4) are not this piece's.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12512,7 +12550,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    framings, bundle1, the deltas and the parts' payloads; owed: compressed streams (`GZ`, `BZ`, `ZS`, D-17).
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
-   string and the bundle2 capability blob, and `batch` escaping.
+   string and the bundle2 capability blob, and `batch` escaping. Built (A-569, `crates/hg`: `ssh`, `http`,
+   `capabilities`, `batch`, `wire`).
 3. The objects and the index: changeset texts, flat manifests and file metadata parsed and written, nodes checked, the
    index's tables, and an existing repository's store imported as a base.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
@@ -12550,8 +12589,12 @@ and export by landing).
 > **Status (2026-11-19, A-542, its first half).** Built: node-exclusive operations in the merge engine
 > (`slates-merge`): `NODE_EXCLUSIVE`, the high bit of an operation's flags, and the verdict's pass that refuses a
 > node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
-> Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
-> (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
+> Its second half, `Copy`, part 1 (2026-11-19): Copy's maps. Every map of a green's state copies a path's tree by
+> reference (`crates/merge/src/dims/copy.rs`: the source's keys beneath it held as one subtree of A-534's radix tree
+> and grafted beneath the destination, its own key set to the source's value), O(the two paths' lengths) whatever the
+> tree holds, a copied file one more holder of its block, no walk (the arena's visited count does not move).
+> Owed, part 2: the engine's `Copy` operation, recorded by one entry for the destination's prefix in the histories, the
+> change index and `last_changed`, never a walk (the A-542 entry's plan).
 >
 > **Status (2026-11-19, A-553).** Built: the Subversion index (`slates-svn`'s `index`, piece 4, item 2): node rows with
 > FSFS's node, copy and copy-root identities, predecessors and counts, texts, property lists and mergeinfo counts;
@@ -12946,8 +12989,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
    vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
    cut anywhere).
-3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
-   persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
+3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
+   A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation owed, with
+   §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -36723,6 +36767,39 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   key to the destination and `graft` the source's `subtree` under it in each current-value map, O(path length) per
   map, and begin each copied key's history at the copy's version with its source recorded. Building a second
   persistent structure here was ruled out, and g261 built its tree so a prefix is one shared node.
+- **Copy, part 1: its maps (2026-11-19, g292; A-534 on main since f8ba01f61).** Applied to `crates/merge/src/dims.rs`
+  (the module's "A tree is copied by reference"; `escaped`, the attribute key's path bytes) and
+  `crates/merge/src/dims/copy.rs` with its tests (new). `Dim::copy_tree(from, to)` checks the destination by descents
+  alone (its own key, and a count taken and given back on the prefix beneath it), holds the source's keys beneath it as
+  one subtree, grafts them beneath the destination and sets the destination's own key to the source's value; `Files`
+  makes each copied file one more holder of its block; `Xattrs` copies a path's own attributes and its descendants'
+  as two prefixes, both held before either graft. Cost: two descents, two counts, the nodes of the destination's path
+  and the subtree's top node: O(the two paths' lengths), whatever the tree holds (a radix node's children start with
+  distinct bytes, so the top node's copy is bounded by the byte alphabet); no walk. Refused, nothing changed, onto a
+  present destination or one with a key beneath it (Subversion's copy needs its destination absent), and from or onto
+  the root, whose tree no one prefix names. The subtree is held before the graft, so a copy into its own subtree
+  (which FSFS allows, `tree.c` `copy_helper`) copies the source as it was. Tests: the cost against a tree of 1 and of
+  4,096 files (the arena's visited count unmoved, no block made, at most twice the destination path's nodes and two
+  more gained); the refusals; a copy beneath itself; and an oracle (generated puts, removals and copies, from and onto
+  any path and the root, forked at a generated step, on the file, mode and attribute maps, each equal after every step
+  to a reference that copies key by key, the originals unchanged by the fork's copies, every node and block freed at
+  the end; its census requires copies that grafted, copies into their own source, both refusals and forks). Evidence
+  (the Mac Studio, kiln, 2026-11-19 02:49 UTC, load 27, debug): red with both copies returning nothing, the four new
+  tests failed and the two older `dims` tests passed; green, `cargo test --locked -p slates-merge --lib dims::` 6 of
+  6 and the crate's whole `--lib` 26 of 26. Until part 2 calls them, the copies are reached only from tests, which the
+  module states as a dead-code expectation that fails once part 2 calls them.
+- **Copy, part 2, owed: the engine's operation.** `OpKind::Copy`, appended as wire value 16, its source in `src` as a
+  rename's is; applied by `copy_tree` in every map; judged node-exclusively (a destination present, or changed since the
+  base, conflicts). The one history rule (A-534) reads a key with no history as present since version 0, which a
+  grafted key is not, so the copy is recorded as one entry for the destination's prefix: an appearance record (the
+  prefix, the version, the source and its version), one change-index entry and one `last_changed` entry for the prefix;
+  a key's reader takes the latest appearance above it after its own last entry as its first value, and a key's first
+  change after an appearance records, at the appearance's version, the value it held. Found while reading the engine,
+  for part 2 to settle: the identity's set hash (A-202) folds each changed key's entry, and a graft brings a whole
+  subtree's entries under new names, so either the identity's next read pays the subtree once, or entries are hashed
+  relative to their nearest copy so a graft moves a subtree's sum in one step; a copied hard link's reverse map
+  (`links_to`) gains the copy's links, one per link, so a source holding hard links is either refused (Subversion has
+  none) or paid per link; and the root's copy (Subversion's copy of `/`) is not one prefix in the attribute map.
 - **Tests** (`node_exclusive_tests.rs`, a module of the engine). Seven cases, each running one work plain and
   node-exclusive against the same change since its base (§4.16 accepts the plain one, the flag refuses it): an
   identical overwrite, a disjoint one, a property change against a text change, an identical addition, a move whose
@@ -37211,8 +37288,8 @@ and:
 - **Found by the sweep, left open** (GAPS, with the bug record):
   - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, fixed since).
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
-  - A clone is admitted with no entry allowance.
-  - A resize leaves the entry allowance at the size the volume was made with.
+  - A clone is admitted with no entry allowance (fixed since by A-572).
+  - A resize leaves the entry allowance at the size the volume was made with (fixed since by A-572).
   - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
@@ -37826,10 +37903,10 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
   sibling's open would name the new spelling while the driver joined the old node, and a rename would move the node and
   not the record.
 - **Rejected.** Recording each open as WinFsp upper-cases it, which keeps every record equal to the driver's by
-  construction: `GetFinalPathNameByHandleW` would then show upper case to Rust's `canonicalize`, Python's `realpath`
-  and git, which ask it for a file's path (A-369), and a notification of an entry under a held directory would carry
-  the upper-cased directory to watchers. Answering every open with its stored path, as A-543's record planned: refused by the driver
-  for any spelling that differs by more than case, and out of step with a node Windows already holds.
+  construction: `GetFinalPathNameByHandleW` would then show upper case to Rust's `canonicalize`, Python's `realpath` and
+  git, which ask it for a file's path (A-369), and a notification of an entry under a held directory would carry the
+  upper-cased directory to watchers. Answering every open with its stored path, as A-543's record planned: refused by
+  the driver for any spelling that differs by more than case, and out of step with a node Windows already holds.
 - **Also fixed.** WinFsp v2.1's DLL counts an open's normalized name twice when it places the open's security descriptor
   after it (`src/dll/fsop.c` 468, then 413), and leaves the alignment between them unwritten, so a Create's size reached
   bytes of the receive packet's earlier response. `finish_response` clears both spans, keeping A-215's rule that no
@@ -37837,9 +37914,9 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
 - **Cost.** On a folding drive, one look-up a component per open (the stored path), and one indexed look-up a component
   of the open names until Windows holds none (`OpenNames::spelled_at`), keyed by the upcased units; nothing on an exact
   drive.
-- **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are a
-  node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell otherwise
-  leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.
+- **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are
+  a node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell
+  otherwise leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.
 - **Tests.** Every host: `normalized::tests` (seven: each spelling names one node by its made spelling; a case-sensitive
   drive answers nothing; a stored spelling answered only where the driver takes it; the spelling Windows holds a path or
   a prefix by; past 1,024 units the driver's upper-cased name; a lost surrogate unanswered; final sigma takes the open
@@ -37891,7 +37968,8 @@ publication" and "an outsider's change beneath a base during a takeover's gap"),
   pages, since no walk can name them until each publication records the volume's live counter beside its reserved
   ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
   between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
-  kill-in-window tests) are Linux's, main's to run.
+  kill-in-window tests) are Linux's, main's to run. The numbers closed by A-578 (2026-11-19): every publication records
+  the live counter, and the round names the numbers between it and the ceiling.
 
 ### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
 
@@ -37964,6 +38042,33 @@ commit a part, in order of harm.
     image (the names its directories carry that name a child) must all be equal.
   - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (3 counted live, 6 after the
     restart); green with the rule; `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored.
+- **Part 2, a clone was admitted with no entry allowance.**
+  - **What was there.** A create's admission (`admit_dimensions`) and a restart's re-admission set a volume's entry
+    allowance. A clone's admission (`admit_clone`) set its inode allowance alone, so a clone's names had no bound until
+    a restart.
+  - **The rule.** A clone's admission sets its entry allowance as a create's does: the share of its policy, never below
+    the entries it holds, which are its snapshot's (A-549), as a restart floors it. It reserves nothing, so it is set from
+    the clone's own count once the clone exists, not before the snapshot is pinned as the version slots are.
+  - **Tests.** `a_clone_is_admitted_with_an_entry_allowance_never_below_its_snapshots_entries`
+    (`crates/server/src/verbs.rs`, `clone_admission_tests`): the clone of a snapshot holding names past its share is
+    allowed exactly its snapshot's entries, which a walk of its namespace counts; a small origin's clone gets the share;
+    none refused.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the rule's lines taken out (`u64::MAX` against 4,104),
+    green with them; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test).
+- **Part 3, a resize left the entry allowance at the size the volume was made with.**
+  - **What was there.** `resize` re-derived the inode allowance from the new policy, floored at the live count, but
+    never the entry allowance, which only a create and a restart set. A volume grown from 64 KiB to 1 MiB kept the
+    smaller share; one shrunk kept the larger.
+  - **The rule.** A resize moves the entry allowance with the new policy as it moves the inode allowance: the new
+    policy's share, never below the entries the volume holds. It reserves nothing, so it is set once the core has
+    accepted the new limit.
+  - **Tests.** `a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held`
+    (`crates/server/src/verbs.rs`, the new `resize_admission_tests`). Resized up, a volume holding names past the smallest
+    policy's share gets the larger share. Resized down, it gets the smallest share floored at its entries, which a walk
+    of its namespace counts. None is refused.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (4,096 against 65,536 after the
+    resize up); green with the rule; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored, and
+    `resize_admission_tests` 1 of 1.
 
 ### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
 Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's
@@ -38144,12 +38249,26 @@ entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `cr
   `cargo fmt --check` clean; `slates-machine --lib memory_pressure` 1 of 1 (the dispatch source opens and drops on
   macOS); `slates-server --lib -- pressure:: purge_round_tests nfs_state:: deadlines:: reap:: remote_attach:: landing::
   config::` 39 of 39, the fall held back 1.9 ms after it and the refused purge sent again 1.0013 s after its round.
-- **Left for the next piece, in order.** Base hints with their delegation drain, the idle seal, the huge-page re-arm;
-  then the reap loop and its tick are deleted, and §4.7's status says so.
+- **The huge-page re-arm (job 5).** A decline of a huge-page placement likely to hold (§4.6, the backed route's L1,
+  A-193) is remembered so the next ranges are served unplaced without asking, and the shard's deadline keeper re-arms
+  it a retry window after the decline: `ShardsBackings::place` remembers it (`remember_decline`) and notes it
+  (`take_declined`, read as each state borrow closes), the keeper sleeps to `ShardState::placement_rearm_at`, and
+  nothing wakes while no decline is held. The reap loop's tick re-armed at its looks whatever their phase, so a decline
+  just before a look was asked again at once, before the host could have freed anything. Test:
+  `crates/server/src/deadlines.rs` `a_declined_placement_is_asked_again_a_window_after_the_decline` (past the tick's
+  first look: re-armed no sooner than a window after the decline and within half a window more). macOS never declines
+  (the collapse is Linux's), so the test drives the decline the product remembers; it cannot run on main's code,
+  which has no way to remember one, so its red is by mutation (the keeper's re-arm removed, the tick's put back). The
+  Mac Studio (2026-11-19 18:44 local, load 22, debug): red by that mutation, re-armed 484 ms after the decline at the
+  tick's next look; green on a36c98b, `cargo fmt --check` clean and `slates-server --lib -- deadlines:: pressure::
+  purge_round_tests reap::` 14 of 14, re-armed 1.006 s after the decline.
+- **Left, in order.** Base hints with their delegation drain, the idle seal; then the reap loop and its tick are
+  deleted, and §4.7's status says so.
 
 Applied in the same change to: §4.2 and §4.7 (status blocks), GAPS (the reaper series' line), `unsafe-budget.toml`,
 `xtask/src/main.rs` (the host-path table's reason for slates-machine), `crates/machine/src/{lib,memory_pressure}.rs`,
-`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`.
+`crates/server/src/{pressure,daemon,state,config,lib,nfs,nfs_state,deadlines,reap}.rs`,
+`crates/vfs/src/shards_backing.rs`, CLAUDE.md (the huge-page re-arm's canonical example).
 
 ### A-567 — A mount taken over from a daemon that died adopts each file its kernel held from before the successor's first journal record, so a replayed write's bytes are stale, never taken as fresh (2026-11-19, goal 85 B8 via g083; §4.6 "Cache posture", the dirty-page write-back rule; A-61, A-63, A-147, A-152, A-158, A-192, A-231)
 
@@ -38411,6 +38530,287 @@ a `more` that never stops them.
   charge before them answered 13,503 bytes after sequence 128 where 105 waited. The Linux and Windows halves
   (`channel.rs`, the server's `fuse.rs` and `winfsp.rs`) and the integration suites were not compiled here; they are
   filed for main's lanes.
+
+### A-574 — A laptop's failover detection is what its watchdog and its anchor measure: the widest shard window, then the anchor's lapse bound, read at every beat on every node (2026-11-19, UI goal 86 via g076b; R3's class D, its last fixed-window term; R8; §4.4 "Derived constants", §4.14 `daemon.alive`; A-363, A-405, A-455, A-467)
+Applied in the same change to: §4.4's status (the failover delay's paragraph), GAPS (the failover delay's entry: A-405's
+sentence and the class D line), `docs/cli.md` (an unrenewed CLI attachment's lapse on a laptop),
+`crates/anchor/src/{layout,segment}.rs` (`SUP_LAPSE_BOUND`, `Supervision::record_lapse_bound`, `lapse_bound_ns`, the
+word declared), `crates/api/src/role/anchor.rs` (`publish_lapse_bound` in the observation loop),
+`crates/cluster/src/failover.rs` (`supervision`, `Failover::supervise`, its readings; `Failover::supervised` deleted;
+the laptop paragraph; two tests), `crates/server/src/watchdog.rs` (`widest_window_ns`), `crates/server/src/fleet.rs`
+(`refresh_supervision`, `publish_failover`, `fan_failover` and its counters; the configuration fan no longer carries the
+delay; its test), `crates/server/src/daemon.rs` (the boot reading in `init_shard`, the beat's reading and fan in
+`heartbeat_loop`, `stop_parts` over `widest_window_ns`, `inject_failover`'s note, the test) and `crates/cli/tests/cli.rs`
+(formation's allowed counters: `fleet.failover_fan.sent`).
+- **What was there.** A node no peer's detector judges (a laptop at `f = 0`, a fleet node before its detector's first
+  period) took the liveness window `W` as its detection term (A-405: `Failover::supervised(LIVENESS_BUDGET_NS)`), set
+  once at boot, whatever the host. And a laptop never refreshed its failover estimate at all: the estimate is refreshed
+  by the fleet's record-plane coordinator and fanned with the fleet's configuration, neither of which a laptop runs, so
+  every shard of a laptop held the value its boot computed, for good.
+- **What detection is there.** A laptop's detector is its supervision (A-232). Its watchdog judges a shard stuck once
+  the window it judges that shard by has passed since the shard last moved (A-455: `W` raised to the scheduler overrun
+  the shard measured, within the observation budget), and only then withholds the beat; its anchor kills the daemon
+  once that beat is its lapse bound old (A-467: `W` plus the anchor's own measured lateness p99, within the same
+  ceiling) and starts it again. So a wedge is detected after the stuck shard's window and then the anchor's lapse, in
+  turn: A-405's single window left the anchor's lapse out, and on a quiet host undercounted by a window.
+- **The rule.** `D` where no peer's detector judges the node is the widest window the watchdog judges the daemon's
+  shards by, then the anchor's lapse bound (`slates_cluster::failover::supervision`); a daemon run alone, whose watchdog
+  ends it at the verdict, has no lapse, the window alone. The anchor publishes its lapse bound in its supervision block
+  whenever it moves (`SUP_LAPSE_BOUND`, zero where no anchor wrote one; no layout change, as the anchor's other words).
+  The control shard reads both at every beat (`heartbeat_loop`, `fleet::refresh_supervision`), on every node, laptop or
+  fleet, and publishes the delay (`fleet::publish_failover`, the same publication the coordinator's refresh uses); a
+  shard reads the same at its boot. The beat then fans the delay to every other shard where it moved
+  (`fleet::fan_failover`, counted `fleet.failover_fan.sent` and `.refused`), so the configuration fan no longer carries
+  it: one fan on every node.
+- **R8.** One estimator and one sum on every node: a laptop's detection and confirmation are its degenerate inputs (no
+  detector's term, no council's), never a branch, and a fleet node's supervision is read the same way and stands until
+  its detector's term replaces it.
+- **What changes.** A laptop's failover delay at rest is the window, the anchor's lapse and the recovery prior, about
+  three seconds where it was two, and it follows the machine: a host that holds a shard off its CPU, or an anchor whose
+  own waits run late, lengthens it as long as they lengthen detection. Every wait that reads the delay follows on a
+  laptop: an unrenewed CLI attachment's term, a write lease's, a staging buffer's, a status capture's, a FUSE helper's
+  ceiling, a taken-back copy's claim. A test's injected delay is held on every shard by the same beat.
+- **Tests.** `a_nodes_supervision_is_its_watchdogs_widest_window_then_its_anchors_lapse` and
+  `a_laptop_and_a_fleet_node_derive_their_failover_delay_by_one_sum` (`crates/cluster/src/failover.rs`),
+  `a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse` (`crates/server/src/daemon.rs`: a
+  two-shard daemon with no fleet, the lapse bound published in its block as its anchor does; every shard's delay comes to
+  hold it, the control shard's detection the widest window and then exactly the lapse), and
+  `a_shard_is_fanned_the_failover_delay_when_it_moves` (`crates/server/src/fleet.rs`, now the beat's fan).
+- **Evidence.** On the Mac Studio (kiln r256, 2026-11-19, load 2.4, debug build). Red first, on the tests alone
+  (`da2c2d30e`): the supervision read `Term { ns: 1000000000, samples: 0 }` where the rule gives 2.2 s and a reading, and
+  the laptop daemon's delay never held the published lapse within ten seconds. Green on the change merged with main
+  (`714f2ce20`): `cargo test --locked -p slates-cluster --lib -- failover::` 12 of 12, `-p slates-anchor --lib` 40 of
+  40, `-p slates-server --lib -- laptop_failover_tests fleet::tests::a_shard_is_fanned fleet::tests::an_installed_fan
+  watchdog late_beat_tests starved_share_tests` 34 of 34, `-p slates-api --lib -- role::anchor` 13 of 13 (one ignored,
+  the held process's role), `cargo fmt --all --check` clean. A real anchor's publication and the beat's fan in a
+  formed fleet are main's to run (the anchor and CLI flows, the fleet formation test).
+
+### A-578 — Every publication records the live inode counter beside the reserved ceiling, and a takeover names the numbers between them (2026-11-19, g232; UI goal 85, A-573's owed item; §4.6 "A mount taken over by a restarted daemon", §4.8 publications; A-150, A-573; image version 33)
+Applied in the same change to: §4.6 (the takeover paragraph), A-573 (its owed item closed), GAPS (A-573's two still-open
+notes), `crates/vfs/src/recover.rs` (`IMAGE_VERSION` 33, `VolumeImage::live_counter`, `to_image`, `encode_image_into`,
+the rebuild), `crates/vfs/src/delta.rs` (`VolumeDelta::live_counter`, `delta`, `encode_delta`, `VolumeImage::apply`),
+`crates/vfs/src/volume.rs` (`unrecorded_counters`, `visit_head_inodes`), `crates/vfs/src/base.rs` (tests),
+`crates/vfs/tests/model.rs` (the publication oracle).
+- **What was there.** A publication recorded only the reserved ceiling (A-150): the counter plus the store's reserve,
+  where a successor starts. A number the dead daemon issued after its last publication, below that ceiling, is in no
+  image: another path's create a listing showed, or a base directory's entries first loaded after it. A-573's round
+  named every inode the successor holds, and could not name these, so a descriptor a kernel opened on one before the
+  death kept its cached pages; the successor refused the number (`NotFound`) and never served it.
+- **The rule.** Each publication records the volume's live counter beside its reserved ceiling: the image
+  (`VolumeImage::live_counter`) and every delta (`VolumeDelta::live_counter`), in both encodings, the struct builders
+  and the streamed encoders the daemon writes. Recovery folds the deltas into the image and rebuilds the volume with the
+  counters from the live one up to the ceiling (`Volume::unrecorded_counters`): numbers no image holds and this daemon
+  never issues, since its own counter starts at the ceiling. The takeover walk of the head
+  (`Volume::visit_head_inodes`) names them in their place in counter order: the restored inodes below them, then each
+  of them under the volume's prefix, then what this daemon issued since. An image whose live counter passes its ceiling
+  is refused (`RecoveryIncomplete`). The live counter stays out of the roots a clean volume is judged by: a base
+  directory's load issues numbers and changes nothing published, and the last publication's two counters already bound
+  what was issued since. The gap is at most a reserve of numbers per takeover (A-150's 262,144 on the box), each a
+  `FUSE_NOTIFY_INVAL_INODE` the kernel answers at once for a number it never cached, sent in the round's slices.
+- **Format.** Image version 33: the image and every delta carry the new counter, so a reader of version 32 refuses it,
+  and this reader refuses 32. No shim reads the old form.
+- **Tests.** `a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover` (red first: a file made
+  and a base directory first loaded after the publication; the successor refuses both numbers and its walk names both),
+  `the_takeover_walk_in_slices_joins_whole_across_the_unrecorded_counters` (the walk across the restored inodes, the
+  unrecorded counters and the successor's own, whole and in slices of 1 to 5),
+  `an_image_whose_live_counter_passes_its_ceiling_is_refused` (hostile), all in `crates/vfs/src/base.rs` under a
+  nonzero reserve. The publication oracle (`check_publication`, `crates/vfs/tests/model.rs`) now checks each folded
+  publication's two counters against the volume's own and that they differ, under the model's nonzero reserve (A-150's
+  gotcha: with none they coincide, and an encoder writing one for the other passes unseen); main's to run. On the Mac
+  Studio (debug, 2026-11-19, load 19 to 23): `slates-vfs --lib` 90 of 90 (1 ignored), `slates-bridge-core --lib` 40 of
+  40; red with the unrecorded counters dropped at the rebuild: the first test failed at its naming, its refusal holding;
+  red with the ceiling's check removed: the hostile image rebuilt.
+
+### A-576 — A volume can fold names by Windows' own upcase table, so a name a WinFsp drive takes for another is that entry (2026-11-19, goal 85, g258; §4.4 name policy, §4.5 "Lookup", §4.6 "Windows", D-4; part 1 of 2; after A-551's third case)
+Applied in the same change to: §4.5 ("Lookup"), §4.6 (the folding-drive paragraph), GAPS (the folding-drive entry's
+third case), `crates/vfs/src/upcase.rs` (new: the table, its lookup, its tests), `crates/vfs/src/names.rs`
+(`NameEquivalence::Upcase`, `Folded::Upcase`), `crates/vfs/src/export.rs` (policy id 2), `crates/vfs/src/recover.rs`
+(`PolicyImage::Upcase`, appended), `crates/vfs/src/image.rs` (the folded index), `crates/vfs/src/volume.rs` (the
+volume's
+tests), `crates/vfs/src/lib.rs`, `crates/server/src/image.rs` (an archive naming the policy refused `Unsupported`),
+`crates/bridge-winfsp/src/host.rs` (the Windows check), `crates/bridge-winfsp/src/normalized.rs` (its tests on the real
+table).
+- **What was there.** A-551 serves a folding volume through a WinFsp drive that compares names without case, by the
+  system's upcase table, while the volume folds by NFC and Unicode lowercasing (`Fold`, APFS's rule). The two disagree:
+  over single BMP characters the table joins two characters lowercasing keeps apart only at final sigma (`Σ`, `ς`, `σ`),
+  so a `Fold` volume could hold `σ.txt` and `ς.txt` as two files that the driver opens as one file node, one cache and
+  one share-access record over two files; and lowercasing with NFC joins 838 pairs the table keeps apart, each one file
+  the driver sees as two nodes. (Python's Unicode 13 as the model of the lowercasing, 2026-11-19.)
+- **The rule (the coordinator's, from principle).** A volume served by a folding drive folds names exactly as the drive
+  does, so no two of its files are one name to Windows; a refusal at the second open would leave the state reachable.
+  `NameEquivalence::Upcase` folds each UTF-16 unit through Windows' upcase table, unit for unit with no normalization:
+  `ς` and `σ` are one name, refused `EEXIST` at create and link, and a rename onto the other spelling replaces that
+  entry; a decomposed and a precomposed `é` are two names, as on NTFS. The volume's lookups, its directory index and its
+  ordering are the table's, through the same hash and comparison paths the other policies take.
+- **The table.** Microsoft's recommended up-case table, Table 25 of the exFAT file system specification (§7.2.5.1,
+  learn.microsoft.com, read 2026-11-19): 2,918 compressed entries whose TableChecksum is E619D30Dh, as the specification
+  states; 874 of the 65,536 units map to another; no unit past ASCII maps into ASCII. The volume core holds the 874
+  mappings, and its tests hold them to the specification's table through that checksum and entry by entry. The driver
+  compares by the system's NLS table (`RtlCompareUnicodeString`), which ntdll's `RtlUpcaseUnicodeChar` reads; that the
+  two agree at every unit is a Windows test for main (`the_volumes_upcase_table_is_the_systems`), stated from memory
+  until it runs.
+- **Rejected.** Redefining `Fold` as the table: every image already made is hashed and ordered by `Fold`'s rule, and a
+  macOS mount of a folding volume wants APFS's normalization. A refusal at the drive's second open of a twin: the two
+  files would stay, and only Windows' view would be guarded.
+- **Part 2 (owed).** The protocol's and the catalog's name policies (`NamePolicy`, `DbNamePolicy`, appended and
+  published), the CLI's and the SDKs' and MCP's choice of it, an archive importing it, and what a WinFsp mount of a
+  `Fold` volume does (A-551's residuals) once a drive's volume can be made `Upcase`; and at mount, whether the system's
+  table is the volume's (the Windows check above, made where the drive is).
+- **Tests.** Every host: `upcase::tests` (the specification's table through its checksum and at every unit; the sigmas
+  and the letters the table leaves; sigma the one unit two others map to),
+  `names::tests::upcase_folds_names_as_windows_upcase_table_does` and the ordering oracle over all three policies with
+  equal hashes for equal names, the volume's `a_name_windows_folds_alike_to_an_entry_is_that_entry` and
+  `a_rebuilt_volume_folds_as_windows_upcase_table_does`, and export's policy round trip. On the Mac Studio (debug, load
+  average 26 to 39, 2026-11-19 02:36 UTC), `cargo test -p slates-vfs --lib -- upcase names:: an_archives_name_policy
+  upcase_name_tests`: red with the table removed in a copy (no unit past ASCII upcased), 5 of 10 failed; green 10 of 10;
+  the vfs lib 90 of 90 (one ignored); the bridge's `normalized::` 7 of 7 on the real table; the server's `image::` 2 of
+  2. Windows (main's): the table check.
+
+### A-569 — Mercurial's wire protocol version 1, decoded and encoded as a pure core and held to what stock Mercurial 7.2 sent and answered over SSH and HTTP (2026-11-19, g291 for UI goal 91; §4.17.3 piece 2; §4.9; A-514, A-545, A-16)
+Applied in the same change to: §4.17.3 (its status and piece 2), `crates/hg` (`ssh`, `http`, `capabilities`, `batch`
+and `wire`, new; `quote`, `lines` and `decimal`, shared, with bundle2's stream parameters and pushkey's listkeys
+lines and reply numbers moved onto them, `pushkey::ReplyText::new` now infallible; `fixtures/wire/` and its
+`make-wire-fixtures.sh`), `.gitattributes` (the captures binary, so their CRLF heads stay as captured), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§14).
+- **What it does.** Reads and writes the framings both transports use. SSH: a command line; its arguments for its
+  spec, each `<name> <length>\n<value>` and the dictionary `* <count>\n` with its entries, in any order, each name
+  once; `unbundle`'s chunked input; a string answer `<length>\n<value>`; a push's answer (an empty string, then the
+  result); the out-of-band error (an empty line on stdout, the message and `\n-\n` on stderr); a request as 7.2's
+  client writes it (sorted by name, so the dictionary first). HTTP: the command (`cmd`); the form fields of the query,
+  of the `X-HgArg-<N>` headers joined (matched without case) and of the body's front behind `X-HgArgs-Post`; a spec's
+  arguments read in 7.2's precedence (the arguments' first value over the query's) and its dictionary in 7.2's
+  order; the body after the post arguments (`unbundle`'s input); what a client reads (`X-HgProto`: `0.1`, `0.2`, the
+  engines, `zlib,none` when it names none); the `0.2` header (the engine's name and its length), a push's bodies
+  without bundle2, and the form and header splitting 7.2's client writes. The capabilities line (`capabilities`,
+  `hello`) read in place and written; the bundle2 capability blob (`encodecaps`, `decodecaps`) through both of its
+  quotings. `batch`: the four escapes, the calls of `cmds`, the answers. Serving the commands (piece 4) and the
+  compression engines (D-17) are not this piece's.
+- **From the sources (`research/mercurial-server.md` §1 and §14).** 7.2's `wireprotoserver.py`
+  (`sshv1protocolhandler`, `_sshv1respondbytes`, `_sshv1respondstream`, `_sshv1respondooberror`,
+  `httpv1protocolhandler`, `decodevaluefromheaders`, `_httpresponsetype`, `genversion2`), `wireprotov1server.py`
+  (`batch`, the specs), `wireprototypes.py` (the batch escapes), `httppeer.py` (`makev1commandrequest`,
+  `encodevalueinheaders`), `sshpeer.py` (`_sendrequest`) and `bundle2.py` (`encodecaps`, `decodecaps`). Measured in
+  the captures: arguments arrive as the bytes the client meant over SSH and all three HTTP ways (`café` intact);
+  header names travel lower-case; a bundle2 push sends `heads` = `force` in hex; 7.2 refuses a bundle1 client with
+  `application/hg-error` over HTTP but with `abort:` on stderr and a closed session over SSH; `getbundle` is `0.2`
+  (`zstd` by default, `none` where offered alone) and chunked, string answers `0.1` with a length.
+- **Stricter than 7.2, on purpose.** A length or count is decimal digits alone (7.2's `int()` takes a sign, spaces
+  and `_`, and `read(-1)` reads to the end); an argument line is a name without whitespace, one space and the length
+  (7.2 splits at any whitespace); an argument sent twice is refused (7.2 keeps the last, then fails on the missing
+  one); an `X-HgArgs-Post` past the body is refused (7.2 reads what there is); a `batch` escape other than the four is
+  refused (7.2's `replace` chain leaves it), as are a call without its space and an argument without exactly one `=`
+  (7.2's `split` fails on them).
+- **Bounds, none a literal.** A command line by the longest command name the server serves; an argument line by its
+  spec's longest name and the digits of the caller's room; every length and count by that room (a dictionary's count
+  by the room over its smallest entry, four bytes); an SSH read takes what is buffered and says how many bytes it
+  needs, and charges nothing until it is whole. Every decoded byte (form fields, unquoted capabilities, unescaped
+  calls) and every vector is counted first and charged to the caller's admission, then built once; what a decode
+  joins or sorts on the way (the `X-HgArg` headers, the dictionary's first places) is charged beside it and freed. A
+  dictionary's names are deduplicated by a sort, not by comparing each with every other.
+- **Golden vectors.** `crates/hg/fixtures/wire`, made on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock
+  Mercurial 7.2 from PyPI through `uvx` (CPython 3.12.16), from a clone of the branch, exactly:
+  `crates/hg/fixtures/wire/make-wire-fixtures.sh "$OUT"` with `OUT` a new directory under `~/.cache`. SSH sessions
+  through an ssh stand-in recording both directions and stderr (a clone, a pull with discovery's `batch`, a push with
+  `unbundle`'s chunked input, `debugwireargs`, a refused bundle1 clone); HTTP exchanges through a recording proxy
+  before `hg serve` (a clone with `X-HgArg` headers and `0.2`, the same with `server.compressionengines=none`, a push,
+  `debugwireargs` in headers, behind `X-HgArgs-Post` and in the query, a refused bundle1 clone): 103 files, 30,469
+  bytes, each SHA-256 checked equal after the copy. The script's first run stopped at the push (`hg pull` left the
+  client on the old head, so its commit made a second head); it updates to the pulled tip now.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 126 of 126 in 1.0 s
+  (load 21.7), `cargo fmt -p slates-hg -- --check` clean. Red first, by stubs: with the public bodies of `ssh`, `http`,
+  `batch` and `capabilities` stubbed (branch `agents/g291-hg-wire-red`, d89d89d82; signatures kept, results empty or
+  refused), 37 of 126 failed, every test of those four modules and every golden wire test, but for the one property
+  that holds for any body (`ssh`'s arbitrary bytes never panicking); the 89 that passed are A-514's and A-545's and the
+  shared helpers'. Golden: every SSH request of the captures read with its spec and written again to its bytes, the
+  sessions read whole; the server's answers read and framed again into its bytes; the capabilities line and both
+  bundle2 blobs (the server's and the client's `bundlecaps`) read and written back; discovery's `batch` and its
+  answers; a pushed bundle read chunk by chunk and decoded; the reply stream and the next answer after it; HTTP
+  arguments alike in headers, body and query, and written again to the headers, body and query 7.2 sent; `X-HgProto`;
+  `0.1` answers, `0.2` answers naming `zstd` and `none` (that payload a bundle2 stream decoded whole); a pushed body
+  decoded; the `hg-error` refusal. Hostile: command and argument lines past their bounds, arguments the spec does not
+  name or sent twice, non-digit lengths, lengths and counts past the room (`u64::MAX` among them), cut requests at
+  every length asking for more, post lengths past the body, missing named arguments, admissions too small (nothing
+  charged), broken `0.2` headers, broken escapes and calls, arbitrary bytes (property tests).
+- **Owed.** Serving the commands, and which SSH refusals use the out-of-band form (piece 4); the compression engines
+  for `0.2` and bundle2 streams (D-17); `getbundle`'s argument types (node lists, booleans, lists), with read serving.
+
+### A-585 — A holder whose store is lost answers no read and accepts no record under its old id (2026-11-19, UI goal 81 (kiln dbe13f39, g250), part "Chaos across real processes", the failure half; §4.8 "Promotion and takeover"; D-26)
+Applied in the same change to: GAPS (the live-shipping entry's real-process chaos line) and `crates/db/src/ledger.rs`
+(`Cohort::lose_store`, `Holder::lost`; the takeover and the offer skip a lost holder).
+- **The fault.** A volume's store fails suddenly under a replica. The holder's records and its fence are gone.
+- **The rule it needs.** Such a holder answers no phase-one read and accepts no record under its old id. Its nothing
+  must never count toward a takeover's quorum as a promise. At `f = 2`, with a record committed on `f + 1` of the five
+  candidates, one of those holders losing its store and another host down leaves the record on one holder. A read of
+  the store-lost holder and the two that never held it would make a quorum that misses the record. The server meets
+  the rule by construction: each start takes a fresh member identity (`Daemon::member_identity`), so a host that
+  restarts without its store is a new member no cohort names until it is placed. The register's simulation now states
+  the rule and checks it.
+- **The invariants checked.** NoLoss and Continuity: the record is adopted. TotalOrder: the next record commits at the
+  next position. StaleNeverCommits: the superseded owner commits nothing more. Agreement: no position is held by a
+  quorum with two values. Also a client that disconnects mid-write: its write is kept whole or dropped whole by the
+  next owner, never split, and every committed write survives.
+- **Tests.** `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: the first takeover read three
+  empty logs and dropped the committed record) and `a_write_its_client_left_is_kept_or_dropped_whole`
+  (`crates/db/src/ledger.rs`). Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `ledger::` 3 of 3. Red once on a
+  mutated copy whose takeover read the store-lost holder: the takeover succeeded with an empty log (`Ok(0)`).
+- **Owed (main's).** The real-process runs of both faults: a replica's store destroyed under the live log, and a client
+  killed mid-write (run-requests.md).
+
+### A-583 — The fleet's own tests of a captured clone's landing after a takeover and after a live-shipped move (2026-11-19, g230, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover", §4.10 "Live shipping"; the tests A-544 and A-565 filed for main)
+Applied in the same change to: GAPS (g267's captured-clone status: the two tests written, their run owed),
+`crates/server/tests/fleet.rs` (the two tests and their helpers, beside A-291's captured-clone move test).
+- **What was owed.** A-544 and A-565 were proved by lib tests that built a successor's or a move target's state by hand
+  (`take_over_named`, `take_over_named_as`). Neither ran the fleet: no three daemons had seen a captured clone's record
+  ride its head to the survivors, nor a live-shipped clone's mark reach its move's target.
+- **The tests.** Both overlay one captured tree on a (a file the agent rewrites, one it removes, one it leaves alone),
+  capture its base, clone the capture, and let the agent rewrite, make and remove one file each. Each landing goes into
+  a directory holding the captured tree with an outsider's edit to the file the agent left alone. It is presented
+  through a client of the node that serves the clone, approved under that node's issuer secret as the human's surface
+  approves, and landed.
+  - `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` (A-544). Two clones: the first
+    snapshotted, the second never. Before a stops, the test waits until a has counted `fleet.carry.recorded`, both
+    survivors hold the first clone's head naming a's sealed manifest, and their catalog's capture record names the same
+    manifest. Both must also hold the second clone's catalog. Then a stops, as the takeover tests' owner does.
+    - The first clone's successor (the survivor rendezvous ranks first) must place its head and catalog and serve the
+      agent's tree. Its plan must be one replacement, one create and one removal, with no conflict. The landing must
+      write them and keep the outsider's file.
+    - The second clone's successor must serve an empty root and refuse the landing `Unsupported`, writing nothing.
+  - `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture` (A-565). The clone is live-shipped
+    and snapshotted. Once a counts its record, the clone is moved to b until done. b must serve the agent's tree, and
+    the landing on b must hold the same three changes and land them, the outsider's file kept.
+- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
+  helper, so no lib test came with them.
+
+### A-555, second piece — The fetch driver: a volume's owner shard runs its S3 host's fetches, woken by the host when a fetch is wanted and ended with it (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base"; D-9, R6, R8; A-471, A-524, A-555)
+Applied in the same change to: `crates/base` (`s3::driver`, new: `HostCell`, `drive` and their tests; `s3::fetch::Store`
+over the network client and `SimS3`; `s3::host`: `next_fetch_or_wait`, a wanted fetch waking the driver, and the host's
+drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); §4.15's status; GAPS (A-464's entry).
+
+- **Why.** A-555's first piece parks a request on the fetch it met and wakes it at `base_wait::land`; nothing called
+  `land`, so in a daemon no parked request would ever wake.
+- **Woken by the host, never polling.** The host is sans-io, so the driver waits on it: an idle driver's waker is kept by
+  the host and woken the moment a miss queues a fetch. A fetch starts with the request that needs it, and an idle volume
+  costs no wake.
+- **One fetch at a time.** The client keeps one connection and sends one request at a time (A-471), and the fetches
+  under way are bounded by the requests that wait on them (§4.15's bounds); a request parks on its own fetch whatever is
+  ahead of it in the queue. Fetches side by side are left to a measurement to decide, not assumed.
+- **It lives as long as its host.** The host wakes its driver as it is dropped (its volume destroyed, its base replaced),
+  and the driver, finding no host, ends; an answer that arrives after that is handed to nothing. So the driver's task is
+  detached with its end built in: no task outlives what it serves, and no owner needs to remember it (CLAUDE.md §2 item
+  9).
+- **One code path (R8).** `drive` is the same over the network client and `SimS3` (`Store`), and over the shard's slot
+  and a test's cell (`HostCell`).
+- **Rejected.** Polling the host on a timer: a wake per period on every idle S3 volume, and a fetch delayed by up to a
+  period. Waking the driver from the request's parking: a miss whose request is refused at the bound would leave its
+  fetch unasked.
+- **Owed.** The driver's start where a volume over an S3 base is made or recovered (the wire's create and the
+  credential's hand-off, A-555's next piece: the store client is built from the base's name and its credential), and
+  fetches side by side if a measurement asks for them.
+- **Evidence.** Mac Studio (debug, 2026-11-19, kiln r356): red first with the host not waking its driver, at a miss
+  (the miss woke nothing: 0 wakes where 1 was due) and at its drop (0 where 1 was due); then green: `cargo test --locked
+  -p slates-base --lib -- s3` 58 of 58 (the driver's three: an idle driver woken once by a miss and running its fetch, a
+  fetch the store holds open landing only once answered, a driver ending at its host's drop), `-p slates-server --lib --
+  base_wait` 4 of 4, `cargo fmt --check` clean.
 
 ### A-582 — git's wire codecs, part 1: pkt-lines and side-band-64k as pure codecs, with golden vectors from stock git's own wire (2026-11-19, UI goal 91 via g251b; §4.17.2 "The wire" and piece 1; D-28)
 

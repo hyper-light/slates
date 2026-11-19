@@ -36,34 +36,42 @@
 > with an applier; idx v2; and the pack stream, which needs a deflate engine chosen by measurement (§4.17.2 piece 3).
 > The captured packs and indexes for those parts are in the fixtures already.
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
-> (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks
-> are greens; phases only move toward public, and a public changeset is never dropped or rewritten; markers are kept and
-> exchanged; topics are review requests; a stock push is judged whole-file and answered with Mercurial's own race abort,
-> and rebase on push is a line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code
-> and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2,
-> bundle1, changegroups `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input,
-> every structure counted and charged exactly to the caller's admission before it is built, no recursion; proven by
-> `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden
-> vectors stock `hg` 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle`
-> lists it, every text rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed,
-> four tests failed). **Built (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and
-> `check:bookmarks`, `check:heads` and `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies,
-> listkeys lines and namespace nodes), nothing allocated in decoding, every encoder's exact length given before it
-> writes; proven by `cargo test -p slates-hg --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against
-> golden vectors stock `hg` 7.2 made twice, byte for byte alike but the replies' cut
-> (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over SSH captured on the wire, the server's
-> replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask findings in the crate are folded in (the
-> no-panic root attribute among them); clippy and xtask are main's to rerun. Measured on stock 7.2 and recorded
-> (research §13): its C and pure marker readers disagree on a marker's size and on parent counts 0 and past 3. Owed, in
-> order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
-> (D-17); (2) the SSH and HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory;
-> (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8)
-> access and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow,
-> ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own
-> suite through a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a
-> 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
-> run checks it). No speed is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
+> piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
+> heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
+> dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
+> and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
+> markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built
+> (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups `01` to `05` and their deltas, every length
+> read as 7.2 reads it and checked against the input, every structure counted and charged exactly to the caller's
+> admission before it is built, no recursion; proven by `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio
+> (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg` 7.2 made
+> (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text rebuilds
+> from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed). **Built
+> (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and `check:bookmarks`, `check:heads` and
+> `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies, listkeys lines and namespace nodes),
+> nothing allocated in decoding, every encoder's exact length given before it writes; proven by `cargo test -p slates-hg
+> --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against golden vectors stock `hg` 7.2 made twice,
+> byte for byte alike but the replies' cut (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over
+> SSH captured on the wire, the server's replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask
+> findings in the crate are folded in (the no-panic root attribute among them); clippy and xtask are main's to rerun.
+> Measured on stock 7.2 and recorded (research §13): its C and pure marker readers disagree on a marker's size and on
+> parent counts 0 and past 3. **Built (A-569):** the wire protocol's version 1 framings: SSH's commands, arguments,
+> dictionary, chunked input, answers and error form; HTTP's arguments from the query, the `X-HgArg-<N>` headers and the
+> body's front behind `X-HgArgs-Post` in 7.2's precedence, `X-HgProto`, and the `0.1`, `0.2` and `hg-error` framings;
+> the capabilities line and the bundle2 capability blob; `batch`'s escapes and calls; every line bounded by the server's
+> own table and spec and the digits of the caller's room, every length and count by that room, every decoded byte
+> charged to the admission first; proven by `cargo test -p slates-hg --lib`, 126 of 126 on the Mac Studio (2026-11-19,
+> debug, load 21.7), against 103 captures stock `hg` 7.2 made over SSH and HTTP
+> (`crates/hg/fixtures/wire/make-wire-fixtures.sh`), every request and answer read and written again to its bytes. Owed,
+> in order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
+> (D-17); (3) the objects and the index, and import of a repository directory; (4) read serving; (5) pushes; (6) the
+> changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
+> (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
+> and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
+> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
+> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
+> main measures it.
 
 > **Open (g267, 2026-11-19, found settling A-565): a live clone is answered before any of it is durable.** A clone of a
 > live-shipped volume is live-shipped too, but the `Clone` verb's reply waits on its origin's log
@@ -109,8 +117,12 @@
 > authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
 > 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
 > `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
-> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. Owed, in order: `Copy` in the
-> engine (on A-534's persistent radix tree); the commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. A-542's second half, part 1
+> (2026-11-19): Copy's maps, every map of a green's state copying a path's tree by reference on A-534's radix tree,
+> O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
+> Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
+> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
@@ -1167,7 +1179,10 @@
 >   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
 >   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
 >   head has no record, and a move waits for its head's record); since A-565 a live-shipped one's move marks its
->   rebuild from the log too; owed of it, the fleet's own three-daemon tests of a move and a takeover (filed for main),
+>   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
+>   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
+>   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
+>   their first compile and run owed to main; owed of it, A-503's own move test (a clone moved b to c after a to b),
 >   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
@@ -1553,8 +1568,19 @@
 >   (the DLL drops a longer normalized name), so a rename of a directory above it that the records spell otherwise
 >   leaves that record behind; and names the table folds alike and the volume keeps apart (final sigma `ς` against `σ`)
 >   are two files to the volume and one node to the driver, so the second's open while the first is open shares the
->   first's node and cache. The last would need the volume to refuse such a name beside its twin on a drive's volume,
->   or the drive to refuse the second open; neither is built.
+>   first's node and cache. Decided 2026-11-19 (the coordinator, from principle): the volume refuses the twin at create,
+>   so the state is never reachable; a refusal at the second open would leave it.
+> - **Built, A-576 part 1 (2026-11-19, goal 85, g258): a volume can fold by Windows' own upcase table.**
+>   `NameEquivalence::Upcase` folds each UTF-16 unit through Microsoft's recommended exFAT up-case table (specification
+>   Table 25, TableChecksum E619D30Dh, 874 units mapped; `crates/vfs/src/upcase.rs`), unit for unit with no
+>   normalization, as WinFsp's driver compares: `ς` beside `σ` is refused `EEXIST` at create and link, a rename onto it
+>   replaces the entry, and a decomposed and a precomposed `é` are two names. Such a volume and its drive take the same
+>   names for one, so neither residual above that comes from the two rules (the first and the last) can arise on it.
+>   Held by vfs's unit tests on every host (red 5 of 10 with the table removed, green 10 of 10, Mac Studio).
+> - **Owed, A-576 part 2:** the policy in the protocol and the catalog (`NamePolicy`, `DbNamePolicy`, appended and
+>   published), its choice in the CLI, the SDKs and MCP, an archive importing it (refused `Unsupported` until then), and
+>   what a WinFsp mount of a `Fold` volume does once a drive's volume can be made `Upcase`. Main's: the Windows check
+>   that the system's table is the volume core's at every unit (`the_volumes_upcase_table_is_the_systems`).
 
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
@@ -4128,8 +4154,10 @@
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
-> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
-> (two seconds there); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
+> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision as its detection, and
+> **since A-574 that detection is measured**: the widest window the watchdog judges the daemon's shards by and then the
+> lapse bound its anchor publishes, read at every beat on every node and fanned to every shard by the beat (about three
+> seconds of `F` on a quiet laptop, where the fixed window gave two); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
 > take the failover delay as their term**, and a write lease stays its holder's while any of its write attachments
 > lives (renewed at each lapse; another principal refused `LeaseHeld` meanwhile), where before it ran out at its term
 > under a live writer. **Since A-425 the NFSv4 lease is derived**: an idle Linux client's renewal floor (5 s,
@@ -4220,11 +4248,17 @@
 > memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
 > polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. NFSv4
 > purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
-> leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
-> re-arm.
-> Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
-> in the event-driven reaper series), and a laptop's
-> failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
+> leaves the table owing. A lasting huge-page decline is re-armed by the keeper a retry window after it. Still on the
+> tick, owed after goal 81, then 89-92, then 84-86 (Ada's order, 2026-11-19): base hints with their delegation drain
+> (the A-470 plan's descriptor readiness, as one set a shard: each overlay's watcher descriptor, inotify or a kqueue, in
+> an epoll or kqueue of the shard's keyed by the volume's generational handle and awaited by one task, so a destroy that
+> closes a watcher meets a stale handle, never a descriptor number reused under a waiting task; Windows keeps no
+> watcher), and the idle seal with its purge (aging buckets: each file's last write sets the instant it turns idle, the
+> keeper sleeps to the earliest); then the reap loop and its tick are deleted, no interval and no sweep, and §4.7 says
+> so.
+> Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
+> series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
+> the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -5343,7 +5377,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; since 2026-11-17 the credit
 > is the whole state's bytes, not a fixed two entries, A-200 amended, the entry at the top of this ledger); a candidate's copy kept across its own
 > restart; real-process chaos
-> (partitions, injected latency, volume failure, client disconnect). The owner's `put_wal` is its `Local` records,
+> (partitions, injected latency, volume failure, client disconnect). The volume-failure and client-disconnect faults
+> are in the register's simulation since A-585 (g250, 2026-11-19, goal 81): `ledger::Cohort::lose_store` (a store lost
+> under a replica: the holder answers no read and accepts no record under its old id, as a fresh-id restart does), with
+> `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: a store-lost holder answering with nothing
+> completed a quorum that missed a committed record at `f = 2`) and `a_write_its_client_left_is_kept_or_dropped_whole`;
+> the real-process runs of both faults are main's (run-requests.md). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.
@@ -8248,10 +8287,10 @@ entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-ent
   head, and recovery looked a head-shared entry up only among the images of the head's own inodes, which a clone's
   origin-shared files are not. No test had recovered a clone with a snapshot of its own; A-549's restart test recovers
   one without.
-- Open: a clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
-  restart set both), so its namespace dimension is unbounded until a restart.
-- Open: a resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume
-  was made with (`verbs::resize`).
+- Fixed since by A-572 (below): a clone was admitted with no entry allowance (`admit_clone` set the inode allowance
+  alone, where a create and a restart set both), so its namespace dimension was unbounded until a restart.
+- Fixed since by A-572 (below): a resize moved the inode allowance with the new policy but left the entry allowance at
+  the size the volume was made with (`verbs::resize`).
 - Fixed since by A-572 (below), found by reading: recovery counted a whiteout as a live entry (`rebuild_entries`
   re-inserted one through `dir_insert`, which counted it; the live count and `DirNode::live_len` never do), so a
   restarted overlay's entry count and its allowance's floor at the restart were raised by its whiteouts.
@@ -8273,8 +8312,13 @@ the recovery oracle and the server's recovery suite over a clone with a snapshot
   placement now counts, and is admitted, only when it names a child (`Volume::dir_place`, `dir_insert`), as
   `dir_remove` and `DirNode::live_len` already kept it. Measured before on the Mac Studio: an overlay with three
   whiteouts counted 3 entries live and 6 after a restart.
-- Open, next in this piece: a clone is admitted with no entry allowance; a resize leaves the entry allowance at the size
-  the volume was made with.
+- Fixed 2026-11-19: a clone was admitted with no entry allowance (`admit_clone` set the inode allowance alone, where a
+  create and a restart set both), so its namespace dimension was unbounded until a restart. It now gets a create's
+  share, never below the entries it holds, its snapshot's (A-549). Measured before on the Mac Studio: a clone of a
+  snapshot holding 4,104 names (a 64 KiB origin's share of 4,096 and 8 past it) carried `u64::MAX`.
+- Fixed 2026-11-19: a resize left the entry allowance at the share of the size the volume was made with. It now moves
+  with the new policy as the inode allowance does, never below the entries held (`verbs::resize`). Measured before on
+  the Mac Studio: a volume grown from 64 KiB to 1 MiB kept 4,096 where 65,536 was owed.
 
 ## 8d. Phase 2 record (2026-09-05)
 
@@ -12150,6 +12194,9 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   (`HostCounts::unkept`). A slot's base host is a `BaseHost` (a host directory or an S3 base). Proven: see A-555's
 >   evidence.
 > - **Owed.**
+>   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
+>     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
+>     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
 >   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
 >     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
 >     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
@@ -18142,20 +18189,20 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   looked the inode up after the last publication, no restored reference names it, and the takeover round left it
   cached. The change was never acknowledged, so this is a dirty read surviving a crash, not a lost acknowledgement. Not
   reproduced. Now a mount of the head is sent every inode of the head (`Volume::visit_head_inodes`;
-  `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover`, red with the old set). **Still
-  open:** a number the dead daemon issued after its last publication (an unpublished create a listing showed) is in no
-  image and no head; the successor refuses it (`NotFound`), never serving it, but a descriptor opened before the death
-  keeps its cached pages until each publication records the volume's live counter beside its reserved ceiling (the
-  image and the delta, both encodings, the publication oracle), so the round can name the numbers between the two.
+  `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover`, red with the old set). A number
+  the dead daemon issued after its last publication (an unpublished create a listing showed) is in no image and no
+  head; the successor refuses it (`NotFound`), never serving it, and since A-578 (2026-11-19) names it too: every
+  publication records the volume's live counter beside its reserved ceiling (image version 33, both encodings), and the
+  round names the numbers between the two
+  (`a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover`, red without it).
 - **An outsider's change beneath a base during a takeover's gap (from A-158) — fixed 2026-11-19 (A-573, B10 (b)) for
   every base file the successor holds.** A base file the kernel looked up after the last publication is in no restored
   reference, and the successor's watcher did not run while no daemon did. Its names and attributes revalidate within
   the base's timestamp granularity, but its cached pages stayed (a FUSE mount asks no `FUSE_AUTO_INVAL_DATA`). Not
   reproduced. Now every inode of the head is named, base files loaded before the last publication among them
   (`a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit`, red with the
-  old set). **Still open:** a base directory first loaded after the last publication gave its files numbers no image
-  holds, so they are the numbers above: refused, never served, their pages kept by a descriptor opened before the
-  death until publications record the live counter.
+  old set). A base directory first loaded after the last publication gave its files numbers no image holds, so they are
+  the numbers above: refused, never served, and named by the round since A-578 (2026-11-19).
 - **Kernels before FUSE 7.44 keep renamed-away names across a takeover (open, from A-158).** They take no
   `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
   mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but
