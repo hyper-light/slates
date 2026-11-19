@@ -143,9 +143,11 @@ fn yield_catalogued(state: &mut ShardState) {
     // Its live log ships nothing more and its writers are answered now (A-409).
     crate::live_ship::yielded(state, *volume);
   }
-  #[cfg(target_os = "linux")]
+  // Its mounts and streams end as revoked ones do (A-346; a Shards stream, A-584).
   for volume in newly {
+    #[cfg(target_os = "linux")]
     crate::fuse::superseded(state, volume);
+    crate::shards::superseded(state, volume);
   }
 }
 

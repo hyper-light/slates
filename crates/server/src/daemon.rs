@@ -3028,9 +3028,10 @@ impl Daemon {
   }
 
   /// Test support: this node is superseded on `volume` at `epoch` (`live_ship::inject_superseded`, never reachable from
-  /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts are told, or as a restart
-  /// over a kept fence finds it, telling none (A-344). So a mount's answer to a takeover (A-346) is driven without a
-  /// fleet, each path alone. Delivered on the volume's owner shard; `Ok` once installed, else the typed refusal.
+  /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts and streams are told, or as
+  /// a restart over a kept fence finds it, telling none (A-344). So a mount's or a Shards stream's answer to a takeover
+  /// (A-346, A-584) is driven without a fleet, each path alone. Delivered on the volume's owner shard; `Ok` once
+  /// installed, else the typed refusal.
   pub fn inject_superseded(
     &self,
     volume: slates_ipc::protocol::VolumeId,
