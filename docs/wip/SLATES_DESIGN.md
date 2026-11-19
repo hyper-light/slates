@@ -49367,10 +49367,13 @@ at start).
   refused, copies laid out by destination. The restatement: a copy of `trunk` at version 1 with an edit beneath it
   rebased past a change to its source, restated as the copy and the edit. The oracle: generated works over the fixture
   (copies of `trunk`, `trunk/d` or the root at version 1 or the head to `b` or `tags/t`, edits and files made in the
-  copied tree, a rename out of it, a link into it), each rebased as it submits: refused `TypeChanged` alike where it
-  renames out or links in (A-586), else its restated journal composed again over the head and submitted giving the
-  green the original submit gives; a census of copies, edits and made files restated, renames out and links in
-  refused. The owner's count (`crates/server/src/work_home.rs`): a sealed work whose journal copies the root, handed
-  to the owner's rebase step composed nowhere, rebases clean with its copy restated and counts once; one making a
-  directory rebases clean and counts nothing. A segment of layout 13 refused at start.
+  copied tree, a rename out of it, a link into it), each rebased as it submits: refused alike, a type change among the
+  windows, where it renames out or links in (A-586), else its restated journal composed again over the head and
+  submitted giving the green the original submit gives; a census of copies, edits and made files restated, renames out
+  and links in refused. Its first run (kiln r193) met a work that edits a copied file and renames one out: refused
+  alike, two type changes and a delete against modify on the rename's destination, whose source the base never held;
+  the oracle had asked type changes alone, and that work is now a fixed test. The owner's count
+  (`crates/server/src/work_home.rs`): a sealed work whose journal copies the root, handed to the owner's rebase step
+  composed nowhere, counts once whatever the owner answers it; one making a directory rebases clean and counts nothing.
+  A segment of layout 13 refused at start.
 - **Evidence.** Pending the Studio run.

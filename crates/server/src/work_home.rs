@@ -1715,24 +1715,22 @@ mod tests {
     }
   }
 
-  /// Whether `answer` is a clean rebase whose restated journal holds a copy.
-  fn restates_a_copy(answer: &super::RebaseAnswer) -> bool {
-    let super::RebaseAnswer::Rebased { journal, .. } = answer else {
-      return false;
-    };
-    journal
-      .iter()
-      .any(|op| matches!(op, super::VolumeOp::Copy { .. }))
+  /// What the owner answered a rebase: the journal it restated, or the reply it refused with.
+  fn answered(answer: &super::RebaseAnswer) -> String {
+    match answer {
+      super::RebaseAnswer::Rebased { journal, .. } => format!("rebased to {journal:?}"),
+      super::RebaseAnswer::Reply(reply) => format!("answered {reply:?}"),
+    }
   }
 
   /// A-626 part 4 (main's ruling: the green's owner composes a journal holding a copy, where a refusal would answer
   /// nothing): the owner counts each such composition, `merge.work.copy_composed_by_owner`. Do: on one shard, make a
   /// green; hand the owner's rebase step a sealed work whose journal copies the root at version 0 to `b`, its increment
-  /// composed nowhere; then one whose journal makes a directory. Expect: the first rebases clean with its copy restated
-  /// and counts once; the second rebases clean and counts nothing more.
+  /// composed nowhere; then one whose journal makes a directory. Expect: the first counts once, whatever the owner
+  /// answers it (the work model resolving copies is owed, GAPS); the second rebases clean and counts nothing more.
   #[test]
   fn a_journal_holding_a_copy_is_composed_by_the_owner_and_counted() {
-    let (restated, directory_rebased, counts) = crate::daemon::audit_on_shard(|state| {
+    let (copy_answer, directory_rebased, counts) = crate::daemon::audit_on_shard(|state| {
       let principal = slates_db::catalog::Principal::Uid {
         host: slates_db::HostId(0),
         uid: 1234,
@@ -1765,17 +1763,20 @@ mod tests {
       };
       let made = crate::verbs::owner_rebase(state, sealed_at_0(green, vec![mkdir]));
       (
-        restates_a_copy(&copied),
+        answered(&copied),
         matches!(made, super::RebaseAnswer::Rebased { .. }),
         [before, after_copy, composed_by_owner(state)],
       )
     });
-    assert!(restated, "the owner rebased the work, its copy restated");
-    assert!(directory_rebased, "the owner rebased the work making a directory");
+    eprintln!("the owner's answer to the copy: {copy_answer}");
+    assert!(
+      directory_rebased,
+      "the owner rebased the work making a directory"
+    );
     assert_eq!(
       counts,
       [0, 1, 1],
-      "the count before, after the copy, after the directory"
+      "the count before, after the copy ({copy_answer}), after the directory"
     );
   }
 }

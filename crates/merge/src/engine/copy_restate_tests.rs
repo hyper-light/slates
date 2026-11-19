@@ -284,12 +284,13 @@ struct Census {
   links_in_refused: u64,
 }
 
-/// Whether every outcome's windows are type changes.
+/// Whether the windows name a type change (A-586: a rename out of a copied tree, a link into one), among any others the
+/// work's other steps add: an edit of the file it then renames out adds a delete against modify on the rename's
+/// destination, whose source the base never held (the oracle's first run, kiln r193, Mac Studio).
 fn refused_typed(windows: &[super::ConflictWindow]) -> bool {
-  !windows.is_empty()
-    && windows
-      .iter()
-      .all(|window| window.class == MergeConflictClass::TypeChanged)
+  windows
+    .iter()
+    .any(|window| window.class == MergeConflictClass::TypeChanged)
 }
 
 /// The oracle on one work: rebase on one fixture, submit on a twin; refused alike, or the restated journal, composed
@@ -405,10 +406,27 @@ fn a_rebase_restates_a_copy_and_the_edit_beneath_it() -> Result<(), String> {
   restate(&work, &mut Census::default())
 }
 
+/// A-626 part 4 (the oracle's first run, kiln r193, shrunk): a work that copies `trunk` to `b`, edits a copied file and
+/// renames a copied file out of the tree. Do: rebase it and submit it. Expect both refused alike, a type change among
+/// the windows (A-586), beside the delete against modify the edit before the rename adds on its destination.
+#[test]
+fn an_edit_then_a_rename_out_of_a_copy_is_refused_alike() -> Result<(), String> {
+  let green = fixture()?;
+  let raw: Raw = ((0, 0, false), vec![(188, 150), (130, 81)]);
+  let work = Work::of(&green, &raw);
+  let mut census = Census::default();
+  restate(&work, &mut census)?;
+  if census.renames_out_refused != 1 {
+    return Err(format!("not refused as a rename out: {census:?}"));
+  }
+  Ok(())
+}
+
 /// A-626 part 4's oracle. Do: generate works over the fixture that copy `trunk`, `trunk/d` or the root, at version 1 or
 /// the head, to `b` or `tags/t`, then edit copied files, make files in the copied tree, rename a copied file out of it,
 /// or link a name in it to a file outside; each based at version 1 and rebased past version 2. Expect each to rebase as
-/// it submits: refused `TypeChanged` alike where it renames out of the tree or links into it (A-586), else rebased,
+/// it submits: refused alike, a type change among the windows, where it renames out of the tree or links into it
+/// (A-586; an edit before the rename out adds a delete against modify on its destination), else rebased,
 /// its restated journal composed again over the head and submitted giving the green the original submit gives; and the
 /// census to show copies, edits and made files restated, and renames out and links in refused.
 #[test]
