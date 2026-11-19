@@ -313,13 +313,14 @@
 > site's `svnserve -t` (`SvnServices` beside the other services): A-656's ra_svn connection over the channel, the
 > client's URL found as `find_repos` finds it (E125001, E125002, E210005), A-597's policy asked (E170001), the tunnel's
 > user the principal the key proved (its index key in hexadecimal), never the SSH login; sources lent a step at a time
-> (`SvnStores`); a commit begun, its hooks passed where none is configured, its work refused 200007; the tunnel ending as
-> `svnserve -t` 1.15.0 ends, held to stock recordings (the `mkdir` commit; scripted sessions recorded on the Mac Studio,
-> 2026-11-19) and end to end over the SSH edge. @@TESTS@@ Owed: the lender of a Subversion store over A-662's map (its
-> entry holds the index alone), without which the daemon's site cannot start the tunnel; the daemon's edge (A-684); a
-> configured hook run, not refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends
-> E210002 where `svnserve` exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout
-> svn+ssh://` against a daemon.
+> (`SvnStores`); a commit begun, its hooks passed where none is configured, its work refused 200007; the tunnel ending
+> as `svnserve -t` 1.15.0 ends, held to stock recordings (the `mkdir` commit; scripted sessions recorded on the Mac
+> Studio, 2026-11-19) and end to end over the SSH edge (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26 of
+> 35, green 35 of 35; slates-svn `handshake:: serve::` 60 of 60; fmt clean). Owed: the lender of a Subversion store over
+> A-662's map (its entry holds the index alone), without which the daemon's site cannot start the tunnel; the daemon's
+> edge (A-684); a configured hook run, not refused; CRAM-MD5 through the tunnel; a client leaving during a refused
+> edit's drop ends E210002 where `svnserve` exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's
+> `svn checkout svn+ssh://` against a daemon.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

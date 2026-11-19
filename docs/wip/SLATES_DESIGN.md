@@ -14841,19 +14841,20 @@ for Subversion.)
 > SSH site's `exec` of `svnserve -t` (`SvnServices`, beside the other services) runs A-656's one ra_svn connection over
 > the channel, the greeting written first. The client's URL is found as `find_repos` finds it: the longest run of
 > leading segments naming a Subversion repository here, its root URL the client's URL cut after it; `..` refused
-> E125001, another scheme E125002, no repository E210005; a principal A-597's policy lets reach it for no right
-> refused E170001 "No access allowed to this repository". The tunnel's user, which `EXTERNAL` takes, is the principal
-> the client's key proved, named by its index key in hexadecimal until §4.13 names people, never the SSH login. The
+> E125001, another scheme E125002, no repository E210005; a principal A-597's policy lets reach it for no right refused
+> E170001 "No access allowed to this repository". The tunnel's user, which `EXTERNAL` takes, is the principal the
+> client's key proved, named by its index key in hexadecimal until §4.13 names people, never the SSH login. The
 > repository's sources are lent afresh each step (`SvnStores`); a commit begins with its transaction, its hooks pass
 > where none is configured and refuse it where one is, and its work is refused 200007 until A-655 part 2b. The tunnel
-> ends as `svnserve -t` 1.15.0 ends: its error on standard error, `svnserve: E` and six digits, and `EXIT_FAILURE`.
-> Held to stock `svnserve -t`: the recorded `mkdir` commit item for item through the commit's start, and the scripted
+> ends as `svnserve -t` 1.15.0 ends: its error on standard error, `svnserve: E` and six digits, and `EXIT_FAILURE`. Held
+> to stock `svnserve -t`: the recorded `mkdir` commit item for item through the commit's start, and the scripted
 > sessions recorded on the Mac Studio (2026-11-19), their output, standard error and exit status; and end to end over
-> the SSH edge with a key. @@TESTS@@ Owed: the lender of a store over A-662's map (no Subversion store holds a green,
-> lock table, UUID or `svnserve.conf` facts yet), which the daemon's site needs to start the tunnel; the daemon's edge
-> (A-684); a configured hook run rather than refused; CRAM-MD5 through the tunnel; a client that leaves during a refused
-> edit's drop ends E210002 where `svnserve` exits 0; `svn checkout svn+ssh://` with a stock client against a daemon
-> (main's run).
+> the SSH edge with a key (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26 of 35 with the site sending the
+> tunnel to the other services, green 35 of 35; slates-svn `handshake:: serve::` 60 of 60; fmt clean). Owed: the lender
+> of a store over A-662's map (no Subversion store holds a green, lock table, UUID or `svnserve.conf` facts yet), which
+> the daemon's site needs to start the tunnel; the daemon's edge (A-684); a configured hook run rather than refused;
+> CRAM-MD5 through the tunnel; a client that leaves during a refused edit's drop ends E210002 where `svnserve` exits 0;
+> `svn checkout svn+ssh://` with a stock client against a daemon (main's run).
 
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
@@ -50924,7 +50925,26 @@ Applied in the same change to:
   tests. One recorded ending the tunnel does not meet: a client that leaves while a refused edit's commands are being
   dropped (`open-dir` of a missing path, then gone) ends 0 there and E210002 here, since A-656's `Waiting` does not
   tell the drop from a live edit (GAPS).
-- **Tests.** @@TESTS@@
+- **Tests.** `vcs_ssh::svn::tests`, each held to stock `svnserve -t` 1.15.0, the command dispatched by the site and
+  stepped as the edge steps one: `the_scripted_sessions_are_the_recorded_ones` (the first batch's clients, outputs and
+  errors, their SHA-256 as recorded); `a_stock_commit_is_answered_as_svnserve_t_answers_it_until_the_owners_step` (the
+  recorded `mkdir`, split inside an item, item for item through the commit's start, then 200007; `abort-edit`, exit 0;
+  every byte consumed; the store lent); `a_scripted_session_is_answered_as_svnserve_t_answers_it` (a URL naming the
+  repository's root, and one beneath it); `the_tunnels_user_is_the_principal_the_key_proved_never_the_login`;
+  `a_url_naming_no_subversion_repository_is_refused_as_svnserve_t_refuses_it` (no repository, another scheme, `..`, a
+  git repository's name); `a_principal_the_policy_keeps_out_is_refused_as_svnserve_t_refuses_a_closed_repository`;
+  `a_repository_whose_store_is_not_held_here_is_not_served`; `the_tunnel_ends_as_svnserve_t_ends_each_session` (seven
+  recorded endings); `the_tunnel_is_served_beside_the_other_services`. And the edge's
+  `vcs_ssh::tests::an_svnserve_tunnel_serves_a_stock_session_over_the_channel`: a key's principal runs `svnserve -t`
+  over a real SSH connection on the runtime's TCP, the recorded `latest` session and EOF, its output as `svnserve -t`
+  wrote it, exit-status 0, EOF and close in order.
+- **Runs.** macOS arm64, the Mac Studio, kiln r311, 2026-11-19 (22:47 to 22:59Z, load 14 to 25), over main
+  `b94ae6e90` with the change (`934e36797`): `cargo fmt -p slates-server -p slates-svn -- --check` clean; red, a scratch
+  copy whose `SvnServices` sends `svnserve -t` to the other services as today's site does, `cargo test --locked -p
+  slates-server --lib vcs_ssh:: -- --test-threads=4` 26 passed, 9 failed (the ten new but the digests'); green, the
+  same 35 of 35, no compiler warning; `cargo test --locked -p slates-svn --lib -- handshake:: serve::` 60 of 60
+  (`Unserved::failure` moved out of `Server::refuse`). No integration target reaches the tunnel: the daemon starts no
+  SSH edge yet (A-684).
 - **Owed.** The lender of a Subversion store over A-662's map: A-662's Subversion entry holds the index alone, with no
   green, lock table, UUID or `svnserve.conf` facts, so no production lender exists and the daemon's site cannot start
   the tunnel until one does; the daemon's SSH edge (A-684) and the connection moved to the repository's owner shard;
