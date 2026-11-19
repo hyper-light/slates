@@ -640,6 +640,13 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   `unknown` for a kind not asked; a dirent's lists empty for fields not asked; a directory's size 2^64 - 1; the date
   parsed and written again (time 0's when none). Recorded: `README.TXT` matches `read*` (the name folded, the pattern
   as the client sent it); `dir` matching neither `a*` nor `*.txt` walked, its `b.txt` reported.
+- **`get-location-segments`** [C: `serve.c` `get_location_segments`, `gls_receiver`; `rev_hunt.c`
+  `svn_repos_node_location_segments`, `maybe_crop_and_send_segment`, `svn_repos__prev_location`; `tree.c`
+  `fs_closest_copy`, `fs_node_origin_rev`; recorded]: `serve.c` settles a missing or negative peg and start to the
+  youngest and end to 0, and refuses end > start and start > peg after `done` in its own words; the library refuses a
+  peg past the youngest. The loop crops each segment to the range in place before the gap is computed from it.
+  Recorded: `branches/b1/a.txt`@11 is 9-11 there (its replacement by a copy of `trunk/a.txt`@5), a gap 6-8, then 1-5
+  at `trunk/a.txt`; `tags/t1/a.txt` 7-11, gap 6-6, 1-5; the root 0-11 with an empty path.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and

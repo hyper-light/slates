@@ -13468,9 +13468,11 @@ and export by landing).
 > resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Its third slice (2026-11-19, g297):
 > `list`, `svn_repos_list`'s walk streamed a slice at a time (each slice bounded by the bytes it writes and the entries
 > it visits), its patterns matched by APR's `apr_fnmatch` after Subversion's fold, exact over ASCII names; `svn ls -v
-> -R` replayed whole. Owed: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`;
-> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
-> (A-606).
+> -R` replayed whole. Its fourth slice (2026-11-19, g297): `get-location-segments`, `svn_repos_node_location_segments`'
+> loop a turn a step (the closest copy or the node's origin, each segment cropped to the range, the gap to the copy's
+> source), `serve.c`'s range refusals after `done`. Owed: `log` with merged revisions, `get-file-revs`,
+> `get-deleted-rev`; the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
+> authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -42406,8 +42408,22 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   reverse, names not folded, the kind `none` when not asked, `exclude` walked, dates never read, directories kept at
   `files`, recursion at every depth: each failed named tests; the eighth, an empty pattern list walked, answers the
   same bytes and failed once the test of its one slice was added).
-- **Owed** (the next slices): `log` with merged revisions, `get-location-segments`, `get-file-revs`,
-  `get-deleted-rev`, each replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
+- **Part 2, its fourth slice** (2026-11-19, g297): `get-location-segments` (`reads/segments.rs`). The parameters
+  `c(?r)(?r)(?r)` (path, peg, start, end); after the authentication request a missing or negative peg or start is the
+  youngest and a missing or negative end 0; an end younger than the start and a start younger than the peg are refused
+  after `done` (160006, `serve.c`'s own words), and a peg past the youngest ("No such revision N"). The walk is
+  `svn_repos_node_location_segments`' loop: a turn takes the closest copy of the path in the current revision
+  (`svn_repos__prev_location`, the index's youngest copy root as `get-locations` takes it), its segment from the copy's
+  revision, or from the node's origin (the revision its node identity was born in, `svn_fs_node_origin_rev`), to the
+  current revision; sends it where it meets the range, cropped; sends the gap down to the copy's source likewise, its
+  path absent; and moves to the source. A segment's path has no leading separator (the root's is empty). One turn is
+  one step of a `Stream`; `segment_turn` is shared with `log`'s history as mergeinfo. Tests (the Mac Studio, `cargo
+  test -p slates-svn --lib`, 2026-11-19): 331 of 331, rustfmt's layout taken; the session (16 commands: copies,
+  a replacement, gaps, the root, a cropped range, both range refusals, an absent path, a peg past the youngest, a
+  negative peg) replayed whole; the parameters and the streaming. Red-checked five ways (no gaps, no cropping, the
+  origin ignored, the two refusals swapped, no `done` before a range refusal): each failed the session's replay.
+- **Owed** (the next slices): `log` with merged revisions, `get-file-revs`, `get-deleted-rev`, each replayed against
+  the transcripts already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
   when the session could authenticate.

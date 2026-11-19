@@ -22,8 +22,8 @@
 
 use super::stream::{Progress, Stream};
 use super::{
-  DONE, Failure, Outcome, Reads, Repository, SEPARATOR, SVN_ERR_FS_NO_SUCH_REVISION, optional_revnum,
-  path_and_revision,
+  DONE, Failure, Outcome, Reads, Repository, SEPARATOR, SVN_ERR_FS_NO_SUCH_REVISION,
+  optional_revnum, path_and_revision,
 };
 use crate::index::Revision;
 use crate::ra_svn::{ItemError, Value, write};
@@ -266,7 +266,11 @@ impl SegmentStream {
   /// One turn: its segments written and the walk moved on, or the end written: `done`, then the answer or the
   /// refusal.
   fn turn<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), ItemError> {
-    let Some((path, revision)) = self.next.take().filter(|(_, revision)| *revision >= self.end) else {
+    let Some((path, revision)) = self
+      .next
+      .take()
+      .filter(|(_, revision)| *revision >= self.end)
+    else {
       return self.finish(reads, None);
     };
     match reads.segment_turn(&path, revision, self.start, self.end) {
